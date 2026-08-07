@@ -5671,3 +5671,70 @@ environments.py:79 `if not base_dir: return cwd`              <-- and base_dir i
 **Related:** #1057, #1059, #1060 (the cwd-is-not-the-caller cluster — this is its fourth instance and the only one on product code), #1000 (a required check green because it read the wrong directory), ADR 0050 AC-6, ADR 0092.
 
 **Source:** surfaced 2026-08-05 by a repo-wide sweep for the cwd-as-identity shape, reported as one of five candidates and held as **relayed, not confirmed** until the chain was read end to end on 2026-08-06. Filed only after that verification: the sweep's own severity ranking put it first, and a subagent's severity claim is not evidence.
+
+## 1077. `announce-session.ps1` skips reachable peers on `isRunning: false`, which means IDLE, not dead
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **6/10** · Difficulty **2/10** · _quick win_. The announce hook instructs every session *"No exact row, or isRunning is false -> SKIP that peer"*, then has the model record the outcome under the token `NOT_RUNNING`. Measured 2026-08-06: **`isRunning: false` means the session is IDLE and `send_message` DELIVERS to it**; `isRunning: true` means it is mid-turn and the message QUEUES. The field reads **backwards** as a reachability signal, so the rule drops exactly the peers that are ready to answer.
+
+**Cluster:** Session coordination / roster semantics. **Priority:** P2. **Verdict:** build (small). **Severity:** no product effect and no security effect — this governs agent coordination. The cost is silent: a session follows the rule, reports fewer live peers than exist, and nothing raises.
+
+**Measured by sending into real peers and getting real replies, not inferred from the field.**
+
+| target state | result |
+| --- | --- |
+| `isRunning: false` (idle) | **delivered**, answered within one turn |
+| `isRunning: true` (busy) | *"Message queued … will be processed after the in-flight turn finishes"* |
+
+**It has already cost a wrong report to the owner.** A session applying the SKIP rule told the owner there was **no live coordinator** and was corrected with *"there is a live coordinator... talk to it."* `presence.ps1` had listed it live throughout. The two rosters also disagreed on that session's **branch**, so branch cannot join them either — only cwd can.
+
+**This item is the SKIP rule, not the field.** The defect is that this repo's own hook elevates `isRunning` to a disqualifier without saying what it means, and then records the outcome under a token that reads as *"gone"*.
+
+**Fix shape, offered not decided.** Either drop the `isRunning` condition entirely (cwd match alone decides reachability, and a failed `send_message` is loud), or keep it and invert the reading — skip on `true` if anything, since that is the state that queues. Whichever is chosen, the `NOT_RUNNING` receipt token must go: it records a delivery that would have succeeded. A negative control per #1000 needs a peer that is idle at the time of the run, since an all-busy roster cannot distinguish the two rules.
+
+**Related:** #1000 (a rule green because its outcome token cannot express the case it got wrong), #1057 (a refusal whose text misleads the reader about what was checked).
+
+**Source:** found 2026-08-06 by a session that followed the rule, misreported the roster to the owner, was corrected, and then settled a question its own notes had recorded as *"UNVERIFIED, do not assert either way: whether send_message delivers to an isRunning:false session"* — including that note's own prediction that if it delivered, the SKIP rule would be dropping reachable peers.
+
+## 1078. `new.ps1` prints cleanup advice that throws when followed as written
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **3/10** · Difficulty **1/10** · _quick win_. Run from a worktree, `new.ps1` anchors on `$PSScriptRoot` and creates the new tree beside **itself** — e.g. under `.claude/worktrees/` — then prints *"When done (run from the MAIN checkout): `scripts\worktree\remove.ps1 -Name <name>`"*. From the main checkout that resolves to `<repo-parent>/<repo-leaf>-<name>`, which does not exist, and `remove.ps1` throws *"No such worktree"*. The command only works run from the worktree that created it, which is not what the line says.
+
+**Cluster:** Developer tooling / refusal and advice accuracy. **Priority:** P4. **Verdict:** build (trivial). **Severity:** low and loud — `remove.ps1` fails closed with a clear message naming the path it looked for. Nothing is destroyed and no wrong tree is removed; the cost is a confusing failure at cleanup time.
+
+**Third instance of the same class, and that is why it is worth a number rather than a comment.** #1032 was rule 3b printing a `new.ps1` command `new.ps1` refuses to run. #1057 was rule 3d naming `remove.ps1` and `prune-merged.ps1` for a worktree family neither can reach. This is the same defect in `new.ps1`'s **own output**, about a worktree `new.ps1` **just created** — so the anchoring is correct and only the advice is wrong.
+
+**The fix is to print the path that was actually used.** `new.ps1` knows `$RepoRoot` and `$WorktreePath` at the point it prints; the line should name the checkout the command must be run from rather than asserting "the MAIN checkout", or print the plain `git -C <root> worktree remove <path>` that works from anywhere.
+
+**Do not fix by changing where `new.ps1` puts the worktree.** Anchoring on `$PSScriptRoot` is what BACKLOG #1060 established as correct for a script invoked by absolute path; the defect is the sentence, not the placement.
+
+**Related:** #1057 and #1032 (the same class, one and two rules over), #1060 (the anchoring that makes the placement correct).
+
+**Source:** found 2026-08-06 while creating a worktree to fix #1057 — the tool being used to clean up after the defect exhibited the defect.
+
+## 1079. `security.yml`'s header denies the push-to-main trigger its own `on:` block declares
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **2/10** · Difficulty **1/10** · _quick win_. The header comment states *"NO push-to-main trigger (dropped for CI cost)"* and explains the reasoning at length. The `on:` block a few lines later carries `push: branches: [main]`, with its own comment calling it the *"Post-merge re-scan (main only)"*. Two comments in one file, each describing the trigger set, and they contradict each other.
+
+**Cluster:** Documentation accuracy / CI. **Priority:** P4. **Verdict:** build (trivial — delete or correct one comment). **Severity:** none to the build. The workflow behaves as the `on:` block says; only a reader is misled.
+
+**Why it is worth a number at all.** This is a **security** workflow whose header is otherwise load-bearing — the same block documents that `continue-on-error` leaves branch protection green while discarding findings, and points at `tests/test_security_posture.py` as the guard that refuses it. A reader who finds one paragraph of that header demonstrably false has no way to know which of the others still hold. The cost is to the header's credibility, not to CI.
+
+**Determine which is stale before editing.** The push arm's own comment gives a reason — a fork PR is scanned structural-only, so without this arm no fully-loaded scan sees fork-contributed content — that does not obviously yield to the cost argument in the header. Whichever survives, the other must go, not be softened.
+
+**Related:** #1000 (a claim about a control that its own configuration contradicts).
+
+**Source:** noticed 2026-08-06 while reading the workflow to answer whether a PR's checks audit the merge ref or the head — an unrelated question.
+
+## 1080. `setup-leak-gate.ps1` reports the LOADED token set as if it were the one it just installed
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **3/10** · Difficulty **1/10** · _quick win_. `-Synthetic` prints *"Installed the SYNTHETIC template"* and then, three lines later, *"CONFIGURED with the real token set."* Both are individually true when `MEFOR_FORBIDDEN_TOKENS` is set: the script installed the synthetic file, and the scanner loaded the real list from the environment, which wins over the file. Nothing in the output says the env source **overrode** what was just installed, so the two lines read as a contradiction or, worse, as confirmation that the synthetic install produced a real-token gate.
+
+**Cluster:** Developer tooling / reporting accuracy. **Priority:** P4. **Verdict:** build (trivial). **Severity:** low, and the direction is safe — the gate really is loaded with the real set, so the operator is better protected than the message implies, not worse. The cost is that a reader cannot tell which source armed the gate, which is the one question the script's own docstring says the verify step exists to answer.
+
+**The script's stated purpose is what makes this a defect rather than a nit.** Its header: *"A green gate is evidence only if you confirmed it can see the class it is meant to catch"*, and it *"always finishes by invoking the scanner and printing the per-section detector counts"*. Printing the counts without printing **where they came from** leaves exactly the ambiguity the step was written to close.
+
+**Fix shape.** Have the verify step name the resolved source — the `MEFOR_FORBIDDEN_TOKENS` path versus `scripts/security/scan-tokens.local.txt` — and say plainly when the environment overrode the file just written. `scan_forbidden.py` already distinguishes the three states internally (structural-only, synthetic, real) to build that line; it needs the provenance too, not just the verdict.
+
+**Related:** #1063 (the same script, anchoring rather than reporting), #1000 (a gate whose green does not say what it was green about).
+
+**Source:** observed 2026-08-06 while arming a fresh worktree during #1063's fix. Held unfiled as marginal, and filed on the owner's instruction.
