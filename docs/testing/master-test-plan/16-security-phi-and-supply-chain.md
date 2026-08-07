@@ -16,7 +16,7 @@ prove a guard actually **refuses**, rather than asserting it exists. It covers:
 
 - **Transport posture** — the TLS floor, the forward-secrecy cipher gate, KEX-group pinning, the
   bind ladder, and the cleartext-hop refusal authority
-  ([`config/tls_policy.py:435` `insecure_hop_disposition`](messagefoundry/config/tls_policy.py),
+  ([`config/tls_policy.py:435` `insecure_hop_disposition`](../../../messagefoundry/config/tls_policy.py),
   `:481 enforce_insecure_hop`; ADR 0092 as amended by **ADR 0153**, which deleted the `is_phi` ALLOW arm
   and `audited_opt_out` so **no data label can permit a cleartext hop**).
 - **Posture configuration** — `[security]` (ADR 0118), the `[security].enforcement` REFUSE/WARN dial
