@@ -51,9 +51,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$repo = (& git rev-parse --path-format=absolute --show-toplevel).Trim()
-if (-not $repo) { throw "Not inside a git repository." }
-$common = (& git rev-parse --path-format=absolute --git-common-dir).Trim()
+# Anchored on the SCRIPT, not the current directory -- the reasoning is written out once, at the head of
+# alloc.ps1 (BACKLOG #1060). It applies here identically and was found here by inspection rather than by
+# a second reproduction: this file recorded `worktree = $repo` from the same unanchored call, so an
+# absolute `-File` invocation from another worktree took the claim in the caller's name. A claim is
+# advisory for free-text keys and ENFORCED for numbered ones by scripts/hooks/claim_check.py, which reads
+# the repo from cwd correctly because it runs as a commit hook -- cwd IS the committing worktree there.
+# Hook right, tool wrong, and only the tool can be invoked from somewhere else.
+$repo = (& git -C $PSScriptRoot rev-parse --path-format=absolute --show-toplevel 2>$null)
+if (-not $repo) { throw "scripts/coord/ is not inside a git repository: $PSScriptRoot" }
+$repo = $repo.Trim()
+$common = (& git -C $repo rev-parse --path-format=absolute --git-common-dir).Trim()
 $claims = Join-Path $common "mefor-coord/claims"
 New-Item -ItemType Directory -Force -Path $claims | Out-Null
 
@@ -202,8 +210,8 @@ if ($List) { Show-List; exit 0 }
 $safe = ConvertTo-KeyFile $Take
 $file = Join-Path $claims "$safe.json"
 
-$branch = & git branch --show-current
-if ([string]::IsNullOrWhiteSpace($branch)) { $branch = "detached@" + (& git rev-parse --short HEAD) }
+$branch = & git -C $repo branch --show-current
+if ([string]::IsNullOrWhiteSpace($branch)) { $branch = "detached@" + (& git -C $repo rev-parse --short HEAD) }
 $branch = $branch.Trim()
 
 try {
@@ -345,4 +353,17 @@ Write-Host "CLAIMED '$Take'" -ForegroundColor Green
 Write-Host "  by   : $repo [$branch]"
 Write-Host "  note : $(if ($Note) { $Note } else { '(no note)' })"
 Write-Host "  release when done:  pwsh -NoProfile -File scripts\coord\claim.ps1 -Release $Take"
+
+# Same note alloc.ps1 prints, for the same reason (BACKLOG #1060): anchoring is correct but surprising,
+# and a claim recorded to a worktree the caller is not standing in otherwise surfaces only as a refused
+# commit later. Silent on the ordinary same-tree invocation.
+$cwdTop = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
+if ($cwdTop) {
+    $a = ($cwdTop.Trim() -replace '\\', '/').TrimEnd('/')
+    $b = ($repo -replace '\\', '/').TrimEnd('/')
+    if ($a -ine $b) {
+        Write-Host "  NOTE: your shell is in $a, but this script lives in $b, so the claim is" -ForegroundColor Yellow
+        Write-Host "        recorded to $b. -Release must be run against that same worktree." -ForegroundColor Yellow
+    }
+}
 exit 0

@@ -84,6 +84,11 @@ function ConvertTo-Norm([string]$p) {
 
 # Every worktree sharing one .git. Keyed on the worktree SET rather than a single path, because the
 # whole point is seeing siblings, not just yourself.
+# The Branch this returns is the WORKTREE's, read live from git, and is therefore current at the moment
+# of the call. It is NOT a session attribute: a session record carries no branch at all (see
+# session-registry.ps1). The session-list MCP tool reports the branch a session STARTED on, which does
+# not follow a later `git switch` -- so the two legitimately disagree for a checkout that has moved, and
+# a disagreement is not evidence that either is broken. Use this one for "what is that checkout on now".
 function Get-RepoWorktrees([string]$RepoHint) {
     $gitArgs = @()
     if ($RepoHint) { $gitArgs = @("-C", $RepoHint) }

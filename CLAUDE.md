@@ -500,16 +500,17 @@ harness process only.)
 - Document each connector/transport and transform with its config schema and an example
   message.
 - When asked for tabular results, provide the final table directly — not code that generates it.
-- **Review security prose by asking what a reader would DO with it, not whether it is accurate.** The
-  three rules below are instances of it. Reasoning, evidence and dates:
-  [`docs/Secure_Development_Standards.md`](docs/Secure_Development_Standards.md) §3 *"Reviewing
-  security prose"* — the source of record.
-- **State a load-bearing fact ONCE and link to it; never restate it.**
-- **A completeness claim is a liability — prefer "at least" to an enumeration.**
-- **A compensating control must not rest on a false premise.**
-- **Confirm your instrument answers the question you asked, not one adjacent to it** — `git diff` on a
-  staged file, `--is-ancestor` under squash-merge, `$?` after a pipe, a *job* conclusion for a *step*
-  question. Name the question and what the tool returns; check they are the same sentence.
+- **Review security prose by asking what a reader would DO with it, not whether it is accurate**
+  (**SDS-3.4**). The rules below are instances of it. Reasoning, evidence and dates:
+  [`docs/Secure_Development_Standards.md`](docs/Secure_Development_Standards.md) **SDS-3.4 to SDS-3.8**,
+  under *"Reviewing security prose"* — the source of record.
+- **State a load-bearing fact ONCE and link to it; never restate it** (**SDS-3.5**).
+- **A completeness claim is a liability — prefer "at least" to an enumeration** (**SDS-3.6**).
+- **A compensating control must not rest on a false premise** (**SDS-3.7**).
+- **Confirm your instrument answers the question you asked, not one adjacent to it** (**SDS-3.8**) —
+  `git diff` on a staged file, `--is-ancestor` under squash-merge, `$?` after a pipe, a *job*
+  conclusion for a *step* question. Name the question and what the tool returns; check they are the
+  same sentence.
 
 ---
 

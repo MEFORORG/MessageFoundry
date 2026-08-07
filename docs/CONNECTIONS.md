@@ -840,9 +840,11 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   (`pip install 'messagefoundry[sftp]'`, lazily imported so an install that never uses SFTP skips it).
   **Host-key verification is ON by default** (the system host keys plus an optional extra `known_hosts`,
   paramiko `RejectPolicy`); an unknown key is **refused** unless `MEFOR_ALLOW_INSECURE_TLS` is set (and
-  loudly logged when it is). **This one cell reads the raw escape and is *not* clamped** — unlike the
-  `tls_verify` / `encrypt` cells elsewhere in this document, the variable still works here on a
-  production-PHI enforcing instance, so it is the SFTP setting to audit for rather than assume inert.
+  loudly logged when it is). **Since #329 this cell routes the escape through the clamped
+  `weakened_tls_escape_permitted_here()`** — like the `tls_verify` / `encrypt` cells elsewhere in this
+  document, so on a production-PHI enforcing instance the escape is inert and an unknown host key stays
+  refused (`RejectPolicy`) even with the variable set; it takes effect only on a non-enforcing / non-PHI
+  instance.
 - **`Ftp(...)`** — stdlib `ftplib`, **no extra**: `tls=False` is plain FTP, `tls=True` is **FTPS**
   (explicit TLS + `PROT P`, encrypting the control *and* data channels). FTPS **verifies the server
   certificate and hostname by default** (a verifying `SSLContext`, not ftplib's no-verify fallback).
@@ -2433,7 +2435,7 @@ Legend: ✅ native · ~ partial / via extension / via another transport · ❌ n
 | **IBM MQ / MSMQ** | ~ | ❌ | ✅ | ❌ | not on roadmap |
 | **Kafka / streaming** | ~ | ❌ | ✅ | ❌ | not on roadmap |
 | **DICOM** (imaging) | ✅ | ~ | ✅ | ✅ | `DICOM-IN` C-STORE SCP (Phase 1) + `DICOM-OUT` C-STORE SCU/C-ECHO + `DICOMWEB-OUT` STOW-RS all shipped (ADR 0025); DICOMweb send exceeds both incumbents |
-| **Serial (RS‑232)** + X/Y‑Modem/Kermit + **ASTM E1381/E1394/E1318** | ~ | ❌ | ✅ | ❌ | **declined-by-design (v0.2+)** — legacy/niche lab-instrument connectivity, no feed demand ([BACKLOG.md](BACKLOG.md) #27) |
+| **Serial (RS‑232)** + X/Y‑Modem/Kermit + **ASTM E1381/E1394/E1318** | ~ | ❌ | ✅ | ❌ | **declined-by-design (v0.2+)** — legacy/niche lab-instrument connectivity, no feed demand ([BACKLOG #27](archive/backlog/BACKLOG-CLOSED.md#27-serial-rs-232--astm-e1381e1394e1318--decision-decline-unless-lab-analyzer-demand-no-build)) |
 | **FHIR** endpoint/client | ✅ | ✅ | ✅ | ~ | `FHIR-OUT` shipped (`FHIR()`, ADR 0022) + SMART Backend Services client auth (ADR 0024); the inbound **server facade** is deferred (BACKLOG #20) |
 | **Internal channel‑to‑channel** | ✅ | ✅ | ✅ | ✅ | the routing graph (wired by name) — plus two first-class internal inbounds: `Loopback()` (a captured reply) and `PassThrough()` (1:N internal re-ingress), ADR 0013 |
 | Printer / command‑line / screen‑scrape | ~ | ❌ | ✅ | ❌ | not on roadmap (niche) |

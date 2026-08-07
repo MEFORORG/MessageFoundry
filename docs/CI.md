@@ -17,7 +17,7 @@ claims move with it.
 | Workflow | What it does |
 |---|---|
 | `ci.yml` | Lint (`ruff check` + `ruff format --check`), types (`mypy --strict`, plus a `--platform win32` pass on Linux so Windows type-branches are checked), and the `pytest` suite across **ubuntu-latest**, **windows-2022**, and **windows-2025** (Python 3.14). Also builds the VS Code extension (`ide/`). A `CI gate` job rolls the legs up. |
-| `security.yml` | Static and supply-chain security: `bandit` (Python SAST), `semgrep`, `pip-audit` and `npm-audit` against the hash-locked tree, `gitleaks` (secret scan), `forbidden-content` (customer/PHI leak guard), a crypto-inventory check, an SBOM build, and a `trivy` scan. A **daily cron** re-runs the dependency audits so a CVE filed against an unchanged pin is caught within ~24h. |
+| `security.yml` | Static and supply-chain security: `bandit` (Python SAST), `semgrep`, `pip-audit` and `npm-audit` against the hash-locked tree, `gitleaks` (secret scan), `forbidden-content` (customer/PHI leak guard), a crypto-inventory check, an SBOM build, and a `trivy` scan. A **daily cron** re-runs the dependency audits so a CVE filed against an unchanged pin is caught within ~24h. A separate `released-line-audit` job runs on the same cron and audits the **latest release tag's** pinned core runtime, which the daily audits do not cover — they read the checked-out tree, so between a fix landing on `main` and a release carrying it the two answers differ. Hard-failing but **not** a required check (schedule/dispatch only), the same posture as `dast.yml`. |
 | `codeql.yml` | GitHub CodeQL analysis (python / javascript-typescript). |
 | `scorecard.yml` | OpenSSF Scorecard analysis. |
 | `cla.yml` | CLA Assistant — records the Contributor License Agreement signature on each PR. |
@@ -51,9 +51,11 @@ The stable contexts required on `main` are — mirroring
 
 That last string is the **job key** in `cla.yml`, whose job declares no `name:`. Branch protection
 matches the job name, never the workflow name — so the context is `cla`, not "CLA Assistant". Every
-non-advisory job in `security.yml` is in the set; the two that are not (`sbom`, `trivy`) declare
-`continue-on-error: true`, and `tests/test_security_posture.py` pins which side of that line each one
-is on.
+non-advisory job in `security.yml` is in the set. Three are not, in two different ways: `sbom` and
+`trivy` declare `continue-on-error: true`, while `released-line-audit` deliberately does **not** — it
+is advisory by *placement*, being schedule/dispatch-only so it can never report on a PR, and it still
+goes red on a finding (the `dast.yml` posture). `tests/test_security_posture.py` pins which of the
+three buckets each job is in.
 
 CodeQL is **advisory** (not in the required set) — its SARIF upload needs `security-events: write`,
 which fork-PR tokens do not have, so requiring it would block PRs from forks. Scorecard is advisory for

@@ -245,8 +245,11 @@ def test_scorecard_negative_claims_survive(sentence: str) -> None:
         "| Dynamic | DAST / authenticated testing of the running app | Per release and periodically |",
         # §6.1 — the Independent review row, a DIFFERENT tier, untouched by a self-run pass.
         "| Independent review | Third-party source-code review + penetration test per 800-115",
-        # §A.6 — the source of record for the independent-engagement status.
-        "**Independent ASVS-L3 review & DAST (§6.3 / §6.4).** Not yet performed",
+        # A.6 — the source of record for the independent-engagement status. This pin was written
+        # against "(§6.3 / §6.4)" and fired when the deviations register moved to rule identifiers,
+        # which is the pin working: the anchor genuinely moved. It now names the rule rather than two
+        # section numbers, so a future renumbering cannot move it again.
+        "**Independent ASVS-L3 review & DAST — SDS-6.4.3.** Not yet performed",
     ],
 )
 def test_sds_independent_review_row_is_unchanged(row: str) -> None:

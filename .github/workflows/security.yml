@@ -38,6 +38,11 @@ on:
     # clock. pip-audit/npm-audit here are a second detector independent of GitHub's advisory-review lag.
     - cron: "0 6 * * *"
   workflow_dispatch:
+    inputs:
+      released_line_audit_tag:
+        description: "released-line-audit: audit THIS release tag instead of the selected latest. Leave blank for normal runs; used to re-run the positive control against an older tag."
+        required: false
+        type: string
 
 concurrency:
   # Per-ref for PR events so a rapid re-push supersedes its own in-flight scan (ci.yml's pattern —
@@ -163,6 +168,150 @@ jobs:
         # --package-lock-only audits straight from the committed package-lock.json (no install needed) —
         # fast and reproducible. Default level fails on ANY severity, matching pip-audit's strict posture.
         run: npm audit --package-lock-only
+
+  released-line-audit:
+    name: released-line-audit (latest release's pinned runtime)
+    runs-on: ubuntu-latest
+    # WHAT THIS ANSWERS, and why the `pip-audit` job above does not. That job audits the CHECKED-OUT
+    # tree, so on the daily cron it audits `main`. "Is what we would ship next current" is the right
+    # question and it is a DIFFERENT question from "does the version we already shipped carry a known
+    # advisory". The two answers diverge from the moment a fix lands on main until a release carries
+    # it, and nothing watched that window.
+    #
+    # MEASURED 2026-08-06, stated in the conditional because there are ZERO deployments (CLAUDE.md
+    # section 0). v0.3.2 was tagged 2026-07-28 pinning cryptography 49.0.0. GHSA-g6cj-pr64-35w5 /
+    # CVE-2026-69247 / PYSEC-2026-3552 (fixed in 50.0.0) published 2026-08-03. The required `pip-audit`
+    # gate above caught it on main THE SAME DAY and the pin was bumped -- that gate worked, and this job
+    # is NOT a second detector for it. What did not exist was anything noticing that days later no
+    # release carries the fix, so an operator scanning the published v0.3.2 SBOM WOULD see an advisory
+    # our shipped VEX says nothing about (security/vex/messagefoundry.openvex.json has no statements).
+    #
+    # SCOPE = the latest released line only. docs/SUPPORT-POLICY.md -- only the latest released version
+    # is supported pre-1.0 and there is no back-port. A finding against an older tag has no supported
+    # remedy, so scanning one would manufacture unactionable work.
+    #
+    # ADVISORY BY PLACEMENT, NOT BY continue-on-error -- the dast.yml posture recorded in
+    # .github/required-contexts.txt. It goes RED on a finding. It is schedule/dispatch-only, so it can
+    # never report on a PR and must never become a required context (the required-but-absent trap).
+    # tests/test_security_posture.py pins both halves of that.
+    #
+    # NO VEX IS APPLIED HERE, deliberately. Applying our maintained OpenVEX would let a `fixed` or
+    # `not_affected` statement written on main suppress the finding against the ALREADY-SHIPPED
+    # artifact -- security/vex/README.md's own worked example names the product with no version
+    # qualifier, so a statement applies to every release forever. That would turn this gate green at
+    # the exact moment the assessment was written and before any release carried the fix. To accept a
+    # triaged advisory, add `--ignore-vuln <ID>` below with the reason in a comment: explicit,
+    # greppable and per-advisory, the same escape hatch the pip-audit job documents.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing in this job pushes or uploads the tree, so the persisted git credential has no work
+          # to do. Fixed at the source rather than leaning on this file's artipacked entry in
+          # .github/zizmor.yml, which that config's own header asks for.
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Install pip-audit (hash-pinned, from the CI toolchain lock)
+        # Same install as the pip-audit job above: no new tool, no new pin, no second vulnerability
+        # database, nothing that can drift out of step with an operator-facing command.
+        run: python -m pip install --require-hashes -r ci/locks/ci-scanners.lock
+      - name: Audit the latest released line's pinned core runtime
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          # Hoisted, never interpolated into the script body (zizmor: template injection). A dispatch
+          # input is untrusted text and is shape-checked before it reaches `gh`.
+          TAG_OVERRIDE: ${{ inputs.released_line_audit_tag }}
+        run: |
+          set -euo pipefail
+
+          # WHICH TAG. Deliberately NOT `/releases/latest`: that endpoint excludes pre-releases, and
+          # release.yml publishes pre-release `-*` tags to PRODUCTION PyPI -- so its default answers a
+          # narrower question than the one asked. The web console is separately versioned under a
+          # `webconsole-v*` namespace and ships no engine runtime lock, so it is excluded by shape.
+          # Enumerate, filter, and PRINT the rule applied plus every candidate considered.
+          if [ -n "${TAG_OVERRIDE:-}" ]; then
+            case "$TAG_OVERRIDE" in
+              v[0-9]*.[0-9]*.[0-9]*) targets="$TAG_OVERRIDE" ;;
+              *) echo "::error::refusing tag override '$TAG_OVERRIDE' -- engine tags are vX.Y.Z[-suffix]" >&2 ; exit 2 ;;
+            esac
+            echo "selection rule: OPERATOR OVERRIDE via workflow_dispatch input"
+          else
+            releases="$(gh release list --limit 100 --json tagName,isDraft,isPrerelease,publishedAt)"
+            echo "--- candidates considered ---"
+            printf '%s' "$releases" | jq -r '.[] | "\(.publishedAt)  \(.tagName)  draft=\(.isDraft) prerelease=\(.isPrerelease)"'
+            echo "selection rule: newest non-draft engine tag, PLUS the newest pre-release when it is newer than that"
+            targets="$(printf '%s' "$releases" | jq -r '
+                [ .[]
+                  | select(.isDraft | not)
+                  | select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+(-.+)?$")) ]
+                | sort_by(.publishedAt) | reverse
+                | ( (map(select(.isPrerelease | not)) | .[0:1]) + (.[0:1] | map(select(.isPrerelease))) )
+                | map(.tagName) | unique | .[]')"
+          fi
+
+          if [ -z "$targets" ]; then
+            echo "::error::no published engine release matched the selection rule -- this gate examined NOTHING. Failing closed." >&2
+            exit 2
+          fi
+
+          examined=0
+          for tag in $targets; do
+            echo "=== $tag ==="
+            # Read the lock AT THE TAG. This is the exact file release.yml installs into a clean venv to
+            # generate the shipped CycloneDX SBOM, so it is the same component population the published
+            # messagefoundry-sbom.cdx.json inventories -- not a fresh resolve of main.
+            gh api "repos/$GH_REPO/contents/docker/locks/requirements-core.lock?ref=$tag" \
+              -H "Accept: application/vnd.github.raw" > "core-$tag.lock"
+            pinned="$(awk '/^[^#[:space:]-]/ && /==/ {n++} END {print n+0}' "core-$tag.lock")"
+            echo "$tag: docker/locks/requirements-core.lock carries $pinned pinned requirements"
+            # A run that examined nothing must never read as clean. 41 at the time of writing; this
+            # floor is a collapse detector, not a pin.
+            if [ "$pinned" -lt 25 ]; then
+              echo "::error::$tag: read only $pinned pinned requirements -- the audit input is missing or truncated. Failing closed." >&2
+              exit 2
+            fi
+            pip-audit -r "core-$tag.lock" --desc
+            echo "$tag: CLEAN -- $pinned pinned requirements of the CORE RUNTIME closure, no known advisory"
+            examined=$((examined + 1))
+          done
+
+          echo "released-line-audit: examined $examined release(s):"
+          printf '%s\n' "$targets"
+          echo "SCOPE: the CORE RUNTIME closure only (docker/locks/requirements-core.lock), which is"
+          echo "what the shipped SBOM inventories. Extras (webauthn, dicom, sqlserver) and the CI"
+          echo "toolchain are covered against main by the pip-audit job, not here. A wheel adopter"
+          echo "resolves against pyproject.toml's FLOORS, so a finding here is a statement about the"
+          echo "published SBOM's inventory, not about every install."
+      - name: What to do about a finding
+        if: failure()
+        run: |
+          set -euo pipefail
+          echo "The latest released line pins a component with a known advisory. The order matters."
+          echo
+          echo "1. TRIAGE FIRST. .github/SECURITY.md -- the clock starts at UPSTREAM-FIX availability,"
+          echo "   not at this run. Priority is KEV first, then EPSS >= 0.7, with CVSS only as a"
+          echo "   tiebreaker, weighing reachability. Pick the row from that file's SLA table. A HIGH"
+          echo "   CVSS that is unreachable lands on the LAST row, not the High row."
+          echo
+          echo "2. THE REMEDY IS A RELEASE. docs/SUPPORT-POLICY.md -- there is no back-port, and"
+          echo "   adopting a fix is a one-line pin bump, so a patch release on the latest line is the"
+          echo "   only vendor action that changes an adopter's state."
+          echo
+          echo "3. IF IT IS UNREACHABLE, record the assessment as an OpenVEX statement in"
+          echo "   security/vex/messagefoundry.openvex.json (security/vex/README.md) and bump the"
+          echo "   document version. It ships with the NEXT release: release.yml copies that file from"
+          echo "   the working tree at tag time, so the VEX commit must PRECEDE the tag."
+          echo
+          echo "4. NEVER edit the shipped artifact. The released SBOM and VEX are Sigstore-signed and"
+          echo "   SLSA-attested at tag time. A post-tag assessment reaches consumers via the next"
+          echo "   release, never by amending an old one."
+          echo
+          echo "5. NO UPSTREAM FIX YET? .github/SECURITY.md -- apply a documented compensating control"
+          echo "   and track to the fix. To silence a triaged advisory here, add '--ignore-vuln <ID>'"
+          echo "   to the pip-audit call in the previous step, with the reason."
 
   sbom:
     name: SBOMs (CycloneDX, multi-ecosystem)
