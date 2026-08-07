@@ -11,7 +11,9 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.anon import DEFAULT_RULES
 from messagefoundry.anon import anonymize as engine_anonymize
+from messagefoundry.anon import leak as engine_leak
 from messagefoundry.generators import (
     _core,
     _hl7data,
@@ -109,6 +111,47 @@ def test_leak_tables_are_sourced_from_the_guard_when_present() -> None:
             "no token source configured (fork CI / fresh clone) — tables legitimately empty"
         )
     assert tee_leak.FORBIDDEN and tee_leak.ESTATE_TOKENS  # type: ignore[attr-defined]
+
+
+# Synthetic-PHI-shape inputs (never a real value) whose UNMAPPED fields carry SSN/phone/MRN shapes,
+# plus a benign case — the structural walk + coverage report + token-floor signal must agree between
+# the engine (delegating to _scanner()) and the tee (reimplementing over _GUARD). The structural block
+# is copied byte-for-byte between the two leak.py files; this is the divergence guard for it.
+_LEAK_PARITY_INPUTS = [
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y\rDST|1|123-45-6789",
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y"
+    "\rDST|1|202-555-0188|(202) 555-0188",
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1|98765^^^HOSP^MR||X^Y",
+    "MSH|^~\\&|A|B|C|D|20260101120000||ADT^A01|M1|P|2.5.1"
+    "\rEVN|A01|20260101120000\rOBX|1|NM|8480-6^Systolic^LN||128|mm[Hg]",
+]
+
+
+def _structural_fields(report: object) -> tuple[object, ...]:
+    """The STRUCTURAL/coverage fields of a LeakReport — the byte-copied #331 logic this guard pins.
+
+    ``token_tables_live`` / ``token_floor_reason`` are intentionally excluded: they are derived from
+    the token authority, not the structural walk, and the engine's ``_scanner()`` (lazily lru_cached
+    on first call) and the tee's ``_GUARD`` (loaded at import) can snapshot the token source at
+    different times within a full-suite run — a fixture that patches ``MEFOR_FORBIDDEN_TOKENS`` before
+    the first ``_scanner()`` call poisons its token-floor view for the session. Those fields' cross-
+    copy agreement is already pinned by ``test_leak_token_table_matches_publish_guard``; here we guard
+    the detectors + coverage report, which are pure functions of (text, rules).
+    """
+    return (report.hits, report.unmapped_fields, report.structural_hits)  # type: ignore[attr-defined]
+
+
+def test_leak_check_and_report_engine_equals_tee() -> None:
+    for msg in _LEAK_PARITY_INPUTS:
+        eng_hits = engine_leak.leak_check(msg, rules=DEFAULT_RULES)
+        tee_hits = tee_leak.leak_check(msg, rules=DEFAULT_RULES)
+        assert eng_hits == tee_hits, f"leak_check diverged on {msg!r}: {eng_hits!r} != {tee_hits!r}"
+        eng_report = _structural_fields(engine_leak.leak_report(msg, rules=DEFAULT_RULES))
+        tee_report = _structural_fields(tee_leak.leak_report(msg, rules=DEFAULT_RULES))
+        assert eng_report == tee_report, (
+            f"leak_report structural fields diverged on {msg!r}:"
+            f"\n  ENG {eng_report!r}\n  TEE {tee_report!r}"
+        )
 
 
 def test_adversarial_inputs_engine_output_equals_tee_output() -> None:
