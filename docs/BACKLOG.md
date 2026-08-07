@@ -6298,3 +6298,31 @@ Both readings reach the same operational conclusion, which is the whole point of
 **Related:** #1073 (the pass), #1089–#1092 (the findings that got their own numbers).
 
 **Source:** BACKLOG #1073's ASCQM 1.1 catalogue pass over all 74 live elements, with an adversarial refutation stage on every non-not-applicable verdict.
+
+## 1097. The interpreter recursion list is a fixed set of flag spellings, but PowerShell accepts unambiguous prefixes, so `-Com` hides its argument from every rule
+
+> 🔢 **Filed 2026-08-07 — not started. ⛔ LIVE ON THE INSTALLED GATE, and it is a FAIL-OPEN, not a wording defect.** Value **8/10** · Difficulty **2/10** · _do it_. `worktree_gate.ps1:285` recurses into an interpreter argument for a FIXED list of spellings -- `-c` / `-lc` / `-Command` / `/c` / `/k`. **PowerShell accepts any unambiguous PREFIX**, so `-Com` and `-Comm` run code and are not on the list. Their argument is therefore blanked as an ordinary quoted span and its contents are invisible to EVERY rule.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P1. **Verdict:** build. **Severity:** no product effect and no PHI effect. It is a live route-around of the whole gate: whatever a session may not do directly, it may do inside `pwsh -Com '...'`.
+
+**Measured against real PowerShell, not inferred:**
+
+```
+pwsh -NoProfile -Com  'Write-Output RAN_Com_OK'   -> RAN_Com_OK
+pwsh -NoProfile -Comm 'Write-Output RAN_Comm_OK'  -> RAN_Comm_OK
+pwsh -NoProfile -Cm   '...'                       -> not recognized (ambiguous, so inert)
+```
+
+So `-Com` and `-Comm` are working spellings. `-Cm` is not, which bounds the family: it is every unambiguous prefix of `-Command` from `-C` upward, not any letter cluster.
+
+**Reachability on the committed gate.** The single-line form already ALLOWs today. A newline-spanning or here-string form currently DENIES, but only by accident: every line of a multi-line span reaches the scanner raw, so the disarm is seen as ordinary text rather than because the interpreter was recognised. **That accident is load-bearing and easy to remove** -- a change that blanks message bodies correctly deletes it, which is exactly what a candidate fix for #1086 did, converting the accident into a clean fail-open across all forms.
+
+**⛔ THE OBVIOUS FIX IS INSUFFICIENT AND WAS MEASURED SO.** Adding `-C|-Com|-Comm` to the list closes every spelling on the committed gate -- and on a gate that also blanks message bodies it closes only the single-line one, leaving the here-string route open behind it. So the fix must be verified against the gate as it will ship, not against the gate as it is.
+
+**The work.** Recognise the interpreter flag by PREFIX rather than by literal, for the shells that accept prefixes. `pwsh`/`powershell` accept any unambiguous prefix of `-Command` (and of `-EncodedCommand`, `-File`, `-NoProfile`); `bash`/`sh` do not -- their flags are single letters and clusters (`-c`, `-lc`, `-ec`), which the current list already handles. Bound it to the shells that actually behave this way rather than widening globally.
+
+**Test it by the PREFIX FAMILY, not by one spelling.** A test that pins `-Command` cannot see this, and a test that pins `-Com` alone cannot see `-Comm`. Enumerate `-C` through `-Command` and assert each denies, plus `-Cm` asserting the family is bounded -- that negative is what stops a fix widening into any-letters-ending-in-m, which is the shape that produced a separate fail-open in the #1086 candidate.
+
+**Related:** #1072 (text shapes rule 3c does not read -- this is the interpreter-recursion instance and the most severe of them), #1086 (the candidate fix that would have converted this from accidental-deny to clean fail-open), #1069, #1071, #1000 (a control green because its tests pin one spelling of a family).
+
+**Source:** found 2026-08-07 by the adversarial verification of a candidate fix for #1086. Two verifiers independently measured the abbreviation family; the third accepted the candidate because its corpus contained no such payload, which is itself the #1000 shape. The pre-existing half was separated from the introduced half by measuring both against the committed gate.
