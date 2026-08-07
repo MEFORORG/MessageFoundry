@@ -5264,6 +5264,26 @@ cd ../Unrelated && git -C . config core.hooksPath /dev/null
 
 **Source:** measured 2026-08-06 by the adversarial verification of round 1's shipped fix, recorded in #1061's banner, and filed as its own item 2026-08-07 after #1082 withdrew the only other live false-deny claim — leaving this the last one, and too easy to lose inside another item's prose.
 
+## 1086. Rule 3c reads a PowerShell here-string as a command, so a commit message that quotes a disarm key is refused
+
+> 🔢 **Filed 2026-08-07 — not started. ⛔ LIVE ON THE INSTALLED GATE, and it refused the commit that filed #1085.** Value **7/10** · Difficulty **3/10** · _do it_. `git commit -m @'...'@` whose MESSAGE quotes a disarm command is denied by rule 3c. The hook scans the tool-call text, matches the key, and refuses — though the quoted text is data being passed to `-m` and nothing was ever going to execute. **The gate cannot commit a faithful description of its own defect.**
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P2. **Verdict:** build. **Severity:** no product effect and no PHI effect. It blocks the specific act of DOCUMENTING a gate defect, which is a self-concealing failure: the harder a finding is to describe without quoting it, the harder it is to file.
+
+**Measured, and it is self-demonstrating.** The commit filing #1085 was refused. Its message contained the defective command as evidence. Rewriting the message so the key was not adjacent to `config` let the identical commit through — same file content, same staged diff, different prose.
+
+**⚠️ IT IS INTERMITTENT, AND THE REASON MAKES IT LOOK RANDOM.** Several earlier items in the same series quoted disarm commands and committed **fine**. They passed by ACCIDENT: their messages happened to also contain `--show-origin` or `--get`, which trip rule 3c's READ exclusion and skip the whole segment. So whether a commit message is refused depends on **unrelated content elsewhere in the same message**. A reader hitting this will not find a rule; they will find a coin flip.
+
+**Mechanism.** `Get-ScannableSegments` deliberately blanks quoted spans precisely to stop prose being read as a command — its own comment records three measured false positives that motivated it (`echo about to merge stuff` denying with `verb=merge`, and a commit message containing `clean`). **A PowerShell here-string (`@'...'@`) is not one of the shapes it blanks.** The same reasoning that produced the quote-blanking applies and was simply not extended to this form.
+
+**⛔ THE FIX IS NOT "BLANK HERE-STRINGS TOO", or not only that.** That file already learned this the hard way: blanking every quoted span made `pwsh -Command "git reset --hard"` ALLOW, because an interpreter argument is quoted but IS code that runs. The distinction the file settled on is **quoted-and-inert versus quoted-and-executed**, and a here-string can be either — `@'...'@` passed to `git commit -m` is inert; the same construct passed to `pwsh -Command` or `bash -c` is code. Any fix must preserve that distinction rather than key on the delimiter. The narrow, defensible version is: a here-string consumed by a **`-m`/`--message` argument** is a message, not a command.
+
+**Test it both ways in the same commit, or the fix is the regression.** A case asserting a `-m` here-string quoting a disarm key ALLOWS, and a case asserting a here-string handed to `pwsh -Command` still DENIES. The second is the one that matters — it is the exact regression the quote-blanking incident produced last time.
+
+**Related:** #1072 (text shapes rule 3c does not read — this is its false-deny mirror: a shape it reads that it should not), #1085 and #1082 (the other live wording/false-deny defects on this rule), #1069 (the gate blind to a quoted key — this item is the gate seeing a quoted command that is not one), #1000.
+
+**Source:** found 2026-08-07 by being refused. The commit that filed #1085 was blocked by the very rule the item documents, which is how the intermittency was noticed — several earlier commits in the same series had quoted the same class of command and passed.
+
 **Source:** identified 2026-08-05 while fixing #1032, and deliberately deferred rather than swept in, so that fix stayed scoped to one rule. Recorded here because a deferral nobody files is a deferral dropped.
 
 ## 1036. A Rule 4 deny names the first allowlisted repo's tooling regardless of which repo fired it
