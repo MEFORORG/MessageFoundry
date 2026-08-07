@@ -880,6 +880,17 @@ throughput discussion 2026-06-13.
 
 ## Connector & feature-breadth gaps vs. Mirth Connect — ranked for v0.2+ (#20–#27)
 
+> **Historical snapshot (the 2026-06-18 brochure mapping) — do not action the ranking below.**
+> Verified 2026-08-07: every backlog number this section cites — `#7`, `#20`–`#27` and `#35`, ten of
+> ten — has since closed and moved verbatim into
+> [`archive/backlog/BACKLOG-CLOSED.md`](archive/backlog/BACKLOG-CLOSED.md). **None is in this file.**
+> So the "**#7** above" and "**#35** below" directions below lead out of the document, and
+> "**P1 — close first**" names work that already shipped: `#20` (FHIR, ADR 0022) and `#21`
+> (observability, PR #407) both landed, and the section's own habit of marking `#24` and `#35`
+> SHIPPED inline makes the unmarked `#20`/`#21` read as still open. What survives here is the
+> **brochure gap-mapping itself**; take any item's current state from its archive entry, never from
+> the priority tier printed below. Breadth of the same defect elsewhere in the repo: **#1095**.
+
 These items came from mapping MessageFoundry against the **Mirth Connect "Cost-Effective
 Interoperability" brochure** — its base connector list + the Gold/Platinum extension matrix
 (owner request, 2026-06-18). The gaps are almost entirely **connector/protocol breadth** and
@@ -6301,9 +6312,13 @@ Both readings reach the same operational conclusion, which is the whole point of
 
 ## 1094. CLAUDE.md §12 decline markers cite the live backlog file for items that have archived
 
-> 🔢 **Filed 2026-08-07 — not started.** Value **4/10** · Difficulty **1/10** · _quick win_. §12's **Don't** list is where a decline is lifted so it **outlives the backlog item that recorded it**. Two of its markers cite [`docs/BACKLOG.md`](BACKLOG.md) `#26` and `#27` — and retiring an item **moves it verbatim** into [`archive/backlog/BACKLOG-CLOSED.md`](archive/backlog/BACKLOG-CLOSED.md). Measured on `origin/main` 2026-08-07: `## 26.` and `## 27.` are **absent** from `docs/BACKLOG.md` and **present** in the archive. Both pointers are already dead.
+> ✅ **Closed 2026-08-07 — already satisfied when filed; no work was performed under this number.** The repoint this item asks for merged as `befe997e` (PR #271) **one commit before this item itself landed** (`7ecff8ae`, PR #272). Re-verified on `origin/main` after both: §12 now reads *"BACKLOG #26 — closed, so it lives in [`docs/archive/backlog/BACKLOG-CLOSED.md`](archive/backlog/BACKLOG-CLOSED.md), not in the live ledger"*, and the same for `#27`. The finding below was true when measured and stale by the time it was recorded — a filing race, not a wrong observation. Original scoring, for the record: Value **4/10** · Difficulty **1/10** · _quick win_.
+>
+> ⚠️ **The two markers named here were the whole scope, and they are only two instances of a much larger class.** A repo-wide sweep the same day found **at least 90** further path-bearing citations naming `docs/BACKLOG.md` for an item that lives in the archive, plus broken relative hrefs and stale line anchors. That breadth is **#1095**, which also carries the detectability argument below at its true scale. Closing this number does not close that.
 
-**Cluster:** Documentation record / instrument accuracy. **Priority:** P3. **Verdict:** build (trivial). **Severity:** no product effect and no security effect. The decline text itself is intact and still binding; only the route back to its reasoning is broken.
+§12's **Don't** list is where a decline is lifted so it **outlives the backlog item that recorded it**. Two of its markers cited [`docs/BACKLOG.md`](BACKLOG.md) `#26` and `#27` — and retiring an item **moves it verbatim** into [`archive/backlog/BACKLOG-CLOSED.md`](archive/backlog/BACKLOG-CLOSED.md). Measured on `origin/main` 2026-08-07: `## 26.` and `## 27.` were **absent** from `docs/BACKLOG.md` and **present** in the archive. Both pointers were dead until `befe997e` repointed them.
+
+**Cluster:** Documentation record / instrument accuracy. **Priority:** P3. **Verdict:** build (trivial) — superseded by the fix having already landed. **Severity:** no product effect and no security effect. The decline text itself was intact and still binding throughout; only the route back to its reasoning was broken.
 
 **Nothing in this repository can catch this class today, and that is the argument for whatever check is proposed.** The markdown link resolves perfectly — it points at `docs/BACKLOG.md`, which exists — so a link checker cannot fire. The part that goes stale is the **human-readable number beside the link**, which no tool reads. That is why two instances sat unnoticed rather than being caught by the gates this repo already runs. A check that only validates link targets will report this file clean forever.
 
@@ -6316,3 +6331,36 @@ Both readings reach the same operational conclusion, which is the whole point of
 **Related:** #1073 (the decline whose marker nearly repeated this), #1000 (a control whose green is not evidence about what it appears to cover), #1087 and #1063 (the same cluster — an instrument answering a narrower question than the one asked), [`../CLAUDE.md`](../CLAUDE.md) §11 (state a load-bearing fact once and link to it — which is what makes the link's durability load-bearing).
 
 **Source:** found 2026-08-07 while verifying #1073's §12 marker against `origin/main` for HANDOFF-1073 item B5. The `#26`/`#27` absence was measured in both files rather than inferred, and the 44-occurrence convention count was re-run without a head limit after a first reading of "~18" turned out to be an artifact of the truncated output.
+
+## 1095. Backlog citations across the repo name the live ledger for items that have archived
+
+> 🔢 **Filed 2026-08-07 — not started.** Value **5/10** · Difficulty **4/10**. Retiring an item moves it verbatim from [`BACKLOG.md`](BACKLOG.md) into [`archive/backlog/BACKLOG-CLOSED.md`](archive/backlog/BACKLOG-CLOSED.md), and every citation that named the live file keeps pointing at a file the item is no longer in. **#1094** fixed two such markers in `../CLAUDE.md` §12; this is the same defect at repo scale. Measured on `origin/main` 2026-08-07 with `parse_items` for item locations: of **129** path-bearing `BACKLOG.md` citations, **at least 69 distinct sites across at least 35 files** name the live ledger for an item that lives in the archive.
+
+**Cluster:** Documentation record / instrument accuracy. **Priority:** P3. **Verdict:** build. **Severity:** no product effect and no security effect — the cited *decisions* are intact; only the route back to their reasoning is broken.
+
+**The test is "does the cited FILE contain the item", not "is the item CLOSED".** These differ, and a sweep built on the wrong one corrupts good citations. Closed items are archived in batches, so a closed item can sit in the live ledger legitimately for a while: at filing time **#1073** is closed and still in [`BACKLOG.md`](BACKLOG.md), so a citation naming the live file for it is **correct**. Any tooling here must resolve the number against the file it actually lives in.
+
+**At least four distinct classes, and they differ in DETECTABILITY. This is the item's central constraint** — state it in any plan, or a linter closes the visible third and the rest is declared done:
+
+| Class | Count (2026-08-07) | Catchable by a link checker? |
+|---|---|---|
+| Path-bearing citation names the live ledger; item is archived | at least 69 sites / 35 files | **No** — the link resolves perfectly. Only the human-readable number beside it is stale. |
+| Relative href does not resolve at all | 13 | Yes |
+| `BACKLOG.md:<line>` anchor past end of file | 12 (file is 6318 lines; one anchor cites **8429**) | Yes |
+| `BACKLOG.md:<line>` anchor in range but drifted onto unrelated text | 31 | **No** — resolves, lands somewhere plausible, says the wrong thing. |
+
+The two "No" rows are the majority and the harder half. Root cause for the anchor classes is the same archival pass that produced the first: it shortened the ledger under citations that had been correct.
+
+**Do not repoint a subset.** Uniform staleness is at least *detectable* — a reader who knows the ledger archives can discount every bare number. Repointing some sites and not others asserts by contrast that the untouched siblings are still live. The clearest case is [`BACKLOG.md`](BACKLOG.md) §"Connector & feature-breadth gaps" (see its snapshot note): all ten numbers it cites are archived, so attaching an archive path to only the two decline-by-design lines would actively mislead about the other eight.
+
+**Do not hand-write anchor fragments** (carried from #1094). A fragment that is wrong is worse than none, because it looks precise and lands nowhere. Derive the slug and *replay the rule against fragments already committed* before trusting it — GitHub replaces each space individually and does **not** collapse runs, so a removed `+` or dash legitimately yields a doubled hyphen that reads like a typo. Two independent derivations disagreed on exactly that during the #1094 work; the collapsing one was wrong.
+
+**A gate is now feasible, and half of the reason previously given against one is obsolete.** PR #271 declined a gate on two grounds. Ground (a) — *"a backlog number resolving to an archived item is not mechanically distinguishable from one resolving to nothing without encoding the archive's shape"* — is **false**: [`scripts/docs/backlog_status_check.py`](../scripts/docs/backlog_status_check.py) `scan()` already parses the live ledger and the archive into **one namespace** and already builds a number-to-(file, line) map, on every PR. A citation checker is one lookup against a map the repo already maintains. Ground (b) — *"a gate that fails on a legitimate archive is one people delete"* — **still holds** and is the binding design constraint: at least 69 pre-existing violations means a corpus-wide gate is red on day one and gets suppressed. That argues for **diff-scoping**, not for no gate; [`.github/workflows/backlog-hygiene.yml`](../.github/workflows/backlog-hygiene.yml) already computes base/head deltas for exactly this reason. Note also that **no link checker of any kind runs in CI today**, so even the two catchable classes are currently unguarded.
+
+**Already specified elsewhere — do not file a third time.** In [`testing/master-test-plan/18-interop-migration-and-uat.md`](testing/master-test-plan/18-interop-migration-and-uat.md): `MIG-74` is a P1 row reading *"Every doc path named in shipped text or a docstring resolves — one linter, one boundary allowlist"*, and **`MIG-35` is already named there as "the BACKLOG-reference classifier", folding into MIG-74** (:128) — so the exact check this item needs is specified, just unbuilt. This item supplies what those rows lack: the measured counts, the detectability split, and the warning that `MIG-74` as worded ("paths resolve") would pass the **largest** class untouched, because those paths *do* resolve.
+
+**Scope note — markdown only.** The sweep behind these numbers read `*.md`. Citations also live in `harness/`, `ide/src/`, `messagefoundry/` and `.github/workflows/`, and rot identically; they are **not** counted above and should be swept before anyone calls the class closed.
+
+**Related:** #1094 (two instances of this class, closed — already satisfied when filed), #1073 (whose §12 marker prompted the original find, and which is itself the closed-but-not-archived case), #1000 (a control whose green is not evidence about what it appears to cover), [`../CLAUDE.md`](../CLAUDE.md) §11 (state a load-bearing fact once and link to it — which is what makes a link's durability load-bearing).
+
+**Source:** repo-wide sweep 2026-08-07 while repointing the [`CONNECTIONS.md`](CONNECTIONS.md) serial/ASTM decline (PR #273, the `docs/CONNECTIONS.md` half of the same two-marker pair #1094 covered in `../CLAUDE.md`). Item locations came from `parse_items` imported from the status-check script rather than a hand-rolled scan; the resolver was validated on planted good-and-bad citations, including the closed-but-not-yet-archived case, before its output was believed.
