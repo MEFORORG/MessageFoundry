@@ -3,7 +3,7 @@
 **Status:** Accepted (2026-07-10) — ratified by the owner 2026-07-10; the PLAN-8 lanes may build. Gating rule: **phase 1 (the vocabulary) requires only the #26-amendment merge; phases 2–3 require this ADR Accepted.** In practice phase 1 builds after Acceptance anyway — its v1 roster is fixed by §2 and MULTISESSION-PLAN-8 bundles it with phase 2a in one lane. **Amendment A — ACCEPTED, ratified by the owner 2026-07-30 and IN FORCE:** a `note` row kind so comment-only rows stop projecting as opaque `code`, superseding ADR 0106 §5 (L); §3's enum and §4's ladder read as amended, and BACKLOG #248 is the build. **Amendment B — ⛔ DECLINED by owner ruling 2026-07-30 (too risky):** ADR 0089 Phase D "helper descent" is **not adopted and not to be built** — aliasing across duplicate call sites has no solution in any ADR, and the yield is unmeasured and may be negative. The specification is retained so the decline is auditable, not as a plan; reopening needs a **new** amendment. The better lever, explicitly not declined, is teaching Phase A the `msg["X"] = v` subscript form — it widens what is editable without touching the row shape.
 **Deciders:** owner + IDE/DX working group
 **Related:** BACKLOG **#222** (this build), **#26 amendment** (the narrow carve-out this ADR operates under), **#221** (sibling IDE-polish lane), the deep-research findings ([`docs/research/ide-low-code-options.md`](../research/ide-low-code-options.md) — verified precedents: InterSystems low-code custom editors, Kaoto/Karavan/AWS Workflow Studio, Iguana annotations, Corepoint action-lists), ADR 0007/0033/0014 (the sanctioned config-as-data GUIs), ADR 0072 (traced dry-run — the live values rendered beside action rows), ADR 0010/0043 (`db_lookup`/`fhir_lookup` — the sanctioned read-only lookups the lens renders as DBSelect-style rows), ADR 0035 (IDE workspace-trust — `lens` CLI calls are exec-gated like every CLI call), CLAUDE.md §9 (PHI), §12 (the amended bright line).
-Plan: [`docs/releases/MULTISESSION-PLAN-8.md`](../releases/MULTISESSION-PLAN-8.md) (L2 builds phases 1+2a; L3 builds phase 2b; L4 = phase 3, owner-gated).
+Plan: `docs/releases/MULTISESSION-PLAN-8.md` (L2 builds phases 1+2a; L3 builds phase 2b; L4 = phase 3, owner-gated).
 **Code references** are `origin/main @ 954bd22`; line numbers drift — locate exactly at implementation time.
 
 ---
@@ -654,3 +654,161 @@ accepts. The criteria are nonetheless **built and tested** — the amendment lan
 - **AC-C5** — THE SYSTEM SHALL release the edit slot only through `releaseEdit`; a bare `endEdit()` call
   in the provider SHALL fail a source-scan test, as SHALL a `render()` whose first statement is not the
   debounce cancel → inventory test refs.
+
+## Amendment D (2026-08-05) — a `route` row kind: `@router` functions get a Steps view (BACKLOG #232)
+
+> **Status of this amendment: ACCEPTED — owner-ratified 2026-08-05.** It widens the grammar so a
+> `@router` def gets the same Steps projection a `@handler` already has: §3's row enum gains a `route`
+> kind and §4's recognition grammar gains one router-return rule. The evidence below was verified
+> against `main` before ratification.
+>
+> **In force means the grammar changed, not that the build is done.** The shipped `lens parse` emits no
+> `route` row yet — the BACKLOG #232 build is handed off in
+> [`../releases/HANDOFF-232-router-steps.md`](../releases/HANDOFF-232-router-steps.md), which carries the
+> files, the verified anchors, and the falsifications. The Acceptance Criteria in §D.6 are **build gates,
+> not caveats**.
+
+### D.1 What this widens, and the §2 rule it widens under
+
+§2's rule is: **"widening the roster is an ordinary addition, widening the *grammar* (§4) requires
+amending this ADR."** A `route` row is a grammar widening, not a roster addition — so, exactly as
+Amendment A did under this same clause, this amendment touches **both** sections that clause spans:
+
+- **§3's row enum gains `route`.** Per `@router`, the contract now emits `route` / `control` / `note` /
+  `code` rows — the enum grows the same way Amendment A grew it with `note` / `diagnostic`.
+- **§4's recognition grammar gains one rule** — the router-return recognizer (§D.4). §3's statement that
+  routers are "out of v1 scope" is superseded for `@router` defs by this amendment.
+
+The BACKLOG #232 item and its ranked-table row cite "the §3 grammar". Per §2 the *grammar* rule is **§4**;
+§3 is the row **enum**. The `route` kind touches §3's enum **and** §4's grammar, and is cited that way
+here — as Amendment A cited it (`:150-152`). The stale item/table wording is surfaced to the owner in the
+handoff rather than propagated into this ADR.
+
+### D.2 This reverses a recorded scope decision — the original reasoning, and whether it still holds
+
+Two documents put routers outside the lens; both are quoted so the reversal is auditable:
+
+- **ADR 0076 §3** — `lens parse` "emits, per `@handler` (routers are **out of v1 scope**)"; the shipped
+  parser encodes it as `continue  # not a @handler (router or plain def) — out of v1 scope`
+  (`messagefoundry/lens.py:306`).
+- **The #26 carve-out** (the 2026-07-10 amendment in `docs/archive/backlog/BACKLOG-CLOSED.md`) permits "a
+  structured action-list *lens* … that renders/edits real Python **Handlers** … **because the artifact and
+  the only execution path remain plain reviewable `.py`** (the decline's rationale, diffable code-first
+  config, is preserved)." It says Handlers.
+
+**The finding: "Handlers" in the #26 carve-out is INCIDENTAL, not a design position against routing.** The
+carve-out's stated reason is a *property* — the plain-`.py`, single-artifact, single-execution-path shape
+— and that property holds identically for a `@router` (authored as reviewable Python, run on the one
+execution path, no declarative artifact). The set the amendment still declines is "drag-drop / canvas
+*logic* authoring, declarative field-mapping, and any declarative logic **execution** layer" — none of
+which is routing. "Handlers" named the only lens that existed at the time (#222). The bright line is the
+declarative-vs-plain-Python artifact/execution model, not handler-vs-router.
+
+**What was genuinely blocking, and what merely dictated the shape.** §3's "out of v1 scope" is real, but it
+is a *grammar* gap, not a veto: the v1 vocabulary is a field-**mutation** roster
+(`copy_field`/`set_field`/…, §2) mapped onto the mutable `Message` API, and a router does not mutate `msg`
+— it **selects destinations**. So the v1 row enum had **no kind** for a routing return, and that — not any
+objection to routing being legible — is why routers were out of v1. **Nothing here is a live blocker; it
+dictates *how* to add routers (a new `route` row kind, not vocabulary reuse), not *whether*.** Consequently
+naming Routers in the CLAUDE.md §12 carve-out is essentially a **formality** (it extends the same carve-out
+to a construct sharing the exact property it was granted for), while the `route` row kind is a **genuine
+grammar expansion** on the owner's judgement — the one non-incidental fact.
+
+### D.3 The `route` row contract
+
+`lens parse` emits, per `@router` (keyed on the enclosing decorator, §D.4), a `route` row:
+
+```
+{ "kind": "route", "handlers": ["<handler name>", …], "unrouted": true,
+  "line_start": <int>, "line_end": <int>, "nesting": <int> }
+```
+
+- `handlers` is the **handler-name** list the router selected — a different namespace from a `send` row's
+  `outbounds`, which are **outbound-connection** names (§D.5). Its literal-or-empty rule mirrors `send`'s:
+  string-literal names are captured; a non-literal element yields `handlers: []`.
+- `unrouted` is an **additive discriminator** (older consumers ignore it, per §A.7) present only on a
+  **routed-nowhere** return, distinct from a `send` row's `filtered`. It maps to the store disposition
+  **UNROUTED** ("routed nowhere, logged, never dropped") — never FILTERED, never dropped.
+
+The coverage partition (§3) is unchanged in kind: a `@router` body tiles into `route` / `control` / `note`
+/ `code` rows that exactly partition the def body.
+
+### D.4 `return []` disambiguation — by the enclosing decorator
+
+`return []` is ambiguous across roles: in a `@handler` it is an explicit **filter** (a `send` row with
+`filtered: true`, `messagefoundry/lens.py:678-686`); in a `@router` it is **routed nowhere** (UNROUTED).
+The recognizer therefore branches on the enclosing def's role, threaded from `parse_source` through
+`_partition_suite` → `_emit_stmt` → `_classify_simple`:
+
+| router return | `route` row |
+|---|---|
+| `return []` / `return ()` / `return None` / a bare `return` | `handlers: []`, `unrouted: true` |
+| `return ["a", "b"]` / `return ("a",)` (string-literal names) | `handlers: ["a", "b"]` |
+| `return "a"` (bare string literal) | `handlers: ["a"]` |
+| a non-literal element (`return [pick(msg)]`, `return names`) | `handlers: []`, **no** `unrouted` (dynamic; mirrors `send`'s empty-on-non-literal) |
+
+A `@handler` `return []` is **unchanged and byte-identical** to today — the role branch is the only thing
+that makes a router return classify as `route`. The router return shape is verified against the engine's
+own normalizer `_handler_names` (`messagefoundry/pipeline/dryrun.py:98-101`): `list[str] | str | None`,
+where `[]` == routed nowhere.
+
+### D.5 `route` vs widening `send` — decided
+
+The build uses a **new `route` kind**, not a widened `send`. A `send` row carries outbound-connection names
+and belongs to the outbound delivery stage; a `route` row carries handler names and belongs to the routed
+stage. They are different namespaces at different pipeline stages, and the editors (Add-palette, field
+pickers, rewrite templates) must not offer outbound-connection completions on a routing return or vice
+versa. Overloading `send` would fuse the two.
+
+### D.6 Non-goals for v1 (each keeps a router a router)
+
+- **A router body recognizes routing constructs only** — `route` returns, control rows (`if` / `elif` /
+  `else` / `for` guards), `note` rows, and `code` rows for everything else. It does **not** recognize
+  action / lookup / send / diagnostic rows, and the router Add-palette offers only routing-relevant items
+  (route-to-handler, a guard, a comment). A router stays pure destination-selection: `db_lookup` /
+  `fhir_lookup` **raise** outside a live Handler (ADR 0010/0043, the router/handler boundary), so a lookup
+  call in a router body projects as a `code` row, never a `lookup` row.
+- **No cross-module and no helper descent** — the handler path's ceilings (ADR 0089 §4; Amendment B) are
+  inherited unchanged.
+- **No relaxation of the §5 guardrails** — sync-on-save, one-editor-at-a-time, degrade-to-text-editor, and
+  the byte-stable row-scoped splice apply to a `route` edit exactly as to a handler-row edit.
+
+### D.7 Contract-version skew (must be handled, not discovered)
+
+Same hazard Amendment A §A.7 records: `parse_source` emits no schema version and the extension shells
+whatever `messagefoundry` is on `PATH`. An older IDE receiving `kind: "route"` would hit the default-less
+title switch and render a **blank, titleless row**. `route` emission is therefore **gated behind a flag or
+a contract version**, and the kind is threaded through **both** implementations — `ide/src/stepsModel.ts`
+and the CSP-isolated `ide/media/stepsWebview.js` (which cannot import from `src/`) — never one alone.
+
+### D.8 Consequence deltas
+
+§3's coverage invariant is unchanged in kind and gains the `@router` corpus. §4's ladder gains one
+recognition rule (router return → `route`). §6 gate 1 (coverage partition) gains router cases; gate 2
+(byte-stability) gains the `route` edit op class. `lens parse`'s JSON stays additively back-compatible for
+handlers (a `route` kind appears only for a `@router`), which is why §A.7's flag/contract gate is the whole
+compatibility story.
+
+## Acceptance Criteria
+
+- **AC-R1** — WHEN `lens parse` encounters a `@router` def body, THE SYSTEM SHALL emit rows whose line
+  ranges exactly partition the def body (`route` / `control` / `note` / `code`) — never dropped, reordered,
+  or synthesized → router coverage-partition property test over the sample and adversarial router corpus.
+- **AC-R2** — WHEN a `@router` returns string-literal handler names (list, tuple, or a bare string), THE
+  SYSTEM SHALL emit a `route` row whose `handlers` is exactly those names; WHEN it returns `[]` / `()` /
+  `None` or a bare `return`, THE SYSTEM SHALL emit `handlers: []` with `unrouted: true`; WHEN any element
+  is non-literal, THE SYSTEM SHALL emit `handlers: []` WITHOUT `unrouted` → route-return classification
+  test.
+- **AC-R3** — WHERE the enclosing decorator is `@handler`, a `return []` SHALL remain byte-identical to the
+  current `send` / `filtered` projection — no `route` row, no `unrouted` — so the role branch never
+  regresses the handler path → handler-vs-router disambiguation test, the handler leg asserted first as the
+  guard.
+- **AC-R4** — WHEN a `route` row's handler list is set to its current value THE SYSTEM SHALL produce a
+  byte-identical file, and WHEN set to a new list THE SYSTEM SHALL change only that row's line range and
+  re-parse to the same kind, span, nesting, and suite → byte-stability + round-trip test.
+- **AC-R5** — THE SYSTEM SHALL NOT offer transform verbs (action / lookup / send / diagnostic) in a
+  `@router`'s Add-palette, and a `db_lookup` / `fhir_lookup` call inside a router body SHALL project as a
+  `code` row, never a `lookup` row → router-palette scope test.
+- **AC-R6** — WHERE the consuming IDE predates the `route` kind, THE SYSTEM SHALL gate `route` emission
+  behind a flag or contract version so an older IDE never renders a blank, titleless router row →
+  contract-version-skew test.

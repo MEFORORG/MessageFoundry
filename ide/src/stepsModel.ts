@@ -684,7 +684,10 @@ export interface EditMessage {
   lineStart: number;
   lineEnd: number;
   name: string; // the param name (e.g. "dst", "to")
-  value: string; // the new value, as typed in the field
+  // The new value, as typed in the field. A `number` for a number-kind widget (BACKLOG #235) so it
+  // round-trips to the engine as a JSON number and renders as an int/float literal — a string would
+  // render a re-typed string literal (`_render_literal` emits `6` for an int but `"6"` for a str).
+  value: string | number;
   // The row's PROJECTION-TIME source text (the row as the user saw it when the lens projected the inputs),
   // echoed back from the webview's `data-expect-src` and carried to `lens rewrite` as `expect_src` (F7).
   // Optional so a hand-built message (tests / an older payload) may omit it — then no stale check is sent.
@@ -697,7 +700,9 @@ export interface EditRequest {
   line_start: number;
   line_end: number;
   op: "set_params";
-  params: Record<string, string>;
+  // A number-kind field carries a JS number so `JSON.stringify` emits a bare `6` (an int/float literal),
+  // not `"6"` (a re-typed string literal) — BACKLOG #235. Every other param stays a string.
+  params: Record<string, string | number>;
   // The projected row's source text from the LIVE buffer (no EOL). `lens rewrite` verifies it still
   // matches the row before splicing, so a stale coordinate (a coincidental same-shape row) is refused
   // instead of edited in the wrong place (F7). Omitted → no stale check (older/no-buffer callers).
@@ -706,10 +711,12 @@ export interface EditRequest {
 
 /**
  * Map a webview edit message to the engine's `lens rewrite` edit spec (ADR 0076 §5) — pure, so the
- * mapping is unit-testable without the Extension Host. The value is passed as a JSON string, which the
- * engine renders as a Python **string literal** when the current argument is a literal (the common
- * analyst edit: a field path, a code, a destination name); the engine refuses — and the provider
- * surfaces — an edit of an argument that is currently an expression, so the lens never guesses.
+ * mapping is unit-testable without the Extension Host. A string value is rendered by the engine as a
+ * Python **string literal** when the current argument is a literal (the common analyst edit: a field
+ * path, a code, a destination name); a number value (a number-kind widget, BACKLOG #235) passes through
+ * as a JSON number so the engine renders an int/float literal, not a re-typed `"6"`. The engine refuses
+ * — and the provider surfaces — an edit of an argument that is currently an expression, so the lens
+ * never guesses.
  *
  * `expectSrc` is the row's PROJECTION-TIME source text (the row as the user saw it when the lens
  * projected the inputs). It is taken from the explicit argument when given (older 2-arg callers) and
@@ -2236,7 +2243,72 @@ export function pickMode(action: string | undefined, param: string): "path" | "s
   return action && HL7_PATH_PARAMS[action]?.includes(param) ? "path" : undefined;
 }
 
-function renderParamsHtml(params: ParamField[], editable: Set<string>, handlerName: string, row: RowViewModel): string {
+// ---- op parameter schema (BACKLOG #235) -------------------------------------------------------------
+//
+// The IDE drives each EDITABLE param's input WIDGET from the engine's own type hints instead of a
+// hand-maintained per-op input table (a second source of truth that drifts from the signatures). The
+// engine emits it as `messagefoundry lens schema --json` (messagefoundry/lens_schema.py); the IDE shells
+// it via cli.lensSchema() and threads it through the pure renderer below. This WIDENS what an
+// already-recognized, already-editable row exposes as a richer control — it does NOT widen the
+// recognition grammar or make any new param editable (the editable gating is unchanged, ADR 0076 §5).
+
+/** One parameter's schema entry, as `lens schema` emits it (see lens_schema.py's module docstring). */
+export interface OpParamSchema {
+  name: string;
+  // The minimal, stable kind vocabulary the engine emits. `unknown` (and any absent op) falls back to a
+  // plain text input, so an unrecognized hint never breaks the form.
+  kind: "str" | "int" | "float" | "bool" | "enum" | "list" | "codeset" | "unknown";
+  required: boolean;
+  keyword_only: boolean;
+  choices?: string[]; // enum kinds only
+  default?: string | number | boolean | null; // present only when the default is a JSON scalar
+  nullable?: boolean; // an `X | None` slot
+}
+
+/** The whole `lens schema` payload: op-name -> its editable params. */
+export type OpSchema = Record<string, OpParamSchema[]>;
+
+/** The input widget a param resolves to (a text input is the universal fallback). */
+export interface WidgetSpec {
+  kind: "text" | "number" | "enum";
+  choices?: string[]; // enum only
+}
+
+/**
+ * Resolve the input widget for one op's param from the schema (pure — the single place the kind ->
+ * widget mapping lives, so the renderer and its tests agree). An `enum` (with choices) -> a dropdown; an
+ * `int`/`float` -> a validated number field; everything else — `str`, `codeset` (an expression slot, not
+ * a per-row literal), `unknown`, an op ABSENT from the schema, or no schema at all -> a text input (the
+ * current behavior, so an unmapped/older contract degrades cleanly).
+ */
+export function resolveWidget(
+  op: string | undefined,
+  paramName: string,
+  schema: OpSchema | undefined,
+): WidgetSpec {
+  if (!op || !schema) {
+    return { kind: "text" };
+  }
+  const param = schema[op]?.find((p) => p.name === paramName);
+  if (!param) {
+    return { kind: "text" };
+  }
+  if (param.kind === "enum" && param.choices && param.choices.length > 0) {
+    return { kind: "enum", choices: param.choices };
+  }
+  if (param.kind === "int" || param.kind === "float") {
+    return { kind: "number" };
+  }
+  return { kind: "text" };
+}
+
+function renderParamsHtml(
+  params: ParamField[],
+  editable: Set<string>,
+  handlerName: string,
+  row: RowViewModel,
+  schema?: OpSchema,
+): string {
   if (params.length === 0) {
     return "";
   }
@@ -2248,11 +2320,51 @@ function renderParamsHtml(params: ParamField[], editable: Set<string>, handlerNa
         // stale coordinate is refused, not mis-spliced (F7). An empty value shows a `[blank]` placeholder (a
         // hint, NOT a value) so a freshly-inserted template reads as "fill me in"; `placeholder` is inert on
         // submit, so the F7 round-trip is unaffected.
-        const input =
-          `<input type="text" class="edit" data-handler="${escapeHtml(handlerName)}" ` +
+        //
+        // BACKLOG #235: the input WIDGET is resolved from the engine's param schema (enum -> <select>,
+        // int/float -> type=number, everything else -> text). Every widget carries the IDENTICAL edit
+        // coordinates (data-handler/data-line-start/data-line-end/data-expect-src/data-name) so the F7
+        // stale-guard round-trip is unchanged; with no schema (the read-only callers) every param resolves
+        // to `text`, so this markup is byte-identical to before.
+        const attrs =
+          `data-handler="${escapeHtml(handlerName)}" ` +
           `data-line-start="${row.lineStart}" data-line-end="${row.lineEnd}" ` +
           `data-expect-src="${escapeHtml(row.expectSrc ?? "")}" ` +
-          `data-name="${escapeHtml(p.name)}" value="${escapeHtml(p.value)}" placeholder="[blank]" />`;
+          `data-name="${escapeHtml(p.name)}"`;
+        const widget = resolveWidget(row.action, p.name, schema);
+        let input: string;
+        if (widget.kind === "enum" && widget.choices) {
+          // A closed-set param -> a dropdown; the current value is pre-selected. When the current literal
+          // is NOT one of the schema's choices (a hand-authored value the vocabulary no longer lists), it
+          // is prepended as the selected option so the dropdown DISPLAYS the actual argument — otherwise a
+          // <select> with no selected option shows its FIRST choice, misrepresenting an unchanged literal.
+          // The out-of-set option still round-trips through the same edit splice; an empty value takes no
+          // such option (the [blank] hint role is left to the choices).
+          const inSet = widget.choices.includes(p.value);
+          const current =
+            !inSet && p.value !== ""
+              ? `<option value="${escapeHtml(p.value)}" selected>${escapeHtml(p.value)}</option>`
+              : "";
+          const options = widget.choices
+            .map(
+              (c) =>
+                `<option value="${escapeHtml(c)}"${c === p.value ? " selected" : ""}>` +
+                `${escapeHtml(c)}</option>`,
+            )
+            .join("");
+          input = `<select class="edit" ${attrs}>${current}${options}</select>`;
+        } else if (widget.kind === "number") {
+          // A number field posts a JS number (see stepsWebview.js) so the engine renders an int/float
+          // literal, never a re-typed string literal (`_render_literal` renders `6` for an int but `"6"`
+          // for a str — posting the string would silently retype the arg).
+          input =
+            `<input type="number" class="edit" ${attrs} ` +
+            `value="${escapeHtml(p.value)}" placeholder="[blank]" />`;
+        } else {
+          input =
+            `<input type="text" class="edit" ${attrs} ` +
+            `value="${escapeHtml(p.value)}" placeholder="[blank]" />`;
+        }
         // ADR 0104 §2.3: a pickable HL7 path/segment slot gets a picker button BESIDE its input. The input is
         // NEVER removed (free-text always available); the pick writes through the SAME edit splice. Only a
         // slot with a pick button gets the horizontal `.edit-row` wrapper — every other editable field's
@@ -2320,7 +2432,7 @@ function renderRowActionsHtml(row: RowViewModel, handlerName: string): string {
 /** Render one row as a nested list item. Pure — every dynamic value is escaped. `handlerName` scopes an
  * editable field's edit coordinates + the structural affordances (phase 3); omit it (read-only callers)
  * to keep every field disabled and hide the structural buttons. */
-export function renderRowHtml(row: RowViewModel, handlerName = ""): string {
+export function renderRowHtml(row: RowViewModel, handlerName = "", schema?: OpSchema): string {
   const indent = `style="margin-left:${row.nesting * INDENT_PX}px"`;
   const badge = row.badge ? `<span class="badge">${escapeHtml(row.badge)}</span>` : "";
   const subtitle = row.subtitle ? `<span class="subtitle">${escapeHtml(row.subtitle)}</span>` : "";
@@ -2332,7 +2444,7 @@ export function renderRowHtml(row: RowViewModel, handlerName = ""): string {
   const body =
     row.kind === "code"
       ? `<pre class="code">${escapeHtml(row.code ?? "")}</pre>`
-      : renderParamsHtml(row.params, editable, handlerName, row);
+      : renderParamsHtml(row.params, editable, handlerName, row, schema);
   const lineLabel =
     row.lineStart === row.lineEnd ? `line ${row.lineStart}` : `lines ${row.lineStart}–${row.lineEnd}`;
   // A MOVABLE row (an action/lookup/send row, or a whole if/for block via its header row) is a drag SOURCE
@@ -2376,8 +2488,8 @@ export function renderRowHtml(row: RowViewModel, handlerName = ""): string {
 }
 
 /** Render one handler's Steps (header + ordered nested rows). Pure. */
-export function renderHandlerHtml(handler: HandlerViewModel): string {
-  const rows = handler.rows.map((r) => renderRowHtml(r, handler.handler)).join("");
+export function renderHandlerHtml(handler: HandlerViewModel, schema?: OpSchema): string {
+  const rows = handler.rows.map((r) => renderRowHtml(r, handler.handler, schema)).join("");
   return (
     `<section class="handler">` +
     `<h2>${escapeHtml(handler.handler)}` +
@@ -2388,12 +2500,13 @@ export function renderHandlerHtml(handler: HandlerViewModel): string {
   );
 }
 
-/** Render every handler's Steps body (the provider wraps this in the CSP/nonce page shell). Pure. */
-export function renderHandlersHtml(handlers: HandlerViewModel[]): string {
+/** Render every handler's Steps body (the provider wraps this in the CSP/nonce page shell). Pure.
+ * `schema` (BACKLOG #235) drives each editable param's widget; omitted -> every param is a text input. */
+export function renderHandlersHtml(handlers: HandlerViewModel[], schema?: OpSchema): string {
   if (handlers.length === 0) {
     return `<p class="empty">No handlers to show.</p>`;
   }
-  return handlers.map(renderHandlerHtml).join("");
+  return handlers.map((h) => renderHandlerHtml(h, schema)).join("");
 }
 
 /**
