@@ -40,7 +40,7 @@ specifically the **non-production vs production** distinction. Concretely:
 - **Per-artifact-kind publish semantics** — Router/Handler `*.py`, `connections.toml`, `codesets/*`,
   and (critically) the artifacts that are **not** publishable at all: alert rules, `[security]`/auth
   config and AI policy in `messagefoundry.toml`.
-- **Version control as the delivery mechanism** — [`docs/VERSION-CONTROL.md`](../VERSION-CONTROL.md),
+- **Version control as the delivery mechanism** — [`docs/VERSION-CONTROL.md`](../../VERSION-CONTROL.md),
   the offline git init + `messagefoundry check` pre-commit hook
   ([`ide/src/sourceControl.ts`](../../../ide/src/sourceControl.ts)), and the air-gapped `git bundle` path.
 
