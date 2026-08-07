@@ -100,15 +100,15 @@ These are complementary to the **OWASP ASVS 5.0 Level 3** verification (source-a
 
 NIST does **not** issue certificates for these frameworks. The project may **display alignment claims**, but words them honestly and backs them with evidence:
 
-- **Use:** "Built to NIST SP 800-218 (SSDF)," "NIST SSDF–aligned," "tested per NIST SP 800-115," "controls mapped to NIST SP 800-66 Rev. 2," "HIPAA-compliant deployment supported."
-- **Do not use:** "NIST certified" or any phrasing implying a certificate exists.
-- **Back every claim** with the implemented practice and its evidence (this standard, test reports, the ASVS attestation, the applicability profile). A self-attestation is a formal, legally significant declaration — only make it if it is true.
-- A third-party assessor may **validate** an attestation; that raises its weight but is still not a NIST certificate.
+- **SDS-3.1 — MAY display an alignment claim, and MUST word it as one of these.** "Built to NIST SP 800-218 (SSDF)," "NIST SSDF–aligned," "tested per NIST SP 800-115," "controls mapped to NIST SP 800-66 Rev. 2," "HIPAA-compliant deployment supported." *Evidence:* the published wording, matched against this list.
+- **SDS-3.2 — MUST NOT use "NIST certified", or any phrasing implying a certificate exists.** NIST issues none for these frameworks, so the phrase describes nothing that could be produced on request. *Evidence:* a sweep of published surfaces for the phrase.
+- **SDS-3.3 — MUST back every claim with the implemented practice and its evidence** — this standard, test reports, the ASVS attestation, the applicability profile. A self-attestation is a formal, legally significant declaration; only make it if it is true. *Evidence:* the claims register (SDS-9.5), one row per published claim.
+
+A third-party assessor may **validate** an attestation; that raises its weight but is still not a NIST certificate.
 
 #### Reviewing security prose: ask what a reader would DO with it
 
-**Review security prose by asking what a reader would DO with it, not whether it is accurate.** This is
-the governing instruction; the three rules below are instances of it.
+- **SDS-3.4 — MUST review security prose by asking what a reader would DO with it, not whether it is accurate.** This is the governing instruction; the rules below are instances of it. *Evidence:* the review record, naming what a reader would do with the sentence rather than whether it is true.
 
 It matters because the expensive failures are not false statements. A correctness review terminates at
 "yes, that sentence is accurate" — and every finding in the 2026-07-30 documentation audit passed that
@@ -116,7 +116,7 @@ test. Each was **true about the mechanism and misleading about the posture**: a 
 every spot-check while pointing the reader somewhere they cannot go. Six such findings were caught by
 asking what happens to someone who acts on the sentence; **none** was caught by accuracy checking.
 
-- **State a load-bearing fact ONCE, and link to it; never restate it.** A repo that states a fact twice
+- **SDS-3.5 — MUST state a load-bearing fact ONCE, and link to it; never restate it.** *Evidence:* the source of record, linked rather than restated, and no second copy of the fact. A repo that states a fact twice
   will eventually state it two ways, and the stale copy is the one that gets cited — a reader who finds
   *a* statement stops looking for the other. Three instances in a single day: `harden_kex_groups`
   described as pinning key-exchange groups across **five** live documents, when `SSLContext.set_groups`
@@ -126,17 +126,17 @@ asking what happens to someone who acts on the sentence; **none** was caught by 
   URL" while §7 documented the exact query parameters that carry it. In every case the repo held
   **both** the right and the wrong version. The mitigation is structural, not diligence: pick the source
   of record, link to it, and let the copy die.
-- **A completeness claim is a liability.** "Two configurations do X, and a reviewer should hear both"
+- **SDS-3.6 — MUST prefer "at least" to an enumeration; a completeness claim is a liability.** *Evidence:* the claim, worded as a floor, naming the case that matters and pointing at the reference. "Two configurations do X, and a reviewer should hear both"
   invites the check and then survives it, because a reader who confirms the named case stops looking.
   Twice this documentation set shipped such a sentence wrong in *both* directions at once — naming a
   case that no longer existed while omitting one that did. Where you cannot enumerate exhaustively, say
   "at least", name the case that matters, and point at the reference.
-- **A compensating control must not rest on a false premise.** A `Referrer-Policy` relaxation was
+- **SDS-3.7 — A compensating control MUST NOT rest on a false premise.** *Evidence:* the stated justification, re-derived against the code rather than accepted. A `Referrer-Policy` relaxation was
   justified on the grounds that console URLs "carry opaque ids only (never PHI)" — untrue of the
   console's own search route. The control itself was sound; the stated reason was not, and the next
   person to touch it reasons from the comment. A wrong justification is worse than none.
 
-- **Confirm your instrument answers the question you asked, not one adjacent to it.** The rules above
+- **SDS-3.8 — MUST confirm the instrument answers the question asked, not one adjacent to it.** *Evidence:* the question and what the instrument returns, written down side by side and checked to be the same sentence. The rules above
   catch prose that is true and misleading; this one catches a claim that is **false when written, while
   feeling measured**. The rule is the question — ***does my instrument answer the question I asked, or
   one adjacent to it?*** — and it outlives every example below. **The pairs are dated illustrations, not
@@ -302,11 +302,13 @@ Spec-driven development treats the artifacts that describe *what* a change must 
 | **Tasks** | Decomposition of decisions/requirements into work items / lanes / gates. | PW.1–PW.2 |
 | **Verification** | Automated checks + human conformance reviews that test/inspect against the spec. | PW.7 (review), PW.8 (test) |
 
-A project SHOULD keep these five layers present and connected; the recommended connections are described in §5.3–§5.5.
+- **SDS-5.1.1 — SHOULD keep these five layers present and connected.** The recommended connections are described in §5.3–§5.5. *Evidence:* an artifact per layer, each linked to the layer above it.
 
 ### 5.2 EARS acceptance criteria
 
-A change's behavioral acceptance criteria SHOULD be written in **EARS (Easy Approach to Requirements Syntax)** — a small, constrained grammar that turns prose requirements into testable, unambiguous statements. EARS offers five templates:
+- **SDS-5.2.1 — SHOULD write a change's behavioral acceptance criteria in EARS (Easy Approach to Requirements Syntax)**, a small constrained grammar that turns prose requirements into testable, unambiguous statements. *Evidence:* the criteria, each matching one of the five templates below.
+
+EARS offers five templates:
 
 | Template | Form |
 |---|---|
@@ -322,22 +324,22 @@ This fits the project's existing posture: the standing contract's invariants alr
 
 ### 5.3 Requirement → design → tasks → test traceability
 
-Each acceptance criterion SHOULD carry an **ID** linked to the test or fixture that exercises it, so coverage is **mechanical, not prose** — "which criteria are untested" becomes computable rather than a judgment call. The reference project already owns the pieces — decisions in ADRs, requirement IDs in the backlog, tasks in release/multisession plans — and the recommendation is to **connect** them: criterion ID → test/fixture link. *(Lineage: AWS Kiro requirements/design/tasks triad; distilled.)*
+- **SDS-5.3.1 — SHOULD give each acceptance criterion an ID linked to the test or fixture that exercises it**, so coverage is **mechanical, not prose** and "which criteria are untested" becomes computable rather than a judgment call. *Evidence:* a criterion-to-test link per criterion, and a report of the unlinked ones. The reference project already owns the pieces — decisions in ADRs, requirement IDs in the backlog, tasks in release/multisession plans — and the recommendation is to **connect** them: criterion ID → test/fixture link. *(Lineage: AWS Kiro requirements/design/tasks triad; distilled.)*
 
 ### 5.4 Clarify and analyze (lightweight, advisory)
 
 Two lightweight checks are recommended, both explicitly **advisory, not hard gates**:
 
-- **Clarify** — force ambiguity resolution before build, surfacing and answering open questions while they are still cheap to change. The project already has an informal version: the ADR **"To resolve on acceptance"** block.
-- **Analyze** — automated cross-artifact consistency/coverage: does every acceptance criterion have a task and a test? does any artifact contradict the constitution's invariants?
+- **SDS-5.4.1 — SHOULD run a clarify step before build**, forcing ambiguity resolution while open questions are still cheap to change. The project already has an informal version: the ADR **"To resolve on acceptance"** block. *Evidence:* the resolved questions on the decision record, dated before the implementation.
+- **SDS-5.4.2 — SHOULD run an analyze check for cross-artifact consistency and coverage:** does every acceptance criterion have a task and a test? does any artifact contradict the constitution's invariants? *Evidence:* the check's report for the change.
 
-These SHOULD be run as lightweight advisory checks. They introduce no new blocking release gate (cf. §6.4). *(Lineage: GitHub Spec Kit `specify → clarify → plan → tasks → analyze → implement`; distilled.)*
+Both are **advisory** and introduce no new blocking release gate (cf. §6.4). *(Lineage: GitHub Spec Kit `specify → clarify → plan → tasks → analyze → implement`; distilled.)*
 
 ### 5.5 Executable acceptance criteria (living documentation)
 
 BDD / Specification-by-Example expresses acceptance criteria as Given/When/Then scenarios with concrete `(input → expected outcome)` example tables that **execute** as tests — so specification and verification cannot silently drift, and the spec doubles as living documentation. This fits naturally with EARS's WHEN/THEN phrasing, and the HL7 domain (well-defined inputs, well-defined dispositions) is well suited to example-driven verification. The concrete reference-project opportunity (detailed as R2 in Appendix A.7):
 
-> A project's dry-run gate that already replays fixtures through the real graph but asserts only "didn't error" **SHOULD** be upgraded to assert an **expected disposition per fixture** (e.g. `PROCESSED` / `UNROUTED` / `FILTERED` / `ERROR`), turning it into an executable acceptance-criteria check.
+- **SDS-5.5.1 — A dry-run gate that replays fixtures through the real graph SHOULD assert an expected disposition per fixture** (`PROCESSED` / `UNROUTED` / `FILTERED` / `ERROR`) rather than only that it did not error, turning it into an executable acceptance-criteria check. *Evidence:* the declared expectation per fixture, and the gate asserting it.
 
 *(Lineage: BDD / Specification-by-Example; distilled, not BDD-tool adoption.)*
 
@@ -375,10 +377,10 @@ Testing follows the methodology of NIST SP 800-115 (*Technical Guide to Informat
 
 The independent review is scoped to **OWASP ASVS version 5.0.0** (released May 2025), **Level 3**:
 
-- **Version-pinned citation.** Requirements are cited as `v5.0.0-<chapter>.<section>.<requirement>`; identifiers changed substantially from 4.0.x, so the version is always stated.
+- **SDS-6.3.1 — MUST cite ASVS requirements as `v5.0.0-<chapter>.<section>.<requirement>`, always stating the version.** Identifiers changed substantially from 4.0.x, so a bare number resolves to a different requirement depending on which edition the reader holds. *Evidence:* the citations, each carrying its version.
 - **Scale and level model.** ~350 requirements across **17 chapters**. Levels are **cumulative** — L3 includes all of L1 and L2. **MessageFoundry targets Level 3** (defence-in-depth for the highest-assurance contexts), chosen above the usual L2 norm because the engine carries PHI; L1 and L2 form the cumulative baseline and are assessed first.
 - **Access required for L3.** L3 is a white-box / hybrid review: the assessor needs source code, developer access, documentation, and an authenticated test instance running **synthetic, non-PHI** data.
-- **Documented Security Decisions (new in 5.0).** Each chapter opens with a requirement to document *how* its controls are applied and *why*. This standard, the per-interface threat models (PW.1), and the secure-default baseline (PW.9) serve as that documentation. **Each project documents which chapters are in scope and records exclusions with justification** — see the applicability profile. (Documenting exclusions is itself an ASVS practice.)
+- **SDS-6.3.2 — MUST record which ASVS chapters are in scope, and justify every exclusion**, in the applicability profile. Documenting exclusions is itself an ASVS practice, and each 5.0 chapter opens with a requirement to document *how* its controls are applied and *why*; this standard, the per-interface threat models (SDS-4.3.1) and the secure-default baseline (SDS-4.3.44) serve as that documentation. *Evidence:* the profile's chapter table, every excluded row carrying a reason.
 - **5.0 modernizations to honor.** Cryptography (V11) reflects current guidance, including post-quantum considerations; authentication and password rules (V6) align with NIST SP 800-63; ASVS 5.0 scopes to **applications and APIs** (host/network infrastructure is the deployer's responsibility, §2).
 
 **The 17 chapters (v5.0.0):** V1 Encoding and Sanitization · V2 Validation and Business Logic · V3 Web Frontend Security · V4 API and Web Service · V5 File Handling · V6 Authentication · V7 Session Management · V8 Authorization · V9 Self-contained Tokens · V10 OAuth and OIDC · V11 Cryptography · V12 Secure Communication · V13 Configuration · V14 Data Protection · V15 Secure Coding and Architecture · V16 Security Logging and Error Handling · V17 WebRTC.

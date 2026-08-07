@@ -60,6 +60,13 @@ _ID_ANYWHERE = re.compile(r"\bSDS-\d+(?:\.\d+)+\b")
 #: A heading, capturing its dotted number when it has one (``### 4.3 Produce ...`` -> ``4.3``).
 _HEADING = re.compile(r"^(#{2,4})\s+(?:(A?\.?\d+(?:\.\d+)*)\.?\s+)?(.*)$")
 
+#: An inline rule: a bullet opening with a bolded identifier and its requirement. Anchored at the start
+#: of the line so a bolded identifier mid-sentence stays a citation.
+_INLINE_RULE = re.compile(r"^\s*[-*]\s+\*\*(SDS-\d+(?:\.\d+)+)\s*[—-]\s*(.+?)\*\*")
+
+#: The evidence clause an inline rule carries in place of a table's third column.
+_EVIDENCE_CLAUSE = re.compile(r"\*Evidence:\*\s*(.+?)(?:\s*\*\(|$)")
+
 
 @dataclass(frozen=True)
 class Rule:
@@ -102,39 +109,90 @@ def _parse_id(rule_id: str) -> tuple[str, int] | None:
 def parse_rules(text: str) -> list[Rule]:
     """Every identified rule defined in ``text``, in document order.
 
-    A definition is a table row whose FIRST cell is exactly an identifier. That shape is what makes a
-    rule a rule; an identifier mentioned inside a sentence is a citation, not a definition.
+    Two definition shapes, because the standard has two kinds of section.
+
+    A TABLE row whose first cell is exactly an identifier defines a rule. That is the shape used
+    wherever a section is a list of obligations.
+
+    An INLINE rule is a bullet opening ``- **SDS-x.y - <requirement>.**``, used where the requirement
+    is inseparable from the argument that justifies it. Sections 3 and 5 are essays whose evidence IS
+    the surrounding prose -- the dated audit that produced a rule, the retracted claims that named it --
+    and tabling them would throw away the part that makes them persuasive. An inline rule still carries
+    its evidence, in a trailing ``*Evidence:* ...`` clause, so no rule anywhere escapes the requirement
+    to say what settles it.
+
+    An identifier appearing anywhere else is a CITATION, not a definition.
     """
     rules: list[Rule] = []
     heading_number = ""
     in_retired = False
-    for lineno, line in enumerate(text.splitlines(), start=1):
+    lines = text.splitlines()
+    for lineno, line in enumerate(lines, start=1):
         if line.startswith("## "):
             in_retired = line.strip() == _RETIRED_HEADING
         match = _HEADING.match(line)
-        if match:
-            heading_number = match.group(2) or ""
+        if match and match.group(2):
+            # Only a NUMBERED heading changes the section context. An unnumbered subheading -- "A note
+            # on claims and wording", "Reviewing security prose" -- sits inside its parent section, and
+            # blanking the context here would silently skip the mis-siting check for every rule under
+            # it, which is precisely where the prose rules live.
+            heading_number = match.group(2)
         if in_retired:
             continue
+
         cells = _split_row(line)
-        if len(cells) < 3:
+        if len(cells) >= 3 and (parsed := _parse_id(cells[0])) is not None:
+            rules.append(
+                Rule(
+                    rule_id=cells[0],
+                    section=parsed[0],
+                    number=parsed[1],
+                    requirement=cells[1],
+                    evidence=cells[2],
+                    line=lineno,
+                    heading_number=heading_number,
+                )
+            )
             continue
-        parsed = _parse_id(cells[0])
+
+        inline = _INLINE_RULE.match(line)
+        if inline is None:
+            continue
+        parsed = _parse_id(inline.group(1))
         if parsed is None:
             continue
-        section, number = parsed
         rules.append(
             Rule(
-                rule_id=cells[0],
-                section=section,
-                number=number,
-                requirement=cells[1],
-                evidence=cells[2],
+                rule_id=inline.group(1),
+                section=parsed[0],
+                number=parsed[1],
+                requirement=inline.group(2),
+                evidence=_inline_evidence(lines, lineno - 1),
                 line=lineno,
                 heading_number=heading_number,
             )
         )
     return rules
+
+
+def _inline_evidence(lines: list[str], start: int) -> str:
+    """The ``*Evidence:*`` clause of the inline rule beginning at ``lines[start]``.
+
+    A bullet in this document wraps across several indented source lines, so the clause is looked for
+    across the whole bullet rather than on its first line. Returning "" when there is none is what makes
+    ``test_every_rule_carries_evidence`` fail, which is the intent -- a prose rule is not exempt.
+    """
+    body: list[str] = [lines[start]]
+    for line in lines[start + 1 :]:
+        if (
+            not line.strip()
+            or _INLINE_RULE.match(line)
+            or line.lstrip().startswith(("-", "|", "#"))
+        ):
+            break
+        body.append(line)
+    found = _EVIDENCE_CLAUSE.search(" ".join(part.strip() for part in body))
+    return found.group(1).strip() if found else ""
 
 
 def parse_retired(text: str) -> list[Retired]:
@@ -405,6 +463,58 @@ def test_selfbite_a_citation_is_not_a_definition() -> None:
     text = "Deviation from SDS-4.3.7 is recorded in A.6.\n"
     assert parse_rules(text) == []
     assert _ID_ANYWHERE.findall(text) == ["SDS-4.3.7"]
+
+
+def test_selfbite_an_inline_rule_is_parsed_with_its_evidence() -> None:
+    text = (
+        "### 3. Claims\n\n"
+        "- **SDS-3.1 — MUST state a fact once.** A repo that states it twice will state it two ways.\n"
+        "  *Evidence:* the source of record, linked rather than restated.\n"
+    )
+    (rule,) = parse_rules(text)
+    assert rule.rule_id == "SDS-3.1"
+    assert rule.requirement == "MUST state a fact once."
+    assert rule.evidence == "the source of record, linked rather than restated."
+
+
+def test_selfbite_an_inline_rule_without_evidence_is_caught() -> None:
+    """A prose rule is not exempt from naming what settles it; empty evidence must reach the check."""
+    text = (
+        "### 3. Claims\n\n- **SDS-3.1 — MUST state a fact once.** Some argument, but no clause.\n"
+    )
+    (rule,) = parse_rules(text)
+    assert rule.evidence == ""
+
+
+def test_selfbite_a_bolded_identifier_mid_sentence_is_not_a_definition() -> None:
+    """Otherwise citing a rule emphatically would define a second, evidence-free copy of it."""
+    text = "### 3. Claims\n\nThe deviation cites **SDS-3.1** and records its owner.\n"
+    assert parse_rules(text) == []
+    assert _ID_ANYWHERE.findall(text) == ["SDS-3.1"]
+
+
+def test_selfbite_an_inline_rule_inherits_its_numbered_parent_heading() -> None:
+    """Prose rules live under UNNUMBERED subheadings; the mis-siting check must still see section 3."""
+    text = (
+        "## 3. How this maps to NIST\n\n"
+        "#### Reviewing security prose\n\n"
+        "- **SDS-3.1 — MUST ask what a reader would do.** *Evidence:* the review record.\n"
+    )
+    (rule,) = parse_rules(text)
+    assert rule.heading_number == "3", "an unnumbered subheading must not blank the section context"
+    assert rule.section == "3"
+
+
+def test_selfbite_evidence_does_not_bleed_across_bullets() -> None:
+    """Two adjacent inline rules must not share one clause, which would mask a missing one."""
+    text = (
+        "### 3. Claims\n\n"
+        "- **SDS-3.1 — MUST do a thing.** No clause here.\n"
+        "- **SDS-3.2 — MUST do another.** *Evidence:* the second one's own evidence.\n"
+    )
+    first, second = parse_rules(text)
+    assert first.evidence == ""
+    assert second.evidence == "the second one's own evidence."
 
 
 def test_selfbite_malformed_identifiers_are_rejected() -> None:
