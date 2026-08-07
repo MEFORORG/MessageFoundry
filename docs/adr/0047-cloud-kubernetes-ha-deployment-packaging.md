@@ -8,7 +8,7 @@
   packages an **operator-assembled** L4 load balancer whose VIP *follows* failover via a primary-only
   health check — it does **not** build an engine that *manipulates* a VIP. Any future engine-managed VIP
   is a distinct, deferred item (see *Out of scope* and *To resolve on acceptance*).
-- **Related:** [BACKLOG #41](../BACKLOG.md) (this) · the ratifying research
+- **Related:** [BACKLOG #41](../archive/backlog/BACKLOG-CLOSED.md#41-cloud--kubernetes-ha-deployment-packaging-container-fast-follow-follow-ons) (this) · the ratifying research
   [`research/cloud-deployment-research-2026-06.md`](../research/cloud-deployment-research-2026-06.md) ·
   [ADR 0017](0017-consumer-deployment-model.md) (consumer deployment model, container fast-follow, PR #480) ·
   [ADR 0037](0037-multi-process-sharding-l3.md) (L3 process sharding — the CPU-scaling lever, **not** an HA

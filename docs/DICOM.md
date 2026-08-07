@@ -39,7 +39,7 @@ These are **declined or deferred by design** in [ADR 0025](adr/0025-dicom-codec-
 | **MPPS** (Modality Performed Procedure Step) | Out of scope |
 | **Query/Retrieve** — C-FIND / C-MOVE / C-GET | Out of scope (Mirth doesn't have these) |
 | **DICOMweb QIDO-RS / WADO-RS** (query/retrieve over HTTP) | Out of scope; our DICOMweb is **store/send only** |
-| **Inbound DICOMweb (STOW-RS) receiver** | Deferred — needs the inbound HTTP listener (ADR 0023, not yet authored; [backlog](BACKLOG.md) #7) |
+| **Inbound DICOMweb (STOW-RS) receiver** | Deferred — needs the inbound HTTP listener (ADR 0023, not yet authored; [backlog](archive/backlog/BACKLOG-CLOSED.md#7-inbound-soaprest-listener--web-service-source-v03) #7) |
 | **Pixel-data transformation / rendering**, `numpy` | Headers + SR only — also a security boundary (no decompression-bomb surface) |
 
 ---

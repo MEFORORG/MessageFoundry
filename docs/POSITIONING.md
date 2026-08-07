@@ -58,7 +58,7 @@ remote production database. The durable, code-first core is the same at every si
 
 - **Not a visual / drag-drop transformer.** Code-first authoring *is* the differentiator — a guided
   editor that drifts toward declarative *logic* authoring is an anti-goal (see
-  [BACKLOG.md](BACKLOG.md) #26).
+  [BACKLOG-CLOSED.md](archive/backlog/BACKLOG-CLOSED.md#26-visual--template-driven-channel-authoring--decision-decline-by-design-no-build) #26).
 - **Not a broker-coupled architecture.** The staged database queue *is* the durability layer; we don't
   require Kafka/JMS to be reliable.
 - **Not chasing native per-core benchmark wins.** The honest trade is interpreted-language flexibility +

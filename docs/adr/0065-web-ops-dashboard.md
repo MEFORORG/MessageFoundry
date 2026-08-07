@@ -1,6 +1,6 @@
 # ADR 0065 — Zero-install same-origin browser ops dashboard (read-only, M1)
 
-- **Status:** **Accepted (2026-07-02) — building (M1).** Implements [BACKLOG #75](../BACKLOG.md) "option
+- **Status:** **Accepted (2026-07-02) — building (M1).** Implements [BACKLOG #75](../archive/backlog/BACKLOG-CLOSED.md#75-browser--web-operator-monitor) "option
   b" (the scheduled zero-install browser ops dashboard). This ADR settles the M1 (read-only) design; the
   safe-action + CSRF work is M2 and the full desktop-console port ("option c") stays gated per #75.
 - **Builds on (must not redesign):** the API is the engine's only external boundary and every route
@@ -234,14 +234,14 @@ desktop-console retirement ("option c", gated per #75).
 
 `docs/security/ASVS-L3-ASSESSMENT.md` (the "no browser frontend" premise + the flipped cells),
 `docs/SECURITY.md` (the exposed-gate now covers `/ui`), `docs/PHI.md` (write the missing browser-client
-section), and supersedes the CORS + localStorage language in [BACKLOG #75](../BACKLOG.md).
+section), and supersedes the CORS + localStorage language in [BACKLOG #75](../archive/backlog/BACKLOG-CLOSED.md#75-browser--web-operator-monitor).
 
 ---
 
 ## Amendment (2026-07-19) — Historical trend charts + status-colored data-flow graph (BACKLOG #76)
 
 - **Status:** **Accepted (2026-07-19).** Additive to the accepted M1/M2 design — no boundary, PHI, or
-  CSP change. Implements [BACKLOG #76](../BACKLOG.md) "historical-metrics charting + status-colored
+  CSP change. Implements [BACKLOG #76](../archive/backlog/BACKLOG-CLOSED.md#76-historical-metrics-charting--status-colored-data-flow-graph) "historical-metrics charting + status-colored
   data-flow graph" (lane `dg-s8a`, Wave 6).
 
 **What it adds.** A read-only **Monitoring → Flow & trends** page (`/ui/monitoring`) with two panels:
@@ -252,7 +252,7 @@ section), and supersedes the CORS + localStorage language in [BACKLOG #75](../BA
    `graph --json` CLI and the IDE CONNECTIONS view use). A new **read-only** JSON endpoint
    `GET /graph/edges` (`monitoring:read`) returns those edges plus each connection node's **live status**
    (running/stopped/failed/filtered/not_deployed, read from the `RegistryRunner`). The node colour is
-   **derived from live status**, never operator-assigned (that is [BACKLOG #79](../BACKLOG.md)'s scope).
+   **derived from live status**, never operator-assigned (that is [BACKLOG #79](../archive/backlog/BACKLOG-CLOSED.md#79-correlation-object-ux--visual-bidirectional-correlation-editor)'s scope).
 
 2. **Historical trend charts.** A new **read-only** JSON endpoint `GET /metrics/history` (`monitoring:read`)
    returns a bounded **in-memory ring** of point-in-time samples (queue-by-status counts). The ring is
@@ -285,7 +285,7 @@ section), and supersedes the CORS + localStorage language in [BACKLOG #75](../BA
 
 ## Amendment (2026-07-19) — Per-message 'Waiting for Reply' outbound display state + cosmetic display delay (BACKLOG #136)
 
-- **Status:** **Accepted (2026-07-19).** Implements [BACKLOG #136](../BACKLOG.md) "'Waiting for Reply'
+- **Status:** **Accepted (2026-07-19).** Implements [BACKLOG #136](../archive/backlog/BACKLOG-CLOSED.md#136-waiting-for-reply-per-message-connection-state--display-delay) "'Waiting for Reply'
   per-message connection state + display delay" (lane `dg-s8a`, Wave 6). A light, additive display note.
 
 **What it adds (display only — no delivery-path change).** An outbound MLLP connection already blocks on
@@ -307,7 +307,7 @@ display state and a cosmetic knob for when to show it. This adds:
 
 **#136 × #117 interaction (do NOT break).** "Waiting for Reply" is **inapplicable in no-ack mode**: the
 marker is stamped **only around an ACK read that actually happens**, so an outbound that skips the ACK
-read ([BACKLOG #117](../BACKLOG.md), a different wave) never sets it and the badge never shows there — the
+read ([BACKLOG #117](../archive/backlog/BACKLOG-CLOSED.md#117-sender-no-wait-for-ack-fire-and-forward-option), a different wave) never sets it and the badge never shows there — the
 state is rendered **only on ACK-waiting outbounds**, by construction.
 
 - **AC-10** — WHILE an MLLP outbound is awaiting a reply AND at least `waiting_display_delay` has elapsed

@@ -8,7 +8,7 @@ policy — partner-NAK vs transport vs internal-error split, the **retry-forever
 [`pipeline/alerts.py`](../messagefoundry/pipeline/alerts.py) defaulting to `WARNING` logs, and the
 `connection_stopped` emit-point), and Layer 4b (the `queue_buildup` detector + its `buildup_max_depth`
 / `buildup_max_oldest_seconds` threshold and the `pending_depth` store query). A **real** alerting
-framework (routing the `AlertSink` events to notifications) remains [`BACKLOG.md`](BACKLOG.md) item 5;
+framework (routing the `AlertSink` events to notifications) remains [`BACKLOG-CLOSED.md`](archive/backlog/BACKLOG-CLOSED.md#5-alerting-framework--fifo-operational-alerts-near-term--the-fifo-defaults-depend-on-it) item 5;
 the next foundational step is **Phase 2** — per-stage durable queues (ADR-first, top of `BACKLOG.md`).
 Companion to the engine survey in
 [`hl7-message-ordering-reference.md`](hl7-message-ordering-reference.md); per-key ordering is the

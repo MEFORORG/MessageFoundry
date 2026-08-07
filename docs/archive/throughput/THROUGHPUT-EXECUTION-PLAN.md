@@ -19,12 +19,12 @@ falsifier for the `2H` thesis, a cannot-claim ledger, and a persistence phase. T
 >
 > ⚠️ **ADR 0107's "do not build F2 or F3" uses the Phase-4 plan's labels, NOT this document's §Phase F labels — do
 > not map them across.** Against **this** plan's lever table: **F1 (`accepts=` seam) SHIPPED**
-> ([ADR 0084](../../adr/0084-accepts-router-seam.md), [BACKLOG #213](../../BACKLOG.md)); **F2 (`fifo_claim_batch` flip) is
-> owner-closed default-OFF**, priced at ≤ +4.7% against a +8% bar ([BACKLOG #212](../../BACKLOG.md); shipped
+> ([ADR 0084](../../adr/0084-accepts-router-seam.md), [BACKLOG #213](../backlog/BACKLOG-CLOSED.md#213-accepts-seam-pure-router-stage-predicate-plus-an-advisory-lint)); **F2 (`fifo_claim_batch` flip) is
+> owner-closed default-OFF**, priced at ≤ +4.7% against a +8% bar ([BACKLOG #212](../backlog/BACKLOG-CLOSED.md#212-fifo_claim_batch-decide-the-shipped-default-verification-done--it-is-not-a-no-op); shipped
 > `default=1`, [`config/settings.py:301`](../../../messagefoundry/config/settings.py)); **F3 (the pooled tempdb claim
 > rewrite) is ⛔ DECLINED** — but by [ADR 0114](../../adr/0114-phase-4-claim-path-call-complexity-reduction-driver-interface-redesign-ingress-routed-reset-fold.md)
-> keeping the table variables as load-bearing for per-lane FIFO, **not** by ADR 0107 ([BACKLOG #210](../../BACKLOG.md));
-> **F4 (group-commit) is ⛔ DECLINED** ([BACKLOG #217](../../BACKLOG.md)); **F5's transform-overlap mechanism MERGED**,
+> keeping the table variables as load-bearing for per-lane FIFO, **not** by ADR 0107 ([BACKLOG #210](../backlog/BACKLOG-CLOSED.md#210-remove-the-tempdb-table-variables-from-the-pooled-claim-query));
+> **F4 (group-commit) is ⛔ DECLINED** ([BACKLOG #217](../backlog/BACKLOG-CLOSED.md#217-group-commit--durable-write--sequenced-after-the-claim-path)); **F5's transform-overlap mechanism MERGED**,
 > its commit-collapse residual unbuilt, owner-deferred and ADR-gated ([BACKLOG #214](../../BACKLOG.md)).
 >
 > So **§Phase F is stale as a plan** — every lever it sequences has since shipped, been declined, or been deferred,
