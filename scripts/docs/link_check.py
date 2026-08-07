@@ -20,10 +20,20 @@ links accumulated across 19 files before anyone counted them.
   repository invariant.
 * **Fragments.** ``#some-anchor`` is not validated here; only the path is. Heading slugs churn on
   every retitle and would make this noisy.
-* **Withheld directories.** ``docs/security/``, ``docs/reviews/`` and ``docs/marketing/`` are
-  gitignored post-cutover. The master test plan states a missing path there is a deliberate
-  publishing boundary, not a defect, so flagging them would train readers to ignore the gate.
+* **Withheld directories.** ``docs/security/``, ``docs/reviews/``, ``docs/marketing/``,
+  ``docs/releases/`` and ``.claude/`` are gitignored. The master test plan states a missing path
+  there is a deliberate publishing boundary, not a defect, so flagging them would train readers to
+  ignore the gate. ``.claude/`` is the instructive one: it is *present* in a long-lived local
+  checkout and absent from CI's clean clone, so omitting it makes this checker pass locally and fail
+  on the runner.
 * **Fenced code.** A path inside ``` is sample output being shown, not a link to follow.
+* **Inline code.** A link inside backticks is being *displayed*, not offered -- the same argument as
+  fenced code, at smaller scale. Four real sites turn on it: a regex whose character class contains
+  ``](``, two VS Code ``command:`` URIs (one quoted as an attack payload), and ADR 0160 quoting the
+  very link it records as having been removed. Repointing any of them would corrupt the text.
+  Measured 2026-08-07, the cost is **10** links no longer checked out of 5,344, five of which were
+  passing. The discriminator is POSITION, not shape: the dominant repo idiom ``[`x.md`](../x.md)``
+  closes its span before the ``]``, so it is still checked.
 * **``file.py:27`` citation targets.** The repo's ``file_path:line_number`` convention appears inside
   some hrefs. Those cannot resolve as paths whatever prefix is used; repairing them is a convention
   decision, not a repair, so they are reported under ``--include-line-cites`` and otherwise skipped.
@@ -44,12 +54,28 @@ import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
-# Gitignored post-cutover; a missing target here is a publishing boundary, not a broken link.
-WITHHELD = ("docs/security/", "docs/reviews/", "docs/marketing/")
+# Gitignored; a missing target here is a publishing boundary, not a broken link.
+#
+# docs/releases/ joined when ADR 0160 Phase 1 untracked it (.gitignore carries "/docs/releases/") --
+# an archived throughput doc still cites the v0.1 plan that moved out with it.
+#
+# .claude/ joined for a sharper reason, and it is the one to remember: it is gitignored
+# (.gitignore:142) but PRESENT in a long-lived local checkout, so a repo-wide run passes there and
+# fails in CI, which clones clean. The first measurement of this class was taken in such a checkout
+# and undercounted by exactly these 7 links. Read a gate result as a fact about the CONFIGURATION it
+# ran in, and confirm the instrument answers the question asked (CLAUDE.md section 11, SDS-3.8).
+WITHHELD = (
+    "docs/security/",
+    "docs/reviews/",
+    "docs/marketing/",
+    "docs/releases/",
+    ".claude/",
+)
 
 _LINK = re.compile(r"\]\((?P<href>[^)\s]+?)(?P<frag>#[^)\s]*)?\)")
 _LINE_CITE = re.compile(r":\d+$")
 _FENCE = re.compile(r"^\s*```")
+_CODE = re.compile(r"`[^`]*`")
 
 
 def repo_root() -> Path:
@@ -123,7 +149,15 @@ def check(root: Path, subtree: str | None, include_line_cites: bool) -> tuple[li
                 continue
             if in_fence:
                 continue
+            code_spans = [c.span() for c in _CODE.finditer(text)]
             for m in _LINK.finditer(text):
+                # A link inside backticks is DISPLAYED, not offered. Tested by POSITION rather than
+                # shape, so that the dominant idiom -- [`x.md`](../x.md), whose span closes before
+                # the "]" -- keeps being checked. test_links_inside_inline_code_are_not_followed
+                # asserts both halves, because a shape-based rule would silently stop checking most
+                # of the docs while still looking green.
+                if any(s <= m.start() < e for s, e in code_spans):
+                    continue
                 href = m.group("href")
                 if href.startswith(("http://", "https://", "mailto:", "#")):
                     continue

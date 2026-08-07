@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""Guard the backlog archive against the link breakage that ARCHIVING ITSELF causes.
+"""Guard every relative markdown link in the repository, archive included.
 
 Closing an item moves its text verbatim from ``docs/BACKLOG.md`` into
 ``docs/archive/backlog/BACKLOG-CLOSED.md`` -- two directories deeper -- and nothing rewrites its
@@ -11,15 +11,24 @@ from** ``docs/``, which is what pins the cause to the move rather than to author
 The move is **manual** -- no script performs it -- so there is nothing to fix upstream. A guard is
 the only thing that can catch the next one, and it has to run at the moment the item lands.
 
-**Scope is deliberately the archive only.** A repo-wide assertion would be red on day one over
-pre-existing breakage elsewhere, and a gate that is red on arrival gets suppressed rather than fixed
-(the same reasoning the ledger gate records). Widening it is a one-line change to ``_SUBTREE`` once
-the remaining subtrees are clean; the checker itself is already repo-wide capable.
+**Scope is the whole repository.** It was archive-only when first written, because a repo-wide
+assertion was red over pre-existing breakage elsewhere and a gate that is red on arrival gets
+suppressed rather than fixed. That reason has expired: the remaining subtrees were repaired in the
+same change that widened this (333 root-relative hrefs under ``docs/testing/``, the 270 here, ADR
+slug rot in ``docs/BACKLOG.md``), and the checker's three false-positive classes -- links inside
+inline code, the withheld ``docs/releases/``, and the withheld ``.claude/`` -- were fixed rather than
+tolerated. Repo-wide is now green, which is the only state in which widening is honest.
+
+``.claude/`` is worth remembering: it is gitignored but PRESENT in a long-lived local checkout, so
+the first repo-wide measurement was taken somewhere it resolved and undercounted this class by 7.
+Widening on that number would have put the gate red on CI's clean clone on arrival -- the precise
+outcome the paragraph above says gets a gate suppressed.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -27,7 +36,11 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parent.parent
 _CHECKER = _ROOT / "scripts" / "docs" / "link_check.py"
-_SUBTREE = "docs/archive/backlog"
+
+# The gate reads the whole repo. The planted-repo tests below pass an explicit subtree instead, so
+# their "scanned exactly one file" assertions keep meaning what they say.
+_GATE_SUBTREE: str | None = None
+_PLANTED_SUBTREE = "docs/archive/backlog"
 
 
 def _load():
@@ -45,56 +58,91 @@ def checker():
     return _load()
 
 
-def test_archive_links_all_resolve(checker) -> None:
-    """Every relative link in the backlog archive resolves."""
-    failures, checked, files = checker.check(_ROOT, _SUBTREE, include_line_cites=False)
+def _plant(tmp_path: Path, name: str, body: str) -> Path:
+    """A throwaway git repo containing one archive-shaped markdown file."""
+    repo = tmp_path / "r"
+    (repo / "docs" / "archive" / "backlog").mkdir(parents=True)
+    (repo / "docs" / "real.md").write_text("# real\n", encoding="utf-8")
+    (repo / "docs" / "archive" / "backlog" / name).write_text(body, encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    return repo
+
+
+def test_every_relative_link_in_the_repo_resolves(checker) -> None:
+    failures, checked, files = checker.check(_ROOT, _GATE_SUBTREE, include_line_cites=False)
     # Assert the scan actually READ something. Without this the test passes just as happily when a
     # path change makes it scan zero files -- the anti-narrowing floor the status-check gate uses.
-    assert files >= 1, f"scanned {files} files under {_SUBTREE} -- the scan itself is broken"
-    assert checked >= 200, (
-        f"only {checked} links checked under {_SUBTREE}; expected 200+. Either the archive shrank "
-        "dramatically or the link regex stopped matching -- both make a green result meaningless."
+    assert files >= 100, f"scanned {files} markdown files -- the scan itself is broken"
+    assert checked >= 4000, (
+        f"only {checked} links checked repo-wide; expected 4000+ (5,327 at the time this floor was "
+        "set). Either the docs shrank dramatically or the link regex stopped matching -- both make "
+        "a green result meaningless."
     )
-    assert not failures, "unresolved links in the backlog archive:\n" + "\n".join(failures)
+    assert not failures, "unresolved relative links:\n" + "\n".join(failures)
 
 
 def test_checker_detects_a_planted_break(tmp_path, checker) -> None:
     """A green result is only evidence if the checker can SEE the class it claims to cover.
 
-    Builds a throwaway git repo containing one markdown file with one deliberately broken link and
-    one good link, and asserts the checker reports exactly the broken one. Without this, a regex
-    that silently stopped matching would make every run above pass.
+    Without this, a regex that silently stopped matching would make every run above pass.
     """
-    import subprocess
-
-    repo = tmp_path / "r"
-    (repo / "docs" / "archive" / "backlog").mkdir(parents=True)
-    (repo / "docs" / "real.md").write_text("# real\n", encoding="utf-8")
-    (repo / "docs" / "archive" / "backlog" / "A.md").write_text(
-        "[good](../../real.md) and [bad](../../nope-does-not-exist.md)\n", encoding="utf-8"
+    repo = _plant(
+        tmp_path, "A.md", "[good](../../real.md) and [bad](../../nope-does-not-exist.md)\n"
     )
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
-
-    failures, checked, files = checker.check(repo, _SUBTREE, include_line_cites=False)
+    failures, checked, files = checker.check(repo, _PLANTED_SUBTREE, include_line_cites=False)
     assert files == 1, f"expected to scan 1 planted file, scanned {files}"
     assert checked == 2, f"expected 2 relative links, saw {checked}"
     assert len(failures) == 1, f"expected exactly the planted break, got: {failures}"
     assert "nope-does-not-exist.md" in failures[0]
 
 
-def test_withheld_directories_are_not_flagged(tmp_path, checker) -> None:
-    """docs/security|reviews|marketing are gitignored by design; flagging them trains people to
-    ignore the gate. Pinned so a future refactor cannot quietly start reporting them."""
-    import subprocess
+def test_withheld_prefixes_are_the_gitignored_ones(checker) -> None:
+    """Pin the exemption list as a SET, so adding a prefix to the checker is a deliberate act with a
+    failing test attached rather than a silent widening of what goes unchecked."""
+    assert set(checker.WITHHELD) == {
+        "docs/security/",
+        "docs/reviews/",
+        "docs/marketing/",
+        "docs/releases/",
+        ".claude/",
+    }
 
-    repo = tmp_path / "r"
-    (repo / "docs" / "archive" / "backlog").mkdir(parents=True)
-    (repo / "docs" / "archive" / "backlog" / "A.md").write_text(
-        "[withheld](../../security/ASVS-L2.md)\n", encoding="utf-8"
+
+@pytest.mark.parametrize(
+    "prefix",
+    ["docs/security/", "docs/reviews/", "docs/marketing/", "docs/releases/", ".claude/"],
+)
+def test_withheld_directories_are_not_flagged(tmp_path, checker, prefix: str) -> None:
+    """A gitignored target is a publishing boundary, not a defect; flagging it trains people to
+    ignore the gate. ``docs/releases/`` joined when ADR 0160 Phase 1 untracked it, and ``.claude/``
+    joined because it is gitignored yet PRESENT in a long-lived local checkout -- so leaving it out
+    makes the repo-wide gate green locally and red on CI's clean clone, which is how it was found.
+    Planted at the real relative depth so a resolution bug cannot pass this by accident."""
+    href = "../../../" + prefix + "GONE.md"  # docs/archive/backlog/A.md is three levels down
+    repo = _plant(tmp_path, "A.md", f"[withheld]({href})\n")
+    failures, _checked, _files = checker.check(repo, _PLANTED_SUBTREE, include_line_cites=False)
+    assert not failures, f"withheld prefix {prefix} should be exempt, got: {failures}"
+
+
+def test_links_inside_inline_code_are_not_followed(tmp_path, checker) -> None:
+    """A link inside backticks is being DISPLAYED, not offered -- the same reason fenced code is
+    skipped. Four real sites depend on this: a regex containing ``](`` inside a character class, two
+    VS Code ``command:`` URIs (one quoted as an attack payload), and ADR 0160 quoting the very link
+    it records as removed. Repointing any of them would corrupt the text.
+
+    The discriminator is POSITION, not shape. The dominant repo idiom ``[`x.md`](../x.md)`` closes
+    its code span before the ``]``, so it must still be checked -- asserted here, because a rule that
+    skipped by shape would silently stop checking most of the docs.
+    """
+    repo = _plant(
+        tmp_path,
+        "A.md",
+        "a `[bad](../../nope.md)` shown as text\n"
+        "b [`real.md`](../../real.md) a genuine link with a code-span label\n"
+        "c [also bad](../../missing.md) a genuine broken link\n",
     )
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
-
-    failures, _checked, _files = checker.check(repo, _SUBTREE, include_line_cites=False)
-    assert not failures, f"withheld path should be exempt, got: {failures}"
+    failures, checked, _files = checker.check(repo, _PLANTED_SUBTREE, include_line_cites=False)
+    assert checked == 2, f"expected the code-span link skipped and 2 checked, saw {checked}"
+    assert len(failures) == 1, f"expected only the uncoded break, got: {failures}"
+    assert "missing.md" in failures[0]
