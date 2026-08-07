@@ -6464,12 +6464,36 @@ What was unwatched is the **release-lag window**: the interval between a fix lan
 
 **At least four distinct classes, and they differ in DETECTABILITY. This is the item's central constraint** — state it in any plan, or a linter closes the visible third and the rest is declared done:
 
-| Class | Count (2026-08-07) | Catchable by a link checker? |
-|---|---|---|
-| Path-bearing citation names the live ledger; item is archived | at least 69 sites / 35 files | **No** — the link resolves perfectly. Only the human-readable number beside it is stale. |
-| Relative href does not resolve at all | 13 | Yes |
-| `BACKLOG.md:<line>` anchor past end of file | 12 (file is 6318 lines; one anchor cites **8429**) | Yes |
-| `BACKLOG.md:<line>` anchor in range but drifted onto unrelated text | 31 | **No** — resolves, lands somewhere plausible, says the wrong thing. |
+| Class | Count as filed | Re-measured repo-wide | Catchable by a link checker? | Status |
+|---|---|---|---|---|
+| Path-bearing citation names the live ledger; item is archived | at least 69 sites / 35 files | 73 sites / 34 files | **No** — the link resolves perfectly. Only the human-readable number beside it is stale. | repaired |
+| Relative href does not resolve at all | 13 | **at least 629** | Yes | repaired |
+| `BACKLOG.md:<line>` anchor past end of file | 12 | 7 | Yes | converted to item references |
+| `BACKLOG.md:<line>` anchor in range but drifted onto unrelated text | 31 | 36 of 43 | **No** — resolves, lands somewhere plausible, says the wrong thing. | 25 converted, 18 left deliberately |
+
+**Three of those four filed counts were wrong, and the way they were wrong is the item's own subject.**
+The href figure of 13 was low by two orders of magnitude: the repaired sites total at least 629 (333
+root-relative hrefs under `testing/`, 270 broken by the archival move, 3 ADR-slug and depth errors,
+23 `file:line` targets). The anchor counts moved in the *opposite* direction between filing and
+repair, and not because anything improved — this file grew 6,318 → 6,616 lines, so five anchors that
+were safely past EOF came back **into** range and now land on plausible-looking wrong items. A
+dangling pointer degrades into a confident one as the file grows.
+
+**Root cause of the anchor class, which is not gradual drift.** Commit `4ea15017` (the master test
+plan) is **not** a descendant of `03f1fbd7` (the 185-item archival) — they were parallel branches.
+The plan's anchors were authored against an 8,742-line ledger and merged alongside a commit that cut
+this file to 3,858. They were stale on arrival. That also explains the anchor citing line **8429**,
+which is absurd against 6,616 lines and was ordinary against 8,742.
+
+**18 anchors were left unconverted on purpose**, in three groups. Nine sites make a present-tense
+claim that the repo has since falsified — the alerting chapter still says #139 and `PHI.md`
+"currently contradict each other" when #139 was corrected 2026-08-01 and the code fixed by #323 on
+2026-08-02 (filed as #1100). Attaching a durable item reference to a dead claim relaunders it, so
+those need a content fix, not a repoint. Six cannot be attributed to any item at all, one of them
+pointing at an un-numbered narrative bullet; they stay uniformly stale, because uniform staleness is
+detectable and a confident wrong pointer is not. Three are not citations — two sit inside a fenced
+transcript in #1083 reproducing scanner output, and one is #347's own **Source:** paragraph
+narrating a deliberate falsification.
 
 The two "No" rows are the majority and the harder half. Root cause for the anchor classes is the same archival pass that produced the first: it shortened the ledger under citations that had been correct.
 
@@ -6481,9 +6505,11 @@ The two "No" rows are the majority and the harder half. Root cause for the ancho
 
 **Already specified elsewhere — do not file a third time.** In [`testing/master-test-plan/18-interop-migration-and-uat.md`](testing/master-test-plan/18-interop-migration-and-uat.md): `MIG-74` is a P1 row reading *"Every doc path named in shipped text or a docstring resolves — one linter, one boundary allowlist"*, and **`MIG-35` is already named there as "the BACKLOG-reference classifier", folding into MIG-74** (:128) — so the exact check this item needs is specified, just unbuilt. This item supplies what those rows lack: the measured counts, the detectability split, and the warning that `MIG-74` as worded ("paths resolve") would pass the **largest** class untouched, because those paths *do* resolve.
 
-**Scope note — markdown only.** The sweep behind these numbers read `*.md`. Citations also live in `harness/`, `ide/src/`, `messagefoundry/` and `.github/workflows/`, and rot identically; they are **not** counted above and should be swept before anyone calls the class closed.
+**Scope note — the non-markdown sweep has now RUN, and it found nothing.** The counts as filed read `*.md` only, and this note used to say citations in `harness/`, `ide/src/`, `messagefoundry/` and `.github/workflows/` "rot identically" and must be swept before the class could be called closed. That sweep ran 2026-08-07 across 1,219 tracked non-markdown files. It surfaced 68 distinct repo-relative paths that do not exist and **not one of them is a rotted citation**: they are test fixtures (`docs/adr/0001-collision.md`, `messagefoundry/x.py`, `tests/test_a.py`), targets inside withheld directories, or past-tense historical comments — `.github/workflows/release.yml:51` names the pre-cutover `scripts/publish/publish.ps1` under a heading reading "THIS GUARD WAS INVERTED UNTIL THE CUTOVER". The prediction was wrong, and the reason is worth keeping: citations in code are mostly written *about* the past, where prose citations are written as *pointers*. **Do not re-open this as unswept scope.**
 
-**Related:** #1094 (two instances of this class, closed — already satisfied when filed), #1073 (whose §12 marker prompted the original find, and which is itself the closed-but-not-archived case), #1000 (a control whose green is not evidence about what it appears to cover), [`../CLAUDE.md`](../CLAUDE.md) §11 (state a load-bearing fact once and link to it — which is what makes a link's durability load-bearing).
+**A gate now covers the catchable half, repo-wide.** `scripts/docs/link_check.py` with `tests/test_archive_link_resolution.py` asserts that every relative markdown link in the repository resolves — 5,327 links across 347 files. Widening it beyond the archive required removing three false-positive classes first, because a gate red on arrival gets suppressed rather than fixed: links inside inline code (a regex whose character class contains `](`, two VS Code `command:` URIs, and ADR 0160 quoting the link it records as removed), and the withheld `docs/releases/` and `.claude/`. **`.claude/` is the one to carry forward** — it is gitignored but *present* in a long-lived local checkout, so the first repo-wide measurement passed there and undercounted by 7; widening on that number would have put the gate red on CI's clean clone. A gate result is a fact about the configuration it ran in. The gate was then proved able to fail, by planting a break in a real document outside the archive and watching it go red.
+
+**Related:** #1094 (two instances of this class, closed — already satisfied when filed), #1073 (whose §12 marker prompted the original find, and which is itself the closed-but-not-archived case), #1000 (a control whose green is not evidence about what it appears to cover), #1099 (#1094's claim that an archival pass *generates* the anchor, describing tooling that does not exist), #1100 (the nine sites whose citing claim is dead, split out of this item rather than repointed), [`../CLAUDE.md`](../CLAUDE.md) §11 (state a load-bearing fact once and link to it — which is what makes a link's durability load-bearing).
 
 **Source:** repo-wide sweep 2026-08-07 while repointing the [`CONNECTIONS.md`](CONNECTIONS.md) serial/ASTM decline (PR #273, the `docs/CONNECTIONS.md` half of the same two-marker pair #1094 covered in `../CLAUDE.md`). Item locations came from `parse_items` imported from the status-check script rather than a hand-rolled scan; the resolver was validated on planted good-and-bad citations, including the closed-but-not-yet-archived case, before its output was believed.
 
@@ -6614,3 +6640,96 @@ So `-Com` and `-Comm` are working spellings. `-Cm` is not, which bounds the fami
 
 **Source:** found 2026-08-07 by the adversarial verification of a candidate fix for #1086. Two verifiers independently measured the abbreviation family; the third accepted the candidate because its corpus contained no such payload, which is itself the #1000 shape. The pre-existing half was separated from the introduced half by measuring both against the committed gate.
 
+## 1098. The coordination hook prints a session UUID where a commit SHA is expected
+
+> 🔢 **Filed 2026-08-07 - not started.** Value **4/10** · Difficulty **2/10**. The parallel-session banner
+> printed at session start lists each live worktree with what reads as a commit SHA in the trailing
+> column. For at least one row the value is a **session UUID**: `061726a4` resolves to
+> `.git/mefor-coord/announce/061726a4-....json`, not to any object in the repository. The branch
+> names in the same banner are reliable; the SHAs are not.
+
+**Cluster:** Coordination tooling / instrument accuracy. **Priority:** P3. **Verdict:** build.
+**Severity:** no product effect. The cost is that a reader who trusts the column reasons about the
+wrong tree - and the banner exists precisely to tell sessions where other sessions are.
+
+**Why it matters more than the size suggests.** This is a value printed in the position a SHA
+occupies, so it fails the SDS-3.8 test: the instrument answers a different question from the one the
+column header asks, and nothing in the output says so. A session comparing "is that worktree ahead
+of mine" against a UUID gets a `git` error at best and a wrong answer if the prefix happens to
+resolve. Either print the real SHA or rename the column to what it actually holds; do not leave a
+field whose meaning depends on which row you are reading.
+
+**Related:** #1000 (a control whose green is not evidence about what it appears to cover),
+[`../CLAUDE.md`](../CLAUDE.md) §11 (SDS-3.8 - confirm the instrument answers the question asked).
+
+**Source:** observed 2026-08-07 during the #1095 work and deferred at the time only for ledger
+contention; recorded in the #1095 handoff note rather than lost.
+
+## 1099. BACKLOG #1094 describes an archival pass that generates anchors; no archival tooling exists
+
+> 🔢 **Filed 2026-08-07 - not started.** Value **4/10** · Difficulty **1/10**. #1094 states that "the archival
+> pass generates the anchor". There is **no archival tooling in the repository at all** - closing an
+> item is a manual move of its text from [`BACKLOG.md`](BACKLOG.md) into
+> [`archive/backlog/BACKLOG-CLOSED.md`](archive/backlog/BACKLOG-CLOSED.md). That sentence describes a
+> generator that was never built.
+
+**Cluster:** Documentation record / instrument accuracy. **Priority:** P3. **Verdict:** build (a
+prose correction). **Severity:** no product effect.
+
+**Why this is not pedantry.** #1094 is closed, so the sentence now sits in the archive as settled
+record, and it points maintenance at the wrong place: it implies the fix for anchor rot belongs in a
+tool, when the only thing that can catch it is a gate at the moment the item lands - which is exactly
+the reasoning `tests/test_archive_link_resolution.py`
+records. A future reader looking for the generator to fix will not find one.
+
+**The work.** Correct the sentence in place in the archive, marked as a correction rather than a
+silent rewrite, since the surrounding text is a closed record.
+
+**Related:** #1094, #1095 (the repo-scale instance of the same class), #1000.
+
+**Source:** found 2026-08-07 while resolving the #1095 anchor classes; the absence of archival
+tooling was confirmed by looking for it, not assumed.
+
+## 1100. The master test plan asserts document contradictions that were resolved before it was written
+
+> 🔢 **Filed 2026-08-07 - not started.** Value **6/10** · Difficulty **3/10**. Nine sites in the master test
+> plan make **present-tense claims that the repository has already falsified**. The clearest cluster
+> is five cells in
+> [`15-alerting-and-observability.md`](testing/master-test-plan/15-alerting-and-observability.md),
+> which assert that #139 and [`PHI.md`](PHI.md) "currently contradict each other" and set exit
+> criteria requiring three documents be made "to agree with the code". #139 was corrected 2026-08-01
+> and the code fixed by #323 on 2026-08-02: `alert_sinks.py` builds a verifying context,
+> `tests/test_alert_smtp_tls.py` exists, and `PHI.md` row 11 already states that posture.
+
+**Cluster:** Documentation record / instrument accuracy. **Priority:** P3. **Verdict:** build.
+**Severity:** no product effect and no security effect - but a **test plan** is the wrong document to
+carry dead assertions, because its rows are written to be executed. An exit criterion demanding that
+a resolved contradiction be resolved is a gate that can never inform anyone.
+
+**The other four sites.** [`00-strategy-and-governance.md`](testing/master-test-plan/00-strategy-and-governance.md)
+and [`19-execution-phasing-and-sign-off.md`](testing/master-test-plan/19-execution-phasing-and-sign-off.md)
+both say [`BACKLOG.md`](BACKLOG.md) "says so itself" about the published-baseline boundary; that prose
+now lives in **#185**, in the archive, and `grep` finds zero occurrences of it in the live file. The
+ranked-backlog row at `BACKLOG.md` for **#338** is a pre-shipping snapshot still scoring it P3 and
+`_fill-in_` after #338 shipped 2026-08-06 and its restatements were corrected. And #323's amendment
+of **#139** in the archive carries a present-tense reading that #139's own text now contradicts.
+
+**Why it was split out of #1095 rather than fixed there.** #1095 converts dead
+`BACKLOG.md:<line>` anchors to item references. At these nine sites the pointer is dead **and so is
+the sentence around it**. Converting the pointer would attach a durable, confident-looking reference
+to a claim that is false - relaundering it. That is a strictly worse outcome than leaving the stale
+anchor visible, so all nine were deliberately left unconverted and collected here. **The fix is a
+content edit per site, not a repoint.**
+
+**Do not fix these with a script.** Each needs the claim checked against the code before the sentence
+is rewritten, and at least one of the nine may warrant deleting the row rather than restating it.
+
+**Related:** #1095 (the anchor conversion that stopped at these nine), #139, #323, #338, #185, #1000
+(a control whose green is not evidence about what it covers),
+[`../CLAUDE.md`](../CLAUDE.md) §0 (present-tense claims about a not-deployed beta) and §11 (SDS-3.7 - a
+compensating control must not rest on a false premise).
+
+**Source:** found 2026-08-07 by the adversarial verification pass over the #1095 anchor mappings.
+Every one of the nine was proposed as a clean repoint by a first-pass reader and refuted by a second
+reader instructed to refute by default, who checked each citing claim against the code rather than
+against the anchor.
