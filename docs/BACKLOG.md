@@ -5702,7 +5702,9 @@ environments.py:79 `if not base_dir: return cwd`              <-- and base_dir i
 
 ## 1074. The SDS attestation posture does not record that the CISA self-attestation exempts freely-available OSS
 
-> 🔢 **Filed 2026-08-06 — not started.** Value **4/10** · Difficulty **1/10** · _quick win_. [`Secure_Development_Standards.md`](Secure_Development_Standards.md) §6.3 states the software is *"self-attested as NIST SSDF-aligned"* and never says what that attestation is, and is not, answerable to. The CISA Secure Software Development Attestation Form explicitly **exempts software that is freely obtained and publicly available**. One missing sentence, and its absence invites an error in **either** direction.
+> ✅ **SHIPPED 2026-08-07 — the documentation is the whole deliverable.** Value **4/10** · Difficulty **1/10** · _quick win_. Two paragraphs added to [`Secure_Development_Standards.md`](Secure_Development_Standards.md) **§9** (see the citation correction below), plus the 800-218A guard placed in the AI companion's `Aligns to` row rather than its body — that row is where a reader would go to add the wrong anchor, so that is where the note has to be. Original filing follows. §9 states the software is *"self-attested as NIST SSDF-aligned"* and never said what that attestation is, and is not, answerable to. The CISA Secure Software Development Attestation Form explicitly **exempts software that is freely obtained and publicly available**. One missing sentence, and its absence invited an error in **either** direction.
+
+**CITATION CORRECTION, and it was wrong as filed.** This item said the attestation posture lives in **§6.3**. It does not: §6.3 is *OWASP ASVS 5.0 Level 3 — scope*, and the attestation posture is in **§9 Evidence and attestation**. The error came from matching the phrase without opening the section around it. Recorded rather than silently repaired because a wrong section pointer in a filed item is the same defect class the item itself is about — a claim nobody has checked and a claim nobody has noticed is wrong look identical until someone follows it.
 
 **Cluster:** Standards record / attestation honesty. **Priority:** P3. **Verdict:** build (small). **Severity:** no product effect and no security effect. The defect is in the record: a reader cannot tell from §6.3 whether the SSDF alignment discharges an obligation or volunteers evidence, and those imply different things about what may be claimed to a buyer.
 
@@ -5725,7 +5727,9 @@ environments.py:79 `if not base_dir: return cwd`              <-- and base_dir i
 
 ## 1075. Re-map SDS section 4 when NIST SP 800-218r1 (SSDF 1.2) goes final
 
-> 🔢 **Filed 2026-08-06 — not started, and deliberately blocked on an external event.** Value **3/10** · Difficulty **4/10**. **The correct action today is none**, and that is why this exists: without a filed item, a future session finds a newer SSDF version and re-maps against a **draft**, replacing a correct citation with one that can still change before publication.
+> ✅ **CLOSED 2026-08-07 — NOT by doing the re-map, which remains correctly undone.** Value **3/10** · Difficulty **4/10**. Closed on the owner's reading, which was right: the SDS maps **SP 800-218 v1.1, and v1.1 is the current final version**, so this item described zero present work and zero present defect. A watch item for an event with no announced date is backlog noise. **Its one load-bearing sentence was not discarded — it was re-sited**, into [`Secure_Development_Standards.md`](Secure_Development_Standards.md) §9 alongside #1074, where the reader who would re-map against the draft is actually looking. A guard in the document beats a guard in the ledger.
+
+**DO NOT read this as "the SSDF 1.2 re-map is done."** It is not started and must not be started: SP 800-218r1 is still an Initial Public Draft (published 2025-12-17, comments closed 2026-01-30, no announced finalisation date). The trigger, the per-ID re-resolution rule, and the PW.7-deviation caveat now live in SDS §9. **If r1 goes Final, that is a new item** — do not reopen this one, because its number is closed and a reopened closed item is invisible to anyone reading the ledger for open work.
 
 **Cluster:** Standards record. **Priority:** P3. **Verdict:** build, **when triggered**. **Severity:** none today — the SDS is correct as it stands.
 
