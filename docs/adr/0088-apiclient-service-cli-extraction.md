@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-07-10
-- **Related:** [ADR 0032](0032-console-desktop-launch.md) · [CLAUDE.md §2 / §10](../../CLAUDE.md) · BACKLOG #103 · [MULTISESSION-PLAN-9](../releases/MULTISESSION-PLAN-9.md)
+- **Related:** [ADR 0032](0032-console-desktop-launch.md) · [CLAUDE.md §2 / §10](../../CLAUDE.md) · BACKLOG #103 · MULTISESSION-PLAN-9
 
 ---
 

@@ -120,6 +120,7 @@ def run_checks(
     handler_security_allow: frozenset[str] = frozenset(),
     service_config: str | Path | None = None,
     suppress_service_toml_search: bool = False,
+    project_root: str | Path | None = None,
 ) -> CheckReport:
     """Run the gate against ``config_dir``; ``messages_dir`` enables the dry-run check when it has
     fixtures. Set ``run_lint=False`` to skip the advisory ruff/mypy pass. ``strict_handler_security``
@@ -133,6 +134,14 @@ def run_checks(
     given) suppresses the legacy upward-walk so ``check`` matches ``serve``'s resolution. With both
     defaulted (today's ``messagefoundry check --config config``), the upward-walk is preserved — no
     regression.
+
+    ``project_root`` (``--project-root``) is the anchor for ``environments/<env>.toml``, and it exists
+    because the gate previously VALIDATED that file under the supplied root and then READ the values
+    from the process working directory (BACKLOG #1062). It is threaded to the build check and applied
+    the way ``serve`` applies it — as a ``[environments].base_dir`` CLI override, which by
+    ``load_settings``' CLI > env > file precedence overrides a file-set ``base_dir`` exactly as
+    ``__main__.py``'s ``serve`` does. Left ``None`` the resolution is unchanged and still falls back to
+    the process directory, so the documented ``check --config config`` invocation is untouched.
     """
     results = [
         _check_validate(config_dir),
@@ -151,6 +160,7 @@ def run_checks(
             config_dir,
             service_config=service_config,
             suppress_search=suppress_service_toml_search,
+            project_root=project_root,
         ),
         _check_reference_backend(
             config_dir,
@@ -1277,6 +1287,7 @@ def _check_build(
     *,
     service_config: str | Path | None = None,
     suppress_search: bool = False,
+    project_root: str | Path | None = None,
 ) -> CheckResult:
     """Run the **posture-stamped** ``build_check_registry`` that ``serve``/``reload`` run, so a config
     ``serve`` would REFUSE — most importantly a production-PHI cleartext / weakened-TLS transport hop
@@ -1318,8 +1329,20 @@ def _check_build(
         return CheckResult(
             "build-check", ok=True, required=True, skipped=True, detail="no messagefoundry.toml"
         )
+    # --project-root anchors the env VALUES, applied exactly as `serve` applies it (__main__.py, the
+    # `cli["environments"]["base_dir"] = args.project_root` line): as a [environments].base_dir CLI
+    # override, which load_settings' CLI > env > file precedence puts above a file-set base_dir.
+    #
+    # Without it the caller's root was used to VALIDATE that <root>/<env_dir>/<env>.toml EXISTS and then
+    # discarded, while the values below were read from the PROCESS directory -- so the ADR 0092
+    # posture-keyed insecure-hop refusal could be decided against a different environment's hosts and
+    # schemes than the one the operator named (BACKLOG #1062). Left None, resolution is unchanged and
+    # still falls back to the process directory, so `check --config config` is untouched.
+    cli: dict[str, dict[str, object]] | None = (
+        {"environments": {"base_dir": str(project_root)}} if project_root is not None else None
+    )
     try:
-        settings = load_settings(config_path=toml)
+        settings = load_settings(config_path=toml, cli=cli)
     except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
         return CheckResult(
             "build-check",

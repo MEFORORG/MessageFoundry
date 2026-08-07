@@ -19,7 +19,7 @@ provided both sides move together.
 
 The semgrep arm below is CI-vs-CI, not hook-vs-CI, and that asymmetry is deliberate rather than a
 forgotten half: there is no semgrep pre-commit hook to compare against, because semgrep has no
-supported Windows install (docs/releases/BACKLOG-MULTISESSION-PLAN.md) and this is a Windows-first
+supported Windows install (recorded in the maintainer-internal backlog plan) and this is a Windows-first
 project. So semgrep's scope is pinned to its sibling CI gate, bandit — the two scan the same
 checkout in the same job file for the same reason, and a path excluded from one but not the other
 means one of them is enforcing a standard the other is not.
