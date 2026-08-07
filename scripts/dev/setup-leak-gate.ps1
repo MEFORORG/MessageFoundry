@@ -34,9 +34,23 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$repo = (& git rev-parse --show-toplevel 2>$null)
-if (-not $repo) { throw 'Not inside a git checkout.' }
+
+# Repo root = parent of scripts\ = parent of this script's dir (scripts\dev). Same form postgres.ps1 and
+# sqlserver.ps1 in this directory already use.
+#
+# NOT `git rev-parse --show-toplevel`: that resolves against the CURRENT DIRECTORY, not against the path
+# this script was handed. Invoked by absolute -File path from another worktree -- the ordinary shape on a
+# clone carrying dozens of them -- it armed the CALLER's checkout and printed CONFIGURED about that one,
+# while the checkout the operator named kept no token source and went on failing closed (BACKLOG #1063).
+# An absolute -File invocation is naming the checkout to act on; it must not then consult a different one.
+# -From names the token SOURCE, not the checkout, so it never covered this.
+$repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $secDir  = Join-Path $repo 'scripts/security'
+# ASSERT what the derivation only IMPLIES. Discovering a wrong root later, as a confusing scanner
+# failure, is how this class stays invisible; new.ps1 takes the same posture after deriving its path.
+if (-not (Test-Path -LiteralPath $secDir)) {
+    throw "Derived repo root has no scripts/security -- this script must live in <repo>/scripts/dev/: $repo"
+}
 $local   = Join-Path $secDir 'scan-tokens.local.txt'
 $example = Join-Path $secDir 'scan-tokens.local.txt.example'
 $scanner = Join-Path $secDir 'scan_forbidden.py'
