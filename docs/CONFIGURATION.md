@@ -819,9 +819,12 @@ service account — the forbidden-import guard is defence-in-depth (a module imp
 installed keeps a live reference), never a compensating control. All of one inbound's Routers/Handlers
 share a single worker, so this does **not** confine one Handler from another — the boundary is between
 admin code and the engine, exactly as `mode=off` shares an address space. A grandchild the Handler
-spawns inherits the response pipe and outlives the worker's kill; the codec plus the request-answer
-binding is what makes that harmless (it can still force a respawn, i.e. dead-letter messages on that
-inbound), not the process teardown. The child's **stderr is inherited by the engine**, so a
+spawns inherits the response pipe and can stage a frame while the worker is alive; killing the worker
+now reaps its whole process tree (a Windows kill-on-close job object / a POSIX process group), so such
+a grandchild no longer outlives the kill (BACKLOG #342). That reap is best-effort process hygiene: what
+makes a stray frame *harmless* is still the codec plus the request-answer binding (a live grandchild can
+force a respawn, i.e. dead-letter messages on that inbound, but nothing more), not the process teardown.
+The child's **stderr is inherited by the engine**, so a
 Handler that prints goes into the engine's log unparsed and un-redacted. ADR 0072 Router/Handler
 tracing does not compose with `mode=subprocess` (the sandbox branch precedes the tracer branch), and a
 `mode=subprocess` graph cannot use the ADR-0071 fused thread-hop path (it is hard-disabled).
