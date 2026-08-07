@@ -427,23 +427,59 @@ Each deploying organization conducts its own HIPAA Security Risk Assessment of t
 
 Integration software authenticates **systems, not people**, on its interfaces. Each connection uses the strongest mechanism the partner system supports, drawn from the hierarchy below; the mechanism, scope, and credential reference for every connection are recorded in its connection definition. (Maps to ASVS V6/V9/V10/V12; HIPAA person-or-entity authentication and transmission security.) *Which mechanisms a given project implements is recorded in its profile.*
 
-**Preferred — system-to-system:**
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-7.4.1 | Each connection **MUST** use the strongest mechanism in the hierarchy below that the partner system supports. | The connection definition, against the partner's stated capability |
+| SDS-7.4.2 | The mechanism, scope and credential reference **MUST** be recorded in every connection's definition. | The connection definition, all three fields populated |
 
-- **Mutual TLS (mTLS).** Client-certificate authentication over **TLS 1.2+ (prefer 1.3)** with strong cipher suites; validate the full chain to a trusted CA, check revocation (OCSP/CRL), rotate certificates before expiry. Where tokens are also used, prefer **sender-constrained (mTLS-bound) access tokens** (ASVS 5.0 V10).
-- **OAuth 2.0 client-credentials grant.** The default for machine-to-machine API auth. Prefer **asymmetric client authentication (`private_key_jwt`)** over shared secrets; issue short-lived, per-connection scoped tokens; validate issuer, audience, expiry, and scope on every request.
-- **SMART on FHIR (Backend Services).** For any FHIR REST interface, authenticate using the SMART **Backend Services** profile — OAuth 2.0 client-credentials with a **signed JWT client assertion** and `system/` scopes; validate granted scopes against the requested operation.
+**Preferred — system-to-system.** Mutual TLS, the OAuth 2.0 client-credentials grant, and SMART on FHIR Backend Services.
 
-**Directory / enterprise integration (e.g., Active Directory):**
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-7.4.3 | mTLS **MUST** run over TLS 1.2 or later with strong cipher suites. | The negotiated version and suite list |
+| SDS-7.4.4 | mTLS **SHOULD** use TLS 1.3. | The configured preference order |
+| SDS-7.4.5 | **MUST** validate the full client-certificate chain to a trusted CA. | The trust store, and a rejected-untrusted-chain test |
+| SDS-7.4.6 | **MUST** check certificate revocation (OCSP or CRL). | The revocation configuration, and a rejected-revoked-cert test |
+| SDS-7.4.7 | **MUST** rotate certificates before expiry. | An expiry monitor, and the rotation record |
+| SDS-7.4.8 | Where bearer tokens are also used, **SHOULD** prefer sender-constrained (mTLS-bound) access tokens. | The token binding, per ASVS 5.0 V10 |
+| SDS-7.4.9 | Machine-to-machine API authentication **MUST** default to the OAuth 2.0 client-credentials grant. | The default in the connection factory |
+| SDS-7.4.10 | **SHOULD** prefer asymmetric client authentication (`private_key_jwt`) over a shared secret. | The registered client authentication method |
+| SDS-7.4.11 | **MUST** issue short-lived, per-connection scoped tokens. | The configured lifetime and scope, per connection |
+| SDS-7.4.12 | **MUST** validate issuer, audience, expiry and scope on every request. | The validation code, and a test rejecting each of the four |
+| SDS-7.4.13 | Any FHIR REST interface **MUST** authenticate using the SMART Backend Services profile. | The interface's configured mechanism |
+| SDS-7.4.14 | SMART authentication **MUST** use a signed JWT client assertion and `system/` scopes. | The assertion, and the granted scope list |
+| SDS-7.4.15 | **MUST** validate granted scopes against the requested operation. | The scope check, and a test refusing an out-of-scope operation |
 
-- **Run under a least-privilege service account — preferably a group-Managed Service Account (gMSA)** on Windows/AD — so the password is auto-rotated and never stored in configuration.
-- **Use Kerberos / Integrated Windows Authentication**; prefer Kerberos over NTLM (disable NTLM where feasible) with correct SPNs.
-- **Authenticate to databases with integrated authentication** (the service account) rather than a stored database password, where supported.
-- **Perform directory lookups over LDAPS (LDAP over TLS) only** — never cleartext LDAP; bind with a least-privilege account.
-- **Map roles to directory security groups** for centralized RBAC; if human operators authenticate, **federate to the enterprise identity provider (AD FS / Entra ID) via OIDC or SAML** rather than a local user store.
+**Directory / enterprise integration** (for example Active Directory).
 
-**Legacy / interoperability tier** *(supported, least-preferred, documented per connection):* HTTP Basic over TLS, per-connection API keys, or SOAP **WS-Security** (UsernameToken or, preferably, X.509 certificate tokens with message-level signing). Always over TLS; credentials vaulted, scoped per connection, and rotated. Used only when a partner system cannot support a preferred mechanism, with the exception recorded.
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-7.4.16 | **MUST** run under a least-privilege service account. | The account and its granted rights |
+| SDS-7.4.17 | **SHOULD** use a group-Managed Service Account on Windows/AD, so the password is auto-rotated and never stored in configuration. | The account type; no password in configuration |
+| SDS-7.4.18 | **MUST** use Kerberos or Integrated Windows Authentication for directory-integrated authentication. | The negotiated mechanism |
+| SDS-7.4.19 | **SHOULD** prefer Kerberos over NTLM, and disable NTLM where feasible. | The disabled-NTLM setting, or a stated reason it is infeasible |
+| SDS-7.4.20 | **MUST** register correct service principal names. | The SPN registration |
+| SDS-7.4.21 | **SHOULD** authenticate to databases with integrated authentication rather than a stored password, where supported. | The connection configuration, carrying no password |
+| SDS-7.4.22 | **MUST** perform directory lookups over LDAPS only. Cleartext LDAP is **MUST NOT**. | The configured scheme and port |
+| SDS-7.4.23 | **MUST** bind to the directory with a least-privilege account. | The bind account's granted rights |
+| SDS-7.4.24 | **SHOULD** map roles to directory security groups for centralized RBAC. | The group-to-role map |
+| SDS-7.4.25 | Where human operators authenticate, **SHOULD** federate to the enterprise identity provider via OIDC or SAML rather than a local user store. | The federation configuration, or the A.6 deviation |
 
-**Across all mechanisms:** TLS everywhere (no cleartext sensitive transport); credentials and keys in a secret store, never in code or config; per-connection least privilege; and per-connection IP allowlisting / network segmentation as defense-in-depth.
+**Legacy / interoperability tier.** Supported, least-preferred, and documented per connection: HTTP Basic over TLS, per-connection API keys, or SOAP WS-Security.
+
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-7.4.26 | A legacy mechanism **MAY** be used only where a partner system cannot support a preferred one. | The partner's stated limitation |
+| SDS-7.4.27 | Each such use **MUST** be recorded as an exception on the connection. | The recorded exception |
+| SDS-7.4.28 | A legacy mechanism **MUST** run over TLS, with its credential vaulted, scoped per connection, and rotated. | The transport, the vault reference, and the rotation record |
+| SDS-7.4.29 | WS-Security **SHOULD** use X.509 certificate tokens with message-level signing rather than UsernameToken. | The configured token type |
+
+**Across all mechanisms.**
+
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-7.4.30 | **MUST NOT** carry sensitive data over a cleartext transport, on any interface. | A transport inventory, every entry TLS |
+| SDS-7.4.31 | **MUST** hold credentials and keys in a secret store, never in code or configuration, and apply per-connection least privilege. **SHOULD** add per-connection IP allowlisting or network segmentation as defense-in-depth. | The secret-store references; the per-connection grants; the allowlist where present |
 
 ---
 
