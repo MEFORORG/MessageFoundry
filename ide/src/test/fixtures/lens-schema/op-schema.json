@@ -1,0 +1,322 @@
+{
+  "copy_field": [
+    {
+      "name": "src",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "dst",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    }
+  ],
+  "set_field": [
+    {
+      "name": "path",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "value",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    }
+  ],
+  "append_to_field": [
+    {
+      "name": "path",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "suffix",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    }
+  ],
+  "trim_field": [
+    {
+      "name": "path",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    }
+  ],
+  "substring_field": [
+    {
+      "name": "path",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "start",
+      "kind": "int",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "end",
+      "kind": "int",
+      "required": false,
+      "keyword_only": false,
+      "nullable": true,
+      "default": null
+    }
+  ],
+  "pad_field": [
+    {
+      "name": "path",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "width",
+      "kind": "int",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "fill",
+      "kind": "str",
+      "required": false,
+      "keyword_only": true,
+      "default": "0"
+    },
+    {
+      "name": "side",
+      "kind": "enum",
+      "required": false,
+      "keyword_only": true,
+      "choices": [
+        "left",
+        "right"
+      ],
+      "default": "left"
+    }
+  ],
+  "replace_literal": [
+    {
+      "name": "path",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "old",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "new",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    }
+  ],
+  "convert_case": [
+    {
+      "name": "path",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "mode",
+      "kind": "enum",
+      "required": true,
+      "keyword_only": false,
+      "choices": [
+        "upper",
+        "lower",
+        "title"
+      ]
+    }
+  ],
+  "arith_field": [
+    {
+      "name": "path",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "op",
+      "kind": "enum",
+      "required": true,
+      "keyword_only": false,
+      "choices": [
+        "+",
+        "-",
+        "*",
+        "/"
+      ]
+    },
+    {
+      "name": "operand",
+      "kind": "float",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "ndigits",
+      "kind": "int",
+      "required": false,
+      "keyword_only": true,
+      "nullable": true,
+      "default": null
+    }
+  ],
+  "format_date": [
+    {
+      "name": "path",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "out_fmt",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "in_fmt",
+      "kind": "str",
+      "required": false,
+      "keyword_only": true,
+      "nullable": true,
+      "default": null
+    }
+  ],
+  "date_diff_field": [
+    {
+      "name": "start_path",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "end_path",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "dst",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "unit",
+      "kind": "enum",
+      "required": false,
+      "keyword_only": true,
+      "choices": [
+        "days",
+        "years",
+        "hours",
+        "minutes"
+      ],
+      "default": "days"
+    }
+  ],
+  "split_field": [
+    {
+      "name": "src",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "sep",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "dests",
+      "kind": "list",
+      "required": true,
+      "keyword_only": false
+    }
+  ],
+  "code_lookup": [
+    {
+      "name": "path",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "table",
+      "kind": "codeset",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "default",
+      "kind": "unknown",
+      "required": false,
+      "keyword_only": true
+    }
+  ],
+  "copy_segment": [
+    {
+      "name": "segment_id",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    },
+    {
+      "name": "occurrence",
+      "kind": "int",
+      "required": false,
+      "keyword_only": true,
+      "default": 1
+    },
+    {
+      "name": "index",
+      "kind": "int",
+      "required": false,
+      "keyword_only": true,
+      "nullable": true,
+      "default": null
+    }
+  ],
+  "delete_segment": [
+    {
+      "name": "segment_id",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    }
+  ],
+  "log_note": [
+    {
+      "name": "template",
+      "kind": "str",
+      "required": true,
+      "keyword_only": false
+    }
+  ],
+  "checkpoint": [
+    {
+      "name": "label",
+      "kind": "str",
+      "required": false,
+      "keyword_only": false,
+      "default": ""
+    }
+  ]
+}

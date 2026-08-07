@@ -837,6 +837,24 @@ worktree gate blocked it." The primary's HEAD belongs to the user, not to a sess
 
 # ---------------------------------------------------------------------------------------------------
 # Rule 1 -- writing INTO the primary's working tree, from anywhere.
+#
+# ANOTHER GATE DEPENDS ON THIS ONE, and not for the reason the rest of this file talks about. Elsewhere the
+# relationship is that this hook PROTECTS the ledger gate's inputs -- rule 3c refuses a core.hooksPath
+# repoint, rule 1b refuses a write to alloc/. This is different and it runs the other way: the ledger gate's
+# ownership check keys on the WORKTREE that allocated a number (scripts/hooks/ledger_check.py owns()), and
+# that key is only meaningful because rule 1 makes each session build somewhere of its own. Before this gate
+# existed the key was MEASURED broken -- co-tenant sessions in the shared primary all mapped to one worktree,
+# so the check was a no-op between exactly the sessions it was meant to separate. See
+# docs/LEDGER-GATE.md, "Ownership keying -- and why it works now": the two gates are a pair.
+#
+# WHY IT IS WRITTEN HERE rather than only there. That document states the dependency from the DEPENDENT's
+# side, which is invisible from the side that can break it -- and breaking it does not look like breaking a
+# gate. Widening what rule 1 governs disarms no hook and fails no test; it quietly turns owns() back into a
+# no-op for the newly-ungoverned paths, and the ledger then merges clean and corrupts silently, which is the
+# defect that registry exists to prevent (measured 3x: d1d0a5a, 5b7d046, 9f3483d). This is not hypothetical:
+# the first cut of rule 1b's exemption widened rule 1 to the whole of .git/mefor-coord/ and exposed
+# alloc/<kind>/<n>.json, so a Write could forge an allocation owns() would then authorise. It was caught by
+# an adversarial review, not by any gate. So if you are about to widen this rule, that is the cost to price.
 # ---------------------------------------------------------------------------------------------------
 if ($tool -notin @("Write", "Edit", "MultiEdit", "NotebookEdit")) { exit 0 }
 

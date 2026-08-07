@@ -1007,6 +1007,25 @@ class AuthService:
                 ok=False, error="user not found in directory", reason="not_in_directory"
             )
 
+        # BACKLOG #1015 (ADR 0142): subject-continuity guard. The AD-backed account is still RESOLVED by
+        # its username (roles stay LDAP-sourced), but its federated identity is PINNED to the non-
+        # reassignable OIDC (issuer, sub). If a local account for this resolved username is already bound
+        # to a DIFFERENT verified subject, an IdP has reassigned the username to a new person — refuse
+        # rather than hand the new subject the prior holder's account (the account-takeover-without-
+        # credential-compromise this item closes). An unbound account (never federated-logged-in) binds
+        # on first login below, in _complete_ad_login.
+        bound = await self._store.get_user_by_username(principal.username)
+        if (
+            bound is not None
+            and bound.oidc_subject is not None
+            and (bound.oidc_issuer, bound.oidc_subject)
+            != (principal_claims.issuer, principal_claims.subject)
+        ):
+            await self._directory_reject_audit(username, "oidc", "federated_subject_conflict")
+            return LoginOutcome(
+                ok=False, error="federated sign-in failed", reason="federated_subject_conflict"
+            )
+
         max_expires_at = principal_claims.expires_at
         if self._settings.oidc_session_max_hours:
             max_expires_at = min(
@@ -1041,6 +1060,7 @@ class AuthService:
                 "mfa_verified": mfa_verified,
             },
             max_expires_at=max_expires_at,
+            federated_subject=(principal_claims.issuer, principal_claims.subject),
         )
 
     async def _directory_reject_audit(self, actor: str, mech: str, reason: str) -> None:
@@ -1062,7 +1082,12 @@ class AuthService:
         mech: str | None = None,
         evidence: Mapping[str, object] | None = None,
         max_expires_at: float | None = None,
+        federated_subject: tuple[str, str] | None = None,
     ) -> LoginOutcome:
+        # ``federated_subject`` is the verified OIDC ``(issuer, sub)`` and is passed ONLY by the
+        # federated path (BACKLOG #1015). It defaults to None, so the AD-simple-bind and Kerberos
+        # callers stay byte-identical — no extra store write, no changed audit row. The federated
+        # caller has already enforced the subject-continuity guard before reaching here.
         existing = await self._store.get_user_by_username(principal.username)
         if existing is not None and existing.auth_provider != AuthProvider.AD.value:
             # Never let an AD login adopt/overwrite a like-named LOCAL account (provider confusion).
@@ -1074,6 +1099,20 @@ class AuthService:
             )
             return LoginOutcome(ok=False, error="account conflict")
         user = await self._upsert_ad_user(principal)
+        if (
+            federated_subject is not None
+            and (
+                user.oidc_issuer,
+                user.oidc_subject,
+            )
+            != federated_subject
+        ):
+            # First federated login for this account (or an unbound AD account's first): record the
+            # (issuer, sub) binding so a later reassigned-username login carrying a different subject is
+            # refused by the guard above. A matching binding is left untouched (no updated_at churn).
+            await self._store.set_user_federated_subject(
+                user.id, federated_subject[0], federated_subject[1]
+            )
         role_ids = sorted(await self._store.roles_for_ad_groups(principal.groups))
         previous = set(await self._store.get_user_role_ids(user.id))
         await self._store.set_user_roles(user.id, role_ids, assigned_by="ad-sync")
