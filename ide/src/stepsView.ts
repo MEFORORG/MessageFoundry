@@ -34,6 +34,7 @@ import {
   codesetList,
   configDir,
   isExecGated,
+  lensSchema,
   messageSetsDir,
   runJson,
   runJsonWithStdin,
@@ -74,6 +75,7 @@ import {
   type HandlerViewModel,
   type LensParseResult,
   type LiveInlineValue,
+  type OpSchema,
   type RowKind,
   type StructuralRequest,
 } from "./stepsModel";
@@ -166,6 +168,12 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
   // (§2.3 P2/P3; `undefined` until that build lands). Loaded once — pure in-memory data, no per-pick I/O.
   private readonly schema: Hl7Schema | undefined;
   private readonly structures: Hl7Structures | undefined;
+  // The transform-vocabulary param schema (BACKLOG #235) that drives each editable param's input widget
+  // (enum -> dropdown, int -> number field). Shelled ONCE (`lens schema`, config-independent) and cached
+  // for the panel's life — pure signature-derived data, so it never changes between projections. Left
+  // undefined if the fetch fails (an older/unavailable engine) -> every param falls back to a text input.
+  private opSchema: OpSchema | undefined;
+  private opSchemaFetched = false;
   // ADR 0104 §2.3 P2: handler name -> its recognized message type, stashed by render() from the lens parse
   // (a projection of the current parse, never persisted state). Read by scopeFor to rank the picker.
   private handlerTypes = new Map<
@@ -316,6 +324,16 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       rerender.cancel();
       guard.takeSuppressedChange();
       const ws = workspaceDir();
+      // Fetch the op-param schema ONCE (BACKLOG #235) — it drives each editable param's input widget and
+      // is config-independent signature data, so a single shell suffices for the panel's life. A failure
+      // leaves it undefined (every param falls back to a text input); it never blocks the projection.
+      if (!this.opSchemaFetched) {
+        this.opSchemaFetched = true;
+        this.opSchema = await lensSchema(ws).catch(() => undefined);
+        if (disposed) {
+          return;
+        }
+      }
       // Project the LIVE buffer (piped over stdin as `lens parse -`), NOT the on-disk file: after a
       // structural edit's WorkspaceEdit the buffer is dirty (buffer != disk), and the row coordinates
       // must describe what the user actually sees. Parsing the same `source` we then slice for the
@@ -366,7 +384,14 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       const scriptUri = panel.webview.asWebviewUri(
         vscode.Uri.joinPath(this.extensionUri, "media", "stepsWebview.js"),
       );
-      panel.webview.html = pageHtml(panel.webview, handlers, this.sampleLabel, this.version, scriptUri);
+      panel.webview.html = pageHtml(
+        panel.webview,
+        handlers,
+        this.sampleLabel,
+        this.version,
+        scriptUri,
+        this.opSchema,
+      );
       // Arm the handshake: if the freshly-loaded script doesn't ping within 3s, it failed to initialize.
       sawAlive = false;
       setTimeout(() => {
@@ -568,7 +593,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         lineStart?: number;
         lineEnd?: number;
         name?: string;
-        value?: string;
+        // A number for a number-kind widget (BACKLOG #235); a string for every other field.
+        value?: string | number;
         direction?: "up" | "down";
         toLineStart?: number;
         toLineEnd?: number;
@@ -620,7 +646,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           typeof m.lineStart === "number" &&
           typeof m.lineEnd === "number" &&
           typeof m.name === "string" &&
-          typeof m.value === "string" &&
+          // A number-kind widget posts a JS number (BACKLOG #235); every other field posts a string.
+          (typeof m.value === "string" || typeof m.value === "number") &&
           typeof m.expectSrc === "string"
         ) {
           void applyEdit({
@@ -929,9 +956,10 @@ function pageHtml(
   sampleLabel: string | undefined,
   version: string,
   scriptUri: vscode.Uri,
+  schema: OpSchema | undefined,
 ): string {
   const n = nonce();
-  const body = renderHandlersHtml(handlers);
+  const body = renderHandlersHtml(handlers, schema);
   // The insert-toolbar dropdown: a leading "[select item]" placeholder (value ""), then one option per
   // insertable item, built from the single-source-of-truth ADD_MENU_CATALOG (ADR 0106), grouped into
   // <optgroup>s. Each <option> value is the catalog item id (the ADD_MENU_BY_ID allowlist key the provider

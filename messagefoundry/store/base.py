@@ -1685,6 +1685,14 @@ class AuthStore(Protocol):
         self, user_id: str, scope_json: str | None, *, now: float | None = None
     ) -> None: ...
 
+    async def set_user_federated_subject(
+        self, user_id: str, issuer: str, subject: str, *, now: float | None = None
+    ) -> None:
+        """Bind a user's verified federated ``(issuer, sub)`` identity (BACKLOG #1015). Recorded on the
+        first federated login so a later login whose reassignable username resolves to this account but
+        carries a different subject is refused, not handed the account."""
+        ...
+
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]: ...
 
     async def list_ad_group_role_map(self) -> Sequence[Row]: ...

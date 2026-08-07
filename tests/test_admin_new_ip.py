@@ -17,10 +17,10 @@ from pathlib import Path
 
 import httpx
 import pytest
-from _totp_clock import fresh_totp
+from _totp_clock import pin_totp_clock
 
 from messagefoundry.api import create_app
-from messagefoundry.auth import Role
+from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.notifications import ADMIN_NEW_IP, SecurityEvent
 from messagefoundry.auth.service import AuthService
@@ -196,7 +196,9 @@ async def test_loopback_addresses_treated_as_same_host() -> None:
         await store.close()
 
 
-async def test_verify_mfa_reanchors_session_to_the_new_ip() -> None:
+async def test_verify_mfa_reanchors_session_to_the_new_ip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Completing the second factor (TOTP) from a new address re-anchors the session, like reauth — so
     an MFA-required admin who roamed clears the new-IP signal with one credential proof, not two."""
     store = await MessageStore.open(":memory:")
@@ -208,13 +210,21 @@ async def test_verify_mfa_reanchors_session_to_the_new_ip() -> None:
         assert out.ok and out.identity is not None and out.token is not None
         identity, token = out.identity, out.token
         enroll = await service.begin_mfa_enrollment(identity)
+        # Pin the TOTP clock so the enrollment confirm and the later verify_mfa sit in distinct steps
+        # (enrollment now consumes the activating step, BACKLOG #1021).
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
         await service.confirm_mfa_enrollment(
-            identity, fresh_totp(enroll.secret), token=token, client="10.1.1.1"
+            identity, totp.totp(enroll.secret, now=t0), token=token, client="10.1.1.1"
         )
         # Roam to a new address → flagged.
         assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
-        # Completing MFA from the new address re-anchors the session (parity with reauth).
-        assert await service.verify_mfa(token, fresh_totp(enroll.secret), client="10.2.2.2") is True
+        # Completing MFA from the new address re-anchors the session (parity with reauth), using a code
+        # in a strictly later step than enrollment consumed.
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        code = totp.totp(enroll.secret, now=t1)
+        assert await service.verify_mfa(token, code, client="10.2.2.2") is True
         assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is False
     finally:
         await store.close()

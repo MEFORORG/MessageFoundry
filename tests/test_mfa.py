@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import asyncio
 
-from _totp_clock import fresh_totp
+import pytest
+from _totp_clock import fresh_totp, pin_totp_clock
 
 from messagefoundry.auth import totp
 from messagefoundry.auth.identity import AuthProvider, Identity
@@ -72,27 +73,64 @@ async def test_enroll_confirm_status_and_recovery_codes() -> None:
         await store.close()
 
 
-async def test_login_requires_second_factor_after_enrollment() -> None:
+async def test_login_requires_second_factor_after_enrollment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store = await _store()
     try:
         service = AuthService(store, AuthSettings(mfa_recovery_code_count=2))
         identity, token, password = await _bootstrap_login(service)
         enroll = await service.begin_mfa_enrollment(identity)
-        await service.confirm_mfa_enrollment(identity, fresh_totp(enroll.secret), token=token)
+        # Pin the TOTP clock so the enrollment confirm and the later login verify sit in distinct,
+        # provably-adjacent steps: enrollment now consumes the activating step (BACKLOG #1021), so a
+        # login code from the SAME step would be refused as a replay, not accepted.
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        activating = totp.totp(enroll.secret, now=t0)
+        await service.confirm_mfa_enrollment(identity, activating, token=token)
 
         out = await service.login("admin", password)
         assert out.ok and out.mfa_required is True and out.token is not None
         assert await service.mfa_satisfied(out.token) is False  # step-up gate would 403
 
-        code = totp.totp(enroll.secret)
-        wrong = "000000" if code != "000000" else "111111"
+        wrong = "000000" if activating != "000000" else "111111"
         assert await service.verify_mfa(out.token, wrong) is False
         assert await service.mfa_satisfied(out.token) is False
-        # Recompute the TOTP immediately before the success-path verify: the wrong-code verify above
-        # runs two argon2id recovery-code checks (~100-200 ms), long enough that a 30 s TOTP step
-        # boundary could stale the code computed at enrollment time and flake this assertion.
-        assert await service.verify_mfa(out.token, fresh_totp(enroll.secret)) is True
+        # The successful login verify must sit in a strictly later step than enrollment consumed.
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        assert await service.verify_mfa(out.token, totp.totp(enroll.secret, now=t1)) is True
         assert await service.mfa_satisfied(out.token) is True
+    finally:
+        await store.close()
+
+
+async def test_enrollment_consumes_the_activating_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    # BACKLOG #1021: the code that activates MFA is a live second factor, so it must be single-use like
+    # any login code (ASVS 6.5.1). Before the fix, confirm went through the bool verify_totp wrapper,
+    # which discarded the matched step and never consumed it — leaving the activating code replayable
+    # on POST /auth/mfa-verify for the rest of its ~30 s step on first deployment. Pin the clock so the
+    # confirm and the replay land in the SAME step S0: the replay is refused because enrollment already
+    # spent S0, not because the code went stale at a boundary.
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(mfa_recovery_code_count=1))
+        identity, _token, password = await _bootstrap_login(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        activating = totp.totp(enroll.secret, now=t0)
+        # Confirm succeeds and consumes step S0 (returns the recovery codes, not None).
+        assert await service.confirm_mfa_enrollment(identity, activating, token=_token) is not None
+
+        # A fresh login, then replay the SAME activating code while still pinned to step S0: refused,
+        # because enrollment already consumed S0 (the login path advances the high-water mark to S0
+        # at enroll, so this replay resolves to a non-greater step).
+        out = await service.login("admin", password)
+        assert out.token is not None
+        assert await service.verify_mfa(out.token, activating) is False
+        assert await service.mfa_satisfied(out.token) is False
     finally:
         await store.close()
 
@@ -136,7 +174,9 @@ async def test_recovery_code_single_use() -> None:
         await store.close()
 
 
-async def test_totp_code_is_single_use_within_its_window() -> None:
+async def test_totp_code_is_single_use_within_its_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # ASVS 6.5.1: a TOTP code is consumed on first use; replaying the SAME code (still valid inside its
     # ~30 s step window) on a fresh session is rejected, so a captured code can't be reused.
     store = await _store()
@@ -144,9 +184,16 @@ async def test_totp_code_is_single_use_within_its_window() -> None:
         service = AuthService(store, AuthSettings())
         identity, token, password = await _bootstrap_login(service)
         enroll = await service.begin_mfa_enrollment(identity)
-        await service.confirm_mfa_enrollment(identity, fresh_totp(enroll.secret), token=token)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        activating = totp.totp(enroll.secret, now=t0)
+        await service.confirm_mfa_enrollment(identity, activating, token=token)
 
-        code = totp.totp(enroll.secret)
+        # Move to a step later than the one enrollment consumed (BACKLOG #1021); the login code and its
+        # replay both live in THIS step, so the replay is refused for reuse, not for staleness.
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        code = totp.totp(enroll.secret, now=t1)
         out = await service.login("admin", password)
         assert out.token is not None
         assert await service.verify_mfa(out.token, code) is True  # consumes the step
@@ -175,7 +222,7 @@ async def test_consume_totp_step_is_monotonic() -> None:
         await store.close()
 
 
-async def test_disable_and_admin_reset_clear_mfa() -> None:
+async def test_disable_and_admin_reset_clear_mfa(monkeypatch: pytest.MonkeyPatch) -> None:
     store = await _store()
     try:
         notifier = _FakeNotifier()
@@ -184,15 +231,29 @@ async def test_disable_and_admin_reset_clear_mfa() -> None:
         )
         identity, token, _ = await _bootstrap_login(service)
         enroll = await service.begin_mfa_enrollment(identity)
-        await service.confirm_mfa_enrollment(identity, fresh_totp(enroll.secret), token=token)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        activating = totp.totp(enroll.secret, now=t0)
+        await service.confirm_mfa_enrollment(identity, activating, token=token)
 
         await service.disable_mfa(identity)
         assert (await service.mfa_status(identity)).enabled is False
         assert any(e.event_type == MFA_DISABLED for e in notifier.events)
 
-        # Re-enroll, then an admin reset clears it again and revokes sessions.
+        # Re-enroll, then an admin reset clears it again and revokes sessions. The single-use high-water
+        # mark PERSISTS across disable (disable_totp does not clear last_totp_step — correct and
+        # conservative, do NOT clear it), so the re-enroll confirm must land in a LATER step than the
+        # first enrollment consumed or it would be rejected as a replay and silently leave MFA disabled
+        # (BACKLOG #1021). Assert it actually re-enabled so the admin reset below is proven to clear a
+        # live enrollment, not a no-op.
         enroll2 = await service.begin_mfa_enrollment(identity)
-        await service.confirm_mfa_enrollment(identity, fresh_totp(enroll2.secret), token=token)
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        reenrolled = await service.confirm_mfa_enrollment(
+            identity, totp.totp(enroll2.secret, now=t1), token=token
+        )
+        assert reenrolled is not None
+        assert (await service.mfa_status(identity)).enabled is True
         await service.admin_reset_mfa(identity.user_id, actor="admin")
         assert (await service.mfa_status(identity)).enabled is False
     finally:

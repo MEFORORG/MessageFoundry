@@ -664,7 +664,7 @@ accepts. The criteria are nonetheless **built and tested** — the amendment lan
 >
 > **In force means the grammar changed, not that the build is done.** The shipped `lens parse` emits no
 > `route` row yet — the BACKLOG #232 build is handed off in
-> [`../releases/HANDOFF-232-router-steps.md`](../releases/HANDOFF-232-router-steps.md), which carries the
+> `HANDOFF-232-router-steps.md`, a maintainer-internal document, which carries the
 > files, the verified anchors, and the falsifications. The Acceptance Criteria in §D.6 are **build gates,
 > not caveats**.
 

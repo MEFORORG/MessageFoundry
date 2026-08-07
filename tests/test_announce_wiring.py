@@ -298,6 +298,65 @@ def test_status_reports_the_announce_row(settings: Path) -> None:
     assert ANNOUNCE_REL in out
 
 
+def run_installer_rc(settings: Path, *args: str) -> tuple[int, str]:
+    """Like run_installer, but RETURNS the exit code instead of asserting it is 0.
+
+    run_installer asserts success, so it structurally cannot test a failure path -- an assertion that
+    can only observe one outcome is not a check. These two tests are about the exit code itself.
+    """
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(INSTALLER),
+            "-SettingsPath",
+            str(settings),
+            *args,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def test_a_multi_value_filter_works_through_the_documented_file_invocation(settings: Path) -> None:
+    """`pwsh -File` hands every argument over as a STRING, so a comma list arrives as ONE element.
+
+    `-Only PreToolUse,UserPromptSubmit` used to bind as the single string
+    "PreToolUse,UserPromptSubmit", match no event via -contains, and select zero rows -- while
+    printing "No wiring rows selected" and exiting 0. The .EXAMPLE block uses the -File form, so the
+    documented invocation worked for one value and silently did nothing for two, which is what an
+    operator wiring more than one tier at a time actually types.
+    """
+    rc, out = run_installer_rc(settings, "-Only", "PreToolUse,UserPromptSubmit", "-WhatIf")
+    assert rc == 0, out
+    assert "collision_gate.ps1" in out, out
+    assert "announce-session.ps1" in out, out
+    # And the rows it did NOT ask for stay out, so this is a filter rather than a no-op that
+    # happens to print everything.
+    assert "mail-drain.ps1" not in out, out
+
+
+def test_a_filter_that_matches_nothing_fails_loudly_and_names_what_exists(settings: Path) -> None:
+    """NEGATIVE CONTROL for the test above, and the more important half.
+
+    A filter matching nothing exited 0, so a misspelled event was indistinguishable from a successful
+    install: the operator saw a clean exit and believed the roots were wired. It must fail, and it must
+    say what the real events are -- refusing without correcting leaves the caller exactly where they
+    started.
+    """
+    rc, out = run_installer_rc(settings, "-Only", "NoSuchEvent", "-WhatIf")
+    assert rc != 0, f"a filter matching nothing exited 0: {out}"
+    assert "NO WIRING ROWS MATCHED" in out, out
+    assert "NoSuchEvent" in out, "the message must name what was asked for"
+    for known in ("SessionStart", "PreToolUse", "UserPromptSubmit", "Stop"):
+        assert known in out, f"the message must list the real events; {known} missing: {out}"
+
+
 def test_only_removes_announce_without_disarming_the_gate(settings: Path) -> None:
     """Without -Only, the 2am remedy for a misbehaving announce hook is a full -Uninstall that takes
     the collision gate and the SessionStart banner with it."""
