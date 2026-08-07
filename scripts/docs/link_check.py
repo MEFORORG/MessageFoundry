@@ -59,11 +59,18 @@ from pathlib import Path, PurePosixPath
 # docs/releases/ joined when ADR 0160 Phase 1 untracked it (.gitignore carries "/docs/releases/") --
 # an archived throughput doc still cites the v0.1 plan that moved out with it.
 #
-# .claude/ joined for a sharper reason, and it is the one to remember: it is gitignored
-# (.gitignore:142) but PRESENT in a long-lived local checkout, so a repo-wide run passes there and
-# fails in CI, which clones clean. The first measurement of this class was taken in such a checkout
-# and undercounted by exactly these 7 links. Read a gate result as a fact about the CONFIGURATION it
-# ran in, and confirm the instrument answers the question asked (CLAUDE.md section 11, SDS-3.8).
+# .claude/ (.gitignore:142) is exempt on the SAME publishing-boundary grounds -- 7 docs link to
+# .claude/settings.json, which no clone has.
+#
+# It is listed here as POLICY, not as protection. It was originally added as protection, because a
+# filesystem fallback made those 7 links pass in a long-lived local checkout and fail on CI's clean
+# clone -- the first repo-wide measurement was taken in such a checkout and undercounted by exactly
+# 7. That hazard is now closed STRUCTURALLY in tracked_paths(): resolution never consults the
+# filesystem, so no gitignored-but-present path can pass locally and fail on the runner, listed here
+# or not. Removing this entry would make those 7 links fail honestly and identically everywhere.
+# Keeping an enumerated exemption as the reason a control holds is the compensating-control-on-a-
+# false-premise shape (CLAUDE.md section 11, SDS-3.7); the enumeration expresses intent, the
+# resolver provides the guarantee.
 WITHHELD = (
     "docs/security/",
     "docs/reviews/",
@@ -118,9 +125,21 @@ def _normalise(base: PurePosixPath, href: str) -> str:
     return "/".join(parts)
 
 
-def check(root: Path, subtree: str | None, include_line_cites: bool) -> tuple[list[str], int, int]:
-    """Return ``(failures, links_checked, files_scanned)``."""
-    tracked = set(
+def tracked_paths(root: Path) -> set[str]:
+    """Every tracked FILE, plus every directory that contains one.
+
+    Resolution is against this set ALONE -- never against the filesystem. That is what makes a run
+    in a long-lived local checkout and a run on CI's clean clone give the same answer, which for a
+    repo-wide invariant is the difference between a control and a coin flip. A filesystem fallback
+    passes any path that merely happens to be present, and gitignored-but-present paths are exactly
+    the ones a developer has and CI does not: `.claude/` is the measured case, 7 links that passed
+    locally and would have failed on the runner.
+
+    ``git ls-files`` lists files and never directories, so the ancestor prefixes have to be derived
+    or every link to a directory breaks -- 122 of them here (``docs/adr``, ``environments``,
+    ``.github/workflows``). Those are legitimate: a directory link resolves for anyone who clones.
+    """
+    files = set(
         subprocess.run(  # nosec B603 B607 - fixed argv, no shell, no caller-supplied executable
             ["git", "-C", str(root), "ls-files"],
             capture_output=True,
@@ -129,6 +148,18 @@ def check(root: Path, subtree: str | None, include_line_cites: bool) -> tuple[li
             check=True,
         ).stdout.splitlines()
     )
+    dirs: set[str] = set()
+    for f in files:
+        part = f
+        while "/" in part:
+            part = part.rsplit("/", 1)[0]
+            dirs.add(part)
+    return files | dirs
+
+
+def check(root: Path, subtree: str | None, include_line_cites: bool) -> tuple[list[str], int, int]:
+    """Return ``(failures, links_checked, files_scanned)``."""
+    tracked = tracked_paths(root)
     failures: list[str] = []
     checked = 0
     files = tracked_markdown(root, subtree)
@@ -173,8 +204,9 @@ def check(root: Path, subtree: str | None, include_line_cites: bool) -> tuple[li
                 if any(target.startswith(w) for w in WITHHELD):
                     continue
                 checked += 1
-                if target not in tracked and not (root / target).exists():
-                    failures.append(f"{rel}:{lineno}: ({href}) -> {target} does not exist")
+                # Tracked set only -- deliberately NO filesystem fallback. See tracked_paths().
+                if target not in tracked:
+                    failures.append(f"{rel}:{lineno}: ({href}) -> {target} is not tracked")
 
     return failures, checked, len(files)
 

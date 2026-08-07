@@ -115,14 +115,55 @@ def test_withheld_prefixes_are_the_gitignored_ones(checker) -> None:
 )
 def test_withheld_directories_are_not_flagged(tmp_path, checker, prefix: str) -> None:
     """A gitignored target is a publishing boundary, not a defect; flagging it trains people to
-    ignore the gate. ``docs/releases/`` joined when ADR 0160 Phase 1 untracked it, and ``.claude/``
-    joined because it is gitignored yet PRESENT in a long-lived local checkout -- so leaving it out
-    makes the repo-wide gate green locally and red on CI's clean clone, which is how it was found.
-    Planted at the real relative depth so a resolution bug cannot pass this by accident."""
+    ignore the gate. ``docs/releases/`` joined when ADR 0160 Phase 1 untracked it; ``.claude/``
+    joined because 7 docs link to ``.claude/settings.json``, which no clone has.
+
+    This list expresses INTENT. It is not what makes the gate environment-independent -- that is
+    ``tracked_paths()`` never consulting the filesystem, pinned by
+    ``test_resolution_ignores_the_filesystem``. Planted at the real relative depth so a resolution
+    bug cannot pass this by accident."""
     href = "../../../" + prefix + "GONE.md"  # docs/archive/backlog/A.md is three levels down
     repo = _plant(tmp_path, "A.md", f"[withheld]({href})\n")
     failures, _checked, _files = checker.check(repo, _PLANTED_SUBTREE, include_line_cites=False)
     assert not failures, f"withheld prefix {prefix} should be exempt, got: {failures}"
+
+
+def test_resolution_ignores_the_filesystem(tmp_path, checker) -> None:
+    """The gate must give the SAME answer in a long-lived checkout and on CI's clean clone.
+
+    A filesystem fallback breaks that: it passes any path that merely happens to be PRESENT, and
+    gitignored-but-present paths are precisely the ones a developer has and CI does not. Not
+    hypothetical -- ``.claude/settings.json`` is untracked, present locally, absent on the runner,
+    and 7 docs link to it; the first repo-wide measurement of this gate passed locally for exactly
+    that reason and undercounted by 7.
+
+    So a target that EXISTS ON DISK but is not tracked must still fail. This test fails against a
+    resolver carrying an ``(root / target).exists()`` fallback, which is what makes it worth having.
+    """
+    repo = _plant(tmp_path, "A.md", "[present but untracked](../../untracked.txt)\n")
+    (repo / "docs" / "untracked.txt").write_text("i am here\n", encoding="utf-8")
+    assert (repo / "docs" / "untracked.txt").is_file(), "must really be on disk to prove anything"
+
+    failures, _checked, _files = checker.check(repo, _PLANTED_SUBTREE, include_line_cites=False)
+    assert len(failures) == 1, f"present-but-untracked must fail; got: {failures}"
+    assert "untracked.txt" in failures[0]
+
+
+def test_directory_links_resolve(tmp_path, checker) -> None:
+    """``git ls-files`` lists files and never directories, so ancestor prefixes must be DERIVED or
+    every link to a directory breaks -- 122 of them in this repo (``docs/adr``, ``environments``,
+    ``.github/workflows``), all legitimate, since a directory link resolves for anyone who clones.
+    This is the constraint that stops the fix above from being simply "drop the fallback"."""
+    import subprocess as sp
+
+    repo = _plant(tmp_path, "A.md", "[a directory](../../real-dir)\n")
+    (repo / "docs" / "real-dir").mkdir()
+    (repo / "docs" / "real-dir" / "kept.md").write_text("# kept\n", encoding="utf-8")
+    sp.run(["git", "add", "-A"], cwd=repo, check=True)
+
+    failures, checked, _files = checker.check(repo, _PLANTED_SUBTREE, include_line_cites=False)
+    assert checked == 1, f"expected the directory link to be checked, saw {checked}"
+    assert not failures, f"a directory containing a tracked file must resolve, got: {failures}"
 
 
 def test_links_inside_inline_code_are_not_followed(tmp_path, checker) -> None:
