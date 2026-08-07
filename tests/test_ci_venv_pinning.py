@@ -255,7 +255,8 @@ SECURITY_YML_PIP_BOOTSTRAPS = 2
 #: not being looked at. The tests below are the ones that look.
 #:
 #: THE COUNT IS LOAD-BEARING, not decoration. Five install sites collapse onto three (workflow, lock)
-#: pairs — `security.yml` installs `ci-scanners.lock` twice (the pip-audit step and the bandit step) and
+#: pairs — `security.yml` installs `ci-scanners.lock` three times (the pip-audit step, the bandit step
+#: and released-line-audit, which audits the latest release tag's core lock rather than the tree) and
 #: `quality-advisory.yml` installs `ci-quality.lock` twice (the coverage job and the mutation job). An
 #: `assert lines` non-vacuity check is satisfied by ONE surviving line, so deleting either of a pair
 #: leaves its job installing nothing while every check here stays green. Measured: with only "≥1", four
@@ -263,7 +264,7 @@ SECURITY_YML_PIP_BOOTSTRAPS = 2
 #: is silent (`pytest -q --cov` dies on `unrecognized arguments`, `|| true` swallows it, and the
 #: diff-coverage step reports "skipped" and exits 0).
 LOCK_INSTALLED_TOOLCHAINS = (
-    ("security.yml", "ci/locks/ci-scanners.lock", 2),
+    ("security.yml", "ci/locks/ci-scanners.lock", 3),
     ("zizmor.yml", "ci/locks/ci-scanners.lock", 1),
     ("quality-advisory.yml", "ci/locks/ci-quality.lock", 2),
 )
