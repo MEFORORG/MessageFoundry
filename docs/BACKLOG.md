@@ -5140,7 +5140,36 @@ Resolved against both ledger files with `parse_items`: **`#3` is an OPEN item to
 
 **Scope note.** Two categories must NOT be swept up. Relative file *references* with trailing prose (Rule 1a telling a human where the source lives) are deliberately not runnable command forms. Comment-based help inside a `.NOTES` block is never emitted at runtime. Both look similar to grep and neither is a defect.
 
-**Related:** #1032 (same class, the instance that was fixed), #1040 (the deny-text output surface these sit in).
+**Related:** #1032 (same class, the instance that was fixed), #1040 (the deny-text output surface these sit in), #1076 (the *injection* sibling on the same line-475/477 pair — distinct from this item, which is a runnability defect in the emitter's OWN path).
+
+## 1076. Rule 3b emits the branch name unquoted into the READ remediation, one line below the quoting that fixed the same class
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **7/10** · Difficulty **2/10** · _quick win_. PR #214 quoted `$dest` at `worktree_gate.ps1:475` to close a refname-into-a-command injection. **Line 477 emits the same value BARE**, inside the same remediation block the same message tells an agent to run. `$( )` is command substitution in both PowerShell and bash, so a branch named `pwn$(calc)` executes. Measured against the installed gate.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P2. **Verdict:** build. **Severity:** no product effect and no PHI effect — this governs agent behaviour in development. It is a live injection channel into an enforcement control's own output, and the value that carries it is **attacker-chosen from a public fork**.
+
+**Measured, not reasoned.** From a governed linked worktree, `git checkout` onto a local branch named `pwn$(calc)`:
+
+```
+    pwsh -NoProfile -File "...\new.ps1" -Branch 'pwn$(calc)' -Name pwn-calc      <- :475, correctly quoted
+    git -C "...\wt1" show pwn$(calc):<path>   git -C "...\wt1" diff HEAD..pwn$(calc)   <- :477, BARE
+```
+
+A bare `Write-Output main$(calc):seed.txt` emits `mainPWNED-EXECUTED:seed.txt`. A branch named `quote'name` yields an unbalanced quote that swallows the rest of the line. `;` and `|` are unreachable (line 389 cuts at the first separator), but `$`, backtick, `&`, `(`, `)`, `'` and `#` all survive.
+
+**Getting the ref is the easy half.** Development happens directly in the public repo; `gh pr checkout`, `git checkout --track` and `git fetch origin <ref>:<ref>` all create `refs/heads/<attacker-chosen-name>` from an outside contributor's fork branch. The FIRST checkout falls through at :424 and DWIM-creates the ref; the SECOND trips rule 3b.
+
+**⛔ FOLDING IS THE WRONG INSTRUMENT AND WOULD LOOK LIKE A FIX.** `Get-SafeForMessage` neutralises line structure and length — it does not touch `$`, backtick, `&` or `'`. **The fix is quoting, as :475 already does.** Keep the two treatments distinct and named: quote-doubling for a value entering a COMMAND, folding for a value entering PROSE. Conflating them is what produced the miss.
+
+**A second unsafe interpolation on the same line.** `$selfTopRaw` at :477 sits inside `"..."`, and `$( )` and backticks expand INSIDE double quotes in both shells — measured with worktree directories named `wt$(id)` and ``wt`id` ``. The earlier reasoning that a `"` cannot occur in a Windows path is true and irrelevant: `"` is not the operative character.
+
+**Confirmed in a second, independent copy.** The `claude-multisession` fork carries the same remediation shape. Its `Get-SafeForMessage` additionally strips `["';|&$` + backtick]`, so the fork is **not** exploitable through it — which is a working existence proof that a metacharacter-stripping fold is a viable second layer. **Do both:** quoting is the local correctness fix; a fold that strips shell metacharacters is defence in depth for the next remediation line somebody adds without thinking about it, which is the more likely failure to recur.
+
+**No test covers it, and the gap has the same shape as the defect.** `grep -rn "destQ|show \$dest|HEAD\.\." tests/` returns one unrelated allow-case. **PR #214's quoting fix is itself untested, which is how the miss one line below it survived review.** A fix needs a rule 3b case asserting the emitted READ line against a hostile refname — asserting the STRING, not merely that the call denied.
+
+**Related:** #1035 (the runnability sibling on the same emitter — that one is the gate's OWN path containing a space; this one is an attacker-chosen value executing), #1040 (the general form — deny text is attacker-influenceable output an agent is instructed to act on), #1032 (a remediation the receiving side rejects), #1069 (the gate blind to a QUOTED key — the mirror: this item is the gate EMITTING an unquoted one).
+
+**Source:** found 2026-08-06 by a three-pass audit (inventory, adversarial attack, refutation) of the committed gate, prompted by a coordination message from a peer session generalising this gate. That message's own premise was overturned by measurement: the values it named are newline-unreachable here, and the reachable defect was one its proposed fix would not have closed.
 
 **Source:** identified 2026-08-05 while fixing #1032, and deliberately deferred rather than swept in, so that fix stayed scoped to one rule. Recorded here because a deferral nobody files is a deferral dropped.
 
