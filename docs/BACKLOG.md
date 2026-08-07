@@ -6298,3 +6298,21 @@ Both readings reach the same operational conclusion, which is the whole point of
 **Related:** #1073 (the pass), #1089–#1092 (the findings that got their own numbers).
 
 **Source:** BACKLOG #1073's ASCQM 1.1 catalogue pass over all 74 live elements, with an adversarial refutation stage on every non-not-applicable verdict.
+
+## 1094. CLAUDE.md §12 decline markers cite the live backlog file for items that have archived
+
+> 🔢 **Filed 2026-08-07 — not started.** Value **4/10** · Difficulty **1/10** · _quick win_. §12's **Don't** list is where a decline is lifted so it **outlives the backlog item that recorded it**. Two of its markers cite [`docs/BACKLOG.md`](BACKLOG.md) `#26` and `#27` — and retiring an item **moves it verbatim** into [`archive/backlog/BACKLOG-CLOSED.md`](archive/backlog/BACKLOG-CLOSED.md). Measured on `origin/main` 2026-08-07: `## 26.` and `## 27.` are **absent** from `docs/BACKLOG.md` and **present** in the archive. Both pointers are already dead.
+
+**Cluster:** Documentation record / instrument accuracy. **Priority:** P3. **Verdict:** build (trivial). **Severity:** no product effect and no security effect. The decline text itself is intact and still binding; only the route back to its reasoning is broken.
+
+**Nothing in this repository can catch this class today, and that is the argument for whatever check is proposed.** The markdown link resolves perfectly — it points at `docs/BACKLOG.md`, which exists — so a link checker cannot fire. The part that goes stale is the **human-readable number beside the link**, which no tool reads. That is why two instances sat unnoticed rather than being caught by the gates this repo already runs. A check that only validates link targets will report this file clean forever.
+
+**The repo already has the correct form, at scale.** `docs/BACKLOG.md` carries **44** citations shaped `[#52](archive/backlog/BACKLOG-CLOSED.md#52-corepoint-capability-parity-gaps--prioritized-roadmap-input-2026-06-27)`, and [`AOAG-DEPLOYMENT.md`](AOAG-DEPLOYMENT.md) does the same for `#100`/`#101`. So this is a §12 omission, not a missing convention.
+
+**Fix shape.** Repoint the `#26` and `#27` markers at the archive. **Do not hand-write the fragment** — the archival pass generates the anchor, and a pointer with a wrong fragment is worse than one with none, because it looks precise and lands nowhere. Either derive it from the generator or cite the file without a fragment. A marker that must outlive its item is best served naming **both** locations (live now, archive after), which is what [`../CLAUDE.md`](../CLAUDE.md) §12's ISO 5055 marker was corrected to do.
+
+**The near-miss is the reason this is worth a number.** The 5055 decline marker filed under #1073 cited only the live file, and would have rotted identically the moment #1073 archived — caught in review before merge. The session that wrote it had **already noticed** the #26/#27 staleness earlier that day and judged it not worth chasing, then reproduced it in a marker whose entire purpose is to outlive its item. A rot consciously declined is one you have stopped seeing well enough to avoid repeating.
+
+**Related:** #1073 (the decline whose marker nearly repeated this), #1000 (a control whose green is not evidence about what it appears to cover), #1087 and #1063 (the same cluster — an instrument answering a narrower question than the one asked), [`../CLAUDE.md`](../CLAUDE.md) §11 (state a load-bearing fact once and link to it — which is what makes the link's durability load-bearing).
+
+**Source:** found 2026-08-07 while verifying #1073's §12 marker against `origin/main` for HANDOFF-1073 item B5. The `#26`/`#27` absence was measured in both files rather than inferred, and the 44-occurrence convention count was re-run without a head limit after a first reading of "~18" turned out to be an artifact of the truncated output.
