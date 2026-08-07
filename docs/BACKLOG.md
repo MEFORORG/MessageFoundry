@@ -5751,9 +5751,9 @@ environments.py:79 `if not base_dir: return cwd`              <-- and base_dir i
 
 **Source:** owner question 2026-08-06 — "what about NIST SP 800-218 v1.1 (SSDF)". Draft status re-verified directly against the CSRC publication page the same day rather than taken from a secondary summary.
 
-## 1077. `announce-session.ps1` skips reachable peers on `isRunning: false`, which means IDLE, not dead
+## 1077. `announce-session.ps1` skips reachable peers on `isRunning: false`, which does not mean dead
 
-> 🔢 **Filed 2026-08-06 — not started.** Value **6/10** · Difficulty **2/10** · _quick win_. The announce hook instructs every session *"No exact row, or isRunning is false -> SKIP that peer"*, then has the model record the outcome under the token `NOT_RUNNING`. Measured 2026-08-06: **`isRunning: false` means the session is IDLE and `send_message` DELIVERS to it**; `isRunning: true` means it is mid-turn and the message QUEUES. The field reads **backwards** as a reachability signal, so the rule drops exactly the peers that are ready to answer.
+> 🔢 **Filed 2026-08-06 — not started.** Value **6/10** · Difficulty **2/10** · _quick win_. The announce hook instructs every session *"No exact row, or isRunning is false -> SKIP that peer"*, then has the model record the outcome under the token `NOT_RUNNING`. Measured 2026-08-06: a peer listed `isRunning: false` was **delivered to** and answered within one turn, while `isRunning: true` **queued** behind the in-flight turn. The field reads **backwards** as a reachability signal, so the rule drops exactly the peers most able to answer.
 
 **Cluster:** Session coordination / roster semantics. **Priority:** P2. **Verdict:** build (small). **Severity:** no product effect and no security effect — this governs agent coordination. The cost is silent: a session follows the rule, reports fewer live peers than exist, and nothing raises.
 
@@ -5761,8 +5761,12 @@ environments.py:79 `if not base_dir: return cwd`              <-- and base_dir i
 
 | target state | result |
 | --- | --- |
-| `isRunning: false` (idle) | **delivered**, answered within one turn |
-| `isRunning: true` (busy) | *"Message queued … will be processed after the in-flight turn finishes"* |
+| `isRunning: false` | **delivered**, answered within one turn |
+| `isRunning: true` | *"Message queued … will be processed after the in-flight turn finishes"* |
+
+**WHAT `false` ACTUALLY MEANS IS "NOT OBSERVABLE", NOT "IDLE" — and the narrower reading was this item's own first draft.** It was filed saying *"`isRunning: false` means the session is IDLE"*, which is what the measurement above shows **for the one desktop peer it was taken on**. The general statement is weaker and safer: the field reports what the Desktop app can observe, and observability is not uniform across surfaces. A **VS Code** session is the case the narrow reading cannot cover — it is never entered into the Desktop app's in-memory session map at all, so it is *absent* rather than listed-and-quiet, and no value of `isRunning` describes it.
+
+Both readings reach the same operational conclusion, which is the whole point of the item: **`false` is never evidence that a peer is finished, gone, or safe to take claims from.** Only the mechanism differs, and a measurement generalised past its sample is exactly the defect class this cluster is about — so it is corrected here rather than left standing because the conclusion happened to survive it.
 
 **It has already cost a wrong report to the owner.** A session applying the SKIP rule told the owner there was **no live coordinator** and was corrected with *"there is a live coordinator... talk to it."* `presence.ps1` had listed it live throughout. The two rosters also disagreed on that session's **branch**, so branch cannot join them either — only cwd can.
 
