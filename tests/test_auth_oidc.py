@@ -319,6 +319,50 @@ def test_multi_aud_with_matching_azp_accepted(rsa_key: rsa.RSAPrivateKey) -> Non
     assert principal.username == "jdoe"
 
 
+# --- claims: two malformed-IdP shapes reject as audited ClaimsErrors, not 500s (BACKLOG #1016) -----
+
+
+def test_a_non_ascii_nonce_is_a_mismatch_not_a_crash(rsa_key: rsa.RSAPrivateKey) -> None:
+    """A non-ASCII token nonce must reject as an audited ``nonce_mismatch``, not an unhandled 500.
+    ``hmac.compare_digest`` raises ``TypeError`` on a str carrying non-ASCII, so without the encoding
+    guard a hostile ``nonce`` would, on first deployment, surface as a 500 that skips the closed-set
+    audit row every other claim rejection emits. The policy nonce is ASCII ``n-123``."""
+    jws = _mint(rsa_key, "k1", _good_claims(nonce="n-éé"))
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == "nonce_mismatch"
+    assert exc.value.reason in oidc.REASONS
+
+
+@pytest.mark.parametrize("aud", [[["mefor-console"]], [{"a": 1}]])
+def test_an_unhashable_aud_element_is_claim_aud_not_a_crash(
+    rsa_key: rsa.RSAPrivateKey, aud: Any
+) -> None:
+    """A ``list`` aud carrying an unhashable element (a nested list, or a dict) raises ``TypeError``
+    from ``set(aud)`` — the one malformed shape that escapes the fall-through to an empty set. It
+    must reject as an audited ``claim_aud``, not a 500. A top-level dict/int/None already falls
+    through cleanly, so reaching the guard proves it fired: pre-fix the path raises before the
+    membership check below it could run."""
+    jws = _mint(rsa_key, "k1", _good_claims(aud=aud))
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == "claim_aud"
+    assert exc.value.reason in oidc.REASONS
+
+
+def test_the_malformed_shape_guards_do_not_over_reject_a_valid_token(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """Negative control (guard-the-guard): the two malformed-shape guards must not reject an ordinary
+    valid token — an ASCII nonce equal to the policy nonce and a plain str aud validate byte-
+    identically. The existing ``{"nonce": "wrong"}`` rung already proves an ASCII wrong-nonce still
+    routes to ``nonce_mismatch``, so the encoding guard does not swallow real mismatches."""
+    jws = _mint(rsa_key, "k1", _good_claims())
+    principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert principal.username == "jdoe"
+    assert principal.subject == "S-1-5-21-abc"
+
+
 def test_mfa_gate_off_accepts_a_password_only_token(rsa_key: rsa.RSAPrivateKey) -> None:
     jws = _mint(rsa_key, "k1", _good_claims(amr=["pwd"]))
     principal = oidc.validate_id_token(

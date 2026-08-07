@@ -190,6 +190,20 @@ def _verify_signature(id_token: str, key: object, policy: OidcClaimPolicy) -> Ma
         raise ClaimsError("malformed_payload", str(exc)) from exc
 
 
+def _nonce_matches(received: str, expected: str) -> bool:
+    """Constant-time nonce comparison — mirrors ``flow.state_matches`` at the encoding boundary.
+
+    ``hmac.compare_digest`` raises ``TypeError`` on a ``str`` carrying non-ASCII, so comparing the
+    token nonce directly turns a hostile ``nonce`` like ``n-éé`` into an unhandled 500 that skips the
+    audited ``nonce_mismatch`` branch. The flow nonce we minted is base64url, so a non-ASCII token
+    nonce cannot match anyway — this is a plain non-match, not a special case.
+    """
+    try:
+        return hmac.compare_digest(received.encode("ascii"), expected.encode("ascii"))
+    except UnicodeEncodeError:
+        return False
+
+
 def _check_core_claims(
     claims: Mapping[str, object], policy: OidcClaimPolicy, now: float
 ) -> tuple[float, str]:
@@ -214,7 +228,15 @@ def _check_core_claims(
         raise ClaimsError("claim_iss", "iss does not match the pinned issuer")
 
     aud = claims.get("aud")
-    audiences = {aud} if isinstance(aud, str) else set(aud) if isinstance(aud, list) else set()
+    # A ``list`` aud whose elements are unhashable (a list-of-lists, or a list carrying a dict)
+    # raises ``TypeError`` from ``set(aud)`` — the one malformed shape that escapes past the fall-
+    # through to an empty set. Convert it into the same audited ``claim_aud`` rejection the
+    # membership check below emits, rather than a 500 with no closed-set audit row. The body is kept
+    # to the single set-building expression so the only TypeError caught is the one from that call.
+    try:
+        audiences = {aud} if isinstance(aud, str) else set(aud) if isinstance(aud, list) else set()
+    except TypeError as exc:
+        raise ClaimsError("claim_aud", "aud is malformed") from exc
     if policy.client_id not in audiences:
         raise ClaimsError("claim_aud", "aud does not contain the client_id")
     # With multiple audiences, azp MUST be present and equal to our client_id (OIDC core 3.1.3.7/2).
@@ -238,7 +260,7 @@ def _check_core_claims(
             raise ClaimsError("not_yet_valid", "id_token nbf is in the future")
 
     token_nonce = claims.get("nonce")
-    if not isinstance(token_nonce, str) or not hmac.compare_digest(token_nonce, policy.nonce):
+    if not isinstance(token_nonce, str) or not _nonce_matches(token_nonce, policy.nonce):
         raise ClaimsError("nonce_mismatch", "id_token nonce does not match the flow nonce")
 
     # ``sub`` is REQUIRED of an id_token by OIDC Core 2 and is the only stable identifier the
