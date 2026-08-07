@@ -5126,7 +5126,7 @@ Resolved against both ledger files with `parse_items`: **`#3` is an OPEN item to
 
 **Related:** \#1032 (same file family, and the same shape of a remediation that cannot execute), PR #209.
 
-**Source:** surfaced 2026-08-05 while adding the two new guards, from the observation that a guard everything else leans on can be switched off by a missing interpreter. Held for the owner: session `nice-payne-4dcee0` has it as analysis only, with no build decision taken.
+**Source:** surfaced 2026-08-05 while adding the two new guards, from the observation that a guard everything else leans on can be switched off by a missing interpreter. Held for the owner: another session has it as analysis only, with no build decision taken.
 
 ## 1035. Gate remediations interpolate an unquoted `-File` path into a command the reader is told to run
 
@@ -5170,6 +5170,35 @@ A bare `Write-Output main$(calc):seed.txt` emits `mainPWNED-EXECUTED:seed.txt`. 
 **Related:** #1035 (the runnability sibling on the same emitter — that one is the gate's OWN path containing a space; this one is an attacker-chosen value executing), #1040 (the general form — deny text is attacker-influenceable output an agent is instructed to act on), #1032 (a remediation the receiving side rejects), #1069 (the gate blind to a QUOTED key — the mirror: this item is the gate EMITTING an unquoted one).
 
 **Source:** found 2026-08-06 by a three-pass audit (inventory, adversarial attack, refutation) of the committed gate, prompted by a coordination message from a peer session generalising this gate. That message's own premise was overturned by measurement: the values it named are newline-unreachable here, and the reachable defect was one its proposed fix would not have closed.
+
+## 1082. Rule 3c's deny text for a `--global` or `--system` disarm write names the wrong mechanism, and whether the write takes effect is not knowable from the command
+
+> 🔢 **Filed 2026-08-07 — not started. ⛔ THE VERDICT IS CORRECT; ONLY THE WORDING IS WRONG. Do NOT "fix" this by allowing the write.** For `git config --global core.hooksPath <dir>` aimed at a governed repo, rule 3c denies and says *"would change the SHARED git configuration of <repo>"*. That sentence is false — the write lands in `~/.gitconfig`. But the DENY is right, because the write can still disarm the repo **by inheritance**. Value **4/10** · Difficulty **3/10** · _do it_.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P3. **Verdict:** build. **Severity:** no product effect, no PHI effect. A deny message that names the wrong mechanism teaches the reader the control is confused, which is how a control stops being trusted.
+
+**⛔ AN EARLIER FILING OF THIS AS A FALSE DENY WAS WRONG, AND THE RETRACTION IS THE POINT OF THIS ITEM.** This defect was briefed to a fix round as *"rule 3c denies `--global` writes it has no business refusing"*. Three independent verifiers measured that premise and **withdrew it**: in a repo with `core.hooksPath` unset at every scope, `git config --global core.hooksPath <emptydir>` leaves `.git/config` untouched and the next commit runs with **the hook never firing** (`COMMIT-1 rc=1 GATE-FIRED` -> `COMMIT-2 rc=0`, hook skipped). **Flipping rule 3c to ALLOW would have been a fail-open.** The implementing pass refused to flip it, which was the correct call.
+
+**AND THE VERIFIERS' GENERALISATION NEEDS ITS OWN QUALIFIER, measured in this repo 2026-08-07.** It is **not** universally true that a `--global` write reaches a governed repo:
+
+```
+git config --show-origin --get core.hooksPath
+file:.git/worktrees/<wt>/config.worktree    <primary>/.git/hooks
+```
+
+This repo sets `core.hooksPath` at **worktree** scope, which beats global — so here a `--global` write of that key would **not** take effect. In the verifiers' fresh rig, unset at every scope, it **would**. ⇒ **Whether the write matters depends on whether the governed repo sets the same key at a more specific scope, and that is NOT knowable from the command text.** Denying is the correct conservative default. Note the asymmetry: `--global alias.*` is far more likely to take effect than `--global core.hooksPath`, because a repo rarely pins the same alias locally.
+
+**The work.** Say what is true and no more. Something of the shape: *"'<key>' is on the disarm list. `--global`/`--system` writes your per-user or machine-wide config rather than this repository's, but git falls back to those scopes when the repository does not set the key, so the write can still disarm this checkout's hooks. Refused because the gate cannot tell which case applies from the command alone."* Two constraints from the measured record:
+- ⛔ It must not claim the write changes the SHARED configuration of the repo. It does not.
+- ⛔ It must not claim the write is harmless, either. A round-4 candidate printed *"This does NOT change the shared configuration"* and that was graded BLOCKING by three verifiers — over a multi-line command whose second segment did a local write, the reader saw a reassurance printed over a real disarm.
+
+**A separate, real defect found in the same pass and NOT fixed here:** `Get-ScannableSegments` splits on lines, and `Write-Deny` exits on the first hit, so **a multi-line command is judged by its first segment only**. That is a wording hazard today and a correctness hazard for any rule that reasons per-segment. Needs its own item.
+
+**Test it by the wording, not the verdict.** The verdict does not move, so a test ending in a bare `assert_denied` cannot see this at all — and a round-4 mutant that reinstated the old self-contradicting bullet **survived a fully green suite** for exactly that reason. Assert the string.
+
+**Related:** #1061 (the rule), #1065, #1066, #1069-#1072 (the other open 3c defects), #1040 (deny text is output an agent acts on), #1076 (the same rule family emitting an unquoted value into a runnable command).
+
+**Source:** the premise was mine, briefed to round 4 on 2026-08-06 as a live false deny, and overturned by that round's own verification on 2026-08-07. Filed as what it actually is.
 
 **Source:** identified 2026-08-05 while fixing #1032, and deliberately deferred rather than swept in, so that fix stayed scoped to one rule. Recorded here because a deferral nobody files is a deferral dropped.
 
