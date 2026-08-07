@@ -179,41 +179,110 @@ SSDF organizes secure development into four practice groups: **Prepare the Organ
 
 ### 4.1 Prepare the Organization (PO.1–PO.5)
 
-- **Security requirements (PO.1).** Security requirements are documented (this standard plus each project's standing contract, e.g., a `CLAUDE.md` or equivalent) and treated as first-class alongside functional requirements. Captured as first-class specs, these requirements drive design and tests per **§5 (Spec-Driven Development)** — recommended.
-- **Roles and responsibilities (PO.2).** Maintainer/reviewer roles are defined; security ownership is explicit; onboarding includes secure-development orientation.
-- **Supporting toolchains (PO.3).** Source control; CI/CD with automated security checks (§6.2); dependency and secret scanning; pinned, integrity-verified dependencies.
-- **Security check criteria (PO.4).** Pass/fail release gates are defined (§6.4); a release does not ship with unresolved high/critical findings.
-- **Secure development environments (PO.5).** Disk-encrypted developer machines; **no real PHI in development or test** (synthetic or de-identified data only); least-privilege access to repositories and environments.
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-4.1.1 | **MUST** document the project's security requirements — this standard plus the project's standing contract — and treat them as first-class alongside functional requirements. **(PO.1)** | This standard, and the standing contract file it names |
+| SDS-4.1.2 | **SHOULD** capture those requirements as first-class specs that drive design and tests (§5). **(PO.1)** | A spec artifact per requirement, linked to its design and tests |
+| SDS-4.1.3 | **MUST** define maintainer and reviewer roles, with security ownership stated explicitly rather than assumed. **(PO.2)** | The written role assignment, naming who owns security |
+| SDS-4.1.4 | **MUST** include secure-development orientation in onboarding. **(PO.2)** | The onboarding material |
+| SDS-4.1.5 | **MUST** hold all source in version control. **(PO.3)** | The repository |
+| SDS-4.1.6 | **MUST** run automated security checks in CI on every change (§6.2). **(PO.3)** | The CI workflow definition and a run of it |
+| SDS-4.1.7 | **MUST** run dependency scanning and secret scanning. **(PO.3)** | The scanner jobs and their most recent results |
+| SDS-4.1.8 | **MUST** pin dependencies and verify their integrity. **(PO.3)** | A hash-locked dependency file, checked in CI for drift |
+| SDS-4.1.9 | **MUST** define pass/fail release gates (§6.4). **(PO.4)** | The documented gate list |
+| SDS-4.1.10 | **MUST NOT** ship a release carrying unresolved high or critical findings. **(PO.4)** | The gate result for the released commit |
+| SDS-4.1.11 | **MUST** require disk encryption on developer machines. **(PO.5)** | A stated and reviewed environment baseline |
+| SDS-4.1.12 | **MUST NOT** use real PHI in development or test. Synthetic or de-identified data only. **(PO.5)** | The test corpus, and the de-identification path that produced it |
+| SDS-4.1.13 | **MUST** grant least-privilege access to repositories and environments. **(PO.5)** | A dated access review |
 
 ### 4.2 Protect the Software (PS.1–PS.3)
 
-- **Protect code from unauthorized access/tampering (PS.1).** Branch protection, required reviews, least-privilege access; no direct commits to the main branch; signed commits where supported.
-- **Verify release integrity (PS.2).** Releases are versioned and integrity-verifiable (checksums/signatures); a software bill of materials (SBOM) is generated per release.
-- **Archive and protect releases (PS.3).** Each released version, its build inputs, and its SBOM are archived to support incident analysis and reproducibility.
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-4.2.1 | **MUST** enforce branch protection and required reviews on the trunk. **(PS.1)** | The protection settings, and a rejected direct push |
+| SDS-4.2.2 | **MUST NOT** permit direct commits to the main branch. **(PS.1)** | The protection settings |
+| SDS-4.2.3 | **SHOULD** sign commits where the platform supports it. **(PS.1)** | Signature status on trunk commits |
+| SDS-4.2.4 | **MUST** version releases and make them integrity-verifiable by checksum or signature. **(PS.2)** | The published checksums or signatures |
+| SDS-4.2.5 | **MUST** generate a software bill of materials per release. **(PS.2)** | The SBOM attached to the release |
+| SDS-4.2.6 | **MUST** archive each released version, its build inputs and its SBOM, so an incident can be analysed against what actually shipped. **(PS.3)** | The retained archive, and a retrieval of one past release |
 
 ### 4.3 Produce Well-Secured Software (PW.1, PW.2, PW.4–PW.9)
 
-- **Secure design and threat modeling (PW.1–PW.2).** Each interface and component is threat-modeled; trust boundaries are identified and documented; designs are reviewed against the security requirements before build. The reviewed design artifact and its acceptance criteria are the spec; **§5** describes the recommended clarify/analyze gates applied before build.
-- **Reuse well-secured components (PW.4).** Prefer vetted libraries; avoid rolling custom cryptography.
-- **Secure coding practices (PW.5).** Mandatory:
-  - **Input validation** — validate structure and content at every ingress; reject or quarantine malformed input rather than processing it. *(Example: HL7 message validation in MEFOR.)*
-  - **Parameterized queries only** — no string-built SQL; use an ORM or parameterized statements throughout.
-  - **Authentication & authorization** — enforce on every action; deny by default; interface mechanisms per §7.4.
-  - **Web-service interfaces (REST and SOAP)** — authenticate every endpoint; validate and size-limit payloads against a schema; for SOAP/XML, disable external-entity resolution (XXE) and DTD processing; apply rate limiting and timeouts; never expose stack traces or sensitive data in fault responses.
-  - **File-handler interfaces** — confine reads/writes to configured directories and canonicalize paths (reject `../` traversal and symlink escapes); validate file type and size by content, not extension; use atomic write-then-rename so partial files are never processed; least-privilege storage, never an executable or web-served path; never execute file contents; scan inbound files for malware where feasible; encrypt sensitive files at rest and securely delete after processing per retention.
-  - **Cryptography** — TLS for all network communication; encryption at rest for sensitive data; approved algorithms and libraries; use FIPS-validated crypto where a deployment requires it.
-  - **Secrets** — never in code, prompts, or commit history; sourced from environment/secret store; enforced by pre-commit and CI secret scanning.
-  - **Error handling and logging** — fail closed; never log secrets or sensitive data; produce a tamper-resistant, timestamped audit log.
-- **Secure build configuration (PW.6).** Reproducible builds; security-relevant build/interpreter and dependency settings fixed in the pipeline.
-- **Code review and analysis (PW.7).** Every change is peer-reviewed; static analysis (SAST) and software composition analysis (SCA) run in CI (§6.2). Review also confirms the change conforms to its spec's acceptance criteria — see **§5** (analyze, cross-artifact coverage); recommended.
-- **Test executable code (PW.8).** A maintained automated test suite runs on every change; security test cases are included. Tests SHOULD trace to the spec's acceptance criteria (**§5**, executable acceptance criteria) so coverage is mechanical, not prose. Test *quality* — not just presence — is judged per the [Code Quality & Anti-Slop Standards](Code_Quality_Standards.md): behavior-verifying assertions over mock choreography, with mutation testing as *guidance*. Heed its **anti-metric rule** — **never gate quality on line-coverage % alone** (a gameable slop-hiding place); measure structure and behavior, not a single scoreboard.
-- **Secure defaults (PW.9).** Ships secure-by-default (TLS on, encryption on, least-privilege accounts, verbose audit logging); insecure options require explicit, documented opt-in.
+**Secure design and threat modeling (PW.1–PW.2).** The reviewed design artifact and its acceptance criteria are the spec; §5 describes the recommended clarify/analyze gates applied before build.
+
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-4.3.1 | **MUST** threat-model each interface and component. **(PW.1–PW.2)** | A written threat model per interface, dated |
+| SDS-4.3.2 | **MUST** identify and document trust boundaries. **(PW.1–PW.2)** | The boundary list in the threat model |
+| SDS-4.3.3 | **MUST** review a design against the security requirements **before** build. **(PW.1–PW.2)** | The review record, dated earlier than the implementation |
+| SDS-4.3.4 | **SHOULD** apply the clarify and analyze gates of §5 before build. **(PW.1–PW.2)** | Resolved clarifications on the design record |
+
+**Reuse well-secured components (PW.4).**
+
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-4.3.5 | **SHOULD** prefer a vetted library over a new implementation. **(PW.4)** | The dependency's provenance, recorded when it was added |
+| SDS-4.3.6 | **MUST NOT** implement custom cryptography. **(PW.4)** | Absence of hand-rolled primitives; a named library for each |
+
+**Secure coding practices (PW.5).** Every rule below is mandatory unless it says otherwise.
+
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-4.3.7 | **MUST** validate structure and content at every ingress. | The validator, and a test per ingress that rejects malformed input |
+| SDS-4.3.8 | **MUST** reject or quarantine malformed input rather than processing it. | The error/dead-letter path, and its disposition record |
+| SDS-4.3.9 | **MUST NOT** build SQL by string concatenation. Parameterized statements or an ORM throughout. | A source scan showing no string-built statements |
+| SDS-4.3.10 | **MUST** enforce authentication and authorization on every action (§7.4). | A route-to-permission map covering every action |
+| SDS-4.3.11 | **MUST** deny by default. | The default-deny path, and a test that an unmapped action is refused |
+| SDS-4.3.12 | **MUST** authenticate every web-service endpoint. | The endpoint inventory, each with its mechanism |
+| SDS-4.3.13 | **MUST** validate and size-limit payloads against a schema. | The schema, and the configured limit |
+| SDS-4.3.14 | **MUST** disable external-entity resolution and DTD processing for SOAP/XML. | The parser configuration, and an XXE regression test |
+| SDS-4.3.15 | **MUST** apply rate limiting and timeouts. | The configured values |
+| SDS-4.3.16 | **MUST NOT** expose stack traces or sensitive data in fault responses. | A fault-response test asserting the redacted shape |
+| SDS-4.3.17 | **MUST** confine file reads and writes to configured directories, canonicalizing paths and rejecting traversal and symlink escapes. | The canonicalization, and traversal/symlink regression tests |
+| SDS-4.3.18 | **MUST** validate file type and size by content, not by extension. | The content-sniffing check |
+| SDS-4.3.19 | **MUST** write files atomically (write-then-rename) so a partial file is never processed. | The write path |
+| SDS-4.3.20 | **MUST NOT** store handled files in an executable or web-served path. | The configured storage location |
+| SDS-4.3.21 | **MUST NOT** execute file contents. | Absence of any execution path from handled content |
+| SDS-4.3.22 | **SHOULD** scan inbound files for malware where feasible. | The scanner, or a stated reason it is not feasible |
+| SDS-4.3.23 | **MUST** encrypt sensitive files at rest and securely delete them after processing, per the retention policy. | The encryption setting and the deletion step |
+| SDS-4.3.24 | **MUST** use TLS for all network communication. | The TLS configuration and its minimum version floor |
+| SDS-4.3.25 | **MUST** encrypt sensitive data at rest. | The at-rest encryption setting |
+| SDS-4.3.26 | **MUST** use approved algorithms and libraries. | The cryptographic inventory |
+| SDS-4.3.27 | **MUST** use FIPS-validated cryptography where a deployment requires it. | The deployment's validated-module configuration |
+| SDS-4.3.28 | **MUST NOT** place secrets in code, in prompts, or in commit history. | A clean secret-scan over the full history |
+| SDS-4.3.29 | **MUST** source secrets from the environment or a secret store. | The configuration surface, carrying no literal secret |
+| SDS-4.3.30 | **MUST** enforce the two rules above by pre-commit and CI secret scanning. | The pre-commit hook and the CI job, each observed to fail on a planted secret |
+| SDS-4.3.31 | **MUST** fail closed. | A test per control asserting the closed outcome on error |
+| SDS-4.3.32 | **MUST NOT** log secrets or sensitive data. | A redaction test over the log surface |
+| SDS-4.3.33 | **MUST** produce a tamper-resistant, timestamped audit log. | The log's integrity mechanism, and a detected-tamper test |
+
+**Build, review, test and defaults (PW.6–PW.9).**
+
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-4.3.34 | **MUST** make builds reproducible. **(PW.6)** | Two builds of one commit producing the same artifact |
+| SDS-4.3.35 | **MUST** fix security-relevant build, interpreter and dependency settings in the pipeline rather than on a developer machine. **(PW.6)** | The pipeline definition |
+| SDS-4.3.36 | **MUST** peer-review every change. Where a project cannot staff a human second reviewer, the deviation and its compensating controls are recorded in A.6. **(PW.7)** | The review record per change, or the A.6 entry |
+| SDS-4.3.37 | **MUST** run static analysis and software composition analysis in CI (§6.2). **(PW.7)** | The SAST and SCA jobs, and their results for the released commit |
+| SDS-4.3.38 | **SHOULD** confirm in review that a change conforms to its spec's acceptance criteria (§5). **(PW.7)** | The criteria, checked off in the review |
+| SDS-4.3.39 | **MUST** maintain an automated test suite that runs on every change. **(PW.8)** | The suite, and its run on the change |
+| SDS-4.3.40 | **MUST** include security test cases in that suite. **(PW.8)** | The security tests, named |
+| SDS-4.3.41 | **SHOULD** trace tests to the spec's acceptance criteria so coverage is mechanical rather than prose (§5). **(PW.8)** | A criterion-to-test link per criterion |
+| SDS-4.3.42 | **MUST** judge test *quality*, not merely presence, per the [Code Quality & Anti-Slop Standards](Code_Quality_Standards.md) — behavior-verifying assertions over mock choreography, with mutation testing as guidance. **(PW.8)** | The quality review against that rubric |
+| SDS-4.3.43 | **MUST NOT** gate quality on line-coverage percentage alone; it is a gameable single scoreboard. Measure structure and behavior. **(PW.8)** | The gate definition, showing no coverage-only threshold |
+| SDS-4.3.44 | **MUST** ship secure-by-default: transport encryption on, at-rest encryption on, least-privilege accounts, audit logging on. **(PW.9)** | The shipped default configuration |
+| SDS-4.3.45 | **MUST** require an explicit, documented opt-in for any insecure option. **(PW.9)** | The opt-in setting and the documentation stating its risk |
 
 ### 4.4 Respond to Vulnerabilities (RV.1–RV.3)
 
-- **Identify on an ongoing basis (RV.1).** Continuous dependency monitoring; a defined intake channel for internally and externally reported issues (§8).
-- **Assess, prioritize, remediate (RV.2).** Findings are triaged by severity with target remediation timelines (set per project in the profile); fixes are verified before closure.
-- **Root-cause analysis (RV.3).** Significant vulnerabilities receive a root-cause review; systemic causes feed back into this standard.
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-4.4.1 | **MUST** monitor dependencies continuously. **(RV.1)** | The monitoring job and its most recent run |
+| SDS-4.4.2 | **MUST** publish a defined intake channel for internally and externally reported issues (§8). **(RV.1)** | The published channel |
+| SDS-4.4.3 | **MUST** triage findings by severity against target remediation timelines set in the applicability profile. **(RV.2)** | The triage record, with dates against the profile's targets |
+| SDS-4.4.4 | **MUST** verify a fix before closing the finding. **(RV.2)** | The verifying test or check, referenced from the closure |
+| SDS-4.4.5 | **MUST** perform a root-cause review of a significant vulnerability. **(RV.3)** | The root-cause record |
+| SDS-4.4.6 | **MUST** feed systemic causes back into this standard. **(RV.3)** | The resulting change to this document, in Version history |
 
 ---
 
