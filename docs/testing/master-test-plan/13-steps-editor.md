@@ -9,7 +9,7 @@
 
 ### 12.1 Scope & objectives
 
-**In scope.** The BACKLOG #26 carve-out (#222, SHIPPED — `docs/BACKLOG.md:6689`): a structured Steps view over real Python Handlers via a typed action vocabulary, where **plain `.py` stays the only artifact and the only execution path**. Concretely:
+**In scope.** The BACKLOG #26 carve-out (#222, SHIPPED): a structured Steps view over real Python Handlers via a typed action vocabulary, where **plain `.py` stays the only artifact and the only execution path**. Concretely:
 
 - The **projection contract** — `messagefoundry lens parse [--json]` (`messagefoundry/__main__.py:374-390`, `:2770`) → `messagefoundry/lens.py:270 parse_module` / `:285 parse_source`, and its **coverage-partition invariant** (`lens.py:11-21`).
 - The **rewrite contract** — `messagefoundry lens rewrite` (`__main__.py:392-404`, `:2793`) → `lens.py:1406 rewrite_module` / `:1423 rewrite_source`, its 11 ops (`lens.py:1382-1396 _SUPPORTED_OPS`), the row-scoped byte-space splice, the F7 stale-coordinate guard (`lens.py:1533 _check_expect_src`), the re-parse gate (`:1582 _assert_reparses`) and the 100-column refusal (`:1403 _MAX_LINE_LENGTH`).

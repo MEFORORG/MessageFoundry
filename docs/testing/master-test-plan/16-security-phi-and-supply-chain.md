@@ -888,7 +888,7 @@ This area is signed off for release when **all** of the following hold:
     campaign? Which dependency (`hypothesis` / `atheris` / `schemathesis`) is approved?**
     *Blocks:* SEC-67. The HL7, X12, DICOM and base64-carriage parsers are the most
     attacker-exposed code in the product and today have only hand-written adversarial cases — and two
-    of them sit on single-maintainer upstreams with no dormancy contingency (`docs/BACKLOG.md:394`).
+    of them sit on single-maintainer upstreams with no dormancy contingency (BACKLOG #89).
 
 13. **Which licence-resolution tool becomes the SEC-77 gate, and who ratifies the allow-list —
     specifically the rule that a term acceptable for AGPL distribution but not sublicensable under
