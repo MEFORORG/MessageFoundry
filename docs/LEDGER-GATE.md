@@ -209,7 +209,7 @@ Three of them landed one level up, at `refs/vault/**` rather than `refs/remotes/
 made `vault/main` *look* like a remote-tracking ref when it was not:
 `git rev-parse --symbolic-full-name vault/main` resolved to `refs/vault/main`, because gitrevisions tries
 `refs/<name>` **before** `refs/remotes/<name>`. `refs/remotes/vault/main` never existed.
-[`docs/releases/BACKLOG-MULTISESSION-PLAN.md`](releases/BACKLOG-MULTISESSION-PLAN.md) §0 called it a
+`docs/releases/BACKLOG-MULTISESSION-PLAN.md` §0 called it a
 remote-tracking ref on that basis; that line is corrected.
 
 ### What was deleted, and what it cost the allocator
