@@ -14,6 +14,42 @@
 
 ---
 
+## How to read the rules
+
+Each requirement in this standard is one testable statement carrying a stable identifier and the
+evidence that settles it. Cite the identifier — in a documented deviation (A.6), in a review, in a
+companion standard — so that the citation and the requirement it names stay the same sentence.
+
+| Element | What it means |
+|---|---|
+| `SDS-<section>.<n>` | A stable identifier. It survives rewording of the text around it |
+| **MUST**, **MUST NOT** | Absolute. Not meeting one is a deviation recorded in A.6, never a judgment call |
+| **SHOULD**, **SHOULD NOT** | Depart from it only for a stated reason you have weighed |
+| **MAY** | A free choice. Conforming either way |
+| Evidence | What a reviewer looks at. A requirement with no checkable evidence is an aspiration |
+
+Those words carry that meaning **only in capitals**; the same words in lowercase prose do not.
+
+**An identifier is a permanent name, never a position.** A new rule takes the next free number in its
+section and is **appended** — inserting one must never renumber those after it, because a citation
+written against the old number would then resolve silently to a different requirement. Reword a rule
+freely under the same identifier. Change *what it demands* and the identifier is retired and a new one
+allocated; [Retired rules](#retired-rules) keeps the tombstone, so a citation that outlives its rule
+lands on a record of what happened rather than on somebody else's requirement.
+
+**The numeric part resembles a section number because of where the rule was first written, not because
+it is a lookup.** An identifier is a name. If the surrounding section is ever renumbered the identifier
+does not move, and that is the property that makes it worth citing: this document has been renumbered
+once already (§5–§9 became §6–§10 when Spec-Driven Development was inserted; see Version history), and
+citations written against the old numbers are still resolving to the wrong requirements today.
+
+**Not every statement here is a rule.** The NIST and HIPAA crosswalks (§3, §7.2), the spec-stack and
+EARS tables (§5.1, §5.2), the control-area inventory (§7.1), the reference list (§10) and the
+Applicability Profile (Appendix A) describe, map or record; they carry no identifiers and nothing
+conforms *to* them. A.6 is the register that **cites** rules — it does not state them.
+
+---
+
 ## 1. Purpose and scope
 
 This is the secure development standard for an **open-source software project intended for use in regulated environments, including healthcare** (handling of protected health information, PHI).
@@ -579,6 +615,18 @@ PW.8 (test executable code) is the home of `messagefoundry check` (validate + dr
 - **R1 — EARS "Acceptance Criteria" block on the ADR template.** Each ADR **SHOULD** carry an EARS "Acceptance Criteria" block, each criterion bearing an ID linked to its test or fixture. Doc-only, zero-code; formalizes the existing SHALL-style house register. *(Lineage: AWS Kiro requirements.md; distilled.)*
 - **R2 — Make the dry-run gate executable-spec.** `messagefoundry/checks.py` **SHOULD** read an **expected disposition per fixture** (`PROCESSED` / `UNROUTED` / `FILTERED` / `ERROR`) and assert it, upgrading today's "didn't error" dry-run (`_check_dryrun` asserts only not-`ERROR`) into an executable acceptance-criteria check. **Backward-compatible:** a fixture with no declared expectation keeps today's not-`ERROR` semantics. *(Lineage: BDD / Specification-by-Example; distilled.)*
 - **R3 — Promote clarify, add analyze.** The ADR **"To resolve on acceptance"** block **SHOULD** be promoted into an explicit **clarify** step (resolve ambiguity before `Accepted`), and an **analyze**-style advisory coverage check **SHOULD** verify that every **Accepted** ADR's acceptance criteria has a linked test, and that no artifact contradicts a `CLAUDE.md` invariant. **Advisory, not a hard gate** — it belongs in the advisory tier alongside `ruff`/`mypy`, not the required `validate`/`dryrun` tier. *(Lineage: GitHub Spec Kit pipeline; distilled.)*
+
+---
+
+## Retired rules
+
+A retired identifier is **never reissued**. A rule is retired when *what it demands* changes; a rule
+whose wording changes keeps its identifier and does not appear here. A citation that outlives its rule
+resolves to a row below rather than to whatever requirement later took the number.
+
+| Retired ID | Retired in | What it required | Why, and what replaced it |
+|---|---|---|---|
+| — | — | *No rule has been retired yet.* | — |
 
 ---
 
