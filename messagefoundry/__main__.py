@@ -4292,6 +4292,10 @@ def _check(args: argparse.Namespace) -> int:
         handler_security_allow=frozenset(args.handler_security_allow or ()),
         service_config=service_config,
         suppress_service_toml_search=args.project_root is not None,
+        # The root was already used to anchor --config/--service-config and to REQUIRE that
+        # <root>/<env_dir>/<env>.toml exists; pass it on so the build check READS the values from there
+        # too, rather than from wherever the shell happens to be (BACKLOG #1062).
+        project_root=args.project_root,
     )
     if args.json:
         _print_json(report.to_json(), compact=True)
