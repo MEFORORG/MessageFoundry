@@ -5676,7 +5676,11 @@ environments.py:79 `if not base_dir: return cwd`              <-- and base_dir i
 
 ## 1073. Mine the free ASCQM 1.1 weakness catalogue against the existing gates; decline ISO 5055 as a measure
 
-> 🔢 **Filed 2026-08-06 — not started.** Value **4/10** · Difficulty **3/10**. ISO/IEC 5055:2021 defines four quality measures as **counts** of CWE-keyed severe weaknesses. The **measure** is declined for the reasons below and should not be re-litigated. The **catalogue** behind it is free, curated by a standards body, and contains a slice worth one bounded pass: the system-level weaknesses that a unit-level linter structurally cannot see.
+> ✅ **SHIPPED 2026-08-07 — the pass ran over all 74 live elements; the measure stays declined.** Value **4/10** · Difficulty **3/10**. Findings filed as #1089, #1090, #1091, #1092 and the #1093 inventory. The decline marker now sits in [`../CLAUDE.md`](../CLAUDE.md) §12, which is the part that outlives this item — a decline recorded only here would vanish when this item archives, exactly as #26 and #27 would have. Original filing follows. ISO/IEC 5055:2021 defines four quality measures as **counts** of CWE-keyed severe weaknesses. The **measure** is declined for the reasons below and should not be re-litigated. The **catalogue** behind it is free, curated by a standards body, and contains a slice worth one bounded pass: the system-level weaknesses that a unit-level linter structurally cannot see.
+
+**THE COUNTS ARE RESOLVED, and the conflict was a UNITS problem nobody had named.** CISQ's 74 / 74 / 29 / 15 counts **CWEs**, including contributing child CWEs. ASCQM's 22 / 29 / 15 / 20 counts **elements**, and one element carries several CWEs — which is why the element count is roughly a third of the CWE count. Measured from the spec: **84 elements, 74 live, 10 marked Dropped by the standard itself.** Security 22, Performance Efficiency 15 and Maintainability 20 reconcile **exactly**; Reliability came to 27 against 29 expected, and `ASCRM-RLB-13` carries no CWE mapping — both are **known shortfalls, not resolved**. **Performance Efficiency = 15 is now CONFIRMED** from the spec and its unverified mark is lifted. **The "139 total" stays UNCONFIRMED**: 152 distinct CWE references appear across the 261 pages, but that is a mention count over the whole document including front matter, so it neither confirms nor refutes 139. That mark stays, and it is doing its job.
+
+**THE FIRST RUN SILENTLY EXAMINED 62 OF 74 ELEMENTS, AND THE RESULT LOOKED COMPLETE.** One of six triage batches died on a connection error. The surviving five returned a confident report with a headline gap count, and **nothing in it indicated that a sixth of the catalogue had never been read.** The 12 unexamined elements spanned all four measures and included three Security elements (CWE-99, CWE-456, CWE-789) — and CWE-456 became a filed finding (#1093) once actually judged, so the omission was **not** harmless. It was caught by arithmetic (62 + 12 = 74), not by any signal the run produced. Recorded because it is this repo's own [`Code_Quality_Standards.md`](Code_Quality_Standards.md) §4.0 failure mode reproduced **inside the tool built to hunt for it**: a process that reports a conclusion without recording what it measured is indistinguishable from one that measured everything. **Any future catalogue pass must assert its own coverage before its findings are read.**
 
 **Cluster:** Code quality / standards coverage. **Priority:** P3. **Verdict:** build (small) for the pass; **decline** for the measure. **Severity:** no product effect and no security effect — this is a coverage question about the gates, not a defect in them.
 
@@ -5841,3 +5845,105 @@ Both readings reach the same operational conclusion, which is the whole point of
 **Related:** #1078 (`new.ps1` printing cleanup advice that throws — the same script, the same "correct action, wrong accompanying claim" shape), #1060 (anchoring, which is what makes the worktree placement itself correct), #1000 (a control whose green is not evidence).
 
 **Source:** found 2026-08-07 from a `git pull --ff-only` failure while syncing a worktree, and connected to a bogus "unpushed" reading reported hours earlier in the same session — one root cause behind two symptoms that had been treated as unrelated. Mechanism confirmed at `new.ps1:133` and the `push.default` posture verified against the live config before the warning above was written.
+
+## 1089. HL7 `parse_path` accepts component 0, so `PID-5.0` silently reads and OVERWRITES the last component
+
+> 🔢 **Filed 2026-08-07 — not started.** Value **8/10** · Difficulty **2/10** · _quick win_. `parsing/peek.py::parse_path` accepts `\d+` for the component index, so `PID-5.0` parses with `comp=0`; every consumer then indexes `x[comp - 1]`, which is `x[-1]`. `msg.field('PID-5.0')` returns the **last** component and `msg.set('PID-5.0', v)` silently **overwrites** it. **The X12 twin already validates this and is tested; the HL7 side has neither the guard nor the test.**
+
+**Cluster:** HL7 parsing / silent data corruption. **Priority:** P2. **Verdict:** build (small). **Severity:** would put PHI in the wrong component on a first deployment, **with no exception, no `ERROR` disposition and no dead-letter** — the message delivers looking successful. Nothing is deployed (§0), so this is what a deploying site would hit, not something happening today.
+
+**Reproduced by execution, not inferred.** `msg.field('PID-5.0')` returns the last component; `msg.set('PID-5.0', v)` overwrites it; on an empty field the same path raises a bare `IndexError` rather than a domain error.
+
+**The asymmetry is the evidence it is an oversight.** `parsing/x12/message.py` raises `X12PeekError` on an index below 1 and has a parametrized test for it. The HL7 path, which is the **default** content type and the one carrying PHI, has neither. A repo-wide `grep parse_path tests/` returns zero.
+
+**Why nothing sees it.** mypy sees a well-typed `int`; ruff has no bounds rule; mutmut's scope is `parsing/binary.py` alone. It is reachable from operator-facing surfaces — `api/app.py`'s `field_path` query parameter and `store/content_search.py` — so the bad path can arrive from outside, not only from a Handler author's typo.
+
+**The fix is the guard the X12 side already has**, plus the parametrized test copied across. Test the **write** path too: a read returning the wrong component is visible to a careful operator, a write that silently replaces one is not.
+
+**Related:** #1093 (the inventory this came from), #1073 (the pass), #1027 (a green that is not evidence about what it appears to cover).
+
+**Source:** BACKLOG #1073's ASCQM catalogue pass, element `ASCSM-CWE-129` (CWE-129). Reproduced by running the two calls, not concluded from reading the regex.
+
+## 1090. `write_reference_snapshot`'s `json.dumps` has no `default=`, so a TOML date in a file reference source fails the sync
+
+> 🔢 **Filed 2026-08-07 — not started.** Value **6/10** · Difficulty **2/10** · _quick win_. `store/{store,postgres,sqlserver}.py::write_reference_snapshot` calls `json.dumps(v)` over a `Mapping[str, Any]` with **no `default=` hook**. `tomllib` materializes a TOML date as `datetime.date`, which `json.dumps` cannot encode. **The DATABASE reference source coerces its values; the FILE source does not** — one producer of the same sink was hardened and its sibling was not.
+
+**Cluster:** Reference data / serialization boundary. **Priority:** P3. **Verdict:** build (small). **Severity:** on a first deployment, a reference TOML carrying an ordinary `effective = 2026-01-01` would fail its sync and every Handler using that code set would then raise **with the cause obscured** — the sync logs one WARNING naming the exception class only, by deliberate design.
+
+**This verdict flipped from "covered" under adversarial review**, and the reason it flipped is worth keeping: the original "covered" rested on the population of serialization boundaries being closed at two. It is three. `_load_file_source` returns `dict(load_code_set(path))` uncoerced, while `_load_database_source` routes through a `_cell` coercion.
+
+**Why nothing sees it.** The `Mapping[str, Any]` signature defeats mypy strict at exactly the point that matters. The one semgrep rule in the neighbourhood is CWE-502 deserialization, an **adjacent** class. **Every existing test uses CSV**, where all values are already `str`, so the whole test suite is structurally incapable of reaching the defect.
+
+**Two candidate fixes, and they are not equivalent.** Routing the file producer through `_cell` fixes this instance; giving the sink a `default=` hook fixes the class, including the next producer nobody has written yet. Prefer the sink.
+
+**Related:** #1093, #1073.
+
+**Source:** BACKLOG #1073's ASCQM pass, element `ASCRM-RLB-3` (CWE-1070). Verified against the shipped loader and sink.
+
+## 1091. Hard-coded credential detection reads neither `.ps1` nor `.yaml`, and the entropy gate floors out on exactly the interesting secrets
+
+> 🔢 **Filed 2026-08-07 — not started.** Value **7/10** · Difficulty **4/10**. The two required gates that are supposed to stop a committed credential have a **combined blind spot that covers most of the places a credential would actually live**. bandit is a Python AST scanner and does not parse `.ps1` or `.yaml` **at all**; gitleaks' operative generic rule is entropy-gated, so a **low-entropy** credential — `password`, `changeme`, a short site code — falls below the threshold and is not reported.
+
+**Cluster:** Secrets / supply-chain-in. **Priority:** P2. **Verdict:** build. **Severity:** a first deployment could carry a **defaulted database credential into production with both required gates green**. Two defaulted credentials sit in the tracked tree today and pass both.
+
+**READ THE SEVERITY PRECISELY.** This is **not** a live exposure and must never be written as one: nothing is deployed (§0), and the two tracked values are development defaults, not live secrets. The defect is that **the control cannot see the class**, so the next one — a real credential, added by someone trusting the gate — would land the same way.
+
+**Where a credential would live and be unseen:** `connections.toml`, `docker/compose.yaml`, `docker/k8s/*.yaml`, `scripts/dev/*.ps1`, and `samples/config/` (which is bandit-excluded outright).
+
+**The `env()` guidance is not a control.** Enforcement exists at exactly three seams in `config/wiring.py`. Everywhere else "supply it via `env()`" is documentation, and documentation does not fail a build.
+
+**Difficulty 4 is the false-positive budget, not the rule.** A naive low-entropy rule over YAML and PowerShell will fire on every `password:` key in every sample. The item is really "extend detection to the file types the project actually uses, with an allowlist for the deliberate development defaults" — and the allowlist must be **explicit and reviewable**, because an allowlist nobody can enumerate is the gate turned off.
+
+**Related:** #1093, #1073, #1092 (the same shape — a control believed stronger than its measured scope).
+
+**Source:** BACKLOG #1073's ASCQM pass, element `ASCSM-CWE-798`. Scanner behaviour confirmed against the pinned configurations, not inferred from the tools' reputations.
+
+## 1092. Every gate verdict that moved under measurement moved the same way, and three of them falsify a sentence the project had written down
+
+> 🔢 **Filed 2026-08-07 — not started.** Value **9/10** · Difficulty **3/10**. Across a 74-element audit with an adversarial refutation stage, **eight verdicts flipped and every one flipped the same direction: "covered" to "gap." Not one "gap" was refuted into "covered."** A symmetric process would not do that. The gates in this repo are, **on measured output**, weaker than the repo's own prose about them — and this item is about the **prose**, not the gates.
+
+**Cluster:** Quality record / claim honesty. **Priority:** P2. **Verdict:** build. **Severity:** no product effect. The defect is that the project's own quality record asserts machine enforcement that measurement does not support, and that record is read by adopters and by future sessions deciding what is already covered.
+
+**Three specific written claims were falsified by measurement.** These are the actionable core:
+
+1. [`Code_Quality_Standards.md`](Code_Quality_Standards.md) states that import and layer rules are **"machine-checked in CI"**, and scores signal 1 **Built — Strong** on the strength of `tests/test_dependency_boundaries.py`. That test walks `ast.Import` only, roots at `messagefoundry/`, and never opens a file under `harness/`, `tee/` or `scripts/`. `harness/load/__init__.py`'s own docstring claims the package "never imports the engine's pipeline/store/config internals" — **already false, and nothing measures it.**
+2. The shell-execution drift test's premise that an injectable new site **cannot land quietly**. It asserts a **file-path set**, never how a command string is built, and it exempts by name the three files that build them. Demonstrated by mutation: an unvalidated elevated `ShellExecuteW` added to `service.py` leaves both tests green.
+3. The claim that the web console is the only templated-HTML surface. `ide/src/` carries roughly fifteen `webview.html` assignment sinks across twelve modules, behind five different hand-rolled escapers — one of which does not escape quotes and says so in an in-file comment.
+
+**The general shape, and it is the reusable part.** *A gate's name is a claim; only its measured output and scope are evidence.* Each of these three passed review for as long as it did because the reviewer read what the gate was **called**. This is [`Code_Quality_Standards.md`](Code_Quality_Standards.md) §4.0's liveness rule extended one step: §4.0 asks whether a gate **ran**; this asks whether what it ran on is **what the prose says it covers**.
+
+**The deliverable is a scope audit of the quality record**, not a code change: for each "machine-checked" or "enforced" claim in the scorecard, name the instrument, state its measured scope, and correct any claim the scope does not support. Signals 1, 3 and 5 are the ones this audit already reached.
+
+**Related:** #1093, #1073, [`Code_Quality_Standards.md`](Code_Quality_Standards.md) §4.0, #1000 (a required check green because it read the wrong directory), #1027, #1018 (guards that go quiet).
+
+**Source:** BACKLOG #1073's ASCQM pass. The directional asymmetry (8 of 8 flips in one direction) is the statistic that turned three separate findings into one item.
+
+## 1093. ASCQM gap-hunt inventory: the BACKLOG #1073 findings not filed as their own items
+
+> 🔢 **Filed 2026-08-07 — not started.** Value **5/10** · Difficulty **2/10**. A holding item so the remainder of the #1073 pass is not lost between the four findings that got their own numbers (#1089–#1092) and the ~19 that are correctly **null**. **Nothing here is a new investigation** — each entry names its element, its site and why no current gate reaches it. Triage and split; do not treat this as one unit of work.
+
+**Cluster:** Quality gates / coverage. **Priority:** P3. **Verdict:** triage, then split. **Severity:** no product effect; several entries would become one on a first deployment.
+
+**Closable by enabling something already installed** — highest value per effort in the whole pass:
+
+- **`CWE-456` missing initialization.** `mypy --strict` does **not** include `possibly-undefined`. Enabling it caught 4 of 5 probe shapes, and the corpus is **measured clean — 0 findings across 279 files** — so it adopts green with zero remediation debt. One line in `pyproject.toml`. Partial: it does not catch conditionally-bound attributes, and the item should say so.
+- **`CWE-772`/`CWE-404` resource release.** Against a six-leak probe, ruff reported exactly **one** finding — `SIM115`, on builtin `open()`. A leaked socket, SMTP session, stream writer and dangling task all passed. `RUF006` is unselected; `filterwarnings` and `ResourceWarning` appear **nowhere in the tree**, so Python's own leak signal is emitted and discarded; `tests/conftest.py` autouse-mutes "Task was destroyed but it is pending" at every teardown.
+- **`CWE-1121` complexity scope.** The C901 scan argument is literally `messagefoundry` in all five places, missing a complexity-92 function in the shipped web console. `test_lint_scope_parity.py` already forces whole-repo scope for the required ruff leg for exactly this reason; nothing pins this one.
+- **`CWE-789` unbounded allocation.** `parsing/compression.py` decompressors default `max_output_bytes=None` and are re-exported to Handlers.
+
+**Needs a purpose-built check (system-level — the stated reason for the pass):**
+
+- **`CWE-424`/`CWE-1057` data access outside the store.** `pipeline/cluster.py` holds its own asyncpg pool and issues DDL including `CREATE TABLE nodes/leader_lease`; `cluster_sqlserver.py` drives 11 private store members. Both **deliberately avoid importing the store**, which is precisely what makes the one import-scanning gate blind.
+- **`CWE-424`/`CWE-1054` client-to-engine layer skip.** `harness/load/` constructs store classes directly and reaches `_pool`. Overlaps #1092 claim 1.
+- **`CWE-1088` timeouts.** `tests/test_ldap_timeouts.py` is a genuine AST gate **for ldap3 only** — and it exists because that convention already failed once. Nothing stops the identical regression at urllib, smtplib, ftplib, `socket.create_connection`, `asyncio.open_connection` or pynetdicom.
+- **`CWE-89` SQL.** bandit's only SQL heuristic, **B608, is explicitly disabled**, justified by a point-in-time manual review — and a review is not a control. Every interpolated token is a code constant **today**; nothing holds it there.
+- **`CWE-22` path traversal.** No shared `safe_join` choke point exists for a test to enforce, so each sink is guarded by whoever remembered.
+- **`CWE-1094`/`CWE-1067` index and scan.** No `EXPLAIN` anywhere in the tree; the repo's own test plan already records this as open.
+
+**DO NOT file the ~19 metric findings** (file length, parameter count, inheritance depth, child-class count, literal density, outward calls). They are correctly "gap" under the element definitions and are backed by no defect. [`Code_Quality_Standards.md`](Code_Quality_Standards.md) §4.1 governs: **a count is not an item.**
+
+**TWO PREMISES HERE WERE NOT VERIFIED, and must be before anything rests on them.** CodeQL's actual query coverage was established from suite selectors and query tags, **not by executing CodeQL against this tree**, so roughly a dozen verdicts citing "CodeQL does not carry query X" are unconfirmed. And every "not a required context" rests on the checked-in `.github/required-contexts.txt`, not the live API — a file whose own header records the required set moving five times in one day. **A live contradiction was found and deserves its own item:** `.github/workflows/security.yml` asserts CodeQL "runs free and IS a required context" while `required-contexts.txt` lists it under DELIBERATELY NOT REQUIRED. One of them is wrong.
+
+**Related:** #1073 (the pass), #1089–#1092 (the findings that got their own numbers).
+
+**Source:** BACKLOG #1073's ASCQM 1.1 catalogue pass over all 74 live elements, with an adversarial refutation stage on every non-not-applicable verdict.

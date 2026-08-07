@@ -559,6 +559,16 @@ harness process only.)
 - Don't build **Serial (RS-232) / ASTM E1381/E1394/E1318** lab-instrument connectivity —
   **declined-by-design (v0.2+)**: no real feed demand, outside the HL7/FHIR/X12/DICOM scope
   ([`docs/BACKLOG.md`](docs/BACKLOG.md) #27, [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md)).
+- Don't adopt **ISO/IEC 5055:2021 / OMG ASCQM** as a quality **measure** — **declined-by-design
+  (2026-08-07)**, three reasons each independently sufficient: no free or open-source
+  5055-conformant **Python** analyser exists (the conformant ecosystem is C/C++/Java/C#/COBOL-
+  weighted), there is no contract counterparty for the clause the standard exists to support (it is
+  written into development and outsourcing contracts; this is OSS on PyPI), and a weakness-**count**
+  score collides with the anti-metric rule in
+  [`docs/Code_Quality_Standards.md`](docs/Code_Quality_Standards.md) §4.1. **The catalogue is a
+  different question and was adopted:** the ASCQM 1.1 weakness list is free from OMG, one bounded
+  pass over it ran under [`docs/BACKLOG.md`](docs/BACKLOG.md) #1073, and its findings are #1089–#1093.
+  Re-running that pass is legitimate; adopting the score is not.
 - Don't keep grinding in a polluted context — `/clear` after repeated failures.
 - Don't use **glyphs or emoji** in prose, comments, commit messages, PR bodies or replies — say the
   word (§11). The backlog status-banner alphabet is the one machine-parsed holdout; read it with
