@@ -15,7 +15,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
-from messagefoundry.auth import Role
+from messagefoundry.auth import Role, totp
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
@@ -295,10 +295,12 @@ async def test_admin_user_update_opt_out_uses_window(engine: Engine) -> None:
         assert r.status_code == 200, r.text
 
 
-async def test_login_and_verify_mfa_never_grant_an_action(engine: Engine) -> None:
+async def test_login_and_verify_mfa_never_grant_an_action(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """AC-3: neither login nor verify_mfa mints a per-action grant — only reauth(purpose=…) does."""
 
-    from _totp_clock import fresh_totp
+    from _totp_clock import pin_totp_clock
 
     service = await _service(engine)
     await _add_admin(service, "boss")
@@ -309,13 +311,20 @@ async def test_login_and_verify_mfa_never_grant_an_action(engine: Engine) -> Non
         # Login stamped the session window but no action grant.
         assert await service.has_recent_step_up(token) is True
         assert await service.has_action_step_up(token, "mfa_enroll") is False
-        # Enroll + confirm TOTP (drives the service directly, past the HTTP step-up).
+        # Enroll + confirm TOTP (drives the service directly, past the HTTP step-up). Pin the TOTP clock
+        # so the later verify_mfa can use a strictly-later step than enrollment consumes (BACKLOG #1021).
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
         enroll = await service.begin_mfa_enrollment(identity)
-        await service.confirm_mfa_enrollment(identity, fresh_totp(enroll.secret), token=token)
+        await service.confirm_mfa_enrollment(
+            identity, totp.totp(enroll.secret, now=t0), token=token
+        )
         # A fresh MFA-required login, then verify_mfa: it seeds the session window but NOT an action grant.
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
         token2 = (await service.login("boss", PW)).token
         assert token2 is not None
-        assert await service.verify_mfa(token2, fresh_totp(enroll.secret)) is True
+        assert await service.verify_mfa(token2, totp.totp(enroll.secret, now=t1)) is True
         assert await service.has_recent_step_up(token2) is True  # verify_mfa re-anchored the window
         assert await service.has_action_step_up(token2, "mfa_disable") is False  # but no grant
         # Only reauth(purpose=…) mints one — and it is single-use.

@@ -20,12 +20,18 @@ Rules (ADR 0076 §2):
 * Every path uses the same ``SEG-F[.C[.S]]`` grammar as :class:`Message`, which reads the message's own
   MSH encoding characters — never hardcoded delimiters — and re-encodes structurally (never string
   slicing).
+* A **closed-set** argument (``convert_case`` mode, ``pad_field`` side, ``arith_field`` op,
+  ``date_diff_field`` unit) is typed ``Literal[...]`` **and** kept behind its runtime ``ValueError``
+  guard: the type layer rejects a wrong literal at author time (and lets ``lens schema`` project it as an
+  ``enum`` dropdown, BACKLOG #235), while the guard still catches a dynamically-supplied bad value at run
+  time — the overlap is intentional, two layers guarding different callers, not a restated check.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime
+from typing import Literal
 
 from messagefoundry.parsing.message import Message
 from messagefoundry.timezone import parse_hl7_timestamp
@@ -73,7 +79,7 @@ def append_to_field(msg: Message, path: str, suffix: str) -> None:
     msg.set(path, (msg.field(path) or "") + suffix)
 
 
-def convert_case(msg: Message, path: str, mode: str) -> None:
+def convert_case(msg: Message, path: str, mode: Literal["upper", "lower", "title"]) -> None:
     """Upper/lower/title-case the value at ``path`` in place (Corepoint ``ItemConvert``/``ItemFormat``).
 
     ``mode`` is one of ``"upper"`` / ``"lower"`` / ``"title"``. A no-op on an absent field; raises
@@ -167,7 +173,9 @@ def substring_field(msg: Message, path: str, start: int, end: int | None = None)
     msg.set(path, value[start:end])
 
 
-def pad_field(msg: Message, path: str, width: int, *, fill: str = "0", side: str = "left") -> None:
+def pad_field(
+    msg: Message, path: str, width: int, *, fill: str = "0", side: Literal["left", "right"] = "left"
+) -> None:
     """Pad the value at ``path`` to ``width`` with ``fill`` on ``side`` (Corepoint ``ItemConvert`` pad).
 
     ``side="left"`` right-justifies (e.g. zero-pad an MRN); ``side="right"`` left-justifies. A value
@@ -199,7 +207,12 @@ def replace_literal(msg: Message, path: str, old: str, new: str) -> None:
 
 
 def arith_field(
-    msg: Message, path: str, op: str, operand: float, *, ndigits: int | None = None
+    msg: Message,
+    path: str,
+    op: Literal["+", "-", "*", "/"],
+    operand: float,
+    *,
+    ndigits: int | None = None,
 ) -> None:
     """Apply a bounded arithmetic operation to the numeric value at ``path`` (Corepoint ``ItemExpr``).
 
@@ -234,7 +247,12 @@ def arith_field(
 
 
 def date_diff_field(
-    msg: Message, start_path: str, end_path: str, dst: str, *, unit: str = "days"
+    msg: Message,
+    start_path: str,
+    end_path: str,
+    dst: str,
+    *,
+    unit: Literal["days", "years", "hours", "minutes"] = "days",
 ) -> None:
     """Write the whole-number interval between two message timestamps to ``dst`` (Corepoint ``ItemDiffDate``).
 

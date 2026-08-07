@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 
 _ROOT = Path(__file__).resolve().parent.parent
 _PKG = _ROOT / "messagefoundry"
@@ -185,9 +186,12 @@ def test_secret_setting_keys_are_registered() -> None:
     # every one that is not a bare identifier in _NON_ROTATABLE_SECRET_SETTING_KEYS — must be a registered
     # critical secret with a rotation row, so a FUTURE connector credential added there trips this gate
     # until it is inventoried + documented. Both are imported from wiring (the single source of truth,
-    # ALSO read by the ASVS-13.3.4 runtime fingerprinter connector_secret_env_values, so the registration
-    # gate and the runtime rotation set can never disagree); imported locally so a collection-time wiring
-    # import error is contained to this one test.
+    # ALSO read by the ASVS-13.3.4 runtime fingerprinter connector_secret_env_values). This gate proves
+    # only the FORWARD direction (every _SECRET_SETTING_KEYS member is registered); that the registration
+    # gate and the runtime rotation set agree is ENFORCED, not self-evident -- the reverse is checked by
+    # test_registered_connector_secrets_are_reachable_by_the_fingerprinter (BACKLOG #1009), which is the
+    # direction body_secret_value slipped through (it entered CRITICAL_SECRETS by hand, never through
+    # _SECRET_SETTING_KEYS). Imported locally so a collection-time wiring import error is contained here.
     from messagefoundry.config.wiring import (
         _NON_ROTATABLE_SECRET_SETTING_KEYS,
         _SECRET_SETTING_KEYS,
@@ -208,6 +212,99 @@ def test_secret_setting_keys_are_registered() -> None:
         "register each here AND add a rotation row in docs/ASVS-L2-PHASE0-CHANGES.md §4 (or add "
         f"it to _NON_ROTATABLE_SETTING_KEYS if it is a non-secret identifier): {missing}"
     )
+
+
+# --- ASVS 13.3.4: the REVERSE of test_secret_setting_keys_are_registered (BACKLOG #1009) ----------
+#
+# The forward gate proves _SECRET_SETTING_KEYS is registered. It is blind to the other direction: a
+# registered CONNECTOR secret whose runtime setting never resolves through connector_secret_env_values
+# (the ASVS-13.3.4 fingerprinter). The SOAP body_secret_value class entered CRITICAL_SECRETS by hand
+# without passing through _SECRET_SETTING_KEYS, and the fingerprinter's bare-frozenset filter dropped it
+# -- so a rotation of a SOAP injected body secret was not auto-detected, while the forward gate walked
+# straight past (its comment even promised the two sets "can never disagree"). This gate closes that
+# direction: every registered connector secret must be REACHABLE by the fingerprinter (ADR 0015).
+
+#: Registered connector secrets that name NO reachable connector setting, each with the reason. Kept
+#: here (not only in prose) so an exclusion is a reviewed decision with a hygiene test behind it, exactly
+#: like _NOT_FINGERPRINTED: silently removing a real reachable secret must not pass unnoticed.
+_NOT_A_CONNECTOR_SETTING: dict[str, str] = {
+    "private_key_password": (
+        "a per-message JWS SigningConfig passphrase (ADR 0018); the connector-level setting names are "
+        "sign_private_key / sign_private_key_password (transports/signing.py), neither a "
+        "_SECRET_SETTING_KEYS member, so connector_secret_env_values does not resolve it. Whether the "
+        "JWS signing key is itself fingerprinted/redacted is a real but SEPARATE question, deliberately "
+        "not folded into the one-predicate #1009 scope"
+    ),
+}
+
+#: A registered connector secret whose runtime setting name is DYNAMIC -- the CRITICAL_SECRETS key is a
+#: family label, not the literal setting the fingerprinter sees. Maps label -> a representative concrete
+#: setting name in that family, so the reachability probe uses a name _is_secret_setting accepts.
+_CONNECTOR_SETTING_REPRESENTATIVE: dict[str, str] = {
+    "body_secret_value": "body_secret_value_0",  # Soap(body_secrets=...) -> body_secret_value_<i>
+}
+
+
+def test_registered_connector_secrets_are_reachable_by_the_fingerprinter() -> None:
+    """The missing reverse of test_secret_setting_keys_are_registered (BACKLOG #1009, ADR 0015).
+
+    For every registered CONNECTOR secret (a CRITICAL_SECRETS key that is not a fixed ``MEFOR_*`` env
+    var), build a representative outbound whose settings name that secret and assert
+    ``connector_secret_env_values`` returns its env key -- so a future registry entry added by hand
+    cannot silently fall through the fingerprint filter the way ``body_secret_value`` did.
+
+    Mutation (current bug): revert the ``config/wiring.py`` predicate to bare ``_SECRET_SETTING_KEYS``
+    membership -> ``body_secret_value``'s probe key is absent from the result -> named in ``unreachable``.
+    Mutation (future-proofing): add a fabricated unreachable entry to ``CRITICAL_SECRETS`` -> it is named
+    in ``unreachable`` too. Both are genuine reds, not vacuous passes.
+    """
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import (
+        ConnectionSpec,
+        EnvRef,
+        OutboundConnection,
+        Registry,
+        connector_secret_env_values,
+    )
+
+    connector_secrets = [
+        k
+        for k in CRITICAL_SECRETS
+        if not k.startswith("MEFOR_") and k not in _NOT_A_CONNECTOR_SETTING
+    ]
+    reg = Registry()
+    env_values: dict[str, str] = {}
+    probes: dict[str, str] = {}  # registered secret -> its unique probe env-value key
+    for secret in connector_secrets:
+        # The fingerprinter reads setting NAMES and ignores connector type, so a REST spec carrying an
+        # arbitrary secret setting name is a valid probe of the filter (no connector-type validation runs).
+        setting_name = _CONNECTOR_SETTING_REPRESENTATIVE.get(secret, secret)
+        probe = f"probe_env_{secret}"
+        settings: dict[str, Any] = {setting_name: EnvRef(key=probe)}
+        reg.outbound[f"OB_{secret}"] = OutboundConnection(
+            name=f"OB_{secret}",
+            spec=ConnectionSpec(type=ConnectorType.REST, settings=settings),
+        )
+        env_values[probe] = f"SYNTH-{secret}"  # synthetic; env key names are not PHI
+        probes[secret] = probe
+
+    resolved = connector_secret_env_values(reg, env_values)
+    unreachable = sorted(secret for secret, probe in probes.items() if probe not in resolved)
+    assert not unreachable, (
+        "registered connector secret(s) that connector_secret_env_values does not resolve -- a rotation "
+        "of them would not be fingerprinted (ASVS 13.3.4). Fix the wiring._is_secret_setting / "
+        "_SECRET_SETTING_KEYS coverage, or excuse each in _NOT_A_CONNECTOR_SETTING WITH the reason it "
+        f"names no connector setting: {unreachable}"
+    )
+
+    # Hygiene: the two curated maps must be disjoint and may name only registered CONNECTOR secrets, so
+    # neither can rot into a place to park an unreachable secret (mirrors the _NOT_FINGERPRINTED discipline).
+    overlap = sorted(set(_NOT_A_CONNECTOR_SETTING) & set(_CONNECTOR_SETTING_REPRESENTATIVE))
+    assert not overlap, f"secret(s) both excused AND represented -- pick one: {overlap}"
+    for name in (*_NOT_A_CONNECTOR_SETTING, *_CONNECTOR_SETTING_REPRESENTATIVE):
+        assert name in CRITICAL_SECRETS and not name.startswith("MEFOR_"), (
+            f"{name!r} in a curated connector-secret map is not a registered connector secret"
+        )
 
 
 def test_scanner_flags_a_planted_secret(tmp_path: Path) -> None:
