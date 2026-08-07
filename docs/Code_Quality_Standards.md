@@ -196,6 +196,8 @@ stops measuring is worse than an absent one, because the scorecard still counts 
 
 **Do NOT certify quality — or fail a build — on any single one of:** line-coverage %, LOC, raw or cognitive cyclomatic complexity, or SonarQube severity counts. Each is a weak or gameable predictor (§2). They may be *surfaced as advisory triage signals*; they must never be *the* quality gate. This mirrors the AI companion's "gates are deterministic checks, never ask the model to be secure" — here: *a scoreboard is never the verdict.*
 
+**This rule is one of the three reasons ISO/IEC 5055:2021 / OMG ASCQM is declined as a quality measure.** The decline is recorded once, with its reasons, in [`../CLAUDE.md`](../CLAUDE.md) §12 — do not restate them here.
+
 ### 4.2 No validated single threshold (honest)
 
 The literature validates that single metrics fail, but supplies **no validated numeric cutoff** for a combined scorecard. Thresholds (e.g. a mutation-score floor on changed code, a max new-clone count) are therefore **set empirically per project and recorded in the Appendix**, reviewed as data accumulates — not imported as universal constants. Where this document names a directional target, it is flagged as project-set, not evidence-certified.
