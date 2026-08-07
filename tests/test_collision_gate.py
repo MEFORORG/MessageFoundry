@@ -409,7 +409,18 @@ def test_uninstall_removes_only_our_entries(settings: Path) -> None:
 
 
 def test_status_reports_installed_state(settings: Path) -> None:
-    assert "missing" in run_installer(settings, "-Status")
+    # UPPERCASE. The installer prints "MISSING"; a lowercase substring check is case-sensitive and so
+    # failed against output saying exactly what this test wants it to say. The word changed when
+    # -Status grew its per-root breakdown -- deliberately, so an absent row reads as loudly as a
+    # present one -- and the assertion did not move with it.
+    #
+    # THIS IS THE SECOND COPY OF THAT BUG AND THE SWEEP THAT SHOULD HAVE CAUGHT IT LOOKED IN ONE FILE.
+    # The first was in test_announce_wiring.py. Asked whether the class recurred, the sweep covered
+    # that file rather than every caller of the installer, reported "no third instance", and missed
+    # this one -- an instrument whose scope was narrower than the question, which is the same failure
+    # the fix itself was about. THREE test modules drive install-coordination.ps1:
+    # test_announce_wiring.py, this file, and test_installed_coord_hooks.py. Sweep all three.
+    assert "MISSING" in run_installer(settings, "-Status")
     run_installer(settings)
     assert "INSTALLED" in run_installer(settings, "-Status")
 

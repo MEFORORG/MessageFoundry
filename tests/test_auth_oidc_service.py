@@ -28,7 +28,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from messagefoundry.auth import oidc
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, LoginOutcome
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.settings import AuthSettings
@@ -125,8 +125,18 @@ PRINCIPAL = AdPrincipal(
 
 
 class _FakeLdap:
-    def __init__(self, principal: AdPrincipal | None = PRINCIPAL) -> None:
+    def __init__(
+        self,
+        principal: AdPrincipal | None = PRINCIPAL,
+        *,
+        by_username: dict[str, AdPrincipal | None] | None = None,
+    ) -> None:
+        # ``by_username`` maps a (domain-stripped) resolve key to the AD object it resolves to, so a test
+        # can express a CHANGED OIDC display-username that still resolves to the same AD object (BACKLOG
+        # #1015). When it is None (the default), the fixed ``principal`` is returned for any username, so
+        # every pre-existing caller is unchanged.
         self._principal = principal
+        self._by_username = by_username
         self.resolved: list[str] = []
 
     def authenticate(self, username: str, password: str) -> AdPrincipal | None:
@@ -134,6 +144,8 @@ class _FakeLdap:
 
     def resolve_principal(self, username: str) -> AdPrincipal | None:
         self.resolved.append(username)
+        if self._by_username is not None:
+            return self._by_username.get(username, self._principal)
         return self._principal
 
 
@@ -178,6 +190,20 @@ def _stub_exchange(monkeypatch: pytest.MonkeyPatch, id_token: str) -> list[dict[
 
 async def _audit_rows(store: MessageStore, action: str) -> list[Mapping[str, Any]]:
     return [a for a in await store.list_audit() if a["action"] == action]
+
+
+async def _oidc_login(
+    service: AuthService,
+    monkeypatch: pytest.MonkeyPatch,
+    rsa_key: rsa.RSAPrivateKey,
+    **claim_over: Any,
+) -> LoginOutcome:
+    """Run one federated login, stubbing the token exchange to return a freshly-minted id_token whose
+    claims are ``_claims(**claim_over)`` (so a test can vary ``sub`` / ``preferred_username``)."""
+    _stub_exchange(monkeypatch, _mint(rsa_key, _claims(**claim_over)))
+    return await service.authenticate_oidc(
+        AUTH_CODE, _flow(), redirect_uri="https://ops.example/ui/oidc/callback"
+    )
 
 
 # --- #285 (ASVS 6.7.1): the enforcement dial reaches the OIDC anchor's construction seam ------------
@@ -300,6 +326,107 @@ async def test_an_alternate_upn_suffix_is_accepted_when_allow_listed(
             AUTH_CODE, _flow(), redirect_uri="https://ops.example/ui/oidc/callback"
         )
         assert out.ok
+    finally:
+        await store.close()
+
+
+# --- #1015: the account is keyed on (issuer, sub), never the reassignable username -----------------
+
+
+async def test_changed_subject_same_username_does_not_take_over(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1015, the P1 regression. A first federated login binds the local account to its verified
+    subject. When the IdP later REASSIGNS the username to a different person (a new ``sub``, a normal IdP
+    lifecycle operation), that new subject must NOT be handed the prior holder's account — that is account
+    takeover with no credential compromise. The login is refused with a closed-set audit reason and the
+    bound account is left untouched."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        first = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
+        assert first.ok and first.identity is not None
+        account = await store.get_user_by_username("jdoe")
+        assert account is not None
+        assert account.oidc_subject == "S-1-alice"  # bound on the first federated login
+
+        # The username is reassigned to a new person (new sub); they complete a federated login.
+        second = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-bob")
+        assert not second.ok and second.token is None
+        assert second.reason == "federated_subject_conflict"
+
+        after = await store.get_user_by_username("jdoe")
+        assert after is not None
+        assert after.id == account.id  # the same account, not taken over
+        assert after.oidc_subject == "S-1-alice"  # still bound to the ORIGINAL subject
+        rows = await _audit_rows(store, "auth.login_failed")
+        assert any('"reason": "federated_subject_conflict"' in (r["detail"] or "") for r in rows)
+    finally:
+        await store.close()
+
+
+async def test_same_subject_changed_username_is_same_account(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The converse of the takeover case: the SAME person (same ``sub``) whose display username changed
+    but still resolves to the same on-prem AD object must land on the SAME local account, with the
+    display refreshed — not be refused and not fork a second row."""
+    store = await MessageStore.open(":memory:")
+    try:
+        renamed = AdPrincipal(
+            username="jdoe",  # same AD object (stable sAMAccountName), new display name
+            display_name="Jane Doe-Smith",
+            email="jane@corp.example",
+            dn="CN=jdoe,DC=corp,DC=example",
+            groups=PRINCIPAL.groups,
+        )
+        ldap = _FakeLdap(by_username={"jdoe": PRINCIPAL, "jsmith": renamed})
+        service = await _service(store, rsa_key, ldap=ldap)
+
+        first = await _oidc_login(
+            service, monkeypatch, rsa_key, sub="S-1-alice", preferred_username="jdoe@corp.example"
+        )
+        assert first.ok
+        account = await store.get_user_by_username("jdoe")
+        assert account is not None
+        assert account.oidc_subject == "S-1-alice"
+        assert account.display_name == "J Doe"
+
+        # Same subject, a changed preferred_username that AD resolves to the same object.
+        second = await _oidc_login(
+            service, monkeypatch, rsa_key, sub="S-1-alice", preferred_username="jsmith@corp.example"
+        )
+        assert second.ok and second.identity is not None
+        after = await store.get_user_by_username("jdoe")
+        assert after is not None
+        assert after.id == account.id  # same local account
+        assert after.oidc_subject == "S-1-alice"  # binding stable
+        assert after.display_name == "Jane Doe-Smith"  # refreshed from the resolved AD object
+        assert await store.get_user_by_username("jsmith") is None  # no forked row
+    finally:
+        await store.close()
+
+
+async def test_username_reused_across_two_subjects_does_not_collide(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two distinct subjects present the same display username at different times. The second must be
+    refused cleanly (no unhandled exception, a closed-set audit reason) and must not share the first
+    subject's account or receive a session."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        first = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
+        assert first.ok
+
+        second = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-carol")
+        assert not second.ok and second.token is None
+        assert second.reason == "federated_subject_conflict"
+
+        account = await store.get_user_by_username("jdoe")
+        assert account is not None
+        assert account.oidc_subject == "S-1-alice"  # still the first subject's account
+        assert len([u for u in await store.list_users() if u.username == "jdoe"]) == 1
     finally:
         await store.close()
 

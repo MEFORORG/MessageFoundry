@@ -489,3 +489,92 @@ def test_malformed_env_file_fails_cleanly_not_traceback(
     err = capsys.readouterr().err
     assert "could not read environment values" in err
     assert "dev.toml" in err
+
+
+# --- AC-6 / BACKLOG #1062: the build check must READ values from the root it VALIDATED -------------
+
+
+def _root_with_values(root: Path, peer_host: str, *, env: str = "prod") -> Path:
+    """A project root carrying a config, a service toml, and one environment value file."""
+    _config_dir(root, _ENV_GRAPH)
+    (root / "messagefoundry.toml").write_text(f'[ai]\nenvironment = "{env}"\n', encoding="utf-8")
+    envdir = root / "environments"
+    envdir.mkdir(exist_ok=True)
+    (envdir / f"{env}.toml").write_text(f'peer_host = "{peer_host}"\n', encoding="utf-8")
+    return root
+
+
+def test_build_check_reads_values_from_the_root_not_the_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1062. ``check --project-root R`` hard-fails when ``R/<env_dir>/<env>.toml`` is absent,
+    then used to DROP R and read the values from the process directory -- so the ADR 0092 posture-keyed
+    insecure-hop refusal could be decided against a different environment's hosts and schemes than the
+    one the operator named. ``serve`` never had this: it writes the root into ``[environments].base_dir``
+    before ``load_settings``.
+
+    Asserted by the DIVERGENCE, which is the only shape that can fail: the process directory holds its
+    OWN value file with a different host. A test run from inside the root passes with the bug present,
+    because both anchors agree there -- the same masking that hid the rule 3d defect on Windows.
+    """
+    root = _root_with_values(tmp_path / "R", "10.0.0.9")
+    elsewhere = _root_with_values(tmp_path / "W", "192.168.1.1")
+    monkeypatch.chdir(elsewhere)  # the process directory is NOT the root
+
+    seen: list[str] = []
+    import messagefoundry.checks as checks_mod
+    import messagefoundry.config.environments as env_mod
+
+    # `_check_build` imports this inside the function, so the patch must land on the SOURCE module.
+    real = env_mod.load_environment_values
+
+    def _spy(*, base_dir: Path, **kw: object) -> object:
+        seen.append(str(base_dir))
+        return real(base_dir=base_dir, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(env_mod, "load_environment_values", _spy)
+
+    checks_mod.run_checks(
+        root / "config",
+        run_lint=False,
+        service_config=str(root / "messagefoundry.toml"),
+        suppress_service_toml_search=True,
+        project_root=str(root),
+    )
+
+    assert seen, "the build check never resolved environment values -- the test proves nothing"
+    assert seen[0] == str(root), f"values were read from {seen[0]}, not the supplied root {root}"
+    assert str(elsewhere) not in seen
+
+
+def test_without_a_root_the_build_check_still_falls_back_to_the_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half, and the one that makes the fix a correction rather than a widening: with no
+    ``--project-root`` the resolution is unchanged and still anchors on the process directory, so the
+    documented ``messagefoundry check --config config`` invocation is untouched."""
+    here = _root_with_values(tmp_path / "here", "10.0.0.9")
+    monkeypatch.chdir(here)
+
+    seen: list[str] = []
+    import messagefoundry.checks as checks_mod
+    import messagefoundry.config.environments as env_mod
+
+    # `_check_build` imports this inside the function, so the patch must land on the SOURCE module.
+    real = env_mod.load_environment_values
+
+    def _spy(*, base_dir: Path, **kw: object) -> object:
+        seen.append(str(base_dir))
+        return real(base_dir=base_dir, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(env_mod, "load_environment_values", _spy)
+
+    checks_mod.run_checks(
+        here / "config",
+        run_lint=False,
+        service_config=str(here / "messagefoundry.toml"),
+        suppress_service_toml_search=True,
+    )
+
+    assert seen, "the build check never resolved environment values -- the test proves nothing"
+    assert seen[0] == str(here)
