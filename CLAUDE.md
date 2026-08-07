@@ -546,10 +546,13 @@ harness process only.)
   accept-and-drop a received message.
 - Don't build **visual / template-driven authoring** (drag-drop transformer, declarative
   field-mapping) — **declined-by-design (v0.2+)**: code-first Routers/Handlers *are* the
-  differentiator ([`docs/BACKLOG.md`](docs/BACKLOG.md) #26). *Narrow carve-out (2026-07-10, #26
-  amendment; widened to Routers 2026-08-05 per ADR 0076 Amendment D, BACKLOG #232):* a
-  **structured Steps view** over real Python Handlers **and Routers** via a typed action
-  vocabulary (BACKLOG #222; the router `route` row kind is #232, ADR-gated) is permitted — the
+  differentiator (BACKLOG #26 — closed, so it lives in
+  [`docs/archive/backlog/BACKLOG-CLOSED.md`](docs/archive/backlog/BACKLOG-CLOSED.md), not in the
+  live ledger). *Narrow carve-out (2026-07-10, #26 amendment; widened to Routers 2026-08-05 per
+  [ADR 0076](docs/adr/0076-typed-action-vocabulary-action-list-lens.md) Amendment D, BACKLOG
+  #232):* a **structured Steps view** over real Python Handlers **and Routers** via a typed action
+  vocabulary (BACKLOG #222 — closed, same archive; the router `route` row kind is #232, still open
+  in [`docs/BACKLOG.md`](docs/BACKLOG.md), ADR-gated) is permitted — the
   carve-out was granted because the `.py` stays the **only artifact and the only execution path**,
   and that property holds identically for a `@router` (a byte-splice Steps view over a real
   `@router` projects destination selection from reviewable Python; it introduces no declarative
@@ -558,7 +561,9 @@ harness process only.)
   remain declined.
 - Don't build **Serial (RS-232) / ASTM E1381/E1394/E1318** lab-instrument connectivity —
   **declined-by-design (v0.2+)**: no real feed demand, outside the HL7/FHIR/X12/DICOM scope
-  ([`docs/BACKLOG.md`](docs/BACKLOG.md) #27, [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md)).
+  (BACKLOG #27 — closed, so it lives in
+  [`docs/archive/backlog/BACKLOG-CLOSED.md`](docs/archive/backlog/BACKLOG-CLOSED.md), not in the
+  live ledger; the connector-parity row is [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md)).
 - Don't adopt **ISO/IEC 5055:2021 / OMG ASCQM** as a quality **measure** — **declined-by-design
   (2026-08-07)**, three reasons each independently sufficient: no free or open-source
   5055-conformant **Python** analyser exists (the conformant ecosystem is C/C++/Java/C#/COBOL-
