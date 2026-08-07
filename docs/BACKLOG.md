@@ -5340,6 +5340,61 @@ cd ../Unrelated && git -C . config core.hooksPath /dev/null
 
 **Source:** found 2026-08-07 by being refused. The commit that filed #1085 was blocked by the very rule the item documents, which is how the intermittency was noticed — several earlier commits in the same series had quoted the same class of command and passed.
 
+---
+
+### ⭐ A FIX WAS BUILT, VERIFIED, AND REJECTED — and the correction is MEASURED. Start here, do not redesign.
+
+A candidate was written and put through three adversarial verifiers on 2026-08-07. **Verdict NOT READY**,
+for one defect. The design is right and should be kept; only a single classifier regex is wrong. Patch
+banked at `FINDINGS-1061-verifiers-2026-08-06\1086-patch-NOT-READY.diff`, synthesis beside it. Resume
+with `resumeFromRunId: "wf_b4050e2f-77d"` — **re-apply the banked patch first**, or the verifiers inspect
+a clean tree and verify nothing.
+
+**WHAT WAS RIGHT** (both pinned by killed mutants, do not undo either): key on the CONSUMING FLAG, not
+the delimiter; and run the message-blanking **AFTER** the interpreter recursion. The "blank before
+recursion" mutant is killed by seven to nine interpreter payloads in all three mutation runs.
+
+**WHAT WAS WRONG — the whole rejection.** The flag classifier `-(?![A-Za-z]*[ce])[A-Za-z]*m` matches an
+**open-ended letter cluster**. PowerShell accepts unambiguous parameter PREFIXES, so `-Com` and `-Comm`
+are working spellings of `-Command` that contain no lowercase `c` or `e` and end in `m` — they were
+classified as MESSAGE and their code was blanked:
+
+```
+pwsh -Com  @'...'@   committed DENY/3c  ->  candidate ALLOW
+pwsh -Comm @'...'@   committed DENY/3c  ->  candidate ALLOW
+pwsh -Com  @'git reset --hard'@          committed DENY/3   -> candidate ALLOW
+pwsh -Com  @'git worktree remove ...'@   committed DENY/3d  -> candidate ALLOW
+```
+
+**THE MEASURED REPLACEMENT.** Replace the open-ended cluster with a CLOSED set of git message flags —
+`--message`, `-m`, `-am`, or a bounded class such as `-[amsSnqve]*m`. Two verifiers independently
+measured that this returns those four rows to DENY, keeps all eleven #1086 ALLOW cases and every
+narrowness case ALLOW, and produces **zero other verdict movement**. It also stops `-Cm`, `-Em` and
+`-Program` being misclassified.
+
+⛔ **TWO THINGS THE CANDIDATE DID NOT DISCLOSE, both must be in the redo:**
+1. **A surviving mutant.** Relaxing the separator `[ \t=]+` to `[ \t=]*` survives the entire suite —
+   found independently by two verifiers, same mutant hash. Non-equivalence: `git commit -m"a\n<disarm>\nb"`
+   and the `-m'...'` and `-m@'...'@` glued forms go DENY to ALLOW under it. **The `+` is load-bearing and
+   no test says so.** Add one.
+2. **Two spellings of #1086's own defect remain refused**: `git commit -m"multi-line"` and
+   `-m'multi-line'` — glued, no separator — because of that same `[ \t=]+`. Narrow, but it is this
+   item's own shape and belongs in the disclosure list.
+
+**TEST BY THE PREFIX FAMILY, NOT ONE SPELLING** (this is #1097's requirement and it applies here too):
+enumerate `-C` through `-Command` asserting each DENIES, plus `-Cm` as the bounding negative proving the
+family does not widen into any-letters-ending-in-m.
+
+⚠️ **AND THE READING RULE THIS ROUND EARNED:** two of three verifiers found the fail-open; **the third
+ACCEPTED, because its corpus contained no `-Com` payload.** Its evidence could not see the class it was
+approving — #1000's shape occurring inside the verification of a #1000 fix. **Do not read "one verifier
+accepted" as evidence; read what its corpus covered.**
+
+**Relationship to #1097.** They are separable and must both be fixed: #1097 is the PRE-EXISTING
+interpreter-recursion gap on the committed gate; this item's candidate would have converted #1097's
+accidental here-string denial into a clean fail-open. Fix #1097 first or together, and verify either
+against the gate **as it will ship**, not as it is.
+
 **Source:** identified 2026-08-05 while fixing #1032, and deliberately deferred rather than swept in, so that fix stayed scoped to one rule. Recorded here because a deferral nobody files is a deferral dropped.
 
 ## 1036. A Rule 4 deny names the first allowlisted repo's tooling regardless of which repo fired it
@@ -6400,3 +6455,31 @@ The two "No" rows are the majority and the harder half. Root cause for the ancho
 **Related:** #1094 (two instances of this class, closed — already satisfied when filed), #1073 (whose §12 marker prompted the original find, and which is itself the closed-but-not-archived case), #1000 (a control whose green is not evidence about what it appears to cover), [`../CLAUDE.md`](../CLAUDE.md) §11 (state a load-bearing fact once and link to it — which is what makes a link's durability load-bearing).
 
 **Source:** repo-wide sweep 2026-08-07 while repointing the [`CONNECTIONS.md`](CONNECTIONS.md) serial/ASTM decline (PR #273, the `docs/CONNECTIONS.md` half of the same two-marker pair #1094 covered in `../CLAUDE.md`). Item locations came from `parse_items` imported from the status-check script rather than a hand-rolled scan; the resolver was validated on planted good-and-bad citations, including the closed-but-not-yet-archived case, before its output was believed.
+## 1097. The interpreter recursion list is a fixed set of flag spellings, but PowerShell accepts unambiguous prefixes, so `-Com` hides its argument from every rule
+
+> 🔢 **Filed 2026-08-07 — not started. ⛔ LIVE ON THE INSTALLED GATE, and it is a FAIL-OPEN, not a wording defect.** Value **8/10** · Difficulty **2/10** · _do it_. `worktree_gate.ps1:285` recurses into an interpreter argument for a FIXED list of spellings -- `-c` / `-lc` / `-Command` / `/c` / `/k`. **PowerShell accepts any unambiguous PREFIX**, so `-Com` and `-Comm` run code and are not on the list. Their argument is therefore blanked as an ordinary quoted span and its contents are invisible to EVERY rule.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P1. **Verdict:** build. **Severity:** no product effect and no PHI effect. It is a live route-around of the whole gate: whatever a session may not do directly, it may do inside `pwsh -Com '...'`.
+
+**Measured against real PowerShell, not inferred:**
+
+```
+pwsh -NoProfile -Com  'Write-Output RAN_Com_OK'   -> RAN_Com_OK
+pwsh -NoProfile -Comm 'Write-Output RAN_Comm_OK'  -> RAN_Comm_OK
+pwsh -NoProfile -Cm   '...'                       -> not recognized (ambiguous, so inert)
+```
+
+So `-Com` and `-Comm` are working spellings. `-Cm` is not, which bounds the family: it is every unambiguous prefix of `-Command` from `-C` upward, not any letter cluster.
+
+**Reachability on the committed gate.** The single-line form already ALLOWs today. A newline-spanning or here-string form currently DENIES, but only by accident: every line of a multi-line span reaches the scanner raw, so the disarm is seen as ordinary text rather than because the interpreter was recognised. **That accident is load-bearing and easy to remove** -- a change that blanks message bodies correctly deletes it, which is exactly what a candidate fix for #1086 did, converting the accident into a clean fail-open across all forms.
+
+**⛔ THE OBVIOUS FIX IS INSUFFICIENT AND WAS MEASURED SO.** Adding `-C|-Com|-Comm` to the list closes every spelling on the committed gate -- and on a gate that also blanks message bodies it closes only the single-line one, leaving the here-string route open behind it. So the fix must be verified against the gate as it will ship, not against the gate as it is.
+
+**The work.** Recognise the interpreter flag by PREFIX rather than by literal, for the shells that accept prefixes. `pwsh`/`powershell` accept any unambiguous prefix of `-Command` (and of `-EncodedCommand`, `-File`, `-NoProfile`); `bash`/`sh` do not -- their flags are single letters and clusters (`-c`, `-lc`, `-ec`), which the current list already handles. Bound it to the shells that actually behave this way rather than widening globally.
+
+**Test it by the PREFIX FAMILY, not by one spelling.** A test that pins `-Command` cannot see this, and a test that pins `-Com` alone cannot see `-Comm`. Enumerate `-C` through `-Command` and assert each denies, plus `-Cm` asserting the family is bounded -- that negative is what stops a fix widening into any-letters-ending-in-m, which is the shape that produced a separate fail-open in the #1086 candidate.
+
+**Related:** #1072 (text shapes rule 3c does not read -- this is the interpreter-recursion instance and the most severe of them), #1086 (the candidate fix that would have converted this from accidental-deny to clean fail-open), #1069, #1071, #1000 (a control green because its tests pin one spelling of a family).
+
+**Source:** found 2026-08-07 by the adversarial verification of a candidate fix for #1086. Two verifiers independently measured the abbreviation family; the third accepted the candidate because its corpus contained no such payload, which is itself the #1000 shape. The pre-existing half was separated from the introduced half by measuring both against the committed gate.
+
