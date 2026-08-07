@@ -11,11 +11,12 @@
     messagefoundry codeset upsert --config ./samples/config --data '{...}'         # edit codesets/*.csv
     messagefoundry generate  --type ADT --count 5 --out ./out/adt                 # synthetic HL7
     messagefoundry hl7schema --json                                               # HL7 field schema
+    messagefoundry lens schema --json                                             # Steps-view param widget schema
     messagefoundry init      ./my-config-repo                                      # scaffold a config repo
 
-The introspection subcommands (validate/graph/dryrun/check/hl7schema) print to stdout for the VS
-Code extension / git hooks; they touch no network and start no server. Heavy imports are deferred
-per-command so a quick `validate`/`hl7schema` call doesn't pay for FastAPI/uvicorn.
+The introspection subcommands (validate/graph/dryrun/check/hl7schema/lens schema) print to stdout
+for the VS Code extension / git hooks; they touch no network and start no server. Heavy imports are
+deferred per-command so a quick `validate`/`hl7schema`/`lens schema` call doesn't pay for FastAPI/uvicorn.
 """
 
 from __future__ import annotations
@@ -411,6 +412,15 @@ def main(argv: list[str] | None = None) -> int:
         '\'{"line_start":7,"line_end":7,"op":"move_row","direction":"up"}\'; '
         "omit to read the edit spec from stdin (only when 'module' is a file path, not '-')",
     )
+
+    lens_schema = lens_sub.add_parser(
+        "schema",
+        help="emit the transform-vocabulary parameter schema as JSON (op -> params with "
+        "kind/choices/required/keyword_only), derived from the action + diagnostic signatures; "
+        "the Steps editor drives its per-param input widgets from it (never imports/executes a "
+        "module, starts no server)",
+    )
+    lens_schema.add_argument("--json", action="store_true", help="emit compact JSON")
 
     import_cmd = sub.add_parser(
         "import",
@@ -3114,7 +3124,22 @@ def _lens(args: argparse.Namespace) -> int:
     exit, matching the IDE's degradation-to-text-editor behavior."""
     if args.lens_command == "rewrite":
         return _lens_rewrite(args)
+    if args.lens_command == "schema":
+        return _lens_schema(args)
     return _lens_parse(args)
+
+
+def _lens_schema(args: argparse.Namespace) -> int:
+    """``lens schema`` — emit the transform-vocabulary param schema (ADR 0076 §5) the Steps editor's
+    per-param input widgets consume.
+
+    Derived from the action + diagnostic signatures via stdlib ``inspect``/``typing`` only (no new
+    runtime dependency, ADR 0076 §6.5); lazy-imported inside the handler like ``_hl7schema`` so a
+    quick call never pays for FastAPI/uvicorn. Starts no server; imports/executes no config module."""
+    from messagefoundry.lens_schema import op_param_schema
+
+    _print_json(op_param_schema(), compact=args.json)
+    return 0
 
 
 def _lens_parse(args: argparse.Namespace) -> int:
@@ -4286,6 +4311,10 @@ def _check(args: argparse.Namespace) -> int:
         handler_security_allow=frozenset(args.handler_security_allow or ()),
         service_config=service_config,
         suppress_service_toml_search=args.project_root is not None,
+        # The root was already used to anchor --config/--service-config and to REQUIRE that
+        # <root>/<env_dir>/<env>.toml exists; pass it on so the build check READS the values from there
+        # too, rather than from wherever the shell happens to be (BACKLOG #1062).
+        project_root=args.project_root,
     )
     if args.json:
         _print_json(report.to_json(), compact=True)

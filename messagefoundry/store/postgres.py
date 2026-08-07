@@ -521,7 +521,9 @@ _SCHEMA: list[str] = [
         totp_enabled         BOOLEAN NOT NULL DEFAULT FALSE,
         totp_enrolled_at     DOUBLE PRECISION,
         totp_recovery_codes  TEXT,
-        last_totp_step       INTEGER
+        last_totp_step       INTEGER,
+        oidc_issuer          TEXT,
+        oidc_subject         TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS roles (
         id           TEXT PRIMARY KEY,
@@ -1074,12 +1076,16 @@ class PostgresStore:
                 "SELECT column_name FROM information_schema.columns WHERE table_name='users'"
             )
         }
+        # Federated (issuer, sub) identity keying (BACKLOG #1015): NULL on existing rows = "not yet
+        # federated" (username stays the sole key), byte-identical to before. Idempotent.
         for column, decl in (
             ("totp_secret", "TEXT"),
             ("totp_enabled", "BOOLEAN NOT NULL DEFAULT FALSE"),
             ("totp_enrolled_at", "DOUBLE PRECISION"),
             ("totp_recovery_codes", "TEXT"),
             ("last_totp_step", "INTEGER"),
+            ("oidc_issuer", "TEXT"),
+            ("oidc_subject", "TEXT"),
         ):
             if column not in users_cols:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -6461,6 +6467,19 @@ class PostgresStore:
         now = time.time() if now is None else now
         await self._execute(
             "UPDATE users SET channel_scope=$1, updated_at=$2 WHERE id=$3", scope_json, now, user_id
+        )
+
+    async def set_user_federated_subject(
+        self, user_id: str, issuer: str, subject: str, *, now: float | None = None
+    ) -> None:
+        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015)."""
+        now = time.time() if now is None else now
+        await self._execute(
+            "UPDATE users SET oidc_issuer=$1, oidc_subject=$2, updated_at=$3 WHERE id=$4",
+            issuer,
+            subject,
+            now,
+            user_id,
         )
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:

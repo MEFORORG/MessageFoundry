@@ -13,7 +13,10 @@ answer a later dispatch, and the engine's code-set tables — not the child's ow
 from __future__ import annotations
 
 import math
+import os
 import queue
+import signal
+import sys
 import time
 from pathlib import Path
 from types import MappingProxyType
@@ -856,4 +859,144 @@ def test_the_engines_code_sets_win_over_the_childs_own_load(graph: tuple[Registr
             _deliveries(registry, "h_ok")
         )
     finally:
+        session.close()
+
+
+# --- (BACKLOG #342) killing the worker reaps its whole process tree ----------
+
+# A graph whose Handler spawns a GRANDCHILD that inherits fd 1 (the response pipe). `close_fds=False`
+# plus un-redirected stdout makes the grandchild inherit the worker's fd 1 on BOTH platforms; it then
+# sleeps well past the test, so absent a tree-reap it lingers as an orphan STILL HOLDING the pipe (the
+# #342 defect). `subprocess`/`sys` are not in DEFAULT_FORBIDDEN_MODULES, so the Handler may import them.
+_ORPHAN_GRAPH = """
+from messagefoundry import inbound, outbound, router, handler, MLLP, Send
+
+inbound("IB_O", MLLP(port=19351), router="r")
+outbound("OB_O", MLLP(host="127.0.0.1", port=19352))
+
+
+@router("r")
+def r(msg):
+    return "h_orphan"
+
+
+@handler("h_orphan")
+def h_orphan(msg):
+    import subprocess
+    import sys
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        close_fds=False,  # inherit the worker's open fds, fd 1 (the response pipe) among them
+    )
+    with open(__PIDFILE__, "w", encoding="utf-8") as fh:
+        fh.write(str(child.pid))
+    return Send("OB_O", "SPAWNED")
+"""
+
+
+def _orphan_graph(tmp_path: Path) -> tuple[Registry, str, Path]:
+    """Write the orphan-spawning graph and return ``(registry, config_dir, pidfile)`` — mirrors the
+    ``_codeset_graph`` pattern. ``pidfile`` is where the Handler records the grandchild's pid."""
+    pidfile = tmp_path / "grandchild.pid"
+    source = _ORPHAN_GRAPH.replace("__PIDFILE__", repr(str(pidfile)))
+    (tmp_path / "graph.py").write_text(source, encoding="utf-8")
+    return load_config(tmp_path), str(tmp_path), pidfile
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether ``pid`` names a live process — cross-platform, no third-party deps."""
+    if sys.platform == "win32":
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return False  # no such pid (or already fully reaped)
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by someone else — still "alive"
+    return True
+
+
+def _best_effort_kill_pid(pid: int) -> None:
+    """Kill ``pid`` if it is still around, swallowing every failure. Keeps a FALSIFY run (where the
+    reap is disabled and the grandchild survives) from leaking a 30s sleeper."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            process_terminate = 0x0001
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = kernel32.OpenProcess(process_terminate, False, pid)
+            if handle:
+                try:
+                    kernel32.TerminateProcess(handle, 1)
+                finally:
+                    kernel32.CloseHandle(handle)
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def test_worker_kill_reaps_the_whole_process_tree(tmp_path: Path) -> None:
+    """Killing the worker must reap the WHOLE tree, not just the immediate child (BACKLOG #342).
+
+    A Handler spawns a grandchild that inherits fd 1 (the response pipe). Before the fix a bare
+    ``proc.kill()`` terminated only the worker, leaving the grandchild alive — an orphan still holding
+    the pipe, so the pipe never reached EOF and the kill was incomplete. The fix reaps the tree: a
+    Windows ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` job object (exercised locally, this host is
+    Windows) or a POSIX new-session process group killed with ``killpg`` (exercised by the CI
+    ubuntu-latest leg).
+
+    The observable is platform-neutral: for THIS grandchild — which holds fd 1 until it exits —
+    pipe-EOF is equivalent to "grandchild reaped", so the primary assert covers BOTH halves of the
+    defect (pipe released AND no lingering process). ``_pid_alive`` re-checks the process half
+    directly. See the FALSIFICATION recorded in the lane report: forcing
+    ``_assign_kill_on_close_job`` to return ``None`` degrades the Windows path to a bare
+    ``proc.kill()``, the grandchild survives, the pipe never EOFs, and this test goes red."""
+    registry, config_dir, pidfile = _orphan_graph(tmp_path)
+    session = _session(config_dir)
+    grandchild_pid: int | None = None
+    try:
+        # Drive the Handler so the worker spawns the fd-1-holding grandchild.
+        assert _deliveries(registry, "h_orphan", sandbox=session, run_context=RunContext()) == [
+            ("OB_O", "SPAWNED")
+        ]
+        grandchild_pid = int(pidfile.read_text())
+        proc = session._proc
+        assert proc is not None
+        responses = session._responses  # capture THIS generation's queue before the kill
+
+        # The single funnel for a wall-cap kill / crash cleanup / shutdown.
+        session._kill(proc)
+
+        # PRIMARY: the response pipe reaches EOF only once EVERY holder of fd 1 is gone — the worker
+        # AND the grandchild. The reader thread enqueues `_EOF` at that point.
+        try:
+            frame = responses.get(timeout=8.0)
+        except queue.Empty:
+            frame = None
+        assert frame is _EOF, (
+            "response pipe never reached EOF -- a grandchild still holds it; the worker tree "
+            "was not reaped"
+        )
+        # SECONDARY: the process half, asserted directly.
+        assert not _pid_alive(grandchild_pid), "the grandchild survived the worker kill"
+    finally:
+        if grandchild_pid is not None:
+            _best_effort_kill_pid(grandchild_pid)
         session.close()
