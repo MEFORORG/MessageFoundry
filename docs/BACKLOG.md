@@ -5225,6 +5225,15 @@ Both contain the identical slug. Only the first carries a `worktrees/` prefix.
 
 **Mitigation already applied:** the live instance at `:5129` was redacted in the commit that filed #1082. ⛔ **That is partial — it is already in git history and on `origin`,** so treat the redaction as stopping further propagation, not as removing it.
 
+⛔⛔ **AND THE TRAP THAT MAKES THE OBVIOUS FIX WRONG FOR A NEW LEAK: A REDACTION COMMIT REPUBLISHES THE TOKEN IN ITS OWN DIFF.** `git show <the redaction commit>` contains the removed line **verbatim**, as a `-` line. On a public repo the fix and the disclosure are therefore **the same object** — committing a redaction of a not-yet-public token publishes exactly what it removes, and does so in a commit whose message draws attention to it.
+
+⇒ **The order matters and "commit the redaction" is only correct for an ALREADY-PUBLIC token.** Decide which case you are in first:
+- **Token already on the remote** (this case): a normal redaction commit adds nothing new. Redact, commit, and record that history retains it.
+- **Token NOT yet pushed:** do **not** add a redaction commit. Remove it from the commit that introduced it — amend, or rebase the branch — so the token never reaches the remote in any object. A redaction commit here converts a local mistake into a published one.
+- **Token pushed but sensitive enough to matter** (a customer or site token rather than an auto-generated name): redaction is insufficient in either form. That is a history-rewrite and disclosure question for the owner, not a commit.
+
+⚠️ **Severity here was assessed on the token's SHAPE, deliberately without echoing it:** `adjective-noun-6hex`, three parts, an auto-generated agent session name — not a customer, prospect segment, site code or competitor token, which is the family that makes a slug leak actually matter. **That classification is what made this routine rather than an owner-level call**, and the same triage should gate any future instance. A guard fix that cannot distinguish those families by severity will either under-refuse or become noise.
+
 **Related:** #1056 (the item whose Source line carried the instance), #1000 (a control green because it cannot see the class it covers), #1063 and #1060 (the same guard family reading the wrong thing).
 
 **Source:** found 2026-08-07 while committing #1082, when a routine slug grep returned a hit the leak gate had just passed. The gate had refused a different commit of mine for the prefixed form the day before, which is what made the disagreement visible.
