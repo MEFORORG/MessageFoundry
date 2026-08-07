@@ -15,30 +15,61 @@ hook.
 
 ---
 
-## Status: wired on `SessionStart` and `Stop`, on the default config root -- and INERT until the scripts reach `main`
+## Status: LIVE on all five config roots, and verified end to end through the installed hook
 
 **Read the config, not this line, before relying on it** -- a status sentence in a document is exactly
-the observation that goes stale without saying so. As last verified against `~/.claude/settings.json`:
-the drain is registered on **both `SessionStart` and `Stop`**, on the default root only. No
-`~/.claude-account-N` carries it. The coordination banner
-(`scripts/worktree/session-context.ps1`) is a *different* hook that shares the `SessionStart` event and
-is deliberately still absent; install one tier at a time with
-`-Only <event> -Script mail-drain`, because `-Only SessionStart` alone would wire the banner too. The
-urgent tier ([`scripts/hooks/mail-watch.ps1`](../scripts/hooks/mail-watch.ps1)) is armed in code and
-registered nowhere.
+the observation that goes stale without saying so. As last verified 2026-08-06 against every config
+root: the drain is registered on **both `SessionStart` and `Stop`**, on **all five roots** (`~/.claude`
+plus `.claude-account-1` through `-4`). All four numbered roots are in active use, so a drain on the
+default root alone would have left the cross-login case -- half the reason this channel exists --
+unreachable.
 
-> **THE ROWS ARE LIVE AND THE HOOK STILL DOES NOTHING, IN ALMOST EVERY WORKTREE.** The installed shim
-> resolves `scripts/hooks/mail-drain.ps1` from the **primary checkout first**, falling back to the
-> session's own worktree. These scripts are not on `main` yet, so the primary does not carry them:
-> measured, both bases probed, primary `False` and the branch worktree `True`. Every session outside a
-> worktree holding this branch therefore fires the hook, resolves nothing, and exits 0 -- which is
-> **byte-identical to a healthy hook with no mail**, the exact defect
-> [observability rule 1](#three-observability-rules) exists to prevent.
+The coordination banner (`scripts/worktree/session-context.ps1`) is a *different* hook that shares the
+`SessionStart` event and is deliberately still absent. **Install one tier at a time with
+`-Only <event> -Script mail-drain`**: `-Only SessionStart` alone would wire the banner too. The urgent
+tier ([`scripts/hooks/mail-watch.ps1`](../scripts/hooks/mail-watch.ps1)) is armed in code and
+registered nowhere, by decision.
+
+**VERIFIED END TO END, through the installed hook command rather than a convenient stand-in.** The
+earlier VS Code run drove the drain by absolute path, which does not exercise the thing that actually
+runs; this one used the shim verbatim from `~/.claude/settings.json`:
+
+| check | result |
+|---|---|
+| shim resolution, probed from five worktrees on unrelated branches | resolves in **all** of them, via the primary checkout |
+| message queued with `main`'s `mail.ps1` | delivered by the installed hook command |
+| receipt written by the drain process | `disposition: shown-consumed`, `byHookEvent: Stop` |
+| box afterwards | `inbox 0`, `seen 1` -- consumed exactly once |
+
+⚠️ **What made it live was `git pull` in the primary checkout, not the merge** -- see the note below,
+which is the trap this section was wrong about for several hours.
+
+> **RETAINED AS A LESSON, NOT AS CURRENT STATE: for several hours the rows were live and the hook did
+> nothing, in almost every worktree.** The shim resolves `scripts/hooks/mail-drain.ps1` from the
+> **primary checkout first**, falling back to the session's own worktree. Two things follow, and both
+> cost real time to find:
 >
-> It becomes live everywhere the moment the scripts land on `main`, in every session started after
-> that, with no further action and no announcement. **Re-test on the target surface at that point**;
-> do not treat the wiring as verified because the rows are present. A row in a settings file is not a
-> hook that fired, which is what the installer prints on every run.
+> **1. A single-vantage check cannot see this failure.** Probed from two places while it was broken:
+>
+> | probed from | primary base | own-worktree fallback | resolves |
+> |---|---|---|---|
+> | a worktree carrying the branch | `False` | `True` | yes -- **only because that branch carried the file** |
+> | any other worktree | `False` | `False` | **nothing** |
+>
+> Checking from the branch worktree returns `True` and looks healthy. Everywhere else the hook fired,
+> resolved nothing and exited 0 -- **byte-identical to a healthy hook with no mail**, the exact defect
+> [observability rule 1](#three-observability-rules) exists to prevent. **Probe a shim-resolved hook
+> from a worktree that does NOT carry the branch**, or the fallback masks a broken primary resolution.
+>
+> **2. Merging to `main` is NOT what makes a shim-resolved hook live, and an earlier draft of this
+> section said it was.** Measured immediately after PR #210 landed: `mail-drain.ps1` was on
+> `origin/main` and **still absent from the primary checkout's working tree**, which was three commits
+> behind. **The shim resolves a WORKING TREE, not a ref.** Nothing pulls the primary automatically, so
+> the channel stayed inert across the whole machine until somebody did -- and the merge notification is
+> exactly the moment an operator is most likely to believe it went live. **The activating action was
+> `git pull` in the primary checkout.**
+>
+> A row in a settings file is not a hook that fired, which is what the installer prints on every run.
 
 The show/consume split described in ["Showing is not consuming"](#showing-is-not-consuming) is what
 makes wiring `SessionStart` safe: a discarded session can display mail but cannot consume it.
@@ -351,12 +382,28 @@ specific to two claimers racing a single source onto a single destination.
 Those are two separate acts, and keeping them separate is what stops a session nobody is looking at
 swallowing the mail. The mechanism:
 
-- **At `Stop`** (the only consuming event): render anything this session has not already been shown,
-  then **consume** -- claim, receipt, move to `seen/` -- everything this session has been shown,
-  including what it was shown earlier at `SessionStart`.
+- **At `Stop`** (the only consuming event): render **everything deliverable**, then **consume** --
+  claim, receipt, move to `seen/` -- **exactly what it just rendered, and nothing else**. Markers are
+  ignored here entirely.
 - **At `SessionStart`, and at any other event**: render the mail and **leave it in the inbox**. A
-  marker file `box/<key>/shown/<stem>--<session-key>.marker` records that this session has seen it, so
-  the same session is not shown it a second time.
+  marker file `box/<key>/shown/<stem>--<session-key>.marker` records the display, and suppresses a
+  re-display at another *non-consuming* event. It can never authorise a consume.
+
+⛔ **CONSUMPTION DEPENDS ONLY ON WHAT THE SAME INVOCATION RENDERED, and that is a correction to an
+earlier design rather than an embellishment of it.** `Stop` used to consume what a *marker* said this
+session had been shown at an earlier drain, without re-rendering it. That was measured losing mail:
+**session ids are reused across launches**, so a discarded session mints a marker and a later session
+carrying the same id inherits it -- then consumes a message it was never shown, with a clean receipt.
+Reproduced end to end before removal.
+
+**No check could have rescued it.** `session_id`, `transcript_path` and `cwd` are identical between
+the two sessions, so nothing available to this hook separates them. The failure was structural, not a
+missing guard, which is why the fix deletes the cross-invocation trust instead of hardening it. What
+a drain rendered *in this process, in this invocation* is a fact no other session can forge.
+
+**The price, paid knowingly: a session shown mail at `SessionStart` is shown it again at its first
+`Stop`.** That is a guaranteed duplicate rather than an occasional one. Do not reintroduce a
+held-consume to remove it without first solving the identity problem above.
 
 **Why**, and it is the defect measured in ["What still blocks wiring"](#what-still-blocks-wiring) 1b: a
 `SessionStart` hook that CONSUMES state can lose that state to a session that never existed. A hook
@@ -378,17 +425,15 @@ the one to watch:
   that submitted prompts. The five phantoms fired `SessionStart` and nothing else. Previously the
   argument was weaker -- that they never became conversations, so presumably never took a turn -- and
   it now rests on observed teardown behaviour instead.
-- **A phantom's session id must differ from the surviving session's. THIS ONE IS AT RISK, and the same
-  run is what put it there.** Session ids are **reused across launches**: one of the six carried an id
-  observed hours earlier in a previous run. It happened to be a phantom and the real session had a
-  different id, so the precondition held -- but it held by luck, not by construction. A phantom that
-  reused the *surviving* session's id would mint a marker indistinguishable from that session's own,
-  suppressing a display it never made and letting the next `Stop` consume the message unseen. Every
-  artefact here is keyed by session id, so nothing in this design can detect that case.
+- **A phantom's session id must differ from the surviving session's. THIS ONE IS NOW MOOT, AND THE
+  REASON IS THE FIX ABOVE.** It was measured VIOLABLE -- session ids are reused across launches, and
+  the resulting loss was reproduced end to end: a phantom marked a message, a later session carrying
+  the same id had its display suppressed, and its `Stop` consumed a message it had never seen.
 
-  It is not hypothetical-in-principle the way it was before this run: id reuse is now observed
-  behaviour. What is unobserved is the specific collision. **Do not close this by reasoning; measure
-  whether a phantom can ever carry the id of a session that survives.**
+  That precondition no longer has to hold, because consumption no longer depends on identity at all.
+  A consuming drain renders what it consumes, so a marker inherited from any other session -- phantom
+  or not, same id or not -- can at worst suppress one *non-consuming* display. It cannot cause a
+  consume. **The dependency was removed rather than the risk being argued down.**
 
 **The marker is the per-session record of a display, and the receipt is not.** A receipt is named
 `<stem>.json` -- one slot per **message**, last writer wins -- so it can say *some* session was shown

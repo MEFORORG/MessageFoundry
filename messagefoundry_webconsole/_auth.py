@@ -521,17 +521,33 @@ def require_ui_step_up(
     JSON ``require_phi_read`` routes charge. It defaults **False** because most routes riding this
     factory are admin writes (user/role management, replay, purge, config reload) that emit no message
     body: charging a PHI budget there would throttle administration on a quota that measures PHI reads.
-    Set it on a step-up route only when the route's own response carries PHI. It is **not** yet set on
-    every such route: at least ``GET /ui/messages/search``, ``GET /ui/messages/search/layered`` and
-    ``GET /ui/uploaded-logs/file/{file_id}`` would still skip this budget on a deployed instance.
-    BACKLOG #324 gated the edit pair only, by owner ruling, and deliberately left those — a gap stated
-    here, not an accepted posture. That list is a **sample, not a census**: to know which routes charge
-    the budget today, read the gates, not this docstring.
+    The charge runs in the DEPENDENCY, i.e. on EVERY request the route serves, BEFORE the body. So set
+    it only when the route's own response carries PHI *and* the handler it calls does NOT already pace
+    the budget itself — otherwise the two charges stack. The rule splits by handler:
 
-    ORDERING, deliberate: the budget is charged inside ``base``, i.e. BEFORE the step-up freshness
-    check below — so a request that ends in a 303 to ``/ui/reauth`` has already spent a token. That is
-    the fail-safe direction (an attacker cannot probe the route for free by letting the window go
-    stale) and is immaterial at the shipped 120-reads/60s default.
+    * Handlers whose pacing lives ONLY in their ``require_phi_read`` Depends — e.g. ``get_message`` —
+      do NOT charge when a /ui route calls them DIRECTLY (that Depends is skipped on a direct call), so
+      the gate ``phi=`` is the route's single charge. ``GET /ui/messages/{id}/edit`` and
+      ``POST /ui/messages/{id}/edit-resend`` set it for exactly this reason (BACKLOG #324).
+    * Handlers that call ``enforce_phi_read_pacing`` in their OWN body — ``search_messages``,
+      ``export_messages``, ``layered_search``, ``browse_uploaded_file`` (``require_step_up`` paces
+      NON-GET only, so these step-up GETs pace themselves) — are ALREADY charged whenever a route
+      reaches them, so a gate ``phi=`` would spend the SAME per-actor bucket twice. A route that always
+      reaches such a handler (``GET /ui/uploaded-logs/file/{file_id}``) therefore passes NO ``phi=``. A
+      route that reaches one only on its criteria path and otherwise short-circuits to a render
+      (``GET /ui/messages/search``, ``GET /ui/messages/search/layered``) also passes NO ``phi=``:
+      instead it charges ``enforce_phi_read_pacing`` INLINE on the short-circuit branch only (BACKLOG
+      #1025), so the render is budgeted without double-charging the real-search path.
+
+    To know which routes charge the budget today, read the gates AND the handler bodies, not this
+    docstring.
+
+    ORDERING, deliberate (gate ``phi=`` routes, i.e. the edit pair): the budget is charged inside
+    ``base``, i.e. BEFORE the step-up freshness check below — so a request that ends in a 303 to
+    ``/ui/reauth`` has already spent a token. That is the fail-safe direction (an attacker cannot probe
+    the route for free by letting the window go stale) and is immaterial at the shipped 120-reads/60s
+    default. (An INLINE charge, as the two search routes use, runs after the dependency instead, so a
+    stale-window request there redirects before charging — harmless, since a redirect emits no PHI.)
     """
     # allow_mfa_pending: the base must NOT fire the 6.3.3 redirect for a step-up route. This
     # factory runs its OWN mfa_satisfied check below, which 303s to /ui/reauth *carrying the

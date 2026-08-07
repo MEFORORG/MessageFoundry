@@ -155,15 +155,19 @@
       b.addEventListener('click', () => vscode.postMessage({ command: 'openSource', line: Number(b.dataset.line) }));
     }
     // A recognized-row field posts its edit on change (blur/enter) — the provider shells lens rewrite
-    // and applies the byte-stable result via a WorkspaceEdit (ADR 0076 §5).
-    for (const inp of document.querySelectorAll('input.edit')) {
+    // and applies the byte-stable result via a WorkspaceEdit (ADR 0076 §5). The selector covers the
+    // text inputs AND the richer widgets (BACKLOG #235): a <select class=edit> dropdown (enum param) and
+    // a type=number input (int/float param). A number field posts a JS NUMBER so JSON.stringify emits a
+    // bare `6` (an int literal) rather than `"6"` (a re-typed string literal); a select/text posts its
+    // string value unchanged. A <select> reports type 'select-one', so only a real number input is coerced.
+    for (const inp of document.querySelectorAll('input.edit, select.edit')) {
       inp.addEventListener('change', () => vscode.postMessage({
         command: 'edit',
         handler: inp.dataset.handler,
         lineStart: Number(inp.dataset.lineStart),
         lineEnd: Number(inp.dataset.lineEnd),
         name: inp.dataset.name,
-        value: inp.value,
+        value: inp.type === 'number' ? Number(inp.value) : inp.value,
         // The row's projection-time source (data-expect-src) — carried to lens rewrite as expect_src so a
         // stale coordinate (a shift in a dirty split view) is REFUSED, not silently mis-edited (F7).
         expectSrc: inp.dataset.expectSrc,
