@@ -45,16 +45,69 @@
 param(
     [switch]$Status,
     [switch]$Uninstall,
-    # Settings file to modify. Tests point this at a fixture instead of the real user settings.
-    [string]$SettingsPath = (Join-Path $env:USERPROFILE ".claude\settings.json"),
+    # Settings file(s) to modify. Tests point this at a fixture instead of the real user settings.
+    #
+    # DEFAULT IS EVERY CONFIG ROOT, NOT JUST ~/.claude, AND THAT CHANGE FIXES A MEASURED HOLE.
+    # This script's own rationale used to be that user level "is per-machine and loads in every
+    # worktree". That premise is false on a machine with more than one login: a config root owns its
+    # OWN settings.json, and a session reads the one belonging to the root it authenticated against.
+    # Measured 2026-08-05: five roots existed (~/.claude plus .claude-account-1..4); the coordination
+    # hooks were present in ONE of them; MessageFoundry sessions had really run under accounts 1, 2 and
+    # 3 (transcript directories under each); and two multi-megabyte transcripts from accounts 1 and 2
+    # contained ZERO announce firings. Those sessions ran with no banner, no collision gate and no
+    # announce, and nothing reported the absence.
+    #
+    # This matters most for the surface the mail channel exists to reach: the VS Code extension
+    # launches under its own login, and on this host the live VS Code sessions were on account-4 while
+    # the Desktop sessions were on the default root. Wiring only ~/.claude would leave the delivery hook
+    # absent from exactly the sessions that cannot be reached any other way.
+    #
+    # scripts/worktree/install-gate.ps1 already loops the roots this way; this is that precedent applied
+    # to the coordination hooks.
+    [string[]]$SettingsPath,
     # Limit the operation to these events (install, uninstall and -Status alike). Announce lives on its
     # own event, so `-Only UserPromptSubmit -Uninstall` removes it WITHOUT disarming the collision gate
     # or the SessionStart banner. Without this the only 2am remedy is a hand-edit of the user settings.
     [string[]]$Only,
-    [string[]]$Except
-)
+    [string[]]$Except,
+    # Limit to the rows whose Script matches. -Only filters by EVENT, and an event can carry more than
+    # one row: SessionStart carries BOTH the coordination banner and the mail drain. So
+    # `-Only SessionStart` silently installs the banner too, which is a different hook with a different
+    # blast radius, and there was no way to ask for one tier of one event.
+    #
+    # That matters because wiring this channel ONE TIER AT A TIME is the deliberate pattern -- the mail
+    # drain went live on Stop alone while SessionStart stayed out, for a measured reason (see
+    # docs/SESSION-MAIL.md). A switch that cannot express the thing you are actually doing pushes you
+    # toward a hand-edit of the user settings file, which is exactly what this script exists to avoid.
+    #
+    # Substring match, because the rows carry repo-relative paths and 'mail-drain' is what an operator
+    # actually types. It composes with -Only and -Except rather than replacing them.
+    [string[]]$Script)
 
 $ErrorActionPreference = "Stop"
+
+# Every config root that should carry the coordination hooks.
+#
+# THE DISCRIMINATOR IS A REGEX ON THE NAME, NOT A GLOB, AND NOT "HAS A settings.json".
+# Measured on this host: `~/.claude-account-2.lock` is a DIRECTORY, not a lock file, and it contains a
+# settings.json of its own. A `.claude-account-*` glob adopts it; so does any "looks like a config root
+# because it has settings" test. Writing hooks into a stale artifact is invisible until someone wonders
+# why a root they never use keeps reappearing. `Get-ClaudeConfigRoots` (session-registry.ps1) filters on
+# a `sessions/` subdir instead, which is right for READING a roster but wrong here: a root that exists
+# but has not run a session yet has no sessions/ and still needs wiring, because the first session it
+# runs is exactly the one that would come up uncoordinated.
+function Get-CoordSettingsPaths {
+    $home_ = $env:USERPROFILE
+    $roots = @(
+        Get-ChildItem -LiteralPath $home_ -Directory -Filter ".claude*" -Force -EA SilentlyContinue |
+            Where-Object { $_.Name -match '^\.claude$|^\.claude-account-\d+$' } |
+            ForEach-Object { $_.FullName }
+    )
+    if ($roots.Count -eq 0) { $roots = @((Join-Path $home_ ".claude")) }
+    return @($roots | ForEach-Object { Join-Path $_ "settings.json" })
+}
+
+if (-not $SettingsPath -or $SettingsPath.Count -eq 0) { $SettingsPath = Get-CoordSettingsPaths }
 
 # Marker so we can find and replace exactly our own entries on a re-install, without disturbing hooks
 # another tool (or another session) added to the same file.
@@ -71,6 +124,13 @@ $MARKER = "mefor-coord"
 # user settings file (verified), and neither string contains the other, so neither installer can
 # delete the other's hook.
 $ANNOUNCE_MARKER = "mefor-announce"
+
+# A THIRD marker for the async mail drain. Chosen so that NO marker is a substring of another in either
+# direction -- Test-IsOurs is a substring match, so "mefor-mail" and a hypothetical "mefor-mail-urgent"
+# would strip each other and the second one to be installed would silently delete the first. Check any
+# future marker against all three before adding it.
+#   mefor-coord / mefor-announce / mefor-mail   -- pairwise non-containing.
+$MAIL_MARKER = "mefor-mail"
 
 # The shim. No installed copy: it locates the script in a checkout and runs it, so a `git pull` updates
 # the hook everywhere with nothing to fall stale. Silent and exit-0 outside a repo, because this file is
@@ -133,15 +193,68 @@ $WIRING = @(
     @{ Event = "SessionStart"; Matcher = $null; Script = "scripts/worktree/session-context.ps1"; Timeout = 30; Msg = "Session coordination"; Marker = $MARKER; Shim = "std" }
     @{ Event = "PreToolUse"; Matcher = "Edit|Write|MultiEdit|NotebookEdit"; Script = "scripts/hooks/collision_gate.ps1"; Timeout = 20; Msg = "Checking for a colliding session"; Marker = $MARKER; Shim = "std" }
     @{ Event = "UserPromptSubmit"; Matcher = $null; Script = "scripts/hooks/announce-session.ps1"; Timeout = 15; Msg = "Announcing to sessions in this repo"; Marker = $ANNOUNCE_MARKER; Shim = "announce" }
+    # The async mail drain, on TWO events and deliberately not on PreToolUse.
+    #   SessionStart -- mail that was waiting before you arrived.
+    #   Stop         -- mail that landed during the turn. The docs are explicit that injecting at Stop
+    #                   resumes rather than ends the conversation, so the session can act on it.
+    # Measured on this repo's recent transcripts: 19.0 tool calls per turn at the mean. A PreToolUse
+    # matcher would pay the ~366ms spawn ~19 times per turn for the same practical latency, which is
+    # exactly the standing tax that keeps steer-inject opt-in. Stop pays it once.
+    @{ Event = "SessionStart"; Matcher = $null; Script = "scripts/hooks/mail-drain.ps1"; Timeout = 20; Msg = "Checking session mail"; Marker = $MAIL_MARKER; Shim = "std" }
+    @{ Event = "Stop"; Matcher = $null; Script = "scripts/hooks/mail-drain.ps1"; Timeout = 20; Msg = "Checking session mail"; Marker = $MAIL_MARKER; Shim = "std" }
 )
+
+# The unfiltered table, kept so a filter that matches nothing can tell the operator what DOES exist.
+# Naming the real events and scripts turns a dead end into a correction; without it the message can
+# only say that nothing matched, which is the same information the exit code already carries.
+$WIRING_ALL = $WIRING
+
+# SPLIT ON COMMAS, BECAUSE `pwsh -File` HANDS EVERY ARGUMENT OVER AS A STRING. The documented
+# invocation in .EXAMPLE is the -File form, and it binds a multi-value switch as ONE element:
+# `-Only PreToolUse,UserPromptSubmit` arrives as the single string "PreToolUse,UserPromptSubmit",
+# `-contains` then matches nothing, and the run selected zero rows while reporting success. Measured
+# 2026-08-06 -- it printed "No wiring rows selected" and exited 0, which reads as "done". Splitting
+# here makes the documented form mean what it looks like it means; passing a real array in-process
+# still works, because splitting a single-element array on a character it does not contain is a no-op.
+# Only the identifier-shaped switches are split. -SettingsPath is NOT: a Windows path may legally
+# contain a comma, and silently cutting one in half would be a worse bug than the one being fixed.
+function Split-Csv([string[]]$Values) {
+    if (-not $Values) { return @() }
+    return @($Values | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+$Only = Split-Csv $Only
+$Except = Split-Csv $Except
+$Script = Split-Csv $Script
 
 if ($Only) { $WIRING = @($WIRING | Where-Object { $Only -contains $_.Event }) }
 if ($Except) { $WIRING = @($WIRING | Where-Object { $Except -notcontains $_.Event }) }
-if (-not $WIRING) { Write-Host "No wiring rows selected."; exit 0 }
+if ($Script) {
+    $WIRING = @($WIRING | Where-Object {
+            $row = $_
+            @($Script | Where-Object { $row.Script -like "*$_*" }).Count -gt 0
+        })
+}
+# NONZERO, NOT exit 0. A filter that matches nothing is a user error -- a misspelled event, a -Script
+# that hits no row -- and exiting 0 made it indistinguishable from a successful install. That is the
+# silent-no-op shape this script exists to report on rather than commit: the operator sees a clean
+# exit and believes the roots were wired. Naming what was asked for is the difference between "there
+# was nothing to do" and "you asked for something that does not exist".
+if (-not $WIRING) {
+    $asked = @()
+    if ($Only) { $asked += "-Only $($Only -join ',')" }
+    if ($Except) { $asked += "-Except $($Except -join ',')" }
+    if ($Script) { $asked += "-Script $($Script -join ',')" }
+    Write-Host ""
+    Write-Host "NO WIRING ROWS MATCHED $($asked -join ' ') -- nothing was examined and nothing was written." -ForegroundColor Yellow
+    Write-Host "  Known events : $((($WIRING_ALL | ForEach-Object { $_.Event }) | Sort-Object -Unique) -join ', ')"
+    Write-Host "  Known scripts: $((($WIRING_ALL | ForEach-Object { $_.Script }) | Sort-Object -Unique) -join ', ')"
+    Write-Host ""
+    exit 2
+}
 
-function Read-Settings {
-    if (-not (Test-Path -LiteralPath $SettingsPath)) { return [ordered]@{} }
-    $raw = Get-Content -LiteralPath $SettingsPath -Raw
+function Read-Settings([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return [ordered]@{} }
+    $raw = Get-Content -LiteralPath $Path -Raw
     if (-not $raw.Trim()) { return [ordered]@{} }
     # Fail loudly rather than overwrite: a settings file we cannot parse is one we must not rewrite,
     # because a bad write silently disables EVERY setting in it.
@@ -153,68 +266,96 @@ function Test-IsOurs([hashtable]$Entry, [string]$Marker = $MARKER) {
     return $false
 }
 
-$settings = Read-Settings
-if (-not $settings.hooks) { $settings.hooks = [ordered]@{} }
-
+# --- Status: report EVERY root, and report the ones with nothing as loudly as the ones with something.
+# A per-root breakdown is the point. A single aggregated "INSTALLED" is what let a four-root hole sit
+# unnoticed: the root you happen to be running under says yes, and nothing asks about the others.
 if ($Status) {
     Write-Host ""
-    Write-Host "Coordination hooks in $SettingsPath"
-    $any = $false
-    foreach ($w in $WIRING) {
-        $groups = @($settings.hooks[$w.Event])
-        $ours = @($groups | Where-Object { $_ -and (Test-IsOurs $_ $w.Marker) })
-        $state = if ($ours.Count -gt 0) { "INSTALLED" } else { "missing" }
-        if ($ours.Count -gt 0) { $any = $true }
-        Write-Host ("  {0,-16} {1,-40} {2}" -f $w.Event, $w.Script, $state)
+    Write-Host "Coordination hooks, as of $([DateTime]::UtcNow.ToString('o'))"
+    Write-Host "Roots examined: $($SettingsPath.Count)"
+    foreach ($p in $SettingsPath) {
+        $s = $null
+        try { $s = Read-Settings $p } catch {
+            Write-Host ""
+            Write-Host "  $p" -ForegroundColor Yellow
+            Write-Host "    UNREADABLE -- cannot report on this root: $($_.Exception.Message)" -ForegroundColor Yellow
+            continue
+        }
+        if (-not $s.hooks) { $s.hooks = [ordered]@{} }
+        Write-Host ""
+        Write-Host "  $p"
+        foreach ($w in $WIRING) {
+            $ours = @(@($s.hooks[$w.Event]) | Where-Object { $_ -and (Test-IsOurs $_ $w.Marker) })
+            $state = if ($ours.Count -gt 0) { "INSTALLED" } else { "MISSING" }
+            Write-Host ("    {0,-16} {1,-38} {2}" -f $w.Event, $w.Script, $state)
+        }
     }
     Write-Host ""
-    if (-not $any) { Write-Host "  Not installed. Run without -Status to wire it up." -ForegroundColor Yellow }
     exit 0
 }
 
-# Strip our entries first -- this is both the uninstall path and the idempotency of re-install.
-foreach ($w in $WIRING) {
-    if ($settings.hooks[$w.Event]) {
-        $kept = @(@($settings.hooks[$w.Event]) | Where-Object { $_ -and -not (Test-IsOurs $_ $w.Marker) })
-        if ($kept.Count -gt 0) { $settings.hooks[$w.Event] = $kept } else { $settings.hooks.Remove($w.Event) }
-    }
-}
+# --- Install / uninstall, once per root ----------------------------------------------------------
+# One root failing must not stop the others. A throw part-way through used to leave the machine in a
+# state nobody wrote down: some roots wired, some not, and no record of which.
+$failed = @()
+foreach ($path in $SettingsPath) {
+    try {
+        $settings = Read-Settings $path
+        if (-not $settings.hooks) { $settings.hooks = [ordered]@{} }
 
-if (-not $Uninstall) {
-    foreach ($w in $WIRING) {
-        $entry = [ordered]@{}
-        if ($w.Matcher) { $entry.matcher = $w.Matcher }
-        $entry.hooks = @(
-            [ordered]@{
-                type          = "command"
-                command       = $(if ($w.Shim -eq "announce") { New-AnnounceShimCommand } else { New-ShimCommand $w.Script $w.Marker })
-                shell         = "powershell"
-                timeout       = $w.Timeout
-                statusMessage = $w.Msg
+        # Strip our entries first -- this is both the uninstall path and the idempotency of re-install.
+        foreach ($w in $WIRING) {
+            if ($settings.hooks[$w.Event]) {
+                $kept = @(@($settings.hooks[$w.Event]) | Where-Object { $_ -and -not (Test-IsOurs $_ $w.Marker) })
+                if ($kept.Count -gt 0) { $settings.hooks[$w.Event] = $kept } else { $settings.hooks.Remove($w.Event) }
             }
-        )
-        $existing = @($settings.hooks[$w.Event])
-        $settings.hooks[$w.Event] = @($existing | Where-Object { $_ }) + @($entry)
+        }
+
+        if (-not $Uninstall) {
+            foreach ($w in $WIRING) {
+                $entry = [ordered]@{}
+                if ($w.Matcher) { $entry.matcher = $w.Matcher }
+                $entry.hooks = @(
+                    [ordered]@{
+                        type          = "command"
+                        command       = $(if ($w.Shim -eq "announce") { New-AnnounceShimCommand } else { New-ShimCommand $w.Script $w.Marker })
+                        shell         = "powershell"
+                        timeout       = $w.Timeout
+                        statusMessage = $w.Msg
+                    }
+                )
+                $existing = @($settings.hooks[$w.Event])
+                $settings.hooks[$w.Event] = @($existing | Where-Object { $_ }) + @($entry)
+            }
+        }
+
+        $backup = "$path.bak-coord"
+        if ($PSCmdlet.ShouldProcess($path, $(if ($Uninstall) { "remove coordination hooks" } else { "install coordination hooks" }))) {
+            if (Test-Path -LiteralPath $path) { Copy-Item -LiteralPath $path -Destination $backup -Force }
+            $json = $settings | ConvertTo-Json -Depth 12
+            # Validate what we are about to write BEFORE replacing the file. A malformed settings.json
+            # does not error at startup -- it silently disables every setting in it, which is the worst
+            # failure mode here, and it is worst of all in a root we cannot test by starting a session.
+            try { $null = $json | ConvertFrom-Json } catch { throw "generated settings JSON is invalid: $_" }
+            Set-Content -LiteralPath $path -Value $json -Encoding UTF8
+            Write-Host ("  {0}  {1}" -f $(if ($Uninstall) { "REMOVED " } else { "INSTALLED" }), $path)
+        }
+    }
+    catch {
+        $failed += [pscustomobject]@{ Path = $path; Error = $_.Exception.Message }
+        Write-Host ("  FAILED    {0}  -- {1}" -f $path, $_.Exception.Message) -ForegroundColor Red
     }
 }
 
-$backup = "$SettingsPath.bak-coord"
-if ($PSCmdlet.ShouldProcess($SettingsPath, $(if ($Uninstall) { "remove coordination hooks" } else { "install coordination hooks" }))) {
-    if (Test-Path -LiteralPath $SettingsPath) { Copy-Item -LiteralPath $SettingsPath -Destination $backup -Force }
-    $json = $settings | ConvertTo-Json -Depth 12
-    # Validate what we are about to write BEFORE replacing the file. A malformed settings.json does not
-    # error at startup -- it silently disables every setting in it, which is the worst failure mode here.
-    try { $null = $json | ConvertFrom-Json } catch { throw "Refusing to write: generated settings JSON is invalid. $_" }
-    Set-Content -LiteralPath $SettingsPath -Value $json -Encoding UTF8
-
+Write-Host ""
+Write-Host ("Roots examined: {0}   succeeded: {1}   failed: {2}   as of {3}" -f `
+        $SettingsPath.Count, ($SettingsPath.Count - $failed.Count), $failed.Count, [DateTime]::UtcNow.ToString('o'))
+if (-not $Uninstall) {
+    foreach ($w in $WIRING) { Write-Host ("  {0,-16} -> {1}" -f $w.Event, $w.Script) }
     Write-Host ""
-    if ($Uninstall) { Write-Host "Coordination hooks REMOVED from $SettingsPath" -ForegroundColor Yellow }
-    else {
-        Write-Host "Coordination hooks INSTALLED (user level -- loads in every worktree)" -ForegroundColor Green
-        foreach ($w in $WIRING) { Write-Host ("  {0,-16} -> {1}" -f $w.Event, $w.Script) }
-        Write-Host ""
-        Write-Host "  Takes effect in NEWLY STARTED sessions; existing ones keep the config they booted with."
-    }
-    Write-Host "  backup: $backup"
-    Write-Host ""
+    Write-Host "  Takes effect in NEWLY STARTED sessions; existing ones keep the config they booted with."
+    Write-Host "  A root listed above is a root whose settings FILE now carries the entry. That is not the"
+    Write-Host "  same as a hook that FIRED -- confirm with a session started under that login."
 }
+Write-Host ""
+if ($failed.Count -gt 0) { exit 1 }

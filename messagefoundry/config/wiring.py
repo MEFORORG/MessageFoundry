@@ -691,9 +691,13 @@ def _is_secret_setting(name: str) -> bool:
 #: They live in :data:`_SECRET_SETTING_KEYS` only so ``/metadata`` redacts them defence-in-depth (a
 #: username can leak directory structure). The **single source of truth** for "which secret settings are
 #: rotatable": imported by ``tests/test_secret_rotation_inventory.py`` (the ASVS-13.1.4 registration gate)
-#: and read by :func:`connector_secret_env_values` (the ASVS-13.3.4 rotation fingerprinter), so the
-#: redaction list, the doc registration gate, and the runtime fingerprint set can never disagree about
-#: which members are credentials you rotate.
+#: and read by :func:`connector_secret_env_values` (the ASVS-13.3.4 rotation fingerprinter). That the
+#: redaction list, the doc registration gate, and the runtime fingerprint set agree about which members
+#: are credentials you rotate is **enforced by two gates, not assumed**: the forward gate
+#: (``test_secret_setting_keys_are_registered``) proves every rotatable key is registered, and the
+#: reverse gate (``test_registered_connector_secrets_are_reachable_by_the_fingerprinter``, BACKLOG #1009)
+#: proves every registered connector secret is reachable by the fingerprinter — the direction a
+#: hand-added registry entry (the SOAP ``body_secret_value`` class) had slipped through.
 _NON_ROTATABLE_SECRET_SETTING_KEYS: frozenset[str] = frozenset(
     {"username", "basic_user", "proxy_user", "ws_username", "credential_username"}
 )
@@ -708,8 +712,10 @@ def connector_secret_env_values(
     each with the DEK-derived keyed MAC so a per-Connection connector credential is monitored for rotation
     exactly like the fixed ``MEFOR_*`` classes.
 
-    A setting is included when its key is a **rotatable** credential — in :data:`_SECRET_SETTING_KEYS` and
-    not a non-rotatable identifier in :data:`_NON_ROTATABLE_SECRET_SETTING_KEYS` — AND it is an ``env()``
+    A setting is included when its key is a **rotatable** credential — recognised by
+    :func:`_is_secret_setting` (so the SOAP ``body_secret_value_<i>`` prefix class is covered, not only
+    the fixed :data:`_SECRET_SETTING_KEYS` names) and not a non-rotatable identifier in
+    :data:`_NON_ROTATABLE_SECRET_SETTING_KEYS` — AND it is an ``env()``
     ref whose key resolves to a **non-empty string** in ``env_values``. Values are returned **transiently**
     to be MAC'd — never persisted or logged; the map key is the operator-chosen env name, never the value.
     Connections sharing an env key collapse to one entry (one secret → one rotation clock). Inline (non-
@@ -722,7 +728,7 @@ def connector_secret_env_values(
     specs += [c.spec for c in registry.outbound.values()]
     for spec in specs:
         for name, value in spec.settings.items():
-            if name in _NON_ROTATABLE_SECRET_SETTING_KEYS or name not in _SECRET_SETTING_KEYS:
+            if name in _NON_ROTATABLE_SECRET_SETTING_KEYS or not _is_secret_setting(name):
                 continue
             if isinstance(value, EnvRef):
                 resolved = env_values.get(value.key)

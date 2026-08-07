@@ -22,10 +22,14 @@ code; this module is the **opt-in** boundary that closes the documented residual
   per message would destroy the throughput target.
 
 **Both legs of the pipe are untrusted by contract.** The child runs exactly the code the sandbox
-exists to distrust, and a grandchild it spawns inherits fd 1 (the response pipe) and outlives
-``proc.kill()``. So the wire is **MFW2**, a closed-tag JSON+segment codec whose decode path is
-``json.loads`` plus ``bytes.decode`` and a literal tag match — it cannot name a type, import a module,
-or reach ``__reduce__``. Nothing is pickled in either direction.
+exists to distrust: while it lives, a grandchild it spawns inherits fd 1 (the response pipe) and can
+write onto it. Killing the worker now reaps its whole process tree — a Windows
+``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` job object, or a POSIX new-session process group killed with
+``killpg`` (see :meth:`SandboxSession._kill`) — so no such grandchild lingers as an orphan past the
+kill. That reap is best-effort process *hygiene*, not the trust control: a grandchild can still stage
+a frame while the worker is alive, so the wire is **MFW2**, a closed-tag JSON+segment codec whose
+decode path is ``json.loads`` plus ``bytes.decode`` and a literal tag match — it cannot name a type,
+import a module, or reach ``__reduce__``. Nothing is pickled in either direction.
 
 **Frames answer requests, never the other way round.** Each dispatch mints a fresh
 :func:`secrets.token_hex` request id and binds the whole ``(id, phase, name)`` triple on the way back,
@@ -67,10 +71,13 @@ imports. It depends only on ``config`` (the :class:`RunContext` shape), its own 
 
 from __future__ import annotations
 
+import ctypes
 import enum
 import logging
+import os
 import queue
 import secrets
+import signal
 import struct
 import subprocess
 import sys
@@ -211,6 +218,168 @@ def _read_frame_bytes(stream: Any) -> bytes | None:
     return _read_exact(stream, length)
 
 
+# --- process-tree reaping (Windows job object / POSIX process group) ----------
+# A sandboxed Handler can spawn a grandchild that inherits fd 1 (the response pipe). Killing only the
+# immediate worker would leave that grandchild alive, still holding the pipe and lingering as an
+# orphan for the engine's lifetime. So the worker is spawned as its own process-group leader (POSIX)
+# or assigned to a kill-on-close job object (Windows), and :meth:`SandboxSession._kill` reaps the
+# whole tree. This is best-effort process hygiene, NOT the trust control — ADR 0087's codec, the
+# per-dispatch ``secrets`` id, and the unsolicited-frame check are what keep a stray grandchild frame
+# harmless — so a setup failure degrades to a single-process kill (logged) rather than wedging a feed.
+
+#: ``SetInformationJobObject`` info class + the ``LimitFlags`` bit for a job that terminates its whole
+#: process tree when the job is closed/terminated (``JOBOBJECTINFOCLASS`` / ``winnt.h``).
+_JobObjectExtendedLimitInformation: Final = 9
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: Final = 0x2000
+
+
+# The three Win32 structs below are plain ctypes layout classes (no Windows-only ctypes types), so
+# they define cleanly on every platform and are only ever *used* under a ``sys.platform == "win32"``
+# guard. Field names/types mirror ``winnt.h`` exactly — the layout must match for the API to read it.
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = (
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    )
+
+
+class _IO_COUNTERS(ctypes.Structure):
+    _fields_ = (
+        ("ReadOperationCount", ctypes.c_uint64),
+        ("WriteOperationCount", ctypes.c_uint64),
+        ("OtherOperationCount", ctypes.c_uint64),
+        ("ReadTransferCount", ctypes.c_uint64),
+        ("WriteTransferCount", ctypes.c_uint64),
+        ("OtherTransferCount", ctypes.c_uint64),
+    )
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = (
+        ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", _IO_COUNTERS),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    )
+
+
+def _kill_single(proc: subprocess.Popen[bytes]) -> None:
+    """Best-effort single-process kill (the reap fallback when no job/group is available)."""
+    try:  # noqa: SIM105
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _close_handle(kernel32: Any, handle: int) -> None:
+    """Close a Win32 handle, swallowing a failure (nothing to do about it, and it must not raise
+    from a kill path)."""
+    try:  # noqa: SIM105
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+    except OSError:
+        pass
+
+
+def _assign_kill_on_close_job(proc: subprocess.Popen[bytes]) -> int | None:
+    """Assign ``proc`` to a fresh Windows job object whose whole tree dies when the job is terminated
+    or its last handle closes; return the job handle (an int) to hold open for the worker's lifetime.
+
+    Returns ``None`` off Windows or on ANY failure (missing API, a job-setup error) — the caller then
+    degrades to a single-process kill and a lingering grandchild is a hygiene residual, not a trust
+    hole (ADR 0087). Mirrors the fail-open ctypes pattern in :mod:`messagefoundry.crashdump`."""
+    if sys.platform != "win32":
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except OSError:  # pragma: no cover - kernel32 is always present on win32
+        return None
+    create = getattr(kernel32, "CreateJobObjectW", None)
+    set_info = getattr(kernel32, "SetInformationJobObject", None)
+    assign = getattr(kernel32, "AssignProcessToJobObject", None)
+    if create is None or set_info is None or assign is None:  # pragma: no cover - defensive
+        log.warning(
+            "sandbox: Windows job-object API missing; kill degrades to a single-process kill"
+        )
+        return None
+    create.restype = ctypes.c_void_p
+    create.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    set_info.restype = ctypes.c_int
+    set_info.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    assign.restype = ctypes.c_int
+    assign.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    handle = create(None, None)
+    if not handle:  # pragma: no cover - defensive
+        log.warning("sandbox: CreateJobObject failed; kill degrades to a single-process kill")
+        return None
+    info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    set_ok = set_info(
+        handle, _JobObjectExtendedLimitInformation, ctypes.byref(info), ctypes.sizeof(info)
+    )
+    # `proc._handle` is the CreateProcess handle (full access); race-free vs PID reuse, unlike a
+    # re-OpenProcess by pid. It is a private CPython attr not in typeshed, hence the ignore.
+    if not set_ok or not assign(handle, int(proc._handle)):  # type: ignore[attr-defined,unused-ignore]
+        log.warning("sandbox: job-object setup failed; kill degrades to a single-process kill")
+        _close_handle(kernel32, int(handle))
+        return None
+    return int(handle)
+
+
+def _terminate_job(job: int) -> None:
+    """Terminate every process in ``job`` (the worker and its whole tree) and close the handle."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type-checker / non-Windows
+        return
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except OSError:  # pragma: no cover - kernel32 is always present on win32
+        return
+    terminate = getattr(kernel32, "TerminateJobObject", None)
+    if terminate is not None:
+        terminate.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        terminate.restype = ctypes.c_int
+        try:  # noqa: SIM105
+            terminate(ctypes.c_void_p(job), 1)
+        except OSError:  # pragma: no cover - defensive
+            pass
+    _close_handle(kernel32, job)
+
+
+def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None) -> None:
+    """Kill the worker AND every process it spawned.
+
+    Windows: terminate the kill-on-close job the worker was assigned to (falling back to a
+    single-process kill when none was assigned). POSIX: ``SIGKILL`` the worker's own process group,
+    which ``start_new_session=True`` made it the leader of — guarded on ``pgid == proc.pid`` so this
+    only ever signals the worker's own group and never the caller's (e.g. the engine/pytest group)."""
+    if sys.platform == "win32":
+        if job is not None:
+            _terminate_job(job)
+        else:
+            _kill_single(proc)
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        _kill_single(proc)
+        return
+    if pgid == proc.pid:
+        try:  # noqa: SIM105
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):  # pragma: no cover - defensive
+            pass
+    else:  # pragma: no cover - start_new_session guarantees leadership; belt-and-suspenders
+        _kill_single(proc)
+
+
 # --- the persistent worker session (parent side) -----------------------------
 
 
@@ -242,6 +411,10 @@ class SandboxSession:
         # codec.enc_code_sets). `None` = the caller published none, so the child keeps its own load.
         self._code_sets = code_sets
         self._proc: subprocess.Popen[bytes] | None = None
+        # The Windows kill-on-close job handle the current worker is assigned to (``None`` on POSIX,
+        # off Windows, or when the worker has no live job). Always tracks ``self._proc``: set right
+        # after spawn, cleared by every ``_kill``. POSIX reaps via the worker's process group instead.
+        self._job: int | None = None
         self._responses: queue.Queue[Any] = queue.Queue()
         self._lock = threading.Lock()
         self._closed = False
@@ -254,11 +427,18 @@ class SandboxSession:
 
     def _spawn(self) -> None:
         """Launch the child and complete its bootstrap (config load + guard install). Fail-closed."""
+        # Reap any prior generation FIRST. A worker that died on its own (the ``_live_worker`` respawn
+        # path) leaves its kill-on-close job handle in ``self._job``; overwriting it below without
+        # reaping would leak the handle and let that dead worker's orphaned grandchild tree survive.
+        # A no-op on the first spawn and whenever there is no live proc.
+        self._kill(self._proc)
         # A fresh response queue per spawn so a prior (killed) worker's trailing EOF can't leak into
         # this generation's reads.
         self._responses = queue.Queue()
         # Fixed argv (this interpreter + our own worker module), no shell, no
-        # untrusted input in the command line — so B603 does not apply.
+        # untrusted input in the command line — so B603 does not apply. ``start_new_session`` puts the
+        # worker in its own POSIX process group so ``_kill`` can ``killpg`` its whole tree; it is a
+        # POSIX-only ``setsid`` (False on Windows, where a job object does the reaping instead).
         proc = subprocess.Popen(  # nosec B603
             [sys.executable, "-m", WORKER_MODULE],
             stdin=subprocess.PIPE,
@@ -266,8 +446,14 @@ class SandboxSession:
             stderr=None,  # let the child's stderr (logging) pass through to the engine's stderr
             bufsize=0,
             close_fds=True,
+            start_new_session=sys.platform != "win32",
         )
         assert proc.stdin is not None and proc.stdout is not None
+        # Assign the Windows kill-on-close job BEFORE the boot frame. The boot frame triggers
+        # ``load_config()``, which runs top-level admin config — the earliest untrusted code and the
+        # first chance to spawn a grandchild. Until then the worker parks on its first stdin read, so
+        # assigning here is race-free: any process the worker later spawns is already in the job.
+        self._job = _assign_kill_on_close_job(proc)
         reader = threading.Thread(
             target=self._reader_loop, args=(proc.stdout, self._responses), daemon=True
         )
@@ -323,10 +509,12 @@ class SandboxSession:
     def _kill(self, proc: subprocess.Popen[bytes] | None) -> None:
         if proc is None:
             return
-        try:  # noqa: SIM105
-            proc.kill()
-        except OSError:
-            pass
+        # Reap the WHOLE tree, not just ``proc``: a grandchild the Handler spawned inherited fd 1 (the
+        # response pipe) and would outlive a bare ``proc.kill()`` as an orphan still holding the pipe.
+        # ``self._job`` is the current worker's kill-on-close job on Windows (``None`` on POSIX, where
+        # the worker's process group is reaped instead). Clear it after — the handle is now closed.
+        _reap_process_tree(proc, self._job)
+        self._job = None
         try:  # noqa: SIM105
             proc.wait(timeout=5)
         except (subprocess.TimeoutExpired, OSError):
@@ -345,11 +533,12 @@ class SandboxSession:
 
         The protocol is strictly one request, one frame, so a FRAME queued **before** a dispatch or
         left over **after** its answer was written by something other than the call we made — a
-        Handler writing straight to fd 1, or a grandchild that inherited it and outlived
-        ``proc.kill()``. Letting such a frame sit in the queue is the whole exploit: the next dispatch
-        would take it as its own answer. It is not an authoring accident either — ``print()`` goes
-        through the text wrapper, not the frame writer — so there is no benign case to preserve. Drop
-        the worker and dead-letter the message in hand.
+        Handler writing straight to fd 1, or a grandchild that inherited it while the worker was
+        alive. Letting such a frame sit in the queue is the whole exploit: the next dispatch would
+        take it as its own answer. It is not an authoring accident either — ``print()`` goes through
+        the text wrapper, not the frame writer — so there is no benign case to preserve. Drop the
+        worker and dead-letter the message in hand; :meth:`_kill` then reaps that grandchild along
+        with the rest of the worker's tree, so it cannot keep writing to the pipe.
 
         :data:`_EOF` is the opposite case and must NOT be treated the same way. It is a parent-private
         singleton with no wire form (see :class:`_Eof`), so a worker cannot manufacture one — it

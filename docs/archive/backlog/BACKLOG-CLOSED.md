@@ -1977,7 +1977,7 @@ attachment-handler + data-pruner behavior researched the same day (citations abo
 
 > ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** Base (#595) **and** the L1 expansion (#794) are both on `main`, so the 🔶 "EXPANDING" note below is historical: `ide/snippets/messagefoundry.code-snippets` holds **36** snippets — **32** body-level idioms (past the ~30 L1 target) plus the 4 pre-existing module-frame scaffolds `meforinbound`/`meforoutbound`/`meforrouter`/`meforhandler`, which are not idioms — and `ide/src/insertElement.ts` provides the category quick-pick (`buildPicks`, `:42`) plus the `@router`/`@handler` cursor-context filter (`detectContext`, `:69`, applied at `:114`) that reads the *same* snippets file — one source of truth. Stays inside CLAUDE.md §12 / #26: the snippets emit **editable Python**, never a declarative surface. _(was 🔢 P3 · Value 4/10 · Difficulty 2/10.)_
 
-> 🔶 **Base shipped (PR #595 — ~14 idioms + the `messagefoundry.insertElement` quick-pick); EXPANDING under [MULTISESSION-PLAN-7](releases/MULTISESSION-PLAN-7.md) L1.** L1 adds ~16 more editable-Python idioms (→ ~30: string format, `re.sub`, `match/case`, fan-out, `fhir_lookup`, non-HL7 body access, router idioms), surfaces *Insert Element…* in the editor-title dropdown + a keybinding + a discoverability CodeLens, and adds an `@router`/`@handler` cursor-context filter. Deterministic sibling for the AI `/transform` — see [`docs/AI-OFF-MATRIX.md`](AI-OFF-MATRIX.md). Stays inside #26 (emits editable Python, never a declarative surface).
+> 🔶 **Base shipped (PR #595 — ~14 idioms + the `messagefoundry.insertElement` quick-pick); EXPANDING under MULTISESSION-PLAN-7 L1.** L1 adds ~16 more editable-Python idioms (→ ~30: string format, `re.sub`, `match/case`, fan-out, `fhir_lookup`, non-HL7 body access, router idioms), surfaces *Insert Element…* in the editor-title dropdown + a keybinding + a discoverability CodeLens, and adds an `@router`/`@handler` cursor-context filter. Deterministic sibling for the AI `/transform` — see [`docs/AI-OFF-MATRIX.md`](AI-OFF-MATRIX.md). Stays inside #26 (emits editable Python, never a declarative surface).
 
 **The code-first answer to Corepoint's Action-List "Add Action" palette.** Handlers and Routers are the core
 authoring surface; developers repeatedly drop the same ~12–15 idioms (field copy, format, date convert, code
@@ -2235,7 +2235,7 @@ investigation (2026-06-27).
 > ✅ **SHIPPED in 0.2.10 (Plan-5 Wave 2, PR #624).** The `alert_instance` table (3 backends), `GET /alerts/active`
 > + ack/resolve (RBAC `MONITORING_DIAGNOSE`), the real `ConnectionRow.alerts_active` count, and a console Alerts
 > tab are built — [ADR 0044](adr/0044-operator-alert-state.md) (Accepted). See
-> [`releases/MULTISESSION-PLAN-5.md`](releases/MULTISESSION-PLAN-5.md) Lane L7.
+> `releases/MULTISESSION-PLAN-5.md` Lane L7.
 
 **Type:** feature — operator monitoring. Today alerts are stateless emit-points (ADR 0014) and the
 `ConnectionRow.alerts_active` field is **stubbed `0`**. Add a persisted `alert_instance` store table
@@ -2251,7 +2251,7 @@ parity gap analysis.
 > ✅ **SHIPPED in 0.2.10 (Plan-5 Wave 2, PR #624).** Admin-defined custom roles (permission subset, no new
 > kinds) persisted via an additive `roles` migration on all 3 backends, gated by `USERS_MANAGE`; built-ins stay;
 > narrowing revokes on live sessions — [ADR 0045](adr/0045-custom-rbac-roles.md) (Accepted). See
-> [`releases/MULTISESSION-PLAN-5.md`](releases/MULTISESSION-PLAN-5.md) Lane L8.
+> `releases/MULTISESSION-PLAN-5.md` Lane L8.
 
 **Type:** feature — RBAC. Today there are **6 fixed built-in roles**. Add admin-defined named roles, each a
 chosen **subset** of the existing `Permission` catalog (no new permission kinds), persisted via a `roles`-table
@@ -2266,7 +2266,7 @@ gap analysis.
 > ✅ **SHIPPED (Plan-5 Wave 1, PR #618, 2026-06-27).** `fhir_lookup(connection, query)` is built — a read-only
 > GET / search that extends the `db_lookup` carve-out to FHIR ([ADR 0043](adr/0043-fhir-read-lookup.md),
 > Accepted), off the event loop, raises on a Router / in dry-run. See
-> [`releases/MULTISESSION-PLAN-5.md`](releases/MULTISESSION-PLAN-5.md) Lane L2.
+> `releases/MULTISESSION-PLAN-5.md` Lane L2.
 
 **Type:** feature — live enrichment. The FHIR client (ADR 0022) is **write-only** today. Add a handler-callable,
 read-only `fhir_lookup(connection, query)` (read-by-id GET / search) that **extends** the ADR 0010 `db_lookup`
@@ -2280,7 +2280,7 @@ loop, raises on a Router / in dry-run, re-run-divergent by design (read-side onl
 
 > ✅ **SHIPPED (Plan-5 Wave 1, PR #618, 2026-06-27).** `Message` now exposes age-from-DOB, length-of-stay, and
 > the tolerant HL7-TS parse (reusing `timezone.py`, no duplicate parser). See
-> [`releases/MULTISESSION-PLAN-5.md`](releases/MULTISESSION-PLAN-5.md) Lane L1.
+> `releases/MULTISESSION-PLAN-5.md` Lane L1.
 
 **Type:** feature — transform ergonomics. **`messagefoundry/timezone.py` already provides the tolerant
 HL7-TS→`datetime` parse** (`_parse_hl7_timestamp` / `convert_hl7_timestamp` / `to_zone`); this item adds only
@@ -2294,7 +2294,7 @@ and surfaces the existing parser on the `Message` surface. MSH-encoding-aware, *
 
 > ✅ **SHIPPED — verified on `origin/main` (2026-07-09).** **CHANGELOG: “Turnkey DR backup + restore-verify (#60, [ADR 0049](adr/0049-turnkey-dr-backup-restore-verify.md))”** — `messagefoundry backup` / `restore-verify` CLI ships, off by default (`[backup].enabled = false`). This item's banner was never updated, which caused it to be reported as OPEN in PR #850's `#52` anchor — corrected there.
 
-> 📌 **PRE-RESERVED (Plan-5, 2026-06-27).** See [`releases/MULTISESSION-PLAN-5.md`](releases/MULTISESSION-PLAN-5.md)
+> 📌 **PRE-RESERVED (Plan-5, 2026-06-27).** See `releases/MULTISESSION-PLAN-5.md`
 > §G (deferred tail). **Owner-gated** (backup cadence / retention / restore-verify posture).
 
 **Type:** operations — DR. An engine-managed scheduled backup of the config bundle + store (config-tier slice
@@ -2923,7 +2923,7 @@ suffices) — that determines whether #90 is worth doing now or behind the durab
 
 > ✅ **SHIPPED — verified on `origin/main` (2026-07-09).** Live-debug **v1** (#793) and **v2** (#805, per-statement inline values + hover) are both merged; `ide/src` carries the debug lanes.
 
-> 📐 **Phased in [MULTISESSION-PLAN-7](releases/MULTISESSION-PLAN-7.md).** **v1** (L2 — IDE-only, no engine change): a debounced on-save watcher shells `dryrun --json` against a synthetic sample and renders CodeLens summaries (router routed-to · disposition · single-handler Send count — accurate multi-handler attribution is a v2 feature, since today's `--json` flattens handler→delivery). **v2** (L6): per-statement inline values + hover, driven by the new traced dry-run mode ([ADR 0072](adr/0072-traced-dryrun-mode.md)) — **PHI-redacted by default**, synthetic samples only. The deterministic sibling to an interactive AI loop (offline, no breakpoints) — see [`docs/AI-OFF-MATRIX.md`](AI-OFF-MATRIX.md).
+> 📐 **Phased in MULTISESSION-PLAN-7.** **v1** (L2 — IDE-only, no engine change): a debounced on-save watcher shells `dryrun --json` against a synthetic sample and renders CodeLens summaries (router routed-to · disposition · single-handler Send count — accurate multi-handler attribution is a v2 feature, since today's `--json` flattens handler→delivery). **v2** (L6): per-statement inline values + hover, driven by the new traced dry-run mode ([ADR 0072](adr/0072-traced-dryrun-mode.md)) — **PHI-redacted by default**, synthetic samples only. The deterministic sibling to an interactive AI loop (offline, no breakpoints) — see [`docs/AI-OFF-MATRIX.md`](AI-OFF-MATRIX.md).
 
 **Type:** developer-experience feature — the highest-leverage DX investment surfaced by the **#87** competitive
 recon, and the one genuine DX *differentiator* of the code-first commercial engine class.
@@ -3182,7 +3182,7 @@ browser-impossible per its own docstring). Sequence the extraction / rehoming / 
 > ✅ **SHIPPED — Cookbook gallery + VS Code onboarding walkthrough (PLAN-7 L3, PR #798).** `ide/src/cookbook.ts` + `cookbookRecipes.ts` + the five `ide/media/walkthrough/*.md` steps, with `ide/src/test/suite/cookbook.test.ts`. The deterministic sibling of the AI `/explain` ([`AI-OFF-MATRIX.md`](AI-OFF-MATRIX.md)) and the code-first analogue of Corepoint's Cookbook.
 
 
-> 📐 **Scoped in [MULTISESSION-PLAN-7](releases/MULTISESSION-PLAN-7.md) L3 (owner-promote to build).** The deterministic sibling for the AI `/explain` ([`docs/AI-OFF-MATRIX.md`](AI-OFF-MATRIX.md)) and the code-first analogue of Corepoint's Cookbook.
+> 📐 **Scoped in MULTISESSION-PLAN-7 L3 (owner-promote to build).** The deterministic sibling for the AI `/explain` ([`docs/AI-OFF-MATRIX.md`](AI-OFF-MATRIX.md)) and the code-first analogue of Corepoint's Cookbook.
 
 **Type:** developer-experience / onboarding.
 
