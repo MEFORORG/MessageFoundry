@@ -242,7 +242,11 @@ from messagefoundry.config.settings import (
     hop_posture_from_ai,
     security_loosenings,
 )
-from messagefoundry.config.tls_policy import fips_attestation, phi_read_hop_disposition
+from messagefoundry.config.tls_policy import (
+    fips_attestation,
+    kex_groups_report,
+    phi_read_hop_disposition,
+)
 from messagefoundry.config.wiring import (
     EnvRef,
     Registry,
@@ -1427,8 +1431,13 @@ def create_app(
             )
         # Build the broker from the SERVER's settings (never the request body). The SSRF endpoint-allowlist
         # + cleartext-credential checks run in the constructor; a misconfiguration is an operator error.
+        # #329: thread the derived instance posture (the same _phi_read_posture derived at create_app time
+        # from ai_settings, which == app.state.ai == `ai` on the managed path) so the broker's cleartext-
+        # http credential refusal is clamped on an enforcing-PHI instance — the escape can no longer put
+        # the api_key on the wire. Without this the route would build the broker with an unclamped escape
+        # (green and inert), the exact failure mode #329 exists to close.
         try:
-            broker = ai_broker_from_settings(ai)
+            broker = ai_broker_from_settings(ai, posture=_phi_read_posture)
         except AiBrokerError as exc:
             _log.warning("engine AI broker misconfigured: %s", exc)
             raise HTTPException(503, "engine-brokered AI assistance is not available") from exc
@@ -1535,6 +1544,9 @@ def create_app(
         # FIPS-provider attestation of the interpreter's ssl/_hashlib OpenSSL (report-only, #73 / ADR 0120):
         # metadata (a boolean + version string), never key material, never enforced.
         fips_mode, openssl_version = fips_attestation()
+        # TLS key-exchange groups read-out (report-only, #338). Pure helper over a throwaway probe
+        # context; reflects/changes NO live TLS behaviour, reports "inherited" until Python 3.15.
+        kex_groups = kex_groups_report()
         # Platform memory-encryption READ-OUT (report-only, ADR 0152 Phase 1). Pure platform read
         # (/proc/cpuinfo flags + guest device presence on Linux; all-None everywhere else), no engine
         # state, never raises. It reports what the HOST SAYS ABOUT ITSELF and therefore satisfies
@@ -1576,6 +1588,7 @@ def create_app(
             synthetic_relaxation=synthetic_relaxation,
             fips_mode=fips_mode,  # interpreter ssl/_hashlib OpenSSL FIPS-provider state; None=undeterminable
             openssl_version=openssl_version,  # that OpenSSL's version string (public metadata)
+            kex_groups=kex_groups,  # report-only: are the approved KEX groups pinned or inherited (#338)?
             # ADR 0152: a SELF-REPORT plus the operator's claim. Neither satisfies ASVS 11.7.1 at any
             # value — see the field comments on SecurityPosture. The disclaimer ships IN THE BODY
             # (memory_encryption_note), unconditionally: this endpoint is the designated evidence
@@ -5331,19 +5344,27 @@ def create_managed_app(
         # WITHOUT changing capacity. A no-op returning None in production / every other test, so the
         # engine is byte-identical when the gate is unset. Stashed for /stats + shut down in finally.
         app.state.connscale_executor = maybe_install_executor_shim(asyncio.get_running_loop())
+        # #329: the derived instance hop posture, computed ONCE here for the OUT-OF-GATE cells this
+        # lifespan builds — the alerts webhook sink (notifier_from_settings) and the LDAPS bind
+        # (AuthService → LdapAuthenticator). Neither is built inside an active_hop_posture scope, so
+        # current_hop_posture() is None there and their weakened-TLS escape would ship UNCLAMPED (green
+        # and inert) without an explicit posture; threading this makes the ADR-0092 clamp apply on first
+        # deployment. None when the instance declares no [ai] (SQLite/test) → the unclamped escape,
+        # byte-identical. Reuses the same hop_posture_from_ai derivation the store hop and the runner use.
+        _hop_posture = (
+            hop_posture_from_ai(
+                ai_settings, enforcement=(security_settings or SecuritySettings()).enforcement
+            )
+            if ai_settings is not None
+            else None
+        )
         # #200 (ADR 0092 decision 2): thread the derived instance posture so the engine<->store weakened-
         # TLS refusal (connection_string / _build_ssl) clamps MEFOR_ALLOW_INSECURE_TLS — the escape can
         # never relax a production-PHI store hop. None when no [ai] (SQLite/test) → unclamped, unchanged.
         store = await open_store(
             resolved,
             message_events=message_events,
-            posture=(
-                hop_posture_from_ai(
-                    ai_settings, enforcement=(security_settings or SecuritySettings()).enforcement
-                )
-                if ai_settings
-                else None
-            ),
+            posture=_hop_posture,
         )
         # Offline uploaded-logs store (BACKLOG #125/#126, ADR 0134), on the LIVE store's cipher instance.
         # DISABLED (None) unless [store].uploads_dir is set, so no PHI-at-rest surface exists unless an
@@ -5385,6 +5406,8 @@ def create_managed_app(
                 # #323 layer 3: the instance [tls] internal-CA policy reaches the alerts SMTP hop too, so
                 # an estate on a private CA needs no per-alert CA path.
                 trust_anchor_policy=tls_settings.policy() if tls_settings else None,
+                # #329: clamp the webhook sink's cleartext-http escape to the derived instance posture.
+                posture=_hop_posture,
             )
             if alerts_settings is not None
             else None
@@ -5633,6 +5656,10 @@ def create_managed_app(
                 # central run_anchor_preflight above) rather than refusing at enforce-only. Central
                 # preflight already ran before any listener bound; this keeps the seam consistent.
                 enforcing=trust_anchors_enforcing,
+                # #329: thread the derived instance posture to the LDAPS bind so its ad_tls_verify=false
+                # escape is clamped on an enforcing-PHI instance (LdapAuthenticator is built out of the
+                # connector-construction gate, so the clamp is inert unless the posture arrives here).
+                hop_posture=_hop_posture,
             )
             bootstrap = await auth.initialize()
             app.state.auth = auth
