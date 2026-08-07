@@ -567,8 +567,11 @@ harness process only.)
   score collides with the anti-metric rule in
   [`docs/Code_Quality_Standards.md`](docs/Code_Quality_Standards.md) §4.1. **The catalogue is a
   different question and was adopted:** the ASCQM 1.1 weakness list is free from OMG, one bounded
-  pass over it ran under [`docs/BACKLOG.md`](docs/BACKLOG.md) #1073, and its findings are #1089–#1093.
-  Re-running that pass is legitimate; adopting the score is not.
+  pass over it ran under **#1073**, and its findings are **#1089–#1093**. Re-running that pass is
+  legitimate; adopting the score is not. *(#1073 is closed, so it lives in
+  [`docs/archive/backlog/BACKLOG-CLOSED.md`](docs/archive/backlog/BACKLOG-CLOSED.md) once archived,
+  not in [`docs/BACKLOG.md`](docs/BACKLOG.md) — a marker here has to outlive its item by
+  construction, so it must not cite only the live file.)*
 - Don't keep grinding in a polluted context — `/clear` after repeated failures.
 - Don't use **glyphs or emoji** in prose, comments, commit messages, PR bodies or replies — say the
   word (§11). The backlog status-banner alphabet is the one machine-parsed holdout; read it with
