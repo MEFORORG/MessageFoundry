@@ -6,11 +6,52 @@
 | **Applies to** | Any application developed under this standard. **MessageFoundry (MEFOR)** is the reference implementation (Appendix A). |
 | **Maintained by** | Project maintainers (open-source). Each deploying organization assigns its own local owner. |
 | **Status** | Published — adopter-facing |
-| **Version** | 2.2 |
-| **Date** | July 30, 2026 |
+| **Version** | 2.3 |
+| **Date** | August 7, 2026 |
 | **License** | Publishable under the project's open-source license; intended to be shared with adopters and reused across projects. |
 | **Review cadence** | At least annually, and on any material architecture or threat change |
 | **Aligns to** | NIST SP 800-218 (SSDF) · NIST SP 800-115 · NIST SP 800-66 Rev. 2 (HIPAA Security Rule) · OWASP ASVS 5.0 Level 3. Its Spec-Driven Development practices (§5) are a distilled synthesis by this document — not an external standard or certification. |
+
+---
+
+## How to read the rules
+
+Each requirement in this standard is one testable statement carrying a stable identifier and the
+evidence that settles it. Cite the identifier — in a documented deviation (A.6), in a review, in a
+companion standard — so that the citation and the requirement it names stay the same sentence.
+
+| Element | What it means |
+|---|---|
+| `SDS-<section>.<n>` | A stable identifier. It survives rewording of the text around it |
+| **MUST**, **MUST NOT** | Absolute. Not meeting one is a deviation recorded in A.6, never a judgment call |
+| **SHOULD**, **SHOULD NOT** | Depart from it only for a stated reason you have weighed |
+| **MAY** | A free choice. Conforming either way |
+| Evidence | What a reviewer looks at. A requirement with no checkable evidence is an aspiration |
+
+Those words carry that meaning **only in capitals**; the same words in lowercase prose do not.
+
+**An identifier is a permanent name, never a position.** A new rule takes the next free number in its
+section and is **appended** — inserting one must never renumber those after it, because a citation
+written against the old number would then resolve silently to a different requirement. Reword a rule
+freely under the same identifier. Change *what it demands* and the identifier is retired and a new one
+allocated; [Retired rules](#retired-rules) keeps the tombstone, so a citation that outlives its rule
+lands on a record of what happened rather than on somebody else's requirement.
+
+**The numeric part resembles a section number because of where the rule was first written, not because
+it is a lookup.** An identifier is a name. If the surrounding section is ever renumbered the identifier
+does not move, and that is the property that makes it worth citing: this document has been renumbered
+once already (§5–§9 became §6–§10 when Spec-Driven Development was inserted; see Version history), and
+citations written against the old numbers are still resolving to the wrong requirements today.
+
+**Cite a requirement by identifier; cite a section by number.** "See §5" points a reader at a place to
+read, and a section number is the right name for that. "This deviates from §6.4" names a requirement,
+and must give the identifier — that is the citation that silently changes meaning when the document is
+reorganised, and A.6 is where it does the most damage.
+
+**Not every statement here is a rule.** The NIST and HIPAA crosswalks (§3, §7.2), the spec-stack and
+EARS tables (§5.1, §5.2), the control-area inventory (§7.1), the reference list (§10) and the
+Applicability Profile (Appendix A) describe, map or record; they carry no identifiers and nothing
+conforms *to* them. A.6 is the register that **cites** rules — it does not state them.
 
 ---
 
@@ -64,15 +105,15 @@ These are complementary to the **OWASP ASVS 5.0 Level 3** verification (source-a
 
 NIST does **not** issue certificates for these frameworks. The project may **display alignment claims**, but words them honestly and backs them with evidence:
 
-- **Use:** "Built to NIST SP 800-218 (SSDF)," "NIST SSDF–aligned," "tested per NIST SP 800-115," "controls mapped to NIST SP 800-66 Rev. 2," "HIPAA-compliant deployment supported."
-- **Do not use:** "NIST certified" or any phrasing implying a certificate exists.
-- **Back every claim** with the implemented practice and its evidence (this standard, test reports, the ASVS attestation, the applicability profile). A self-attestation is a formal, legally significant declaration — only make it if it is true.
-- A third-party assessor may **validate** an attestation; that raises its weight but is still not a NIST certificate.
+- **SDS-3.1 — MAY display an alignment claim, and MUST word it as one of these.** "Built to NIST SP 800-218 (SSDF)," "NIST SSDF–aligned," "tested per NIST SP 800-115," "controls mapped to NIST SP 800-66 Rev. 2," "HIPAA-compliant deployment supported." *Evidence:* the published wording, matched against this list.
+- **SDS-3.2 — MUST NOT use "NIST certified", or any phrasing implying a certificate exists.** NIST issues none for these frameworks, so the phrase describes nothing that could be produced on request. *Evidence:* a sweep of published surfaces for the phrase.
+- **SDS-3.3 — MUST back every claim with the implemented practice and its evidence** — this standard, test reports, the ASVS attestation, the applicability profile. A self-attestation is a formal, legally significant declaration; only make it if it is true. *Evidence:* the claims register (SDS-9.5), one row per published claim.
+
+A third-party assessor may **validate** an attestation; that raises its weight but is still not a NIST certificate.
 
 #### Reviewing security prose: ask what a reader would DO with it
 
-**Review security prose by asking what a reader would DO with it, not whether it is accurate.** This is
-the governing instruction; the three rules below are instances of it.
+- **SDS-3.4 — MUST review security prose by asking what a reader would DO with it, not whether it is accurate.** This is the governing instruction; the rules below are instances of it. *Evidence:* the review record, naming what a reader would do with the sentence rather than whether it is true.
 
 It matters because the expensive failures are not false statements. A correctness review terminates at
 "yes, that sentence is accurate" — and every finding in the 2026-07-30 documentation audit passed that
@@ -80,7 +121,7 @@ test. Each was **true about the mechanism and misleading about the posture**: a 
 every spot-check while pointing the reader somewhere they cannot go. Six such findings were caught by
 asking what happens to someone who acts on the sentence; **none** was caught by accuracy checking.
 
-- **State a load-bearing fact ONCE, and link to it; never restate it.** A repo that states a fact twice
+- **SDS-3.5 — MUST state a load-bearing fact ONCE, and link to it; never restate it.** *Evidence:* the source of record, linked rather than restated, and no second copy of the fact. A repo that states a fact twice
   will eventually state it two ways, and the stale copy is the one that gets cited — a reader who finds
   *a* statement stops looking for the other. Three instances in a single day: `harden_kex_groups`
   described as pinning key-exchange groups across **five** live documents, when `SSLContext.set_groups`
@@ -90,17 +131,17 @@ asking what happens to someone who acts on the sentence; **none** was caught by 
   URL" while §7 documented the exact query parameters that carry it. In every case the repo held
   **both** the right and the wrong version. The mitigation is structural, not diligence: pick the source
   of record, link to it, and let the copy die.
-- **A completeness claim is a liability.** "Two configurations do X, and a reviewer should hear both"
+- **SDS-3.6 — MUST prefer "at least" to an enumeration; a completeness claim is a liability.** *Evidence:* the claim, worded as a floor, naming the case that matters and pointing at the reference. "Two configurations do X, and a reviewer should hear both"
   invites the check and then survives it, because a reader who confirms the named case stops looking.
   Twice this documentation set shipped such a sentence wrong in *both* directions at once — naming a
   case that no longer existed while omitting one that did. Where you cannot enumerate exhaustively, say
   "at least", name the case that matters, and point at the reference.
-- **A compensating control must not rest on a false premise.** A `Referrer-Policy` relaxation was
+- **SDS-3.7 — A compensating control MUST NOT rest on a false premise.** *Evidence:* the stated justification, re-derived against the code rather than accepted. A `Referrer-Policy` relaxation was
   justified on the grounds that console URLs "carry opaque ids only (never PHI)" — untrue of the
   console's own search route. The control itself was sound; the stated reason was not, and the next
   person to touch it reasons from the comment. A wrong justification is worse than none.
 
-- **Confirm your instrument answers the question you asked, not one adjacent to it.** The rules above
+- **SDS-3.8 — MUST confirm the instrument answers the question asked, not one adjacent to it.** *Evidence:* the question and what the instrument returns, written down side by side and checked to be the same sentence. The rules above
   catch prose that is true and misleading; this one catches a claim that is **false when written, while
   feeling measured**. The rule is the question — ***does my instrument answer the question I asked, or
   one adjacent to it?*** — and it outlives every example below. **The pairs are dated illustrations, not
@@ -143,41 +184,110 @@ SSDF organizes secure development into four practice groups: **Prepare the Organ
 
 ### 4.1 Prepare the Organization (PO.1–PO.5)
 
-- **Security requirements (PO.1).** Security requirements are documented (this standard plus each project's standing contract, e.g., a `CLAUDE.md` or equivalent) and treated as first-class alongside functional requirements. Captured as first-class specs, these requirements drive design and tests per **§5 (Spec-Driven Development)** — recommended.
-- **Roles and responsibilities (PO.2).** Maintainer/reviewer roles are defined; security ownership is explicit; onboarding includes secure-development orientation.
-- **Supporting toolchains (PO.3).** Source control; CI/CD with automated security checks (§6.2); dependency and secret scanning; pinned, integrity-verified dependencies.
-- **Security check criteria (PO.4).** Pass/fail release gates are defined (§6.4); a release does not ship with unresolved high/critical findings.
-- **Secure development environments (PO.5).** Disk-encrypted developer machines; **no real PHI in development or test** (synthetic or de-identified data only); least-privilege access to repositories and environments.
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-4.1.1 | **MUST** document the project's security requirements — this standard plus the project's standing contract — and treat them as first-class alongside functional requirements. **(PO.1)** | This standard, and the standing contract file it names |
+| SDS-4.1.2 | **SHOULD** capture those requirements as first-class specs that drive design and tests (§5). **(PO.1)** | A spec artifact per requirement, linked to its design and tests |
+| SDS-4.1.3 | **MUST** define maintainer and reviewer roles, with security ownership stated explicitly rather than assumed. **(PO.2)** | The written role assignment, naming who owns security |
+| SDS-4.1.4 | **MUST** include secure-development orientation in onboarding. **(PO.2)** | The onboarding material |
+| SDS-4.1.5 | **MUST** hold all source in version control. **(PO.3)** | The repository |
+| SDS-4.1.6 | **MUST** run automated security checks in CI on every change (§6.2). **(PO.3)** | The CI workflow definition and a run of it |
+| SDS-4.1.7 | **MUST** run dependency scanning and secret scanning. **(PO.3)** | The scanner jobs and their most recent results |
+| SDS-4.1.8 | **MUST** pin dependencies and verify their integrity. **(PO.3)** | A hash-locked dependency file, checked in CI for drift |
+| SDS-4.1.9 | **MUST** define pass/fail release gates (§6.4). **(PO.4)** | The documented gate list |
+| SDS-4.1.10 | **MUST NOT** ship a release carrying unresolved high or critical findings. **(PO.4)** | The gate result for the released commit |
+| SDS-4.1.11 | **MUST** require disk encryption on developer machines. **(PO.5)** | A stated and reviewed environment baseline |
+| SDS-4.1.12 | **MUST NOT** use real PHI in development or test. Synthetic or de-identified data only. **(PO.5)** | The test corpus, and the de-identification path that produced it |
+| SDS-4.1.13 | **MUST** grant least-privilege access to repositories and environments. **(PO.5)** | A dated access review |
 
 ### 4.2 Protect the Software (PS.1–PS.3)
 
-- **Protect code from unauthorized access/tampering (PS.1).** Branch protection, required reviews, least-privilege access; no direct commits to the main branch; signed commits where supported.
-- **Verify release integrity (PS.2).** Releases are versioned and integrity-verifiable (checksums/signatures); a software bill of materials (SBOM) is generated per release.
-- **Archive and protect releases (PS.3).** Each released version, its build inputs, and its SBOM are archived to support incident analysis and reproducibility.
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-4.2.1 | **MUST** enforce branch protection and required reviews on the trunk. **(PS.1)** | The protection settings, and a rejected direct push |
+| SDS-4.2.2 | **MUST NOT** permit direct commits to the main branch. **(PS.1)** | The protection settings |
+| SDS-4.2.3 | **SHOULD** sign commits where the platform supports it. **(PS.1)** | Signature status on trunk commits |
+| SDS-4.2.4 | **MUST** version releases and make them integrity-verifiable by checksum or signature. **(PS.2)** | The published checksums or signatures |
+| SDS-4.2.5 | **MUST** generate a software bill of materials per release. **(PS.2)** | The SBOM attached to the release |
+| SDS-4.2.6 | **MUST** archive each released version, its build inputs and its SBOM, so an incident can be analysed against what actually shipped. **(PS.3)** | The retained archive, and a retrieval of one past release |
 
 ### 4.3 Produce Well-Secured Software (PW.1, PW.2, PW.4–PW.9)
 
-- **Secure design and threat modeling (PW.1–PW.2).** Each interface and component is threat-modeled; trust boundaries are identified and documented; designs are reviewed against the security requirements before build. The reviewed design artifact and its acceptance criteria are the spec; **§5** describes the recommended clarify/analyze gates applied before build.
-- **Reuse well-secured components (PW.4).** Prefer vetted libraries; avoid rolling custom cryptography.
-- **Secure coding practices (PW.5).** Mandatory:
-  - **Input validation** — validate structure and content at every ingress; reject or quarantine malformed input rather than processing it. *(Example: HL7 message validation in MEFOR.)*
-  - **Parameterized queries only** — no string-built SQL; use an ORM or parameterized statements throughout.
-  - **Authentication & authorization** — enforce on every action; deny by default; interface mechanisms per §7.4.
-  - **Web-service interfaces (REST and SOAP)** — authenticate every endpoint; validate and size-limit payloads against a schema; for SOAP/XML, disable external-entity resolution (XXE) and DTD processing; apply rate limiting and timeouts; never expose stack traces or sensitive data in fault responses.
-  - **File-handler interfaces** — confine reads/writes to configured directories and canonicalize paths (reject `../` traversal and symlink escapes); validate file type and size by content, not extension; use atomic write-then-rename so partial files are never processed; least-privilege storage, never an executable or web-served path; never execute file contents; scan inbound files for malware where feasible; encrypt sensitive files at rest and securely delete after processing per retention.
-  - **Cryptography** — TLS for all network communication; encryption at rest for sensitive data; approved algorithms and libraries; use FIPS-validated crypto where a deployment requires it.
-  - **Secrets** — never in code, prompts, or commit history; sourced from environment/secret store; enforced by pre-commit and CI secret scanning.
-  - **Error handling and logging** — fail closed; never log secrets or sensitive data; produce a tamper-resistant, timestamped audit log.
-- **Secure build configuration (PW.6).** Reproducible builds; security-relevant build/interpreter and dependency settings fixed in the pipeline.
-- **Code review and analysis (PW.7).** Every change is peer-reviewed; static analysis (SAST) and software composition analysis (SCA) run in CI (§6.2). Review also confirms the change conforms to its spec's acceptance criteria — see **§5** (analyze, cross-artifact coverage); recommended.
-- **Test executable code (PW.8).** A maintained automated test suite runs on every change; security test cases are included. Tests SHOULD trace to the spec's acceptance criteria (**§5**, executable acceptance criteria) so coverage is mechanical, not prose. Test *quality* — not just presence — is judged per the [Code Quality & Anti-Slop Standards](Code_Quality_Standards.md): behavior-verifying assertions over mock choreography, with mutation testing as *guidance*. Heed its **anti-metric rule** — **never gate quality on line-coverage % alone** (a gameable slop-hiding place); measure structure and behavior, not a single scoreboard.
-- **Secure defaults (PW.9).** Ships secure-by-default (TLS on, encryption on, least-privilege accounts, verbose audit logging); insecure options require explicit, documented opt-in.
+**Secure design and threat modeling (PW.1–PW.2).** The reviewed design artifact and its acceptance criteria are the spec; §5 describes the recommended clarify/analyze gates applied before build.
+
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-4.3.1 | **MUST** threat-model each interface and component. **(PW.1–PW.2)** | A written threat model per interface, dated |
+| SDS-4.3.2 | **MUST** identify and document trust boundaries. **(PW.1–PW.2)** | The boundary list in the threat model |
+| SDS-4.3.3 | **MUST** review a design against the security requirements **before** build. **(PW.1–PW.2)** | The review record, dated earlier than the implementation |
+| SDS-4.3.4 | **SHOULD** apply the clarify and analyze gates of §5 before build. **(PW.1–PW.2)** | Resolved clarifications on the design record |
+
+**Reuse well-secured components (PW.4).**
+
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-4.3.5 | **SHOULD** prefer a vetted library over a new implementation. **(PW.4)** | The dependency's provenance, recorded when it was added |
+| SDS-4.3.6 | **MUST NOT** implement custom cryptography. **(PW.4)** | Absence of hand-rolled primitives; a named library for each |
+
+**Secure coding practices (PW.5).** Every rule below is mandatory unless it says otherwise.
+
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-4.3.7 | **MUST** validate structure and content at every ingress. | The validator, and a test per ingress that rejects malformed input |
+| SDS-4.3.8 | **MUST** reject or quarantine malformed input rather than processing it. | The error/dead-letter path, and its disposition record |
+| SDS-4.3.9 | **MUST NOT** build SQL by string concatenation. Parameterized statements or an ORM throughout. | A source scan showing no string-built statements |
+| SDS-4.3.10 | **MUST** enforce authentication and authorization on every action (§7.4). | A route-to-permission map covering every action |
+| SDS-4.3.11 | **MUST** deny by default. | The default-deny path, and a test that an unmapped action is refused |
+| SDS-4.3.12 | **MUST** authenticate every web-service endpoint. | The endpoint inventory, each with its mechanism |
+| SDS-4.3.13 | **MUST** validate and size-limit payloads against a schema. | The schema, and the configured limit |
+| SDS-4.3.14 | **MUST** disable external-entity resolution and DTD processing for SOAP/XML. | The parser configuration, and an XXE regression test |
+| SDS-4.3.15 | **MUST** apply rate limiting and timeouts. | The configured values |
+| SDS-4.3.16 | **MUST NOT** expose stack traces or sensitive data in fault responses. | A fault-response test asserting the redacted shape |
+| SDS-4.3.17 | **MUST** confine file reads and writes to configured directories, canonicalizing paths and rejecting traversal and symlink escapes. | The canonicalization, and traversal/symlink regression tests |
+| SDS-4.3.18 | **MUST** validate file type and size by content, not by extension. | The content-sniffing check |
+| SDS-4.3.19 | **MUST** write files atomically (write-then-rename) so a partial file is never processed. | The write path |
+| SDS-4.3.20 | **MUST NOT** store handled files in an executable or web-served path. | The configured storage location |
+| SDS-4.3.21 | **MUST NOT** execute file contents. | Absence of any execution path from handled content |
+| SDS-4.3.22 | **SHOULD** scan inbound files for malware where feasible. | The scanner, or a stated reason it is not feasible |
+| SDS-4.3.23 | **MUST** encrypt sensitive files at rest and securely delete them after processing, per the retention policy. | The encryption setting and the deletion step |
+| SDS-4.3.24 | **MUST** use TLS for all network communication. | The TLS configuration and its minimum version floor |
+| SDS-4.3.25 | **MUST** encrypt sensitive data at rest. | The at-rest encryption setting |
+| SDS-4.3.26 | **MUST** use approved algorithms and libraries. | The cryptographic inventory |
+| SDS-4.3.27 | **MUST** use FIPS-validated cryptography where a deployment requires it. | The deployment's validated-module configuration |
+| SDS-4.3.28 | **MUST NOT** place secrets in code, in prompts, or in commit history. | A clean secret-scan over the full history |
+| SDS-4.3.29 | **MUST** source secrets from the environment or a secret store. | The configuration surface, carrying no literal secret |
+| SDS-4.3.30 | **MUST** enforce the two rules above by pre-commit and CI secret scanning. | The pre-commit hook and the CI job, each observed to fail on a planted secret |
+| SDS-4.3.31 | **MUST** fail closed. | A test per control asserting the closed outcome on error |
+| SDS-4.3.32 | **MUST NOT** log secrets or sensitive data. | A redaction test over the log surface |
+| SDS-4.3.33 | **MUST** produce a tamper-resistant, timestamped audit log. | The log's integrity mechanism, and a detected-tamper test |
+
+**Build, review, test and defaults (PW.6–PW.9).**
+
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-4.3.34 | **MUST** make builds reproducible. **(PW.6)** | Two builds of one commit producing the same artifact |
+| SDS-4.3.35 | **MUST** fix security-relevant build, interpreter and dependency settings in the pipeline rather than on a developer machine. **(PW.6)** | The pipeline definition |
+| SDS-4.3.36 | **MUST** peer-review every change. Where a project cannot staff a human second reviewer, the deviation and its compensating controls are recorded in A.6. **(PW.7)** | The review record per change, or the A.6 entry |
+| SDS-4.3.37 | **MUST** run static analysis and software composition analysis in CI (§6.2). **(PW.7)** | The SAST and SCA jobs, and their results for the released commit |
+| SDS-4.3.38 | **SHOULD** confirm in review that a change conforms to its spec's acceptance criteria (§5). **(PW.7)** | The criteria, checked off in the review |
+| SDS-4.3.39 | **MUST** maintain an automated test suite that runs on every change. **(PW.8)** | The suite, and its run on the change |
+| SDS-4.3.40 | **MUST** include security test cases in that suite. **(PW.8)** | The security tests, named |
+| SDS-4.3.41 | **SHOULD** trace tests to the spec's acceptance criteria so coverage is mechanical rather than prose (§5). **(PW.8)** | A criterion-to-test link per criterion |
+| SDS-4.3.42 | **MUST** judge test *quality*, not merely presence, per the [Code Quality & Anti-Slop Standards](Code_Quality_Standards.md) — behavior-verifying assertions over mock choreography, with mutation testing as guidance. **(PW.8)** | The quality review against that rubric |
+| SDS-4.3.43 | **MUST NOT** gate quality on line-coverage percentage alone; it is a gameable single scoreboard. Measure structure and behavior. **(PW.8)** | The gate definition, showing no coverage-only threshold |
+| SDS-4.3.44 | **MUST** ship secure-by-default: transport encryption on, at-rest encryption on, least-privilege accounts, audit logging on. **(PW.9)** | The shipped default configuration |
+| SDS-4.3.45 | **MUST** require an explicit, documented opt-in for any insecure option. **(PW.9)** | The opt-in setting and the documentation stating its risk |
 
 ### 4.4 Respond to Vulnerabilities (RV.1–RV.3)
 
-- **Identify on an ongoing basis (RV.1).** Continuous dependency monitoring; a defined intake channel for internally and externally reported issues (§8).
-- **Assess, prioritize, remediate (RV.2).** Findings are triaged by severity with target remediation timelines (set per project in the profile); fixes are verified before closure.
-- **Root-cause analysis (RV.3).** Significant vulnerabilities receive a root-cause review; systemic causes feed back into this standard.
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-4.4.1 | **MUST** monitor dependencies continuously. **(RV.1)** | The monitoring job and its most recent run |
+| SDS-4.4.2 | **MUST** publish a defined intake channel for internally and externally reported issues (§8). **(RV.1)** | The published channel |
+| SDS-4.4.3 | **MUST** triage findings by severity against target remediation timelines set in the applicability profile. **(RV.2)** | The triage record, with dates against the profile's targets |
+| SDS-4.4.4 | **MUST** verify a fix before closing the finding. **(RV.2)** | The verifying test or check, referenced from the closure |
+| SDS-4.4.5 | **MUST** perform a root-cause review of a significant vulnerability. **(RV.3)** | The root-cause record |
+| SDS-4.4.6 | **MUST** feed systemic causes back into this standard. **(RV.3)** | The resulting change to this document, in Version history |
 
 ---
 
@@ -197,11 +307,13 @@ Spec-driven development treats the artifacts that describe *what* a change must 
 | **Tasks** | Decomposition of decisions/requirements into work items / lanes / gates. | PW.1–PW.2 |
 | **Verification** | Automated checks + human conformance reviews that test/inspect against the spec. | PW.7 (review), PW.8 (test) |
 
-A project SHOULD keep these five layers present and connected; the recommended connections are described in §5.3–§5.5.
+- **SDS-5.1.1 — SHOULD keep these five layers present and connected.** The recommended connections are described in §5.3–§5.5. *Evidence:* an artifact per layer, each linked to the layer above it.
 
 ### 5.2 EARS acceptance criteria
 
-A change's behavioral acceptance criteria SHOULD be written in **EARS (Easy Approach to Requirements Syntax)** — a small, constrained grammar that turns prose requirements into testable, unambiguous statements. EARS offers five templates:
+- **SDS-5.2.1 — SHOULD write a change's behavioral acceptance criteria in EARS (Easy Approach to Requirements Syntax)**, a small constrained grammar that turns prose requirements into testable, unambiguous statements. *Evidence:* the criteria, each matching one of the five templates below.
+
+EARS offers five templates:
 
 | Template | Form |
 |---|---|
@@ -217,22 +329,22 @@ This fits the project's existing posture: the standing contract's invariants alr
 
 ### 5.3 Requirement → design → tasks → test traceability
 
-Each acceptance criterion SHOULD carry an **ID** linked to the test or fixture that exercises it, so coverage is **mechanical, not prose** — "which criteria are untested" becomes computable rather than a judgment call. The reference project already owns the pieces — decisions in ADRs, requirement IDs in the backlog, tasks in release/multisession plans — and the recommendation is to **connect** them: criterion ID → test/fixture link. *(Lineage: AWS Kiro requirements/design/tasks triad; distilled.)*
+- **SDS-5.3.1 — SHOULD give each acceptance criterion an ID linked to the test or fixture that exercises it**, so coverage is **mechanical, not prose** and "which criteria are untested" becomes computable rather than a judgment call. *Evidence:* a criterion-to-test link per criterion, and a report of the unlinked ones. The reference project already owns the pieces — decisions in ADRs, requirement IDs in the backlog, tasks in release/multisession plans — and the recommendation is to **connect** them: criterion ID → test/fixture link. *(Lineage: AWS Kiro requirements/design/tasks triad; distilled.)*
 
 ### 5.4 Clarify and analyze (lightweight, advisory)
 
 Two lightweight checks are recommended, both explicitly **advisory, not hard gates**:
 
-- **Clarify** — force ambiguity resolution before build, surfacing and answering open questions while they are still cheap to change. The project already has an informal version: the ADR **"To resolve on acceptance"** block.
-- **Analyze** — automated cross-artifact consistency/coverage: does every acceptance criterion have a task and a test? does any artifact contradict the constitution's invariants?
+- **SDS-5.4.1 — SHOULD run a clarify step before build**, forcing ambiguity resolution while open questions are still cheap to change. The project already has an informal version: the ADR **"To resolve on acceptance"** block. *Evidence:* the resolved questions on the decision record, dated before the implementation.
+- **SDS-5.4.2 — SHOULD run an analyze check for cross-artifact consistency and coverage:** does every acceptance criterion have a task and a test? does any artifact contradict the constitution's invariants? *Evidence:* the check's report for the change.
 
-These SHOULD be run as lightweight advisory checks. They introduce no new blocking release gate (cf. §6.4). *(Lineage: GitHub Spec Kit `specify → clarify → plan → tasks → analyze → implement`; distilled.)*
+Both are **advisory** and introduce no new blocking release gate (cf. §6.4). *(Lineage: GitHub Spec Kit `specify → clarify → plan → tasks → analyze → implement`; distilled.)*
 
 ### 5.5 Executable acceptance criteria (living documentation)
 
-BDD / Specification-by-Example expresses acceptance criteria as Given/When/Then scenarios with concrete `(input → expected outcome)` example tables that **execute** as tests — so specification and verification cannot silently drift, and the spec doubles as living documentation. This fits naturally with EARS's WHEN/THEN phrasing, and the HL7 domain (well-defined inputs, well-defined dispositions) is well suited to example-driven verification. The concrete reference-project opportunity (detailed as R2 in Appendix A.7):
+BDD / Specification-by-Example expresses acceptance criteria as Given/When/Then scenarios with concrete `(input → expected outcome)` example tables that **execute** as tests — so specification and verification cannot silently drift, and the spec doubles as living documentation. This fits naturally with EARS's WHEN/THEN phrasing, and the HL7 domain (well-defined inputs, well-defined dispositions) is well suited to example-driven verification.
 
-> A project's dry-run gate that already replays fixtures through the real graph but asserts only "didn't error" **SHOULD** be upgraded to assert an **expected disposition per fixture** (e.g. `PROCESSED` / `UNROUTED` / `FILTERED` / `ERROR`), turning it into an executable acceptance-criteria check.
+- **SDS-5.5.1 — A dry-run gate that replays fixtures through the real graph SHOULD assert an expected disposition per fixture** — for example received / unrouted / filtered / errored — rather than only that it did not error, turning it into an executable acceptance-criteria check. A fixture declaring no expectation keeps the weaker semantics, so adoption is incremental. *Evidence:* the declared expectation per fixture, and the gate asserting it.
 
 *(Lineage: BDD / Specification-by-Example; distilled, not BDD-tool adoption.)*
 
@@ -258,18 +370,22 @@ Testing follows the methodology of NIST SP 800-115 (*Technical Guide to Informat
 
 ### 6.2 Internal testing (continuous)
 
-- SAST and SCA run automatically; builds fail on new high/critical findings.
-- Secret scanning runs pre-commit and in CI; the full git history is kept clean of secrets, credentials, keys, and any sensitive data.
-- Security-focused test cases (authn/authz, input validation, error handling) are part of the standard suite.
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-6.2.1 | **MUST** run SAST and SCA automatically on every change. | The jobs, and their run on the change |
+| SDS-6.2.2 | **MUST** fail the build on a new high or critical finding. | The failure threshold, and a build observed to fail on one |
+| SDS-6.2.3 | **MUST** run secret scanning both pre-commit and in CI. | Both hooks, each observed to fail on a planted secret |
+| SDS-6.2.4 | **MUST** keep the full git history clean of secrets, credentials, keys and sensitive data. | A history-wide scan, not a scan of the tip |
+| SDS-6.2.5 | **MUST** carry security-focused test cases — authentication, authorization, input validation, error handling — in the standard suite. | Those tests, named, running in the standard suite |
 
 ### 6.3 OWASP ASVS 5.0 Level 3 — scope
 
 The independent review is scoped to **OWASP ASVS version 5.0.0** (released May 2025), **Level 3**:
 
-- **Version-pinned citation.** Requirements are cited as `v5.0.0-<chapter>.<section>.<requirement>`; identifiers changed substantially from 4.0.x, so the version is always stated.
+- **SDS-6.3.1 — MUST cite ASVS requirements as `v5.0.0-<chapter>.<section>.<requirement>`, always stating the version.** Identifiers changed substantially from 4.0.x, so a bare number resolves to a different requirement depending on which edition the reader holds. *Evidence:* the citations, each carrying its version.
 - **Scale and level model.** ~350 requirements across **17 chapters**. Levels are **cumulative** — L3 includes all of L1 and L2. **MessageFoundry targets Level 3** (defence-in-depth for the highest-assurance contexts), chosen above the usual L2 norm because the engine carries PHI; L1 and L2 form the cumulative baseline and are assessed first.
 - **Access required for L3.** L3 is a white-box / hybrid review: the assessor needs source code, developer access, documentation, and an authenticated test instance running **synthetic, non-PHI** data.
-- **Documented Security Decisions (new in 5.0).** Each chapter opens with a requirement to document *how* its controls are applied and *why*. This standard, the per-interface threat models (PW.1), and the secure-default baseline (PW.9) serve as that documentation. **Each project documents which chapters are in scope and records exclusions with justification** — see the applicability profile. (Documenting exclusions is itself an ASVS practice.)
+- **SDS-6.3.2 — MUST record which ASVS chapters are in scope, and justify every exclusion**, in the applicability profile. Documenting exclusions is itself an ASVS practice, and each 5.0 chapter opens with a requirement to document *how* its controls are applied and *why*; this standard, the per-interface threat models (SDS-4.3.1) and the secure-default baseline (SDS-4.3.44) serve as that documentation. *Evidence:* the profile's chapter table, every excluded row carrying a reason.
 - **5.0 modernizations to honor.** Cryptography (V11) reflects current guidance, including post-quantum considerations; authentication and password rules (V6) align with NIST SP 800-63; ASVS 5.0 scopes to **applications and APIs** (host/network infrastructure is the deployer's responsibility, §2).
 
 **The 17 chapters (v5.0.0):** V1 Encoding and Sanitization · V2 Validation and Business Logic · V3 Web Frontend Security · V4 API and Web Service · V5 File Handling · V6 Authentication · V7 Session Management · V8 Authorization · V9 Self-contained Tokens · V10 OAuth and OIDC · V11 Cryptography · V12 Secure Communication · V13 Configuration · V14 Data Protection · V15 Secure Coding and Architecture · V16 Security Logging and Error Handling · V17 WebRTC.
@@ -278,7 +394,14 @@ The independent review is scoped to **OWASP ASVS version 5.0.0** (released May 2
 
 ### 6.4 Release gates
 
-A production release requires: passing automated checks, no unresolved high/critical findings, current independent-review status (or a documented risk acceptance), and updated evidence (§9).
+A production release requires all four of the following. A gate that is skipped is a deviation recorded in A.6, not a judgment call at release time.
+
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-6.4.1 | Every automated check **MUST** pass. | The green run for the released commit, not for its branch tip |
+| SDS-6.4.2 | There **MUST NOT** be an unresolved high or critical finding. | The finding register at the release date |
+| SDS-6.4.3 | Independent-review status **MUST** be current, or a dated risk acceptance **MUST** be in force. | The review report, or the A.6 entry with its date and owner |
+| SDS-6.4.4 | The evidence set (§9) **MUST** be updated to match what shipped. | The evidence set, dated at or after the release |
 
 ---
 
@@ -322,23 +445,59 @@ Each deploying organization conducts its own HIPAA Security Risk Assessment of t
 
 Integration software authenticates **systems, not people**, on its interfaces. Each connection uses the strongest mechanism the partner system supports, drawn from the hierarchy below; the mechanism, scope, and credential reference for every connection are recorded in its connection definition. (Maps to ASVS V6/V9/V10/V12; HIPAA person-or-entity authentication and transmission security.) *Which mechanisms a given project implements is recorded in its profile.*
 
-**Preferred — system-to-system:**
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-7.4.1 | Each connection **MUST** use the strongest mechanism in the hierarchy below that the partner system supports. | The connection definition, against the partner's stated capability |
+| SDS-7.4.2 | The mechanism, scope and credential reference **MUST** be recorded in every connection's definition. | The connection definition, all three fields populated |
 
-- **Mutual TLS (mTLS).** Client-certificate authentication over **TLS 1.2+ (prefer 1.3)** with strong cipher suites; validate the full chain to a trusted CA, check revocation (OCSP/CRL), rotate certificates before expiry. Where tokens are also used, prefer **sender-constrained (mTLS-bound) access tokens** (ASVS 5.0 V10).
-- **OAuth 2.0 client-credentials grant.** The default for machine-to-machine API auth. Prefer **asymmetric client authentication (`private_key_jwt`)** over shared secrets; issue short-lived, per-connection scoped tokens; validate issuer, audience, expiry, and scope on every request.
-- **SMART on FHIR (Backend Services).** For any FHIR REST interface, authenticate using the SMART **Backend Services** profile — OAuth 2.0 client-credentials with a **signed JWT client assertion** and `system/` scopes; validate granted scopes against the requested operation.
+**Preferred — system-to-system.** Mutual TLS, the OAuth 2.0 client-credentials grant, and SMART on FHIR Backend Services.
 
-**Directory / enterprise integration (e.g., Active Directory):**
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-7.4.3 | mTLS **MUST** run over TLS 1.2 or later with strong cipher suites. | The negotiated version and suite list |
+| SDS-7.4.4 | mTLS **SHOULD** use TLS 1.3. | The configured preference order |
+| SDS-7.4.5 | **MUST** validate the full client-certificate chain to a trusted CA. | The trust store, and a rejected-untrusted-chain test |
+| SDS-7.4.6 | **MUST** check certificate revocation (OCSP or CRL). | The revocation configuration, and a rejected-revoked-cert test |
+| SDS-7.4.7 | **MUST** rotate certificates before expiry. | An expiry monitor, and the rotation record |
+| SDS-7.4.8 | Where bearer tokens are also used, **SHOULD** prefer sender-constrained (mTLS-bound) access tokens. | The token binding, per ASVS 5.0 V10 |
+| SDS-7.4.9 | Machine-to-machine API authentication **MUST** default to the OAuth 2.0 client-credentials grant. | The default in the connection factory |
+| SDS-7.4.10 | **SHOULD** prefer asymmetric client authentication (`private_key_jwt`) over a shared secret. | The registered client authentication method |
+| SDS-7.4.11 | **MUST** issue short-lived, per-connection scoped tokens. | The configured lifetime and scope, per connection |
+| SDS-7.4.12 | **MUST** validate issuer, audience, expiry and scope on every request. | The validation code, and a test rejecting each of the four |
+| SDS-7.4.13 | Any FHIR REST interface **MUST** authenticate using the SMART Backend Services profile. | The interface's configured mechanism |
+| SDS-7.4.14 | SMART authentication **MUST** use a signed JWT client assertion and `system/` scopes. | The assertion, and the granted scope list |
+| SDS-7.4.15 | **MUST** validate granted scopes against the requested operation. | The scope check, and a test refusing an out-of-scope operation |
 
-- **Run under a least-privilege service account — preferably a group-Managed Service Account (gMSA)** on Windows/AD — so the password is auto-rotated and never stored in configuration.
-- **Use Kerberos / Integrated Windows Authentication**; prefer Kerberos over NTLM (disable NTLM where feasible) with correct SPNs.
-- **Authenticate to databases with integrated authentication** (the service account) rather than a stored database password, where supported.
-- **Perform directory lookups over LDAPS (LDAP over TLS) only** — never cleartext LDAP; bind with a least-privilege account.
-- **Map roles to directory security groups** for centralized RBAC; if human operators authenticate, **federate to the enterprise identity provider (AD FS / Entra ID) via OIDC or SAML** rather than a local user store.
+**Directory / enterprise integration** (for example Active Directory).
 
-**Legacy / interoperability tier** *(supported, least-preferred, documented per connection):* HTTP Basic over TLS, per-connection API keys, or SOAP **WS-Security** (UsernameToken or, preferably, X.509 certificate tokens with message-level signing). Always over TLS; credentials vaulted, scoped per connection, and rotated. Used only when a partner system cannot support a preferred mechanism, with the exception recorded.
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-7.4.16 | **MUST** run under a least-privilege service account. | The account and its granted rights |
+| SDS-7.4.17 | **SHOULD** use a group-Managed Service Account on Windows/AD, so the password is auto-rotated and never stored in configuration. | The account type; no password in configuration |
+| SDS-7.4.18 | **MUST** use Kerberos or Integrated Windows Authentication for directory-integrated authentication. | The negotiated mechanism |
+| SDS-7.4.19 | **SHOULD** prefer Kerberos over NTLM, and disable NTLM where feasible. | The disabled-NTLM setting, or a stated reason it is infeasible |
+| SDS-7.4.20 | **MUST** register correct service principal names. | The SPN registration |
+| SDS-7.4.21 | **SHOULD** authenticate to databases with integrated authentication rather than a stored password, where supported. | The connection configuration, carrying no password |
+| SDS-7.4.22 | **MUST** perform directory lookups over LDAPS only. Cleartext LDAP is **MUST NOT**. | The configured scheme and port |
+| SDS-7.4.23 | **MUST** bind to the directory with a least-privilege account. | The bind account's granted rights |
+| SDS-7.4.24 | **SHOULD** map roles to directory security groups for centralized RBAC. | The group-to-role map |
+| SDS-7.4.25 | Where human operators authenticate, **SHOULD** federate to the enterprise identity provider via OIDC or SAML rather than a local user store. | The federation configuration, or the A.6 deviation |
 
-**Across all mechanisms:** TLS everywhere (no cleartext sensitive transport); credentials and keys in a secret store, never in code or config; per-connection least privilege; and per-connection IP allowlisting / network segmentation as defense-in-depth.
+**Legacy / interoperability tier.** Supported, least-preferred, and documented per connection: HTTP Basic over TLS, per-connection API keys, or SOAP WS-Security.
+
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-7.4.26 | A legacy mechanism **MAY** be used only where a partner system cannot support a preferred one. | The partner's stated limitation |
+| SDS-7.4.27 | Each such use **MUST** be recorded as an exception on the connection. | The recorded exception |
+| SDS-7.4.28 | A legacy mechanism **MUST** run over TLS, with its credential vaulted, scoped per connection, and rotated. | The transport, the vault reference, and the rotation record |
+| SDS-7.4.29 | WS-Security **SHOULD** use X.509 certificate tokens with message-level signing rather than UsernameToken. | The configured token type |
+
+**Across all mechanisms.**
+
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-7.4.30 | **MUST NOT** carry sensitive data over a cleartext transport, on any interface. | A transport inventory, every entry TLS |
+| SDS-7.4.31 | **MUST** hold credentials and keys in a secret store, never in code or configuration, and apply per-connection least privilege. **SHOULD** add per-connection IP allowlisting or network segmentation as defense-in-depth. | The secret-store references; the per-connection grants; the allowlist where present |
 
 ---
 
@@ -346,11 +505,21 @@ Integration software authenticates **systems, not people**, on its interfaces. E
 
 Because the software is developed in the open and adopted by others, the project also maintains:
 
-- **Repository hygiene.** No secrets or sensitive data ever committed; the full history is scanned and kept clean. A clear `LICENSE`.
-- **Coordinated vulnerability disclosure.** A published `SECURITY.md` with a private reporting channel and a disclosure timeline; reported issues feed the RV process (§4.4).
-- **Signed, verifiable releases.** Release artifacts are signed and accompanied by an SBOM (PS.2), so adopters can verify provenance and integrity.
-- **Contribution review.** All external contributions are security-reviewed before merge; signed commits / DCO required; maintainers gate merges; dependency provenance is checked.
-- **Adopter guidance.** A deployment/hardening guide so adopters can stand the software up securely and meet their §2 responsibilities.
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-8.1 | **MUST NOT** commit a secret or sensitive data to the public repository. | A clean scan of the tip |
+| SDS-8.2 | **MUST** scan the full history and keep it clean, not only the tip. | The history-wide scan result |
+| SDS-8.3 | **MUST** publish a clear `LICENSE`. | The file, at the repository root |
+| SDS-8.4 | **MUST** publish a `SECURITY.md` carrying a private reporting channel. | The file, and a channel that accepts a report |
+| SDS-8.5 | **MUST** publish a disclosure timeline. | The stated windows in `SECURITY.md` |
+| SDS-8.6 | **MUST** feed reported issues into the RV process (§4.4). | A reported issue traced to its triage record |
+| SDS-8.7 | **MUST** sign release artifacts. | The signature, and a verification of it |
+| SDS-8.8 | **MUST** accompany each release with an SBOM, so an adopter can verify provenance and integrity. **(PS.2)** | The SBOM attached to the release |
+| SDS-8.9 | **MUST** security-review every external contribution before merge. | The review record per external contribution |
+| SDS-8.10 | **MUST** require signed commits or a DCO on contributions. | The enforced setting |
+| SDS-8.11 | **MUST** gate merges through maintainers. | The branch protection rule naming who may merge |
+| SDS-8.12 | **MUST** check the provenance of a dependency before adopting it. | The provenance note recorded when it was added |
+| SDS-8.13 | **MUST** publish a deployment and hardening guide, so adopters can stand the software up securely and meet their §2 responsibilities. | The published guide |
 
 ---
 
@@ -358,11 +527,14 @@ Because the software is developed in the open and adopted by others, the project
 
 The project maintains a current evidence set so any claim is backed:
 
-- This **Secure Development Standards** document and each project's standing contract.
-- **SSDF practice evidence** (toolchain configuration, review records, SBOMs, secure-default settings).
-- **Test results** — CI security-scan history; the independent **OWASP ASVS 5.0 Level 3** report and re-test results.
-- **Per-project applicability profile** (Appendix A and onward).
-- A **claims register** recording each published claim, its wording, and the evidence behind it.
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-9.1 | **MUST** keep this document and each project's standing contract current. | Both files, with a review date inside the stated cadence |
+| SDS-9.2 | **MUST** retain SSDF practice evidence: toolchain configuration, review records, SBOMs, secure-default settings. | The retained artifacts, per practice |
+| SDS-9.3 | **MUST** retain test results: CI security-scan history, and the independent ASVS report with its re-test results. | The scan history, and the report where one exists |
+| SDS-9.4 | **MUST** maintain a per-project applicability profile. | Appendix A, and one appendix per further project |
+| SDS-9.5 | **MUST** maintain a claims register recording each published claim, its exact wording, and the evidence behind it. | The register, one row per published claim |
+| SDS-9.6 | **MUST** publish attestations with releases, so an adopter can rely on them. | The attestation attached to the release |
 
 **Attestation posture.** The software is self-attested as NIST SSDF–aligned, tested per NIST SP 800-115, **assessed against** OWASP ASVS 5.0 **using Level 3 as the target** — an assessment **in progress**, not a completed verification — and built to support HIPAA-compliant deployment (controls mapped to NIST SP 800-66 Rev. 2). Third-party validation of the SSDF attestation and of the ASVS assessment raises the weight of these claims.
 
@@ -491,30 +663,35 @@ current position on it.
 ### A.6 Documented deviations
 
 Honest record of where MEFOR's *current* practice differs from the body of the standard, with the
-compensating control (the standard requires exclusions/deviations be documented, §6.3).
+compensating control. Recording a deviation is itself required (SDS-6.3.2). **Each entry names the
+rule it departs from by identifier**, so the departure and the requirement cannot drift apart.
 
-- **Single-maintainer development (PO.2 / PW.7).** The project is solo-maintained today, so the
-  standard's "every change is peer-reviewed" cannot mean a *human second reviewer*. Compensating
+- **Single-maintainer development — SDS-4.3.36 (PO.2 / PW.7).** The project is solo-maintained today, so
+  SDS-4.3.36's "**MUST** peer-review every change" cannot mean a *human second reviewer*. Compensating
   controls: blocking automated review (bandit/semgrep SAST, pip-audit SCA, gitleaks), AI-assisted
   review, branch protection + required CI checks, and no direct pushes to `main`. Revisit when a
   second maintainer joins. **Detailed record:** the AI-assisted-review compensating control — and the
   full risk-tiered discipline for building with Claude Code — is operationalized in
   [`Secure_AI_Development_Standards.md`](Secure_AI_Development_Standards.md), the companion standard
   that owns and expands this deviation.
-- **Independent ASVS-L3 review & DAST (§6.3 / §6.4).** Not yet performed; a **dated risk acceptance**
+- **Independent ASVS-L3 review & DAST — SDS-6.4.3.** Not yet performed; a **dated risk acceptance**
   is in force pre-1.0. An independent engagement is planned — it is a **$25,000–$50,000** commitment
   that the project intends to fund through a grant or sponsorship rather than licence revenue.
   MessageFoundry is **self-hosted**, so the decision to deploy it beyond loopback, and the assessment
   that justifies that decision, rest with the **implementing organization**: this standard states what
   has and has not been independently verified, and does not gate your deployment on it.
-- **Federated operator SSO (§7.4).** API/WSS/MLLP **TLS and client-cert mTLS are built** (opt-in via
+- **Federated operator SSO — SDS-7.4.25.** API/WSS/MLLP **TLS and client-cert mTLS are built** (opt-in via
   cert config) and **native TOTP MFA for local accounts is built** (ADR 0002 WP-14); the remaining
   deferred operator-auth item is **federated SSO (OIDC/SAML via Entra)**, held safe by the fail-closed
   `127.0.0.1` bind guard. Federation gets a dedicated ADR before off-loopback exposure.
-- **Mechanical requirement→test traceability (§5.3, recommended).** Not yet enforced: acceptance
-  criteria are not uniformly ID'd and linked to tests, and the dry-run gate asserts only "didn't error"
-  (R2). This is **not a deviation from a hard requirement** — §5 traceability is **recommended (SHOULD)**,
-  adopted incrementally — but it is recorded here for honesty. Tracked as R1–R3 in §A.7.
+- **Mechanical requirement→test traceability — SDS-5.3.1.** Not yet enforced: acceptance criteria are
+  not uniformly ID'd and linked to tests. This is **not a deviation from a hard requirement** —
+  SDS-5.3.1 is **SHOULD**, adopted incrementally — but it is recorded here for honesty. Tracked as
+  R1 and R3 in A.7.2.
+  **SDS-5.5.1 is no longer deferred.** The dry-run gate reads a declared expected disposition per
+  fixture and asserts it, in [`checks.py`](../messagefoundry/checks.py); a fixture with no declared
+  expectation keeps the older not-`ERROR` semantics. This entry previously recorded R2 as outstanding
+  after it had been built.
 
 **ASVS 5.0 L3 deferred items — accepted / deferred** (risk accepted **2026-06-16**, refreshed after
 MFA + admin-defense landed **2026-06-17**; owner: project maintainer). Each is deferred-by-design behind
@@ -577,8 +754,20 @@ PW.8 (test executable code) is the home of `messagefoundry check` (validate + dr
 #### A.7.2 Recommendations (all **recommended / SHOULD**, advisory)
 
 - **R1 — EARS "Acceptance Criteria" block on the ADR template.** Each ADR **SHOULD** carry an EARS "Acceptance Criteria" block, each criterion bearing an ID linked to its test or fixture. Doc-only, zero-code; formalizes the existing SHALL-style house register. *(Lineage: AWS Kiro requirements.md; distilled.)*
-- **R2 — Make the dry-run gate executable-spec.** `messagefoundry/checks.py` **SHOULD** read an **expected disposition per fixture** (`PROCESSED` / `UNROUTED` / `FILTERED` / `ERROR`) and assert it, upgrading today's "didn't error" dry-run (`_check_dryrun` asserts only not-`ERROR`) into an executable acceptance-criteria check. **Backward-compatible:** a fixture with no declared expectation keeps today's not-`ERROR` semantics. *(Lineage: BDD / Specification-by-Example; distilled.)*
+- **R2 — Make the dry-run gate executable-spec. BUILT (SDS-5.5.1).** [`checks.py`](../messagefoundry/checks.py) reads an expected disposition from a `<fixture>.expect` sidecar (`RECEIVED` / `UNROUTED` / `FILTERED` / `ERROR`, with `PROCESSED` and `ROUTED` accepted as aliases of `RECEIVED`) and asserts it, so the dry-run is an executable acceptance-criteria check rather than a not-`ERROR` smoke test. A fixture with no sidecar keeps the older semantics, so adoption is incremental. Retained here rather than deleted because A.6 recorded it as outstanding after it had shipped, and a recommendation that quietly disappears leaves no trace of having been met. *(Lineage: BDD / Specification-by-Example; distilled.)*
 - **R3 — Promote clarify, add analyze.** The ADR **"To resolve on acceptance"** block **SHOULD** be promoted into an explicit **clarify** step (resolve ambiguity before `Accepted`), and an **analyze**-style advisory coverage check **SHOULD** verify that every **Accepted** ADR's acceptance criteria has a linked test, and that no artifact contradicts a `CLAUDE.md` invariant. **Advisory, not a hard gate** — it belongs in the advisory tier alongside `ruff`/`mypy`, not the required `validate`/`dryrun` tier. *(Lineage: GitHub Spec Kit pipeline; distilled.)*
+
+---
+
+## Retired rules
+
+A retired identifier is **never reissued**. A rule is retired when *what it demands* changes; a rule
+whose wording changes keeps its identifier and does not appear here. A citation that outlives its rule
+resolves to a row below rather than to whatever requirement later took the number.
+
+| Retired ID | Retired in | What it required | Why, and what replaced it |
+|---|---|---|---|
+| — | — | *No rule has been retired yet.* | — |
 
 ---
 
@@ -586,6 +775,7 @@ PW.8 (test executable code) is the home of `messagefoundry check` (validate + dr
 
 | Version | Date | Change |
 |---|---|---|
+| 2.3 | August 7, 2026 | **Rules given stable identifiers.** 145 requirements now carry an `SDS-<section>.<n>` identifier, an RFC 2119 keyword in capitals, and the evidence that settles them; see *How to read the rules*. **Section numbers are unchanged** — identifiers were added alongside, so every existing citation still resolves. A.6 now names the rule each deviation departs from, replacing the `(§6.3 / §6.4)` / `(§7.4)` / `(§5.3)` positional citations that the §5–§9 → §6–§10 renumbering below had already broken elsewhere. A *Retired rules* table holds tombstones so a retired identifier is never reissued, and `tests/test_sds_rule_ids_are_stable.py` enforces the convention in CI. Two corrections of record: A.6 listed R2 (the executable dry-run gate) as outstanding after it had shipped, and the standing contract introduced four prose-review rules as "the three rules below". No requirement was added, removed, weakened or strengthened. |
 | 2.2 | July 30, 2026 | **Independent-review deviation reframed.** The independent ASVS-L3 review & DAST is no longer stated as a precondition for off-loopback/production exposure. MessageFoundry is self-hosted, so the deployment decision — and the assessment supporting it — belong to the implementing organization; this standard records what has and has not been independently verified rather than gating deployment on it. The engagement remains planned, at an estimated $25,000–$50,000, intended to be grant- or sponsor-funded. Also drops a dangling citation to `security/RELEASE-GATE.md`, which is not present in this repository. No change to the SSDF / ASVS / HIPAA mappings. |
 | 2.1 | July 29, 2026 | **Code-quality companion added.** Cross-linked the new [Code Quality & Anti-Slop Standards](Code_Quality_Standards.md) (evidence-based anti-slop rubric, ISO/IEC 25010): a companion-standards pointer in §1 and a test-*quality* + anti-metric note at PW.8. No change to the SSDF / ASVS / HIPAA mappings or Appendix A. |
 | 2.0 | June 24, 2026 | Restructured baseline around SSDF, spec-driven development, NIST SP 800-115 testing tiers and SP 800-66 Rev. 2 safeguards. Content carried forward unchanged at this baseline. The full prior changelog — MEFOR-specific drafts → genericization (project-agnostic, with an Appendix A applicability profile) → OWASP ASVS 5.0 Level 3 re-target → NIST SP 800-53 removal → §5 Spec-Driven Development addition and the §5–§9 → §6–§10 renumbering — is preserved in git history. |

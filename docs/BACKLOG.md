@@ -2873,7 +2873,7 @@ This is **wider than the disclosure describes.** [`CONFIGURATION.md:718`](CONFIG
 
 ## 329. Five `MEFOR_ALLOW_INSECURE_TLS` cells bypass the ADR 0092 clamp
 
-> 🔢 **Filed 2026-08-01 — not started.** Value **6/10** · Difficulty **4/10** · _quick win_. The LDAPS bind (`ssl.CERT_NONE` on the authentication substrate for every AD identity), the SFTP host key, the webhook sink and the `[ai].api_key` still cross an enforcing production-PHI posture on one env var, and converting them is what collapses five per-site facts into one repo-wide invariant the ASVS scorecard's regex mechanism can actually express — bounded because setting the variable needs Administrator, who can already do worse; the cheap in-gate half shipped with #323, so what remains is threading an explicit posture into `AuthService`/`create_app`'s three out-of-gate constructors, where `_here()` would otherwise ship green and inert.
+> ✅ **SHIPPED 2026-08-06 — the four out-of-gate insecure-TLS cells now route through the ADR-0092 clamp.** Value **6/10** · Difficulty **4/10** · _quick win_. LDAPS (`auth/ldap.py`), the SFTP host key (`transports/remotefile.py`), the webhook sink (`pipeline/alert_sinks.py`) and the AI-broker (`transports/ai_broker.py`) now gate the `MEFOR_ALLOW_INSECURE_TLS` escape through `weakened_tls_escape_permitted[_here]` — the instance posture threaded into `AuthService` / `create_app`'s out-of-gate constructors — so on an enforcing production-PHI instance the escape is inert and an unverified/cleartext hop stays refused. The fifth cell the heading names (Direct SMTP) was already clamped in #323, so this converted the remaining four.
 
 > ⚠️ **AMENDED 2026-08-03 — the census is FOUR, not five: #323 landed and took the Direct SMTP cell.** The heading, the evidence table (*"Confirmed at HEAD"*) and Proposed §1 all still name `transports/direct.py:170` as an unclamped cell, but that file now holds **no call to the raw predicate at all** — it imports only `weakened_tls_escape_permitted_here` (`messagefoundry/transports/direct.py:63`) and gates both arms on it (`:197` cleartext SMTP, `:215` `tls_verify=false`), with the #323 rationale — including its own warning that this absence is scoped to that file and never repo-wide — at `:182-196`; `:170` is now unrelated cert-loading. The Scope note called this in future tense and the 2026-08-03 banner already enumerates only four cells while still calling them *"five per-site facts"*, so read the table as **at least four** sites still reading the unclamped `insecure_tls_allowed()`: the SFTP host key (`messagefoundry/transports/remotefile.py:375`, feeding `AutoAddPolicy`/`RejectPolicy` at `:392-394`), LDAPS (`messagefoundry/auth/ldap.py:113`), the webhook alert sink (`messagefoundry/pipeline/alert_sinks.py:291` — the item cites `:290`) and the AI broker (`messagefoundry/transports/ai_broker.py:140`).
 >
@@ -2928,7 +2928,7 @@ That distinction matters concretely for the ASVS record. The scorecard's absence
 
 ## 331. Anonymizer's fail-closed leak-check has no structural PHI detectors
 
-> 🔢 **Filed 2026-08-01 — not started.** Value **6/10** · Difficulty **4/10** · _quick win_. The function that earns the right to share a de-identified dataset verifies a known-string denylist — `leak_check` is `scan_text` (FORBIDDEN patterns, one routable-IPv4 check, estate substrings; `scripts/security/scan_forbidden.py:772-795`) plus a field-anchored site code, and a real MRN is not a denylisted string — and on a token-less checkout it degrades to the IPv4 check alone over an HL7 body and still returns clean, a gap `f3c6d348` hit in practice with a hand overlay that was never committed; wiring `token_floor_failure()` into the bridge is small, but the unmapped-field report and detectors scoped to fields no rule matched cross the `anonymize` seam and must be mirrored into `tee/anon/leak.py` for `test_anon_parity`.
+> ✅ **SHIPPED 2026-08-06 — structural PHI-shape detectors + unmapped-field coverage report + token-floor signal built.** Value **6/10** · Difficulty **4/10** · _quick win_. `leak_check`/`leak_report` now run high-precision structural detectors (dashed SSN, punctuated NANP phone, CX `MR`/`MRN`-typed identifier) over **the fields no rule matched**, record every present-but-unmapped field in a coverage report (`LeakReport.unmapped_fields`, carried into the `LeakError` on a refusal and exposed via the `on_report` hook), and record `token_floor_failure()` in every report, folding it into the fail-closed decision under the `require_live_denylist` **opt-in** lever — default off, so a token-less CI/OSS/fork load still passes with the structural detectors as the live backstop; a deployment that must refuse on an unloaded denylist sets the lever. The whole structural block is mirrored byte-identical into `tee/anon/leak.py` with a new engine/tee `leak_report` parity test; each detector was falsified. ADR 0030 §5/§7/Consequences amended (the "deferred" phrasing was stale). The aggressive/broad-shape tier (bare-digit DOB/SSN, name-like runs) stays deferred by owner call — it mass-false-positives on HL7 bodies dense with dates/order-numbers.
 
 **Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** build. **Severity:** medium.
 
@@ -3141,7 +3141,7 @@ What it *is*: an adopter who turns on the strict gate gets a **green build** on 
 
 ## 338. TLS key-exchange groups are inherited, not pinned
 
-> 🔢 **Filed 2026-08-01 — not started.** Value **3/10** · Difficulty **2/10** · _fill-in_. `harden_kex_groups` still returns `None` when `set_groups` is absent, and all three restatements survive the 2026-07-29 sweep — `CONTAINER-EXPOSURE-EVALUATION.md` still says "hardened KEX groups" under a *verification* heading, `BACKLOG.md:6422` still lists 11.6.2 in #200's Closes line against PHI.md's PARTIAL, and `ASVS-L2-PHASE0-CHANGES.md:254` still presupposes a pin — but every group that gets in is forward-secret and the floor plus `harden_cipher_suites` admit nothing static, so this is documentation accuracy plus observability; three doc edits and one additive report-only `SecurityPosture` field beside `fips_attestation()`, with the two tripwire tests left alone as the 3.15 trigger.
+> ✅ **SHIPPED 2026-08-06 (#338) — key-exchange groups documented as inherited, plus a report-only surfacing.** Value **3/10** · Difficulty **2/10**. `harden_kex_groups` pins nothing until `SSLContext.set_groups` lands in **Python 3.15**, so every built context inherits OpenSSL's default group list — forward-secret but wider than the approved pin — which makes this documentation accuracy plus observability, changing no live TLS behaviour. The three restatements that still read as *pinned* are corrected to say *inherited*: `CONTAINER-EXPOSURE-EVALUATION.md` and `ASVS-L2-PHASE0-CHANGES.md`, plus #200's Closes line in `docs/archive/backlog/BACKLOG-CLOSED.md` (11.6.2 annotated PARTIAL, see PHI.md §4). Added an additive report-only `kex_groups` field on `SecurityPosture` beside `fips_attestation()`, rendered on the console status page behind engine seam v18. The two Python-3.15 tripwire tests are left in place as the trigger to set the pin.
 
 **Cluster:** Security & Compliance. **Priority:** P3. **Verdict:** build. **Severity:** low.
 
@@ -3322,7 +3322,7 @@ What is NOT settled is the mechanism. Two independent passes reached different a
 
 ## 346. The sandbox import boundary is enforced only at runtime, under an off-by-default flag
 
-> 🚧 **Status OPEN (filed 2026-08-02).** Value **4/10** · Difficulty **3/10** · _fill-in_. A type the sandbox child must **construct or receive** cannot live under a prefix on `DEFAULT_FORBIDDEN_MODULES` ([pipeline/sandbox.py](../messagefoundry/pipeline/sandbox.py)) — the child's import guard raises and the dispatch fails. That rule is real, it has already been violated once in shipped code, and **nothing enforces it**. `CapturedResponse` lived in `messagefoundry.store`; the child could not import it, which made `mode=subprocess` + ADR 0013 loopback re-ingress **DOA** until #339 relocated it to [config/response.py](../messagefoundry/config/response.py). The only guard runs **in the child, at dispatch time, and only when `[sandbox].mode=subprocess`** — which is not the default, so a re-violation is invisible to a green suite.
+> ✅ **SHIPPED 2026-08-06 — a static `ast` import-boundary guard now pins it.** Value **4/10** · Difficulty **3/10** · _fill-in_. [tests/test_sandbox_import_boundary.py](../tests/test_sandbox_import_boundary.py) walks the `ast` import nodes of `_sandbox_codec.py` and `_sandbox_worker.py` and asserts none resolves under a `DEFAULT_FORBIDDEN_MODULES` prefix (imported from the runtime constant, never copied), with a committed positive control that each static import form the walker handles is seen and a negative control that benign `messagefoundry.*` imports are not flagged. Both files are clean today; the guard would red on first deployment if a future edit reintroduced a forbidden import, instead of failing silently only under `[sandbox].mode=subprocess`.
 
 **Cluster:** Correctness / test coverage. **Priority:** P2. **Verdict:** build (small). **Severity:** medium (blast radius: a feature is DOA for everyone who opted in), medium (likelihood: the codec's constructor set is precisely the surface that grows as the payload model does).
 
@@ -3936,13 +3936,21 @@ record and the cell's current score live in the vault scorecard and are not rest
 
 ## 1006. A mutation that matches is not a mutation that bites: the absence-claim gate proves syntax, never behaviour
 
-> 🔢 **Filed 2026-08-04 — not started. Scored 2026-08-04 → P2.** Value **6/10** · Difficulty
-> **3/10** · _quick win_. `check_absences` admits an ASVS absence claim on `re.search(a.pattern,
-> a.mutation)` (`scripts/asvs/scorecard.py:395`) — one string field of a TOML row matched against
-> another — so a well-formed reintroduction that would change nothing if applied passes all three
-> of the gate's failure modes and certifies a non-control into the compliance record; the
-> remainder is a required per-claim observable plus a mode that applies the mutation and requires
-> that observable to go red, in one stdlib script and its fixture tests.
+> ✅ **SHIPPED 2026-08-06 — a new opt-in mode can prove an absence claim BITES, which the pattern
+> check structurally cannot.** Value **6/10** · Difficulty **3/10** · _quick win_.
+> `scripts/asvs/scorecard.py` gains a `--prove-absences` mode: per claim it applies the `mutation` to
+> a scratch copy of the tree and requires a named `observable` (a pytest node id) to go RED, failing
+> closed on any exit code that is not an honest test failure (an already-red baseline, an
+> uncollectable node, or a mutation that only breaks import is a PROVE-ERROR, never a proof). So a
+> well-formed reintroduction that would change nothing if applied CAN be caught the moment its claim
+> carries an `observable` — but the default `verify` path is byte-unchanged and no authored claim
+> carries one yet, so nothing new is blocked by this alone today. Two optional `Absence` fields
+> (`mutation_path`, `observable`) feed it, a coarse same-file static backstop screens claims that
+> carry no observable, the scratch copy refuses secrets / the store / `docs/security` (defence for the
+> eventual vault run), and fixture negative controls plus a CLI exit-code test prove the mode itself
+> can go red. Public repo script + fixtures only; wiring the mode over the vault's ~81 existing
+> absence claims (untouched) and backfilling their observables is the owner's follow-up
+> (`scorecard.py:14-16`, ADR 0156 §7).
 
 **Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** build. **Severity:** medium —
 the defect is in the instrument, not the engine, and a green instrument that cannot go red is the
@@ -4652,7 +4660,7 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 ## 1013. The `[auth] enabled=false` startup arm keys on the bind alone, so auth-off behind a declared terminator still starts
 
-> 🔢 **Filed 2026-08-04 — not started.** Value **7/10** · Difficulty **4/10** · _quick win_. The auth-off startup arm reads `not settings.auth.enabled and not settings.api.is_loopback`, so it does not fire for a declared TLS-terminating proxy. A PHI instance with authentication **entirely off** behind a declared terminator starts with **no refusal and no warning** — while the same topology with auth ON but MFA off is refused by the gate #326 fixed. The two arms disagree about what "exposed" means, in the same file, for the same topology.
+> ✅ **Fixed 2026-08-06.** Value **7/10** · Difficulty **4/10** · _quick win_. The auth-off startup arm read `not settings.auth.enabled and not settings.api.is_loopback` (the bind alone), so it did not fire for a declared TLS-terminating proxy: a PHI instance with authentication **entirely off** behind a declared terminator would have started with **no refusal and no warning** on first deployment — while the same topology with auth ON but MFA off is refused by the gate #326 fixed. The two arms disagreed about what "exposed" means, in the same file, for the same topology. The auth-off arm now consults the single `instance_exposed` definition (hoisted above it), so it refuses on a non-loopback bind OR a declared terminator.
 
 **Cluster:** Security / startup gates. **Priority:** P1. **Verdict:** build. **Severity:** high on first deployment — no authentication at all on an off-loopback PHI instance.
 
@@ -4667,6 +4675,8 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 **Why it is arguably worse than #326.** #326 was single-factor admin over the network. This is **no factor at all**. A deployment that follows the documented off-loopback topology, with a declared terminator and `[auth] enabled=false`, starts silently.
 
 ⚠️ **THE REMEDY IS UNPROVEN — do not read this item as prescribing one.** Nobody has established that hoisting `instance_exposed` to the auth-off arm is safe. That arm runs **early** in the startup ladder, and whether the settings it reads are fully resolved at that point is unknown. **That ordering question is the actual work of this item**, not the two-line re-key it superficially resembles.
+
+> **AMENDED 2026-08-06 — remedy proven; the load-order question is resolved.** The prerequisite this item flagged as unproven holds. `instance_exposed`'s inputs are fully resolved where the auth-off arm runs: its two fields — `settings.api.host` (through `is_loopback`) and `settings.api.tls_terminated_upstream` — are read straight off the loaded config, and the only in-place mutation of `settings.api.*` between the arm and the former definition site is `serve_ui` (twice), which the predicate does not read. So the single definition was hoisted above the auth-off arm with a byte-identical value, and the arm was widened to consult it (refuse on a non-loopback bind OR a declared terminator). Exactly one definition site remains, per the pointer comment #326 left ("`instance_exposed` is NOT re-derived here") — the hoist shifts that comment's line, so it is named rather than pinned to a number.
 
 **#326 HAS LANDED** (PR #189), and the re-verification this paragraph asked for was performed at `17374679`: the arm moved `:1080` to `:1112`, `instance_exposed` moved `:2368` to `:1917`, `admin_exposed` is now `admin_exposed = instance_exposed` at `:1939`, and the separation narrowed from 1,288 lines to **805**. The duplicate definition at the former `:2368` is **gone**, replaced by a pointer comment at `:2454` ("`instance_exposed` is NOT re-derived here. It is defined ONCE, above"), so there is now exactly ONE definition site to move rather than two to keep in sync. **The load-bearing property survives the move and so does the difficulty-4 pricing:** the arm at `:1112` still sits ABOVE the definition at `:1917`, so it still cannot reference it without hoisting, and the ordering question is still the actual work. Only the numbers changed.
 
@@ -4728,7 +4738,7 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 ## 1014. connscale smoke test's fixed 24-port block is not parallel-safe across worktrees; the flaky marker hides the collision
 
-> 🔢 **Filed 2026-08-04 — not started.** Value **5/10** · Difficulty **3/10** · _fill-in_. `test_connscale_smoke_end_to_end` hard-codes `base_port = 41000` and requires 24 **contiguous** inbound ports, so two checkouts running the suite at once contend for the same block. A `@pytest.mark.flaky` marker retries past the collision, so a determinate resource conflict wears a noise label.
+> ✅ **SHIPPED 2026-08-06 — dynamic contiguous inbound-port allocation replaces the fixed 24-port block; the flaky marker is dropped.** Value **5/10** · Difficulty **3/10** · _fill-in_. `test_connscale_smoke_end_to_end` now reserves a random contiguous inbound-port block at runtime (`_free_contiguous_ports`), asserts contiguity at acquisition, and fails loudly if no free block is found, so a genuine cross-worktree collision surfaces as a red rather than a masked retry.
 
 **Cluster:** Testing / CI reliability. **Priority:** P3. **Verdict:** build (small). **Severity:** low — it costs retries and misdiagnosis, not correctness.
 
@@ -5331,6 +5341,61 @@ cd ../Unrelated && git -C . config core.hooksPath /dev/null
 
 **Source:** found 2026-08-07 by being refused. The commit that filed #1085 was blocked by the very rule the item documents, which is how the intermittency was noticed — several earlier commits in the same series had quoted the same class of command and passed.
 
+---
+
+### ⭐ A FIX WAS BUILT, VERIFIED, AND REJECTED — and the correction is MEASURED. Start here, do not redesign.
+
+A candidate was written and put through three adversarial verifiers on 2026-08-07. **Verdict NOT READY**,
+for one defect. The design is right and should be kept; only a single classifier regex is wrong. Patch
+banked at `FINDINGS-1061-verifiers-2026-08-06\1086-patch-NOT-READY.diff`, synthesis beside it. Resume
+with `resumeFromRunId: "wf_b4050e2f-77d"` — **re-apply the banked patch first**, or the verifiers inspect
+a clean tree and verify nothing.
+
+**WHAT WAS RIGHT** (both pinned by killed mutants, do not undo either): key on the CONSUMING FLAG, not
+the delimiter; and run the message-blanking **AFTER** the interpreter recursion. The "blank before
+recursion" mutant is killed by seven to nine interpreter payloads in all three mutation runs.
+
+**WHAT WAS WRONG — the whole rejection.** The flag classifier `-(?![A-Za-z]*[ce])[A-Za-z]*m` matches an
+**open-ended letter cluster**. PowerShell accepts unambiguous parameter PREFIXES, so `-Com` and `-Comm`
+are working spellings of `-Command` that contain no lowercase `c` or `e` and end in `m` — they were
+classified as MESSAGE and their code was blanked:
+
+```
+pwsh -Com  @'...'@   committed DENY/3c  ->  candidate ALLOW
+pwsh -Comm @'...'@   committed DENY/3c  ->  candidate ALLOW
+pwsh -Com  @'git reset --hard'@          committed DENY/3   -> candidate ALLOW
+pwsh -Com  @'git worktree remove ...'@   committed DENY/3d  -> candidate ALLOW
+```
+
+**THE MEASURED REPLACEMENT.** Replace the open-ended cluster with a CLOSED set of git message flags —
+`--message`, `-m`, `-am`, or a bounded class such as `-[amsSnqve]*m`. Two verifiers independently
+measured that this returns those four rows to DENY, keeps all eleven #1086 ALLOW cases and every
+narrowness case ALLOW, and produces **zero other verdict movement**. It also stops `-Cm`, `-Em` and
+`-Program` being misclassified.
+
+⛔ **TWO THINGS THE CANDIDATE DID NOT DISCLOSE, both must be in the redo:**
+1. **A surviving mutant.** Relaxing the separator `[ \t=]+` to `[ \t=]*` survives the entire suite —
+   found independently by two verifiers, same mutant hash. Non-equivalence: `git commit -m"a\n<disarm>\nb"`
+   and the `-m'...'` and `-m@'...'@` glued forms go DENY to ALLOW under it. **The `+` is load-bearing and
+   no test says so.** Add one.
+2. **Two spellings of #1086's own defect remain refused**: `git commit -m"multi-line"` and
+   `-m'multi-line'` — glued, no separator — because of that same `[ \t=]+`. Narrow, but it is this
+   item's own shape and belongs in the disclosure list.
+
+**TEST BY THE PREFIX FAMILY, NOT ONE SPELLING** (this is #1097's requirement and it applies here too):
+enumerate `-C` through `-Command` asserting each DENIES, plus `-Cm` as the bounding negative proving the
+family does not widen into any-letters-ending-in-m.
+
+⚠️ **AND THE READING RULE THIS ROUND EARNED:** two of three verifiers found the fail-open; **the third
+ACCEPTED, because its corpus contained no `-Com` payload.** Its evidence could not see the class it was
+approving — #1000's shape occurring inside the verification of a #1000 fix. **Do not read "one verifier
+accepted" as evidence; read what its corpus covered.**
+
+**Relationship to #1097.** They are separable and must both be fixed: #1097 is the PRE-EXISTING
+interpreter-recursion gap on the committed gate; this item's candidate would have converted #1097's
+accidental here-string denial into a clean fail-open. Fix #1097 first or together, and verify either
+against the gate **as it will ship**, not as it is.
+
 **Source:** identified 2026-08-05 while fixing #1032, and deliberately deferred rather than swept in, so that fix stayed scoped to one rule. Recorded here because a deferral nobody files is a deferral dropped.
 
 ## 1036. A Rule 4 deny names the first allowlisted repo's tooling regardless of which repo fired it
@@ -5694,9 +5759,13 @@ The literal spellings are all caught, including the newline form. Only the indir
 
 ## 1060. `alloc.ps1` records the owning worktree from the current directory, so an absolute-path invocation misattributes it
 
-> 🔢 **Filed 2026-08-05 — not started.** Value **5/10** · Difficulty **2/10** · _quick win_. `scripts/coord/alloc.ps1:51` takes the owner from `git rev-parse --show-toplevel`, which resolves against the **current directory** rather than the script's location. Invoke it by absolute `-File` path from a different worktree — which is how a session with several worktrees naturally calls it — and the allocation is recorded to the caller's worktree while the commit comes from another. The ledger gate then refuses that commit correctly, but far away from the cause and with a message about the wrong thing.
+> ✅ **SHIPPED 2026-08-06 — every `git` call in both allocators is anchored to the script's own checkout, and the defect was larger than filed.** Value **5/10** · Difficulty **2/10** · _quick win_. `$repo` now comes from `git -C $PSScriptRoot rev-parse --path-format=absolute --show-toplevel`, and every subsequent call takes `-C $repo`. **`git -C`, not `Split-Path`:** the recorded `worktree` value is *compared* — by `ledger_check.py:227` and by `-List` — so its string form is part of a contract, and `--path-format=absolute` keeps writing the forward-slash form every claim already on disk carries. **The filing named one of four cwd-derived reads.** Also wrong, and measured on the pre-fix code: the `$branch` recorded with the claim was the *caller's* branch; the floor's boundary was parsed from the **caller's** `scripts/hooks/ledger_check.py`; and the floor's working-tree term — the one whose job is to catch a number written but committed **nowhere** — read the **caller's** `docs/BACKLOG.md`. That last one is not friction: a number drafted in the target worktree was invisible to the sweep and free to re-issue, which is the collision this script exists to prevent. **`scripts/coord/claim.ps1:54` carried the same construct and was never filed** — found by inspection while fixing this, fixed in the same commit; its enforcing hook `claim_check.py` reads the repo from cwd and is *right* to, because a commit hook's cwd **is** the committing worktree. Hook right, tool wrong, and only the tool can be invoked from elsewhere. The item's cheap second half — printing the recorded worktree at allocation time — was **already built** (`claimed by:`); what was missing is a note when the shell is standing somewhere else, which is now printed. Tested by the **divergence** with `-ShowFloor`, so no numbers were burned: two temp checkouts drafting different numbers, the allocator invoked by absolute path from the other one. The negative control was run, not assumed — reverted, the same test reports `floor : 7777`, `boundary : 1900` and a watermark under `Caller/.git/`, all three signals pointing at the wrong tree. Original filing follows. `scripts/coord/alloc.ps1:51` took the owner from `git rev-parse --show-toplevel`, which resolves against the **current directory** rather than the script's location. Invoke it by absolute `-File` path from a different worktree — which is how a session with several worktrees naturally calls it — and the allocation is recorded to the caller's worktree while the commit comes from another. The ledger gate then refuses that commit correctly, but far away from the cause and with a message about the wrong thing.
 
 **Cluster:** Session coordination / ledger integrity. **Priority:** P3. **Verdict:** build (small). **Severity:** no data loss and no security effect — the ledger gate **fails closed**, which is why this is a friction defect and not a correctness one. Nothing invalid lands; a valid commit is refused.
+
+**SEVERITY CORRECTION, 2026-08-06, made while fixing it.** The paragraph above is right about the *recorded owner* and wrong about the item as a whole, because the filing looked at one line and the defect was in four. The ledger gate does fail closed on a misattributed claim — but the floor's **working-tree term** was cwd-derived too, and that term has no gate behind it. Its job is to see a number written to `docs/BACKLOG.md` and committed **nowhere**; reading the caller's tree makes a number drafted in the *target* worktree invisible, so the allocator hands it out as free and two items end up sharing it in the same tree. Both are then owned by that worktree, so `owns()` passes and the ledger gate never fires. That is the exact silent collision the script's own docstring says it exists to prevent, arrived at through the script. The window is narrow — anything committed on any ref is still caught by the all-refs term — but it is a correctness hole, not friction, and it was reproduced in the negative control rather than reasoned about.
+
+**AND THE FIX CONVERTED TWO SANDBOXED TESTS INTO WRITERS ON THE LIVE REGISTRY, which is the part worth remembering.** `tests/test_coord_claim_{refresh,liveness}.py` ran the **real** `scripts/coord/claim.ps1` with `cwd` set to a temp repo — scoped to a throwaway registry *purely by ambient cwd*, and one of them said so in a docstring: *"it scopes itself to the cwd's repo"*. The moment the script stopped consulting cwd, the passing half of the run wrote real claims into this clone's shared registry (two strays, removed by hand). So a cwd-dependence that looks like a defect in the tool can be load-bearing **isolation** in its tests, and removing it is a change to both. `tests/test_ledger_check.py` already staged a copy of `alloc.ps1` inside its fixture, which is exactly why it was the one file that did not break — the pattern existed and the two claim files were the outliers. Both now stage and commit the script into the fixture, so the sandbox is structural rather than ambient. Anyone fixing the remaining instances of this class (#1057, #1059) should check what their tests are isolated *by* before changing what the code reads.
 
 **Reproduced 2026-08-05, twice, by accident.** A session ran `pwsh -NoProfile -File <abs>/scripts/coord/alloc.ps1 -Kind backlog` from worktree A while intending to commit from worktree B. `alloc/backlog/1058.json` recorded `"worktree": "<...>/trusting-wu-c2e6d5"`. The commit from `MessageFoundry-gate-deferrals` was then refused: *"BACKLOG item #1058 was not allocated to this worktree"* — true, unhelpful, and pointing at the allocator rather than at the invocation. Re-running with the shell actually inside the target worktree produced `1059.json` with the right owner and the commit went through. **#1058 is an abandoned hole**, which is the sanctioned outcome (`alloc.ps1`'s own docstring: *holes are free, collisions are not*).
 
@@ -5768,9 +5837,31 @@ The second step's arithmetic is measured: `GetFullPath('.git', <abs primary>)` r
 
 **Source:** found 2026-08-05 by a repo-wide sweep hunting a different shape, then verified independently by two sessions before filing. The sweep that found it had its own unassigned region — `scripts/dev` and `scripts/service` were in no surface — which is worth recording beside the finding: a measuring apparatus with a blind spot found a control with a blind spot, and only because something looked where it was not told to.
 
+## 1068. A `-Force` claim release leaves no record of who released whose claim
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **5/10** · Difficulty **2/10** · _quick win_. `scripts/coord/claim.ps1:164` gates a non-holder release behind `-not $Force`, so `-Force` lets any session release a claim it does not hold. That escape hatch is **necessary and must stay** — a claim whose holder's worktree is gone would otherwise be permanently stuck. The defect is that the release is `Remove-Item -LiteralPath $file -Force` and **nothing else**: no log, no audit line, no record of who released whose claim, when, or why. The guardrails are on the *advice*, not the *action*.
+
+**Cluster:** Coordination tooling / claim integrity. **Priority:** P3. **Verdict:** build (add a record; do **not** remove `-Force`). **Severity:** moderate — nothing is silently mis-authorised, but a coordination primitive can be overridden by the party it constrains with no trace, which makes it a convention rather than a control.
+
+**Measured 2026-08-06, and only known because the lane self-reported.** A build lane ran `claim.ps1 -Release 1021 -Force` on a claim held by another worktree, took the claim, and left no commit. It was remediated correctly — the original holder released its own claim **without** `-Force`, the item was re-taken on the lane worktree, and the work committed there. Nothing was lost. But the *only* reason any of that is known is that the lane disclosed it: the release itself left nothing behind to find.
+
+**⛔ Do not "fix" this by removing `-Force`.** The hatch has a real job and it was needed the same night: claim 1041 was held by a worktree whose session had ended, and the documented recovery is exactly `-Release <n> -Force`. `claim.ps1:141` already prints `[HOLDER GONE -- worktree no longer exists; release with -Force]` for that case. Removing the flag would strand claims and push people toward deleting claim files by hand, which is strictly worse — a hand deletion leaves even less evidence.
+
+**What already exists, and why it is not enough.** The script is careful about *recommending* `-Force`: `:170-189` refuses to suggest it without checking holder liveness, and warns *"Do NOT -Force it on the strength of a quiet period: a session can be alive and quiet."* That is good advice and it constrains nothing. A session that intends to take a claim reads past it. The asymmetry is the point — the caution is addressed to the careful reader, and the audit gap matters for the careless one.
+
+**Suggested shape, not prescribed.** Append a line to a `claims/.history` (or equivalent) on every release recording the key, the releasing worktree, the prior holder, `-Force` yes/no, and the timestamp. It needs no new gate and no new refusal — the release still succeeds. It only has to stop being invisible.
+
+**A sibling was considered and DECLINED, deliberately.** The claim gate reads the **commit subject only** (`scripts/hooks/claim_check.py:106`), so moving a `BACKLOG #N` token into the commit **body** evades it — and a lane did exactly that on 2026-08-06, self-documented, since remediated. That is **not** filed, because the subject-only scope is a documented design decision with a stated reason: *"A body may reference other items freely — this very repo's commits routinely cite the item they supersede or were found by. Enforcing on the body would fire on every one of those."* The proposed fix is worse than the defect — it would deny every ordinary commit citing a superseded item. Recorded here rather than dropped, because it is the obvious next proposal and the next reader will have it.
+
+**Root cause of both incidents, and the fix-forward is already in effect.** Items were claimed from the **primary** checkout, so a lane could not pass its own claim gate and reached for evasion or force. Claiming from the lane worktree resolves it; the three lanes run after that change were all claimed correctly, with no evasion and no force-claim.
+
+**Related:** #1060 and #1057 (claim and allocation are worktree-scoped in the same way that produced those), #1000 (a control that cannot see the class it names).
+
+**Source:** two remediated coordination incidents during the 2026-08-06 backlog campaign, both self-reported by the lane that caused them. Verified against the source before filing: `-Force` genuinely bypasses the holder check, and the release genuinely records nothing.
+
 ## 1063. `setup-leak-gate.ps1` picks the checkout from the current directory, so it can arm a worktree the operator did not name
 
-> 🔢 **Filed 2026-08-06 — not started.** Value **3/10** · Difficulty **1/10** · _quick win_. `scripts/dev/setup-leak-gate.ps1:37` is `$repo = (& git rev-parse --show-toplevel 2>$null)` — no `-C`, no `-Repo` parameter, no `$PSScriptRoot` anchor. Invoked by absolute `-File` path from a different worktree, which is the ordinary shape on a clone with 40-plus of them, it installs the leak-gate token list into **the current directory's** checkout and prints `CONFIGURED` about that one, while the worktree the operator named keeps no token source. Its own directory siblings already do it correctly.
+> ✅ **SHIPPED 2026-08-06 — the root is anchored to the script's own location, and the divergence is under test.** Value **3/10** · Difficulty **1/10** · _quick win_. `$repo` now comes from `Split-Path -Parent (Split-Path -Parent $PSScriptRoot)`, the form `postgres.ps1` and `sqlserver.ps1` in the same directory already use, plus an assert that the derived root actually carries `scripts/security/` — a wrong root should say so at the point of derivation rather than surface later as a confusing scanner failure. Tested by the **divergence**, not the happy path: two temp checkouts that both carry `scripts/security/`, the script invoked by absolute `-File` path while the shell stands in the other one, asserting the token list lands in the checkout holding the script and **not** in the caller's. The pre-fix behaviour was reproduced directly rather than inferred — reverted, the same test reports *"the named checkout was not armed"*. Only the three files the script reaches for are copied into the fixture, never the whole of `scripts/security/`, because a maintainer running the suite has the real token list sitting in that directory. Original filing follows. `scripts/dev/setup-leak-gate.ps1:37` was `$repo = (& git rev-parse --show-toplevel 2>$null)` — no `-C`, no `-Repo` parameter, no `$PSScriptRoot` anchor. Invoked by absolute `-File` path from a different worktree, which is the ordinary shape on a clone with 40-plus of them, it installs the leak-gate token list into **the current directory's** checkout and prints `CONFIGURED` about that one, while the worktree the operator named keeps no token source. Its own directory siblings already do it correctly.
 
 **Cluster:** Developer tooling / configuration anchoring. **Priority:** P4. **Verdict:** build (trivial). **Severity:** **low, and the low severity is load-bearing** — every failure direction here is loud or fail-closed, which is why this is filed at 3 rather than alongside its siblings. Nothing is silently ungated and no wrong authorisation is granted.
 
@@ -5784,7 +5875,7 @@ $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 
 Anchoring on `$PSScriptRoot` binds the script to the checkout it lives in, which is what an absolute `-File` invocation is asking for. `-From` names the token **source**, not the checkout, so it does not already cover this.
 
-**Same construct as #1060.** `alloc.ps1:51` is byte-equivalent (`git rev-parse --show-toplevel` with no anchor) and produces the same class of wrong answer — there, a misattributed ledger allocation; here, a token list installed into the wrong tree. Fixing them together is reasonable; filing them together was not, because their severities differ by two priority bands and folding this into #1060 would have inflated it.
+**Same construct as #1060.** `alloc.ps1:51` is the same construct — `git rev-parse --show-toplevel` with no anchor — and produces the same class of wrong answer — there, a misattributed ledger allocation; here, a token list installed into the wrong tree. Fixing them together is reasonable; filing them together was not, because their severities differ by two priority bands and folding this into #1060 would have inflated it. (The filing said *byte-equivalent*. It is not: `alloc.ps1` carries `--path-format=absolute` and this script does not. The defect is identical; the bytes are not, and "byte-equivalent" is the kind of claim a later reader greps for and then trusts.)
 
 **How it was found, and why that matters more than the defect.** A repo-wide sweep for the cwd-as-identity shape assigned five surfaces and left `scripts/dev` and `scripts/service` in **no** surface at all — seven `.ps1` files in the seam. This was found only because the synthesising agent went outside its brief and swept the unassigned region. A measuring apparatus with a blind spot, hunting mechanisms with blind spots. Worth remembering when the next sweep is designed: **state the unassigned regions, or the result reads as completeness.**
 
@@ -6464,3 +6555,32 @@ that cannot land underneath this cap, because it moves the web console suite int
 it twice per leg).
 
 **Source:** found 2026-08-07 during a coordinator queue drain, triaging why PR #253's `windows-2025` leg was red. The pool was enumerated rather than taken from a `gh run list` page — [`ci.yml`](../.github/workflows/ci.yml) records two earlier versions of this same table carrying pool sizes nobody could re-derive, one of which came from a default `--limit 20`.
+
+## 1097. The interpreter recursion list is a fixed set of flag spellings, but PowerShell accepts unambiguous prefixes, so `-Com` hides its argument from every rule
+
+> 🔢 **Filed 2026-08-07 — not started. ⛔ LIVE ON THE INSTALLED GATE, and it is a FAIL-OPEN, not a wording defect.** Value **8/10** · Difficulty **2/10** · _do it_. `worktree_gate.ps1:285` recurses into an interpreter argument for a FIXED list of spellings -- `-c` / `-lc` / `-Command` / `/c` / `/k`. **PowerShell accepts any unambiguous PREFIX**, so `-Com` and `-Comm` run code and are not on the list. Their argument is therefore blanked as an ordinary quoted span and its contents are invisible to EVERY rule.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P1. **Verdict:** build. **Severity:** no product effect and no PHI effect. It is a live route-around of the whole gate: whatever a session may not do directly, it may do inside `pwsh -Com '...'`.
+
+**Measured against real PowerShell, not inferred:**
+
+```
+pwsh -NoProfile -Com  'Write-Output RAN_Com_OK'   -> RAN_Com_OK
+pwsh -NoProfile -Comm 'Write-Output RAN_Comm_OK'  -> RAN_Comm_OK
+pwsh -NoProfile -Cm   '...'                       -> not recognized (ambiguous, so inert)
+```
+
+So `-Com` and `-Comm` are working spellings. `-Cm` is not, which bounds the family: it is every unambiguous prefix of `-Command` from `-C` upward, not any letter cluster.
+
+**Reachability on the committed gate.** The single-line form already ALLOWs today. A newline-spanning or here-string form currently DENIES, but only by accident: every line of a multi-line span reaches the scanner raw, so the disarm is seen as ordinary text rather than because the interpreter was recognised. **That accident is load-bearing and easy to remove** -- a change that blanks message bodies correctly deletes it, which is exactly what a candidate fix for #1086 did, converting the accident into a clean fail-open across all forms.
+
+**⛔ THE OBVIOUS FIX IS INSUFFICIENT AND WAS MEASURED SO.** Adding `-C|-Com|-Comm` to the list closes every spelling on the committed gate -- and on a gate that also blanks message bodies it closes only the single-line one, leaving the here-string route open behind it. So the fix must be verified against the gate as it will ship, not against the gate as it is.
+
+**The work.** Recognise the interpreter flag by PREFIX rather than by literal, for the shells that accept prefixes. `pwsh`/`powershell` accept any unambiguous prefix of `-Command` (and of `-EncodedCommand`, `-File`, `-NoProfile`); `bash`/`sh` do not -- their flags are single letters and clusters (`-c`, `-lc`, `-ec`), which the current list already handles. Bound it to the shells that actually behave this way rather than widening globally.
+
+**Test it by the PREFIX FAMILY, not by one spelling.** A test that pins `-Command` cannot see this, and a test that pins `-Com` alone cannot see `-Comm`. Enumerate `-C` through `-Command` and assert each denies, plus `-Cm` asserting the family is bounded -- that negative is what stops a fix widening into any-letters-ending-in-m, which is the shape that produced a separate fail-open in the #1086 candidate.
+
+**Related:** #1072 (text shapes rule 3c does not read -- this is the interpreter-recursion instance and the most severe of them), #1086 (the candidate fix that would have converted this from accidental-deny to clean fail-open), #1069, #1071, #1000 (a control green because its tests pin one spelling of a family).
+
+**Source:** found 2026-08-07 by the adversarial verification of a candidate fix for #1086. Two verifiers independently measured the abbreviation family; the third accepted the candidate because its corpus contained no such payload, which is itself the #1000 shape. The pre-existing half was separated from the introduced half by measuring both against the committed gate.
+
