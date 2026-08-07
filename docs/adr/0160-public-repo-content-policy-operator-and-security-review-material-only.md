@@ -86,6 +86,17 @@ were tracked in the **repository root** — session handoffs in the project's fr
 covered by a `/HANDOFF-*.md` rule rather than by their two filenames, so the next one fails closed
 instead of waiting to be noticed. **103 files** in total.
 
+⚠️ **A 104th followed, and the shape is the lesson.** `docs/releases/HANDOFF-232-router-steps.md`
+entered `main` via **PR #225** *while the Phase 1 PR was open*. Phase 1 removed 101 paths **named
+individually**, so a file created after that commit was built was never in the list — and a
+`.gitignore` rule **does not untrack**, so `/docs/releases/` left it behind and the directory came
+back holding one file. Removed in the follow-up that also records this paragraph.
+
+**A removal that enumerates paths has a window, open for exactly as long as the PR is, during which
+the directory it is clearing can be refilled.** Nothing detected this: it surfaced only because the
+merge conflict forced a re-read of the tree. If a future phase clears a directory, re-check it at
+merge time rather than trusting the file list computed when the branch was cut.
+
 **Order of operations, and it is the load-bearing part.** Custody moved to the vault
 (`wshallwshall/MessageFoundry`) and was committed there **before** anything left the public tree.
 Gitignoring alone would have left 103 files as single **unversioned** copies — no history, no
@@ -155,6 +166,32 @@ already names.
 
 **Phase 3 — in-file references.** Strip Claude-Code process prose from documents that otherwise stay
 (`docs/AI.md`, `docs/ARCHITECTURE.md`, `docs/Code_Quality_Standards.md`). Surgical edits, not removals.
+
+### D6 — considered and LEFT, so the next sweep does not re-derive them
+
+Three sets were found while executing Phase 1 and deliberately not acted on. They are recorded
+because a sweep run against D1 will surface all three again, and an unrecorded "we looked and left
+it" is indistinguishable from an oversight.
+
+**1. Eleven files citing `docs/releases/` paths in PROSE.** Not links — nothing 404s. They read as
+provenance: *"the v0.1 execution plan §Q3 set the two-tier gate"* stays true after the file moves.
+The two citations that *were* rewritten during Phase 1 are a different case: a `.toml` comment and a
+test docstring naming a path a reader would try to open. ⛔ **ADR 0160's own citations must never be
+"cleaned"** — this is the ADR that removed the directory, and the paths are the evidence.
+
+**2. Twenty-two handoff DOCUMENTS outside `docs/releases/`** — 21 under `docs/benchmarks/`, one at
+`docs/quality-gates/HANDOFF-mutation-coverage.md`. ⚠️ A name-based sweep reports **155** matches
+here; **133 of those are benchmark DATA files** (json/txt) that merely sit inside directories named
+`HANDBACK_*`. Overstating the finding six-fold is the first trap. The second is that the bench
+handoffs carry the **measurement narrative** for the data beside them — removing them strips the
+rationale from records that stay, which is the defect the Consequences section below names. And the
+Phase 1 justification does not transfer: `docs/releases/` **misrepresented the project** to a first
+reader, whereas a benchmark handoff reads as exactly what it is.
+
+**3. Unanchoring `/HANDOFF-*.md`.** Rejected, with the reasoning kept in `.gitignore` beside the rule
+so it is refuted where it will next be proposed: the two locations that matter are already covered,
+and an unanchored pattern would fail closed on `docs/benchmarks/`, where handoffs are tracked on
+purpose.
 
 ### D5 — the process TOOLING stays tracked: DECLINED on measured cost, not blocked on someone
 
