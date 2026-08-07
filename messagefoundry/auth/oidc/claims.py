@@ -95,6 +95,15 @@ class FederatedPrincipal:
 
     username: str
     subject: str
+    # The pinned issuer this assertion was verified against (``policy.issuer``, which ``_check_core_claims``
+    # already proved the token's ``iss`` equals). Carried alongside ``subject`` so the relying party can
+    # PIN the local federated account's identity to the non-reassignable ``(issuer, sub)`` tuple (BACKLOG
+    # #1015): the AD-backed account is still resolved BY its username (ADR 0142 keeps roles LDAP-sourced),
+    # but a login whose reassignable username resolves to an account already bound to a DIFFERENT
+    # ``(issuer, sub)`` is refused — so a reassigned username cannot take over the prior holder's account.
+    # A ``sub`` is only guaranteed stable WITHIN one issuer, so the binding needs both halves even though
+    # a single issuer is pinned today.
+    issuer: str
     amr: tuple[str, ...]
     acr: str | None
     # The signature-verified ``exp`` (epoch seconds). ADR 0142 AC-6 caps the engine session at it, so
@@ -338,6 +347,7 @@ def validate_id_token(
     return FederatedPrincipal(
         username=username,
         subject=subject,
+        issuer=policy.issuer,
         amr=amr,
         acr=acr,
         expires_at=expires_at,

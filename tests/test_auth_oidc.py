@@ -256,6 +256,16 @@ def test_verified_exp_is_carried_not_reparsed(rsa_key: rsa.RSAPrivateKey) -> Non
     assert principal.expires_at == 1_002_500
 
 
+def test_federated_principal_carries_issuer(rsa_key: rsa.RSAPrivateKey) -> None:
+    """BACKLOG #1015: the principal carries the pinned ``issuer`` so the relying party can key the local
+    account on the non-reassignable ``(issuer, sub)`` tuple, not on the reassignable username. It is the
+    policy issuer (already proven equal to the token's ``iss`` by the core-claim rung), not sub-only."""
+    jws = _mint(rsa_key, "k1", _good_claims())
+    principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert principal.issuer == "https://idp.example"
+    assert principal.subject == "S-1-5-21-abc"
+
+
 @pytest.mark.parametrize(
     ("mutate", "reason"),
     [
