@@ -96,7 +96,6 @@ FRAME_OVERHEAD_BYTES = _const("FRAME_OVERHEAD_BYTES")
 MAX_LINE_CHARS = _const("MAX_LINE_CHARS")
 # Held messages consumed per drain. It bounds WORK, not delivery: the remainder keeps its marker and is
 # consumed at the next turn boundary, exactly as a message over MAX_MESSAGES is shown at the next drain.
-MAX_HELD_CONSUME = _const("MAX_HELD_CONSUME")
 
 
 # --------------------------------------------------------------------------------------------------
@@ -626,6 +625,57 @@ def test_the_naive_shared_destination_pattern_does_not_exclude(tmp_path: Path) -
 
 
 @pytest.mark.timeout(300)
+def test_a_session_reusing_a_phantoms_id_cannot_consume_mail_it_never_saw(
+    repo: Path, tmp_path: Path
+) -> None:
+    """THE SESSION-ID REUSE LOSS -- reproduced 2026-08-06, then fixed by removing cross-invocation trust.
+
+    Session ids are REUSED ACROSS LAUNCHES; one of six ids in the measured phantom run had been seen
+    hours earlier. So a discarded session can mint a shown-marker, and a LATER session that happens to
+    carry the same id inherits it. Under the marker-gated design that later session had its display
+    suppressed and then consumed the message at its Stop -- a message consumed by a session that never
+    saw it, with a clean receipt.
+
+    Nothing INSIDE that design could separate the two sessions: every artefact is keyed by the id they
+    share, so the three invocations below were byte-identical to one healthy session showing mail at
+    start and consuming it at the turn boundary.
+
+    The fix is structural rather than a better check: consumption depends only on what THE SAME
+    INVOCATION rendered. A session that was not shown the message in this very drain cannot consume it,
+    whatever any marker says.
+    """
+    shared = "bbbbbbbb-1111-2222-3333-555555555555"
+    info = seed(repo, tmp_path, [{"body": "REUSE-LOSS: consumed by a session that never saw me"}])
+    key = str(info["key"])
+
+    # 1. The phantom: SessionStart only, then discarded. It may display; it must not consume.
+    first = injection(run_drain(repo, event="SessionStart", session_id=shared))
+    assert "REUSE-LOSS" in first, "the phantom should still be shown the message"
+    assert box_files(repo, key, "inbox"), (
+        "a non-consuming event must leave the message in the inbox"
+    )
+
+    # 2. A DIFFERENT session that happens to reuse the id, and its turn boundary.
+    second = injection(run_drain(repo, event="Stop", session_id=shared))
+
+    # UNCONDITIONAL, AND IT WAS NOT AT FIRST. This was written as
+    # `if not box_files(...): assert shown`, which passes VACUOUSLY the moment either half of the
+    # defect is absent -- a mutation restoring only the marker suppression left the message in the
+    # inbox, the guard never ran, and the test went green against code that had the bug half back.
+    # A check that can pass without exercising anything is not a check.
+    #
+    # The consuming drain must RENDER what it is entitled to consume, so assert the render directly.
+    # That is red under the original defect (suppressed, then consumed unseen) AND under a partial
+    # regression that restores only the suppression.
+    assert "REUSE-LOSS" in second, (
+        "the consuming drain did not render the message. Under the original defect it consumed it "
+        "unseen; under a partial regression it suppresses the display and strands it. Either way a "
+        f"session is deciding what it saw from a marker another session minted. Injection: {second[:400]!r}"
+    )
+    assert box_files(repo, key, "inbox") == [], "rendered at Stop but not consumed"
+    assert len(box_files(repo, key, "seen")) == 1
+
+
 def test_the_claim_verdict_agrees_with_the_filesystem(tmp_path: Path) -> None:
     """DEFECT 4, the verdict half -- and the half that was nearly shipped broken.
 
@@ -1442,44 +1492,46 @@ def test_the_phantom_arm_can_see_the_defect_it_asserts_against(repo: Path, tmp_p
 # --- 8b. A real session, and the wired path. ----------------------------------------------------
 
 
-def test_a_real_session_is_shown_mail_once_and_consumes_it_at_its_turn_boundary(
+def test_a_real_session_is_shown_mail_again_at_its_turn_boundary_and_consumes_it_there(
     repo: Path, tmp_path: Path
 ) -> None:
     """The half that makes SessionStart's non-consumption safe rather than merely deferred.
 
-    Three separate properties, and each fails differently: the mail is shown at SessionStart, it is
-    NOT shown a second time to the same session, and it leaves the inbox at that session's first turn
-    boundary. A drain that re-rendered at Stop would satisfy the third and fail the second.
+    THIS TEST USED TO ASSERT THE OPPOSITE -- shown once, not re-rendered at Stop -- and that behaviour
+    was removed deliberately. Suppressing the second display required trusting a marker across
+    invocations, and a marker is keyed by a session id that IS REUSED ACROSS LAUNCHES, so a session
+    inheriting a phantom's marker consumed mail it had never been shown. Reproduced, then fixed by
+    deleting the trust rather than hardening it.
 
-    ``observedUtc`` is carried FORWARD rather than reset, so the consuming receipt still records when
-    the text was actually put in front of a reader. Collapsing the two stamps would make the receipt
-    claim the mail was shown at Stop, which is the one thing it was not.
+    So the contract is now: shown at SessionStart, shown AGAIN at the first Stop, and consumed there.
+    The duplicate display is the price, and it is the accepted side of this channel's one tradeoff --
+    duplicate display is accepted, silent loss is not.
+
+    ``observedUtc`` therefore records the STOP emit, because that is when the consuming drain actually
+    put the text in front of a reader. It is no longer carried forward from an earlier display, since
+    nothing may now assert that a previous invocation showed anything to this session.
     """
-    info = seed(repo, tmp_path, [{"body": "one display, one consume"}])
+    info = seed(repo, tmp_path, [{"body": "shown twice, consumed once"}])
     key = str(info["key"])
     stem = str(info["rows"][0]["stem"])
 
-    start = injection(run_drain(repo, event="SessionStart", session_id=SESSION_A))
-    assert "one display, one consume" in start
-    shown_at = receipt_json(repo, stem)["observedUtc"]
-    assert shown_at
+    start_text = injection(run_drain(repo, event="SessionStart", session_id=SESSION_A))
+    assert "shown twice, consumed once" in start_text
+    assert box_files(repo, key, "inbox"), "a non-consuming event must not consume"
+    assert receipt_json(repo, stem)["disposition"] == "shown-held"
 
     stop = injection(run_drain(repo, event="Stop", session_id=SESSION_A))
-    assert "one display, one consume" not in stop, "the same session was shown the mail twice"
-    assert "had already been shown to this session and were NOT shown again" in stop
-    assert "consumed at this turn boundary" in stop
+    # THE LOAD-BEARING ASSERTION: the consuming drain RENDERED what it consumed.
+    assert "shown twice, consumed once" in stop, (
+        "the consuming drain removed the message without rendering it -- that is the silent loss"
+    )
     assert box_files(repo, key, "inbox") == []
     assert box_files(repo, key, "claiming") == []
     assert len(box_files(repo, key, "seen")) == 1
 
     final = receipt_json(repo, stem)
     assert final["disposition"] == "shown-consumed"
-    assert final["observedUtc"] == shown_at, (
-        "the consuming receipt reset observedUtc, so it now claims the mail was shown at Stop"
-    )
-    assert final["consumedUtc"] and final["consumedUtc"] != shown_at
-    # Requirement: after consumption, no marker for that message survives.
-    assert markers(repo, key) == []
+    assert final["observedUtc"], "a consumed receipt must record when it was emitted"
 
 
 def test_stop_alone_shows_and_consumes_with_no_preceding_session_start(
@@ -2005,19 +2057,20 @@ def test_a_case_variant_marker_is_one_file_and_is_reported_as_one(
     assert markers(repo, key) == [], "a case variant was consumed but never swept"
 
 
-def test_the_consumed_receipt_carries_the_time_it_was_shown_not_the_time_it_was_consumed(
+def test_a_receipt_never_pairs_one_sessions_id_with_anothers_emit_time(
     repo: Path, tmp_path: Path
 ) -> None:
-    """``observedUtc`` COMES FROM THE MARKER, and that is a correctness property rather than a
-    plumbing detail.
+    """The receipt is ONE SLOT PER MESSAGE, so its two identifying fields must describe ONE emit.
 
-    The receipt is one slot per MESSAGE, so under the accepted duplicate it may already hold ANOTHER
-    session's emit time; pairing that with this session's id would make the file name a display that
-    did not happen then. The marker is per-(message, session), so its ``markedUtc`` is the right
-    timestamp by construction.
+    Under the accepted duplicate, several sessions display the same message and each overwrites that
+    slot. The failure to guard against is a receipt naming session A while carrying the timestamp of
+    B's display -- a file asserting a display that did not happen at that time, by that session.
 
-    Asserted three ways: the consumed receipt's ``observedUtc`` matches the SessionStart emit exactly,
-    it is not the consume time, and the sibling session's later emit does not move it.
+    This used to be enforced by sourcing ``observedUtc`` from the per-(message, session) MARKER. That
+    is gone: markers may no longer be trusted across invocations, because a session id is REUSED
+    ACROSS LAUNCHES and an inherited marker let a session consume mail it had never seen. The property
+    is now structural instead -- a consuming drain RENDERS what it consumes, so the id and the stamp
+    both come from the same emit and cannot disagree.
     """
     stem = "20260101T000000001-aaaaaa"
     seed(repo, tmp_path, [{"stem": stem, "body": "two sessions, one receipt slot"}])
@@ -2028,84 +2081,24 @@ def test_the_consumed_receipt_carries_the_time_it_was_shown_not_the_time_it_was_
 
     # B displays the same message and overwrites the single receipt slot with its own emit time.
     run_drain(repo, event="SessionStart", session_id=SESSION_B)
-    assert receipt_json(repo, stem)["observedUtc"] != shown_by_a
+    shown_by_b = receipt_json(repo, stem)["observedUtc"]
+    assert shown_by_b != shown_by_a
 
-    run_drain(repo, event="Stop", session_id=SESSION_A)
+    text = injection(run_drain(repo, event="Stop", session_id=SESSION_A))
+    assert "two sessions, one receipt slot" in text, (
+        "the consuming drain must render what it consumes"
+    )
+
     final = receipt_json(repo, stem)
     assert final["disposition"] == "shown-consumed"
     assert final["bySessionId"] == SESSION_A
-    assert final["observedUtc"] == shown_by_a, (
-        "the receipt pairs one session's id with another session's emit time -- it now names a "
-        "display that did not happen at that moment"
+    # The stamp belongs to A's OWN consuming emit -- later than B's display, and not B's.
+    assert final["observedUtc"] != shown_by_b, (
+        "the receipt names session A but carries B's emit time"
     )
-    assert final["consumedUtc"] != final["observedUtc"]
-
-
-def test_a_held_consume_that_cannot_finish_is_reported_and_not_claimed_as_done(
-    repo: Path, tmp_path: Path
-) -> None:
-    """THE COUNTER THAT COULD NOT EXIST UNDER THE OLD ORDERING, and the contradiction it removes.
-
-    Complete-Held runs BEFORE the injection is built, so unlike the delivery loop's finalize a failure
-    there IS reportable -- the drain used to carry a comment saying no such counter could ever exist,
-    written when the step ran later. Without it the injection said the held mail "was consumed at this
-    turn boundary" while the message sat in ``claiming/``.
-
-    The failure is induced by making the receipt unwritable between the show and the consume, which is
-    also the arm that proves ``Write-MailReceipt`` still refuses to finalize without a receipt.
-    """
-    stem = "20260101T000000001-aaaaaa"
-    info = seed(repo, tmp_path, [{"stem": stem, "body": "held, then the disk went away"}])
-    key = str(info["key"])
-
-    assert "held, then the disk went away" in injection(
-        run_drain(repo, event="SessionStart", session_id=SESSION_A)
+    assert final["observedUtc"] > shown_by_b, (
+        "the consuming receipt's stamp predates a display that happened before it"
     )
-    rd = mail_root(repo) / "receipts"
-    shutil.rmtree(rd)
-    rd.write_text("not a directory", encoding="ascii")
-
-    text = injection(run_drain(repo, event="Stop", session_id=SESSION_A))
-    assert "could NOT be consumed this pass" in text
-    assert "1 of them were consumed at this turn boundary" not in text
-    assert "0 of them were consumed at this turn boundary" in text
-    assert box_files(repo, key, "seen") == []
-
-
-def test_more_held_messages_than_the_consume_cap_are_deferred_not_dropped(
-    repo: Path, tmp_path: Path
-) -> None:
-    """THE BOUND ON THE HELD LIST, asserted because the reasoning it replaced was invalid.
-
-    The drain used to say the held list was bounded by ``MAX_MESSAGES`` "because displays are capped
-    per drain". True premise, wrong conclusion: the bound is ``MAX_MESSAGES`` times the number of
-    non-consuming drains, so repeated SessionStarts grow it without limit. ``MAX_HELD_CONSUME`` is the
-    real bound, and like every other cap in this channel it DEFERS rather than drops.
-
-    Driven with a cap lowered by nothing -- the arm builds enough held messages to cross the shipped
-    value by running the display cap repeatedly, which is the same mechanism that produced the unbounded
-    growth.
-    """
-    total = MAX_HELD_CONSUME + MAX_MESSAGES
-    info = seed(
-        repo,
-        tmp_path,
-        [{"body": f"held message {i}"} for i in range(total)],
-    )
-    key = str(info["key"])
-    # MAX_MESSAGES shown per non-consuming drain, so this many drains to hold them all.
-    for _ in range(-(-total // MAX_MESSAGES)):
-        run_drain(repo, event="SessionStart", session_id=SESSION_A)
-    assert len(markers(repo, key)) == total
-
-    text = injection(run_drain(repo, event="Stop", session_id=SESSION_A))
-    assert "were over this drain's consume cap" in text
-    assert len(box_files(repo, key, "seen")) == MAX_HELD_CONSUME
-    assert len(box_files(repo, key, "inbox")) == total - MAX_HELD_CONSUME
-
-    injection(run_drain(repo, event="Stop", session_id=SESSION_A))
-    assert box_files(repo, key, "inbox") == [], "the deferred remainder was never consumed"
-    assert len(box_files(repo, key, "seen")) == total
 
 
 def test_the_off_switch_neither_shows_nor_consumes_held_mail(repo: Path, tmp_path: Path) -> None:

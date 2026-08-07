@@ -227,3 +227,34 @@ def _find_free_pid() -> int:
     proc.wait(timeout=30)
     time.sleep(0.3)  # let the OS reap it before we claim the pid is gone
     return proc.pid
+
+
+def test_outside_a_repo_the_json_roster_carries_an_unavailable_receipt(tmp_path: Path) -> None:
+    """ "I could not look" must not render as "nobody is live" on the machine-readable channel.
+
+    presence.ps1 already emits an UNAVAILABLE receipt to STDERR for the RepoFound=true /
+    Available=false case, precisely so an empty stdout list stops being ambiguous -- its own comment
+    says so. The RepoFound=FALSE path returned the same ``[]`` with NO receipt at all, so one of the
+    two ways of being unable to look stayed silent on exactly the channel a consumer parses. The fix
+    had been applied to one of two paths.
+
+    stdout is deliberately unchanged and still ``[]``: every existing consumer keeps working, and the
+    receipt is what separates the cases. Asserting BOTH is the point -- a test that only checked
+    stderr would pass against a version that had broken the JSON contract.
+    """
+    outside = tmp_path / "not-a-repo"
+    outside.mkdir()
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(PRESENCE), "-Json"],
+        cwd=str(outside),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.stdout.strip() == "[]", f"the JSON contract changed: {proc.stdout!r}"
+    assert "UNAVAILABLE" in proc.stderr, (
+        "an unreadable roster emitted no receipt, so an empty list is indistinguishable from "
+        f"'nobody is live': stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "not inside a git repository" in proc.stderr.lower(), proc.stderr

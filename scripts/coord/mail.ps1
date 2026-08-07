@@ -309,9 +309,22 @@ if ($Send) {
     if ($To -ieq 'all') {
         # Broadcast: every live peer in this repo EXCEPT this one. Uses the shared roster so there is
         # exactly one notion of "who is here" -- see scripts/coord/presence.ps1.
-        $rosterJson = & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'presence.ps1') -Json 2>$null
+        # CAPTURE STDERR, DO NOT DISCARD IT. presence.ps1 deliberately writes an "UNAVAILABLE" receipt
+        # to stderr precisely so that "the fence could not look" stops rendering as an
+        # indistinguishable empty list on stdout -- its own comment says so. This call used to end in
+        # `2>$null`, which threw that receipt away and then printed a line claiming the empty result
+        # meant "the roster returned nobody, not the roster could not look". It could not know that:
+        # the only channel carrying the difference had just been suppressed. A message asserting a
+        # distinction the code destroyed is a compensating control resting on a false premise.
+        $rosterErr = @()
+        $rosterJson = & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'presence.ps1') -Json 2>&1 |
+            ForEach-Object {
+                if ($_ -is [System.Management.Automation.ErrorRecord]) { $rosterErr += [string]$_; }
+                else { $_ }
+            }
+        $rosterUnavailable = @($rosterErr | Where-Object { $_ -match 'UNAVAILABLE' }).Count -gt 0
         $roster = @()
-        try { $roster = @($rosterJson | ConvertFrom-Json) } catch { $roster = @() }
+        try { $roster = @($rosterJson | ConvertFrom-Json) } catch { $roster = @(); $rosterUnavailable = $true }
         $me = (Get-Location).Path.TrimEnd('\', '/').ToLowerInvariant()
         foreach ($r in $roster) {
             if (-not $r.Worktree) { continue }
@@ -320,8 +333,20 @@ if ($Send) {
             $targets += $r.Worktree
         }
         if ($targets.Count -eq 0) {
+            # THE TWO CASES ARE NOW SEPARATED BY EVIDENCE RATHER THAN BY ASSERTION, and they exit
+            # differently: an empty roster is a real answer, an unavailable one is a non-answer and must
+            # not read as "nobody is here".
+            if ($rosterUnavailable) {
+                Write-Host ""
+                Write-Host "ROSTER UNAVAILABLE -- nothing was broadcast, and this is NOT 'nobody is live'." -ForegroundColor Yellow
+                Write-Host "  presence.ps1 could not measure who is here, so an empty peer list proves nothing."
+                foreach ($e in $rosterErr) { Write-Host "  $e" -ForegroundColor Yellow }
+                Write-Host "  Run scripts\coord\presence.ps1 to see why, then re-send."
+                Write-Host ""
+                exit 1
+            }
             Write-Host "No live peers to broadcast to. Nothing written."
-            Write-Host "  (This is 'the roster returned nobody', not 'the roster could not look' -- see presence.ps1 -Json.)"
+            Write-Host "  (The roster WAS readable and returned nobody -- presence.ps1 emitted no UNAVAILABLE receipt.)"
             exit 0
         }
     }
