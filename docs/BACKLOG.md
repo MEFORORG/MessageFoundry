@@ -2513,7 +2513,7 @@ def route_demo_oru(msg):
 
 ## 238. OpenFlow step-attribute completeness pass over the engine vocabulary
 
-> 🔢 **Filed 2026-07-30 — not started.** Value **1/10** · Difficulty **1/10** · _fill-in_. A review whose output is findings, not a feature; OpenFlow is explicitly **not** a compatibility target.
+> ✅ **CLOSED 2026-08-06 — findings note delivered.** Value **1/10** · Difficulty **1/10**. The gap-map lives at [docs/research/openflow-step-attributes.md](research/openflow-step-attributes.md); OpenFlow remains explicitly **not** a compatibility target — the note is a vocabulary map, not a gap-to-close list.
 
 **Cluster:** IDE & Authoring / Engine. **Priority:** P3. **Verdict:** build (a review, not a feature). **Severity:** none — this is a gap-analysis task whose output is findings.
 
