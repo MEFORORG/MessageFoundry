@@ -48,10 +48,17 @@ def git(repo: Path, *args: str) -> str:
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     r = tmp_path / "repo"
-    r.mkdir()
+    (r / "scripts" / "coord").mkdir(parents=True)
     subprocess.run(["git", "init", "-q", "-b", "main", str(r)], check=True, capture_output=True)
     git(r, "config", "user.email", "t@example.invalid")
     git(r, "config", "user.name", "t")
+    # STAGE THE SCRIPT INSIDE THE FIXTURE, and commit it, because claim.ps1 anchors on its own location
+    # rather than on the cwd (BACKLOG #1060). This is also what makes the sandbox STRUCTURAL: these
+    # tests used to be scoped to a temp registry only by ambient cwd, so the moment the script stopped
+    # consulting cwd they began writing REAL claims into this clone's shared registry -- measured, two
+    # strays landed there on the first run after the fix. Committing it means a linked worktree of this
+    # fixture carries its own copy, which is how `peer_holding` still gets a claim held by the peer.
+    shutil.copy2(CLAIM, r / "scripts" / "coord" / "claim.ps1")
     (r / "f.txt").write_text("x", encoding="utf-8")
     git(r, "add", "-A")
     git(r, "commit", "-qm", "base")
@@ -59,9 +66,20 @@ def repo(tmp_path: Path) -> Path:
 
 
 def claim(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    """Run the real script from ``cwd`` -- it scopes itself to the cwd's repo, and has no -Repo."""
+    """Run the checkout's OWN copy -- the script scopes itself to where it LIVES, not to the cwd.
+
+    ``cwd`` still names the worktree under test, but it does so by HOLDING that copy rather than by
+    being the ambient directory, which is what a session invoking `scripts\\coord\\claim.ps1` does.
+    """
     return subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(CLAIM), *args],
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(cwd / "scripts" / "coord" / "claim.ps1"),
+            *args,
+        ],
         cwd=str(cwd),
         capture_output=True,
         text=True,
