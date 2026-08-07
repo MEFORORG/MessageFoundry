@@ -5200,6 +5200,35 @@ This repo sets `core.hooksPath` at **worktree** scope, which beats global — so
 
 **Source:** the premise was mine, briefed to round 4 on 2026-08-06 as a live false deny, and overturned by that round's own verification on 2026-08-07. Filed as what it actually is.
 
+## 1083. The forbidden-content guard requires a path prefix on a worktree slug, so a bare slug in prose reaches the public repo
+
+> 🔢 **Filed 2026-08-07 — not started.** Value **6/10** · Difficulty **1/10** · _quick win_. `scripts/security/scan_forbidden.py:96` is `_WORKTREE_SLUG = re.compile(r"(?i:(?:claude/|worktrees/)[a-z0-9]+(?:-[a-z0-9]+)*-[0-9a-f]{6})")`. **The `claude/` or `worktrees/` prefix is MANDATORY**, so a bare slug in prose matches the shape and not the pattern, and ships. ⛔ **A live instance has been on `origin` since 2026-08-05** and the guard passed it on every commit since.
+
+**Cluster:** Repo hygiene / public-repo content control. **Priority:** P2. **Verdict:** build. **Severity:** no product effect and no PHI effect. It leaks an internal task name into a **public** repository — low individual harm, but the guard exists precisely because the project decided these should not ship, and it is failing silently at that job.
+
+**Measured, both directions, same commit.** The guard REFUSED a commit of mine for the path form and PASSED the bare form in the same file:
+
+```
+REFUSED   docs/BACKLOG.md:5800  worktree/branch slug (internal project name)
+          ... the round-3 fix in `.claude/worktrees/<slug>`.
+PASSED    docs/BACKLOG.md:5129  (already on origin since 2026-08-05)
+          ... Held for the owner: session `<slug>` has it as analysis only ...
+```
+
+Both contain the identical slug. Only the first carries a `worktrees/` prefix.
+
+**Why it is a blind spot and not a judgement call.** The comment block at `:89-95` reasons carefully about **case** — it notes agent slugs are lowercase by convention but that `new.ps1` passes `-Branch` to `git worktree add -b` after only a `git check-ref-format` check, which permits mixed case, and that `-Name` reaches the worktree DIRECTORY verbatim, so it deliberately folds case. **It says nothing about the prefix being mandatory.** The author thought about one axis of reachability and not the other, and the pattern is green because it cannot see the shape it does not require a prefix for.
+
+**The work.** Make the prefix optional: match the slug shape (`[a-z0-9]+(?:-[a-z0-9]+)*-[0-9a-f]{6}`) with or without `claude/` / `worktrees/`. ⚠️ **Assess the false-positive cost before doing it** — a bare `word-word-6hex` shape is more collidable than a prefixed one, and this repo legitimately writes short hex in prose (`git hash-object` prefixes, blob ids, `sha 3e7db362`). A guard that fires on ordinary commit prose gets allowlisted into uselessness, which is worse than the leak. Measure the hit rate over the existing corpus first, and prefer narrowing by context (a backticked token, a `session`/`worktree`/`branch` lead-in) over widening the shape.
+
+**Test it with a negative control, because this defect IS a missing one.** Add a fixture containing the bare form and assert the scanner FIRES. The existing suite cannot distinguish "no slug present" from "slug present in a shape I do not match" — which is the same failure as the guard itself.
+
+**Mitigation already applied:** the live instance at `:5129` was redacted in the commit that filed #1082. ⛔ **That is partial — it is already in git history and on `origin`,** so treat the redaction as stopping further propagation, not as removing it.
+
+**Related:** #1056 (the item whose Source line carried the instance), #1000 (a control green because it cannot see the class it covers), #1063 and #1060 (the same guard family reading the wrong thing).
+
+**Source:** found 2026-08-07 while committing #1082, when a routine slug grep returned a hit the leak gate had just passed. The gate had refused a different commit of mine for the prefixed form the day before, which is what made the disagreement visible.
+
 **Source:** identified 2026-08-05 while fixing #1032, and deliberately deferred rather than swept in, so that fix stayed scoped to one rule. Recorded here because a deferral nobody files is a deferral dropped.
 
 ## 1036. A Rule 4 deny names the first allowlisted repo's tooling regardless of which repo fired it
