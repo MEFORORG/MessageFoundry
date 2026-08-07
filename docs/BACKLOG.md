@@ -78,7 +78,7 @@ handed out as free — which is exactly how #240–#247 were issued over cited n
 **Released 2026-06-18.** `v0.1.0` is tagged, signed, and published to PyPI — the GitHub release (marked
 Latest) carries the wheel + sdist + CycloneDX SBOM + Sigstore signatures + SLSA build provenance. The
 `v0.1.0-rc1` pre-release (2026-06-16) preceded it. Full scope and the hard-gate record:
-[`releases/v0.1-PLAN.md`](releases/v0.1-PLAN.md). Capability catalog across every area, with status:
+`releases/v0.1-PLAN.md`. Capability catalog across every area, with status:
 [`FEATURE-MAP.md`](FEATURE-MAP.md).
 
 v0.1 delivered a **server DB as the supported production path (PostgreSQL + SQL Server)**, **engine HA
@@ -135,7 +135,7 @@ had been declined on a premise its own ADR 0053 contradicts). **#40** self-hoste
 **#41** cloud / Kubernetes HA packaging and **#61** third-tier DR standby have all shipped; **#11** WebAuthn
 shipped (ADR 0068 L5a); **#39** (frozen console installer Phase B) was built then retired (2026-07-01,
 superseded by the #75 browser ops dashboard). Sequencing context for the earlier wave lives in
-[`releases/MULTISESSION-PLAN-6.md`](releases/MULTISESSION-PLAN-6.md).
+`releases/MULTISESSION-PLAN-6.md`.
 
 ---
 
@@ -507,7 +507,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 | **#219** | Harness-invariant property test + cross-observer INCONCLUSIVE guard ✅ | 7 | 3 | _quick win_ | ✅ BUILT | Structural CI guard codifying the anti-fabrication invariant that stops the B-class harness bug from recurring in any future throughput gate. **BUILT 2026-07-10** (A4a property test + A4b `observers_inconclusive`). |
 | **#208** | Fix the per-PID engine CPU collector (attribution is blind without it) | 7 | 6 | _big bet_ | ✅ CLOSED | **CLOSED — shipped 2026-07-20; the residual is OFF-REPO and no in-repo change can close it.** The blocking premise is discharged: an admissible aggregate verdict bounds engine CPU at ≤ 0.36 cores/shard (`PLAN-ENGINE-ATTRIBUTION.md:81`, `:280`). Deliberately published with **no sizing figure**. |
 | **#211** | Claim-mode lane-count sweep (16 → 1,500 lanes) — NOT a default flip | 7 | 6 | _big bet_ | ✅ CLOSED | **CLOSED — owner-ratified 2026-07-17, characterization-only.** The A/B ran and is published (`THROUGHPUT-STATUS-2026-07-10.md:256`, `:259`, `:664`). ⚠️ **Not a licence to flip the `claim_mode` default, and not a rig ask** — the 1,500-lane claim storm is precisely why the default stands. |
-| **#215** | Shard-scaling curve N = 1, 2, 4, 8, 16 on one unified store | 7 | 6 | _big bet_ | ✅ CLOSED | **CLOSED — Phase 5 is DONE; the answer is DECLINING** (`THROUGHPUT-STATUS-2026-07-10.md:942`), per-shard ceiling `R ∈ [2, 3)` at N=8. The *"unmeasured"* framing is retracted. ⚠️ The `m7i.8xlarge` upsize it asks for is **retired** (`:1719`) — do not fund it. |
+| **#215** | Shard-scaling curve N = 1, 2, 4, 8, 16 on one unified store | 7 | 6 | _big bet_ | ✅ CLOSED | **CLOSED — Phase 5 is DONE; the answer is DECLINING** (`THROUGHPUT-STATUS-2026-07-10.md:942`), per-shard ceiling `R ∈ 2, 3)` at N=8. The *"unmeasured"* framing is retracted. ⚠️ The `m7i.8xlarge` upsize it asks for is **retired** (`:1719`) — do not fund it. |
 | **#216** | 1,500-connection traffic-driving harness mode (the demo shape) | 7 | 6 | _big bet_ | ✅ SHIPPED | **SHIPPED (verified 2026-07-28).** ⚠️ The *"no existing harness covers it"* premise is **retracted as false**: `harness/load/estate/` + `harness/config/estate/` + `python -m harness --estate`, with `count = 1500` in `estate-demo.toml`. ⚠️ `simple_fraction=0.72` and `hub_fanout=3` still need **OWNER SIGN-OFF**. |
 | **#218** | 2-point shard probe (N=1 vs N=4) — the cheap early killer | 7 | 6 | _big bet_ | ✅ CLOSED | **CLOSED — the experiment RAN (C1, 2026-07-10) and answered DECLINING:** 11.33 → 15.42 ingress/s = **1.36× for 4× shards** (`THROUGHPUT-STATUS-2026-07-10.md:265`). Direction firm, magnitudes soft (both soaks collapsed). Re-running re-derives a published verdict. |
 | **#210** | Remove the tempdb table variables from the pooled claim query | 7 | 7 | _big bet_ | ⛔ DECLINED | **DECLINED — withdrawn, owner-ratified 2026-07-17** (*"Do not build it"*, `THROUGHPUT-STATUS-2026-07-10.md:675`). ⚠️ **ADR 0114 deliberately PRESERVES the four table variables** (`store/sqlserver.py:702-717`) — they are load-bearing for per-lane FIFO. Removing them is a rejected design, not an unfinished one. |
@@ -542,7 +542,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 > **Update (2026-06-28).** Since this 2026-06-19 snapshot, **most rows below shipped** (through `0.2.10`) — the
 > per-item ✅ banners + `CHANGELOG.md` are authoritative, and the now-shipped on-trigger rows are flipped to
 > **done** inline. The remaining *buildable* set is **#33 / #40 / #41** (actionable) + **#52 / #60 / #61**
-> (owner-decision), planned ADRs-first in [`releases/MULTISESSION-PLAN-6.md`](releases/MULTISESSION-PLAN-6.md).
+> (owner-decision), planned ADRs-first in [`releases/MULTISESSION-PLAN-6.md`.
 > (**#39** frozen console installer Phase B was built then **🪦 retired** on 2026-07-01 — no longer buildable-set.)
 
 | Item | Value | Verdict | Effort | Why / trigger |
@@ -593,7 +593,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 
 The shipping configuration (SQLite/server-DB, single uvicorn worker, **localhost bind + required auth**)
 carries no open network exposure. The gaps below are **by design and tracked** — full context in
-[`releases/v0.1-PLAN.md`](releases/v0.1-PLAN.md) (the gates + the *Security posture* subsection),
+`releases/v0.1-PLAN.md` (the gates + the *Security posture* subsection),
 `security/CISO-REVIEW.md` (30-risk register), and the ASVS-L2 assessment.
 
 **Known gaps (by design):**
@@ -1057,7 +1057,7 @@ parity analysis.
 
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
 
-> 📐 **Partly promoted by [MULTISESSION-PLAN-7](releases/MULTISESSION-PLAN-7.md):** the **HL7-segment/field-aware before/after diff** (lane **L4**, client-side TS, no engine change) and **profiling + coverage** panes (lane **L7**, consuming the [ADR 0072](adr/0072-traced-dryrun-mode.md) traced dry-run) are scheduled as part of the no-AI build experience. The **hex / `mfb64:` pane** stays demand-gated.
+> 📐 **Partly promoted by MULTISESSION-PLAN-7:** the **HL7-segment/field-aware before/after diff** (lane **L4**, client-side TS, no engine change) and **profiling + coverage** panes (lane **L7**, consuming the [ADR 0072](adr/0072-traced-dryrun-mode.md) traced dry-run) are scheduled as part of the no-AI build experience. The **hex / `mfb64:` pane** stays demand-gated.
 
 **Cluster:** Minor gaps (console/IDE). **Priority:** P3. **Verdict:** demand-gate.
 
@@ -2458,7 +2458,7 @@ def route_demo_oru(msg):
 
 ## 235. Generate Steps view parameter forms from Python type hints
 
-> 🔢 **Filed 2026-07-30 — not started.** Value **4/10** · Difficulty **4/10** · _fill-in_. Widens what is *editable* without widening the recognition grammar; sequence deliberately against #237.
+> ✅ **Closed 2026-08-05 -- engine-emitted param schema (`lens schema` CLI) + schema-driven IDE renderer; int-to-number, the retype-trap fix, and enum-to-dropdown (convert_case/pad_field/arith_field/date_diff_field, narrowed to Literal) are all live; code-set picker is N/A (no editable code-set literal to attach to); code/control rows stay read-only.** Value **4/10** · Difficulty **4/10** · _fill-in_. Widens what is *editable* without widening the recognition grammar; sequence deliberately against #237.
 
 **Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (evaluate as its own lane). **Severity:** low.
 
@@ -3066,7 +3066,7 @@ Honestly bounded: **this is build-time only.** No PHI path, no running-engine su
 
 ## 337. handler-security lint: `getattr` indirection and the undecorated helper
 
-> 🔢 **Filed 2026-08-01 — not started.** Value **3/10** · Difficulty **3/10** · _fill-in_. `_AMBIENT_BARE_NAMES` (`checks.py:476`) still matches a literal name chain and `checks.py` contains no `getattr` resolution at all, and the rule loop still bails on `_message_fn_decorator(node) is None` (`:937`) so the `_<feed>_transforms.py` helper CONNECTIONS.md steers PHI handling into is never opened — but the lint is advisory unless an adopter opts into `--strict-handler-security`, and evading it reaches neither the DEK nor the audit chain in either sandbox posture; ~15 lines splicing a constant into `_dotted_call_name` plus a `phi-to-log` widening that must be recalibrated against the two shipped sample helpers before it lands.
+> ✅ **Done 2026-08-05 (#337).** Value **3/10** · Difficulty **3/10**. Both recall gaps in `_check_handler_security` (`checks.py`) are closed and pinned. A constant `getattr(mod, "name")` indirection now resolves in `_dotted_call_name`, so `getattr(os, "system")(...)` is flagged for `ambient-authority` (the shared resolver also flags a `getattr(time, "time")()` wall-clock read for `impure-transform`); and `phi-to-log` now scans undecorated `_*` transform helpers keyed on the first positional parameter, while `impure-transform` stays decorated-scope so the shipped `_pdf_mdm_transforms.py` ingest-time timestamp fallback stays clean. New `tests/test_checks_handler_security.py` cases cover both, and the change was proven green against `samples/config` before landing. Still an advisory-by-default filter — an evasion reaches neither the DEK nor the audit chain in either sandbox posture; ADR 0144 amended, to be re-scored upward when ADR 0147 (OS-level default-deny) lands.
 
 **Cluster:** Security & Compliance. **Priority:** P3. **Verdict:** build (small). **Severity:** low.
 
@@ -4629,7 +4629,7 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 **Explicitly not this item:** the `db_lookup` gap. `transports/database.py` builds its own connection string and emits no `MultiSubnetFailover`, so a deployment reaching the same listener through the DATABASE connector needs the DNS-side configuration regardless of what this rig measures. Whether that connector should get the keyword is a separate owner decision — do not let a green result here be read as "the workaround is obsolete".
 
-**Do not extrapolate from the AD lab.** [`plan-11/w19-ad-lab-integration-validation.md`](releases/plan-11/w19-ad-lab-integration-validation.md) covers AD/Kerberos integration and records this as *"needs the SQL AG rig"*. Its note that "all shipped — this is confirmation, nothing is blocked" is true of the code and false of the documentation.
+**Do not extrapolate from the AD lab.** `plan-11/w19-ad-lab-integration-validation.md` covers AD/Kerberos integration and records this as *"needs the SQL AG rig"*. Its note that "all shipped — this is confirmation, nothing is blocked" is true of the code and false of the documentation.
 
 **Related:** #100 (the shipped setting), [`AOAG-DEPLOYMENT.md`](AOAG-DEPLOYMENT.md) §4.5 / §5.3, `messagefoundry/config/settings.py` (`multi_subnet_failover`, default `false`), `messagefoundry/store/sqlserver.py` (`connection_string`), [`CONFIGURATION.md`](CONFIGURATION.md).
 
@@ -5637,7 +5637,7 @@ Anchoring on `$PSScriptRoot` binds the script to the checkout it lives in, which
 
 ## 1062. `check` validates the env value file under `--project-root` then reads the values from the current directory
 
-> 🔢 **Filed 2026-08-06 — not started.** Value **7/10** · Difficulty **2/10** · _quick win_. `messagefoundry check --project-root R` anchors `--config` under `R` and **hard-fails** if `R/<env_dir>/<env>.toml` is absent — then drops `R`. `run_checks` takes no project root, so the build check re-derives the value anchor from `Path.cwd()`. The gate therefore **verifies the file under the root you supplied and reads the values from wherever your shell happens to be.** `serve` does not have this defect, in the same file, by one line.
+> ✅ **SHIPPED 2026-08-06 — the root is threaded through and applied the way `serve` applies it.** Value **7/10** · Difficulty **2/10** · _quick win_. `run_checks` gained a `project_root` parameter, threaded to the build check and set as a `[environments].base_dir` **CLI override** — the same mechanism `serve` uses, so `load_settings`' CLI > env > file precedence puts it above a file-set `base_dir`. Left unset the resolution is unchanged and still falls back to the process directory, so `check --config config` is untouched. Two tests, asserted by the DIVERGENCE (the process directory holds its own value file with a different host); the pre-fix behaviour was reproduced directly rather than inferred — values were read from the process directory while the root was the one validated. Original filing follows. `messagefoundry check --project-root R` anchors `--config` under `R` and **hard-fails** if `R/<env_dir>/<env>.toml` is absent — then drops `R`. `run_checks` takes no project root, so the build check re-derives the value anchor from `Path.cwd()`. The gate therefore **verifies the file under the root you supplied and reads the values from wherever your shell happens to be.** `serve` does not have this defect, in the same file, by one line.
 
 **Cluster:** Configuration anchoring / gate integrity. **Priority:** P2. **Verdict:** build (small). **Severity:** would mis-decide a **required, blocking** check on a deploying site. Nothing is deployed (§0), so this is what a deploying site would hit on first use, not something happening today. It is also the only finding in this cluster on **product code** rather than developer tooling.
 
@@ -5671,3 +5671,70 @@ environments.py:79 `if not base_dir: return cwd`              <-- and base_dir i
 **Related:** #1057, #1059, #1060 (the cwd-is-not-the-caller cluster — this is its fourth instance and the only one on product code), #1000 (a required check green because it read the wrong directory), ADR 0050 AC-6, ADR 0092.
 
 **Source:** surfaced 2026-08-05 by a repo-wide sweep for the cwd-as-identity shape, reported as one of five candidates and held as **relayed, not confirmed** until the chain was read end to end on 2026-08-06. Filed only after that verification: the sweep's own severity ranking put it first, and a subagent's severity claim is not evidence.
+
+## 1077. `announce-session.ps1` skips reachable peers on `isRunning: false`, which means IDLE, not dead
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **6/10** · Difficulty **2/10** · _quick win_. The announce hook instructs every session *"No exact row, or isRunning is false -> SKIP that peer"*, then has the model record the outcome under the token `NOT_RUNNING`. Measured 2026-08-06: **`isRunning: false` means the session is IDLE and `send_message` DELIVERS to it**; `isRunning: true` means it is mid-turn and the message QUEUES. The field reads **backwards** as a reachability signal, so the rule drops exactly the peers that are ready to answer.
+
+**Cluster:** Session coordination / roster semantics. **Priority:** P2. **Verdict:** build (small). **Severity:** no product effect and no security effect — this governs agent coordination. The cost is silent: a session follows the rule, reports fewer live peers than exist, and nothing raises.
+
+**Measured by sending into real peers and getting real replies, not inferred from the field.**
+
+| target state | result |
+| --- | --- |
+| `isRunning: false` (idle) | **delivered**, answered within one turn |
+| `isRunning: true` (busy) | *"Message queued … will be processed after the in-flight turn finishes"* |
+
+**It has already cost a wrong report to the owner.** A session applying the SKIP rule told the owner there was **no live coordinator** and was corrected with *"there is a live coordinator... talk to it."* `presence.ps1` had listed it live throughout. The two rosters also disagreed on that session's **branch**, so branch cannot join them either — only cwd can.
+
+**This item is the SKIP rule, not the field.** The defect is that this repo's own hook elevates `isRunning` to a disqualifier without saying what it means, and then records the outcome under a token that reads as *"gone"*.
+
+**Fix shape, offered not decided.** Either drop the `isRunning` condition entirely (cwd match alone decides reachability, and a failed `send_message` is loud), or keep it and invert the reading — skip on `true` if anything, since that is the state that queues. Whichever is chosen, the `NOT_RUNNING` receipt token must go: it records a delivery that would have succeeded. A negative control per #1000 needs a peer that is idle at the time of the run, since an all-busy roster cannot distinguish the two rules.
+
+**Related:** #1000 (a rule green because its outcome token cannot express the case it got wrong), #1057 (a refusal whose text misleads the reader about what was checked).
+
+**Source:** found 2026-08-06 by a session that followed the rule, misreported the roster to the owner, was corrected, and then settled a question its own notes had recorded as *"UNVERIFIED, do not assert either way: whether send_message delivers to an isRunning:false session"* — including that note's own prediction that if it delivered, the SKIP rule would be dropping reachable peers.
+
+## 1078. `new.ps1` prints cleanup advice that throws when followed as written
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **3/10** · Difficulty **1/10** · _quick win_. Run from a worktree, `new.ps1` anchors on `$PSScriptRoot` and creates the new tree beside **itself** — e.g. under `.claude/worktrees/` — then prints *"When done (run from the MAIN checkout): `scripts\worktree\remove.ps1 -Name <name>`"*. From the main checkout that resolves to `<repo-parent>/<repo-leaf>-<name>`, which does not exist, and `remove.ps1` throws *"No such worktree"*. The command only works run from the worktree that created it, which is not what the line says.
+
+**Cluster:** Developer tooling / refusal and advice accuracy. **Priority:** P4. **Verdict:** build (trivial). **Severity:** low and loud — `remove.ps1` fails closed with a clear message naming the path it looked for. Nothing is destroyed and no wrong tree is removed; the cost is a confusing failure at cleanup time.
+
+**Third instance of the same class, and that is why it is worth a number rather than a comment.** #1032 was rule 3b printing a `new.ps1` command `new.ps1` refuses to run. #1057 was rule 3d naming `remove.ps1` and `prune-merged.ps1` for a worktree family neither can reach. This is the same defect in `new.ps1`'s **own output**, about a worktree `new.ps1` **just created** — so the anchoring is correct and only the advice is wrong.
+
+**The fix is to print the path that was actually used.** `new.ps1` knows `$RepoRoot` and `$WorktreePath` at the point it prints; the line should name the checkout the command must be run from rather than asserting "the MAIN checkout", or print the plain `git -C <root> worktree remove <path>` that works from anywhere.
+
+**Do not fix by changing where `new.ps1` puts the worktree.** Anchoring on `$PSScriptRoot` is what BACKLOG #1060 established as correct for a script invoked by absolute path; the defect is the sentence, not the placement.
+
+**Related:** #1057 and #1032 (the same class, one and two rules over), #1060 (the anchoring that makes the placement correct).
+
+**Source:** found 2026-08-06 while creating a worktree to fix #1057 — the tool being used to clean up after the defect exhibited the defect.
+
+## 1079. `security.yml`'s header denies the push-to-main trigger its own `on:` block declares
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **2/10** · Difficulty **1/10** · _quick win_. The header comment states *"NO push-to-main trigger (dropped for CI cost)"* and explains the reasoning at length. The `on:` block a few lines later carries `push: branches: [main]`, with its own comment calling it the *"Post-merge re-scan (main only)"*. Two comments in one file, each describing the trigger set, and they contradict each other.
+
+**Cluster:** Documentation accuracy / CI. **Priority:** P4. **Verdict:** build (trivial — delete or correct one comment). **Severity:** none to the build. The workflow behaves as the `on:` block says; only a reader is misled.
+
+**Why it is worth a number at all.** This is a **security** workflow whose header is otherwise load-bearing — the same block documents that `continue-on-error` leaves branch protection green while discarding findings, and points at `tests/test_security_posture.py` as the guard that refuses it. A reader who finds one paragraph of that header demonstrably false has no way to know which of the others still hold. The cost is to the header's credibility, not to CI.
+
+**Determine which is stale before editing.** The push arm's own comment gives a reason — a fork PR is scanned structural-only, so without this arm no fully-loaded scan sees fork-contributed content — that does not obviously yield to the cost argument in the header. Whichever survives, the other must go, not be softened.
+
+**Related:** #1000 (a claim about a control that its own configuration contradicts).
+
+**Source:** noticed 2026-08-06 while reading the workflow to answer whether a PR's checks audit the merge ref or the head — an unrelated question.
+
+## 1080. `setup-leak-gate.ps1` reports the LOADED token set as if it were the one it just installed
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **3/10** · Difficulty **1/10** · _quick win_. `-Synthetic` prints *"Installed the SYNTHETIC template"* and then, three lines later, *"CONFIGURED with the real token set."* Both are individually true when `MEFOR_FORBIDDEN_TOKENS` is set: the script installed the synthetic file, and the scanner loaded the real list from the environment, which wins over the file. Nothing in the output says the env source **overrode** what was just installed, so the two lines read as a contradiction or, worse, as confirmation that the synthetic install produced a real-token gate.
+
+**Cluster:** Developer tooling / reporting accuracy. **Priority:** P4. **Verdict:** build (trivial). **Severity:** low, and the direction is safe — the gate really is loaded with the real set, so the operator is better protected than the message implies, not worse. The cost is that a reader cannot tell which source armed the gate, which is the one question the script's own docstring says the verify step exists to answer.
+
+**The script's stated purpose is what makes this a defect rather than a nit.** Its header: *"A green gate is evidence only if you confirmed it can see the class it is meant to catch"*, and it *"always finishes by invoking the scanner and printing the per-section detector counts"*. Printing the counts without printing **where they came from** leaves exactly the ambiguity the step was written to close.
+
+**Fix shape.** Have the verify step name the resolved source — the `MEFOR_FORBIDDEN_TOKENS` path versus `scripts/security/scan-tokens.local.txt` — and say plainly when the environment overrode the file just written. `scan_forbidden.py` already distinguishes the three states internally (structural-only, synthetic, real) to build that line; it needs the provenance too, not just the verdict.
+
+**Related:** #1063 (the same script, anchoring rather than reporting), #1000 (a gate whose green does not say what it was green about).
+
+**Source:** observed 2026-08-06 while arming a fresh worktree during #1063's fix. Held unfiled as marginal, and filed on the owner's instruction.
