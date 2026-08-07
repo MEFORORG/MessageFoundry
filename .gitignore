@@ -158,3 +158,35 @@ scripts/security/scan-tokens.local.txt
 #    not exist. Published from the newest copy, de-branded back to the generic lineage its own
 #    revision history names.)
 /docs/CI-TOPOLOGY.md
+
+# --- Development-process material (ADR 0160 Phase 1) ----------------------------------------------
+# Subject test, from ADR 0160 D1: a tracked file must be something an OPERATOR running MessageFoundry
+# needs, or something a SECURITY REVIEWER assessing it needs. Material whose subject is how this
+# project is DEVELOPED -- session orchestration, wave schedules, per-session briefs -- fails both.
+#
+# Custody moved to the vault (wshallwshall/MessageFoundry) BEFORE these left the tracked tree, so
+# this rule is not the only copy. That ordering is the point: gitignoring alone would have left 103
+# files as single unversioned copies that `git clean -xdf` erases.
+#
+# NOT a confidentiality control, and must never be described as one -- `git log` still contains all
+# of it, and none of it was ever secret. It is process noise, not sensitive content. Anything
+# genuinely sensitive belongs in the vault and always did (see the blanket rules above).
+#
+# HANDOFF-*.md is anchored to the ROOT and deliberately a PATTERN rather than the two filenames it
+# currently matches: session handoffs kept landing in the repo's front door, and a pattern fails
+# closed on the next one instead of waiting for somebody to notice. A handoff that genuinely must
+# ship can still be force-added (`git add -f`).
+#
+# ⛔ DO NOT "FIX" THE ANCHOR BY DROPPING THE LEADING SLASH. It looks like a gap -- the root-anchored
+# form matches nothing under docs/ -- and it was proposed as a tightening on exactly that reasoning.
+# It is the wrong fix twice over:
+#   * The two places a handoff must not land are the repo ROOT and docs/releases/, and BOTH are
+#     already covered -- the root by the rule below, the directory by the rule above it. The case
+#     that motivated the change (PR #225 landing a handoff in docs/releases/ while the Phase 1 PR was
+#     open) is closed by that directory rule the moment nothing is tracked there, which is now true.
+#   * An unanchored `HANDOFF-*.md` would fail closed on `docs/benchmarks/`, where 21 handoff
+#     documents are TRACKED ON PURPOSE: they carry the measurement narrative for the ~133 data files
+#     beside them, and a new benchmark run legitimately produces another. Silently ignoring those
+#     would break working practice to close a gap that is already shut.
+/docs/releases/
+/HANDOFF-*.md

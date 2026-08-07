@@ -63,7 +63,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.08.05.2"
+$GateVersion = "2026.08.06.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -122,7 +122,20 @@ function Write-Deny([string]$Reason, [string]$Rule = "?", [string]$Detail = "") 
 
 # Canonicalize before comparing. Without GetFullPath, `...\MessageFoundry-tpA\..\MessageFoundry\x.md`
 # does not string-match the primary's prefix and walks straight through the gate.
-function Get-ComparablePath([string]$Path, [string]$Base) {
+#
+# SPLIT IN TWO (BACKLOG #1061) so there is exactly ONE definition of "resolve this path", with two views
+# of the result. Rule 3c needs this resolution but must NOT have the lowercasing tail: it hands the result
+# to `git -C`, and this file warns at the top of the rule-3b resolver and again inside rule 3d that a
+# lowercased path works on Windows and silently misses the real directory on a case-sensitive filesystem.
+# A second resolver written beside this one would be two definitions that drift invisibly, so the raw form
+# IS the shared core and Get-ComparablePath is a fold on top of it.
+#
+# The non-fully-qualified base is now REJECTED explicitly rather than thrown and caught. Same answer --
+# GetFullPath demands a FULLY QUALIFIED base and threw otherwise -- but stating it makes "" mean exactly
+# one thing, "I could not resolve this", which rule 3c distinguishes from "git says this is not a repo".
+# IsPathFullyQualified, not IsPathRooted: on Windows `IsPathRooted("/tmp")` is true while
+# `GetFullPath(x, "/tmp")` still throws, and that throw is what the old catch was absorbing.
+function Get-FullPathRaw([string]$Path, [string]$Base) {
     if (-not $Path) { return "" }
     try {
         # A RELATIVE path must resolve against the SESSION's cwd, not this hook process's. `../../..` is
@@ -130,13 +143,18 @@ function Get-ComparablePath([string]$Path, [string]$Base) {
         # GetFullPath($Path) alone resolved it against wherever pwsh happened to be started -- so
         # `cd ../../.. && git reset --hard` did not look like it touched the primary and was ALLOWED
         # (measured, along with six other spellings). Callers that already have an absolute path may omit
-        # $Base; GetFullPath throws on a non-rooted base, which the catch turns into "not governed".
-        $full = if ($Base -and -not [System.IO.Path]::IsPathRooted($Path)) {
-            [System.IO.Path]::GetFullPath($Path, $Base)
-        } else {
-            [System.IO.Path]::GetFullPath($Path)
+        # $Base.
+        if ($Base -and -not [System.IO.Path]::IsPathRooted($Path)) {
+            if (-not [System.IO.Path]::IsPathFullyQualified($Base)) { return "" }
+            return [System.IO.Path]::GetFullPath($Path, $Base)
         }
+        return [System.IO.Path]::GetFullPath($Path)
     } catch { return "" }
+}
+
+function Get-ComparablePath([string]$Path, [string]$Base) {
+    $full = Get-FullPathRaw $Path $Base
+    if (-not $full) { return "" }
     ($full -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
 }
 
@@ -552,9 +570,73 @@ if ($tool -in @("Bash", "PowerShell")) {
         $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw)
         if ($where.Count -eq 0) { continue }
 
-        $common = "$(& git -C $where[0] rev-parse --git-common-dir 2>$null)".Trim()
+        # ROOT THE TARGET AGAINST THE SESSION CWD BEFORE ASKING GIT ANYTHING (BACKLOG #1061). This block
+        # used to read `& git -C $where[0]` and `Get-ComparablePath $common $where[0]`, and with a
+        # RELATIVE target it failed OPEN. Measured on the installed hook by two sessions independently:
+        #     git -C <primary-absolute> config core.hooksPath /dev/null   -> DENIED
+        #     git -C ../../..           config core.hooksPath /dev/null   -> ALLOWED
+        #     cd ../../.. && git        config core.hooksPath /dev/null   -> ALLOWED
+        # `../../..` is simply how a session in <primary>/.claude/worktrees/<x> names the repo root. It
+        # needs no variable and no intent, and it disarms the ledger, claim and secret-leak commit gates
+        # for every worktree at once -- verbatim what the deny text below says this rule exists to stop.
+        #
+        # THE MECHANISM IS A BASE THAT IS NOT A BASE. `rev-parse --git-common-dir` answers RELATIVE TO
+        # THE TARGET: from the PRIMARY it returns the bare string ".git"; from a linked worktree it
+        # returns an absolute path. Get-ComparablePath then resolved ".git" against $where[0] -- the
+        # target token AS WRITTEN -- and GetFullPath demands a fully qualified base, so it threw, the
+        # catch returned "", no root matched "", and `if (-not $govCfg) { continue }` allowed. The hole
+        # was scoped to the primary precisely BECAUSE only the primary answers relatively, which is also
+        # why the crux test (disarming FROM a linked worktree) stayed green straight over it.
+        #
+        # DO NOT "FIX" THIS WITH ONE TOKEN. `Get-ComparablePath $common $cwdRaw` still ALLOWS: ".git" is
+        # relative to the TARGET, not to the session, so it resolves to <session-worktree>/.git -- a real
+        # path that is not the primary's common dir. The gate would read as fixed and stay open for a
+        # second, harder-to-see reason. Two steps are required: root the TARGET against the session cwd,
+        # then root the common dir against THAT.
+        #
+        # AND THE ROOTED PATH GOES TO `git -C` TOO, not only into the comparison. `& git -C <relative>`
+        # resolved against THIS HOOK PROCESS's cwd, which is not the session's -- so a relative target
+        # naming a LINKED worktree made git exit 128 and fall through to ALLOW as well. Measured with the
+        # two cwds deliberately diverged, `git -C .` and a relative sibling-worktree path both flipped
+        # DENY -> ALLOW; the pytest harness does not set the subprocess cwd, so that divergence is the
+        # condition under test, not a hypothetical. Get-FullPathRaw and NOT Get-ComparablePath, because a
+        # Get-ComparablePath value is LOWERCASED and this file warns twice (the rule-3b resolver, and
+        # inside rule 3d) that a lowercased path handed to `git -C` passes on Windows and silently misses
+        # the real directory on a case-sensitive filesystem.
+        #
+        # THE TWO FAILURE CONDITIONS ARE DIFFERENT AND ARE ANSWERED DIFFERENTLY:
+        #   * THE TARGET CANNOT BE RESOLVED AT ALL -- DENY. Nothing has been asked of git yet, so there is
+        #     no evidence either way about which repository this writes to; "unresolvable means not
+        #     governed" is exactly how this defect shipped, and reinstating it here would leave the fix
+        #     one malformed cwd away from the hole it closes. It takes a payload whose cwd is itself
+        #     non-absolute, so it costs an ordinary session nothing.
+        #   * GIT FAILS ON A RESOLVED TARGET -- ALLOW, unchanged. That is git ANSWERING: the path is not a
+        #     repository. test_a_non_repo_cwd_fails_open pins it, and the reason it pins it is that a
+        #     guardrail which wedges on an unexpected shape gets uninstalled.
+        $whereRaw = Get-FullPathRaw $where[0] $cwdRaw
+        if (-not $whereRaw) {
+            Write-Deny -Rule "3c" -Detail "git config $badKey (unresolvable target)" -Reason @"
+BLOCKED: this sets '$badKey', and the gate cannot tell WHICH repository it would set it in.
+
+The target path '$(Get-SafeForMessage $where[0])' could not be resolved to an absolute path from this
+session's working directory ('$(Get-SafeForMessage $cwdRaw)'), so the check that would normally answer
+"is this the shared configuration of a governed checkout?" cannot run at all.
+
+'$badKey' is on the disarm list: setting it in a governed repository turns off the ledger, claim and
+secret-leak commit gates for every worktree of it at once. An unanswerable question about that key is
+refused rather than assumed safe.
+
+What to do instead:
+  * Re-run it with an ABSOLUTE path for the target (`git -C "<full path>" config ...`). Then the gate can
+    see which repository is being configured, and an ordinary non-governed repo is allowed as usual.
+  * Ordinary per-user config (user.email, user.name, and anything not on the disarm list) is untouched by
+    this rule in any spelling.
+"@
+        }
+
+        $common = "$(& git -C $whereRaw rev-parse --git-common-dir 2>$null)".Trim()
         if ($LASTEXITCODE -ne 0 -or -not $common) { continue }
-        $commonCmp = Get-ComparablePath $common $where[0]
+        $commonCmp = Get-ComparablePath $common $whereRaw
         $govCfg = $null
         foreach ($r in $roots) {
             if ($commonCmp -eq $r.Compare -or $commonCmp.StartsWith("$($r.Compare)/")) { $govCfg = $r; break }
@@ -583,9 +665,21 @@ What to do instead:
     # Rule 3d -- `git worktree remove` / `move`, which DESTROYS OR RELOCATES ANOTHER SESSION'S CHECKOUT.
     # Every rule above protects a tree from being swapped; this one protects it from being deleted, which
     # is strictly worse and was entirely unguarded. The verb list could never have caught it: `worktree`
-    # is two tokens (`worktree remove`) where every other entry is one, and git refuses to remove the
-    # worktree you are STANDING in -- so a `worktree remove` that reaches git is, by construction, aimed
-    # at somebody else's.
+    # is two tokens (`worktree remove`) where every other entry is one.
+    #
+    # THIS RULE ONCE JUSTIFIED HAVING NO CWD CHECK WITH "git refuses to remove the worktree you are
+    # STANDING in, so a remove that reaches git is aimed at somebody else's". THAT INFERENCE IS
+    # UNREACHABLE FROM HERE (BACKLOG #1041). A PreToolUse hook decides whether anything reaches git at
+    # all, so git's refusal never happens and the premise is never tested -- a rule cannot defer to a
+    # guard that runs only after it has already decided. Reproduced: a session standing in a linked
+    # worktree ran `git worktree remove <that same path>` and was told the tree belonged to ANOTHER
+    # SESSION, then sent to confirm with a colleague who does not exist.
+    #
+    # So the cwd check is now made rather than argued for, just below. It is narrow on purpose: it
+    # establishes "this IS the tree you are standing in", which is the one ownership fact available
+    # here. It does NOT establish the converse -- a worktree that is not yours to stand in may still be
+    # nobody's, and this rule has no occupancy or authorship signal to tell those apart. The deny text
+    # below says only what is checked.
     #
     # The target is the PATH ARGUMENT, not the cwd, and it cannot be judged with Test-Governed: a linked
     # worktree is exempt there (correctly, for tree swaps) and a sibling worktree falls outside the roots
@@ -617,12 +711,50 @@ What to do instead:
         }
         if (-not $govWt) { continue }
 
-        Write-Deny -Rule "3d" -Detail "git worktree $wtVerb" -Reason @"
-BLOCKED: 'git worktree $wtVerb $victimRaw' acts on a worktree of $($govWt.Display) that belongs to
-ANOTHER SESSION -- git refuses to remove the worktree you are standing in, so this one is not yours.
+        # Is the victim the tree THIS session is standing in? $victimCmp above is the shared COMMON git
+        # dir -- every worktree of one repo reports the same value, so it cannot answer this. Resolve
+        # both TOPLEVELS instead. A git failure leaves $isSelf false, which keeps the pre-existing text.
+        #
+        # $cwdRaw, NEVER $cwd. $cwd is the Get-ComparablePath form, which is LOWERCASED, and this file
+        # already warns at the top of the rule-3b resolver that every `git -C` must take the raw path:
+        # on a case-sensitive filesystem `git -C /tmp/.../primary-wt` misses the real `.../Primary-wt`.
+        # Written with $cwd first, it passed on Windows (case-insensitive) and failed on the Linux CI
+        # leg, where the lookup returned nothing, $isSelf went false, and BOTH branches emitted the
+        # generic deny -- byte-identical, which is exactly what the non-vacuity test below asserts
+        # against. Platform-masked, and caught only because that test compares the two denies.
+        $victimTop = Get-ComparablePath "$(& git -C $victimRaw rev-parse --show-toplevel 2>$null)".Trim()
+        $selfTop = Get-ComparablePath "$(& git -C $cwdRaw rev-parse --show-toplevel 2>$null)".Trim()
+        $isSelf = $victimTop -and $selfTop -and ($victimTop -eq $selfTop)
 
-Removing it deletes that session's working tree and its branch, along with any uncommitted work in them.
-There is no undo, and the session using it finds out when its next file read fails.
+        if ($isSelf) {
+            Write-Deny -Rule "3d" -Detail "git worktree $wtVerb (own worktree)" -Reason @"
+BLOCKED: 'git worktree $wtVerb $victimRaw' acts on THE WORKTREE THIS SESSION IS RUNNING IN.
+
+This is not somebody else's tree and nothing here says it is. git would refuse it too -- you cannot remove
+the worktree you are standing in -- but this gate runs BEFORE git, so you would have got a confusing
+failure from the hook rather than a clear one from git.
+
+There is no version of this you can run from here. Removing your own checkout mid-session deletes the
+files you are working on, and the removal has to happen from OUTSIDE this tree, after the session ends.
+
+What to do instead:
+  * Finish and COMMIT anything you still want. A commit survives the tree being deleted; a dirty tree
+    does not.
+  * Then ask the user, in these words: "I am finished in $victimRaw and it can be removed once this
+    session ends." Removal is theirs to run from the main checkout:
+        pwsh -NoProfile -File $($govWt.Display)\scripts\worktree\remove.ps1 -Name <directory-name>
+  * If you only wanted to leave it, just stop using it -- an unused worktree costs disk, not correctness.
+"@
+        }
+        else {
+            Write-Deny -Rule "3d" -Detail "git worktree $wtVerb" -Reason @"
+BLOCKED: 'git worktree $wtVerb $victimRaw' acts on a worktree of $($govWt.Display) that is NOT the tree
+this session is running in. This gate cannot tell whether another session is using it -- it has no
+occupancy or authorship signal -- so it refuses rather than guess.
+
+If it IS in use, removing it deletes that session's working tree and its branch, along with any
+uncommitted work in them. There is no undo, and the session using it finds out when its next file read
+fails. That asymmetry is why the default is refusal even though the tree may well be abandoned.
 
 What to do instead:
   * Cleaning up merged worktrees is a maintenance job with its own dry-run-by-default tool. Run it and
@@ -633,6 +765,7 @@ What to do instead:
   * If you are certain it is abandoned and must go now, that is the user's call, not yours. Say so:
     "I want to remove the worktree $victimRaw and I need you to confirm it is not in use."
 "@
+        }
     }
 
     # The verb must be a whole SUBCOMMAND. `\bmerge\b` is not enough: a hyphen counts as a word boundary,
@@ -786,6 +919,24 @@ worktree gate blocked it." The primary's HEAD belongs to the user, not to a sess
 
 # ---------------------------------------------------------------------------------------------------
 # Rule 1 -- writing INTO the primary's working tree, from anywhere.
+#
+# ANOTHER GATE DEPENDS ON THIS ONE, and not for the reason the rest of this file talks about. Elsewhere the
+# relationship is that this hook PROTECTS the ledger gate's inputs -- rule 3c refuses a core.hooksPath
+# repoint, rule 1b refuses a write to alloc/. This is different and it runs the other way: the ledger gate's
+# ownership check keys on the WORKTREE that allocated a number (scripts/hooks/ledger_check.py owns()), and
+# that key is only meaningful because rule 1 makes each session build somewhere of its own. Before this gate
+# existed the key was MEASURED broken -- co-tenant sessions in the shared primary all mapped to one worktree,
+# so the check was a no-op between exactly the sessions it was meant to separate. See
+# docs/LEDGER-GATE.md, "Ownership keying -- and why it works now": the two gates are a pair.
+#
+# WHY IT IS WRITTEN HERE rather than only there. That document states the dependency from the DEPENDENT's
+# side, which is invisible from the side that can break it -- and breaking it does not look like breaking a
+# gate. Widening what rule 1 governs disarms no hook and fails no test; it quietly turns owns() back into a
+# no-op for the newly-ungoverned paths, and the ledger then merges clean and corrupts silently, which is the
+# defect that registry exists to prevent (measured 3x: d1d0a5a, 5b7d046, 9f3483d). This is not hypothetical:
+# the first cut of rule 1b's exemption widened rule 1 to the whole of .git/mefor-coord/ and exposed
+# alloc/<kind>/<n>.json, so a Write could forge an allocation owns() would then authorise. It was caught by
+# an adversarial review, not by any gate. So if you are about to widen this rule, that is the cost to price.
 # ---------------------------------------------------------------------------------------------------
 if ($tool -notin @("Write", "Edit", "MultiEdit", "NotebookEdit")) { exit 0 }
 

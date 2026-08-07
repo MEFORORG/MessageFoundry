@@ -36,6 +36,20 @@ the engine compatibility range.
   role gets `403` on the editor (it can still resubmit through the JSON API); no built-in role is
   affected, since `ADMINISTRATOR` and `OPERATOR` grant both. Both verbs additionally charge the
   per-actor PHI-read budget now, so either can return `429` + `Retry-After` under automation.
+- **The two content-search step-up GET routes now charge the per-actor PHI-read budget on their
+  short-circuit renders** (BACKLOG #1025). `GET /ui/messages/search` and `GET /ui/messages/search/layered`
+  already charged the budget when they ran a real search — the reused engine handlers
+  (`search_messages` / `layered_search`) pace it in their own body — but the bare-form and no-preset
+  re-renders return *before* reaching those handlers, so on a deployed instance those render paths
+  would have skipped the per-actor read budget. Each now charges `enforce_phi_read_pacing` **inline on
+  its short-circuit branch only**, so the render spends a token and the route can return `429` +
+  `Retry-After` under automation, **without** double-charging the real-search path (a gate-level
+  `phi=`, which runs on every request, would have spent the bucket twice whenever a criterion was
+  supplied). `GET /ui/uploaded-logs/file/{file_id}`, named alongside them in the original report, was
+  found already paced by its own handler (`browse_uploaded_file`) on every call — it has no
+  short-circuit — and is deliberately left unchanged; a charge there would double-count the same
+  budget. **No engine UI seam change:** the charge reuses the existing `enforce_phi_read_pacing` helper
+  the reused handlers already call.
 
 ## [0.2.15] — 2026-07-06 — Early Access
 

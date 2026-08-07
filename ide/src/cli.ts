@@ -4,6 +4,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 
+import type { OpSchema } from "./stepsModel";
+
 export interface CliResult {
   stdout: string;
   stderr: string;
@@ -274,6 +276,16 @@ export interface CodeSetDetail {
 /** `codeset list` — every code set under codesets/ as a SUMMARY, sorted by name. */
 export function codesetList(cwd?: string): Promise<CodeSetSummary[]> {
   return runJson<CodeSetSummary[]>(["codeset", "list", "--config", configDir()], cwd);
+}
+
+/**
+ * `lens schema` — the transform-vocabulary parameter schema (BACKLOG #235; op -> editable params with
+ * their widget kind/choices), derived by the engine from its own action + diagnostic signatures. The
+ * Steps editor drives its per-param input widgets from it. Config-independent (a pure signature
+ * introspection), so it takes no `--config`; the CLI is lazy-imported engine-side and starts no server.
+ */
+export function lensSchema(cwd?: string): Promise<OpSchema> {
+  return runJson<OpSchema>(["lens", "schema"], cwd);
 }
 
 /** `codeset show NAME` — the DETAIL/grid for one code set (a .toml one comes back read-only). */
