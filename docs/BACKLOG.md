@@ -5821,3 +5821,23 @@ Both readings reach the same operational conclusion, which is the whole point of
 **Related:** #1063 (the same script, anchoring rather than reporting), #1000 (a gate whose green does not say what it was green about).
 
 **Source:** observed 2026-08-06 while arming a fresh worktree during #1063's fix. Held unfiled as marginal, and filed on the owner's instruction.
+
+## 1087. `new.ps1` sets a worktree branch's upstream to the BASE, so every instrument keyed on `@{u}` answers a different question than the one asked
+
+> 🔢 **Filed 2026-08-07 — not started.** Value **7/10** · Difficulty **1/10** · _quick win_. `new.ps1:133` runs `git worktree add <path> -b <Branch> <Base>` with `-Base origin/main`. Git's default `branch.autoSetupMerge` then sets the new branch's upstream to the remote-tracking base, so **`@{u}` resolves to `origin/main`, not to the branch's own remote ref** — measured on a live worktree. The visible symptom is trivial. The consequence is not: **`@{u}..HEAD` reports a branch's own commits as "unpushed" forever, including immediately after a successful push.**
+
+**Cluster:** Developer tooling / instrument accuracy. **Priority:** P2. **Verdict:** build (one flag). **Severity:** no product effect. The cost is that a routine safety question gets a confidently wrong answer, silently, with no error.
+
+**The loud symptom is the harmless one.** `git pull --ff-only` in such a worktree fails with *"Not possible to fast-forward, aborting"* because it is trying to fast-forward the branch onto `origin/main`. That is self-correcting: it refuses, and naming the branch explicitly (`git pull --ff-only origin <branch>`) works. **`git pull` WITHOUT `--ff-only` does not fail** — it merges `origin/main` into the branch and produces a merge commit. Quieter, and worse.
+
+**The real defect is the instrument, and it corrupted a safety check the same night.** A session checking whether its worktrees were safe to remove ran `git log @{u}..HEAD` and read **2 and 1 unpushed commits** on two branches that were byte-identical to their remotes. Both were fully pushed. The check that decides *"is anything at risk if I delete this worktree"* rests partly on that number, so the misconfiguration turns a safety question into a false positive — and a false negative is available the same way. Same class as the other instrument defects in this cluster: `git cherry` under squash-merge, ancestry as a proxy for content, a *job* conclusion answering a *step* question. **Name what the tool returns and check it is the same sentence as the question.**
+
+⛔⛔ **DO NOT FIX THIS WITH `git config push.default upstream`.** It is the first thing someone reaches for — it makes bare `git pull`/`git push` "work" — and it is **strictly worse than the defect**. With the upstream set to `origin/main`, `push.default upstream` makes a bare `git push` write the feature branch **onto `main`**, and on this repo push to `main` is not blocked server-side. The only reason that is not already possible is that `push.default` is **unset** (verified 2026-08-07: unset both local and global), so git uses `simple`, which refuses when the upstream's name differs from the local branch's name. **That default is load-bearing and must not be relaxed while the upstream is wrong.**
+
+**The fix is one flag at creation, not a config change.** Either pass `--no-track` on the `worktree add` so no upstream is set at all, or set the upstream to the branch's own remote ref after the first push. `--no-track` is the smaller change and leaves `@{u}` unresolvable, which fails **loudly** rather than answering the wrong question — the correct failure direction for an instrument.
+
+**Test it by the divergence, per #1000.** A test that creates a worktree and asserts `@{u}` is unset (or equals the branch's own remote) passes trivially; the case that distinguishes is asserting that `@{u}..HEAD` is **empty** for a branch whose tip equals its pushed remote ref. Under the current behaviour that assertion fails, which is the whole point.
+
+**Related:** #1078 (`new.ps1` printing cleanup advice that throws — the same script, the same "correct action, wrong accompanying claim" shape), #1060 (anchoring, which is what makes the worktree placement itself correct), #1000 (a control whose green is not evidence).
+
+**Source:** found 2026-08-07 from a `git pull --ff-only` failure while syncing a worktree, and connected to a bogus "unpushed" reading reported hours earlier in the same session — one root cause behind two symptoms that had been treated as unrelated. Mechanism confirmed at `new.ps1:133` and the `push.default` posture verified against the live config before the warning above was written.
