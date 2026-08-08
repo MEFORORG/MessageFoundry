@@ -19,9 +19,15 @@ name: Nightly failure notice
 #
 # SCOPE: schedule-only, deliberately. A push/PR failure is already visible on the PR itself; alerting
 # there would be pure noise, and `workflow_run` fires for every CI completion regardless of trigger.
+#
+# TWO WORKFLOWS, ONE ISSUE PER WORKFLOW. `Security` was added because its daily cron carries jobs that
+# do not run on a PR -- `released-line-audit` most of all, whose whole subject (the LATEST RELEASE) no
+# PR can change. The issue title is DERIVED from the completed workflow's name, so a green nightly CI
+# cannot close an issue opened by a red Security run: a single shared title would let one signal close
+# the other, which is the same silence this workflow exists to end.
 on:
   workflow_run:
-    workflows: ["CI"]
+    workflows: ["CI", "Security"]
     types: [completed]
 
 # Read-only by default; the one job that writes escalates to `issues: write` and nothing else.
@@ -49,10 +55,13 @@ jobs:
           RUN_URL: ${{ github.event.workflow_run.html_url }}
           RUN_STARTED: ${{ github.event.workflow_run.run_started_at }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          # Derived, not hardcoded: one issue per watched workflow. A shared title would let a green
+          # nightly CI close an issue a red Security run opened.
+          WF_NAME: ${{ github.event.workflow_run.name }}
         run: |
           set -euo pipefail
 
-          TITLE="Nightly CI is failing"
+          TITLE="Nightly $WF_NAME is failing"
           LABEL="bug"
 
           # Find an OPEN issue with this exact title. `--search` is deliberately anchored on the title
@@ -68,7 +77,7 @@ jobs:
             # nag nobody reads -- an alert that is always on is the same as no alert.
             if [ -n "$existing" ]; then
               gh issue comment "$existing" --body \
-                "Nightly CI is green again as of [this run]($RUN_URL) (\`$HEAD_SHA\`). Closing."
+                "Nightly $WF_NAME is green again as of [this run]($RUN_URL) (\`$HEAD_SHA\`). Closing."
               gh issue close "$existing"
               echo "closed #$existing — nightly recovered"
             else
@@ -90,9 +99,10 @@ jobs:
           - commit: \`$HEAD_SHA\`
           - started: $RUN_STARTED
 
-          A scheduled run is not a PR context, so this failure appears nowhere else. The nightly-only
-          legs are the server-DB store, load/throughput and service-smoke suites — exactly the ones the
-          three required \`test\` legs skip — so a break here is invisible until someone looks.
+          A scheduled run is not a PR context, so this failure appears nowhere else. For CI that is the
+          server-DB store, load/throughput and service-smoke legs the three required \`test\` legs skip;
+          for Security it is the daily dependency audits and the released-line audit, whose subject is a
+          published release that no pull request can change.
 
           This issue is opened once and commented on each subsequent failure; it closes itself when a
           nightly goes green again."

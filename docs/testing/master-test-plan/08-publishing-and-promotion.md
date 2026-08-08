@@ -12,37 +12,37 @@
 This chapter owns **the whole path by which authored configuration reaches a running engine**, and
 specifically the **non-production vs production** distinction. Concretely:
 
-- **The IDE Stage → Promote flow** — [`ide/src/promote.ts`](../../ide/src/promote.ts) (validate →
+- **The IDE Stage → Promote flow** — [`ide/src/promote.ts`](../../../ide/src/promote.ts) (validate →
   environment pick → engine-shard pick → host policy → env-aware dry-run pre-flight → modal confirm →
-  apply), [`ide/src/promoteTarget.ts`](../../ide/src/promoteTarget.ts) (pure target resolution),
-  [`ide/src/engineTarget.ts`](../../ide/src/engineTarget.ts) (SEC-005 host policy).
+  apply), [`ide/src/promoteTarget.ts`](../../../ide/src/promoteTarget.ts) (pure target resolution),
+  [`ide/src/engineTarget.ts`](../../../ide/src/engineTarget.ts) (SEC-005 host policy).
 - **The engine reload contract** — `POST /config/reload`
-  ([`messagefoundry/api/app.py:2741-2891`](../../messagefoundry/api/app.py)), reload-root confinement
-  (`Engine._resolve_reload_target`, [`engine.py:1508-1521`](../../messagefoundry/pipeline/engine.py)),
+  ([`messagefoundry/api/app.py:2741-2891`](../../../messagefoundry/api/app.py)), reload-root confinement
+  (`Engine._resolve_reload_target`, [`engine.py:1508-1521`](../../../messagefoundry/pipeline/engine.py)),
   `config:deploy` + `require_step_up`, ADR 0041 D2 dual-control, and the quiesce-and-swap in
-  `RegistryRunner.reload` ([`wiring_runner.py:3046-3184`](../../messagefoundry/pipeline/wiring_runner.py)).
+  `RegistryRunner.reload` ([`wiring_runner.py:3046-3184`](../../../messagefoundry/pipeline/wiring_runner.py)).
 - **The web console config-deploy page** — `/ui/config` +
-  [`messagefoundry_webconsole/routes/config.py`](../../messagefoundry_webconsole/routes/config.py)
+  [`messagefoundry_webconsole/routes/config.py`](../../../messagefoundry_webconsole/routes/config.py)
   (fixed `ReloadRequest(config_dir=None, dry_run=False)`) and the provenance badge in
-  [`pages/config.py`](../../messagefoundry_webconsole/pages/config.py).
+  [`pages/config.py`](../../../messagefoundry_webconsole/pages/config.py).
 - **Attestation & attribution** — ADR 0041 D1 content fingerprint
-  ([`config/fingerprint.py`](../../messagefoundry/config/fingerprint.py)), `GET /config/provenance`,
+  ([`config/fingerprint.py`](../../../messagefoundry/config/fingerprint.py)), `GET /config/provenance`,
   the `config_reload*` audit family, and ADR 0041 D3 wheel self-attestation
-  ([`integrity.py`](../../messagefoundry/integrity.py)) where it interacts with a publish.
+  ([`integrity.py`](../../../messagefoundry/integrity.py)) where it interacts with a publish.
 - **Environment values and target isolation** — `environments/<env>.toml` + `MEFOR_VALUE_*`
-  ([`config/environments.py`](../../messagefoundry/config/environments.py)), ADR 0050 project-root
+  ([`config/environments.py`](../../../messagefoundry/config/environments.py)), ADR 0050 project-root
   anchoring, deferred `env()` resolution *on the target*, and wrong-target / environment-crossing safety.
 - **Multi-target publishing** — several named `messagefoundry.environments` entries, engine-shard
   sub-targets within one environment, and cluster config-version convergence
-  ([`pipeline/config_convergence.py`](../../messagefoundry/pipeline/config_convergence.py)).
+  ([`pipeline/config_convergence.py`](../../../messagefoundry/pipeline/config_convergence.py)).
 - **Atomicity, partial publish, rollback, and behaviour of in-flight messages / open connections across
   a publish**, including publishing during a cluster failover.
 - **Per-artifact-kind publish semantics** — Router/Handler `*.py`, `connections.toml`, `codesets/*`,
   and (critically) the artifacts that are **not** publishable at all: alert rules, `[security]`/auth
   config and AI policy in `messagefoundry.toml`.
-- **Version control as the delivery mechanism** — [`docs/VERSION-CONTROL.md`](../VERSION-CONTROL.md),
+- **Version control as the delivery mechanism** — [`docs/VERSION-CONTROL.md`](../../VERSION-CONTROL.md),
   the offline git init + `messagefoundry check` pre-commit hook
-  ([`ide/src/sourceControl.ts`](../../ide/src/sourceControl.ts)), and the air-gapped `git bundle` path.
+  ([`ide/src/sourceControl.ts`](../../../ide/src/sourceControl.ts)), and the air-gapped `git bundle` path.
 
 **Explicitly NOT in scope here (owned elsewhere — cited, not restated):**
 

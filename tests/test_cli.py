@@ -611,6 +611,78 @@ def test_serve_non_loopback_with_auth_off_refused_despite_flag(
     assert "refusing to serve the API on non-loopback" not in err  # ...not the bind gate
 
 
+def test_serve_refuses_auth_off_behind_declared_terminator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # BACKLOG #1013 (positive regression): auth entirely off behind a DECLARED TLS terminator is exposed
+    # exactly like an off-loopback bind — the API would answer as a full-privilege identity with no
+    # authentication — so the auth-off startup arm must refuse it, not only the non-loopback case. A
+    # loopback bind (default local_access_only) + a declared terminator -> instance_exposed True, auth
+    # off. The arm returns before the env-required check (like the non-loopback case above), so no --env,
+    # store key, or server mock is needed.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.require_sign_in = false\n"
+        "[api]\n"
+        "tls_terminated_upstream = true\n"
+        'trusted_proxies = ["10.0.0.1"]\n',  # settings.py requires this alongside the terminator
+        encoding="utf-8",
+    )
+    assert main(["serve", "--config", str(SAMPLES_CONFIG)]) == 2
+    err = capsys.readouterr().err
+    # rc alone is not enough: the later env-required gate also returns 2, so the message asserts are
+    # what give this test teeth (they disappear if the arm reverts to the bare bind check).
+    assert "enabled=false" in err  # the no-auth gate fired
+    assert (
+        "tls_terminated_upstream" in err or "reverse proxy" in err
+    )  # named the terminator exposure
+
+
+def test_serve_auth_off_on_unexposed_loopback_still_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from messagefoundry.store.crypto import generate_key
+
+    # BACKLOG #1013 (negative control): the arm was WIDENED, not broadened to fire on any auth-off. A
+    # true loopback dev instance with no declared terminator (instance_exposed False) is the supported
+    # no-auth flow and must still start silently.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.handles_real_patient_data = false\n"
+        "security.local_access_only = true\n"
+        "security.require_sign_in = false\n",
+        encoding="utf-8",
+    )
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
+    # The widened arm stayed silent because the instance is not exposed.
+    assert "refusing to serve with [auth] enabled=false" not in capsys.readouterr().err
+
+
+def test_serve_auth_on_behind_terminator_unaffected_by_arm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # BACKLOG #1013: the arm is inert under auth ON even when exposed. A synthetic loopback instance
+    # behind a declared terminator is instance_exposed True, but auth is on by default (require_mfa
+    # defaults on -> the MFA-at-exposure gate stays quiet; synthetic keeps the PHI gates quiet), so the
+    # auth-off arm must not fire.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.handles_real_patient_data = false\n"
+        "security.local_access_only = true\n"
+        "[api]\n"
+        "tls_terminated_upstream = true\n"
+        'trusted_proxies = ["10.0.0.1"]\n',
+        encoding="utf-8",
+    )
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
+    assert "enabled=false" not in capsys.readouterr().err  # the arm did not fire (auth is on)
+
+
 def test_serve_insecure_bind_clamp_keys_on_enforcement_not_tier(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

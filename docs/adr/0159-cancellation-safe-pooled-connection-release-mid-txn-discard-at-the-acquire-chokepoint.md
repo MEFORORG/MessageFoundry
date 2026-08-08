@@ -5,7 +5,7 @@
 
 - **Status:** Accepted (2026-08-02)
 - **Date:** 2026-08-02
-- **Related:** [BACKLOG #348](../BACKLOG.md) · [ADR 0066](0066-pooled-stage-claimers.md) §9 (the `SET LOCK_TIMEOUT 0` never-block claim, whose 1222→EMPTY translation is what made this silent) · [ADR 0114](0114-phase-4-claim-path-call-complexity-reduction-driver-interface-redesign-ingress-routed-reset-fold.md) §2 (the shielded finally-guard — **explicitly not** a rollback guard; see §3 below) · [ADR 0001](0001-staged-pipeline-architecture.md) (the staged queue whose at-least-once contract bounds the damage)
+- **Related:** [BACKLOG #348](../archive/backlog/BACKLOG-CLOSED.md#348-sql-server-a-cancelled-store-call-returns-a-pooled-connection-mid-transaction-holding-x-locks) · [ADR 0066](0066-pooled-stage-claimers.md) §9 (the `SET LOCK_TIMEOUT 0` never-block claim, whose 1222→EMPTY translation is what made this silent) · [ADR 0114](0114-phase-4-claim-path-call-complexity-reduction-driver-interface-redesign-ingress-routed-reset-fold.md) §2 (the shielded finally-guard — **explicitly not** a rollback guard; see §3 below) · [ADR 0001](0001-staged-pipeline-architecture.md) (the staged queue whose at-least-once contract bounds the damage)
 
 ---
 

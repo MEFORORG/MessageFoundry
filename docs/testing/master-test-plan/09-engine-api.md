@@ -13,7 +13,7 @@ harness at runtime, with no failing test on either side.
 ### 8.1 Scope & objectives
 
 This chapter covers the single FastAPI application built by
-`create_app()` / `create_managed_app()` ([`messagefoundry/api/app.py:1018`](messagefoundry/api/app.py),
+`create_app()` / `create_managed_app()` ([`messagefoundry/api/app.py:1018`](../../../messagefoundry/api/app.py),
 `:5156`) — verified live at **105 route objects** (104 `APIRoute` + the `/ws/stats`
 `APIWebSocketRoute`; 67 declared in `api/app.py`, 38 in `api/auth_routes.py`), **109** with
 `expose_docs=True`, **203** with `serve_ui=True`.
@@ -24,7 +24,7 @@ In scope:
   Pydantic models (`api/models.py` 89 + `api/auth_models.py` 32); OpenAPI drift; cross-language
   mirrors (`apiclient/client.py`, the IDE's TypeScript DTOs, the tray's `/health` key literal).
 - **Deny-by-default authorization plumbing** as it is *enforced on the wire*: the nine factories in
-  [`api/security.py`](messagefoundry/api/security.py) — `require` (:182), `require_paced` (:250),
+  [`api/security.py`](../../../messagefoundry/api/security.py) — `require` (:182), `require_paced` (:250),
   `require_service_cert` (:430), `require_phi_read` (:504), `require_step_up` (:569),
   `require_reauth_only` (:609), `require_step_up_action` (:651), `require_reauth_only_action` (:694),
   `authorize_ws` (:768) — plus `enforce_phi_read_hop` (:480), `enforce_phi_read_pacing` (:523),

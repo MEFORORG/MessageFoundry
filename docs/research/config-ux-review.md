@@ -3,7 +3,7 @@
 **Date:** 2026-06-19 · **Status:** research / findings (no code) · **Owner action:** see *Candidate
 follow-up items* + *Circulation* below.
 
-This is BACKLOG **[#33](../BACKLOG.md)** — a **review/design** pass over *how* an operator or analyst
+This is BACKLOG **[#33](../archive/backlog/BACKLOG-CLOSED.md#33-review-the-end-to-end-configuration-method-across-every-surface-config-ux-consolidation)** — a **review/design** pass over *how* an operator or analyst
 actually configures a MessageFoundry deployment, before the surfaces multiply further in v0.2+. It
 **identifies and circulates** findings only; **no code or config is changed here**, and any *acted-on*
 recommendation is recorded below as a **separate** backlog candidate with its real file contention

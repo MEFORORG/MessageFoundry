@@ -115,6 +115,14 @@ a PR that implements BACKLOG #N must update BACKLOG.md
 #                                 never report on a PR (required-but-absent trap). Advisory by
 #                                 placement, not by continue-on-error: the job goes red on a finding.
 #                                 See ADR 0155.
+#   security.yml's             -- `released-line-audit (latest release's pinned runtime)` is
+#   released-line-audit           schedule/dispatch only, so it can never report on a PR
+#                                 (required-but-absent trap). Advisory by placement, not by
+#                                 continue-on-error: it goes red on a finding, and
+#                                 tests/test_security_posture.py holds that. It also could not be
+#                                 actioned by a PR author -- its remedy is cutting a release on the
+#                                 latest line (docs/SUPPORT-POLICY.md), not editing the branch under
+#                                 review. BACKLOG #1081.
 #   ingress-rate-probe.yml     -- workflow_dispatch only, so it never reports on a PR. It is also
 #                                 structurally unfit to gate anything: it MEASURES a runner's ingress
 #                                 service rate and exits 0 even when the reconcile fails, because a

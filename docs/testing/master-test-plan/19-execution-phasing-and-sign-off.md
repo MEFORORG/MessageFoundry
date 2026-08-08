@@ -16,7 +16,7 @@ countable go/no-go.
 Three conventions before anything else, because mixing them is the single easiest way to corrupt this
 plan:
 
-- **Phase IDs here are `E0`–`E7`** (*execution*). [`docs/testing/FEATURE-COVERAGE-PLAN.md`](../../docs/testing/FEATURE-COVERAGE-PLAN.md)
+- **Phase IDs here are `E0`–`E7`** (*execution*). [`docs/testing/FEATURE-COVERAGE-PLAN.md`](../FEATURE-COVERAGE-PLAN.md)
   already owns `P0`–`P7` for its own phase roadmap and `FCP:CRIT-n`/`FCP:STORE-n`/`FCP:PIPE-14`-style
   **gap** IDs in a *different* ID space from this plan's row IDs. Never write "P2" meaning a phase of
   this plan, and never assume `STORE-10` means the same row in both documents — it does not.
@@ -357,7 +357,7 @@ this phase is a *set of parallel tracks*, not a serial block.
 | Real directory | AD DS domain: writable DC + DNS + Kerberos SPN + a real OIDC IdP — **plus the owner-held lab runbook released to whoever builds it** (see §18.10) | 27 `AUTH` rows: `AUTH-07`, `AUTH-08`, `AUTH-10`..`AUTH-13`, `AUTH-15`..`AUTH-24`, `AUTH-28`, `AUTH-33`, `AUTH-34`, `AUTH-36`, `AUTH-38`..`AUTH-40`, `AUTH-51`, `AUTH-52`, `AUTH-58`, `AUTH-64` | **7 are campaign-gate P0s** — `AUTH-08`, `AUTH-11`, `AUTH-12`, `AUTH-17`, `AUTH-19`, `AUTH-20`, `AUTH-28`. ADR 0142 status is literally "code COMPLETE, awaiting lab validation". `AUTH-09`, `AUTH-26`, `AUTH-27` and `AUTH-29` are P0 but run on `dev-PC` — do **not** park them here |
 | Two-box HA / domain | A second Windows host; optionally an AlwaysOn AG lab and a k8s cluster | `HA-36`..`HA-40`, `HA-51`, `HA-52` | **`HA-52` is the campaign-gate P0** (floating VIP / L4 LB, real-sender reconnect through a VIP move). The DB-restart-under-load drill is already owned manually by **`W25:S4.10`** — build only the automated arm. `HA-03`, `HA-04`, `HA-06`, `HA-22` and `HA-45` were previously parked here in error: they run on `container-CI` / `dev-PC` and belong in E1/E2 |
 | Promotion pipeline (the **two-engine publishing rig**) | A non-production **and** a production-like engine, separately administered (`PUB2`) | `PUB-11`, `PUB-46`, `PUB-69` | **`PUB-11` is the campaign-gate P0.** Cross-node fingerprint divergence needs two real nodes, and a promote against localhost cannot exercise the remote `config_dir: null` path. `PUB-10`, `PUB-18`, `PUB-20`, `PUB-21`, `PUB-32`, `PUB-33` and `PUB-53` run on `container-CI` and belong in E3 |
-| Host acceptance | The W2025 box | Owned by [`WIN2025-TEST-PLAN`](../../docs/testing/WIN2025-TEST-PLAN.md) — **do not restate** | This plan contributes only the automated arms it converts |
+| Host acceptance | The W2025 box | Owned by [`WIN2025-TEST-PLAN`](../WIN2025-TEST-PLAN.md) — **do not restate** | This plan contributes only the automated arms it converts |
 | Upgrade & vintage | A store written by a prior engine vintage; both wheels | `MIG-01`, `MIG-02`, `MIG-06`..`MIG-17`, `MIG-47`, `MIG-49` | Console seam bump bricks the whole engine, not just `/ui`. `MIG-18` is a pointer row — no separate work |
 | Reconcile PHI fix | none (prerequisite, do in E3/E4) | `MIG-36`, `MIG-37`, `MIG-38` | **Blocking prerequisite for `W25:S3.10`** — the reconcile harness leaks field values by default |
 | Real-hardware SQL Server | The existing self-hosted `mefor-win2025-sql` VM | `STORE`, `HA`, `PIPE` server-DB rows re-run on real Windows + real ODBC | No procurement: the runner exists, dispatch-only; just turn the VM on |
@@ -518,8 +518,8 @@ only (SQL Server / PostgreSQL) · `1` = once, backend-independent · `M` = manua
 **What runs on the W2025 box.** `PIPE`, `STORE`, `PARSE`, `API`, `ALERT`, `PERF` and `MIG` at `x3`
 (once per backend, under the NSSM service identity); `HA` at `x2`; `CONN` at `x3` for the transports;
 `CFG` and `PUB` once; `AUTH`, `WEB`, `IDE`, `TRAY` and `SEC` as manual human-closed rows.
-**The box's own acceptance content is owned by [`WIN2025-TEST-PLAN`](../../docs/testing/WIN2025-TEST-PLAN.md)
-and stamped through [`WIN2025-TEST-MATRIX`](../../docs/testing/WIN2025-TEST-MATRIX.md) via
+**The box's own acceptance content is owned by [`WIN2025-TEST-PLAN`](../WIN2025-TEST-PLAN.md)
+and stamped through [`WIN2025-TEST-MATRIX`](../WIN2025-TEST-MATRIX.md) via
 `python -m harness.acceptance` — this plan adds the automated arms and does not re-run `W25:S0.5`'s
 "do NOT re-run on the box" list.**
 
@@ -796,7 +796,7 @@ footnote.
 ### 22.1 Artifacts
 
 The per-tool artifact table is already written and correct — see
-[`WIN2025-TEST-PLAN` §`W25:S6.1`](../../docs/testing/WIN2025-TEST-PLAN.md). **Do not restate it.** It covers
+[`WIN2025-TEST-PLAN` §`W25:S6.1`](../WIN2025-TEST-PLAN.md). **Do not restate it.** It covers
 `verify --report-md/--report-json`, `check --json`, `graph --json`, `audit-verify` (which **exits 0
 even on FAIL** — its output must be string-parsed), `harness.acceptance --report-md/--report-csv/--xlsx`,
 `harness --scenario`, `harness --load --report-json/--report-csv` with `--baseline`/`--tolerance`,
@@ -926,7 +926,7 @@ by a later chapter re-auditing an earlier one. Each gets three things:
 2. a regression test that fails on the pre-fix code;
 3. a note naming **which of the six coverage dimensions missed it** (functional / security /
    performance / HA / PHI / cross-backend — the dimensions
-   [`FEATURE-COVERAGE-PLAN`](../../docs/testing/FEATURE-COVERAGE-PLAN.md) already defines).
+   [`FEATURE-COVERAGE-PLAN`](../FEATURE-COVERAGE-PLAN.md) already defines).
 
 Track the count per chapter per phase. A chapter whose escape count is rising is a chapter whose
 audit was wrong, and it gets re-audited — **not** a chapter that needs more rows.
@@ -1003,7 +1003,7 @@ Part II corrected its own recon 17 times out of 17. That is the maintenance prob
 ### 25.1 The ADR-ships-with-test-IDs rule
 
 This is not new machinery — it is an extension of what the repo already enforces.
-[`docs/adr/TEMPLATE.md`](../../docs/adr/TEMPLATE.md) already requires behavioural acceptance criteria
+[`docs/adr/TEMPLATE.md`](../../adr/TEMPLATE.md) already requires behavioural acceptance criteria
 in EARS form, each linked with `→` to the test or fixture that verifies it, and `messagefoundry
 adr-analyze` already checks that each `→` link resolves to a real file.
 
@@ -1011,7 +1011,7 @@ The extension: **an ADR that lands must also name the master-plan row ID it clos
 the chapter matrix must gain that row **in the same commit**. Same discipline, same commit boundary,
 as the ledger gate that already blocks an unallocated ADR or BACKLOG number
 (`scripts/hooks/ledger_check.py`, wired through `.pre-commit-config.yaml`; see
-[`docs/LEDGER-GATE.md`](../../docs/LEDGER-GATE.md)).
+[`docs/LEDGER-GATE.md`](../../LEDGER-GATE.md)).
 
 Three consequences worth stating plainly:
 
@@ -1055,12 +1055,12 @@ this plan cites them rather than absorbing them:
 
 | Artifact | Owns | This plan's relationship |
 |---|---|---|
-| [`FEATURE-COVERAGE-PLAN.md`](../../docs/testing/FEATURE-COVERAGE-PLAN.md) | The subsystem coverage-gap audit across six dimensions, phases `P0`–`P7`, gap IDs in its own space | Chapters cite it and re-grade stale rows **in the same commit** as the re-grading. `SEC`'s open question — extend it, or freeze it with this plan as standing owner — must be answered in E0 |
-| [`WIN2025-TEST-PLAN.md`](../../docs/testing/WIN2025-TEST-PLAN.md) + [`WIN2025-TEST-MATRIX.md`](../../docs/testing/WIN2025-TEST-MATRIX.md) + [`WIN2025-ACCEPTANCE.md`](../../docs/testing/WIN2025-ACCEPTANCE.md) | Host and service-identity acceptance on the box; the 54-row signed matrix; the `W25:S6.3` sign-off gate | **B4 cites `W25:S6.3` verbatim.** This plan adds only the automated arms and respects `W25:S0.5`'s do-not-re-run list |
-| [`VERIFY.md`](../../docs/testing/VERIFY.md) | On-box deployment acceptance across the five `verify` sections | Cited as a per-release and per-backend tool; `CFG-40` covers only its untested report writers |
-| [`LOAD-TESTING.md`](../../docs/LOAD-TESTING.md) + `harness/load/` | Throughput, connection-scale, failover-under-load, the profiles, GO/NO-GO verdicts and the falsifier practice | `PERF` adds gates and a filling term **around** the rig; it does not reimplement it |
-| [`CI-QUALITY.md`](../../docs/CI-QUALITY.md) + [`docs/quality-gates/`](../../docs/quality-gates/) | The two-checkpoint story and the advisory-gate build handoff | §23 extends the shipped signals (coverage, mutation, liveness); it does not add a new gate framework |
-| [`FEATURE-MAP.md`](../../docs/FEATURE-MAP.md) | The capability status catalog and the published posture claims | B6 pins the drifted rows; B8 re-confirms the risk acceptance it records |
+| [`FEATURE-COVERAGE-PLAN.md`](../FEATURE-COVERAGE-PLAN.md) | The subsystem coverage-gap audit across six dimensions, phases `P0`–`P7`, gap IDs in its own space | Chapters cite it and re-grade stale rows **in the same commit** as the re-grading. `SEC`'s open question — extend it, or freeze it with this plan as standing owner — must be answered in E0 |
+| [`WIN2025-TEST-PLAN.md`](../WIN2025-TEST-PLAN.md) + [`WIN2025-TEST-MATRIX.md`](../WIN2025-TEST-MATRIX.md) + [`WIN2025-ACCEPTANCE.md`](../WIN2025-ACCEPTANCE.md) | Host and service-identity acceptance on the box; the 54-row signed matrix; the `W25:S6.3` sign-off gate | **B4 cites `W25:S6.3` verbatim.** This plan adds only the automated arms and respects `W25:S0.5`'s do-not-re-run list |
+| [`VERIFY.md`](../VERIFY.md) | On-box deployment acceptance across the five `verify` sections | Cited as a per-release and per-backend tool; `CFG-40` covers only its untested report writers |
+| [`LOAD-TESTING.md`](../../LOAD-TESTING.md) + `harness/load/` | Throughput, connection-scale, failover-under-load, the profiles, GO/NO-GO verdicts and the falsifier practice | `PERF` adds gates and a filling term **around** the rig; it does not reimplement it |
+| [`CI-QUALITY.md`](../../CI-QUALITY.md) + [`docs/quality-gates/`](../../quality-gates) | The two-checkpoint story and the advisory-gate build handoff | §23 extends the shipped signals (coverage, mutation, liveness); it does not add a new gate framework |
+| [`FEATURE-MAP.md`](../../FEATURE-MAP.md) | The capability status catalog and the published posture claims | B6 pins the drifted rows; B8 re-confirms the risk acceptance it records |
 
 ### 25.5 Review cadence for the plan itself
 

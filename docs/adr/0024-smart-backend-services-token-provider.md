@@ -32,7 +32,7 @@
   (the at-least-once/purity invariant the per-request mint preserves), ADR 0023 (the **inbound** FHIR server
   facade — a *separate, deferred, not-yet-written* decision; this ADR is client-only and needs nothing from it),
   [CLAUDE.md](../../CLAUDE.md) §6/§8/§9 (asyncio-non-blocking, HL7/FHIR version-explicitness, never-log-secrets/PHI),
-  [FEATURE-MAP.md](../FEATURE-MAP.md) §7, [BACKLOG.md](../BACKLOG.md) #35.
+  [FEATURE-MAP.md](../FEATURE-MAP.md) §7, [BACKLOG-CLOSED.md](../archive/backlog/BACKLOG-CLOSED.md#35-smart-backend-services-token-provider--fhirrest-client-oauth2-p2--adr-0024) #35.
 
 ## Context
 

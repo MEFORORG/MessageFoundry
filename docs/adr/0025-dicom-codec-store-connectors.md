@@ -626,7 +626,7 @@ the SR→PowerScribe flow the practice runs on Corepoint's DICOM Gear, authored 
 
 5. **A code-first SR→HL7 Handler (CHOSEN) vs a declarative DICOM-mapping surface (the Corepoint-GUI model).** A
    declarative field-mapping surface is precisely Corepoint DICOM Gear's model — and **declined-by-design** for
-   MessageFoundry ([CLAUDE.md](../../CLAUDE.md) §12, [BACKLOG.md](../BACKLOG.md) #26: visual/template-driven
+   MessageFoundry ([CLAUDE.md](../../CLAUDE.md) §12, [BACKLOG-CLOSED.md](../archive/backlog/BACKLOG-CLOSED.md#26-visual--template-driven-channel-authoring--decision-decline-by-design-no-build) #26: visual/template-driven
    authoring is declined; code-first Routers/Handlers *are* the differentiator). The SR→HL7 mapping is a **pure
    Python Handler** that calls the codec's mapping helpers; the helpers spare boilerplate but the Handler owns the
    decisions. **Rejected (declarative mapper), CHOSEN (code-first Handler).**

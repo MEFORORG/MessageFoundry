@@ -6,7 +6,7 @@
 - **Deciders:** owner (explicit toolkit choice: "No-Qt ctypes spine") + a 25-agent research→design→judge→verify
   workflow (three competing designs scored by a governance / correctness / security judge panel; the no-Qt
   design won 251–242, the count-showing signed-in design was eliminated).
-- **Related:** BACKLOG [#239](../BACKLOG.md); [#103](../BACKLOG.md) (retired the PySide6 desktop console —
+- **Related:** BACKLOG [#239](../BACKLOG.md); [#103](../archive/backlog/BACKLOG-CLOSED.md#103-retire-the-pyside6-desktop-console-in-favor-of-the-web-console-p3-owner-decision) (retired the PySide6 desktop console —
   and named "a tiny standalone tray/service-manager" as the sanctioned home for out-of-band service control);
   [ADR 0032](0032-console-desktop-launch.md) (retired); [ADR 0065](0065-web-ops-dashboard.md)
   (the web console is the sole operator UI); [ADR 0088](0088-apiclient-service-cli-extraction.md) (Qt-free/FastAPI-free

@@ -9,10 +9,10 @@ from pathlib import Path
 
 import httpx
 import pytest
-from _totp_clock import fresh_totp
+from _totp_clock import fresh_totp, pin_totp_clock
 
 from messagefoundry.api import create_app
-from messagefoundry.auth import Role
+from messagefoundry.auth import Role, totp
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
@@ -145,7 +145,9 @@ async def test_security_events_feed_is_scoped_to_caller(engine: Engine) -> None:
     assert "auth.login_failed" in bob_actions  # bob sees his own failure
 
 
-async def test_mfa_enroll_confirm_and_step_up_gate(engine: Engine) -> None:
+async def test_mfa_enroll_confirm_and_step_up_gate(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # WP-14 / ASVS 6.3.3: the full TOTP lifecycle over the API + the step-up MFA gate. An MFA-required
     # session 403s on a require_step_up route with X-MFA-Required until POST /auth/mfa-verify.
     service = await _service(engine, AuthSettings(login_rate_limit_enabled=False))
@@ -160,9 +162,16 @@ async def test_mfa_enroll_confirm_and_step_up_gate(engine: Engine) -> None:
         assert r.status_code == 200
         secret = r.json()["secret"]
 
-        # Confirm with a live code → activates MFA + returns the one-time recovery codes.
+        # Confirm with a live code → activates MFA + returns the one-time recovery codes. Pin the TOTP
+        # clock so the activating confirm code and the later /auth/mfa-verify code sit in distinct steps
+        # (enrollment now consumes the activating step, BACKLOG #1021). The in-process ASGI server
+        # shares this totp module, so the pin covers its server-side verify too.
         assert (await _reauth(c, tok, purpose="mfa_confirm")).status_code == 200
-        r = await c.post("/me/mfa/confirm", json={"code": fresh_totp(secret)}, headers=_auth(tok))
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        r = await c.post(
+            "/me/mfa/confirm", json={"code": totp.totp(secret, now=t0)}, headers=_auth(tok)
+        )
         assert r.status_code == 200 and len(r.json()["recovery_codes"]) == 10
         st = (await c.get("/me/mfa", headers=_auth(tok))).json()
         assert st["enabled"] is True and st["required"] is True
@@ -175,7 +184,12 @@ async def test_mfa_enroll_confirm_and_step_up_gate(engine: Engine) -> None:
         # A require_step_up route is blocked with X-MFA-Required until the 2nd factor is verified.
         r = await c.put("/ad-group-map", json={"entries": []}, headers=_auth(tok2))
         assert r.status_code == 403 and r.headers.get("X-MFA-Required") == "1"
-        r = await c.post("/auth/mfa-verify", json={"code": fresh_totp(secret)}, headers=_auth(tok2))
+        # Verify from a strictly later step than enrollment consumed.
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        r = await c.post(
+            "/auth/mfa-verify", json={"code": totp.totp(secret, now=t1)}, headers=_auth(tok2)
+        )
         assert r.status_code == 200
         # Now it passes (password step-up satisfied at login; MFA now satisfied).
         r = await c.put("/ad-group-map", json={"entries": []}, headers=_auth(tok2))
@@ -1301,6 +1315,28 @@ async def test_security_posture_reports_fips_attestation(engine: Engine) -> None
     assert body["openssl_version"] == expected_version == _ssl.OPENSSL_VERSION
     # AC-4 — the version string is public metadata, never key material; the boolean carries no secret.
     assert isinstance(body["openssl_version"], str)
+    # The read stays audited (security.posture_view) — a viewer's read produced an audit row.
+    rows = await engine.store.list_audit(limit=20, action="security.posture_view")
+    assert rows  # at least the read above was recorded
+
+
+async def test_security_posture_reports_kex_groups(engine: Engine) -> None:
+    # #338 / ASVS 11.6.2: the posture route reports whether the approved TLS key-exchange groups are
+    # PINNED on built contexts or INHERITED from OpenSSL's default group list — report-only metadata,
+    # MONITORING_READ-gated + audited like the rest of the payload, and it changes NO live TLS behaviour
+    # (inherited on every interpreter before Python 3.15).
+    from messagefoundry.config.tls_policy import kex_groups_report
+
+    service = await _service(engine)
+    await _add(service, "vw", Role.VIEWER)  # holds monitoring:read
+    async with _posture_client(engine, service) as c:
+        vw = _auth((await _login(c, "vw")).json()["token"])
+        resp = await c.get("/security/posture", headers=vw)
+    assert resp.status_code == 200
+    body = resp.json()
+    # The additive field is present and matches the pure helper's read-out; inherited on this runtime.
+    assert body["kex_groups"] == kex_groups_report()
+    assert "inherited" in body["kex_groups"]
     # The read stays audited (security.posture_view) — a viewer's read produced an audit row.
     rows = await engine.store.list_audit(limit=20, action="security.posture_view")
     assert rows  # at least the read above was recorded

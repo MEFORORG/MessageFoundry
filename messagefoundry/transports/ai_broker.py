@@ -41,7 +41,8 @@ import urllib.parse
 import urllib.request
 from typing import TYPE_CHECKING
 
-from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, insecure_tls_allowed
+from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, weakened_tls_escape_permitted
+from messagefoundry.config.tls_policy import HopPosture
 
 # Reuse rest.py's hardened, TLS-verifying, no-redirect opener + URL redaction (no new HTTP plumbing) —
 # exactly as smart.py / fhir.py / soap.py do. No import cycle: rest.py never imports this module.
@@ -114,6 +115,7 @@ class AiBroker:
         model: str = "claude-opus-4-8",
         max_output_tokens: int = _DEFAULT_MAX_OUTPUT_TOKENS,
         timeout_seconds: float = _DEFAULT_TIMEOUT,
+        posture: HopPosture | None = None,
     ) -> None:
         if not endpoint:
             raise AiBrokerError(
@@ -136,8 +138,13 @@ class AiBroker:
                 "list it explicitly to permit engine-brokered AI egress (SSRF fail-closed)"
             )
         # The api_key is a credential — refuse to send it over cleartext http (mirrors smart.py's token
-        # endpoint), unless the dev escape is set for a trusted-network dev/test box.
-        if scheme == "http" and not insecure_tls_allowed():
+        # endpoint), unless the dev escape is set for a trusted-network dev/test box. #329: read the
+        # escape through the ADR-0092 clamp (weakened_tls_escape_permitted) so on an enforcing-PHI
+        # instance the blunt env var can never re-permit the key on the wire. The broker is built out of
+        # the connector-construction gate (the create_app ai_chat route), so the posture is threaded
+        # explicitly; None (a direct/test construction) falls back to the unclamped escape — byte-
+        # identical to the pre-#329 bare read.
+        if scheme == "http" and not weakened_tls_escape_permitted(posture):
             raise AiBrokerError(
                 "[ai].endpoint over cleartext http would expose the api_key; refused unless "
                 f"{INSECURE_TLS_ESCAPE_ENV} is set (dev/trusted-network only) — use https"
@@ -239,14 +246,20 @@ class AiBroker:
         return text
 
 
-def ai_broker_from_settings(ai: AiSettings) -> AiBroker:
+def ai_broker_from_settings(ai: AiSettings, *, posture: HopPosture | None = None) -> AiBroker:
     """Build the :class:`AiBroker` from the loaded ``[ai]`` settings, or raise :class:`AiBrokerError`
     when the engine broker is not fully configured. Settings arrive already ``env()``-resolved (the API
-    lifespan stashes the resolved :class:`AiSettings` on ``app.state.ai``)."""
+    lifespan stashes the resolved :class:`AiSettings` on ``app.state.ai``).
+
+    ``posture`` (#329) is the derived instance hop posture, threaded from the create_app ai_chat route so
+    the broker's cleartext-http credential refusal is clamped on an enforcing-PHI instance (the escape
+    can no longer put the ``api_key`` on the wire there). ``None`` = the unclamped escape, byte-identical
+    to before."""
     return AiBroker(
         endpoint=ai.endpoint or "",
         api_key=ai.api_key or "",
         allowed_endpoints=list(ai.allowed_endpoints),
         provider=ai.provider,
         model=ai.model,
+        posture=posture,
     )
