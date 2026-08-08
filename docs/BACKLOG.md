@@ -5689,7 +5689,7 @@ and `enforce_admins` governs **protected branches**. Re-enabling it would refuse
 
 ## 1057. Rule 3d has no occupancy signal, so it cannot tell an abandoned worktree from a live one
 
-> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **5/10** · _fill-in_. #1041 fixed rule 3d's *false* claim; this is the *missing* one underneath it. The rule refuses every governed worktree that is not the caller's own, because it has no way to ask whether anyone is actually using it. The refusal is right by default — a needless refusal costs a message, a wrong allow deletes a live session's work — but it is unactionable for a caller cleaning up a worktree it created itself, who must escalate to a human for something it was entitled to do.
+> 🚧 **PARTLY SHIPPED 2026-08-06 — the REMEDY slice is in; the occupancy body is NOT, and this item stays open for it.** Value **4/10** · Difficulty **5/10** · _fill-in_. What shipped is the half nobody had noticed: rule 3d refused correctly and then handed the caller a command that **throws**. `remove.ps1 -Name` resolves only to `<repo-parent>/<repo-leaf>-<name>` — `new.ps1:79-81` *asserts* that shape, so the sibling family is the only one it can produce — and `prune-merged.ps1` excludes anything with a `.claude/worktrees/` path segment **outright**, by its own header, with `-Name` unable to reach them either. Census on this clone: **45 sibling worktrees, 8 Claude-managed, 4 other — and all six live sessions sat in the 8**, so the remedy failed for the population that actually reaches the rule. Verified against the **installed** gate, not only the repo copy. The deny now branches on worktree family and, for anything the two scripts cannot serve, prints a literal `git -C "<primary>" worktree remove "<path>"` plus a line saying why `prune-merged.ps1` does not apply; the sibling family keeps `prune-merged.ps1`, which is dry-run by default and consults occupancy, so the fix is not "stop naming the scripts" — a test pins that. Writing the test enlarged the defect: the own-tree branch printed the literal placeholder `-Name <directory-name>` for **both** families, so it named the tool correctly and still could not be pasted; the gate has the resolved path and now uses it. **This is a remedy-text change only** — which worktrees rule 3d refuses is untouched, and nothing security-relevant reads the classification, which is what makes a misclassification cheap here and expensive in rule 3c. **Same defect as #1032, one rule over** (there, rule 3b printed a `new.ps1` command `new.ps1` refuses to run). **Still open, and unchanged below:** rule 3d has no occupancy or authorship signal, so an *unoccupied* worktree is still refused rather than allowed — the three structural options, the measured 0-of-24 occupancy result and the fail-closed constraint all stand as written. See also **#1064**, a measured rule 3d fail-open confirmed 2026-08-06, deliberately not touched here. Original filing follows. #1041 fixed rule 3d's *false* claim; this is the *missing* one underneath it. The rule refuses every governed worktree that is not the caller's own, because it has no way to ask whether anyone is actually using it. The refusal is right by default — a needless refusal costs a message, a wrong allow deletes a live session's work — but it is unactionable for a caller cleaning up a worktree it created itself, who must escalate to a human for something it was entitled to do.
 
 **Cluster:** Session-drift controls / refusal accuracy. **Priority:** P3. **Verdict:** build (medium). **Severity:** no data loss, and no security effect — the rule fails *closed*. The cost is a correct refusal the reader cannot act on, and the standing invitation to route around a guard that says no to legitimate work.
 
@@ -6553,12 +6553,22 @@ Killed at the cap (`Tests (pytest)` step conclusion `failure`, all at 36:0x):
 
 **Scope note — the two failures on this leg today are DIFFERENT and must not be merged into one cause.** PR #253 is a genuine timeout (no test failed) and PR #256 (`fix-1013`) is an assertion failure in `tests/test_connscale_cpu_probe.py` and `tests/test_connscale_smoke.py`, whose own comment already records this leg failing twice in one job on 2026-07-30. Only the first belongs to this item.
 
-## THIS ITEM SUPERSEDES #1084, AND THE TWO MUST NOT BOTH LAND UNRECONCILED
+## THIS ITEM SUPERSEDES #1084, AND #1084 WAS DROPPED RATHER THAN LANDED
 
-> ⚠️ **Forward-looking citation, flagged as such.** At the time of writing, **#1084 is not on `main`** — it
-> exists only on `origin/claude/gate-3d-remedy-1057` (**PR #261**, open). So this cross-reference does not
-> resolve yet and will only do so once #261 lands. It is stated anyway because the collision is invisible
-> from any worktree reading `docs/BACKLOG.md`, which is exactly how it was nearly missed.
+> **SETTLED 2026-08-08 — and the outcome is the opposite of what this block used to predict.** It
+> previously read *"#1084 is not on `main`; it exists only on `origin/claude/gate-3d-remedy-1057`
+> (PR #261, open), so this cross-reference will only resolve once #261 lands."* **#261 landed WITHOUT
+> #1084.** The item was dropped during #261's merge resolution, on the owner's instruction, on exactly
+> the grounds set out below. **#1084 never reached `main` and no longer will**, so a reader grepping for
+> it will not find it — that absence is the resolution, not a gap. The number stays allocated and burned
+> rather than reused.
+>
+> This item is therefore the survivor, and per the paragraph below the reconciliation is written into it
+> here rather than left for a reader to infer. **Nothing further is owed to #1084.**
+>
+> *This block is retained rather than deleted because the collision was invisible from any worktree
+> reading `docs/BACKLOG.md` — which is exactly how it was nearly missed — and whoever finds it by
+> grepping `1084` deserves the outcome and not only the diagnosis.*
 
 **#1084 is the same defect, found the same day, on the same leg and the same cap.** This item's kill table
 literally contains #1084's originating run (PR #261, `31149117314`). It is **not** a duplicate in the
