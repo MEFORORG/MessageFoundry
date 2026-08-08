@@ -742,6 +742,13 @@ def _build_record(
     # (msg/s actually absorbed/delivered vs the OFFERED aggregate rate) — the A/B non-regression guard.
     achieved_read_per_s, achieved_written_per_s = _throughput_rates(samples)
 
+    # Wall #3, the ASSERTED form: empty claims per MESSAGE ABSORBED (BACKLOG #1101). Both rates above
+    # are Δ/span over the same first→last in-hold samples, so dividing them cancels the span exactly and
+    # leaves Δclaims/Δread — no wall clock, and therefore nothing for runner contention or a mid-hold
+    # reload stall to move. This is what the monotonicity SLO reads; the per-second form is retained for
+    # the report because it is the operator-facing number.
+    empty_per_msg = _empty_claims_per_msg(total_per_s, achieved_read_per_s)
+
     # Wall #4 + footprint: handle peak + CPU-seconds + working set, drained from the side map (each
     # None where the OS probe couldn't read).
     proc = _drain_proc(samples)
@@ -772,6 +779,7 @@ def _build_record(
         empty_claims_per_s=total_per_s,
         idle_poll_per_s=idle_per_s,
         wake_fanout_per_s=wake_per_s,
+        empty_claims_per_msg=empty_per_msg,
         fd_count_peak=proc.handles_peak,
         reload_seconds=reload_seconds,
         ack_p50_ms=ack.p50_ms,
@@ -896,6 +904,23 @@ def _empty_claim_rates(samples: list[EngineSample]) -> tuple[float, float, float
     idle = (last.empty_claims_idle_poll - first.empty_claims_idle_poll) / span
     wake = (last.empty_claims_wake_fanout - first.empty_claims_wake_fanout) / span
     return max(0.0, total), max(0.0, idle), max(0.0, wake)
+
+
+def _empty_claims_per_msg(total_per_s: float, achieved_read_per_s: float) -> float | None:
+    """Empty claims per message absorbed — the wall-clock-free form of wall #3 (BACKLOG #1101).
+
+    Both inputs are Δ/span over the SAME first→last in-hold samples, so ``span`` cancels and this is
+    exactly ``Δempty_claims / Δread``. That is why it survives runner contention: slowing the run
+    scales numerator and denominator identically. The per-SECOND form does not — it keeps ``span`` in
+    the denominator, so a slow arm reads as an improvement, which is the defect #1101 records.
+
+    Returns ``None`` when no messages were absorbed in the window. The ratio is genuinely undefined
+    there and returning 0.0 would be a fabricated reading that then chains through the monotonicity
+    comparison as a real one.
+    """
+    if achieved_read_per_s <= 0.0:
+        return None
+    return max(0.0, total_per_s / achieved_read_per_s)
 
 
 def _throughput_rates(samples: list[EngineSample]) -> tuple[float, float]:
@@ -1058,7 +1083,10 @@ def _evaluate_slos(profile: ConnScaleProfile, records: list[ConnScaleRecord]) ->
         out.append(_monotonic_slo("fd_count_monotonic", records, lambda r: r.fd_count_peak))
     if slo.empty_claims_monotonic:
         out.append(
-            _monotonic_slo("empty_claims_monotonic", records, lambda r: r.empty_claims_per_s)
+            # PER MESSAGE, not per second (BACKLOG #1101). The per-second form put wall clock in the
+            # denominator, so CPU contention alone flipped this red with no engine change — measured
+            # 0.451 to 2.49 across four replicates of one commit on one box.
+            _monotonic_slo("empty_claims_monotonic", records, lambda r: r.empty_claims_per_msg)
         )
     return out
 
@@ -1081,11 +1109,16 @@ def _monotonic_slo(  # type: ignore[no-untyped-def]
     skipped, not failed."""
     ok = True
     detail_parts: list[str] = []
-    by_mode: dict[str, list[ConnScaleRecord]] = {}
+    # Group by (sweep_mode, claim_mode), NOT sweep_mode alone (BACKLOG #1101). Chaining prev_val across
+    # claim modes compares per_lane against pooled, and compare.py:22-25 states pooled's empty-claim
+    # rate SHOULD be materially lower — so a correct engine would fail this the moment a profile set
+    # claim_modes = ["per_lane", "pooled"]. No shipped profile does, which is the only reason it has
+    # never fired; the grouping is wrong independently of that.
+    by_mode: dict[tuple[str, str], list[ConnScaleRecord]] = {}
     for r in records:
-        by_mode.setdefault(r.sweep_mode, []).append(r)
+        by_mode.setdefault((r.sweep_mode, r.claim_mode), []).append(r)
     floor = 1.0 - tolerance
-    for mode, rs in by_mode.items():
+    for (mode, claim_mode), rs in by_mode.items():
         ordered = sorted(rs, key=lambda r: r.count)
         prev_val: float | None = None
         for r in ordered:
@@ -1095,8 +1128,9 @@ def _monotonic_slo(  # type: ignore[no-untyped-def]
             v = float(val)
             if prev_val is not None and v < prev_val * floor:
                 ok = False
+                label = mode if claim_mode == "per_lane" else f"{mode}/{claim_mode}"
                 detail_parts.append(
-                    f"{mode}@N={r.count}: {v:.1f} < prior {prev_val:.1f} * {floor:.2f}"
+                    f"{label}@N={r.count}: {v:.3g} < prior {prev_val:.3g} * {floor:.2f}"
                 )
             prev_val = v
     observed = "monotonic" if ok else "; ".join(detail_parts)

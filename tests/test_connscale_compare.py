@@ -50,6 +50,7 @@ def _record(
         empty_claims_per_s=idle_poll,
         idle_poll_per_s=idle_poll,
         wake_fanout_per_s=0.0,
+        empty_claims_per_msg=None,
         fd_count_peak=100,
         reload_seconds=None,
         ack_p50_ms=1.0,
