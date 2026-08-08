@@ -53,7 +53,6 @@ from typing import Any, TypeVar
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
-    insecure_tls_allowed,
     weakened_tls_escape_permitted_here,
 )
 from messagefoundry.config.tls_policy import (
@@ -370,9 +369,13 @@ class _SftpClient(_RemoteClient):
         self._known_hosts = settings.get("known_hosts")
         self._timeout = float(settings.get("connect_timeout", 30.0))
         # Fail fast at construction (build_check time): an unknown-host-key posture without the escape
-        # must never silently weaken to auto-accept. The accept-unknown policy is gated here so the
-        # connector refuses to build rather than trust-on-first-use a man-in-the-middle.
-        self._accept_unknown = insecure_tls_allowed()
+        # must never silently weaken to auto-accept. #329: read the escape through the ADR-0092 clamp
+        # (weakened_tls_escape_permitted_here consults the active construction posture, exactly like the
+        # FTPS tls_verify=false sibling at :176 that this class is built alongside), so under an
+        # enforcing-PHI posture the escape is INERT — the accept-unknown policy then stays RejectPolicy
+        # and an unknown host key is refused at connect (:392-394), as today. Off the construction gate
+        # (posture unstamped) the escape is unclamped, byte-identical to the pre-#329 bare read.
+        self._accept_unknown = weakened_tls_escape_permitted_here()
         if self._accept_unknown:
             logger.warning(
                 "REMOTEFILE sftp %s accepts UNKNOWN host keys (AutoAddPolicy) because %s is set "

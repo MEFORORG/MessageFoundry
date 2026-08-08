@@ -3,7 +3,7 @@
 - **Status:** Accepted (2026-07-17) — the DEMAND-GATE-BACKLOG session builds it. IDE-only, no engine
   change; phased (one coherent commit per layer), pushes/PR owner-approved.
 - **Date:** 2026-07-17
-- **Related:** BACKLOG [#168](../BACKLOG.md) (Test Bench saved regression collections); [ADR
+- **Related:** BACKLOG [#168](../archive/backlog/BACKLOG-CLOSED.md#168-test-bench-saved-regression-collections) (Test Bench saved regression collections); [ADR
   0030](0030-anonymization-test-harness-tee.md) (de-identification — the framework authors use to
   build PHI-free cases); [ADR 0072](0072-traced-dryrun-mode.md) / the Test Bench before/after diff
   (`hl7diff.ts`, reused here for the compare); CLAUDE.md §9 (PHI rules — this ADR adds a **new

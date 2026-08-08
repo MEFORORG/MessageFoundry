@@ -195,13 +195,15 @@ jobs:
             tests/test_crit2_inline_doc_drift.py tests/test_doc_ref_handle.py tests/test_docs_db_grants.py \
             tests/test_docs_runbooks.py tests/test_docs_security_pathways.py tests/test_security_doc_drift.py \
             tests/test_security_doc_rate_limits.py tests/test_threat_model_doc_drift.py \
-            tests/test_backlog_status_check.py
+            tests/test_backlog_status_check.py tests/test_sds_rule_ids_are_stable.py \
+            tests/test_link_resolution.py
           pytest -q -rs \
             tests/test_asvs_file_surface_doc_drift.py tests/test_cloud_phi_hipaa_doc_drift.py \
             tests/test_crit2_inline_doc_drift.py tests/test_doc_ref_handle.py tests/test_docs_db_grants.py \
             tests/test_docs_runbooks.py tests/test_docs_security_pathways.py tests/test_security_doc_drift.py \
             tests/test_security_doc_rate_limits.py tests/test_threat_model_doc_drift.py \
-            tests/test_backlog_status_check.py
+            tests/test_backlog_status_check.py tests/test_sds_rule_ids_are_stable.py \
+            tests/test_link_resolution.py
 
       # PySide6's offscreen platform plugin needs a few system libraries even
       # headless. Linux-only; Windows runners need no equivalent.

@@ -57,7 +57,7 @@ the wrong item is the failure mode the erratum exists to prevent, and it looks l
 ## 1. SQL Server store backend — concurrency safety (review H-6, H-7, H-8, M-6, low-2 + low-3 store half)
 
 > ✅ **DONE / RESOLVED — all five defects fixed; SQL Server is a supported production backend.**
-> Verified defect-by-defect in [`store/sqlserver.py`](../messagefoundry/store/sqlserver.py) (2026-06-15):
+> Verified defect-by-defect in [`store/sqlserver.py`](../../../messagefoundry/store/sqlserver.py) (2026-06-15):
 > (1) audit hash-chain append race → serialized under `_audit_lock`, with `_backfill_audit_chain` run in
 > `open()` before the store is returned; (2) finalize deadlock / missing RCSI → RCSI enabled pre-pool
 > (`_ensure_database_options`, enabling RCSI + snapshot isolation) + per-message transaction-scoped `sp_getapplock`; (3) inert pyodbc timeout → real
@@ -124,10 +124,10 @@ client. "Moderate risk"; not verifiable in offscreen Qt tests, so it deserves a 
 > below for history.
 
 **Type:** delivery-reliability. **Near-term**, not deferred-indefinitely: it pairs with the FIFO
-ordering work in [`message-ordering-design.md`](message-ordering-design.md) and is what makes FIFO
+ordering work in [`message-ordering-design.md`](../../message-ordering-design.md) and is what makes FIFO
 genuinely usable rather than merely correct.
 
-**What:** outbound `_check_ack` ([`transports/mllp.py`](../messagefoundry/transports/mllp.py))
+**What:** outbound `_check_ack` ([`transports/mllp.py`](../../../messagefoundry/transports/mllp.py))
 collapses every negative ACK to one `DeliveryError`, so **AR (permanent reject)** is retried exactly
 like **AE (transient error)**. Under the FIFO **retry-forever default**, that means a
 permanently-rejected message **blocks the whole connection indefinitely** (until an operator sees the
@@ -151,12 +151,12 @@ lane for its full backoff schedule.
 > ✅ **DONE — emit-points in Phase 1 Layer 4 (PRs #137/#138); real notifier in PR #139.** The FIFO
 > worker emits `connection_stopped` + `queue_buildup` to an `AlertSink`; the default `LoggingAlertSink`
 > logs them, and a configurable **webhook + email** notifier (`[alerts]` settings,
-> [`pipeline/alert_sinks.py`](../messagefoundry/pipeline/alert_sinks.py)) routes them for real. Richer
+> [`pipeline/alert_sinks.py`](../../../messagefoundry/pipeline/alert_sinks.py)) routes them for real. Richer
 > destinations / templating / send-retry / named-policy rules remain future work behind the same seam.
 > Kept below for history.
 
 **Type:** operational reliability. **Near-term**: the conservative FIFO defaults
-([`message-ordering-design.md`](message-ordering-design.md)) are only *safe* if the operator is
+([`message-ordering-design.md`](../../message-ordering-design.md)) are only *safe* if the operator is
 notified — a stopped connection or a building queue that nobody sees is worse than a dropped message.
 
 **What:** there is no alerting framework yet (rules / thresholds / notification routing). The console
@@ -226,12 +226,12 @@ so nothing yet requires MEFOR to *host* a web service.
 
 **What:** an inbound HTTP listener, **owned by the connector** (a `SOAP`/`REST` *source*), that
 accepts a partner's web-service call, hands the request body to the **payload-agnostic ingress**
-([`adr/0004-payload-agnostic-ingress.md`](adr/0004-payload-agnostic-ingress.md)) as a `RawMessage`,
+([`adr/0004-payload-agnostic-ingress.md`](../../adr/0004-payload-agnostic-ingress.md)) as a `RawMessage`,
 and returns a **synchronous** HTTP/SOAP response (status, or a SOAP envelope / a captured downstream
 reply) in the same request. ADR 0003 explicitly left this open: the non-HL7 **source** direction is
 "decided: payload-agnostic ingress … but its detailed design is a **follow-up ADR before any non-HL7
 source is built**"
-([`adr/0003-non-hl7-transports-database-rest-soap.md`](adr/0003-non-hl7-transports-database-rest-soap.md) §3/§5).
+([`adr/0003-non-hl7-transports-database-rest-soap.md`](../../adr/0003-non-hl7-transports-database-rest-soap.md) §3/§5).
 That follow-up ADR + the listener are unwritten and unbuilt.
 
 **Design constraints (for the ADR):**
@@ -317,7 +317,7 @@ local `main` and needed a rebase onto `origin/main` before merge.
 
 **Type:** tooling / validation — `messagefoundry check`. No product/runtime impact.
 
-**What:** `_check_dryrun` ([`checks.py`](../messagefoundry/checks.py)) runs **every fixture against every
+**What:** `_check_dryrun` ([`checks.py`](../../../messagefoundry/checks.py)) runs **every fixture against every
 inbound** (`for fixture: for inbound: dry_run(...)`). For a single-feed scaffold that is one clean run,
 but for a config repo with many inbounds it **cross-products**: a feed's fixture is routed through the
 *other* feeds' handlers, which error on the unexpected message shape (missing segments, wrong type). In
@@ -352,7 +352,7 @@ estate; a per-feed re-run confirmed every feed was clean (the only true errors w
 
 **What:** `inbound(…, content_type=…)` accepts a value that reaches the pipeline as the connection's
 `content_type`, and the route/dry-run path does `ic.content_type.value`
-([`pipeline/dryrun.py`](../messagefoundry/pipeline/dryrun.py)), which assumes a `ContentType` **enum**.
+([`pipeline/dryrun.py`](../../../messagefoundry/pipeline/dryrun.py)), which assumes a `ContentType` **enum**.
 So a connection authored with the **string** `"x12"` (instead of `ContentType.X12`) raises a cryptic
 `AttributeError: 'str' object has no attribute 'value'` deep in dry-run, with no hint that the
 content_type is the cause. The factory neither coerces the string to the enum nor rejects it at load.
@@ -375,8 +375,8 @@ traced.
 ## 14. Parallel-run "tee" for the Corepoint → MEFOR cutover
 
 > ✅ **BUILT — shipped #335 (relay) + #340 (purge/export).** The standalone, dependency-free MLLP tee relay
-> lives in [`tee/`](../tee/) (`relay.py`/`mllp.py`/`store.py`/`__main__.py`; guide
-> [`docs/TEE-RELAY.md`](TEE-RELAY.md)) and verifiably implements the decided architecture below: it **always
+> lives in [`tee/`](../../../tee) (`relay.py`/`mllp.py`/`store.py`/`__main__.py`; guide
+> [`docs/TEE-RELAY.md`](../../TEE-RELAY.md)) and verifiably implements the decided architecture below: it **always
 > AAs Epic on receipt** (its own ACK authority), fans the unchanged message out to Corepoint (production)
 > **and** a shadow MEFOR, **fails closed** (shuts the Epic listener) on a Corepoint transport failure while a
 > **shadow-leg failure is only logged/dropped** (never trips, never back-pressures), **logs every NAK** to a
@@ -525,21 +525,21 @@ Proposed — no code yet). Their sequencing dependency is now **satisfied**: bot
 **What:** evaluating MessageFoundry against Corepoint's system-event-log taxonomy (the Transport /
 Diagnostic / Alert / Miscellaneous filter, 21 event types) surfaced two real gaps worth closing, each
 designed via an adversarially-verified workflow:
-- **[`adr/0020-protocol-diagnostic-capture.md`](adr/0020-protocol-diagnostic-capture.md)** — Corepoint
+- **[`adr/0020-protocol-diagnostic-capture.md`](../../adr/0020-protocol-diagnostic-capture.md)** — Corepoint
   **"Protocol Data" + "Protocol Text"**. A per-connection, OFF-by-default, bounded **RAM ring** (durable
   only on a transport error or operator snapshot) + a live WebSocket, capturing literal transport frames
   and the **pre-message failures that have no `message_id`** (bad framing, TLS-accept failure, peer reset,
   allowlist refuse) — the motivating gap. Adds a new sibling `protocol_trace` table across all 3 backends
   (a new raw-PHI-at-rest tier; SQL Server needs its own id-keyed cipher pass). The larger of the two
   (~6–8d).
-- **[`adr/0021-inbound-ack-nak-capture-response-sent.md`](adr/0021-inbound-ack-nak-capture-response-sent.md)**
+- **[`adr/0021-inbound-ack-nak-capture-response-sent.md`](../../adr/0021-inbound-ack-nak-capture-response-sent.md)**
   — Corepoint **"Response Sent"** (the ACK/NAK MEFOR returns to an inbound sender), framed as **ADR 0013
   Increment 3**: extend the existing `response` table with a `kind` discriminator (+ `ack_code`/`ack_phase`),
   **zero new cipher/purge code**, captured synchronously in `_handle_inbound`. AA bodies stored encrypted;
   every NAK stores `body=NULL` + a `safe_text`-scrubbed reason only (#120). Cheaper (~3–4d).
 
 **Build order when un-deferred:** **0021 first** (cheap, reuses ADR 0013), then **0020**. Both ADRs are now
-registered (Proposed) in [`adr/README.md`](adr/README.md); ADR 0019 — the KeyProvider seam they were drafted
+registered (Proposed) in [`adr/README.md`](../../adr/README.md); ADR 0019 — the KeyProvider seam they were drafted
 alongside — is already merged (#334). Ratify both (Status → Accepted) before building. Full impl plan / test
 matrix / risks live in the two ADRs.
 
@@ -695,8 +695,8 @@ hang is unrelated to that docs change and the suite was green on py3.13 across t
 **What:** decide **whether or not** the basic (shipped) package should include some **open-source git
 offering** rather than relying on the adopter to bring their own VCS. The config model is already
 code-/data-as-files (Router/Handler Python modules + `connections.toml`, [ADR
-0007](adr/0007-gui-manageable-connections-toml.md)) deployed from an adopter-owned repo ([ADR
-0017](adr/0017-consumer-deployment-model.md)), and the IDE extension already has `promote`/`deploy`
+0007](../../adr/0007-gui-manageable-connections-toml.md)) deployed from an adopter-owned repo ([ADR
+0017](../../adr/0017-consumer-deployment-model.md)), and the IDE extension already has `promote`/`deploy`
 flows — so the natural question is whether MEFOR should **bundle** a git capability (config version
 control / change-tracking / rollback / audited promote) in the base package, or keep assuming the
 adopter supplies git out-of-band.
@@ -720,7 +720,7 @@ packaging/onboarding story.
 
 ## 19. Build a user guide
 
-> ✅ **DONE — shipped in PR #412** ([`docs/USER-GUIDE.md`](USER-GUIDE.md)): an end-to-end, task-oriented
+> ✅ **DONE — shipped in PR #412** ([`docs/USER-GUIDE.md`](../../USER-GUIDE.md)): an end-to-end, task-oriented
 > guide (install/run as a Windows service, first-message quickstart on `samples/config` + `send_mllp.py`,
 > author Connections/Routers/Handlers, console + IDE, dispositions/dead-letter troubleshooting) that links
 > the reference docs rather than duplicating them. History below.
@@ -731,7 +731,7 @@ packaging/onboarding story.
 config authors (install/run the engine as a service, author Connections/Routers/Handlers, use the
 console + IDE extension, monitor dispositions, troubleshoot the error/dead-letter path). Today the docs
 are reference- and decision-oriented (ARCHITECTURE / CONNECTIONS / CONFIGURATION / SERVICE / SECURITY /
-the ADRs) plus [`EARLY-ADOPTER-GUIDE.md`](EARLY-ADOPTER-GUIDE.md); there is no single guided "how to use
+the ADRs) plus [`EARLY-ADOPTER-GUIDE.md`](../../EARLY-ADOPTER-GUIDE.md); there is no single guided "how to use
 MessageFoundry" walkthrough that ties them together for a new user.
 
 **Points to settle when started:**
@@ -766,7 +766,7 @@ client OAuth2** (the token-acquisition flow real EHR FHIR servers require, where
 insufficient) → **#35** ✅ SHIPPED (ADR 0024 Accepted, PR #432). **Deferred / still open:** the inbound **FHIR server
 facade** → **ADR 0023** (sequenced with the inbound HTTP listener, #7); bidirectional **HL7 v2 ↔ FHIR mapping**
 stays code-first Handlers (no production-ready pure-Python converter); profile/terminology conformance; a FHIR
-*read/search* client. See [`docs/CONNECTIONS.md`](CONNECTIONS.md) (the `FHIR — FHIR(...)` section) +
+*read/search* client. See [`docs/CONNECTIONS.md`](../../CONNECTIONS.md) (the `FHIR — FHIR(...)` section) +
 `samples/config/IB_FHIR_INTAKE.py`.
 
 **Type:** feature — a new format **and** transport. The single highest-value brochure gap.
@@ -785,7 +785,7 @@ riding payload-agnostic ingress (ADR 0004) as a first-class content type; a FHIR
 the inbound-listener work (#7). HL7 v2 ↔ FHIR *mapping* is a separate, larger effort — leave it to
 handlers initially. Build the codec before the server facade.
 
-**Components (research 2026-06-19 — [`research/non-hl7-transform-components.md`](research/non-hl7-transform-components.md)):**
+**Components (research 2026-06-19 — [`research/non-hl7-transform-components.md`](../../research/non-hl7-transform-components.md)):**
 the resource codec can be **adopted, not hand-rolled** — FHIR is the *one* non-HL7 format with a mature,
 offline, permissively-licensed model. Pair **`fhir.resources`** (BSD-3, pydantic-v2 — the typed
 `FhirResource` model: construct/read/set/validate/encode; offline, zero terminology calls) with
@@ -801,7 +801,7 @@ note above). The FHIR **REST transport** half is a separate `transports/` connec
 **Why P1:** high effort, but it is the standout gap. Pull into v0.2 if any target customer needs FHIR.
 
 **Source:** Mirth brochure gap analysis (2026-06-18); component picks from the 2026-06-19 non-HL7
-transform-support research ([`research/non-hl7-transform-components.md`](research/non-hl7-transform-components.md)).
+transform-support research ([`research/non-hl7-transform-components.md`](../../research/non-hl7-transform-components.md)).
 
 ---
 
@@ -899,7 +899,7 @@ land first.
 > (Promoted to NOW 2026-06-20, reversing the 2026-06-19 defer:
 > a **named adopter — a radiology practice on Corepoint's DICOM option ("DICOM Gear")** with a live imaging feed
 > overrode the earlier "narrow audience, zero feed" defer.) See
-> **[ADR 0025](adr/0025-dicom-codec-store-connectors.md)**.
+> **[ADR 0025](../../adr/0025-dicom-codec-store-connectors.md)**.
 
 **Type:** feature — imaging transport + format.
 
@@ -964,7 +964,7 @@ more demand than JMS alone.
 > Routers/Handlers *are* the differentiator; no visual/template/drag-drop authoring is built, by design.
 
 > 🔁 **AMENDMENT — narrowed, not reversed (2026-07-10, owner-directed re-evaluation).** Findings:
-> [`docs/research/ide-low-code-options.md`](research/ide-low-code-options.md). Still declined: drag-drop /
+> [`docs/research/ide-low-code-options.md`](../../research/ide-low-code-options.md). Still declined: drag-drop /
 > canvas *logic* authoring, declarative field-mapping, and any declarative logic **execution** layer.
 > **Carved out:** a **structured action-list *lens*** — a VS Code custom editor that renders/edits real
 > Python Handlers expressed in a typed action vocabulary (**#222**, ADR-gated) — because the artifact and
@@ -1001,7 +1001,7 @@ strategic requirement; the mutable `Message` API was kept reusable so a future d
 
 **What:** Mirth lists **Serial** and **ASTM E1381** (base) + **ASTM E1394/E1318** (Gold/Platinum).
 These are **lab-analyzer / point-of-care** protocols. MEFOR has none, and they are **not on the
-roadmap** ([`docs/CONNECTIONS.md`](CONNECTIONS.md) marks Serial "legacy/niche").
+roadmap** ([`docs/CONNECTIONS.md`](../../CONNECTIONS.md) marks Serial "legacy/niche").
 
 **Decision / why:** explicitly **decline** unless a customer specifically needs lab-instrument
 integration — legacy, narrow, and high-effort relative to the audience. If pursued: a Serial source/
@@ -1015,15 +1015,15 @@ priority; situational.
 ## 28. Run a load test (execute the load harness on the current build)
 
 > ✅ **DONE — executed on the local test boxes (2026-06-27).** The no-loss / latency-under-load harness was
-> run against the current `0.2.9` build and [`benchmarks/TUNING-BASELINE.md`](benchmarks/TUNING-BASELINE.md)
+> run against the current `0.2.9` build and [`benchmarks/TUNING-BASELINE.md`](../../benchmarks/TUNING-BASELINE.md)
 > carries the result. **Caveat:** these are the **consumer-hardware floor** figures (a ~15 W APU + consumer
 > SSD with the engine + DB co-located — a deliberately conservative floor, *not* the enterprise number). A
 > single-box-NVMe / enterprise-shaped run to pin the real ceiling is **slated for #40** (the self-hosted
 > Windows Server 2025 + SQL Server 2025 CI leg), which will be the standing home for the recurring perf runs.
 
 **Type:** validation / verification — *running* existing tooling, not new code. The load harness is
-**BUILT** ([`harness/load/`](../harness/load/), [`docs/LOAD-TESTING.md`](LOAD-TESTING.md)) and a Gate-#3
-baseline is published ([`benchmarks/TUNING-BASELINE.md`](benchmarks/TUNING-BASELINE.md)).
+**BUILT** ([`harness/load/`](../../../harness/load), [`docs/LOAD-TESTING.md`](../../LOAD-TESTING.md)) and a Gate-#3
+baseline is published ([`benchmarks/TUNING-BASELINE.md`](../../benchmarks/TUNING-BASELINE.md)).
 
 **What:** actually run the harness against the **current** build — a full warmup→ramp→sustained→spike→soak
 profile — and capture a fresh **no-message-loss** + latency-under-load + SLO verdict on the shipping config
@@ -1041,7 +1041,7 @@ pass is the evidence for a pilot/cutover and the regression guard for pipeline/s
 ## 29. Run a throughput test (re-measure + refresh the tuning baseline)
 
 > ✅ **DONE — re-measured on the local test boxes (2026-06-27).** Throughput (msg/s + p50/p95/p99) was
-> re-run across the store backends and [`benchmarks/TUNING-BASELINE.md`](benchmarks/TUNING-BASELINE.md)
+> re-run across the store backends and [`benchmarks/TUNING-BASELINE.md`](../../benchmarks/TUNING-BASELINE.md)
 > refreshed. As with #28 these are the **consumer-hardware floor** numbers; the enterprise-hardware
 > re-measure is **slated for #40** (the self-hosted Windows Server 2025 + SQL Server 2025 leg), the standing
 > home for recurring throughput runs.
@@ -1049,7 +1049,7 @@ pass is the evidence for a pilot/cutover and the regression guard for pipeline/s
 **Type:** validation / benchmark — *running* the existing benchmark, not new tooling.
 
 **What:** re-run the throughput benchmark (msg/sec + p50/p95/p99 latency) across the supported store
-backends and **refresh** [`benchmarks/TUNING-BASELINE.md`](benchmarks/TUNING-BASELINE.md), including the
+backends and **refresh** [`benchmarks/TUNING-BASELINE.md`](../../benchmarks/TUNING-BASELINE.md), including the
 active-passive failover-load figure. The on-demand benchmark CI workflow (#283/#290/#294) is the vehicle;
 this item is to **execute it on the current build and update the published numbers** — notably after the
 active-active code removal, which reworks the per-lane claim path.
@@ -1142,7 +1142,7 @@ follow. (A generic JSON/XML *model* is otherwise low-value — `RawMessage.json(
 navigable tree, and XML has no fixed domain to model outside SOAP/CDA.)
 
 **Source:** non-HL7 transform-support research (2026-06-19),
-[`research/non-hl7-transform-components.md`](research/non-hl7-transform-components.md); ADR 0004 §"To
+[`research/non-hl7-transform-components.md`](../../research/non-hl7-transform-components.md); ADR 0004 §"To
 resolve" (the flagged `.xml()` accessor).
 
 ---
@@ -1176,14 +1176,14 @@ validation is a slow path few feeds need at MVP — pull forward when a partner 
 conformance checking (or 997/999 acks).
 
 **Source:** non-HL7 transform-support research (2026-06-19),
-[`research/non-hl7-transform-components.md`](research/non-hl7-transform-components.md); ADR 0012 §5 + §"Out
+[`research/non-hl7-transform-components.md`](../../research/non-hl7-transform-components.md); ADR 0012 §5 + §"Out
 of scope (deferred / known limitations)".
 
 ---
 
 ## 33. Review the end-to-end configuration method across every surface (config-UX consolidation)
 
-> ✅ **SHIPPED — verified on `origin/main` (2026-07-10).** #33's deliverable was a findings doc, not a PR: [`docs/research/config-ux-review.md`](research/config-ux-review.md) (31 findings, follow-ups A–E as separate items) merged in #421 (`9e9ffc6`). Re-scored to value 1 (ships a document, blocks nobody), then flipped: an already-delivered review is closed, not open buildable work.
+> ✅ **SHIPPED — verified on `origin/main` (2026-07-10).** #33's deliverable was a findings doc, not a PR: [`docs/research/config-ux-review.md`](../../research/config-ux-review.md) (31 findings, follow-ups A–E as separate items) merged in #421 (`9e9ffc6`). Re-scored to value 1 (ships a document, blocks nobody), then flipped: an already-delivered review is closed, not open buildable work.
 
 **Type:** review / design — a holistic pass over *how* an operator or analyst actually configures a
 deployment, before the surfaces multiply further in v0.2+. Not a single bug; a consolidation/usability
@@ -1202,7 +1202,7 @@ put behind a guided editor. In scope:
   mapping, and the local-account/MFA bootstrap.
 - **Everything else** — `connections.toml` (ADR 0007), `environments/<env>.toml` + `MEFOR_VALUE_*`, the
   rest of `messagefoundry.toml` (`[api]`/`[inbound]`/`[delivery]`/`[egress]`/`[logging]`/`[retention]`/
-  `[cluster]`/`[ai]`), and `MEFOR_*` secrets — the full settings catalog ([`CONFIGURATION.md`](CONFIGURATION.md)).
+  `[cluster]`/`[ai]`), and `MEFOR_*` secrets — the full settings catalog ([`CONFIGURATION.md`](../../CONFIGURATION.md)).
 
 **Scope:** inventory each surface (file, format, who edits it, validation path, env/secret overlay);
 flag inconsistencies, gaps, and footguns (e.g. a silently-wrong `env()` base path, an
@@ -1214,11 +1214,11 @@ doc + ranked follow-up items, not a single PR.
 review now keeps configuration coherent and approachable (the wizards / "Python is the power tool, not
 the price of entry" goal) before more knobs land in v0.2+.
 
-**Source:** owner request (2026-06-19); relates to [`CONFIGURATION.md`](CONFIGURATION.md) (settings
+**Source:** owner request (2026-06-19); relates to [`CONFIGURATION.md`](../../CONFIGURATION.md) (settings
 catalog), ADR 0007 (`connections.toml`), ADR 0017 (config repo), and #18 (bundled git offering).
 
 > **Review delivered (2026-06-19, Lane L / Plan-3 §B).** Findings doc:
-> [`docs/research/config-ux-review.md`](research/config-ux-review.md) (date-stamped, time-boxed; 4-surface
+> [`docs/research/config-ux-review.md`](../../research/config-ux-review.md) (date-stamped, time-boxed; 4-surface
 > sweep → adversarial verification, 31 findings confirmed). **#33 identifies + circulates only — no code or
 > config was changed.** Headline: the **split-anchor inconsistency** — one logical bundle resolves against
 > three filesystem roots (`--config` vs CWD-for-`environments/` vs bare-CWD-for-`messagefoundry.toml`/the
@@ -1259,14 +1259,14 @@ catalog), ADR 0007 (`connections.toml`), ADR 0017 (config repo), and #18 (bundle
 gap (today retention is deployment-wide only).
 
 **What:** data retention is a **single, store-wide policy**. The `[retention]` service-settings section
-([`config/settings.py`](../messagefoundry/config/settings.py) `RetentionSettings`) is enforced by **one**
-global [`RetentionRunner`](../messagefoundry/pipeline/retention.py) (one per process), and its windows
+([`config/settings.py`](../../../messagefoundry/config/settings.py) `RetentionSettings`) is enforced by **one**
+global [`RetentionRunner`](../../../messagefoundry/pipeline/retention.py) (one per process), and its windows
 (`messages_days`, `dead_letter_days`, `state_max_age_days`) drive the store purge methods
 (`purge_message_bodies` / `purge_dead_letters` / `purge_state` in
-[`store/store.py`](../messagefoundry/store/store.py)), each of which takes a **single `older_than`
+[`store/store.py`](../../../messagefoundry/store/store.py)), each of which takes a **single `older_than`
 cutoff and purges store-wide by message age only** — there is no per-connection dimension. `Source` /
-`Destination` / `ConnectionSpec` ([`config/models.py`](../messagefoundry/config/models.py),
-[`config/wiring.py`](../messagefoundry/config/wiring.py)) carry no retention field. So every feed shares
+`Destination` / `ConnectionSpec` ([`config/models.py`](../../../messagefoundry/config/models.py),
+[`config/wiring.py`](../../../messagefoundry/config/wiring.py)) carry no retention field. So every feed shares
 one retention window: an operator cannot keep ADT for 90 days while pruning a high-volume / low-value
 lab feed at 7, or null bodies sooner for one chatty connection to bound its PHI footprint.
 
@@ -1319,8 +1319,8 @@ client slice with the genuinely-deferred App-Launch / authorization-server piece
 
 **What:** ADR 0022 shipped the FHIR data plane (codec + outbound REST destination), but its auth is a
 **static** `bearer_token` / basic credential read **once** from `env()` at construction
-([`transports/fhir.py`](../messagefoundry/transports/fhir.py) `_build_headers`,
-[`transports/rest.py`](../messagefoundry/transports/rest.py)). A real **SMART-secured** FHIR server (Epic,
+([`transports/fhir.py`](../../../messagefoundry/transports/fhir.py) `_build_headers`,
+[`transports/rest.py`](../../../messagefoundry/transports/rest.py)). A real **SMART-secured** FHIR server (Epic,
 Oracle Health / Cerner) does **not** accept a long-lived static token: it requires **SMART Backend Services**
 authorization — OAuth2 `client_credentials` with an **asymmetric, signed `client_assertion` JWT**
 (`RS384`/`ES384`), returning a **short-lived** (~300 s) bearer with **no** refresh token (re-mint the
@@ -1332,7 +1332,7 @@ SMART FHIR API."
 - A code-first **`with_smart_backend()` composer** over `FHIR()`/`Rest()` (mirroring `with_signing()`),
   carrying `smart_*` settings (`token_url`, `client_id`, `scope` e.g. `system/*.rs`, `private_key` via
   `env()`, `algorithm` default `RS384`, `key_id`), every secret via `env()`.
-- **Extend the ADR 0018 signing core** ([`transports/signing.py`](../messagefoundry/transports/signing.py))
+- **Extend the ADR 0018 signing core** ([`transports/signing.py`](../../../messagefoundry/transports/signing.py))
   with `RS384`/`ES384` (SHA-384, P-384) + an **attached compact JWS** encoder beside the existing detached
   form — **no new dependency** (core `cryptography`).
 - A **`transports/smart.py`** `SmartBackendTokenProvider`: mint the `client_assertion`, `POST` it to the token
@@ -1370,11 +1370,11 @@ on FHIR?" Multi-agent FHIR-vs-SMART gap analysis: the client token flow is the o
 
 **Type:** feature — test/migration tooling. A shared **anonymizer** that strips/replaces PHI while
 preserving message *structure*, consumed by both the standalone send/receive **test harness**
-([`harness/`](../harness/)) and the parallel-run **tee relay** ([`tee/`](../tee/), #14), so real-world
+([`harness/`](../../../harness)) and the parallel-run **tee relay** ([`tee/`](../../../tee), #14), so real-world
 message shapes can be captured and replayed as **testing datasets without exposing PHI**. Not built.
 
 **What:** today the only PHI-free message sources are the synthetic conformant **generators**
-([`generators/`](../messagefoundry/generators/)) — they produce *valid* HL7 but not the *messy, real*
+([`generators/`](../../../messagefoundry/generators)) — they produce *valid* HL7 but not the *messy, real*
 shapes (quirky vendor segments, odd repetitions, non-conformant fields) that actually break a migration.
 The richest source of realistic shapes is live traffic, which is exactly what the **tee** already sees
 (it fans Epic's real messages to Corepoint + shadow MEFOR) and what the **test harness** sends/receives —
@@ -1421,7 +1421,7 @@ framework (CLAUDE.md §9) is funded and wants a concrete first consumer. Until t
 generators cover the conformant-fixture need.
 
 **Source:** owner request (2026-06-20) — anonymization for the test harness + tee, "to be used for
-testing data sets without exposing PHI." Design recorded in [ADR 0030](adr/0030-anonymization-test-harness-tee.md).
+testing data sets without exposing PHI." Design recorded in [ADR 0030](../../adr/0030-anonymization-test-harness-tee.md).
 Builds on the tee (#14) capture/export path, the synthetic generators, and the planned de-identification
 framework (CLAUDE.md §9).
 
@@ -1546,7 +1546,7 @@ test net around the console's failure handling. Companion to #37 on the monitori
 > ratified Accepted 2026-06-28) and pulled back out on 2026-07-01: the packaging assets
 > (`packaging/console-installer/`), the `release-console-installer` job in `.github/workflows/release.yml`,
 > and the AC-linked tests were **deleted**. See the [ADR 0032 *Amendment (2026-07-01) — Phase B
-> retired*](adr/0032-console-desktop-launch.md). **Rationale:** zero uptake (the CI leg failed on every
+> retired*](../../adr/0032-console-desktop-launch.md). **Rationale:** zero uptake (the CI leg failed on every
 > tag release v0.2.11–v0.2.14; one out-of-band `.exe` with 0 downloads on a private repo), the no-Python/
 > no-IT demand gate never fired (adopters are pip + IT-covered), and the OV/EV signing cert was never
 > provisioned so it only ever shipped unsigned. The zero-install audience is now served by **#75** (the
@@ -1555,7 +1555,7 @@ test net around the console's failure handling. Companion to #37 on the monitori
 > installable; only the *frozen* conveyance is gone. The freeze recipe remains in git history if a
 > genuine no-Python/no-IT site appears before #75 covers it.
 
-**Type:** distribution. The deferred second half of [ADR 0032](adr/0032-console-desktop-launch.md): a
+**Type:** distribution. The deferred second half of [ADR 0032](../../adr/0032-console-desktop-launch.md): a
 standalone desktop installer for the admin console that needs **no Python on the machine at all**.
 
 **What:** ADR 0032 Phase A (built) makes the console a clickable icon via a windowed `gui-script`
@@ -1650,15 +1650,15 @@ self-hosted-runner exposure; not blocking the hosted-CI 2025 coverage that alrea
 
 ## 41. Cloud / Kubernetes HA deployment packaging (container fast-follow follow-ons)
 
-> ✅ **DONE — ratified as [ADR 0047](adr/0047-cloud-kubernetes-ha-deployment-packaging.md) (Accepted
+> ✅ **DONE — ratified as [ADR 0047](../../adr/0047-cloud-kubernetes-ha-deployment-packaging.md) (Accepted
 > 2026-06-28) and built.** All six deliverables shipped: (1) the multi-replica HA reference manifest
-> [`docker/k8s/ha-postgres.yaml`](../docker/k8s/ha-postgres.yaml) (Postgres `replicas: 3`,
+> [`docker/k8s/ha-postgres.yaml`](../../../docker/k8s/ha-postgres.yaml) (Postgres `replicas: 3`,
 > `[cluster].enabled`, PDB `maxUnavailable: 1`, lease-TTL-aware grace) + a `ha`-profile Postgres service in
-> [`docker/compose.yaml`](../docker/compose.yaml); (2) Postgres-led [`docs/CLOUD-DEPLOYMENT.md`](CLOUD-DEPLOYMENT.md)
+> [`docker/compose.yaml`](../../../docker/compose.yaml); (2) Postgres-led [`docs/CLOUD-DEPLOYMENT.md`](../../CLOUD-DEPLOYMENT.md)
 > (SQLite/single-node framed POC/edge); (3) the MLLP L4-LB recipe + (4) the hybrid edge-relay template (same
-> doc); (5) [`docs/CLOUD-PHI-HIPAA.md`](CLOUD-PHI-HIPAA.md); (6) the raw-TCP/X12 startup TLS guard ratified
+> doc); (5) [`docs/CLOUD-PHI-HIPAA.md`](../../CLOUD-PHI-HIPAA.md); (6) the raw-TCP/X12 startup TLS guard ratified
 > as already-shipped (`check_tcp_tls_exposure`, PR #558) + the stale "unguarded" comments rewritten; plus a
-> `kubeconform`/policy-lint CI leg ([`.github/workflows/manifest-lint.yml`](../.github/workflows/manifest-lint.yml)).
+> `kubeconform`/policy-lint CI leg ([`.github/workflows/manifest-lint.yml`](../../../.github/workflows/manifest-lint.yml)).
 > The single-node manifest + default compose stay unchanged; no engine reliability code changed.
 
 **Type:** deployment packaging + docs — the follow-ons that turn the shipped engine container (ADR 0017
@@ -1672,7 +1672,7 @@ StatefulSet shipped in PR #480. Cloud tiers **(a)** run-on-any-platform and **(b
 staged backends + self-fencing leader election (`DbCoordinator` / `SqlServerCoordinator`, `/cluster/*`)
 exist, but there is no example manifest, load balancer, or managed-DB wiring to copy. Full analysis +
 competitor comparison (Mirth / IRIS / Corepoint / Rhapsody) + confidence caveats:
-[`research/cloud-deployment-research-2026-06.md`](research/cloud-deployment-research-2026-06.md).
+[`research/cloud-deployment-research-2026-06.md`](../../research/cloud-deployment-research-2026-06.md).
 
 **What (ranked, when picked up):**
 1. **Multi-replica HA reference manifest** — Postgres-backed `replicas: 3`, `[cluster].enabled=true`,
@@ -1704,8 +1704,8 @@ adopter yet, and building the HA assembly kit before a real cloud feed validates
 exact speculative-build trap the connector/codec backlog is demand-gated to avoid.
 
 **Source:** cloud-containerization research + codebase assessment (2026-06-22,
-[`research/cloud-deployment-research-2026-06.md`](research/cloud-deployment-research-2026-06.md)); ADR 0017
-container fast-follow (PR #480); [`CONTAINER-EXPOSURE-EVALUATION.md`](CONTAINER-EXPOSURE-EVALUATION.md).
+[`research/cloud-deployment-research-2026-06.md`](../../research/cloud-deployment-research-2026-06.md)); ADR 0017
+container fast-follow (PR #480); [`CONTAINER-EXPOSURE-EVALUATION.md`](../../CONTAINER-EXPOSURE-EVALUATION.md).
 
 ---
 
@@ -1744,7 +1744,7 @@ store-connect isn't read as "the service can reach the store".
 
 > **Update (2026-06-23) — BUILT.** `store.connect`'s PASS detail now states it opened "as the calling
 > user (NOT proof the NSSM service account can connect — confirm the service-identity grants)", and the
-> load-bearing MANUAL disposition row is emphasized in [`docs/testing/VERIFY.md`](testing/VERIFY.md).
+> load-bearing MANUAL disposition row is emphasized in [`docs/testing/VERIFY.md`](../../testing/VERIFY.md).
 
 ---
 
@@ -1844,15 +1844,15 @@ lost", "trying to connect", "reconnecting". Today the connection layer is silent
 records the *exceptional* edges:
 - **Inbound (MLLP/TCP listeners):** a successful client accept is **not logged** — only refusals
   (`source_ip_allowlist`), at-capacity (silent), frame-over-cap, and unexpected per-connection errors are
-  ([`transports/mllp.py`](../messagefoundry/transports/mllp.py) `_serve_client`,
-  [`transports/tcp.py`](../messagefoundry/transports/tcp.py)). When a peer connects and sends normally, the
+  ([`transports/mllp.py`](../../../messagefoundry/transports/mllp.py) `_serve_client`,
+  [`transports/tcp.py`](../../../messagefoundry/transports/tcp.py)). When a peer connects and sends normally, the
   **message** is what's counted/dispositioned in the store — there is no "accepted connection from <peer>" event.
-- **Outbound (delivery):** [`MLLPDestination`](../messagefoundry/transports/mllp.py) opens a **fresh connection
+- **Outbound (delivery):** [`MLLPDestination`](../../../messagefoundry/transports/mllp.py) opens a **fresh connection
   per delivery** (connect → send → ACK → close), so there is no persistent connection to "lose" or
   "reconnect". A connect/IO failure becomes a `DeliveryError` → retry-with-backoff, and **each failed attempt
   is not written to the technical log** — the detail goes to the store row's `last_error`, surfaced to
   operators only via the `AlertSink` `queue_buildup` when a lane backs up
-  ([`pipeline/wiring_runner.py`](../messagefoundry/pipeline/wiring_runner.py) delivery loop, the
+  ([`pipeline/wiring_runner.py`](../../../messagefoundry/pipeline/wiring_runner.py) delivery loop, the
   `except DeliveryError` arm). So there is no "trying to connect… refused… retrying" stream.
 
 What the technical log *does* carry at connection level: engine/wiring lifecycle (`wiring started: N inbound,
@@ -1896,7 +1896,7 @@ loop; relationship to the #16 Corepoint event-log gap analysis (2026-06-17) + AD
 **Type:** feature — selective PHI/storage minimization. Large **base64-encoded embedded documents** (PDF
 reports, CCD/C-CDA, scanned images) ride inline in messages — in HL7 they arrive in **OBX-5** (ED data
 type), and generically anywhere via the ADR 0028 `mfb64:v1:` carriage marker
-([`adr/0028-base64-binary-carriage-codec.md`](adr/0028-base64-binary-carriage-codec.md)). These blobs are
+([`adr/0028-base64-binary-carriage-codec.md`](../../adr/0028-base64-binary-carriage-codec.md)). These blobs are
 often tens to hundreds of KB each and are stored verbatim in the raw message at **every** persisted stage
 (`ingress` → `routed` → `outbound`), so a chatty document feed bloats the store far out of proportion to
 its message *count*. The ask: let **each connection** carry a setting to **purge just the embedded
@@ -1904,8 +1904,8 @@ documents** after a timeframe, keeping the rest of the message (segments, fields
 intact.
 
 **Gap today.** Retention is all-or-nothing on the whole body: the global `RetentionRunner`
-([`pipeline/retention.py`](../messagefoundry/pipeline/retention.py)) calls `purge_message_bodies`
-([`store/store.py`](../messagefoundry/store/store.py)), which **nulls the entire raw body** keep-metadata,
+([`pipeline/retention.py`](../../../messagefoundry/pipeline/retention.py)) calls `purge_message_bodies`
+([`store/store.py`](../../../messagefoundry/store/store.py)), which **nulls the entire raw body** keep-metadata,
 store-wide, by message age only. There is no way to evict *only the bulky attachment* while preserving the
 surrounding HL7 (the segments an operator still wants to see), and no per-connection window (that broader
 gap is **#34**). Nothing offloads the blob at ingest either — it rides the pipeline inline.
@@ -1977,7 +1977,7 @@ attachment-handler + data-pruner behavior researched the same day (citations abo
 
 > ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** Base (#595) **and** the L1 expansion (#794) are both on `main`, so the 🔶 "EXPANDING" note below is historical: `ide/snippets/messagefoundry.code-snippets` holds **36** snippets — **32** body-level idioms (past the ~30 L1 target) plus the 4 pre-existing module-frame scaffolds `meforinbound`/`meforoutbound`/`meforrouter`/`meforhandler`, which are not idioms — and `ide/src/insertElement.ts` provides the category quick-pick (`buildPicks`, `:42`) plus the `@router`/`@handler` cursor-context filter (`detectContext`, `:69`, applied at `:114`) that reads the *same* snippets file — one source of truth. Stays inside CLAUDE.md §12 / #26: the snippets emit **editable Python**, never a declarative surface. _(was 🔢 P3 · Value 4/10 · Difficulty 2/10.)_
 
-> 🔶 **Base shipped (PR #595 — ~14 idioms + the `messagefoundry.insertElement` quick-pick); EXPANDING under MULTISESSION-PLAN-7 L1.** L1 adds ~16 more editable-Python idioms (→ ~30: string format, `re.sub`, `match/case`, fan-out, `fhir_lookup`, non-HL7 body access, router idioms), surfaces *Insert Element…* in the editor-title dropdown + a keybinding + a discoverability CodeLens, and adds an `@router`/`@handler` cursor-context filter. Deterministic sibling for the AI `/transform` — see [`docs/AI-OFF-MATRIX.md`](AI-OFF-MATRIX.md). Stays inside #26 (emits editable Python, never a declarative surface).
+> 🔶 **Base shipped (PR #595 — ~14 idioms + the `messagefoundry.insertElement` quick-pick); EXPANDING under MULTISESSION-PLAN-7 L1.** L1 adds ~16 more editable-Python idioms (→ ~30: string format, `re.sub`, `match/case`, fan-out, `fhir_lookup`, non-HL7 body access, router idioms), surfaces *Insert Element…* in the editor-title dropdown + a keybinding + a discoverability CodeLens, and adds an `@router`/`@handler` cursor-context filter. Deterministic sibling for the AI `/transform` — see [`docs/AI-OFF-MATRIX.md`](../../AI-OFF-MATRIX.md). Stays inside #26 (emits editable Python, never a declarative surface).
 
 **The code-first answer to Corepoint's Action-List "Add Action" palette.** Handlers and Routers are the core
 authoring surface; developers repeatedly drop the same ~12–15 idioms (field copy, format, date convert, code
@@ -2046,7 +2046,7 @@ the ADR 0014 alert engine already ships `queue_buildup`/`connection_stopped` rul
 
 ## 51. Message-content search — HL7 field-path / raw-content matching in Log Search (P3)
 
-> ✅ **SHIPPED in 0.2.10 (Plan-5 Wave 2, PR #624).** First slice built per [ADR 0046](adr/0046-message-content-search.md)
+> ✅ **SHIPPED in 0.2.10 (Plan-5 Wave 2, PR #624).** First slice built per [ADR 0046](../../adr/0046-message-content-search.md)
 > (Accepted): **scan-and-decrypt-per-row** (the store is AES-GCM-encrypted at rest, so a plain `LIKE` is
 > impossible) — metadata-pre-filtered, hard row/result caps, decrypt off the event loop, behind `messages:view_*`
 > + step-up + a `message_search` audit row that never logs the needle. The cleartext key-field index was
@@ -2158,13 +2158,13 @@ Per-domain gap classification, grep-verified against the codebase, with adversar
 
 `POST /config/reload` is the broadest-blast-radius runtime action (it swaps the entire live graph, including any
 planted code) yet is gated by step-up re-verification **only** — a single re-authenticated operator applies it
-alone. The dual-control maker-checker machinery already exists ([`api/approvals.py`](../messagefoundry/api/approvals.py),
+alone. The dual-control maker-checker machinery already exists ([`api/approvals.py`](../../../messagefoundry/api/approvals.py),
 used today for bulk dead-letter replay + connection purge); `config:deploy` is simply not in the gated set.
 **Shape:** add `config_reload` to the configurable `[approvals].operations`, so a **distinct** second approver
 releases it (the requester can never self-approve; both identities written to the hash-chained audit). **Opt-in /
 deny-by-default** — single-operator deployments are unchanged until enabled. Pairs with the ADR 0041 D1 fingerprint
 (the approver sees *which bytes* they are releasing). **Source:** insider-code-tampering review (2026-06-27);
-[ADR 0041](adr/0041-load-path-attestation-and-change-attribution.md) D2.
+[ADR 0041](../../adr/0041-load-path-attestation-and-change-attribution.md) D2.
 
 ## 54. Startup engine self-attestation vs `dist-info/RECORD` + enforced non-editable wheel (ADR 0041 D3) (P2)
 
@@ -2181,10 +2181,10 @@ audit row at all** — `messagefoundry verify` checks host/flow and `integrity-c
 code. **Shape:** at startup (and on demand) hash the loaded engine module files against the wheel's
 `*.dist-info/RECORD` (a zero-new-artifact baseline already shipped in the wheel); on drift, **fail-closed or alert
 (policy-driven)** and write a `startup_integrity` row to the hash-chained, off-box-teed audit. Tighten
-[ADR 0017](adr/0017-consumer-deployment-model.md)'s non-editable, hash-locked wheel from recommendation to the
+[ADR 0017](../../adr/0017-consumer-deployment-model.md)'s non-editable, hash-locked wheel from recommendation to the
 **enforced production default** (retire editable `pip install -e .` from prod docs); the attestation must be a
 no-op/advisory off an editable dev install so it never bricks development. **Source:** insider-code-tampering review
-(2026-06-27); [ADR 0041](adr/0041-load-path-attestation-and-change-attribution.md) D3.
+(2026-06-27); [ADR 0041](../../adr/0041-load-path-attestation-and-change-attribution.md) D3.
 
 ---
 
@@ -2234,7 +2234,7 @@ investigation (2026-06-27).
 
 > ✅ **SHIPPED in 0.2.10 (Plan-5 Wave 2, PR #624).** The `alert_instance` table (3 backends), `GET /alerts/active`
 > + ack/resolve (RBAC `MONITORING_DIAGNOSE`), the real `ConnectionRow.alerts_active` count, and a console Alerts
-> tab are built — [ADR 0044](adr/0044-operator-alert-state.md) (Accepted). See
+> tab are built — [ADR 0044](../../adr/0044-operator-alert-state.md) (Accepted). See
 > `releases/MULTISESSION-PLAN-5.md` Lane L7.
 
 **Type:** feature — operator monitoring. Today alerts are stateless emit-points (ADR 0014) and the
@@ -2250,7 +2250,7 @@ parity gap analysis.
 
 > ✅ **SHIPPED in 0.2.10 (Plan-5 Wave 2, PR #624).** Admin-defined custom roles (permission subset, no new
 > kinds) persisted via an additive `roles` migration on all 3 backends, gated by `USERS_MANAGE`; built-ins stay;
-> narrowing revokes on live sessions — [ADR 0045](adr/0045-custom-rbac-roles.md) (Accepted). See
+> narrowing revokes on live sessions — [ADR 0045](../../adr/0045-custom-rbac-roles.md) (Accepted). See
 > `releases/MULTISESSION-PLAN-5.md` Lane L8.
 
 **Type:** feature — RBAC. Today there are **6 fixed built-in roles**. Add admin-defined named roles, each a
@@ -2264,7 +2264,7 @@ gap analysis.
 ## 58. FHIR client read / search lookup — `fhir_lookup` (read-only, like `db_lookup`) (P2)
 
 > ✅ **SHIPPED (Plan-5 Wave 1, PR #618, 2026-06-27).** `fhir_lookup(connection, query)` is built — a read-only
-> GET / search that extends the `db_lookup` carve-out to FHIR ([ADR 0043](adr/0043-fhir-read-lookup.md),
+> GET / search that extends the `db_lookup` carve-out to FHIR ([ADR 0043](../../adr/0043-fhir-read-lookup.md),
 > Accepted), off the event loop, raises on a Router / in dry-run. See
 > `releases/MULTISESSION-PLAN-5.md` Lane L2.
 
@@ -2292,7 +2292,7 @@ and surfaces the existing parser on the `Message` surface. MSH-encoding-aware, *
 
 ## 60. Turnkey disaster recovery — scheduled config/store backup + restore-verify (config-tier slice) (P3, owner decision)
 
-> ✅ **SHIPPED — verified on `origin/main` (2026-07-09).** **CHANGELOG: “Turnkey DR backup + restore-verify (#60, [ADR 0049](adr/0049-turnkey-dr-backup-restore-verify.md))”** — `messagefoundry backup` / `restore-verify` CLI ships, off by default (`[backup].enabled = false`). This item's banner was never updated, which caused it to be reported as OPEN in PR #850's `#52` anchor — corrected there.
+> ✅ **SHIPPED — verified on `origin/main` (2026-07-09).** **CHANGELOG: “Turnkey DR backup + restore-verify (#60, [ADR 0049](../../adr/0049-turnkey-dr-backup-restore-verify.md))”** — `messagefoundry backup` / `restore-verify` CLI ships, off by default (`[backup].enabled = false`). This item's banner was never updated, which caused it to be reported as OPEN in PR #850's `#52` anchor — corrected there.
 
 > 📌 **PRE-RESERVED (Plan-5, 2026-06-27).** See `releases/MULTISESSION-PLAN-5.md`
 > §G (deferred tail). **Owner-gated** (backup cadence / retention / restore-verify posture).
@@ -2305,7 +2305,7 @@ cadence / retention / restore-verify posture.
 
 ## 61. Third-tier DR standby — right-sized box that takes over when the HA pair fails, running only high-priority feeds (P3, owner decision)
 
-> ✅ **DONE — ratified as [ADR 0048](adr/0048-third-tier-disaster-recovery-standby.md) (Accepted
+> ✅ **DONE — ratified as [ADR 0048](../../adr/0048-third-tier-disaster-recovery-standby.md) (Accepted
 > 2026-06-28) and built (#641).** A **third recovery tier** *below* the shipped active-passive HA — distinct from **#60**
 > (scheduled backup + restore-verify) and from the v0.1 HA failover. Owner DR posture: **cold-seed from
 > #60 · manual activation · cold standby · feed-priority tiers**. Shipped: a per-connection **`priority`
@@ -2381,7 +2381,7 @@ server sitting unused — spins up and runs only the high-priority feeds."
 
 **Type:** storage efficiency + observability — operator knob. Every message writes ~**3 + H + N** `message_events`
 rows (`received` / `routed` / `transformed` / `delivered`) via `_event()`
-([`store/store.py`](../messagefoundry/store/store.py)) — and they are **ungated today**: there is no per-message
+([`store/store.py`](../../../messagefoundry/store/store.py)) — and they are **ungated today**: there is no per-message
 "store verbosity" setting (only after-the-fact retention/pruning, and the `[diagnostics]` toggles for
 `response_sent` / `connection_events`). On a high-volume feed these routine rows can dominate the store's row count.
 
@@ -2404,7 +2404,7 @@ cluster** with **#34** / **#47** / **#62**. Surfaced by the 2026-06-28 DB write-
 
 ## 65. Generic outbound HTTP auth — OAuth2 client-credentials / HTTP Digest / NTLM
 
-> ✅ **SHIPPED (2026-07-12) — OAuth2 client-credentials (symmetric) + HTTP Digest; NTLM/Negotiate scoped out.** A pluggable auth-provider seam ([`transports/http_auth.py`](../messagefoundry/transports/http_auth.py), [ADR 0024 amendment 2026-07-12](adr/0024-smart-backend-services-token-provider.md)) selected per connection on REST/SOAP/FHIR, additive (off by default → byte-identical): **(1) OAuth2 client-credentials with a SYMMETRIC `client_secret`** — a `BearerTokenProvider` (`OAuth2ClientCredentialsProvider`) that slots into the destinations' existing per-request bearer-injection seam beside the SMART provider (`bearer_provider_from_settings` unifies them; mutually exclusive), `client_secret_basic`/`client_secret_post`, mint+cache+invalidate-on-401, cleartext-token-endpoint refused; **(2) HTTP Digest (RFC 7616)** via the stdlib `urllib.request.HTTPDigestAuthHandler` folded into a per-connection opener (never the shared one), cleartext-refused. Composers `with_oauth2_client_credentials()` / `with_http_digest()` mirror `with_smart_backend`; secrets are `env()`-resolved + redacted (`oauth2_client_secret`/`http_auth_password` in `_SECRET_SETTING_KEYS`), never logged. No new dependency (stdlib urllib + rest.py's hardened opener). Tests: `tests/test_http_auth.py`. **Scoped out (honest): NTLM/Negotiate.** Its handshake is **connection-bound** (type1/type2/type3 must ride one keep-alive TCP connection), which `urllib.request` (a fresh connection per `open()`) cannot satisfy; a correct build needs a keep-alive HTTP client driven by `pyspnego` (already in `requirements.lock`, backing the AD/SSO server path) — a separate follow-up the provider seam is shaped to admit. _(was 🔢 DEMAND-GATE · Value 7/10 · Difficulty 4/10.)_
+> ✅ **SHIPPED (2026-07-12) — OAuth2 client-credentials (symmetric) + HTTP Digest; NTLM/Negotiate scoped out.** A pluggable auth-provider seam ([`transports/http_auth.py`](../../../messagefoundry/transports/http_auth.py), [ADR 0024 amendment 2026-07-12](../../adr/0024-smart-backend-services-token-provider.md)) selected per connection on REST/SOAP/FHIR, additive (off by default → byte-identical): **(1) OAuth2 client-credentials with a SYMMETRIC `client_secret`** — a `BearerTokenProvider` (`OAuth2ClientCredentialsProvider`) that slots into the destinations' existing per-request bearer-injection seam beside the SMART provider (`bearer_provider_from_settings` unifies them; mutually exclusive), `client_secret_basic`/`client_secret_post`, mint+cache+invalidate-on-401, cleartext-token-endpoint refused; **(2) HTTP Digest (RFC 7616)** via the stdlib `urllib.request.HTTPDigestAuthHandler` folded into a per-connection opener (never the shared one), cleartext-refused. Composers `with_oauth2_client_credentials()` / `with_http_digest()` mirror `with_smart_backend`; secrets are `env()`-resolved + redacted (`oauth2_client_secret`/`http_auth_password` in `_SECRET_SETTING_KEYS`), never logged. No new dependency (stdlib urllib + rest.py's hardened opener). Tests: `tests/test_http_auth.py`. **Scoped out (honest): NTLM/Negotiate.** Its handshake is **connection-bound** (type1/type2/type3 must ride one keep-alive TCP connection), which `urllib.request` (a fresh connection per `open()`) cannot satisfy; a correct build needs a keep-alive HTTP client driven by `pyspnego` (already in `requirements.lock`, backing the AD/SSO server path) — a separate follow-up the provider seam is shaped to admit. _(was 🔢 DEMAND-GATE · Value 7/10 · Difficulty 4/10.)_
 
 **Cluster:** DB & web-service breadth. **Priority:** P2. **Verdict:** shipped (OAuth2-CC symmetric + HTTP Digest; NTLM/Negotiate scoped out).
 
@@ -2420,7 +2420,7 @@ cluster** with **#34** / **#47** / **#62**. Surfaced by the 2026-06-28 DB write-
 
 ## 66. Non-SQL-Server database connectors — Postgres / Oracle / MySQL / generic ODBC DSN
 
-> ✅ **SHIPPED (2026-07-12).** The DATABASE source/destination gained a **generic ODBC dialect** (`dialect="generic"`) decoupled from the Driver-18 / T-SQL hardcoding: the operator names any OS-installed ODBC driver (`odbc_driver`) + supplies driver-specific keywords (`odbc_params`, brace-quoted/injection-safe) so PostgreSQL / Oracle / MySQL reach over their own ODBC drivers — **no new Python DB dependency** (reuses the present `aioodbc`; the OS-level driver install is documented). Credentials stay in the `env()`-resolved/redacted top-level `username`/`password` under `odbc_user_key`/`odbc_password_key` (default `UID`/`PWD`). The SQL Server preset (`dialect="sqlserver"`, default) is **byte-identical** and stays the supported/CI-exercised path; the `:name` parameterization, error classification, pooling and `[egress].allowed_db` gate are unchanged. **TLS on the generic path is operator-owned** (configured via the driver's own `odbc_params` keyword, e.g. `SSLmode=verify-full`) — MessageFoundry can't introspect an arbitrary driver's TLS posture, so the posture-keyed weakened-TLS refusal (#200 / ADR 0092) is intentionally exempt here, documented in the [ADR 0092 amendment (2026-07-12)](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md); to keep that delegation from being silent, generic-dialect construction logs a **WARNING** when no TLS keyword is set (DEBUG when one is). Docs: `docs/CONNECTIONS.md` (*Generic ODBC*) + `docs/CONFIGURATION.md`; tests in `tests/test_database_transport.py`. **Scoped out (honest):** native async drivers (`asyncpg`-as-connector / `oracledb` / `mysqlclient`) stay dep-heavy/out-of-scope; the `SELECT 1` reachability probe needs `FROM DUAL` on Oracle; read-only `db_lookup` (ADR 0010) stays SQL-Server-only. _(was 🔢 DEMAND-GATE · Value 6/10 · Difficulty 5/10.)_
+> ✅ **SHIPPED (2026-07-12).** The DATABASE source/destination gained a **generic ODBC dialect** (`dialect="generic"`) decoupled from the Driver-18 / T-SQL hardcoding: the operator names any OS-installed ODBC driver (`odbc_driver`) + supplies driver-specific keywords (`odbc_params`, brace-quoted/injection-safe) so PostgreSQL / Oracle / MySQL reach over their own ODBC drivers — **no new Python DB dependency** (reuses the present `aioodbc`; the OS-level driver install is documented). Credentials stay in the `env()`-resolved/redacted top-level `username`/`password` under `odbc_user_key`/`odbc_password_key` (default `UID`/`PWD`). The SQL Server preset (`dialect="sqlserver"`, default) is **byte-identical** and stays the supported/CI-exercised path; the `:name` parameterization, error classification, pooling and `[egress].allowed_db` gate are unchanged. **TLS on the generic path is operator-owned** (configured via the driver's own `odbc_params` keyword, e.g. `SSLmode=verify-full`) — MessageFoundry can't introspect an arbitrary driver's TLS posture, so the posture-keyed weakened-TLS refusal (#200 / ADR 0092) is intentionally exempt here, documented in the [ADR 0092 amendment (2026-07-12)](../../adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md); to keep that delegation from being silent, generic-dialect construction logs a **WARNING** when no TLS keyword is set (DEBUG when one is). Docs: `docs/CONNECTIONS.md` (*Generic ODBC*) + `docs/CONFIGURATION.md`; tests in `tests/test_database_transport.py`. **Scoped out (honest):** native async drivers (`asyncpg`-as-connector / `oracledb` / `mysqlclient`) stay dep-heavy/out-of-scope; the `SELECT 1` reachability probe needs `FROM DUAL` on Oracle; read-only `db_lookup` (ADR 0010) stays SQL-Server-only. _(was 🔢 DEMAND-GATE · Value 6/10 · Difficulty 5/10.)_
 
 **Cluster:** DB & web-service breadth. **Priority:** P2. **Verdict:** shipped (generic-ODBC subset; native async drivers scoped out).
 
@@ -2436,7 +2436,7 @@ cluster** with **#34** / **#47** / **#62**. Surfaced by the 2026-06-28 DB write-
 
 ## 67. Stored-procedure OUT-param / return-value binding
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0013](adr/0013-query-response-orchestration.md) **Amendment (2026-07-17)** (`:534`). A DATABASE outbound may capture a stored-proc call's OUT parameters + scalar RETURN value: `capture_out_params` (`messagefoundry/transports/database.py:561-567`, implying `capture_response` at `:568-570`), captured **pre-commit inside `send()`** (`:601`) via `_capture_merged`, which walks every `nextset()` (`:657-664`); wired at `messagefoundry/config/wiring.py:1732` and gated to real proc calls by `_is_db_proc_call` (`:1682-1685`, gate at `:3425-3439`); reachable from `connections.toml` (`config/connections_file.py:262-280`); `tests/test_database_out_params_capture.py` (12 tests).
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0013](../../adr/0013-query-response-orchestration.md) **Amendment (2026-07-17)** (`:534`). A DATABASE outbound may capture a stored-proc call's OUT parameters + scalar RETURN value: `capture_out_params` (`messagefoundry/transports/database.py:561-567`, implying `capture_response` at `:568-570`), captured **pre-commit inside `send()`** (`:601`) via `_capture_merged`, which walks every `nextset()` (`:657-664`); wired at `messagefoundry/config/wiring.py:1732` and gated to real proc calls by `_is_db_proc_call` (`:1682-1685`, gate at `:3425-3439`); reachable from `connections.toml` (`config/connections_file.py:262-280`); `tests/test_database_out_params_capture.py` (12 tests).
 >
 > ⚠️ **Three things this close does NOT say.** **(a) Mechanism:** it is a **trailing readback `SELECT` inside the proc batch**, *not* native ODBC output-parameter bindvar binding — pyodbc/aioodbc cannot bind those (ADR 0013:553-558). Do not describe it as native OUT-param binding. **(b) A REAL DEFECT rides this close, unfixed:** the ODBC escape `{ ? = CALL proc(:x) }` is the canonical example in `wiring.py:1755`, in the gate's error text (`:3437`) and in the test fixture — but `_parse_named_params` (`database.py:374-383`) substitutes **only** `:name`, so the leading return-value `?` is never bound. Against a real driver that is a parameter-count error (SQLSTATE 07xxx, permanent → dead-letter). Only `DECLARE @rv INT; EXEC @rv = proc :x; SELECT @rv` actually works today. **This warrants a new item.** **(c) Coverage** is fake-cursor only — no live SQL Server round-trip — and a proc that COMMITs internally defeats the pre-commit-capture assumption (ADR 0013:570-577). _(was 🔢 DEMAND-GATE · Value 3/10 · Difficulty 3/10.)_
 
@@ -2473,7 +2473,7 @@ cluster** with **#34** / **#47** / **#62**. Surfaced by the 2026-06-28 DB write-
 
 ## 69. WSDL import — SOAP type-tree + validate-against-WSDL
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0122](adr/0122-wsdl-import-pure-soap-type-tree-validate-against-wsdl-no-zeep.md), **Accepted 2026-07-17**, index row `docs/adr/README.md:149`. A pure WSDL 1.1 importer lives at `messagefoundry/parsing/xml/wsdl.py:3-14` — a typed read-only operation/message tree (`parse_wsdl`, frozen `WsdlDefinition` at `:90-101`) plus `validate_request`/`validate_response` against the embedded XSD (`:103-149`), with the SSRF seam closed by `_refuse_remote_imports` (`:212-228`) and PHI-safe `WsdlError`/`WsdlSecurityError` (`parsing/xml/errors.py:57-69`). **No `zeep`, no new dependency.** `tests/test_wsdl_import.py` (14 tests incl. DOCTYPE and remote-import refusal).
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0122](../../adr/0122-wsdl-import-pure-soap-type-tree-validate-against-wsdl-no-zeep.md), **Accepted 2026-07-17**, index row `docs/adr/README.md:149`. A pure WSDL 1.1 importer lives at `messagefoundry/parsing/xml/wsdl.py:3-14` — a typed read-only operation/message tree (`parse_wsdl`, frozen `WsdlDefinition` at `:90-101`) plus `validate_request`/`validate_response` against the embedded XSD (`:103-149`), with the SSRF seam closed by `_refuse_remote_imports` (`:212-228`) and PHI-safe `WsdlError`/`WsdlSecurityError` (`parsing/xml/errors.py:57-69`). **No `zeep`, no new dependency.** `tests/test_wsdl_import.py` (14 tests incl. DOCTYPE and remote-import refusal).
 >
 > ⚠️ **Scope boundaries — do not over-read this close.** WSDL **1.1 only**; document/literal is first-class and **rpc/encoded raises** (`wsdl.py:126-129`); multi-document import graphs are **not resolved** (a remote import is refused, a local one is not fetched — split contracts must be inlined by the operator); validation covers the SOAP **body** against the embedded XSD only — not headers, WS-Security or MTOM. `transports/soap.py` is deliberately **untouched**: a WSDL checks an envelope, it never drives one, so **#70** (synchronous WSCall) stays declined-by-design and is *not* closed by this, and **#184** (serving our *own* endpoint WSDL) remains open. ⚠️ **Two undisclosed limits worth a follow-up:** `WsdlPart` is exported but no public API returns one, and `_body_element_for_message` unconditionally takes `parts[0].element` — the binding's `<soap:body parts="…">` selector is never read, so a WS-I-conformant multi-part `wsdl:message` can select the wrong part. _(was 🔢 DEMAND-GATE · Value 3/10 · Difficulty 5/10.)_
 
@@ -2541,7 +2541,7 @@ cluster** with **#34** / **#47** / **#62**. Surfaced by the 2026-06-28 DB write-
 
 ## 73. Explicit FIPS-mode attestation
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0120](adr/0120-fips-provider-mode-attestation-report-only-on-security-posture.md). `fips_attestation()` at `messagefoundry/config/tls_policy.py:88-107` reads `(fips_mode, openssl_version)` from `_hashlib.get_fips_mode()` + `ssl.OPENSSL_VERSION` — its docstring states "a read-out, never enforcement (#73)", returns `None` when undeterminable and **never raises**. Surfaced on the security posture (`messagefoundry/api/app.py:1495-1497`, `:1533-1534`) with `fips_mode: bool | None` / `openssl_version: str | None` on the model (`api/models.py:930-936`).
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0120](../../adr/0120-fips-provider-mode-attestation-report-only-on-security-posture.md). `fips_attestation()` at `messagefoundry/config/tls_policy.py:88-107` reads `(fips_mode, openssl_version)` from `_hashlib.get_fips_mode()` + `ssl.OPENSSL_VERSION` — its docstring states "a read-out, never enforcement (#73)", returns `None` when undeterminable and **never raises**. Surfaced on the security posture (`messagefoundry/api/app.py:1495-1497`, `:1533-1534`) with `fips_mode: bool | None` / `openssl_version: str | None` on the model (`api/models.py:930-936`).
 >
 > ⚠️ **Two ratified narrowings, not oversights.** **(a)** The attestation covers **only** the OpenSSL that CPython's `ssl`/`_hashlib` link against — **not** the separately-linked OpenSSL inside the `cryptography` wheel that encrypts **PHI at rest**. ADR 0120 records this deliberately and names attesting that backend as a possible follow-up *if a buyer requires it*; anyone needing it must **file a new item** rather than reopen this one. **(b) Report-only by design** — no `serve` refusal, no cipher change, no warning keyed on the value. ADR 0120 explicitly rejects enforcement. _(was 🔢 DEMAND-GATE · Value 2/10 · Difficulty 2/10.)_
 
@@ -2595,7 +2595,7 @@ cluster** with **#34** / **#47** / **#62**. Surfaced by the 2026-06-28 DB write-
 >   can't set the `Authorization` header; the query-token fallback was removed). Since **b ⊂ c**, shipping
 >   the dashboard first forecloses nothing.
 > - **Installer removal — DONE (2026-07-01), decoupled.** Retired as **#39**; see the [ADR 0032 *Amendment
->   (2026-07-01)*](adr/0032-console-desktop-launch.md). Its zero-install audience transfers **here** (the
+>   (2026-07-01)*](../../adr/0032-console-desktop-launch.md). Its zero-install audience transfers **here** (the
 >   dashboard serves "viewable without a Python install" from the engine's own FastAPI app).
 >
 > **Decision:** keep this item scoped to **option b**; treat option c as a gated *direction*, not committed
@@ -2607,7 +2607,7 @@ cluster** with **#34** / **#47** / **#62**. Surfaced by the 2026-06-28 DB write-
 **Cluster:** Operational/monitoring. **Priority:** P2. **Verdict:** do — **"option b"** (a separate web dashboard; see decision basis).
 
 > **M1 status (2026-07-02):** the read-only slice is **built** on branch `feat/web-ops-dashboard-m1`
-> ([ADR 0065](adr/0065-web-ops-dashboard.md)) — same-origin `/ui` behind `[api].serve_ui` (default off),
+> ([ADR 0065](../../adr/0065-web-ops-dashboard.md)) — same-origin `/ui` behind `[api].serve_ui` (default off),
 > HttpOnly+SameSite cookie confined to `/ui` (JSON API stays header-only), strict CSP + `no-store`,
 > autoescape-by-default rendering, connections dashboard (live poll) + message log + audited raw view +
 > dead-letter list, stdlib renderer (no new dependency), 12 tests. **Held for owner review; not merged.**
@@ -2649,7 +2649,7 @@ cluster** with **#34** / **#47** / **#62**. Surfaced by the 2026-06-28 DB write-
 
 ## 76. Historical-metrics charting + status-colored data-flow graph
 
-> ✅ **SHIPPED (first slice) — verified against `origin/main` (2026-07-28).** [ADR 0065](adr/0065-web-ops-dashboard.md) amendment (2026-07-19). Both halves the item asked for exist: a historical-metrics ring (`messagefoundry/api/metrics.py:58-62`, `MetricsSample`/`MetricsHistory` at `:68`/`:79`), instantiated at `api/app.py:1133` and fed from counts the ~1s `/ws/stats` loop **already** fetched — zero extra store I/O (`:4860-4867`) — exposed as `GET /metrics/history` (`:4122-4140`); and a status-colored data-flow graph via `GET /graph/edges` (`:4142-4150`), which joins `build_wiring_graph` edges with live `RegistryRunner` status and whose docstring states it constructs **no** channel/route object (CLAUDE.md §12 holds).
+> ✅ **SHIPPED (first slice) — verified against `origin/main` (2026-07-28).** [ADR 0065](../../adr/0065-web-ops-dashboard.md) amendment (2026-07-19). Both halves the item asked for exist: a historical-metrics ring (`messagefoundry/api/metrics.py:58-62`, `MetricsSample`/`MetricsHistory` at `:68`/`:79`), instantiated at `api/app.py:1133` and fed from counts the ~1s `/ws/stats` loop **already** fetched — zero extra store I/O (`:4860-4867`) — exposed as `GET /metrics/history` (`:4122-4140`); and a status-colored data-flow graph via `GET /graph/edges` (`:4142-4150`), which joins `build_wiring_graph` edges with live `RegistryRunner` status and whose docstring states it constructs **no** channel/route object (CLAUDE.md §12 holds).
 >
 > ⚠️ **History is in-memory and process-local** — lost on restart, and accrues **only while a browser holds the Connections dashboard open** (the page says so itself). That is the deliberate first slice: ADR 0065's amendment scopes a durable table out **by name** because it would flip `store_schema`. #76 asked for charts, not durability — but do not read this close as durable metrics history. The trend chart plots outbox-by-status counts only. _(was 🔢 DEMAND-GATE · Value 4/10 · Difficulty 3/10.)_
 
@@ -2777,7 +2777,7 @@ integration engine whose architecture most closely mirrors MessageFoundry's mode
 with an embedded scripting language as the transform surface). **Its identity is deliberately not named
 in-repo** — it is a low-profile competitor and naming it in a public/mirrored doc only gives it
 exposure/SEO; the name and findings live in **private strategy notes only**. (Public positioning names
-only the well-known incumbents — Mirth Connect, Corepoint — per [POSITIONING.md](POSITIONING.md).)
+only the well-known incumbents — Mirth Connect, Corepoint — per [POSITIONING.md](../../POSITIONING.md).)
 Study: its scripting/authoring ergonomics, deployment + ops model, throughput claims and how they are
 substantiated, licensing/pricing, target customers, and docs/marketing — for what MEFOR can learn and
 where it most sharply differentiates.
@@ -2798,14 +2798,14 @@ out of any published or mirrored document.
 ## 88. Low-allocation built-ins HL7 parser — free-threading keystone + ~14× single-thread peek speedup (P2)
 
 > ✅ **Parser DONE — built + merged #655 (2026-06-29).** The low-allocation built-ins parser shipped as the
-> **default tolerant hot-path backend** ([ADR 0054](adr/0054-low-allocation-builtins-hl7-parser.md), Accepted;
+> **default tolerant hot-path backend** ([ADR 0054](../../adr/0054-low-allocation-builtins-hl7-parser.md), Accepted;
 > `Peek`/`Message` drop-in). What remains open is the **downstream free-threading exploitation** it unblocks
-> ([ADR 0053](adr/0053-free-threaded-multicore-engine.md) WS4 go/no-go, tracked separately) — not the parser.
+> ([ADR 0053](../../adr/0053-free-threaded-multicore-engine.md) WS4 go/no-go, tracked separately) — not the parser.
 
 **Type:** core parsing / performance. The single highest-leverage perf item — it unlocks free-threaded
 multi-core scaling **and** speeds up every deployment.
 
-**What:** replace the hot-path HL7 parse (today [`parsing/peek.py`](../messagefoundry/parsing/peek.py)'s
+**What:** replace the hot-path HL7 parse (today [`parsing/peek.py`](../../../messagefoundry/parsing/peek.py)'s
 `Peek`, built on **python-hl7**) with a **low-allocation parser that returns built-in types (dict/list/str)**
 instead of a user-defined-class object tree. Measured (ADR 0053 WS3, 2026-06-29, cp314t / 265KF, 8 P-cores):
 a dict/list/str parse scales **6.44× under free-threading and runs ~14× faster single-thread** (158k vs 11k
@@ -2816,18 +2816,18 @@ free-threading (built-in *immortal* types don't). Not allocation in general (pur
 
 **Why it matters (dual win):**
 - **Free-threading keystone:** ADR 0053's free-threaded multi-core path is a NO-GO with python-hl7 (~2×) but
-  a **GO with this parser** (~6.4×). It is the gating dependency for [ADR 0053](adr/0053-free-threaded-multicore-engine.md).
+  a **GO with this parser** (~6.4×). It is the gating dependency for [ADR 0053](../../adr/0053-free-threaded-multicore-engine.md).
 - **Single-thread / sharding win regardless:** a ~14× faster peek raises per-core throughput → it helps the
-  single-process and [ADR 0037](adr/0037-multi-process-sharding-l3.md) sharded paths **even if free-threading
+  single-process and [ADR 0037](../../adr/0037-multi-process-sharding-l3.md) sharded paths **even if free-threading
   never ships**.
 
 **Scope / hard parts:** must stay **tolerant** (real feeds are non-conformant — the python-hl7 contract),
 read encoding chars from **MSH-2** (don't hardcode `|^~\&`), handle escapes / repetitions / components /
 subcomponents, and back the engine's `Peek` field-path API (`MSH-9.1`, filters) + the transform `Message`
-model ([`parsing/message.py`](../messagefoundry/parsing/message.py)). Strict validation (hl7apy) stays the
+model ([`parsing/message.py`](../../../messagefoundry/parsing/message.py)). Strict validation (hl7apy) stays the
 opt-in slow path (it won't scale, but it's rare).
 
-**Sequencing:** the **parser is built + merged — [ADR 0054](adr/0054-low-allocation-builtins-hl7-parser.md)**
+**Sequencing:** the **parser is built + merged — [ADR 0054](../../adr/0054-low-allocation-builtins-hl7-parser.md)**
 (Accepted 2026-06-29, shipped as #655 — design + the `Peek`/`Message` drop-in contract + the migration, now
 the default tolerant hot-path backend). The remaining downstream is ADR 0053's WS4 / the free-threading go/no-go.
 
@@ -2875,13 +2875,13 @@ endgame). Vendoring entrenches the dependency; building replaces it.
 
 ## 90. Free-threading reliability re-arch — H1a DB-owner-loop + H2/H3/H4 (ADR 0053 committed scope) (P2)
 
-> ⛔ **DECLINED (2026-07-09).** Free-threading was a **NO-GO** — [ADR 0053](adr/0053-free-threaded-multicore-engine.md) records the thread-hop-fusion lever below the 10 % bar. The committed scale path is engine sharding (ADR 0037/0063). Reopen only if a real feed's transform CPU is far higher.
+> ⛔ **DECLINED (2026-07-09).** Free-threading was a **NO-GO** — [ADR 0053](../../adr/0053-free-threaded-multicore-engine.md) records the thread-hop-fusion lever below the 10 % bar. The committed scale path is engine sharding (ADR 0037/0063). Reopen only if a real feed's transform CPU is far higher.
 
 **Type:** core concurrency / reliability. The engine changes to run the staged-pipeline workers as real OS
 threads under free-threading (cp314t), preserving the invariants. Gated on #91 (the A/B that confirms a real
 engine-level win) before building.
 
-**What** (from [ADR 0053](adr/0053-free-threaded-multicore-engine.md) WS4, all ~0 reliability cost):
+**What** (from [ADR 0053](../../adr/0053-free-threaded-multicore-engine.md) WS4, all ~0 reliability cost):
 - **H1a** — a dedicated store-owned event loop owns `self._db` + `self._lock`; every store call marshals onto
   it via `run_coroutine_threadsafe`, **generalizing the existing `wiring_runner._run_lookup` seam**. Keeps
   the single-writer-connection model byte-for-byte. (REJECT H1b — threading.Lock + per-loop writer pool — it
@@ -2903,7 +2903,7 @@ gap) — it does **not** move the store fsync ceiling. Complementary to ADR 0037
 
 > ⛔ **DECLINED 2026-07-20 — on four unavailable rig inputs, and on a premise measurement has since removed.** The 2026-07-10 re-score reopened this because the earlier decline misquoted ADR 0053; that correction was right at the time, but the A/B is no longer decisive.
 >
-> **Why it cannot pay off at the current wall.** Free-threading buys parallel CPU across cores, and the engine is **not** CPU-bound: per-shard engine CPU measures **~0.06–0.36 cores** (`docs/benchmarks/PLAN-ENGINE-ATTRIBUTION.md:81`). There is no engine-CPU saturation for FT to relieve. [ADR 0053](adr/0053-free-threaded-multicore-engine.md) itself gates on exactly that condition — **NO-GO unless a real feed's transform CPU is far higher** (`:33`: *">~23 % for +25 %, ~57 % for 2×"*) — and the related fusion lever already returned **NO-GO** at +6.5/+9.3/+10.0 % against a ≥10 % bar ([ADR 0071](adr/0071-cut-executor-round-trips-b5.md)`:3`). The wall is **store-side**, and — this matters — it is **not** transaction-shaped and remains **unnamed**: [ADR 0098](adr/0098-store-side-scaling-levers-are-exhausted-transaction-amortization-is-the-only-path-to-45m-day.md)'s authoritative H1 is *"Four store-side scaling levers are measured dead ends"*, and its **filename's** *"transaction amortization is the only path"* was **withdrawn as WRONG** the same day as an elimination inference (`0098:3-11`); [ADR 0107](adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md) then measured transaction-reduction elasticity at **−0.115** and closed that lever too (`0107:57-59`). ⚠️ Cite neither ADR as naming the wall. What is established is narrower and sufficient here: the wall is **not engine CPU**, and engine CPU is the only thing a GIL-vs-FT A/B could move. **Re-open only if a real feed shows transform CPU near ADR 0053's stated threshold** — that is the trigger, not a general interest in free-threading. _(was 🔢 P2 · Value 6/10 · Difficulty 5/10.)_
+> **Why it cannot pay off at the current wall.** Free-threading buys parallel CPU across cores, and the engine is **not** CPU-bound: per-shard engine CPU measures **~0.06–0.36 cores** (`docs/benchmarks/PLAN-ENGINE-ATTRIBUTION.md:81`). There is no engine-CPU saturation for FT to relieve. [ADR 0053](../../adr/0053-free-threaded-multicore-engine.md) itself gates on exactly that condition — **NO-GO unless a real feed's transform CPU is far higher** (`:33`: *">~23 % for +25 %, ~57 % for 2×"*) — and the related fusion lever already returned **NO-GO** at +6.5/+9.3/+10.0 % against a ≥10 % bar ([ADR 0071](../../adr/0071-cut-executor-round-trips-b5.md)`:3`). The wall is **store-side**, and — this matters — it is **not** transaction-shaped and remains **unnamed**: [ADR 0098](../../adr/0098-store-side-scaling-levers-are-exhausted-transaction-amortization-is-the-only-path-to-45m-day.md)'s authoritative H1 is *"Four store-side scaling levers are measured dead ends"*, and its **filename's** *"transaction amortization is the only path"* was **withdrawn as WRONG** the same day as an elimination inference (`0098:3-11`); [ADR 0107](../../adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md) then measured transaction-reduction elasticity at **−0.115** and closed that lever too (`0107:57-59`). ⚠️ Cite neither ADR as naming the wall. What is established is narrower and sufficient here: the wall is **not engine CPU**, and engine CPU is the only thing a GIL-vs-FT A/B could move. **Re-open only if a real feed shows transform CPU near ADR 0053's stated threshold** — that is the trigger, not a general interest in free-threading. _(was 🔢 P2 · Value 6/10 · Difficulty 5/10.)_
 
 **Type:** measurement / gate. The GO/NO-GO confirmation for ADR 0053's scoped throughput claim **before**
 building #90.
@@ -2923,7 +2923,7 @@ suffices) — that determines whether #90 is worth doing now or behind the durab
 
 > ✅ **SHIPPED — verified on `origin/main` (2026-07-09).** Live-debug **v1** (#793) and **v2** (#805, per-statement inline values + hover) are both merged; `ide/src` carries the debug lanes.
 
-> 📐 **Phased in MULTISESSION-PLAN-7.** **v1** (L2 — IDE-only, no engine change): a debounced on-save watcher shells `dryrun --json` against a synthetic sample and renders CodeLens summaries (router routed-to · disposition · single-handler Send count — accurate multi-handler attribution is a v2 feature, since today's `--json` flattens handler→delivery). **v2** (L6): per-statement inline values + hover, driven by the new traced dry-run mode ([ADR 0072](adr/0072-traced-dryrun-mode.md)) — **PHI-redacted by default**, synthetic samples only. The deterministic sibling to an interactive AI loop (offline, no breakpoints) — see [`docs/AI-OFF-MATRIX.md`](AI-OFF-MATRIX.md).
+> 📐 **Phased in MULTISESSION-PLAN-7.** **v1** (L2 — IDE-only, no engine change): a debounced on-save watcher shells `dryrun --json` against a synthetic sample and renders CodeLens summaries (router routed-to · disposition · single-handler Send count — accurate multi-handler attribution is a v2 feature, since today's `--json` flattens handler→delivery). **v2** (L6): per-statement inline values + hover, driven by the new traced dry-run mode ([ADR 0072](../../adr/0072-traced-dryrun-mode.md)) — **PHI-redacted by default**, synthetic samples only. The deterministic sibling to an interactive AI loop (offline, no breakpoints) — see [`docs/AI-OFF-MATRIX.md`](../../AI-OFF-MATRIX.md).
 
 **Type:** developer-experience feature — the highest-leverage DX investment surfaced by the **#87** competitive
 recon, and the one genuine DX *differentiator* of the code-first commercial engine class.
@@ -2958,7 +2958,7 @@ deep-dive + console-medium evaluation (2026-06-29).
 
 ## 93. Engine + database performance monitoring — engine-wide volume/connection KPI roll-up + a throughput-overload (saturation) alert (P2)
 
-> ✅ **SHIPPED — 2026-07-12.** The two genuine net-new slivers this connective item owns, plus the DB-signals sliver, landed; the rest is cross-linked as already-shipped. **(1) Engine-wide KPI headline** — `SystemStatus.kpis` on `/status` (total messages, combined inbound+outbound endpoint count with running/stopped, engine-wide msg/s) **reusing the existing `recent_done` rate window** (no second sampler), surfaced on the console Engine Status page and the #75 web dashboard (seam v3). **(2) Saturation alert on the derivative** — a new `saturation` `AlertSink` event + `SaturationDetector` (bounded per-`(stage,lane)` depth-sample history) + `[delivery].saturation_sustain_samples` knob (deny-by-default), firing on *sustained rising backlog* (ingest > drain) and provably **NOT** on a bursty-but-draining lane, routed through the existing rules/throttle path ([ADR 0014 amendment](adr/0014-alerting-rules-engine.md); the declined timed-escalation scope is settled explicitly). **(3) DB signals** — `/metrics` gains store commit/body-copy counters + connection-pool **saturation** + acquire-wait percentiles (the `[store].pool_size` gap). Sibling monitoring surfaces (#21/#56/#74/#75/#81) were already shipped — not duplicated.
+> ✅ **SHIPPED — 2026-07-12.** The two genuine net-new slivers this connective item owns, plus the DB-signals sliver, landed; the rest is cross-linked as already-shipped. **(1) Engine-wide KPI headline** — `SystemStatus.kpis` on `/status` (total messages, combined inbound+outbound endpoint count with running/stopped, engine-wide msg/s) **reusing the existing `recent_done` rate window** (no second sampler), surfaced on the console Engine Status page and the #75 web dashboard (seam v3). **(2) Saturation alert on the derivative** — a new `saturation` `AlertSink` event + `SaturationDetector` (bounded per-`(stage,lane)` depth-sample history) + `[delivery].saturation_sustain_samples` knob (deny-by-default), firing on *sustained rising backlog* (ingest > drain) and provably **NOT** on a bursty-but-draining lane, routed through the existing rules/throttle path ([ADR 0014 amendment](../../adr/0014-alerting-rules-engine.md); the declined timed-escalation scope is settled explicitly). **(3) DB signals** — `/metrics` gains store commit/body-copy counters + connection-pool **saturation** + acquire-wait percentiles (the `[store].pool_size` gap). Sibling monitoring surfaces (#21/#56/#74/#75/#81) were already shipped — not duplicated.
 
 **Type:** feature — observability + alerting. A **connective** item: most of the operator-facing monitoring
 surface this asks for is **already tracked** (and partly shipped) under sibling items — this entry exists to name
@@ -3021,13 +3021,13 @@ items (#21/#56/#64/#74/#75/#76/#81) reconciled the same day.
 
 ## 97. Keep-alive / persistent outbound connections — per-connector setting (P3, on-trigger)
 
-> ✅ **SHIPPED — merged 2026-07-24 (PR #1220); verified against `origin/main` (2026-07-28).** The residual — porting MLLP's persistent-connection pattern to the `Tcp()`/`X12()` outbounds — is built behind a per-outbound `persistent=false` opt-in with the same knobs and semantics as MLLP minus TLS (raw TCP has none): `self.persistent` + `idle_timeout_seconds` + `max_connection_age_seconds` at `messagefoundry/transports/tcp.py:124` and `messagefoundry/transports/x12.py:94`. [ADR 0067](adr/0067-persistent-outbound-mllp.md) now carries the `Tcp()`/`X12()` parity box checked at `:128` and a full **§9 amendment** (`:130`) fixing the reconnect model to exactly-one-redial-before-first-byte (**not** this item's original "reconnect-with-backoff" wording — a failed redial is a normal charged `DeliveryError` the delivery worker retries). **This supersedes any framing that the work is stranded on the `dg-s5` lane: it is on `main`.** _(was 🔢 DEMAND-GATE · Value 3/10 · Difficulty 3/10.)_
+> ✅ **SHIPPED — merged 2026-07-24 (PR #1220); verified against `origin/main` (2026-07-28).** The residual — porting MLLP's persistent-connection pattern to the `Tcp()`/`X12()` outbounds — is built behind a per-outbound `persistent=false` opt-in with the same knobs and semantics as MLLP minus TLS (raw TCP has none): `self.persistent` + `idle_timeout_seconds` + `max_connection_age_seconds` at `messagefoundry/transports/tcp.py:124` and `messagefoundry/transports/x12.py:94`. [ADR 0067](../../adr/0067-persistent-outbound-mllp.md) now carries the `Tcp()`/`X12()` parity box checked at `:128` and a full **§9 amendment** (`:130`) fixing the reconnect model to exactly-one-redial-before-first-byte (**not** this item's original "reconnect-with-backoff" wording — a failed redial is a normal charged `DeliveryError` the delivery worker retries). **This supersedes any framing that the work is stranded on the `dg-s5` lane: it is on `main`.** _(was 🔢 DEMAND-GATE · Value 3/10 · Difficulty 3/10.)_
 
 **Type:** feature — a per-outbound-connection option to **hold the TCP link open across deliveries** (keep-alive / persistent) instead of the current connect-per-message behavior.
 
 **What:** an opt-in **per-connector setting** (e.g. `keepalive = true` / a `connection_mode = "persistent" | "on_demand"` knob in the outbound's `settings`, default `on_demand` so existing configs stay byte-identical) on the MLLP / raw-TCP / X12 outbound connectors. When enabled, the delivery worker reuses one open connection (reconnecting on drop/idle), rather than opening + closing a fresh socket every message as it does today. Wants: a bounded idle-close / max-lifetime, reconnect-with-backoff on a dropped link, and clean teardown on `stop()`/reload — all per-connection, with the setting validated at build (dry-run / `check`), consistent with the other outbound knobs.
 
-**Why:** confirmed gap — every TCP-family outbound opens a **fresh connection per delivery** today and there is no toggle: `MLLPDestination` ([`transports/mllp.py`](../messagefoundry/transports/mllp.py), *"Phase 1 opens a fresh connection per delivery … a persistent/pooled connection can come later"*) and `TcpDestination` ([`transports/tcp.py`](../messagefoundry/transports/tcp.py), *"Opens a fresh connection per delivery … pooling can come later"*); listed as an unbuilt MLLP feature gap in [`CONNECTIONS.md`](CONNECTIONS.md) ("keep-connection-open/pooling"). Inbound listeners are already persistent (peer-driven, idle-bounded by `receive_timeout`) — this closes the outbound half. The connect-per-message default is simple and robust to flaky peers, so this is genuinely additive and stays **off by default**; the at-least-once / idempotent-receiver contract is unchanged (a reused link that drops mid-ACK still retries, same as today). **Trigger:** a partner that needs a held-open link (a persistent-session receiver, or a high-rate feed where per-message connect setup is measurable overhead). Relates to **#82** (the sender-polish bundle this splits from — pacing + MSA-2↔MSH-10 matching stay there), **#46** (connection lifecycle events would gain reconnect/retry signals), and **#65** (outbound-connector option surface).
+**Why:** confirmed gap — every TCP-family outbound opens a **fresh connection per delivery** today and there is no toggle: `MLLPDestination` ([`transports/mllp.py`](../../../messagefoundry/transports/mllp.py), *"Phase 1 opens a fresh connection per delivery … a persistent/pooled connection can come later"*) and `TcpDestination` ([`transports/tcp.py`](../../../messagefoundry/transports/tcp.py), *"Opens a fresh connection per delivery … pooling can come later"*); listed as an unbuilt MLLP feature gap in [`CONNECTIONS.md`](../../CONNECTIONS.md) ("keep-connection-open/pooling"). Inbound listeners are already persistent (peer-driven, idle-bounded by `receive_timeout`) — this closes the outbound half. The connect-per-message default is simple and robust to flaky peers, so this is genuinely additive and stays **off by default**; the at-least-once / idempotent-receiver contract is unchanged (a reused link that drops mid-ACK still retries, same as today). **Trigger:** a partner that needs a held-open link (a persistent-session receiver, or a high-rate feed where per-message connect setup is measurable overhead). Relates to **#82** (the sender-polish bundle this splits from — pacing + MSA-2↔MSH-10 matching stay there), **#46** (connection lifecycle events would gain reconnect/retry signals), and **#65** (outbound-connector option surface).
 
 **Source:** owner request (2026-06-30) — "add keepalive feature for outbound connections, controlled by a setting per outbound connector."
 
@@ -3042,13 +3042,13 @@ keyword for Availability-Group-listener deployments.
 
 **What:** a `multi_subnet_failover = true|false` bool on `StoreSettings` (default `false`, SQL Server
 backend only) that makes `connection_string()`
-([`store/sqlserver.py`](../messagefoundry/store/sqlserver.py)) emit `MultiSubnetFailover=Yes` —
+([`store/sqlserver.py`](../../../messagefoundry/store/sqlserver.py)) emit `MultiSubnetFailover=Yes` —
 inserted **before** the `Encrypt`/`TrustServerCertificate` tail so the last-wins TLS posture is
 unchanged. No injection surface (it's a bool riding the existing validated-settings machinery); env
 override rides the standard `MEFOR_STORE_*` path. Decide-at-build rider while in there: whether to
 also surface ODBC 18's idle-connection-resiliency knobs (`ConnectRetryCount` /
 `ConnectRetryInterval`), which today sit at driver defaults because the DSN cannot set them
-(relevant to the [`AOAG-DEPLOYMENT.md`](AOAG-DEPLOYMENT.md) §5.3 reconnect-after-failover posture).
+(relevant to the [`AOAG-DEPLOYMENT.md`](../../AOAG-DEPLOYMENT.md) §5.3 reconnect-after-failover posture).
 
 **Why:** the store's ODBC connection string is a **fixed keyword list with no passthrough** — by
 design (STORE-5 anti-injection) — so it cannot emit AG-aware keywords at all
@@ -3059,7 +3059,7 @@ without `MultiSubnetFailover=Yes` tries the listener's IPs sequentially, each at
 matters; with the keyword, ODBC Driver 18 attempts all listener IPs in parallel. The documented
 interim workaround — listener-side `RegisterAllProvidersIP=0` + `HostRecordTTL 300` — works but
 shifts cross-subnet client recovery onto DNS TTL expiry + cross-site DNS replication
-([`AOAG-DEPLOYMENT.md`](AOAG-DEPLOYMENT.md) §4.5, which this item unblocks).
+([`AOAG-DEPLOYMENT.md`](../../AOAG-DEPLOYMENT.md) §4.5, which this item unblocks).
 
 **Source:** owner request (2026-07-03) during the AOAG deployment-guide build ("if that's something
 to fix, add it to the backlog"); gap confirmed by adversarial review of `connection_string()`.
@@ -3074,14 +3074,14 @@ to fix, add it to the backlog"); gap confirmed by adversarial review of `connect
 
 **What:** a per-node cluster knob — an `acquire_delay_seconds` handicap **or** a
 `promotable = false` flag — evaluated in the expired-lease branch of the leadership claim
-([`pipeline/cluster_sqlserver.py`](../messagefoundry/pipeline/cluster_sqlserver.py) /
-[`cluster.py`](../messagefoundry/pipeline/cluster.py) `_claim_or_renew_lease`), surfaced in
+([`pipeline/cluster_sqlserver.py`](../../../messagefoundry/pipeline/cluster_sqlserver.py) /
+[`cluster.py`](../../../messagefoundry/pipeline/cluster.py) `_claim_or_renew_lease`), surfaced in
 `GET /cluster/nodes`, so a designated node (e.g. a remote DR-site engine) never wins a routine
 first-lease-wins race and only becomes leader when no preferred node can.
 
 **Why:** MEFOR leadership is today an **unweighted first-MERGE-wins race** with no site
 preference, node priority, or non-promotable flag (confirmed: no such setting in
-[`config/settings.py`](../messagefoundry/config/settings.py) `ClusterSettings` or the cluster
+[`config/settings.py`](../../../messagefoundry/config/settings.py) `ClusterSettings` or the cluster
 modules). A warm standby at a remote DR site therefore wins ~1-in-2 to ~1-in-3 of routine
 leadership transitions (leader-host death, patching restarts, config-restarts, DB blips), binding
 listeners and driving the primary-site DB cross-WAN (~7 commits × WAN-RTT/msg) silently and with
@@ -3102,7 +3102,7 @@ is combined with `[cluster]` membership.
 **Type:** bug / hardening.
 
 **What:** on the server-DB backends, `run_restore_verify` **passes a config-only archive**
-([`pipeline/dr_backup.py`](../messagefoundry/pipeline/dr_backup.py) lines 655-662), so
+([`pipeline/dr_backup.py`](../../../messagefoundry/pipeline/dr_backup.py) lines 655-662), so
 `POST /dr/activate` can bless priority-feed activation against an empty or arbitrarily stale store
 on a SQL Server estate — **worse** than the fail-closed behavior ADR 0048 promises on SQLite.
 **Fix:** make server-DB DR activation verify that a DBA-attested restored `mefor` database is
@@ -3125,15 +3125,15 @@ very priority clinical feeds it exists to protect.
 > (`tests/test_console_*.py`) removed; the `[project.gui-scripts]` windowed launcher + `scripts/console/`
 > shortcut tooling deleted; the `[console]` extra renamed to `[harness]` (PySide6 + httpx + truststore;
 > `keyring` — the launcher-only OS-token cache — dropped, lock re-exported). The browser web console
-> (`/ui`, [ADR 0065](adr/0065-web-ops-dashboard.md)) is the sole operator UI; PySide6 is now harness-only.
-> [ADR 0032](adr/0032-console-desktop-launch.md) flipped to **RETIRED**. Completes the deferred remainder of
-> the [ADR 0088](adr/0088-apiclient-service-cli-extraction.md) partial.
+> (`/ui`, [ADR 0065](../../adr/0065-web-ops-dashboard.md)) is the sole operator UI; PySide6 is now harness-only.
+> [ADR 0032](../../adr/0032-console-desktop-launch.md) flipped to **RETIRED**. Completes the deferred remainder of
+> the [ADR 0088](../../adr/0088-apiclient-service-cli-extraction.md) partial.
 
-**Partial (PLAN-9 W3, 2026-07-10 — [ADR 0088](adr/0088-apiclient-service-cli-extraction.md)) — now COMPLETE:**
+**Partial (PLAN-9 W3, 2026-07-10 — [ADR 0088](../../adr/0088-apiclient-service-cli-extraction.md)) — now COMPLETE:**
 `apiclient/` + the `messagefoundry service` CLI were extracted first (the reusable-core half: the Qt-free
 `EngineClient` client + local Windows service control). The 2026-07-13 retirement (banner above) finished the
 job — deleting `console/`, rehoming the Qt widgets to `harness/`, and renaming the `[console]` extra — and
-flipped [ADR 0032](adr/0032-console-desktop-launch.md) to RETIRED.
+flipped [ADR 0032](../../adr/0032-console-desktop-launch.md) to RETIRED.
 
 **Type:** architecture / feature (large) — collapse the two operator UIs to one, keeping the
 browser `/ui` console ([#75](#75-browser--web-operator-monitor)) as the sole operator client.
@@ -3144,7 +3144,7 @@ blockers; the owner has now waived the first (moving harness code is acceptable)
 concrete moves:
 - Extract the **Qt-free** HTTP API client `console/client.py`
   (`EngineClient` / `ApiError` — verified zero Qt imports) into a shared home (e.g.
-  `messagefoundry/apiclient/`); the harness ([`harness/monitor.py`](../harness/monitor.py),
+  `messagefoundry/apiclient/`); the harness ([`harness/monitor.py`](../../../harness/monitor.py),
   `scenarios.py`, `load/…`) and any other consumer import it there.
 - Rehome the shared Qt widgets the harness reuses
   (`console/widgets.py` `ConfigurableTable` /
@@ -3154,7 +3154,7 @@ concrete moves:
   (`console/service_control.py`: `sc query` state +
   elevated `net start/stop`/install; a browser can't UAC-elevate and can't stop the very engine
   hosting its own API) — to the CLI (`messagefoundry service install|start|stop|status`, wrapping
-  the existing [`scripts/service/`](../scripts/service/) NSSM scripts) or a tiny standalone
+  the existing [`scripts/service/`](../../../scripts/service) NSSM scripts) or a tiny standalone
   tray/service-manager.
 
 Then audit remaining web-vs-desktop parity gaps (the ADR 0065 full port already reached additive
@@ -3179,10 +3179,10 @@ browser-impossible per its own docstring). Sequence the extraction / rehoming / 
 
 ## 104. Cookbook + Walkthrough — offline solved-problems gallery + VS Code onboarding (P2, IDE/DX)
 
-> ✅ **SHIPPED — Cookbook gallery + VS Code onboarding walkthrough (PLAN-7 L3, PR #798).** `ide/src/cookbook.ts` + `cookbookRecipes.ts` + the five `ide/media/walkthrough/*.md` steps, with `ide/src/test/suite/cookbook.test.ts`. The deterministic sibling of the AI `/explain` ([`AI-OFF-MATRIX.md`](AI-OFF-MATRIX.md)) and the code-first analogue of Corepoint's Cookbook.
+> ✅ **SHIPPED — Cookbook gallery + VS Code onboarding walkthrough (PLAN-7 L3, PR #798).** `ide/src/cookbook.ts` + `cookbookRecipes.ts` + the five `ide/media/walkthrough/*.md` steps, with `ide/src/test/suite/cookbook.test.ts`. The deterministic sibling of the AI `/explain` ([`AI-OFF-MATRIX.md`](../../AI-OFF-MATRIX.md)) and the code-first analogue of Corepoint's Cookbook.
 
 
-> 📐 **Scoped in MULTISESSION-PLAN-7 L3 (owner-promote to build).** The deterministic sibling for the AI `/explain` ([`docs/AI-OFF-MATRIX.md`](AI-OFF-MATRIX.md)) and the code-first analogue of Corepoint's Cookbook.
+> 📐 **Scoped in MULTISESSION-PLAN-7 L3 (owner-promote to build).** The deterministic sibling for the AI `/explain` ([`docs/AI-OFF-MATRIX.md`](../../AI-OFF-MATRIX.md)) and the code-first analogue of Corepoint's Cookbook.
 
 **Type:** developer-experience / onboarding.
 
@@ -3216,7 +3216,7 @@ postgres]` cases are the regression guard (no new test file needed).
 
 **What:** per-connection retention (#34 / ADR 0027) maps a **keep-forever** override to a
 `float('-inf')` cutoff, bound as a `FLOAT` parameter by `_qmark_cutoff_case`
-([`store/store.py`](../messagefoundry/store/store.py)) inside `purge_message_bodies` on all three
+([`store/store.py`](../../../messagefoundry/store/store.py)) inside `purge_message_bodies` on all three
 backends. SQLite's dynamic typing accepts `-inf`, but the **server backends reject it**: SQL Server
 via pyodbc raises `('42000', …) not a valid instance of data type float`, and Postgres via asyncpg
 raises `UndefinedFunctionError`. So a purge pass on SQL Server / Postgres with **any** keep-forever
@@ -3268,7 +3268,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 109. Invalid-credential sender auto-stop (partner-account lockout protection)
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md). `credential_fault_policy: Literal["stop", "dead_letter"] = Field(default="stop")` (`messagefoundry/config/settings.py:1111-1118`, asserted at construction `pipeline/wiring_runner.py:922-923`). On a permanent auth failure the lane **STOPs and RETAINS its queue un-errored** — `release_claimed` back to PENDING, never dead-lettered — plus a `connection_stopped` alert (`wiring_runner.py:4051-4074`), so a backlog cannot re-auth-storm the partner account. `transports/remotefile.py:118-121` threads `credential_fault` through `NegativeAckError`.
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0095](../../adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md). `credential_fault_policy: Literal["stop", "dead_letter"] = Field(default="stop")` (`messagefoundry/config/settings.py:1111-1118`, asserted at construction `pipeline/wiring_runner.py:922-923`). On a permanent auth failure the lane **STOPs and RETAINS its queue un-errored** — `release_claimed` back to PENDING, never dead-lettered — plus a `connection_stopped` alert (`wiring_runner.py:4051-4074`), so a backlog cannot re-auth-storm the partner account. `transports/remotefile.py:118-121` threads `credential_fault` through `NegativeAckError`.
 >
 > ⚠️ **The ledger was self-contradictory here:** the ranked-table row already read ✅ SHIPPED while this banner still said demand-gate — the table was right. ⚠️ **Live-server validation is still outstanding:** all merged coverage is unit-level against a stub connector; a real FTP/SFTP handshake pass is tracked at `docs/releases/plan-11/w19-ad-lab-integration-validation.md:48`, which itself frames #109 as "built and unit-green". That pointer is preserved here deliberately so the lab pass is not lost by this close. _(was 🔢 DEMAND-GATE · Value 6/10 · Difficulty 4/10.)_
 
@@ -3289,7 +3289,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 111. File-endpoint alternate Windows / network-share credentials
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0132](adr/0132-per-endpoint-alternate-windows-credential-for-file-unc-shares-win32-ctypes-no-pywin32-no-impersonation-privilege.md). `messagefoundry/transports/wincred.py:3` gives the File connector a per-endpoint alternate Windows credential: a real `advapi32.LogonUserW` `LOGON32_LOGON_NEW_CREDENTIALS` + `ImpersonateLoggedOnUser` via **ctypes — no pywin32** (`:182-227`), fully bracketed LogonUser → Impersonate → call → RevertToSelf → CloseHandle on a dedicated single-worker executor (`:109-139`, `:151-165`), and `ensure_supported` raising `CredentialUnsupportedError` off Windows — **loud, never silent** (`:101-106`). Modelled at `config/models.py:476-530`, authored as `File(credential_username=…, credential_domain=…, …)` (`config/wiring.py:1123-1125`).
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0132](../../adr/0132-per-endpoint-alternate-windows-credential-for-file-unc-shares-win32-ctypes-no-pywin32-no-impersonation-privilege.md). `messagefoundry/transports/wincred.py:3` gives the File connector a per-endpoint alternate Windows credential: a real `advapi32.LogonUserW` `LOGON32_LOGON_NEW_CREDENTIALS` + `ImpersonateLoggedOnUser` via **ctypes — no pywin32** (`:182-227`), fully bracketed LogonUser → Impersonate → call → RevertToSelf → CloseHandle on a dedicated single-worker executor (`:109-139`, `:151-165`), and `ensure_supported` raising `CredentialUnsupportedError` off Windows — **loud, never silent** (`:101-106`). Modelled at `config/models.py:476-530`, authored as `File(credential_username=…, credential_domain=…, …)` (`config/wiring.py:1123-1125`).
 >
 > ⚠️ **The live win32 path is not exercised in CI** — `tests/test_file_alt_credential.py` fakes all four ctypes primitives; a real `LogonUser` against a real alt-credential UNC share is a Windows-CI / manual gate. That is an accepted, ADR-documented limitation (`wincred.py:29-31`), so this close does **not** claim share-level verification. ⚠️ **Not SMB remote-scheme support:** `docs/CONNECTIONS.md:1827` still lists "SMB / network share" as a *planned* File remote scheme — a genuinely separate gap. _(was 🔢 DEMAND-GATE · Value 5/10 · Difficulty 5/10.)_
 
@@ -3309,7 +3309,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 112. Outbound forward web-proxy address ('Use Default Web Proxy')
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0126](adr/0126-outbound-forward-egress-web-proxy-for-the-stdlib-http-family.md). `messagefoundry/transports/rest.py:513-522` carries the forward/egress proxy seam (BACKLOG #112/#127/#128) with a `_PROXY_DEFAULT = "default"` sentinel meaning *use the OS/environment proxy via `getproxies()`* — the item's literal "Use Default Web Proxy". `ProxyConfig` (`:586-611`) exposes `use_default`, `_build_proxy_handler` and per-host `for_host`; `proxy_config_from_settings` (`:695-746`) resolves unset → `None` and `"default"` → the OS proxy.
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0126](../../adr/0126-outbound-forward-egress-web-proxy-for-the-stdlib-http-family.md). `messagefoundry/transports/rest.py:513-522` carries the forward/egress proxy seam (BACKLOG #112/#127/#128) with a `_PROXY_DEFAULT = "default"` sentinel meaning *use the OS/environment proxy via `getproxies()`* — the item's literal "Use Default Web Proxy". `ProxyConfig` (`:586-611`) exposes `use_default`, `_build_proxy_handler` and per-host `for_host`; `proxy_config_from_settings` (`:695-746`) resolves unset → `None` and `"default"` → the OS proxy.
 >
 > ⚠️ **`FhirLookup()` exposes no proxy kwarg** (`config/wiring.py:483-535`): a `fhir_lookup` read connection can only inherit the site-wide `[egress].proxy_url`/`proxy_no_proxy` and cannot authenticate to a proxy per-lookup. ADR 0126 declares that out of scope **by name**, and the item's own trigger (a site mandating all outbound HTTP traverse a corporate proxy) is served by the site-wide default — so this is a bounded, ratified edge, not an unbuilt half. _(was 🔢 DEMAND-GATE · Value 5/10 · Difficulty 3/10.)_
 
@@ -3349,7 +3349,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 117. Sender no-wait-for-ACK (fire-and-forward) option
 
-> ✅ **SHIPPED — merged 2026-07-24 (PR #1220); verified against `origin/main` (2026-07-28).** The opt-in per-outbound MLLP toggle is built: `self.no_ack` at `messagefoundry/transports/mllp.py:620` — default `False` = today's ACK-waiting behaviour, byte-identical; when on, `send()` frames, writes, drains and finalizes on the TCP write, reading no ACK (*at-most-once-confirmation*: no NAK-/timeout-driven retry). [ADR 0124](adr/0124-outbound-mllp-fire-and-forward-no-wait-for-ack-delivery-on-write.md) **is on `main`**, with its index row at `docs/adr/README.md:151`. The build constraints above were met, and the interaction with #82 is **guarded, not merely documented**: `messagefoundry/config/wiring.py:3388-3405` raises a `WiringError` at `check`/dry-run time for `no_ack` on a non-MLLP outbound, for `no_ack` + `capture_response`/`reingress_to`, and for `no_ack` + `verify_ack_control_id` (no ACK is read, so there is no MSA-2 to correlate) — pinned by `tests/test_no_ack_wiring.py:47-60`. _(was 🔢 DEMAND-GATE · Value 3/10 · Difficulty 3/10.)_
+> ✅ **SHIPPED — merged 2026-07-24 (PR #1220); verified against `origin/main` (2026-07-28).** The opt-in per-outbound MLLP toggle is built: `self.no_ack` at `messagefoundry/transports/mllp.py:620` — default `False` = today's ACK-waiting behaviour, byte-identical; when on, `send()` frames, writes, drains and finalizes on the TCP write, reading no ACK (*at-most-once-confirmation*: no NAK-/timeout-driven retry). [ADR 0124](../../adr/0124-outbound-mllp-fire-and-forward-no-wait-for-ack-delivery-on-write.md) **is on `main`**, with its index row at `docs/adr/README.md:151`. The build constraints above were met, and the interaction with #82 is **guarded, not merely documented**: `messagefoundry/config/wiring.py:3388-3405` raises a `WiringError` at `check`/dry-run time for `no_ack` on a non-MLLP outbound, for `no_ack` + `capture_response`/`reingress_to`, and for `no_ack` + `verify_ack_control_id` (no ACK is read, so there is no MSA-2 to correlate) — pinned by `tests/test_no_ack_wiring.py:47-60`. _(was 🔢 DEMAND-GATE · Value 3/10 · Difficulty 3/10.)_
 
 > 🛠 **Decline overturned (2026-07-09) — historical.** A prioritization pass recommended DECLINE; the stated reason was **invalid**. Purity binds `@router` / `@handler` — **not connectors** (CLAUDE.md §8: “side effects (DB, network) belong in connections/transports”). This was an unfired **demand-gate**, not an architectural impossibility — and it has since been built (see the banner above).
 >
@@ -3389,7 +3389,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 119. Nightly automatic application-log compression
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0137](adr/0137-time-boxed-retention-maintenance-pass-between-phase-cap.md) (2026-07-24 amendment). `messagefoundry/pipeline/retention.py:514-530` gzips application-log **files** older than `app_log_compress_days` **in place**, dispatched off the event loop via `asyncio.to_thread`, **free-space-prechecked and integrity-validated before the original is removed** — `_has_free_space` (`:788-813`) uses `shutil.disk_usage` with a `size + max(size//10, 1 MiB)` bar and **fails closed** on `OSError`. Entry point `_compress_app_logs` (`:705`).
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0137](../../adr/0137-time-boxed-retention-maintenance-pass-between-phase-cap.md) (2026-07-24 amendment). `messagefoundry/pipeline/retention.py:514-530` gzips application-log **files** older than `app_log_compress_days` **in place**, dispatched off the event loop via `asyncio.to_thread`, **free-space-prechecked and integrity-validated before the original is removed** — `_has_free_space` (`:788-813`) uses `shutil.disk_usage` with a `size + max(size//10, 1 MiB)` bar and **fails closed** on `OSError`. Entry point `_compress_app_logs` (`:705`).
 >
 > ⚠️ **Not a nightly clock.** Compression runs on the **retention-pass cadence** (`[retention].purge_interval_seconds`, default 3600 s), not on an off-peak daily pin analogous to `vacuum_at`; there is no `app_log_compress_at` knob. That is a superset of "nightly" in *frequency* but not in *placement* — an operator who specifically wants heavy compression confined to an off-peak hour does not have that dial, and would need a new item. _(was 🔢 DEMAND-GATE · Value 2/10 · Difficulty 3/10.)_
 
@@ -3427,7 +3427,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 121. Maximum log-maintenance task duration cap
 
-> ✅ **SHIPPED (mechanism) — verified against `origin/main` (2026-07-28).** [ADR 0137](adr/0137-time-boxed-retention-maintenance-pass-between-phase-cap.md). The between-phase duration cap is `messagefoundry/pipeline/retention.py:392-409` — `cap = s.max_pass_seconds`, a monotonic `pass_start` and a **latching** `_deadline_hit()` gating **every** phase (`:420`, `:427`, `:443`, `:459`, `:467`, `:481`, `:501`, `:511`, `:527`) and the maintenance block (`:530-552`). A cap-skipped phase leaves its marker unadvanced (`:536-543`, `:546-549`), so skipped work is retried next pass rather than silently lost.
+> ✅ **SHIPPED (mechanism) — verified against `origin/main` (2026-07-28).** [ADR 0137](../../adr/0137-time-boxed-retention-maintenance-pass-between-phase-cap.md). The between-phase duration cap is `messagefoundry/pipeline/retention.py:392-409` — `cap = s.max_pass_seconds`, a monotonic `pass_start` and a **latching** `_deadline_hit()` gating **every** phase (`:420`, `:427`, `:443`, `:459`, `:467`, `:481`, `:501`, `:511`, `:527`) and the maintenance block (`:530-552`). A cap-skipped phase leaves its marker unadvanced (`:536-543`, `:546-549`), so skipped work is retried next pass rather than silently lost.
 >
 > ⚠️ **The shipped default deviates from the item's ask, deliberately.** The Scope said "default four hours"; the build ships `max_pass_seconds = 0.0` (**OFF**) and *recommends* 14400 — an ADR 0137:79-83 decision to honour the `[retention]` keep/off convention so an upgrade stays byte-identical. The **mechanism is complete; only the default differs.** ⚠️ **The cap is soft** — checked between phases, so a single long-running phase can overrun it. ⚠️ `max_pass_seconds` is **missing from the `[retention]` table in `docs/CONFIGURATION.md`** (its sibling `app_log_compress_days` is documented) — a small doc gap. _(was 🔢 DEMAND-GATE · Value 2/10 · Difficulty 3/10.)_
 
@@ -3447,7 +3447,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 123. Resend a stored message to an ALTERNATE connection
 
-> ✅ **SHIPPED (2026-07-11, [ADR 0090](adr/0090-resend-a-stored-message-to-an-alternate-outbound-connection.md) Accepted).** The API/engine capability is built: `store.resend_to(...)` on all three backends (SQLite/Postgres/SQL Server) + an additive `resend_log(resend_key UNIQUE)` idempotency table, `engine.resend`, `POST /messages/{id}/resend` (new `Permission.MESSAGES_RESEND` step-up, cross-channel authorization to BOTH the origin's and the alternate outbound's channel, `message_resend` audit — never the body). Ships the retained transformed body (never re-runs the transform); one new `stage='outbound'` row on the origin at the alternate lane's TAIL; FIFO-safe under the second control-plane writer (SQLite process-lock, SQL Server #285 blocking claim, Postgres per-lane `pg_advisory_xact_lock` funnel); 409 on a retention-nulled source. Was re-scored 2026-07-10 → DEMAND-GATE (V6/D4, _quick win_); trigger fired (Corepoint cutover operator-parity). **Residual:** the **console/webconsole Resend UI** (a desired-if-clean follow-on — the API/engine capability is the #123 deliverable). **[#153](#153-edit-and-resend-a-stored-message) (edit-and-resend) has since SHIPPED on this seam ([ADR 0090](adr/0090-resend-a-stored-message-to-an-alternate-outbound-connection.md) §9), adding a web-console editor.**
+> ✅ **SHIPPED (2026-07-11, [ADR 0090](../../adr/0090-resend-a-stored-message-to-an-alternate-outbound-connection.md) Accepted).** The API/engine capability is built: `store.resend_to(...)` on all three backends (SQLite/Postgres/SQL Server) + an additive `resend_log(resend_key UNIQUE)` idempotency table, `engine.resend`, `POST /messages/{id}/resend` (new `Permission.MESSAGES_RESEND` step-up, cross-channel authorization to BOTH the origin's and the alternate outbound's channel, `message_resend` audit — never the body). Ships the retained transformed body (never re-runs the transform); one new `stage='outbound'` row on the origin at the alternate lane's TAIL; FIFO-safe under the second control-plane writer (SQLite process-lock, SQL Server #285 blocking claim, Postgres per-lane `pg_advisory_xact_lock` funnel); 409 on a retention-nulled source. Was re-scored 2026-07-10 → DEMAND-GATE (V6/D4, _quick win_); trigger fired (Corepoint cutover operator-parity). **Residual:** the **console/webconsole Resend UI** (a desired-if-clean follow-on — the API/engine capability is the #123 deliverable). **[#153](#153-edit-and-resend-a-stored-message) (edit-and-resend) has since SHIPPED on this seam ([ADR 0090](../../adr/0090-resend-a-stored-message-to-an-alternate-outbound-connection.md) §9), adding a web-console editor.**
 
 **Cluster:** Store / Operations. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -3465,7 +3465,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 126. Delete an uploaded data file from the server
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0134](adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md), **Accepted 2026-07-18**. `DELETE /uploads/{file_id}` (`messagefoundry/api/app.py:3890`) — docstring "destructive + irreversible" — behind `require_step_up(Permission.FILES_DELETE)` (`:3895`), calling `uploads.delete` (`:3901`, which unlinks **both** the blob and its metadata, `uploads.py:466-483`), writing an `upload.delete` audit row (`:3905`), and 503-ing when `uploads_dir` is unset (`:3609-3615`).
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0134](../../adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md), **Accepted 2026-07-18**. `DELETE /uploads/{file_id}` (`messagefoundry/api/app.py:3890`) — docstring "destructive + irreversible" — behind `require_step_up(Permission.FILES_DELETE)` (`:3895`), calling `uploads.delete` (`:3901`, which unlinks **both** the blob and its metadata, `uploads.py:466-483`), writing an `upload.delete` audit row (`:3905`), and 503-ing when `uploads_dir` is unset (`:3609-3615`).
 >
 > ⚠️ **Scope boundary:** this deletes only files uploaded through the **#125 uploaded-logs** subsystem — **not arbitrary server-side files**. The item's title, Scope and Trigger all bound the ask that way, so it matches; stated here so a future need to delete non-uploaded server files is filed as new work rather than assumed covered. Deletion is per-file (no bulk sweep). _(was 🔢 DEMAND-GATE · Value 2/10 · Difficulty 3/10.)_
 
@@ -3485,7 +3485,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 128. Bypass the forward proxy for local (intranet) requests
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0126](adr/0126-outbound-forward-egress-web-proxy-for-the-stdlib-http-family.md). `_proxy_bypasses` (`messagefoundry/transports/rest.py:550-568`) does NO_PROXY-style matching of a host against a per-connection bypass list: exact host, `.suffix`/`*.suffix`, `*`, port and trailing dot stripped, IPv6 literals matched intact (helper `_strip_proxy_host_port` at `:540-547` is IPv6-safe). A bypassed host gets **no proxy handler *and* no `Proxy-Authorization`** — byte-identical to no proxy at all (`ProxyConfig.for_host`, `:586-611`).
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0126](../../adr/0126-outbound-forward-egress-web-proxy-for-the-stdlib-http-family.md). `_proxy_bypasses` (`messagefoundry/transports/rest.py:550-568`) does NO_PROXY-style matching of a host against a per-connection bypass list: exact host, `.suffix`/`*.suffix`, `*`, port and trailing dot stripped, IPv6 literals matched intact (helper `_strip_proxy_host_port` at `:540-547` is IPv6-safe). A bypassed host gets **no proxy handler *and* no `Proxy-Authorization`** — byte-identical to no proxy at all (`ProxyConfig.for_host`, `:586-611`).
 >
 > ⚠️ **Evaluated per fixed destination host at construction, not per request.** That is correct for this engine — a connection's destination and token-endpoint hosts are fixed — and is reasoned explicitly at ADR 0126:68-76, but it is **not** request-time `NO_PROXY` evaluation; in `"default"` mode the system `no_proxy` is delegated to urllib instead. ⚠️ Direct test coverage is **REST-only**; SOAP/FHIR inherit the same helper without their own cases. _(was 🔢 DEMAND-GATE · Value 2/10 · Difficulty 2/10.)_
 
@@ -3527,7 +3527,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 >
 > **Build constraints:** see above
 
-> ✅ **BUILT (2026-07-10, [ADR 0082](adr/0082-outbound-batch-aggregation.md)).** Opt-in per-outbound `batch = { max_count, max_wait_ms }` (MLLP/HL7v2 only; rejected on a capturing/reingressing outbound). The delivery worker coalesces the lane's contiguous FIFO head-prefix — count-**or**-head-age trigger — into ONE `BHS`…`BTS` envelope (`parsing.encode_batch`, the encode-side inverse of `split_batch`) on a single send, then completes all N in **one** store transaction (`mark_batch_done` / `mark_batch_failed` / `dead_letter_batch`, atomic). **Invariants preserved:** strict per-lane FIFO (members are the oldest contiguous rows in seq order), at-least-once (every member INFLIGHT throughout → a crash recovers the whole set via `reset_stale_inflight`), and a re-run re-derives the **byte-identical** envelope (BHS-7 from the head's re-run-stable `created_at`, BHS-11 from the head member's control id — no clock). Runs **inside the pooled claim** (ADR 0066 decision #5 — no forced `per_lane`): the injected `_dispatch_delivery` routes a batching lane to the shared batch body with **zero** changes to the `StageDispatcher` state machine (the held slot spans the bounded `max_wait_ms` window). A permanent NAK dead-letters all N; a graceful stop flushes the partial. Verified on **SQLite + SQL Server** across all six ADR 0082 acceptance criteria (`tests/test_outbound_batch.py`, `test_batch_completion.py`, `test_batch_config.py`, `test_encode_batch.py`); adversarially verified (FIFO / at-least-once / determinism / atomicity).
+> ✅ **BUILT (2026-07-10, [ADR 0082](../../adr/0082-outbound-batch-aggregation.md)).** Opt-in per-outbound `batch = { max_count, max_wait_ms }` (MLLP/HL7v2 only; rejected on a capturing/reingressing outbound). The delivery worker coalesces the lane's contiguous FIFO head-prefix — count-**or**-head-age trigger — into ONE `BHS`…`BTS` envelope (`parsing.encode_batch`, the encode-side inverse of `split_batch`) on a single send, then completes all N in **one** store transaction (`mark_batch_done` / `mark_batch_failed` / `dead_letter_batch`, atomic). **Invariants preserved:** strict per-lane FIFO (members are the oldest contiguous rows in seq order), at-least-once (every member INFLIGHT throughout → a crash recovers the whole set via `reset_stale_inflight`), and a re-run re-derives the **byte-identical** envelope (BHS-7 from the head's re-run-stable `created_at`, BHS-11 from the head member's control id — no clock). Runs **inside the pooled claim** (ADR 0066 decision #5 — no forced `per_lane`): the injected `_dispatch_delivery` routes a batching lane to the shared batch body with **zero** changes to the `StageDispatcher` state machine (the held slot spans the bounded `max_wait_ms` window). A permanent NAK dead-letters all N; a graceful stop flushes the partial. Verified on **SQLite + SQL Server** across all six ADR 0082 acceptance criteria (`tests/test_outbound_batch.py`, `test_batch_completion.py`, `test_batch_config.py`, `test_encode_batch.py`); adversarially verified (FIFO / at-least-once / determinism / atomicity).
 
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
 
@@ -3547,7 +3547,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 136. 'Waiting for Reply' per-message connection state + display delay
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0065](adr/0065-web-ops-dashboard.md) amendment (2026-07-19). The cosmetic "Waiting for Reply" side-band marker plus its pre-display delay is `messagefoundry/transports/mllp.py:634-640` — explicitly **display-only**, with the delay independent of `timeout_seconds`/pacing. `waiting_for_reply(now)` (`:731-738`) returns True only once `waiting_display_delay` has elapsed, and the flag is stamped/cleared in a `finally` around the ACK read on **both** send paths — `_send_once` (`:843-849`) and `_send_persistent` (`:930-945`).
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0065](../../adr/0065-web-ops-dashboard.md) amendment (2026-07-19). The cosmetic "Waiting for Reply" side-band marker plus its pre-display delay is `messagefoundry/transports/mllp.py:634-640` — explicitly **display-only**, with the delay independent of `timeout_seconds`/pacing. `waiting_for_reply(now)` (`:731-738`) returns True only once `waiting_display_delay` has elapsed, and the flag is stamped/cleared in a `finally` around the ACK read on **both** send paths — `_send_once` (`:843-849`) and `_send_persistent` (`:930-945`).
 >
 > ⚠️ **MLLP-only.** The runner's probe is duck-typed, so REST/HTTP, DICOM C-STORE/C-ECHO and every other reply-waiting outbound report `False`. That matches the item's own Why (which scoped the gap to outbound MLLP's ACK wait), so it is a by-construction boundary rather than an unbuilt remainder — but extending it to other reply-waiting connectors would be **new work**. _(was 🔢 DEMAND-GATE · Value 2/10 · Difficulty 4/10.)_
 
@@ -3567,7 +3567,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 138. Customisable alert-email subject and body templates
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0127](adr/0127-operator-editable-alert-email-templates-with-a-non-phi-variable-allowlist.md). `_ALERT_TEMPLATE_VARS` (`messagefoundry/config/settings.py:2474-2490`) is a **closed, non-PHI variable allowlist** — severity / type / connection / timestamp / depth / oldest_age_seconds / cooldown_seconds / rule_id — a name-for-name match with the item's own Build-constraints list. `validate_alert_template` (`:2493-2521`) parses with `string.Formatter().parse` and **never** `str.format`, rejecting unknown names, attribute/index access and conversions.
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0127](../../adr/0127-operator-editable-alert-email-templates-with-a-non-phi-variable-allowlist.md). `_ALERT_TEMPLATE_VARS` (`messagefoundry/config/settings.py:2474-2490`) is a **closed, non-PHI variable allowlist** — severity / type / connection / timestamp / depth / oldest_age_seconds / cooldown_seconds / rule_id — a name-for-name match with the item's own Build-constraints list. `validate_alert_template` (`:2493-2521`) parses with `string.Formatter().parse` and **never** `str.format`, rejecting unknown names, attribute/index access and conversions.
 >
 > ⚠️ **The Scope's phrase "alert *and message* variables" is deliberately NOT delivered** — no message-derived variable is admitted. That is **required** by the item's own Build-constraints and PHI caveat ("NEVER raw message body or arbitrary HL7 fields … or be declined") and is recorded as safe-by-design in ADR 0127. It is a **satisfied constraint, not an outstanding half** — do not re-open it as a gap. _(was 🔢 DEMAND-GATE · Value 4/10 · Difficulty 3/10.)_
 
@@ -3579,7 +3579,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 **Why:** Real gap. Alert-email content is fixed by the internal `_subject()`/`_body()` helpers in alert_sinks.py (plain-text only, no interpolation knobs); operators can customize alert severity/routing/cooldown via `[alerts].rules` but cannot edit the notification subject or body or emit HTML.
 
-**PHI caveat:** MessageFoundry alert emails are deliberately fixed, **PHI-free metadata**. A template that interpolates message fields would carry PHI into e-mail, which CLAUDE.md §9 / [`PHI.md`](PHI.md) forbid at INFO+ and off-box. Any build must gate interpolation to non-PHI variables, or be declined.
+**PHI caveat:** MessageFoundry alert emails are deliberately fixed, **PHI-free metadata**. A template that interpolates message fields would carry PHI into e-mail, which CLAUDE.md §9 / [`PHI.md`](../../PHI.md) forbid at INFO+ and off-box. Any build must gate interpolation to non-PHI variables, or be declined.
 
 **Nearest existing mechanism:** The hardcoded `_subject()` and `_body()` helpers in messagefoundry/pipeline/alert_sinks.py (fixed "[MessageFoundry] SEVERITY type — connection" subject + a key:value dump body), plus `AlertRuleSet`/`AlertRule` in config/settings.py which lets operators tune severity, transport routing, and cooldown per event — but not the email subject or body text.
 
@@ -3603,7 +3603,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 **Why it is an anti-feature:** unconditionally trusting an SMTP server's certificate defeats TLS. The only escape (`MEFOR_ALLOW_INSECURE_TLS`) is global and deliberately loud. Recorded for parity completeness, not as a want.
 
-> ⚠️ **CORRECTED 2026-08-01, RESOLVED 2026-08-02.** This item once asserted "The engine's `EmailAlertSink` uses STARTTLS with a verifying context by design." That was **FALSE when written** — the shape [`CLAUDE.md`](../CLAUDE.md) §11 names as worst, *a compensating control resting on a false premise*: `smtplib.starttls()` with no context falls back to `ssl._create_stdlib_context`, which **is** `ssl._create_unverified_context` (`CERT_NONE`, `check_hostname=False`), so the sink encrypted without authenticating and a reader would have concluded alert email was TLS-verified when it was not. [#323](#323) layer 3 has now landed, so **the sentence is true for the first time** — verification is built, not assumed, and `tests/test_alert_smtp_tls.py` asserts it against a negative control. The standing instruction is therefore lifted, with one condition: state it as **built and tested**, never as "by design". ⚠️ **This item stays DECLINED.** #323 built *verification*; #139 asks for the **anti-feature** — unconditionally trusting any certificate. That capability now exists as `email_tls_verify = false`, but it is deliberately **not** the per-mail-server knob this item wanted: it is instance-wide, it is a named loosening, and on an enforcing PHI instance it refuses to start without `[security].allow_unverified_alert_smtp_tls`. If a partner ever mandates an unvalidatable relay, the answer is `email_tls_ca_file`, not this item.
+> ⚠️ **CORRECTED 2026-08-01, RESOLVED 2026-08-02.** This item once asserted "The engine's `EmailAlertSink` uses STARTTLS with a verifying context by design." That was **FALSE when written** — the shape [`CLAUDE.md`](../../../CLAUDE.md) §11 names as worst, *a compensating control resting on a false premise*: `smtplib.starttls()` with no context falls back to `ssl._create_stdlib_context`, which **is** `ssl._create_unverified_context` (`CERT_NONE`, `check_hostname=False`), so the sink encrypted without authenticating and a reader would have concluded alert email was TLS-verified when it was not. [#323](#323) layer 3 has now landed, so **the sentence is true for the first time** — verification is built, not assumed, and `tests/test_alert_smtp_tls.py` asserts it against a negative control. The standing instruction is therefore lifted, with one condition: state it as **built and tested**, never as "by design". ⚠️ **This item stays DECLINED.** #323 built *verification*; #139 asks for the **anti-feature** — unconditionally trusting any certificate. That capability now exists as `email_tls_verify = false`, but it is deliberately **not** the per-mail-server knob this item wanted: it is instance-wide, it is a named loosening, and on an enforcing PHI instance it refuses to start without `[security].allow_unverified_alert_smtp_tls`. If a partner ever mandates an unvalidatable relay, the answer is `email_tls_ca_file`, not this item.
 
 **Nearest existing mechanism (UPDATED 2026-08-02):** `EmailTransport` / `send_plain_email` in `pipeline/alert_sinks.py`. Its TLS knobs are now `email_use_tls` (STARTTLS vs cleartext), **`email_tls_verify`** (authenticate the relay — the keep-TLS-but-trust-any-cert override this item described, though instance-wide rather than per-server) and **`email_tls_ca_file`** (the preferred answer: trust the relay's own CA and keep verification on), gated by `[security].allow_unverified_alert_smtp_tls`. ⚠️ The old text here claimed the global `MEFOR_ALLOW_INSECURE_TLS` / `insecure_tls_allowed()` escape applied to this cell; it never did — measured, that escape is read in `alert_sinks.py` **only** on the webhook `http://` branch, so cleartext alert SMTP was gated by nothing at all until #323 layer 3's serve gate covered it.
 
@@ -3635,7 +3635,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 142. 'Leave source file' - process-in-place file/FTP source disposition
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0129](adr/0129-process-in-place-file-disposition-and-cross-backend-processed-file-dedup-ledger.md). `after_read='leave'` is a validated third disposition on the file source (`messagefoundry/transports/file.py:298-302`) and is honoured where the disposition is applied — `_after_processing` returns without moving or deleting the source (`:762-765`). It correctly relaxes the two write preconditions a read-only share cannot satisfy: the poll-directory write check (`:400`) and best-effort `.processed`/`.error` subdir creation (`:355`). The re-poll dedup it needs is the cross-backend ledger the banner said was missing: the `ProcessedFileLedger` protocol at `messagefoundry/transports/base.py:65` over a `processed_files` table (`:250`) implemented on **all three** store backends. _(was 🔢 DEMAND-GATE · Value 6/10 · Difficulty 6/10.)_
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0129](../../adr/0129-process-in-place-file-disposition-and-cross-backend-processed-file-dedup-ledger.md). `after_read='leave'` is a validated third disposition on the file source (`messagefoundry/transports/file.py:298-302`) and is honoured where the disposition is applied — `_after_processing` returns without moving or deleting the source (`:762-765`). It correctly relaxes the two write preconditions a read-only share cannot satisfy: the poll-directory write check (`:400`) and best-effort `.processed`/`.error` subdir creation (`:355`). The re-poll dedup it needs is the cross-backend ledger the banner said was missing: the `ProcessedFileLedger` protocol at `messagefoundry/transports/base.py:65` over a `processed_files` table (`:250`) implemented on **all three** store backends. _(was 🔢 DEMAND-GATE · Value 6/10 · Difficulty 6/10.)_
 
 **Cluster:** Connections & Transports. **Priority:** P2. **Verdict:** demand-gate. **Severity (vs Corepoint):** moderate.
 
@@ -3653,7 +3653,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 143. Alert suspend / mute (windowed)
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0044](adr/0044-operator-alert-state.md) amendment. The windowed mute is built as a deliberately **notification-only** gate (`messagefoundry/pipeline/alert_sinks.py:842`, cache at `:598`) — a suspended alert stays open, counted and visible, so muting never hides a live condition. Driven by `POST /alerts/{alert_id}/suspend` (`messagefoundry/api/app.py:2372`, returning the updated `AlertInstanceInfo`; surfaced at `:2300`), with the window persisted **durably** as `suspended_until` on all three store backends (`messagefoundry/store/store.py:603`, column `:1444`, migrated at `:3038`; plus `store/postgres.py` and `store/sqlserver.py`) — so it survives a restart rather than living in the notifier's memory. _(was 🔢 DEMAND-GATE · Value 6/10 · Difficulty 4/10.)_
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0044](../../adr/0044-operator-alert-state.md) amendment. The windowed mute is built as a deliberately **notification-only** gate (`messagefoundry/pipeline/alert_sinks.py:842`, cache at `:598`) — a suspended alert stays open, counted and visible, so muting never hides a live condition. Driven by `POST /alerts/{alert_id}/suspend` (`messagefoundry/api/app.py:2372`, returning the updated `AlertInstanceInfo`; surfaced at `:2300`), with the window persisted **durably** as `suspended_until` on all three store backends (`messagefoundry/store/store.py:603`, column `:1444`, migrated at `:3038`; plus `store/postgres.py` and `store/sqlserver.py`) — so it survives a restart rather than living in the notifier's memory. _(was 🔢 DEMAND-GATE · Value 6/10 · Difficulty 4/10.)_
 
 **Cluster:** Alerting. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** moderate.
 
@@ -3669,7 +3669,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 144. Alert-triggered connection-control action
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0128](adr/0128-alert-rule-connection-control-action-auto-stop-restart-on-fire.md). An alert rule may now carry a control action from a closed, validated vocabulary — `_ALERT_CONTROL_ACTIONS = frozenset({"restart_inbound", "restart_outbound"})` (`messagefoundry/config/settings.py:2472`, rejected at `:2666` if the rule names anything else) — dispatched **off-worker and never-raising**, and deliberately **before** the transport-suppression return, so a rule can auto-remediate *quietly* (`transports=[]`) or alongside a page (`messagefoundry/pipeline/alert_sinks.py:945-947`). ⚠️ **Half the item's title is deliberately NOT built:** a bare `stop` (and a bare `start`) is **declined by design** — the whitelist is exactly the two *warm-restart* primitives, because "a bare stop with no re-arm is an easy way to silently wedge a feed" (`0128:31-32`). Auto-*stop* is closed as declined, not pending. ⚠️ **The banner's *"notify-only"* characterisation is FALSE against `origin/main` and is retracted here.** _(was 🔢 DEMAND-GATE · Value 6/10 · Difficulty 3/10.)_
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0128](../../adr/0128-alert-rule-connection-control-action-auto-stop-restart-on-fire.md). An alert rule may now carry a control action from a closed, validated vocabulary — `_ALERT_CONTROL_ACTIONS = frozenset({"restart_inbound", "restart_outbound"})` (`messagefoundry/config/settings.py:2472`, rejected at `:2666` if the rule names anything else) — dispatched **off-worker and never-raising**, and deliberately **before** the transport-suppression return, so a rule can auto-remediate *quietly* (`transports=[]`) or alongside a page (`messagefoundry/pipeline/alert_sinks.py:945-947`). ⚠️ **Half the item's title is deliberately NOT built:** a bare `stop` (and a bare `start`) is **declined by design** — the whitelist is exactly the two *warm-restart* primitives, because "a bare stop with no re-arm is an easy way to silently wedge a feed" (`0128:31-32`). Auto-*stop* is closed as declined, not pending. ⚠️ **The banner's *"notify-only"* characterisation is FALSE against `origin/main` and is retracted here.** _(was 🔢 DEMAND-GATE · Value 6/10 · Difficulty 3/10.)_
 
 **Cluster:** Alerting. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** moderate.
 
@@ -3687,7 +3687,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 145. HA / DR failover event alert
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0014](adr/0014-alerting-rules-engine.md) amendment. Both transition edges are first-class alert events, not log lines: `leadership_acquired` / `leadership_lost` (`messagefoundry/pipeline/alert_sinks.py:800`, with `leadership_lost` registered as the **auto-resolving inverse** of `leadership_acquired` at `:101-103`, so a step-down/clean-release/self-fence closes the open alert instead of leaving it stuck), and `dr_activated` / `dr_released` emitted by the `DrCoordinator` at its real fire sites — `messagefoundry/pipeline/dr.py:281` (on promotion) and `:341` (on fail-back), through the `_alert_dr` helper at `:645`; the fail-back auto-resolves the open instance and deliberately pages nobody (`:340`). *(The same names on `messagefoundry/pipeline/alerts.py:215`/`:223` are the `AlertSink` **Protocol** stubs — the contract, not the emit sites.)* Payloads carry node / role / epoch only: cluster-topology facts, **no PHI**. ⚠️ **The banner's *"only log at INFO"* premise is FALSE against `origin/main` and is retracted here.** _(was 🔢 DEMAND-GATE · Value 6/10 · Difficulty 3/10.)_
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0014](../../adr/0014-alerting-rules-engine.md) amendment. Both transition edges are first-class alert events, not log lines: `leadership_acquired` / `leadership_lost` (`messagefoundry/pipeline/alert_sinks.py:800`, with `leadership_lost` registered as the **auto-resolving inverse** of `leadership_acquired` at `:101-103`, so a step-down/clean-release/self-fence closes the open alert instead of leaving it stuck), and `dr_activated` / `dr_released` emitted by the `DrCoordinator` at its real fire sites — `messagefoundry/pipeline/dr.py:281` (on promotion) and `:341` (on fail-back), through the `_alert_dr` helper at `:645`; the fail-back auto-resolves the open instance and deliberately pages nobody (`:340`). *(The same names on `messagefoundry/pipeline/alerts.py:215`/`:223` are the `AlertSink` **Protocol** stubs — the contract, not the emit sites.)* Payloads carry node / role / epoch only: cluster-topology facts, **no PHI**. ⚠️ **The banner's *"only log at INFO"* premise is FALSE against `origin/main` and is retracted here.** _(was 🔢 DEMAND-GATE · Value 6/10 · Difficulty 3/10.)_
 
 **Cluster:** Alerting. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** moderate.
 
@@ -3705,7 +3705,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 146. Per-rule alert recipients
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0014](adr/0014-alerting-rules-engine.md) amendment (2026-07-17). `recipients: list[str] | None = None` on `AlertRule` (`messagefoundry/config/settings.py:2586-2593`): `None` keeps the global `[alerts].email_to`; a non-empty list re-targets the email transport for events that rule matches (the Corepoint-parity routing the item asked for). It is an **internal routing key popped before any webhook payload**, and `_check_recipients` (`:2644-2660`) rejects empty/all-blank lists **fail-closed**.
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0014](../../adr/0014-alerting-rules-engine.md) amendment (2026-07-17). `recipients: list[str] | None = None` on `AlertRule` (`messagefoundry/config/settings.py:2586-2593`): `None` keeps the global `[alerts].email_to`; a non-empty list re-targets the email transport for events that rule matches (the Corepoint-parity routing the item asked for). It is an **internal routing key popped before any webhook payload**, and `_check_recipients` (`:2644-2660`) rejects empty/all-blank lists **fail-closed**.
 >
 > ⚠️ **Email-only by design:** a rule that sets `recipients` while routing solely to a webhook silently no-ops (a webhook has no recipient concept) — ADR 0014's amendment states this explicitly. ⚠️ **Configured addresses are never readable back through the API:** `GET /alerts/rules` reports only an integer `recipient_count`, for secret-guard parity — so the console cannot display who is targeted. _(was 🔢 DEMAND-GATE · Value 5/10 · Difficulty 2/10.)_
 
@@ -3723,7 +3723,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 147. Per-connection active-window scheduler
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md). `ActiveWindow` (`messagefoundry/config/models.py:278-346`, docstring citing BACKLOG #147) is a declarative `datetime.weekday()` day-set + local start/end + IANA timezone: same-day `[start,end)`, past-midnight wrap anchored on the start weekday, `start == end` rejected as ambiguous. `Schedule` (`:349-374`) adds an `invert` flag selecting availability vs **maintenance** windows, with `is_active(now_utc)` at `:369-374`; `schedule=None` is always-on and byte-identical (no task spawned). The runner reconciles up/down state through the **same** `start_inbound`/`stop_inbound` the API uses, so a park is a clean stop.
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0095](../../adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md). `ActiveWindow` (`messagefoundry/config/models.py:278-346`, docstring citing BACKLOG #147) is a declarative `datetime.weekday()` day-set + local start/end + IANA timezone: same-day `[start,end)`, past-midnight wrap anchored on the start weekday, `start == end` rejected as ambiguous. `Schedule` (`:349-374`) adds an `invert` flag selecting availability vs **maintenance** windows, with `is_active(now_utc)` at `:369-374`; `schedule=None` is always-on and byte-identical (no task spawned). The runner reconciles up/down state through the **same** `start_inbound`/`stop_inbound` the API uses, so a park is a clean stop.
 >
 > ⚠️ **The ledger was self-contradictory here:** the ranked-table row already read ✅ SHIPPED while this banner still said demand-gate — the table was right. ⚠️ **Genuine remainder, verified by grep:** `_start_schedulers` is called **only** from `start()` (`pipeline/wiring_runner.py:2274`) and **not** from the config-reload path — so a schedule added or edited by `/config/reload` does not take effect until the engine restarts. Worth a small follow-up item; it does not keep #147 open. _(was 🔢 DEMAND-GATE · Value 6/10 · Difficulty 4/10.)_
 
@@ -3747,7 +3747,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 >
 > **Build constraints:** 1) The full body must still be durably committed to the store (streamed to a store-backed/chunked BLOB) BEFORE the ACK, preserving ACK-on-receipt and count-and-log — the ACK simply waits until the stream is fully persisted; nothing accepted-and-dropped. 2) The stored body is the canonical re-run input so each stage handoff (ingress->routed->outbound) re-derives identically, keeping at-least-once safe. 3) Strict hl7apy validation stays whole-body/synchronous, so the streaming path targets content-types where…
 
-> ✅ **COMPLETE — Phase 0 substrate + Phase 1a ingress detach + Phase 1b delivery re-attach + Phase 3a retention decref + Phase 4 SS+PG parity + Phase 3b operator read/download surface ALL shipped (Phase 3b 2026-07-13, [ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md)). Streaming very-large HL7 attachments works on ALL THREE store backends WITH the operator read surface — go-live parity met (the production store is SQL Server).** Streaming a single very-large HL7 message (a base64 PDF in `OBX-5.5` past the 16 MiB cap) into Epic by **detaching the opaque document from the transformable skeleton**. **Phase 0** = the content-addressed, chunked, per-chunk-`mfenc`-sealed **attachment substrate** (`attachment`/`attachment_chunk` tables + `put_attachment`/`read_attachment`/`attachment_incref`/`attachment_decref`/`sweep_orphan_attachments`, generalizing the `shared_body` refcount+GC; startup orphan/incomplete sweep so no PHI chunk is left at rest; key-rotation re-seals chunks; `supports_streaming_attachments` capability flag — SQLite True, SS/PG raise) + the `mfdoc:v1:ref:` live document-handle helpers in `parsing/binary.py`. **Phase 1a** = the **ingress wiring**: a per-inbound `stream_threshold_bytes` opt-in detaches each oversized OBX-5 ED document **verbatim** into the substrate before the ingress commit (`iter_obx_documents`/`chunk_b64` + the parsed-model replace), replaces it with a `mfdoc:v1:ref:` handle, and `enqueue_ingress` increfs the attachment **in the same transaction** as the skeleton row (the two-object commit) so the ACK fires only after the document is durable; a header NAK still fires synchronously before any commit; strict validation downgrades to header-only over threshold; the per-connection `max_message_bytes` OOM guard + the aggregate `[inbound].stream_inflight_budget_bytes` DoS budget replace the frame-cap-as-only-guard; below-/no-threshold is byte-identical. **Owner rulings:** inline MLLP MDM delivery (no FHIR-Binary), pure pass-through (doc-mutating transforms a non-goal), store the `OBX-5.5` value **verbatim** (Approach B), 3-backend parity before go-live. **SQLite-only.** **Phase 1b** = the **delivery wiring** completing the round-trip: the pure `reattach_documents_in_hl7(text, reader)` (injected async reader) splices the stored **verbatim** base64 back into `OBX-5.5` byte-for-byte at the terminal egress, hydrated by `RegistryRunner._hydrate_payload` before `connector.send` on both the single-item and batch paths; a no-handle payload short-circuits to a byte-identical passthrough (single substring check, no store read), and hydration is **fail-loud** (a missing/GC'd attachment → retryable `DeliveryError`, so the connector **never** receives a raw `mfdoc:v1:ref:` handle = no silent corruption) and a **pure read** (never decref → retry-idempotent + fan-out-safe). The outbound MLLP send is **uncapped** so the large hydrated MDM (shape A) and a Handler-built large MDM (shape B) stream inline; `max_frame_bytes` bounds only the ACK read. Worked end-to-end samples: `samples/config/IB_STREAM_MDM.py` (detach→hydrate round-trip) + `samples/config/IB_PDF_TO_MDM.py` (PDF→base64→MDM). **Phase 3a** = the **message→attachment linkage + retention decref** (SQLite): a `message_attachment(message_id, attachment_id)` join table persists which attachments a message holds (inserted **atomically with the ingress incref** in `enqueue_ingress`), and `purge_message_bodies` **decrefs each referenced attachment + deletes its join rows in the body-purge transaction** — ordered so a crash-re-run is a no-op (a re-run finds the join rows gone → no double-decref, no refcount underflow, no premature GC of a **shared** attachment a sibling message still references). Delivery stays a pure read (fan-out decrefs **once** at purge, never per-delivery); below-/no-attachment retention is byte-identical. This **closes the over-retention gap** — a purged-but-referenced document is now reclaimed at its last referrer instead of over-retaining PHI at rest. **Phase 4** = **SQL Server + Postgres substrate parity** (the go-live gate — the production store is SQL Server): the whole Phase-0→3a substrate (the `attachment`/`attachment_chunk`/`message_attachment` schema, `put_attachment`/`read_attachment`/`attachment_incref`/`attachment_decref`/`sweep_orphan_attachments`, the ingress two-object commit, the retention decref + dead-row split across `purge_message_bodies`/`purge_dead_letters`, and the key-rotation re-seal) is implemented on both server backends at **byte-for-byte behavioral parity** with the SQLite reference — dialect (SS `NVARCHAR(MAX)`/`CASE`-clamp vs PG `TEXT`/`GREATEST`, `?` vs `$N` placeholders) and each backend's transaction model adapted only, the SQLite implementation itself untouched — with `supports_streaming_attachments` flipped **True** so the startup orphan sweep + ingress detach now run on all three, and SS/PG parity tests (`test_sqlserver_store.py`/`test_postgres_store.py`) on the CI legs covering the same round-trip/dedup/refcount/ingress-rollback/purge-idempotence/dead-row-split/fan-out/seal/reseal assertions as the SQLite suite. **Streaming now works identically on SQLite + SQL Server + Postgres — go-live parity met.** **Phase 3b** = the **operator read/download surface**: a store `attachments_for(message_id)` read method (metadata-only `message_attachment` JOIN `attachment`, all three backends), an additive `MessageDetail.attachments` list (`id`/`content_type`/`total_bytes`, populated by `get_message`), and an audited, `MESSAGES_VIEW_RAW`-gated `GET /messages/{id}/attachments/{attachment_id}` download that reconstructs the verbatim base64 and **base64-decodes once** to the original document bytes (byte-for-byte round-trip) — behind the SAME channel-scope **404-not-403** guard as `get_message` **plus** a `(message_id, attachment_id)` **linkage existence** check (content-addressing shares one blob across messages/tenants, so the linkage is what scopes access — a guessed content address unlinked to an in-scope message is a 404), a **validated** `Content-Type` (attacker-influenced OBX-5.2 label defaulted to `application/octet-stream` — no header injection), and a `record_view` + tamper-evident `attachment_download` audit **before the bytes leave** (bytes/base64 never logged). The **web console** message-detail view renders an Attachments panel (content type + human size + a Download link to a `/ui` route that reuses the engine's audited handler in-process — a browser GET carries the session cookie, not the bearer). Reuses `MESSAGES_VIEW_RAW` (a detached document is the same PHI as the raw body — no new permission); API + web console only (the PySide6 desktop console is deprecated — no new surface). Seam bumped to v4. **#149 COMPLETE** (streaming very-large HL7 attachments — all three backends + operator read surface).
+> ✅ **COMPLETE — Phase 0 substrate + Phase 1a ingress detach + Phase 1b delivery re-attach + Phase 3a retention decref + Phase 4 SS+PG parity + Phase 3b operator read/download surface ALL shipped (Phase 3b 2026-07-13, [ADR 0105](../../adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md)). Streaming very-large HL7 attachments works on ALL THREE store backends WITH the operator read surface — go-live parity met (the production store is SQL Server).** Streaming a single very-large HL7 message (a base64 PDF in `OBX-5.5` past the 16 MiB cap) into Epic by **detaching the opaque document from the transformable skeleton**. **Phase 0** = the content-addressed, chunked, per-chunk-`mfenc`-sealed **attachment substrate** (`attachment`/`attachment_chunk` tables + `put_attachment`/`read_attachment`/`attachment_incref`/`attachment_decref`/`sweep_orphan_attachments`, generalizing the `shared_body` refcount+GC; startup orphan/incomplete sweep so no PHI chunk is left at rest; key-rotation re-seals chunks; `supports_streaming_attachments` capability flag — SQLite True, SS/PG raise) + the `mfdoc:v1:ref:` live document-handle helpers in `parsing/binary.py`. **Phase 1a** = the **ingress wiring**: a per-inbound `stream_threshold_bytes` opt-in detaches each oversized OBX-5 ED document **verbatim** into the substrate before the ingress commit (`iter_obx_documents`/`chunk_b64` + the parsed-model replace), replaces it with a `mfdoc:v1:ref:` handle, and `enqueue_ingress` increfs the attachment **in the same transaction** as the skeleton row (the two-object commit) so the ACK fires only after the document is durable; a header NAK still fires synchronously before any commit; strict validation downgrades to header-only over threshold; the per-connection `max_message_bytes` OOM guard + the aggregate `[inbound].stream_inflight_budget_bytes` DoS budget replace the frame-cap-as-only-guard; below-/no-threshold is byte-identical. **Owner rulings:** inline MLLP MDM delivery (no FHIR-Binary), pure pass-through (doc-mutating transforms a non-goal), store the `OBX-5.5` value **verbatim** (Approach B), 3-backend parity before go-live. **SQLite-only.** **Phase 1b** = the **delivery wiring** completing the round-trip: the pure `reattach_documents_in_hl7(text, reader)` (injected async reader) splices the stored **verbatim** base64 back into `OBX-5.5` byte-for-byte at the terminal egress, hydrated by `RegistryRunner._hydrate_payload` before `connector.send` on both the single-item and batch paths; a no-handle payload short-circuits to a byte-identical passthrough (single substring check, no store read), and hydration is **fail-loud** (a missing/GC'd attachment → retryable `DeliveryError`, so the connector **never** receives a raw `mfdoc:v1:ref:` handle = no silent corruption) and a **pure read** (never decref → retry-idempotent + fan-out-safe). The outbound MLLP send is **uncapped** so the large hydrated MDM (shape A) and a Handler-built large MDM (shape B) stream inline; `max_frame_bytes` bounds only the ACK read. Worked end-to-end samples: `samples/config/IB_STREAM_MDM.py` (detach→hydrate round-trip) + `samples/config/IB_PDF_TO_MDM.py` (PDF→base64→MDM). **Phase 3a** = the **message→attachment linkage + retention decref** (SQLite): a `message_attachment(message_id, attachment_id)` join table persists which attachments a message holds (inserted **atomically with the ingress incref** in `enqueue_ingress`), and `purge_message_bodies` **decrefs each referenced attachment + deletes its join rows in the body-purge transaction** — ordered so a crash-re-run is a no-op (a re-run finds the join rows gone → no double-decref, no refcount underflow, no premature GC of a **shared** attachment a sibling message still references). Delivery stays a pure read (fan-out decrefs **once** at purge, never per-delivery); below-/no-attachment retention is byte-identical. This **closes the over-retention gap** — a purged-but-referenced document is now reclaimed at its last referrer instead of over-retaining PHI at rest. **Phase 4** = **SQL Server + Postgres substrate parity** (the go-live gate — the production store is SQL Server): the whole Phase-0→3a substrate (the `attachment`/`attachment_chunk`/`message_attachment` schema, `put_attachment`/`read_attachment`/`attachment_incref`/`attachment_decref`/`sweep_orphan_attachments`, the ingress two-object commit, the retention decref + dead-row split across `purge_message_bodies`/`purge_dead_letters`, and the key-rotation re-seal) is implemented on both server backends at **byte-for-byte behavioral parity** with the SQLite reference — dialect (SS `NVARCHAR(MAX)`/`CASE`-clamp vs PG `TEXT`/`GREATEST`, `?` vs `$N` placeholders) and each backend's transaction model adapted only, the SQLite implementation itself untouched — with `supports_streaming_attachments` flipped **True** so the startup orphan sweep + ingress detach now run on all three, and SS/PG parity tests (`test_sqlserver_store.py`/`test_postgres_store.py`) on the CI legs covering the same round-trip/dedup/refcount/ingress-rollback/purge-idempotence/dead-row-split/fan-out/seal/reseal assertions as the SQLite suite. **Streaming now works identically on SQLite + SQL Server + Postgres — go-live parity met.** **Phase 3b** = the **operator read/download surface**: a store `attachments_for(message_id)` read method (metadata-only `message_attachment` JOIN `attachment`, all three backends), an additive `MessageDetail.attachments` list (`id`/`content_type`/`total_bytes`, populated by `get_message`), and an audited, `MESSAGES_VIEW_RAW`-gated `GET /messages/{id}/attachments/{attachment_id}` download that reconstructs the verbatim base64 and **base64-decodes once** to the original document bytes (byte-for-byte round-trip) — behind the SAME channel-scope **404-not-403** guard as `get_message` **plus** a `(message_id, attachment_id)` **linkage existence** check (content-addressing shares one blob across messages/tenants, so the linkage is what scopes access — a guessed content address unlinked to an in-scope message is a 404), a **validated** `Content-Type` (attacker-influenced OBX-5.2 label defaulted to `application/octet-stream` — no header injection), and a `record_view` + tamper-evident `attachment_download` audit **before the bytes leave** (bytes/base64 never logged). The **web console** message-detail view renders an Attachments panel (content type + human size + a Download link to a `/ui` route that reuses the engine's audited handler in-process — a browser GET carries the session cookie, not the bearer). Reuses `MESSAGES_VIEW_RAW` (a detached document is the same PHI as the raw body — no new permission); API + web console only (the PySide6 desktop console is deprecated — no new surface). Seam bumped to v4. **#149 COMPLETE** (streaming very-large HL7 attachments — all three backends + operator read surface).
 
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
 
@@ -3767,7 +3767,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 150. User-writable per-message metadata bag
 
-> ✅ **BUILT (2026-07-10, [ADR 0081](adr/0081-per-message-metadata-bag.md)).** A Handler returns `SetMeta(key, value)` (a declarative op alongside `Send`/`SetState`, ADR 0005 template); it is merged under the row's `metadata.user` sub-key **inside** the exactly-once `transform_handoff` transaction — no separate write, idempotent on a crash re-run, and it never clobbers the ADR 0013 correlation lineage sharing the `messages.metadata` column. Values are `str`, capped ≤32 keys / ≤4 KiB per message (over-cap dead-letters). The bag surfaces **read-only** and PHI-redacted on `MessageSummary.metadata` (internal lineage keys stripped — this also closed a pre-existing lineage-leak on that field); there is no write route. Merge is verified byte-for-byte on **all three store backends** (SQLite, SQL Server incl. the fused B5 sync path, Postgres) — `tests/test_metadata_bag.py` + `tests/test_sqlserver_sync_handoff.py::test_transform_handoff_sync_merges_setmeta`. All five ADR 0081 acceptance criteria met. _Follow-up (not in the ratified spec): server-side search-by-metadata-key filtering + console Log-Search columns._
+> ✅ **BUILT (2026-07-10, [ADR 0081](../../adr/0081-per-message-metadata-bag.md)).** A Handler returns `SetMeta(key, value)` (a declarative op alongside `Send`/`SetState`, ADR 0005 template); it is merged under the row's `metadata.user` sub-key **inside** the exactly-once `transform_handoff` transaction — no separate write, idempotent on a crash re-run, and it never clobbers the ADR 0013 correlation lineage sharing the `messages.metadata` column. Values are `str`, capped ≤32 keys / ≤4 KiB per message (over-cap dead-letters). The bag surfaces **read-only** and PHI-redacted on `MessageSummary.metadata` (internal lineage keys stripped — this also closed a pre-existing lineage-leak on that field); there is no write route. Merge is verified byte-for-byte on **all three store backends** (SQLite, SQL Server incl. the fused B5 sync path, Postgres) — `tests/test_metadata_bag.py` + `tests/test_sqlserver_sync_handoff.py::test_transform_handoff_sync_merges_setmeta`. All five ADR 0081 acceptance criteria met. _Follow-up (not in the ratified spec): server-side search-by-metadata-key filtering + console Log-Search columns._
 
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
 
@@ -3787,7 +3787,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 151. Saved / layered Log-Search filter presets
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0136](adr/0136-per-user-saved-and-layered-log-search-filter-presets-extends-the-adr-0046-search-seam.md). Saved presets: `GET /search/presets` (`messagefoundry/api/app.py:3917`), `POST /search/presets` (`:3945`, step-up, create-or-replace). Layering is `_compose_preset_layers` (`:782-830`), AND-composing up to `_MAX_PRESET_LAYERS = 8` (`:314-316`).
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0136](../../adr/0136-per-user-saved-and-layered-log-search-filter-presets-extends-the-adr-0046-search-seam.md). Saved presets: `GET /search/presets` (`messagefoundry/api/app.py:3917`), `POST /search/presets` (`:3945`, step-up, create-or-replace). Layering is `_compose_preset_layers` (`:782-830`), AND-composing up to `_MAX_PRESET_LAYERS = 8` (`:314-316`).
 >
 > ⚠️ **Layering is a bounded AND-compose, not free boolean composition:** metadata scalars take the first non-empty value and a conflicting second is a **400**; **exactly one** preset across the layer set may carry a content predicate (0 or >1 → 400); capped at 8 layers. That sits within the item's Scope wording ("layer several into a single combined filter") but is narrower than arbitrary boolean logic — say so rather than implying a general query builder. _(was 🔢 DEMAND-GATE · Value 5/10 · Difficulty 5/10.)_
 
@@ -3827,7 +3827,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 153. Edit-and-resend a stored message
 
-> ✅ **SHIPPED (2026-07-11, [ADR 0090](adr/0090-resend-a-stored-message-to-an-alternate-outbound-connection.md) §9 amendment, Accepted).** Stacked on #123's resend seam. **The editable copy is client-side + ephemeral** (no stored edited-PHI draft); **Resubmit re-routes by default** — the edited raw re-enters on the ORIGINAL channel as a fresh `RECEIVED`, correlated child and flows the normal router→transform→outbound pipeline (`store.reingress` on all 3 backends) — with an **optional direct power-path** to a chosen outbound (`store.resend_to(body_override=...)`). **The original stays byte-identical** (only read, never written; count-and-log). **Idempotent re-ingress** fixes the `enqueue_ingress` uuid4/no-dedup double-deliver: the key is claimed in `resend_log` first (bound to `(origin, "@reingress:<channel>")`) + a content-addressed child id, so a retry delivers exactly once. `POST /messages/{id}/edit-resend` (`{raw, idempotency_key, reroute, to?}`, new `Permission.MESSAGES_EDIT` step-up implying `messages:view_raw`, `message_edit_resend` audit — never the body); a PHI-safe `RequestValidationError` handler strips the offending value from a 422 so a malformed edited body never leaks. Web console: message-detail **"Edit & resubmit →"** → an editor page with an editable **copy**, a **"Modified"** badge, **Revert**, and **Resubmit** (the original detail view is untouched). **Residuals:** the **PySide6 desktop-console editor** (desired-if-clean; web console is the deliverable) + browser-textarea newline normalization (re-parsed tolerantly). 3-backend Postgres/SQL Server parity + the offscreen-Qt console + TS/ide legs are **CI-gated**. _(was P1 · V4/5 · D3/5; re-scored 2026-07-10 → DEMAND-GATE V6/D4; trigger fired — Corepoint cutover operator-parity.)_
+> ✅ **SHIPPED (2026-07-11, [ADR 0090](../../adr/0090-resend-a-stored-message-to-an-alternate-outbound-connection.md) §9 amendment, Accepted).** Stacked on #123's resend seam. **The editable copy is client-side + ephemeral** (no stored edited-PHI draft); **Resubmit re-routes by default** — the edited raw re-enters on the ORIGINAL channel as a fresh `RECEIVED`, correlated child and flows the normal router→transform→outbound pipeline (`store.reingress` on all 3 backends) — with an **optional direct power-path** to a chosen outbound (`store.resend_to(body_override=...)`). **The original stays byte-identical** (only read, never written; count-and-log). **Idempotent re-ingress** fixes the `enqueue_ingress` uuid4/no-dedup double-deliver: the key is claimed in `resend_log` first (bound to `(origin, "@reingress:<channel>")`) + a content-addressed child id, so a retry delivers exactly once. `POST /messages/{id}/edit-resend` (`{raw, idempotency_key, reroute, to?}`, new `Permission.MESSAGES_EDIT` step-up implying `messages:view_raw`, `message_edit_resend` audit — never the body); a PHI-safe `RequestValidationError` handler strips the offending value from a 422 so a malformed edited body never leaks. Web console: message-detail **"Edit & resubmit →"** → an editor page with an editable **copy**, a **"Modified"** badge, **Revert**, and **Resubmit** (the original detail view is untouched). **Residuals:** the **PySide6 desktop-console editor** (desired-if-clean; web console is the deliverable) + browser-textarea newline normalization (re-parsed tolerantly). 3-backend Postgres/SQL Server parity + the offscreen-Qt console + TS/ide legs are **CI-gated**. _(was P1 · V4/5 · D3/5; re-scored 2026-07-10 → DEMAND-GATE V6/D4; trigger fired — Corepoint cutover operator-parity.)_
 
 **Cluster:** Store / Operations. **Priority:** P3. **Verdict:** ✅ shipped. **Severity (vs Corepoint):** moderate.
 
@@ -3843,7 +3843,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 154. HTTP response-header capture on delivery response
 
-> ✅ **SHIPPED (2026-07-12).** A per-connection **allow-list** of HTTP response header names (`capture_response_headers` on `Rest()`/`FHIR()`/`Soap()`) is captured from a capturing reply into `DeliveryResponse.headers` ([ADR 0013 amendment 2026-07-12](adr/0013-query-response-orchestration.md)) — **only the allow-listed names**, never all headers (PHI gate: a partner reply header may carry sensitive data). The captured map JSON-encodes into a new nullable **`resp_headers`** column on the `response` table across all 3 backends (SQLite/Postgres/SQL Server — schema + idempotent add-column migration), **encrypted at rest** and **rekey/retention-covered** exactly like `detail`, and surfaces through `correlate_response` as `CapturedResponse.headers`. A re-ingressed answer's Handler reads them via the shipped **`response_get(dest).headers`** seam (no new reader — the response_view already flows to the loopback Handler in both the normal and fused paths). Default (no allow-list) is **byte-identical** (`headers == {}`, column `NULL`). Captured headers are documented as a **captured external value** (like the `fhir_lookup` read-only carve-out) — deterministic per reply, so re-ingress stays re-run-stable from the immutable stored copy. Tests: `tests/test_response_headers_capture.py`. _(was 🔢 DEMAND-GATE · Value 7/10 · Difficulty 4/10.)_
+> ✅ **SHIPPED (2026-07-12).** A per-connection **allow-list** of HTTP response header names (`capture_response_headers` on `Rest()`/`FHIR()`/`Soap()`) is captured from a capturing reply into `DeliveryResponse.headers` ([ADR 0013 amendment 2026-07-12](../../adr/0013-query-response-orchestration.md)) — **only the allow-listed names**, never all headers (PHI gate: a partner reply header may carry sensitive data). The captured map JSON-encodes into a new nullable **`resp_headers`** column on the `response` table across all 3 backends (SQLite/Postgres/SQL Server — schema + idempotent add-column migration), **encrypted at rest** and **rekey/retention-covered** exactly like `detail`, and surfaces through `correlate_response` as `CapturedResponse.headers`. A re-ingressed answer's Handler reads them via the shipped **`response_get(dest).headers`** seam (no new reader — the response_view already flows to the loopback Handler in both the normal and fused paths). Default (no allow-list) is **byte-identical** (`headers == {}`, column `NULL`). Captured headers are documented as a **captured external value** (like the `fhir_lookup` read-only carve-out) — deterministic per reply, so re-ingress stays re-run-stable from the immutable stored copy. Tests: `tests/test_response_headers_capture.py`. _(was 🔢 DEMAND-GATE · Value 7/10 · Difficulty 4/10.)_
 
 **Cluster:** Web Services & HTTP. **Priority:** P3. **Verdict:** shipped. **Severity (vs Corepoint):** moderate.
 
@@ -3861,7 +3861,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 > ⛔ **DECLINED — owner ruling 2026-07-24** (*"if it is Direct, then close it"*). Zero live feed, declining relevance, and the remainder is a multi-component HISP + XDR subsystem needing new dependencies and its own ADR — not breadth worth carrying.
 >
-> ⚠️ **This decline is NOT a removal instruction. Do NOT delete `messagefoundry/transports/direct.py`; the outbound S/MIME half ships and stays.** That module is a working Direct-Project **S/MIME-over-SMTP destination** ([ADR 0085](adr/0085-direct-hisp-smime-connector.md), PR1, outbound only — it signs/encrypts the clinical payload as an S/MIME message independent of transport TLS and submits it over STARTTLS SMTP off the event loop; `messagefoundry/transports/direct.py:3-15`). What is declined is the *rest* of the connector — the inbound half, HISP integration and XDR. Reading this ⛔ as "rip out Direct" would delete shipped, working code. _(was 🔢 P3 · Value 3/10 · Difficulty 7/10.)_
+> ⚠️ **This decline is NOT a removal instruction. Do NOT delete `messagefoundry/transports/direct.py`; the outbound S/MIME half ships and stays.** That module is a working Direct-Project **S/MIME-over-SMTP destination** ([ADR 0085](../../adr/0085-direct-hisp-smime-connector.md), PR1, outbound only — it signs/encrypts the clinical payload as an S/MIME message independent of transport TLS and submits it over STARTTLS SMTP off the event loop; `messagefoundry/transports/direct.py:3-15`). What is declined is the *rest* of the connector — the inbound half, HISP integration and XDR. Reading this ⛔ as "rip out Direct" would delete shipped, working code. _(was 🔢 P3 · Value 3/10 · Difficulty 7/10.)_
 
 **Cluster:** Connections & Transports. **Priority:** P3. **Verdict:** **owner go/no-go**. **Severity (vs Corepoint):** minor.
 
@@ -3869,7 +3869,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 **Trigger:** build when an adopter has a live Direct or XDR HIE / referral-CCD feed to migrate off Corepoint.
 
-**Partial build (PLAN-9 Wave 3, 2026-07-10 — branch `plan9-directhisp`):** **PR1 — outbound S/MIME-over-SMTP — is BUILT** ([ADR 0085](adr/0085-direct-hisp-smime-connector.md)): a new `ConnectorType.DIRECT` + `DirectDestination` that **SIGNs then ENCRYPTs** the Handler body via core `cryptography` `serialization.pkcs7` (**no new dependency** — `endesive` rejected, `dnspython` deferred) and submits `application/pkcs7-mime; smime-type=enveloped-data` over the reused EMAIL STARTTLS / `refuse_cleartext_credentials` posture; signing key+cert / per-partner recipient cert / trust anchor cross-validated at construction (fail-loud); a fail-closed `[egress].allowed_direct` host gate kept separate from `allowed_smtp`. **Item stays OPEN** (demand-gated) — the inbound Direct mail source + MDN + DNS-CERT/LDAP discovery + IHE XDR/XDM are **deferred later phases** (ADR 0085), to be built when a live Direct/XDR feed triggers.
+**Partial build (PLAN-9 Wave 3, 2026-07-10 — branch `plan9-directhisp`):** **PR1 — outbound S/MIME-over-SMTP — is BUILT** ([ADR 0085](../../adr/0085-direct-hisp-smime-connector.md)): a new `ConnectorType.DIRECT` + `DirectDestination` that **SIGNs then ENCRYPTs** the Handler body via core `cryptography` `serialization.pkcs7` (**no new dependency** — `endesive` rejected, `dnspython` deferred) and submits `application/pkcs7-mime; smime-type=enveloped-data` over the reused EMAIL STARTTLS / `refuse_cleartext_credentials` posture; signing key+cert / per-partner recipient cert / trust anchor cross-validated at construction (fail-loud); a fail-closed `[egress].allowed_direct` host gate kept separate from `allowed_smtp`. **Item stays OPEN** (demand-gated) — the inbound Direct mail source + MDN + DNS-CERT/LDAP discovery + IHE XDR/XDM are **deferred later phases** (ADR 0085), to be built when a live Direct/XDR feed triggers.
 
 **Why:** Partial. The plain-SMTP EmailDestination (ADR 0029) delivers over STARTTLS only and the generic SOAP client exists, but neither implements S/MIME message-level security, HISP trust bundles, cert discovery, MDN, an inbound mail path, or IHE XDR/XDM packaging.
 
@@ -3883,7 +3883,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 160. Timer-source cron / calendar schedule
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0011](adr/0011-timer-scheduled-source.md) amendment (2026-07-17). `_CronSchedule` (`messagefoundry/transports/timer.py:48-56`) is a **pure, stdlib-only 5-field cron next-fire evaluator**: `*`, lists, ranges and steps; Sunday as 0 **or** 7; and the Vixie OR rule when both DOM and DOW are restricted. `parse` (`:80-110`) takes exactly 5 fields and **fails loud** on an unsatisfiable expression via a horizon check; `matches` (`:112-124`); `next_after` (`:126-141`) is strictly future and timezone-preserving.
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0011](../../adr/0011-timer-scheduled-source.md) amendment (2026-07-17). `_CronSchedule` (`messagefoundry/transports/timer.py:48-56`) is a **pure, stdlib-only 5-field cron next-fire evaluator**: `*`, lists, ranges and steps; Sunday as 0 **or** 7; and the Vixie OR rule when both DOM and DOW are restricted. `parse` (`:80-110`) takes exactly 5 fields and **fails loud** on an unsatisfiable expression via a horizon check; `matches` (`:112-124`); `next_after` (`:126-141`) is strictly future and timezone-preserving.
 >
 > ⚠️ **The re-score line's "plus a dep" was RESOLVED, not satisfied:** `croniter` was considered and **rejected** in favour of the pure-stdlib evaluator (ADR 0011:126-134). Do not go looking for a dependency that was never added. ⚠️ **Documented MVP limits:** numeric fields only (no `JAN`/`MON` names), 5 fields only (no seconds field), and no `@reboot`-style macros. _(was 🔢 DEMAND-GATE · Value 5/10 · Difficulty 3/10.)_
 
@@ -3957,7 +3957,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 168. Test Bench saved regression collections
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0121](adr/0121-test-bench-saved-regression-collections-phi-at-rest-posture-hl7-aware-compare.md). `ide/src/testCollections.ts:1-5` is a pure, dependency-free model + compare for saved Test Bench regression collections, deliberately **reusing** `hl7diff.diffMessages` rather than reimplementing it. `TestCase{name, input, expected}` + `TestCollection{name, cases}` (`:15-25`) are the persisted, named, groupable unit the item asked for; `DEFAULT_VOLATILE_FIELDS` (`:42-45`) ignores MSH-7 / MSH-10 so the compare is meaningful; `compareMessages` at `:97-147`.
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0121](../../adr/0121-test-bench-saved-regression-collections-phi-at-rest-posture-hl7-aware-compare.md). `ide/src/testCollections.ts:1-5` is a pure, dependency-free model + compare for saved Test Bench regression collections, deliberately **reusing** `hl7diff.diffMessages` rather than reimplementing it. `TestCase{name, input, expected}` + `TestCollection{name, cases}` (`:15-25`) are the persisted, named, groupable unit the item asked for; `DEFAULT_VOLATILE_FIELDS` (`:42-45`) ignores MSH-7 / MSH-10 so the compare is meaningful; `compareMessages` at `:97-147`.
 >
 > ⚠️ **This adds a NEW PHI-at-rest surface:** case bodies persist in **plaintext** VS Code per-workspace storage, mitigated only by an in-UI notice and a steer toward synthetic cases. ADR 0121 **defers** encrypting `workspaceState` — an operator handling real messages in the Test Bench should know this. ⚠️ The volatile-field ignore policy is a **fixed module constant** (MSH-7/MSH-10); per-collection custom ignore policies are not available. _(was 🔢 DEMAND-GATE · Value 4/10 · Difficulty 4/10.)_
 
@@ -4029,9 +4029,9 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 185. ASVS 5.0 Level-3 re-score — 67 open findings (tracking index)
 
-> ✅ **CLOSED 2026-07-28 — SUPERSEDED by the [ADR 0115](adr/0115-asvs-l3-drive-to-pass-secure-by-default-flips-and-residual-closure.md) re-partition into #242–#246.** This is an **index-only umbrella that owns no findings and ships nothing runnable** (its own score was Value 1 / Difficulty 1) — a tracking wrapper, not work. ADR 0115 (**Accepted 2026-07-16**, owner-directed scope decision) re-partitioned the ASVS L3 programme into phased builds across **BACKLOG #242–#246**, which is where the findings now live and are tracked. An index whose contents have been re-partitioned elsewhere has nothing left to index, so it closes as superseded rather than as delivered.
+> ✅ **CLOSED 2026-07-28 — SUPERSEDED by the [ADR 0115](../../adr/0115-asvs-l3-drive-to-pass-secure-by-default-flips-and-residual-closure.md) re-partition into #242–#246.** This is an **index-only umbrella that owns no findings and ships nothing runnable** (its own score was Value 1 / Difficulty 1) — a tracking wrapper, not work. ADR 0115 (**Accepted 2026-07-16**, owner-directed scope decision) re-partitioned the ASVS L3 programme into phased builds across **BACKLOG #242–#246**, which is where the findings now live and are tracked. An index whose contents have been re-partitioned elsewhere has nothing left to index, so it closes as superseded rather than as delivered.
 >
-> ⚠️ **This is NOT a claim that "ASVS is done".** It is a statement about *this index*, nothing more. The programme **continued past this published baseline** — the file you are reading ends at #231, while #242–#246 and their successors do not appear in it at all — so the state of ASVS L3 cannot be read off this item in either direction. The assessment, remediation and risk-acceptance documents ADR 0115 references live under `docs/security/`, which is **gitignored post-cutover** and therefore not readable from the public repo; their absence here is a publishing boundary, not evidence of completion (see [`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md)). _(was 🔢 P3 · Value 1/10 · Difficulty 1/10 · _fill-in_. Filed by the independent ASVS 5.0 L3 re-score, PR #854.)_
+> ⚠️ **This is NOT a claim that "ASVS is done".** It is a statement about *this index*, nothing more. The programme **continued past this published baseline** — the file you are reading ends at #231, while #242–#246 and their successors do not appear in it at all — so the state of ASVS L3 cannot be read off this item in either direction. The assessment, remediation and risk-acceptance documents ADR 0115 references live under `docs/security/`, which is **gitignored post-cutover** and therefore not readable from the public repo; their absence here is a publishing boundary, not evidence of completion (see [`SECURITY-DOCS-POLICY.md`](../../SECURITY-DOCS-POLICY.md)). _(was 🔢 P3 · Value 1/10 · Difficulty 1/10 · _fill-in_. Filed by the independent ASVS 5.0 L3 re-score, PR #854.)_
 
 **Cluster:** Security & Compliance. **Priority:** P1. **Verdict:** build (indexed below). **Severity:** n/a (index).
 
@@ -4072,7 +4072,7 @@ Two findings are worth surfacing here. **Posture B scores worse on Fails than Po
 
 ## 187. Authentication defaults: require MFA, tighten TOTP skew, phishing-resistant factor
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** All three parts are built. **Defaults:** `require_mfa: bool = True` (`messagefoundry/config/settings.py:1662`) and the strict `totp_skew_steps: int = 0` (`:1682`, values > 2 rejected) — ASVS 6.3.3 / 6.5.5. **Phishing-resistant factor:** WebAuthn passkeys ship via the `[webauthn]` extra **by design, NOT a core dep** ([ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md) §3: its pyOpenSSL transitive hard-caps `cryptography<50`, so keeping it an extra leaves the core PHI crypto upgrade-agile). **The "sole deferred residual" is closed:** [ADR 0079](adr/0079-kerberos-idp-session-coordination.md) is no longer Proposed — its status line reads **Accepted, mechanism 2 built 2026-07-22** — shipping the directory reconciler (`messagefoundry/auth/reconcile.py`; `_directory_reconciler` at `messagefoundry/api/app.py:5066`, which re-resolves principals holding live sessions and revokes those AD has disabled or deleted) behind five `[auth]` settings at `messagefoundry/config/settings.py:1777-1803`. ⚠️ **Scope note, not a residual of this item:** `ad_session_recheck_seconds` still ships at `0` (`:1777`), so no reconciler task is created until an operator sets it (`docs/SECURITY.md:1321` recommends `300` for an off-loopback PHI deployment serving AD accounts). Flipping that default is owner-approved but is a **separate code+test change on a separate lane**, deliberately not folded into this docs-only reconcile. _(was 🚧 core shipped / Kerberos residual · Value 8/10 · Difficulty 5/10.)_
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** All three parts are built. **Defaults:** `require_mfa: bool = True` (`messagefoundry/config/settings.py:1662`) and the strict `totp_skew_steps: int = 0` (`:1682`, values > 2 rejected) — ASVS 6.3.3 / 6.5.5. **Phishing-resistant factor:** WebAuthn passkeys ship via the `[webauthn]` extra **by design, NOT a core dep** ([ADR 0068](../../adr/0068-browser-webauthn-passkeys-offloopback.md) §3: its pyOpenSSL transitive hard-caps `cryptography<50`, so keeping it an extra leaves the core PHI crypto upgrade-agile). **The "sole deferred residual" is closed:** [ADR 0079](../../adr/0079-kerberos-idp-session-coordination.md) is no longer Proposed — its status line reads **Accepted, mechanism 2 built 2026-07-22** — shipping the directory reconciler (`messagefoundry/auth/reconcile.py`; `_directory_reconciler` at `messagefoundry/api/app.py:5066`, which re-resolves principals holding live sessions and revokes those AD has disabled or deleted) behind five `[auth]` settings at `messagefoundry/config/settings.py:1777-1803`. ⚠️ **Scope note, not a residual of this item:** `ad_session_recheck_seconds` still ships at `0` (`:1777`), so no reconciler task is created until an operator sets it (`docs/SECURITY.md:1321` recommends `300` for an off-loopback PHI deployment serving AD accounts). Flipping that default is owner-approved but is a **separate code+test change on a separate lane**, deliberately not folded into this docs-only reconcile. _(was 🚧 core shipped / Kerberos residual · Value 8/10 · Difficulty 5/10.)_
 
 **Cluster:** Security & Compliance. **Priority:** P1. **Verdict:** build. **Severity:** high.
 
@@ -4120,7 +4120,7 @@ Two findings are worth surfacing here. **Posture B scores worse on Fails than Po
 
 ## 190. PHI data-plane integrity defaults: JWS signing, GCM rekey counter, keyed audit chain
 
-> ✅ **SHIPPED 2026-07-11 (ADR 0093) — remainder resolved: pinned internal-CA trust anchor BUILT; JWS scoped out (shipped, ADR 0018); ECH scoped out (infeasible).** The two sharpest cells shipped earlier (11.3.4 GCM invocation counter; 16.4.2 HMAC-keyed audit chain — see the partial-build note below). The remaining three parts are now closed: (1) **BUILT** — a pinned internal-CA TLS trust anchor: a small opt-in `[tls]` section (`internal_ca_file` + `trust_anchor_mode` = `system`/`augment`/`pinned`) + a pure `resolve_trust_anchor` wired into the internal-outbound connector client-verify contexts (MLLP/DICOM-SCU/FTPS), composing with (never weakening) the existing fail-closed no-CA/`tls_verify=false`/cleartext refusals; default `system` = byte-identical. (2) **SCOPED OUT** — detached-JWS signing (4.1.5/12.3.4) is already shipped (ADR 0018 / `transports/signing.py`); every PHI-plane surface already has integrity (bodies=ADR 0018, audit=HMAC chain, at-rest=GCM AEAD). (3) **SCOPED OUT** — ECH for outbound SNI (12.1.5): Python 3.14 stdlib `ssl` has no ECH API, no SVCB/HTTPS resolver, and it would need a new dependency — recorded as a documented risk acceptance. See [ADR 0093](adr/0093-pinned-internal-ca-trust-anchor.md) and [SECURITY.md](SECURITY.md) ("Outbound TLS trust anchor" + "PHI data-plane integrity residuals — scope-outs"). _Re-scored 2026-07-10 → P2, value 6/10 · difficulty 7/10 · big bet (ASVS 5.0 L3 re-score, PR #854)._
+> ✅ **SHIPPED 2026-07-11 (ADR 0093) — remainder resolved: pinned internal-CA trust anchor BUILT; JWS scoped out (shipped, ADR 0018); ECH scoped out (infeasible).** The two sharpest cells shipped earlier (11.3.4 GCM invocation counter; 16.4.2 HMAC-keyed audit chain — see the partial-build note below). The remaining three parts are now closed: (1) **BUILT** — a pinned internal-CA TLS trust anchor: a small opt-in `[tls]` section (`internal_ca_file` + `trust_anchor_mode` = `system`/`augment`/`pinned`) + a pure `resolve_trust_anchor` wired into the internal-outbound connector client-verify contexts (MLLP/DICOM-SCU/FTPS), composing with (never weakening) the existing fail-closed no-CA/`tls_verify=false`/cleartext refusals; default `system` = byte-identical. (2) **SCOPED OUT** — detached-JWS signing (4.1.5/12.3.4) is already shipped (ADR 0018 / `transports/signing.py`); every PHI-plane surface already has integrity (bodies=ADR 0018, audit=HMAC chain, at-rest=GCM AEAD). (3) **SCOPED OUT** — ECH for outbound SNI (12.1.5): Python 3.14 stdlib `ssl` has no ECH API, no SVCB/HTTPS resolver, and it would need a new dependency — recorded as a documented risk acceptance. See [ADR 0093](../../adr/0093-pinned-internal-ca-trust-anchor.md) and [SECURITY.md](../../SECURITY.md) ("Outbound TLS trust anchor" + "PHI data-plane integrity residuals — scope-outs"). _Re-scored 2026-07-10 → P2, value 6/10 · difficulty 7/10 · big bet (ASVS 5.0 L3 re-score, PR #854)._
 
 **Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** build. **Severity:** medium.
 
@@ -4236,7 +4236,7 @@ Two findings are worth surfacing here. **Posture B scores worse on Fails than Po
 
 ## 197. Runtime sandbox for admin-authored Router/Handler code
 
-> ✅ **SHIPPED 2026-07-10 (ADR 0087, PLAN-9 Wave 3).** Opt-in `[sandbox]` subprocess isolation built: `mode=off` (default) runs Routers/Handlers in-process **byte-identically, zero overhead**; `mode=subprocess` runs each inbound's Router/Handler in a **persistent per-inbound worker child** (`pipeline/sandbox.py` + `_sandbox_worker.py` + `_sandbox_codec.py`; stdlib-only, no new dep — RestrictedPython rejected), never a per-message fork. The OS-process boundary denies admin code reach to the parent DEK/audit-chain/sockets (the child loads only the message *graph*); plus a forbidden-import guard (socket/store/crypto), a parent-enforced wall-clock cap (+ POSIX `RLIMIT_CPU`/`RLIMIT_AS`), and a **fail-closed** refusal of the live `db_lookup`/`fhir_lookup` bridges. Interposed at the `route_only`/`transform_one` seam (the in-process `mode=off` path composes with the ADR 0072 tracer; `mode=subprocess` bypasses the tracer — see residuals); engine-side handler/outbound-name validation stays engine-side; a denial → `ERROR`/dead-letter **post-ACK** (no NAK, never dropped). Wired live through `wiring_runner`/`engine`/`app`; RunContext re-marshalled across the boundary. **Does NOT close the WP-L3-17 (ASVS 15.2.5) residual — corrected 2026-08-02 (BACKLOG #339).** Two independent reasons, both verified rather than inferred: (a) confinement is **address-space only** — `DEFAULT_FORBIDDEN_MODULES` blocks socket/ssl/asyncio/multiprocessing and the secret-bearing packages but **not `os`/`subprocess`**, so a sandboxed Handler still reaches host command execution; and (b) until #339 the IPC transport pickled the child's return value and the *engine parent* deserialized it, so the boundary was bypassable outright by any Handler with a custom `__reduce__`. OS-level default-deny is [ADR 0147](adr/0147-hardened-runtime-isolation-for-router-handler-code-ipc-brokered-sandbox-extends-adr-0087.md), still Proposed. The private `ASVS-L3-REMEDIATION-PLAN.md` WP-L3-17 row and `THREAT-MODEL.md` 15.1.5 row were flipped on the original claim and are corrected to match. **Deferred residuals:** default-off (opt-in); the ADR 0072 protocol-tracer is not forwarded across the subprocess boundary (`mode=subprocess` bypasses it; `mode=off` composes); `db_lookup`/`fhir_lookup` forward-over-IPC (sandboxed live-enrichment Handlers run `mode=off`); load-time top-level config exec not sandboxed (unchanged safe-source DACL gate); least-privilege service account default is environment-delegated.
+> ✅ **SHIPPED 2026-07-10 (ADR 0087, PLAN-9 Wave 3).** Opt-in `[sandbox]` subprocess isolation built: `mode=off` (default) runs Routers/Handlers in-process **byte-identically, zero overhead**; `mode=subprocess` runs each inbound's Router/Handler in a **persistent per-inbound worker child** (`pipeline/sandbox.py` + `_sandbox_worker.py` + `_sandbox_codec.py`; stdlib-only, no new dep — RestrictedPython rejected), never a per-message fork. The OS-process boundary denies admin code reach to the parent DEK/audit-chain/sockets (the child loads only the message *graph*); plus a forbidden-import guard (socket/store/crypto), a parent-enforced wall-clock cap (+ POSIX `RLIMIT_CPU`/`RLIMIT_AS`), and a **fail-closed** refusal of the live `db_lookup`/`fhir_lookup` bridges. Interposed at the `route_only`/`transform_one` seam (the in-process `mode=off` path composes with the ADR 0072 tracer; `mode=subprocess` bypasses the tracer — see residuals); engine-side handler/outbound-name validation stays engine-side; a denial → `ERROR`/dead-letter **post-ACK** (no NAK, never dropped). Wired live through `wiring_runner`/`engine`/`app`; RunContext re-marshalled across the boundary. **Does NOT close the WP-L3-17 (ASVS 15.2.5) residual — corrected 2026-08-02 (BACKLOG #339).** Two independent reasons, both verified rather than inferred: (a) confinement is **address-space only** — `DEFAULT_FORBIDDEN_MODULES` blocks socket/ssl/asyncio/multiprocessing and the secret-bearing packages but **not `os`/`subprocess`**, so a sandboxed Handler still reaches host command execution; and (b) until #339 the IPC transport pickled the child's return value and the *engine parent* deserialized it, so the boundary was bypassable outright by any Handler with a custom `__reduce__`. OS-level default-deny is [ADR 0147](../../adr/0147-hardened-runtime-isolation-for-router-handler-code-ipc-brokered-sandbox-extends-adr-0087.md), still Proposed. The private `ASVS-L3-REMEDIATION-PLAN.md` WP-L3-17 row and `THREAT-MODEL.md` 15.1.5 row were flipped on the original claim and are corrected to match. **Deferred residuals:** default-off (opt-in); the ADR 0072 protocol-tracer is not forwarded across the subprocess boundary (`mode=subprocess` bypasses it; `mode=off` composes); `db_lookup`/`fhir_lookup` forward-over-IPC (sandboxed live-enrichment Handlers run `mode=off`); load-time top-level config exec not sandboxed (unchanged safe-source DACL gate); least-privilege service account default is environment-delegated.
 
 **Cluster:** Security & Compliance. **Priority:** P3. **Verdict:** build (large). **Severity:** high (blast radius), low (likelihood).
 
@@ -4252,7 +4252,7 @@ Two findings are worth surfacing here. **Posture B scores worse on Fails than Po
 
 ## 198. In-use memory protection: zeroization, mlock, and the unwrapped-DEK residual
 
-> ✅ **CLOSED 2026-07-13 — code-partial + documented deployment-requirement risk-acceptance (owner partial-accept, NOT a full technical close).** The honest disposition of an item that pure-Python cannot fully close: **(1) code-feasible half BUILT** — best-effort `mlock`/`VirtualLock` + `memset`-zeroize of **every** key/plaintext buffer the cipher owns as a *mutable* `bytearray` (the unwrapped DEK, retired decrypt-only keys, and the `encrypt`/`decrypt` plaintext buffers) landed in `store/crypto.py` (`_install_key`/`_secure_zero`/`_lock_memory`), fail-safe (a lock/wipe failure degrades, never raises or corrupts) and `mfenc:v1` byte-identical; a full-path zeroize-verification test pins every owned secret buffer ends all-zero (`tests/test_store_encryption.py`). **No additional code-owned mutable buffer remains to wipe** — the residual copies are CPython-**immutable** `str`/`bytes` (caller plaintext, the returned ciphertext-only marker, `cryptography`'s `decrypt()` output, the transient `bytes(dek)` constructor copies) + OpenSSL's internal `EVP` key copy, all unreachable to scrub. **(2) 13.3.3 = best-effort partial + accepted residual; 11.7.2 = active on a keyed instance (already true); 11.7.1 (full in-use memory *encryption*) = ACCEPTED as a stated DEPLOYMENT REQUIREMENT** (disabled/encrypted swap, restricted local admin, confidential-compute host where memory forensics is in scope — [PHI.md §10](PHI.md#10-secure-deployment--operations-checklist), [SECURITY.md](SECURITY.md) "In-use memory protection") with a signed risk-acceptance (ASVS-L3-RISK-ACCEPTANCE-REGISTER.md theme 5). The ASVS scorecard verdicts (13.3.3 Fail / 11.7.1 Fail / 11.7.2 Partial) are **unchanged** — an accepted risk stays an unmet requirement; what changed is that the gap is owned, dated, and scheduled for review. _Re-scored 2026-07-10 → P2 (Value 6 · Difficulty 6, big bet; ASVS 5.0 L3 re-score, PR #854)._
+> ✅ **CLOSED 2026-07-13 — code-partial + documented deployment-requirement risk-acceptance (owner partial-accept, NOT a full technical close).** The honest disposition of an item that pure-Python cannot fully close: **(1) code-feasible half BUILT** — best-effort `mlock`/`VirtualLock` + `memset`-zeroize of **every** key/plaintext buffer the cipher owns as a *mutable* `bytearray` (the unwrapped DEK, retired decrypt-only keys, and the `encrypt`/`decrypt` plaintext buffers) landed in `store/crypto.py` (`_install_key`/`_secure_zero`/`_lock_memory`), fail-safe (a lock/wipe failure degrades, never raises or corrupts) and `mfenc:v1` byte-identical; a full-path zeroize-verification test pins every owned secret buffer ends all-zero (`tests/test_store_encryption.py`). **No additional code-owned mutable buffer remains to wipe** — the residual copies are CPython-**immutable** `str`/`bytes` (caller plaintext, the returned ciphertext-only marker, `cryptography`'s `decrypt()` output, the transient `bytes(dek)` constructor copies) + OpenSSL's internal `EVP` key copy, all unreachable to scrub. **(2) 13.3.3 = best-effort partial + accepted residual; 11.7.2 = active on a keyed instance (already true); 11.7.1 (full in-use memory *encryption*) = ACCEPTED as a stated DEPLOYMENT REQUIREMENT** (disabled/encrypted swap, restricted local admin, confidential-compute host where memory forensics is in scope — [PHI.md §10](../../PHI.md#10-secure-deployment--operations-checklist), [SECURITY.md](../../SECURITY.md) "In-use memory protection") with a signed risk-acceptance (ASVS-L3-RISK-ACCEPTANCE-REGISTER.md theme 5). The ASVS scorecard verdicts (13.3.3 Fail / 11.7.1 Fail / 11.7.2 Partial) are **unchanged** — an accepted risk stays an unmet requirement; what changed is that the gap is owned, dated, and scheduled for review. _Re-scored 2026-07-10 → P2 (Value 6 · Difficulty 6, big bet; ASVS 5.0 L3 re-score, PR #854)._
 
 **Cluster:** Security & Compliance. **Priority:** P3. **Verdict:** owner decision — **partial-accept (code-partial + documented deployment-requirement risk-acceptance)**. **Severity:** medium.
 
@@ -4290,7 +4290,7 @@ Two findings are worth surfacing here. **Posture B scores worse on Fails than Po
 
 **Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** build. **Severity:** medium.
 
-**Closes (ASVS 5.0 L3):** 4.2.1, 4.4.1, 11.6.2, 12.1.3, 12.2.2, 12.3.1, 12.3.3, 12.3.5 · *(class 3)*
+**Closes (ASVS 5.0 L3):** 4.2.1, 4.4.1, 11.6.2 (PARTIAL - KEX-group pin inert until Python 3.15; see PHI.md §4), 12.1.3, 12.2.2, 12.3.1, 12.3.3, 12.3.5 · *(class 3)*
 
 **Scope:** Extend the existing exposed-gate pattern (which already refuses a non-loopback plaintext bind) to the remaining unencrypted and unauthenticated paths: the Posture-B proxy→engine cleartext `ws://` / `http://` hop, the `--allow-insecure-bind` escape, mTLS as an *identity* rather than a bare admission gate, KEX/cipher validation when TLS is proxy-terminated, and cert-authenticated (rather than IP-trusted) intra-service auth.
 
@@ -4298,7 +4298,7 @@ Two findings are worth surfacing here. **Posture B scores worse on Fails than Po
 
 **Source:** ASVS re-score 2026-07-09, remediation class 3.
 
-**Partial build (PLAN-9 Wave 2, 2026-07-10 — branch `plan9-tls`):** the **fail-closed core is BUILT and live** — an off-loopback **Posture-B** bind now **refuses to start** (`return 2`) on production PHI unless the operator affirmatively declares both the proxy→engine intra-service-auth posture (`[api].proxy_intra_service_auth`) and the proxy TLS/KEX floor (`proxy_tls_min_version`), attestations made fail-closed like the `require_mfa` ladder; `--allow-insecure-bind` provably cannot bypass it (it lives only in the mutually-exclusive no-TLS arm); loopback/synthetic start byte-identically. The **mTLS-as-Identity** resolver ([ADR 0083](adr/0083-mtls-client-certificate-identity.md)) is deny-by-default, `CERT_REQUIRED`-rooted, and spoof-resistant. **mTLS-identity is now ACTIVATED** (PLAN-9 Wave 3, branch `plan9-tlsact`): a fork-free scope-populating shim (`api/tls_client_cert.py` — a uvicorn protocol subclass reading `getpeercert()` in `connection_made`) surfaces the verified peer cert under the pinned uvicorn, and `resolve_client_cert_identity` is wired behind a **cert-only, PHI-fenced** `require_service_cert` dependency on `GET /service/identity` — a cert-mapped Identity (even a full admin) is provably **401'd on any PHI/step-up route** (tested), never bypassing `require_step_up`/`require_mfa`; loopback/no-mTLS stay byte-identical. **Item stays OPEN** pending the remaining gaps: a real-socket uvicorn+mTLS **integration test** (activation is unit-verified, not yet handshake-tested — it would guard two uvicorn internals against version drift), an **audit event** on successful cert auth, and true runtime KEX enforcement (vs the operator attestation shipped here).
+**Partial build (PLAN-9 Wave 2, 2026-07-10 — branch `plan9-tls`):** the **fail-closed core is BUILT and live** — an off-loopback **Posture-B** bind now **refuses to start** (`return 2`) on production PHI unless the operator affirmatively declares both the proxy→engine intra-service-auth posture (`[api].proxy_intra_service_auth`) and the proxy TLS/KEX floor (`proxy_tls_min_version`), attestations made fail-closed like the `require_mfa` ladder; `--allow-insecure-bind` provably cannot bypass it (it lives only in the mutually-exclusive no-TLS arm); loopback/synthetic start byte-identically. The **mTLS-as-Identity** resolver ([ADR 0083](../../adr/0083-mtls-client-certificate-identity.md)) is deny-by-default, `CERT_REQUIRED`-rooted, and spoof-resistant. **mTLS-identity is now ACTIVATED** (PLAN-9 Wave 3, branch `plan9-tlsact`): a fork-free scope-populating shim (`api/tls_client_cert.py` — a uvicorn protocol subclass reading `getpeercert()` in `connection_made`) surfaces the verified peer cert under the pinned uvicorn, and `resolve_client_cert_identity` is wired behind a **cert-only, PHI-fenced** `require_service_cert` dependency on `GET /service/identity` — a cert-mapped Identity (even a full admin) is provably **401'd on any PHI/step-up route** (tested), never bypassing `require_step_up`/`require_mfa`; loopback/no-mTLS stay byte-identical. **Item stays OPEN** pending the remaining gaps: a real-socket uvicorn+mTLS **integration test** (activation is unit-verified, not yet handshake-tested — it would guard two uvicorn internals against version drift), an **audit event** on successful cert auth, and true runtime KEX enforcement (vs the operator attestation shipped here).
 
 ---
 
@@ -4352,7 +4352,7 @@ Two findings are worth surfacing here. **Posture B scores worse on Fails than Po
 
 ## 204. Enforce lookup-input encoding, content scanning, and SMART AS assumptions
 
-> ✅ **SHIPPED 2026-07-12 — all three parts closed.** **(1) Encoding (ASVS 1.2.2):** the `fhir_lookup` injection path is closed by the safe structured `params=` search form (shipped in #870) — each value is percent-encoded (`urlencode(quote_via=quote, safe="")`), so an HL7-derived value like `"123&_count=99999"` becomes a single literal `identifier` value and can never inject an extra FHIR search parameter (`transports/fhir.py::_encode_search_params`/`_resolve_read_url`, tested in `tests/test_fhir_lookup.py`). The flat `?`-query form stays a documented author-responsibility escape hatch (defense-in-depth-screened for `#`/second-`?`/control chars), the FHIR analog of raw-SQL-string vs bound `db_lookup` params. **(2) Content-scan contract (ASVS 5.4.3):** the pre-ingest scan-hook seam (shipped in #199) is now an **enforced, fail-closed precondition** on both the local `File(...)` and remote `Sftp/Ftp(...)` sources — a `ScanRejected` quarantines to `.error`, and a scanner **malfunction** (any other exception — AV/ICAP unreachable, a plugin bug) also fails closed: the file is never emitted and is left in place to re-scan (this change, `transports/file.py`/`remotefile.py`, tested). **No ICAP client is bundled** — that stays an operator/plugin integration; the contract + trust boundary is documented in [CONNECTIONS.md](CONNECTIONS.md#file-handling--quarantine-policy-asvs-511). **(3) SMART AS boundary (ASVS 10.4.16):** `private_key_jwt` *enforcement* is documented in [SECURITY.md](SECURITY.md) as the **authorization server's responsibility** — the client engine only *presents* the assertion — an explicit trust boundary. _(was P2 · re-scored 2026-07-10; filed by the ASVS 5.0 L3 re-score, PR #854.)_
+> ✅ **SHIPPED 2026-07-12 — all three parts closed.** **(1) Encoding (ASVS 1.2.2):** the `fhir_lookup` injection path is closed by the safe structured `params=` search form (shipped in #870) — each value is percent-encoded (`urlencode(quote_via=quote, safe="")`), so an HL7-derived value like `"123&_count=99999"` becomes a single literal `identifier` value and can never inject an extra FHIR search parameter (`transports/fhir.py::_encode_search_params`/`_resolve_read_url`, tested in `tests/test_fhir_lookup.py`). The flat `?`-query form stays a documented author-responsibility escape hatch (defense-in-depth-screened for `#`/second-`?`/control chars), the FHIR analog of raw-SQL-string vs bound `db_lookup` params. **(2) Content-scan contract (ASVS 5.4.3):** the pre-ingest scan-hook seam (shipped in #199) is now an **enforced, fail-closed precondition** on both the local `File(...)` and remote `Sftp/Ftp(...)` sources — a `ScanRejected` quarantines to `.error`, and a scanner **malfunction** (any other exception — AV/ICAP unreachable, a plugin bug) also fails closed: the file is never emitted and is left in place to re-scan (this change, `transports/file.py`/`remotefile.py`, tested). **No ICAP client is bundled** — that stays an operator/plugin integration; the contract + trust boundary is documented in [CONNECTIONS.md](../../CONNECTIONS.md#file-handling--quarantine-policy-asvs-511). **(3) SMART AS boundary (ASVS 10.4.16):** `private_key_jwt` *enforcement* is documented in [SECURITY.md](../../SECURITY.md) as the **authorization server's responsibility** — the client engine only *presents* the assertion — an explicit trust boundary. _(was P2 · re-scored 2026-07-10; filed by the ASVS 5.0 L3 re-score, PR #854.)_
 
 **Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** build. **Severity:** medium.
 
@@ -4400,7 +4400,7 @@ Note the honest framing: an accepted risk is still an unmet requirement. These f
 
 ## 207. txn/msg and bytes/msg counters in the harness
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** Closed by [ADR 0141](adr/0141-publish-copies-per-message-as-the-207-sizing-proxy-the-bytes-per-message-figure-stays-refused.md), **Accepted 2026-07-20**, whose own text names this item — *"BACKLOG **#207** (this closes it)"* (`:10`). **txn/msg is measured, not modelled:** the engine-side counter is `Store.committed_txns` (`messagefoundry/store/base.py:220-233` — write-path commits only; read-snapshot-release commits are excluded so it stays the currency ADR 0051 sizes on), self-differenced over the run into `EngineSummary.committed_txns` + `txn_per_message_measured` (`harness/load/report.py:112-113`, `:676-682`). A zero delta reports `None` — *"not measured"* — rather than a fabricated `0/msg`. ⚠️ **Backend caveat:** the counter is **not wired on PostgreSQL** — `messagefoundry/store/postgres.py:793` hardcodes `self.committed_txns = 0` (its commits happen implicitly inside scattered `conn.transaction()` blocks; live wiring is a separate pass), so on a Postgres run both figures degrade to *"not measured"* rather than being measured. SQLite and SQL Server report real values. **The second counter resolved differently, by design:** `bytes/msg` **stays refused**; `body_copies` / copies-per-message ships as the sizing proxy instead (`harness/load/report.py:114`, `:132`; `SCHEMA_VERSION = 3` at `:24`). That is the ADR's decision, not an unbuilt residual. _(was 🔢 P2 · Value 5/10 · Difficulty 4/10.)_
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** Closed by [ADR 0141](../../adr/0141-publish-copies-per-message-as-the-207-sizing-proxy-the-bytes-per-message-figure-stays-refused.md), **Accepted 2026-07-20**, whose own text names this item — *"BACKLOG **#207** (this closes it)"* (`:10`). **txn/msg is measured, not modelled:** the engine-side counter is `Store.committed_txns` (`messagefoundry/store/base.py:220-233` — write-path commits only; read-snapshot-release commits are excluded so it stays the currency ADR 0051 sizes on), self-differenced over the run into `EngineSummary.committed_txns` + `txn_per_message_measured` (`harness/load/report.py:112-113`, `:676-682`). A zero delta reports `None` — *"not measured"* — rather than a fabricated `0/msg`. ⚠️ **Backend caveat:** the counter is **not wired on PostgreSQL** — `messagefoundry/store/postgres.py:793` hardcodes `self.committed_txns = 0` (its commits happen implicitly inside scattered `conn.transaction()` blocks; live wiring is a separate pass), so on a Postgres run both figures degrade to *"not measured"* rather than being measured. SQLite and SQL Server report real values. **The second counter resolved differently, by design:** `bytes/msg` **stays refused**; `body_copies` / copies-per-message ships as the sizing proxy instead (`harness/load/report.py:114`, `:132`; `SCHEMA_VERSION = 3` at `:24`). That is the ADR's decision, not an unbuilt residual. _(was 🔢 P2 · Value 5/10 · Difficulty 4/10.)_
 
 **Cluster:** Throughput & Scale. **Priority:** P1. **Verdict:** build. **Severity:** medium.
 
@@ -4446,7 +4446,7 @@ Note the honest framing: an accepted risk is still an unmet requirement. These f
 
 ## 210. Remove the tempdb table variables from the pooled claim query
 
-> ⛔ **DECLINED — withdrawn, owner-ratified 2026-07-17.** `docs/benchmarks/THROUGHPUT-STATUS-2026-07-10.md` §Phase 1 (`:652`) says it plainly at `:675` — **"Do not build it."** — and the tempdb rewrite is struck through as **WITHDRAWN** at `:1760`. ⚠️ **Critically, the four table variables are PRESERVED ON PURPOSE — do not "clean them up".** [ADR 0114](adr/0114-phase-4-claim-path-call-complexity-reduction-driver-interface-redesign-ingress-routed-reset-fold.md) redesigned this exact claim path and **deliberately kept** the `@heads` / `@locked` / `@keep` / `@claimed` declarations in the shared probe-then-claim body (`messagefoundry/store/sqlserver.py:702-717`, `_fifo_heads_steps`, implementing ADR 0066 §3.2 with the #285 inversion fix). They are load-bearing for strict per-lane FIFO, not incidental scaffolding. Removing them is a **rejected** design, not an unfinished one. _(was 🔢 P2 · Value 7/10 · Difficulty 7/10.)_
+> ⛔ **DECLINED — withdrawn, owner-ratified 2026-07-17.** `docs/benchmarks/THROUGHPUT-STATUS-2026-07-10.md` §Phase 1 (`:652`) says it plainly at `:675` — **"Do not build it."** — and the tempdb rewrite is struck through as **WITHDRAWN** at `:1760`. ⚠️ **Critically, the four table variables are PRESERVED ON PURPOSE — do not "clean them up".** [ADR 0114](../../adr/0114-phase-4-claim-path-call-complexity-reduction-driver-interface-redesign-ingress-routed-reset-fold.md) redesigned this exact claim path and **deliberately kept** the `@heads` / `@locked` / `@keep` / `@claimed` declarations in the shared probe-then-claim body (`messagefoundry/store/sqlserver.py:702-717`, `_fifo_heads_steps`, implementing ADR 0066 §3.2 with the #285 inversion fix). They are load-bearing for strict per-lane FIFO, not incidental scaffolding. Removing them is a **rejected** design, not an unfinished one. _(was 🔢 P2 · Value 7/10 · Difficulty 7/10.)_
 
 **Cluster:** Throughput & Scale. **Priority:** P1. **Verdict:** build. **Severity:** high.
 
@@ -4480,7 +4480,7 @@ Note the honest framing: an accepted risk is still an unmet requirement. These f
 
 ## 212. fifo_claim_batch: decide the shipped default (verification DONE — it is NOT a no-op)
 
-> ✅ **CLOSED — owner-ratified 2026-07-17. DECIDED: `fifo_claim_batch` SHIPS OFF.** This item asked for exactly one thing — the default decision — and it has been made. **The shipped code already matches the decision:** `fifo_claim_batch: int = Field(default=1, ge=1, …)` at `messagefoundry/config/settings.py:295`, where `1` is documented as OFF and byte-identical to the single `TOP(1)`/`LIMIT 1` claim (the batch method is never invoked); `> 1` stays available as opt-in throughput tuning. **No code change is required to close this.** The rationale is measured, not assumed: the lever prices out at an **upper bound of ~+4.7%** (`docs/benchmarks/THROUGHPUT-STATUS-2026-07-10.md:749`, `:1930`) against the pre-registered **+8% PROCEED bar** ([ADR 0107](adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md)`:62`), and the published row already marks it *"ships OFF"* (`THROUGHPUT-STATUS §Phase 3(2)`, `:549`). **Revisit only on a latency or store-load rationale — not a throughput one**, which is settled. _(was 🔢 P2 · Value 6/10 · Difficulty 2/10.)_
+> ✅ **CLOSED — owner-ratified 2026-07-17. DECIDED: `fifo_claim_batch` SHIPS OFF.** This item asked for exactly one thing — the default decision — and it has been made. **The shipped code already matches the decision:** `fifo_claim_batch: int = Field(default=1, ge=1, …)` at `messagefoundry/config/settings.py:295`, where `1` is documented as OFF and byte-identical to the single `TOP(1)`/`LIMIT 1` claim (the batch method is never invoked); `> 1` stays available as opt-in throughput tuning. **No code change is required to close this.** The rationale is measured, not assumed: the lever prices out at an **upper bound of ~+4.7%** (`docs/benchmarks/THROUGHPUT-STATUS-2026-07-10.md:749`, `:1930`) against the pre-registered **+8% PROCEED bar** ([ADR 0107](../../adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md)`:62`), and the published row already marks it *"ships OFF"* (`THROUGHPUT-STATUS §Phase 3(2)`, `:549`). **Revisit only on a latency or store-load rationale — not a throughput one**, which is settled. _(was 🔢 P2 · Value 6/10 · Difficulty 2/10.)_
 
 **Cluster:** Throughput & Scale. **Priority:** P2. **Verdict:** build (decide the default). **Severity:** medium.
 
@@ -4502,7 +4502,7 @@ The code read is done (`pipeline/stage_dispatcher.py:797-800`, `pipeline/wiring_
 
 ## 213. accepts= seam (pure router-stage predicate) plus an advisory lint
 
-> ✅ **SHIPPED — re-verified against `origin/main` (2026-07-28).** The [ADR 0084](adr/0084-accepts-router-seam.md) `accepts=` router-stage seam is built end to end: the `HandlerAccepts` predicate type plus the fail-closed `_check_accepts_predicate` (`messagefoundry/config/wiring.py:2291`, which REJECTS a predicate naming the transform-only `state_get`/`response_get` — those fail *open* in the router phase and would silently invert a migrated suppression filter); `Registry.handler_accepts` (`:2760`, registered `:2817`, validated `:2845-2848`, re-checked on load `:4179-4186`); the component-wise `message_type_of(...)` helper (`:2355`); dry-run parity via `_accepted` (`messagefoundry/pipeline/dryrun.py:206`); sandbox parity (`messagefoundry/pipeline/_sandbox_worker.py:115`); the advisory lint `_check_accepts_candidate` (`messagefoundry/checks.py:388`); and `tests/test_accepts_seam.py` (749 lines). _(was 🔢 P1 · Value 8/10 · Difficulty 7/10 — the highest double-build risk in this reconcile: the banner described ~1,500 already-merged lines as unstarted work.)_
+> ✅ **SHIPPED — re-verified against `origin/main` (2026-07-28).** The [ADR 0084](../../adr/0084-accepts-router-seam.md) `accepts=` router-stage seam is built end to end: the `HandlerAccepts` predicate type plus the fail-closed `_check_accepts_predicate` (`messagefoundry/config/wiring.py:2291`, which REJECTS a predicate naming the transform-only `state_get`/`response_get` — those fail *open* in the router phase and would silently invert a migrated suppression filter); `Registry.handler_accepts` (`:2760`, registered `:2817`, validated `:2845-2848`, re-checked on load `:4179-4186`); the component-wise `message_type_of(...)` helper (`:2355`); dry-run parity via `_accepted` (`messagefoundry/pipeline/dryrun.py:206`); sandbox parity (`messagefoundry/pipeline/_sandbox_worker.py:115`); the advisory lint `_check_accepts_candidate` (`messagefoundry/checks.py:388`); and `tests/test_accepts_seam.py` (749 lines). _(was 🔢 P1 · Value 8/10 · Difficulty 7/10 — the highest double-build risk in this reconcile: the banner described ~1,500 already-merged lines as unstarted work.)_
 
 **Cluster:** Throughput & Scale. **Priority:** P1. **Verdict:** build (**ADR 0084 ratified — go**). **Severity:** medium.
 
@@ -4556,7 +4556,7 @@ The code read is done (`pipeline/stage_dispatcher.py:797-800`, `pipeline/wiring_
 
 ## 217. Group-commit / durable-write — sequenced AFTER the claim path
 
-> ⛔ **DECLINED — dead by measurement, three times over.** [ADR 0069](adr/0069-durable-write-throughput-lever.md) found the server-side commit tier only ~9% utilised, so there is nothing for group-commit to amortize. [ADR 0099](adr/0099-phase-4-group-commit-amortize-the-per-event-transaction-cost.md) (**Accepted 2026-07-12** *for the withdrawal + the gate*) then formally **withdrew group-commit itself** — superseding [ADR 0055](adr/0055-group-commit-durable-write.md) (`0099:95`) — and gated a *different*, still-unfunded build, inline stage-fusion ([ADR 0057](adr/0057-inline-step-a-fast-path.md); `0099:23-24`, `:30`). [ADR 0107](adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md) (**Accepted 2026-07-13**) closes Phase 4 entirely — its status line reads *"closes options; authorizes no build. **Do not build F2 or F3.**"* (`:3`) — and terminates the adjacent inline fast-path, stamping [ADR 0057](adr/0057-inline-step-a-fast-path.md) **⛔ DO NOT PROMOTE** (`0107:7`, `0057:3`). Transaction reduction is a **measured dead end**: the residual carriage-byte trim does not justify the seam. Do not re-open on a modelled or analytical argument — only new *measurement* contradicting ADR 0107 would. _(was 🔢 P3 · Value 4/10 · Difficulty 7/10.)_
+> ⛔ **DECLINED — dead by measurement, three times over.** [ADR 0069](../../adr/0069-durable-write-throughput-lever.md) found the server-side commit tier only ~9% utilised, so there is nothing for group-commit to amortize. [ADR 0099](../../adr/0099-phase-4-group-commit-amortize-the-per-event-transaction-cost.md) (**Accepted 2026-07-12** *for the withdrawal + the gate*) then formally **withdrew group-commit itself** — superseding [ADR 0055](../../adr/0055-group-commit-durable-write.md) (`0099:95`) — and gated a *different*, still-unfunded build, inline stage-fusion ([ADR 0057](../../adr/0057-inline-step-a-fast-path.md); `0099:23-24`, `:30`). [ADR 0107](../../adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md) (**Accepted 2026-07-13**) closes Phase 4 entirely — its status line reads *"closes options; authorizes no build. **Do not build F2 or F3.**"* (`:3`) — and terminates the adjacent inline fast-path, stamping [ADR 0057](../../adr/0057-inline-step-a-fast-path.md) **⛔ DO NOT PROMOTE** (`0107:7`, `0057:3`). Transaction reduction is a **measured dead end**: the residual carriage-byte trim does not justify the seam. Do not re-open on a modelled or analytical argument — only new *measurement* contradicting ADR 0107 would. _(was 🔢 P3 · Value 4/10 · Difficulty 7/10.)_
 
 **Cluster:** Throughput & Scale. **Priority:** P2. **Verdict:** build. **Severity:** medium.
 
@@ -4625,7 +4625,7 @@ The code read is done (`pipeline/stage_dispatcher.py:797-800`, `pipeline/wiring_
 ## 221. IDE native-surface polish — walkthrough, registered custom editors, status bar, TOML association (DX)
 
 > ✅ **SHIPPED — verified against `origin/main` (2026-07-28).**
-> [ADR 0100](adr/0100-ide-native-surface-polish-and-open-to-messagefoundry-startup-experience-backlog-221.md)
+> [ADR 0100](../../adr/0100-ide-native-surface-polish-and-open-to-messagefoundry-startup-experience-backlog-221.md)
 > is **Accepted (2026-07-12)**, names this item in its own filename and title, and every surface it
 > claims exists in `ide/`: **3** registered `customEditors` (`ide/package.json:527`) with
 > Reopen-With-Text; a **9**-step Get-Started walkthrough; the engine-target status-bar item
@@ -4666,15 +4666,15 @@ the Marketplace-publish gate (the publish do-next explicitly waits on "planned I
 > The projection engine is `messagefoundry/lens.py`, driven by a `messagefoundry lens` subcommand
 > (`messagefoundry/__main__.py:374`) that **statically parses** a config module into the per-`@handler`
 > row contract and never imports it. The custom editor is `ide/src/stepsView.ts`.
-> [ADR 0076](adr/0076-typed-action-vocabulary-action-list-lens.md) plus
-> [ADR 0106](adr/0106-steps-view-add-dropdown-vocabulary-expansion-adr-0076-phase-b.md) (phase-B
-> palette), [ADR 0108](adr/0108-steps-view-accumulator-send-fan-out-copy-on-send-authoring.md) and the
-> [ADR 0103](adr/0103-steps-view-row-context-menu.md) follow-up recorded below are all built. The
+> [ADR 0076](../../adr/0076-typed-action-vocabulary-action-list-lens.md) plus
+> [ADR 0106](../../adr/0106-steps-view-add-dropdown-vocabulary-expansion-adr-0076-phase-b.md) (phase-B
+> palette), [ADR 0108](../../adr/0108-steps-view-accumulator-send-fan-out-copy-on-send-authoring.md) and the
+> [ADR 0103](../../adr/0103-steps-view-row-context-menu.md) follow-up recorded below are all built. The
 > **#26 amendment** this required is ratified and recorded in CLAUDE.md §12: the Steps view is a
 > *projection* — plain `.py` stays the only artifact and the only execution path.
 > _(was 🔢 Open · Value 6/10 · Difficulty 6/10 · _big bet_.)_
 >
-> **Follow-up (2026-07-12, IDE v0.0.22, [ADR 0103](adr/0103-steps-view-row-context-menu.md)):** the
+> **Follow-up (2026-07-12, IDE v0.0.22, [ADR 0103](../../adr/0103-steps-view-row-context-menu.md)):** the
 > Steps view gains a right-click **row context menu** (Insert before/after, Delete, Move up/down) as a new
 > surface over the *existing* insert/delete/move ops (no new engine path) — plus a `[blank]` placeholder on
 > empty editable param inputs. Additive; the toolbar Insert dropdown is unchanged (its "insert-collapse"
@@ -4717,7 +4717,7 @@ phases 2–3. **Composes with:** #92 (shipped), #84, #33, #48, the AI participan
 
 ## 223. Server-DB DR restore vintage/completeness attestation (the #102 residual)
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0102](adr/0102-server-db-dr-restore-vintage-completeness-attestation-residual.md) is **Accepted (2026-07-12)** and the mechanism it authorized is built. **(c)** the vintage/completeness residual is formally risk-accepted; **(b)** the opt-in cross-check ships: `[dr].restore_token` (`messagefoundry/config/settings.py:3314` — default `""` = OFF, leaving the #102 gate byte-unchanged and a SQLite no-op; a cloud URL is rejected by the `_no_cloud_restore_token` validator at `:3347`) is cross-checked by `_verify_restore_token` (`messagefoundry/pipeline/dr.py:480`, invoked from the gate at `:478`) against the restored DB's **own** latest `dr_backup` anchor — a **vintage floor** a bare boolean attestation cannot give (a stale or wrong native restore is refused closed). It is deliberately **not** completeness proof. **(a) — the full engine-driven server-DB store seed — is OUT OF THIS ITEM'S SCOPE by ADR 0102's own construction:** it is *"explicitly deferred as a separate, owner-scheduled decision"* (`0102:67`, section header at `:128`), because it re-opens the #52 DBA-delegation boundary. ⚠️ **State of (a), stated precisely:** the in-repo record is **DEFERRED (owner decision)**; the 2026-07-28 reconcile carries an owner ruling **declining** it dated 2026-07-20, which is **not recorded anywhere in this repo**. Either way it is a separately-scheduled owner call, not a residual of #223 — so with (b)+(c) built, this item closes. Do not restate the decline as an in-repo fact until an ADR or amendment records it. _(was 🚧 DESIGN + RISK-ACCEPTANCE RECORDED.)_
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0102](../../adr/0102-server-db-dr-restore-vintage-completeness-attestation-residual.md) is **Accepted (2026-07-12)** and the mechanism it authorized is built. **(c)** the vintage/completeness residual is formally risk-accepted; **(b)** the opt-in cross-check ships: `[dr].restore_token` (`messagefoundry/config/settings.py:3314` — default `""` = OFF, leaving the #102 gate byte-unchanged and a SQLite no-op; a cloud URL is rejected by the `_no_cloud_restore_token` validator at `:3347`) is cross-checked by `_verify_restore_token` (`messagefoundry/pipeline/dr.py:480`, invoked from the gate at `:478`) against the restored DB's **own** latest `dr_backup` anchor — a **vintage floor** a bare boolean attestation cannot give (a stale or wrong native restore is refused closed). It is deliberately **not** completeness proof. **(a) — the full engine-driven server-DB store seed — is OUT OF THIS ITEM'S SCOPE by ADR 0102's own construction:** it is *"explicitly deferred as a separate, owner-scheduled decision"* (`0102:67`, section header at `:128`), because it re-opens the #52 DBA-delegation boundary. ⚠️ **State of (a), stated precisely:** the in-repo record is **DEFERRED (owner decision)**; the 2026-07-28 reconcile carries an owner ruling **declining** it dated 2026-07-20, which is **not recorded anywhere in this repo**. Either way it is a separately-scheduled owner call, not a residual of #223 — so with (b)+(c) built, this item closes. Do not restate the decline as an in-repo fact until an ADR or amendment records it. _(was 🚧 DESIGN + RISK-ACCEPTANCE RECORDED.)_
 
 **Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** owner decision (design first). **Severity:** medium.
 
@@ -4753,7 +4753,7 @@ phases 2–3. **Composes with:** #92 (shipped), #84, #33, #48, the AI participan
 
 **Cluster:** DX / IDE. **Priority:** P2. **Verdict:** build. **Severity:** low.
 
-**What:** the action-list lens (ADR 0076 phase 2b/3, shipped in #893/#903) renders each recognized row and reserves a slot for the shipped #92 live-debug value beside it, but the **acquisition is stubbed** — `ide/src/actionLens.ts` `liveValuesFor` returns `[]` with a documented TODO. Wire it so the lens shows the actual per-row values flowing through the open Handler against the selected sample (**PHI-redacted by default; never auto-`--show-phi`** — the redacted-merge logic already exists and is tested). This completes the "Corepoint-familiar action rows **+** live values + real Python underneath" combination — the differentiator the IDE deep-research identified ([`docs/research/ide-low-code-options.md`](research/ide-low-code-options.md)).
+**What:** the action-list lens (ADR 0076 phase 2b/3, shipped in #893/#903) renders each recognized row and reserves a slot for the shipped #92 live-debug value beside it, but the **acquisition is stubbed** — `ide/src/actionLens.ts` `liveValuesFor` returns `[]` with a documented TODO. Wire it so the lens shows the actual per-row values flowing through the open Handler against the selected sample (**PHI-redacted by default; never auto-`--show-phi`** — the redacted-merge logic already exists and is tested). This completes the "Corepoint-familiar action rows **+** live values + real Python underneath" combination — the differentiator the IDE deep-research identified ([`docs/research/ide-low-code-options.md`](../../research/ide-low-code-options.md)).
 
 **Why (needs a design decision, not just a wire-up):** the review of #893 found the only two acquisition paths are (a) reach into the shipped `LiveDebugController`'s private last-trace + reveal-gate state, or (b) run a **second** traced dry-run from the lens (a new invocation of the ADR 0072 trace path). (b) is cleaner but is a PHI-carrying path that must reuse the ADR 0072 redaction gate exactly — so pick the approach in a short design note / ADR-0076 addendum before building. Line-addressed trace rows already map to lens row line ranges (the `mergeLiveValues` seam).
 
@@ -4763,13 +4763,13 @@ phases 2–3. **Composes with:** #92 (shipped), #84, #33, #48, the AI participan
 
 ## 226. Revise the ported migration estate to the per-feed "Hybrid" config layout (split monolithic feeds)
 
-> ✅ **DONE (primary ask) — owner-attested 2026-08-03; the sweep is OFF-REPO and no in-repo change could have closed it.** The estate-wide split landed in the maintainer-internal migration repository, not here: every ported feed now carries the per-feed **Hybrid** layout — transport config in `connections.toml`, `@router` in `<INBOUND>_router.py`, `@handler` in `<INBOUND>_handler.py`, field-level steps in a `_<feed>_transforms.py` helper — verified feed-by-feed for parity. Nothing in this repository is changed by it; the layout it converges on is the one already documented in [`docs/CONNECTIONS.md`](CONNECTIONS.md) §"Decomposing by role" and shipped runnable as `samples/config/IB_DEMO_ORU_*`. _(was 🔢 · V4/10 · D4/10 · fill-in.)_
+> ✅ **DONE (primary ask) — owner-attested 2026-08-03; the sweep is OFF-REPO and no in-repo change could have closed it.** The estate-wide split landed in the maintainer-internal migration repository, not here: every ported feed now carries the per-feed **Hybrid** layout — transport config in `connections.toml`, `@router` in `<INBOUND>_router.py`, `@handler` in `<INBOUND>_handler.py`, field-level steps in a `_<feed>_transforms.py` helper — verified feed-by-feed for parity. Nothing in this repository is changed by it; the layout it converges on is the one already documented in [`docs/CONNECTIONS.md`](../../CONNECTIONS.md) §"Decomposing by role" and shipped runnable as `samples/config/IB_DEMO_ORU_*`. _(was 🔢 · V4/10 · D4/10 · fill-in.)_
 >
 > ⚠️ **Neither "Also" clause is delivered, and neither is a residual of this item.** (1) *Align the IDE Corepoint-import / scaffold path to emit the Hybrid layout* — **there is no Corepoint-import path in `ide/` to align**; that tooling is [#105](../../BACKLOG.md#105-deterministic-corepoint-import-tooling--action-list--code-first-scaffold-p3-deferred-owner-decision), still open, so this clause is a **constraint on #105's design**, not work this item can perform. The scaffold half is likewise misaddressed: "Insert Element" (#48) drops per-file idioms from the bundled snippet catalog into the current buffer (`ide/src/insertElement.ts:1-5`) — it emits no multi-file feed layout and was never a layout emitter. (2) *Consider a recursive-glob / folder-per-feed loader enhancement* was filed as a **"consider"**, and it was not taken: `load_config` still globs `*.py` **non-recursively** (`config/wiring.py:4162`), which is the documented flat-merge behaviour the Hybrid layout is designed around. Do not re-open #226 for either.
 
 **Cluster:** Migration / DX. **Priority:** P2. **Verdict:** build (per-feed, mechanical). **Severity:** low.
 
-**What:** The ported migration estate currently lands each feed as a **single monolithic `.py`** bundling the inbound/outbound connections, the `@router`, and the `@handler(s)` with inline transform logic (e.g. the `IB_400` EKG/ECG → vendor ECG management system port). Convert each migrated feed to the per-feed **Hybrid** layout the project now documents — transport config → `connections.toml`; `@router` → `<INBOUND>_router.py`; `@handler` → `<INBOUND>_handler.py`; the field-level transform steps → a `_<feed>_transforms.py` helper. Reference: [`docs/CONNECTIONS.md`](CONNECTIONS.md) §"Decomposing by role" + the runnable `samples/config/IB_DEMO_ORU_*` worked example. Sweep the estate feed-by-feed, verifying parity with `messagefoundry check` (+ dry-run fixtures) after each split.
+**What:** The ported migration estate currently lands each feed as a **single monolithic `.py`** bundling the inbound/outbound connections, the `@router`, and the `@handler(s)` with inline transform logic (e.g. the `IB_400` EKG/ECG → vendor ECG management system port). Convert each migrated feed to the per-feed **Hybrid** layout the project now documents — transport config → `connections.toml`; `@router` → `<INBOUND>_router.py`; `@handler` → `<INBOUND>_handler.py`; the field-level transform steps → a `_<feed>_transforms.py` helper. Reference: [`docs/CONNECTIONS.md`](../../CONNECTIONS.md) §"Decomposing by role" + the runnable `samples/config/IB_DEMO_ORU_*` worked example. Sweep the estate feed-by-feed, verifying parity with `messagefoundry check` (+ dry-run fixtures) after each split.
 
 **Why:** The monolith co-mingles three concerns — transport config, routing, and a large pile of transform logic — in one file, which is hard to review, unit-test, and GUI-edit. The engine **already supports** the split (the graph is name-wired and flat-merged across the config dir — zero engine change); this is authoring hygiene plus Corepoint-familiar separation, and it moves connections onto the data surface (ADR 0007) and the transform steps into small, testable helpers.
 
@@ -4815,13 +4815,13 @@ That makes a real question **unmeasurable today**: *does `fifo_claim_batch` reli
 
 ## 230. ADR 0104 build: copy-on-Send message model + `message_type_of` + HL7 field picker
 
-> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0104](adr/0104-copy-on-send-outbound-message-model-recognition-first-handler-message-type-and-hl7-field-picker.md). **Both** remainders this item names are merged. **(a) The copy-on-Send default flip:** `snapshot_on_send: bool = Field(default=True)` (`messagefoundry/config/settings.py:1164-1175`) — the gate was satisfied on the record (the conservative estate AST scan flagged 1/152 handlers, genuine divergence 0, and `Message.copy()` is now genuine copy-on-write), resolved at `docs/adr/0104-…md:164-178` §8.1. **(b) The HL7 field picker:** the cascading segment→field→component quick-pick at `ide/src/hl7Picker.ts:163`, wired into the Steps-view Set-Field path slot per ADR 0104 §2.3. `message_type_of` ships as the ADR 0084 `accepts=` helper (see **#213**).
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0104](../../adr/0104-copy-on-send-outbound-message-model-recognition-first-handler-message-type-and-hl7-field-picker.md). **Both** remainders this item names are merged. **(a) The copy-on-Send default flip:** `snapshot_on_send: bool = Field(default=True)` (`messagefoundry/config/settings.py:1164-1175`) — the gate was satisfied on the record (the conservative estate AST scan flagged 1/152 handlers, genuine divergence 0, and `Message.copy()` is now genuine copy-on-write), resolved at `docs/adr/0104-…md:164-178` §8.1. **(b) The HL7 field picker:** the cascading segment→field→component quick-pick at `ide/src/hl7Picker.ts:163`, wired into the Steps-view Set-Field path slot per ADR 0104 §2.3. `message_type_of` ships as the ADR 0084 `accepts=` helper (see **#213**).
 >
 > ⚠️ **Two items under this entry's own "Optional fast-follow" line are NOT built and must be re-filed rather than dropped by this close:** freezing `RawMessage.raw` to close the cross-handler leak — `messagefoundry/parsing/message.py:756-762` openly calls it "a separate scan-gated fast-follow" — and a non-HL7 builder. Neither is covered here. _(was 🔢 · filed post-re-score.)_
 
 **Cluster:** IDE & Authoring / Engine. **Priority:** P2. **Verdict:** build (partially shipped). **Severity:** low.
 
-**What:** the build tracker for [ADR 0104](adr/0104-copy-on-send-outbound-message-model-recognition-first-handler-message-type-and-hl7-field-picker.md) (the message-model design + competitor-research eval; backing memo `docs/research/message-model-eval.md`).
+**What:** the build tracker for [ADR 0104](../../adr/0104-copy-on-send-outbound-message-model-recognition-first-handler-message-type-and-hl7-field-picker.md) (the message-model design + competitor-research eval; backing memo `docs/research/message-model-eval.md`).
 
 **Shipped (engine-only, PRs #991 ADR + #995 build):**
 - **Q1 copy-on-Send** — `Message.copy()`/`RawMessage.copy()`/`snapshot_payload` structural clones (deepcopy of the parsed model, backend-preserving — never `parse(encode())`); `Send.__post_init__` snapshots the payload **at construction** when a run-scoped flag is active, so a divergent fan-out (mutate the same message between two Sends) delivers per-destination bytes. The flag rides a `ContextVar` (`config/send_snapshot.py`) activated by a TRANSFORM-phase run-context provider, so it fires uniformly on the split / inline / fused / subprocess-sandbox paths. Gated by `[pipeline].snapshot_on_send`, **default OFF** (byte-identical), threaded `engine`→`RegistryRunner`→`api/app`→serve; read once at engine start.
@@ -4837,21 +4837,21 @@ That makes a real question **unmeasurable today**: *does `fifo_claim_batch` reli
 
 ## 231. Steps view: decorative collapsible block grouping (Corepoint Block analog)
 
-> ⛔ **DECLINED by owner ruling 2026-07-20 — superseding [ADR 0106](adr/0106-steps-view-add-dropdown-vocabulary-expansion-adr-0076-phase-b.md)'s deferral.** ⚠️ **This banner previously read *"🔢 Filed"*, which made it a live double-build trap: the ruling had been made, but the published file still invited the work.** ⚠️ **Chronology, so the authority is not overstated:** ADR 0106 (Accepted 2026-07-12) did **not** decline Block — it explicitly *deferred* it to this item (*"**'Block' is deferred to BACKLOG #231**"*, `0106:20`, `:64`, `:146`), having weighed and rejected `with block(...)` / bare header comment / nested `def`. The **decline is the later owner ruling**, not a pre-existing [#26](#26-visual--template-driven-channel-authoring--decision-decline-by-design-no-build) finding. The rationale invoked is #26's: a decorative, collapsible, labeled grouping whose only purpose is to organize the Steps view is chrome authored in the canvas. The #26 amendment's carve-out is deliberately narrower than this: it permits a **structured Steps view over real Python Handlers via a typed action vocabulary** ([#222](#222-structured-action-list-lens-over-real-python-handlers--typed-action-vocabulary--custom-editor-adr-0076), shipped), where every row projects code that already exists. A Block row would project **nothing executable** — it is chrome authored in the canvas, which is exactly the line #26 draws. The open question below is therefore **answered: out of scope.** Organize long handlers with the existing control-flow rows and ordinary comments. _(was 🔢 Filed 2026-07-12.)_
+> ⛔ **DECLINED by owner ruling 2026-07-20 — superseding [ADR 0106](../../adr/0106-steps-view-add-dropdown-vocabulary-expansion-adr-0076-phase-b.md)'s deferral.** ⚠️ **This banner previously read *"🔢 Filed"*, which made it a live double-build trap: the ruling had been made, but the published file still invited the work.** ⚠️ **Chronology, so the authority is not overstated:** ADR 0106 (Accepted 2026-07-12) did **not** decline Block — it explicitly *deferred* it to this item (*"**'Block' is deferred to BACKLOG #231**"*, `0106:20`, `:64`, `:146`), having weighed and rejected `with block(...)` / bare header comment / nested `def`. The **decline is the later owner ruling**, not a pre-existing [#26](#26-visual--template-driven-channel-authoring--decision-decline-by-design-no-build) finding. The rationale invoked is #26's: a decorative, collapsible, labeled grouping whose only purpose is to organize the Steps view is chrome authored in the canvas. The #26 amendment's carve-out is deliberately narrower than this: it permits a **structured Steps view over real Python Handlers via a typed action vocabulary** ([#222](#222-structured-action-list-lens-over-real-python-handlers--typed-action-vocabulary--custom-editor-adr-0076), shipped), where every row projects code that already exists. A Block row would project **nothing executable** — it is chrome authored in the canvas, which is exactly the line #26 draws. The open question below is therefore **answered: out of scope.** Organize long handlers with the existing control-flow rows and ordinary comments. _(was 🔢 Filed 2026-07-12.)_
 
 **Cluster:** IDE & Authoring. **Priority:** P3 (nice-to-have). **Verdict:** defer / revisit after the palette ships. **Severity:** none (cosmetic/organizational only).
 
 **What:** find an idiomatic way to represent Corepoint's **Block** action in the Steps view — a purely **decorative, non-functional, collapsible grouping** of steps with a descriptive header line. In Corepoint's action-list editor the developer collapses/expands a block; when collapsed only the block's description is shown and every inner step is hidden. It exists solely to make a long action-list readable (e.g. a header "Evaluate Ordering Provider — Is EIHC Provider?" wrapping a ForEach/If/Try group). It carries **zero runtime behavior** — think of it as a labeled, foldable indent level, like a decorative indented block in most languages.
 
-**Why deferred:** no clean idiomatic-Python representation is obviously right, and the recognition-first lens ([ADR 0089](adr/0089-recognition-first-lens-native-idioms.md)) should not impose a construct developers don't naturally write. Options weighed (2026-07-12), none adopted:
+**Why deferred:** no clean idiomatic-Python representation is obviously right, and the recognition-first lens ([ADR 0089](../../adr/0089-recognition-first-lens-native-idioms.md)) should not impose a construct developers don't naturally write. Options weighed (2026-07-12), none adopted:
 - **`# region <label>` / `# endregion`** — the leading candidate: a labeled, hard-boundaried, nestable, zero-runtime region that **VS Code already folds natively**, so the Steps-view Section collapse would equal the text-editor fold. Downside: `#region` is slightly non-idiomatic vs PEP-8.
 - **Bare section-header comment `# ── <label> ──`** — the most idiomatic, but a **soft boundary** (no explicit end; membership is a heuristic; no arbitrary nesting).
 - **`with block("<label>"):` no-op context manager** — a real foldable container, but an **invented, non-idiomatic wrapper** that litters every grouped section and cuts against ADR 0076's "handlers read as ordinary code" — rejected.
 - **Nested `def _section(msg): …` + call** — a `def` creates a variable **scope**, so a value assigned in one group and used later would break — rejected.
 
-**Open question:** how to render a purely-decorative, collapsible, labeled grouping in the Steps view that round-trips to real Python, keeps the `.py` idiomatic, and preserves the lens coverage-partition — or decide it is out of scope (organize via the existing control-flow rows + comments). Revisit once the [ADR 0106](adr/0106-steps-view-add-dropdown-vocabulary-expansion-adr-0076-phase-b.md) palette ships and there is real usage signal.
+**Open question:** how to render a purely-decorative, collapsible, labeled grouping in the Steps view that round-trips to real Python, keeps the `.py` idiomatic, and preserves the lens coverage-partition — or decide it is out of scope (organize via the existing control-flow rows + comments). Revisit once the [ADR 0106](../../adr/0106-steps-view-add-dropdown-vocabulary-expansion-adr-0076-phase-b.md) palette ships and there is real usage signal.
 
-**Related:** [ADR 0106](adr/0106-steps-view-add-dropdown-vocabulary-expansion-adr-0076-phase-b.md) (the authoring palette this defers from), [ADR 0076](adr/0076-typed-action-vocabulary-action-list-lens.md) / [ADR 0089](adr/0089-recognition-first-lens-native-idioms.md) (the lens), #222 (Steps view), #26 (the declined visual-authoring line + its structured-Steps-view carve-out).
+**Related:** [ADR 0106](../../adr/0106-steps-view-add-dropdown-vocabulary-expansion-adr-0076-phase-b.md) (the authoring palette this defers from), [ADR 0076](../../adr/0076-typed-action-vocabulary-action-list-lens.md) / [ADR 0089](../../adr/0089-recognition-first-lens-native-idioms.md) (the lens), #222 (Steps view), #26 (the declined visual-authoring line + its structured-Steps-view carve-out).
 
 **Source:** ADR 0106 palette design (2026-07-12); owner deferred Block pending an idiomatic fit.
 
@@ -4859,11 +4859,11 @@ That makes a real question **unmeasurable today**: *does `fifo_claim_batch` reli
 
 > ✅ **SHIPPED (2026-07-30, PR #81).** `scripts/quality/lens_coverage.py` drives the shipped `lens parse --json` — not a second `ast` walk — so the number cannot drift from what the Steps view actually renders. Measured against the de-identified estate: 388 files · 145 handlers · 1,423 rows · **0 parse refusals**; editable share **42.0%**, fully-typed handlers **14.5%** (21/145), median opaque rows/handler **3**. Full result and the pre-registered decision rule are recorded on PR #81.
 >
-> ⚠️ **The pre-registered rule fired 🔴 RED, and the RED prescription was *not* adopted** — both triggers landed exactly on their boundaries (B = 14.5% missed the 15% floor by 0.5pp; median opaque = 3 hit `≥ 3` exactly), while A = 42.0% sat mid-AMBER. The AMBER prescription (breadth before depth) was taken instead, on the argument that the opacity is *mechanical* — comment-only rows (28%) plus helper delegation (41.8%) are ~70% of the opaque mass and both are addressable within the projection model. **This override was a delegated judgment call, never explicitly ratified by the owner**; treat it as open if the next measurement does not move. See **#248** (comment-only rows — [ADR 0076](adr/0076-typed-action-vocabulary-action-list-lens.md) Amendment A, ratified 2026-07-30). ⚠️ **The other half of that "~70% of the opaque mass" argument no longer stands:** helper delegation was to be addressed by ADR 0089 Phase D, which the owner **declined 2026-07-30 as too risky** (ADR 0076 Amendment B) — and its 41.8% was a heuristic superset whose real yield may be negative. So the breadth-before-depth case now rests on comment-only rows alone; re-measure before assuming the number moves.
+> ⚠️ **The pre-registered rule fired 🔴 RED, and the RED prescription was *not* adopted** — both triggers landed exactly on their boundaries (B = 14.5% missed the 15% floor by 0.5pp; median opaque = 3 hit `≥ 3` exactly), while A = 42.0% sat mid-AMBER. The AMBER prescription (breadth before depth) was taken instead, on the argument that the opacity is *mechanical* — comment-only rows (28%) plus helper delegation (41.8%) are ~70% of the opaque mass and both are addressable within the projection model. **This override was a delegated judgment call, never explicitly ratified by the owner**; treat it as open if the next measurement does not move. See **#248** (comment-only rows — [ADR 0076](../../adr/0076-typed-action-vocabulary-action-list-lens.md) Amendment A, ratified 2026-07-30). ⚠️ **The other half of that "~70% of the opaque mass" argument no longer stands:** helper delegation was to be addressed by ADR 0089 Phase D, which the owner **declined 2026-07-30 as too risky** (ADR 0076 Amendment B) — and its 41.8% was a heuristic superset whose real yield may be negative. So the breadth-before-depth case now rests on comment-only rows alone; re-measure before assuming the number moves.
 
 **Cluster:** IDE & Authoring. **Priority:** P1 — this number decides how much further Steps-view investment is justified. **Verdict:** build (cheap, reproducible). **Severity:** none (measurement).
 
-**What:** re-run [ADR 0089](adr/0089-recognition-first-lens-native-idioms.md) §5's AST coverage scan against the current production estate and publish the delta. **The measurement already exists and must not be re-invented:** ADR 0089 §1 scanned **87 files / 486 `msg`-manipulating functions / 3,852 statements** and found **~66% of projected rows opaque** (`code` / `UNRECOGNIZED control`) with **100% of handlers rendering zero editable action rows**; the index row records **~42% editable after Phase A**. §5 states the scan is explicitly "a **repeatable** coverage check — re-running it after each phase measures the coverage lift and surfaces the shrinking residual".
+**What:** re-run [ADR 0089](../../adr/0089-recognition-first-lens-native-idioms.md) §5's AST coverage scan against the current production estate and publish the delta. **The measurement already exists and must not be re-invented:** ADR 0089 §1 scanned **87 files / 486 `msg`-manipulating functions / 3,852 statements** and found **~66% of projected rows opaque** (`code` / `UNRECOGNIZED control`) with **100% of handlers rendering zero editable action rows**; the index row records **~42% editable after Phase A**. §5 states the scan is explicitly "a **repeatable** coverage check — re-running it after each phase measures the coverage lift and surfaces the shrinking residual".
 
 **What is genuinely unknown:** the number *today*, after Phase A **plus** ADR 0106's 27-item palette, ADR 0108's send fan-out, and ADR 0104's picker landed. ADR 0089 §4 projects Phases A–D reaching **~80–90%** of transform statements against ~13% at baseline; nobody has confirmed where the current build actually sits, so the decision to build Phases B–E (or to stop) is being taken without the number that was designed to inform it.
 
@@ -4930,7 +4930,7 @@ if self._host not in _LOOPBACK_HOSTS and not (
 
 So `calling_ae_allowlist` **alone** satisfies a gate whose stated purpose is to fail closed. A DICOM Calling AE Title is a **caller-asserted string with no cryptographic binding** — any peer that guesses or learns one AE Title is admitted. Empirically confirmed: an SCP on `0.0.0.0` with only `calling_ae_allowlist=["MOD1"]` constructs without error.
 
-**Why it is filed rather than fixed:** the three-control set is a documented contract — [ADR 0025](adr/0025-dicom-codec-store-connectors.md) §9 and the `docs/SECURITY.md` decision-table row both enumerate `calling_ae_allowlist` / `source_ip_allowlist` / mTLS as co-equal satisfiers. Demoting one is an ADR amendment and a breaking change for any site relying on it, so it needs its own decision rather than being a rider on a message correction.
+**Why it is filed rather than fixed:** the three-control set is a documented contract — [ADR 0025](../../adr/0025-dicom-codec-store-connectors.md) §9 and the `docs/SECURITY.md` decision-table row both enumerate `calling_ae_allowlist` / `source_ip_allowlist` / mTLS as co-equal satisfiers. Demoting one is an ADR amendment and a breaking change for any site relying on it, so it needs its own decision rather than being a rider on a message correction.
 
 **Options:** (a) keep three satisfiers but require AE-title to be paired with an IP allowlist or mTLS off-loopback; (b) demote AE-title to *not* satisfying the gate alone, with an explicit audited opt-out mirroring the other loosenings; (c) accept as-is and document the weakness at the gate (the refusal message now warns about it in-band).
 
@@ -4988,7 +4988,7 @@ Nothing in the product moves that default: grep for `_create_default_https_conte
 2. `transports/email.py:182-187` runs `RevocationHopGuard` on that hop, labelled `cell="Email destination (verified SMTP TLS, no revocation check)"` and `description="delivers over verified SMTP TLS but performs no certificate revocation checking"` (`:184-185`). The guard is defined for *"a **VERIFYING** outbound TLS hop"* (`config/tls_policy.py:685`, `:721`) and its docstring asserts *"the caller has already built a verifying context"* (`:703`). So on an enforcing production-PHI instance the engine **refuses to start** because a verified certificate might be *revoked*, on a hop that never checked the certificate at all.
 3. `transports/email.py:147-151` refuses SMTP AUTH only when `use_tls=false` (*"refused — credentials require STARTTLS/implicit TLS"*). With `use_tls=true` the password is sent over the unverified hop, so an on-path attacker presenting any self-signed certificate harvests it.
 
-The same false premise is published to operators: `docs/DEPLOYMENT.md:129` counts *"SMTP/EMAIL"* among *"**seven** verifying outbound TLS hops"*, and #201's shipped banner (`docs/BACKLOG.md:6430`) says the guard *"fires only on a VERIFYING hop"*.
+The same false premise is published to operators: `docs/DEPLOYMENT.md:129` counts *"SMTP/EMAIL"* among *"**seven** verifying outbound TLS hops"*, and #201's shipped banner says the guard *"fires only on a VERIFYING hop"*.
 
 `docs/PHI.md` stream 11 was the one place that was **honest** — it stated the `send_plain_email` defect plainly and warned readers not to generalise it to the connectors. ⚠️ The sentence this item quoted verbatim from it (*"PR #1163 hardened the EMAIL message destination connector, not the `[alerts]` SMTP path"*) **no longer exists** — PR #132 rewrote that row, so the quotation was already stale before layer 3 touched it. Layer 3 rewrote the row again, to the verifying posture. What that doc did not say is that the destination connector it points at has the identical defect.
 
@@ -4999,7 +4999,7 @@ Honestly bounded — this is not remotely exploitable on its own:
 - It **requires network position** (on-path MITM: ARP/DNS/BGP interception, or a compromised intermediate) between the engine and the SMTP server. An attacker without that position gets nothing.
 - **`direct.py` is materially less bad.** Its clinical payload is S/MIME signed+encrypted at the *message* layer, independent of transport TLS (ADR 0085; `transports/direct.py:3-15`), so a TLS MITM there gets envelope metadata, recipients and the AUTH credential — not the clinical body. It is also the one path with no `RevocationHopGuard` at all (grep: the guard appears in `mllp.py:736`, `rest.py:642`, `email.py:182`, never `direct.py`).
 - **The credential exposure is bounded.** It is a mail-submission password; an attacker already on that hop can already read the messages, so it mostly buys persistence and relay abuse rather than a larger PHI win.
-- **No other transport is affected.** MLLP/FTPS/REST/SOAP/FHIR/DICOM-SCU all build explicit contexts through `config/tls_policy.py` helpers (`_mllp_ssl_context` and siblings, per #129's write-up at `docs/BACKLOG.md:5046`). This is specific to the `smtplib` seam — which is precisely *why* it escaped: the shared TLS-policy helpers are never called on it.
+- **No other transport is affected.** MLLP/FTPS/REST/SOAP/FHIR/DICOM-SCU all build explicit contexts through `config/tls_policy.py` helpers (`_mllp_ssl_context` and siblings, per #129's write-up). This is specific to the `smtplib` seam — which is precisely *why* it escaped: the shared TLS-policy helpers are never called on it.
 - **Nothing here is a regression.** It has been the behaviour since ADR 0029; #201's amendment layered a guard on top without checking the premise.
 
 The reason to rate this high anyway is the second-order damage: a green posture gate and a `DEPLOYMENT.md` table currently tell an operator this hop is verified. A control that lies is worse than an absent one.
@@ -5008,11 +5008,11 @@ The reason to rate this high anyway is the second-order damage: a green posture 
 
 1. Add one shared verifying-context factory for the `smtplib` seam in `config/tls_policy.py` (reusing the existing hardening helpers, so `VERIFY_X509_STRICT` and the expiry-relaxation path compose), and pass it as `context=` at all five call sites above.
 2. Expose per-connection `tls_verify` + `ca_cert` on the `Email()` / `Direct()` factories and the `[alerts].email_*` settings, so a private-CA or self-signed mail server is served by **trust configuration**, not by silent non-verification.
-3. Route any resulting `tls_verify=false` through the **same** #200 posture gate as MLLP/FTPS (`docs/BACKLOG.md:6410`), so a production-PHI instance refuses it. Then #201's `RevocationHopGuard` on this path becomes true rather than aspirational.
-4. Correct the false-premise prose in the same commit: `transports/email.py:173`, the guard labels at `:184-185`, `config/tls_policy.py:703`, `docs/DEPLOYMENT.md:129`, and the #201 banner at `docs/BACKLOG.md:6430`. Update `docs/PHI.md:916` to cover all three paths once fixed.
+3. Route any resulting `tls_verify=false` through the **same** #200 posture gate as MLLP/FTPS, so a production-PHI instance refuses it. Then #201's `RevocationHopGuard` on this path becomes true rather than aspirational.
+4. Correct the false-premise prose in the same commit: `transports/email.py:173`, the guard labels at `:184-185`, `config/tls_policy.py:703`, `docs/DEPLOYMENT.md:129`, and the #201 banner. Update `docs/PHI.md:916` to cover all three paths once fixed.
 5. Tests: ⚠️ **the parameter half of this step was already false when layer 3 started** — PR #132 widened all three fakes (including the alerts one) to accept `context`, without the alerts production code ever passing one. So the fakes accepted the kwarg and **discarded** it, and the assertion half was the part that mattered: none asserted verification — they will need the kwarg, plus a positive assertion that the passed context has `check_hostname=True` / `verify_mode=CERT_REQUIRED`. A real-handshake test against a wrong-host certificate is the one that would actually have caught this.
 
-**Related:** [`messagefoundry/transports/email.py`](../messagefoundry/transports/email.py), [`messagefoundry/transports/direct.py`](../messagefoundry/transports/direct.py), [`messagefoundry/pipeline/alert_sinks.py`](../messagefoundry/pipeline/alert_sinks.py), [`messagefoundry/config/tls_policy.py`](../messagefoundry/config/tls_policy.py), [ADR 0029](adr/0029-email-smtp-destination.md), [ADR 0078](adr/0078-certificate-revocation-posture.md), [ADR 0085](adr/0085-direct-hisp-smime-connector.md), [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md), [`docs/PHI.md`](PHI.md) §7 stream 11, [`docs/DEPLOYMENT.md`](DEPLOYMENT.md), #200, #201, #139.
+**Related:** [`messagefoundry/transports/email.py`](../../../messagefoundry/transports/email.py), [`messagefoundry/transports/direct.py`](../../../messagefoundry/transports/direct.py), [`messagefoundry/pipeline/alert_sinks.py`](../../../messagefoundry/pipeline/alert_sinks.py), [`messagefoundry/config/tls_policy.py`](../../../messagefoundry/config/tls_policy.py), [ADR 0029](../../adr/0029-email-smtp-destination.md), [ADR 0078](../../adr/0078-certificate-revocation-posture.md), [ADR 0085](../../adr/0085-direct-hisp-smime-connector.md), [ADR 0092](../../adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md), [`docs/PHI.md`](../../PHI.md) §7 stream 11, [`docs/DEPLOYMENT.md`](../../DEPLOYMENT.md), #200, #201, #139.
 
 **Amends #139:** its rationale at `docs/BACKLOG.md:5264` — *"The engine's `EmailAlertSink` uses STARTTLS with a verifying context by design"* — is **false** and should be retracted there. Note that #139's own **Why:** two lines earlier at `:5262` is accurate (*"calls `starttls()` with the default SSL context"*), so the item contradicts itself; fix both lines together. Note also the inversion: #139 declines building an opt-in trust-any-certificate toggle because *"unconditionally trusting an SMTP server's TLS certificate defeats TLS"*, while the code already does exactly that, unconditionally, with no toggle to turn it off. Once this item lands, #139's decline becomes coherent for the first time.
 
@@ -5024,7 +5024,7 @@ The reason to rate this high anyway is the second-order damage: a green posture 
 
 ## 339. Sandbox IPC codec: parent executed child-chosen code (ADR 0087 MFW2)
 
-> ✅ **SHIPPED 2026-08-01 (ADR 0087 MFW2 amendment, `c0d61b94`).** ADR 0087's `mode=subprocess` boundary was **bypassable**: the worker pickled a Handler's raw return into `{"ok": True, "result": ...}` and the **parent** called `pickle.loads` on it, so a Handler returning an object with a custom `__reduce__` executed arbitrary code in the engine process — the one holding the DEK, the audit chain and every live socket. Proven end-to-end. Both legs now use a **closed-tag, non-executing codec** ([`pipeline/_sandbox_codec.py`](../messagefoundry/pipeline/_sandbox_codec.py)): `json.loads` with no object hooks plus a literal tag dispatch over a closed constructor set, so the decode path cannot name a type, import a module, `getattr` on child data, or reach `__reduce__`. A **restricted unpickler was evaluated and disproved** — a `BUILD` opcode over an allowlisted frozen dataclass yields `Send(to=42, message=[])` with `__post_init__` never running. Adversarial review then found a **second, independent break in the correlation defense the codec introduced**: the request id was a per-spawn nonce + counter, disclosed to the child, and only `(id, phase)` was checked — a Handler could pre-stage a forged frame for the next id and have it consumed as an **unrelated** message's result (silent misdelivery to any registered outbound, no `ERROR`, no disposition anomaly, deterministic). Closed three ways: a fresh `secrets.token_hex(16)` per dispatch, binding of the whole `(id, phase, name)` triple, and an unsolicited-frame check fatal to the worker. `mode=off` stays default and byte-identical. Suppression hygiene: the `nosec B403` and the repo's **only** `nosemgrep` are deleted, not reworded — zero `pickle`/`marshal` remains in `messagefoundry/` or `tee/`.
+> ✅ **SHIPPED 2026-08-01 (ADR 0087 MFW2 amendment, `c0d61b94`).** ADR 0087's `mode=subprocess` boundary was **bypassable**: the worker pickled a Handler's raw return into `{"ok": True, "result": ...}` and the **parent** called `pickle.loads` on it, so a Handler returning an object with a custom `__reduce__` executed arbitrary code in the engine process — the one holding the DEK, the audit chain and every live socket. Proven end-to-end. Both legs now use a **closed-tag, non-executing codec** ([`pipeline/_sandbox_codec.py`](../../../messagefoundry/pipeline/_sandbox_codec.py)): `json.loads` with no object hooks plus a literal tag dispatch over a closed constructor set, so the decode path cannot name a type, import a module, `getattr` on child data, or reach `__reduce__`. A **restricted unpickler was evaluated and disproved** — a `BUILD` opcode over an allowlisted frozen dataclass yields `Send(to=42, message=[])` with `__post_init__` never running. Adversarial review then found a **second, independent break in the correlation defense the codec introduced**: the request id was a per-spawn nonce + counter, disclosed to the child, and only `(id, phase)` was checked — a Handler could pre-stage a forged frame for the next id and have it consumed as an **unrelated** message's result (silent misdelivery to any registered outbound, no `ERROR`, no disposition anomaly, deterministic). Closed three ways: a fresh `secrets.token_hex(16)` per dispatch, binding of the whole `(id, phase, name)` triple, and an unsolicited-frame check fatal to the worker. `mode=off` stays default and byte-identical. Suppression hygiene: the `nosec B403` and the repo's **only** `nosemgrep` are deleted, not reworded — zero `pickle`/`marshal` remains in `messagefoundry/` or `tee/`.
 
 **Cluster:** Security & Compliance. **Priority:** P1. **Verdict:** shipped. **Severity:** high (blast radius: full bypass of the isolation boundary), low (likelihood: requires Handler-authoring rights, i.e. an admin — but distrusting admin code is the sandbox's entire purpose).
 
@@ -5037,7 +5037,7 @@ The reason to rate this high anyway is the second-order damage: a green posture 
 **OPEN — owner decisions, deliberately not taken here:**
 
 1. **Erratum / advisory.** The shipped `mode=subprocess` did not deliver the boundary it advertised, for anyone who opted in. Whether that warrants a security advisory or release note is a disclosure call, not an engineering one.
-2. ~~**`docs/adr/README.md:121` still reads "Closes the WP-L3-17 residual (residual-closure)"**~~ — **DONE 2026-08-01, not open.** The contradiction with `:175` (ADR 0144, "15.2.5 stays **Partial**") was real and :175 was the correct position: confinement is address-space only until [ADR 0147](adr/0147-hardened-runtime-isolation-for-router-handler-code-ipc-brokered-sandbox-extends-adr-0087.md) lands. The edit landed as `08d898bc` in this same PR, once `claude/adr-asvs-scorecard-as-data` merged (ADR 0156, PR #120) and the worktree guard released; the row now records the MFW2 amendment and agrees with `:175`. **This entry is corrected rather than deleted because it read "the edit was NOT made" for the life of the branch, and at least four sessions saw it in that state.** The same closure claim in **#197's banner above** is corrected in the same pass as this note — it was the last copy of it in this file.
+2. ~~**`docs/adr/README.md:121` still reads "Closes the WP-L3-17 residual (residual-closure)"**~~ — **DONE 2026-08-01, not open.** The contradiction with `:175` (ADR 0144, "15.2.5 stays **Partial**") was real and :175 was the correct position: confinement is address-space only until [ADR 0147](../../adr/0147-hardened-runtime-isolation-for-router-handler-code-ipc-brokered-sandbox-extends-adr-0087.md) lands. The edit landed as `08d898bc` in this same PR, once `claude/adr-asvs-scorecard-as-data` merged (ADR 0156, PR #120) and the worktree guard released; the row now records the MFW2 amendment and agrees with `:175`. **This entry is corrected rather than deleted because it read "the edit was NOT made" for the life of the branch, and at least four sessions saw it in that state.** The same closure claim in **#197's banner above** is corrected in the same pass as this note — it was the last copy of it in this file.
 3. **Private-vault doc pass.** `docs/security/THREAT-MODEL.md` 15.1.5 row, `ASVS-L3-REMEDIATION-PLAN.md` WP-L3-17, and theme 6 of `ASVS-L3-RISK-ACCEPTANCE-REGISTER.md` all describe the pre-MFW2 boundary. `tests/test_threat_model_doc_drift.py` had **pinned the literal token `pickle`** in that row — which after this change would have *required* the doc to assert a mechanism the code no longer has — so the anchor moved to `_sandbox_codec`. Those 89 drift tests skip in every checkout (the directory is gitignored with zero tracked files), so **CI cannot catch this drift in either direction**; the vault edit is a manual, coupled follow-up.
 
 **Not fixed here, deliberately (each wants its own item):** process-group kill (a grandchild inherits fd 1 and outlives `proc.kill()`); the unframed inherited stderr; and the latent tuple/set-of-`Send`s accept-and-drop, which this codec **preserves on purpose** (it describes such an item as `{"o": "other"}` and rebuilds an inert `Ignored()` so `_partition` stays the sole filter) rather than changing routing behaviour inside a security fix.
@@ -5056,7 +5056,7 @@ The reason to rate this high anyway is the second-order damage: a green posture 
 
 **What** (the defect as found, 2026-08-02 — past tense throughout; both halves have since shipped, see *Status*): two halves of one hole.
 
-*Half A — the orphan is created and nothing cleans it up.* [`scripts/worktree/prune-merged.ps1`](../scripts/worktree/prune-merged.ps1) removes worktrees. Across its 1,108 lines there **was** no handling of coordination claims — verified by search, not assumed. A claim is a JSON file at `<git-common-dir>/mefor-coord/claims/<key>.json` carrying the holder's `worktree` path; the file lives beside the *shared* object store, so it outlives the worktree that created it. Prune deletes the directory, the claim file remains, and [`claim.ps1`](../scripts/coord/claim.ps1)'s `-Take` hard-blocks on any existing claim file. The key is then unclaimable until a human happens to run `-Release <key> -Force`. Nothing surfaces the condition; nothing times it out (correctly — see *Non-goal*).
+*Half A — the orphan is created and nothing cleans it up.* [`scripts/worktree/prune-merged.ps1`](../../../scripts/worktree/prune-merged.ps1) removes worktrees. Across its 1,108 lines there **was** no handling of coordination claims — verified by search, not assumed. A claim is a JSON file at `<git-common-dir>/mefor-coord/claims/<key>.json` carrying the holder's `worktree` path; the file lives beside the *shared* object store, so it outlives the worktree that created it. Prune deletes the directory, the claim file remains, and [`claim.ps1`](../../../scripts/coord/claim.ps1)'s `-Take` hard-blocks on any existing claim file. The key is then unclaimable until a human happens to run `-Release <key> -Force`. Nothing surfaces the condition; nothing times it out (correctly — see *Non-goal*).
 
 *Half B — the registry could not see that a holder was gone.* `claim.ps1`'s only staleness signal was **age ≥ 12h**, advisory text emitted by `-List` alone. `-Take` — the path an operator actually hits — printed the same "held by another session" block whether the holder was deleted, dead, or actively committing. `-Release` went further and *advised* `-Force` ("If that session is gone, re-run with `-Force`") without ever checking whether it was. PR #106 fixed `-List` by testing the holder path and printing `[HOLDER GONE …]`, but deliberately did not touch `-Take` or `-Release` — so the *blocking* paths stayed blind, which is the half that matters: `-List` is where you browse, `-Take` is where you are stopped.
 
@@ -5081,7 +5081,7 @@ The three surfaces now share **one** liveness helper, because they had been disa
 
 **The asymmetry is the design, not an implementation detail.** A vanished worktree is a fact and the one state safe to act on unasked; *present*, *undatable* and *unprobeable* all read as "coordinate first", never "probably fine". A probe hardwired to `gone` would pass every positive test, so each one is paired with the negative case that catches it. `-Force` itself is untouched: this reports, it does not enforce — refusing to override a live claim would strand every key whose holder is merely unreachable, which is this same bug one level up.
 
-**Related:** [`scripts/worktree/prune-merged.ps1`](../scripts/worktree/prune-merged.ps1); [`scripts/coord/claim.ps1`](../scripts/coord/claim.ps1); [`docs/WORKTREES.md`](WORKTREES.md); PR #106 (`-List` liveness, the half already built); PR #74 (the prune hardening this sits beside — liveness *veto* before deletion, where this is cleanup *after*); #344 (the sibling defect class, *a bound stated independently of the thing it bounds*).
+**Related:** [`scripts/worktree/prune-merged.ps1`](../../../scripts/worktree/prune-merged.ps1); [`scripts/coord/claim.ps1`](../../../scripts/coord/claim.ps1); [`docs/WORKTREES.md`](../../WORKTREES.md); PR #106 (`-List` liveness, the half already built); PR #74 (the prune hardening this sits beside — liveness *veto* before deletion, where this is cleanup *after*); #344 (the sibling defect class, *a bound stated independently of the thing it bounds*).
 
 **Source:** zizmor-1280 handoff, 2026-08-02, which reported claim `7` stranded by a prune and filed the mechanism as unbuilt. Half A and Half B were then re-verified against the code directly rather than inherited: the absent claim handling by search over `prune-merged.ps1`, the `-Take`/`-Release` blindness by reading both `main` and `claim-liveness`.
 
@@ -5095,7 +5095,7 @@ The three surfaces now share **one** liveness helper, because they had been disa
 
 **How it surfaced.** PR #142, CI job `91502517146`, leg `test (windows-2022, py3.14)`: `AssertionError: assert (True and 'DOE' not in 'mfenc:v1:7f...oHUc/t9nnmT9')`.
 
-**The rate — the per-CI-run figure, not the per-assertion one.** For a uniform base64 string of length *L*, a given *k*-character pattern is expected `(L-k+1)/64^k` times. At the observed ciphertext (~146 chars for the `ADT` fixture: 12-byte nonce + 76-byte body + 16-byte tag, base64'd) a 3-char literal gives **p = 5.49e-4 per assertion per run**. Derived here exactly (`Fraction`, cross-checked with `-expm1(N*log1p(-x))`); **the 200k-trial simulation corroborating it came with the originating defect report, not from this filing**; one session reproduced it independently at N=144 windows and another recomputed it analytically. All four agree. But **there are two such assertions** (`:95` and `:303`, both `DOE`) and this repo runs **three OS legs** (`ubuntu` + `windows-2022` + `windows-2025`, one Python version — [`ci.yml`](../.github/workflows/ci.yml)), so what an operator actually experiences is:
+**The rate — the per-CI-run figure, not the per-assertion one.** For a uniform base64 string of length *L*, a given *k*-character pattern is expected `(L-k+1)/64^k` times. At the observed ciphertext (~146 chars for the `ADT` fixture: 12-byte nonce + 76-byte body + 16-byte tag, base64'd) a 3-char literal gives **p = 5.49e-4 per assertion per run**. Derived here exactly (`Fraction`, cross-checked with `-expm1(N*log1p(-x))`); **the 200k-trial simulation corroborating it came with the originating defect report, not from this filing**; one session reproduced it independently at N=144 windows and another recomputed it analytically. All four agree. But **there are two such assertions** (`:95` and `:303`, both `DOE`) and this repo runs **three OS legs** (`ubuntu` + `windows-2022` + `windows-2025`, one Python version — [`ci.yml`](../../../.github/workflows/ci.yml)), so what an operator actually experiences is:
 
 | Scope | Rate |
 | --- | --- |
@@ -5142,7 +5142,7 @@ The `startswith(MARKER_PREFIX)` half stays in every case.
 
 **Whichever is chosen, prove the new assertion can FAIL before trusting that it passes** — break the encryption deliberately (hand the store an `IdentityCipher`, or plant a plaintext body) and watch the rewritten test go red, then restore. This item exists because a green was taken as evidence for a property it could not see; shipping its replacement on an unfalsified green would reproduce the defect in the fix. Note the trap that makes this more than a formality, learned the hard way elsewhere in this repo today: proving the *instrument* can fire is only half — the *workload* must also be able to produce the failure class. An 800-iteration repro loop returned 800/800 green against a live SQL Server while hunting a lock-contention bug, because running the tests in isolation was the one configuration that could not generate contention. A rig that excludes the condition it is hunting reports silence, and silence reads like evidence.
 
-**Related:** [`tests/test_store_encryption.py`](../tests/test_store_encryption.py):95, :303, :49–58 (the convention comment, already correct — the natural home for the ≥6 rule); [`tests/test_content_search.py`](../tests/test_content_search.py):123; CLAUDE.md §9 (the PHI-at-rest guarantee the assertion is reaching for); [`Secure_Development_Standards`](Secure_Development_Standards.md) §3 (reviewing security prose by what a reader would DO with it — the same question, asked of a test instead of a paragraph).
+**Related:** [`tests/test_store_encryption.py`](../../../tests/test_store_encryption.py):95, :303, :49–58 (the convention comment, already correct — the natural home for the ≥6 rule); [`tests/test_content_search.py`](../../../tests/test_content_search.py):123; CLAUDE.md §9 (the PHI-at-rest guarantee the assertion is reaching for); [`Secure_Development_Standards`](../../Secure_Development_Standards.md) §3 (reviewing security prose by what a reader would DO with it — the same question, asked of a test instead of a paragraph).
 
 **#344 — cited for the harm, NOT the cause; do not fold them.** Both are individually-blameless CI reds that invite the wrong fix, in a repo whose two famous "flakes" turned out to be a livelock and a test that was right. But: **#344's thesis is a fixed bound meeting variable latency; #347 is a deterministic property tested by a probabilistic proxy.** (Its *thesis* deliberately — that item's instance 2 has since been re-diagnosed as a swallowed lock-timeout rather than a bound at all, so "#344 = timeouts" is not a premise to lean on.) Neither is fixed by changing a number, for opposite reasons. The one-line discriminator, from #344's owner: **this one would fire at exactly the same rate on an infinitely fast machine.** A reader who follows the link lands on a wall-clock item and must not back-infer that this is a timing bug — it is not.
 
@@ -5154,23 +5154,23 @@ The `startswith(MARKER_PREFIX)` half stays in every case.
 
 ## 348. SQL Server: a cancelled store call returns a pooled connection mid-transaction holding X locks
 
-> ✅ **Status CLOSED (filed + fixed 2026-08-02, [ADR 0159](adr/0159-cancellation-safe-pooled-connection-release-mid-txn-discard-at-the-acquire-chokepoint.md)).** `SqlServerStore`'s write idiom is `except Exception: await conn.rollback(); raise` — used at **90 of the 91** `self._acquire()` sites. `asyncio.CancelledError` derives from `BaseException`, so on a cancellation **no rollback runs**, and aioodbc's `Pool.release()` appends the connection straight back onto the free deque with no rollback, reset or transaction check (0.5.0 `pool.py:196-205`; `_ContextManager.__aexit__` uses the *same* `release` on the exception path). The next borrower inherited an open transaction still holding X locks on `queue` rows. Fixed by quarantining the connection at the `_acquire` chokepoint.
+> ✅ **Status CLOSED (filed + fixed 2026-08-02, [ADR 0159](../../adr/0159-cancellation-safe-pooled-connection-release-mid-txn-discard-at-the-acquire-chokepoint.md)).** `SqlServerStore`'s write idiom is `except Exception: await conn.rollback(); raise` — used at **90 of the 91** `self._acquire()` sites. `asyncio.CancelledError` derives from `BaseException`, so on a cancellation **no rollback runs**, and aioodbc's `Pool.release()` appends the connection straight back onto the free deque with no rollback, reset or transaction check (0.5.0 `pool.py:196-205`; `_ContextManager.__aexit__` uses the *same* `release` on the exception path). The next borrower inherited an open transaction still holding X locks on `queue` rows. Fixed by quarantining the connection at the `_acquire` chokepoint.
 
 **Cluster:** Store & Reliability. **Priority:** P2. **Verdict:** built. **Severity:** medium (pool integrity + a silent stall), low (likelihood: needs a cancellation to land inside a pooled write).
 
 **Reproduced on a live SQL Server 2022 before the fix**, cancelling each call mid-body and inspecting the server: `release_claimed` **7** X locks on `queue`, `reschedule_claimed` **7**, `mark_done` **9**, `enqueue_ingress` **11** — and `claim_fifo_heads` **0** (the control). The connection was back on the free list (`size=1 freesize=1`), a raw writer got **error 1222**, and a real second `claim_fifo_heads` returned **EMPTY-all**. After the fix: **0** locks, no open-transaction session, writer unblocked, connection dropped from the pool rather than re-lent.
 
-**Why it was invisible.** Under [ADR 0066](adr/0066-pooled-stage-claimers.md) §9 the claim runs `SET LOCK_TIMEOUT 0`, so a blocked claimer raises 1222 and the claim path translates that to a **sanctioned** EMPTY-all yield. The symptom is therefore silence — a lane that quietly claims nothing — not an error anyone would see. `enqueue_ingress` is the pre-ACK ingress commit, the engine's hottest path.
+**Why it was invisible.** Under [ADR 0066](../../adr/0066-pooled-stage-claimers.md) §9 the claim runs `SET LOCK_TIMEOUT 0`, so a blocked claimer raises 1222 and the claim path translates that to a **sanctioned** EMPTY-all yield. The symptom is therefore silence — a lane that quietly claims nothing — not an error anyone would see. `enqueue_ingress` is the pre-ACK ingress commit, the engine's hottest path.
 
-**The path that bites is demotion, not shutdown.** `engine.stop()` closes the store shortly after cancelling, so the poisoned connection dies at teardown. Loss of leadership ([`engine.py:1242-1252`](../messagefoundry/pipeline/engine.py), `_stop_graph`) runs the identical cancel chain but **does not close the store** — the pool stays live and shared with the coordinator/convergence loops, so the connection sits in `_free` and is re-borrowed by unrelated callers.
+**The path that bites is demotion, not shutdown.** `engine.stop()` closes the store shortly after cancelling, so the poisoned connection dies at teardown. Loss of leadership ([`engine.py:1242-1252`](../../../messagefoundry/pipeline/engine.py), `_stop_graph`) runs the identical cancel chain but **does not close the store** — the pool stays live and shared with the coordinator/convergence loops, so the connection sits in `_free` and is re-borrowed by unrelated callers.
 
-**Two corrections to the lead that opened this.** (1) It is **not** a two-method asymmetry: an AST census found 90 of 91 `_acquire` bodies share the idiom, and `mark_done`/`enqueue_ingress` were measured leaking identically — a two-method patch would have fixed an arbitrary slice. (2) `claim_fifo_heads` does **not** shield against this; its guard is a `SET LOCK_TIMEOUT` *reset* guard, [ADR 0114](adr/0114-phase-4-claim-path-call-complexity-reduction-driver-interface-redesign-ingress-routed-reset-fold.md) §2 states there is **no rollback** on its cancellation path, and `test_adr0114_claim_fold.py::test_ac3_cancellation_at_body_await_no_rollback_guard_runs` freezes that. It ends clean because the guard **commits**.
+**Two corrections to the lead that opened this.** (1) It is **not** a two-method asymmetry: an AST census found 90 of 91 `_acquire` bodies share the idiom, and `mark_done`/`enqueue_ingress` were measured leaking identically — a two-method patch would have fixed an arbitrary slice. (2) `claim_fifo_heads` does **not** shield against this; its guard is a `SET LOCK_TIMEOUT` *reset* guard, [ADR 0114](../../adr/0114-phase-4-claim-path-call-complexity-reduction-driver-interface-redesign-ingress-routed-reset-fold.md) §2 states there is **no rollback** on its cancellation path, and `test_adr0114_claim_fold.py::test_ac3_cancellation_at_body_await_no_rollback_guard_runs` freezes that. It ends clean because the guard **commits**.
 
-**Not a data-integrity bug.** At-least-once was never at risk — a cancelled `release_claimed` leaves rows `INFLIGHT` and `reset_stale_inflight` re-pends them, which [`stage_dispatcher.py:491-492`](../messagefoundry/pipeline/stage_dispatcher.py) already declares the intended outcome. What was broken is pool integrity.
+**Not a data-integrity bug.** At-least-once was never at risk — a cancelled `release_claimed` leaves rows `INFLIGHT` and `reset_stale_inflight` re-pends them, which [`stage_dispatcher.py:491-492`](../../../messagefoundry/pipeline/stage_dispatcher.py) already declares the intended outcome. What was broken is pool integrity.
 
 **Backend scope: SQL Server only.** Postgres is safe twice over (asyncpg's `Transaction.__aexit__` rolls back on any `BaseException`; its pool also resets under `asyncio.shield`). SQLite shares the code shape but has one writer connection under an `asyncio.Lock` and no pool, so there is no next borrower.
 
-**Related:** ADR 0159, [ADR 0066](adr/0066-pooled-stage-claimers.md) §9, ADR 0114 §2, §1 of this file (the original H-6/H-7/H-8/M-6 concurrency-safety work — M-6 was scoped to `_fetchall`/bootstrap rollback hygiene and never covered the cancellation path).
+**Related:** ADR 0159, [ADR 0066](../../adr/0066-pooled-stage-claimers.md) §9, ADR 0114 §2, §1 of this file (the original H-6/H-7/H-8/M-6 concurrency-safety work — M-6 was scoped to `_fetchall`/bootstrap rollback hygiene and never covered the cancellation path).
 
 **Meets #344 instance 2 at the 1222.** That item (found independently and concurrently) traces the far end of this same chain: a contended head raises 1222, the store swallows it as a normal EMPTY, and the dispatcher goes to phase IDLE with no timer armed — **a test-rig gap, not an engine defect**, since production's periodic sweep re-readies such a lane and the ADR 0070 tests disable that sweep deliberately. Nothing here contradicts that and this item's severity is **not** escalated on it. What this adds is a **duration profile**: #344 assumes momentary producer contention, whereas a connection poisoned by *this* defect holds its `queue` X locks for as long as it sits unclaimed in the pool's free deque, so the 1222 can repeat across successive sweep ticks instead of clearing on the next. Cited by ledger number, not SHA — that branch is unpushed and may be rebased.
 
@@ -5186,7 +5186,7 @@ The `startswith(MARKER_PREFIX)` half stays in every case.
 
 **`installed is True` strictly entails a successful connect** — verified from CPython 3.14.6 source and re-demonstrated locally. `logging_setup.py` sets `forwarder_installed = True` only in the `else:` of `try: _build_syslog_handler(...) except OSError`. In stdlib `handlers.py` the **inet** branch ends `if err is not None: raise err`; the *"not regarded as an error if the other end isn't listening"* swallow applies **only** to the `isinstance(address, str)` AF_UNIX branch. Local negative control: with `createSocket` patched to succeed, `installed=True` (the observed CI failure); patched to raise, `installed=False`.
 
-**⛔ The obvious fix is wrong.** "Bind a socket, read the assigned port, close it, use that" returns a port **from the ephemeral range by construction** — precisely the enabling precondition — and was demonstrated self-connectable on its own output. It appears to pass only because Windows allocates forward-sequentially with the cursor one step past the returned port: undocumented behaviour on a **system-wide** cursor shared with every other process. **This repo had already retired that antipattern** — [`tests/test_load_runner.py`](../tests/test_load_runner.py) documents the TOCTOU race verbatim. A live instance still ships at `tests/test_connection_api.py:61-67` (`_dead_port`) and was **not** fixed here.
+**⛔ The obvious fix is wrong.** "Bind a socket, read the assigned port, close it, use that" returns a port **from the ephemeral range by construction** — precisely the enabling precondition — and was demonstrated self-connectable on its own output. It appears to pass only because Windows allocates forward-sequentially with the cursor one step past the returned port: undocumented behaviour on a **system-wide** cursor shared with every other process. **This repo had already retired that antipattern** — [`tests/test_load_runner.py`](../../../tests/test_load_runner.py) documents the TOCTOU race verbatim. A live instance still ships at `tests/test_connection_api.py:61-67` (`_dead_port`) and was **not** fixed here.
 
 **The fix, and the trap in it.** The contract under test is *"an `OSError` raised while **building** the handler is tolerated"* — **not** *"port X is closed."* Both tests now `monkeypatch.setattr(_TimeoutSysLogHandler | _TlsSysLogHandler, "createSocket", …)` to raise `ConnectionRefusedError`, matching an idiom already used in the same file. The real `_build_syslog_handler`, the real tcp/tls/udp dispatch and the real `except OSError` warn path are all still exercised. ⭐ **Patch `createSocket`, NOT `socket.create_connection`** — `SysLogHandler` uses `getaddrinfo` + `socket.socket()` + `sock.connect()` and never touches `create_connection`, so that patch intercepts nothing and ships a still-flaky test. Two independent analyses got this wrong.
 
@@ -5222,7 +5222,7 @@ The `startswith(MARKER_PREFIX)` half stays in every case.
 
 **Cluster:** Security / Logging. **Priority:** P3. **Verdict:** build (small). **Severity:** low.
 
-**What:** `ControlCharScrubFilter` ([logging_setup.py:81-87](../messagefoundry/logging_setup.py)) covers the rendered message and nothing else:
+**What:** `ControlCharScrubFilter` ([logging_setup.py:81-87](../../../messagefoundry/logging_setup.py)) covers the rendered message and nothing else:
 
 ```python
 def filter(self, record: logging.LogRecord) -> bool:
@@ -5249,7 +5249,7 @@ ValueError: boom
 
 The forged line lands at column 0 on its own physical line; the identical payload passed as a `%`-arg in the same run comes out escaped. The filter order is already right for the fix — `_install_phi_filters` (`:309-311`) adds `RedactionFilter` → `CredentialQueryScrubFilter` → `ControlCharScrubFilter`, so `exc_text` is populated before the scrub filter runs.
 
-This is the residual [ADR 0034](adr/0034-static-analysis-triage-policy-accepted-risk-register.md) already discloses at `:131` and `:144-147` (*"Open hardening (not done)"*). The ADR is honest — its older register line at `:40` is superseded in place by the correction block opened at `:126` — so **the defect is what needs fixing, not the disclosure.**
+This is the residual [ADR 0034](../../adr/0034-static-analysis-triage-policy-accepted-risk-register.md) already discloses at `:131` and `:144-147` (*"Open hardening (not done)"*). The ADR is honest — its older register line at `:40` is superseded in place by the correction block opened at `:126` — so **the defect is what needs fixing, not the disclosure.**
 
 **Why:** it defeats the ASVS 16.4.1 control the project claims, on the sink an operator actually reads during an incident: a forged `… INFO messagefoundry.auth: …` line in the NSSM-captured stdout is indistinguishable from a real one, and a line-oriented SIEM parser ingests it as a record.
 
@@ -5269,7 +5269,7 @@ One correction *widening* the bounding: the residual is not stdout/NSSM alone. `
 3. Add the missing tests. `tests/test_asvs_phase0.py:60-80` has three `ControlCharScrubFilter` tests and all three build records with `exc_info=None` (`_record` at `:56-57`); `tests/test_logging.py:231-237` covers PHI in `stack_info` but asserts nothing about control chars. Add a record carrying `exc_text`/`stack_info` with an embedded CRLF and assert the formatted output has no line matching the record prefix.
 4. Update ADR 0034 `:144-147` from "not done" to the shipped state in the same commit.
 
-**Related:** [`messagefoundry/logging_setup.py`](../messagefoundry/logging_setup.py) (`ControlCharScrubFilter`, `RedactionFilter`, `_install_phi_filters`, `JsonFormatter`, `SyslogForward`), [`messagefoundry/redaction.py`](../messagefoundry/redaction.py) (`redact`/`safe_text`/`safe_exc` — `:81-101`; these do not strip control chars either, but their output is a `%`-arg and so *is* covered), `tests/test_asvs_phase0.py`, `tests/test_logging.py`, [ADR 0034](adr/0034-static-analysis-triage-policy-accepted-risk-register.md) §"Class-rationale corrections" §1, [ADR 0080](adr/0080-tls-syslog-forwarding.md) (the off-box text-format sink), ASVS 5.0 16.4.1.
+**Related:** [`messagefoundry/logging_setup.py`](../../../messagefoundry/logging_setup.py) (`ControlCharScrubFilter`, `RedactionFilter`, `_install_phi_filters`, `JsonFormatter`, `SyslogForward`), [`messagefoundry/redaction.py`](../../../messagefoundry/redaction.py) (`redact`/`safe_text`/`safe_exc` — `:81-101`; these do not strip control chars either, but their output is a `%`-arg and so *is* covered), `tests/test_asvs_phase0.py`, `tests/test_logging.py`, [ADR 0034](../../adr/0034-static-analysis-triage-policy-accepted-risk-register.md) §"Class-rationale corrections" §1, [ADR 0080](../../adr/0080-offbox-forwarding-tls-defaults.md) (the off-box text-format sink), ASVS 5.0 16.4.1.
 
 **Source:** public-repo disclosure audit, 2026-08-01. Classified close-the-weakness-instead: ADR 0034's prose is accurate and self-correcting and stays as written.
 
@@ -5297,13 +5297,13 @@ The webview cannot import from `src/` (it is loaded as a plain script into a `de
 
 **Options (pick at build time):** (a) build the shared pure functions into a small bundled module the webview loads as a local resource (esbuild already runs — `ide/esbuild.js`); (b) move the preview computation into the extension host and post results to the webview; (c) keep both but add a differential test that runs the same fixture corpus through **both** implementations and asserts identical output. (c) is the cheapest guard and could land first regardless of which structural fix is chosen.
 
-**Related:** #222, [ADR 0103](adr/0103-steps-view-row-context-menu.md) (row context menu — move/paste entry points), ADR 0076 §5 (byte-stable splice).
+**Related:** #222, [ADR 0103](../../adr/0103-steps-view-row-context-menu.md) (row context menu — move/paste entry points), ADR 0076 §5 (byte-stable splice).
 
 **Source:** Windmill/Kestra evaluation (2026-07-30); duplication verified by direct read of both files.
 
 ## 326. MFA-at-exposure refusal reads `serve_ui` after it is flipped off
 
-> ✅ **SHIPPED 2026-08-04.** `admin_exposed` is now `instance_exposed` — an off-loopback bind **or** `[api].tls_terminated_upstream` — defined ONCE above its first consumer, from two fields no earlier arm reassigns, and shared with the ASVS 11.7.1 arm that already used it. It reads no console flag, so the ADR 0143 in-place `serve_ui = False` degrades can no longer clear an exposure refusal: the MFA-at-exposure refusal and the #189 dual-control advisory now reach a declared-proxy instance whose console is auto-degraded, explicitly disabled, or absent (arms C/D in `tests/test_cli.py`, a real-gate row in `tests/test_checks_gate_parity.py`, a shape guard in `tests/test_security_doc_drift.py`). Both `exposure_desc` else-branches name the proxy instead of `[api].serve_ui`. **Built to REFUSE, per the owner ruling of 2026-08-04 — the WARN-FIRST blockquote below is SUPERSEDED** and is being amended by a separate session, so do not read it as the shipped behaviour: there is no warning-first phase, no dated flip and no new opt-in, the refusal rides the existing `[security].enforcement` split, and the pre-existing `allow_single_factor_admin_when_exposed` acknowledgment is unchanged (with more postures to act on). A plain loopback bind with nothing declared is byte-identical. The UNDECLARED-proxy residual is deliberately still not refused — nothing was declared, so exposure would be an inference — but it is no longer silent: the ADR 0068 §8 heuristic was **measured** not to cover it (it is about the /ui cookie, and the ADR 0143 auto-degrade suppresses it in the same posture), so a dedicated arm now warns, naming single-factor admin. **Two stale claims in the body below are corrected here rather than rewritten:** the arm table's arm-A string is now `admin interface reached through a declared reverse proxy ([api].tls_terminated_upstream)`, and the `docs/CONFIGURATION.md:1437`/`:1439` citations are wrong anchors — the opt-in scoping rule lives on the `require_memory_encryption_declaration` row and the `enforcement` refuse/warn split at `:88`/`:1020`. **Two residuals are left OPEN for the owner**, recorded in the [ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md) amendment: the `[auth] enabled = false` startup arm still keys on the bind alone (same two-answers-in-one-startup shape, one arm over, and it needs its own hoist plus its own adjudication), and the vault-only `OFF-LOOPBACK-DEPLOYMENT.md` runbook still carries blind-spot wording this fix invalidates.
+> ✅ **SHIPPED 2026-08-04.** `admin_exposed` is now `instance_exposed` — an off-loopback bind **or** `[api].tls_terminated_upstream` — defined ONCE above its first consumer, from two fields no earlier arm reassigns, and shared with the ASVS 11.7.1 arm that already used it. It reads no console flag, so the ADR 0143 in-place `serve_ui = False` degrades can no longer clear an exposure refusal: the MFA-at-exposure refusal and the #189 dual-control advisory now reach a declared-proxy instance whose console is auto-degraded, explicitly disabled, or absent (arms C/D in `tests/test_cli.py`, a real-gate row in `tests/test_checks_gate_parity.py`, a shape guard in `tests/test_security_doc_drift.py`). Both `exposure_desc` else-branches name the proxy instead of `[api].serve_ui`. **Built to REFUSE, per the owner ruling of 2026-08-04 — the WARN-FIRST blockquote below is SUPERSEDED** and is being amended by a separate session, so do not read it as the shipped behaviour: there is no warning-first phase, no dated flip and no new opt-in, the refusal rides the existing `[security].enforcement` split, and the pre-existing `allow_single_factor_admin_when_exposed` acknowledgment is unchanged (with more postures to act on). A plain loopback bind with nothing declared is byte-identical. The UNDECLARED-proxy residual is deliberately still not refused — nothing was declared, so exposure would be an inference — but it is no longer silent: the ADR 0068 §8 heuristic was **measured** not to cover it (it is about the /ui cookie, and the ADR 0143 auto-degrade suppresses it in the same posture), so a dedicated arm now warns, naming single-factor admin. **Two stale claims in the body below are corrected here rather than rewritten:** the arm table's arm-A string is now `admin interface reached through a declared reverse proxy ([api].tls_terminated_upstream)`, and the `docs/CONFIGURATION.md:1437`/`:1439` citations are wrong anchors — the opt-in scoping rule lives on the `require_memory_encryption_declaration` row and the `enforcement` refuse/warn split at `:88`/`:1020`. **Two residuals are left OPEN for the owner**, recorded in the [ADR 0140](../../adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md) amendment: the `[auth] enabled = false` startup arm still keys on the bind alone (same two-answers-in-one-startup shape, one arm over, and it needs its own hoist plus its own adjudication), and the vault-only `OFF-LOOPBACK-DEPLOYMENT.md` runbook still carries blind-spot wording this fix invalidates.
 
 > **OWNER RULING 2026-08-04 — REFUSE OUTRIGHT. Supersedes an earlier ruling on this item that said
 > WARN-FIRST with a dated flip.** No warn-first, no dated flip, no opt-in flag. The corrected
@@ -5327,7 +5327,7 @@ The webview cannot import from `src/` (it is loaded as a plain script into a `de
 
 **Cluster:** Security & Compliance. **Priority:** P1. **Verdict:** build. **Severity:** medium.
 
-**What:** the `serve` startup ladder derives its admin-exposure predicate from a field an earlier arm has already mutated. In [`messagefoundry/__main__.py`](../messagefoundry/__main__.py):
+**What:** the `serve` startup ladder derives its admin-exposure predicate from a field an earlier arm has already mutated. In [`messagefoundry/__main__.py`](../../../messagefoundry/__main__.py):
 
 ```python
 console_exposed = (                                             # :1741
@@ -5357,7 +5357,7 @@ Measured 2026-08-01 against HEAD (`prod`, PHI, `enforcement=enforce`, loopback b
 
 Arm C is the load-bearing one: the TLS-floor probe is itself gated on `settings.api.public_origin` (`:1982`), and once the console degrades nothing requires that key (the `:1779` refusal only applies while `serve_ui` is on), so a JSON-only proxied deployment skips it. In that same rc=0 run the ADR 0152 arm printed `warning: EXPOSED PHI instance ('prod') …` — because it computes the predicate this gate wants, `instance_exposed = not settings.api.is_loopback or settings.api.tls_terminated_upstream` (`:2223`). The engine calls one instance *exposed* for ASVS 11.7.1 and *not exposed* for ASVS 6.3.3 in a single boot.
 
-Test coverage never caught it because the only test of this arm, `tests/test_cli.py:1230-1252` `test_serve_ui_declared_proxy_requires_mfa_on_prod_phi`, sets `security.serve_web_console = true` **explicitly** — the one input that keeps the refusal reachable. [ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md) does not mention `require_mfa`, `admin_exposed`, or single-factor admin anywhere, so the interaction was introduced rather than adjudicated.
+Test coverage never caught it because the only test of this arm, `tests/test_cli.py:1230-1252` `test_serve_ui_declared_proxy_requires_mfa_on_prod_phi`, sets `security.serve_web_console = true` **explicitly** — the one input that keeps the refusal reachable. [ADR 0143](../../adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md) does not mention `require_mfa`, `admin_exposed`, or single-factor admin anywhere, so the interaction was introduced rather than adjudicated.
 
 **Why:** ASVS 6.3.3's admin-MFA backstop is inert in the deployment shape the project recommends, and the operator gets no signal — arm C starts clean with the Administrator role single-factor over a network-facing proxy. **Bounded, and the bound matters.** `require_mfa` still **defaults on** (`settings.py:1696`), so this is only reachable after an operator has *explicitly* written `require_mfa = false`; `security_loosenings()` names that opt-out on every boot (`settings.py:4044-4050`, seen in the arm-C log) and `GET /security/posture` reports it. **The blast radius is NOT** a default deployment, **NOT** an off-loopback bind (`admin_exposed` is `True` from the `not is_loopback` arm regardless of `serve_ui` — arm A's non-loopback sibling is pinned at `tests/test_cli.py:768`), **NOT** an authentication bypass, and **NOT** a way in for an unauthenticated attacker: it removes a *refusal to start*, not a credential check. What is lost is the hard stop that was supposed to make the explicit opt-out impossible to combine with exposure — i.e. exactly the case ADR 0140 built `allow_single_factor_admin_when_exposed` to force an operator to acknowledge. The same flag also silences the #189 dual-control warning (`:1936`) in the same topology, so a second control degrades with it. Finally, the docs at `docs/CONFIGURATION.md:1437` and `docs/REMOTE-CONSOLE.md:182` currently have to carry a *"the gate will not catch you"* caveat; closing the defect is what lets that prose go.
 
@@ -5369,7 +5369,7 @@ Test coverage never caught it because the only test of this arm, `tests/test_cli
 4. Tests: add the arm-C case (declared proxy, console left at default, no `public_origin`) to `tests/test_cli.py` beside `test_serve_ui_declared_proxy_requires_mfa_on_prod_phi`, plus a `serve_web_console = false` variant — an operator who *explicitly disables* the console is in the same exposure posture and must also be caught.
 5. Docs to update once it lands: strike the blind-spot sentences at `docs/CONFIGURATION.md:1437` and `docs/REMOTE-CONSOLE.md:182`, and re-state the two `admin_exposed` decision-table rows at `docs/SECURITY.md:1083-1084`.
 
-**Related:** [`messagefoundry/__main__.py`](../messagefoundry/__main__.py) `:1741`/`:1755`/`:1834`/`:1879`/`:1936`/`:2223`, [`messagefoundry/config/settings.py`](../messagefoundry/config/settings.py) `:674`/`:680`/`:1696`/`:4044`, [ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md) (introduced the in-place flip; silent on this gate), [ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md) (the refusal + its acknowledged escape), [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md) §8 (the exposure ladder), [ADR 0152](adr/0152-in-use-data-protection-for-phi-platform-memory-encryption-attestation-asvs-11-7-1.md) (source of the correct predicate at `:2223`), `tests/test_cli.py:1230-1252`, `tests/test_checks_gate_parity.py:185-194` (its MFA row uses a non-loopback bind, so it is unaffected), `docs/SECURITY-LOOSENING.md` §`allow_single_factor_admin_when_exposed`, #187 (the `require_mfa` default), #189 (the dual-control arm that shares the flag).
+**Related:** [`messagefoundry/__main__.py`](../../../messagefoundry/__main__.py) `:1741`/`:1755`/`:1834`/`:1879`/`:1936`/`:2223`, [`messagefoundry/config/settings.py`](../../../messagefoundry/config/settings.py) `:674`/`:680`/`:1696`/`:4044`, [ADR 0143](../../adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md) (introduced the in-place flip; silent on this gate), [ADR 0140](../../adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md) (the refusal + its acknowledged escape), [ADR 0068](../../adr/0068-browser-webauthn-passkeys-offloopback.md) §8 (the exposure ladder), [ADR 0152](../../adr/0152-in-use-data-protection-for-phi-platform-memory-encryption-attestation-asvs-11-7-1.md) (source of the correct predicate at `:2223`), `tests/test_cli.py:1230-1252`, `tests/test_checks_gate_parity.py:185-194` (its MFA row uses a non-loopback bind, so it is unaffected), `docs/SECURITY-LOOSENING.md` §`allow_single_factor_admin_when_exposed`, #187 (the `require_mfa` default), #189 (the dual-control arm that shares the flag).
 
 **Source:** public-repo disclosure audit, 2026-08-01 — classified close-the-weakness-instead: the disclosure at `docs/CONFIGURATION.md:1437` / `docs/REMOTE-CONSOLE.md:182` is honest and stays until the defect is fixed.
 
@@ -5430,7 +5430,7 @@ Nothing caught it because `ide/src/test/suite/ai-policy.test.ts:31-40` tests the
 4. Test `resolveAiPolicy` itself with an injected fetch + fake `globalState`: (a) a bearer is attached when a session exists, (b) a `null` response does not overwrite a cached `false`, (c) the tokenless status-bar probe is unaffected.
 5. Once the gate can actually fire, re-check `docs/AI.md:188-191` — the trust note's reasoning is sound, but the "`assist_permitted == false` → Disabled" row only becomes true after this change.
 
-**Related:** [`../ide/src/aiPolicy.ts`](../ide/src/aiPolicy.ts), [`../ide/src/engineClient.ts`](../ide/src/engineClient.ts), [`../ide/src/chat.ts`](../ide/src/chat.ts), [`../ide/src/statusBar.ts`](../ide/src/statusBar.ts), [`../ide/src/engineStatusModel.ts`](../ide/src/engineStatusModel.ts), [`../ide/src/auth.ts`](../ide/src/auth.ts), [`../ide/src/test/suite/ai-policy.test.ts`](../ide/src/test/suite/ai-policy.test.ts), `messagefoundry/api/app.py` (`/ai/policy`, `/ai/chat`), `messagefoundry/api/security.py` (`optional_identity`), [ADR 0035](adr/0035-ide-extension-workspace-trust-and-scope.md) (SEC-022 — the control this completes; note its own Related line miscites "ADR 0024 (AI policy)", which is the SMART token provider), [ADR 0135](adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md) (the brokered path, server-gated), [`AI.md`](AI.md), #95.
+**Related:** [`../ide/src/aiPolicy.ts`](../../../ide/src/aiPolicy.ts), [`../ide/src/engineClient.ts`](../../../ide/src/engineClient.ts), [`../ide/src/chat.ts`](../../../ide/src/chat.ts), [`../ide/src/statusBar.ts`](../../../ide/src/statusBar.ts), [`../ide/src/engineStatusModel.ts`](../../../ide/src/engineStatusModel.ts), [`../ide/src/auth.ts`](../../../ide/src/auth.ts), [`../ide/src/test/suite/ai-policy.test.ts`](../../../ide/src/test/suite/ai-policy.test.ts), `messagefoundry/api/app.py` (`/ai/policy`, `/ai/chat`), `messagefoundry/api/security.py` (`optional_identity`), [ADR 0035](../../adr/0035-ide-extension-workspace-trust-and-scope.md) (SEC-022 — the control this completes; note its own Related line miscites "ADR 0024 (AI policy)", which is the SMART token provider), [ADR 0135](../../adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md) (the brokered path, server-gated), [`AI.md`](../../AI.md), #95.
 
 **Source:** public-repo disclosure audit, 2026-08-01.
 
@@ -5504,7 +5504,7 @@ MEFOR_FORBIDDEN_TOKENS=scripts/security/scan-tokens.local.txt.example \
 
 `scripts/dev/setup-leak-gate.ps1 -Synthetic` is a **documented, supported contributor setup** (the example file calls it so in its own header), and the pre-commit hook passes `--require-tokens`, so it blocks *every* commit — not just ones touching that file. A contributor with no access to the real token list would hit an unexplained hard block on unrelated work. The final commit uses the non-numeric `SITEA` instead, which cannot collide with any numeric detector.
 
-**Why:** the example file's synthetic-prefix guidance is written for the person filling in the **token list**, where it is correct and necessary. But it reads as general guidance for *placeholder values*, and a placeholder written into tracked prose is then scanned by the gate that list configures. The convention is self-colliding for its second audience, and nothing warns you. The same trap caught [#325](BACKLOG.md), whose worked examples had to be rewritten to the exempt `<name>` form for exactly this reason.
+**Why:** the example file's synthetic-prefix guidance is written for the person filling in the **token list**, where it is correct and necessary. But it reads as general guidance for *placeholder values*, and a placeholder written into tracked prose is then scanned by the gate that list configures. The convention is self-colliding for its second audience, and nothing warns you. The same trap caught [#325](../../BACKLOG.md), whose worked examples had to be rewritten to the exempt `<name>` form for exactly this reason.
 
 **Proposed:** state in `scan-tokens.local.txt.example` (and in the redaction guidance) that a placeholder written **into tracked content** must not use any prefix appearing in `[site_prefix]` in *either* the real or the example set — prefer a non-numeric stand-in (`SITEA`, `<site>`), matching the `<…>` convention `_HOME_PATH` already exempts. Optionally have the scanner's hit message name the loaded set, so a synthetic-set false positive is self-diagnosing rather than reading as a real leak.
 
@@ -5551,7 +5551,7 @@ What is *not* covered is the thing that will grow: `.semgrep/messagefoundry.yml`
 2. Add `test_ci_semgrep_scans_the_repo_not_an_allow_list` to `tests/test_lint_scope_parity.py`, modelled on `:119-125`, so the next narrowing has to be deliberate. This is the durable half — without it, step 1 can rot again exactly as bandit's did.
 3. If a full widening is rejected, the fallback is appending `messagefoundry_webconsole scripts docker` to the argument list — but note that this is the allow-list shape `:348-352` explicitly retired, and it will go stale the next time a directory is added.
 
-**Related:** `.github/workflows/security.yml:348-360` (the bandit precedent) and `:393-424` (the semgrep job), `.semgrep/messagefoundry.yml`, `tests/test_lint_scope_parity.py`, `.github/required-contexts.txt:74`/`:78`/`:108-110`, `.github/workflows/codeql.yml`, `packaging/messagefoundry-webconsole/pyproject.toml`, [ADR 0065](adr/0065-web-ops-dashboard.md) (the console is a distinct distribution), [ADR 0144](adr/0144-handler-config-taint-rules.md) Inc 3 (the second, `samples/config`-scoped semgrep step).
+**Related:** `.github/workflows/security.yml:348-360` (the bandit precedent) and `:393-424` (the semgrep job), `.semgrep/messagefoundry.yml`, `tests/test_lint_scope_parity.py`, `.github/required-contexts.txt:74`/`:78`/`:108-110`, `.github/workflows/codeql.yml`, `packaging/messagefoundry-webconsole/pyproject.toml`, [ADR 0065](../../adr/0065-web-ops-dashboard.md) (the console is a distinct distribution), [ADR 0144](../../adr/0144-security-lint-gate-over-admin-authored-router-handler-config.md) Inc 3 (the second, `samples/config`-scoped semgrep step).
 
 **Source:** public-repo disclosure audit, 2026-08-01.
 
@@ -5627,7 +5627,7 @@ Two smaller corrections to the record. The deny-list is 16 names but only **13**
 
 **What:** four links, each individually reasonable, compose into a PHI read that no permission authorizes.
 
-1. A custom role may hold `messages:edit` alone. The carve-out set is three permissions wide — [`auth/permissions.py:178-180`](../messagefoundry/auth/permissions.py):
+1. A custom role may hold `messages:edit` alone. The carve-out set is three permissions wide — [`auth/permissions.py:178-180`](../../../messagefoundry/auth/permissions.py):
 
 ```python
 CUSTOM_ROLE_FORBIDDEN_PERMISSIONS: frozenset[Permission] = frozenset(
@@ -5637,7 +5637,7 @@ CUSTOM_ROLE_FORBIDDEN_PERMISSIONS: frozenset[Permission] = frozenset(
 
 and `permissions.py:212` (`forbidden = perms & CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`) is the only capability check `validate_custom_role_permissions` applies, so `{"messages:edit"}` is an accepted role set.
 
-2. The `/ui` editor gates on that permission and nothing else — [`messagefoundry_webconsole/routes/core.py:597-604`](../messagefoundry_webconsole/routes/core.py):
+2. The `/ui` editor gates on that permission and nothing else — [`messagefoundry_webconsole/routes/core.py:597-604`](../../../messagefoundry_webconsole/routes/core.py):
 
 ```python
 @app.get("/ui/messages/{message_id}/edit", response_class=HTMLResponse)
@@ -5648,9 +5648,9 @@ async def ui_message_edit(
     detail = await core.get_message(message_id, request, engine=engine, identity=identity)
 ```
 
-3. The JSON twin's own gate does not fire. `api/app.py:3150` declares `Depends(require_phi_read(Permission.MESSAGES_VIEW_RAW))`, but the console calls the handler as a plain function with `identity=` supplied, so the default is never evaluated. That skip is deliberate and documented at [`api/_ui_seam.py:92`](../messagefoundry/api/_ui_seam.py) — the `/ui` route "re-asserts the equivalent permission via `require_ui*`". Here it re-asserts a *different* one.
+3. The JSON twin's own gate does not fire. `api/app.py:3150` declares `Depends(require_phi_read(Permission.MESSAGES_VIEW_RAW))`, but the console calls the handler as a plain function with `identity=` supplied, so the default is never evaluated. That skip is deliberate and documented at [`api/_ui_seam.py:92`](../../../messagefoundry/api/_ui_seam.py) — the `/ui` route "re-asserts the equivalent permission via `require_ui*`". Here it re-asserts a *different* one.
 
-4. No per-property backstop catches it. `MessageDetail`'s entry in `PHI_FIELDS` ([`api/field_authz.py:64-68`](../messagefoundry/api/field_authz.py)) lists `summary`/`error`/`metadata` only — `raw` is deliberately left to the route gate ("The raw body stays on this route's view_raw gate"). So `redact_unauthorized` (`field_authz.py:89-95`) returns the body untouched and [`pages/messages.py:440,454`](../messagefoundry_webconsole/pages/messages.py) renders it: `original = detail.raw` → `data_original=original` in the editor textarea.
+4. No per-property backstop catches it. `MessageDetail`'s entry in `PHI_FIELDS` ([`api/field_authz.py:64-68`](../../../messagefoundry/api/field_authz.py)) lists `summary`/`error`/`metadata` only — `raw` is deliberately left to the route gate ("The raw body stays on this route's view_raw gate"). So `redact_unauthorized` (`field_authz.py:89-95`) returns the body untouched and [`pages/messages.py:440,454`](../../../messagefoundry_webconsole/pages/messages.py) renders it: `original = detail.raw` → `data_original=original` in the editor textarea.
 
 **Two details beyond the original write-up.** The `POST /ui/messages/{id}/edit-resend` rejection path (`routes/core.py:637-644`) re-calls `core.get_message` and re-renders `pages.message_edit(detail, ...)`, so the **pristine stored** body ships again via `data_original` — the same leak on a second verb. And `require_ui_step_up` builds its base as `require_ui(*permissions, allow_mfa_pending=True)` (`_auth.py:521`) with no `phi=`, so the `_auth.py:260` `allow_phi_read` per-actor throttle never runs here, while the sibling `/ui/messages/{id}`, `/parse-tree` and `/attachments` routes all pass `phi=True` (`routes/core.py:473,483,501`). That second point is **not unique to this route** — `/ui/messages/search`, `/ui/messages/search/layered` and `/ui/uploaded-logs/file/{id}` ride `require_ui_step_up` too — so it may warrant its own item rather than being fixed only here.
 
@@ -5664,13 +5664,13 @@ async def ui_message_edit(
 **Proposed:** pick one of two, not both blindly.
 
 1. *Preferred — enforce the implication at the gate.* Change `routes/core.py:602` (and the `/edit-resend` gate at `:609-620`, which re-renders the same body) to `require_ui_step_up(Permission.MESSAGES_EDIT, Permission.MESSAGES_VIEW_RAW)`. This makes the catalogue's "implies `view_raw`" true by construction, is local, and leaves the permission assignable so a future write-only edit surface stays possible.
-2. *Alternative — forbid the combination.* Add `Permission.MESSAGES_EDIT` to `CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`. Blunter: it also blocks legitimate custom roles that pair edit *with* view_raw, and it is an [ADR 0045](adr/0045-custom-rbac-roles.md) D1 amendment (that set is scoped to escalation primitives, which `messages:edit` is not). Prefer 1.
+2. *Alternative — forbid the combination.* Add `Permission.MESSAGES_EDIT` to `CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`. Blunter: it also blocks legitimate custom roles that pair edit *with* view_raw, and it is an [ADR 0045](../../adr/0045-custom-rbac-roles.md) D1 amendment (that set is scoped to escalation primitives, which `messages:edit` is not). Prefer 1.
 
 Either way: add `phi=True` equivalence for this route (a `phi` parameter threaded through `require_ui_step_up` into its `require_ui` base at `_auth.py:521`), and add the missing regression test. `packaging/messagefoundry-webconsole/tests/test_webui.py:546-555` only exercises `Role.VIEWER`, which holds *neither* permission — nothing today asserts what an edit-without-view_raw identity gets. The new test must mint a `custom:` role holding `messages:edit` alone and assert 403.
 
 **Fix ordering:** `tests/test_security_doc_drift.py:1167-1196` derives the Operator PHI-capability sentence from the catalogue's PHI column and specifically names `messages:edit` as PHI-marked "and it renders the raw body". Fixing the gate makes `docs/SECURITY.md:213` and `:474-477` false, so the doc edit and the code edit must land in the **same commit** or that guard reds.
 
-**Related:** [`messagefoundry_webconsole/routes/core.py`](../messagefoundry_webconsole/routes/core.py), [`messagefoundry_webconsole/_auth.py`](../messagefoundry_webconsole/_auth.py), [`messagefoundry/auth/permissions.py`](../messagefoundry/auth/permissions.py), [`messagefoundry/api/field_authz.py`](../messagefoundry/api/field_authz.py), [`messagefoundry/api/_ui_seam.py`](../messagefoundry/api/_ui_seam.py), [ADR 0045](adr/0045-custom-rbac-roles.md) (custom roles), [ADR 0090](adr/0090-resend-a-stored-message-to-an-alternate-outbound-connection.md) §9 (edit-and-resubmit), [ADR 0065](adr/0065-mount-the-web-console-in-process.md) (the `/ui` mount that creates the gate-skip seam), `docs/SECURITY.md` (catalogue row + PHI-route list), `packaging/messagefoundry-webconsole/tests/test_webui.py`, `tests/test_security_doc_drift.py`, #153 (shipped edit-and-resubmit — the origin of the unenforced "implying `messages:view_raw`" phrasing; closed, do not amend), #177 (effective-permission inspector — would surface such a role).
+**Related:** [`messagefoundry_webconsole/routes/core.py`](../../../messagefoundry_webconsole/routes/core.py), [`messagefoundry_webconsole/_auth.py`](../../../messagefoundry_webconsole/_auth.py), [`messagefoundry/auth/permissions.py`](../../../messagefoundry/auth/permissions.py), [`messagefoundry/api/field_authz.py`](../../../messagefoundry/api/field_authz.py), [`messagefoundry/api/_ui_seam.py`](../../../messagefoundry/api/_ui_seam.py), [ADR 0045](../../adr/0045-custom-rbac-roles.md) (custom roles), [ADR 0090](../../adr/0090-resend-a-stored-message-to-an-alternate-outbound-connection.md) §9 (edit-and-resubmit), [ADR 0065](../../adr/0065-web-ops-dashboard.md) (the `/ui` mount that creates the gate-skip seam), `docs/SECURITY.md` (catalogue row + PHI-route list), `packaging/messagefoundry-webconsole/tests/test_webui.py`, `tests/test_security_doc_drift.py`, #153 (shipped edit-and-resubmit — the origin of the unenforced "implying `messages:view_raw`" phrasing; closed, do not amend), #177 (effective-permission inspector — would surface such a role).
 
 **Source:** public-repo disclosure audit, 2026-08-01. Classified close-the-weakness-instead: the doc is honest and stays; the code is what changes.
 

@@ -12,8 +12,8 @@
   **no dependency** (no zeep, no suds), and closing the **distinct `wsdl:import` / `xsd:import` network
   resolution path** the existing `xmlschema` no-network config does *not* cover.
 - **Related:** [ADR 0015](0015-ws-soap-outbound-mtls-wssecurity.md) (the WS-* / mTLS SOAP outbound whose
-  envelopes this validates but does not replace), BACKLOG [#31](../BACKLOG.md) (the pure XML/SOAP codec this
-  extends — `parsing/xml/`), BACKLOG [#69](../BACKLOG.md), BACKLOG [#70](../BACKLOG.md)
+  envelopes this validates but does not replace), BACKLOG [#31](../archive/backlog/BACKLOG-CLOSED.md#31-safe-xml-rawmessage-accessor--structured-xml-support-xml--soap--cda-p2) (the pure XML/SOAP codec this
+  extends — `parsing/xml/`), BACKLOG [#69](../archive/backlog/BACKLOG-CLOSED.md#69-wsdl-import--soap-type-tree--validate-against-wsdl), BACKLOG [#70](../archive/backlog/BACKLOG-CLOSED.md#70-synchronous-in-transform-web-service-call-wscall)
   (synchronous in-transform WSCall — **declined-by-design**, so a WSDL is a *contract* artifact here, never a
   live-call generator), [CLAUDE.md](../../CLAUDE.md) §4 (the pure `parsing/` carve-out a client may import),
   §8 (untrusted XML is attacker-influenceable), §9 (PHI-safe failure reporting).

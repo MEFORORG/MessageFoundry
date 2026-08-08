@@ -17,7 +17,7 @@ as [BACKLOG #64](../../BACKLOG.md).*
 > [`config/wiring.py:2452`](../../../messagefoundry/config/wiring.py)).
 >
 > So **§2's "the database lever we *should* pull", §4 step 2 and §5 step 2 are stale as a plan** — group-commit is
-> **⛔ DECLINED** ([BACKLOG #217](../../BACKLOG.md)), dead across ADR 0069 (the commit tier is ~9% utilised) → ADR 0099
+> **⛔ DECLINED** ([BACKLOG #217](../backlog/BACKLOG-CLOSED.md#217-group-commit--durable-write--sequenced-after-the-claim-path)), dead across ADR 0069 (the commit tier is ~9% utilised) → ADR 0099
 > (which withdrew ADR 0055) → ADR 0107. Everything else here — the two axes, the core/transform axis, sharding —
 > is unaffected and is left exactly as written: it is the record of the reasoning at the time. Measured throughput
 > lives in [`benchmarks/TUNING-BASELINE.md`](../../benchmarks/TUNING-BASELINE.md); 45M/day remains a **target**
@@ -156,10 +156,10 @@ peek. High payoff, but only after confirming parsing is the bottleneck.
    axis per representative feed — now anchored to the **Corepoint target** (§5).
 2. ~~**Group-commit** (§2) — the single-node durable-write win; the **#1 unbuilt lever**; stays on existing
    backends. Lands under its **own ADR** when built (it touches the most invariant-dense code).~~
-   **⛔ CLOSED 2026-07-13 — do not build it** (ADR 0107 / [BACKLOG #217](../../BACKLOG.md); see the banner).
+   **⛔ CLOSED 2026-07-13 — do not build it** (ADR 0107 / [BACKLOG #217](../backlog/BACKLOG-CLOSED.md#217-group-commit--durable-write--sequenced-after-the-claim-path); see the banner).
 3. **Lean-writes / carriage** — VARBINARY ciphertext ([#62](../../BACKLOG.md)), the `message_events` verbosity
-   knob ([#63](../../BACKLOG.md)), embedded-doc pruning ([#47](../../BACKLOG.md) / ADR 0042), retention
-   ([#34](../../BACKLOG.md)).
+   knob ([#63](../backlog/BACKLOG-CLOSED.md#63-message_events-verbosity-knob--operator-dial-to-suppress-routine-lifecycle-events-store-size--observability-p3)), embedded-doc pruning ([#47](../backlog/BACKLOG-CLOSED.md#47-embedded-document-base64-attachment-pruning--strip-obx-5--mfb64-blobs-after-a-per-connection-window-mirth-attachment-handler-parity-p2) / ADR 0042), retention
+   ([#34](../backlog/BACKLOG-CLOSED.md#34-per-connection-retention--pruning-windows-per-channel-message-storage-mirth-parity-p2)).
 4. **Multi-process sharding by inbound** (§3a) — **BUILT** (ADR 0037); the multi-core path. For the
    shared-server backend, a **multi-DB log split** (move event/audit churn off the queue's writer) is a
    further I/O-isolation step — but the **atomic staged-queue transaction cannot be split**.
@@ -196,7 +196,7 @@ against Rhapsody *marketing*, not this spec):
   denominator makes the store's commit headroom look **larger**, not smaller — it does not rescue the lever.)* And
   group-commit is no longer merely "unbuilt": it is **⛔ DECLINED** — [ADR 0099](../../adr/0099-phase-4-group-commit-amortize-the-per-event-transaction-cost.md)
   withdrew it, [ADR 0107](../../adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md) closed the
-  whole transaction-reduction class ([BACKLOG #217](../../BACKLOG.md)).
+  whole transaction-reduction class ([BACKLOG #217](../backlog/BACKLOG-CLOSED.md#217-group-commit--durable-write--sequenced-after-the-claim-path)).
 - **Storage** — runs higher, but mostly **by construction, not inefficiency**. The "~2× vs Corepoint" was
   estimate-vs-brochure and is **retracted**. The real, code-confirmed drivers are **carriage**
   (`NVARCHAR(MAX)` 2 B/char + base64 of the `mfenc` ciphertext → ~2.66·B on SQL Server; VARBINARY ciphertext
@@ -207,12 +207,12 @@ against Rhapsody *marketing*, not this spec):
 **The measure-first path (each step gated on the one before):**
 
 1. **Measure (the gate).** An enterprise-hardware `E_core` + sustained durable-write IOPS run — the local
-   **Windows Server 2025 + SQL Server 2025 box** ([#40](../../BACKLOG.md)) via the load harness
-   ([#28](../../BACKLOG.md)/[#29](../../BACKLOG.md)) — against the **9,200-IOPS / ~11 KB-msg / 20 + 16-core** target.
+   **Windows Server 2025 + SQL Server 2025 box** ([#40](../backlog/BACKLOG-CLOSED.md#40-ci-leg-against-the-local-windows-server-2025--sql-server-2025-box-real-hardware-coverage-p2)) via the load harness
+   ([#28](../backlog/BACKLOG-CLOSED.md#28-run-a-load-test-execute-the-load-harness-on-the-current-build)/[#29](../backlog/BACKLOG-CLOSED.md#29-run-a-throughput-test-re-measure--refresh-the-tuning-baseline)) — against the **9,200-IOPS / ~11 KB-msg / 20 + 16-core** target.
    Pins `E_core` and the binding axis. **Nothing builds before it.**
 2. ~~**Group-commit** (§2) — *iff* durable-write-bound. Its own ADR.~~ **⛔ CLOSED (ADR 0107); the
    measurement it was gated on ran and the lever is a measured dead end.**
-3. **Lean-writes / carriage** — the [#62](../../BACKLOG.md)/[#63](../../BACKLOG.md)/[#47](../../BACKLOG.md)/[#34](../../BACKLOG.md)
+3. **Lean-writes / carriage** — the [#62](../../BACKLOG.md)/[#63](../backlog/BACKLOG-CLOSED.md#63-message_events-verbosity-knob--operator-dial-to-suppress-routine-lifecycle-events-store-size--observability-p3)/[#47](../backlog/BACKLOG-CLOSED.md#47-embedded-document-base64-attachment-pruning--strip-obx-5--mfb64-blobs-after-a-per-connection-window-mirth-attachment-handler-parity-p2)/[#34](../backlog/BACKLOG-CLOSED.md#34-per-connection-retention--pruning-windows-per-channel-message-storage-mirth-parity-p2)
    cluster.
 4. **Multi-DB log split** — shared-server backend only.
 5. **Deferred contingencies** — the scoped native engine-service core, free-threading

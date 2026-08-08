@@ -177,9 +177,10 @@ trail.
 ### `require_sign_in = false` — disable authentication
 - **What you lose:** every request runs as a full-privilege *system* identity; no RBAC.
 - **When acceptable:** a **loopback-only** embedding/dev harness.
-- **Compensating controls:** loopback bind only.
-- **Still refused:** a non-loopback bind with auth off is a **hard refuse** — serving full-privilege admin to
-  the network is never one "I accept the risk" away, at any posture.
+- **Compensating controls:** a loopback bind with no declared TLS terminator only.
+- **Still refused:** an exposed instance with auth off — a non-loopback bind, **or** a loopback bind behind a
+  declared TLS terminator — is a **hard refuse** — serving full-privilege admin to the network is never one "I
+  accept the risk" away, at any posture.
 
 ### `require_mfa = false` — single-factor admin
 - **What you lose:** the Administrator role authenticates with a password only (no native TOTP second
@@ -223,7 +224,7 @@ trail.
   factor over the network. This ack **downgrades that refusal to a loud, audited warning** (the same
   warn-and-start `enforcement = warn` takes, but scoped to this one control), so the instance boots
   single-factor while staying at `enforce`.
-- **Scope correction ([BACKLOG #326](BACKLOG.md)):** "a declared reverse proxy" above means exactly
+- **Scope correction ([BACKLOG #326](archive/backlog/BACKLOG-CLOSED.md#326-mfa-at-exposure-refusal-reads-serve_ui-after-it-is-flipped-off)):** "a declared reverse proxy" above means exactly
   `[api].tls_terminated_upstream` — the bind-and-proxy posture, **independent of the browser console**. The
   shipped predicate additionally required the console to be *served*, which the ADR 0143 auto-degrade had
   already turned off, so a loopback-behind-a-declared-proxy instance would not have reached this refusal at
@@ -299,8 +300,8 @@ trail.
 - **Compensating controls:** return to `enforce` before carrying real patient traffic; the warnings + startup
   **AUDIT** line + posture view keep the deviation visible.
 - **Still refused (even at `warn`):** the **no-auth-to-the-network** hard refuse (`require_sign_in = false` on
-  a non-loopback bind) is unconditional at **any** enforcement level — `enforcement = warn` does **not** open
-  it — and the unconditional ePHI audit floor is untouched. `enforcement` is **binary** (no `off`): silencing
+  an exposed instance — a non-loopback bind, or a loopback bind behind a declared TLS terminator) is
+  unconditional at **any** enforcement level — `enforcement = warn` does **not** open it — and the unconditional ePHI audit floor is untouched. `enforcement` is **binary** (no `off`): silencing
   a PHI cleartext hop *entirely* is only reachable by declaring the box synthetic
   (`handles_real_patient_data = false`), never by the dial ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)).
 

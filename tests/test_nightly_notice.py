@@ -59,6 +59,17 @@ def test_it_keys_on_the_ci_workflow_s_actual_name() -> None:
     )
 
 
+def test_it_also_watches_the_security_workflow() -> None:
+    """security.yml's daily cron carries jobs no PR can trigger, so its failures need this notice too."""
+    watched = _on(_load(_NOTICE))["workflow_run"]["workflows"]
+    sec_name = _load(_WORKFLOWS / "security.yml").get("name")
+    assert sec_name, "security.yml has no `name:` — workflow_run has nothing to key on"
+    assert sec_name in watched, (
+        f"nightly-notice.yml watches {watched} but security.yml is named {sec_name!r}. Its "
+        "schedule-only jobs — released-line-audit above all — would then fail into silence."
+    )
+
+
 def test_it_only_reacts_to_scheduled_runs() -> None:
     """Without this gate every PR and push failure opens an issue.
 

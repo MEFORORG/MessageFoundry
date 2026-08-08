@@ -1591,6 +1591,7 @@ def test_status_builder_escapes_and_formats() -> None:
         key_id="abc123",
         require_encryption=True,
         allow_unencrypted_phi=False,
+        kex_groups="inherited (test read-out)",  # #338 report-only KEX read-out
     )
     cluster = ClusterStatus(
         node_id="n1", clustered=False, is_leader=True, role="single-node", config_version=0
@@ -1620,6 +1621,8 @@ def test_status_builder_escapes_and_formats() -> None:
     assert "yes" in html and "single-node" in html  # _yn + role
     assert "<b>host</b>" not in html  # hostile node host escaped
     assert "&lt;b&gt;host&lt;/b&gt;" in html
+    # #338: the report-only TLS key-exchange read-out row renders (label + the inherited value).
+    assert "key-exchange" in html and "inherited" in html
     # L6a: the hosting-service badge renders the state + name.
     assert "Hosting service" in html and "MEFOR_Engine" in html and "running" in html
     # When reporting is off, the badge says so (no state leaked).

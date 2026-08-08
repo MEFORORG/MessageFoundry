@@ -22,6 +22,7 @@ from messagefoundry.anon import (
     anonymize_checked,
     leak,
     leak_check,
+    leak_report,
     load_rules,
 )
 from messagefoundry.anon.surrogates import Seps, scrub_site_codes, surrogate_field
@@ -254,6 +255,139 @@ def test_anonymize_checked_fails_closed_and_is_phi_safe(monkeypatch: pytest.Monk
     message = str(exc.value)
     assert "acmecorp" in message.lower()  # names the token category
     assert "DOE" not in message and "999" not in message  # never echoes the body
+
+
+# --- structural PHI detection on UNMAPPED fields (BACKLOG #331) ------------------------------------
+# The known-token denylist cannot see a real MRN/SSN in a field the rule map never mapped (a real MRN
+# is not a denylisted string). These exercise the structural backstop over the UNMAPPED fields. All
+# values are SYNTHETIC PHI SHAPES (fake, reserved-fictional, or component-structured) — never a real
+# value — and each detector is falsified in the lane report. `DST` is a non-standard segment carrying
+# no default rule, so DST-2/3 are the unmapped surface (the f3c6d348 blind-map case in miniature).
+
+_SSN_MSG = _msg(
+    r"MSH|^~\&|SAPP|SFAC|RAPP|RFAC|20260101120000||ADT^A01|M1|P|2.5.1",
+    "PID|1||1^^^H^MR||X^Y",
+    "DST|1|123-45-6789",  # DST-2: unmapped field carrying a synthetic dashed SSN
+)
+
+
+@_NO_SCANNER
+def test_leak_check_catches_unmapped_ssn() -> None:
+    """A synthetic dashed SSN in an unmapped field (DST-2) is caught and fails closed.
+
+    Falsified: deleting `_SSN_DASHED` from leak.py's structural set made leak_check() return [] and
+    anonymize_checked() emit the dataset clean (RED), then restored.
+    """
+    hits = leak_check(_SSN_MSG, rules=DEFAULT_RULES)
+    assert any("SSN" in h for h in hits), hits
+    with pytest.raises(LeakError):
+        anonymize_checked(_SSN_MSG, salt=_SALT)
+
+
+@_NO_SCANNER
+def test_leak_check_catches_unmapped_phone() -> None:
+    """Synthetic punctuated NANP numbers (reserved-fictional 555-01XX) in unmapped fields are caught,
+    both dashed and parenthesised.
+
+    Falsified: removing the two phone detectors let the dataset slip through clean (RED), then restored.
+    """
+    msg = _msg(
+        r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1",
+        "PID|1||1^^^H^MR||X^Y",
+        "DST|1|202-555-0188|(202) 555-0188",  # DST-2 dashed, DST-3 parenthesised
+    )
+    hits = leak_check(msg, rules=DEFAULT_RULES)
+    assert any("phone" in h for h in hits), hits
+    assert any("DST-2" in h for h in hits) and any("DST-3" in h for h in hits), hits
+
+
+@_NO_SCANNER
+def test_leak_check_catches_unmapped_mrn() -> None:
+    """A CX id typed `MR` in an unmapped field (PID-2, absent from DEFAULT_RULES) is caught by HL7
+    structure, and the raw id never surfaces in the reason or the LeakError (PHI-safe).
+
+    Falsified: removing the MR/MRN component detector let the unmapped MRN pass clean (RED), then
+    restored — confirming the CX id-type signal, not a digit heuristic, is doing the work.
+    """
+    msg = _msg(
+        r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1",
+        "PID|1|98765^^^HOSP^MR||X^Y",  # PID-2: unmapped CX, id-typed MR
+    )
+    hits = leak_check(msg, rules=DEFAULT_RULES)
+    assert any("MRN" in h and "PID-2" in h for h in hits), hits
+    assert all("98765" not in h for h in hits)  # names the shape + address, never the id
+    with pytest.raises(LeakError) as exc:
+        anonymize_checked(msg, salt=_SALT)
+    assert "98765" not in str(exc.value)
+
+
+@_NO_SCANNER
+def test_coverage_report_lists_unmapped_fields() -> None:
+    """The coverage report enumerates present-but-unmapped fields (address only) — the batch_18
+    regression: a field nobody mapped is now visible, not silent. The fail-path LeakError carries the
+    value-free coverage clause.
+
+    Falsified: stubbing `unmapped_field_values` to yield nothing emptied `.unmapped_fields` (RED),
+    then restored.
+    """
+    benign = _msg(
+        r"MSH|^~\&|A|B|C|D|20260101120000||ADT^A01|M1|P|2.5.1",
+        "PID|1||1^^^H^MR||X^Y",
+        "DST|1|freeform",  # DST-2: unmapped but benign — enumerated, not flagged
+    )
+    report = leak_report(benign, rules=DEFAULT_RULES)
+    assert "DST-2" in report.unmapped_fields
+    assert report.structural_hits == []  # benign value → enumerated only, no shape hit
+    with pytest.raises(LeakError) as exc:
+        anonymize_checked(_SSN_MSG, salt=_SALT)
+    text = str(exc.value)
+    assert "checked" in text and "unmapped field" in text and "DST-2" in text
+
+
+@_NO_SCANNER
+def test_false_positive_guard_benign_unmapped_fields() -> None:
+    """Unmapped fields dense with dates/coded-values/order-numbers (the mass-false-positive surface
+    ADR 0030 warns of) must NOT trip the check — why the bare-digit DOB/SSN heuristics were rejected.
+
+    Falsified: broadening `_SSN_DASHED` to any 8+ digit run tripped the 14-digit EVN timestamp (RED),
+    then restored.
+    """
+    benign = _msg(
+        r"MSH|^~\&|A|B|C|D|20260101120000||ADT^A01|M1|P|2.5.1",
+        "EVN|A01|20260101120000",  # 14-digit timestamp
+        "OBX|1|NM|8480-6^Systolic^LN||128|mm[Hg]",  # coded observation id
+        "ORC|NW|1000000042",  # unmapped order-number run
+        "PID|1||1^^^H^MR||X^Y",
+    )
+    assert leak_check(benign, rules=DEFAULT_RULES) == []
+    assert anonymize_checked(benign, salt=_SALT)  # clean → returns, no raise
+
+
+@_NO_SCANNER
+def test_token_floor_surfaced_when_tables_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty token load is no longer a SILENT green (#331): the report records it and the strict
+    lever refuses on it — while the default keeps CI/OSS/fork runs (which have no token source) green,
+    the structural detectors being the live backstop.
+
+    The empty-token state is forced deterministically (this dev checkout has a token source; CI does
+    not) by patching the loaded scanner's `TOKENS_PRESENT`. Falsified: stubbing `token_floor_failure`
+    to return None made `.token_floor_reason` None and the strict path stop refusing (RED), restored.
+    """
+    monkeypatch.setattr(leak._scanner(), "TOKENS_PRESENT", False)
+    clean = _msg(
+        r"MSH|^~\&|A|B|C|D|20260101120000||ADT^A01|M1|P|2.5.1",
+        "PID|1||1^^^H^MR||X^Y",
+    )
+    report = leak_report(clean, rules=DEFAULT_RULES)
+    assert report.token_tables_live is False
+    assert report.token_floor_reason is not None
+    # the DEFAULT decision does NOT refuse on empty tokens alone (structural detectors are the backstop)
+    assert anonymize_checked(clean, salt=_SALT)
+    # the strict lever DOES refuse, naming the floor reason but no field value
+    with pytest.raises(LeakError) as exc:
+        anonymize_checked(clean, salt=_SALT, require_live_denylist=True)
+    text = str(exc.value)
+    assert "denylist not live" in text and "fail closed" in text
 
 
 def test_alphanumeric_identifier_preserves_width_and_shape() -> None:

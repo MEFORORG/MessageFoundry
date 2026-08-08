@@ -14,7 +14,7 @@ decision record is [ADR 0149](adr/0149-multi-ecosystem-sbom-vex-and-sbom-quality
 |---|---|---|
 | `messagefoundry-*.whl` / `*.tar.gz` | The Python engine (wheel + sdist) | GitHub release + PyPI |
 | `messagefoundry-sbom.cdx.json` | **CycloneDX SBOM** of the engine — license-complete, from the hash-locked core runtime, lifecycle = `build` | GitHub release |
-| `messagefoundry-vex.openvex.json` | **OpenVEX** — our per-CVE exploitability assessments | GitHub release |
+| `messagefoundry-vex.openvex.json` | **OpenVEX** — the document carrying our exploitability assessment for a CVE, once one has been made | GitHub release |
 | `*.sigstore*` bundles | Sigstore signatures for the wheel, sdist, **SBOM, and VEX** | GitHub release |
 | PEP 740 attestations | PyPI-side provenance (Trusted Publishing) | PyPI |
 | SLSA build provenance | in-toto attestation binding each artifact (incl. SBOM + VEX) to the source commit | GitHub attestations / Sigstore bundle |
@@ -59,12 +59,15 @@ Attestations, and our releases, if you standardize on one tool across ecosystems
 
 ## Using the SBOM + VEX
 
-The SBOM (CycloneDX 1.6) is a machine-readable inventory: components, versions, PackageURLs, hashes, and
-**licenses**. Feed it to your own tooling:
+The SBOM (CycloneDX 1.6) is a machine-readable inventory carrying at least a name, version, PackageURL and
+**license** for every component. It does **not** carry per-component file hashes — the generator we run does
+not emit them (see [How the SBOMs are generated](#how-the-sboms-are-generated-for-auditors)) — so use it as an
+inventory, not as an integrity check on the components it lists. "Hash-locked" elsewhere on this page refers
+to the lock file the inventory is built from, not to a field inside the SBOM. Feed it to your own tooling:
 
 ```bash
-# Scan the SBOM for known CVEs, applying our VEX to suppress vulnerabilities we've assessed as
-# not-affected/fixed — so you triage real risk, not unreachable CVEs:
+# Scan the SBOM for known CVEs. --vex applies whatever assessments our VEX carries; --show-suppressed
+# lists what was suppressed, so a run with nothing to apply is visibly a no-op:
 trivy sbom messagefoundry-sbom.cdx.json --vex messagefoundry-vex.openvex.json --show-suppressed
 
 # Or score the SBOM's completeness (0-10, NTIA minimum elements):
@@ -72,8 +75,11 @@ sbomqs score -b messagefoundry-sbom.cdx.json
 ```
 
 **Do not demand a zero-CVE "clean scan."** Per CISA's *Minimum Requirements for VEX* and NTIA's
-*Software Consumers Playbook*, the correct posture is to accept a valid VEX assessment. Our VEX
-(`security/vex/README.md`) records, per CVE, whether the vulnerable code is reachable in MessageFoundry.
+*Software Consumers Playbook*, the correct posture is to accept a valid VEX assessment. Our VEX is the
+`messagefoundry-vex.openvex.json` release asset above. Where we have assessed a CVE, its statement records
+whether the vulnerable code is reachable in MessageFoundry and carries an OpenVEX `justification`. Where we
+have not, the document says nothing about that CVE and your scanner's finding stands unsuppressed — see
+[`security/vex/README.md`](../security/vex/README.md) for the assessment process and when a statement is added.
 
 ## How the SBOMs are generated (for auditors)
 

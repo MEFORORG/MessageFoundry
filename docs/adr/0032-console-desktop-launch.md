@@ -2,8 +2,8 @@
 
 - **Status:** **RETIRED (2026-07-13) — the PySide6 desktop console is removed.** Superseded by the
   browser web console (`/ui`, `messagefoundry_webconsole`; [ADR 0065](0065-web-ops-dashboard.md),
-  [BACKLOG #75](../BACKLOG.md)) as the sole operator UI, and by [ADR 0088](0088-apiclient-service-cli-extraction.md)
-  (which extracted the Qt-free `apiclient/` + the `messagefoundry service` CLI). [BACKLOG #103](../BACKLOG.md)
+  [BACKLOG #75](../archive/backlog/BACKLOG-CLOSED.md#75-browser--web-operator-monitor)) as the sole operator UI, and by [ADR 0088](0088-apiclient-service-cli-extraction.md)
+  (which extracted the Qt-free `apiclient/` + the `messagefoundry service` CLI). [BACKLOG #103](../archive/backlog/BACKLOG-CLOSED.md#103-retire-the-pyside6-desktop-console-in-favor-of-the-web-console-p3-owner-decision)
   completed the deferred remainder — `messagefoundry/console/` deleted, the reusable Qt view widgets
   rehomed to `harness/`, the `[console]` extra renamed to `[harness]` (keyring dropped), and the
   `[project.gui-scripts]` windowed launcher + `scripts/console/` shortcut tooling removed. Everything
@@ -17,7 +17,7 @@
   Accepted (2026-06-28) and built, then **retired (2026-07-01) — superseded**, and its packaging assets
   + CI leg were removed — see the *Amendment (2026-07-01) — Phase B retired* section below (rationale:
   zero uptake, and the zero-install audience it targeted is now served by the browser ops dashboard,
-  [BACKLOG #75](../BACKLOG.md)). The earlier *Amendment (2026-06-28) — Phase B* section is retained
+  [BACKLOG #75](../archive/backlog/BACKLOG-CLOSED.md#75-browser--web-operator-monitor)). The earlier *Amendment (2026-06-28) — Phase B* section is retained
   below **as the historical record of a now-superseded decision** — it no longer describes shipped code.
 - **Built:** the `[project.gui-scripts]` `messagefoundry-console` entry point
   ([pyproject.toml](../../pyproject.toml)); the window/taskbar icon
@@ -114,7 +114,7 @@ remains an interactive, per-user desktop app.
   `tests/test_frozen_launch_smoke.py`); the frozen-launch checks (AC-B4/AC-B5) run **only on the Windows
   installer CI leg** and skip elsewhere, as noted on each.
 - **Date:** 2026-06-28
-- **Related:** [ADR 0032](0032-console-desktop-launch.md) (Phase A, Accepted) · [BACKLOG #39](../BACKLOG.md) · [CLAUDE.md §2/§10](../../CLAUDE.md) · [release.yml](../../.github/workflows/release.yml) · [NOTICE](../../NOTICE) · MULTISESSION-PLAN-6 Lane L2
+- **Related:** [ADR 0032](0032-console-desktop-launch.md) (Phase A, Accepted) · [BACKLOG #39](../archive/backlog/BACKLOG-CLOSED.md#39-frozen-zero-python-console-installer-phase-b--p3--adr-0032---retired) · [CLAUDE.md §2/§10](../../CLAUDE.md) · [release.yml](../../.github/workflows/release.yml) · [NOTICE](../../NOTICE) · MULTISESSION-PLAN-6 Lane L2
 
 > This is a **Proposed amendment**, not a status change. Phase A of ADR 0032 stays **Accepted/built** and
 > nothing in it is discarded — the `[project.gui-scripts]` `messagefoundry-console` entry point is exactly
@@ -368,7 +368,7 @@ copy of the LGPL library. We satisfy it as follows:
   CI leg, and AC-linked tests — has been **removed from the tree**. The *Amendment (2026-06-28) — Phase
   B* section above is kept as the historical record; it no longer describes shipped code.
 - **Date:** 2026-07-01
-- **Related:** [BACKLOG #39](../BACKLOG.md) (retired) · [BACKLOG #75](../BACKLOG.md) (browser ops
+- **Related:** [BACKLOG #39](../archive/backlog/BACKLOG-CLOSED.md#39-frozen-zero-python-console-installer-phase-b--p3--adr-0032---retired) (retired) · [BACKLOG #75](../archive/backlog/BACKLOG-CLOSED.md#75-browser--web-operator-monitor) (browser ops
   dashboard — the successor for the zero-install audience) · [CLAUDE.md §2/§10](../../CLAUDE.md)
 
 ### Why retire it
@@ -380,7 +380,7 @@ and found the channel is a maintained liability with no evidenced user:
   (v0.2.11–v0.2.14); exactly one `.exe` ever existed (v0.2.14, attached out-of-band, **0 downloads** on
   a private repo). It never delivered an artifact in-band.
 - **Its demand gate never fired.** Phase B was reserved for a site with *no Python and no IT*
-  (§Context above; [BACKLOG #39](../BACKLOG.md) "Why P3"). No such site materialized; current adopters
+  (§Context above; [BACKLOG #39](../archive/backlog/BACKLOG-CLOSED.md#39-frozen-zero-python-console-installer-phase-b--p3--adr-0032---retired) "Why P3"). No such site materialized; current adopters
   are pip + IT-covered (IT already runs the elevated NSSM engine install), and the WIN2025 customer-test
   plan installs the console via `pip`, never the installer.
 - **Its value gate was never met.** The OV/EV Authenticode cert was never provisioned, so every built
@@ -389,7 +389,7 @@ and found the channel is a maintained liability with no evidenced user:
 - **Ongoing carrying cost.** Freezing on hosted runners drifts (runner-image Inno version, `signtool`,
   frozen-exe smoke) — two independent breakage modes across four releases — and the job's failures red
   the release workflow's run-level signal every time, even though the engine + harness ship fine.
-- **The audience moved to the web.** [BACKLOG #75](../BACKLOG.md) (scheduled) serves the exact
+- **The audience moved to the web.** [BACKLOG #75](../archive/backlog/BACKLOG-CLOSED.md#75-browser--web-operator-monitor) (scheduled) serves the exact
   "viewable without a Python/desktop install" audience from the engine's own FastAPI app, so the
   installer's strategic rationale transfers to the browser dashboard rather than being lost.
 
@@ -410,7 +410,7 @@ and found the channel is a maintained liability with no evidenced user:
 ### Reversibility
 
 The freeze recipe survives in git history (this ADR + the removed files) and can be restored as a
-one-off if a genuine no-Python/no-IT site appears before [#75](../BACKLOG.md) covers its needs.
+one-off if a genuine no-Python/no-IT site appears before [#75](../archive/backlog/BACKLOG-CLOSED.md#75-browser--web-operator-monitor) covers its needs.
 
 ---
 
@@ -421,10 +421,10 @@ one-off if a genuine no-Python/no-IT site appears before [#75](../BACKLOG.md) co
   longer describes shipped code. This ADR is kept as the historical record of the desktop console's
   launch model.
 - **Date:** 2026-07-13
-- **Related:** [BACKLOG #103](../BACKLOG.md) (the retirement) · [ADR 0065](0065-web-ops-dashboard.md)
+- **Related:** [BACKLOG #103](../archive/backlog/BACKLOG-CLOSED.md#103-retire-the-pyside6-desktop-console-in-favor-of-the-web-console-p3-owner-decision) (the retirement) · [ADR 0065](0065-web-ops-dashboard.md)
   (the browser web console — the successor operator UI) · [ADR 0088](0088-apiclient-service-cli-extraction.md)
   (the reusable-core extraction: Qt-free `apiclient/` + `messagefoundry service` CLI) ·
-  [BACKLOG #75](../BACKLOG.md) · [CLAUDE.md §2/§10](../../CLAUDE.md)
+  [BACKLOG #75](../archive/backlog/BACKLOG-CLOSED.md#75-browser--web-operator-monitor) · [CLAUDE.md §2/§10](../../CLAUDE.md)
 
 ### Why retire it
 

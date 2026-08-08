@@ -23,6 +23,7 @@ from scripts.asvs.scorecard import (
     Cell,
     Findings,
     ScorecardError,
+    _copy_scratch,
     check_absences,
     check_anchors,
     check_completeness,
@@ -31,6 +32,8 @@ from scripts.asvs.scorecard import (
     count,
     load_corpus,
     load_scorecard,
+    main,
+    prove_absences,
     render_current,
     verify,
 )
@@ -675,3 +678,383 @@ def test_completeness_accepts_a_decided_cell_evidenced_only_by_an_absence_claim(
         Cell(id="2.1.1", level=3, verdict="unverified"),
     ]
     assert not [p for p in check_completeness(cells, CORPUS) if "carry NO anchor" in p]
+
+
+# --- --prove-absences: a mutation that matches is not a mutation that BITES (#1006) ---------------
+#
+# check_absences proves a mutation's pattern fires on it; it never applies the mutation. So a
+# well-formed reintroduction that would change nothing observable passes every check. prove_absences
+# closes that hole by EXECUTING the claim: mutate a scratch copy, run the named observable, require it
+# to go red -- and fail closed on any exit code that is not an honest test failure. Every fixture tree
+# lives in tmp_path (never in the scanned packages), and the mutation is applied only to a scratch
+# copy in a system TemporaryDirectory, so nothing here touches the committed corpus or tmp_path.
+
+_SCANNER = "def scan(p):\n    return 'clean'\n"
+_OBS_TEST = "from scanner import scan\n\n\ndef test_clean():\n    assert scan('x') == 'clean'\n"
+
+
+def _module(tmp_path: Path, name: str, body: str) -> Path:
+    """Write a code module fixture into tmp_path (the code the reintroduction lands in)."""
+    p = tmp_path / name
+    p.write_text(body, encoding="utf-8")
+    return p
+
+
+def _obs_test(tmp_path: Path, name: str, body: str) -> Path:
+    """Write an observable pytest module fixture into tmp_path."""
+    p = tmp_path / name
+    p.write_text(body, encoding="utf-8")
+    return p
+
+
+def _live_claim(mutation: str, mutation_path: str, observable: str) -> Cell:
+    # pattern/positive_control are irrelevant to prove_absences (they drive check_absences); supply
+    # harmless values so the required fields are present.
+    return Cell(
+        id="1.1.1",
+        level=1,
+        verdict="fail",
+        absence=(
+            Absence(
+                pattern="x",
+                positive_control="y",
+                mutation=mutation,
+                mutation_path=mutation_path,
+                observable=observable,
+            ),
+        ),
+    )
+
+
+def test_prove_absences_proves_a_claim_when_the_mutation_reddens_its_observable(
+    tmp_path: Path,
+) -> None:
+    """The positive half: a mutation that shadows `scan` reddens the observable, so the claim BITES.
+
+    Falsified by making `_apply_mutation` a no-op: the observable stays green, the mode reports
+    UNPROVEN, and the `.ok`/`proved_absences == 1` assertions go RED. Restored.
+    """
+    _module(tmp_path, "scanner.py", _SCANNER)
+    _obs_test(tmp_path, "test_scanner.py", _OBS_TEST)
+    claim = _live_claim(
+        'def scan(p): return "infected"', "scanner.py", "test_scanner.py::test_clean"
+    )
+    findings = prove_absences([claim], tmp_path)
+    assert findings.ok, findings.problems
+    assert findings.proved_absences == 1
+
+
+def test_prove_absences_fails_when_the_mutation_reddens_nothing(tmp_path: Path) -> None:
+    """The negative control the brief requires: a mutation to a file the observable never imports
+    reddens nothing, so the claim is UNPROVEN and the mode FAILS.
+
+    Falsified by making the mode accept a mutated exit==0 as a pass (dropping the exit==1
+    requirement): the non-biting claim then reports ok, and `not findings.ok` goes RED -- proving the
+    mode can actually fail. Restored.
+    """
+    _module(tmp_path, "scanner.py", _SCANNER)
+    _module(
+        tmp_path, "unrelated.py", "VALUE = 1\n"
+    )  # exists, but the observable does not import it
+    _obs_test(tmp_path, "test_scanner.py", _OBS_TEST)
+    claim = _live_claim(
+        'def scan(p): return "infected"', "unrelated.py", "test_scanner.py::test_clean"
+    )
+    findings = prove_absences([claim], tmp_path)
+    assert not findings.ok
+    assert any("UNPROVEN" in p for p in findings.problems), findings.problems
+    assert findings.proved_absences == 0
+
+
+def test_prove_absences_fails_closed_when_the_observable_is_already_red(tmp_path: Path) -> None:
+    """An observable that fails on the pristine tree cannot attribute its red to the mutation.
+
+    Falsified by removing the baseline-green check: the already-red observable stays red under the
+    mutation, is miscounted as `proved`, and this test's `not findings.ok` goes RED. Restored.
+    """
+    _module(tmp_path, "scanner.py", _SCANNER)
+    _obs_test(
+        tmp_path,
+        "test_scanner.py",
+        "from scanner import scan\n\n\ndef test_clean():\n    assert scan('x') == 'DIFFERENT'\n",
+    )
+    claim = _live_claim(
+        'def scan(p): return "infected"', "scanner.py", "test_scanner.py::test_clean"
+    )
+    findings = prove_absences([claim], tmp_path)
+    assert not findings.ok
+    assert any("PROVE-ERROR" in p and "baseline" in p for p in findings.problems), findings.problems
+    assert findings.proved_absences == 0
+
+
+def test_prove_absences_fails_closed_when_the_mutation_errors_instead_of_failing(
+    tmp_path: Path,
+) -> None:
+    """A mutation that breaks IMPORT of the observable's module errors at collection (pytest exit 4),
+    not a test failure (exit 1). A collection/usage error must NEVER count as the control biting --
+    otherwise a typo'd node or an import-breaking mutation rebuilds the exact vacuity being fixed.
+
+    Falsified by changing the mutated-run requirement from `exit == 1` to `exit != 0`: the exit-4
+    collection error then masquerades as `proved`, and this test's `not findings.ok` goes RED.
+    Restored.
+    """
+    _module(tmp_path, "scanner.py", _SCANNER)
+    _obs_test(tmp_path, "test_scanner.py", _OBS_TEST)
+    # Appended at module level, this raises when `scanner` is imported -> collection error, not a
+    # failing assertion.
+    claim = _live_claim(
+        'raise RuntimeError("reintroduced")', "scanner.py", "test_scanner.py::test_clean"
+    )
+    findings = prove_absences([claim], tmp_path)
+    assert not findings.ok
+    assert any("PROVE-ERROR" in p and "errored" in p for p in findings.problems), findings.problems
+    assert findings.proved_absences == 0
+
+
+def test_prove_absences_static_backstop_flags_a_raise_into_a_swallowing_file(
+    tmp_path: Path,
+) -> None:
+    """With no observable, the static backstop flags a `raise` landing in a file whose try/except
+    swallows (bare/Exception, log-only body). A screen, not a proof -- but it fails the mode.
+
+    Falsified by forcing `_landing_swallows` to return False: the swallow is not flagged, `findings.ok`
+    becomes True, and this test's `not findings.ok` goes RED. Restored.
+    """
+    _module(
+        tmp_path,
+        "caller.py",
+        "import logging\n\nlog = logging.getLogger(__name__)\n\n\n"
+        "def reconcile():\n    try:\n        work()\n    except Exception:\n"
+        "        log.exception('reconcile failed')\n",
+    )
+    claim = Cell(
+        id="13.3.4",
+        level=3,
+        verdict="fail",
+        absence=(
+            Absence(
+                pattern="x",
+                positive_control="y",
+                mutation='raise RuntimeError("reintroduced")',
+                mutation_path="caller.py",
+                observable="",  # no observable -> static backstop
+            ),
+        ),
+    )
+    findings = prove_absences([claim], tmp_path)
+    assert not findings.ok
+    assert any("SUSPECT" in p and "swallow" in p for p in findings.problems), findings.problems
+    assert findings.static_screened == 1
+
+
+def test_prove_absences_static_backstop_passes_a_non_swallowing_file(tmp_path: Path) -> None:
+    """REACH control: the static backstop must NOT flag a `raise` into a handler that re-raises --
+    proving the heuristic reads the handler body, not merely the presence of a try/except.
+
+    Falsified by forcing `_landing_swallows` to return True: the re-raising file is flagged, and this
+    test's `assert findings.ok` goes RED. Restored.
+    """
+    _module(
+        tmp_path,
+        "plain.py",
+        "def reconcile():\n    try:\n        work()\n    except Exception:\n        raise\n",
+    )
+    claim = Cell(
+        id="13.3.4",
+        level=3,
+        verdict="fail",
+        absence=(
+            Absence(
+                pattern="x",
+                positive_control="y",
+                mutation='raise RuntimeError("reintroduced")',
+                mutation_path="plain.py",
+                observable="",
+            ),
+        ),
+    )
+    findings = prove_absences([claim], tmp_path)
+    assert findings.ok, findings.problems
+    assert findings.static_screened == 1
+    assert not any("SUSPECT" in p for p in findings.problems)
+
+
+def test_prove_absences_leaves_the_root_tree_untouched(tmp_path: Path) -> None:
+    """The mode must run OUT of the tracked tree: mutation lands only on the scratch copy.
+
+    Falsified by pointing `_apply_mutation` at `root` instead of the scratch copy: root's scanner.py
+    changes, `after == before` goes RED (and the claim also drops to UNPROVEN). Restored.
+    """
+    _module(tmp_path, "scanner.py", _SCANNER)
+    _obs_test(tmp_path, "test_scanner.py", _OBS_TEST)
+    before = {p: p.read_bytes() for p in sorted(tmp_path.rglob("*")) if p.is_file()}
+    claim = _live_claim(
+        'def scan(p): return "infected"', "scanner.py", "test_scanner.py::test_clean"
+    )
+    findings = prove_absences([claim], tmp_path)
+    assert findings.proved_absences == 1, findings.problems
+    after = {p: p.read_bytes() for p in sorted(tmp_path.rglob("*")) if p.is_file()}
+    assert after == before
+
+
+def test_load_reads_optional_mutation_path_and_observable_and_omitting_them_still_loads(
+    tmp_path: Path,
+) -> None:
+    """Round-trip: the two new fields load when present, and OMITTING them still loads (vault-safety --
+    the ~81 existing absence claims carry neither and must stay loadable).
+
+    Falsified by dropping the `.get` wiring in load_scorecard (hardcoding ``mutation_path=""``): half
+    (a) then reads "" and its assertion goes RED, while half (b) stays green -- proving the round-trip
+    is actually asserted. Restored.
+    """
+    with_fields = tmp_path / "with.toml"
+    with_fields.write_text(
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "fail"\n'
+        "  [[cell.absence]]\n"
+        '  pattern = "clamd"\n'
+        '  positive_control = "ScanRejected"\n'
+        '  mutation = "import clamd"\n'
+        '  mutation_path = "messagefoundry/scan.py"\n'
+        '  observable = "tests/test_scan.py::test_rejects"\n',
+        encoding="utf-8",
+    )
+    a = load_scorecard(with_fields)[0].absence[0]
+    assert a.mutation_path == "messagefoundry/scan.py"
+    assert a.observable == "tests/test_scan.py::test_rejects"
+
+    without_fields = tmp_path / "without.toml"
+    without_fields.write_text(
+        '[[cell]]\nid = "1.1.2"\nlevel = 2\nverdict = "fail"\n'
+        "  [[cell.absence]]\n"
+        '  pattern = "clamd"\n'
+        '  positive_control = "ScanRejected"\n'
+        '  mutation = "import clamd"\n',
+        encoding="utf-8",
+    )
+    b = load_scorecard(without_fields)[0].absence[0]
+    assert b.mutation_path == "" and b.observable == ""
+
+
+def test_prove_absences_refuses_a_mutation_path_that_escapes_the_scratch_tree(
+    tmp_path: Path,
+) -> None:
+    """`mutation_path` is authored data. An absolute path or a `..` escape would let the mutation land
+    OUTSIDE the scratch copy (defeating the 'never touches root' guarantee), so the mode refuses it as
+    a PROVE-ERROR before applying anything -- it never counts as a proof.
+
+    Falsified by making `_is_within_tree` return True unconditionally: the `..` path is no longer
+    refused, the run falls through to the is_file probe with a different message, and this test's
+    `any("repo-relative" in p ...)` assertion goes RED. Restored.
+    """
+    _module(tmp_path, "scanner.py", _SCANNER)
+    _obs_test(tmp_path, "test_scanner.py", _OBS_TEST)
+    claim = _live_claim(
+        'def scan(p): return "infected"',
+        "../escape.py",  # a `..` that would climb out of the scratch copy
+        "test_scanner.py::test_clean",
+    )
+    findings = prove_absences([claim], tmp_path)
+    assert not findings.ok
+    assert any("PROVE-ERROR" in p and "repo-relative" in p for p in findings.problems), (
+        findings.problems
+    )
+    assert findings.proved_absences == 0
+
+
+def test_copy_scratch_excludes_secrets_store_and_vault_posture(tmp_path: Path) -> None:
+    """The scratch copy the vault mutation-run reads must never carry secrets, the local store, or the
+    vault posture tree -- CLAUDE.md §9 forbids this module reading them at all. `_copy_scratch` skips
+    `.env*`, `*.db`(+WAL sidecars), and `docs/security`, while ordinary sources are still copied.
+
+    Falsified by reverting `_scratch_ignore` to the bare VCS/venv/cache patterns: the `.env`, `*.db`
+    and `docs/security` fixtures are then copied into the scratch dir and every `not (dest/...).exists()`
+    assertion goes RED, while the `keep.py` assertion stays green. Restored.
+    """
+    (tmp_path / ".env").write_text("EXAMPLE_PLACEHOLDER=not-a-secret\n", encoding="utf-8")
+    (tmp_path / "local.db").write_text("binary-store\n", encoding="utf-8")
+    (tmp_path / "local.db-wal").write_text("wal\n", encoding="utf-8")
+    (tmp_path / "docs" / "security").mkdir(parents=True)
+    (tmp_path / "docs" / "security" / "posture.toml").write_text("real = true\n", encoding="utf-8")
+    (tmp_path / "docs" / "PUBLIC.md").write_text("# public\n", encoding="utf-8")
+    (tmp_path / "keep.py").write_text("KEEP = 1\n", encoding="utf-8")
+
+    dest = tmp_path.parent / "scratch_out"
+    _copy_scratch(tmp_path, dest)
+
+    assert not (dest / ".env").exists()
+    assert not (dest / "local.db").exists()
+    assert not (dest / "local.db-wal").exists()
+    assert not (dest / "docs" / "security").exists()
+    # ordinary sources and other docs survive the copy
+    assert (dest / "keep.py").read_text(encoding="utf-8") == "KEEP = 1\n"
+    assert (dest / "docs" / "PUBLIC.md").exists()
+
+
+def _biting_scorecard(sc: Path, mutation_path: str) -> None:
+    """Write a one-claim scorecard whose live absence claim points at `mutation_path`."""
+    sc.write_text(
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "fail"\n'
+        "  [[cell.absence]]\n"
+        '  pattern = "x"\n'
+        '  positive_control = "y"\n'
+        "  mutation = 'def scan(p): return \"infected\"'\n"
+        f'  mutation_path = "{mutation_path}"\n'
+        '  observable = "test_scanner.py::test_clean"\n',
+        encoding="utf-8",
+    )
+
+
+def test_main_prove_absences_returns_0_on_a_biting_claim(tmp_path: Path) -> None:
+    """The CLI contract CI depends on: `--prove-absences` exits 0 when every claim's mutation reddens
+    its observable. Exercises `main` -> `_run_prove_absences` end to end, not just `prove_absences`.
+
+    Falsified by changing `_run_prove_absences`'s `return 0 if findings.ok else 1` to `return 1`: this
+    test's `rc == 0` goes RED while the non-biting test below stays green. Restored.
+    """
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    _module(tree, "scanner.py", _SCANNER)
+    _obs_test(tree, "test_scanner.py", _OBS_TEST)
+    sc = tmp_path / "sc.toml"
+    _biting_scorecard(sc, "scanner.py")
+    rc = main(["--scorecard", str(sc), "--root", str(tree), "--prove-absences"])
+    assert rc == 0
+
+
+def test_main_prove_absences_returns_1_on_a_nonbiting_claim(tmp_path: Path) -> None:
+    """The other half of the contract: `--prove-absences` exits 1 when a claim is UNPROVEN (its
+    mutation reddens nothing). Proves the CLI's non-zero failure path, not only the library's.
+
+    Falsified by changing `_run_prove_absences`'s `return 0 if findings.ok else 1` to `return 0`:
+    this test's `rc == 1` goes RED while the biting test above stays green. Restored.
+    """
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    _module(tree, "scanner.py", _SCANNER)
+    _module(tree, "unrelated.py", "VALUE = 1\n")  # present, but the observable never imports it
+    _obs_test(tree, "test_scanner.py", _OBS_TEST)
+    sc = tmp_path / "sc.toml"
+    _biting_scorecard(sc, "unrelated.py")
+    rc = main(["--scorecard", str(sc), "--root", str(tree), "--prove-absences"])
+    assert rc == 1
+
+
+def test_main_verify_without_corpus_returns_exit_2(tmp_path: Path) -> None:
+    """Verify mode needs the corpus; omitting `--corpus` (without `--prove-absences`) must exit 2 --
+    could-not-measure, never confused with a clean 0. Proves the argparse-independent guard in `main`.
+
+    Falsified by deleting the `if args.corpus is None: ... return 2` branch in `main`: it then falls
+    through to `verify(...)` with `corpus=None`, raising instead of returning 2, and this test's
+    `rc == 2` goes RED. Restored.
+    """
+    sc = tmp_path / "sc.toml"
+    sc.write_text(
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "fail"\n'
+        "  [[cell.absence]]\n"
+        '  pattern = "x"\n'
+        '  positive_control = "y"\n'
+        '  mutation = "import x"\n',
+        encoding="utf-8",
+    )
+    rc = main(["--scorecard", str(sc), "--root", str(tmp_path)])
+    assert rc == 2
