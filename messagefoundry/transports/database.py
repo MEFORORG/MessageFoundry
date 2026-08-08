@@ -478,6 +478,28 @@ async def _acquire(pool: Any, timeout: float) -> Any:
         ) from exc
 
 
+async def _close_cursor(cur: Any) -> None:
+    """Close a cursor BEFORE its connection goes back to the pool (BACKLOG #1104).
+
+    aioodbc/pyodbc keep the ODBC statement handle open until the cursor is closed, and a connection
+    released with an open handle is handed to the NEXT caller still busy. That caller's first command
+    then fails with ``HY000 Connection is busy with results for another command`` — a failure with no
+    relationship to the statement it lands on, which is what made this hard to attribute. An ``UPDATE``
+    leaves a row count pending, so the DATABASE source's ``mark`` is the usual victim, and a failed
+    mark **re-emits the row as a DUPLICATE** (see ``_poll_once``). So this is delivery semantics, not
+    tidiness.
+
+    Never raises. A close failure must not mask the caller's real error, and must not skip the pool
+    release that follows it — leaking a connection to save a cursor would be the worse trade.
+    """
+    if cur is None:
+        return
+    try:
+        await cur.close()
+    except Exception as exc:  # noqa: BLE001 - hygiene only; the caller's outcome always wins
+        logger.debug("DATABASE: cursor close failed, ignored: %s", exc)
+
+
 async def _probe_db(
     get_pool: Callable[[], Any], *, timeout: float = _DEFAULT_DB_ACQUIRE_TIMEOUT
 ) -> None:
@@ -496,6 +518,7 @@ async def _probe_db(
             if state
             else DeliveryError(f"DATABASE connect failed: {exc}")
         ) from exc
+    cur: Any = None
     try:
         cur = await conn.cursor()
         await cur.execute("SELECT 1")
@@ -507,6 +530,7 @@ async def _probe_db(
             else DeliveryError(f"DATABASE probe failed: {exc}")
         ) from exc
     finally:
+        await _close_cursor(cur)
         await pool.release(conn)
 
 
@@ -591,6 +615,7 @@ class DatabaseDestination(DestinationConnector):
         params = _bind_params(payload, self._param_names)  # NegativeAckError(permanent) on bad data
         pool = await self._get_pool()
         conn = await _acquire(pool, self._acquire_timeout)
+        cur: Any = None
         try:
             cur = await conn.cursor()
             try:
@@ -607,6 +632,7 @@ class DatabaseDestination(DestinationConnector):
                     raise  # not a DB driver error → an internal/code error, let the runner handle it
                 raise _classify_db_error(state, str(exc)) from exc
         finally:
+            await _close_cursor(cur)
             await pool.release(conn)
         return captured
 
@@ -890,12 +916,14 @@ class DatabaseSource(SourceConnector):
         hostage to downstream store I/O."""
         pool = await self._get_pool()
         conn = await _acquire(pool, self._acquire_timeout)
+        cur: Any = None
         try:
             cur = await conn.cursor()
             await cur.execute(self._poll_sql)
             columns = [d[0] for d in cur.description]
             rows = list(await cur.fetchall())
         finally:
+            await _close_cursor(cur)
             await pool.release(conn)
         return columns, rows
 
@@ -928,10 +956,12 @@ class DatabaseSource(SourceConnector):
             return
         pool = await self._get_pool()
         conn = await _acquire(pool, self._acquire_timeout)
+        cur: Any = None
         try:
             cur = await conn.cursor()
             await cur.execute(self._mark_sql, params)
         finally:
+            await _close_cursor(cur)
             await pool.release(conn)
 
     async def test_connection(self) -> None:
@@ -1038,6 +1068,7 @@ class DatabaseLookupExecutor:
             # Map the transient pool-timeout onto the lookup's own PHI-free error type so the transform
             # worker dead-letters/errors this message consistently with other lookup failures.
             raise DbLookupError(f"db_lookup on {connection!r}: {exc}") from exc
+        cur: Any = None
         try:
             cur = await conn.cursor()
             await cur.execute(sql, bound)
@@ -1052,6 +1083,7 @@ class DatabaseLookupExecutor:
                 f"db_lookup query on {connection!r} failed" + (f" [{state}]" if state else "")
             ) from exc
         finally:
+            await _close_cursor(cur)
             await pool.release(conn)
         return [dict(zip(columns, row)) for row in rows]  # noqa: B905
 

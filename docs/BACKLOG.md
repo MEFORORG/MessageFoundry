@@ -6955,3 +6955,65 @@ covered -- the comment quoted above is that shape in prose).
 `#1096` cap change. Diagnosed by tracing the port number through `_free_port` and the `api_port + step`
 call site rather than by re-running: the failing port lies outside the inbound window, which is what
 rules out the family `#1014` already fixed and points at the one it did not.
+
+## 1104. the DATABASE connector never closes its cursors, so a pooled connection is returned busy and the source's mark fails, emitting a duplicate
+
+> ✅ **SHIPPED 2026-08-08 — found and fixed in the same pass; reproduced against a real SQL Server 2022 container, not inferred.** Value **6/10** · Difficulty **2/10**. `messagefoundry/transports/database.py` opened a cursor at **five** sites and closed it at **none** — `cur.close()` appeared nowhere in the file. aioodbc/pyodbc keep the ODBC statement handle open until the cursor is closed, so every one of those connections went back to the pool **busy**, and the next caller's first command failed with `HY000 Connection is busy with results for another command`. **This is delivery semantics, not tidiness:** the usual victim is the DATABASE source's `mark`, and `_poll_once` treats a failed mark as at-least-once — the row is left unmarked and **re-emitted as a DUPLICATE**.
+
+**Cluster:** Connectors / delivery semantics. **Priority:** P2. **Verdict:** built. **Severity:** no PHI
+effect. A shipped connector emits duplicate messages on SQL Server whenever the pool hands back a dirty
+connection at the wrong moment. Per CLAUDE.md §0 this is stated in the conditional: **a deploying site
+running a DATABASE source against SQL Server would see duplicates**, at a rate set by pool reuse.
+
+**Observed on `main`**, not on a branch:
+
+```
+DATABASE source mark failed (row will re-emit, a duplicate):
+  ('HY000', '[Microsoft][ODBC Driver 18 for SQL Server]Connection is busy with
+   results for another command (0) (SQLExecDirectW)')
+FAILED tests/test_database_source_integration.py::test_source_polls_and_marks_rows
+assert [(1, 1)] == [(0, 2)]      # 1 row left unmarked -> it re-emits
+```
+
+**Mechanism.** `_select` runs the poll and `_mark` runs an `UPDATE`; both release the connection in a
+`finally` without closing the cursor. An `UPDATE` leaves a row count pending on the statement handle,
+so the connection is dirty when it returns to the pool. The failure then lands on **whatever statement
+next draws that connection**, which is why it reads as unrelated and intermittent.
+
+**⚠️ THE ERROR APPEARS ON THE INNOCENT STATEMENT.** The command that fails is not the one that left the
+handle open. Triaging the reported statement leads nowhere; the cause is one connection-checkout
+earlier. That misdirection is the whole reason this survived.
+
+**Why CI never caught it on `main`.** The `sql server (store + connector)` leg is gated on server-DB and
+docker path changes, so it is **skipped on every `main` push** — measured across the five most recent.
+It runs only on PRs that touch those paths, which is how a real defect sat on `main` while the leg that
+detects it stayed green-by-absence. That is the #1000 shape at the workflow level: a check whose silence
+is mistaken for a pass. **Filing this does not fix that**; the leg's `main` coverage is a separate
+question and is NOT addressed here.
+
+**The fix.** A `_close_cursor` helper, called before `pool.release` at all five sites. It never raises:
+a close failure must not mask the caller's real error, and must not skip the release that follows —
+leaking a pooled connection to save a cursor is the worse trade.
+
+**⚠️ BE HONEST ABOUT THE INTEGRATION EVIDENCE — IT IS WEAK ON ITS OWN.** Measured on the container:
+**1 failure in 10 runs** on the unfixed tree, **0 in 10** with the fix. At a ~10% base rate that
+difference is **well inside chance** and proves nothing by itself. It is recorded as the reproduction
+that found the defect, not as the evidence that it is fixed. The evidence is
+`tests/test_database_cursor_close.py`, which asserts the ordering **deterministically** against a fake
+pool and was **verified to go RED on a mutant** with the closes removed (2 of 3 tests failed; the third
+covers `_close_cursor`'s own contract and correctly did not). A guard with a 10% detection rate is not
+a guard.
+
+**Related:** #1000 (a control green because its evidence could not see the class it covered — both the
+skipped CI leg and the racy integration test are that shape), #1103 (found the same day, also a harness
+/ connector defect whose error message points away from the cause), ADR 0003 (the aioodbc choice this
+rides on).
+
+**Source:** found 2026-08-08 while triaging PR #253's red SQL Server leg. #253 was exonerated **by
+measurement** — the same test fails identically on `main` — after first being exonerated by mechanism
+(that step runs an explicit path list, so `testpaths` cannot reach it). The two reds on #253 were two
+*different* unrelated failures, which is why "it failed twice, so it is real" would have been the wrong
+read. Verified against a Docker SQL Server 2022 container after first confirming the host actually
+reaches the container and not the native `MSSQLSERVER` service also running on that box: both listeners
+on 1433 were Docker processes, and `SERVERPROPERTY('MachineName')` returned the container's own
+hostname. That check is not optional on this machine.
