@@ -176,6 +176,10 @@ class Findings:
     """What a verification pass found. Empty ``problems`` is the only pass condition."""
 
     problems: list[str] = field(default_factory=list)
+    #: Reported, never fatal. A UNIQUE evidence token that merely MOVED is not a broken claim — see
+    #: :func:`check_anchors`. These still print, because letting them accumulate silently is how the
+    #: recorded line numbers rot; they just do not red the gate.
+    advisories: list[str] = field(default_factory=list)
     checked_anchors: int = 0
     checked_absences: int = 0
     skipped_anchors: int = 0
@@ -426,10 +430,35 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
                 continue
             if a.expect in "\n".join(lines[lo:hi]):
                 continue
-            where = " (found elsewhere in the file)" if a.expect in "\n".join(lines) else ""
+            if a.expect in "\n".join(lines):
+                # MOVED, not broken — and for a UNIQUE token the line number was never the proof.
+                # Execution only reaches here PAST the ``occurrences > 1`` guard above, so the token
+                # occurs exactly once in this file: its presence alone pins the evidence, and the line
+                # is a navigation aid. Failing on it asserts something different from what this gate
+                # exists to assert — that the claim is still true, not that it sits where it sat.
+                #
+                # This is not a theoretical tidy-up. The scorecard lives in a repo that no longer
+                # develops this tree, while this tree lands ~21 commits/day, so ONE insertion above a
+                # hot file re-breaks every anchor below it: on 2026-08-07, 130 of 146 failures were a
+                # single constant offset per file (+57 auth/service.py, +61 __main__.py, +47
+                # store/base.py) and the count went 67 -> 146 in ten hours. It recurred the next day
+                # (+102 on .github/workflows/ci.yml). A gate that is red every morning for a reason
+                # nobody must act on is a gate whose next REAL finding gets waved through — and there
+                # was one underneath: a cell asserting a control was absent that had since been built.
+                #
+                # What still reds the gate is unchanged and is the whole signal: a token that is GONE
+                # (the claim may now be false), an AMBIGUOUS token (there the line IS load-bearing and
+                # a re-anchor to the wrong occurrence cannot be detected), a missing evidence path,
+                # and every absence-claim failure. That narrows the gate to claim-invalidation, which
+                # is what ADR 0156 already describes as the intent.
+                findings.advisories.append(
+                    f"{c.id}: {a.path}:{a.line} moved — {a.expect!r} is still in the file (unique), "
+                    f"but >±{ANCHOR_WINDOW} lines away. Re-anchor the line number"
+                )
+                continue
             findings.problems.append(
                 f"{c.id}: {a.path}:{a.line} no longer contains {a.expect!r} within "
-                f"±{ANCHOR_WINDOW} lines{where} — the evidence moved or the claim is now false"
+                f"±{ANCHOR_WINDOW} lines — the evidence moved or the claim is now false"
             )
 
 
@@ -950,6 +979,14 @@ def main(argv: list[str] | None = None) -> int:
         f"{n['unverified']} unverified); "
         f"verified {findings.checked_anchors} evidence anchors and {findings.checked_absences} absence claims"
     )
+    for a in findings.advisories:
+        print(f"  DRIFT {a}", file=sys.stderr)
+    if findings.advisories:
+        print(
+            f"  {len(findings.advisories)} anchor(s) drifted: evidence still present and unique, line "
+            "numbers stale. Not fatal — re-anchor them, do not let them accumulate.",
+            file=sys.stderr,
+        )
     for p in findings.problems:
         print(f"  FAIL {p}", file=sys.stderr)
 

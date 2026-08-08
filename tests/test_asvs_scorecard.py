@@ -160,6 +160,73 @@ def test_anchor_goes_red_when_the_token_is_gone(tmp_path: Path) -> None:
     assert not f.ok and "no longer contains" in f.problems[0]
 
 
+def test_a_unique_token_that_drifted_is_advisory_not_fatal(tmp_path: Path) -> None:
+    """DRIFT is not INVALIDATION. The token sits far below its recorded line but occurs exactly once.
+
+    Execution only reaches the drift branch PAST the ``occurrences > 1`` guard, so uniqueness is what
+    pins the evidence and the line number is navigation. Failing here would assert that the claim sits
+    where it sat, which is a different proposition from the one this gate exists to check.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    body = "\n".join(["filler"] * 300 + ["tls_cert_file = None"] + ["tail"] * 5)
+    (tmp_path / "messagefoundry" / "m.py").write_text(body, encoding="utf-8")
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(Anchor("messagefoundry/m.py", 5, "tls_cert_file"),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert f.ok and f.problems == []
+    assert len(f.advisories) == 1 and "moved" in f.advisories[0]
+
+
+def test_an_ambiguous_token_stays_fatal_even_when_it_drifted(tmp_path: Path) -> None:
+    """Where the line IS load-bearing, drift must not soften it.
+
+    With two occurrences a re-anchor to the WRONG one cannot be detected — the defect this module's
+    uniqueness rule exists to catch. Advisory treatment is reserved for the case where the token
+    itself certifies the evidence.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    body = "\n".join(["filler"] * 200 + ["dupe_token"] + ["filler"] * 200 + ["dupe_token"])
+    (tmp_path / "messagefoundry" / "m.py").write_text(body, encoding="utf-8")
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(Anchor("messagefoundry/m.py", 1, "dupe_token"),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert not f.ok and "AMBIGUOUS" in f.problems[0]
+    assert f.advisories == []
+
+
+def test_ordinary_small_movement_is_neither_problem_nor_advisory(tmp_path: Path) -> None:
+    """The control. Without it, a test asserting "drift is advisory" would still pass if EVERY anchor
+    started reporting drift — the window would have stopped absorbing anything and nothing would say so."""
+    (tmp_path / "messagefoundry").mkdir()
+    body = "\n".join(["filler"] * 20 + ["tls_cert_file = None"] + ["filler"] * 20)
+    (tmp_path / "messagefoundry" / "m.py").write_text(body, encoding="utf-8")
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(Anchor("messagefoundry/m.py", 15, "tls_cert_file"),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert f.problems == [] and f.advisories == []
+
+
 def test_anchor_goes_red_when_the_file_is_gone(tmp_path: Path) -> None:
     cells = [
         Cell(
