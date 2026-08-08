@@ -195,7 +195,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 | 16 | **#114** | Directory validation toggle (perform vs suppress startup validation) | 6 | 3 | _quick win_ | DEMAND-GATE | The remainder is worse than a missing toggle — `File(validate_directory=True)` on an outbound is accepted and silently ignored, so an operator asks for fail-fast and gets neither validation nor an error, with only the on-demand `POST /connections/{name}/test` probe as a workaround; the fix adds a `validate_startup` hook to the `DestinationConnector` contract (`transports/base.py:459`, which today exposes only `send` at `:480`) plus a runner outbound start-path call, mirroring the source seam already at `transports/base.py:436`. |
 | 17 | **#158** | Per-message dynamic FTP host/path/credentials | 6 | 3 | _quick win_ | DEMAND-GATE | Real dynamic-destination gap the shipped code closes off at both ends — host/credentials/`remote_dir` freeze at construction (`messagefoundry/transports/remotefile.py:626-627`) and `render_filename` is hard-capped to one path component (`messagefoundry/transports/file.py:105-127`), so a data-driven target subdirectory cannot be expressed by a static per-folder connection fan-out nor smuggled through the filename; awkward workaround, not a clean one. Build rides the already-shipped #68 per-message metadata carry (`messagefoundry/pipeline/wiring_runner.py:4526-4531`) plus a multi-component path sanitizer — a setting into one connector. |
 | 18 | **#328** | `audit-verify` cannot detect a truncated audit tail | 6 | 3 | _quick win_ | P2 | Both shipped verification surfaces call `verify_audit_chain()` bare (`messagefoundry/__main__.py:3596`, `pipeline/engine.py:860`) and the `audit-verify` subparser declares only `--service-config` and `--db` (`__main__.py:571-578`), so a truncated keyed chain — the residue the anchor exists to catch — reports CLEAN with no way for an operator to supply one; the remainder is a new `audit-anchor` subcommand, an `--expected-anchor` flag into the already-present `expected_anchor=` keyword, and an `[integrity]` key for the startup path, with no change to the comparison logic and no store migration. |
-| 19 | **#344** | Fixed wall-clock bounds have drifted out of proportion to the work they bound | 6 | 3 | _quick win_ | P2 | A mechanical margin check would have flagged windows-2025 at 1.006x before #119 died where the manual alternative was published wrong twice, and the shared Windows budget still admits the three-PRs-each-adding-a-minute death nobody is individually at fault for; `_wait_until` already raises with a full dispatcher/store dump citing proposal 6 (`tests/test_stage_dispatcher.py:485-497`) and no margin script exists under `scripts/ci/`, so the remainder is that script — timing the STEP, keyed on the step's own conclusion, against a right-censored max — plus giving `Web console tests (pytest)` its own cap instead of the shared `matrix.step_timeout` at `ci.yml:442`. |
+| 19 | **#344** | Fixed wall-clock bounds have drifted out of proportion to the work they bound | 6 | 3 | _quick win_ | P2 | A mechanical margin check would have flagged windows-2025 at 1.006x before #119 died where the manual alternative was published wrong twice, and the shared Windows budget still admits the three-PRs-each-adding-a-minute death nobody is individually at fault for; `_wait_until` already raises with a full dispatcher/store dump citing proposal 6 (`tests/test_stage_dispatcher.py:485-497`) and no margin script exists under `scripts/ci/`, so the remainder is that script — timing the STEP, keyed on the step's own conclusion, against a right-censored max — plus giving `Web console tests (pytest)` its own cap instead of the shared `matrix.step_timeout` in `ci.yml`. |
 | 20 | **#1006** | A mutation that matches is not a mutation that bites: the absence-claim gate proves syntax, never behaviour | 6 | 3 | _quick win_ | P2 | `check_absences` admits an ASVS absence claim on `re.search(a.pattern, a.mutation)` (`scripts/asvs/scorecard.py:395`) — one string field of a TOML row matched against another, with the corpus never consulted and the mutation never applied — so a well-formed, honestly-authored reintroduction that would change nothing if written into the code passes all three of the gate's failure modes and certifies a non-control into the record, a mode the `Absence` docstring did not anticipate even while it closed the adjacent one; the remainder is a required per-claim observable plus a mode that applies the mutation and requires that observable to go red, in one stdlib script and its fixture tests. |
 | 21 | **#1007** | Sweep all 345 ASVS cells for present-tense impact language — the record asserts live exposures that do not exist | 6 | 3 | _quick win_ | P2 | The scorecard's 146 residual-prose cells (~64,000 words) and the risk register's 55 signed cell rows were written before the owner ruled the product a not-deployed beta, so cells assert live exposures that do not exist — the "compensating control must not rest on a false premise" defect `docs/Secure_Development_Standards.md:98` forbids — with the only workaround a reader silently discounting every impact sentence by hand; the fix is a wording-only pass under a hard invariant (the `(id, verdict, level)` tuple set byte-identical before and after), a crude screen already sizes it at 77 of 146 candidates spanning every verdict class, one worked example has already landed vault-side, and it moves no verdict, touches no product surface and adds no dependency. |
 | 22 | **#1026** | The ASVS 12.1.1 TLS-floor probe silently does not run with the console off, and its own comment names three of its four conditions | 6 | 3 | _quick win_ | P2 | The probe's gate in `__main__.py` requires FOUR conditions — `tls_terminated_upstream and PHI and enforcing and public_origin` — while the comment directly above names three ("a declared terminator, PHI, and `enforce`") and asserts "every other posture never reaches here", so a reader concludes it runs whenever a PHI instance sits behind a declared terminator under enforce. The undocumented fourth is not self-satisfying: the refusal for an unset `public_origin` is itself gated on `serve_ui`, so with the console OFF nothing requires it, it keeps its `None` default (`config/settings.py:693`), and the probe silently never runs while the API is still off-loopback behind a terminator carrying PHI. ⭐ The same block `return 2`s when the probe's MECHANISM is unavailable, explicitly because "a check that degrades to a no-op when its mechanism disappears reports success forever afterwards" — it refuses a silent no-op one level down and performs one one level up (ADR 0158's class). Value 6: an ASVS 12.1.1 control inert in a legitimate posture with nothing reporting the skip. Difficulty 3 because the design choice is the work, not the code: require `public_origin` in that posture (adds a refusal to a posture that starts today), make the skip loud, or correct only the comment and leave the control inert. ⚠️ The originating report's mechanism was WRONG — it said the console "auto-degrades" so `public_origin` stays unset; the real link is that the requirement for `public_origin` is gated on `serve_ui`. |
@@ -3245,7 +3245,7 @@ Two worked instances the same day. **#74** went green on 2026-07-30 and sat unme
 
 ## 344. Fixed wall-clock bounds have drifted out of proportion to the work they bound
 
-> 🚧 **Status OPEN (filed 2026-08-01).** Value **6/10** · Difficulty **3/10** · _quick win_. A mechanical margin check would have flagged windows-2025 at 1.006x before #119 died where the manual alternative was published wrong twice, and the shared Windows budget still admits the three-PRs-each-adding-a-minute death nobody is individually at fault for; `_wait_until` already raises with a full dispatcher/store dump citing proposal 6 (`tests/test_stage_dispatcher.py:485-497`) and no margin script exists under `scripts/ci/`, so the remainder is that script — timing the STEP, keyed on the step's own conclusion, against a right-censored max — plus giving `Web console tests (pytest)` its own cap instead of the shared `matrix.step_timeout` at `ci.yml:442`. _(was 6/10 · 4/10.)_
+> 🚧 **Status OPEN (filed 2026-08-01).** Value **6/10** · Difficulty **3/10** · _quick win_. A mechanical margin check would have flagged windows-2025 at 1.006x before #119 died where the manual alternative was published wrong twice, and the shared Windows budget still admits the three-PRs-each-adding-a-minute death nobody is individually at fault for; `_wait_until` already raises with a full dispatcher/store dump citing proposal 6 (`tests/test_stage_dispatcher.py:485-497`) and no margin script exists under `scripts/ci/`, so the remainder is that script — timing the STEP, keyed on the step's own conclusion, against a right-censored max — plus giving `Web console tests (pytest)` its own cap instead of the shared `matrix.step_timeout` in `ci.yml`. _(was 6/10 · 4/10.)_
 
 **Cluster:** Developer Experience & CI. **Priority:** P2. **Verdict:** build. **Severity:** medium.
 
@@ -3267,7 +3267,7 @@ Fixed two ways in [`tests/test_stage_dispatcher.py`](../tests/test_stage_dispatc
 
 What is NOT settled is the mechanism. Two independent passes reached different answers — one proposes a sanctioned EMPTY claim dropping the lane to IDLE, terminal because these tests deliberately disable the production sweep (`lane_provider=set()`, `sweep_interval=3600`) that recovers it; the other returned NOT PROVEN, and is right that the evidence cannot distinguish that from a genuine stall, because the assertion is a bare `assert await _wait_until(...)` that prints only `assert False` — recording no phase, no park deadline, no streak, no task state. **The first fix is observability, not a bound** (proposal 6): a failure that cannot say why it failed will be re-diagnosed wrongly every time, which is exactly what happened here.
 
-*Instance 3 (fixed 2026-08-02).* The same `ci.yml`'s `job_timeout`, sized by a `+4`-over-`step_timeout` convention nobody ever summed against what it had to hold. **Two** steps in that job carry `step_timeout` — `Tests (pytest)` and `Web console tests (pytest)` — so the job must cover their sum plus setup, a quantity `step_timeout` cannot bound. Recomputed from measured maxima, ubuntu stood at **−0:20** and windows-2025 at **−0:53** against their own caps: both already underwater, unnoticed because the bound was derived from the other bound instead of from the work. It presents as a **green first step followed by an unattributed job-level kill** (run `30724385719`: `Tests` 25:51 SUCCESS, then the job cancelled at 30:13) — a signature instance 1's proposed step-level margin check would *not* catch, because the step it measures passed. Raised to 26:00 / 46:00. **Still open underneath:** the nesting invariant `ci.yml` asserts holds for the first gated step and for the second on *no* leg, since reaching it already spends setup plus `Tests`; satisfying it would need `job_timeout` past 39:24 (ubuntu) / 73:21 (Windows). The fix is proposal 5.
+*Instance 3 (fixed 2026-08-02).* The same `ci.yml`'s `job_timeout`, sized by a `+4`-over-`step_timeout` convention nobody ever summed against what it had to hold. **Two** steps in that job carry `step_timeout` — `Tests (pytest)` and `Web console tests (pytest)` — so the job must cover their sum plus setup, a quantity `step_timeout` cannot bound. Recomputed from measured maxima, ubuntu stood at **−0:20** and windows-2025 at **−0:53** against their own caps: both already underwater, unnoticed because the bound was derived from the other bound instead of from the work. It presents as a **green first step followed by an unattributed job-level kill** (run `30724385719`: `Tests` 25:51 SUCCESS, then the job cancelled at 30:13) — a signature instance 1's proposed step-level margin check would *not* catch, because the step it measures passed. Raised to 26:00 / 46:00. **Still open underneath:** the nesting invariant `ci.yml` asserts holds for the first gated step and for the second on *no* leg, since reaching it already spends setup plus `Tests`; satisfying it would need `job_timeout` past 55:22 (ubuntu) / 114:05 (Windows) (re-measured 2026-08-08 under the #1096 caps of 25/37 and 55/66; the earlier 39:24 / 73:21 was correct for the retired 19/26 and 36/46 pair). The fix is proposal 5.
 
 *A note on this item's own measurements.* Instance 1's figures have now been published wrong twice — first as 24:35 over "11 passing runs" (a `gh run list` default page, filtered on the **job's** conclusion while timing the **step**, which deletes the tightest rows by construction), then as the right maxima over "101 runs" with an `n` that no pool definition reproduces. The maxima survived both passes; the *pools* did not. An item about bounds stated independently of the work is an uncomfortable place to state a sample size independently of the sample, so: the pool is named in instance 1 and is recomputable from the API in one query.
 
@@ -3278,7 +3278,7 @@ What is NOT settled is the mechanism. Two independent passes reached different a
 2. Size the remaining bounds: `grep` hardcoded `timeout=` / deadline floats under `tests/` and judge each against the work it bounds.
 3. ~~Where a virtual clock drives the system under test, the poll deadline should follow that clock, not `loop.time()`.~~ **WITHDRAWN 2026-08-02 — this proposal was wrong and would have made things worse.** `_wait_until` waits on real asynchronous I/O (store round-trips), never on virtual time, and `ManualClock.now` advances *only* inside `advance()`, which nothing calls from within the poll loop. A `mc.now + timeout` deadline is therefore never reached: the poll spins forever, converting a bounded `assert False` into an **unbounded hang** stopped only by `pytest_timeout` or the job cap — i.e. it manufactures the exact signature instances 1 and 3 are about. Verified by reading `ManualClock` (`tests/test_stage_dispatcher.py`:182-204). The lesson generalises: *a virtual clock can only bound work the virtual clock drives.*
 4. Prefer bounds expressed as a measured ratio with a date **and its pool** over round multiples, per instance 1's post-mortem. A ratio whose pool is not stated cannot be rechecked, and a pool stated but never recomputed is how instance 1 was published wrong twice.
-5. **Stop two steps sharing one `timeout-minutes` budget.** Give `Web console tests (pytest)` its own cap sized to its own work (max observed 3:33) so `job_timeout` no longer has to absorb a budget that belongs to a step. Until then the nesting invariant `ci.yml` asserts is unenforceable for the second gated step on every leg — instance 3 is the worked example.
+5. **Stop two steps sharing one `timeout-minutes` budget.** Give `Web console tests (pytest)` its own cap sized to its own work (max observed 3:59, n=360, 8-day pool, re-measured 2026-08-08; was 3:33 on the earlier pool) so `job_timeout` no longer has to absorb a budget that belongs to a step. Until then the nesting invariant `ci.yml` asserts is unenforceable for the second gated step on every leg — instance 3 is the worked example.
 6. **Make a bound's expiry diagnostic before tuning it — and for instance 2 the instrument already ships.** A bare `assert await _wait_until(...)` reports `assert False` and nothing else, so every occurrence is re-diagnosed from scratch; instance 2 was read as latency for a day on exactly that basis. Have the helper raise on timeout carrying the lane's phase, park deadline and streak, whether its task is alive or holds an exception, the store row's status, and the clock. **One assertion settles instance 2's open mechanism:** `StageDispatcher.empty_claims` ([`stage_dispatcher.py`](../messagefoundry/pipeline/stage_dispatcher.py):1230) returns `(total, wake_fanout, idle_poll)` and is fed by `_record_empty`, called from exactly one site — the EMPTY branch of `_claim_and_dispatch` (:686). Under these tests' topology a clean run must read `(0, 0, 0)`, so `empty_claims[0] > 0` at the moment of failure is proof of a spurious EMPTY, and `== 0` is proof the claim never returned at all. A second, free signature is in the captured log, **for the infra-fault test only**: a healthy `test_adr0070_1_*` emits **four** `re-pending head with backoff` records (at `1001.000 / 1003.500 / 1008.000 / 1016.500`) and the failing run emitted **one**. It does NOT generalise — `test_adr0070_9_*` takes the content path, which uses `mark_failed` and never emits that line, so **zero** there is expected and is not a second mechanism. Read the counter, not the log, when in doubt. This proposal cannot itself be wrong about the cause, which is why it comes before the others.
 
 **Related:** [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) §*Tests (pytest)* (instance 1 and its measurement table); [`tests/test_stage_dispatcher.py`](../tests/test_stage_dispatcher.py) (instance 2 — `_wait_until`'s raising expiry report and the counted `_wait_lane` sweep stand-in); [`store/sqlserver.py`](../messagefoundry/store/sqlserver.py) (`_is_lock_timeout` — the 1222-as-EMPTY yield that instance 2 turned on); ADR 0070 (the infra-fault machinery the affected tests cover); #320 (windows-2025 slowness — the capacity fact that shrinks every Windows margin); #340 (the other half of this triage); [`Secure_Development_Standards`](Secure_Development_Standards.md) §3 (prose asserting a margin the numbers do not support — five instances found on 2026-08-01 alone).
@@ -5689,7 +5689,7 @@ and `enforce_admins` governs **protected branches**. Re-enabling it would refuse
 
 ## 1057. Rule 3d has no occupancy signal, so it cannot tell an abandoned worktree from a live one
 
-> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **5/10** · _fill-in_. #1041 fixed rule 3d's *false* claim; this is the *missing* one underneath it. The rule refuses every governed worktree that is not the caller's own, because it has no way to ask whether anyone is actually using it. The refusal is right by default — a needless refusal costs a message, a wrong allow deletes a live session's work — but it is unactionable for a caller cleaning up a worktree it created itself, who must escalate to a human for something it was entitled to do.
+> 🚧 **PARTLY SHIPPED 2026-08-06 — the REMEDY slice is in; the occupancy body is NOT, and this item stays open for it.** Value **4/10** · Difficulty **5/10** · _fill-in_. What shipped is the half nobody had noticed: rule 3d refused correctly and then handed the caller a command that **throws**. `remove.ps1 -Name` resolves only to `<repo-parent>/<repo-leaf>-<name>` — `new.ps1:79-81` *asserts* that shape, so the sibling family is the only one it can produce — and `prune-merged.ps1` excludes anything with a `.claude/worktrees/` path segment **outright**, by its own header, with `-Name` unable to reach them either. Census on this clone: **45 sibling worktrees, 8 Claude-managed, 4 other — and all six live sessions sat in the 8**, so the remedy failed for the population that actually reaches the rule. Verified against the **installed** gate, not only the repo copy. The deny now branches on worktree family and, for anything the two scripts cannot serve, prints a literal `git -C "<primary>" worktree remove "<path>"` plus a line saying why `prune-merged.ps1` does not apply; the sibling family keeps `prune-merged.ps1`, which is dry-run by default and consults occupancy, so the fix is not "stop naming the scripts" — a test pins that. Writing the test enlarged the defect: the own-tree branch printed the literal placeholder `-Name <directory-name>` for **both** families, so it named the tool correctly and still could not be pasted; the gate has the resolved path and now uses it. **This is a remedy-text change only** — which worktrees rule 3d refuses is untouched, and nothing security-relevant reads the classification, which is what makes a misclassification cheap here and expensive in rule 3c. **Same defect as #1032, one rule over** (there, rule 3b printed a `new.ps1` command `new.ps1` refuses to run). **Still open, and unchanged below:** rule 3d has no occupancy or authorship signal, so an *unoccupied* worktree is still refused rather than allowed — the three structural options, the measured 0-of-24 occupancy result and the fail-closed constraint all stand as written. See also **#1064**, a measured rule 3d fail-open confirmed 2026-08-06, deliberately not touched here. Original filing follows. #1041 fixed rule 3d's *false* claim; this is the *missing* one underneath it. The rule refuses every governed worktree that is not the caller's own, because it has no way to ask whether anyone is actually using it. The refusal is right by default — a needless refusal costs a message, a wrong allow deletes a live session's work — but it is unactionable for a caller cleaning up a worktree it created itself, who must escalate to a human for something it was entitled to do.
 
 **Cluster:** Session-drift controls / refusal accuracy. **Priority:** P3. **Verdict:** build (medium). **Severity:** no data loss, and no security effect — the rule fails *closed*. The cost is a correct refusal the reader cannot act on, and the standing invitation to route around a guard that says no to legitimate work.
 
@@ -6515,7 +6515,7 @@ The two "No" rows are the majority and the harder half. Root cause for the ancho
 
 ## 1096. The windows-2025 `Tests (pytest)` cap is exceeded: max passing step 35:13 against 36:00, and `main` is being killed by it
 
-> 🔢 **Filed 2026-08-07 — not started.** Value **7/10** · Difficulty **3/10** · _quick win_. [`ci.yml`](../.github/workflows/ci.yml) sets `step_timeout: 36` for both Windows legs and, in the same comment block, names its own re-derivation trigger: *"RE-DERIVE IF a windows-2025 `Tests (pytest)` step is ever seen above 28:00 — that is the trigger, not a calendar reminder."* Measured 2026-08-07, **43 of 43** passing windows-2025 steps are above 28:00, the largest passing step is **35:13** (47 seconds of margin, 1.022x), and **five** executions were killed at 36:0x — **two of them `push` runs on `main`**. The trigger has not merely fired; it is universally exceeded, and the cap is now failing green suites.
+> 🚧 **PARTLY SHIPPED 2026-08-08 — the caps are re-derived; the DRIFT underneath them is not fixed, and this item stays open for it.** Value **7/10** · Difficulty **3/10** · _quick win_. **What shipped:** all six values, in one act — `windows-2022`/`windows-2025` `step_timeout` **36 → 55** and `job_timeout` **46 → 66**; `ubuntu-latest` **19 → 25** and **26 → 37**. Ubuntu was changed because it was measurably the *next* instance and its job cap was **already negative** (−0:43 on measured maxima, meaning the job cap could fire before the step cap and destroy the very instrument this item was measured with) — this item was filed as a Windows problem and ubuntu had not been measured. The step cap is sized on windows-2025 (slower step); the **job** cap is sized on windows-2022 (worse setup, 4:05 vs 2:32), correcting a `ci.yml` sentence that claimed both were sized on windows-2025. The 28:00 re-derive trigger is retired for 40:00 (step) and 50:00 (job) — the old one had become permanently tripped, which is indistinguishable from no alarm. **What did NOT ship, and why this stays open:** all three legs' medians are rising monotonically, Windows at **+1:37 to +2:06 per day**, five to six times ubuntu's rate. At that rate the new trigger fires within days. This bought a working merge gate, not a stable one; the actual fix is **#320**, not a larger integer, and re-deriving weekly is the failure mode to avoid. **Do NOT rewrite the "43 of 43" figure below** — it is correct for its own 80-run pool and this item says so explicitly; the wider readings are recorded as separate measurements with their own pools. Original filing follows. [`ci.yml`](../.github/workflows/ci.yml) sets `step_timeout: 36` for both Windows legs and, in the same comment block, names its own re-derivation trigger: *"RE-DERIVE IF a windows-2025 `Tests (pytest)` step is ever seen above 28:00 — that is the trigger, not a calendar reminder."* Measured 2026-08-07, **43 of 43** passing windows-2025 steps are above 28:00, the largest passing step is **35:13** (47 seconds of margin, 1.022x), and **five** executions were killed at 36:0x — **two of them `push` runs on `main`**. The trigger has not merely fired; it is universally exceeded, and the cap is now failing green suites.
 
 **Cluster:** CI capacity / instrument accuracy. **Priority:** P1. **Verdict:** build. **Severity:** no product effect. The engine is unaffected; what is affected is the merge gate, which fails PRs that have nothing wrong with them and reds `main` at random.
 
@@ -6549,16 +6549,26 @@ Killed at the cap (`Tests (pytest)` step conclusion `failure`, all at 36:0x):
 
 **Measure the STEP, and filter on the STEP.** Both mistakes are recorded in [`ci.yml`](../.github/workflows/ci.yml) as having already happened here — *"at least three sessions misread job durations as step durations while triaging this"*, and filtering on **job** conclusion drops the tightest steps by construction, because a step that nearly exhausts `step_timeout` is the most likely to push its job into `job_timeout`. A job-duration reading of this same pool gives 33 to 40 minutes and invites the wrong conclusion that the cap is comfortable.
 
-**`job_timeout` must be re-derived in the same act.** The job carries **two** `step_timeout`-gated pytest steps — `Tests (pytest)` and `Web console tests (pytest)` — and [`ci.yml`](../.github/workflows/ci.yml) is explicit that the current `job_timeout: 46` is sized against the **observed sum**, not against `2 x step_timeout` (which would be 72 on Windows). Raising `step_timeout` without re-deriving `job_timeout` moves the kill from the step cap to the job cap, where it is **worse**: a job-level kill reports no step conclusion, so the next triage loses the instrument this item was measured with.
+**`job_timeout` must be re-derived in the same act.** The job carries **two** `step_timeout`-gated pytest steps — `Tests (pytest)` and `Web console tests (pytest)` — and [`ci.yml`](../.github/workflows/ci.yml) is explicit that the current `job_timeout: 46` is sized against the **observed sum**, not against `2 x step_timeout` (which would be 110 on Windows under the caps this item set). Raising `step_timeout` without re-deriving `job_timeout` moves the kill from the step cap to the job cap, where it is **worse**: a job-level kill reports no step conclusion, so the next triage loses the instrument this item was measured with.
 
 **Scope note — the two failures on this leg today are DIFFERENT and must not be merged into one cause.** PR #253 is a genuine timeout (no test failed) and PR #256 (`fix-1013`) is an assertion failure in `tests/test_connscale_cpu_probe.py` and `tests/test_connscale_smoke.py`, whose own comment already records this leg failing twice in one job on 2026-07-30. Only the first belongs to this item.
 
-## THIS ITEM SUPERSEDES #1084, AND THE TWO MUST NOT BOTH LAND UNRECONCILED
+## THIS ITEM SUPERSEDES #1084, AND #1084 WAS DROPPED RATHER THAN LANDED
 
-> ⚠️ **Forward-looking citation, flagged as such.** At the time of writing, **#1084 is not on `main`** — it
-> exists only on `origin/claude/gate-3d-remedy-1057` (**PR #261**, open). So this cross-reference does not
-> resolve yet and will only do so once #261 lands. It is stated anyway because the collision is invisible
-> from any worktree reading `docs/BACKLOG.md`, which is exactly how it was nearly missed.
+> **SETTLED 2026-08-08 — and the outcome is the opposite of what this block used to predict.** It
+> previously read *"#1084 is not on `main`; it exists only on `origin/claude/gate-3d-remedy-1057`
+> (PR #261, open), so this cross-reference will only resolve once #261 lands."* **#261 landed WITHOUT
+> #1084.** The item was dropped during #261's merge resolution, on the owner's instruction, on exactly
+> the grounds set out below. **#1084 never reached `main` and no longer will**, so a reader grepping for
+> it will not find it — that absence is the resolution, not a gap. The number stays allocated and burned
+> rather than reused.
+>
+> This item is therefore the survivor, and per the paragraph below the reconciliation is written into it
+> here rather than left for a reader to infer. **Nothing further is owed to #1084.**
+>
+> *This block is retained rather than deleted because the collision was invisible from any worktree
+> reading `docs/BACKLOG.md` — which is exactly how it was nearly missed — and whoever finds it by
+> grepping `1084` deserves the outcome and not only the diagnosis.*
 
 **#1084 is the same defect, found the same day, on the same leg and the same cap.** This item's kill table
 literally contains #1084's originating run (PR #261, `31149117314`). It is **not** a duplicate in the
@@ -6839,3 +6849,109 @@ no engine content. Causal exclusion first (the diff reaches no engine code; the 
 `pyproject.toml` `addopts`, so the PR's new test collects **after** `test_connscale_smoke.py` and had
 not run), then reproduced under contention rather than argued. The investigating session retracted two
 of its own mechanisms, above, before the conclusion was accepted.
+
+## 1103. the connscale API port range is derived by increment from a single probed port, so every port after the base is unverified
+
+> 🔢 **Filed 2026-08-08 - not started. Observed failing on `main`'s own CI, not hypothesised.** Value **4/10** · Difficulty **2/10**. `tests/test_connscale_smoke.py` probes **one** free API port and `harness/load/connscale/runner.py:162` then binds `api_port + step` for every sweep step. Only the base was ever checked. A taken port anywhere in that range kills the engine at startup, and on Windows it surfaces as `WinError 10013` -- *access forbidden*, not the `10048` that reads as a collision -- so the failure does not look like a port problem at all.
+
+**Cluster:** Testing / harness reliability. **Priority:** P2. **Verdict:** build. **Severity:** no product
+effect and no PHI effect. The cost is a blocking, required check failing for a reason unconnected to the
+change under test, on a leg that already carries two other unrelated failure modes.
+
+**Value 4:** the Developer Experience & CI ladder caps there, and the workaround (re-run the leg) is real
+if expensive. It is not a product defect -- `harness/` is test scaffolding.
+
+**Observed.** PR #289, `test (windows-2022, py3.14)`, run `31261658519`, job `93113333978`:
+
+```
+FAILED tests/test_connscale_smoke.py::test_connscale_smoke_end_to_end
+  ConnScaleError: engine exited during startup:
+  ERROR uvicorn.error: [Errno 13] error while attempting to bind on address
+  ('127.0.0.1', 62748): [winerror 10013] an attempt was made to access a socket
+  in a way forbidden by its access permissions
+1 failed, 10770 passed, 830 skipped in 1608.73s (0:26:48)
+```
+
+**SECOND OCCURRENCE, ON LINUX, AND IT RETIRES THE "WINDOWS QUIRK" READING.** Added 2026-08-08, hours
+after filing. PR #287 -- a **CodeQL action SHA bump**, two workflow files, no Python at all -- failed the
+same way on `test (ubuntu-latest, py3.14)`, run `31267671690`, job `93128368291`:
+
+```
+ConnScaleError: engine exited during startup:
+  ERROR uvicorn.error: [Errno 98] error while attempting to bind on address
+  ('127.0.0.1', 45382): address already in use
+1 failed, 10453 passed, 1147 skipped in 849.41s (0:14:09)
+```
+
+Port **45382** is in the Linux ephemeral range and, like `62748`, sits far outside the inbound window
+`[20000, 30000)` -- the API family again. The step ran **14:19** against ubuntu's 25:00 cap, so not a
+timeout there either.
+
+**The defect is platform-independent; only the errno differs.** Linux reports `EADDRINUSE` (98) --
+*"address already in use"*, which names the cause. Windows reports `10013` -- *"access forbidden"* --
+which does not. **The honest error message is the Linux one, and the misleading one is what this was
+first found under.** Anyone triaging the Windows form alone will reach for permissions and runner images;
+the Linux form points straight at port allocation. Record both spellings, because the same defect
+presents as two unrelated-looking failures.
+
+Both observed occurrences are on PRs whose content **cannot reach this code**: a CI timeout change (#289)
+and a CodeQL SHA bump (#287). That is the signature of a harness defect rather than a regression, and it
+is why neither was re-run before being diagnosed.
+
+**It is not a timeout and not #1096.** The `Tests (pytest)` STEP ran **27:00** against a 55:00 cap. It is
+also **not #1101** -- that is a throughput SLO assertion, this is a bind failure before the engine
+finishes starting. Three distinct failure modes now share this leg; do not merge them.
+
+**The mechanism, traced rather than inferred.**
+
+* `_free_port()` (`tests/test_connscale_smoke.py`) binds `("127.0.0.1", 0)`, reads `getsockname()[1]`,
+  and **closes the socket in a `finally` before returning**. The returned port is free at the instant it
+  is read and reserved by nothing thereafter.
+* The test calls it once for the API base: `api_port = _free_port()`.
+* `harness/load/connscale/runner.py:162` passes **`api_port=api_port + step`**, with `step` incremented
+  per sweep arm (`:199`, `:206`). The failing run's log carries `62746`, `62747` and `62748`.
+* So exactly one of the three was verified. `62748` was taken, and the engine died at startup.
+
+**Why the symptom hides the cause.** A Windows bind onto a port held by another socket reports **10013**,
+not **10048**. Read as an access-permissions error it invites the wrong fixes -- run CI elevated, adjust
+firewall rules, blame the runner image -- none of which touch a port-allocation defect. The number is the
+tell: `62748` sits in the ephemeral range, far outside the test's own inbound window `[20000, 30000)`, so
+it is not the family `#1014` reserved.
+
+**This is #1014's defect, one port-family over.** #1014 fixed exactly this for the **inbound** block: a
+contiguous reservation, a random anchor to de-correlate concurrent worktrees, contiguity asserted at the
+acquisition site, and a loud failure rather than a silent fixed fallback. None of it was applied to the
+API family. The test's own comment reasons about the API ports *only* relative to the inbound block --
+*"The sink/API ports stay ephemeral (above the inbound window) and won't hit the block"* -- which is true,
+and silent about the increment range colliding with anything else on the machine. **A correct statement
+about one hazard reads as coverage of a hazard it never mentions.**
+
+**The same pattern is in the SINK family and is dormant only by configuration.**
+`harness/load/connscale/runner.py:278` builds `ports=tuple(sink_port + i for i in range(sink_ports))`
+from a single probed `sink_port`. `test_connscale_smoke.py` passes `sink_ports=1`, so today only the
+verified base is used and it cannot fire. Any profile raising `sink_ports` above 1 inherits this item
+without touching it. Fix both families in the same act.
+
+**#1014 removing `@pytest.mark.flaky(reruns=2)` is why this is visible, and that was correct.** The
+retry would have absorbed it. #1014's stated intent was that *"a genuine future collision now surfaces
+as a RED rather than a masked retry"* -- this is that collision, in the family #1014 did not cover.
+
+**The work.** Reserve the API range the way `_free_contiguous_ports` reserves the inbound block: probe a
+contiguous run of the required width, assert contiguity at the acquisition site, fail loudly if no block
+is available, and prefer a random anchor to de-correlate concurrent worktrees. The width is derivable --
+it is the number of sweep arms, which the profile already determines. Do the same for the sink family.
+Do **not** fix this by re-adding a retry: that re-hides the class #1014 deliberately exposed.
+
+**Test it against the range, not the base.** A test that probes one port and asserts it binds cannot see
+this. The guard has to assert that **every** port the sweep will use was reserved, which is the same
+shape as the contiguity assertion `_free_contiguous_ports` already carries for the inbound family.
+
+**Related:** #1014 (the same defect in the inbound family; its fix is the model for this one), #1101
+(the other connscale failure on this leg -- a throughput SLO, not a bind), #1096 (the third failure mode
+on this leg -- the step cap; distinct again), #1000 (a control whose evidence could not see the class it
+covered -- the comment quoted above is that shape in prose).
+
+**Source:** found 2026-08-08 while triaging a red `test (windows-2022, py3.14)` leg on PR #289, the
+`#1096` cap change. Diagnosed by tracing the port number through `_free_port` and the `api_port + step`
+call site rather than by re-running: the failing port lies outside the inbound window, which is what
+rules out the family `#1014` already fixed and points at the one it did not.

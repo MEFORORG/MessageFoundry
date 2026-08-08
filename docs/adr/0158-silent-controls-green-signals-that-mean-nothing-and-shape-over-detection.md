@@ -456,9 +456,16 @@ credits "the session that hit four instances of the same class in one day": four
 - [ ] Restate [`ci.yml`](../../.github/workflows/ci.yml)'s margin block with a defined pool. Three
       independent re-measurements returned 35, 36 and 38 under different predicates; none is the
       stated 11. Decide the pool definition and record the filter beside the number.
-- [ ] Decide whether the 36:00 Windows step cap clears the population spread, and against which
-      anchor: over the maximum passing step (25:51) the headroom is 10:09 and clears the 9:55 spread;
-      over the cap-kill (26:07, a failed step in no success pool) it is 9:53 and does not.
+- [x] **Decided 2026-08-08 (BACKLOG #1096): the 36:00 cap did NOT clear the spread, and it has been
+      re-derived to 55:00.** The question asked which anchor to size against, and the answer is the
+      censored one: at 36:00 the headroom over the maximum passing step (35:47) was 19:13 against an
+      11:59 spread on paper, but the cap-kill anchor is the honest one because windows-2025 was killed
+      at the cap **seven times** in an eight-day pool, so 35:47 is the largest step that FIT and 36:08
+      is a lower bound on what the suite wants. Against that anchor 36:00 had *negative* headroom. At
+      55:00 the rule holds on both Windows legs (windows-2025 +8:14, windows-2022 +14:56). The kills
+      were also confirmed to be **slowness, not a wedge** -- one kill log shows pytest finishing green
+      at 35:48 and the step killed 4.85s later -- which is what makes the killed rows genuine
+      population members rather than outliers to discard.
 - [ ] Correct or drop the table rows now known to be single-run values or job-filtered maxima
       (`24:35` and its `1.46x`, ubuntu `12:27`, windows-2022 `18:39`).
 - [ ] Apply the retraction already filed in `docs/BACKLOG.md` under BACKLOG #323 to the false
