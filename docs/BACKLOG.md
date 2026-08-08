@@ -6733,3 +6733,109 @@ compensating control must not rest on a false premise).
 Every one of the nine was proposed as a clean repoint by a first-pass reader and refuted by a second
 reader instructed to refute by default, who checked each citing claim against the code rather than
 against the anchor.
+
+## 1101. the connscale empty_claims_monotonic SLO reports runner contention as an engine defect
+
+> 🔢 **Filed 2026-08-07 - not started. Reproduced, not inferred.** Value **4/10** · Difficulty **2/10**.
+> `tests/test_connscale_smoke.py:170` asserts `empty_claims_monotonic`: the N=24 empty-claim **rate per
+> second** must be at least 0.75x the N=12 rate. The metric has wall-clock in its denominator and a
+> deliberately un-gated O(N) probe in its numerator's way, so **CPU contention alone flips it red with
+> no engine change**. It reds PRs that touch nothing it measures.
+
+**Cluster:** Developer Experience & CI. **Priority:** P2. **Verdict:** build. **Severity:** no product
+effect, no PHI effect. The cost is queue throughput: a spurious red on a shared runner costs a full CI
+cycle per occurrence, and the queue pays it on PRs with no engine content at all.
+
+**Value 4, not 6.** The ladder caps Developer Experience & CI at 4, and the workaround is real and
+cheap - re-run the leg. It is not a production blind spot and touches no shipped default.
+
+**The observation.** `#281`'s `test (windows-2025, py3.14)` leg, run `31226408247`:
+
+```
+FAILED tests/test_connscale_smoke.py::test_connscale_smoke_end_to_end
+AssertionError: fixed_aggregate@N=24: 255.9 < prior 435.4 * 0.75      ratio 0.588
+1 failed, 10764 passed, 830 skipped in 1849.42s (0:30:49)
+```
+
+**This is NOT #1096.** The `Tests (pytest)` STEP ran 30:59 against the 36:00 cap and **failed** rather
+than being killed. #1096 is the cap; this is an assertion failing well beneath it. `ci.yml` already
+records sessions substituting the job reading for the step reading while triaging that leg - reading the
+job here gives ~32 minutes and invites the wrong cause.
+
+**Reproduced locally by adding CPU contention and nothing else** - same commit, same box, same config:
+
+```
+CI (contended runner)          0.588
+local replicate 1              0.674
+local replicate 2              0.451
+local replicate 3              0.590
+local replicate 4 (PASS)       2.49
+```
+
+A 0.75 threshold cannot discriminate inside a 0.451-2.49 spread. **The gate is a coin flip under load,
+not a detector.**
+
+**Mechanism.** The reload probe fires at `hold*0.5` (`harness/load/connscale/runner.py:384-385`) while
+the sampler is still running (`:389`), and performs a serial O(N) quiesce-and-swap under `_reload_lock`
+(`messagefoundry/pipeline/wiring_runner.py:3518-3545`). Measured under contention: **0.124s at N=12,
+3.63s at N=24** - longer than the entire 1.5s hold. It halts the commits that drive `wake_fanout`,
+which is roughly 90% of the metric's numerator. Disabling `reload_probe` under identical contention
+flips the result to a pass (274.6 -> 282.8, ratio 1.03).
+
+**The sharp part: the corrupting probe is already exempt from assertion.**
+`tests/test_connscale_smoke.py:182-188` exempts that same reload probe from per-step assertion, in its
+own words *"stricter than the probe's own contract and flakes on slow CI runners"*. Its O(N) cost is
+nevertheless loaded in full onto `empty_claims_monotonic`, which **is** asserted per step. The suite
+declined to gate a cost and then gated a high-variance proxy for it.
+
+**The engine was correct in the failing arm.** `no_loss` asserts at `:162-164`, **before** the SLO at
+`:170`, and the reported failure is the `:170` message - so at N=24 every message was received,
+delivered and drained. In the local reproduction the N=24 arm was **better** on what matters: drain
+0.801 -> 0.575s, achieved_read 4.53 -> 5.38/s over the identical window.
+
+**`fd_count_monotonic` is not a control for this.** `handles_peak = max(handles)`
+(`harness/load/connscale/runner.py:963`) is a peak **count** with no time denominator, so it is
+structurally immune to the time dilation that is the entire question. Its passing proves 24 sockets
+opened and nothing else. Do not read it as evidence the arm was healthy.
+
+**Why it surfaces now.** `#1014` removed `@pytest.mark.flaky(reruns=2)` from this test (commit
+`1d988fdc`) so that a genuine cross-worktree port collision would surface red instead of self-healing.
+That change is correct. The side effect is that runner-variance failures in the same test also surface
+red, where the retry used to absorb them - and this test's own comment at `:166` already describes the
+SLO as *"a LOOSE >= per mode; CI runners are noisy"*. The absorber was removed without adjusting the
+assertion it was absorbing for.
+
+**The fix: assert empty claims PER MESSAGE, not per second.** Under `fixed_aggregate`, `sent` is
+constant across N (36 at both, measured), so per-message is exactly the per-commit herd size that the
+mode's own docstring (`harness/load/connscale/profile.py:9-11`) says it exists to measure, and it is
+immune to wall clock. Healthy local readings: **39.1 at N=12, 77.8 at N=24** - a clean 2.0x against a
+0.75 floor. If the O(N) reload cost is worth gating, **gate `reload_seconds` directly** rather than
+through an empty-claim rate.
+
+**Two mechanisms that look right and are WRONG.** Recorded so they are not re-derived:
+
+* *"255.9 is below the 288/s do-nothing floor, therefore impossible."* Inverted. `3N/poll_interval` is
+  a **ceiling** on the idle component, not a floor on the total - a woken worker is preempted and never
+  books an idle timeout. Measured idle ran at 38% of that number on a healthy box.
+* *"the wall-clock window dilates with N."* Not the operative term. Spans measured 2.646 vs 2.649s
+  unloaded and 6.85 vs 6.51s contended - essentially equal at both N. In the failing runs the
+  **numerator collapsed**; the denominator did not grow.
+
+The conclusion survives both; those two arguments do not.
+
+**LATENT, dormant today, worth fixing in the same pass.** `_monotonic_slo` groups only by `sweep_mode`
+(`harness/load/connscale/runner.py:1084-1086`) and chains `prev_val` across the count-sorted group. A
+profile setting `claim_modes = ["per_lane","pooled"]` with `empty_claims_monotonic = true` would
+chain-compare **across claim modes**, and `harness/load/connscale/compare.py:22-25` states that
+pooled's empty-claim rate **should** be materially lower. No shipped profile combines them, so this
+cannot fire today - but the grouping is wrong independently of the metric change above.
+
+**Related:** #1096 (the same leg, a different and genuinely distinct cause - do not merge the two
+stories), #1014 (removed the retry that had been absorbing this class), #1000 (a control green because
+its evidence could not see the class it covered - `fd_count_monotonic` here is the same shape).
+
+**Source:** found 2026-08-07 when `#281`'s windows-2025 leg failed on a docs-and-link-checker diff with
+no engine content. Causal exclusion first (the diff reaches no engine code; the suite is serial per
+`pyproject.toml` `addopts`, so the PR's new test collects **after** `test_connscale_smoke.py` and had
+not run), then reproduced under contention rather than argued. The investigating session retracted two
+of its own mechanisms, above, before the conclusion was accepted.
