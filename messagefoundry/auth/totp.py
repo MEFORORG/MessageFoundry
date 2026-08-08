@@ -109,7 +109,17 @@ def verify_totp_step(
     tolerated future code (``counter+1``) reports ``counter``, never advancing the single-use high-
     water mark past the genuinely-current step. Otherwise burning ``counter+1`` would reject the user's
     own current-step code (a non-greater step) for up to ~30 s — a self-inflicted lockout, not a
-    bypass. The clamp only lowers the recorded step, so single-use is preserved.
+    bypass.
+
+    ⚠️ **At ``window >= 1`` the clamp does not preserve single-use — it is what costs it.** Because a
+    tolerated future code is recorded at ``counter`` rather than at its OWN step, that step is left
+    unspent, so the SAME code verifies again once the clock reaches ``counter+1``: two successful uses
+    of one code, which is what ASVS 6.5.1 forbids. Measured — ``verify_totp_step(s, totp(s, now=t+30),
+    now=t, window=1)`` returns ``step(t)``, and the same code at ``now=t+30`` returns ``step(t)+1``,
+    strictly greater, so a high-water store accepts both. At the shipped default ``window=0``
+    (``[auth].totp_skew_steps``) single-use DOES hold, because a future code is not accepted at all.
+    The second use is the price of the opt-out, not a property of the clamp. Pinned by
+    tests/test_totp_window.py::test_optout_lets_one_tolerated_future_code_be_used_twice.
     """
     candidate = code.strip()
     if len(candidate) != digits or not candidate.isdigit():
