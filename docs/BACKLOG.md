@@ -6955,3 +6955,50 @@ covered -- the comment quoted above is that shape in prose).
 `#1096` cap change. Diagnosed by tracing the port number through `_free_port` and the `api_port + step`
 call site rather than by re-running: the failing port lies outside the inbound window, which is what
 rules out the family `#1014` already fixed and points at the one it did not.
+
+## 1105. `harden_kex_groups`' docstring undercounts its own call sites, in the paragraph written to warn about exactly that
+
+> 🔢 **Filed 2026-08-08 - not started. Measured on `main` at 166634c9, not hypothesised.** Value **3/10** · Difficulty **1/10**. `messagefoundry/config/tls_policy.py:125` says `APPROVED_KEX_GROUPS` reaches "zero of this function's **six** call sites"; `:136` repeats "a call at **six** sites with zero effect". Scanning `messagefoundry/`, `tests/`, `harness/`, `packaging/` and `ide/` for `harden_kex_groups(` finds **seven** sites that build and harden a real TLS context, plus an eighth reference added by `#338`. Nothing checks the number - the tests derive their site list instead - so the docstring is the only place it is asserted, and it is wrong.
+
+**Cluster:** Documentation accuracy / security-comment drift. **Priority:** P3. **Verdict:** build.
+**Severity:** no product effect and no PHI effect, and **no behaviour change of any kind** - the separate,
+already-recorded fact is that `harden_kex_groups` pins nothing on any interpreter this project runs on,
+because `SSLContext.set_groups` is a Python 3.15 API. The cost is to the reader: a security function's own
+self-report is wrong about its blast radius, in the one paragraph a maintainer would trust.
+
+**Value 3:** it is a comment, and the comment is load-bearing only for a future reader. It is filed rather
+than fixed in passing because the ASVS 11.6.2 assessment already routed it onward once (2026-08-02) and it
+survived a change to the same file, which is the signal that it needs an item rather than good intentions.
+
+**The seven context sites, so the fix has a baseline.** `messagefoundry/api/tls.py:55`,
+`messagefoundry/config/tls_policy.py:1001`, `messagefoundry/transports/dicom.py:145` and `:463`,
+`messagefoundry/transports/mllp.py:543` and `:582`, `messagefoundry/transports/remotefile.py:212`. The
+eighth reference is `messagefoundry/config/tls_policy.py:181`, the throwaway probe inside
+`kex_groups_report()` that `#338` added - a report-only read-out, not a built connector context, which is
+why it is named separately rather than folded into the seven.
+
+**It was already wrong before `#338`, and `#338` is not the cause.** The count was seven when the ASVS
+11.6.2 cell recorded the drift on 2026-08-02 ("its own docstring says 'six call sites' twice; the true
+count is SEVEN"). `#338` then edited `tls_policy.py`, added the probe, and left both sentences alone. So
+this is not a regression introduced by that change - it is a stale claim that a change to the same file
+walked past.
+
+**Why this is worth an item and not a typo fix.** The docstring exists to warn about a stale self-report.
+It says so in its own text: *"This docstring previously said 'Python 3.13+'; that was wrong, and it was
+repeated into `docs/PHI.md`, `docs/ASVS-L2-PHASE0-CHANGES.md`, ADR 0092 §4(b) and the ASVS
+scorecard"*, and *"A security control that cannot report whether it did anything reports success forever;
+that is how a call at six sites with zero effect survived three assessments."* The sentence diagnosing a
+propagated wrong number carries a wrong number.
+
+**The fix should probably delete the count rather than correct it.** `tests/test_tls_policy.py:594`
+already states the principle - *"Derived, not a hardcoded site list"* - and
+`test_every_context_that_pins_kex_groups_also_asserts_forward_secrecy` computes the sites by scanning,
+while `test_the_call_site_scan_examined_real_files` asserts only a loose liveness floor (`sites >= 5`)
+precisely so it does not become a second number to maintain. A docstring that restates a count nothing
+checks is a liability (**SDS-3.6**), and the same fact is already stated once where it is derived
+(**SDS-3.5**). Correcting six to seven buys one cycle; saying "every call site" and pointing at the
+deriving test buys all of them.
+
+**Source:** found 2026-08-08 during the ASVS 11.6.2 re-validation after `#338` merged - the cell's own
+"route onward" note was re-checked against `main` rather than carried, and the drift had widened rather
+than closed.
