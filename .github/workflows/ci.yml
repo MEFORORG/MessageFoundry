@@ -590,11 +590,24 @@ jobs:
           # every OS, so $VAR resolves the same on the Windows legs (Git Bash).
           FAULT_TIMEOUT: ${{ matrix.fault_timeout }}
           PYTEST_TIMEOUT: ${{ matrix.pytest_timeout }}
-        run: pytest -q -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
+        # `--ignore-glob` subtracts the web console package, which runs as its OWN step below. BACKLOG
+        # #1027 added that package to the root `testpaths` so a bare local `pytest` stops silently
+        # excluding it; without this subtraction the SAME 356 tests would then run TWICE on every leg.
+        # Measured 2026-08-08 on this branch: bare collection 11,956, console-only 356, with this flag
+        # 11,600.
+        # NOT `--ignore=<path>` -- measured, it does NOT prune a directory that `testpaths` names as a
+        # collection root, and still collected all 11,956. The obvious spelling is the one that fails.
+        # NOT `pytest tests` either: hardcoding the engine path would make CI silently miss any future
+        # third entry in `testpaths`, which is the exact drift #1027 exists to prevent. Subtracting FROM
+        # `testpaths` keeps it the single source of truth for what the suite is.
+        # `tests/test_ci_engine_step_excludes_webconsole.py` pins all three of those decisions.
+        run: pytest -q --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
 
       # The web console's OWN suite (Option B, ADR 0065): the moved /ui tests live in the package's
-      # tests/ (the engine `pytest` above no longer collects them — engine testpaths = ["tests"]), so
-      # run them as a SECOND step on the SAME leg. The package was installed editable in the install
+      # tests/. They ARE in the root `testpaths` since BACKLOG #1027, so a bare local `pytest` collects
+      # them -- the engine step above subtracts them explicitly via `--ignore-glob` rather than relying
+      # on `testpaths` to exclude them, which it no longer does. They still run as a SECOND step on the
+      # SAME leg, under the package's OWN pytest configuration. The package was installed editable in the install
       # step above (`-e packaging/messagefoundry-webconsole`), so both suites exercise the same
       # engine build. Its pyproject sets asyncio_mode="auto" + session loop scopes; the timeout flags
       # mirror the engine step (a hung ASGI test fails fast + named, not at the silent job cap).
