@@ -6872,6 +6872,32 @@ FAILED tests/test_connscale_smoke.py::test_connscale_smoke_end_to_end
 1 failed, 10770 passed, 830 skipped in 1608.73s (0:26:48)
 ```
 
+**SECOND OCCURRENCE, ON LINUX, AND IT RETIRES THE "WINDOWS QUIRK" READING.** Added 2026-08-08, hours
+after filing. PR #287 -- a **CodeQL action SHA bump**, two workflow files, no Python at all -- failed the
+same way on `test (ubuntu-latest, py3.14)`, run `31267671690`, job `93128368291`:
+
+```
+ConnScaleError: engine exited during startup:
+  ERROR uvicorn.error: [Errno 98] error while attempting to bind on address
+  ('127.0.0.1', 45382): address already in use
+1 failed, 10453 passed, 1147 skipped in 849.41s (0:14:09)
+```
+
+Port **45382** is in the Linux ephemeral range and, like `62748`, sits far outside the inbound window
+`[20000, 30000)` -- the API family again. The step ran **14:19** against ubuntu's 25:00 cap, so not a
+timeout there either.
+
+**The defect is platform-independent; only the errno differs.** Linux reports `EADDRINUSE` (98) --
+*"address already in use"*, which names the cause. Windows reports `10013` -- *"access forbidden"* --
+which does not. **The honest error message is the Linux one, and the misleading one is what this was
+first found under.** Anyone triaging the Windows form alone will reach for permissions and runner images;
+the Linux form points straight at port allocation. Record both spellings, because the same defect
+presents as two unrelated-looking failures.
+
+Both observed occurrences are on PRs whose content **cannot reach this code**: a CI timeout change (#289)
+and a CodeQL SHA bump (#287). That is the signature of a harness defect rather than a regression, and it
+is why neither was re-run before being diagnosed.
+
 **It is not a timeout and not #1096.** The `Tests (pytest)` STEP ran **27:00** against a 55:00 cap. It is
 also **not #1101** -- that is a throughput SLO assertion, this is a bind failure before the engine
 finishes starting. Three distinct failure modes now share this leg; do not merge them.
