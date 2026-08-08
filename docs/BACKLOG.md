@@ -4995,7 +4995,7 @@ The comment immediately above says *"Scope is deliberately the posture the requi
 
 ## 1027. The documented `pytest` command silently excludes the webconsole package, so a local green is not evidence about ~344 tests
 
-> 🔢 **Filed 2026-08-05 — not started.** Value **5/10** · Difficulty **3/10** · _fill-in_. `testpaths = ["tests"]` means the command CLAUDE.md documents as the verification gate never collects `packaging/messagefoundry-webconsole/tests`. A **failing** webconsole test sat on `main` through a full day of lanes because every quartet used the documented single path.
+> ✅ **SHIPPED 2026-08-06 — the root `testpaths` now also collects `packaging/messagefoundry-webconsole/tests`, so a bare `pytest -q` from the repo root stops silently excluding the web console suite; the one webauthn-extra-dependent console test that lacked a guard (`test_webauthn_rp_fail_closed_legible`) now skips-with-reason when the optional `[webauthn]` extra is absent, so an extra-less local venv stays green.** Value **5/10** · Difficulty **3/10** · _fill-in_. Local developer-signal fix only — CI already covered the console via its dedicated `Web console tests (pytest)` step; the gap was that the documented local gate collected less than it appeared to.
 
 **Cluster:** Testing / verification integrity. **Priority:** P3. **Verdict:** build (small). **Severity:** no product effect; the defect is that the project's own verification instruction produces a green that is not evidence about roughly 344 tests, and CLAUDE.md §5 states a task is not done until it passes.
 
