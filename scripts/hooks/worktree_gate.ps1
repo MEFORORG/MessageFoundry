@@ -722,9 +722,70 @@ What to do instead:
         # leg, where the lookup returned nothing, $isSelf went false, and BOTH branches emitted the
         # generic deny -- byte-identical, which is exactly what the non-vacuity test below asserts
         # against. Platform-masked, and caught only because that test compares the two denies.
-        $victimTop = Get-ComparablePath "$(& git -C $victimRaw rev-parse --show-toplevel 2>$null)".Trim()
+        $victimTopRaw = "$(& git -C $victimRaw rev-parse --show-toplevel 2>$null)".Trim()
+        if (-not $victimTopRaw) { $victimTopRaw = $victimRaw }
+        $victimTop = Get-ComparablePath $victimTopRaw
         $selfTop = Get-ComparablePath "$(& git -C $cwdRaw rev-parse --show-toplevel 2>$null)".Trim()
         $isSelf = $victimTop -and $selfTop -and ($victimTop -eq $selfTop)
+
+        # WHICH FAMILY IS THE VICTIM IN? The remedy has to be one that can actually reach it, and until
+        # now neither of the two this rule named could (BACKLOG #1057):
+        #
+        #   * `remove.ps1 -Name <dir>` resolves to <repo-parent>/<repo-leaf>-<dir>. new.ps1 ASSERTS that
+        #     shape after deriving it, so the <primary>-<name> sibling family is the only one it can
+        #     produce and the only one remove.ps1 can resolve; handed anything else it fails Test-Path
+        #     and throws "No such worktree".
+        #   * `prune-merged.ps1` excludes anything with a `.claude/worktrees/` path segment OUTRIGHT --
+        #     its own header says so, and -Name cannot reach them either. That exclusion is deliberate:
+        #     those are the trees a live session gets relocated into.
+        #
+        # Census on this clone 2026-08-06: 45 sibling worktrees, 8 Claude-managed, 4 other -- and every
+        # live session sat in the 8. So the refused caller was reliably handed a command that throws and
+        # a tool that reports nothing about their tree. Same defect as #1032, one rule over: there, rule
+        # 3b printed a new.ps1 command new.ps1 refuses to run. A refusal the reader cannot act on is the
+        # standing invitation to route around the guard, which costs more than the refusal buys.
+        #
+        # THIS BRANCHES THE REMEDY STRING ONLY. Which worktrees rule 3d refuses is untouched, and no
+        # security decision reads $isSibling -- which is what makes a misclassification cheap here and
+        # not in rule 3c. FAILURE DIRECTION, pinned by test rather than asserted: a junction or UNC
+        # spelling breaks the prefix match, classifies NOT-sibling, and the not-sibling remedy is a
+        # literal `git worktree remove <abs path>` that is valid for EVERY family, siblings included.
+        # The dangerous direction needs a non-sibling to SPURIOUSLY match `<primary>-<name>`, which an
+        # unresolved alias makes less likely rather than more.
+        $govLeaf = Split-Path $govWt.Display -Leaf
+        $sibPrefix = "$($govWt.Compare)-"
+        $isSibling = $victimTop -and $victimTop.StartsWith($sibPrefix) -and
+                     -not $victimTop.Substring($sibPrefix.Length).Contains('/')
+        # NAME the directory rather than printing `<directory-name>`. The gate has just resolved the
+        # path; leaving the caller to substitute a placeholder into a command is a second chance to get
+        # it wrong, and it is the reason the own-tree branch was unrunnable for the sibling family too.
+        $sibName = if ($isSibling) { (Split-Path $victimTopRaw -Leaf).Substring($govLeaf.Length + 1) } else { $null }
+        $removeCmd = if ($isSibling) {
+            "pwsh -NoProfile -File $($govWt.Display)\scripts\worktree\remove.ps1 -Name $sibName"
+        }
+        else {
+            "git -C `"$($govWt.Display)`" worktree remove `"$victimTopRaw`""
+        }
+        # The sibling family KEEPS prune-merged.ps1 and that is not politeness: it is dry-run by default,
+        # it consults occupancy, and it re-reads its fence immediately before each removal. For the family
+        # it covers it is strictly better than a bare `git worktree remove`, so the fix must not become
+        # "stop naming the scripts" -- a test pins that it is still offered here.
+        $cleanupBullet = if ($isSibling) {
+            @"
+  * Cleaning up merged worktrees is a maintenance job with its own dry-run-by-default tool. Run it and
+    READ what it proposes before applying anything:
+        pwsh -NoProfile -File $($govWt.Display)\scripts\worktree\prune-merged.ps1
+"@
+        }
+        else {
+            @"
+  * prune-merged.ps1 CANNOT help with this one, so do not reach for it: it skips anything under
+    .claude/worktrees and anything that is not a <repo>-<name> sibling, by design, and its -Name cannot
+    reach them either. If this tree really must go, that is the user's call and this is the command --
+    it is not yours to run:
+        $removeCmd
+"@
+        }
 
         if ($isSelf) {
             Write-Deny -Rule "3d" -Detail "git worktree $wtVerb (own worktree)" -Reason @"
@@ -741,8 +802,8 @@ What to do instead:
   * Finish and COMMIT anything you still want. A commit survives the tree being deleted; a dirty tree
     does not.
   * Then ask the user, in these words: "I am finished in $victimRaw and it can be removed once this
-    session ends." Removal is theirs to run from the main checkout:
-        pwsh -NoProfile -File $($govWt.Display)\scripts\worktree\remove.ps1 -Name <directory-name>
+    session ends." Removal is theirs to run from OUTSIDE this tree:
+        $removeCmd
   * If you only wanted to leave it, just stop using it -- an unused worktree costs disk, not correctness.
 "@
         }
@@ -757,9 +818,7 @@ uncommitted work in them. There is no undo, and the session using it finds out w
 fails. That asymmetry is why the default is refusal even though the tree may well be abandoned.
 
 What to do instead:
-  * Cleaning up merged worktrees is a maintenance job with its own dry-run-by-default tool. Run it and
-    READ what it proposes before applying anything:
-        pwsh -NoProfile -File $($govWt.Display)\scripts\worktree\prune-merged.ps1
+$cleanupBullet
   * To find out whether a worktree is still in use, look rather than delete:
         git -C "$($govWt.Display)" worktree list
   * If you are certain it is abandoned and must go now, that is the user's call, not yours. Say so:
