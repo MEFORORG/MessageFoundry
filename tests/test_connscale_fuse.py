@@ -193,6 +193,7 @@ def _rec(
         empty_claims_per_s=0.0,
         idle_poll_per_s=0.0,
         wake_fanout_per_s=0.0,
+        empty_claims_per_msg=None,
         fd_count_peak=100,
         reload_seconds=None,
         ack_p50_ms=1.0,

@@ -100,6 +100,14 @@ class ConnScaleRecord:
     wake_fanout_per_s: (
         float  # the per-commit thundering-herd cost (the herd slope vs N is read here)
     )
+    # Empty claims PER MESSAGE absorbed, over the same first→last in-hold window as the rates above.
+    # BACKLOG #1101: the per-SECOND form has wall clock in its denominator, so anything that slows the
+    # run — CPU contention on a shared CI runner, or the O(N) reload probe firing mid-hold — collapses
+    # it without the engine changing. Per-message is the quantity wall #3 actually means (the herd size
+    # per commit) and is immune to that: numerator and denominator are both deltas over the SAME
+    # samples, so the span cancels algebraically rather than by assumption. None when the window
+    # absorbed no messages, in which case the ratio is undefined and must not be invented as 0.
+    empty_claims_per_msg: float | None
 
     # --- wall #4: FD / socket count ---
     fd_count_peak: int | None  # None when the OS probe couldn't read the PID
@@ -195,6 +203,14 @@ class ConnScaleRecord:
                 # SEPARATED (critic must-change #3): idle-poll re-SELECTs vs the per-commit herd.
                 "idle_poll_per_s": round(self.idle_poll_per_s, 2),
                 "wake_fanout_per_s": round(self.wake_fanout_per_s, 2),
+                # The ASSERTED form (BACKLOG #1101). The per-second numbers above are operator-facing
+                # and carry wall clock; this one is what the monotonicity SLO reads, because it does
+                # not move when the runner is merely slow. None when no messages were absorbed.
+                "total_per_msg": (
+                    None
+                    if self.empty_claims_per_msg is None
+                    else round(self.empty_claims_per_msg, 3)
+                ),
             },
             "wall4_fd": {"count_peak": self.fd_count_peak},
             "wall5_reload": {"seconds": self.reload_seconds},

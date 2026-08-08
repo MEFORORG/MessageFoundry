@@ -48,6 +48,7 @@ def _record(
         empty_claims_per_s=empty_per_s,
         idle_poll_per_s=idle_per_s,
         wake_fanout_per_s=wake_per_s,
+        empty_claims_per_msg=None,
         fd_count_peak=fd,
         reload_seconds=0.05,
         ack_p50_ms=1.0,
