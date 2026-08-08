@@ -6746,7 +6746,7 @@ against the anchor.
 
 ## 1101. the connscale empty_claims_monotonic SLO reports runner contention as an engine defect
 
-> 🔢 **Filed 2026-08-07 - not started. Reproduced, not inferred.** Value **4/10** · Difficulty **2/10**.
+> ✅ **SHIPPED 2026-08-08 - the SLO now reads empty claims PER MESSAGE, and the latent `claim_mode` grouping defect went with it.** The asserted metric is `empty_claims_per_msg`, computed as the ratio of two rates taken over the SAME first-to-last in-hold samples, so the span cancels algebraically and the quantity is exactly `Δempty_claims / Δread` -- there is no wall clock left for runner contention or a mid-hold reload stall to move. `_monotonic_slo` now groups by `(sweep_mode, claim_mode)` rather than `sweep_mode` alone, so a profile combining `per_lane` and `pooled` can no longer chain-compare across claim modes. The per-second numbers are retained in the report as the operator-facing figures; they are simply no longer what gates a merge. **Verified against the failure mode, not just for green:** eight tests pin the invariance property AND the still-detects-a-real-regression property together, and both were shown to go RED under mutation - reverting the grouping fails 3, restoring the per-second metric fails 2. A metric that never fires would have passed a stability test alone, which is why the two are pinned as a pair. **Not done, and deliberately:** gating `reload_seconds` directly was raised below as a conditional ("if that cost is worth gating") and is a separate judgement, not part of this fix. Original filing follows. Value **4/10** · Difficulty **2/10**.
 > `tests/test_connscale_smoke.py:170` asserts `empty_claims_monotonic`: the N=24 empty-claim **rate per
 > second** must be at least 0.75x the N=12 rate. The metric has wall-clock in its denominator and a
 > deliberately un-gated O(N) probe in its numerator's way, so **CPU contention alone flips it red with
@@ -6849,3 +6849,109 @@ no engine content. Causal exclusion first (the diff reaches no engine code; the 
 `pyproject.toml` `addopts`, so the PR's new test collects **after** `test_connscale_smoke.py` and had
 not run), then reproduced under contention rather than argued. The investigating session retracted two
 of its own mechanisms, above, before the conclusion was accepted.
+
+## 1103. the connscale API port range is derived by increment from a single probed port, so every port after the base is unverified
+
+> 🔢 **Filed 2026-08-08 - not started. Observed failing on `main`'s own CI, not hypothesised.** Value **4/10** · Difficulty **2/10**. `tests/test_connscale_smoke.py` probes **one** free API port and `harness/load/connscale/runner.py:162` then binds `api_port + step` for every sweep step. Only the base was ever checked. A taken port anywhere in that range kills the engine at startup, and on Windows it surfaces as `WinError 10013` -- *access forbidden*, not the `10048` that reads as a collision -- so the failure does not look like a port problem at all.
+
+**Cluster:** Testing / harness reliability. **Priority:** P2. **Verdict:** build. **Severity:** no product
+effect and no PHI effect. The cost is a blocking, required check failing for a reason unconnected to the
+change under test, on a leg that already carries two other unrelated failure modes.
+
+**Value 4:** the Developer Experience & CI ladder caps there, and the workaround (re-run the leg) is real
+if expensive. It is not a product defect -- `harness/` is test scaffolding.
+
+**Observed.** PR #289, `test (windows-2022, py3.14)`, run `31261658519`, job `93113333978`:
+
+```
+FAILED tests/test_connscale_smoke.py::test_connscale_smoke_end_to_end
+  ConnScaleError: engine exited during startup:
+  ERROR uvicorn.error: [Errno 13] error while attempting to bind on address
+  ('127.0.0.1', 62748): [winerror 10013] an attempt was made to access a socket
+  in a way forbidden by its access permissions
+1 failed, 10770 passed, 830 skipped in 1608.73s (0:26:48)
+```
+
+**SECOND OCCURRENCE, ON LINUX, AND IT RETIRES THE "WINDOWS QUIRK" READING.** Added 2026-08-08, hours
+after filing. PR #287 -- a **CodeQL action SHA bump**, two workflow files, no Python at all -- failed the
+same way on `test (ubuntu-latest, py3.14)`, run `31267671690`, job `93128368291`:
+
+```
+ConnScaleError: engine exited during startup:
+  ERROR uvicorn.error: [Errno 98] error while attempting to bind on address
+  ('127.0.0.1', 45382): address already in use
+1 failed, 10453 passed, 1147 skipped in 849.41s (0:14:09)
+```
+
+Port **45382** is in the Linux ephemeral range and, like `62748`, sits far outside the inbound window
+`[20000, 30000)` -- the API family again. The step ran **14:19** against ubuntu's 25:00 cap, so not a
+timeout there either.
+
+**The defect is platform-independent; only the errno differs.** Linux reports `EADDRINUSE` (98) --
+*"address already in use"*, which names the cause. Windows reports `10013` -- *"access forbidden"* --
+which does not. **The honest error message is the Linux one, and the misleading one is what this was
+first found under.** Anyone triaging the Windows form alone will reach for permissions and runner images;
+the Linux form points straight at port allocation. Record both spellings, because the same defect
+presents as two unrelated-looking failures.
+
+Both observed occurrences are on PRs whose content **cannot reach this code**: a CI timeout change (#289)
+and a CodeQL SHA bump (#287). That is the signature of a harness defect rather than a regression, and it
+is why neither was re-run before being diagnosed.
+
+**It is not a timeout and not #1096.** The `Tests (pytest)` STEP ran **27:00** against a 55:00 cap. It is
+also **not #1101** -- that is a throughput SLO assertion, this is a bind failure before the engine
+finishes starting. Three distinct failure modes now share this leg; do not merge them.
+
+**The mechanism, traced rather than inferred.**
+
+* `_free_port()` (`tests/test_connscale_smoke.py`) binds `("127.0.0.1", 0)`, reads `getsockname()[1]`,
+  and **closes the socket in a `finally` before returning**. The returned port is free at the instant it
+  is read and reserved by nothing thereafter.
+* The test calls it once for the API base: `api_port = _free_port()`.
+* `harness/load/connscale/runner.py:162` passes **`api_port=api_port + step`**, with `step` incremented
+  per sweep arm (`:199`, `:206`). The failing run's log carries `62746`, `62747` and `62748`.
+* So exactly one of the three was verified. `62748` was taken, and the engine died at startup.
+
+**Why the symptom hides the cause.** A Windows bind onto a port held by another socket reports **10013**,
+not **10048**. Read as an access-permissions error it invites the wrong fixes -- run CI elevated, adjust
+firewall rules, blame the runner image -- none of which touch a port-allocation defect. The number is the
+tell: `62748` sits in the ephemeral range, far outside the test's own inbound window `[20000, 30000)`, so
+it is not the family `#1014` reserved.
+
+**This is #1014's defect, one port-family over.** #1014 fixed exactly this for the **inbound** block: a
+contiguous reservation, a random anchor to de-correlate concurrent worktrees, contiguity asserted at the
+acquisition site, and a loud failure rather than a silent fixed fallback. None of it was applied to the
+API family. The test's own comment reasons about the API ports *only* relative to the inbound block --
+*"The sink/API ports stay ephemeral (above the inbound window) and won't hit the block"* -- which is true,
+and silent about the increment range colliding with anything else on the machine. **A correct statement
+about one hazard reads as coverage of a hazard it never mentions.**
+
+**The same pattern is in the SINK family and is dormant only by configuration.**
+`harness/load/connscale/runner.py:278` builds `ports=tuple(sink_port + i for i in range(sink_ports))`
+from a single probed `sink_port`. `test_connscale_smoke.py` passes `sink_ports=1`, so today only the
+verified base is used and it cannot fire. Any profile raising `sink_ports` above 1 inherits this item
+without touching it. Fix both families in the same act.
+
+**#1014 removing `@pytest.mark.flaky(reruns=2)` is why this is visible, and that was correct.** The
+retry would have absorbed it. #1014's stated intent was that *"a genuine future collision now surfaces
+as a RED rather than a masked retry"* -- this is that collision, in the family #1014 did not cover.
+
+**The work.** Reserve the API range the way `_free_contiguous_ports` reserves the inbound block: probe a
+contiguous run of the required width, assert contiguity at the acquisition site, fail loudly if no block
+is available, and prefer a random anchor to de-correlate concurrent worktrees. The width is derivable --
+it is the number of sweep arms, which the profile already determines. Do the same for the sink family.
+Do **not** fix this by re-adding a retry: that re-hides the class #1014 deliberately exposed.
+
+**Test it against the range, not the base.** A test that probes one port and asserts it binds cannot see
+this. The guard has to assert that **every** port the sweep will use was reserved, which is the same
+shape as the contiguity assertion `_free_contiguous_ports` already carries for the inbound family.
+
+**Related:** #1014 (the same defect in the inbound family; its fix is the model for this one), #1101
+(the other connscale failure on this leg -- a throughput SLO, not a bind), #1096 (the third failure mode
+on this leg -- the step cap; distinct again), #1000 (a control whose evidence could not see the class it
+covered -- the comment quoted above is that shape in prose).
+
+**Source:** found 2026-08-08 while triaging a red `test (windows-2022, py3.14)` leg on PR #289, the
+`#1096` cap change. Diagnosed by tracing the port number through `_free_port` and the `api_port + step`
+call site rather than by re-running: the failing port lies outside the inbound window, which is what
+rules out the family `#1014` already fixed and points at the one it did not.
