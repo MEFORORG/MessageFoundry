@@ -79,6 +79,7 @@ def _record_from_json(d: dict[str, Any]) -> ConnScaleRecord:
         empty_claims_per_s=w3["total_per_s"],
         idle_poll_per_s=w3["idle_poll_per_s"],
         wake_fanout_per_s=w3["wake_fanout_per_s"],
+        empty_claims_per_msg=None,
         fd_count_peak=d["wall4_fd"]["count_peak"],
         reload_seconds=d["wall5_reload"]["seconds"],
         ack_p50_ms=w6["p50"],
