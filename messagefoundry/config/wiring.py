@@ -682,8 +682,26 @@ def _is_secret_setting(name: str) -> bool:
     BACKLOG #236): the factory already forbids an inline literal and an ``env()`` default on them, so
     each renders as a bare ``{"env": key}`` regardless — but the prefix is belt-and-suspenders in case
     a value ever reaches a serializer resolved. The paired ``body_secret_tokens`` are **not** secret:
-    a placeholder is public by nature (it sits in the committed Handler source)."""
-    return name in _SECRET_SETTING_KEYS or name.startswith("body_secret_value_")
+    a placeholder is public by nature (it sits in the committed Handler source).
+
+    ``sign_private_key`` / ``sign_private_key_password`` are named EXPLICITLY (BACKLOG #1106), and the
+    reason they were missing is the point. ``with_signing`` takes parameters ``private_key`` and
+    ``private_key_password`` — both of which this function already classified — and RENAMES them on the
+    way into the settings map (``transports/signing.py``). The parameter was covered and the setting it
+    became was not, so both were served verbatim by ``/metadata`` behind ``MONITORING_READ`` alone and
+    printed by ``graph --json``. Measured 2026-08-09; the leak predated the cell that scored it, so no
+    change-detector was ever in play.
+
+    NOT a ``sign_`` prefix rule: ``sign_key_id`` is an identifier, ``sign_algorithm`` and ``sign_header``
+    are configuration, and a prefix would redact all three while reading as more thorough. The domain is
+    guarded instead by ``tests/test_connection_factory_redaction_domain.py``, which calls every
+    spec-returning factory and asserts nothing credential-shaped survives this function — at the level
+    of EMITTED settings rather than parameters, which is the boundary the rename crosses."""
+    return (
+        name in _SECRET_SETTING_KEYS
+        or name.startswith("body_secret_value_")
+        or name in ("sign_private_key", "sign_private_key_password")
+    )
 
 
 #: Connector secret-setting keys that are IDENTIFIERS (usernames), not rotatable credentials — a
