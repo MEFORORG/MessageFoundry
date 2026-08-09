@@ -353,6 +353,45 @@ failure direction (refuse rather than take over) and is narrow, but a real avail
 follow-on:** an operator **rebind** action that clears/re-binds an account's `(oidc_issuer, oidc_subject)`
 after an out-of-band identity check, so a genuine reassignment is an admin operation rather than a lockout.
 
+**⚠️ SECOND RESIDUAL, added 2026-08-09 — the guard is trust-on-first-use, so A.1's attack still succeeds
+against an UNBOUND account.** This section previously stated only the availability edge above, which read as
+though the takeover half were fully closed. It is not, and the omission is the more consequential half.
+
+The guard's precondition is that the resolved account *already carries* a binding. AC-12 below says so in
+terms — "WHEN the account is unbound, it SHALL record the binding on that login" — so on an account that has
+never federated-logged-in there is nothing to compare against, the check short-circuits, and the binding is
+recorded for whoever arrives first. That is **exactly the scenario A.1 names**: an IdP reassigns an
+already-allowed username to a different principal, the domain check passes, every ladder rung is green, and a
+session is minted on the prior person's account. The guard then protects the *new* holder's binding against
+everyone else.
+
+Reproduced end to end against the shipped code (in-memory SQLite, RS256 `id_token`, stubbed token exchange,
+fake LDAP): an account created by AD-password login (`oidc_subject` NULL) was taken over by a *different*
+verified subject presenting the same reassigned `preferred_username` — same user row, session minted, the
+incumbent's **LDAP-derived roles inherited** — and a third subject was then refused.
+
+The window is not narrow, because *unbound* is the default state:
+
+- every account that predates enabling federation — i.e. the entire existing population on day one; and
+- every account created afterwards by AD-password or Kerberos login, since those callers pass `None` and
+  write no binding (A.2).
+
+What bounds it: the attacker must be a principal the pinned IdP will mint a token for, within an allow-listed
+UPN suffix, and the target AD object must exist (hybrid-only). The suffix allow-list constrains the *suffix*,
+never the local part, and defaults to the configured `ad_domain` — the very suffix the organisation's own IdP
+mints. So the residual is conditional on IdP tenancy, not on engine configuration.
+
+**Follow-ons (a decision, not a recommendation — both carry a rollout cost, and this ADR does not pick one):**
+either *(a)* refuse an unbound account that predates federation, closing the window at the price of locking out
+every existing user until an operator binds them; or *(b)* an operator **pre-binding** step, which avoids the
+lockout but needs a new admin surface and a migration path. Note *(b)* is the same admin surface the
+availability residual above already recommends, so one control can discharge both.
+
+Assessed downstream as ASVS **10.5.2** (`partial` — a refusing control exists and ships on, but covers only
+bound accounts) and **6.8.1** (`partial` — cross-IdP identity is still keyed on the reassignable username, with
+`(issuer, sub)` able only to veto the row that claim already selected). Neither can reach `pass` while this
+window is open.
+
 ### A.5 Acceptance criterion added
 - **AC-12 (subject continuity)** — WHEN an OIDC login's username resolves to an account already bound to an
   `(issuer, sub)` other than the token's, THE SYSTEM SHALL refuse with an audited `federated_subject_conflict`
