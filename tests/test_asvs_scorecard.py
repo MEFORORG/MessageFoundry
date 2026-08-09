@@ -24,12 +24,14 @@ from scripts.asvs.scorecard import (
     Findings,
     ScorecardError,
     _copy_scratch,
+    anchor_form,
     check_absences,
     check_anchors,
     check_completeness,
     check_pinning,
     corpus_digest,
     count,
+    form_summary,
     load_corpus,
     load_scorecard,
     main,
@@ -343,6 +345,286 @@ def test_anchor_goes_red_when_the_file_is_gone(tmp_path: Path) -> None:
     f = Findings()
     check_anchors(cells, tmp_path, f)
     assert not f.ok and "does not exist" in f.problems[0]
+
+
+# --- derived anchor `form`: what does the evidence actually resolve INTO? --------------------------
+#
+# Measured 2026-08-09, vault `origin/main` (1a59e4a1) scorecard against engine tree `c383eeab`:
+# 1,980 anchors, 1,979 located, split 1,479 code / 233 doc / 267 foreign / 0 undetermined. So 500 of
+# the located 1,979 (25.3%) resolve into prose or a non-Python file that no structural or executable
+# check reaches, and the record presented all 1,980 as code evidence.
+#
+# Every test below names the classification rule it pins, because the rule is where the judgement is.
+# The load-bearing one is `..._that_is_not_a_docstring_stays_code`: it is the case a token mask gets
+# wrong, and it is the reason this classifies by POSITION rather than by what the text looks like.
+
+_CSP_MODULE = '''\
+"""Security headers for the web console."""
+
+# The report path is public; the nonce is not.
+CSP_REPORT_PATH = "/ui/csp-report"
+
+_POLICY = (
+    "default-src 'self'; script-src 'nonce-{nonce}' 'strict-dynamic'; "
+    "base-uri 'none'; form-action 'self'; object-src 'none'; "
+    "img-src 'self' data:; connect-src 'self'; font-src 'self'"
+)
+
+
+def header(nonce: str) -> str:
+    """Return the Content-Security-Policy header value."""
+    return _POLICY.format(nonce=nonce)
+'''
+
+_DDL_MODULE = '''\
+"""SQL Server store."""
+
+
+def _schema() -> str:
+    return """
+        CREATE TABLE sessions (
+            token_hash NVARCHAR(64) NOT NULL PRIMARY KEY,
+            user_id NVARCHAR(255) NOT NULL,
+            revoked_at DATETIME2 NULL
+        )
+    """
+'''
+
+
+def test_form_classifies_module_class_and_function_docstrings_as_doc() -> None:
+    src = '"""Module prose here."""\n\n\nclass C:\n    """Class prose here."""\n\n    def m(self):\n        """Method prose here."""\n        return 1\n'
+    for token in ("Module prose", "Class prose", "Method prose"):
+        assert anchor_form("messagefoundry/m.py", src, src.index(token)) == "doc", token
+
+
+def test_form_classifies_a_hash_comment_as_doc() -> None:
+    src = "# why this constant is 64 and not 32\nSIZE = 64\n"
+    assert anchor_form("messagefoundry/m.py", src, src.index("why this constant")) == "doc"
+    assert anchor_form("messagefoundry/m.py", src, src.index("SIZE = 64")) == "code"
+
+
+def test_form_keeps_a_prose_shaped_string_that_is_not_a_docstring_as_code() -> None:
+    """THE case that decides the classification rule, and the reason a token mask was rejected.
+
+    A Content-Security-Policy fragment and a block of SQL DDL are long, quoted, space-separated and
+    operator-free, so a "does this look like code?" mask reads them as English -- while they are the
+    literal subject of the control the cell cites. Measured, a token mask misfiled every CSP fragment
+    in `messagefoundry_webconsole/_security.py` and the whole SQL Server and Postgres DDL as prose.
+
+    Position cannot make that mistake: neither string is the first statement of any scope, so neither
+    is a docstring, whatever it reads like. Falsified by relaxing `_prose_spans` to treat ANY string
+    token as a docstring (drop the `doc_rows` membership test): all four assertions here go RED while
+    the docstring tests above stay green. Restored.
+    """
+    for token in (
+        "script-src 'nonce-{nonce}' 'strict-dynamic'",
+        "base-uri 'none'; form-action 'self'; object-src 'none'; ",
+    ):
+        assert (
+            anchor_form(
+                "messagefoundry_webconsole/_security.py", _CSP_MODULE, _CSP_MODULE.index(token)
+            )
+            == "code"
+        ), token
+    for token in ("token_hash NVARCHAR(64) NOT NULL PRIMARY KEY", "CREATE TABLE sessions"):
+        assert (
+            anchor_form("messagefoundry/store/sqlserver.py", _DDL_MODULE, _DDL_MODULE.index(token))
+            == "code"
+        ), token
+
+
+def test_form_does_not_mistake_a_hash_inside_a_string_for_a_comment() -> None:
+    """`#` is a comment character to a `#`-scan and an ordinary byte to `tokenize`.
+
+    A CSP fragment or a URL fragment carries `#` routinely. Comments therefore come from `tokenize`,
+    which knows it is inside a string literal, rather than from a scan of the line.
+    """
+    src = 'URL = "https://example.test/page#anchor-name"\nVALUE = 1\n'
+    assert anchor_form("messagefoundry/m.py", src, src.index("anchor-name")) == "code"
+
+
+def test_form_classifies_a_non_python_file_as_foreign_without_parsing_it() -> None:
+    """198 `.md`, 17 `.ts`, 16 `.js` and 13 `.yml` anchors are in the live record. No `ast` reaches
+    any of them, ever, so the honest label is `foreign` rather than a Python verdict about them."""
+    md = "# SECURITY.md\n\nThe engine binds 127.0.0.1 by default.\n"
+    assert anchor_form("docs/SECURITY.md", md, md.index("binds 127")) == "foreign"
+    # It is the SUFFIX that decides, not the content: this would parse as Python and must not be tried.
+    assert anchor_form("scripts/x.yml", "VALUE = 1\n", 0) == "foreign"
+
+
+def test_form_is_undetermined_when_the_python_will_not_parse_never_code() -> None:
+    """The dangerous default is `code`, because it inflates the exact number this split deflates.
+
+    Falsified by changing `_form_from_spans` to `return "code"` when `spans is None`: this test goes
+    RED and the "no prose" negative control below stays green. Restored.
+    """
+    broken = "def f(\n"  # unterminated: neither ast nor tokenize can complete it
+    assert anchor_form("messagefoundry/m.py", broken, 0) is None
+
+
+def test_form_is_decided_by_the_tokens_start_not_by_any_overlap() -> None:
+    """An `expect` that begins in code and runs into a trailing comment is CODE.
+
+    Measured on the live record: a START rule and an OVERLAP rule disagree on 57 of 1,712 Python
+    anchors, and every one of those is a code statement whose recorded token happens to run past the
+    end of the statement. Falsified by dropping the LOWER bound from `_form_from_spans` --
+    `any(start < hi ...)`, the left-overlap rule, and a plausible slip -- which classifies this
+    fixture as `doc`: this test goes RED. Restored.
+    """
+    src = "VALUE = 64  # tuned against the 2026-08 bench\n"
+    token = "VALUE = 64  # tuned"
+    assert src.count(token) == 1  # the token really does straddle the boundary
+    assert anchor_form("messagefoundry/m.py", src, src.index(token)) == "code"
+
+
+def test_form_negative_control_a_file_with_no_prose_yields_no_doc(tmp_path: Path) -> None:
+    """The count's negative control: a form that CANNOT occur must come back zero.
+
+    A classifier that returned `doc` on some fixed fraction, or that leaked spans between files
+    through the per-run cache, would show up here and nowhere else -- the positive tests above only
+    assert that `doc` appears.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        "SIZE = 64\nNAME = 'x'\n\n\ndef f():\n    return SIZE\n", encoding="utf-8"
+    )
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(
+                Anchor("messagefoundry/m.py", 1, "SIZE = 64"),
+                Anchor("messagefoundry/m.py", 2, "NAME = 'x'"),
+                Anchor("messagefoundry/m.py", 5, "def f():"),
+            ),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert f.anchor_forms["code"] == 3
+    assert f.anchor_forms["doc"] == 0
+    assert f.anchor_forms["foreign"] == 0
+    assert f.anchor_forms["undetermined"] == 0
+
+
+def test_check_anchors_counts_a_form_for_every_anchor_that_located(tmp_path: Path) -> None:
+    """The split's parts must sum to the located population, or the printed denominator is a fiction."""
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        '"""Prose about the gate."""\n\nSIZE = 64\n', encoding="utf-8"
+    )
+    (tmp_path / "docs" / "SECURITY.md").write_text(
+        "The gate is deny-by-default.\n", encoding="utf-8"
+    )
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(
+                Anchor("messagefoundry/m.py", 3, "SIZE = 64"),
+                Anchor("messagefoundry/m.py", 1, "Prose about the gate"),
+                Anchor("docs/SECURITY.md", 1, "deny-by-default"),
+            ),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert f.ok
+    assert dict(f.anchor_forms) == {"code": 1, "doc": 1, "foreign": 1}
+    assert sum(f.anchor_forms.values()) == f.checked_anchors
+
+
+def test_an_anchor_that_did_not_locate_gets_no_form_at_all(tmp_path: Path) -> None:
+    """GONE and AMBIGUOUS anchors have no landing site, so classifying them would be an invented
+    number inside the one figure whose whole purpose is to stop the record overstating itself.
+
+    Falsified by moving the `anchor_forms` increment above the occurrence guards in `check_anchors`:
+    the sum then reaches 3 and both assertions here go RED. Restored.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        "SIZE = 64\ndupe\nfiller\ndupe\n", encoding="utf-8"
+    )
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(
+                Anchor("messagefoundry/m.py", 1, "SIZE = 64"),
+                Anchor("messagefoundry/m.py", 2, "dupe"),  # AMBIGUOUS
+                Anchor("messagefoundry/m.py", 3, "vanished_token"),  # GONE
+            ),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert len(f.problems) == 2
+    assert sum(f.anchor_forms.values()) == 1
+    assert f.checked_anchors == 3  # scanned three; classified one. Both numbers get printed.
+
+
+def test_form_doc_is_a_label_and_never_a_demotion(tmp_path: Path) -> None:
+    """17 cells rest genuinely on documentation, which is legitimate ground for a documentation
+    requirement. A cell evidenced ONLY by prose must therefore stay green and stay complete.
+
+    This is the fence against the obvious next move -- wiring `form` into the gate. If someone adds
+    `if form != "code": problems.append(...)`, or teaches `check_completeness` that a doc-only cell
+    is unevidenced, this test goes RED and says why.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        '"""Session records are never written to the general log."""\n', encoding="utf-8"
+    )
+    (tmp_path / "docs" / "PHI.md").write_text(
+        "Full payloads go only to the store.\n", encoding="utf-8"
+    )
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(
+                Anchor("messagefoundry/m.py", 1, "never written to the general log"),
+                Anchor("docs/PHI.md", 1, "Full payloads go only to the store"),
+            ),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert f.ok and f.problems == [] and f.advisories == []
+    assert f.anchor_forms["code"] == 0 and f.anchor_forms["doc"] + f.anchor_forms["foreign"] == 2
+    # ... and the completeness check, which decides what counts as evidence, is untouched by form.
+    assert check_completeness(cells, {"1.1.1": 1}) == []
+
+
+def test_form_summary_prints_its_denominator_and_the_population_it_never_saw() -> None:
+    """A broken run and a clean run must not look alike, so the split prints what it SCANNED.
+
+    Parts, the located total, the unlocated remainder, and the derived percentage all appear. A bare
+    "1,479 code" is unreadable: unreadable against what?
+    """
+    f = Findings(checked_anchors=10)
+    f.anchor_forms.update({"code": 5, "doc": 2, "foreign": 2})
+    text = "\n".join(form_summary(f))
+    assert "form of the 9 anchor(s) that located" in text
+    assert "5 code" in text and "2 doc" in text and "2 foreign" in text
+    assert "1 further anchor(s) did NOT locate" in text
+    assert "4 of 9 (44.4%)" in text
+    assert "LABEL and not a demotion" in text
+
+
+def test_form_summary_negative_control_says_zero_rather_than_dividing_by_zero() -> None:
+    """Nothing located: every part is zero, the percentage is 0.0, and no line is silently omitted."""
+    text = "\n".join(form_summary(Findings()))
+    assert "form of the 0 anchor(s) that located" in text
+    assert "0 code" in text and "0 doc" in text and "0 foreign" in text
+    assert "0 of 0 (0.0%)" in text
+    assert "did NOT locate" not in text  # nothing was scanned, so nothing went unclassified
 
 
 # --- absence claims: the class this project is worst at -------------------------------------------
@@ -1208,6 +1490,49 @@ def test_main_prove_absences_returns_1_on_a_nonbiting_claim(tmp_path: Path) -> N
     _biting_scorecard(sc, "unrelated.py")
     rc = main(["--scorecard", str(sc), "--root", str(tree), "--prove-absences"])
     assert rc == 1
+
+
+def test_main_summary_says_RESOLVED_not_VERIFIED_and_carries_the_form_split(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The rendered face of the record must not assert something the check does not establish.
+
+    The summary line used to read "verified N evidence anchors". The run did not verify them; it
+    RESOLVED them -- the token is present and unique in the file, which is not evidence that the
+    control operates. Measured instance: 15.3.1 sat at `pass` with every anchor resolving while the
+    control it named had a hole, found only by executing the code. That distinction lives on the one
+    line most readers will ever read, so it is pinned here end-to-end through `main`, not asserted of
+    a helper.
+
+    The split rides beside it for the same reason: "resolved 1,980" reads as 1,980 pieces of code
+    evidence, and roughly a quarter of them are prose or a non-Python file.
+
+    Falsified by restoring the word "verified" in `main`'s summary: the first two assertions go RED.
+    Falsified independently by deleting the `for line in form_summary(findings)` loop: the split
+    assertions go RED while the wording ones stay green. Both restored.
+    """
+    corpus = _corpus_file(tmp_path, {"1.1.1": 1})
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        '"""Prose about the gate."""\n\nSIZE = 64\n', encoding="utf-8"
+    )
+    sc = _scorecard_file(
+        tmp_path,
+        f'[scorecard]\nasvs_version = "5.0.0"\ncorpus_sha256 = "{corpus_digest(corpus)}"\n'
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\n'
+        "  [[cell.evidence]]\n"
+        '  path = "messagefoundry/m.py"\n  line = 3\n  expect = "SIZE = 64"\n'
+        "  [[cell.evidence]]\n"
+        '  path = "messagefoundry/m.py"\n  line = 1\n  expect = "Prose about the gate"\n',
+    )
+    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "resolved 2 evidence anchors" in out
+    assert "verified 2 evidence anchors" not in out
+    assert "NOT proof the control operates" in out
+    assert "form of the 2 anchor(s) that located: 1 code, 1 doc" in out
+    assert "1 of 2 (50.0%) resolve into prose or a non-Python file" in out
 
 
 def test_main_verify_without_corpus_returns_exit_2(tmp_path: Path) -> None:

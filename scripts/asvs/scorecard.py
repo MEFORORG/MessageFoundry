@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import argparse
 import ast
+import io
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import tokenize
 import tomllib
 from collections import Counter
 from dataclasses import dataclass, field
@@ -32,6 +34,33 @@ from pathlib import Path
 from typing import Any, Final, Literal
 
 Verdict = Literal["pass", "partial", "fail", "na", "needs-review", "unverified"]
+
+#: What KIND of artifact an evidence anchor resolves INTO. Derived at check time from where the token
+#: lands, never authored: it is a property of the landing site, not a judgement about the cell.
+#:
+#: - ``code``  — a Python file, outside every docstring and ``#`` comment.
+#: - ``doc``   — a Python file, inside a docstring (the first statement of a module, class or
+#:   function) or inside a ``#`` comment.
+#: - ``foreign`` — not a Python file at all: ``.md``, ``.ts``, ``.js``, ``.yml``, ``.toml``, …
+#:
+#: **``doc`` is a LABEL, never a demotion**, and nothing here consumes it as one. The split is
+#: rendered so the record stops presenting every anchor as if it were code evidence; it is
+#: deliberately NOT wired into :func:`check_completeness`, into any verdict, or into the exit code.
+#:
+#: Measured 2026-08-09, vault ``origin/main`` 1a59e4a1's scorecard against engine tree c383eeab —
+#: quoted as a (file x ref) pair because a count is a fact about one, and this programme has already
+#: produced three wrong-base errors by dropping the qualifier:
+#:
+#: - 1,980 anchors; 1,979 located; **1,479 code, 233 doc (173 docstring + 60 comment), 267 foreign**
+#:   (197 ``.md``, 17 ``.ts``, 16 ``.js``, 13 ``.yml``, 8 ``.toml``, the rest scattered).
+#: - So **500 of 1,979 (25.3%) resolve into prose or a non-Python file**, which no structural or
+#:   executable scheme reaches, ever.
+#: - **17 of 343 evidenced cells carry NO code anchor at all** and rest entirely on documentation,
+#:   which for a documentation requirement is the correct ground: 1.4.3, 2.1.2, 3.1.1, 3.5.5, 11.1.1,
+#:   12.2.2, 13.1.1-13.1.4, 13.4.3, 14.1.2, 15.1.1, 15.1.2, 15.1.4, 15.2.1, 16.1.1. That figure was
+#:   derived here independently and agrees exactly with the 2026-08-09 recut analysis, which is why
+#:   the label is stated as a label rather than hedged.
+AnchorForm = Literal["code", "doc", "foreign"]
 
 #: The scoring buckets. ``unverified`` is deliberately first-class (ADR 0156 §5): a cell inherited from
 #: an earlier assessment and never re-read against the requirement text is NOT a Pass, and conflating
@@ -197,6 +226,11 @@ class Findings:
     checked_anchors: int = 0
     checked_absences: int = 0
     skipped_anchors: int = 0
+    #: Derived :data:`AnchorForm` of every anchor that LOCATED, plus an ``undetermined`` bucket for a
+    #: Python file that would not parse or tokenize. Anchors that did not locate (GONE or AMBIGUOUS)
+    #: are absent from this counter entirely — there is no landing site to classify — so its total is
+    #: ``checked_anchors`` minus those, and the summary prints both numbers rather than either alone.
+    anchor_forms: Counter[str] = field(default_factory=Counter)
     #: Populated only by :func:`prove_absences`. ``proved_absences`` counts claims whose observable
     #: went red under the applied mutation (a live proof); ``static_screened`` counts claims that took
     #: the static backstop (a screen, not a proof); ``skipped_absences`` counts claims carrying no
@@ -404,6 +438,107 @@ def check_completeness(cells: list[Cell], corpus: dict[str, int]) -> list[str]:
     return problems
 
 
+#: Suffixes this module will submit to Python structural analysis. Everything else is ``foreign`` by
+#: construction — no `ast` and no `tokenize` reaches a `.md`, `.ts`, `.yml` or `.toml` file, ever.
+PYTHON_SUFFIXES: Final[frozenset[str]] = frozenset({".py", ".pyi"})
+
+
+def _prose_spans(text: str) -> list[tuple[int, int]] | None:
+    """Character-offset spans of the docstrings and ``#`` comments in one Python source.
+
+    ``None`` means the source could not be analysed — it does not parse, or does not tokenize. The
+    caller must report that as UNDETERMINED rather than defaulting, because the default that feels
+    natural is ``code`` and it would silently inflate the one number this split exists to deflate.
+
+    **A docstring is identified STRUCTURALLY — the first statement of a module, class or function, via
+    ``ast`` — and never by looking at the string's contents.** That is the whole design, and the
+    alternative was measured and rejected: a token mask ("does this text look like code?") misfiles the
+    Content-Security-Policy fragments in ``messagefoundry_webconsole/_security.py`` and the entire SQL
+    Server and Postgres DDL as prose. Those are long, quoted, space-separated strings that read as
+    English to a mask while being the literal subject of the control their cell cites. Position cannot
+    make that mistake, and not because it is a better mask — because it never asks the question. A
+    string that is not the first statement of a scope is not a docstring, whatever it reads like.
+
+    Comments come from ``tokenize`` rather than a ``#`` scan, so a ``#`` inside a string literal is
+    not mistaken for one — which the CSP and URL fragments in the live record depend on.
+    """
+    line_starts = [0]
+    for i, ch in enumerate(text):
+        if ch == "\n":
+            line_starts.append(i + 1)
+
+    def offset(row: int, col: int) -> int:
+        return line_starts[row - 1] + col
+
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return None
+    # Row pairs, not character columns: `ast` reports `col_offset` as a UTF-8 BYTE offset, which
+    # disagrees with the character offsets everything else here uses the moment a line holds a
+    # non-ASCII character. So `ast` is asked only WHICH string is a docstring, and `tokenize` — whose
+    # columns are characters — supplies the span.
+    doc_rows: set[tuple[int, int]] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not node.body:
+            continue
+        first = node.body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+            and first.end_lineno is not None
+        ):
+            doc_rows.add((first.lineno, first.end_lineno))
+
+    spans: list[tuple[int, int]] = []
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type == tokenize.COMMENT or (
+                tok.type == tokenize.STRING and (tok.start[0], tok.end[0]) in doc_rows
+            ):
+                spans.append((offset(*tok.start), offset(*tok.end)))
+    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
+        return None
+    return spans
+
+
+def _form_from_spans(
+    path: str, spans: list[tuple[int, int]] | None, start: int
+) -> AnchorForm | None:
+    """Classify one landing site against pre-computed spans (see :func:`anchor_form`)."""
+    if Path(path).suffix not in PYTHON_SUFFIXES:
+        return "foreign"
+    if spans is None:
+        return None
+    # The token's START decides, not any overlap. An `expect` that begins in code and runs into a
+    # trailing lint-suppression comment is code; the OVERLAP rule calls it doc and reclassified 57 of
+    # 1,712 live Python anchors that way when both were measured on 2026-08-09. (The suppression
+    # directive is named in words, not written literally: ruff parses one in any comment, and this
+    # module is also inside the corpus that absence patterns grep over.)
+    return "doc" if any(lo <= start < hi for lo, hi in spans) else "code"
+
+
+def anchor_form(path: str, text: str, start: int) -> AnchorForm | None:
+    """The derived ``form`` of one anchor: where does its token actually land?
+
+    ``path`` is the anchor's repo-relative path, ``text`` the file's contents as the anchor check read
+    them, ``start`` the character offset of the match. ``None`` means undetermined — a Python file
+    that would not parse — and is never silently folded into ``code``.
+
+    This answers a question the record has been getting wrong by omission: **a quarter of its anchors
+    resolve into prose or a non-Python file, and no structural or executable check reaches any of them,
+    ever.** The record presented all of them as code evidence. Naming the form does not change a single
+    verdict and must not: see :data:`AnchorForm` for the measurement and for why ``doc`` is a label
+    rather than a demotion.
+    """
+    if Path(path).suffix not in PYTHON_SUFFIXES:
+        return "foreign"
+    return _form_from_spans(path, _prose_spans(text), start)
+
+
 def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
     """Open every evidence anchor and assert its token still resolves, and resolves UNAMBIGUOUSLY.
 
@@ -434,14 +569,25 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
     this file, once* — not *this control operates on the path the cell describes*. A cell can therefore
     be green here and wrong: measured 2026-08-09 on 15.3.1, which was ``pass`` with every anchor
     resolving while the control it named had a hole, found only by executing the code.
+
+    Each anchor that LOCATES is also given a derived :data:`AnchorForm` (:func:`anchor_form`) and
+    counted into ``findings.anchor_forms``. That is reporting only — no branch here reads it, and no
+    verdict depends on it.
     """
+    # Per-run caches. 1,980 live anchors concentrate onto ~224 distinct files (`settings.py` alone
+    # carries 218), so both the read and the parse are re-done an order of magnitude more often than
+    # there are files to do them on.
+    text_cache: dict[Path, str] = {}
+    spans_cache: dict[Path, list[tuple[int, int]] | None] = {}
     for c in cells:
         for a in c.evidence:
             target = root / a.path
             if not target.is_file():
                 findings.problems.append(f"{c.id}: evidence path {a.path} does not exist")
                 continue
-            text = target.read_text(encoding="utf-8", errors="replace")
+            if target not in text_cache:
+                text_cache[target] = target.read_text(encoding="utf-8", errors="replace")
+            text = text_cache[target]
             findings.checked_anchors += 1
             occurrences = text.count(a.expect)
             if occurrences > 1:
@@ -490,7 +636,18 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
             # tokens span a newline, because the old check matched against joined text and nothing
             # forbade it. A per-line scan finds none of those and raises on the lookup; counting
             # newlines before the match handles a multi-line token as naturally as a single-line one.
-            actual = text.count("\n", 0, text.index(a.expect)) + 1
+            start = text.index(a.expect)
+            # Derived form of the landing site. Only anchors that reached here are classified: a GONE
+            # or AMBIGUOUS token has no single landing site, so inventing a form for it would be a
+            # made-up number in a split whose whole purpose is to stop the record overstating itself.
+            if target not in spans_cache:
+                spans_cache[target] = (
+                    _prose_spans(text) if Path(a.path).suffix in PYTHON_SUFFIXES else None
+                )
+            findings.anchor_forms[
+                _form_from_spans(a.path, spans_cache[target], start) or "undetermined"
+            ] += 1
+            actual = text.count("\n", 0, start) + 1
             if actual != a.line:
                 findings.advisories.append(
                     f"{c.id}: {a.path} — {a.expect!r} is unique and present, recorded at line "
@@ -986,6 +1143,43 @@ def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
     return chr(10).join(lines) + chr(10)
 
 
+def form_summary(findings: Findings) -> list[str]:
+    """The derived-``form`` split, printed beside the resolved count — WITH its denominator.
+
+    A bare "1,479 code" is unreadable: unreadable against what? So this prints the population it
+    classified, the population it could not, and the population it never saw, on the principle that a
+    broken run and a clean run must not look alike. The parts sum to ``checked_anchors`` by
+    construction and the reader can check that without leaving the line.
+
+    **Nothing downstream consumes this.** It is the record's rendered face telling the truth about
+    what its evidence is made of, which is not the same act as scoring it. ``doc`` and ``foreign``
+    anchors are not weaker claims — they are claims no structural or executable check can ever reach,
+    which is a fact about the CHECK, not about the cell.
+    """
+    n = findings.anchor_forms
+    located = sum(n.values())
+    unlocated = findings.checked_anchors - located
+    prose = n["doc"] + n["foreign"]
+    pct = (100.0 * prose / located) if located else 0.0
+    out = [
+        f"  form of the {located} anchor(s) that located: {n['code']} code, "
+        f"{n['doc']} doc (docstring or # comment), {n['foreign']} foreign (not a Python file), "
+        f"{n['undetermined']} undetermined (Python that would not parse)"
+    ]
+    if unlocated:
+        out.append(
+            f"  {unlocated} further anchor(s) did NOT locate (GONE or AMBIGUOUS, reported below) and "
+            "carry no form: there is no landing site to classify"
+        )
+    out.append(
+        f"  {prose} of {located} ({pct:.1f}%) resolve into prose or a non-Python file, which no "
+        "structural or executable check reaches, ever. That is a LABEL and not a demotion -- "
+        "documentation is legitimate ground for a documentation requirement -- and it feeds no "
+        "verdict, no completeness check and no exit code here"
+    )
+    return out
+
+
 def _run_prove_absences(scorecard: Path, root: Path) -> int:
     """The ``--prove-absences`` entry point: execute-prove every absence claim (see
     :func:`prove_absences`). Needs no corpus — it applies mutations, it does not grep for patterns."""
@@ -1063,6 +1257,11 @@ def main(argv: list[str] | None = None) -> int:
         f"(token present and unique -- NOT proof the control operates) "
         f"and checked {findings.checked_absences} absence claims"
     )
+    # Beside the resolved count, and deliberately not folded into it: WHAT those anchors resolve into.
+    # "Resolved 1,980" reads as 1,980 pieces of code evidence; roughly a quarter of them are prose or a
+    # non-Python file that no structural or executable check will ever reach. See `form_summary`.
+    for line in form_summary(findings):
+        print(line)
     for a in findings.advisories:
         print(f"  DRIFT {a}", file=sys.stderr)
     if findings.advisories:
