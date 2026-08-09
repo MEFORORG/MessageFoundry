@@ -668,6 +668,62 @@ _SECRET_HEADER_NAMES = frozenset(
     {"authorization", "proxy-authorization", "x-api-key", "api-key", "cookie"}
 )
 
+#: Substrings that make a header name credential-bearing. BACKLOG #1201.
+#:
+#: The five names above were the WHOLE test, by exact membership. That is the same defect as #1106 and
+#: strictly worse, because header names are OPERATOR-AUTHORED FREE TEXT -- there is no factory, no
+#: signature and no registry to enumerate, so an exhaustive list cannot exist even in principle.
+#: Measured 2026-08-09 against the shipped list: ``X-Auth-Token``, ``X-Amz-Security-Token`` (an AWS
+#: SigV4 session credential) and ``Private-Token`` (GitLab's standard auth header) were all returned
+#: VERBATIM by ``/metadata`` and printed by ``graph --json``.
+#:
+#: So the test is by SHAPE, with the explicit set kept as a floor rather than deleted -- ``cookie``
+#: matches no substring rule and must stay named.
+_SECRET_HEADER_SUBSTRINGS = (
+    "auth",
+    "token",
+    "secret",
+    "credential",
+    "password",
+    "passphrase",
+    "key",
+)
+
+#: Header names that CONTAIN a secret-ish substring and are not credentials. Each is here because
+#: redacting it would destroy operator-visible routing or tracing information that is public by nature.
+#: Suffix-matched, because the convention is consistent: an ``-id`` names something, it is not the thing.
+_NOT_SECRET_HEADER_SUFFIXES = (
+    "-id",
+    "-url",
+    "-uri",
+    "-name",
+    "-type",
+    "-version",
+    "-agent",
+    "-for",
+)
+
+#: Exact non-credential headers whose name defeats the suffix rule. ``Idempotency-Key`` is the live one:
+#: it carries "key" and is a client-generated REQUEST identifier, published in the API docs of every
+#: service that uses it.
+_NOT_SECRET_HEADERS = frozenset({"idempotency-key", "x-idempotency-key"})
+
+
+def _is_secret_header(name: str) -> bool:
+    """Would printing this header's VALUE disclose a credential?
+
+    Shape-based on purpose: see :data:`_SECRET_HEADER_SUBSTRINGS`. A false positive costs an operator
+    one redacted value in a diagnostic view and one line in :data:`_NOT_SECRET_HEADERS`; a false
+    negative serves a bearer credential to anyone holding ``MONITORING_READ``. The asymmetry is not
+    close, so this errs toward redacting.
+    """
+    low = str(name).strip().lower()
+    if low in _SECRET_HEADER_NAMES:
+        return True
+    if low in _NOT_SECRET_HEADERS or low.endswith(_NOT_SECRET_HEADER_SUFFIXES):
+        return False
+    return any(tok in low for tok in _SECRET_HEADER_SUBSTRINGS)
+
 
 def _is_secret_setting(name: str) -> bool:
     """Is ``name`` a credential-bearing settings key?
@@ -772,10 +828,7 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
         elif is_secret:
             out[name] = "***"
         elif name == "headers" and isinstance(value, dict):
-            out[name] = {
-                k: ("***" if str(k).lower() in _SECRET_HEADER_NAMES else v)
-                for k, v in value.items()
-            }
+            out[name] = {k: ("***" if _is_secret_header(k) else v) for k, v in value.items()}
         else:
             out[name] = value
     return out

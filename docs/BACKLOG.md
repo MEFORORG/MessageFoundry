@@ -8713,3 +8713,56 @@ filing.
 **What would NOT be an honest pass.** This cell has a recorded precedent for exactly the wrong move: it briefly scored Pass on 2026-07-20 on a runbook edit and was back to Partial by 07-22. Documenting how to configure secure forwarding is not the engine securely transmitting logs, and the record already shows that purchase being reversed. The other one is flipping `forward_protocol` to TLS while `forward_host` stays None -- nothing transmits either way, so the cell is unchanged and the change only looks like progress.
 
 **Source:** filed 2026-08-08 from the ASVS ledger-coverage sweep of the partial and fail cells that carried no backlog item at all; this cell was one of them. The scorecard is the record of record for the verdict; this item tracks the research toward changing it.
+
+## 1201. `redacted_settings` served credential-bearing HTTP headers outside a five-name list
+
+> 🔢 **Filed 2026-08-09 - FIXED IN THE SAME CHANGE, and the entry is published WITH the fix rather than ahead of it.** Value **8/10** · Difficulty **2/10**. Header redaction was `str(k).lower() in _SECRET_HEADER_NAMES` -- an exact-membership test against **five** strings (`authorization`, `proxy-authorization`, `x-api-key`, `api-key`, `cookie`). Header names are **operator-authored free text**, typed into `connections.toml` or a Handler, so an exhaustive list cannot exist even in principle. Measured against the shipped list: `X-Auth-Token`, `X-Amz-Security-Token` and `Private-Token` were all returned VERBATIM.
+
+**Cluster:** Security / secret disclosure. **Priority:** P1. **Verdict:** build (done).
+**Severity:** on a first deployment, an operator who configured an outbound connection with a bearer
+credential in any header outside those five would have had it returned by
+`GET /connections/{name}/metadata` to any caller holding `Permission.MONITORING_READ`, and printed by
+`graph --json` to stdout, a CI log and the IDE graph view. No PHI. Conditional, per the not-deployed
+posture -- but the exposure needs no deployment to be *published*, which is why this entry ships with
+its fix.
+
+**Measured before and after, both serializers:**
+
+```
+BEFORE:  X-Auth-Token, X-Amz-Security-Token, Private-Token  -> value returned verbatim
+AFTER :  all redacted to *** on redacted_settings AND display_settings
+KEPT  :  Content-Type, Accept, User-Agent, X-Correlation-Id, X-Request-Id,
+         X-Forwarded-For, X-Api-Version, Idempotency-Key  -> still readable
+```
+
+**This is `#1106` one surface over, and structurally worse.** `#1106` was a settings key that a factory
+renamed across the parameter/setting boundary; settings keys at least come from function signatures and
+are therefore *enumerable*. Header names come from an operator's keyboard. A listed domain was never
+going to cover them, so the test is now by SHAPE -- a substring rule over
+`auth|token|secret|credential|password|passphrase|key` -- with the original five kept as an explicit
+floor, because `cookie` matches no substring rule and must stay named.
+
+**Erring toward redaction, deliberately, with the cost stated.** A false positive costs an operator one
+masked value in a diagnostic view and one line in the not-a-secret list. A false negative serves a
+bearer credential to a monitoring reader. The asymmetry is not close. Two exclusions keep the
+diagnostic view usable: a suffix rule (`-id`, `-url`, `-uri`, `-name`, `-type`, `-version`, `-agent`,
+`-for`), because an `-id` NAMES something rather than being it; and an exact list for
+`Idempotency-Key`, which carries "key", is a client-generated request identifier, and is published in
+the API docs of every service that uses it.
+
+**Found by generalising the `#1106` guard rather than by a report.** `#1106`'s fix added a test that
+enumerates the redaction DOMAIN by AST and executes the real redactor against every member. The obvious
+next question -- "does the sibling control have the same shape?" -- took one probe. That is the whole
+method: the defect class is *a control whose domain is narrower than its surface*, and the way you find
+the next instance is to ask which other control quantifies over a domain it does not derive.
+`tests/test_connection_factory_redaction_domain.py` now covers both.
+
+**Route onward, NOT closed by this.** The shape rule is a heuristic over a free-text domain, so it is a
+floor and not a proof: a header named without any of those substrings (`X-Shared-Signature`, a
+vendor-specific opaque name) still passes. The durable fix is for the header value to never reach a
+serializer resolved -- the `env()`-only treatment `body_secret_value_*` already gets -- and that is a
+larger change than this one.
+
+**Source:** found 2026-08-09 while probing for a second instance of the `#1106` class before building a
+generalised check, on the reasoning that a meta-check built from one instance is shaped like that
+instance. Two domains were probed; this one leaked.

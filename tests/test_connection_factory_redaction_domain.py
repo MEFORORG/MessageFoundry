@@ -184,6 +184,60 @@ def test_no_factory_emits_a_credential_that_survives_redaction(mod: str, name: s
     )
 
 
+#: Credential-bearing headers a real deployment sends. NOT drawn from `_SECRET_HEADER_NAMES` -- that
+#: frozenset was the defect (BACKLOG #1201): five exact names, matched by membership, against a domain
+#: that is OPERATOR-AUTHORED FREE TEXT and therefore cannot be enumerated even in principle.
+SECRET_HEADERS = [
+    "Authorization",
+    "Proxy-Authorization",
+    "X-API-Key",
+    "Cookie",
+    "X-Auth-Token",  # leaked before #1201
+    "X-Amz-Security-Token",  # leaked before #1201 -- an AWS SigV4 session credential
+    "Private-Token",  # leaked before #1201 -- GitLab's standard auth header
+    "X-Vault-Token",
+    "X-Session-Secret",
+]
+
+#: Headers that must STAY VISIBLE. Redacting these costs an operator their routing and tracing view,
+#: and `Idempotency-Key` is the sharp one -- it carries "key", is a client-generated request id, and is
+#: published in the API docs of every service that uses it.
+PUBLIC_HEADERS = [
+    "Content-Type",
+    "Accept",
+    "User-Agent",
+    "X-Correlation-Id",
+    "X-Request-Id",
+    "X-Forwarded-For",
+    "X-Api-Version",
+    "Idempotency-Key",
+]
+
+
+@pytest.mark.parametrize("header", SECRET_HEADERS)
+def test_a_credential_bearing_header_is_redacted(header: str) -> None:
+    """The #1106 defect again, one surface over, and structurally worse.
+
+    Settings keys come from factory signatures, so they are at least enumerable. HEADER names are typed
+    by an operator into `connections.toml` or a Handler, so no list can be complete -- which is why this
+    is matched by SHAPE and why the test names credentials the shipped list never contained.
+    """
+    spec = messagefoundry.Rest(url="https://example.invalid/x", headers={header: SENTINEL})
+    out = redacted_settings(dict(spec.settings))["headers"]
+    assert SENTINEL not in str(out.get(header)), (
+        f"{header} carries a credential and was served verbatim by /metadata and graph --json"
+    )
+
+
+@pytest.mark.parametrize("header", PUBLIC_HEADERS)
+def test_a_public_header_is_not_redacted(header: str) -> None:
+    """The other half. Erring toward redaction is right, but a rule that hides everything is not a
+    control -- it is a broken diagnostic view, and nothing would say so."""
+    spec = messagefoundry.Rest(url="https://example.invalid/x", headers={header: "public-value"})
+    out = redacted_settings(dict(spec.settings))["headers"]
+    assert out.get(header) == "public-value", f"{header} is not a credential and must stay readable"
+
+
 def test_a_sentinel_under_a_known_secret_key_is_actually_redacted() -> None:
     """POSITIVE CONTROL. Without it, a `redacted_settings` that returned `{}`, or a sentinel that never
     reached the settings at all, would make every assertion above pass while proving nothing."""
