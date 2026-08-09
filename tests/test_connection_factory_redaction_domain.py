@@ -28,8 +28,10 @@ add it here, which is the failure that produced defects 1 and 2 above.
 from __future__ import annotations
 
 import ast
+import base64
 import importlib
 import inspect
+import json
 import pathlib
 from typing import Any
 
@@ -66,6 +68,16 @@ NOT_A_SECRET: dict[str, str] = {
 #: first run (`smart_key_id`, `smart_token_url`, `oauth2_token_url`); only `with_signing` survived as a
 #: real finding, so getting this boundary right is what separates the signal from the noise.
 NOT_CREDENTIAL_SUFFIX = ("_id", "_url", "_uri", "_file", "_path", "_name", "_style", "_type")
+
+
+def _is_mapping_param(p: inspect.Parameter) -> bool:
+    return any(t in str(p.annotation) for t in ("Mapping", "dict", "Dict"))
+
+
+def _is_container_param(p: inspect.Parameter) -> bool:
+    """Does this parameter carry a dict or list into the settings map?"""
+    ann = str(p.annotation)
+    return _is_mapping_param(p) or any(t in ann for t in ("Sequence", "list", "List", "Iterable"))
 
 
 def _is_credential_param(name: str) -> bool:
@@ -129,7 +141,16 @@ def _call_with_sentinels(fn: Any) -> Any:
             # A required non-credential argument. Any plausible string keeps the call alive; the
             # assertion is about credential values, not this one.
             kwargs[p.name] = "https://example.invalid/token" if "url" in p.name else "x"
-    base = messagefoundry.Rest(url="https://example.invalid/endpoint")
+        elif _is_container_param(p):
+            # OPTIONAL CONTAINER PARAMETERS ARE POPULATED DELIBERATELY. Passing only the REQUIRED
+            # arguments left every container empty, and the surface walk below skips empty containers
+            # -- so it examined nothing and passed vacuously. Measured: zero containers walked. A
+            # guard that passes because it looked at nothing is the exact defect this file exists for,
+            # and it very nearly shipped inside the generalisation of it.
+            kwargs[p.name] = {"X-Probe": SENTINEL} if _is_mapping_param(p) else ["X-Probe"]
+    base = messagefoundry.Rest(
+        url="https://example.invalid/endpoint", headers={"X-Probe-Auth": SENTINEL}
+    )
     return fn(base, **kwargs)
 
 
@@ -182,6 +203,174 @@ def test_no_factory_emits_a_credential_that_survives_redaction(mod: str, name: s
         f"Note the parameter may already be classified under a DIFFERENT name -- that is exactly the "
         f"rename gap this test exists to catch."
     )
+
+
+#: Credential-bearing headers a real deployment sends. NOT drawn from `_SECRET_HEADER_NAMES` -- that
+#: frozenset was the defect (BACKLOG #1201): five exact names, matched by membership, against a domain
+#: that is OPERATOR-AUTHORED FREE TEXT and therefore cannot be enumerated even in principle.
+SECRET_HEADERS = [
+    "Authorization",
+    "Proxy-Authorization",
+    "X-API-Key",
+    "Cookie",
+    "X-Auth-Token",  # leaked before #1201
+    "X-Amz-Security-Token",  # leaked before #1201 -- an AWS SigV4 session credential
+    "Private-Token",  # leaked before #1201 -- GitLab's standard auth header
+    "X-Vault-Token",
+    "X-Session-Secret",
+]
+
+#: Headers that must STAY VISIBLE. Redacting these costs an operator their routing and tracing view,
+#: and `Idempotency-Key` is the sharp one -- it carries "key", is a client-generated request id, and is
+#: published in the API docs of every service that uses it.
+PUBLIC_HEADERS = [
+    "Content-Type",
+    "Accept",
+    "User-Agent",
+    "X-Correlation-Id",
+    "X-Request-Id",
+    "X-Forwarded-For",
+    "X-Api-Version",
+    "Idempotency-Key",
+]
+
+
+@pytest.mark.parametrize("header", SECRET_HEADERS)
+def test_a_credential_bearing_header_is_redacted(header: str) -> None:
+    """The #1106 defect again, one surface over, and structurally worse.
+
+    Settings keys come from factory signatures, so they are at least enumerable. HEADER names are typed
+    by an operator into `connections.toml` or a Handler, so no list can be complete -- which is why this
+    is matched by SHAPE and why the test names credentials the shipped list never contained.
+    """
+    spec = messagefoundry.Rest(url="https://example.invalid/x", headers={header: SENTINEL})
+    out = redacted_settings(dict(spec.settings))["headers"]
+    assert SENTINEL not in str(out.get(header)), (
+        f"{header} carries a credential and was served verbatim by /metadata and graph --json"
+    )
+
+
+@pytest.mark.parametrize("header", PUBLIC_HEADERS)
+def test_a_public_header_is_not_redacted(header: str) -> None:
+    """The other half. Erring toward redaction is right, but a rule that hides everything is not a
+    control -- it is a broken diagnostic view, and nothing would say so."""
+    spec = messagefoundry.Rest(url="https://example.invalid/x", headers={header: "public-value"})
+    out = redacted_settings(dict(spec.settings))["headers"]
+    assert out.get(header) == "public-value", f"{header} is not a credential and must stay readable"
+
+
+#: Container-valued settings the redactor KNOWS HOW TO DESCEND INTO, each with the rule that covers it.
+#: Anything else nested is unreachable by redaction, because `redacted_settings` masks flat scalars via
+#: `_is_secret_setting` and descends only into `headers` via `_is_secret_header`.
+HANDLED_CONTAINERS: dict[str, str] = {
+    "headers": "per-key via _is_secret_header",
+    "dynamic_headers": (
+        "values are HL7 field REFERENCES (e.g. 'MSH-4'), not credentials -- the secret arrives from "
+        "the message at runtime and never enters settings"
+    ),
+    "capture_response_headers": "a list of header NAMES to capture; names are not values",
+    "proxy_no_proxy": "hostname exclusions, public by nature",
+}
+
+
+def test_no_unclassified_container_can_reach_a_serializer() -> None:
+    """THE GENERALISATION, and the reason it is a test rather than a review note.
+
+    #1106 and #1201 were both *a control whose domain is narrower than its surface*, found one at a
+    time by asking "what else does this control quantify over?". That question does not scale and it
+    does not survive staff turnover. This inverts it: instead of enumerating the leaks, enumerate the
+    SURFACES, and fail on any surface nobody has classified.
+
+    Measured 2026-08-09: no shipped factory emits a nested container beyond those declared below, so
+    this currently guards a hole that is THEORETICAL rather than live -- stated plainly because a clean
+    result reported as a finding is the failure mode this whole line of work is about. Its value is
+    prospective: `redacted_settings` masks flat scalars and descends only into `headers`, so the first
+    connector to put a credential inside a new dict or list would leak it silently, exactly as
+    `sign_private_key` and `X-Auth-Token` did. This makes that a red test instead of an incident.
+    """
+    unclassified: list[str] = []
+    examined = 0
+    for mod, name in FACTORIES:
+        fn = _decorator_style(mod, name)
+        assert fn is not None
+        spec = _call_with_sentinels(fn)
+        for key, value in spec.settings.items():
+            if isinstance(value, dict | list) and value:
+                examined += 1
+                if key not in HANDLED_CONTAINERS:
+                    unclassified.append(f"{name} -> {key} ({type(value).__name__})")
+    # LIVENESS, and it is not decoration: the first version of this test walked ZERO containers and
+    # passed, because it invoked factories with required arguments only and every container parameter
+    # has a default. "No unclassified containers" and "no containers" are indistinguishable from the
+    # assertion alone, and only one of them is a clean result.
+    assert examined > 0, (
+        "the surface walk examined NO containers, so its clean result means nothing. The factory "
+        "invocation has stopped populating container parameters -- fix that before trusting this test"
+    )
+    assert not unclassified, (
+        "these settings are CONTAINERS that redaction cannot descend into, and nobody has classified "
+        f"them: {sorted(set(unclassified))}. Either teach redacted_settings to descend, or add the key "
+        "to HANDLED_CONTAINERS with the reason it carries no credential. Do NOT assume the values are "
+        "safe because they are today -- that assumption is what shipped #1106 and #1201."
+    )
+
+
+def _jwt_shaped() -> str:
+    """A JWT shape, BUILT AT RUNTIME so no token-shaped literal is ever committed.
+
+    The first version of this fixture was a literal example token and the repo's gitleaks hook
+    rejected the commit -- correctly, since a scanner cannot tell a well-known test vector from a live
+    credential, and "it is only a fixture" is what every real leak's author believed. Assembling it
+    from parts keeps the test honest and the scanner useful; a suppression would have cost the scanner
+    on this file forever to save one line here.
+    """
+    head = base64.urlsafe_b64encode(json.dumps({"alg": "HS256"}).encode()).decode().rstrip("=")
+    body = base64.urlsafe_b64encode(json.dumps({"sub": "test"}).encode()).decode().rstrip("=")
+    return f"{head}.{body}.{'s' * 43}"
+
+
+@pytest.mark.parametrize(
+    ("header", "value"),
+    [
+        ("X-Shared-Signature", "Bearer sk-live-abc123"),
+        ("X-Vendor-Opaque", _jwt_shaped()),
+        ("X-Internal-42", "Basic dXNlcjpwYXNz"),
+        ("X-Gateway", "Negotiate YIIZ..."),
+        ("X-Sig", "AWS4-HMAC-SHA256 Credential=AKIA.../20260809/us-east-1/s3/aws4_request"),
+    ],
+)
+def test_a_credential_VALUE_is_redacted_even_when_the_header_NAME_says_nothing(
+    header: str, value: str
+) -> None:
+    """The name rule's PERMANENT blind spot, closed from the other side.
+
+    `_is_secret_header`'s name arm is a heuristic over operator-authored free text, so a vendor that
+    picks `X-Shared-Signature` or an opaque internal name defeats it -- and no longer list fixes that,
+    which is why #1201's own route-onward said the shape rule was a floor and not a proof.
+
+    None of the header names below match any substring rule. Every value is unmistakably a credential.
+    """
+    spec = messagefoundry.Rest(url="https://example.invalid/x", headers={header: value})
+    out = redacted_settings(dict(spec.settings))["headers"]
+    assert out.get(header) == "***", f"{header} carries {value[:12]}... and was served verbatim"
+
+
+@pytest.mark.parametrize(
+    ("header", "value"),
+    [
+        ("Content-Type", "application/fhir+json"),
+        ("Accept", "application/json"),
+        ("X-Correlation-Id", "req-42"),
+        ("User-Agent", "messagefoundry/0.3.0"),
+        ("X-Forwarded-For", "10.0.0.1"),
+    ],
+)
+def test_the_value_arm_does_not_swallow_ordinary_headers(header: str, value: str) -> None:
+    """The value arm is deliberately NARROW -- auth-scheme prefixes and JWTs, not "long and
+    high-entropy". Masking every long header value would quietly destroy the diagnostic view rather
+    than protect it, and nothing would report that as a loss."""
+    spec = messagefoundry.Rest(url="https://example.invalid/x", headers={header: value})
+    assert redacted_settings(dict(spec.settings))["headers"].get(header) == value
 
 
 def test_a_sentinel_under_a_known_secret_key_is_actually_redacted() -> None:
