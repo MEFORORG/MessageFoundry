@@ -160,6 +160,43 @@ def test_anchor_goes_red_when_the_token_is_gone(tmp_path: Path) -> None:
     assert not f.ok and "no longer contains" in f.problems[0]
 
 
+def test_a_gone_token_is_not_offered_a_replacement_anchor(tmp_path: Path) -> None:
+    """The refusal is ENFORCED, not a convention, because the convention is what decays.
+
+    A GONE token has four possible causes and only two are re-anchors: it moved, it was renamed, THE
+    GAP IT CERTIFIED WAS CLOSED, or its control was removed. A tool that helpfully suggests the
+    nearest similar line collapses all four into the first, and the (c) case is the dangerous one --
+    re-anchoring to the code that CLOSED a gap, while the residual still narrates the gap, yields an
+    anchor that resolves forever while asserting the opposite of the truth.
+
+    Measured instance: 3.7.5 at engine `71dfc2ce`. The file below reproduces its shape -- the old
+    token is gone and a plausible near-match sits right there, which is exactly when a fuzzy
+    suggestion would be most tempting and most wrong.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        'testpaths = ["tests", "packaging/messagefoundry-webconsole/tests"]\n', encoding="utf-8"
+    )
+    cells = [
+        Cell(
+            id="3.7.5",
+            level=3,
+            verdict="partial",
+            evidence=(Anchor("messagefoundry/m.py", 1, 'testpaths = ["tests"]'),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert not f.ok
+    msg = f.problems[0]
+    # It must NOT name a line to move to, nor tell the reader to re-anchor.
+    assert "did you mean" not in msg.lower()
+    assert "re-anchor to" not in msg.lower()
+    assert "Do not re-anchor by default" in msg
+    # And it must put the retire-vs-rescore fork in front of the reader.
+    assert "CLOSED" in msg and "re-score" in msg
+
+
 def test_a_unique_token_that_drifted_is_advisory_not_fatal(tmp_path: Path) -> None:
     """DRIFT is not INVALIDATION. The token sits far below its recorded line but occurs exactly once.
 

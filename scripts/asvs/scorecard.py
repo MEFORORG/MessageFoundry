@@ -452,9 +452,34 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
                 )
                 continue
             if occurrences == 0:
+                # DELIBERATE NON-AFFORDANCE: this branch does NOT propose a replacement anchor, and
+                # must not be "improved" to fuzzy-match a nearby similar line and suggest one. That
+                # single affordance is what manufactures silent corruption, because a GONE token has
+                # FOUR possible causes and only two of them are re-anchors:
+                #
+                #   (a) moved beyond detection, control intact   -> re-anchor          (mechanical)
+                #   (b) renamed or refactored, control intact    -> re-anchor          (judgment)
+                #   (c) THE GAP THIS ANCHOR CERTIFIED WAS CLOSED -> RETIRE the anchor, rewrite the
+                #       residual; the verdict may IMPROVE
+                #   (d) the control was removed or weakened      -> the claim is broken; RE-SCORE
+                #
+                # Worked example of (c), measured 2026-08-09: cell 3.7.5 anchored
+                # `pyproject.toml:311 testpaths = ["tests"]`. BACKLOG #1027 widened testpaths to
+                # include the web console package, so the token vanished -- but the anchor existed to
+                # certify an EXCLUSION (the bucket-drift guard does not run), and that exclusion had
+                # just been CLOSED, because the guard's test sits inside the path #1027 added. A
+                # re-anchor to the new line would have pointed the anchor at the code that closed the
+                # gap while the residual still narrated the gap: a stale-but-resolving anchor,
+                # green forever, asserting the opposite of the truth. It was retired instead.
+                #
+                # A human distinguishes (a)-(d) by reading the cell. A tool cannot, so this one says
+                # what it found and stops. Reporting candidate locations would be acceptable;
+                # recommending one is not.
                 findings.problems.append(
                     f"{c.id}: {a.path}:{a.line} no longer contains {a.expect!r} anywhere in the file "
-                    "— the evidence is GONE, so the claim it supported may now be false"
+                    "— the evidence is GONE. Re-read the cell before touching the anchor: the token "
+                    "may have moved, been renamed, had the gap it certified CLOSED (retire it), or "
+                    "had its control removed (re-score). Do not re-anchor by default"
                 )
                 continue
             # Unique, and therefore LOCATED: past the guard above, the token occurs exactly once in
