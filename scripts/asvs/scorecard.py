@@ -1051,7 +1051,17 @@ def main(argv: list[str] | None = None) -> int:
         f"scanned {len(cells)} cells "
         f"({n['pass']} pass / {n['partial']} partial / {n['fail']} fail / {n['na']} na / "
         f"{n['unverified']} unverified); "
-        f"verified {findings.checked_anchors} evidence anchors and {findings.checked_absences} absence claims"
+        # "verified" OVERCLAIMED, on the line that IS the record's rendered face. An anchor check
+        # proves the token is present and unique in the file. It does not prove the statement still
+        # executes under the control flow the cell reasoned about, and it cannot prove the cell's
+        # conclusion follows from it -- `expect` is matched as a substring, so a statement that moved
+        # inside a `try`, into another function, or under a different condition still resolves.
+        # Measured instance: 15.3.1 sat at `pass` with every anchor resolving while the control it
+        # named had a hole, found only by EXECUTING the code. A summary that says "verified" invites
+        # exactly the inference the tool cannot support.
+        f"resolved {findings.checked_anchors} evidence anchors "
+        f"(token present and unique -- NOT proof the control operates) "
+        f"and checked {findings.checked_absences} absence claims"
     )
     for a in findings.advisories:
         print(f"  DRIFT {a}", file=sys.stderr)
