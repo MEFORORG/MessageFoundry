@@ -24,7 +24,12 @@ name: ASVS prove-absences
 # repo already has. Adding it there would couple a seconds-long stdlib gate to this repo's lockfile.
 #
 # ---------------------------------------------------------------------------------------------------
-# THE INPUT PROBLEM, STATED RATHER THAN ENGINEERED AROUND. This is a finding, not a solved problem.
+# THE INPUT PROBLEM. DECIDED 2026-08-09: option (b) -- the scheduled pass runs in THE VAULT.
+#
+# The three options and their real costs are kept below because the decision is only readable if the
+# rejected alternatives are, and because option (a) stays IMPLEMENTED-AND-OFF in this file: a
+# dispatch-only run here is how the engine-side path is exercised on demand without a standing
+# credential. What moved is the SCHEDULE, not the capability.
 #
 # The scorecard lives in THE VAULT, which is private; this repository is public. The vault's own
 # workflow reads the engine freely -- `repository: MEFORORG/MessageFoundry` with the comment "public:
@@ -57,23 +62,35 @@ name: ASVS prove-absences
 # wrong host for the OUTPUT as well as the wrong holder of the INPUT, and neither of those is fixable
 # by moving the environment, whereas (b)'s only cost IS the environment.
 #
-#   ==> RECOMMENDATION for the owner: (b). This file is the working wiring either way -- the same two
-#       scripts run unchanged in the vault, pointed at a local scorecard and an `engine/` checkout.
+#   ==> DECIDED: (b). The same two scripts run unchanged in the vault, pointed at a local scorecard
+#       and an `engine/` checkout. `prove_report.py` therefore ships HERE and is mirrored THERE, on
+#       the same ADR 0156 §7 footing as `scorecard.py` -- one tool, developed in the repo whose code
+#       it constrains, run in the repo that holds the data. The vault-side scheduled workflow is
+#       sequenced separately and is deliberately NOT built from this branch.
 #
 # ---------------------------------------------------------------------------------------------------
-# WHY A NO-INPUT RUN FAILS INSTEAD OF SKIPPING, and why "advisory" does not cover it.
+# WHY THE `prove` JOB IS DISPATCH-ONLY, AND WHY IT STILL EXITS 2 ON NO INPUT.
+#
+# Those are two different questions and conflating them is what a `schedule:` here would have done.
 #
 # ADVISORY APPLIES TO FINDINGS, NEVER TO THE INSTRUMENT. A claim that will not prove is reported and
 # does not fail this job (see `vars.ASVS_PROVE_STRICT`). A run that could not obtain a scorecard
 # scanned ZERO claims and is not evidence about any of them, so it exits non-zero -- the rule
 # `scorecard.py` already states for its own loader ("Fail closed, never skip ... refusing to report a
-# pass on a missing file"). Until an input source is configured this scheduled job is therefore RED
-# every day, and that is the finding above rendered as a signal rather than as prose in a file nobody
-# opens. If the noise is unwanted, DISABLE the workflow -- never make the no-input path green, which
-# would restore exactly the "green check that never ran" state this whole exercise exists to end.
+# pass on a missing file"). That is unchanged and must stay unchanged: never make the no-input path
+# green, which would restore exactly the "green check that never ran" state this whole exercise
+# exists to end.
 #
-# Note that the no-input path is not a branch nobody takes: it runs the real acquisition, install and
-# entry point every day, so the day a credential appears the rest of the path is already known-working.
+# But a job that fails closed on no input must not be SCHEDULED to obtain no input. With option (a)
+# off, a nightly run here would be RED EVERY DAY BY CONSTRUCTION -- not reporting a finding, just
+# re-announcing a decision already recorded in this file. A gate whose first act is to fail is a gate
+# somebody switches off, and a disabled workflow is indistinguishable from a passing one at a glance.
+# So the failing-closed behaviour stays and the cron goes to the repo that can actually feed it.
+#
+# The `selftest` job below keeps no cron either, and that is not an oversight: its harness also runs
+# as `tests/test_asvs_prove_absences_wiring.py::test_selftest_all_limbs_pass` in the unfiltered
+# `ci.yml` suite on every code PR and push, so a nightly re-run here would re-measure something
+# already measured. The job exists for the paths-filtered case -- a change to the wiring itself.
 #
 # ---------------------------------------------------------------------------------------------------
 # NOT A REQUIRED CHECK. Neither job context is in `.github/required-contexts.txt`, so nothing here can
@@ -81,11 +98,8 @@ name: ASVS prove-absences
 # write scopes, and the advisory default.
 
 on:
-  schedule:
-    # Uncontended slot: quality-advisory is 04:23, zizmor 06:00, required-workflow-state 07:00, and
-    # the vault's own ASVS gate 06:17. No ordering dependency on any of them -- this reads the vault
-    # scorecard as data, not the vault job's result.
-    - cron: "13 5 * * *"
+  # NO `schedule:`. The scheduled pass lives in the vault (see the decision above). Adding a cron back
+  # here re-creates a job that is red every day for a reason nobody can act on from this repository.
   workflow_dispatch:
   # The gate must be able to observe changes to ITSELF (the lesson written up at length above
   # asvs-scorecard.yml's own path filter). On these events only the `selftest` job runs -- see its
@@ -160,9 +174,12 @@ jobs:
     # `vars.ASVS_PROVE_STRICT`). An instrument failure IS fatal -- that distinction is the point.
     name: prove absence claims (advisory)
     needs: selftest
-    # Scheduled and on-demand only. On a PR there is no credential and nothing to prove; the wiring
-    # question is `selftest`'s and it already ran.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # ON DEMAND ONLY. On a PR there is no credential and nothing to prove; the wiring question is
+    # `selftest`'s and it already ran. There is no `schedule` arm to match either -- kept as an
+    # explicit event test rather than deleted, so that re-adding a cron above does NOT silently start
+    # running this job: someone would have to change this line too, and this line is next to the
+    # reason not to.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     # Generous because the prover copies the whole tree PER CLAIM (measured at roughly 1.2s a copy) and
     # spawns a pytest run per provable claim. At today's adoption -- zero -- the whole pass is 0.2s, so

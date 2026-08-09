@@ -8769,10 +8769,10 @@ instance. Two domains were probed; this one leaked.
 
 ## 1203. Decide how the public engine repo obtains the private ASVS scorecard for --prove-absences
 
-> 🔢 **Filed 2026-08-09 - not started. OWNER DECISION, and `.github/workflows/asvs-prove-absences.yml` is RED on the schedule until it is made.** Value **7/10** · Difficulty **2/10**. `--prove-absences` is now wired and runs daily, but its input -- `docs/security/asvs-scorecard.toml` -- lives in the private vault while the job runs in the public engine repo. The credential path is implemented and OFF by default; the recommended alternative needs no credential at all. This item is the decision, not the build.
+> 🔢 **Filed 2026-08-09. DECIDED the same day -- option 2: the scheduled pass runs in the vault. What remains is the vault-side workflow, sequenced separately and deliberately NOT built from the engine branch.** Value **7/10** · Difficulty **2/10**. `--prove-absences` is wired; its input -- `docs/security/asvs-scorecard.toml` -- lives in the vault, so the scheduled pass belongs there rather than in the public engine repo. Engine side is now `workflow_dispatch` only and carries no cron; `scripts/asvs/prove_report.py` ships in the engine and is mirrored into the vault, on the same footing as `scorecard.py` (ADR 0156 §7).
 
-**Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** decide.
-**Severity:** none to the engine. The cost of not deciding is that the daily job stays red and the 276 absence claims stay unproven by execution -- the state BACKLOG #1006 shipped the capability to end.
+**Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** decide -- decision made, build outstanding.
+**Severity:** none to the engine. Until the vault workflow exists the 276 absence claims stay unproven by execution -- the state BACKLOG #1006 shipped the capability to end. The engine job no longer advertises that gap as a daily red: a job that fails closed on no input must not be *scheduled* to obtain no input, because a gate whose first act is to fail is one somebody switches off, and a disabled workflow reads the same as a passing one at a glance. The failing-closed behaviour itself is unchanged and must stay -- advisory applies to findings, never to the instrument.
 
 **Why there is a decision at all.** The vault reads the engine for free: `asvs-scorecard.yml` checks out `MEFORORG/MessageFoundry` with the comment *"public: no token needed"*. The reverse direction has no free version, because the scorecard is in a private repo and the engine is public.
 

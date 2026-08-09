@@ -132,12 +132,33 @@ def test_no_expression_interpolation_inside_run_bodies(workflow: dict) -> None:
             assert "${{" not in str(step.get("run", "")), step.get("name")
 
 
-def test_the_prove_job_does_not_run_on_pull_requests(workflow: dict) -> None:
+def test_the_prove_job_is_dispatch_only(workflow: dict) -> None:
     """On a PR there is no credential, so the prove job would fail for a reason unrelated to the PR.
-    The PR-time question is the wiring's, and `selftest` answers it without a secret."""
+    The PR-time question is the wiring's, and `selftest` answers it without a secret.
+
+    DISPATCH-ONLY as of the 2026-08-09 location decision: the scheduled pass runs in the vault, which
+    is the only repo that can feed it. Both halves are asserted, and the second is the load-bearing
+    one -- a `schedule` arm here would be red every day for a reason nobody can act on from this
+    repository, which is how a gate gets switched off.
+    """
     gate = workflow["jobs"]["prove"]["if"]
-    assert "schedule" in gate and "workflow_dispatch" in gate
+    assert "workflow_dispatch" in gate
+    assert "schedule" not in gate
     assert "pull_request" not in gate
+
+
+def test_the_workflow_has_no_schedule_trigger(raw: str) -> None:
+    """The decision is a property of the TRIGGER, not only of the job gate, and the two can drift
+    apart: a cron could be re-added above while the job's `if:` still excludes it (a workflow that
+    runs nightly to do nothing), or the `if:` widened while no cron exists. Assert the trigger
+    directly so neither half can move alone.
+    """
+    parsed = yaml.safe_load(raw)
+    on = parsed[True] if True in parsed else parsed["on"]
+    assert "schedule" not in on, (
+        "the scheduled prove pass lives in the vault -- a cron here is red every day by construction"
+    )
+    assert "workflow_dispatch" in on
 
 
 def test_the_prove_job_depends_on_the_selftest(workflow: dict) -> None:
