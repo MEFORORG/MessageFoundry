@@ -8713,3 +8713,114 @@ filing.
 **What would NOT be an honest pass.** This cell has a recorded precedent for exactly the wrong move: it briefly scored Pass on 2026-07-20 on a runbook edit and was back to Partial by 07-22. Documenting how to configure secure forwarding is not the engine securely transmitting logs, and the record already shows that purchase being reversed. The other one is flipping `forward_protocol` to TLS while `forward_host` stays None -- nothing transmits either way, so the cell is unchanged and the change only looks like progress.
 
 **Source:** filed 2026-08-08 from the ASVS ledger-coverage sweep of the partial and fail cells that carried no backlog item at all; this cell was one of them. The scorecard is the record of record for the verdict; this item tracks the research toward changing it.
+
+## 1200. the CI docs-only detector exempts EXECUTABLE files under `docs/` from the entire suite
+
+> 🔢 **Filed 2026-08-09 - FIXED in the same change. Reproduced with the workflow's own regex under real `grep -E`, with a negative control.** Value **7/10** · Difficulty **2/10**. `ci.yml`'s `changes` job short-circuits the required `test` legs when every changed path is docs-only. `^docs/` is an alternation branch in that allowlist, so it matches a **`.py` under `docs/`** and short-circuits before the stated `*.py` rule is ever reached. A PR touching only such a file set `code=false` and skipped install, lint, type-check and the whole of pytest.
+
+**Cluster:** CI correctness / gate blindness. **Priority:** P2. **Verdict:** build (done).
+**Severity:** no product effect and no PHI effect. The cost is that a defect here does not fail loudly
+- it REMOVES the thing that would have failed, which is the worst failure mode a gate has.
+
+**Measured, not reasoned.** Extracting the live regex from `ci.yml` and running real `grep -E`:
+
+```
+PRE-FIX (noncode only):
+  docs/security/asvs-apply-cells.py                 -> NON-CODE (suite skipped)
+  docs/benchmarks/.../b5_microbench.py              -> NON-CODE (suite skipped)
+POST-FIX (alwayscode checked first):
+  docs/security/asvs-apply-cells.py                 -> code
+  docs/SECURITY.md                                  -> NON-CODE (still short-circuits)
+  .gitignore                                        -> code (via the noncode branch, BACKLOG #327)
+```
+
+**Blast radius.** Engine: 2 files, both benchmark scripts under
+`docs/benchmarks/results/2026-07-04-adr0071-b5-executor-marshaling/` - low risk. Vault: 3 files,
+including `docs/security/asvs-apply-cells.py`, the tool that WRITES the ASVS record of record and can
+silently un-close an owner-closed cell. **Two mypy errors had been sitting in that file since it was
+written; they could not have survived a single check.** That is the corroboration that the exemption
+was real and not theoretical.
+
+**TWO THINGS MAKE THIS WORSE THAN A MISSING TEST.**
+
+**The comment and the regex disagree, and the comment is what people read.** `ci.yml` states the intent
+in as many words: *"Anything outside the allowlist - any `*.py`, `ide/**`, config, lockfiles, OTHER
+workflows, scripts, samples, harness - counts as CODE and runs the full suite."* The regex does not
+implement that sentence. An auditor reads the comment, agrees with it, and moves on.
+
+**The precedent sits four lines above the defect.** `#327` fixed exactly this shape for `.gitignore` -
+allowlisted as docs-only, so a `.gitignore`-only PR skipped `tests/test_private_paths_stay_ignored.py`,
+*"the one guard that would catch the rule being deleted DID NOT RUN, on exactly the PR shape it exists
+to catch"* - and the lesson was written down in place. The identical defect for `docs/**/*.py` was in
+the regex immediately below that paragraph. **The instance was fixed and the class was left open, with
+the reasoning that would have closed it preserved alongside.** That is the recurring shape: a fix that
+does not generalise is the one that comes back.
+
+**The fix.** An `alwayscode` EXTENSION check evaluated BEFORE the `noncode` allowlist:
+`\.(py|ps1|sh|ts|js|yml|yaml|toml|lock|cfg|ini)$`. An executable file is code wherever it lives. The
+docs-only optimisation is deliberately preserved for actual documents - simply deleting `^docs/` would
+have run the full suite on every prose edit, which is the cost the short-circuit exists to avoid.
+
+**The test drives the DETECTOR, and reads its regexes OUT of `ci.yml`.** A test carrying its own copy
+of the pattern passes forever while the workflow drifts underneath it, reproducing this very defect one
+level up. It asserts the regression in BOTH directions in a single test - the pre-fix logic classifies
+`docs/x.py` as non-code AND the post-fix logic does not - because asserting only the new behaviour
+cannot distinguish a fixed detector from a deleted one (`return True` passes that). It carries a
+negative control, so a regex that accidentally matched everything cannot make every assertion pass
+vacuously.
+
+**Source:** found 2026-08-09 while promoting the ASVS writer out of `docs/security/` (BACKLOG #1200's
+sibling work), and escalated from instance to class by the parallel `asvs-tracking-rework` session,
+which measured the blast radius in both repos and identified the `#327` precedent.
+## 1201. `redacted_settings` served credential-bearing HTTP headers outside a five-name list
+
+> 🔢 **Filed 2026-08-09 - FIXED IN THE SAME CHANGE, and the entry is published WITH the fix rather than ahead of it.** Value **8/10** · Difficulty **2/10**. Header redaction was `str(k).lower() in _SECRET_HEADER_NAMES` -- an exact-membership test against **five** strings (`authorization`, `proxy-authorization`, `x-api-key`, `api-key`, `cookie`). Header names are **operator-authored free text**, typed into `connections.toml` or a Handler, so an exhaustive list cannot exist even in principle. Measured against the shipped list: `X-Auth-Token`, `X-Amz-Security-Token` and `Private-Token` were all returned VERBATIM.
+
+**Cluster:** Security / secret disclosure. **Priority:** P1. **Verdict:** build (done).
+**Severity:** on a first deployment, an operator who configured an outbound connection with a bearer
+credential in any header outside those five would have had it returned by
+`GET /connections/{name}/metadata` to any caller holding `Permission.MONITORING_READ`, and printed by
+`graph --json` to stdout, a CI log and the IDE graph view. No PHI. Conditional, per the not-deployed
+posture -- but the exposure needs no deployment to be *published*, which is why this entry ships with
+its fix.
+
+**Measured before and after, both serializers:**
+
+```
+BEFORE:  X-Auth-Token, X-Amz-Security-Token, Private-Token  -> value returned verbatim
+AFTER :  all redacted to *** on redacted_settings AND display_settings
+KEPT  :  Content-Type, Accept, User-Agent, X-Correlation-Id, X-Request-Id,
+         X-Forwarded-For, X-Api-Version, Idempotency-Key  -> still readable
+```
+
+**This is `#1106` one surface over, and structurally worse.** `#1106` was a settings key that a factory
+renamed across the parameter/setting boundary; settings keys at least come from function signatures and
+are therefore *enumerable*. Header names come from an operator's keyboard. A listed domain was never
+going to cover them, so the test is now by SHAPE -- a substring rule over
+`auth|token|secret|credential|password|passphrase|key` -- with the original five kept as an explicit
+floor, because `cookie` matches no substring rule and must stay named.
+
+**Erring toward redaction, deliberately, with the cost stated.** A false positive costs an operator one
+masked value in a diagnostic view and one line in the not-a-secret list. A false negative serves a
+bearer credential to a monitoring reader. The asymmetry is not close. Two exclusions keep the
+diagnostic view usable: a suffix rule (`-id`, `-url`, `-uri`, `-name`, `-type`, `-version`, `-agent`,
+`-for`), because an `-id` NAMES something rather than being it; and an exact list for
+`Idempotency-Key`, which carries "key", is a client-generated request identifier, and is published in
+the API docs of every service that uses it.
+
+**Found by generalising the `#1106` guard rather than by a report.** `#1106`'s fix added a test that
+enumerates the redaction DOMAIN by AST and executes the real redactor against every member. The obvious
+next question -- "does the sibling control have the same shape?" -- took one probe. That is the whole
+method: the defect class is *a control whose domain is narrower than its surface*, and the way you find
+the next instance is to ask which other control quantifies over a domain it does not derive.
+`tests/test_connection_factory_redaction_domain.py` now covers both.
+
+**Route onward, NOT closed by this.** The shape rule is a heuristic over a free-text domain, so it is a
+floor and not a proof: a header named without any of those substrings (`X-Shared-Signature`, a
+vendor-specific opaque name) still passes. The durable fix is for the header value to never reach a
+serializer resolved -- the `env()`-only treatment `body_secret_value_*` already gets -- and that is a
+larger change than this one.
+
+**Source:** found 2026-08-09 while probing for a second instance of the `#1106` class before building a
+generalised check, on the reasoning that a meta-check built from one instance is shaped like that
+instance. Two domains were probed; this one leaked.
