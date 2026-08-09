@@ -8938,3 +8938,46 @@ is due a re-read - by that session, not by me, since I authored all three fixes.
 allocated. It happened to be next, so nothing collided - but "happened to be next" is exactly the
 reasoning `scripts/coord/alloc.ps1` exists to eliminate, and two sessions doing it simultaneously is
 the documented failure. Allocate, then write.
+
+## 1208. no guard asserts that a credential factory PARAMETER maps to a SETTING name the redactor covers
+
+> 🔢 **Filed 2026-08-09 - not started. THREE MEASURED INSTANCES of one shape, not a hypothesis.** Value **7/10** · Difficulty **4/10**. A connector factory takes a credential parameter and emits it under a DIFFERENT setting name. Every redaction control operates on the SETTING name. Nothing asserts the two agree, so a rename silently moves a credential outside the control's domain.
+
+**Cluster:** Security / secret disclosure - prevention. **Priority:** P2. **Verdict:** build.
+**Severity:** no live defect at filing - the three known instances are closed. This is the guard that
+would have prevented all three, and its absence is why each was found by a person rather than by CI.
+
+**The three instances, all closed, all the same boundary:**
+
+| factory | PARAMETER (classified) | emitted SETTING (was not) | closed by |
+|---|---|---|---|
+| `with_signing` | `private_key` | `sign_private_key` | #1106 |
+| `with_signing` | `private_key_password` | `sign_private_key_password` | #1106 |
+| `Rest` | `proxy` | `proxy_url` | noticed under #1207 |
+
+`_is_secret_setting("private_key")` is True and `_is_secret_setting("sign_private_key")` was False. The
+parameter was covered and the setting it became was not. `proxy` -> `proxy_url` is the same crossing;
+it happens to be harmless because the URL rule now covers it, which is luck rather than design.
+
+**Why the existing guards do not cover it.**
+`test_every_credential_shaped_factory_param_is_classified` reads PARAMETER names - one abstraction level
+away from where redaction operates, which is precisely how #1106 walked through it.
+`test_connection_factory_redaction_domain.py` reads EMITTED settings end to end and would catch a leak,
+but only for a value it can inject: it proves the OUTCOME per factory, not the MAPPING. A credential
+parameter that a factory silently drops, renames into a container, or folds into a composed string is
+outside what either sees.
+
+**Shape of the guard.** For every spec-returning factory, for every credential-shaped parameter, assert
+the value reaches EITHER a setting the redactor masks, OR a documented non-emitting destination. The
+mapping is discoverable by injecting a unique sentinel per parameter and searching the emitted settings
+for it - which is mechanical and needs no per-connector knowledge. A parameter whose sentinel appears
+in NO setting is the interesting case: it was consumed, composed, or dropped, and each of those needs a
+stated reason rather than silence.
+
+**Do NOT implement it by comparing name lists.** That is the defect one level up: `private_key` and
+`sign_private_key` are different strings and any name-based comparison has to be taught the rename,
+which means it cannot catch the next one. Follow the VALUE.
+
+**Source:** raised by the `asvs-tracking-rework` session on 2026-08-09 after `proxy` -> `proxy_url`
+became the third instance: *"that is not a coincidence to note in a residual; it is an argument that the
+rename boundary itself needs a guard"*. Filed before it was forgotten, per that session's request.
