@@ -8766,3 +8766,24 @@ larger change than this one.
 **Source:** found 2026-08-09 while probing for a second instance of the `#1106` class before building a
 generalised check, on the reasoning that a meta-check built from one instance is shaped like that
 instance. Two domains were probed; this one leaked.
+
+## 1203. Decide how the public engine repo obtains the private ASVS scorecard for --prove-absences
+
+> 🔢 **Filed 2026-08-09 - not started. OWNER DECISION, and `.github/workflows/asvs-prove-absences.yml` is RED on the schedule until it is made.** Value **7/10** · Difficulty **2/10**. `--prove-absences` is now wired and runs daily, but its input -- `docs/security/asvs-scorecard.toml` -- lives in the private vault while the job runs in the public engine repo. The credential path is implemented and OFF by default; the recommended alternative needs no credential at all. This item is the decision, not the build.
+
+**Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** decide.
+**Severity:** none to the engine. The cost of not deciding is that the daily job stays red and the 276 absence claims stay unproven by execution -- the state BACKLOG #1006 shipped the capability to end.
+
+**Why there is a decision at all.** The vault reads the engine for free: `asvs-scorecard.yml` checks out `MEFORORG/MessageFoundry` with the comment *"public: no token needed"*. The reverse direction has no free version, because the scorecard is in a private repo and the engine is public.
+
+**The three options, with what each actually costs.**
+
+1. **The engine holds a vault-read credential.** Implemented and off: `vars.ASVS_VAULT_REPO` and `secrets.ASVS_VAULT_READ_TOKEN` do not exist, and the workflow does not create them. Setting both switches it on with no code change. The cost is a security-boundary cost, not a maintenance one: the vault exists so that a compromise of the public repo does not yield the security corpus, and a vault-read token in the public repo's secret store collapses that boundary to a single credential. The checkout is already sparse to the one scorecard file, cone mode off, so the *materialised* blast radius is minimised -- that mitigates the checkout, not the token.
+2. **The prover runs in the vault instead** -- a NEW workflow beside `asvs-scorecard.yml`, not inside it, so that job's deliberate stdlib-only, five-minute constraint is untouched. The vault already checks the engine out with no token, so this needs **no new credential in either direction**. Its cost is that the vault pays an install against a lockfile it does not own. `scripts/asvs/prove_report.py` and `scorecard.py` run there unchanged, pointed at a local scorecard and an `engine/` checkout. **This is the recommendation.**
+3. **A self-hosted runner** that already holds both checkouts. Cheapest operationally; a self-hosted runner attached to a public repo is its own well-known hazard.
+
+**The output points the same way as the input, and this is the half that is easy to miss.** The prover's problem lines name the cell and the control that would not prove, which is a ranked list of the weakest controls on the record -- the same disclosure that got the *"verdict-attributed anchor manifest"* rejected in the 2026-08-08 tracking-rework diagnosis. `prove_report.py` therefore suppresses them by default and prints only counts, with `--detail` reserved for a private log. So the public repo is the wrong holder of the input **and** the wrong host for the output, and neither is fixed by moving the environment -- whereas option 2's only cost *is* the environment.
+
+**What would NOT be an honest resolution.** Making the no-input path green. Advisory applies to findings, never to the instrument: a run that obtained no scorecard scanned zero claims and is not evidence about any of them, which is why it exits 2. A green run that measured nothing is precisely the class [ADR 0158](adr/0158-silent-controls-green-signals-that-mean-nothing-and-shape-over-detection.md) exists to name, and it is the class this whole wiring was built to end. If the daily red is unwanted before a decision is made, **disable the workflow** -- that is honest, and it is visible in the workflow list.
+
+**Source:** filed 2026-08-09 while wiring `--prove-absences` into CI, the follow-up named in #1006's own closing banner. Measured against vault `origin/main` at `1a59e4a195b12bfb54af96397fa4c4e076cc213d`: 276 absence claims, 0 carrying `observable`, 0 carrying `mutation_path`, and 0 references to `--prove-absences` under `.github/` in either repo before this wiring landed. Note that #1006's banner narrates *"~81 existing absence claims"*; the record carries 276, so that figure is stale and should not be quoted onward.
