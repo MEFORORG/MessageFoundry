@@ -668,6 +668,89 @@ _SECRET_HEADER_NAMES = frozenset(
     {"authorization", "proxy-authorization", "x-api-key", "api-key", "cookie"}
 )
 
+#: Substrings that make a header name credential-bearing. BACKLOG #1201.
+#:
+#: The five names above were the WHOLE test, by exact membership. That is the same defect as #1106 and
+#: strictly worse, because header names are OPERATOR-AUTHORED FREE TEXT -- there is no factory, no
+#: signature and no registry to enumerate, so an exhaustive list cannot exist even in principle.
+#: Measured 2026-08-09 against the shipped list: ``X-Auth-Token``, ``X-Amz-Security-Token`` (an AWS
+#: SigV4 session credential) and ``Private-Token`` (GitLab's standard auth header) were all returned
+#: VERBATIM by ``/metadata`` and printed by ``graph --json``.
+#:
+#: So the test is by SHAPE, with the explicit set kept as a floor rather than deleted -- ``cookie``
+#: matches no substring rule and must stay named.
+_SECRET_HEADER_SUBSTRINGS = (
+    "auth",
+    "token",
+    "secret",
+    "credential",
+    "password",
+    "passphrase",
+    "key",
+)
+
+#: Header names that CONTAIN a secret-ish substring and are not credentials. Each is here because
+#: redacting it would destroy operator-visible routing or tracing information that is public by nature.
+#: Suffix-matched, because the convention is consistent: an ``-id`` names something, it is not the thing.
+_NOT_SECRET_HEADER_SUFFIXES = (
+    "-id",
+    "-url",
+    "-uri",
+    "-name",
+    "-type",
+    "-version",
+    "-agent",
+    "-for",
+)
+
+#: Exact non-credential headers whose name defeats the suffix rule. ``Idempotency-Key`` is the live one:
+#: it carries "key" and is a client-generated REQUEST identifier, published in the API docs of every
+#: service that uses it.
+_NOT_SECRET_HEADERS = frozenset({"idempotency-key", "x-idempotency-key"})
+
+
+#: Value shapes that are credentials whatever the header is called. The NAME rule below is a heuristic
+#: over free text and therefore has a permanent blind spot -- a vendor picks ``X-Shared-Signature`` or an
+#: opaque internal name and no substring matches. This is the second arm, and it closes that blind spot
+#: from the other side: it does not matter what the header is called if the VALUE is recognisably a
+#: credential. Deliberately narrow, because a false positive here masks a value an operator may need:
+#:   - an RFC 7235 auth scheme prefix (``Bearer``/``Basic``/``Digest``/``Negotiate``/``AWS4-HMAC-...``)
+#:   - a JWT, which is unmistakable and is what most opaque bearer headers actually carry
+_CREDENTIAL_VALUE_PREFIXES = ("bearer ", "basic ", "digest ", "negotiate ", "aws4-hmac")
+_JWT_SHAPE = re.compile(r"^eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]+$")
+
+
+def _looks_like_a_credential_value(value: object) -> bool:
+    """Is this VALUE a credential regardless of what the header is called?"""
+    if not isinstance(value, str):
+        return False
+    v = value.strip()
+    return v.lower().startswith(_CREDENTIAL_VALUE_PREFIXES) or bool(_JWT_SHAPE.match(v))
+
+
+def _is_secret_header(name: str, value: object = None) -> bool:
+    """Would printing this header's VALUE disclose a credential?
+
+    TWO ARMS, because either alone has a gap. The NAME arm (see :data:`_SECRET_HEADER_SUBSTRINGS`) is a
+    heuristic over operator-authored free text, so an opaque vendor header name defeats it. The VALUE
+    arm catches those, and cannot be defeated by naming, but only recognises shapes it knows. Together
+    they cover a name that looks like a credential OR a value that is one; neither is a proof.
+
+    A false positive costs an operator one redacted value in a diagnostic view and one line in
+    :data:`_NOT_SECRET_HEADERS`; a false negative serves a bearer credential to anyone holding
+    ``MONITORING_READ``. The asymmetry is not close, so this errs toward redacting -- but the VALUE arm
+    is kept narrow (auth-scheme prefixes and JWTs only) rather than "long and high-entropy", because
+    masking every long header value would quietly destroy the view rather than protect it.
+    """
+    if _looks_like_a_credential_value(value):
+        return True
+    low = str(name).strip().lower()
+    if low in _SECRET_HEADER_NAMES:
+        return True
+    if low in _NOT_SECRET_HEADERS or low.endswith(_NOT_SECRET_HEADER_SUFFIXES):
+        return False
+    return any(tok in low for tok in _SECRET_HEADER_SUBSTRINGS)
+
 
 def _is_secret_setting(name: str) -> bool:
     """Is ``name`` a credential-bearing settings key?
@@ -772,10 +855,7 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
         elif is_secret:
             out[name] = "***"
         elif name == "headers" and isinstance(value, dict):
-            out[name] = {
-                k: ("***" if str(k).lower() in _SECRET_HEADER_NAMES else v)
-                for k, v in value.items()
-            }
+            out[name] = {k: ("***" if _is_secret_header(k, v) else v) for k, v in value.items()}
         else:
             out[name] = value
     return out
