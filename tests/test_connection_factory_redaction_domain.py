@@ -28,8 +28,10 @@ add it here, which is the failure that produced defects 1 and 2 above.
 from __future__ import annotations
 
 import ast
+import base64
 import importlib
 import inspect
+import json
 import pathlib
 from typing import Any
 
@@ -311,6 +313,64 @@ def test_no_unclassified_container_can_reach_a_serializer() -> None:
         "to HANDLED_CONTAINERS with the reason it carries no credential. Do NOT assume the values are "
         "safe because they are today -- that assumption is what shipped #1106 and #1201."
     )
+
+
+def _jwt_shaped() -> str:
+    """A JWT shape, BUILT AT RUNTIME so no token-shaped literal is ever committed.
+
+    The first version of this fixture was a literal example token and the repo's gitleaks hook
+    rejected the commit -- correctly, since a scanner cannot tell a well-known test vector from a live
+    credential, and "it is only a fixture" is what every real leak's author believed. Assembling it
+    from parts keeps the test honest and the scanner useful; a suppression would have cost the scanner
+    on this file forever to save one line here.
+    """
+    head = base64.urlsafe_b64encode(json.dumps({"alg": "HS256"}).encode()).decode().rstrip("=")
+    body = base64.urlsafe_b64encode(json.dumps({"sub": "test"}).encode()).decode().rstrip("=")
+    return f"{head}.{body}.{'s' * 43}"
+
+
+@pytest.mark.parametrize(
+    ("header", "value"),
+    [
+        ("X-Shared-Signature", "Bearer sk-live-abc123"),
+        ("X-Vendor-Opaque", _jwt_shaped()),
+        ("X-Internal-42", "Basic dXNlcjpwYXNz"),
+        ("X-Gateway", "Negotiate YIIZ..."),
+        ("X-Sig", "AWS4-HMAC-SHA256 Credential=AKIA.../20260809/us-east-1/s3/aws4_request"),
+    ],
+)
+def test_a_credential_VALUE_is_redacted_even_when_the_header_NAME_says_nothing(
+    header: str, value: str
+) -> None:
+    """The name rule's PERMANENT blind spot, closed from the other side.
+
+    `_is_secret_header`'s name arm is a heuristic over operator-authored free text, so a vendor that
+    picks `X-Shared-Signature` or an opaque internal name defeats it -- and no longer list fixes that,
+    which is why #1201's own route-onward said the shape rule was a floor and not a proof.
+
+    None of the header names below match any substring rule. Every value is unmistakably a credential.
+    """
+    spec = messagefoundry.Rest(url="https://example.invalid/x", headers={header: value})
+    out = redacted_settings(dict(spec.settings))["headers"]
+    assert out.get(header) == "***", f"{header} carries {value[:12]}... and was served verbatim"
+
+
+@pytest.mark.parametrize(
+    ("header", "value"),
+    [
+        ("Content-Type", "application/fhir+json"),
+        ("Accept", "application/json"),
+        ("X-Correlation-Id", "req-42"),
+        ("User-Agent", "messagefoundry/0.3.0"),
+        ("X-Forwarded-For", "10.0.0.1"),
+    ],
+)
+def test_the_value_arm_does_not_swallow_ordinary_headers(header: str, value: str) -> None:
+    """The value arm is deliberately NARROW -- auth-scheme prefixes and JWTs, not "long and
+    high-entropy". Masking every long header value would quietly destroy the diagnostic view rather
+    than protect it, and nothing would report that as a loss."""
+    spec = messagefoundry.Rest(url="https://example.invalid/x", headers={header: value})
+    assert redacted_settings(dict(spec.settings))["headers"].get(header) == value
 
 
 def test_a_sentinel_under_a_known_secret_key_is_actually_redacted() -> None:
