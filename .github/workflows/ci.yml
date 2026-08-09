@@ -845,7 +845,33 @@ jobs:
           # ungated backlog guards above were added for. Treating it as code costs one suite run on a
           # rare PR; the alternative costs the publishing boundary, silently.
           noncode='(\.md$|^docs/|^LICENSE$|^NOTICE$|^AUTHORS$|^\.editorconfig$|^\.gitattributes$|^\.github/(ISSUE_TEMPLATE/|PULL_REQUEST_TEMPLATE))'
+          # EXTENSION OVERRIDE, EVALUATED FIRST (BACKLOG #1200). An executable file is CODE wherever it
+          # lives, including under docs/.
+          #
+          # The paragraph above states the intent exactly -- "any *.py ... counts as CODE" -- and the
+          # regex did not implement it, because `^docs/` is an alternation branch that matches a .py
+          # under docs/ and short-circuits before the *.py rule is ever reached. An auditor reads the
+          # comment, agrees with it, and moves on. Measured on 2026-08-09:
+          # docs/security/asvs-apply-cells.py classified NON-CODE -- the tool that WRITES the ASVS
+          # record of record, able to silently un-close an owner-closed cell, exempt from lint, mypy
+          # and the entire pytest suite by virtue of its directory. Two mypy errors had been sitting in
+          # it since it was written; they could not have survived a single check.
+          #
+          # THE PRECEDENT IS FOUR LINES ABOVE THIS ONE. BACKLOG #327 fixed exactly this shape for
+          # `.gitignore` and wrote the lesson down -- and the identical defect for docs/**/*.py sat in
+          # the regex immediately below the paragraph explaining it. The instance was fixed and the
+          # class left open, with the reasoning that would have closed it preserved in place. Hence an
+          # EXTENSION rule rather than another one-path exception: the next executable file someone
+          # puts under docs/ must not need this discovered a third time.
+          #
+          # The docs-only optimisation is deliberately preserved for actual documents -- deleting
+          # `^docs/` outright would run the full suite on every prose edit, which is the cost this
+          # short-circuit exists to avoid. Order matters: this is checked BEFORE `noncode`.
+          alwayscode='\.(py|ps1|sh|ts|js|yml|yaml|toml|lock|cfg|ini)$'
           if [ -z "$changed" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          elif echo "$changed" | grep -qE "$alwayscode"; then
+            # An executable/config file changed, wherever it lives -> run the full suite.
             echo "code=true" >> "$GITHUB_OUTPUT"
           elif echo "$changed" | grep -qvE "$noncode"; then
             # At least one changed path is NOT docs-only -> run the full suite.

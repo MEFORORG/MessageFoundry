@@ -8713,3 +8713,62 @@ filing.
 **What would NOT be an honest pass.** This cell has a recorded precedent for exactly the wrong move: it briefly scored Pass on 2026-07-20 on a runbook edit and was back to Partial by 07-22. Documenting how to configure secure forwarding is not the engine securely transmitting logs, and the record already shows that purchase being reversed. The other one is flipping `forward_protocol` to TLS while `forward_host` stays None -- nothing transmits either way, so the cell is unchanged and the change only looks like progress.
 
 **Source:** filed 2026-08-08 from the ASVS ledger-coverage sweep of the partial and fail cells that carried no backlog item at all; this cell was one of them. The scorecard is the record of record for the verdict; this item tracks the research toward changing it.
+
+## 1200. the CI docs-only detector exempts EXECUTABLE files under `docs/` from the entire suite
+
+> 🔢 **Filed 2026-08-09 - FIXED in the same change. Reproduced with the workflow's own regex under real `grep -E`, with a negative control.** Value **7/10** · Difficulty **2/10**. `ci.yml`'s `changes` job short-circuits the required `test` legs when every changed path is docs-only. `^docs/` is an alternation branch in that allowlist, so it matches a **`.py` under `docs/`** and short-circuits before the stated `*.py` rule is ever reached. A PR touching only such a file set `code=false` and skipped install, lint, type-check and the whole of pytest.
+
+**Cluster:** CI correctness / gate blindness. **Priority:** P2. **Verdict:** build (done).
+**Severity:** no product effect and no PHI effect. The cost is that a defect here does not fail loudly
+- it REMOVES the thing that would have failed, which is the worst failure mode a gate has.
+
+**Measured, not reasoned.** Extracting the live regex from `ci.yml` and running real `grep -E`:
+
+```
+PRE-FIX (noncode only):
+  docs/security/asvs-apply-cells.py                 -> NON-CODE (suite skipped)
+  docs/benchmarks/.../b5_microbench.py              -> NON-CODE (suite skipped)
+POST-FIX (alwayscode checked first):
+  docs/security/asvs-apply-cells.py                 -> code
+  docs/SECURITY.md                                  -> NON-CODE (still short-circuits)
+  .gitignore                                        -> code (via the noncode branch, BACKLOG #327)
+```
+
+**Blast radius.** Engine: 2 files, both benchmark scripts under
+`docs/benchmarks/results/2026-07-04-adr0071-b5-executor-marshaling/` - low risk. Vault: 3 files,
+including `docs/security/asvs-apply-cells.py`, the tool that WRITES the ASVS record of record and can
+silently un-close an owner-closed cell. **Two mypy errors had been sitting in that file since it was
+written; they could not have survived a single check.** That is the corroboration that the exemption
+was real and not theoretical.
+
+**TWO THINGS MAKE THIS WORSE THAN A MISSING TEST.**
+
+**The comment and the regex disagree, and the comment is what people read.** `ci.yml` states the intent
+in as many words: *"Anything outside the allowlist - any `*.py`, `ide/**`, config, lockfiles, OTHER
+workflows, scripts, samples, harness - counts as CODE and runs the full suite."* The regex does not
+implement that sentence. An auditor reads the comment, agrees with it, and moves on.
+
+**The precedent sits four lines above the defect.** `#327` fixed exactly this shape for `.gitignore` -
+allowlisted as docs-only, so a `.gitignore`-only PR skipped `tests/test_private_paths_stay_ignored.py`,
+*"the one guard that would catch the rule being deleted DID NOT RUN, on exactly the PR shape it exists
+to catch"* - and the lesson was written down in place. The identical defect for `docs/**/*.py` was in
+the regex immediately below that paragraph. **The instance was fixed and the class was left open, with
+the reasoning that would have closed it preserved alongside.** That is the recurring shape: a fix that
+does not generalise is the one that comes back.
+
+**The fix.** An `alwayscode` EXTENSION check evaluated BEFORE the `noncode` allowlist:
+`\.(py|ps1|sh|ts|js|yml|yaml|toml|lock|cfg|ini)$`. An executable file is code wherever it lives. The
+docs-only optimisation is deliberately preserved for actual documents - simply deleting `^docs/` would
+have run the full suite on every prose edit, which is the cost the short-circuit exists to avoid.
+
+**The test drives the DETECTOR, and reads its regexes OUT of `ci.yml`.** A test carrying its own copy
+of the pattern passes forever while the workflow drifts underneath it, reproducing this very defect one
+level up. It asserts the regression in BOTH directions in a single test - the pre-fix logic classifies
+`docs/x.py` as non-code AND the post-fix logic does not - because asserting only the new behaviour
+cannot distinguish a fixed detector from a deleted one (`return True` passes that). It carries a
+negative control, so a regex that accidentally matched everything cannot make every assertion pass
+vacuously.
+
+**Source:** found 2026-08-09 while promoting the ASVS writer out of `docs/security/` (BACKLOG #1200's
+sibling work), and escalated from instance to class by the parallel `asvs-tracking-rework` session,
+which measured the blast radius in both repos and identified the `#327` precedent.
