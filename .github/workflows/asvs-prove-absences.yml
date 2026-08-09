@@ -26,9 +26,10 @@ name: ASVS prove-absences
 # ---------------------------------------------------------------------------------------------------
 # THE INPUT PROBLEM, STATED RATHER THAN ENGINEERED AROUND. This is a finding, not a solved problem.
 #
-# The scorecard lives in a PRIVATE repo (the vault) and this one is PUBLIC. The vault's own workflow
-# reads the engine freely -- `repository: MEFORORG/MessageFoundry` with the comment "public: no token
-# needed" -- but the reverse direction has no free version. Every honest option costs something:
+# The scorecard lives in THE VAULT, which is private; this repository is public. The vault's own
+# workflow reads the engine freely -- `repository: MEFORORG/MessageFoundry` with the comment "public:
+# no token needed" -- but the reverse direction has no free version. Every honest option costs
+# something:
 #
 #   (a) THIS REPO HOLDS A READ CREDENTIAL FOR THE VAULT. What the two knobs below implement, and it
 #       is OFF: neither `vars.ASVS_VAULT_REPO` nor `secrets.ASVS_VAULT_READ_TOKEN` exists today, and
@@ -194,7 +195,7 @@ jobs:
           else
             echo "scorecard input : NONE"
             echo "mode=none" >> "$GITHUB_OUTPUT"
-            echo "::error::ASVS prove-absences has NO SCORECARD INPUT, so this run scanned zero absence claims and is not evidence about any of them. The scorecard lives in a private repo and this one is public; see the block at the top of .github/workflows/asvs-prove-absences.yml for the three options and the recommendation. Do not make this path green -- either configure an input or disable the workflow."
+            echo "::error::ASVS prove-absences has NO SCORECARD INPUT, so this run scanned zero absence claims and is not evidence about any of them. The scorecard lives in the vault, which is private, while this repository is public; see the block at the top of .github/workflows/asvs-prove-absences.yml for the three options and the recommendation. Do not make this path green -- either configure an input or disable the workflow."
           fi
 
       - name: Check out ONLY the scorecard from the vault

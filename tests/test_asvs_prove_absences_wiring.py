@@ -86,9 +86,9 @@ def test_every_action_is_sha_pinned_with_a_version_comment(raw: str) -> None:
 
 
 def test_checkouts_do_not_persist_credentials(workflow: dict) -> None:
-    """The vault checkout carries a read token for a PRIVATE repo. Persisting it into .git/config
-    would leave it available to every later step in the job for no reason -- only the files are
-    wanted."""
+    """The vault checkout carries a read token for the vault, which is private. Persisting it into
+    .git/config would leave it available to every later step in the job for no reason -- only the
+    files are wanted."""
     found = 0
     for job in workflow["jobs"].values():
         for step in job["steps"]:

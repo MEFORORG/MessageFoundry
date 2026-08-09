@@ -1013,6 +1013,9 @@ def test_xml_import_scanner_sees_indented_imports() -> None:
 _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     # ADR 0156: SHA-256 over the ASVS corpus FILE to pin it to the tagged release. No key.
     "scripts/asvs/scorecard.py": frozenset({"hashlib"}),
+    # ADR 0156: SHA-256 over the ASVS SCORECARD file, printed truncated so a --prove-absences run
+    # states which revision of the record it read. No key.
+    "scripts/asvs/prove_report.py": frozenset({"hashlib"}),
     "messagefoundry_webconsole/_security.py": frozenset({"secrets"}),
     "tee/__main__.py": frozenset({"ssl"}),
     "tee/anon/keying.py": frozenset({"hashlib"}),

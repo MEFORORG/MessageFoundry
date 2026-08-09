@@ -65,6 +65,9 @@ _NOT_KEY_MATERIAL: dict[str, str] = {
     "Config fingerprint": "a keyless content hash for change attribution",
     "ASVS corpus pin": "a keyless content hash over a build input (the OWASP ASVS corpus file), "
     "not a key, a secret, or a message authenticator",
+    "ASVS scorecard revision identifier": "a keyless content hash over the scorecard file, printed "
+    "truncated so a --prove-absences run states which revision of the record it read; not a key, a "
+    "secret, or a message authenticator, and unlike the corpus pin above nothing is gated on it",
     "Engine wheel attestation": "a keyless digest over the installed distribution, verified against "
     "a recorded value; no key is involved on either side",
     "AD transport": "a TLS hop whose key material is the OS/directory trust store, not engine-held",
