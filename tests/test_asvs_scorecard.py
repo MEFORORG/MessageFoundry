@@ -160,6 +160,177 @@ def test_anchor_goes_red_when_the_token_is_gone(tmp_path: Path) -> None:
     assert not f.ok and "no longer contains" in f.problems[0]
 
 
+def test_a_gone_token_is_not_offered_a_replacement_anchor(tmp_path: Path) -> None:
+    """The refusal is ENFORCED, not a convention, because the convention is what decays.
+
+    A GONE token has four possible causes and only two are re-anchors: it moved, it was renamed, THE
+    GAP IT CERTIFIED WAS CLOSED, or its control was removed. A tool that helpfully suggests the
+    nearest similar line collapses all four into the first, and the (c) case is the dangerous one --
+    re-anchoring to the code that CLOSED a gap, while the residual still narrates the gap, yields an
+    anchor that resolves forever while asserting the opposite of the truth.
+
+    Measured instance: 3.7.5 at engine `71dfc2ce`. The file below reproduces its shape -- the old
+    token is gone and a plausible near-match sits right there, which is exactly when a fuzzy
+    suggestion would be most tempting and most wrong.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        'testpaths = ["tests", "packaging/messagefoundry-webconsole/tests"]\n', encoding="utf-8"
+    )
+    cells = [
+        Cell(
+            id="3.7.5",
+            level=3,
+            verdict="partial",
+            evidence=(Anchor("messagefoundry/m.py", 1, 'testpaths = ["tests"]'),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert not f.ok
+    msg = f.problems[0]
+    # It must NOT name a line to move to, nor tell the reader to re-anchor.
+    assert "did you mean" not in msg.lower()
+    assert "re-anchor to" not in msg.lower()
+    assert "Do not re-anchor by default" in msg
+    # And it must put the retire-vs-rescore fork in front of the reader.
+    assert "CLOSED" in msg and "re-score" in msg
+
+
+def test_a_unique_token_that_drifted_is_advisory_not_fatal(tmp_path: Path) -> None:
+    """DRIFT is not INVALIDATION. The token sits far below its recorded line but occurs exactly once.
+
+    Execution only reaches the drift branch PAST the ``occurrences > 1`` guard, so uniqueness is what
+    pins the evidence and the line number is navigation. Failing here would assert that the claim sits
+    where it sat, which is a different proposition from the one this gate exists to check.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    body = "\n".join(["filler"] * 300 + ["tls_cert_file = None"] + ["tail"] * 5)
+    (tmp_path / "messagefoundry" / "m.py").write_text(body, encoding="utf-8")
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(Anchor("messagefoundry/m.py", 5, "tls_cert_file"),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert f.ok and f.problems == []
+    assert len(f.advisories) == 1
+    # The advisory carries BOTH numbers and the signed delta, because "it moved" is not actionable and
+    # "301 not 5" is. A re-anchor pass reads this line and needs no second lookup.
+    assert "recorded at line 5" in f.advisories[0]
+    assert "actually at 301" in f.advisories[0]
+    assert "+296" in f.advisories[0]
+
+
+def test_an_ambiguous_token_stays_fatal_even_when_it_drifted(tmp_path: Path) -> None:
+    """Where the line IS load-bearing, drift must not soften it.
+
+    With two occurrences a re-anchor to the WRONG one cannot be detected — the defect this module's
+    uniqueness rule exists to catch. Advisory treatment is reserved for the case where the token
+    itself certifies the evidence.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    body = "\n".join(["filler"] * 200 + ["dupe_token"] + ["filler"] * 200 + ["dupe_token"])
+    (tmp_path / "messagefoundry" / "m.py").write_text(body, encoding="utf-8")
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(Anchor("messagefoundry/m.py", 1, "dupe_token"),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert not f.ok and "AMBIGUOUS" in f.problems[0]
+    assert f.advisories == []
+
+
+def test_a_small_movement_is_advisory_too_not_silent(tmp_path: Path) -> None:
+    """CONTRACT CHANGE 2026-08-09, and this test previously asserted the opposite.
+
+    It used to be named ``test_ordinary_small_movement_is_neither_problem_nor_advisory`` and pinned a
+    six-line offset as reporting NOTHING, because a 40-line window absorbed it. That silence was the
+    defect: measured against a green record, 725 of 1,980 anchors (36.6%) were inside the window and
+    therefore invisible, with the worst at 39 against a limit of 40. An advisory that fires only past
+    the window merges into an empty list and prevents the next recurrence while surfacing none of the
+    accumulation.
+
+    So the rule is now: any nonzero offset is advisory. The window is gone from the decision path.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    body = "\n".join(["filler"] * 20 + ["tls_cert_file = None"] + ["filler"] * 20)
+    (tmp_path / "messagefoundry" / "m.py").write_text(body, encoding="utf-8")
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(Anchor("messagefoundry/m.py", 15, "tls_cert_file"),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert f.problems == []  # still not fatal
+    assert len(f.advisories) == 1 and "+6" in f.advisories[0]
+
+
+def test_an_exactly_located_anchor_reports_nothing(tmp_path: Path) -> None:
+    """The control, in the shape the new contract needs.
+
+    Its predecessor guarded against "the window stopped absorbing anything and nothing said so". That
+    risk is retired with the window. The live risk now is the mirror image: a resolver that reports
+    drift for EVERY anchor — an off-by-one in the line derivation would do it — while the advisory
+    tests above still pass, because they only assert that an advisory appears. This asserts the zero.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    body = "\n".join(["filler"] * 20 + ["tls_cert_file = None"] + ["filler"] * 20)
+    (tmp_path / "messagefoundry" / "m.py").write_text(body, encoding="utf-8")
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            # 20 filler lines, so the token is line 21. Recorded exactly.
+            evidence=(Anchor("messagefoundry/m.py", 21, "tls_cert_file"),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert f.problems == [] and f.advisories == []
+
+
+def test_a_multi_line_expect_token_resolves_and_reports_its_start_line(tmp_path: Path) -> None:
+    """42 of the ~1,980 live ``expect`` tokens SPAN A NEWLINE.
+
+    The old check matched against joined text, so nothing ever forbade a multi-line token and 42
+    accumulated. Deriving the line by scanning ``splitlines()`` finds none of them and raises on the
+    lookup — measured, it bit the parallel session's first measurement script. Counting newlines before
+    the character offset handles a multi-line token as naturally as a single-line one, and the line it
+    reports is the token's FIRST line, which is what a reader navigating to it wants.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    body = "\n".join(["filler"] * 10 + ["def f(", "    x: int,", ") -> None:"] + ["tail"] * 5)
+    (tmp_path / "messagefoundry" / "m.py").write_text(body, encoding="utf-8")
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(Anchor("messagefoundry/m.py", 3, "def f(\n    x: int,"),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert f.problems == []  # it resolves; a line-scanning implementation would not find it at all
+    assert len(f.advisories) == 1
+    assert "actually at 11" in f.advisories[0]  # the token's FIRST line, not its last
+
+
 def test_anchor_goes_red_when_the_file_is_gone(tmp_path: Path) -> None:
     cells = [
         Cell(
