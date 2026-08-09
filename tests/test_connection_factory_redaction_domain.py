@@ -1,0 +1,192 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
+"""Every connection factory's EMITTED settings survive `redacted_settings` (BACKLOG #1106).
+
+This is the third guard against one class, and the first two both failed the same way: **they chose a
+domain narrower than the surface.**
+
+1. The original exhaustive redaction test built its sentinels *from* ``_SECRET_SETTING_KEYS``, so a
+   credential never added to that frozenset could not fail it. Four did exactly that -- ``ws_password``,
+   ``ws_username``, ``client_key_password`` and ``signing_key_password`` -- and were served in plaintext
+   by ``GET /connections/{name}/metadata`` to ``Role.VIEWER``, past green CI.
+2. Its replacement, ``test_every_credential_shaped_factory_param_is_classified``, reads connector
+   factory **parameter names**. That is one abstraction level away from the names redaction actually
+   operates on, and ``with_signing`` renames across exactly that boundary: the parameter is
+   ``private_key`` (classified, because ``_is_secret_setting('private_key')`` is True) and the setting
+   it emits is ``sign_private_key`` (not classified). The parameter was covered and the setting leaked.
+
+So this one asserts the property END TO END, at the level the control operates: **call the factory, take
+the settings it actually emitted, run the real redactor over them, and require that nothing recognisably
+secret survives.** No frozenset is consulted, no parameter name is inspected, and the sentinel values
+come from this test rather than from the thing under test.
+
+**The domain is DERIVED, never listed.** It is every function in the package annotated to return a
+``ConnectionSpec``, found by AST. A new factory joins the domain by existing; nobody has to remember to
+add it here, which is the failure that produced defects 1 and 2 above.
+"""
+
+from __future__ import annotations
+
+import ast
+import importlib
+import inspect
+import pathlib
+from typing import Any
+
+import pytest
+
+import messagefoundry
+from messagefoundry.config.wiring import redacted_settings
+
+PKG = pathlib.Path(messagefoundry.__file__).resolve().parent
+
+#: A value this test invents. Deriving it from the code under test is how guard 1 blinded itself.
+SENTINEL = "MFTEST-CREDENTIAL-MUST-NOT-SURVIVE"
+
+#: Substrings that make a settings KEY look like it carries a credential. Deliberately broad: a false
+#: positive here costs one explicit declaration, a false negative costs a served secret.
+CREDENTIAL_ISH = ("password", "secret", "token", "key", "credential", "passphrase")
+
+#: Keys that contain a credential-ish substring but are NOT secrets, each needing a stated reason.
+#: This is the only allowlist in the file and it is about KEYS, not about values.
+NOT_A_SECRET: dict[str, str] = {
+    "sign_key_id": "a key IDENTIFIER (JWS kid) -- names which key, carries no key material",
+    "key_id": "identifier, not material",
+    "tls_key_file": "a PATH to key material, not the material; the file's contents never enter settings",
+    "encryption_key_file": "a PATH, as above",
+    "smart_private_key_file": "a PATH, as above",
+    "auth_style": "no credential; matched only because callers sometimes spell it *_key",
+}
+
+
+#: Name endings that make a credential-ish parameter NOT a credential: it names or locates one rather
+#: than carrying it. The exclusion belongs HERE, at injection, not in an allowlist of leaks -- feeding a
+#: sentinel to `key_id` and then reporting that it was not redacted would be the TEST being wrong, since
+#: an identifier is not supposed to be redacted. Three of the four factories tripped exactly that on the
+#: first run (`smart_key_id`, `smart_token_url`, `oauth2_token_url`); only `with_signing` survived as a
+#: real finding, so getting this boundary right is what separates the signal from the noise.
+NOT_CREDENTIAL_SUFFIX = ("_id", "_url", "_uri", "_file", "_path", "_name", "_style", "_type")
+
+
+def _is_credential_param(name: str) -> bool:
+    low = name.lower()
+    if low.endswith(NOT_CREDENTIAL_SUFFIX):
+        return False
+    return any(t in low for t in CREDENTIAL_ISH)
+
+
+def _factories_returning_a_spec() -> list[tuple[str, str]]:
+    """AST-enumerate `(module, name)` for every function annotated `-> ConnectionSpec`.
+
+    Annotation-based on purpose: it needs no import, no execution and no registry, so a factory cannot
+    hide from the domain by being unexported. `messagefoundry.__all__` is NOT the domain -- four of
+    these are public and absent from it, and one of those four is the leak this file exists for.
+    """
+    found: list[tuple[str, str]] = []
+    for path in sorted(PKG.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:  # pragma: no cover - a syntax error fails the rest of the suite anyway
+            continue
+        mod = ".".join(path.relative_to(PKG.parent).with_suffix("").parts)
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                and node.returns is not None
+                and "ConnectionSpec" in ast.unparse(node.returns)
+                and not node.name.startswith("_")
+            ):
+                found.append((mod, node.name))
+    return found
+
+
+def _decorator_style(mod: str, name: str) -> Any | None:
+    """Return the callable if it is a `(spec, *, ...) -> ConnectionSpec` decorator, else None.
+
+    Those are the ones that ADD settings to an existing spec, which is where a rename across the
+    parameter/setting boundary can happen. Base constructors are covered by their own connector tests.
+    """
+    fn = getattr(importlib.import_module(mod), name, None)
+    if fn is None or not callable(fn):
+        return None
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):  # pragma: no cover
+        return None
+    return fn if params and params[0].name == "spec" else None
+
+
+def _call_with_sentinels(fn: Any) -> Any:
+    """Invoke the factory, passing SENTINEL for every credential-shaped keyword parameter."""
+    kwargs: dict[str, Any] = {}
+    for p in list(inspect.signature(fn).parameters.values())[1:]:
+        if p.kind not in (p.KEYWORD_ONLY, p.POSITIONAL_OR_KEYWORD):
+            continue
+        looks_secret = _is_credential_param(p.name)
+        if looks_secret:
+            kwargs[p.name] = SENTINEL
+        elif p.default is inspect.Parameter.empty:
+            # A required non-credential argument. Any plausible string keeps the call alive; the
+            # assertion is about credential values, not this one.
+            kwargs[p.name] = "https://example.invalid/token" if "url" in p.name else "x"
+    base = messagefoundry.Rest(url="https://example.invalid/endpoint")
+    return fn(base, **kwargs)
+
+
+FACTORIES = [
+    (mod, name)
+    for mod, name in _factories_returning_a_spec()
+    if _decorator_style(mod, name) is not None
+]
+
+
+def test_the_domain_is_not_empty_and_is_wider_than_the_public_api() -> None:
+    """LIVENESS + the specific blindness that caused #1106.
+
+    If the AST walk silently found nothing, every parametrised test below would vacuously pass. And if
+    someone narrows the domain to `messagefoundry.__all__`, this fails -- that narrowing IS the defect:
+    `with_signing` is public, absent from `__all__`, and the one that leaks.
+    """
+    assert FACTORIES, "the factory AST walk found nothing; the domain is broken, not clean"
+    names = {n for _, n in FACTORIES}
+    exported = set(getattr(messagefoundry, "__all__", []))
+    assert names - exported, (
+        "every spec-returning factory is exported, so this test can no longer detect the "
+        "unexported-factory blindness it was written for"
+    )
+
+
+@pytest.mark.parametrize(("mod", "name"), FACTORIES, ids=[n for _, n in FACTORIES])
+def test_no_factory_emits_a_credential_that_survives_redaction(mod: str, name: str) -> None:
+    """THE ASSERTION, at the level the control actually operates.
+
+    Measured failure this catches, at engine `64f6e178`:
+
+        with_signing(spec, private_key=S, private_key_password=S).settings
+          -> sign_private_key, sign_private_key_password
+        redacted_settings(...) -> both returned VERBATIM
+
+    reachable through `GET /connections/{name}/metadata` behind `MONITORING_READ` alone, and printed by
+    `graph --json` to stdout, a CI log and the IDE.
+    """
+    fn = _decorator_style(mod, name)
+    assert fn is not None
+    spec = _call_with_sentinels(fn)
+    redacted = redacted_settings(dict(spec.settings))
+
+    leaked = sorted(k for k, v in redacted.items() if SENTINEL in str(v) and k not in NOT_A_SECRET)
+    assert not leaked, (
+        f"{mod}.{name} emits settings {leaked} that carry credential material through "
+        f"redacted_settings unredacted. Either classify them (config/wiring.py "
+        f"_SECRET_SETTING_KEYS / _is_secret_setting) or add them to NOT_A_SECRET here WITH a reason. "
+        f"Note the parameter may already be classified under a DIFFERENT name -- that is exactly the "
+        f"rename gap this test exists to catch."
+    )
+
+
+def test_a_sentinel_under_a_known_secret_key_is_actually_redacted() -> None:
+    """POSITIVE CONTROL. Without it, a `redacted_settings` that returned `{}`, or a sentinel that never
+    reached the settings at all, would make every assertion above pass while proving nothing."""
+    spec = messagefoundry.Rest(url="https://example.invalid/x")
+    spec.settings["basic_password"] = SENTINEL
+    assert SENTINEL not in str(redacted_settings(dict(spec.settings)).get("basic_password"))
