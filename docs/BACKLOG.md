@@ -8825,6 +8825,69 @@ larger change than this one.
 generalised check, on the reasoning that a meta-check built from one instance is shaped like that
 instance. Two domains were probed; this one leaked.
 
+## 1206. `redacted_settings` served ODBC driver credentials sitting in `odbc_params`
+
+> 🔢 **Filed 2026-08-09 - FIXED IN THE SAME CHANGE, entry published WITH the fix.** Value **8/10** · Difficulty **3/10**. `redacted_settings` masks flat scalars and descended into `headers` alone, so a credential inside `odbc_params` was returned VERBATIM by `GET /connections/{name}/metadata` behind `MONITORING_READ` and printed by `graph --json` - on the SAME object whose top-level `password` masked correctly.
+
+**Cluster:** Security / secret disclosure. **Priority:** P1. **Verdict:** build (done).
+**Severity:** on a first deployment, an ODBC driver password would be served to any monitoring reader
+and written to stdout, a CI log and the IDE graph view. No PHI.
+
+**Measured, both serializers, before and after:**
+
+```
+BEFORE:  odbc_params={"PWD": S, "sslpassword": S}  -> both returned verbatim
+         password="p" on the same object           -> '***'
+AFTER :  PWD, sslpassword, Password                -> '***'
+         Encrypt, ApplicationIntent,
+         TrustServerCertificate, sslkey (a PATH)   -> still readable
+```
+
+**IT IS NOT MERELY OPERATOR MISUSE, WHICH IS WHY IT MASKS RATHER THAN WARNS.** The docstring says
+`odbc_params` "carries only static driver keywords", and the typed fields carry exactly ONE credential
+(`username`/`password`, key names configurable via `odbc_user_key`/`odbc_password_key`). But
+`_reject_envref_odbc_params` refuses `env()` there. So a connection needing a SECOND driver credential
+- libpq `sslpassword` beside `PWD` - has no typed home and no `env()` form, and the inline literal is
+the only expressible shape. **A refusal that removes the SAFE expression while leaving the UNSAFE one
+is not a mitigation.**
+
+**THIS IS A DISPLAY FIX, NOT A STORAGE FIX** - stated because the difference matters and is easy to
+lose. The credential remains an inline literal in the config file. Keeping it out of the file needs
+`env()` to work here, which needs nested settings to be env-resolved. That changes the resolution path
+and what the refusal above means, so it is the **route-onward** and is deliberately not folded in.
+
+**A THIRD PREDICATE, AND THE FIRST ATTEMPT PROVES WHY.** I reached for `_is_secret_setting` - and it
+returns False for every one of `PWD`, `Password` and `sslpassword`, because it matches a fixed
+frozenset of MessageFoundry SETTINGS names while these are ODBC DRIVER keywords with different
+spellings and different case. **A fix shipped on that predicate would have masked nothing while reading
+as a fix**, inside the change closing a defect whose whole shape is a control whose domain is narrower
+than its surface. `_is_secret_odbc_key` is shape-based and case-insensitive; `pwd` is listed explicitly
+because it is an abbreviation matching no substring rule.
+
+**THE GUARD WRITTEN AGAINST THIS CLASS WAS GREEN OVER IT, AND THAT IS THE REAL FINDING.**
+`tests/test_connection_factory_redaction_domain.py` filtered its AST-derived domain through
+`_decorator_style`, keeping **4 of 23** spec-returning functions and dropping every base constructor
+including `Database`. Its docstring asserted "no shipped factory emits a nested container beyond those
+declared below" and called the hole "THEORETICAL rather than live". **Both false.** That claim is
+DELETED rather than softened - a number a test has not established has no business in the file defining
+the test, and a hedged version keeps the authority while losing the falsifiability.
+
+The domain is now all 23, and `test_the_domain_covers_every_spec_returning_function` fails if any
+discovered function is missing from it. Every other control in that file answers *is this instrument
+working* - make it fail on purpose, confirm the injection landed, run a negative control, assert it
+examined something. **None of them answers *is it pointed at the whole thing*.** The domain is a
+separate claim and now carries its own evidence.
+
+**Found on the way, and worth more than the fix:** `Http` and `Soap` REFUSE an inline intake
+credential outright and demand `env()`, so the value never resolves into settings and no serializer can
+leak it. That is the stronger control `odbc_params` lacks, and it is now asserted by
+`test_a_refusing_connector_actually_refuses_an_inline_credential` rather than left as folklore.
+
+**Source:** found 2026-08-09 by the `asvs-tracking-rework` session's independent assessment of ASVS
+15.3.1, which I had recused from because I authored the two fixes bearing on that cell. Reproduced here
+by execution before any code changed. This is the fourth instance of the class and the second time a
+guard written after the previous instance picked a domain narrower than the surface.
+
 ## 1202. the vault ASVS gate runs a verifier this repo owns, on a bare interpreter, and nothing here checked it would run
 
 > 🔢 **Filed 2026-08-09 - FIXED in the same change. Proved by injecting four contract violations into `scripts/asvs/scorecard.py` and confirming each landed before believing the red.** Value **6/10** · Difficulty **2/10**. The ASVS gate lives in the vault and measures THIS tree. Two of its three claims about this tree need no private data -- that `scripts/asvs/scorecard.py` exists at that literal path, and that it runs as a bare script on stdlib alone -- and neither repo checked either of them.
