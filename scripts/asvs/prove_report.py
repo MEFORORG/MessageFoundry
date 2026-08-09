@@ -62,10 +62,15 @@ EXIT_FINDINGS = 1
 EXIT_INSTRUMENT = 2
 
 #: Parses ``_run_prove_absences``'s one summary line. Coupled to that format ON PURPOSE and with a
-#: hard failure on a miss: if Stream V reformats it, this must go red rather than quietly report
+#: hard failure on a miss: if that line is reformatted, this must go red rather than quietly report
 #: zeros. An unparseable instrument is an instrument failure, not a clean run.
+#:
+#: `.*?` after the prefix tolerates an INSERTION before `proved` -- specifically a `saw N absence
+#: claim(s);` total, which that summary should carry and does not (see the module docstring, point 1).
+#: Deliberately narrow tolerance: it absorbs the one change worth making to that line without becoming
+#: loose enough to match arbitrary text, which selftest limb L7 asserts by feeding it exactly that.
 _SUMMARY_RE = re.compile(
-    r"prove-absences:\s*proved\s+(?P<proved>\d+)\s+by mutation;\s*"
+    r"prove-absences:.*?proved\s+(?P<proved>\d+)\s+by mutation;\s*"
     r"(?P<screened>\d+)\s+static-screened;\s*"
     r"(?P<skipped>\d+)\s+skipped;\s*"
     r"(?P<problems>\d+)\s+problem"
