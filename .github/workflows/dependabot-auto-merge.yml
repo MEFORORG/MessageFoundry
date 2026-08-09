@@ -217,7 +217,12 @@ jobs:
           # low first-dep version makes almost every other name match: false confirmation in the
           # PERMISSIVE direction (measured against the live endpoint at @0.7.0: aiohttp 30, pillow 29,
           # urllib3 9, requests 6). `updated-dependencies-json` carries a per-dependency prevVersion.
-          pairs="$(printf '%s' "$DEPS_JSON" | jq -r '.[] | [.dependencyName, .prevVersion] | @tsv' 2>/dev/null || echo "ERR")"
+          # `||` outside the substitution (see the advisory lookup below). It matters here for a
+          # second reason: jq STREAMS, so a mid-array error can leave earlier rows already on stdout,
+          # and the old form would have appended ERR to a TRUNCATED dependency list — iterating a
+          # subset of the PR's dependencies while still reporting success. Assigning on failure
+          # discards the partial output instead of inheriting it.
+          pairs="$(printf '%s' "$DEPS_JSON" | jq -r '.[] | [.dependencyName, .prevVersion] | @tsv' 2>/dev/null)" || pairs="ERR"
           if [ "$pairs" = "ERR" ] || [ -z "$pairs" ]; then
             echo "::warning::no per-dependency metadata — failing closed (manual review)."
             echo "advisory_ok=false" >> "$GITHUB_OUTPUT"
@@ -236,15 +241,30 @@ jobs:
               advisory_ok=false
               break
             fi
+            # The `||` binds the ASSIGNMENT, never the substitution. `x=$(cmd || echo ERR)` APPENDS
+            # the sentinel to whatever cmd already wrote to stdout, and `gh api` copies the JSON
+            # error BODY to stdout on any HTTP error (only the `gh: ... (HTTP nnn)` line goes to
+            # stderr, which `2>/dev/null` eats). The old form left `count` holding
+            # `{"message":"API rate limit exceeded",...}ERR` — neither "ERR" nor empty, so the
+            # sentinel MISSED; `[ "$count" -lt 1 ]` then failed with "integer expression expected"
+            # and returned 2, which an `if` condition is exempt from under `set -e`. The step printed
+            # "advisory confirmed", wrote advisory_ok=true and exited 0 — this guard inverted to
+            # FAIL-OPEN on precisely the rate-limit/API-error class the comment above names first.
             count="$(gh api -X GET /advisories \
               -f ecosystem=pip \
               -f affects="${name}@${prev}" \
-              --jq '[.[] | select(.withdrawn_at == null)] | length' 2>/dev/null || echo "ERR")"
-            if [ "$count" = "ERR" ] || [ -z "$count" ]; then
-              echo "::warning::advisory lookup failed for '$name' — failing closed (manual review)."
-              advisory_ok=false
-              break
-            fi
+              --jq '[.[] | select(.withdrawn_at == null)] | length' 2>/dev/null)" || count="ERR"
+            # A SHAPE check, not equality against one sentinel. The numeric comparison below needs
+            # "is this a number" answered, and only a shape test answers it for values nobody
+            # anticipated — an equality test recognises exactly the failure it was told about, which
+            # is how a JSON body walked through the old guard.
+            case "$count" in
+              ""|*[!0-9]*)
+                echo "::warning::advisory lookup failed for '$name' — failing closed (manual review)."
+                advisory_ok=false
+                break
+                ;;
+            esac
             if [ "$count" -lt 1 ]; then
               echo "::warning::no published advisory covers '${name}@${prev}' — failing closed (manual review)."
               advisory_ok=false
@@ -307,7 +327,8 @@ jobs:
               ;;
           esac
 
-          pairs="$(printf '%s' "$DEPS_JSON" | jq -r '.[] | [.dependencyName, .newVersion] | @tsv' 2>/dev/null || echo "ERR")"
+          # `||` outside the substitution, and for the same streaming-jq reason as guardrail #2's.
+          pairs="$(printf '%s' "$DEPS_JSON" | jq -r '.[] | [.dependencyName, .newVersion] | @tsv' 2>/dev/null)" || pairs="ERR"
           if [ "$pairs" = "ERR" ] || [ -z "$pairs" ]; then
             echo "::warning::no per-dependency metadata — failing closed (manual review)."
             echo "age_ok=false" >> "$GITHUB_OUTPUT"
@@ -348,19 +369,22 @@ jobs:
                 ;;
             esac
 
-            body="$(curl -sS --fail --max-time 20 --retry 2 "https://pypi.org/pypi/${name}/${ver}/json" 2>/dev/null || echo "ERR")"
+            # `--fail` suppresses the 4xx/5xx body, so the old form happened to work for HTTP errors
+            # — but a TRUNCATED transfer (curl 18/56) exits non-zero with partial bytes already on
+            # stdout, and the sentinel would have been appended to a half a JSON document. Outside.
+            body="$(curl -sS --fail --max-time 20 --retry 2 "https://pypi.org/pypi/${name}/${ver}/json" 2>/dev/null)" || body="ERR"
             if [ "$body" = "ERR" ] || [ -z "$body" ]; then
               echo "::warning::PyPI lookup failed for '${name}==${ver}' — failing closed (manual review)."
               age_ok=false
               break
             fi
-            published="$(printf '%s' "$body" | jq -r '[.urls[].upload_time_iso_8601] | sort | .[0] // empty' 2>/dev/null || echo "ERR")"
+            published="$(printf '%s' "$body" | jq -r '[.urls[].upload_time_iso_8601] | sort | .[0] // empty' 2>/dev/null)" || published="ERR"
             if [ "$published" = "ERR" ] || [ -z "$published" ] || [ "$published" = "null" ]; then
               echo "::warning::no upload timestamp for '${name}==${ver}' — failing closed (manual review)."
               age_ok=false
               break
             fi
-            published_epoch="$(date -u -d "$published" +%s 2>/dev/null || echo "ERR")"
+            published_epoch="$(date -u -d "$published" +%s 2>/dev/null)" || published_epoch="ERR"
             case "$published_epoch" in
               ""|*[!0-9]*)
                 echo "::warning::unparseable upload timestamp '$published' for '${name}==${ver}' — failing closed."
