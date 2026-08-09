@@ -26,8 +26,11 @@ VERDICTS = {"pass", "partial", "fail", "na", "needs-review", "unverified"}
 _BANNED = re.compile(
     "["
     "\u26a0\u26d4\u2705\u2b50\u274c\u2714\u2716\u2717\u2718"  # warning, no-entry, check, star, crosses
-    "\U0001f300-\U0001faff"  # emoji planes
-    "\U0001f000-\U0001f2ff"
+    # ONE range, not the adjacent pair 1f000-1f2ff + 1f300-1faff it replaces. Those are contiguous,
+    # so the union is identical (asserted at the seam by
+    # test_the_banned_class_is_one_contiguous_emoji_range); splitting them read as an overlapping
+    # range to CodeQL, which analyses the class in UTF-16 where both halves share a high surrogate.
+    "\U0001f000-\U0001faff"  # emoji planes
     "\u2190-\u21ff"  # arrows
     "\u2022"  # bullet
     "\ufe0f\ufe0e"  # variation selectors

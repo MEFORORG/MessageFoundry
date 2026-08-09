@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.asvs.apply import main
+from scripts.asvs.apply import _BANNED, main
 
 #: A two-cell record. `5.4.3` is owner-CLOSED, mirroring the real one, because the closed-cell guards
 #: are the ones with the worst failure mode: an un-closing is invisible to every downstream check.
@@ -276,6 +276,25 @@ def test_it_refuses_a_glyph_in_a_residual(tmp_path: Path) -> None:
         ]
     )
     assert rc == 1
+
+
+def test_the_banned_class_is_one_contiguous_emoji_range() -> None:
+    """The emoji planes are ONE range, not the adjacent pair `1f000-1f2ff` + `1f300-1faff`.
+
+    That pair was contiguous, so collapsing it is a pure refactor — CodeQL read the split as an
+    overlapping range because it analyses the class in UTF-16, where both halves share a high
+    surrogate. The rewrite is only safe while the seam stays covered, so the seam is what this
+    asserts: a later edit that re-splits the range and mistypes a bound, or truncates it, leaves a
+    hole exactly here. A hole in a FAIL-CLOSED guard is invisible — nothing goes red, a glyph simply
+    starts getting written into the security record, which is the failure this guard exists to stop.
+
+    The outside-bounds assertions matter too: a range widened to `\\U0001f000-\\U0001ffff` would pass
+    every inside check while quietly banning codepoints nobody reviewed.
+    """
+    for cp in (0x1F000, 0x1F2FF, 0x1F300, 0x1FAFF):  # both ends, and both sides of the old seam
+        assert _BANNED.search(chr(cp)), f"U+{cp:04X} escaped the banned class"
+    for cp in (0x1EFFF, 0x1FB00):  # immediately outside, both ends
+        assert not _BANNED.search(chr(cp)), f"U+{cp:04X} was banned but is outside the range"
 
 
 def test_it_refuses_a_cell_that_is_not_in_the_record(tmp_path: Path) -> None:
