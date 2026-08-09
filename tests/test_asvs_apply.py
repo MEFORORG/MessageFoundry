@@ -286,6 +286,51 @@ def test_it_refuses_a_cell_that_is_not_in_the_record(tmp_path: Path) -> None:
     assert rc == 1
 
 
+def test_a_verdict_move_is_refused_by_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The one refusal here against a WELL-FORMED payload.
+
+    Every other guard rejects malformed input. This one rejects input that is valid and means more
+    than its author intended -- a verdict moving during a pass whose stated purpose was mechanical.
+    That is this writer's whole failure mode, so the safe thing is the default.
+    """
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    rc = main(
+        [str(_payload(tmp_path, [_cell_111(verdict="pass")])), "--scorecard", str(rec), "--apply"]
+    )
+    assert rc == 1
+    assert rec.read_bytes() == before
+    out = capsys.readouterr().out
+    # It must answer the operator's actual next question -- WHICH cell, and TO WHAT. A refusal that
+    # says only "verdict changed" gets re-run with the override reflexively, which turns the guard
+    # into a speed bump.
+    assert "1.1.1" in out
+    assert "'partial' -> 'pass'" in out
+
+
+def test_the_verdict_flag_actually_unlocks_the_move(tmp_path: Path) -> None:
+    """Guard-the-guard: a refusal that cannot be lifted is a bug, not a control.
+
+    Without this, `--allow-verdict-change` could be misspelled, unwired, or shadowed and the test
+    above would still pass -- it only asserts the refusal. This asserts the other half.
+    """
+    rec = _record(tmp_path)
+    rc = main(
+        [
+            str(_payload(tmp_path, [_cell_111(verdict="pass")])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+            "--allow-verdict-change",
+        ]
+    )
+    assert rc == 0
+    got = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}
+    assert got["1.1.1"]["verdict"] == "pass"
+
+
 # --- the CLI contract ------------------------------------------------------------------------------
 
 

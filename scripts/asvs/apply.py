@@ -127,7 +127,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="write. Omitted, the run is a dry run and the file is not touched.",
     )
+    ap.add_argument(
+        "--allow-verdict-change",
+        action="store_true",
+        help=(
+            "permit a payload to move a cell's verdict. Refused by default: a verdict move is an "
+            "assessor decision, and this writer's failure mode is making one during a pass whose "
+            "stated purpose was mechanical."
+        ),
+    )
     args = ap.parse_args(argv)
+    allow_verdict_change = args.allow_verdict_change
     SCORECARD = args.scorecard
     payload = json.loads(args.payload.read_text(encoding="utf-8"))
     dry = not args.apply
@@ -168,6 +178,22 @@ def main(argv: list[str] | None = None) -> int:
                 problems.append(f"{c.get('id')}: missing {field}")
         if c.get("verdict") not in VERDICTS:
             problems.append(f"{c.get('id')}: bad verdict {c.get('verdict')!r}")
+        # A VERDICT MOVE IS AN ASSESSOR ACT AND MUST BE DECLARED. This writer's whole failure mode is
+        # silent verdict movement during a pass whose stated purpose was mechanical: an anchor repair,
+        # a re-render, a bulk transform. Everything else here is a refusal against malformed input;
+        # this is the one refusal against a WELL-FORMED payload that means more than its author
+        # intended. So the safe thing is the default and the dangerous thing is explicit.
+        #
+        # The message names the cell and BOTH verdicts on purpose. A refusal that says only "verdict
+        # changed" leaves the operator's actual next question -- which cell, and to what -- unanswered,
+        # and an unanswerable refusal gets re-run with the override flag reflexively, which converts
+        # the guard into a speed bump.
+        if live and c.get("verdict") != live.get("verdict") and not allow_verdict_change:
+            problems.append(
+                f"{c['id']}: verdict would change {live.get('verdict')!r} -> {c.get('verdict')!r}. "
+                "That is an assessor decision, not a mechanical edit. Re-run with "
+                "--allow-verdict-change if you mean it"
+            )
         if c.get("verdict") == "na" and not (c.get("residual") or "").strip():
             problems.append(f"{c['id']}: verdict 'na' requires a written rationale in residual")
         if c.get("verdict") in {"pass", "partial", "fail"} and not (
