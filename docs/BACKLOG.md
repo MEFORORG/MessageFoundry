@@ -8713,3 +8713,55 @@ filing.
 **What would NOT be an honest pass.** This cell has a recorded precedent for exactly the wrong move: it briefly scored Pass on 2026-07-20 on a runbook edit and was back to Partial by 07-22. Documenting how to configure secure forwarding is not the engine securely transmitting logs, and the record already shows that purchase being reversed. The other one is flipping `forward_protocol` to TLS while `forward_host` stays None -- nothing transmits either way, so the cell is unchanged and the change only looks like progress.
 
 **Source:** filed 2026-08-08 from the ASVS ledger-coverage sweep of the partial and fail cells that carried no backlog item at all; this cell was one of them. The scorecard is the record of record for the verdict; this item tracks the research toward changing it.
+
+## 1202. the vault ASVS gate runs a verifier this repo owns, on a bare interpreter, and nothing here checked it would run
+
+> 🔢 **Filed 2026-08-09 - FIXED in the same change. Proved by injecting four contract violations into `scripts/asvs/scorecard.py` and confirming each landed before believing the red.** Value **6/10** · Difficulty **2/10**. The ASVS gate lives in the vault and measures THIS tree. Two of its three claims about this tree need no private data -- that `scripts/asvs/scorecard.py` exists at that literal path, and that it runs as a bare script on stdlib alone -- and neither repo checked either of them.
+
+**Cluster:** CI correctness / gate blindness. **Priority:** P2. **Verdict:** build (done).
+**Severity:** no product effect and no PHI effect. The cost is that the ASVS record would go on being
+verified by a stale instrument while every check stayed green.
+
+**The shape.** The vault executes the verifier twice, and neither job installs anything:
+`asvs-scorecard.yml` runs `python scripts/asvs/scorecard.py` after a bare `actions/setup-python`, and
+`asvs-verifier-drift.yml`'s `preflight` job runs the INCOMING engine copy as
+`python ../engine/scripts/asvs/scorecard.py` from the vault checkout -- so `sys.path[0]` is
+`scripts/asvs`, not either repo root. `asvs-scorecard.yml` states the invariant in as many words:
+"No install step and no dependency: the verifier is stdlib-only (tomllib, json, re) precisely so this
+job cannot rot on a lockfile it does not own." **Asserted in a comment, enforced nowhere** -- which is
+the compensating-control-on-a-false-premise defect Secure_Development_Standards SDS-3.7 names.
+
+**Why this repo's own tests could not see it.** `tests/test_asvs_scorecard.py` imports the module --
+`from scripts.asvs.scorecard import ...` -- inside a pytest session with the repo root on `sys.path`
+and the project's full extras installed. That is a different import context from the one the vault
+uses, so the invocation that actually matters was never exercised here.
+
+**Measured.** With a USED `import httpx` appended to `scripts/asvs/scorecard.py` (httpx is a real
+engine dependency, so this is not dead code a linter rejects anyway), every pre-existing gate returned
+a verdict IDENTICAL to its unmutated verdict: `ruff check .` PASS -> PASS, `ruff format --check .`
+unchanged, `mypy` unchanged (it types `messagefoundry` and `messagefoundry_webconsole`, not
+`scripts/`), and `tests/test_asvs_scorecard.py` 54 tests PASS -> PASS. `python -I -S -c "import httpx"`
+returns 1, confirming the mutation models the vault runner and not a lint opinion.
+
+**What breaking it would cost, stated exactly.** Not a red gate. The mirror job opens its pull request
+as a DRAFT when the incoming verifier does not run, and a draft is never merged -- so the vault keeps
+verifying the record with its PREVIOUS copy while reporting drift as a warning. That is the recurring
+condition (six hand-made mirror commits, the last found 326 lines behind) that splitting
+`asvs-verifier-drift.yml` out was written to end.
+
+**The guard.** `tests/test_asvs_verifier_vault_contract.py`: the file exists at the hardcoded path; a
+stdlib-only `ast` scan over EVERY import including deferred ones; and a `python -I -S <script> --help`
+run from an unrelated working directory. Four injected violations were each confirmed to land (by
+digest) before their red was believed. A module-level third-party import, a first-party import and a
+rename red both the scan and the smoke run; **a third-party import DEFERRED into a function body reds
+only the `ast` scan and passes the smoke run**, which is why the scan is the load-bearing half.
+
+**Trigger, checked rather than assumed.** Extracting the live `noncode` regex out of `ci.yml` and
+running real `grep -E`: a PR touching only `scripts/asvs/scorecard.py` classifies `code=true`, as does
+one touching only the guard's own file -- so the gate is inside its own trigger -- while a
+`docs/SECURITY.md`-only PR correctly stays `code=false`. No new workflow and no new required context
+were needed; the trigger was already right and the check was what did not exist.
+
+**Not in scope, and not fixable here.** The gate's third claim -- that the recorded evidence anchors
+still resolve -- needs the private assessment record, so it can only run where that record is. No
+credential-free cross-repo trigger exists for it; the vault's daily cron remains its only authority.
