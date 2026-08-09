@@ -1,0 +1,268 @@
+name: ASVS prove-absences
+
+# WHAT THIS WIRES, AND WHY IT WAS WORTH WIRING.
+#
+# `scripts/asvs/scorecard.py --prove-absences` shipped on 2026-08-07. It copies the tree to a scratch
+# dir, asserts a named observable is green, applies a stated reintroduction, and requires the
+# observable to go RED -- real mutation testing of a control, and the only check in the ASVS toolchain
+# that proves a claim by EXECUTION rather than by grep. Measured on 2026-08-09 against vault
+# `origin/main` (1a59e4a1) and engine `main`:
+#
+#     absence claims on the record       : 276
+#       carrying `observable`            :   0
+#       carrying `mutation_path`         :   0
+#     `--prove-absences` invoked in CI   :   0 references under .github/, in EITHER repo
+#
+# A mode nothing invokes cannot go red whatever is inside it, so those 276 green absence claims were
+# exactly as strong the day after that merge as the day before. This file is the invocation. It is
+# deliberately the FIRST half of a two-step: wire it while adoption is zero, harden it after. Making
+# it fail on zero adoption would be correct and entirely inert, because nothing was running it.
+#
+# WHY HERE AND NOT IN THE VAULT'S asvs-scorecard.yml. That job is `timeout-minutes: 5`, has no install
+# step, and its own comment states the stdlib-only constraint is deliberate "so this job cannot rot on
+# a lockfile it does not own". Proving needs the full engine install plus pytest, which is what this
+# repo already has. Adding it there would couple a seconds-long stdlib gate to this repo's lockfile.
+#
+# ---------------------------------------------------------------------------------------------------
+# THE INPUT PROBLEM, STATED RATHER THAN ENGINEERED AROUND. This is a finding, not a solved problem.
+#
+# The scorecard lives in a PRIVATE repo (the vault) and this one is PUBLIC. The vault's own workflow
+# reads the engine freely -- `repository: MEFORORG/MessageFoundry` with the comment "public: no token
+# needed" -- but the reverse direction has no free version. Every honest option costs something:
+#
+#   (a) THIS REPO HOLDS A READ CREDENTIAL FOR THE VAULT. What the two knobs below implement, and it
+#       is OFF: neither `vars.ASVS_VAULT_REPO` nor `secrets.ASVS_VAULT_READ_TOKEN` exists today, and
+#       this workflow does not create them. It is off because the vault exists precisely so that a
+#       compromise of the public repo does not yield the security corpus, and a vault-read token in
+#       the public repo's secret store collapses that boundary to one credential. If it is ever
+#       switched on it MUST be a fine-grained, read-only, contents-scoped token for that one repo, and
+#       the sparse-checkout below keeps the materialised blast radius to the single scorecard file
+#       rather than the whole `docs/security` tree. That mitigates the checkout; it does not mitigate
+#       the token.
+#
+#   (b) THE PROVER RUNS IN THE VAULT INSTEAD, as a NEW workflow beside `asvs-scorecard.yml` rather
+#       than inside it -- own job, own install, own timeout, so the stdlib-only constraint above is
+#       untouched. The vault already checks the engine out with no token at all, so this needs NO new
+#       credential in EITHER direction. Its cost is that the vault pays an install against a lockfile
+#       it does not own. That is a maintenance cost; (a) is a security-boundary cost.
+#
+#   (c) A SELF-HOSTED RUNNER that already holds both checkouts. Cheapest operationally, and a
+#       self-hosted runner attached to a PUBLIC repo is its own well-known hazard. Owner's call.
+#
+# There is a SECOND half to this and it points the same way. The prover's problem lines name the cell
+# and the control that would not prove -- a ranked list of the weakest controls on the record. This
+# repo's run logs are world-readable, so `prove_report.py` suppresses those lines by default and
+# prints only counts (`--detail` opts them back in, for a private log). So the public repo is the
+# wrong host for the OUTPUT as well as the wrong holder of the INPUT, and neither of those is fixable
+# by moving the environment, whereas (b)'s only cost IS the environment.
+#
+#   ==> RECOMMENDATION for the owner: (b). This file is the working wiring either way -- the same two
+#       scripts run unchanged in the vault, pointed at a local scorecard and an `engine/` checkout.
+#
+# ---------------------------------------------------------------------------------------------------
+# WHY A NO-INPUT RUN FAILS INSTEAD OF SKIPPING, and why "advisory" does not cover it.
+#
+# ADVISORY APPLIES TO FINDINGS, NEVER TO THE INSTRUMENT. A claim that will not prove is reported and
+# does not fail this job (see `vars.ASVS_PROVE_STRICT`). A run that could not obtain a scorecard
+# scanned ZERO claims and is not evidence about any of them, so it exits non-zero -- the rule
+# `scorecard.py` already states for its own loader ("Fail closed, never skip ... refusing to report a
+# pass on a missing file"). Until an input source is configured this scheduled job is therefore RED
+# every day, and that is the finding above rendered as a signal rather than as prose in a file nobody
+# opens. If the noise is unwanted, DISABLE the workflow -- never make the no-input path green, which
+# would restore exactly the "green check that never ran" state this whole exercise exists to end.
+#
+# Note that the no-input path is not a branch nobody takes: it runs the real acquisition, install and
+# entry point every day, so the day a credential appears the rest of the path is already known-working.
+#
+# ---------------------------------------------------------------------------------------------------
+# NOT A REQUIRED CHECK. Neither job context is in `.github/required-contexts.txt`, so nothing here can
+# gate a merge or wedge auto-merge. `tests/test_asvs_prove_absences_wiring.py` pins that, the absent
+# write scopes, and the advisory default.
+
+on:
+  schedule:
+    # Uncontended slot: quality-advisory is 04:23, zizmor 06:00, required-workflow-state 07:00, and
+    # the vault's own ASVS gate 06:17. No ordering dependency on any of them -- this reads the vault
+    # scorecard as data, not the vault job's result.
+    - cron: "13 5 * * *"
+  workflow_dispatch:
+  # The gate must be able to observe changes to ITSELF (the lesson written up at length above
+  # asvs-scorecard.yml's own path filter). On these events only the `selftest` job runs -- see its
+  # `if:` -- because the PR-time question is "does the wiring still work", which needs no credential,
+  # while "what does the record say" needs one and would paint every such PR red for a reason that has
+  # nothing to do with the PR.
+  pull_request:
+    paths: &wiring_paths
+      - ".github/workflows/asvs-prove-absences.yml"
+      - "scripts/asvs/**"
+      - "tests/test_asvs_prove_absences_wiring.py"
+  push:
+    branches: [main]
+    paths: *wiring_paths
+
+# Deny by default; each job grants only `contents: read`. Nothing here writes.
+permissions: {}
+
+concurrency:
+  group: asvs-prove-absences-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  selftest:
+    # THE FAIL-ON-PURPOSE GATE, and the reason anything below is believable.
+    #
+    # `prove_report.py selftest` builds fixture trees in a temp dir and drives the wiring through nine
+    # limbs that must each come out a specific way: a biting claim proves (L1), a non-biting claim is
+    # reported but not fatal in advisory mode (L2), the SAME claim fails under --strict (L3, so
+    # "advisory" is a choice rather than the only behaviour), a missing scorecard is an instrument
+    # failure and never a pass (L4), the census actually sees the claim (L5), the public-log detail
+    # suppression is attacked from both sides (L6), an unparseable prover summary is an instrument
+    # failure rather than a report of zeros (L7), and a prover that stopped iterating is caught by
+    # reconciliation (L8 -- its own summary line looks identical whether it walked 276 claims or 2).
+    #
+    # Every limb was confirmed to go red by injecting the matching defect and checking the defect
+    # landed on disk first; a mutation that never applied reads exactly like a pass.
+    name: prove-absences wiring selftest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          cache-dependency-glob: |
+            pyproject.toml
+            requirements.lock
+
+      - name: Install the project
+        # `--constraint constraints.lock` for the same reason every other install here carries it: a
+        # bare `-e ".[dev]"` re-resolves from pyproject's `>=` floors and adopts whatever upstream
+        # published since. The prover spawns pytest, so `[dev]` is the minimum that makes it real.
+        run: uv pip install --system --constraint constraints.lock -e ".[dev]"
+
+      - name: Prove the wiring can go red
+        run: python scripts/asvs/prove_report.py selftest
+
+  prove:
+    # The real pass over the record. Advisory: findings are reported, never fatal (see
+    # `vars.ASVS_PROVE_STRICT`). An instrument failure IS fatal -- that distinction is the point.
+    name: prove absence claims (advisory)
+    needs: selftest
+    # Scheduled and on-demand only. On a PR there is no credential and nothing to prove; the wiring
+    # question is `selftest`'s and it already ran.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # Generous because the prover copies the whole tree PER CLAIM (measured at roughly 1.2s a copy) and
+    # spawns a pytest run per provable claim. At today's adoption -- zero -- the whole pass is 0.2s, so
+    # this budget is for the future, not the present. Revisit alongside the one-pristine-copy fix.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the engine
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # A subdirectory, not the workspace root, so `--root engine` bounds the prover's scratch
+          # copy to the engine tree and can never sweep the vault checkout beside it into a
+          # world-default temp dir. `scorecard.py`'s `_scratch_ignore` defends the same property from
+          # the other side; this is the layout that means it never has to.
+          path: engine
+          persist-credentials: false
+
+      - name: Report where the scorecard is coming from
+        id: input
+        env:
+          # Hoisted into `env` rather than interpolated into the shell body (zizmor
+          # template-injection). Same shape the vault's ASVS job uses for its anchor SHA.
+          VAULT_REPO: ${{ vars.ASVS_VAULT_REPO }}
+        run: |
+          set -euo pipefail
+          if [ -n "${VAULT_REPO}" ]; then
+            echo "scorecard input : private vault repository, sparse checkout of the scorecard alone"
+            echo "mode=vault" >> "$GITHUB_OUTPUT"
+          else
+            echo "scorecard input : NONE"
+            echo "mode=none" >> "$GITHUB_OUTPUT"
+            echo "::error::ASVS prove-absences has NO SCORECARD INPUT, so this run scanned zero absence claims and is not evidence about any of them. The scorecard lives in a private repo and this one is public; see the block at the top of .github/workflows/asvs-prove-absences.yml for the three options and the recommendation. Do not make this path green -- either configure an input or disable the workflow."
+          fi
+
+      - name: Check out ONLY the scorecard from the vault
+        if: steps.input.outputs.mode == 'vault'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ vars.ASVS_VAULT_REPO }}
+          token: ${{ secrets.ASVS_VAULT_READ_TOKEN }}
+          path: vault
+          persist-credentials: false
+          fetch-depth: 1
+          # ONE FILE. `docs/security` is the maintainer-internal corpus -- remediation plans, the
+          # fails register, the risk-acceptance register. A cone-mode-off sparse checkout of the single
+          # path means a credential that can read all of it materialises none of the rest on a runner
+          # whose logs are public.
+          sparse-checkout: docs/security/asvs-scorecard.toml
+          sparse-checkout-cone-mode: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          cache-dependency-glob: |
+            engine/pyproject.toml
+            engine/requirements.lock
+
+      - name: Install the project
+        working-directory: engine
+        run: uv pip install --system --constraint constraints.lock -e ".[dev]"
+
+      - name: Prove the absence claims, and report what was scanned
+        working-directory: engine
+        env:
+          # Both default OFF. STRICT is the whole ratchet -- one variable, proved to bite by selftest
+          # limb L3 -- and it should stay off until adoption is non-zero, because a strict run over
+          # 276 unprovable claims fails on the absence of work rather than on a defect. DETAIL prints
+          # the per-claim problem lines and is ONLY appropriate where the run log is private.
+          STRICT: ${{ vars.ASVS_PROVE_STRICT }}
+          DETAIL: ${{ vars.ASVS_PROVE_DETAIL }}
+          SCORECARD: ${{ github.workspace }}/vault/docs/security/asvs-scorecard.toml
+        run: |
+          set -euo pipefail
+          # An ARRAY, not a string: an unquoted "${flags}" would rely on word splitting (shellcheck
+          # SC2086, and actionlint runs shellcheck over every run body). Explicit `if` blocks rather
+          # than `[ ... ] && flags=...` because under `bash -e` a false test at the end of an `&&`
+          # chain aborts the step -- which would turn "STRICT is off" into a failed job.
+          flags=()
+          if [ "${STRICT:-}" = "true" ]; then
+            flags+=(--strict)
+          fi
+          if [ "${DETAIL:-}" = "true" ]; then
+            flags+=(--detail)
+          fi
+          echo "flags: ${flags[*]:-none (advisory, counts only)}"
+          # --timeout is set BELOW the job's timeout-minutes on purpose. If the prover overruns, the
+          # script's own "did not finish within Ns" instrument failure is what a reader sees; a bare
+          # job kill truncates the log and looks like infrastructure rather than a measurement that
+          # did not complete. A gate that stops must say so in its own words.
+          #
+          # No pipe, so the exit code reaching the runner is this command's own (SDS-3.8). The three
+          # outcomes it can return are distinct and all three matter: 0 clean-or-advisory,
+          # 1 findings-under-strict, 2 the instrument could not measure.
+          python scripts/asvs/prove_report.py run \
+            --scorecard "${SCORECARD}" \
+            --root . \
+            --timeout 2700 \
+            "${flags[@]}"
