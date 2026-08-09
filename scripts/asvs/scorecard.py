@@ -20,12 +20,14 @@ from __future__ import annotations
 
 import argparse
 import ast
+import datetime
 import io
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tokenize
 import tomllib
 from collections import Counter
@@ -1143,6 +1145,237 @@ def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
     return chr(10).join(lines) + chr(10)
 
 
+# --- provenance: every answer carries the refs it was measured at ---------------------------------
+#
+# A count is a fact about a (file x ref) PAIR. Drop the ref and two readings taken from different
+# places print identically — which is exactly how this programme produced three wrong-base errors in
+# one working thread on 2026-08-08/09: one in an adjudication, one in the correction of that
+# adjudication, and one in a DAG-ancestry check that cannot answer "did this land" under squash-merge.
+# Each cost a full re-measurement cycle. A query tool without ref stamping would INDUSTRIALISE that
+# failure, because cheap answers get quoted more, not less.
+#
+# THE REQUIREMENT IS NOT FRESHNESS. IT IS THAT THE FRESHNESS CLAIM IS NEVER SILENT. Those come apart,
+# and separating them dissolves the problem with zero network: the error that motivated this was not
+# reading a stale ref, it was reading a stale ref while the output said nothing about it.
+
+#: Seconds any single git probe may take before it is abandoned. `--status` is meant to be run in a
+#: loop; a probe that can hang is a probe that gets removed.
+_GIT_TIMEOUT: Final[float] = 5.0
+
+
+@dataclass(frozen=True)
+class RepoStamp:
+    """Where a tree actually is, and how much it knows about where it should be.
+
+    Every field is ALWAYS POPULATED. Degradation is a loud labelled value in the field, never an
+    omitted field — an absent qualifier is what produced all three wrong-base errors, where the number
+    was right and the ref was unnamed.
+    """
+
+    #: Short commit, or ``NO-GIT`` when the path is not inside a work tree.
+    sha: str
+    #: Whole-tree dirty. A measurement taken against uncommitted changes is not reproducible and must
+    #: not look like one that is.
+    dirty: bool
+    #: ``CURRENT`` | ``BEHIND <n>`` | ``AHEAD <n>`` | ``DIVERGED`` | ``NO-UPSTREAM`` | ``NO-GIT`` |
+    #: ``UNRESOLVED``. The last two are extensions and they exist BECAUSE of the never-silent rule:
+    #: calling a non-repo ``NO-UPSTREAM`` would be a false statement (it implies a repo), and calling a
+    #: comparison that git refused ``CURRENT`` would be the exact silence this field exists to break.
+    freshness: str
+    #: The ref the freshness was measured AGAINST, or ``none``. Named because "BEHIND 37" is not a
+    #: claim until you know behind WHAT: on a feature branch the branch's own upstream and the
+    #: canonical line are different questions with different answers.
+    upstream: str
+    #: Humanised age of ``FETCH_HEAD``, or ``NEVER-FETCHED``. NOT decoration: ``BEHIND 0`` from a
+    #: six-hour-old fetch and ``BEHIND 0`` from a one-minute-old fetch are different claims and must
+    #: not print identically.
+    remote_knowledge: str
+
+    def ref(self) -> str:
+        return f"{self.sha}+dirty" if self.dirty else self.sha
+
+
+def _git(repo: Path, *args: str) -> str | None:
+    """One read-only git probe. ``None`` on any failure — missing git, not a repo, non-zero, timeout.
+
+    NEVER runs a command that writes. There is deliberately no ``--fetch`` mode in this module: a
+    fetch mutates remote-tracking refs, which a query tool run in a loop has no business doing, and on
+    this machine the vault remote is intermittently unauthenticated, so a network dependency here
+    would fire constantly and the tool would be bypassed inside a day. A bypassed tool is worse than
+    none, because its absence gets read as nobody needing it. Refreshing is ``git fetch``, by hand,
+    which is a different act performed on purpose.
+    """
+    try:
+        proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; every subcommand is read-only
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_GIT_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def _humanise_age(seconds: float) -> str:
+    if seconds < 90:
+        return f"{int(seconds)}s"
+    if seconds < 90 * 60:
+        return f"{int(seconds / 60)}m"
+    if seconds < 48 * 3600:
+        return f"{int(seconds / 3600)}h"
+    return f"{int(seconds / 86400)}d"
+
+
+def _remote_knowledge(repo: Path, now: float) -> str:
+    """How old the last-fetched remote knowledge is, from the mtime of ``FETCH_HEAD``. No network.
+
+    ``FETCH_HEAD`` can live in either the per-worktree git dir or the common one depending on git
+    version and who last fetched, so both are probed and the NEWEST is reported. Reporting the older
+    of the two would overstate staleness; reporting only one would miss a fetch entirely, and a missed
+    fetch reads as ``NEVER-FETCHED``, which is the loudest possible wrong answer.
+    """
+    newest: float | None = None
+    for which in ("--git-dir", "--git-common-dir"):
+        # `--path-format` is git 2.31+. Falling back to the relative form matters more than it looks:
+        # without it an older git would yield no path, `NEVER-FETCHED`, and a confidently wrong
+        # "nobody has ever fetched here" — the loudest possible wrong answer from this field.
+        out = _git(repo, "rev-parse", "--path-format=absolute", which) or _git(
+            repo, "rev-parse", which
+        )
+        if not out:
+            continue
+        try:
+            mtime = (repo / out / "FETCH_HEAD").stat().st_mtime
+        except OSError:
+            continue
+        newest = mtime if newest is None else max(newest, mtime)
+    if newest is None:
+        return "NEVER-FETCHED"
+    return _humanise_age(max(0.0, now - newest))
+
+
+def _freshness(repo: Path) -> tuple[str, str]:
+    """``(freshness, upstream)`` for a work tree, using ZERO network.
+
+    ``git rev-list --left-right --count HEAD...<upstream>`` counts against the LAST-FETCHED
+    remote-tracking ref, which is a purely local object. Measured against the vault checkout whose
+    stale ref caused the original error in this programme: ``BEHIND 37``, remote knowledge 23 minutes
+    old. That pair would have stopped the error dead, with no network call.
+
+    The upstream is the branch's own ``@{upstream}`` when it has one, and ``origin/main`` otherwise —
+    and WHICHEVER was used is returned, because on a feature branch those are different questions.
+    """
+    upstream = _git(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+    if not upstream:
+        upstream = "origin/main" if _git(repo, "rev-parse", "--verify", "origin/main") else ""
+    if not upstream:
+        return "NO-UPSTREAM", "none"
+    counts = _git(repo, "rev-list", "--left-right", "--count", f"HEAD...{upstream}")
+    parts = counts.split() if counts else []
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        # The ref name exists but git would not compare against it (a pruned or corrupt
+        # remote-tracking ref). Labelled, never quietly rendered as CURRENT.
+        return "UNRESOLVED", upstream
+    ahead, behind = int(parts[0]), int(parts[1])
+    if ahead and behind:
+        return "DIVERGED", upstream
+    if behind:
+        return f"BEHIND {behind}", upstream
+    if ahead:
+        return f"AHEAD {ahead}", upstream
+    return "CURRENT", upstream
+
+
+def repo_stamp(path: Path, *, now: float | None = None) -> RepoStamp:
+    """Stamp the work tree containing `path`. Pure read: no fetch, no write, no network."""
+    repo = path if path.is_dir() else path.parent
+    sha = _git(repo, "rev-parse", "--short", "HEAD")
+    if sha is None:
+        # Not a work tree at all. NOT reported as NO-UPSTREAM: that would imply a repo exists and is
+        # simply untracked, which is a different and false statement.
+        return RepoStamp("NO-GIT", False, "NO-GIT", "none", "NEVER-FETCHED")
+    porcelain = _git(repo, "status", "--porcelain")
+    freshness, upstream = _freshness(repo)
+    return RepoStamp(
+        sha=sha,
+        dirty=bool(porcelain),
+        freshness=freshness,
+        upstream=upstream,
+        remote_knowledge=_remote_knowledge(repo, time.time() if now is None else now),
+    )
+
+
+def provenance_lines(scorecard: Path, root: Path, *, now: float | None = None) -> list[str]:
+    """The non-suppressible provenance header. Every query answer carries the refs it was measured at.
+
+    **One deviation from the spec's literal shape, and it is deliberate — do not "fix" it back.** The
+    spec draws ONE ``freshness`` and ONE ``remote-knowledge`` under a line naming TWO repositories.
+    The scorecard and the engine are separate checkouts (the vault's own CI checks out the engine into
+    a subdirectory and runs with ``--root engine``), and a single freshness field covering both would
+    itself be an unnamed qualifier — the reader could not tell which repo it described. That is the
+    precise defect the field exists to prevent, so the group is emitted PER REPO and labelled. No
+    mandated field is renamed, dropped, or given a value outside its stated set.
+
+    ``upstream=`` is likewise additive: "BEHIND 37" is not a claim until you know behind what.
+    """
+    sc = repo_stamp(scorecard, now=now)
+    en = repo_stamp(root, now=now)
+    generated = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+    return [
+        f"# asvs-status scorecard={sc.ref()} engine={en.ref()}",
+        f"#   scorecard: freshness={sc.freshness} upstream={sc.upstream} "
+        f"remote-knowledge={sc.remote_knowledge}",
+        f"#   engine:    freshness={en.freshness} upstream={en.upstream} "
+        f"remote-knowledge={en.remote_knowledge}",
+        f"#   generated={generated}",
+    ]
+
+
+def status_lines(cells: list[Cell]) -> list[str]:
+    """``--status`` proper: what the scorecard SAYS, computed on every call and cached nowhere.
+
+    Nothing here is persisted, because a cached query result would be document number 69 in a corpus
+    where 68 documents assert a tally and approximately one is correct — stale in the same way, for
+    the same reason, with more authority because a tool produced it.
+
+    **This is a pure read of the scorecard and it names what it therefore cannot see.** Whether an
+    anchor still RESOLVES is a fact about the engine tree, costs a 40-second pass, and is what
+    :func:`verify` is for. Printing a structural tally under a heading that implies resolution health
+    would be the same overstatement the summary line was just corrected for.
+    """
+    n = count(cells)
+    total = sum(n.values())
+    examined = sum(1 for c in cells if c.verdict in EXAMINED_VERDICTS and c.last_verified)
+    inherited = sum(1 for c in cells if c.verdict in DECIDED_VERDICTS and not c.last_verified)
+    closed = sum(1 for c in cells if c.decision_closed)
+    anchors = sum(len(c.evidence) for c in cells)
+    anchored_cells = sum(1 for c in cells if c.evidence)
+    paths = {a.path for c in cells for a in c.evidence}
+    absences = sum(len(c.absence) for c in cells)
+    provable = sum(1 for c in cells for a in c.absence if a.observable)
+    unevidenced = sum(
+        1 for c in cells if c.verdict in DECIDED_VERDICTS and not c.evidence and not c.absence
+    )
+    pct = (100.0 * examined / total) if total else 0.0
+    return [
+        f"cells {total}: {n['pass']} pass, {n['partial']} partial, {n['fail']} fail, {n['na']} na, "
+        f"{n['needs-review']} needs-review, {n['unverified']} unverified",
+        f"examined {examined} of {total} ({pct:.1f}%) against the pinned text; "
+        f"{inherited} decided with no last_verified; {closed} closed by owner decision",
+        f"evidence {anchors} anchors in {anchored_cells} cells over {len(paths)} paths; "
+        f"{unevidenced} decided cells carry neither an anchor nor an absence claim",
+        f"absence {absences} claims, {provable} of them carrying an observable "
+        "(the rest cannot be proved by execution)",
+        "NOT CHECKED here: whether any anchor still resolves, whether any absence claim is still "
+        "true, and completeness against the corpus. --status is a pure read of the scorecard; run "
+        "verify for those",
+    ]
+
+
 def form_summary(findings: Findings) -> list[str]:
     """The derived-``form`` split, printed beside the resolved count — WITH its denominator.
 
@@ -1199,6 +1432,26 @@ def _run_prove_absences(scorecard: Path, root: Path) -> int:
     return 0 if findings.ok else 1
 
 
+def _run_status(scorecard: Path, root: Path) -> int:
+    """The ``--status`` entry point: provenance first, then what the scorecard says. No corpus needed.
+
+    Exit 0 on a successful read and 2 when the scorecard cannot be loaded. NEVER 1 — this is a query,
+    not a gate, and a query that borrows the gate's failure code will eventually be wired into CI as
+    one. The gate is :func:`verify`.
+    """
+    for line in provenance_lines(scorecard, root):
+        print(line)
+    try:
+        cells = load_scorecard(scorecard)
+    except ScorecardError as exc:
+        # The provenance header is already out, so even this failure is attributable to a ref.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    for line in status_lines(cells):
+        print(line)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Verify or render the ASVS scorecard (ADR 0156).")
     ap.add_argument("--scorecard", type=Path, required=True)
@@ -1217,11 +1470,23 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="execute-prove absence claims (apply mutation to a scratch tree, require observable red)",
     )
+    # A QUERY, not a gate: a ref-stamped read of the scorecard, no corpus, no engine tree, no network,
+    # nothing cached to disk. It exists because the dominant token cost of ASVS work is not reading
+    # the record, it is reconciling two readings of it that were taken at different refs and printed
+    # identically. There is deliberately NO --fetch: see `_git` on why a query must not mutate.
+    ap.add_argument(
+        "--status",
+        action="store_true",
+        help="print the provenance line and the scorecard's own counts, then exit (no corpus needed)",
+    )
     # NO --anchor-sha injected by CI. The anchor is the commit the EVIDENCE was read on — a property
     # of the assessment, recorded in [scorecard].anchor_commit. Passing ${{ github.sha }} made the
     # rendered file differ on every run, so the drift check could never pass: a gate that cannot go
     # green is as useless as one that cannot go red, and this one shipped that way.
     args = ap.parse_args(argv)
+
+    if args.status:
+        return _run_status(args.scorecard, args.root)
 
     if args.prove_absences:
         return _run_prove_absences(args.scorecard, args.root)

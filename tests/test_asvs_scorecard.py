@@ -13,7 +13,11 @@ while the vault runs the same code against the real posture data.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -24,6 +28,7 @@ from scripts.asvs.scorecard import (
     Findings,
     ScorecardError,
     _copy_scratch,
+    _humanise_age,
     anchor_form,
     check_absences,
     check_anchors,
@@ -36,7 +41,10 @@ from scripts.asvs.scorecard import (
     load_scorecard,
     main,
     prove_absences,
+    provenance_lines,
     render_current,
+    repo_stamp,
+    status_lines,
     verify,
 )
 
@@ -1554,3 +1562,370 @@ def test_main_verify_without_corpus_returns_exit_2(tmp_path: Path) -> None:
     )
     rc = main(["--scorecard", str(sc), "--root", str(tmp_path)])
     assert rc == 2
+
+
+# --- provenance and `--status`: a count is a fact about a (file x ref) PAIR -----------------------
+#
+# Three wrong-base errors occurred in one working thread on 2026-08-08/09. In every one the NUMBER was
+# right and the REF was unnamed, so two readings taken from different places printed identically.
+# These tests exist to make that specific silence impossible, and they lean on real git repositories
+# rather than a mocked one: the failure being prevented is a fact about remote-tracking refs, fetch
+# recency and worktree layout, so a stub would reproduce my assumptions instead of git's behaviour.
+
+_GIT_ID = ("-c", "user.name=t", "-c", "user.email=t@t.invalid", "-c", "commit.gpgsign=false")
+
+
+def _git(repo: Path, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), *_GIT_ID, *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return proc.stdout.strip()
+
+
+def _commit(repo: Path, name: str) -> None:
+    (repo / name).write_text(name, encoding="utf-8")
+    _git(repo, "add", name)
+    _git(repo, "commit", "-m", name)
+
+
+def _origin_and_clone(tmp_path: Path) -> tuple[Path, Path]:
+    """A real bare origin plus a real clone tracking `origin/main`, both on disk."""
+    origin = tmp_path / "origin.git"
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init", "--quiet")
+    _git(seed, "checkout", "--quiet", "-b", "main")
+    _commit(seed, "a.txt")
+    subprocess.run(
+        ["git", "init", "--bare", "--quiet", str(origin)], check=True, capture_output=True
+    )
+    _git(seed, "remote", "add", "origin", str(origin))
+    _git(seed, "push", "--quiet", "-u", "origin", "main")
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", "--quiet", str(origin), str(clone)], check=True, capture_output=True
+    )
+    _git(clone, "checkout", "--quiet", "main")
+    return seed, clone
+
+
+def test_git_is_available_so_no_provenance_test_can_silently_skip() -> None:
+    """None of the tests below is marked skipif, on purpose. A provenance guard that quietly
+    evaporates on a machine without git is the same class of defect as a gate that cannot go red."""
+    assert subprocess.run(["git", "--version"], capture_output=True, check=True).returncode == 0
+
+
+def test_provenance_stamps_a_clean_checkout_with_its_sha_and_a_named_upstream(
+    tmp_path: Path,
+) -> None:
+    _, clone = _origin_and_clone(tmp_path)
+    stamp = repo_stamp(clone)
+    assert stamp.sha == _git(clone, "rev-parse", "--short", "HEAD")
+    assert stamp.dirty is False
+    assert stamp.ref() == stamp.sha and "+dirty" not in stamp.ref()
+    assert stamp.freshness == "CURRENT"
+    assert stamp.upstream == "origin/main"  # named, because BEHIND n is not a claim without it
+
+
+def test_provenance_marks_a_dirty_tree_so_it_cannot_pass_for_a_reproducible_one(
+    tmp_path: Path,
+) -> None:
+    """A measurement taken against uncommitted changes is not reproducible and must not look like one
+    that is. Falsified by hardcoding `dirty=False` in `repo_stamp`: this goes RED. Restored."""
+    _, clone = _origin_and_clone(tmp_path)
+    assert repo_stamp(clone).dirty is False  # control: clean first, so the flag means something
+    (clone / "a.txt").write_text("edited", encoding="utf-8")
+    stamp = repo_stamp(clone)
+    assert stamp.dirty is True
+    assert stamp.ref().endswith("+dirty")
+
+
+def test_freshness_reports_BEHIND_with_its_count_and_needs_no_network(tmp_path: Path) -> None:
+    """THE measured case. The vault checkout that caused the original wrong-base error in this
+    programme reads BEHIND 37 with remote knowledge 23 minutes old; re-measured while building this,
+    the same checkout read BEHIND 38 at 36 minutes. Either line stops the error dead.
+
+    The count comes from `git rev-list --left-right --count HEAD...origin/main`, which counts against
+    the LAST-FETCHED remote-tracking ref -- a purely local object. The fetch below is the test setting
+    up remote knowledge; the tool itself never fetches (see the no-mutation test further down).
+    """
+    seed, clone = _origin_and_clone(tmp_path)
+    _commit(seed, "b.txt")
+    _commit(seed, "c.txt")
+    _git(seed, "push", "--quiet", "origin", "main")
+    _git(clone, "fetch", "--quiet", "origin")
+    stamp = repo_stamp(clone)
+    assert stamp.freshness == "BEHIND 2"
+    assert stamp.upstream == "origin/main"
+
+
+def test_freshness_reports_AHEAD_with_its_count(tmp_path: Path) -> None:
+    _, clone = _origin_and_clone(tmp_path)
+    _commit(clone, "local.txt")
+    assert repo_stamp(clone).freshness == "AHEAD 1"
+
+
+def test_freshness_reports_DIVERGED_when_both_sides_moved(tmp_path: Path) -> None:
+    """DIVERGED is its own value and must not collapse into AHEAD or BEHIND: a branch that is both is
+    the state in which "am I on the right base?" is hardest and most often answered wrongly."""
+    seed, clone = _origin_and_clone(tmp_path)
+    _commit(seed, "remote.txt")
+    _git(seed, "push", "--quiet", "origin", "main")
+    _git(clone, "fetch", "--quiet", "origin")
+    _commit(clone, "local.txt")
+    assert repo_stamp(clone).freshness == "DIVERGED"
+
+
+def test_freshness_is_NO_UPSTREAM_and_is_never_an_omitted_field(tmp_path: Path) -> None:
+    """A repo with no remote at all. The field is POPULATED, not dropped: an absent qualifier is
+    exactly what produced all three wrong-base errors.
+
+    Falsified by returning an empty string from `_freshness` in this branch: the emptiness assertion
+    goes RED and the printed line silently loses its qualifier. Restored.
+    """
+    solo = tmp_path / "solo"
+    solo.mkdir()
+    _git(solo, "init", "--quiet")
+    _git(solo, "checkout", "--quiet", "-b", "main")
+    _commit(solo, "a.txt")
+    stamp = repo_stamp(solo)
+    assert stamp.freshness == "NO-UPSTREAM"
+    assert stamp.upstream == "none"
+    assert stamp.freshness != "" and stamp.remote_knowledge != ""
+
+
+def test_a_path_outside_any_work_tree_is_NO_GIT_and_not_NO_UPSTREAM(tmp_path: Path) -> None:
+    """The two are different statements and conflating them is a lie in the safer-sounding direction.
+
+    NO-UPSTREAM says "this repo tracks nothing"; NO-GIT says "this is not a repo, so no ref exists to
+    quote at all". A copy of the scorecard extracted by `git show` into a temp directory reads the
+    second, and reporting it as the first would let it pass for a checkout.
+    """
+    loose = tmp_path / "loose"
+    loose.mkdir()
+    stamp = repo_stamp(loose)
+    assert stamp.sha == "NO-GIT"
+    assert stamp.freshness == "NO-GIT"
+    assert stamp.upstream == "none"
+
+
+def test_remote_knowledge_is_NEVER_FETCHED_before_any_fetch_has_happened(tmp_path: Path) -> None:
+    solo = tmp_path / "solo"
+    solo.mkdir()
+    _git(solo, "init", "--quiet")
+    _git(solo, "checkout", "--quiet", "-b", "main")
+    _commit(solo, "a.txt")
+    assert repo_stamp(solo).remote_knowledge == "NEVER-FETCHED"
+
+
+def test_remote_knowledge_reports_the_AGE_of_the_last_fetch_not_merely_that_one_happened(
+    tmp_path: Path,
+) -> None:
+    """BEHIND 0 from a six-hour-old fetch and BEHIND 0 from a one-minute-old fetch are DIFFERENT
+    CLAIMS and must not print identically. That is the whole reason this field sits beside the count.
+
+    Falsified by returning a constant from `_remote_knowledge`: the two ages below become equal and
+    this goes RED. Restored.
+    """
+    seed, clone = _origin_and_clone(tmp_path)
+    _git(clone, "fetch", "--quiet", "origin")
+    fresh = repo_stamp(clone).remote_knowledge
+    assert fresh.endswith("s")  # seconds old, just now
+
+    head = Path(_git(clone, "rev-parse", "--path-format=absolute", "--git-dir")) / "FETCH_HEAD"
+    assert head.is_file()
+    old = time.time() - 6 * 3600
+    os.utime(head, (old, old))
+    stale = repo_stamp(clone).remote_knowledge
+    assert stale == "6h"
+    assert stale != fresh
+
+
+def test_humanise_age_covers_each_unit_boundary() -> None:
+    assert _humanise_age(0) == "0s"
+    assert _humanise_age(89) == "89s"
+    assert _humanise_age(90) == "1m"
+    assert _humanise_age(23 * 60) == "23m"
+    assert _humanise_age(90 * 60) == "1h"
+    assert _humanise_age(47 * 3600) == "47h"
+    assert _humanise_age(48 * 3600) == "2d"
+
+
+def test_status_issues_no_write_and_no_network_git_subcommand(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """THE NEGATIVE CONTROL, and the one that matters most here.
+
+    A query tool that fetches mutates repo state as a side effect of being asked a question, and on
+    this machine the vault remote is intermittently unauthenticated, so a network dependency would
+    fire constantly and the tool would be bypassed inside a day. So every git subcommand this mode
+    issues is captured and checked against a read-only allowlist, and the mutating verbs must appear
+    ZERO times: a pattern that cannot occur must come back zero.
+
+    It also checks the OUTCOME and not only the intent -- the remote-tracking refs and the FETCH_HEAD
+    mtime are compared across the run. Asserting on the argv alone would pass a tool that reached the
+    network some other way.
+
+    Falsified by adding a fetch to `repo_stamp`: the allowlist assertion goes RED naming the verb, and
+    the FETCH_HEAD mtime assertion goes RED independently of it. Restored.
+    """
+    seed, clone = _origin_and_clone(tmp_path)
+    _commit(seed, "b.txt")
+    _git(seed, "push", "--quiet", "origin", "main")
+    _git(clone, "fetch", "--quiet", "origin")
+
+    refs_before = _git(clone, "for-each-ref", "refs/remotes")
+    head = Path(_git(clone, "rev-parse", "--path-format=absolute", "--git-dir")) / "FETCH_HEAD"
+    mtime_before = head.stat().st_mtime
+
+    seen: list[list[str]] = []
+    real_run = subprocess.run
+
+    def spy(cmd: Any, *a: Any, **kw: Any) -> Any:
+        seen.append(list(cmd))
+        return real_run(cmd, *a, **kw)
+
+    # Patched on the `subprocess` module itself, which is the same object the verifier imported. That
+    # also means the helper `_git` below is spied, so `verbs` is snapshotted before any helper call.
+    monkeypatch.setattr(subprocess, "run", spy)
+
+    sc = _scorecard_file(clone, '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "unverified"\n')
+    rc = main(["--status", "--scorecard", str(sc), "--root", str(clone)])
+    capsys.readouterr()
+
+    assert rc == 0
+    assert seen, "the spy captured nothing -- this test would otherwise pass vacuously"
+    verbs = {cmd[3] for cmd in seen if len(cmd) > 3}
+    assert verbs <= {"rev-parse", "status", "rev-list"}, f"non-read-only git verb: {verbs}"
+    for forbidden in ("fetch", "pull", "push", "remote", "gc", "prune", "commit", "checkout"):
+        assert forbidden not in verbs
+
+    assert _git(clone, "for-each-ref", "refs/remotes") == refs_before
+    assert head.stat().st_mtime == mtime_before
+
+
+def test_provenance_lines_always_carry_every_mandated_field(tmp_path: Path) -> None:
+    """Non-suppressible and never partially populated. Each field is checked by NAME, so dropping one
+    is a red rather than a shorter line nobody notices."""
+    _, clone = _origin_and_clone(tmp_path)
+    sc = _scorecard_file(clone, '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "unverified"\n')
+    text = "\n".join(provenance_lines(sc, clone))
+    assert text.startswith("# asvs-status scorecard=")
+    assert " engine=" in text
+    assert "scorecard: freshness=" in text and "engine:" in text
+    assert text.count("freshness=") == 2  # one per repo: a single field could not say WHICH repo
+    assert text.count("upstream=") == 2
+    assert text.count("remote-knowledge=") == 2
+    assert "generated=" in text
+
+
+def test_two_readings_of_the_same_filename_at_different_refs_do_not_print_identically(
+    tmp_path: Path,
+) -> None:
+    """THE POINT OF THE WHOLE FEATURE, reproduced in miniature.
+
+    Live instance measured 2026-08-09 while building this: the vault working tree and vault
+    `origin/main` both hold a file called `asvs-scorecard.toml`, and they disagree -- 105 partial /
+    3 fail / 1,978 anchors against 106 partial / 2 fail / 1,980 anchors. Without a ref stamp those are
+    two plausible readings of "the scorecard" and nothing in either output says which is which. That
+    is exactly how three wrong-base errors happened in one thread.
+
+    Here the same file name is read from a stale checkout and a current one. The COUNTS are identical
+    by construction; only the provenance differs, which is the property under test.
+    """
+    seed, clone = _origin_and_clone(tmp_path)
+    body = '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "unverified"\n'
+    sc_current = _scorecard_file(seed, body)
+    sc_stale = _scorecard_file(clone, body)
+    _commit(seed, "b.txt")
+    _git(seed, "push", "--quiet", "origin", "main")
+    _git(clone, "fetch", "--quiet", "origin")
+
+    current = "\n".join(provenance_lines(sc_current, seed))
+    stale = "\n".join(provenance_lines(sc_stale, clone))
+
+    assert sc_current.name == sc_stale.name  # identical file names, as in the live instance
+    assert status_lines(load_scorecard(sc_current)) == status_lines(load_scorecard(sc_stale))
+    assert "BEHIND 1" in stale
+    assert "BEHIND" not in current
+    assert current != stale
+
+
+def test_status_reports_every_verdict_including_needs_review() -> None:
+    """`needs-review` is absent from the verify summary line and present here. A cell that was read
+    and then parked on purpose is not a cell that does not exist, and the record's own renderer once
+    contradicted itself over exactly this distinction."""
+    cells = [
+        Cell(id="1.1.1", level=1, verdict="pass", last_verified="2026-08-09"),
+        Cell(id="1.1.2", level=2, verdict="needs-review", last_verified="2026-08-09"),
+        Cell(id="2.1.1", level=3, verdict="unverified"),
+    ]
+    text = "\n".join(status_lines(cells))
+    assert "cells 3: 1 pass, 0 partial, 0 fail, 0 na, 1 needs-review, 1 unverified" in text
+    assert "examined 2 of 3 (66.7%)" in text
+
+
+def test_status_names_what_it_did_NOT_check() -> None:
+    """A cheap answer that looks like a full one is worse than no answer. `--status` never opens the
+    engine tree, so it must say so rather than let a structural tally read as anchor health.
+
+    Falsified by deleting the final line of `status_lines`: this goes RED. Restored.
+    """
+    text = "\n".join(status_lines([Cell(id="1.1.1", level=1, verdict="unverified")]))
+    assert "NOT CHECKED here" in text
+    assert "whether any anchor still resolves" in text
+    assert "run verify" in text
+
+
+def test_main_status_needs_no_corpus_and_prints_provenance_first(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--status` is a pure scorecard read, so requiring `--corpus` would be friction with no purpose,
+    and the provenance header is the FIRST thing on stdout -- before any number it qualifies."""
+    _, clone = _origin_and_clone(tmp_path)
+    sc = _scorecard_file(
+        clone,
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\nlast_verified = "2026-08-09"\n',
+    )
+    rc = main(["--status", "--scorecard", str(sc), "--root", str(clone)])
+    out = capsys.readouterr().out.splitlines()
+    assert rc == 0
+    assert out[0].startswith("# asvs-status scorecard=")
+    assert any(line.startswith("cells 1:") for line in out)
+
+
+def test_main_status_exits_2_on_an_unreadable_scorecard_and_still_prints_provenance(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Exit 2 is could-not-measure. NEVER 1: a query that borrows the gate's failure code gets wired
+    into CI as a gate, and this one checks nothing about the posture.
+
+    The header still prints, so even the failure is attributable to a ref.
+    """
+    _, clone = _origin_and_clone(tmp_path)
+    rc = main(["--status", "--scorecard", str(clone / "absent.toml"), "--root", str(clone)])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.out.startswith("# asvs-status scorecard=")
+    assert "refusing to report a pass on a missing file" in captured.err
+
+
+def test_status_does_not_run_the_gate_and_cannot_return_the_gates_exit_code(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Negative control on the exit code: a scorecard whose anchor is broken still exits 0 under
+    `--status`, because `--status` does not check anchors. If someone later wires verification into
+    this path, the 41-second cost and this assertion land at the same moment."""
+    _, clone = _origin_and_clone(tmp_path)
+    sc = _scorecard_file(
+        clone,
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\n'
+        "  [[cell.evidence]]\n"
+        '  path = "nowhere/absent.py"\n  line = 1\n  expect = "token_that_does_not_exist"\n',
+    )
+    rc = main(["--status", "--scorecard", str(sc), "--root", str(clone)])
+    capsys.readouterr()
+    assert rc == 0
