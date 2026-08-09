@@ -8765,3 +8765,54 @@ were needed; the trigger was already right and the check was what did not exist.
 **Not in scope, and not fixable here.** The gate's third claim -- that the recorded evidence anchors
 still resolve -- needs the private assessment record, so it can only run where that record is. No
 credential-free cross-repo trigger exists for it; the vault's daily cron remains its only authority.
+
+## 1204. a forward-only lint refusing a NEW hard-coded ASVS tally, with the idiom set rebuilt from the corpus
+
+> 🔢 **Filed 2026-08-09 - FIXED in the same change. Every idiom is driven from both sides, and the eight documents that motivated it were confirmed RED before it landed.** Value **7/10** · Difficulty **3/10**. ADR 0156 made the ASVS count computed. It did not stop anyone writing one down: 44 documents assert a whole-corpus tally, roughly fifty distinct tallies exist, and approximately one is correct.
+
+**Cluster:** Documentation correctness / gate blindness. **Priority:** P2. **Verdict:** build (done).
+**Severity:** no product effect and no PHI effect. The cost is a security record whose published
+numbers disagree with each other and with the tool that derives them.
+
+**Why a lint and not a sweep.** A one-time banner sweep over a file list was tried on the assessment
+corpus. It cost roughly 850 net lines, needed its own repair commit, and the defect regenerated
+inside four days because eight new documents were written after it. **A pass over a file list cannot
+constrain what is written next.** This lint is therefore forward-only: existing tallies are RECORDED
+in `scripts/docs/asvs_tally_baseline.txt`, not edited, and the baseline may only shrink -- it stores
+an occurrence count per claim, so adding a copy of an already-grandfathered tally fails, and removing
+one fails until the entry comes down with it.
+
+**The idiom set was rebuilt from the corpus, and the previous attempt's recall was reproduced first.**
+That attempt matched two shapes, an `N / N / N / N` tuple and `N of 345`. Re-implementing exactly
+those two and running them over the corpus reds **2 of the 8 chapter reports** -- matching the
+register's independent finding that it missed 6 of 8. The five idioms here red **8 of 8**. Two of them
+are shapes the old set could not see at all: a **Markdown table row** whose cells close to the corpus
+total, which is the shape the one CORRECT record is written in, and an **arithmetic assertion** that
+closes to it. A third, markdown-emphasis tolerance, is worth naming on its own: one chapter report
+writes its tally with the verdict words in backticks, and a detector using a bare `\s*` walks past it.
+
+**The discriminator, and why the previous attempt produced 73 false hits.** A run of integers counts
+as a tally only when it SUMS TO THE PINNED CORPUS TOTAL. An unbounded slash tuple matches HL7 field
+notation (`MSH-9/10/12`, `PID-3/4/18`), X12 transaction sets, HTTP status-code lists and config
+defaults; every one of those is now a permanent negative-control test. Corpus STRUCTURE is also
+deliberately not flagged -- the requirement count and the level split are pinned constants that cannot
+go stale, and flagging them is what made the previous attempt red the method document's own worked
+example, which is a literal letter rather than a count.
+
+**Proved on real files, both directions.** Eight mutations, one per idiom, appended to a real document
+in this repo: all eight RED, each confirmed to have landed by digest before its red was believed.
+Five controls appended through the identical path: all five stayed GREEN.
+
+**Trigger, and why it is a separate workflow.** The defect is written into DOCUMENTS, so the pull
+request carrying it is usually docs-only -- and a docs-only pull request sets `code=false` and skips
+the entire pytest suite. A guard reachable only through pytest would not run on the shape it exists
+to police, which is the same defect two guards in `ci.yml` were ungated to fix. Measured with the live
+globs and the live regex: a docs-only pull request FIRES the new workflow and ran no pytest at all
+before. The workflow includes its own file, the lint and the baseline in its trigger.
+
+**Scope, stated plainly.** The engine can only lint the documents it holds. The bulk of the affected
+corpus lives in the assessment repo and can only be linted there; the tool is stdlib-only and
+mirrorable for that reason, and `tests/test_asvs_verifier_vault_contract.py` now holds that property
+over a LIST of mirrored tools rather than the single one it was written for. Wiring it in on that side
+is a change in that repo, not this one. **Retiring the existing 44 documents is explicitly not part of
+this item** -- that is a sweep, it was costed and refused, and it is the owner's decision.

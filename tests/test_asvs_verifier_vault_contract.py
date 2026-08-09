@@ -102,10 +102,26 @@ def non_stdlib(roots: dict[str, list[int]]) -> dict[str, list[int]]:
     }
 
 
-def scan() -> tuple[str, dict[str, list[int]], dict[str, list[int]]]:
-    source = VERIFIER.read_text(encoding="utf-8")
-    roots = import_roots(source, VERIFIER_REL)
+def scan(rel: str = VERIFIER_REL) -> tuple[str, dict[str, list[int]], dict[str, list[int]]]:
+    source = (REPO_ROOT / rel).read_text(encoding="utf-8")
+    roots = import_roots(source, rel)
     return source, roots, non_stdlib(roots)
+
+
+# EVERY tool this repo expects the assessment repo to MIRROR AND RUN, not just the verifier.
+#
+# The stdlib-only rule is a property of the arrangement, not of one file: the assessment repo runs
+# these on a bare `setup-python` with no install step, so any third-party import is fatal there and
+# invisible here. The rule was discovered on the verifier; it is stated once, over a list, because a
+# fix that does not generalise is the one that comes back -- and the second entry arrived four days
+# after the first.
+MIRRORED_TOOLS = (
+    VERIFIER_REL,
+    # Not yet wired into a vault workflow. It is listed anyway, and deliberately: the cheap moment
+    # to hold a tool to the mirror contract is BEFORE it acquires a dependency, not after someone
+    # discovers the mirror will not run.
+    "scripts/docs/asvs_tally_lint.py",
+)
 
 
 def test_the_verifier_is_at_the_path_the_vault_hardcodes() -> None:
@@ -117,29 +133,31 @@ def test_the_verifier_is_at_the_path_the_vault_hardcodes() -> None:
     )
 
 
-def test_the_verifier_imports_only_the_standard_library() -> None:
-    source, roots, bad = scan()
+@pytest.mark.parametrize("rel", MIRRORED_TOOLS)
+def test_a_mirrored_tool_imports_only_the_standard_library(rel: str) -> None:
+    assert (REPO_ROOT / rel).is_file(), f"{rel} is listed as a mirrored tool but is not in the tree"
+    source, roots, bad = scan(rel)
     n_lines = source.count("\n") + 1
     n_imports = sum(len(v) for v in roots.values())
 
     # Print the inventory, not just the verdict: a scan that silently stopped seeing imports and a
     # scan that legitimately found none are the same number, and only the inventory tells them apart.
-    print(f"SCANNED: {VERIFIER_REL} ({n_lines} lines, {n_imports} import statements)")
+    print(f"SCANNED: {rel} ({n_lines} lines, {n_imports} import statements)")
     print(f"FOUND:   {len(roots)} distinct import roots: {sorted(roots)}")
     print(f"FOUND:   {len(bad)} non-stdlib roots: {sorted(bad)}")
 
     # The scan must be capable of seeing anything at all. Zero imports means a broken scanner far
-    # more plausibly than it means a 1,000-line verifier that imports nothing.
+    # more plausibly than it means a 1,000-line tool that imports nothing.
     assert n_imports > 0, (
-        f"scanned {VERIFIER_REL} ({n_lines} lines) and found ZERO import statements -- that is a "
+        f"scanned {rel} ({n_lines} lines) and found ZERO import statements -- that is a "
         f"broken scan, not a clean file"
     )
 
     assert not bad, (
-        f"{VERIFIER_REL} imports {sorted(bad)} outside the standard library "
+        f"{rel} imports {sorted(bad)} outside the standard library "
         f"(lines {sorted(ln for lines in bad.values() for ln in lines)}). "
         f"Scanned {n_imports} import statements across {n_lines} lines. "
-        f"The vault runs this file on a bare interpreter with NO install step, in two workflows. "
+        f"The vault runs mirrored tools on a bare interpreter with NO install step. "
         f"A non-stdlib import does not red the ASVS gate -- it strands the auto-mirror as an "
         f"unmergeable draft and leaves the vault verifying its record with the previous copy."
     )

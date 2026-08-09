@@ -1,0 +1,74 @@
+name: ASVS tally lint
+
+# Refuses a NEW hard-coded ASVS verdict tally in a document (ADR 0156, BACKLOG #1203).
+#
+# WHY THIS IS A SEPARATE WORKFLOW RATHER THAN A pytest TEST, which is where a guard would normally
+# live in this repo. The defect this catches is written into DOCUMENTS, so the pull request that
+# introduces it is usually docs-only -- and on a docs-only pull request ci.yml's `changes` job sets
+# `code=false` and the whole pytest suite is skipped. A guard reachable only through pytest would
+# therefore not run on the exact shape it exists to police. ci.yml already carries two guards that
+# were ungated for precisely this reason (the BACKLOG number-space gate and the status invariant),
+# and the note above them records what the second one cost before it was.
+#
+# The natural home is that same ungated "Doc guards" step in ci.yml. It is not used here because
+# ci.yml's `changes` job is under an open pull request (MEFORORG#299) and a second edit to those
+# lines would conflict. FOLLOW-UP: once #299 lands, fold this into the doc-guards list and delete
+# this file, so there is one place that decides which guards run on a docs-only pull request rather
+# than two.
+#
+# BOTH PATHS ARE LIVE MEANWHILE, deliberately and not as belt-and-braces theatre: this workflow
+# covers docs-only pull requests, and tests/test_asvs_tally_lint.py runs the same lint inside the
+# required `test` legs for code pull requests. They cannot disagree -- both invoke the same module
+# against the same frozen baseline.
+#
+# NOT A REQUIRED CHECK, and it must not become one without the owner's decision: it is paths-
+# filtered, so it does not report on a pull request that touches no document, and a required check
+# that never reports blocks that pull request forever (the required-but-absent trap, docs/CI.md).
+# .github/required-contexts.txt is the record of what is required; it is not listed there.
+on:
+  pull_request:
+    # The filter MUST include this workflow, the lint, and the baseline. A gate excluded from its
+    # own trigger cannot observe changes to itself -- a broken lint or a quietly widened baseline
+    # would merge green and be discovered later by an unrelated documentation edit.
+    paths: &tally_paths
+      - 'docs/**'
+      - 'scripts/docs/asvs_tally_lint.py'
+      - 'scripts/docs/asvs_tally_baseline.txt'
+      - '.github/workflows/asvs-tally-lint.yml'
+  push:
+    branches: [main]
+    paths: *tally_paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: asvs-tally-lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tally:
+    name: no new hard-coded ASVS tally
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # read-only lint job; don't persist the token (zizmor: artipacked)
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      # No install step and no dependency: the lint is stdlib-only, which is also what lets the
+      # assessment repo mirror and run it on a bare interpreter. tests/test_asvs_verifier_vault_contract.py
+      # holds that property for every mirrored tool, so it cannot be lost quietly here.
+      #
+      # The lint prints the file count, the idiom breakdown and the per-file counts before its
+      # verdict, so a run that scanned nothing cannot be read as a run that found nothing.
+      - name: Refuse a new hard-coded ASVS tally
+        run: |
+          python scripts/docs/asvs_tally_lint.py docs \
+            --baseline scripts/docs/asvs_tally_baseline.txt \
+            --allow docs/security/ASVS-CURRENT.md
