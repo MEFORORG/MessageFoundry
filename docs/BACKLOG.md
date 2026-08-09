@@ -7002,3 +7002,72 @@ deriving test buys all of them.
 **Source:** found 2026-08-08 during the ASVS 11.6.2 re-validation after `#338` merged - the cell's own
 "route onward" note was re-checked against `main` rather than carried, and the drift had widened rather
 than closed.
+
+## 1106. `redacted_settings` does not redact the JWS signing key or its passphrase
+
+> 🔢 **Filed 2026-08-08 - not started. EXECUTED against `main` 166634c9, not inferred.** Value **8/10** · Difficulty **2/10**. `_is_secret_setting` (`messagefoundry/config/wiring.py:686`) matches `_SECRET_SETTING_KEYS` plus the `body_secret_value_` prefix. It does **not** match `sign_private_key` or `sign_private_key_password` -- the exact names `with_signing` writes into `spec.settings` at `messagefoundry/transports/signing.py:505-506`. Both are therefore returned **verbatim** by `redacted_settings`, which is the scrubber for `GET /connections/{name}/metadata` and for `graph --json`. The `private_key` that IS in the registry (`wiring.py:623`) is the **SFTP** key -- a different setting.
+
+**Cluster:** Security / secret disclosure. **Priority:** P1. **Verdict:** build. **Severity:** on first
+deployment this would return a **private signing key and its passphrase** to any caller holding
+`Permission.MONITORING_READ`, and would print them to stdout, a CI log and the IDE graph view. No PHI is
+involved and there is no live exposure today (zero deployments), but this is a credential-disclosure
+defect in a shipped default path, not a hardening gap.
+
+**Measured, by executing it at 166634c9:**
+
+```
+redacted_settings({'sign_private_key': '<PEM armour + body>',
+                   'sign_private_key_password': 'hunter2',
+                   'private_key': 'SFTPKEY', 'smart_private_key': 'SMARTKEY'})
+-> {'sign_private_key': '<PEM armour + body, verbatim>',   <-- NOT redacted
+    'sign_private_key_password': 'hunter2',                  <-- NOT redacted
+    'private_key': '***', 'smart_private_key': '***'}
+```
+
+**The full chain, each link read at 166634c9.**
+
+* `with_signing` does `spec.settings.update({... "sign_private_key": private_key,
+  "sign_private_key_password": private_key_password ...})` (`transports/signing.py:501-509`), so the
+  material lands directly in the connection spec's settings map.
+* `GET /connections/{name}/metadata` calls `redacted_settings(ic.spec.settings)` and
+  `redacted_settings(oc.spec.settings)` (`api/app.py:2020`, `:2039`). Its only gate is
+  `Depends(require(Permission.MONITORING_READ))` -- a read-only monitoring permission, not a secrets or
+  config permission.
+* `display_settings` (`config/wiring.py:774`) is a thin wrapper over the same function, called by
+  `__main__.py:2922` and `:2941` for `graph --json`.
+
+**The control's own docstring asserts the property this refutes.** `config/wiring.py:770-773` says
+*"Credentials are scrubbed exactly as the API `/metadata` view scrubs them. This output reaches a
+terminal, a CI log and the IDE, so it earns the same treatment, not a weaker one -- it used to apply
+none at all, printing an inline credential verbatim."* That is true of the SFTP and SMART key classes
+and false of the JWS class, and nothing in the file distinguishes them.
+
+**`#1009`'s reverse gate cannot catch this, and reads green while the hole is open.**
+`tests/test_secret_rotation_inventory.py:248` probes with
+`setting_name = _CONNECTOR_SETTING_REPRESENTATIVE.get(secret, secret)` -- the **registry key**, not the
+name the tree actually emits. `CRITICAL_SECRETS["private_key"]` is labelled *"per-message JWS signing key
+-- PEM material (ADR 0018)"* but resolves through the **SFTP** setting name, so the gate certifies the
+JWS key reachable under a name no code emits. That is a falsely-green check, which is worse than a
+missing one.
+
+**Fix shape.** Add the two names to `_SECRET_SETTING_KEYS` (or give `_is_secret_setting` a `sign_`
+prefix arm consistent with the existing `body_secret_value_` arm), and correct
+`_CONNECTOR_SETTING_REPRESENTATIVE` so the rotation gate probes the emitted name rather than the
+registry key. Then re-run the probe above as a test, so the next divergence between registry key and
+emitted setting name fails rather than passes.
+
+**Route onward.** Whether `with_signing`'s `private_key: object` parameter (`transports/signing.py:467`)
+should accept an inline PEM at all, or be `env()`-only like other key material, is a separate question
+and is NOT settled here. Note the `env()` **fallback default** is also disclosed for this key class
+while it is dropped for `smart_private_key`, so an `env()`-only rule would narrow this defect without
+closing it.
+
+**ASVS.** This moved **15.3.1** from `pass` to `partial` (`redacted_settings` is one of that cell's own
+anchored controls, and the pinned verb is *"only returns the required subset of fields ... some
+individual fields should not be accessible to users"*). It is also relevant to **13.3.2** (`partial`,
+least-privilege access to secret assets) and **16.2.5** (`pass`, output reaching a terminal or CI log);
+neither has been re-assessed against it.
+
+**Source:** found 2026-08-08 by the completeness critic of the ASVS three-cell re-validation, which
+asked which cells the merged `#1009` fix touched that nobody had mapped. Confirmed by execution before
+filing.
