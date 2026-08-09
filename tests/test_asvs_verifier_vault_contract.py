@@ -117,10 +117,13 @@ def scan(rel: str = VERIFIER_REL) -> tuple[str, dict[str, list[int]], dict[str, 
 # after the first.
 MIRRORED_TOOLS = (
     VERIFIER_REL,
-    # Not yet wired into a vault workflow. It is listed anyway, and deliberately: the cheap moment
-    # to hold a tool to the mirror contract is BEFORE it acquires a dependency, not after someone
-    # discovers the mirror will not run.
+    # Not yet wired into a vault workflow. They are listed anyway, and deliberately: the cheap
+    # moment to hold a tool to the mirror contract is BEFORE it acquires a dependency, not after
+    # someone discovers the mirror will not run.
     "scripts/docs/asvs_tally_lint.py",
+    # This one has NO engine-side subject at all -- the record it reads exists only in the vault --
+    # so this list is the only thing standing between it and a dependency nothing here would notice.
+    "scripts/docs/asvs_residual_lint.py",
 )
 
 

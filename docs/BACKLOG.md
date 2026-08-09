@@ -8869,3 +8869,60 @@ mirrorable for that reason, and `tests/test_asvs_verifier_vault_contract.py` now
 over a LIST of mirrored tools rather than the single one it was written for. Wiring it in on that side
 is a change in that repo, not this one. **Retiring the existing 44 documents is explicitly not part of
 this item** -- that is a sweep, it was costed and refused, and it is the owner's decision.
+
+## 1205. half the ASVS record is prose nothing checks: ~2,000 `file:line` citations, none verified
+
+> 🔢 **Filed 2026-08-09 - the FORWARD-ONLY gate is built; the existing population is grandfathered and NOT swept.** Value **7/10** · Difficulty **3/10**. Roughly two thousand `file:line` citations live inside `residual` prose across about 250 cells. Nothing checks any of them, and a sample measured 44.9% stale.
+
+**Cluster:** Documentation correctness / gate blindness. **Priority:** P2. **Verdict:** build (gate done; the population is a separate decision).
+**Severity:** no product effect and no PHI effect. The cost is that the part of the record a reviewer
+actually reads is the part with no gate behind it.
+
+**The demonstration case, verified against public engine code at this commit.** Cell 6.3.3's gated
+`[[cell.evidence]]` anchor for the exposure check points at `messagefoundry/__main__.py:1125`, and
+that line reads `instance_exposed = not settings.api.is_loopback or ...` -- correct, and the only
+occurrence of that statement in the file. The prose in the SAME CELL cites `__main__.py:1917`, which
+is the middle of a warning string about the browser console. **The gated half is right and the read
+half is wrong, in one cell, about one control.**
+
+**Measured at the pinned record.** 2,052 citations across 247 cells; 1,086 name a bare basename with
+no directory. On the "cannot resolve even in principle" claim the honest split is finer than the
+round number suggests: resolved against this worktree, 129 of those basenames match no file at all,
+276 match two or more, and 677 happen to match exactly one. So *unresolvable in practice* is 405; the
+remaining 677 resolve only by luck of there being one candidate, which is not a property the citation
+format guarantees. Both figures are recorded rather than one being quoted.
+
+**Bulk promotion into gated anchors was refused and is not attempted.** Roughly a thousand
+hand-authored tokens, it doubles the gated surface, and it makes *delete the citation* the cheapest
+compliant act on the basenames.
+
+**THE KEY IS THE DESIGN.** A citation is identified by `cell id + field + FILE`, never by its line
+number. Three consequences: the population of (cell, field, file) pairs cannot grow; the occurrence
+count in the frozen baseline stops an existing pair growing either, so the total can only shrink; and
+**repairing a stale line number is FREE and needs no baseline edit, while adding a citation is
+refused and deleting one costs an edit.** That ordering is chosen deliberately -- it makes correction
+the cheapest compliant act, which is the exact inverse of the incentive the rejected approach created.
+
+**It refuses to succeed on an empty scan.** The tool runs where the data is, which is not this repo,
+so the dangerous failure is the silent one: pointed at a renamed field or a document with no cells,
+"no new citations" and "nothing was examined" would otherwise share an exit code. Both now exit 2, and
+the scan inventory prints before the verdict.
+
+**Proved at scale against the real record, locally.** Baseline of 1,233 claims over 2,052
+occurrences; a new path-qualified citation REDs, a new bare basename REDs, deleting a citation without
+lowering the baseline REDs, a renamed field and a missing baseline both exit 2 -- and repairing 6.3.3's
+stale line stays GREEN with no baseline edit. Every mutation confirmed to have landed before its
+verdict was believed.
+
+**Where it can run, stated plainly.** The record exists only in the assessment repo, so unlike the
+tally lint this one has NO engine-side subject at all. What ships here is the tool, stdlib-only and
+mirrorable on the ADR 0156 section 7 footing, with fixture tests; the baseline and the wiring belong
+beside the data. **No engine workflow is added, deliberately** -- a gate pointed at nothing is the
+failure this tool refuses to commit itself.
+
+**One hypothesis I held and measurement refuted.** I expected a baseline keyed on cell id to leak
+verdicts, since residuals sound like a property of unresolved cells. Measured: cited residuals occur
+across every verdict class, including a large majority of the passing ones, and the split of
+cited-residual cells is close to even between pass and not-pass. **The verdict-leak argument does not
+hold** and is withdrawn. The baseline still belongs beside the data, on the stronger ground that a
+frozen list is unverifiable from a repo that cannot see what it grandfathers.
