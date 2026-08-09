@@ -675,12 +675,154 @@ def _landing_swallows(source: str) -> bool:
     )
 
 
+# --- pre-flight screens on the MUTATION itself ----------------------------------------------------
+#
+# The proving loop counts ``mutated == 1`` as "the control bit". That is only sound if the observable
+# went red because of the SEMANTIC change the claim describes. Application is append-based, so a
+# reintroduction breaks the target by REDEFINITION SHADOWING -- and two mutations that shadow nothing
+# semantic still redden the observable, at exit 1, indistinguishably from a surgical proof:
+#
+#   * WRONG ARITY. ``def scan(p)`` reintroduced as ``def scan()`` raises ``TypeError`` at every call
+#     site. Every test touching it fails, exit 1, counted as PROVED. The claim proved that calling a
+#     function with the wrong number of arguments breaks it -- which is true of every function in the
+#     repository and evidence about no control at all. This is the "wrecking ball that reads as a
+#     surgical ablation" case, and it is not hypothetical here: the mutation is authored in a TOML
+#     file in a DIFFERENT REPOSITORY from the signature it copies, with nothing keeping the two in
+#     step (8 signature edits across the anchored surface in 149 commits).
+#   * A MUTATION THAT DOES NOT PARSE. Appending invalid Python breaks import of the target. When the
+#     observable imports it at module scope pytest reports a COLLECTION error (exit 2) and the
+#     existing fail-closed branch catches it -- but an import inside the test body surfaces as an
+#     ordinary test failure at exit 1, and is counted as a proof.
+#
+# NOT IMPLEMENTED, DELIBERATELY: a blanket refusal of ``raise`` in a mutation. That rule belongs to a
+# schema of typed mutation kinds where an "ablate" limb weakens a control and must never throw. This
+# module has no kinds -- every mutation is a REINTRODUCTION -- and a reintroduction that raises is an
+# anticipated, legitimate shape: the static backstop below exists precisely to flag one landing in a
+# swallowing handler, with two tests pinning that behaviour. Banning `raise` would delete the case the
+# backstop was written for. See the report accompanying this change.
+
+
+def _toplevel(source: str) -> tuple[dict[str, ast.arguments], set[str]] | None:
+    """Top-level function signatures by name, plus every top-level name bound. ``None`` if `source`
+    does not parse.
+
+    TOP LEVEL ONLY, and that is the point rather than a simplification: the mutation is APPENDED to
+    the module, so it can only shadow a module-level binding. A method inside a class body is not
+    reachable by this mechanism and must not be compared against.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    sigs: dict[str, ast.arguments] = {}
+    bound: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            sigs[node.name] = node.args
+            bound.add(node.name)
+        elif isinstance(node, ast.ClassDef):
+            bound.add(node.name)
+        elif isinstance(node, ast.Assign):
+            bound.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            bound.add(node.target.id)
+    return sigs, bound
+
+
+def _signature(args: ast.arguments) -> tuple[object, ...]:
+    """The call-compatible shape of a signature: what a CALL SITE can observe.
+
+    Parameter NAMES are included, not just counts -- a rename breaks every keyword call, which is the
+    same wrecking-ball failure as a wrong count and is invisible to an arity-only comparison. Default
+    values are compared by COUNT and never by value: a mutation legitimately changes what a default
+    IS (that can be the whole reintroduction), while changing how many there are moves the arity.
+    """
+    return (
+        tuple(p.arg for p in args.posonlyargs),
+        tuple(p.arg for p in args.args),
+        tuple(p.arg for p in args.kwonlyargs),
+        args.vararg.arg if args.vararg else None,
+        args.kwarg.arg if args.kwarg else None,
+        len(args.defaults),
+        sum(1 for d in args.kw_defaults if d is not None),
+    )
+
+
+def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings) -> bool:
+    """Refuse a mutation that would redden the observable for a reason other than the change it
+    claims. ``False`` means refused, and a PROVE-ERROR has been recorded.
+
+    Runs on the live-proof AND the static-screen path: a mutation whose signature does not match the
+    symbol it shadows is a defective claim whether or not anyone executes it.
+    """
+    if target.suffix != ".py":
+        return True  # nothing to parse; the append is opaque text by design
+    mutation = _toplevel(a.mutation)
+    if mutation is None:
+        findings.problems.append(
+            f"{cell_id}: absence claim PROVE-ERROR — the mutation is not valid Python, so applying it "
+            f"breaks import of {a.mutation_path} rather than reintroducing anything. An observable "
+            "that imports inside a test body reddens at exit 1 and would be counted as a proof"
+        )
+        return False
+    source = _toplevel(target.read_text(encoding="utf-8", errors="replace"))
+    if source is None:
+        # The TARGET does not parse. Not this claim's defect, and not something to refuse it over --
+        # leave it to execution, where the baseline will already be red and fail closed.
+        return True
+    mut_sigs, _ = mutation
+    src_sigs, _ = source
+    for name, margs in mut_sigs.items():
+        real = src_sigs.get(name)
+        if real is None:
+            continue  # shadows no module-level function of that name; nothing to compare
+        if _signature(margs) != _signature(real):
+            findings.problems.append(
+                f"{cell_id}: absence claim PROVE-ERROR — the mutation redefines {name}() with a "
+                f"different signature than {a.mutation_path} declares "
+                f"({_signature(margs)} vs {_signature(real)}). Applied, that raises TypeError at "
+                "every call site, so the observable would go red for the arity and not for the "
+                "reintroduction — a wrecking ball wearing the shape of a surgical proof. Copy the "
+                "live signature; the mutation lives in a different repository from the symbol it "
+                "shadows, so nothing else keeps the two in step"
+            )
+            return False
+    return True
+
+
+def _inventory(tree: Path) -> dict[str, int]:
+    """Relative path -> size for every file in the scratch tree, skipping derived bytecode.
+
+    The pristine copy is reused across claims, so something has to notice if a pytest run WROTE into
+    it -- residue from claim N would otherwise be attributed to claim N+1's mutation. Names and sizes
+    are a stat-only sweep, roughly two orders of magnitude cheaper than the copy it replaces.
+    Honest residual: it cannot see a same-length in-place rewrite.
+    """
+    out: dict[str, int] = {}
+    for p in tree.rglob("*"):
+        if p.is_file() and "__pycache__" not in p.parts:
+            out[str(p.relative_to(tree))] = p.stat().st_size
+    return out
+
+
+def _drop_pycache(target: Path) -> None:
+    """Remove the bytecode cache beside a restored file.
+
+    Belt and braces. CPython invalidates a ``.pyc`` on either source mtime or size, and a restore
+    changes both relative to the mutated run, so this should never be load-bearing -- but the cost of
+    being wrong is a stale module silently serving a mutation that was already reverted, which is a
+    false proof, and the fix is one directory removal.
+    """
+    shutil.rmtree(target.parent / "__pycache__", ignore_errors=True)
+
+
 def _prove_one(
     a: Absence,
     cell_id: str,
     root: Path,
-    scratch_dir: Path,
+    scratch: Path,
     findings: Findings,
+    baselines: dict[str, int],
     *,
     python: str,
     timeout: float,
@@ -707,9 +849,18 @@ def _prove_one(
         )
         return
 
+    if not _screen_mutation(a, cell_id, target_in_root, findings):
+        return
+
     if a.observable:
-        scratch = _copy_scratch(root, scratch_dir)
-        baseline = _run_node(scratch, a.observable, python, timeout)
+        # Baselines are CACHED BY NODE ID. The baseline is a property of the pristine tree and the
+        # node, and the tree is pristine by construction at this point -- re-running it per claim
+        # re-measured a constant, at one pytest subprocess each. Two claims naming the same observable
+        # now pay for one baseline.
+        baseline = baselines.get(a.observable)
+        if baseline is None:
+            baseline = _run_node(scratch, a.observable, python, timeout)
+            baselines[a.observable] = baseline
         if baseline != 0:
             # An already-red or uncollectable observable cannot attribute its red to the mutation.
             findings.problems.append(
@@ -718,8 +869,26 @@ def _prove_one(
                 "be attributed to the mutation"
             )
             return
-        _apply_mutation(scratch, a.mutation_path, a.mutation)
-        mutated = _run_node(scratch, a.observable, python, timeout)
+        # SAVE / APPLY / RUN / RESTORE against ONE pristine copy, rather than a fresh copytree per
+        # claim (measured at roughly 1.2s a copy). `finally` so a crash in the run cannot leave the
+        # shared tree mutated -- that would silently poison every later claim, which is the hazard the
+        # per-claim copy was buying protection from and the reason the restore is verified below.
+        target_in_scratch = scratch / a.mutation_path
+        original = target_in_scratch.read_bytes()
+        try:
+            _apply_mutation(scratch, a.mutation_path, a.mutation)
+            mutated = _run_node(scratch, a.observable, python, timeout)
+        finally:
+            target_in_scratch.write_bytes(original)
+            _drop_pycache(target_in_scratch)
+        if target_in_scratch.read_bytes() != original:
+            # Asserted, not assumed. A restore that silently did not happen turns every subsequent
+            # claim's result into a fact about the previous claim's mutation.
+            findings.problems.append(
+                f"{cell_id}: absence claim PROVE-ERROR — the scratch copy of {a.mutation_path} did "
+                "not restore after the mutated run, so no later claim in this pass is attributable"
+            )
+            return
         if mutated == 1:
             findings.proved_absences += 1  # live proof: the control bit
         elif mutated == 0:
@@ -766,21 +935,44 @@ def prove_absences(
     """
     findings = Findings()
     resolved_root = root.resolve()
+    #: Baseline exit code per observable node id. See the caching note in :func:`_prove_one`.
+    baselines: dict[str, int] = {}
     with tempfile.TemporaryDirectory(prefix="asvs_prove_") as td_base:
         base = Path(td_base)
-        i = 0
+        # ONE pristine copy for the whole pass. It was one per claim, which re-copied the entire tree
+        # to apply a few lines and then threw it away -- at 1.2s a copy that is pure overhead
+        # proportional to adoption, and adoption is the thing this mode exists to grow.
+        generation = 0
+        scratch = _copy_scratch(resolved_root, base / f"tree_{generation}")
+        inventory = _inventory(scratch)
         for c in cells:
             for a in c.absence:
-                i += 1
                 _prove_one(
                     a,
                     c.id,
                     resolved_root,
-                    base / f"scratch_{i}",
+                    scratch,
                     findings,
+                    baselines,
                     python=python,
                     timeout=timeout,
                 )
+                # Reusing one tree is only sound while the tree stays pristine. A test that writes
+                # into it leaves residue that the NEXT claim's mutated run would be blamed for, so the
+                # reuse is CHECKED rather than assumed: on any change beyond the file just restored,
+                # rebuild and say so. Cached baselines are dropped with it -- they were measured
+                # against a tree that no longer exists.
+                now = _inventory(scratch)
+                if now != inventory:
+                    generation += 1
+                    scratch = _copy_scratch(resolved_root, base / f"tree_{generation}")
+                    inventory = _inventory(scratch)
+                    baselines.clear()
+                    findings.advisories.append(
+                        f"{c.id}: the scratch tree was written to during this claim's run, so it was "
+                        "rebuilt and cached baselines were dropped. The claim's own result stands; "
+                        "an observable that writes into the tree it is measuring is worth a look"
+                    )
     return findings
 
 
@@ -995,11 +1187,19 @@ def _run_prove_absences(scorecard: Path, root: Path) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2  # could not measure — never 0, never confused with "clean"
     findings = prove_absences(cells, root)
+    # `saw N` is the TOTAL, and it is here because the other four counters do not close to it: a
+    # static-screened claim can ALSO raise a SUSPECT problem, and five outcomes raise a problem while
+    # incrementing no counter. Without the total, a pass that stopped iterating after two claims
+    # prints the same SHAPE as one that walked all of them, and no reader could tell. The total is
+    # computed from `cells`, so it is independent of anything the proving loop did.
+    seen = sum(len(c.absence) for c in cells)
     print(
-        f"prove-absences: proved {findings.proved_absences} by mutation; "
+        f"prove-absences: saw {seen} absence claim(s); proved {findings.proved_absences} by mutation; "
         f"{findings.static_screened} static-screened; {findings.skipped_absences} skipped; "
         f"{len(findings.problems)} problem(s)"
     )
+    for a in findings.advisories:
+        print(f"  NOTE {a}", file=sys.stderr)
     for p in findings.problems:
         print(f"  FAIL {p}", file=sys.stderr)
     return 0 if findings.ok else 1
