@@ -728,6 +728,41 @@ def _looks_like_a_credential_value(value: object) -> bool:
     return v.lower().startswith(_CREDENTIAL_VALUE_PREFIXES) or bool(_JWT_SHAPE.match(v))
 
 
+#: Credential-bearing ODBC/libpq driver keywords, by SHAPE and case-insensitively (BACKLOG #1206).
+#:
+#: A THIRD predicate rather than reuse, and the first attempt at this fix proves why. I reached for
+#: :func:`_is_secret_setting` -- and it returned False for every one of ``PWD``, ``Password`` and
+#: ``sslpassword``, because it matches a fixed frozenset of MessageFoundry SETTINGS names and these are
+#: ODBC DRIVER keywords with different spellings and different case. A fix that shipped on that
+#: predicate would have masked nothing while reading as a fix, in the change closing a defect whose
+#: whole shape is a control whose domain is narrower than its surface.
+#:
+#: ``pwd`` is listed explicitly because it is an ABBREVIATION and matches no substring rule -- it is
+#: also the single most common spelling in a SQL Server DSN.
+_SECRET_ODBC_SUBSTRINGS = (
+    "pwd",
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "credential",
+    "passphrase",
+)
+
+#: ODBC keywords that carry a credential-ish substring and are PATHS, not material. Masking a path
+#: hides configuration an operator needs to see and protects nothing: the file's contents never enter
+#: settings. ``sslkey`` and ``sslcert`` are libpq file paths.
+_NOT_SECRET_ODBC_KEYS = frozenset({"sslkey", "sslcert", "sslrootcert", "sslcrl"})
+
+
+def _is_secret_odbc_key(name: str) -> bool:
+    """Would printing this ODBC keyword's VALUE disclose a credential?"""
+    low = str(name).strip().lower()
+    if low in _NOT_SECRET_ODBC_KEYS or low.endswith(("_file", "_path")):
+        return False
+    return any(tok in low for tok in _SECRET_ODBC_SUBSTRINGS)
+
+
 def _is_secret_header(name: str, value: object = None) -> bool:
     """Would printing this header's VALUE disclose a credential?
 
@@ -856,6 +891,31 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
             out[name] = "***"
         elif name == "headers" and isinstance(value, dict):
             out[name] = {k: ("***" if _is_secret_header(k, v) else v) for k, v in value.items()}
+        elif name == "odbc_params" and isinstance(value, dict):
+            # BACKLOG #1206. This bag is documented as carrying "only static driver keywords", and the
+            # redactor honoured that by not descending -- so a credential inside it was served verbatim
+            # by /metadata behind MONITORING_READ and printed by graph --json, on the SAME object whose
+            # top-level `password` masked correctly.
+            #
+            # It is not merely operator misuse, which is why this masks rather than warns. The typed
+            # fields carry exactly ONE credential (`username`/`password`, key names configurable via
+            # `odbc_user_key`/`odbc_password_key`), and `_reject_envref_odbc_params` refuses `env()`
+            # here. So a connection needing a SECOND driver credential -- libpq `sslpassword` beside
+            # `PWD` -- has no typed home and no env() form, and the inline literal is the only
+            # expressible shape. A refusal that removes the SAFE expression while leaving the UNSAFE
+            # one is not a mitigation.
+            #
+            # Keys only, by the same predicate the rest of this function uses: real static driver
+            # keywords (`Encrypt`, `TrustServerCertificate`, `ApplicationIntent`) are not
+            # credential-shaped, and the ones that are -- `PWD`, `Password`, `sslpassword` -- are
+            # credentials. Values are NOT shape-tested here: a driver keyword's value is opaque and
+            # masking on its content would hide ordinary configuration with nothing to say so.
+            #
+            # THIS IS A DISPLAY FIX, NOT A STORAGE FIX. The credential remains an inline literal in
+            # the config file. Keeping it out of the file needs `env()` to work here, which needs
+            # nested settings to be env-resolved -- filed as #1206's route-onward, deliberately not
+            # folded in, because it changes the resolution path and what the refusal above means.
+            out[name] = {k: ("***" if _is_secret_odbc_key(k) else v) for k, v in value.items()}
         else:
             out[name] = value
     return out
