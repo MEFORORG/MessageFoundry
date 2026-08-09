@@ -8887,3 +8887,54 @@ leak it. That is the stronger control `odbc_params` lacks, and it is now asserte
 15.3.1, which I had recused from because I authored the two fixes bearing on that cell. Reproduced here
 by execution before any code changed. This is the fourth instance of the class and the second time a
 guard written after the previous instance picked a domain narrower than the surface.
+
+## 1207. an `env()` ref in a headers table, and a credential in URL userinfo, both escaped redaction
+
+> 🔢 **Filed 2026-08-09 - FIXED IN THE SAME CHANGE.** Value **7/10** · Difficulty **2/10**. Two holes, both INSIDE surfaces the redactor already claimed to handle. **(b)** the `headers` branch had no `EnvRef` arm, so an `env()` ref in a headers table came back as the RAW object carrying its `default` intact - while the same `env()` on a top-level credential correctly emits `{"env": key}` with the default dropped. **(c)** `url="https://user:SECRET@host"` was returned verbatim by both serializers while `proxy_password` on the SAME object masked.
+
+**Cluster:** Security / secret disclosure. **Priority:** P1. **Verdict:** build (done).
+**Severity:** on a first deployment, both would be served to any `MONITORING_READ` caller and printed
+by `graph --json`. (b) discloses a FALLBACK secret - the `env()` default is the value used when the
+variable is unset, so it is a credential by construction. No PHI.
+
+**Measured before and after, both serializers:**
+
+```
+(b) BEFORE  headers={"X-Vendor-Thing": env("acme_key", default=S)}
+              -> EnvRef(key='acme_key', default='S')      raw object, default intact, not JSON-safe
+    AFTER   -> {'env': 'acme_key'}                        default dropped
+    control  Content-Type: application/json               untouched
+
+(c) BEFORE  url=https://user:S@host/y                     verbatim
+            proxy_url=http://puser:S@proxy:8080           verbatim
+            proxy_password on the same object             '***'
+    AFTER   url=https://user:***@host/y                    user, host and path PRESERVED
+    control  https://plain.invalid/path?q=1               untouched
+```
+
+**WHY THE DEFAULT IS DROPPED FOR EVERY HEADER, not only credential-shaped ones.** The measured
+instance used `X-Vendor-Thing`, which matches no substring in the header name rule - so gating the
+`EnvRef` arm on that rule would have left this exact case open. A header value sourced from `env()` is
+a credential by intent; nobody `env()`-refs a `Content-Type`. The name heuristic is the wrong gate
+here, and it is precisely the gate that failed.
+
+**WHY THE USER, HOST AND PATH SURVIVE.** Only the password half of the userinfo is replaced. An
+operator diagnosing a connection needs to see which account and which host; masking the whole URL
+would destroy the view rather than protect it, and nothing would report that as a loss. The control
+test asserts a URL without userinfo is left byte-identical, because a masker that rewrites every URL
+would satisfy the leak assertions while silently mangling ordinary configuration.
+
+**`proxy` is another parameter-to-setting rename**, noticed while fixing this: the factory parameter
+is `proxy` and the emitted setting is `proxy_url`. That is the same boundary `with_signing` crosses
+(`private_key` -> `sign_private_key`, BACKLOG #1106) - which is why the URL rule is a NAME set plus a
+suffix rule rather than a suffix rule alone.
+
+**Source:** both found by the `asvs-tracking-rework` session's independent assessment of ASVS 15.3.1,
+alongside the `odbc_params` disclosure fixed as #1206. Reproduced here by execution before any code
+changed. With these closed, the three surfaces that hold 15.3.1 at `partial` are addressed and the cell
+is due a re-read - by that session, not by me, since I authored all three fixes.
+
+**Process note against myself:** the code comments in this change cited `#1207` BEFORE the number was
+allocated. It happened to be next, so nothing collided - but "happened to be next" is exactly the
+reasoning `scripts/coord/alloc.ps1` exists to eliminate, and two sessions doing it simultaneously is
+the documented failure. Allocate, then write.
