@@ -118,8 +118,13 @@ def scan(rel: str = VERIFIER_REL) -> tuple[str, dict[str, list[int]], dict[str, 
 MIRRORED_TOOLS = (
     VERIFIER_REL,
     # Not yet wired into a vault workflow. They are listed anyway, and deliberately: the cheap
-    # moment to hold a tool to the mirror contract is BEFORE it acquires a dependency, not after
-    # someone discovers the mirror will not run.
+    # moment to hold a tool to this contract is BEFORE it acquires a dependency, not after someone
+    # discovers the vault's copy will not run.
+    #
+    # Worded to avoid the literal phrase tests/test_cutover_slug_rot.py ratchets on. That guard
+    # cannot separate "a COPIED TOOL" from "this REPO is a mirror of a private source", which is the
+    # rot it exists to stop -- and a coarse regex over prose is the right trade there. So the cost of
+    # saying this unambiguously is mine to pay, not the ceiling's to absorb.
     "scripts/docs/asvs_tally_lint.py",
     # This one has NO engine-side subject at all -- the record it reads exists only in the vault --
     # so this list is the only thing standing between it and a dependency nothing here would notice.
