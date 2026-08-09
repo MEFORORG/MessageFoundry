@@ -226,6 +226,10 @@ class Findings:
     #: recorded line numbers rot; they just do not red the gate.
     advisories: list[str] = field(default_factory=list)
     checked_anchors: int = 0
+    #: The POPULATION of absence claims a pass looked at. Set by BOTH :func:`check_absences` and
+    #: :func:`prove_absences` — the two passes read the same population, and without it neither one's
+    #: outcome counters can be reconciled against anything. A run that scanned 276 claims and a run
+    #: that scanned zero otherwise print counter sets that look equally plausible.
     checked_absences: int = 0
     skipped_anchors: int = 0
     #: Derived :data:`AnchorForm` of every anchor that LOCATED, plus an ``undetermined`` bucket for a
@@ -236,7 +240,19 @@ class Findings:
     #: Populated only by :func:`prove_absences`. ``proved_absences`` counts claims whose observable
     #: went red under the applied mutation (a live proof); ``static_screened`` counts claims that took
     #: the static backstop (a screen, not a proof); ``skipped_absences`` counts claims carrying no
-    #: ``mutation_path`` (nothing to apply). UNPROVEN and PROVE-ERROR outcomes go into ``problems``.
+    #: ``mutation_path`` (nothing to apply).
+    #:
+    #: **These three do NOT sum to the population, and that is why ``checked_absences`` above must be
+    #: printed beside them.** FIVE outcomes raise a problem and increment no counter at all — a
+    #: ``mutation_path`` that escapes the tree, one that is not a file, a baseline that is not green,
+    #: an UNPROVEN mutated-green, and a mutated run that errored rather than failed. The arithmetic
+    #: that closes is::
+    #:
+    #:     checked_absences - proved_absences - static_screened - skipped_absences
+    #:         == claims that ended in a problem-only branch
+    #:
+    #: and note that ``len(problems)`` is NOT that number: a SUSPECT finding rides along with a claim
+    #: already counted in ``static_screened``, so problems and claims are different populations.
     proved_absences: int = 0
     static_screened: int = 0
     skipped_absences: int = 0
@@ -931,6 +947,9 @@ def prove_absences(
         for c in cells:
             for a in c.absence:
                 i += 1
+                # The POPULATION, recorded before any outcome branch, so it is right whichever branch
+                # this claim takes. Without it the outcome counters float free of what was scanned.
+                findings.checked_absences += 1
                 _prove_one(
                     a,
                     c.id,
@@ -1422,8 +1441,14 @@ def _run_prove_absences(scorecard: Path, root: Path) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2  # could not measure — never 0, never confused with "clean"
     findings = prove_absences(cells, root)
+    # `saw N` is the denominator, and it comes FIRST because the parts are unreadable without it: a
+    # run over 276 claims and a run over zero otherwise print counter sets that look equally
+    # plausible. The three outcome counters deliberately do not sum to it -- five problem-only
+    # outcomes increment nothing -- so the remainder is derivable and the gap is the point rather
+    # than a rounding error. See `Findings.proved_absences` for the closing arithmetic.
     print(
-        f"prove-absences: proved {findings.proved_absences} by mutation; "
+        f"prove-absences: saw {findings.checked_absences} absence claim(s); "
+        f"proved {findings.proved_absences} by mutation; "
         f"{findings.static_screened} static-screened; {findings.skipped_absences} skipped; "
         f"{len(findings.problems)} problem(s)"
     )

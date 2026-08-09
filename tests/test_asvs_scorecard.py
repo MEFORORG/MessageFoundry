@@ -1929,3 +1929,121 @@ def test_status_does_not_run_the_gate_and_cannot_return_the_gates_exit_code(
     rc = main(["--status", "--scorecard", str(sc), "--root", str(clone)])
     capsys.readouterr()
     assert rc == 0
+
+
+# --- prove-absences: the counters must be reconcilable against the population they came from ------
+
+
+def test_prove_absences_records_the_population_it_saw(tmp_path: Path) -> None:
+    """`checked_absences` is set BEFORE any outcome branch, so it is right whichever branch is taken.
+
+    Falsified by moving the increment inside `_prove_one` after the `mutation_path` guard: the skipped
+    claim then goes uncounted and the first assertion goes RED. Restored.
+    """
+    _module(tmp_path, "scanner.py", _SCANNER)
+    _obs_test(tmp_path, "test_scanner.py", _OBS_TEST)
+    proved = _live_claim(
+        'def scan(p): return "infected"', "scanner.py", "test_scanner.py::test_clean"
+    )
+    skipped = Cell(
+        id="1.1.2",
+        level=1,
+        verdict="fail",
+        absence=(Absence(pattern="x", positive_control="y", mutation="import x"),),
+    )
+    findings = prove_absences([proved, skipped], tmp_path)
+    assert findings.checked_absences == 2
+    assert findings.proved_absences == 1
+    assert findings.skipped_absences == 1
+
+
+def test_prove_absences_counters_close_against_the_population(tmp_path: Path) -> None:
+    """The arithmetic that makes the summary readable, asserted rather than asserted-in-prose.
+
+    FIVE outcomes raise a problem and increment no counter (an escaping `mutation_path`, one that is
+    not a file, a baseline that is not green, an UNPROVEN mutated-green, and a mutated run that
+    errored). So the closing identity is population minus the three counters, and this fixture drives
+    one claim into each of four different branches to check it holds across them.
+
+    Note what is NOT asserted: that `len(problems)` equals the problem-only count. It does not, and
+    cannot -- a SUSPECT finding rides along with a claim already counted in `static_screened`, so
+    problems and claims are different populations. Asserting that equality would pin a false identity.
+    """
+    _module(tmp_path, "scanner.py", _SCANNER)
+    _module(tmp_path, "quiet.py", "VALUE = 1\n")
+    _obs_test(tmp_path, "test_scanner.py", _OBS_TEST)
+
+    proved = _live_claim(
+        'def scan(p): return "infected"', "scanner.py", "test_scanner.py::test_clean"
+    )
+    skipped = Cell(
+        id="1.1.2",
+        level=1,
+        verdict="fail",
+        absence=(Absence(pattern="x", positive_control="y", mutation="import x"),),
+    )
+    screened = Cell(
+        id="1.1.3",
+        level=1,
+        verdict="fail",
+        absence=(
+            Absence(
+                pattern="x", positive_control="y", mutation="VALUE = 2", mutation_path="quiet.py"
+            ),
+        ),
+    )
+    problem_only = Cell(
+        id="1.1.4",
+        level=1,
+        verdict="fail",
+        absence=(
+            Absence(
+                pattern="x",
+                positive_control="y",
+                mutation="import x",
+                mutation_path="not_a_file.py",
+            ),
+        ),
+    )
+
+    f = prove_absences([proved, skipped, screened, problem_only], tmp_path)
+    assert f.checked_absences == 4
+    remainder = f.checked_absences - f.proved_absences - f.static_screened - f.skipped_absences
+    assert remainder == 1  # exactly the PROVE-ERROR claim, derived rather than counted
+    assert f.proved_absences == 1 and f.skipped_absences == 1 and f.static_screened == 1
+
+
+def test_prove_absences_summary_prints_the_population_before_the_parts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A run that scanned N claims and a run that scanned zero must not print equally plausible
+    counter sets. Without `saw N` they do: all four numbers are zero in both.
+
+    Falsified by deleting the `saw ... absence claim(s);` term from `_run_prove_absences`: both
+    assertions go RED. Restored.
+    """
+    _module(tmp_path, "scanner.py", _SCANNER)
+    _obs_test(tmp_path, "test_scanner.py", _OBS_TEST)
+    sc = tmp_path / "sc.toml"
+    _biting_scorecard(sc, "scanner.py")
+    rc = main(["--scorecard", str(sc), "--root", str(tmp_path), "--prove-absences"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "prove-absences: saw 1 absence claim(s);" in out
+    assert "proved 1 by mutation" in out
+
+
+def test_prove_absences_summary_negative_control_an_empty_run_says_saw_zero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The negative control: a scorecard with NO absence claims must say so, not print four zeroes
+    that read like a clean pass over a real population."""
+    sc = tmp_path / "sc.toml"
+    sc.write_text(
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "unverified"\n',
+        encoding="utf-8",
+    )
+    rc = main(["--scorecard", str(sc), "--root", str(tmp_path), "--prove-absences"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "saw 0 absence claim(s)" in out
