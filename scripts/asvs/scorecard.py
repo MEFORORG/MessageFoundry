@@ -125,11 +125,22 @@ class ScorecardError(Exception):
 
 @dataclass(frozen=True)
 class Anchor:
-    """A claim that some token exists in the tree, at roughly a known place."""
+    """A claim that some token exists in the tree, at roughly a known place.
+
+    ``sym`` and ``ctx`` are OPTIONAL and additive. ``None`` means *not asserted*; an empty string means
+    *asserted to be nothing* — module level for ``sym``, unnested for ``ctx``. Those are different
+    claims and a single ``str`` default would silently merge them, turning every un-backfilled anchor
+    into an assertion that it sits at module level and unnested. See :func:`derive_sym_ctx`.
+    """
 
     path: str
     line: int
     expect: str
+    #: Enclosing symbol, dotted (``ClassName.method``). ``""`` = module level, ``None`` = not asserted.
+    sym: str | None = None
+    #: Block-node chain from the symbol inward (``Try.body``, ``Try.body>If.orelse``). ``""`` =
+    #: unnested, ``None`` = not asserted.
+    ctx: str | None = None
 
 
 @dataclass(frozen=True)
@@ -237,6 +248,11 @@ class Findings:
     #: are absent from this counter entirely — there is no landing site to classify — so its total is
     #: ``checked_anchors`` minus those, and the summary prints both numbers rather than either alone.
     anchor_forms: Counter[str] = field(default_factory=Counter)
+    #: Anchors carrying a ``sym`` or a ``ctx``, so the summary can say how much of the record the
+    #: structural check actually reached. Backfill is Stream D's; until it lands this is small, and a
+    #: check that silently covers 3 of 1,980 anchors while printing like a whole-corpus result is the
+    #: exact overstatement this pass has been correcting everywhere else.
+    checked_sym_ctx: int = 0
     #: Populated only by :func:`prove_absences`. ``proved_absences`` counts claims whose observable
     #: went red under the applied mutation (a live proof); ``static_screened`` counts claims that took
     #: the static backstop (a screen, not a proof); ``skipped_absences`` counts claims carrying no
@@ -374,7 +390,17 @@ def load_scorecard(path: Path) -> list[Cell]:
                 verified_at=str(raw.get("verified_at", "")),
                 reviewed_by=str(raw.get("reviewed_by", "")),
                 evidence=tuple(
-                    Anchor(path=str(e["path"]), line=int(e["line"]), expect=str(e["expect"]))
+                    Anchor(
+                        path=str(e["path"]),
+                        line=int(e["line"]),
+                        expect=str(e["expect"]),
+                        # `.get(...)` WITHOUT a "" default, deliberately: absent must stay None. An
+                        # empty string is the assertion "module level" / "unnested", so defaulting to
+                        # it would turn all 1,980 un-backfilled anchors into that claim overnight and
+                        # light up every anchor that is legitimately inside a function.
+                        sym=None if e.get("sym") is None else str(e["sym"]),
+                        ctx=None if e.get("ctx") is None else str(e["ctx"]),
+                    )
                     for e in raw.get("evidence", [])
                 ),
                 absence=tuple(
@@ -557,6 +583,158 @@ def anchor_form(path: str, text: str, start: int) -> AnchorForm | None:
     return _form_from_spans(path, _prose_spans(text), start)
 
 
+# --- sym + ctx: WHERE in the file's structure the token sits ---------------------------------------
+
+#: The block-bearing fields of every statement that can nest another, and **the single source of truth
+#: for both derivation and validation.** A `ctx` value is well-formed exactly when every element names
+#: a key here and one of its fields, so a typo cannot produce a chain that silently never matches.
+#: One table, two consumers — the alternative is a validator and a deriver that disagree, which is the
+#: same defect shape as a gate whose check and whose error message were written separately.
+_BLOCK_FIELDS: Final[dict[str, tuple[str, ...]]] = {
+    "Try": ("body", "handlers", "orelse", "finalbody"),
+    "TryStar": ("body", "handlers", "orelse", "finalbody"),
+    "If": ("body", "orelse"),
+    "For": ("body", "orelse"),
+    "AsyncFor": ("body", "orelse"),
+    "While": ("body", "orelse"),
+    "With": ("body",),
+    "AsyncWith": ("body",),
+    "Match": ("cases",),
+}
+
+#: Nodes that nest a statement but are never reached by a name of their own: an ``ExceptHandler``
+#: comes only via ``Try.handlers``, a ``match_case`` only via ``Match.cases``.
+#:
+#: **Kept separate from :data:`_TRANSPARENT` on purpose, and the separation was earned by a failed
+#: injection.** "Can the walk descend into this?" and "does it contribute a chain element?" are two
+#: questions, and a first cut answered both from one set. That made the second one UNTESTABLE:
+#: deleting ``ExceptHandler`` from the transparent set silently stopped the walk DESCENDING rather
+#: than starting to RECORD, the chain came out identical by a different route, and an injection that
+#: should have reddened a test changed nothing observable. Two tables, two behaviours, both drivable.
+_DESCEND_ONLY: Final[dict[str, tuple[str, ...]]] = {
+    "ExceptHandler": ("body",),
+    "match_case": ("body",),
+}
+
+#: Nodes descended through WITHOUT contributing an element — recording them would double every
+#: handler chain (``Try.handlers>ExceptHandler.body``) for no added discrimination. Must name every
+#: key of :data:`_DESCEND_ONLY`; a test asserts that, because the two are independent by design and
+#: nothing else would notice them drifting apart.
+_TRANSPARENT: Final[frozenset[str]] = frozenset({"ExceptHandler", "match_case"})
+
+#: Nodes that OPEN A SYMBOL: they contribute a name to ``sym`` and RESET ``ctx``, because a block
+#: chain is meaningful only within the symbol that contains it.
+_SCOPE_NODES: Final = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+_SYM_RE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z_]\w*(\.[A-Za-z_]\w*)*")
+
+
+def _block_fields(node: ast.AST) -> tuple[str, ...]:
+    """Which fields the walk may descend into. DESCENT ONLY — whether the step is recorded is
+    :data:`_TRANSPARENT`'s question, asked separately in :func:`sym_ctx_at`."""
+    if isinstance(node, (ast.Module, *_SCOPE_NODES)):
+        return ("body",)
+    name = type(node).__name__
+    return _BLOCK_FIELDS.get(name) or _DESCEND_ONLY.get(name, ())
+
+
+def _next_block(node: ast.AST, line: int) -> tuple[str, ast.AST] | None:
+    """The (field, child) one level in that contains `line`, or ``None`` at the innermost node."""
+    for fieldname in _block_fields(node):
+        for child in getattr(node, fieldname, None) or []:
+            lo = getattr(child, "lineno", None)
+            hi = getattr(child, "end_lineno", None)
+            if lo is not None and hi is not None and lo <= line <= hi:
+                return fieldname, child
+    return None
+
+
+def derive_sym_ctx(text: str, line: int) -> tuple[str, str] | None:
+    """The enclosing symbol and block chain at `line`. ``None`` when the source will not parse.
+
+    ``sym`` is dotted and outermost-first (``SqlServerStore.route_handoff``), ``""`` at module level.
+    ``ctx`` is the chain of block statements between the symbol and the line, joined by ``>``
+    (``Try.body``, ``Try.body>If.orelse``), ``""`` when unnested.
+
+    **``ctx``, NOT raw indentation, and the difference is the whole reason this field is shaped this
+    way.** Cell 12.3.5 carries the identical 4-versus-8 indent mismatch as 10.5.4 and is a non-event —
+    a hand-trimming slip, with ``ctx`` unchanged at both ends. Indentation flags it and would have to
+    be triaged; ``ctx`` correctly does not fire, because nothing about the statement's position in the
+    control flow changed. An indentation check would have spent a person's attention on a whitespace
+    edit while claiming to be a structural signal.
+
+    Containment is decided by LINE, so a one-line compound (``if x: y = 1``) attributes the line to the
+    ``If`` rather than to the assignment inside it. `ast` reports ``col_offset`` as a UTF-8 BYTE offset,
+    which disagrees with the character offsets the rest of this module uses the moment a line holds a
+    non-ASCII character; line granularity has no such failure mode and every real anchor is a statement
+    on its own line.
+
+    **For a multi-line ``expect`` the line is the token's FIRST line**, matching what the drift
+    advisory reports. Any backfill must derive at the same line or the 42 multi-line tokens in the
+    record will mismatch by construction — not because anything moved, but because the two ends
+    measured different lines.
+    """
+    tree = parse_or_none(text)
+    return None if tree is None else sym_ctx_at(tree, line)
+
+
+def parse_or_none(text: str) -> ast.Module | None:
+    """``ast.parse`` that reports failure as a value. Callers must surface it, never default it."""
+    try:
+        return ast.parse(text)
+    except (SyntaxError, ValueError):
+        return None
+
+
+def sym_ctx_at(tree: ast.Module, line: int) -> tuple[str, str]:
+    """The symbol/chain walk itself, split from parsing so a file is parsed once per run and not
+    once per anchor — ``settings.py`` alone carries 218 anchors."""
+    sym: list[str] = []
+    ctx: list[str] = []
+    node: ast.AST = tree
+    while True:
+        step = _next_block(node, line)
+        if step is None:
+            break
+        fieldname, child = step
+        name = type(node).__name__
+        if not isinstance(node, (ast.Module, *_SCOPE_NODES)) and name not in _TRANSPARENT:
+            ctx.append(f"{name}.{fieldname}")
+        if isinstance(child, _SCOPE_NODES):
+            sym.append(child.name)
+            ctx.clear()  # a block chain is meaningful only INSIDE the symbol that holds it
+        node = child
+    return ".".join(sym), ">".join(ctx)
+
+
+def malformed_sym_ctx(sym: str | None, ctx: str | None) -> str | None:
+    """Why these values could never match anything, or ``None`` if they are well-formed.
+
+    Well-formedness is checked against :data:`_BLOCK_FIELDS`, the same table the deriver walks, so a
+    chain that is accepted here is one the deriver can actually produce. This is the only part of the
+    sym/ctx feature that is FATAL rather than advisory, and the reason is that it is a defect in the
+    RECORD rather than a fact about the code: no amount of engine movement can cause it, the fix is
+    unambiguous, and an unmatchable chain otherwise sits there advising forever.
+    """
+    if sym is not None and sym and not _SYM_RE.fullmatch(sym):
+        return f"sym {sym!r} is not a dotted Python identifier path"
+    if ctx is None or not ctx:
+        return None
+    for element in ctx.split(">"):
+        node, _, fieldname = element.partition(".")
+        if node not in _BLOCK_FIELDS:
+            return (
+                f"ctx element {element!r} names {node!r}, which is not a block statement this "
+                f"deriver can produce (known: {', '.join(sorted(_BLOCK_FIELDS))})"
+            )
+        if fieldname not in _BLOCK_FIELDS[node]:
+            return (
+                f"ctx element {element!r} names field {fieldname!r}, which {node} does not have "
+                f"(known: {', '.join(_BLOCK_FIELDS[node])})"
+            )
+    return None
+
+
 def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
     """Open every evidence anchor and assert its token still resolves, and resolves UNAMBIGUOUSLY.
 
@@ -597,6 +775,7 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
     # there are files to do them on.
     text_cache: dict[Path, str] = {}
     spans_cache: dict[Path, list[tuple[int, int]] | None] = {}
+    ast_cache: dict[Path, ast.Module | None] = {}
     for c in cells:
         for a in c.evidence:
             target = root / a.path
@@ -672,6 +851,90 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
                     f"{a.line} but actually at {actual} (offset {actual - a.line:+d}). "
                     "Advisory: the line is a navigation aid, not the proof"
                 )
+            _check_sym_ctx(c.id, a, text, actual, ast_cache, target, findings)
+
+
+def _check_sym_ctx(
+    cell_id: str,
+    a: Anchor,
+    text: str,
+    actual: int,
+    ast_cache: dict[Path, ast.Module | None],
+    target: Path,
+    findings: Findings,
+) -> None:
+    """Validate a recorded ``sym``/``ctx`` against where the token now sits.
+
+    **THIS IS A DISPLACEMENT SIGNAL, NOT A DEFECT DETECTOR; its security-relevant precision measured
+    0 of 1 on the only datum the corpus offers, because 10.5.4's red was a HARDENING.** The change
+    that moved that statement into a ``try`` made the code safer, and a structural check fired on it.
+    Read this field as "your reasoning about this cell is stale, go re-read it" — never as "something
+    is wrong here". A signal described as a defect detector, in the place people read it, will be
+    quoted as one, and this one would then be quoted at 0% precision.
+
+    That is why a mismatch is an ADVISORY and not a problem. The only fatal outcome is a value that is
+    malformed (:func:`malformed_sym_ctx`) — a defect in the record, which no engine movement can cause.
+
+    **ADDITIVE to the line-drift advisory, never a replacement.** The two catch different things and
+    neither dominates: a token can move hundreds of lines without leaving its symbol (drift fires,
+    sym/ctx does not), and a token can be welded into a new ``try`` or ``if`` without moving at all
+    (sym/ctx fires, drift does not).
+
+    Measured 2026-08-09, vault ``origin/main`` 1a59e4a1's anchors against engine tree ``4667e945``,
+    over the 1,712 Python anchors that locate and parse. **The region is the innermost node the
+    ``(sym, ctx)`` PAIR pins** — both fields must match, so the pair is only as loose as its tighter
+    half:
+
+    - **536 of 1,712 (31.3%)** sit in a region spanning MORE than the 81 lines the retired +/-40
+      window covered. For those, sym/ctx alone is the LOOSER of the two signals.
+    - Region spans: median 33, p90 567, max 9,799.
+    - 1,403 of 1,712 are unnested (``ctx == ""``) and 280 are at module level (``sym == ""``), so for
+      most anchors the pair reduces to "which function is this in".
+
+    **The 38.4% / 639 figure this work was briefed with is reproducible, under a LOOSER definition:**
+    scoring the region as the enclosing SYMBOL only, ignoring the ``ctx`` refinement, gives **634** at
+    this ref against that brief's 639. Both definitions support the same conclusion and it is the only
+    one that matters here — replacing drift with sym/ctx would lose detection on roughly a third of
+    the record — so this stays additive either way.
+    """
+    if a.sym is None and a.ctx is None:
+        return  # not asserted. Absence of the field is not an assertion that the region is empty.
+    findings.checked_sym_ctx += 1
+    problem = malformed_sym_ctx(a.sym, a.ctx)
+    if problem:
+        findings.problems.append(
+            f"{cell_id}: {a.path}:{a.line} {problem}. A chain this deriver cannot produce would "
+            "advise forever without ever matching, so it is refused rather than left to rot"
+        )
+        return
+    if Path(a.path).suffix not in PYTHON_SUFFIXES:
+        findings.problems.append(
+            f"{cell_id}: {a.path}:{a.line} records sym/ctx on a non-Python file, which has no "
+            "enclosing symbol and no block structure — no derivation can ever confirm or deny it"
+        )
+        return
+    if target not in ast_cache:
+        ast_cache[target] = parse_or_none(text)
+    tree = ast_cache[target]
+    if tree is None:
+        findings.advisories.append(
+            f"{cell_id}: {a.path} — sym/ctx recorded but the file will not parse, so neither could "
+            "be derived. Advisory: UNDETERMINED, which is not the same as agreeing"
+        )
+        return
+    got_sym, got_ctx = sym_ctx_at(tree, actual)
+    if a.sym is not None and a.sym != got_sym:
+        findings.advisories.append(
+            f"{cell_id}: {a.path} — {a.expect!r} recorded sym={a.sym!r} but now sits in "
+            f"sym={got_sym!r} (line {actual}). Advisory: DISPLACEMENT, not a defect — re-read the "
+            "cell's reasoning, do not assume anything is wrong"
+        )
+    if a.ctx is not None and a.ctx != got_ctx:
+        findings.advisories.append(
+            f"{cell_id}: {a.path} — {a.expect!r} recorded ctx={a.ctx!r} but now sits in "
+            f"ctx={got_ctx!r} (line {actual}). Advisory: DISPLACEMENT, not a defect — the control "
+            "flow around this token changed, which may be a HARDENING (10.5.4 was)"
+        )
 
 
 def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
@@ -1423,6 +1686,15 @@ def form_summary(findings: Findings) -> list[str]:
             f"  {unlocated} further anchor(s) did NOT locate (GONE or AMBIGUOUS, reported below) and "
             "carry no form: there is no landing site to classify"
         )
+    covered = findings.checked_sym_ctx
+    out.append(
+        f"  sym/ctx asserted on {covered} of {findings.checked_anchors} anchor(s)"
+        + (
+            "; the rest assert neither, and absence of the field is NOT agreement"
+            if covered < findings.checked_anchors
+            else ""
+        )
+    )
     out.append(
         f"  {prose} of {located} ({pct:.1f}%) resolve into prose or a non-Python file, which no "
         "structural or executable check reaches, ever. That is a LABEL and not a demotion -- "

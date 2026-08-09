@@ -22,6 +22,8 @@ from typing import Any
 import pytest
 
 from scripts.asvs.scorecard import (
+    _DESCEND_ONLY,
+    _TRANSPARENT,
     Absence,
     Anchor,
     Cell,
@@ -36,10 +38,12 @@ from scripts.asvs.scorecard import (
     check_pinning,
     corpus_digest,
     count,
+    derive_sym_ctx,
     form_summary,
     load_corpus,
     load_scorecard,
     main,
+    malformed_sym_ctx,
     prove_absences,
     provenance_lines,
     render_current,
@@ -2047,3 +2051,375 @@ def test_prove_absences_summary_negative_control_an_empty_run_says_saw_zero(
     out = capsys.readouterr().out
     assert rc == 0
     assert "saw 0 absence claim(s)" in out
+
+
+# --- sym + ctx: WHERE in the structure, and it is a DISPLACEMENT signal ---------------------------
+#
+# Measured 2026-08-09, vault origin/main 1a59e4a1's anchors against engine tree 4667e945: over the
+# 1,712 Python anchors that locate and parse, 536 (31.3%) sit in a (sym, ctx) region wider than the
+# 81 lines the retired +/-40 window covered -- so sym/ctx alone is LOOSER for those, and this is
+# additive to the drift advisory rather than a replacement for it. The brief's 38.4%/639 reproduces
+# at 634 under the looser symbol-only region definition; both support the same conclusion.
+
+_NESTED = '''\
+"""Module docstring."""
+
+TOP = 1
+
+
+class Store:
+    """A store."""
+
+    def revoke(self, keep):
+        rows = []
+        try:
+            rows = self.query()
+        except OSError:
+            rows = []
+        if keep:
+            for r in rows:
+                if r.stale:
+                    self.drop(r)
+        return rows
+
+
+def loose():
+    return TOP
+'''
+
+
+def _sym_ctx(text: str, token: str) -> tuple[str, str] | None:
+    return derive_sym_ctx(text, text.count("\n", 0, text.index(token)) + 1)
+
+
+def test_sym_ctx_derives_module_level_as_two_empty_strings() -> None:
+    """`""` is the assertion "module level, unnested" -- a real claim, not a missing value."""
+    assert _sym_ctx(_NESTED, "TOP = 1") == ("", "")
+
+
+def test_sym_ctx_derives_the_enclosing_symbol_dotted() -> None:
+    assert _sym_ctx(_NESTED, "rows = self.query()") == ("Store.revoke", "Try.body")
+    assert _sym_ctx(_NESTED, "return TOP") == ("loose", "")
+
+
+def test_sym_ctx_names_the_handler_limb_not_the_body_limb() -> None:
+    """`Try.body` and `Try.handlers` are different regions and a statement moving between them is
+    exactly the displacement this field exists to notice.
+
+    The handler's own `ExceptHandler.body` is deliberately NOT a second chain element: it is reachable
+    only through `Try.handlers`, so recording it would double every handler chain for no added
+    discrimination.
+    """
+    assert _sym_ctx(_NESTED, "rows = self.query()") == ("Store.revoke", "Try.body")
+    assert _sym_ctx(_NESTED, "except OSError") == ("Store.revoke", "Try.handlers")
+
+
+def test_sym_ctx_chains_nested_blocks_outermost_first() -> None:
+    assert _sym_ctx(_NESTED, "self.drop(r)") == ("Store.revoke", "If.body>For.body>If.body")
+
+
+def test_sym_ctx_resets_the_chain_at_a_symbol_boundary() -> None:
+    """A block chain is meaningful only inside the symbol holding it. A nested function inside a
+    `try` must not inherit `Try.body`, or every helper defined in a guarded block reads as guarded.
+
+    Falsified by deleting the `ctx.clear()` in `sym_ctx_at`: the inner function's ctx becomes
+    `Try.body` and this goes RED. Restored.
+    """
+    src = "def outer():\n    try:\n        def inner():\n            return 1\n    except OSError:\n        pass\n"
+    assert derive_sym_ctx(src, 4) == ("outer.inner", "")
+
+
+def test_sym_ctx_is_None_when_the_file_will_not_parse() -> None:
+    assert derive_sym_ctx("def f(\n", 1) is None
+
+
+def test_sym_ctx_is_not_indentation_the_12_3_5_non_event(tmp_path: Path) -> None:
+    """CELL 12.3.5's SHAPE, and the reason this field is `ctx` rather than an indent check.
+
+    12.3.5 carries the identical 4-versus-8 indent mismatch as 10.5.4 and is a NON-EVENT: a
+    hand-trimming slip, with the statement's position in the control flow unchanged at both ends.
+    Here the same statement is re-indented under a block that already contained it. Indentation
+    changed; `ctx` did not, and correctly does not fire.
+
+    Falsified by deriving from `len(line) - len(line.lstrip())` instead of the block chain: the two
+    derivations differ and this goes RED. Restored.
+    """
+    before = "def f():\n    if x:\n        do_it()\n"
+    after = "def f():\n    if x:\n            do_it()\n"  # slipped indent, same block
+    assert _sym_ctx(before, "do_it()") == _sym_ctx(after, "do_it()") == ("f", "If.body")
+
+
+def test_sym_ctx_DOES_fire_when_a_statement_is_welded_into_a_try_the_10_5_4_shape() -> None:
+    """The other half: 10.5.4's shape, where the statement really did change control-flow region.
+
+    And the honest reading of it -- that change was a HARDENING. The signal fired correctly and the
+    finding was "your reasoning is stale", not "something is broken". Its security-relevant precision
+    on the only datum the corpus offers is 0 of 1.
+    """
+    before = "def f():\n    conn.rollback()\n"
+    after = "def f():\n    try:\n        conn.rollback()\n    except OSError:\n        pass\n"
+    assert _sym_ctx(before, "conn.rollback()") == ("f", "")
+    assert _sym_ctx(after, "conn.rollback()") == ("f", "Try.body")
+
+
+# --- validation: malformed is FATAL, mismatched is ADVISORY ---------------------------------------
+
+
+def test_malformed_ctx_names_an_unknown_node_type() -> None:
+    assert "not a block statement" in (malformed_sym_ctx(None, "Tyr.body") or "")
+
+
+def test_malformed_ctx_names_a_field_the_node_does_not_have() -> None:
+    """`With` has no `orelse`. The table that validates is the table the deriver walks, so an accepted
+    chain is one the deriver can actually produce."""
+    assert "does not have" in (malformed_sym_ctx(None, "With.orelse") or "")
+
+
+def test_malformed_sym_rejects_a_non_identifier() -> None:
+    assert "dotted Python identifier" in (malformed_sym_ctx("Store revoke()", None) or "")
+
+
+def test_wellformed_sym_and_ctx_pass_validation() -> None:
+    assert malformed_sym_ctx("Store.revoke", "Try.body>If.orelse") is None
+    assert malformed_sym_ctx("", "") is None  # module level, unnested: a claim, and a valid one
+    assert malformed_sym_ctx(None, None) is None  # not asserted
+
+
+def test_a_malformed_ctx_is_FATAL_because_no_code_movement_can_cause_it(tmp_path: Path) -> None:
+    """The only fatal outcome in this feature. A chain the deriver cannot produce would advise
+    forever without ever matching, and the fix is unambiguous.
+
+    Falsified by downgrading the `malformed_sym_ctx` branch in `_check_sym_ctx` to an advisory:
+    `not f.ok` goes RED. Restored.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text("def f():\n    do_it()\n", encoding="utf-8")
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(Anchor("messagefoundry/m.py", 2, "do_it()", ctx="Nope.body"),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert not f.ok
+    assert "not a block statement" in f.problems[0]
+
+
+def test_sym_ctx_on_a_non_python_file_is_FATAL(tmp_path: Path) -> None:
+    """Markdown has no enclosing symbol. Recording one is an authoring error no derivation can ever
+    confirm or deny, so it is refused rather than left as a permanent silent pass."""
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "SECURITY.md").write_text("deny by default\n", encoding="utf-8")
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(Anchor("docs/SECURITY.md", 1, "deny by default", sym="f"),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert not f.ok and "non-Python file" in f.problems[0]
+
+
+def test_a_MISMATCHED_ctx_is_ADVISORY_never_fatal(tmp_path: Path) -> None:
+    """THE severity decision, and it is load-bearing.
+
+    A mismatch means the token moved into a different control-flow region. On the only datum the
+    corpus offers -- 10.5.4 -- that movement was a HARDENING. A check that redded the gate on it
+    would have demanded a rollback of a security improvement. So: advisory.
+
+    Falsified by appending to `problems` instead of `advisories` in `_check_sym_ctx`: `f.ok` goes RED.
+    Restored.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        "def f():\n    try:\n        conn.rollback()\n    except OSError:\n        pass\n",
+        encoding="utf-8",
+    )
+    cells = [
+        Cell(
+            id="10.5.4",
+            level=3,
+            verdict="pass",
+            evidence=(Anchor("messagefoundry/m.py", 3, "conn.rollback()", sym="f", ctx=""),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert f.ok and f.problems == []
+    assert len(f.advisories) == 1
+    assert "DISPLACEMENT, not a defect" in f.advisories[0]
+    assert "HARDENING" in f.advisories[0]
+    assert "ctx=''" in f.advisories[0] and "ctx='Try.body'" in f.advisories[0]
+
+
+def test_sym_and_ctx_are_validated_INDEPENDENTLY(tmp_path: Path) -> None:
+    """An anchor may assert one and not the other, and asserting neither is not agreement."""
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        "def f():\n    if x:\n        do_it()\n", encoding="utf-8"
+    )
+    sym_only = Anchor("messagefoundry/m.py", 3, "do_it()", sym="WRONG")
+    ctx_only = Anchor("messagefoundry/m.py", 3, "do_it()", ctx="If.body")
+    neither = Anchor("messagefoundry/m.py", 3, "do_it()")
+
+    f = Findings()
+    check_anchors([Cell(id="1.1.1", level=1, verdict="pass", evidence=(sym_only,))], tmp_path, f)
+    assert len(f.advisories) == 1 and "sym=" in f.advisories[0]
+
+    g = Findings()
+    check_anchors([Cell(id="1.1.1", level=1, verdict="pass", evidence=(ctx_only,))], tmp_path, g)
+    assert g.advisories == []  # ctx is right, so nothing to say
+
+    h = Findings()
+    check_anchors([Cell(id="1.1.1", level=1, verdict="pass", evidence=(neither,))], tmp_path, h)
+    assert h.advisories == [] and h.checked_sym_ctx == 0
+
+
+def test_sym_ctx_is_ADDITIVE_to_the_drift_advisory_and_neither_replaces_the_other(
+    tmp_path: Path,
+) -> None:
+    """THE MANDATED PROPERTY, asserted rather than asserted-in-prose. Three anchors, three outcomes:
+
+      - moved a long way, same region        -> drift only    (sym/ctx would have missed it)
+      - did not move, region changed         -> sym/ctx only  (drift would have missed it)
+      - moved AND region changed             -> both
+
+    Measured, 536 of 1,712 Python anchors sit in a (sym, ctx) region wider than the retired 81-line
+    window, so replacing drift with this loses detection on roughly a third of the record.
+
+    Falsified by making `_check_sym_ctx` return early whenever the line drifted (i.e. treating them as
+    alternatives): the second and third counts go RED. Restored.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    body = (
+        "def f():\n"
+        + "".join(f"    pad_{i} = {i}\n" for i in range(200))
+        + "    moved_far = 1\n"
+        + "def g():\n    try:\n        welded = 2\n    except OSError:\n        pass\n"
+    )
+    (tmp_path / "messagefoundry" / "m.py").write_text(body, encoding="utf-8")
+
+    # moved a long way, still in `f` and still unnested: drift fires, sym/ctx does not.
+    drift_only = Anchor("messagefoundry/m.py", 3, "moved_far = 1", sym="f", ctx="")
+    # Recorded at its TRUE line, so drift stays silent and only the region change speaks.
+    # def f=1, 200 pads=2..201, moved_far=202, def g=203, try=204, welded=205.
+    region_only = Anchor("messagefoundry/m.py", 205, "welded = 2", sym="g", ctx="")
+
+    f1 = Findings()
+    check_anchors([Cell(id="1.1.1", level=1, verdict="pass", evidence=(drift_only,))], tmp_path, f1)
+    assert len(f1.advisories) == 1 and "navigation aid" in f1.advisories[0]
+
+    f2 = Findings()
+    check_anchors(
+        [Cell(id="1.1.2", level=1, verdict="pass", evidence=(region_only,))], tmp_path, f2
+    )
+    assert len(f2.advisories) == 1 and "DISPLACEMENT" in f2.advisories[0]
+
+    both = Anchor("messagefoundry/m.py", 1, "welded = 2", sym="g", ctx="")
+    f3 = Findings()
+    check_anchors([Cell(id="1.1.3", level=1, verdict="pass", evidence=(both,))], tmp_path, f3)
+    assert len(f3.advisories) == 2
+    assert any("navigation aid" in x for x in f3.advisories)
+    assert any("DISPLACEMENT" in x for x in f3.advisories)
+
+
+def test_load_reads_sym_and_ctx_and_absent_stays_None(tmp_path: Path) -> None:
+    """ABSENT and EMPTY are different claims. Defaulting absent to `""` would turn every one of the
+    1,980 un-backfilled anchors into an assertion of "module level, unnested" overnight.
+
+    Falsified by changing the loader to `str(e.get("sym", ""))`: the `is None` assertions go RED.
+    Restored.
+    """
+    sc = _scorecard_file(
+        tmp_path,
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\n'
+        "  [[cell.evidence]]\n"
+        '  path = "m.py"\n  line = 1\n  expect = "x"\n'
+        "  [[cell.evidence]]\n"
+        '  path = "m.py"\n  line = 2\n  expect = "y"\n  sym = "f"\n  ctx = "Try.body"\n'
+        "  [[cell.evidence]]\n"
+        '  path = "m.py"\n  line = 3\n  expect = "z"\n  sym = ""\n  ctx = ""\n',
+    )
+    absent, filled, empty = load_scorecard(sc)[0].evidence
+    assert absent.sym is None and absent.ctx is None
+    assert filled.sym == "f" and filled.ctx == "Try.body"
+    assert empty.sym == "" and empty.ctx == ""
+
+
+def test_the_summary_reports_how_much_of_the_record_sym_ctx_actually_reached(
+    tmp_path: Path,
+) -> None:
+    """Coverage is printed because backfill has not happened yet. A structural check that reaches 1 of
+    3 anchors while printing like a whole-corpus result is the overstatement this pass keeps fixing.
+
+    Falsified by deleting the `sym/ctx asserted on` line from `form_summary`: this goes RED. Restored.
+    """
+    f = Findings(checked_anchors=3, checked_sym_ctx=1)
+    f.anchor_forms.update({"code": 3})
+    text = "\n".join(form_summary(f))
+    assert "sym/ctx asserted on 1 of 3 anchor(s)" in text
+    assert "absence of the field is NOT agreement" in text
+
+
+def test_summary_sym_ctx_negative_control_says_nothing_extra_at_full_coverage() -> None:
+    """The qualifier appears only when coverage is partial, so it cannot become wallpaper."""
+    f = Findings(checked_anchors=2, checked_sym_ctx=2)
+    f.anchor_forms.update({"code": 2})
+    text = "\n".join(form_summary(f))
+    assert "sym/ctx asserted on 2 of 2 anchor(s)" in text
+    assert "NOT agreement" not in text
+
+
+def test_the_walk_descends_THROUGH_a_handler_into_its_nested_blocks() -> None:
+    """DESCENT, which is a different property from whether the handler is RECORDED.
+
+    Added after an injection that should have failed did not: deleting `ExceptHandler` from
+    `_TRANSPARENT` silently stopped the walk descending instead of starting to record, so the chain
+    came out identical by a different route and no test could tell. Descent and recording now come
+    from two tables, and this test drives descent -- a statement nested inside an `if` inside an
+    `except` body is only reachable if the walk goes THROUGH the handler.
+
+    Falsified by removing `ExceptHandler` from `_DESCEND_ONLY`: the chain truncates to
+    `Try.handlers` and this goes RED. Restored.
+    """
+    src = (
+        "def f():\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except OSError:\n"
+        "        if retry:\n"
+        "            recover()\n"
+    )
+    assert derive_sym_ctx(src, 6) == ("f", "Try.handlers>If.body")
+
+
+def test_a_handler_contributes_no_chain_element_of_its_own() -> None:
+    """RECORDING, the other half. `ExceptHandler.body` would double every handler chain for no added
+    discrimination, because a handler is reachable by exactly one route its parent already names.
+
+    Falsified by removing `ExceptHandler` from `_TRANSPARENT`: the chain becomes
+    `Try.handlers>ExceptHandler.body>If.body` and this goes RED. Restored.
+    """
+    src = (
+        "def f():\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except OSError:\n"
+        "        if retry:\n"
+        "            recover()\n"
+    )
+    _, ctx = derive_sym_ctx(src, 6) or ("", "")
+    assert "ExceptHandler" not in ctx
+
+
+def test_descent_and_transparency_tables_do_not_drift_apart() -> None:
+    """They are separate by design, so nothing else would notice one gaining an entry the other
+    lacks. A node in `_DESCEND_ONLY` but not `_TRANSPARENT` would start emitting a chain element
+    nobody authored; the reverse would make a transparent node undescendable."""
+    assert frozenset(_DESCEND_ONLY) == _TRANSPARENT
