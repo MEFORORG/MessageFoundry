@@ -181,7 +181,12 @@ def test_a_unique_token_that_drifted_is_advisory_not_fatal(tmp_path: Path) -> No
     f = Findings()
     check_anchors(cells, tmp_path, f)
     assert f.ok and f.problems == []
-    assert len(f.advisories) == 1 and "moved" in f.advisories[0]
+    assert len(f.advisories) == 1
+    # The advisory carries BOTH numbers and the signed delta, because "it moved" is not actionable and
+    # "301 not 5" is. A re-anchor pass reads this line and needs no second lookup.
+    assert "recorded at line 5" in f.advisories[0]
+    assert "actually at 301" in f.advisories[0]
+    assert "+296" in f.advisories[0]
 
 
 def test_an_ambiguous_token_stays_fatal_even_when_it_drifted(tmp_path: Path) -> None:
@@ -208,9 +213,18 @@ def test_an_ambiguous_token_stays_fatal_even_when_it_drifted(tmp_path: Path) -> 
     assert f.advisories == []
 
 
-def test_ordinary_small_movement_is_neither_problem_nor_advisory(tmp_path: Path) -> None:
-    """The control. Without it, a test asserting "drift is advisory" would still pass if EVERY anchor
-    started reporting drift — the window would have stopped absorbing anything and nothing would say so."""
+def test_a_small_movement_is_advisory_too_not_silent(tmp_path: Path) -> None:
+    """CONTRACT CHANGE 2026-08-09, and this test previously asserted the opposite.
+
+    It used to be named ``test_ordinary_small_movement_is_neither_problem_nor_advisory`` and pinned a
+    six-line offset as reporting NOTHING, because a 40-line window absorbed it. That silence was the
+    defect: measured against a green record, 725 of 1,980 anchors (36.6%) were inside the window and
+    therefore invisible, with the worst at 39 against a limit of 40. An advisory that fires only past
+    the window merges into an empty list and prevents the next recurrence while surfacing none of the
+    accumulation.
+
+    So the rule is now: any nonzero offset is advisory. The window is gone from the decision path.
+    """
     (tmp_path / "messagefoundry").mkdir()
     body = "\n".join(["filler"] * 20 + ["tls_cert_file = None"] + ["filler"] * 20)
     (tmp_path / "messagefoundry" / "m.py").write_text(body, encoding="utf-8")
@@ -224,7 +238,60 @@ def test_ordinary_small_movement_is_neither_problem_nor_advisory(tmp_path: Path)
     ]
     f = Findings()
     check_anchors(cells, tmp_path, f)
+    assert f.problems == []  # still not fatal
+    assert len(f.advisories) == 1 and "+6" in f.advisories[0]
+
+
+def test_an_exactly_located_anchor_reports_nothing(tmp_path: Path) -> None:
+    """The control, in the shape the new contract needs.
+
+    Its predecessor guarded against "the window stopped absorbing anything and nothing said so". That
+    risk is retired with the window. The live risk now is the mirror image: a resolver that reports
+    drift for EVERY anchor — an off-by-one in the line derivation would do it — while the advisory
+    tests above still pass, because they only assert that an advisory appears. This asserts the zero.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    body = "\n".join(["filler"] * 20 + ["tls_cert_file = None"] + ["filler"] * 20)
+    (tmp_path / "messagefoundry" / "m.py").write_text(body, encoding="utf-8")
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            # 20 filler lines, so the token is line 21. Recorded exactly.
+            evidence=(Anchor("messagefoundry/m.py", 21, "tls_cert_file"),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
     assert f.problems == [] and f.advisories == []
+
+
+def test_a_multi_line_expect_token_resolves_and_reports_its_start_line(tmp_path: Path) -> None:
+    """42 of the ~1,980 live ``expect`` tokens SPAN A NEWLINE.
+
+    The old check matched against joined text, so nothing ever forbade a multi-line token and 42
+    accumulated. Deriving the line by scanning ``splitlines()`` finds none of them and raises on the
+    lookup — measured, it bit the parallel session's first measurement script. Counting newlines before
+    the character offset handles a multi-line token as naturally as a single-line one, and the line it
+    reports is the token's FIRST line, which is what a reader navigating to it wants.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    body = "\n".join(["filler"] * 10 + ["def f(", "    x: int,", ") -> None:"] + ["tail"] * 5)
+    (tmp_path / "messagefoundry" / "m.py").write_text(body, encoding="utf-8")
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(Anchor("messagefoundry/m.py", 3, "def f(\n    x: int,"),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert f.problems == []  # it resolves; a line-scanning implementation would not find it at all
+    assert len(f.advisories) == 1
+    assert "actually at 11" in f.advisories[0]  # the token's FIRST line, not its last
 
 
 def test_anchor_goes_red_when_the_file_is_gone(tmp_path: Path) -> None:

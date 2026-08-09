@@ -67,11 +67,25 @@ DECIDED_VERDICTS: Final[frozenset[str]] = frozenset({"pass", "partial", "fail", 
 #: `needs-review` cells the two sets are identical, so no test and no CI run could tell them apart.
 EXAMINED_VERDICTS: Final[frozenset[str]] = DECIDED_VERDICTS | {"needs-review"}
 
-#: How far from the recorded line the expected token may drift before the anchor is considered broken.
-#: Anchors name a TOKEN rather than a bare line number precisely so that ordinary edits above a cell's
-#: evidence do not thrash every anchor in the file; the window keeps the line number meaningful without
-#: making it load-bearing.
-ANCHOR_WINDOW: Final[int] = 40
+#: RETIRED 2026-08-09. There was an ``ANCHOR_WINDOW = 40`` here: a token found within 40 lines of its
+#: recorded position passed silently, beyond it the anchor failed. It is gone rather than widened,
+#: because measurement showed it could not do the job its docstring claimed.
+#:
+#: It could not disambiguate. ``check_anchors`` rejects a multi-occurrence token as AMBIGUOUS and
+#: ``continue``s BEFORE any window test, so by the time a window could apply the token is unique, and a
+#: unique token is located by searching for it. The window's own justification named the
+#: ``UPDATE sessions SET revoked_at=`` pair, 19 lines apart — the exact case the uniqueness guard now
+#: rejects first.
+#:
+#: What it actually did was decide, on an arbitrary threshold, which stale line numbers to keep quiet
+#: about. Measured on 2026-08-09 against a green record: of 1,980 anchors, 731 (36.9%) resolved ONLY
+#: because of the window, median offset 9, p90 30, MAX 39 — one line from the cliff, three days after a
+#: re-anchor pass reset the whole distribution by hand-retyping 130 integers. A tolerance that is 37%
+#: spent three days after a reset is not a tolerance; it is a decaying budget whose next expiry is one
+#: insertion above a hot file away.
+#:
+#: So the line number left the decision path entirely: uniqueness locates the evidence, and the
+#: recorded line is reported output that an advisory corrects. See :func:`check_anchors`.
 
 
 class ScorecardError(Exception):
@@ -393,21 +407,33 @@ def check_completeness(cells: list[Cell], corpus: dict[str, int]) -> list[str]:
 def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
     """Open every evidence anchor and assert its token still resolves, and resolves UNAMBIGUOUSLY.
 
-    When the code moves, this reds a test — instead of the sentence rotting in place and the next
-    session funding work that is already done.
+    **Two outcomes, and they are not the same event.** A token that is GONE or AMBIGUOUS reds the gate:
+    the claim it supported may now be false, or cannot be checked. A token that is unique and present
+    but sits at a different line is an ADVISORY: the evidence is exactly where searching for it says it
+    is, and only the recorded number is stale. Conflating the two is what made this gate red every
+    morning for a reason nobody had to act on — and a gate in that state is one whose next real finding
+    gets waved through. There was one underneath: a cell asserting a control was absent that had since
+    been built.
 
-    **Uniqueness is not pedantry; it is what makes the resolution mean anything.** An ``expect`` that
-    occurs many times in its file resolves from almost anywhere: with ``await conn.rollback()``
-    appearing 101 times in one module, *any* line number in that file lands within ±40 of some
-    occurrence, so the anchor cannot fail and certifies nothing. Two such anchors sat in this scorecard
-    as evidence for weeks.
+    **Uniqueness is not pedantry; it is the whole locator.** An ``expect`` that occurs many times in its
+    file resolves from almost anywhere: with ``await conn.rollback()`` appearing 101 times in one
+    module, any line in that file sits near some occurrence, so the anchor cannot fail and certifies
+    nothing. Two such anchors sat in this scorecard as evidence for weeks. Because uniqueness now does
+    the locating alone, it is the strictest rule here.
 
-    It also closes a defect in the REPAIR path rather than the detection path. When code moves, the
-    check correctly reports it — but a re-anchor to the nearest occurrence can silently install a
-    *stale-but-resolving* anchor that passes forever. That happened live: after ADR 0154 landed,
-    ``UPDATE sessions SET revoked_at=`` had two occurrences 19 lines apart — one the keep-N revoke, one
-    a different method entirely — each inside the other's window, so the check would have accepted the
-    wrong one. A repair is exactly where suspicion lapses, because the tool has just proved it works.
+    It also closes a defect in the REPAIR path rather than the detection path. A re-anchor to the
+    nearest occurrence can silently install a *stale-but-resolving* anchor that passes forever. That
+    happened live: after ADR 0154 landed, ``UPDATE sessions SET revoked_at=`` had two occurrences 19
+    lines apart — one the keep-N revoke, one a different method entirely — and a positional check would
+    have accepted the wrong one. A repair is exactly where suspicion lapses, because the tool has just
+    proved it works. Rejecting the ambiguity outright is what makes the repair safe.
+
+    **What this still cannot see, stated so nobody reads more into a green than is there.** ``expect``
+    is matched as a substring of the file, so a statement that moves into a ``try``, into a different
+    function, or under a different condition still resolves. The anchor certifies *this token exists in
+    this file, once* — not *this control operates on the path the cell describes*. A cell can therefore
+    be green here and wrong: measured 2026-08-09 on 15.3.1, which was ``pass`` with every anchor
+    resolving while the control it named had a hole, found only by executing the code.
     """
     for c in cells:
         for a in c.evidence:
@@ -416,9 +442,6 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
                 findings.problems.append(f"{c.id}: evidence path {a.path} does not exist")
                 continue
             text = target.read_text(encoding="utf-8", errors="replace")
-            lines = text.splitlines()
-            lo = max(0, a.line - 1 - ANCHOR_WINDOW)
-            hi = min(len(lines), a.line + ANCHOR_WINDOW)
             findings.checked_anchors += 1
             occurrences = text.count(a.expect)
             if occurrences > 1:
@@ -428,38 +451,27 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
                     "re-anchor cannot be checked. Cite a longer token that appears exactly once"
                 )
                 continue
-            if a.expect in "\n".join(lines[lo:hi]):
-                continue
-            if a.expect in "\n".join(lines):
-                # MOVED, not broken — and for a UNIQUE token the line number was never the proof.
-                # Execution only reaches here PAST the ``occurrences > 1`` guard above, so the token
-                # occurs exactly once in this file: its presence alone pins the evidence, and the line
-                # is a navigation aid. Failing on it asserts something different from what this gate
-                # exists to assert — that the claim is still true, not that it sits where it sat.
-                #
-                # This is not a theoretical tidy-up. The scorecard lives in a repo that no longer
-                # develops this tree, while this tree lands ~21 commits/day, so ONE insertion above a
-                # hot file re-breaks every anchor below it: on 2026-08-07, 130 of 146 failures were a
-                # single constant offset per file (+57 auth/service.py, +61 __main__.py, +47
-                # store/base.py) and the count went 67 -> 146 in ten hours. It recurred the next day
-                # (+102 on .github/workflows/ci.yml). A gate that is red every morning for a reason
-                # nobody must act on is a gate whose next REAL finding gets waved through — and there
-                # was one underneath: a cell asserting a control was absent that had since been built.
-                #
-                # What still reds the gate is unchanged and is the whole signal: a token that is GONE
-                # (the claim may now be false), an AMBIGUOUS token (there the line IS load-bearing and
-                # a re-anchor to the wrong occurrence cannot be detected), a missing evidence path,
-                # and every absence-claim failure. That narrows the gate to claim-invalidation, which
-                # is what ADR 0156 already describes as the intent.
-                findings.advisories.append(
-                    f"{c.id}: {a.path}:{a.line} moved — {a.expect!r} is still in the file (unique), "
-                    f"but >±{ANCHOR_WINDOW} lines away. Re-anchor the line number"
+            if occurrences == 0:
+                findings.problems.append(
+                    f"{c.id}: {a.path}:{a.line} no longer contains {a.expect!r} anywhere in the file "
+                    "— the evidence is GONE, so the claim it supported may now be false"
                 )
                 continue
-            findings.problems.append(
-                f"{c.id}: {a.path}:{a.line} no longer contains {a.expect!r} within "
-                f"±{ANCHOR_WINDOW} lines — the evidence moved or the claim is now false"
-            )
+            # Unique, and therefore LOCATED: past the guard above, the token occurs exactly once in
+            # this file, so its presence alone pins the evidence and the line number proves nothing
+            # extra. Derive where it actually is and report any disagreement with the record.
+            #
+            # DERIVED FROM THE CHARACTER OFFSET, NOT BY SCANNING LINES. 42 of the ~1,980 ``expect``
+            # tokens span a newline, because the old check matched against joined text and nothing
+            # forbade it. A per-line scan finds none of those and raises on the lookup; counting
+            # newlines before the match handles a multi-line token as naturally as a single-line one.
+            actual = text.count("\n", 0, text.index(a.expect)) + 1
+            if actual != a.line:
+                findings.advisories.append(
+                    f"{c.id}: {a.path} — {a.expect!r} is unique and present, recorded at line "
+                    f"{a.line} but actually at {actual} (offset {actual - a.line:+d}). "
+                    "Advisory: the line is a navigation aid, not the proof"
+                )
 
 
 def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
@@ -982,9 +994,17 @@ def main(argv: list[str] | None = None) -> int:
     for a in findings.advisories:
         print(f"  DRIFT {a}", file=sys.stderr)
     if findings.advisories:
+        pct = (
+            100.0 * len(findings.advisories) / findings.checked_anchors
+            if findings.checked_anchors
+            else 0.0
+        )
         print(
-            f"  {len(findings.advisories)} anchor(s) drifted: evidence still present and unique, line "
-            "numbers stale. Not fatal — re-anchor them, do not let them accumulate.",
+            f"  {len(findings.advisories)} of {findings.checked_anchors} anchors "
+            f"({pct:.1f}%) carry a stale line number: the evidence is present and unique, only the "
+            "recorded position is wrong. NOT fatal, and re-anchoring is bookkeeping rather than "
+            "assessment — but the percentage is the thing to watch, because it only ever grows "
+            "between re-anchor passes.",
             file=sys.stderr,
         )
     for p in findings.problems:
