@@ -4995,7 +4995,7 @@ The comment immediately above says *"Scope is deliberately the posture the requi
 
 ## 1027. The documented `pytest` command silently excludes the webconsole package, so a local green is not evidence about ~344 tests
 
-> 🔢 **Filed 2026-08-05 — not started.** Value **5/10** · Difficulty **3/10** · _fill-in_. `testpaths = ["tests"]` means the command CLAUDE.md documents as the verification gate never collects `packaging/messagefoundry-webconsole/tests`. A **failing** webconsole test sat on `main` through a full day of lanes because every quartet used the documented single path.
+> ✅ **SHIPPED 2026-08-06 — the root `testpaths` now also collects `packaging/messagefoundry-webconsole/tests`, so a bare `pytest -q` from the repo root stops silently excluding the web console suite; the one webauthn-extra-dependent console test that lacked a guard (`test_webauthn_rp_fail_closed_legible`) now skips-with-reason when the optional `[webauthn]` extra is absent, so an extra-less local venv stays green.** Value **5/10** · Difficulty **3/10** · _fill-in_. Local developer-signal fix only — CI already covered the console via its dedicated `Web console tests (pytest)` step; the gap was that the documented local gate collected less than it appeared to.
 
 **Cluster:** Testing / verification integrity. **Priority:** P3. **Verdict:** build (small). **Severity:** no product effect; the defect is that the project's own verification instruction produces a green that is not evidence about roughly 344 tests, and CLAUDE.md §5 states a task is not done until it passes.
 
@@ -6746,7 +6746,7 @@ against the anchor.
 
 ## 1101. the connscale empty_claims_monotonic SLO reports runner contention as an engine defect
 
-> 🔢 **Filed 2026-08-07 - not started. Reproduced, not inferred.** Value **4/10** · Difficulty **2/10**.
+> ✅ **SHIPPED 2026-08-08 - the SLO now reads empty claims PER MESSAGE, and the latent `claim_mode` grouping defect went with it.** The asserted metric is `empty_claims_per_msg`, computed as the ratio of two rates taken over the SAME first-to-last in-hold samples, so the span cancels algebraically and the quantity is exactly `Δempty_claims / Δread` -- there is no wall clock left for runner contention or a mid-hold reload stall to move. `_monotonic_slo` now groups by `(sweep_mode, claim_mode)` rather than `sweep_mode` alone, so a profile combining `per_lane` and `pooled` can no longer chain-compare across claim modes. The per-second numbers are retained in the report as the operator-facing figures; they are simply no longer what gates a merge. **Verified against the failure mode, not just for green:** eight tests pin the invariance property AND the still-detects-a-real-regression property together, and both were shown to go RED under mutation - reverting the grouping fails 3, restoring the per-second metric fails 2. A metric that never fires would have passed a stability test alone, which is why the two are pinned as a pair. **Not done, and deliberately:** gating `reload_seconds` directly was raised below as a conditional ("if that cost is worth gating") and is a separate judgement, not part of this fix. Original filing follows. Value **4/10** · Difficulty **2/10**.
 > `tests/test_connscale_smoke.py:170` asserts `empty_claims_monotonic`: the N=24 empty-claim **rate per
 > second** must be at least 0.75x the N=12 rate. The metric has wall-clock in its denominator and a
 > deliberately un-gated O(N) probe in its numerator's way, so **CPU contention alone flips it red with
@@ -6956,6 +6956,67 @@ covered -- the comment quoted above is that shape in prose).
 call site rather than by re-running: the failing port lies outside the inbound window, which is what
 rules out the family `#1014` already fixed and points at the one it did not.
 
+## 1104. the DATABASE connector never closes its cursors, so a pooled connection is returned busy and the source's mark fails, emitting a duplicate
+
+> ✅ **SHIPPED 2026-08-08 — found and fixed in the same pass; reproduced against a real SQL Server 2022 container, not inferred.** Value **6/10** · Difficulty **2/10**. `messagefoundry/transports/database.py` opened a cursor at **five** sites and closed it at **none** — `cur.close()` appeared nowhere in the file. aioodbc/pyodbc keep the ODBC statement handle open until the cursor is closed, so every one of those connections went back to the pool **busy**, and the next caller's first command failed with `HY000 Connection is busy with results for another command`. **This is delivery semantics, not tidiness:** the usual victim is the DATABASE source's `mark`, and `_poll_once` treats a failed mark as at-least-once — the row is left unmarked and **re-emitted as a DUPLICATE**.
+
+**Cluster:** Connectors / delivery semantics. **Priority:** P2. **Verdict:** built. **Severity:** no PHI
+effect. A shipped connector emits duplicate messages on SQL Server whenever the pool hands back a dirty
+connection at the wrong moment. Per CLAUDE.md §0 this is stated in the conditional: **a deploying site
+running a DATABASE source against SQL Server would see duplicates**, at a rate set by pool reuse.
+
+**Observed on `main`**, not on a branch:
+
+```
+DATABASE source mark failed (row will re-emit, a duplicate):
+  ('HY000', '[Microsoft][ODBC Driver 18 for SQL Server]Connection is busy with
+   results for another command (0) (SQLExecDirectW)')
+FAILED tests/test_database_source_integration.py::test_source_polls_and_marks_rows
+assert [(1, 1)] == [(0, 2)]      # 1 row left unmarked -> it re-emits
+```
+
+**Mechanism.** `_select` runs the poll and `_mark` runs an `UPDATE`; both release the connection in a
+`finally` without closing the cursor. An `UPDATE` leaves a row count pending on the statement handle,
+so the connection is dirty when it returns to the pool. The failure then lands on **whatever statement
+next draws that connection**, which is why it reads as unrelated and intermittent.
+
+**⚠️ THE ERROR APPEARS ON THE INNOCENT STATEMENT.** The command that fails is not the one that left the
+handle open. Triaging the reported statement leads nowhere; the cause is one connection-checkout
+earlier. That misdirection is the whole reason this survived.
+
+**Why CI never caught it on `main`.** The `sql server (store + connector)` leg is gated on server-DB and
+docker path changes, so it is **skipped on every `main` push** — measured across the five most recent.
+It runs only on PRs that touch those paths, which is how a real defect sat on `main` while the leg that
+detects it stayed green-by-absence. That is the #1000 shape at the workflow level: a check whose silence
+is mistaken for a pass. **Filing this does not fix that**; the leg's `main` coverage is a separate
+question and is NOT addressed here.
+
+**The fix.** A `_close_cursor` helper, called before `pool.release` at all five sites. It never raises:
+a close failure must not mask the caller's real error, and must not skip the release that follows —
+leaking a pooled connection to save a cursor is the worse trade.
+
+**⚠️ BE HONEST ABOUT THE INTEGRATION EVIDENCE — IT IS WEAK ON ITS OWN.** Measured on the container:
+**1 failure in 10 runs** on the unfixed tree, **0 in 10** with the fix. At a ~10% base rate that
+difference is **well inside chance** and proves nothing by itself. It is recorded as the reproduction
+that found the defect, not as the evidence that it is fixed. The evidence is
+`tests/test_database_cursor_close.py`, which asserts the ordering **deterministically** against a fake
+pool and was **verified to go RED on a mutant** with the closes removed (2 of 3 tests failed; the third
+covers `_close_cursor`'s own contract and correctly did not). A guard with a 10% detection rate is not
+a guard.
+
+**Related:** #1000 (a control green because its evidence could not see the class it covered — both the
+skipped CI leg and the racy integration test are that shape), #1103 (found the same day, also a harness
+/ connector defect whose error message points away from the cause), ADR 0003 (the aioodbc choice this
+rides on).
+
+**Source:** found 2026-08-08 while triaging PR #253's red SQL Server leg. #253 was exonerated **by
+measurement** — the same test fails identically on `main` — after first being exonerated by mechanism
+(that step runs an explicit path list, so `testpaths` cannot reach it). The two reds on #253 were two
+*different* unrelated failures, which is why "it failed twice, so it is real" would have been the wrong
+read. Verified against a Docker SQL Server 2022 container after first confirming the host actually
+reaches the container and not the native `MSSQLSERVER` service also running on that box: both listeners
+on 1433 were Docker processes, and `SERVERPROPERTY('MachineName')` returned the container's own
+hostname. That check is not optional on this machine.
 ## 1105. `harden_kex_groups`' docstring undercounts its own call sites, in the paragraph written to warn about exactly that
 
 > 🔢 **Filed 2026-08-08 - not started. Measured on `main` at 166634c9, not hypothesised.** Value **3/10** · Difficulty **1/10**. `messagefoundry/config/tls_policy.py:125` says `APPROVED_KEX_GROUPS` reaches "zero of this function's **six** call sites"; `:136` repeats "a call at **six** sites with zero effect". Scanning `messagefoundry/`, `tests/`, `harness/`, `packaging/` and `ide/` for `harden_kex_groups(` finds **seven** sites that build and harden a real TLS context, plus an eighth reference added by `#338`. Nothing checks the number - the tests derive their site list instead - so the docstring is the only place it is asserted, and it is wrong.

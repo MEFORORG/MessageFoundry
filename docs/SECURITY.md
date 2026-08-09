@@ -749,7 +749,11 @@ The TOTP secret is stored **encrypted at rest** (the store cipher) and recovery 
 **argon2id-hashed**; verification uses the server clock and a constant-time compare over a **configurable
 clock-skew window** (`[auth].totp_skew_steps`, **default `0` = the current 30 s step only** — strictest
 replay window, ASVS 6.5.5; set `1`/`2` to restore RFC-6238 ±1 network-delay tolerance, the forward step
-clamped to the current step so single-use holds). TOTP is a shared-secret factor — L3 *prefers*
+clamped to the current step to avoid a self-inflicted lockout). ⚠️ **Single-use (ASVS 6.5.1) holds only at
+the default `0`.** At `totp_skew_steps >= 1` the clamp records a tolerated *future* code against the
+current step, leaving that code's own step unspent — so the **same code verifies a second time** once the
+clock reaches it. That is the cost of the opt-out, and it is why the default is `0`. TOTP is a
+shared-secret factor — L3 *prefers*
 phishing-resistant factors: **WebAuthn passkeys are the built WP-14b sibling** (next section), and TOTP
 stays fully supported alongside them (a non-browser client — e.g. the test harness, or CLI/API
 automation — has no `navigator.credentials`, so TOTP remains its usable second factor).
