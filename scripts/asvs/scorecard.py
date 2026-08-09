@@ -849,6 +849,50 @@ def verify(scorecard: Path, corpus: Path, root: Path) -> Findings:
     return findings
 
 
+def _headline_caveat(unexamined: int) -> list[str]:
+    """The "why there is no headline score" blockquote, in the version that is TRUE right now.
+
+    This used to be one unconditional string, and it outlived its own premise. It said *"a count that
+    folds in cells not yet re-verified"* and *"until the baseline sweep completes"* — both load-bearing
+    on there BEING unverified cells. The sweep completed (345/345, 0 unverified) and the paragraph kept
+    printing, so the document disclaimed its own numbers on a ground that measurement had already
+    retired. A caveat resting on a false premise is the defect ASSESSMENT-METHOD warns about, and it is
+    worse than a missing caveat: a reader who checks the premise and finds it false discards the whole
+    warning, including the half that is still true.
+
+    So it forks. The debt branch is the original, unchanged. The complete branch keeps the part that
+    does NOT depend on re-verification debt — a count over heterogeneous requirements is not a security
+    measure, and a movement in it has several causes of which only one is improvement (§2.2) — and adds
+    the denominator, because a reader who is going to compute a percentage anyway should compute the
+    same one twice rather than invent it.
+    """
+    if unexamined:
+        return [
+            "> **There is deliberately no headline score here.** A count that folds in cells not yet",
+            "> re-verified is an average over verdicts reached from a paraphrase, not a measurement. Those",
+            "> cells were graded by the earlier lineage — against the requirement verb as restated in our",
+            "> own scorecards, because the ASVS 5.0.0 text was not held until 2026-07-31. That is",
+            "> re-verification debt, not unassessed surface.",
+            "> Until the baseline sweep completes, the honest number is the one above:",
+            "> how much of the survey is done. Verdict counts below cover **examined cells only** unless",
+            "> stated otherwise.",
+        ]
+    return [
+        "> **The baseline sweep is COMPLETE — every verdict below was reached against the pinned",
+        "> requirement text, not a paraphrase.** The re-verification debt this section used to warn",
+        "> about is discharged, so the counts are a measurement and the table is the record.",
+        "> **There is still deliberately no single headline score**, for a reason that does not expire:",
+        "> a count over requirements that differ wildly in scope and cost is not a security measure, and",
+        "> a movement in it has several possible causes of which only one is improvement — a cell can",
+        "> move because scope was re-declared, because an earlier reading was corrected, or because the",
+        "> pinned corpus changed, all with zero lines of engine code touched (see ASSESSMENT-METHOD",
+        "> §2.2 before quoting any delta as progress).",
+        "> If you are going to normalise anyway, normalise once and say which: **N/A cells are out of the",
+        "> declared scope with a written rationale**, so the applicable denominator is the total minus",
+        "> N/A, and `needs-review` carries no verdict and belongs in neither numerator.",
+    ]
+
+
 def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
     """The generated entry point — survey progress FIRST, verdict counts second.
 
@@ -885,14 +929,7 @@ def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
         f"requirement text ({pct:.1f}%).** {unexamined} carry a verdict that has not been re-verified "
         "against it.",
         "",
-        "> **There is deliberately no headline score here.** A count that folds in cells not yet",
-        "> re-verified is an average over verdicts reached from a paraphrase, not a measurement. Those",
-        "> cells were graded by the earlier lineage — against the requirement verb as restated in our",
-        "> own scorecards, because the ASVS 5.0.0 text was not held until 2026-07-31. That is",
-        "> re-verification debt, not unassessed surface.",
-        "> Until the baseline sweep completes, the honest number is the one above:",
-        "> how much of the survey is done. Verdict counts below cover **examined cells only** unless",
-        "> stated otherwise.",
+        *_headline_caveat(unexamined),
         "",
         "| State | Count | Meaning |",
         "|---|---:|---|",
