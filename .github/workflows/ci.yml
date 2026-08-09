@@ -139,7 +139,7 @@ jobs:
       # contradictions, no duplicates — is satisfied just as easily by scanning a remnant of the corpus
       # as the whole of it. Without a floor, a change that stopped the archive being read would go green.
       # Raise the number when the total legitimately grows; it must never be lowered to make CI pass.
-      # ⚠️ THE FLOOR LIVES IN TWO PLACES AND NOTHING COMPARES THEM: here, and `_MIN_TOTAL_ITEMS` in
+      # WARNING: THE FLOOR LIVES IN TWO PLACES AND NOTHING COMPARES THEM: here, and `_MIN_TOTAL_ITEMS` in
       # tests/test_backlog_status_check.py. Raise BOTH, or the lower one becomes the only floor that
       # binds. Found on 2026-08-05 at 277 against a corpus of 300 — 23 items of accumulated slack, in a
       # guard whose entire purpose is to notice the corpus shrinking.
@@ -167,7 +167,7 @@ jobs:
       # docs-only PR pays a base editable install and ~5s of tests rather than the full extras install.
       # The gated steps below are deliberately UNTOUCHED, so a code PR is byte-identical to before.
       #
-      # ⚠️ 89 of these tests SKIP here and that is structural, not a gap to fix in this step:
+      # WARNING: 89 of these tests SKIP here and that is structural, not a gap to fix in this step:
       # `tests/test_threat_model_doc_drift.py` asserts against `docs/security/THREAT-MODEL.md`, which is
       # vault-only and absent from this tree. ADR 0156 records that class (six `*_doc_drift` modules
       # assert against documents `git ls-files docs/security/` shows are not present) and ASVS 15.1.3 is
@@ -295,7 +295,7 @@ jobs:
       # Step-level watchdog UNDER the job cap (#55): the windows-2022 leg intermittently
       # wedges ~25% in (a Windows ProactorEventLoop listener-teardown / socket wait that the shared
       # session event loop can't get past), emits no output for ~12 min, then the JOB cap CANCELS it
-      # — a red ✗ with no stack and no named test. Two belts make that fail FAST and NAMED instead:
+      # — a red X with no stack and no named test. Two belts make that fail FAST and NAMED instead:
       #   * `--timeout-method=thread` (the ONLY method on Windows — SIGALRM is POSIX-only) dumps ALL
       #     thread stacks at the per-test cap (matrix `pytest_timeout`, 120s on these Windows legs),
       #     naming the stuck frame.
@@ -834,7 +834,11 @@ jobs:
           # A path appears in `changed` even if only deleted/renamed, so a pure doc rename still short-
           # circuits, and a code deletion still runs.
           #   Allowlisted (docs-only) paths: any *.md anywhere, docs/**, top-level LICENSE/NOTICE/AUTHORS,
-          #   .editorconfig, .gitignore/.gitattributes, .github/{ISSUE_TEMPLATE,PULL_REQUEST_TEMPLATE,...}.md.
+          #   .editorconfig, .gitattributes, .github/{ISSUE_TEMPLATE,PULL_REQUEST_TEMPLATE,...}.md.
+          #   NOT .gitignore -- #327 removed it from the regex and this line went on listing it for
+          #   weeks, the THIRD instance in this file of a comment stating the opposite of its code.
+          #   `.gitattributes` IS still listed here and is nonetheless CODE: `alwayscodepath` below is
+          #   checked first and wins. Precedence, not deletion -- see the reasoning there.
           # Be conservative: when in doubt a path is CODE. Empty diff (shouldn't happen on a PR) => code=true.
           # `.gitignore` is NOT in this allowlist, deliberately (BACKLOG #327). Six of its rules are the
           # sole control keeping maintainer-internal material out of a public commit, and
@@ -845,7 +849,51 @@ jobs:
           # ungated backlog guards above were added for. Treating it as code costs one suite run on a
           # rare PR; the alternative costs the publishing boundary, silently.
           noncode='(\.md$|^docs/|^LICENSE$|^NOTICE$|^AUTHORS$|^\.editorconfig$|^\.gitattributes$|^\.github/(ISSUE_TEMPLATE/|PULL_REQUEST_TEMPLATE))'
+          # EXTENSIONLESS CONFIG THAT IS ALWAYS CODE (BACKLOG #1200). The extension rule below cannot
+          # reach a file with no extension, and `.gitattributes` is exactly that: it was still in the
+          # docs-only allowlist above, so a `.gitattributes`-only PR skipped lint, mypy and the whole
+          # suite. It is not cosmetic -- the vault's own asvs-scorecard.yml records that a change here
+          # "silently alters how the corpus is materialized, which is exactly what makes the digest
+          # differ", so it is an input to the ASVS corpus pin.
+          #
+          # Stated as a POSITIVE list and CHECKED FIRST, rather than by deleting the entry from
+          # `noncode`, for two reasons. "Is code" should not depend on the ABSENCE of a line somewhere
+          # else -- a future edit re-adding a path to `noncode` would silently undo this with nothing
+          # to say so. And keeping the historical `noncode` intact is what lets
+          # tests/test_ci_docs_only_detector.py assert the regression in BOTH directions: it can still
+          # reconstruct the old classification by disabling this rule alone. `.gitignore` is named for
+          # the first reason even though #327 already removed it -- it was code only by falling through.
+          alwayscodepath='^(\.gitattributes|\.gitignore)$'
+          # EXTENSION OVERRIDE, EVALUATED FIRST (BACKLOG #1200). An executable file is CODE wherever it
+          # lives, including under docs/.
+          #
+          # The paragraph above states the intent exactly -- "any *.py ... counts as CODE" -- and the
+          # regex did not implement it, because `^docs/` is an alternation branch that matches a .py
+          # under docs/ and short-circuits before the *.py rule is ever reached. An auditor reads the
+          # comment, agrees with it, and moves on. Measured on 2026-08-09:
+          # docs/security/asvs-apply-cells.py classified NON-CODE -- the tool that WRITES the ASVS
+          # record of record, able to silently un-close an owner-closed cell, exempt from lint, mypy
+          # and the entire pytest suite by virtue of its directory. Two mypy errors had been sitting in
+          # it since it was written; they could not have survived a single check.
+          #
+          # THE PRECEDENT IS FOUR LINES ABOVE THIS ONE. BACKLOG #327 fixed exactly this shape for
+          # `.gitignore` and wrote the lesson down -- and the identical defect for docs/**/*.py sat in
+          # the regex immediately below the paragraph explaining it. The instance was fixed and the
+          # class left open, with the reasoning that would have closed it preserved in place. Hence an
+          # EXTENSION rule rather than another one-path exception: the next executable file someone
+          # puts under docs/ must not need this discovered a third time.
+          #
+          # The docs-only optimisation is deliberately preserved for actual documents -- deleting
+          # `^docs/` outright would run the full suite on every prose edit, which is the cost this
+          # short-circuit exists to avoid. Order matters: this is checked BEFORE `noncode`.
+          alwayscode='\.(py|ps1|sh|ts|js|yml|yaml|toml|lock|cfg|ini)$'
           if [ -z "$changed" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          elif echo "$changed" | grep -qE "$alwayscode"; then
+            # An executable/config file changed, wherever it lives -> run the full suite.
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          elif echo "$changed" | grep -qE "$alwayscodepath"; then
+            # Extensionless config the extension rule cannot see -> run the full suite.
             echo "code=true" >> "$GITHUB_OUTPUT"
           elif echo "$changed" | grep -qvE "$noncode"; then
             # At least one changed path is NOT docs-only -> run the full suite.
