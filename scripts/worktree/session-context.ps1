@@ -72,10 +72,18 @@ if ($root) {
             if ($others.Count -gt 0) {
                 $lines += ""
                 $lines += "LIVE sessions in this repo right now ($($others.Count) besides you):"
+                # LABEL THE ID IN EVERY ROW (BACKLOG #1098). Bare, the 8-hex token reads as an
+                # abbreviated commit SHA -- and it reads that way for a concrete reason, not a vague
+                # one: the `git worktree list` block a few lines above puts a REAL abbreviated SHA in
+                # exactly this shape, before a bracketed branch. It is a registry session id, resolves
+                # to no git object, and a session that compared "is that worktree ahead of mine"
+                # against it got an error at best and the wrong tree if the prefix happened to resolve.
+                # The word goes on the ROW, not in a legend, so the column cannot mean one thing in one
+                # row and something else in the next.
                 foreach ($p in $others) {
                     $where = if ($p.IsPrimary) { "the SHARED PRIMARY" } else { $p.Worktree }
                     $flag = if ($p.State -ne "LIVE") { "  [$($p.State)]" } else { "" }
-                    $lines += "  $($p.Short)  $($p.Surface)  in $where  [$($p.Branch)]$flag"
+                    $lines += "  session $($p.Short)  $($p.Surface)  in $where  [$($p.Branch)]$flag"
                 }
                 # The surfaces differ in what can reach them, and that changes how you coordinate.
                 if (@($others | Where-Object { $_.Surface -ne "desktop" }).Count -gt 0) {
@@ -103,7 +111,8 @@ if ($root) {
                     $lines += ""
                     $lines += "WHAT THEY ARE BUILDING -- check before you start, so you don't build it twice:"
                     foreach ($b in $busy) {
-                        $lines += "  $($b.Short) [$($b.Branch)] -- $(@($b.Files).Count) file(s) changed"
+                        # Same id, same banner, same label -- see the note on the roster rows above.
+                        $lines += "  session $($b.Short) [$($b.Branch)] -- $(@($b.Files).Count) file(s) changed"
                         foreach ($w in @($b.Work | Select-Object -First 3)) { $lines += "      $w" }
                     }
                     $lines += "  Everything in flight:  pwsh -NoProfile -File scripts\coord\overlap.ps1"

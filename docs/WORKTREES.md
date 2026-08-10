@@ -551,10 +551,17 @@ per session. It stays silent, and keeps its powder dry, when there's nobody to t
 resume mints a new session id, so a 30-minute per-checkout cooldown suppresses the immediate re-announce.
 
 **Expect about half the roster to be unreachable.** `presence.ps1` is authoritative for who **exists**;
-`list_sessions` is authoritative only for who can be **messaged**, and the two disagree. Measured
-2026-08-01: of 6 registry-LIVE peers, `list_sessions` reported `isRunning: true` for one. The hook cannot
-call MCP and so cannot filter on that, which is why the cap is a budget of *delivered* messages the model
-tops up past unreachable peers, rather than a candidate list the hook trims.
+`list_sessions` is authoritative only for who can be **messaged**, and the two disagree. The cap is
+therefore a budget of *delivered* messages the model tops up past unreachable peers, rather than a
+candidate list the hook trims.
+
+**Reachability is an exact `cwd` match and nothing else — never `isRunning`.** That flag means *"executing
+a turn right now"*, so as a reachability test it reads **backwards**: `false` is an idle peer that answers,
+`true` is one that queues. The field, its measurement and the cross-surface caveat are recorded once, in
+[`scripts/coord/session-registry.ps1`](../scripts/coord/session-registry.ps1)'s header. The announce hook
+instructed every session to skip on `isRunning: false` until **BACKLOG #1077**; an earlier reading of this
+paragraph counted `isRunning: true` for 1 of 6 registry-LIVE peers and treated that as a reachability
+rate, when it was a count of who happened to be mid-turn.
 
 **State, receipts and the kill switch.** `<git-common-dir>/mefor-coord/announce/` holds one
 `<session-id>.json` marker per session (delete it to force a re-announce), `receipts/<key>.tsv` — one
