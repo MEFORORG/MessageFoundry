@@ -978,7 +978,7 @@ leading performance driver**. The strategy + the **no-rewrite / no-broker** deci
 [**ADR 0051**](adr/0051-corepoint-throughput-parity-strategy.md); the engineering note is
 [`THROUGHPUT-IMPROVEMENTS.md`](archive/throughput/THROUGHPUT-IMPROVEMENTS.md) §5.
 
-**Honest verdict (2026-06-28) — PRE-MEASUREMENT HISTORY. Two of its six clauses are falsified; corrections
+**Honest verdict (2026-06-28) — PRE-MEASUREMENT HISTORY. At least two of its clauses are falsified; corrections
 follow immediately below and are what to read.** Kept dated rather than rewritten, because it is the record
 the plan was built on. NOT at demonstrated parity at 45M/day (the earlier "at parity" claim was vs
 Rhapsody *marketing*, not this spec): **compute** unvalidated (only `E_core ≈ 42 msg/s` measured on an
@@ -1005,8 +1005,10 @@ encrypt-by-default, **not** inefficiency (the "~2× vs Corepoint" was estimate-v
 >   ([ADR 0055](adr/0055-group-commit-durable-write.md) withdrawal banner). You cannot buy throughput by
 >   consuming less of a resource you are barely touching. Group-commit is not "unbuilt" pending a decision;
 >   it is **WITHDRAWN — DO NOT BUILD**.
-> - **The other four clauses stand as written** — the throughput measurement does not bear on carriage,
->   HA/multi-DB maturity, or cost/openness, and the "~2× vs Corepoint" retraction was already recorded.
+> - **The remaining clauses stand as written**, including the lead "not at demonstrated parity" — the
+>   throughput measurement does not bear on carriage, HA/multi-DB maturity or cost/openness, and the
+>   "~2× vs Corepoint" retraction was already recorded. No count is given on purpose: an enumeration here
+>   would be one more figure to drift.
 
 **Ordered plan (each step gated on the one before) — status reconciled 2026-08-10; the step text is the
 2026-06-28 original, each verdict is current:**
