@@ -345,10 +345,11 @@ verified** (ADR 0094). It is genuinely narrower than `tls_verify=false` — that
 - it does **not** route through `InsecureHopGuard`, because verification stays on, so **no
   cleartext/verify-off refusal keys on it**.
 
-It **is reported**, on every surface the other loosenings use: `security_loosenings()`, and therefore
-`GET /security/posture` and the serve-time loosening warning, plus a `tls-allow-expired` line from
-`messagefoundry check` naming each connection and its peer, alongside the WARNING each construction
-logs. Reported is not gated — nothing refuses it, and nothing takes it away again.
+It **is reported**: `security_loosenings()`, and therefore `GET /security/posture` on a running engine,
+plus a `tls-allow-expired` line from `messagefoundry check` naming each connection and its peer,
+alongside the WARNING each construction logs. Like every connection-scoped declaration it is **not** in
+the serve-time loosening warning, which fires before the graph is loaded and says so. Reported is not
+gated — nothing refuses it, and nothing takes it away again.
 
 Two consequences worth stating plainly. **(1)** Combined with the ungated revocation hops in
 [Revocation-guard behavior](#revocation-guard-behavior), a PHI hop can be pinned to a certificate that

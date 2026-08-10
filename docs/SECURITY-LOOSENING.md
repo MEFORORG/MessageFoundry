@@ -438,7 +438,9 @@ trail.
   behind it.
 - **It is never silent:** a WARN at each construction naming the host; a `tls-allow-expired` line in
   `messagefoundry check` naming every declaring connection and its peer; and a `tls_allow_expired` entry
-  in `security_loosenings()`, and so in `GET /security/posture` and the serve-time loosening warning.
+  in `security_loosenings()`, and so in `GET /security/posture` on a running engine. **Not** the
+  serve-time loosening warning — that fires before the graph is loaded, exactly as for
+  `cleartext_accepted`, and the construction WARN covers the same ground moments later.
 - **What it cannot do — and the one thing you must supply:** it is **advisory only**. No posture gate
   keys on it, `[security].enforcement = enforce` does not touch it, and no `MEFOR_ALLOW_INSECURE_TLS`
   is needed to set it. Reported is not gated. The engine will tell you *which* connections have it set,
