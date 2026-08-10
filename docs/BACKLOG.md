@@ -9051,3 +9051,83 @@ job has never completed its decision step.
 correctly refuted my first diagnosis of that job's failure (I said the control "detected drift and
 could not act"; the scheduled run predated the drift by 88 minutes and its parity step passed - the
 control has never yet detected this class at all).
+## 1210. the connscale FD/RSS peak has no provenance, so a stale-ppid subtree adoption becomes the reported number
+
+> 🔢 **Filed 2026-08-09 - NOT FIXED, diagnosis only.** Value **7/10** · Difficulty **5/10**. `test_connscale_smoke_end_to_end` failed CI on `fd_count_monotonic` with `fixed_per_conn@N=24: 344 < prior 3.56e+04 * 0.75`. The engine was almost certainly healthy in both arms: the 35,600 is the artefact. `handles_peak`/`ws_peak` are `max()` over a subtree SUM whose covering PID set is never recorded or validated, so one bad resolution poisons the step and `max()` latches it permanently.
+
+**Cluster:** Load harness / measurement integrity. **Priority:** P2. **Verdict:** research then build.
+**Blast radius:** the SLO is asserted by the smoke test, so this reds PRs that touch nothing near
+the harness - it red a scorecard-writer PR (#298) whose diff was two `scripts/asvs/` files.
+
+**35,600 handles at N=12 is not a plausible engine reading.** Calibrated against this repo's own
+published at-scale run (`docs/benchmarks/results/2026-07-03-adr0066-pooled-atscale/pooled_ab_atscale.txt`):
+
+```
+N=500 -> fd_count_peak 2333    N=1000 -> 3835    N=1500 -> 5335
+linear fit ~3.0 handles/connection over an ~833 base  =>  N=12 predicts ~870
+observed  N=24 -> 344      (in band, low side)
+observed  N=12 -> 35,600   (6.7x the reading for a FIFTEEN HUNDRED connection engine)
+```
+
+No leak produces 35,600 at N=12 and 344 at N=24 minutes later in the same sweep, from two
+separately-spawned engines.
+
+**The mechanism is stale-`ParentProcessId` adoption, not a leak.** `_walk_descendants`
+(`harness/load/connscale/probe.py`) BFSes the ppid->children map from the engine root and **validates
+nothing** - no creation time, no image name, no cardinality bound. Windows does not clear
+`ParentProcessId` when a parent exits, and it recycles PIDs, so any live process whose
+`ParentProcessId` equals the engine's recycled PID is adopted along with its entire subtree.
+Measured on the maintainer's box (406 processes, 204,882 handles total): seven dead PIDs still have
+live processes pointing at them, and walking one as if it were a freshly-recycled engine PID summed
+144,688 handles. The observed range is reproducible by this mechanism.
+
+**In the connscale smoke the engine has no children at all.** `harness/load/failover.py` spawns
+`serve` with no `--shards`, and `__main__.py` runs uvicorn in-process; children come only from the
+shard supervisor. So **every descendant the walk finds is by construction not the engine.** A
+cardinality bound alone would have caught this.
+
+**Why #220's gate does not cover it, and why copying that gate would be WRONG.** #220 hardened the
+CPU path to degrade set-change intervals to gaps. That is right for a DIFFERENCE - differencing two
+sums taken over different PID sets is arithmetically invalid however legitimate the joiner. But an
+INSTANTANEOUS gauge summed over a genuinely larger subtree is *correct*, so the fix here is not the
+same gate. The real gap is that the number carries no record of the set it covered, leaving a
+legitimate growth and a misresolution indistinguishable - and the SLO draws a verdict anyway.
+Secondary: **#220's gate is a change-detector, not a binding check.** A step whose first and only
+resolution adopts a wrong-but-stable subtree yields `pa == pb` on every interval, so CPU reports too,
+and the flat-counter guard will not fire because an adopted tree does burn CPU. The smoke profile is
+exactly that shape.
+
+**The exposure was asserted as correct by the test that shipped #220's fix.**
+`tests/test_connscale_cpu_probe.py` `test_a_membership_changed_interval_is_degraded_to_a_gap` ends:
+
+```python
+# The non-CPU gauges still read - the process set was observed, only its CPU delta is unsound.
+assert d.handles_peak == 61
+assert d.working_set_peak_bytes == 6_000_000
+```
+
+Two problems. The rationale is true of the differencing arithmetic and false of a peak over a set
+never validated to be the engine. And the fixture is **physically unrealizable**: it varies
+`cpu_pids` `{100}` -> `{100,200}` -> `{100}` while pinning `handles=61` across all three ticks, but
+the Windows probe reads handles and CPU from the SAME `Get-Process` rows, so a joining PID
+necessarily moves both. It constructs the one input shape in which this exposure is invisible, then
+asserts the pass-through as correct.
+
+**Fix shape, ranked by leverage (proposal, not applied - needs a go):**
+1. **Validate the walk rather than gate the aggregate.** A genuine descendant cannot predate its
+   root. `_descendants_windows` already queries `Win32_Process`; add `CreationDate` and reject any
+   candidate created before the root. `/proc/<pid>/stat` field 22 gives the same on POSIX. This
+   single change would have prevented the observed number.
+2. **Record the covering PID set for the FD/RSS sum** - on Windows `cpu_pids` already IS that set and
+   is simply not consulted - so a five-figure handle count is auditable rather than anonymous.
+3. **Give FD/RSS a plausibility guard**, the analogue of `_CPU_FLAT_GAP_SPAN_S`: for a non-sharded
+   engine, a subtree of cardinality > 1 is a wrong binding and should degrade to a gap, not a number.
+4. **Fix the fixture** so `handles` moves with the PID set; the current one cannot fail on this class.
+
+**Not covered by #1101**, the sibling SLO defect on the same test. #1101 touches `handles_peak` once,
+only to dismiss it as a control for time dilation - correct about dilation, silent on provenance.
+(Its anchor `runner.py:963` has also drifted; the line is now 988.)
+
+**Source:** the CI red on #298, 2026-08-09. My first reading was "handles has no PID-set gate like
+CPU does"; an independent verification pass sharpened it to the above and corrected the remedy - the
+gate is the wrong shape, validation of the walk is the right one.
