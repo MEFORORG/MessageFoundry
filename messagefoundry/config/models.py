@@ -236,6 +236,12 @@ class Source(BaseModel):
     """An inbound connector endpoint."""
 
     type: ConnectorType
+    # The declaring inbound connection's name, carried so a connector can NAME itself in an operator-
+    # facing log line (#333 — the generic-ODBC TLS reminder was anonymous, and its remedy is
+    # per-connection). Unlike :attr:`Destination.name` this is OPTIONAL: a Source is also built directly
+    # in tests and DSN-shape checks where there is no graph, and the runner's `_source_config` is the one
+    # production path that fills it (from `InboundConnection.name`).
+    name: str | None = None
     settings: dict[str, Any] = Field(default_factory=dict)
     ack_mode: AckMode = AckMode.ORIGINAL
     # Per-connection insecure-hop attestation (#200, ADR 0092): the operator affirms THIS connection's

@@ -135,6 +135,8 @@ __all__ = [
     "load_config",
     "validate_config",
     "accepted_cleartext_hops",
+    "expiry_relaxed_hops",
+    "unverified_generic_db_hops",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -3553,6 +3555,110 @@ def accepted_cleartext_hops(registry: Registry) -> list[tuple[str, str]]:
         if spec.settings.get("cleartext_accepted"):
             reason = spec.settings.get("cleartext_reason")
             out.append((f"fhir_lookup:{spec.name}", str(reason) if reason else "(none recorded)"))
+    return sorted(out)
+
+
+def _peer_label(settings: Mapping[str, Any]) -> str:
+    """A readable, secret-free peer address for a connection's settings — the ``url`` if it has one,
+    else ``host``/``server`` with its ``port``, else ``"(unknown peer)"``.
+
+    Three keys because the connectors genuinely use three: ``url`` (Rest/FHIR/Soap), ``host``
+    (MLLP/DICOM/Ftp) and ``server`` (Database, which is also the ``[egress].allowed_db`` allowlist key).
+
+    An unresolved :class:`EnvRef` renders as ``env(<key>)``: the KEY, never the value, because these
+    labels land in a posture report and a resolved value can be a credentialed URL. A resolved ``url``
+    is passed through :func:`_mask_url_userinfo` for the same reason — the password half of
+    ``https://user:SECRET@host/`` must not ride into ``GET /security/posture``."""
+
+    def one(value: object) -> str | None:
+        if isinstance(value, EnvRef):
+            return f"env({value.key})"
+        return str(_mask_url_userinfo(value)) if value else None
+
+    url = one(settings.get("url"))
+    if url:
+        return url
+    host = one(settings.get("host")) or one(settings.get("server"))
+    if not host:
+        return "(unknown peer)"
+    port = one(settings.get("port"))
+    return f"{host}:{port}" if port else host
+
+
+def expiry_relaxed_hops(registry: Registry) -> list[tuple[str, str]]:
+    """Every OUTBOUND connection that declares ``tls_allow_expired``, as ``(name, peer)`` (#129 /
+    ADR 0094, surfaced by #333).
+
+    The sibling of :func:`accepted_cleartext_hops`, and the same contract: the SINGLE reader, so
+    ``messagefoundry check``, ``security_loosenings()`` and ``GET /security/posture`` can never report
+    different sets. Sorted by connection name for a stable, diffable list.
+
+    The flag lands in the connection's ``spec.settings`` dict (the six outbound factories that take it
+    — ``MLLP``/``Rest``/``FHIR``/``DICOM``/``Soap``/``Ftp``) rather than in a typed
+    ``OutboundConnection`` field like ``cleartext_accepted``, so this reads the dict.
+
+    **Outbound only, and that is a fact about the graph rather than a scoping choice.** ``FhirLookup``
+    exposes ``verify_tls`` but no ``tls_allow_expired``, and no inbound factory takes it (an inbound
+    verifies a CLIENT cert, which is a different question). Said here explicitly so that ADDING the
+    parameter to a lookup or an inbound later cannot silently escape this reader: whoever adds it must
+    extend this function, exactly as ``accepted_cleartext_hops`` had to grow its ``fhir_lookups`` arm.
+
+    Pure — it reads the loaded graph and touches nothing else."""
+    return sorted(
+        (oc.name, _peer_label(oc.spec.settings))
+        for oc in registry.outbound.values()
+        if oc.spec.settings.get("tls_allow_expired")
+    )
+
+
+def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
+    """Every generic-ODBC ``DATABASE`` connection whose ``odbc_params`` leave TLS unenforced, as
+    ``(name, reason)`` (#66 / ADR 0092 amendment, surfaced by #333).
+
+    On ``dialect='generic'`` MessageFoundry cannot introspect an arbitrary driver's TLS posture, so the
+    posture-keyed weakened-TLS refusal does not apply and TLS is delegated to the operator's own driver
+    keyword. ADR 0092 accepted that exemption on the strength of ONE mitigation — construction logs it —
+    and a log line emitted once at startup is not the surface anyone queries three months later. This is
+    that surface.
+
+    It walks **both** connection tables, unlike :func:`accepted_cleartext_hops`: a ``DatabasePoll``
+    inbound crosses the same hop in the same dialect with the same credential in the same DSN, so
+    reading only ``outbound`` would report a live unenforced hop as absent. Inbound names are prefixed
+    ``inbound:`` because the two tables are separate namespaces and a name could otherwise collide.
+
+    ``registry.lookups`` is deliberately NOT walked, and the reason is a property of the code rather
+    than a scoping choice: neither ``DatabaseLookup`` nor ``DatabaseRef`` takes a ``dialect`` or
+    ``odbc_params`` parameter, and the ADR 0010 read executor calls ``_build_dsn`` directly, so a live
+    lookup is SQL-Server-only and keeps that preset's posture-keyed refusal. Stated here so that giving
+    a lookup the generic dialect later cannot silently escape this reader — whoever adds it must extend
+    this function.
+
+    The classification is :func:`~messagefoundry.transports.database.generic_odbc_tls_unenforced` — the
+    same predicate the construction WARNING uses, imported here rather than restated, so this reader and
+    that log line can never disagree. Imported lazily inside the function: ``config`` must not take a
+    module-import dependency on ``transports`` (the one-way rule), and this reader runs on operator
+    surfaces, never on the hot path.
+
+    Pure — it reads the loaded graph and touches nothing else."""
+    from messagefoundry.transports.database import generic_odbc_tls_unenforced
+
+    def unenforced(settings: Mapping[str, Any]) -> str | None:
+        if str(settings.get("dialect", "sqlserver")).lower() != "generic":
+            return None
+        params = settings.get("odbc_params") or {}
+        return generic_odbc_tls_unenforced(params) if isinstance(params, Mapping) else None
+
+    out: list[tuple[str, str]] = []
+    for label, table in (
+        ("", registry.outbound),
+        ("inbound:", registry.inbound),
+    ):
+        for conn in table.values():
+            if conn.spec.type is not ConnectorType.DATABASE:
+                continue
+            reason = unenforced(conn.spec.settings)
+            if reason is not None:
+                out.append((f"{label}{conn.name}", f"{reason} ({_peer_label(conn.spec.settings)})"))
     return sorted(out)
 
 
