@@ -782,8 +782,22 @@ class _AuthException(Exception):
     pass
 
 
+class _FakeTransport:
+    """Stands in for ``paramiko.Transport`` so the #178 algorithm floor has an offer to read.
+
+    Deliberately a MINIMAL above-floor set rather than a copy of paramiko's real defaults: these
+    host-key tests must keep measuring the host-key policy, and a fake that drifted below the floor
+    would make them pass for the wrong reason (a floor refusal also raises permanently). If the floor
+    ever rejects these three, that is a genuine failure worth seeing here."""
+
+    _preferred_kex = ("curve25519-sha256@libssh.org",)
+    _preferred_ciphers = ("aes256-ctr",)
+    _preferred_macs = ("hmac-sha2-256",)
+
+
 class _FakeParamiko:
     SSHClient = _FakeSSHClient
+    Transport = _FakeTransport
     RejectPolicy = _RejectPolicy
     AutoAddPolicy = _AutoAddPolicy
     SSHException = _SSHException

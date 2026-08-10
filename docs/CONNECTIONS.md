@@ -845,6 +845,14 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   document, so on a production-PHI enforcing instance the escape is inert and an unknown host key stays
   refused (`RejectPolicy`) even with the variable set; it takes effect only on a non-enforcing / non-PHI
   instance.
+  **Since #178 the negotiated key exchange, cipher and MAC are held to an algorithm floor** mapped from
+  the one the TLS hops assert on their contexts (`messagefoundry/config/ssh_policy.py` — forward-secret
+  key exchange, no 64-bit-block cipher, no MD5/SHA-1 MAC). It prunes `3des-cbc` and the MD5/SHA-1 MACs
+  from paramiko's offer and leaves everything a current OpenSSH server negotiates by default, so an
+  ordinary partner is unaffected. A partner that offers nothing above the floor is **refused with a
+  message naming the algorithms refused and what to enable instead** — not a timeout or a bare
+  `Incompatible ssh server`. There is **no configuration surface and no override**: the operator-tunable
+  allow-list is the separate, still-deferred half of #178.
 - **`Ftp(...)`** — stdlib `ftplib`, **no extra**: `tls=False` is plain FTP, `tls=True` is **FTPS**
   (explicit TLS + `PROT P`, encrypting the control *and* data channels). FTPS **verifies the server
   certificate and hostname by default** (a verifying `SSLContext`, not ftplib's no-verify fallback).

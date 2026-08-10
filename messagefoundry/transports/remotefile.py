@@ -7,7 +7,9 @@ A single connector type (``REMOTEFILE``) with a ``protocol`` setting selecting t
 - ``sftp`` — SSH file transfer (paramiko, the ``[sftp]`` extra — lazily imported, so installs that
   never use SFTP skip it). **Host-key verification is ON by default**; an unknown key is refused
   unless the explicit dev escape ``MEFOR_ALLOW_INSECURE_TLS`` is set (and logged loudly when it is),
-  mirroring the SQL Server backend's weakened-TLS posture.
+  mirroring the SQL Server backend's weakened-TLS posture. The negotiated key exchange, cipher and
+  MAC are held to the same floor the TLS hops assert on their contexts — see
+  :mod:`messagefoundry.config.ssh_policy`, which is where that floor is defined and justified.
 - ``ftp`` — plain FTP (stdlib ``ftplib``). Cleartext: credentials over plain ``ftp`` are **refused**
   unless the escape is set (use ``ftps``/``sftp``), mirroring :func:`refuse_cleartext_credentials`.
 - ``ftps`` — FTP over explicit TLS (``ftplib.FTP_TLS`` + ``PROT P``), credentials encrypted. **The
@@ -54,6 +56,10 @@ from messagefoundry.config.models import ConnectorType, ContentType, Destination
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     weakened_tls_escape_permitted_here,
+)
+from messagefoundry.config.ssh_policy import (
+    ssh_disabled_algorithms,
+    ssh_floor_refusal,
 )
 from messagefoundry.config.tls_policy import (
     TrustAnchorPolicy,
@@ -384,8 +390,57 @@ class _SftpClient(_RemoteClient):
                 INSECURE_TLS_ESCAPE_ENV,
             )
 
+    @property
+    def _connector(self) -> str:
+        """The label the algorithm-floor errors identify this hop by, matching the log-line style."""
+        return f"REMOTEFILE sftp {self._host}"
+
+    def _algorithm_offer(self, paramiko: Any) -> dict[str, list[str]]:
+        """The key-exchange / cipher / MAC names the SSH library would propose (#178).
+
+        The only thing this reads from paramiko; the policy applied to it lives in
+        ``config/ssh_policy.py``, which is also where the floor is justified. Read through
+        ``getattr`` so a library that stops exposing one of the lists leaves that category ABSENT,
+        which makes :func:`ssh_disabled_algorithms` refuse rather than leaving it silently
+        unfloored. Recomputed per connect rather than cached: it is an attribute read next to a TCP
+        connect and a key exchange, and a cache keyed on nothing would outlive a test's fake
+        library."""
+        transport = getattr(paramiko, "Transport", None)
+        raw = {
+            "kex": getattr(transport, "_preferred_kex", None),
+            "ciphers": getattr(transport, "_preferred_ciphers", None),
+            "macs": getattr(transport, "_preferred_macs", None),
+        }
+        return {category: list(names) for category, names in raw.items() if names is not None}
+
+    def _floor_refusal(self, paramiko: Any, exc: Exception) -> str | None:
+        """The operator-actionable text for a negotiation failure the floor caused, else ``None``.
+
+        Recomputes the floor rather than carrying it on the instance: this runs on an error path, and
+        state stashed during a connect would be stale (or absent) for a connect that never got that
+        far. A derivation failure here yields ``None`` so the caller reports the ORIGINAL negotiation
+        error -- an error path must not raise a second, unrelated exception over the first."""
+        try:
+            offer = self._algorithm_offer(paramiko)
+            disabled = ssh_disabled_algorithms(offer, connector=self._connector)
+        except ValueError:
+            return None
+        return ssh_floor_refusal(
+            str(exc),
+            connector=self._connector,
+            host=self._host,
+            port=self._port,
+            disabled=disabled,
+            offered=offer,
+        )
+
     def _connect(self) -> Any:
         paramiko = _import_paramiko()
+        # Applied here rather than passed in, so there is no parameter a caller could omit: an
+        # algorithm floor that one code path can skip is not a floor.
+        disabled = ssh_disabled_algorithms(
+            self._algorithm_offer(paramiko), connector=self._connector
+        )
         client = paramiko.SSHClient()
         client.load_system_host_keys()
         if self._known_hosts:
@@ -405,6 +460,7 @@ class _SftpClient(_RemoteClient):
             timeout=self._timeout,
             allow_agent=False,
             look_for_keys=False,
+            disabled_algorithms=disabled,
         )
         return client
 
@@ -477,8 +533,21 @@ class _SftpClient(_RemoteClient):
             ) from exc
         except paramiko.SSHException as exc:
             # SSHException covers an unknown/rejected host key (RejectPolicy) — a security stop the
-            # operator must resolve, so it's permanent, not a retry.
-            raise _RemoteError(f"SFTP connection rejected: {exc}", permanent=True) from exc
+            # operator must resolve, so it's permanent, not a retry. It ALSO covers a peer that offers
+            # nothing above the algorithm floor; that refusal gets its own message naming what was
+            # refused and what the server could enable instead, because "SFTP connection rejected:
+            # Incompatible ssh server (no acceptable macs)" reads like a partner defect and gives an
+            # operator nothing to act on. `ssh_floor_refusal` returns None for every incompatibility
+            # the floor did not cause, so the generic message still covers those.
+            raise _RemoteError(
+                self._floor_refusal(paramiko, exc) or f"SFTP connection rejected: {exc}",
+                permanent=True,
+            ) from exc
+        except ValueError as exc:
+            # The floor derivation itself refused (an unclassified algorithm, or a library exposing no
+            # preferred list) — or a malformed private key. Both are operator-fixable configuration,
+            # never transient, so retrying the backlog against them would be pure noise.
+            raise _RemoteError(f"SFTP connect refused: {exc}", permanent=True) from exc
         except (OSError, EOFError) as exc:
             raise _RemoteError(f"SFTP connect failed: {exc}", permanent=False) from exc
         try:
