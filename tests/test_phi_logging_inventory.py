@@ -557,10 +557,9 @@ _ALLOWED_SINK_MODULES: dict[str, str] = {
     "messagefoundry/tray/__main__.py": (
         "the tray's RotatingFileHandler — named in 'Not in this inventory, and why'"
     ),
-    "messagefoundry/pipeline/_sandbox_worker.py": (
-        "the ADR 0087 sandbox child's basicConfig onto the engine's INHERITED stderr — disclosed as "
-        "the one in-product writer outside the filter chain"
-    ),
+    # The ADR 0087 sandbox child is deliberately ABSENT (BACKLOG #1054): it no longer constructs a sink
+    # of its own. It calls logging_setup's `configure_stderr_logging`, so the handler — and the filter
+    # chain on it — is built by the module already listed above, and stream 2 covers it.
     # 16.2.3's other half: a module that WRITES log CONTENT to an operator-chosen destination is a
     # log sink even though it constructs no logging handler. The support bundle copies a 500-line
     # app-log tail out of the ACL'd directory into a zip whose whole purpose is to be handed off.
@@ -671,12 +670,17 @@ def test_the_tray_file_sink_is_scoped_out_by_name() -> None:
     )
 
 
-def test_the_sandbox_worker_stderr_writer_is_disclosed() -> None:
-    """The filter-coverage claim is true only of the ENGINE process.
+def test_the_sandbox_worker_stderr_writer_is_filtered_not_disclosed() -> None:
+    """§7's filter-coverage claim must match how the ADR 0087 child actually configures logging.
 
-    Under ``[sandbox].mode = "subprocess"`` the ADR 0087 child inherits the engine's stderr
-    (``stderr=None``) and configures a bare ``basicConfig``, so WARNING+ records from admin-authored
-    Handler code reach stream 1's own sink unfiltered. Asserted both ways.
+    The child inherits the engine's stderr (``stderr=None``) either way, so what decides the doc is
+    whether it builds its own **unfiltered** handler. It used to: a bare ``basicConfig``, whose handler
+    carries no filters, put WARNING+ records from admin-authored Handler code onto stream 1's own sink
+    outside the chain, and §7 disclosed that. It now calls ``configure_stderr_logging``, which installs
+    the same three filters (BACKLOG #1054), so the disclosure must be gone instead.
+
+    Pinned BOTH ways, because the interesting direction is the regression: a future edit that put
+    ``basicConfig`` back would silently reopen the gap, and this reddens and demands §7 say so again.
     """
     from messagefoundry.config.settings import ServiceSettings
 
@@ -684,10 +688,11 @@ def test_the_sandbox_worker_stderr_writer_is_disclosed() -> None:
         encoding="utf-8"
     )
     sandbox = (_ROOT / "messagefoundry" / "pipeline" / "sandbox.py").read_text(encoding="utf-8")
-    inherits = "logging.basicConfig" in worker and "stderr=None" in sandbox
+    assert "stderr=None" in sandbox, "the child no longer inherits the engine's stderr; revisit §7"
+    unfiltered = "logging.basicConfig" in worker
     text = _doc_text()
     disclosed = "outside the filter chain" in text
-    if inherits:
+    if unfiltered:
         assert disclosed, (
             "the sandbox worker child writes to the engine's INHERITED stderr through a bare "
             "basicConfig, so §7's 'three filters on every record' claim is not true of it. Say so."
@@ -696,10 +701,16 @@ def test_the_sandbox_worker_stderr_writer_is_disclosed() -> None:
             "the filter-coverage sentence must be scoped to the engine process"
         )
     else:
-        assert not disclosed, "the sandbox child no longer inherits stderr; drop the disclosure"
+        assert not disclosed, (
+            "the sandbox child installs the filter chain itself; §7 must not still disclose it as a "
+            "writer outside the chain — an exclusion that no longer exists reads as an open weakness"
+        )
+        assert "configure_stderr_logging" in worker, (
+            "the child neither uses basicConfig nor configure_stderr_logging — it may have no filter "
+            "chain at all. Establish which, and say so in §7."
+        )
     assert ServiceSettings().sandbox.mode == "off", (
-        "[sandbox].mode no longer defaults off; the disclosure describes an OPT-IN posture — "
-        "revisit §7 in the same change."
+        "[sandbox].mode no longer defaults off; §7 describes an OPT-IN posture — revisit it here."
     )
 
 
