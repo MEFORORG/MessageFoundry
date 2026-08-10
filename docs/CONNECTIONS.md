@@ -1060,8 +1060,12 @@ The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};]
 > driver's TLS posture — so the weakened-TLS refusal does **not** apply here. Configure **verifying** TLS
 > via the driver's own keyword in `odbc_params` (psqlODBC `SSLmode=verify-full`, MySQL
 > `SSLMODE=VERIFY_IDENTITY`, Oracle wallet). Never point PHI at an unverified generic hop. So the
-> delegation is never *silent*, a generic connection with **no** ssl/tls/encrypt keyword in `odbc_params`
-> logs a **WARNING** at construction (dropped to DEBUG once a TLS keyword is set); this exemption is
+> delegation is never *silent*, a generic connection logs a **WARNING** at construction, naming itself,
+> when `odbc_params` carries **no** ssl/tls/encrypt keyword **or** carries one set to a no-TLS value
+> (`SSLmode=disable`/`allow`/`prefer`, MySQL `DISABLED`/`PREFERRED`, `Encrypt=no`/`0`/`false`/`off`) —
+> dropped to DEBUG only once a keyword is set to something outside that deny-list. It is also reported
+> by `security_loosenings()` / `GET /security/posture` and by `messagefoundry check`'s `generic-db-tls`
+> line, for `DatabasePoll` inbounds as well as `Database` outbounds (#333). This exemption is
 > recorded in the [ADR 0092 amendment (2026-07-12)](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md).
 
 > **Scope / limitations.** Native async DB drivers (`asyncpg`-as-connector, `oracledb`, `mysqlclient`) are
