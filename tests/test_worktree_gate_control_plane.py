@@ -637,6 +637,101 @@ def test_the_pre_existing_denies_survive_the_split(
     assert_denied(run_gate_in(shell(command, cwd=cwd), repo.repos, hook_cwd=cwd))
 
 
+# ------------------------- rule 3c: the argument reader, quotes and spaces included (BACKLOG #1066)
+#
+# Every path reader in the resolver was ``"?([^"\s]+)"?`` against the raw line: DOUBLE quotes only, and
+# stopping at a SPACE. That is two fail-opens in one expression, and neither needs an unusual spelling --
+# this file writes a single-quoted argument two lines from the case it is testing.
+#
+#   * a single-quoted token keeps its leading quote, so ``GetFullPath`` turns even an ABSOLUTE path into
+#     a relative one and nothing matches a governed root;
+#   * a governed root whose path contains a space is truncated away entirely.
+#
+# The option is now located in the length-preserving quote mask and its value read out of the raw text at
+# the same offset. That also makes a ``-C`` inside a quoted VALUE inert, which closes the second spelling
+# filed under #1065 -- the mask blanks it, so a config value carrying ``-C HEAD`` can no longer nominate
+# HEAD as the repository being configured. The quoted-and-INERT case and the quoted-and-EXECUTED case
+# stay distinct: an interpreter argument is recursed into by ``Get-ScannableSegments`` and comes back as
+# its own unquoted line.
+
+
+@pytest.fixture
+def spaced_root(tmp_path: Path) -> SimpleNamespace:
+    """A governed root whose path contains a SPACE.
+
+    Named ``Zed Repo`` on purpose. With a root called ``Primary Two`` the truncated prefix
+    ``<tmp>/Primary`` is ITSELF a governed root in this rig, so the case would deny for an accidental
+    reason and read as the rule working. The fixture has to make the truncation actually miss."""
+    root = tmp_path / "Zed Repo"
+    subprocess.run(["git", "init", "-b", "main", str(root)], check=True, capture_output=True)
+    repos = tmp_path / "spaced-repos.txt"
+    repos.write_text(f"{root}\n", encoding="utf-8")
+    return SimpleNamespace(root=root, repos=repos)
+
+
+@pytest.mark.parametrize(
+    ("command", "cwd_key"),
+    [
+        ("git -C '../Primary' config " + _DISARM, "wt"),
+        ("git -C 'GOVERNED' config " + _DISARM, "wt"),
+        ("cd '../Primary' && git config " + _DISARM, "wt"),
+        ('git config core.hooksPath "/nope -C HEAD"', "primary"),
+        ("git config core.hooksPath '/nope -C HEAD'", "primary"),
+        ("git --git-dir 'GOVERNED/.git' config " + _DISARM, "other"),
+        ('git --git-dir="GOVERNED/.git" config ' + _DISARM, "other"),
+    ],
+)
+def test_a_quoted_target_is_read_rather_than_mangled(
+    repo: SimpleNamespace, ungoverned: Path, command: str, cwd_key: str
+) -> None:
+    """All seven measured ALLOW on the committed gate. The last two of the first group are the
+    value-embedded ``-C`` recorded under #1065: the flag sits INSIDE a quoted config value, git never
+    sees it as a flag, and reading it as one made the rule inspect a repository the command never
+    touches -- then allow, because that repository does not exist."""
+    cwd = {"primary": repo.primary, "wt": repo.wt, "other": ungoverned}[cwd_key]
+    command = command.replace("GOVERNED", str(repo.primary))
+    reason = assert_denied(run_gate_in(shell(command, cwd=cwd), repo.repos, hook_cwd=cwd))
+    assert "SHARED git configuration" in reason
+
+
+def test_a_governed_root_whose_path_has_a_SPACE_is_seen(spaced_root: SimpleNamespace) -> None:
+    """The truncation half. `[^"\\s]+` stopped at the space, so this root was invisible in BOTH quoting
+    styles -- measured ALLOW on the committed gate for each."""
+    for quote in ('"', "'"):
+        cmd = f"git -C {quote}{spaced_root.root}{quote} config {_DISARM}"
+        cwd = spaced_root.root.parent
+        reason = assert_denied(run_gate_in(shell(cmd, cwd=cwd), spaced_root.repos, hook_cwd=cwd))
+        assert "SHARED git configuration" in reason
+
+
+def test_the_spaced_root_still_allows_an_ordinary_key(spaced_root: SimpleNamespace) -> None:
+    """Reading the path decides WHICH repository, never WHICH KEYS."""
+    cmd = f'git -C "{spaced_root.root}" config user.email me@example.com'
+    cwd = spaced_root.root.parent
+    assert run_gate_in(shell(cmd, cwd=cwd), spaced_root.repos, hook_cwd=cwd) is None
+
+
+@pytest.mark.parametrize(
+    ("command", "cwd_key"),
+    [
+        ("git -C 'UNGOVERNED' config " + _DISARM, "primary"),
+        ("cd '../Unrelated' && git config " + _DISARM, "primary"),
+        ("git -C 'GOVERNED' config user.email a@b.c", "wt"),
+        ('git commit -m "use -C HEAD to reuse a message"', "primary"),
+        ("git config user.name 'Some One'", "primary"),
+    ],
+)
+def test_reading_quoted_arguments_does_not_widen_the_rule(
+    repo: SimpleNamespace, ungoverned: Path, command: str, cwd_key: str
+) -> None:
+    """Narrowness. A quoted token at an UNGOVERNED repo stays allowed, an ordinary key at a governed one
+    stays allowed, a commit message that merely writes `-C HEAD` is still prose, and a quoted value with
+    a space in it is still an ordinary config write."""
+    cwd = {"primary": repo.primary, "wt": repo.wt}[cwd_key]
+    command = command.replace("GOVERNED", str(repo.primary)).replace("UNGOVERNED", str(ungoverned))
+    assert run_gate_in(shell(command, cwd=cwd), repo.repos, hook_cwd=cwd) is None
+
+
 # --------------------------------------------------------------- rule 3d: destroying another worktree
 
 

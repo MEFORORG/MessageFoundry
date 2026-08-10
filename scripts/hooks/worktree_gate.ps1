@@ -231,27 +231,51 @@ function ConvertTo-WorktreeSlug([string]$Branch) {
 function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$CwdRaw) {
     $out = @()
 
+    $mask = Get-QuoteMask $Line
+
     # git's global `-C <path>`, read CASE-SENSITIVELY. `-match` is case-INsensitive in PowerShell, so
     # git's lowercase `-c name=value` config override was captured as if it were a path -- and being the
     # first match it also shadowed a real `-C` later in the same command.
-    if ($Line -cmatch '(?:^|\s)-C\s+"?([^"\s]+)"?') {
-        $out += $Matches[1]
+    #
+    # THE OPTION IS FOUND IN THE MASK; ITS VALUE IS READ OUT OF THE RAW TEXT (BACKLOG #1066). Every
+    # reader here used to be `"?([^"\s]+)"?` against the raw line -- DOUBLE quotes only, and stopping at
+    # a SPACE. Both halves of that were live fail-opens, measured on the committed gate:
+    #     git -C '../Primary' <disarm>      ALLOW  the token keeps its leading quote, so GetFullPath
+    #     git -C '<absolute>' <disarm>      ALLOW  turns even an ABSOLUTE path into a relative one
+    #     git -C "<root with a space>" ...  ALLOW  truncated at the space, so a governed root whose path
+    #                                              contains one stopped being seen at all
+    # This is the ordinary spelling, not an evasion: this rule's own test file writes a single-quoted
+    # argument two lines from the case it is testing.
+    #
+    # Finding the option in the MASK preserves a distinction that matters rather than collapsing it. A
+    # `-C` inside a quoted VALUE is INERT -- git never sees it as a flag -- and the mask blanks it, which
+    # is what stops a quoted config value containing `-C <x>` from nominating <x> as the repository. A
+    # `-C` inside an INTERPRETER argument is EXECUTED and still counts, because Get-ScannableSegments
+    # recurses into that argument and hands its contents back as their own line, unquoted.
+    $cvals = @(Get-OptionValuesRaw $Line $mask '(?:^|\s)-C(?=\s)')
+    if ($cvals.Count -gt 0) {
+        $out += $cvals[0]
     } else {
         $cd = $null
         if ($Prefix -notmatch '(?:^|\s)(?:popd|cd\s+-(?:\s|$))' -and $Prefix -notmatch '[({]') {
-            $cds = [regex]::Matches($Prefix, '(?:^|\s)(?:cd|pushd)\s+"?([^"&|;]+?)"?\s*(?:&&|;|\||$)')
-            if ($cds.Count -eq 1) { $cd = $cds[0].Groups[1].Value.Trim() }
+            $cds = [regex]::Matches((Get-QuoteMask $Prefix), '(?:^|\s)(?:cd|pushd)(?=\s)')
+            if ($cds.Count -eq 1) { $cd = Read-ArgAt $Prefix ($cds[0].Index + $cds[0].Length) }
         }
         $out += $(if ($cd) { $cd } else { $CwdRaw })
     }
 
-    # ADDITIONAL, never instead of: see the note above.
-    if ($Line -cmatch '(?:^|\s)--work-tree[=\s]+"?([^"\s]+)"?') { $out += $Matches[1]; $out += $CwdRaw }
-    if ($Line -cmatch '(?:^|\s)GIT_WORK_TREE="?([^"\s]+)"?')    { $out += $Matches[1]; $out += $CwdRaw }
+    # ADDITIONAL, never instead of: see the note above. Same reader, because the same truncation applied
+    # to all four and fixing one of four identical spellings is how this file's -- detach/-d denylist got
+    # it wrong twice.
+    $wt = @(Get-OptionValuesRaw $Line $mask '(?:^|\s)--work-tree(?:=|(?=\s))')
+    if ($wt.Count -gt 0) { $out += $wt[0]; $out += $CwdRaw }
+    $gwt = @(Get-OptionValuesRaw $Line $mask '(?:^|\s)GIT_WORK_TREE=')
+    if ($gwt.Count -gt 0) { $out += $gwt[0]; $out += $CwdRaw }
     # --git-dir names the repo; the tree is its parent. Add both rather than reason about which.
-    if ($Line -cmatch '(?:^|\s)--git-dir[=\s]+"?([^"\s]+)"?') {
-        $out += $Matches[1]
-        $out += (Join-Path $Matches[1] "..")
+    $gd = @(Get-OptionValuesRaw $Line $mask '(?:^|\s)--git-dir(?:=|(?=\s))')
+    if ($gd.Count -gt 0) {
+        $out += $gd[0]
+        $out += (Join-Path $gd[0] "..")
     }
     $out | Where-Object { $_ }
 }
@@ -308,6 +332,43 @@ function Get-QuoteMask([string]$Text) {
         }
     }
     return $sb.ToString()
+}
+
+# Read the ARGUMENT that begins at or after $Index in the RAW text, the way a shell would: leading
+# whitespace is skipped, a QUOTED argument yields its contents with the quotes stripped and any spaces
+# kept, and a BARE one runs to the next whitespace or command separator. `x&&y` is `x` followed by a
+# separator in every shell, so stopping there is not a shortcut.
+#
+# $Index is meant to come from a match against Get-QuoteMask's output. That only works because the mask
+# is length-preserving: the offset means the same character in both strings.
+function Read-ArgAt([string]$Text, [int]$Index) {
+    $i = $Index
+    while ($i -lt $Text.Length -and [char]::IsWhiteSpace($Text[$i])) { $i++ }
+    if ($i -ge $Text.Length) { return "" }
+    $ch = $Text[$i]
+    if ($ch -eq '"' -or $ch -eq "'") {
+        $end = $Text.IndexOf($ch, $i + 1)
+        if ($end -lt 0) { return "" }          # unterminated quote: read nothing rather than guess
+        return $Text.Substring($i + 1, $end - $i - 1)
+    }
+    $end = $i
+    while ($end -lt $Text.Length -and -not ([char]::IsWhiteSpace($Text[$end]) -or $Text[$end] -in @('&', '|', ';'))) {
+        $end++
+    }
+    return $Text.Substring($i, $end - $i)
+}
+
+# Every value of an OPTION on this line: the option token is located in the length-preserving $Mask, so a
+# spelling of it inside a quoted argument is inert, and the value is then read out of the RAW $Line at
+# the same offset. $Pattern must END where the value begins -- use a lookahead for the space-separated
+# form and consume the `=` for the attached one.
+function Get-OptionValuesRaw([string]$Line, [string]$Mask, [string]$Pattern) {
+    $out = @()
+    foreach ($m in [regex]::Matches($Mask, $Pattern)) {
+        $v = Read-ArgAt $Line ($m.Index + $m.Length)
+        if ($v) { $out += $v }
+    }
+    return $out
 }
 
 # Split a scan line into the individual COMMAND INVOCATIONS it chains together, at UNQUOTED `&&`, `||`,
