@@ -10,11 +10,12 @@ Windows/Unix built-ins so no new runtime dep):
   The subtree matters because ``EngineNode`` spawns the engine as ``sys.executable -m messagefoundry
   serve``, and on Windows a venv's ``Scripts\\python.exe`` can be a **launcher shim** that re-execs the
   base interpreter as a CHILD — so ``EngineNode.pid`` is then a thin idle process while the real engine
-  is a descendant, and keying only to the root PID measures the shim. (``serve`` itself spawns nothing:
-  ``uvicorn.run`` is in-process, and children otherwise come only from the ``--shards`` supervisor. The
-  shim is a property of the *launching* interpreter, not of ``serve``, so whether the root is thin is
-  environment-dependent — measured on the maintainer's box 2026-08-10, a stdlib venv on a
-  ``pythoncore-3.14`` install: root 61 handles / 6.55 MB, its re-exec child 141 handles / 15.2 MB.)
+  is a descendant, and keying only to the root PID measures the shim. (Note the child is NOT ``serve``
+  spawning uvicorn: ``uvicorn.run`` is in-process, and the child-spawning path in ``serve`` is at least
+  the ``--shards`` supervisor, which the connscale smoke does not use. The shim is a property of the
+  *launching* interpreter, not of ``serve``, so whether the root is thin is environment-dependent —
+  measured on the maintainer's box 2026-08-10, a stdlib venv over a ``pythoncore-3.14`` install: root
+  61 handles / 6.55 MB, its re-exec child 141 handles / 15.2 MB.)
   The sampler resolves the subtree PIDs periodically (a process-table walk) and then sums a cheap
   per-tick read of each: on Windows ``Get-Process -Id <pids>`` (HandleCount / TotalProcessorTime /
   WorkingSet64); on POSIX ``/proc/<pid>/fd`` + ``/proc/<pid>/stat`` (utime+stime) + ``/proc/<pid>/
