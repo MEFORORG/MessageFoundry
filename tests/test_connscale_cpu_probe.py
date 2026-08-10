@@ -61,6 +61,16 @@ def _sample(elapsed: float) -> EngineSample:
 # A stable single-PID subtree — the common case, where every interval is a clean same-set delta.
 _STABLE_PIDS = frozenset({1234})
 
+# Per-PID handle / RSS weights, so a fixture tick's handles and working set MOVE WITH the PID set it
+# was summed over — as the real probe's do. BACKLOG #1210: the fixture used to pin ``handles=61`` and
+# ``working_set_bytes=6_000_000`` on EVERY tick regardless of the ``cpu_pids`` it was varying. On
+# Windows both come from the SAME ``Get-Process`` rows, so a PID joining the sum necessarily moves
+# both; a tick where the set grows and the handle count does not is physically unrealizable. That made
+# it the one input shape in which an over-wide subtree is INVISIBLE, and the fixture then asserted the
+# FD/RSS pass-through as correct. Deriving from the set means no test can pin them apart again.
+_HANDLES_PER_PID = 61
+_WS_BYTES_PER_PID = 6_000_000
+
 
 def _derive(pairs: list[tuple[float, float | None]]) -> object:
     """Drive ``_drain_proc`` over (elapsed_s, cumulative_cpu_seconds) readings, holding the summed-over
@@ -72,12 +82,19 @@ def _derive_sets(
     triples: list[tuple[float, float | None, frozenset[int] | None]],
 ) -> object:
     """Drive ``_drain_proc`` over (elapsed_s, cumulative_cpu_seconds, cpu_pids) readings, so a test can
-    change the summed-over subtree between ticks (#220)."""
+    change the summed-over subtree between ticks (#220).
+
+    ``handles`` / ``working_set_bytes`` are DERIVED from that tick's PID set (see ``_HANDLES_PER_PID``),
+    never pinned: a tick with no observed set reports both as gaps, and a tick over a wider set reports
+    a proportionally wider footprint."""
     samples = []
     for elapsed, cpu, pids in triples:
         s = _sample(elapsed)
         _PROC_BY_SAMPLE[id(s)] = ProcSample(
-            handles=61, cpu_seconds=cpu, working_set_bytes=6_000_000, cpu_pids=pids
+            handles=None if pids is None else _HANDLES_PER_PID * len(pids),
+            cpu_seconds=cpu,
+            working_set_bytes=None if pids is None else _WS_BYTES_PER_PID * len(pids),
+            cpu_pids=pids,
         )
         samples.append(s)
     return _drain_proc(samples)
@@ -91,8 +108,9 @@ def test_flat_cpu_counter_over_a_long_span_is_a_gap_not_zero() -> None:
     assert d.cpu_util_cores_mean is None
     assert d.cpu_util_cores_peak is None
     # The non-CPU gauges still read — the process WAS there, which is precisely why flat CPU is a bug.
-    assert d.handles_peak == 61
-    assert d.working_set_peak_bytes == 6_000_000
+    # The subtree here is the single stable PID, so the footprint is one PID's worth.
+    assert d.handles_peak == _HANDLES_PER_PID * len(_STABLE_PIDS)
+    assert d.working_set_peak_bytes == _WS_BYTES_PER_PID * len(_STABLE_PIDS)
 
 
 def test_flat_cpu_counter_over_a_short_span_stays_zero() -> None:
@@ -149,9 +167,14 @@ def test_a_membership_changed_interval_is_degraded_to_a_gap() -> None:
     assert d.cpu_seconds_total is None
     assert d.cpu_util_cores_mean is None
     assert d.cpu_util_cores_peak is None
-    # The non-CPU gauges still read — the process set was observed, only its CPU delta is unsound.
-    assert d.handles_peak == 61
-    assert d.working_set_peak_bytes == 6_000_000
+    # The non-CPU gauges still read, and they read the WIDER middle tick — `max()` latches the two-PID
+    # sum. That is arithmetically fine for an instantaneous gauge over a genuinely larger subtree, and
+    # it is exactly why an over-wide subtree is not a #220-shaped problem: the number is not a
+    # difference, so no gate here can tell a real second process from an adopted one — provenance has
+    # to be established at the WALK (BACKLOG #1210). The old form of this assertion read `== 61` on all
+    # three ticks, which pinned the join to zero effect and asserted that pass-through as correct.
+    assert d.handles_peak == _HANDLES_PER_PID * 2
+    assert d.working_set_peak_bytes == _WS_BYTES_PER_PID * 2
 
 
 def test_a_departing_pid_does_not_drive_cpu_negative() -> None:
