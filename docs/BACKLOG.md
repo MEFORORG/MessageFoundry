@@ -8981,3 +8981,73 @@ which means it cannot catch the next one. Follow the VALUE.
 **Source:** raised by the `asvs-tracking-rework` session on 2026-08-09 after `proxy` -> `proxy_url`
 became the third instance: *"that is not a coincidence to note in a residual; it is an argument that the
 rename boundary itself needs a guard"*. Filed before it was forgotten, per that session's request.
+## 1209. the dependency advisory guard inverts to FAIL-OPEN when the advisory API errors
+
+> 🔢 **Filed 2026-08-09 - FIXED IN THE SAME CHANGE, entry published WITH the fix.** Value **9/10** · Difficulty **2/10**. Guardrail #2 of `dependabot-auto-merge.yml` reads `count="$(gh api ... || echo "ERR")"`. The `||` runs INSIDE the command substitution, so it APPENDS to stdout rather than replacing it - and `gh api` copies the JSON error BODY to stdout on any HTTP error. The sentinel `[ "$count" = "ERR" ]` therefore misses, and the guard emits `advisory_ok=true` for a lookup that never succeeded.
+
+**Cluster:** CI / supply chain. **Priority:** P1. **Verdict:** build (done).
+**Severity:** unlike the redaction items above, this is not conditional on a first deployment - the
+workflow runs in CI today. What bounds it is narrower and worth stating exactly: the engine's merge
+condition also requires `age_ok`, and the age step returns false for every ecosystem that can be
+`eligible`, a disjointness the file documents about itself. So the falsely-true `advisory_ok` cannot
+ALONE merge anything as shipped. It flips a security decision the workflow publishes, and the file
+labels the surviving blocker "a FORWARD guard ... load-bearing the day a Python allow row is
+populated" - one line's edit away from making this directly merge-affecting.
+
+**The mechanism, reproduced end to end against the shipped step body:**
+
+```
+gh api on any HTTP error:  JSON body -> STDOUT, "gh: ... (HTTP nnn)" -> stderr (eaten by 2>/dev/null)
+  count = '{"message":"API rate limit exceeded","status":"403"}ERR'
+  [ "$count" = "ERR" ] || [ -z "$count" ]   -> MISSES (neither)
+  [ "$count" -lt 1 ]                        -> "integer expression expected", returns 2
+                                            -> an `if` CONDITION is exempt from `set -e`
+  -> "::notice::published advisory confirmed", advisory_ok=true, step exits 0
+```
+
+Measured by running the real `ghsa` body from `origin/main` and from the fix, under `bash -e`, with a
+`gh` stub reproducing the stream split:
+
+```
+                    gh ERRORS          gh returns 1
+pre-fix (main)      advisory_ok=true   advisory_ok=true     <- FAIL OPEN
+fixed               advisory_ok=false  advisory_ok=true     <- fails closed, happy path intact
+```
+
+**A stub that merely exits non-zero would have proved nothing** - it would pass against the defective
+code too. The defect is that the BODY reached the variable, so the stub has to write the body.
+
+**The comment directly above the defect asserted the opposite:** "Fail closed on any error", and the
+header, "a rate-limit/API error or no-matching-advisory routes to manual review, never auto-merge."
+A compensating control resting on a false premise, which is the shape SDS-3.7 names.
+
+**The existing test could not see it.** `test_ghsa_step_queries_the_advisory_api_and_emits_a_guard`
+asserted the STRING `"advisory_ok=false" in body` - satisfied by a step that merely CONTAINS the words,
+and the fail-open lived underneath a passing version of exactly that check. The file already had the
+right instrument: `_run_step_body` executes shipped `run:` bodies under `bash -e` and returns the
+parsed `$GITHUB_OUTPUT`. Guardrail #2 was the one guard not using it.
+`test_the_advisory_guard_fails_closed_when_the_api_errors` now executes the body across three rows,
+including a discriminating PASS so the suite cannot be satisfied by a step that denies unconditionally.
+
+**The domain, because fixing one instance is how this class survives:** a sweep of 63 workflow and
+script files across both repositories found 24 instances of the idiom - 16 provably harmless (`git
+rev-parse --verify --quiet` writes nothing on failure), and the rest fixed here. Moving the `||` outside
+the substitution also fixes the streaming cases for free: jq emits rows before a mid-array error, and
+the old form would have appended the sentinel to a TRUNCATED dependency list while still reporting
+success. Assigning on failure discards partial output instead of inheriting it.
+
+The `count` guard additionally moved from an equality test against one sentinel to a SHAPE test
+(`case "$count" in ""|*[!0-9]*)`). An equality test recognises exactly the failure it was told about,
+which is how a JSON body walked through it; the numeric comparison's real question is "is this a
+number", and only a shape test answers that for values nobody anticipated.
+
+**Sibling, same idiom, in the private scorecard repo:** its `asvs-verifier-drift.yml` mirror-decision
+step fails the opposite way - `remote_tip` holds the 404 body instead of the empty string, so it
+refuses to decide on EVERY run where the mirror branch does not exist, which is the steady state. That
+one fails closed and is therefore a dead control rather than a disclosure; it is why the daily drift
+job has never completed its decision step.
+
+**Source:** found 2026-08-09 while sweeping for siblings of the drift-workflow defect, after a peer
+correctly refuted my first diagnosis of that job's failure (I said the control "detected drift and
+could not act"; the scheduled run predated the drift by 88 minutes and its parity step passed - the
+control has never yet detected this class at all).

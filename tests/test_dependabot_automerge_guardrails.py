@@ -456,6 +456,79 @@ def test_release_age_holds_the_version_track_and_undatable_ecosystems(
     )
 
 
+def _gh_stub(tmp_path: Path, count: str | None) -> Path:
+    """A ``gh`` on PATH that ignores its arguments.
+
+    ``count=None`` reproduces an HTTP error the way the real client does, and that split is the
+    whole point: **``gh api`` writes the JSON error BODY to stdout** and only its ``gh: ... (HTTP
+    nnn)`` line to stderr. A stub that merely exits non-zero would pass against the defective code
+    and prove nothing — the defect was that the body reached the variable.
+    """
+    stub_dir = tmp_path / "ghstub"
+    stub_dir.mkdir()
+    stub = stub_dir / "gh"
+    if count is None:
+        stub.write_text(
+            "#!/usr/bin/env bash\n"
+            'echo \'{"message":"API rate limit exceeded","status":"403"}\'\n'
+            "echo 'gh: API rate limit exceeded (HTTP 403)' >&2\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+    else:
+        stub.write_text(f"#!/usr/bin/env bash\necho '{count}'\n", encoding="utf-8")
+    stub.chmod(0o755)
+    return stub_dir
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or shutil.which("jq") is None,
+    reason="needs bash + jq, same runner matrix as the release-age rows below",
+)
+@pytest.mark.parametrize(
+    ("label", "count", "expected"),
+    [
+        # The discriminating PASS — without it the suite would be satisfied by a step that denies
+        # unconditionally, which is the failure mode a fail-closed guard degrades into.
+        ("one published advisory", "1", "true"),
+        ("no advisory covers the version", "0", "false"),
+        # THE REGRESSION ROW. This is the one that was red before the fix: `gh` exits non-zero with
+        # a JSON error body on STDOUT, `$(cmd || echo ERR)` APPENDED the sentinel to that body, and
+        # the resulting value was neither "ERR" nor empty. The equality sentinel missed, the numeric
+        # comparison failed with "integer expression expected" and returned 2, an `if` condition is
+        # exempt from `set -e`, and the step printed "advisory confirmed" and emitted
+        # advisory_ok=true while exiting 0. The guard inverted to FAIL-OPEN on exactly the
+        # rate-limit/API-error class its own header promises routes to manual review.
+        ("advisory API errors (rate limit)", None, "false"),
+    ],
+)
+def test_the_advisory_guard_fails_closed_when_the_api_errors(
+    label: str, count: str | None, expected: str, tmp_path: Path
+) -> None:
+    """Guardrail #2 EXECUTED, not string-matched.
+
+    The sibling assertion ``"advisory_ok=false" in body`` cannot distinguish a guard that fails
+    closed from one that merely contains the words — the fail-open above lived underneath a passing
+    version of exactly that check. Asserting on the emitted OUTPUT is what makes the difference
+    visible.
+    """
+    rc, out = _run_step_body(
+        "ghsa",
+        {
+            "DEP_GROUP": "pip-security",
+            "DEPS_JSON": '[{"dependencyName":"requests","prevVersion":"2.19.0"}]',
+            "GH_TOKEN": "stub",
+        },
+        tmp_path,
+        path_prepend=_gh_stub(tmp_path, count),
+    )
+    assert rc == 0, f"the ghsa body aborted under `bash -e` (rc={rc}) — CI would fail the step"
+    assert out.get("security_track") == "true", "the fixture should select the security track"
+    assert out.get("advisory_ok") == expected, (
+        f"{label} -> advisory_ok={out.get('advisory_ok')!r}, expected {expected!r}"
+    )
+
+
 def _curl_stub(tmp_path: Path, payload: str | None) -> Path:
     """A ``curl`` on PATH that ignores its arguments. ``payload=None`` makes it fail like a network
     or HTTP error would (``--fail`` exits non-zero), which must route to manual review."""
