@@ -366,10 +366,20 @@ The engine logs to stdout/stderr with a stdlib `logging` setup (one timestamped 
 stream — see [`messagefoundry/logging_setup.py`](../messagefoundry/logging_setup.py)),
 with a CR/LF log-injection filter and a `safe_exc()` PHI-redaction chokepoint on the
 exception path (WP-6c — see [PHI.md §7](PHI.md#7-logging--phi-redaction)). NSSM captures
-those streams to the files above and rotates them at ~10 MB. Structured (JSON) logging
-+ off-box (syslog/SIEM) forwarding are planned (bundled with off-box exposure); until
-then **avoid raising the level to `DEBUG` in production**, since verbose output may
-include message content.
+those streams to the files above and rotates them at ~10 MB.
+
+**Structured (JSON) logging and off-box (syslog/SIEM) forwarding are built**, and both
+are configured under `[logging]`. Set `format = "json"` to render stdout as one JSON
+object per line. Point `forward_host` at a syslog/SIEM collector to ship a copy of every
+record off-box: naming a host turns forwarding on by default, `forward_format` is
+already `json`, and `forward_protocol` is `udp` (default), `tcp`, or `tls` (native RFC
+5425 — no local agent). An enforcing production-PHI instance refuses a plaintext or
+unverified-TLS collector hop unless the operator attests it. The PHI-redaction and
+CR/LF-scrub filters above apply to **every** sink, the forwarder included. Settings of
+record, with the full `[logging]` table: [`CONFIGURATION.md`](CONFIGURATION.md).
+
+Whatever the format or destination, **avoid raising the level to `DEBUG` in
+production** — verbose output may include message content.
 
 **Restrict the log directory's ACL** so the captured stdout/stderr (operational data,
 not message bodies) is readable only by administrators and the service account — NSSM's
