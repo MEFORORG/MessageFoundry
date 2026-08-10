@@ -85,7 +85,16 @@ def _build_client(addr: str | None, token: str | None) -> Any:
 
     enforce_outbound_length_limits(addr or "", {"X-Vault-Token": token} if token else {})
     # hvac.Client() reads VAULT_ADDR/VAULT_TOKEN from the environment when url/token are None.
-    client: Any = hvac.Client(url=addr, token=token)
+    #
+    # allow_redirects=False (BACKLOG #1042, ASVS 15.3.2/1.3.6): every other shipped HTTP egress
+    # refuses redirects (transports/rest.py's _NO_REDIRECT_OPENER, auth/oidc_http.py's local twin),
+    # and this client was the exception -- hvac's default is True. `token` rides as an
+    # `X-Vault-Token` header on EVERY Transit call, so a 3xx from an on-path attacker (absent TLS
+    # integrity) or a spoofed Vault would otherwise relocate the request, and requests re-sends the
+    # header on a same-host redirect. Measured against hvac 2.4.0: the kwarg lands on the adapter,
+    # which passes it to requests.Session.request. Shared with crypto_transit.py, so the Transit
+    # cipher inherits the policy from this one construction point.
+    client: Any = hvac.Client(url=addr, token=token, allow_redirects=False)
     return client
 
 
