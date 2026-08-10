@@ -278,7 +278,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui_step_up_action(STEP_UP_ACTION_MFA_DISABLE)),
     ) -> Response:
         assert_same_origin(request)
-        await admin.disable_my_mfa(request=request, service=service, identity=identity)
+        try:
+            await admin.disable_my_mfa(request=request, service=service, identity=identity)
+        except HTTPException as exc:
+            # The seam's ONLY in-body raise is the last-required-factor refusal (ADR 0068 AC-10) —
+            # the step-up/CSRF gates above have already run. Render it on the account page exactly as
+            # ui_webauthn_delete renders the passkey twin, instead of leaking the API's JSON body.
+            return await _account_response(
+                service, identity, request, error=str(exc.detail), status_code=exc.status_code
+            )
         return RedirectResponse("/ui/account?m=mfa_off", status_code=303)
 
     # --- L6b: self-service session management (#75 parity — desktop sessions.py twin) ---

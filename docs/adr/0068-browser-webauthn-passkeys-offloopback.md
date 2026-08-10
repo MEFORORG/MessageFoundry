@@ -135,9 +135,14 @@ TOTP-specific (a WebAuthn-only user's TOTP code gets "not enrolled", never a loc
 
 **No WebAuthn recovery codes** — they are phishable knowledge secrets that undercut the
 phishing-resistant tier. Recovery = enroll ≥2 passkeys (UI nudge) / keep TOTP alongside /
-`admin_reset_mfa`, which is **extended to also delete all WebAuthn credentials**. Deleting the
-**last remaining second factor while MFA is required is refused** ("enroll another factor first");
-TOTP-disable keeps its existing behavior this lane (parity follow-up recorded). Documented
+`admin_reset_mfa`, which is **extended to also delete all WebAuthn credentials**. Removing the
+**last remaining second factor while MFA is required is refused** ("enroll another factor first").
+This lane guarded the passkey-delete route only, recording a parity follow-up for TOTP-disable; that
+follow-up **landed under BACKLOG #1022** (in [`docs/BACKLOG.md`](../BACKLOG.md) until archived, then
+`docs/archive/backlog/BACKLOG-CLOSED.md`), so `disable_mfa` now carries the same guard, keyed the
+same way. The refusal is stated over the resulting **state**, not over one route: with the guard on
+one side only, a user holding TOTP plus one passkey could delete the passkey (permitted while TOTP
+remained) and then disable TOTP, reaching zero enrolled factors by ordering alone. Documented
 consequence: a passkey-only local user cannot satisfy the TOTP-shaped JSON `/auth/mfa-verify`, so
 desktop-console step-up actions become unavailable to them (enroll-page warning; owner-accepted).
 An extra-less install with enrolled credentials gets a **startup advisory** naming
@@ -283,9 +288,14 @@ advisory-only, restated).
 - **AC-9** — WHEN any new `/ui` POST (enroll, verify, delete, `/ui/reauth/webauthn`) receives a
   cross-site request, THE SYSTEM SHALL reject it with 403.
   → `tests/test_webui.py::test_all_admin_posts_reject_cross_site`
-- **AC-10** — IF deleting a WebAuthn credential would remove the user's last second factor WHILE MFA
-  is required for them, THEN THE SYSTEM SHALL refuse with "enroll another factor first".
-  → `tests/test_webauthn.py::test_last_factor_delete_refused_while_required`
+- **AC-10** — IF removing a second factor — **either** deleting a WebAuthn credential **or** disabling
+  TOTP — would leave the user with no enrolled factor WHILE MFA is required for them, THEN THE SYSTEM
+  SHALL refuse with "enroll another factor first". Scoping this to the passkey route alone forbade one
+  *path* to the zero-factor state rather than the state itself, so the guard is stated over the state
+  and both removal orders are covered (BACKLOG #1022 widened it).
+  → `tests/test_webauthn.py::test_last_factor_delete_refused_while_required` (passkey route),
+  `tests/test_mfa.py::test_disable_mfa_refused_when_totp_is_the_last_factor` (TOTP route),
+  `tests/test_mfa.py::test_zero_factor_state_is_unreachable_by_either_removal_order` (the state)
 - **AC-11** — WHEN `admin_reset_mfa` runs, THE SYSTEM SHALL delete the user's WebAuthn credentials
   alongside TOTP state (existing session-revoke semantics unchanged).
   → `tests/test_webauthn.py::test_admin_reset_mfa_clears_webauthn_credentials`

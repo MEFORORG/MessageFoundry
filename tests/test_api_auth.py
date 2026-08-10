@@ -282,6 +282,29 @@ async def test_require_mfa_admin_is_not_bootstrap_locked_out(engine: Engine) -> 
         assert status["enabled"] is True and status["required"] is True
 
 
+async def test_delete_me_mfa_maps_the_last_factor_refusal_to_400(engine: Engine) -> None:
+    # BACKLOG #1022: the guard added to disable_mfa raises ValueError; without this mapping the route
+    # would 500. RED when the try/except around service.disable_mfa is dropped (500, not 400) or when
+    # the guard itself stops firing (200 — MFA silently stripped to zero enrolled factors).
+    service = await _service(engine, AuthSettings(login_rate_limit_enabled=False))  # require_mfa on
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "adm")).json()["token"]
+        await _reauth(c, tok, purpose="mfa_enroll")
+        secret = (await c.post("/me/mfa/enroll", headers=_auth(tok))).json()["secret"]
+        await _reauth(c, tok, purpose="mfa_confirm")
+        assert (
+            await c.post("/me/mfa/confirm", json={"code": fresh_totp(secret)}, headers=_auth(tok))
+        ).status_code == 200
+        # Confirming marked the session MFA-verified, so the disable step-up is password-only.
+        assert (await _reauth(c, tok, purpose="mfa_disable")).status_code == 200
+
+        r = await c.request("DELETE", "/me/mfa", headers=_auth(tok))
+        assert r.status_code == 400
+        assert "enroll another factor first" in r.json()["detail"]
+        assert (await c.get("/me/mfa", headers=_auth(tok))).json()["enabled"] is True
+
+
 async def test_security_events_feed_payload_is_phi_free(engine: Engine) -> None:
     # The feed carries only non-PHI audit metadata (ts/action/detail) — never message bodies or
     # credential material. Mirrors the PHI-free assertion already made on the email-notification body.

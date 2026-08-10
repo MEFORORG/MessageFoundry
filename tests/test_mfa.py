@@ -21,7 +21,7 @@ from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.notifications import MFA_DISABLED, MFA_ENABLED, SecurityEvent
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import MessageStore, WebAuthnCredential
 
 
 class _FakeNotifier:
@@ -226,8 +226,17 @@ async def test_disable_and_admin_reset_clear_mfa(monkeypatch: pytest.MonkeyPatch
     store = await _store()
     try:
         notifier = _FakeNotifier()
+        # ``require_mfa=False`` is load-bearing, not incidental: this test's subject is that disable and
+        # admin-reset CLEAR the enrollment, and under the default (``require_mfa=True``,
+        # ``every_local_account``) the last-factor guard added for BACKLOG #1022 correctly refuses to
+        # strip the account's only factor. The refusal itself is covered below, under the default; here
+        # the documented opt-out puts the clear-semantics back in view. Enrolling a passkey instead
+        # would have been the other way to get here — rejected because it would have made this test
+        # depend on the optional [webauthn] extra.
         service = AuthService(
-            store, AuthSettings(mfa_recovery_code_count=2), security_notifier=notifier
+            store,
+            AuthSettings(mfa_recovery_code_count=2, require_mfa=False),
+            security_notifier=notifier,
         )
         identity, token, _ = await _bootstrap_login(service)
         enroll = await service.begin_mfa_enrollment(identity)
@@ -256,6 +265,132 @@ async def test_disable_and_admin_reset_clear_mfa(monkeypatch: pytest.MonkeyPatch
         assert (await service.mfa_status(identity)).enabled is True
         await service.admin_reset_mfa(identity.user_id, actor="admin")
         assert (await service.mfa_status(identity)).enabled is False
+    finally:
+        await store.close()
+
+
+# --- last-factor guard parity: TOTP-disable vs passkey-delete (BACKLOG #1022) ---
+#
+# Deliberately EXTRA-FREE (ADR 0068 section 4). The guard is a property of the account's factor state
+# and has nothing to do with the optional ``[webauthn]`` extra, so the passkey side is staged through
+# the ``AuthStore`` surface (the ``tests/_webauthn_store_contract.py`` precedent) rather than a real
+# ceremony. A ``pytest.importorskip("webauthn")`` on this path would silently skip the guard on every
+# leg that installs without the extra — a skip wearing a pass.
+
+
+async def _stage_passkey(store: MessageStore, user_id: str, *, id_hash: str) -> None:
+    await store.add_webauthn_credential(
+        WebAuthnCredential(
+            credential_id_hash=id_hash,
+            credential_id=f"cred-{id_hash}",
+            user_id=user_id,
+            rp_id="t",
+            public_key="cose-public-key-b64url",
+            sign_count=0,
+            transports=None,
+            device_type="multi_device",
+            backed_up=True,
+            label=id_hash,
+            aaguid="aaguid-0000",
+            created_at=1000.0,
+            last_used_at=None,
+        )
+    )
+
+
+async def _enable_totp(service: AuthService, identity: Identity, token: str, at: float) -> None:
+    enroll = await service.begin_mfa_enrollment(identity)
+    await service.confirm_mfa_enrollment(identity, totp.totp(enroll.secret, now=at), token=token)
+    assert (await service.mfa_status(identity)).enabled is True
+
+
+async def test_disable_mfa_refused_when_totp_is_the_last_factor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #1022 / ADR 0068 AC-10: TOTP-disable now refuses exactly where passkey-delete does.
+    # RED when disable_mfa stops consulting has_webauthn_credentials + _mfa_required_for.
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())  # require_mfa on by default
+        identity, token, _ = await _bootstrap_login(service)
+        pin_totp_clock(monkeypatch, 1_000_000.0)
+        await _enable_totp(service, identity, token, 1_000_000.0)
+
+        with pytest.raises(ValueError, match="enroll another factor first"):
+            await service.disable_mfa(identity)
+        assert (await service.mfa_status(identity)).enabled is True  # still on — the guard held
+    finally:
+        await store.close()
+
+
+async def test_disable_mfa_allowed_while_a_passkey_remains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The guard must NOT be a TOTP-only check: a user who keeps a passkey is still enrolled and stays
+    # free to drop TOTP. RED when the guard degenerates into "an enrolled user keeps TOTP".
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        identity, token, _ = await _bootstrap_login(service)
+        pin_totp_clock(monkeypatch, 1_000_000.0)
+        await _enable_totp(service, identity, token, 1_000_000.0)
+        await _stage_passkey(store, identity.user_id, id_hash="pk1")
+
+        await service.disable_mfa(identity)
+        assert (await service.mfa_status(identity)).enabled is False
+        assert await store.has_webauthn_credentials(identity.user_id) is True
+    finally:
+        await store.close()
+
+
+async def test_disable_mfa_allowed_when_mfa_is_not_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The guard keys on _mfa_required_for, exactly as the passkey path does, so the documented
+    # ``[auth].require_mfa = false`` opt-out still lets a voluntarily-enrolled user turn TOTP off.
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(require_mfa=False))
+        identity, token, _ = await _bootstrap_login(service)
+        pin_totp_clock(monkeypatch, 1_000_000.0)
+        await _enable_totp(service, identity, token, 1_000_000.0)
+
+        await service.disable_mfa(identity)
+        assert (await service.mfa_status(identity)).enabled is False
+    finally:
+        await store.close()
+
+
+async def test_zero_factor_state_is_unreachable_by_either_removal_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The item's actual claim, and the reason the guard is stated over the STATE rather than over one
+    route: with TOTP plus one passkey enrolled, EITHER removal is permitted first and the SECOND one is
+    refused. Before the guard, the passkey-then-TOTP order reached zero enrolled factors while the
+    TOTP-then-passkey order did not — the same end state, allowed or refused purely by ordering."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())  # require_mfa on
+        identity, token, _ = await _bootstrap_login(service)
+        pin_totp_clock(monkeypatch, 1_000_000.0)
+
+        # Order A — passkey first, then TOTP. This is the ordering that used to reach zero factors.
+        await _enable_totp(service, identity, token, 1_000_000.0)
+        await _stage_passkey(store, identity.user_id, id_hash="pk-a")
+        assert await service.delete_webauthn_credential(identity, "pk-a") is True  # TOTP remains
+        with pytest.raises(ValueError, match="enroll another factor first"):
+            await service.disable_mfa(identity)
+        assert (await service.mfa_status(identity)).enabled is True
+
+        # Order B — TOTP first, then the passkey. Refused at the second step, as it always was.
+        await _stage_passkey(store, identity.user_id, id_hash="pk-b")
+        await service.disable_mfa(identity)  # a passkey remains, so this is permitted
+        with pytest.raises(ValueError, match="enroll another factor first"):
+            await service.delete_webauthn_credential(identity, "pk-b")
+
+        # Whichever order was taken, exactly one factor survives.
+        status = await service.mfa_status(identity)
+        assert (status.enabled, status.webauthn_enrolled) == (False, True)
     finally:
         await store.close()
 

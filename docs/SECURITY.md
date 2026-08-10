@@ -328,7 +328,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/me/mfa` | `require` | |
 | `POST` | `/me/mfa/enroll` | `require_reauth_only_action` (action `mfa_enroll`) | password-only step-up — the MFA gate is skipped so a required-but-unenrolled user cannot deadlock |
 | `POST` | `/me/mfa/confirm` | `require_reauth_only_action` (action `mfa_confirm`) | per-actor ceremony limiter; password-only step-up |
-| `DELETE` | `/me/mfa` | `require_step_up_action` (action `mfa_disable`) | step-up bound to the disable action (current factor + a fresh password). ⚠️ **No last-factor guard** — this is the TOTP path (`disable_mfa`), and it does **not** refuse when it would leave the account with zero enrolled factors. The passkey removal path does refuse; see BACKLOG #1022 for the asymmetry |
+| `DELETE` | `/me/mfa` | `require_step_up_action` (action `mfa_disable`) | step-up bound to the disable action (current factor + a fresh password). **400** when TOTP is the account's last enrolled factor and MFA is still required — the same refusal the passkey-removal path makes, so the zero-factor state is unreachable by either removal order (ADR 0068 AC-10) |
 | `GET` | `/me/sessions` | `require` | |
 | `GET` | `/me/security-events` | `require` | |
 | `DELETE` | `/me/sessions/{session_id}` | `require_reauth_only` | password-only step-up |
@@ -736,7 +736,9 @@ dual-control approval above (the requester re-verifies; an independent approver 
 Local accounts can enroll a native **RFC 6238 TOTP** second factor (ASVS 6.3.3): `POST /me/mfa/enroll`
 returns a setup key + `otpauth://` URI for an authenticator app, `POST /me/mfa/confirm` activates it and
 returns the **single-use recovery codes** (shown once), and `POST /auth/mfa-verify` satisfies a session's
-second factor with a TOTP code or a recovery code. `DELETE /me/mfa` disables it; an administrator clears a
+second factor with a TOTP code or a recovery code. `DELETE /me/mfa` disables it — **refused when TOTP is
+your last enrolled factor and MFA is still required for you** ("enroll another factor first"), the same
+refusal the passkey-removal path makes; an administrator clears a
 lost authenticator via `POST /users/{id}/reset-mfa` (which also revokes the user's sessions). With
 `[auth].require_mfa` on — **the default since BACKLOG #187 (secure-by-default, including the loopback
 bind)** — the **Administrator** role must satisfy MFA before any step-up operation (the gate returns

@@ -3260,6 +3260,30 @@ async def test_disable_mfa_enforces_full_stepup_when_stale(engine: Engine) -> No
         assert user is not None and user.totp_enabled  # still on — the gate held
 
 
+async def test_disable_mfa_last_factor_refusal_renders_on_the_account_page(
+    engine: Engine,
+) -> None:
+    # BACKLOG #1022: the console's disable action reaches the SAME seam the JSON DELETE /me/mfa does,
+    # so the last-factor refusal arrives as the route's HTTPException. It must render on the account
+    # page exactly as the passkey twin does (ui_webauthn_delete), not leak the API's JSON error body.
+    # RED when the except-HTTPException arm is dropped (the JSON detail surfaces) or when the service
+    # guard stops firing (303 to /ui/account?m=mfa_off — MFA stripped to zero enrolled factors).
+    service = AuthService(engine.store, AuthSettings())  # require_mfa on (secure default)
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        await _enroll_mfa(c, service, "op")
+        uid = await _uid(service, "op")
+        await _mint_action(c, "/ui/account/mfa/disable")
+        r = await c.post("/ui/account/mfa/disable", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 400
+        assert "enroll another factor first" in r.text
+        assert r.headers["content-type"].startswith("text/html")
+        user = await service.store.get_user(uid)
+        assert user is not None and user.totp_enabled  # still on — the guard held
+
+
 async def test_mfa_posts_reject_cross_site(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
