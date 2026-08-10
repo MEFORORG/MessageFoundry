@@ -79,7 +79,12 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
-from messagefoundry.store.base import Row, warm_pool_connections, warm_pool_target
+from messagefoundry.store.base import (
+    Row,
+    acquire_pooled,
+    warm_pool_connections,
+    warm_pool_target,
+)
 from messagefoundry.store.content_search import SearchSpec, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
@@ -1302,19 +1307,41 @@ class PostgresStore:
     # --- pooled-statement helpers --------------------------------------------
 
     @asynccontextmanager
-    async def _timed_acquire(self) -> AsyncIterator[Any]:
+    async def _timed_acquire(self, *, record: bool = True) -> AsyncIterator[Any]:
         """Acquire a pooled connection, recording the **wait time** into the acquire-wait histogram
-        (B11 pool-wait wall). Byte-equivalent to ``self._pool.acquire()`` except for the perf_counter
-        pair around it — the connection yielded and the release on block-exit are unchanged. The
-        transactional claim/handoff paths use this so the connection-scale harness can read how long
-        the per-lane workers spend WAITING for a pooled connection as the pool saturates; the
-        low-frequency convenience reads (``_fetchall``/``_fetchone``/``_execute``) acquire+release
-        internally and are deliberately not timed, so a status poll never pollutes the worker curve."""
+        (B11 pool-wait wall). Equivalent to ``self._pool.acquire()`` except for the perf_counter pair
+        around it and the bound below — the connection yielded and the release on block-exit are
+        unchanged (asyncpg's acquire context manager does nothing on exit but ``await
+        pool.release(con)``, 0.31.0 ``pool.py:1059-1068``). The transactional claim/handoff paths use
+        this so the connection-scale harness can read how long the per-lane workers spend WAITING for
+        a pooled connection as the pool saturates; the low-frequency convenience reads
+        (``_fetchall``/``_fetchone``/``_execute``) pass ``record=False``, so a status poll still never
+        pollutes the worker curve.
+
+        BACKLOG #1052: the borrow is BOUNDED here. ``acquire_pooled`` raises
+        :class:`~messagefoundry.store.base.StoreAcquireTimeout` at ``[store].acquire_timeout``, which
+        every caller's ``except Exception`` already treats as a transient stage failure.
+
+        **Scope, stated because it is narrower than "this backend".** What goes through here is at
+        least the message-pipeline borrows: the transactional claim/handoff sites, plus the
+        ``_fetchall``/``_fetchone``/``_execute`` convenience trio, which were routed through here for
+        exactly that reason — they called ``self._pool.fetch(...)``, which acquires inside asyncpg with
+        no timeout, so leaving them outside would have left the class open while looking closed. It is
+        **not** every call in this module that can reach a pool. Unlike ``SqlServerStore._acquire``,
+        which is that backend's sole borrow site,
+        this is not yet a single chokepoint — do not describe it as one, and check
+        ``tests/test_store_pool_acquire_timeout.py`` (which pins the set of borrows that bypass it)
+        before widening any claim in ``docs/CONNECTIONS.md``."""
         t0 = perf_counter()
-        pool_acquire = self._pool.acquire()
-        async with pool_acquire as conn:
+        conn = await acquire_pooled(
+            self._pool, timeout=self._settings.acquire_timeout, backend="postgres"
+        )
+        if record:
             self._acquire_wait.record((perf_counter() - t0) * 1000.0)
+        try:
             yield conn
+        finally:
+            await self._pool.release(conn)
 
     def pool_status(self) -> PoolStatus | None:
         """The asyncpg pool snapshot (B11): size/idle occupancy + the PRIMARY acquire-wait percentiles.
@@ -1335,14 +1362,22 @@ class PostgresStore:
         this backend never reads its flag), so there is no gate verdict to report here."""
         return None
 
+    # These three used to call `self._pool.fetch/fetchrow/execute`, each of which acquires a pooled
+    # connection internally with NO timeout (asyncpg 0.31.0 `pool.py:613-634` — `async with
+    # self.acquire()`). Routing them through `_timed_acquire(record=False)` bounds them by
+    # `[store].acquire_timeout` (BACKLOG #1052) without putting a low-frequency status poll into the
+    # worker acquire-wait curve.
     async def _fetchall(self, sql: str, *params: Any) -> list[Any]:
-        return list(await self._pool.fetch(sql, *params))
+        async with self._timed_acquire(record=False) as conn:
+            return list(await conn.fetch(sql, *params))
 
     async def _fetchone(self, sql: str, *params: Any) -> Any:
-        return await self._pool.fetchrow(sql, *params)
+        async with self._timed_acquire(record=False) as conn:
+            return await conn.fetchrow(sql, *params)
 
     async def _execute(self, sql: str, *params: Any) -> None:
-        await self._pool.execute(sql, *params)
+        async with self._timed_acquire(record=False) as conn:
+            await conn.execute(sql, *params)
 
     async def _count(self, table: str) -> int:
         row = await self._pool.fetchrow(f"SELECT COUNT(*) AS n FROM {table}")  # table is a constant

@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import asyncio
 import types
-from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
@@ -116,34 +115,35 @@ class _GatedCursor:
 class _FakePool:
     """aioodbc's pool semantics, verbatim on the point that matters: a released connection rejoins
     the FREE list — and so becomes lendable to the next borrower — only when it is not ``closed``
-    (aioodbc 0.5.0 ``pool.py:200-204``)."""
+    (aioodbc 0.5.0 ``pool.py:200-204``).
+
+    Modelled as the driver's own ``acquire``/``release`` PAIR rather than its ``_ContextManager``
+    wrapper, because ``_acquire`` now calls the two explicitly to fit the BACKLOG #1052 bound between
+    them. That is strictly closer to the real pool: ``_ContextManager.__aexit__`` does nothing but
+    ``await pool.release(conn)`` (0.5.0 ``utils.py:86-103``), so the release rule under test is
+    unchanged and this file's guarantee — *can the next borrower be handed this connection?* — is
+    asserted against the same rule as before."""
 
     def __init__(self, conn: _FakeConn, ops: list[str]) -> None:
         self._conn = conn
         self.ops = ops
         self.free: list[_FakeConn] = []
 
-    def acquire(self) -> Any:
-        conn = self._conn
-        ops = self.ops
-        free = self.free
+    async def acquire(self) -> Any:
+        return self._conn
 
-        @asynccontextmanager
-        async def _cm() -> Any:
-            try:
-                yield conn
-            finally:
-                ops.append("release")
-                if not conn.closed:
-                    free.append(conn)  # lendable again
-
-        return _cm()
+    async def release(self, conn: _FakeConn) -> None:
+        self.ops.append("release")
+        if not conn.closed:
+            self.free.append(conn)  # lendable again
 
 
 def _make_store(conn: _FakeConn, ops: list[str]) -> SqlServerStore:
     store = SqlServerStore.__new__(SqlServerStore)
     store._pool = _FakePool(conn, ops)  # type: ignore[assignment]
-    store._settings = types.SimpleNamespace(command_timeout=0)  # type: ignore[assignment]
+    store._settings = types.SimpleNamespace(  # type: ignore[assignment]
+        command_timeout=0, acquire_timeout=30.0
+    )
     store._acquire_wait = AcquireWaitHistogram()
     store.committed_txns = 0
     store.body_copies = 0

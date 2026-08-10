@@ -16,7 +16,6 @@ statement still runs after it.
 from __future__ import annotations
 
 import types
-from contextlib import asynccontextmanager
 
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
 from messagefoundry.store.sqlserver import _SCHEMA_LOCK, SqlServerStore, _schema_hash
@@ -71,23 +70,25 @@ class _FakeConn:
 
 
 class _FakePool:
+    """aioodbc's ``acquire``/``release`` pair — the shape ``_acquire`` calls directly so the
+    BACKLOG #1052 bound can sit between the two."""
+
     def __init__(self, conn: _FakeConn):
         self._conn = conn
 
-    def acquire(self) -> object:
-        conn = self._conn
+    async def acquire(self) -> object:
+        return self._conn
 
-        @asynccontextmanager
-        async def _cm():  # type: ignore[no-untyped-def]
-            yield conn
-
-        return _cm()
+    async def release(self, conn: object) -> None:
+        return None
 
 
 def _make_store(conn: _FakeConn) -> SqlServerStore:
     store = SqlServerStore.__new__(SqlServerStore)
     store._pool = _FakePool(conn)  # type: ignore[assignment]
-    store._settings = types.SimpleNamespace(command_timeout=0)  # type: ignore[assignment]
+    store._settings = types.SimpleNamespace(  # type: ignore[assignment]
+        command_timeout=0, acquire_timeout=30.0
+    )
     store._acquire_wait = AcquireWaitHistogram()  # B11: _acquire records acquire-wait into this
     # A1 live cost counters — normally set by __init__ (bypassed here); _commit bumps committed_txns.
     store.committed_txns = 0
@@ -163,9 +164,9 @@ async def test_ensure_schema_exempts_statement_timeout_for_the_ddl_batch() -> No
     executed: list[tuple[str, object]] = []
     conn = _FakeConn(executed)
     store = _make_store(conn)
-    store._settings = types.SimpleNamespace(
-        command_timeout=30
-    )  # non-zero, so the override is visible
+    store._settings = types.SimpleNamespace(  # type: ignore[assignment]
+        command_timeout=30, acquire_timeout=30.0
+    )  # non-zero command_timeout, so the DDL override is visible
 
     await store._ensure_schema()
 
@@ -178,7 +179,9 @@ async def test_marker_current_skips_batch_applock_and_timeout_exemption() -> Non
     executed: list[tuple[str, object]] = []
     conn = _FakeConn(executed, marker_current=True)
     store = _make_store(conn)
-    store._settings = types.SimpleNamespace(command_timeout=30)  # type: ignore[assignment]
+    store._settings = types.SimpleNamespace(  # type: ignore[assignment]
+        command_timeout=30, acquire_timeout=30.0
+    )
 
     ran = await store._ensure_schema()
 

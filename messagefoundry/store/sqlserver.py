@@ -65,7 +65,7 @@ from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
-from messagefoundry.store.base import warm_pool_connections, warm_pool_target
+from messagefoundry.store.base import acquire_pooled, warm_pool_connections, warm_pool_target
 from messagefoundry.store.content_search import SearchSpec, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
@@ -2975,10 +2975,24 @@ class SqlServerStore:
         into the acquire-wait histogram. Every store DB call funnels through here (the single _acquire
         chokepoint), so the connection-scale harness sees how long the per-lane workers wait for a
         pooled connection as the pool saturates. Read-only/additive — the timing never changes the
-        acquired connection or its release."""
+        acquired connection or its release.
+
+        BACKLOG #1052: that same chokepoint is where the borrow is BOUNDED. ``Connection Timeout``
+        bounds the login and ``command_timeout`` the statement; neither bounds the wait for a free
+        pooled connection, so a wedged pool blocked the acquiring task forever. ``acquire_pooled``
+        raises :class:`~messagefoundry.store.base.StoreAcquireTimeout` at
+        ``[store].acquire_timeout``, which every caller's ``except Exception`` already treats as a
+        transient stage failure. The ``async with pool.acquire()`` became an explicit
+        acquire/release only because the bound has to sit between the two; aioodbc's context manager
+        does nothing on exit but ``await pool.release(conn)`` (0.5.0 ``utils.py:86-103``), and the
+        ADR 0159 ordering below is preserved exactly — the quarantine still runs BEFORE the release,
+        which is what makes a poisoned connection unlendable."""
         t0 = perf_counter()
-        async with self._pool.acquire() as conn:
-            self._acquire_wait.record((perf_counter() - t0) * 1000.0)
+        conn = await acquire_pooled(
+            self._pool, timeout=self._settings.acquire_timeout, backend="sqlserver"
+        )
+        self._acquire_wait.record((perf_counter() - t0) * 1000.0)
+        try:
             raw = getattr(conn, "_conn", None)
             if raw is not None:
                 raw.timeout = self._settings.command_timeout  # seconds; 0 = no limit
@@ -2997,6 +3011,8 @@ class SqlServerStore:
                 if not isinstance(exc, Exception):
                     await self._release_dirty(conn)
                 raise
+        finally:
+            await self._pool.release(conn)
 
     async def _release_dirty(self, conn: Any) -> None:
         """Quarantine a pooled connection whose transaction was abandoned by a cancellation, so it

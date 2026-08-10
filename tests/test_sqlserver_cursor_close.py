@@ -15,7 +15,6 @@ like this would have caught that it was insufficient.
 from __future__ import annotations
 
 import types
-from contextlib import asynccontextmanager
 
 import pytest
 
@@ -67,25 +66,20 @@ class _FakeConn:
 
 
 class _FakePool:
-    """Mimics aioodbc's pool: ``acquire()`` is an async context manager that, on exit, appends a
-    ``release`` marker so a test can assert the cursor was closed BEFORE the connection was released."""
+    """Mimics aioodbc's pool ``acquire``/``release`` pair; ``release`` appends a marker so a test can
+    assert the cursor was closed BEFORE the connection was released. (``_acquire`` calls the two
+    explicitly rather than through the driver's ``_ContextManager``, so the bound from BACKLOG #1052
+    can sit between them; ``__aexit__`` did nothing but ``await pool.release(conn)`` anyway.)"""
 
     def __init__(self, conn: _FakeConn, events: list[str]):
         self._conn = conn
         self._events = events
 
-    def acquire(self) -> object:
-        conn = self._conn
-        events = self._events
+    async def acquire(self) -> object:
+        return self._conn
 
-        @asynccontextmanager
-        async def _cm():  # type: ignore[no-untyped-def]
-            try:
-                yield conn
-            finally:
-                events.append("release")
-
-        return _cm()
+    async def release(self, conn: object) -> None:
+        self._events.append("release")
 
 
 def _make_store(conn: _FakeConn, events: list[str]) -> SqlServerStore:
@@ -94,7 +88,9 @@ def _make_store(conn: _FakeConn, events: list[str]) -> SqlServerStore:
     # instrumentation doesn't AttributeError on this driver-free path.
     store = SqlServerStore.__new__(SqlServerStore)
     store._pool = _FakePool(conn, events)  # type: ignore[assignment]
-    store._settings = types.SimpleNamespace(command_timeout=0)  # type: ignore[assignment]
+    store._settings = types.SimpleNamespace(  # type: ignore[assignment]
+        command_timeout=0, acquire_timeout=30.0
+    )
     store._acquire_wait = AcquireWaitHistogram()
     # A1 live cost counters — normally set by __init__ (bypassed here); _commit bumps committed_txns.
     store.committed_txns = 0

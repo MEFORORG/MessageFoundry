@@ -32,6 +32,7 @@ covered by the encoder tests below plus their own (CI-only) store suites.
 from __future__ import annotations
 
 import json
+import types
 from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
@@ -42,6 +43,7 @@ from messagefoundry.config.settings import ReferenceSettings
 from messagefoundry.config.wiring import FileRef, ReferenceSpec
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner, _load_file_source
 from messagefoundry.store.metadata import encode_reference_value
+from messagefoundry.store.pool_metrics import AcquireWaitHistogram
 from messagefoundry.store.store import MessageStore
 
 REF = ReferenceSettings()
@@ -192,8 +194,11 @@ class _Sentinel(RuntimeError):
 
 
 class _RefusingPool:
-    def acquire(self, *args: object, **kwargs: object) -> object:
+    async def acquire(self, *args: object, **kwargs: object) -> object:
         raise _Sentinel("reached the connection acquire")
+
+    async def release(self, conn: object) -> None:  # pragma: no cover - never acquired
+        raise AssertionError("nothing was ever acquired")
 
 
 class _PlainCipher:
@@ -213,6 +218,10 @@ async def test_server_backend_sinks_encode_a_toml_date(backend: str, tmp_path: P
     store = _Store.__new__(_Store)
     store._cipher = _PlainCipher()  # type: ignore[assignment]
     store._pool = _RefusingPool()  # type: ignore[assignment]
+    store._settings = types.SimpleNamespace(  # type: ignore[assignment]
+        command_timeout=0, acquire_timeout=30.0
+    )
+    store._acquire_wait = AcquireWaitHistogram()
 
     rows = _load_file_source({"path": str(_toml(tmp_path / "payers.toml", NESTED_TOML))})
     # Pre-fix this raised TypeError from json.dumps; the sentinel proves the list was built.

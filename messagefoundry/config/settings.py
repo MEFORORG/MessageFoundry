@@ -508,6 +508,17 @@ class StoreSettings(_Section):
     pool_size: int = 40
     connect_timeout: int = 15  # seconds
     command_timeout: int = 30  # seconds
+    # Upper bound (seconds) on ONE pooled-connection borrow from the server-DB store pool, and on the
+    # throwaway pool a DatabaseRef reference sync opens (BACKLOG #1052, ASVS 13.2.6). Server-DB only —
+    # SQLite has no pool. `connect_timeout` bounds the LOGIN and `command_timeout` the STATEMENT;
+    # neither bounds the WAIT for a free pooled connection, which was unbounded, so a pool-exhausted or
+    # unresponsive database could block an acquiring task forever with the queue backing up behind it.
+    # At the limit the borrow raises `StoreAcquireTimeout`, which every store caller already handles as
+    # a transient stage failure (retry / dead-letter) — see docs/CONNECTIONS.md "Behaviour at the
+    # store-pool acquire limit". 30 s matches the connector tier's per-connection `acquire_timeout` and
+    # sits far above a healthy wait; watch p95/p99 in the pool_status acquire-wait histogram before
+    # lowering it. Must be > 0: the point of the knob is that the wait is always bounded.
+    acquire_timeout: float = 30.0
     db_schema: str | None = (
         None  # 'db_schema' avoids shadowing BaseModel.schema; env: MEFOR_STORE_DB_SCHEMA
     )
@@ -600,6 +611,15 @@ class StoreSettings(_Section):
     def _positive_warm_pool_timeout(cls, value: float) -> float:
         if value <= 0:
             raise ValueError("warm_pool_timeout must be > 0")
+        return value
+
+    @field_validator("acquire_timeout")
+    @classmethod
+    def _positive_acquire_timeout(cls, value: float) -> float:
+        # No "0 disables" escape hatch, unlike command_timeout: an unbounded pool wait is the defect
+        # this setting exists to remove, so there is deliberately no way to configure it back.
+        if value <= 0:
+            raise ValueError("acquire_timeout must be > 0 (the pool wait is always bounded)")
         return value
 
     @field_validator("warm_pool_target")
