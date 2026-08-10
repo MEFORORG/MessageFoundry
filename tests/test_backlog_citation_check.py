@@ -314,6 +314,36 @@ def test_editing_an_existing_line_brings_it_into_scope(tmp_path: Path) -> None:
     assert "docs/OLD.md:1" in done.stdout, done.stdout
 
 
+def test_diff_scope_reads_the_file_at_head_not_the_working_tree(tmp_path: Path) -> None:
+    """Line numbers come from ``--head``, so the content must too, or they index a different file.
+
+    On a ``pull_request`` event ``actions/checkout`` lands the MERGE ref, not the head commit, so
+    the checked-out file can legitimately differ from the one the diff measured. This reproduces the
+    divergence in the cheapest available way -- five lines prepended in the working tree after the
+    commit -- and pins the direction that matters: reading the tree would look for line 1 in a file
+    where the citation is now on line 6, find nothing, and report GREEN over a real violation.
+    """
+    repo = _plant_repo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD").strip()
+    (repo / "docs" / "NEW.md").write_text("new: [#900](BACKLOG.md)\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "add a stale citation")
+    head = _git(repo, "rev-parse", "HEAD").strip()
+
+    (repo / "docs" / "NEW.md").write_text(
+        "pad\npad\npad\npad\npad\nnew: [#900](BACKLOG.md)\n", encoding="utf-8"
+    )
+
+    done = _run(repo, "--base", base, "--head", head)
+    assert done.returncode == 1, (
+        "the gate went green over a real violation -- it read the working tree, where the citation "
+        "has moved to line 6, instead of the head commit the line numbers came from:\n"
+        + done.stdout
+        + done.stderr
+    )
+    assert "docs/NEW.md:1" in done.stdout, done.stdout
+
+
 def test_an_unreadable_ledger_refuses_rather_than_reporting_the_whole_corpus(
     tmp_path: Path,
 ) -> None:

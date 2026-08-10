@@ -298,6 +298,26 @@ def _read(root: Path, rel: str) -> str | None:
         return None
 
 
+def _read_at(root: Path, rev: str, rel: str) -> str | None:
+    """One file's content AT ``rev``, or None if it is absent there.
+
+    In diff scope this replaces reading the working tree, and the reason is that the two answer
+    different questions. On a ``pull_request`` event ``actions/checkout`` lands the MERGE ref -- base
+    merged with head -- while ``--base/--head`` computes line numbers against HEAD. Where a file
+    moved on both sides those line numbers index a file the checkout does not contain, so a finding
+    would name a line that is not the line, in either direction. Content and line numbers must come
+    from the same revision or the instrument is answering an adjacent question.
+    """
+    done = subprocess.run(  # nosec B603 B607 - fixed argv, no shell, no caller-supplied executable
+        ["git", "-C", str(root), "show", f"{rev}:{rel}"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    return done.stdout if done.returncode == 0 else None
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -333,12 +353,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    head_rev: str | None = args.head
     if args.base is None:
         scope_lines: dict[str, set[int]] | None = None
         files = tracked_markdown(root)
         scope = f"<whole repo>, {len(files)} markdown files"
     else:
-        scope_lines = added_lines(root, args.base, args.head)
+        assert head_rev is not None  # nosec B101 - paired with --base by the check above
+        scope_lines = added_lines(root, args.base, head_rev)
         files = sorted(scope_lines)
         n_lines = sum(len(v) for v in scope_lines.values())
         listed = ", ".join(f"{f} (+{len(scope_lines[f])})" for f in files) or "(none)"
@@ -348,7 +370,9 @@ def main(argv: list[str] | None = None) -> int:
     citations: list[Citation] = []
     unreadable: list[str] = []
     for rel in files:
-        text = _read(root, rel)
+        # Diff scope reads the file AT --head, never the working tree: see _read_at(). Repo-wide is
+        # a local report over what is checked out, which is the question being asked there.
+        text = _read(root, rel) if head_rev is None else _read_at(root, head_rev, rel)
         if text is None:
             # A file that vanished between the diff and the read is a deletion, not a finding.
             if scope_lines is None:
