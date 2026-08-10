@@ -205,6 +205,20 @@ def test_a_gated_step_with_no_recorded_maximum_FAILS_CLOSED() -> None:
     assert "Tests (pytest) @ ubuntu-latest" in str(exc.value)  # prints what it scanned
 
 
+def test_a_baseline_row_recording_a_zero_maximum_is_refused(tmp_path: Path) -> None:
+    """A 0:00 maximum divides by zero in the percent-of-record line, and a row asserting the suite has
+    never run is not an observation. Refuse at load, where the row is still nameable."""
+    bad = tmp_path / "b.toml"
+    bad.write_text(
+        '[[baseline]]\nstep = "S"\nleg = "L"\nmax_passing = "0:00"\ncensored = false\n'
+        'source = "measured 2026-01-01 over nothing at all, which is the point of this fixture."\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(MarginError) as exc:
+        load_baselines(bad)
+    assert "has no row, not a zero one" in str(exc.value)
+
+
 def test_every_baseline_row_states_its_pool_and_its_date() -> None:
     """A ratio whose pool is not stated cannot be rechecked, and that is this item's own finding about
     its own measurements. Enforced rather than requested."""

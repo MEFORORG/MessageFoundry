@@ -150,6 +150,13 @@ def load_baselines(path: Path = _BASELINE) -> list[Baseline]:
             )
         except KeyError as exc:
             raise MarginError(f"baseline row is missing {exc}: {entry!r}") from exc
+        if rows[-1].max_passing_seconds <= 0:
+            # A 0:00 maximum divides by zero in the percent-of-record line, and a row that records
+            # "no observation" as "zero seconds" is a row asserting the suite has never run.
+            raise MarginError(
+                f"baseline row {rows[-1].step!r} @ {rows[-1].leg!r} records a maximum of "
+                f"{entry['max_passing']!r}. A leg with no observation has no row, not a zero one."
+            )
     if not rows:
         raise MarginError(f"baseline {path} records no rows -- refusing to check against nothing")
     return rows
