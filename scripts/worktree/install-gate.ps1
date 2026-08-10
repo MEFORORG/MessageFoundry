@@ -122,10 +122,20 @@ function Get-ConfigCandidates([string]$Root) {
 }
 
 # Config dirs to wire. Default: ~/.claude + every existing ~/.claude-account-<N> (the VS Code launchers).
+#
+# -Force IS LOAD-BEARING AND ITS ABSENCE IS INVISIBLE ON WINDOWS. Get-ChildItem omits hidden entries
+# without it. On Windows a dot-prefixed directory carries no hidden ATTRIBUTE, so every ~/.claude-account-N
+# enumerates either way and the omission cannot be reproduced locally. On Linux the dot prefix IS the
+# hidden convention, so this glob returns NOTHING and the wire set collapses to the single explicit
+# ~/.claude candidate on the line above -- which is not a glob and so survives. That is precisely the
+# shape CI reported on the ubuntu leg (writer wired ['.claude']; the reader, anchored by #199, judged
+# ['.claude', '.claude-account-1', '.claude-account-42']), and it is why the parity test caught here what
+# no Windows run could. Get-ConfigCandidates above already passes -Force for the same reason; the two
+# enumerations must agree, and a difference between them is the exact defect #1024 exists to close.
 if (-not $ConfigDir -or $ConfigDir.Count -eq 0) {
     $cands = @( (Join-Path $HomeDir ".claude") )
     $cands += @(
-        Get-ChildItem -LiteralPath $HomeDir -Directory -Filter ".claude-account-*" -ErrorAction SilentlyContinue |
+        Get-ChildItem -LiteralPath $HomeDir -Directory -Filter ".claude-account-*" -Force -ErrorAction SilentlyContinue |
             Where-Object { $LauncherName.IsMatch($_.Name) } |
             ForEach-Object { $_.FullName }
     )
