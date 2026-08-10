@@ -644,6 +644,31 @@ function Test-Governed([string]$Candidate) {
     return $null
 }
 
+# The COMMON DIR of a governed root, as a comparable path -- the object rule 3c actually governs
+# (BACKLOG #1067). Empty when the root is not a repository, or is not a repository's TOP LEVEL: an
+# allowlist entry may name a directory that merely contains checkouts, and a root that is a SUBDIRECTORY
+# of some repo would otherwise report that repo's git dir and quietly govern the whole thing.
+#
+# Cached because the roots do not change within one invocation and each answer costs two git calls. The
+# rule only reaches here when a disarm key is already present, so this is not on the ordinary path.
+$rootGitDirCache = @{}
+function Get-RootGitDirCmp($Root) {
+    $key = $Root.Compare
+    if ($rootGitDirCache.ContainsKey($key)) { return $rootGitDirCache[$key] }
+    $value = ""
+    $where = $Root.Display
+    $top = "$(& git -C $where rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
+    if ($LASTEXITCODE -eq 0 -and $top -and
+        (ConvertFrom-LocalAdminShare (Get-ComparablePath $top)) -eq (ConvertFrom-LocalAdminShare $key)) {
+        $common = "$(& git -C $where rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
+        if ($LASTEXITCODE -eq 0 -and $common) {
+            $value = ConvertFrom-LocalAdminShare (Get-ComparablePath $common)
+        }
+    }
+    $rootGitDirCache[$key] = $value
+    return $value
+}
+
 # Rule 3c's target resolution, in ONE place (BACKLOG #1061). Every caller that has to answer "which
 # repository would this configure?" goes through here, so the two steps can never drift apart again:
 #
@@ -692,10 +717,29 @@ function Resolve-ConfigTarget([string]$TargetRaw, [string]$CwdRaw) {
     # BOTH SIDES go through the admin-share rewrite (BACKLOG #1071). Doing only the candidate side would
     # close the spelling that was measured and leave its mirror -- an allowlist entry written in the UNC
     # form -- silently governing nothing.
+    #
+    # GOVERNANCE IS REPOSITORY IDENTITY, NOT A PATH PREFIX (BACKLOG #1067). This compared the target's
+    # common dir against the root's WORKING TREE path, so any repository living anywhere UNDER a governed
+    # root inherited its governance -- including an independent clone vendored there, which shares
+    # nothing with it. Measured: a disarm write in <primary>/vendor/thirdparty DENIED, and the message
+    # named the PRIMARY and said every worktree of it shares one git directory, which is simply untrue
+    # of that repository. A refusal that misdescribes what it blocked teaches people to route around the
+    # gate.
+    #
+    # The comparison is now against the ROOT'S OWN COMMON DIR. That keeps every case that must keep
+    # denying: the primary and each of its worktrees, sibling or nested under .claude/worktrees, all
+    # answer the SAME common dir. It also keeps SUBMODULES on the deny side, deliberately -- a
+    # submodule's git dir lives under <primary>/.git/modules/, so the equality-or-under test still
+    # catches it and nothing flips silently. The identity-only test the item warned about would have
+    # flipped them, and whether that is right is its own decision, not a side effect of this one.
     $cmp = ConvertFrom-LocalAdminShare (Get-ComparablePath $common)
     $root = $null
     foreach ($r in $roots) {
-        $rc = ConvertFrom-LocalAdminShare $r.Compare
+        # Falls back to the path prefix when the root is not itself a repository's top level -- an
+        # allowlist entry may legitimately name a directory that merely CONTAINS checkouts, and that
+        # behaviour is unchanged.
+        $rc = Get-RootGitDirCmp $r
+        if (-not $rc) { $rc = ConvertFrom-LocalAdminShare $r.Compare }
         if ($cmp -eq $rc -or $cmp.StartsWith("$rc/")) { $root = $r; break }
     }
     [pscustomobject]@{ Raw = $TargetRaw; Rooted = $rooted; CommonCmp = $cmp; Root = $root; Unresolvable = $false }

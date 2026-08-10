@@ -1125,6 +1125,138 @@ def test_a_determined_target_is_still_named(
     assert ungoverned.is_dir()
 
 
+# ------------------------ rule 3c governs a REPOSITORY, not a path prefix (BACKLOG #1067)
+#
+# "Is this governed?" was an equality-or-slash-prefix test against the root's WORKING TREE path, so any
+# repository living anywhere under a governed root inherited its governance -- including an independent
+# clone vendored there, which shares nothing with it. The refusal then said every worktree of this
+# repository shares one git directory, which is simply untrue of that repository, and a refusal that
+# misdescribes what it blocked teaches people to route around the gate.
+#
+# The comparison is now against the root's own COMMON DIR. The pair that has to hold: a vendored
+# independent repo ALLOWS, and a worktree nested under ``.claude/worktrees`` -- whose git dir really is
+# the primary's -- keeps DENYING.
+
+
+@pytest.fixture
+def vendored(repo: SimpleNamespace) -> Path:
+    """An INDEPENDENT repository living under the primary. Its top level is itself and its git dir is
+    its own; it shares nothing with the primary but its path."""
+    vend = repo.primary / "vendor" / "thirdparty"
+    vend.mkdir(parents=True)
+    subprocess.run(["git", "init", "-b", "main", str(vend)], check=True, capture_output=True)
+    return vend
+
+
+@pytest.fixture
+def submodule(repo: SimpleNamespace, ungoverned: Path) -> Path:
+    """A real git SUBMODULE of the primary. Its git dir lives under ``<primary>/.git/modules/``, which is
+    why it must stay on the deny side: the identity-only fix would have flipped it silently, and whether
+    that is right is its own decision rather than a side effect of this one."""
+    subprocess.run(
+        ["git", "-C", str(ungoverned), "commit", "--allow-empty", "-m", "seed"],
+        check=True,
+        capture_output=True,
+        env=None,
+    )
+    p = subprocess.run(
+        [
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "-C",
+            str(repo.primary),
+            "submodule",
+            "add",
+            str(ungoverned).replace("\\", "/"),
+            "sub",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode != 0:
+        pytest.skip(f"could not add a local submodule: {p.stderr.strip()[:200]}")
+    return repo.primary / "sub"
+
+
+def test_a_VENDORED_independent_repo_under_the_primary_is_allowed(
+    repo: SimpleNamespace, vendored: Path
+) -> None:
+    """The defect, from the vendored repo's own cwd. Measured DENY on the committed gate, with a message
+    naming the PRIMARY."""
+    assert (
+        run_gate_in(shell(f"git config {_DISARM}", cwd=vendored), repo.repos, hook_cwd=vendored)
+        is None
+    )
+
+
+def test_the_VENDORED_repo_is_allowed_by_an_absolute_path_token_too(
+    repo: SimpleNamespace, vendored: Path
+) -> None:
+    """Same repository, named from outside. Also DENY on the committed gate -- the defect is in the
+    governance predicate, so it does not care how the target was spelled."""
+    assert (
+        run_gate_in(
+            shell(f'git -C "{vendored}" config {_DISARM}', cwd=repo.primary),
+            repo.repos,
+            hook_cwd=repo.primary,
+        )
+        is None
+    )
+
+
+def test_a_NESTED_claude_worktree_keeps_denying(repo: SimpleNamespace) -> None:
+    """The other half of the pair, and the one that makes this a correction rather than a hole.
+
+    A worktree under ``.claude/worktrees`` sits under the primary's path exactly like the vendored repo
+    does -- but its common dir IS the primary's, so its config write really does land in the shared
+    file. Path shape cannot tell those two apart; repository identity can."""
+    nested = _nested_worktree(repo)
+    reason = assert_denied(
+        run_gate_in(shell(f"git config {_DISARM}", cwd=nested), repo.repos, hook_cwd=nested)
+    )
+    assert "SHARED git configuration" in reason
+
+
+def test_a_SUBMODULE_of_the_primary_keeps_denying(repo: SimpleNamespace, submodule: Path) -> None:
+    """The flip the item warned about, pinned so it cannot happen by accident.
+
+    A submodule's git dir is ``<primary>/.git/modules/<name>``, so the equality-or-under test still
+    catches it. The tempting identity-ONLY predicate would have turned every submodule config write from
+    DENY to ALLOW as an invisible side effect of fixing the vendored case."""
+    assert_denied(
+        run_gate_in(
+            shell(f'git -C "{submodule}" config {_DISARM}', cwd=repo.primary),
+            repo.repos,
+            hook_cwd=repo.primary,
+        )
+    )
+
+
+def test_the_governed_primary_and_its_sibling_worktree_keep_denying(repo: SimpleNamespace) -> None:
+    """The baseline pair. If these ever stop denying, the predicate has been rewritten rather than
+    narrowed, which is the failure mode of every earlier attempt at this rule."""
+    for cwd in (repo.primary, repo.wt):
+        reason = assert_denied(
+            run_gate_in(shell(f"git config {_DISARM}", cwd=cwd), repo.repos, hook_cwd=cwd)
+        )
+        assert "SHARED git configuration" in reason
+
+
+def test_an_allowlist_root_that_is_not_a_repository_still_governs_by_prefix(
+    tmp_path: Path, repo: SimpleNamespace
+) -> None:
+    """The fallback, stated rather than assumed. An allowlist entry may legitimately name a directory
+    that merely CONTAINS checkouts; there is no repository there to take an identity from, so the path
+    prefix is still the answer and the old behaviour is unchanged."""
+    repos = tmp_path / "container-repos.txt"
+    repos.write_text(f"{tmp_path}\n", encoding="utf-8")
+    reason = assert_denied(
+        run_gate_in(shell(f"git config {_DISARM}", cwd=repo.primary), repos, hook_cwd=repo.primary)
+    )
+    assert "SHARED git configuration" in reason
+
+
 # --------------------------------------------------------------- rule 3d: destroying another worktree
 
 
