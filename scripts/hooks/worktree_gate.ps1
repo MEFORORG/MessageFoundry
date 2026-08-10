@@ -797,7 +797,17 @@ if ($tool -in @("Bash", "PowerShell")) {
     # sibling worktrees and the primary alike. Any git failure falls through to ALLOW.
     # -----------------------------------------------------------------------------------------------
     $dangerKeys = 'core\.hookspath|core\.worktree|alias\.[\w.-]+|include\.path|includeif\.'
-    $gitToken = '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)'
+    # The leading class includes a BACKTICK (BACKLOG #1072). A disarm write wrapped in backtick command
+    # substitution was ALLOWED, because the character immediately before `git` was not in this class and
+    # the token was therefore not seen at all. Thirteen other wrapper spellings -- `(`, `$(`, `{ }`,
+    # exec, eval, xargs, timeout, winpty, then, find -exec, env, sudo -- already denied, so the wrapper
+    # story was thirteen of fourteen measured shapes and never "wrappers no longer hide git".
+    #
+    # SCOPED TO THIS RULE ON PURPOSE. Rules 3 and 3d carry a byte-identical expression and the same gap
+    # is open there, measured. Widening them is a change to what THOSE rules refuse and needs their own
+    # red-first controls and their own item; it is recorded rather than done here, because a rule whose
+    # deny surface moved without a control is how the previous attempts at this file failed.
+    $gitToken = '(^|[\s;&|(''"\\/`])git(\.exe)?["'']?(\s|$)'
     $keyMatch = "(?:\bconfig\b[^|;&]*?\s|-c\s+)(?<key>$dangerKeys)"
     $readOnly = '(?:^|\s)--(get|get-all|get-regexp|list|show-origin)(\s|$)'
     foreach ($seg in (Get-ScannableSegments $cmd)) {

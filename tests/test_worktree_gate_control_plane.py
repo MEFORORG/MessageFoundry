@@ -930,6 +930,90 @@ def test_an_ALLOWLIST_ENTRY_written_as_an_admin_share_still_governs(
     assert "SHARED git configuration" in reason
 
 
+# ------------------------------------- rule 3c reads TEXT, and text has shapes (BACKLOG #1072)
+#
+# One of these is FIXED and the rest are PINNED AS MEASURED. A shape recorded as an assertion cannot be
+# quietly closed or quietly widened; a shape described in prose can be both, and a deleted case is
+# indistinguishable from one that never existed.
+
+_BT = "`"
+
+
+def test_a_BACKTICK_wrapped_disarm_is_denied(repo: SimpleNamespace) -> None:
+    """The fixed one, and it is a single character. Backtick command substitution put a character before
+    `git` that was not in the rule's leading class, so the token was not seen at all and the write was
+    ALLOWED. Measured on the committed gate."""
+    cmd = f"{_BT}git config {_DISARM}{_BT}"
+    reason = assert_denied(
+        run_gate_in(shell(cmd, cwd=repo.primary), repo.repos, hook_cwd=repo.primary)
+    )
+    assert "SHARED git configuration" in reason
+
+
+@pytest.mark.parametrize(
+    "wrapper",
+    ["$(CMD)", "(CMD)", "{ CMD }", "exec CMD", "eval CMD", "timeout 5 CMD", "env CMD", "sudo CMD"],
+)
+def test_the_other_wrapper_spellings_were_already_denied(
+    repo: SimpleNamespace, wrapper: str
+) -> None:
+    """The non-vacuity pair for the case above: these eight DENY on the committed gate and must go on
+    denying, so the backtick fix reads as the one-character correction it is rather than as "wrappers
+    started being handled". The wrapper story was never "wrappers no longer hide git"."""
+    cmd = wrapper.replace("CMD", f"git config {_DISARM}")
+    assert_denied(run_gate_in(shell(cmd, cwd=repo.primary), repo.repos, hook_cwd=repo.primary))
+
+
+@pytest.mark.parametrize(
+    ("command", "cwd_key"),
+    [
+        (f"{_BT}git config {_DISARM}{_BT}", "other"),
+        (f"{_BT}git config user.email a@b.c{_BT}", "primary"),
+        (f'git commit -m "run {_BT}git config core.hooksPath{_BT} later"', "primary"),
+    ],
+)
+def test_the_backtick_class_does_not_widen_the_rule(
+    repo: SimpleNamespace, ungoverned: Path, command: str, cwd_key: str
+) -> None:
+    """Seeing the token decides that a git command is PRESENT -- never which repository or which keys.
+    The third case matters most: this repository's own prose writes backticked commands constantly."""
+    cwd = {"primary": repo.primary, "other": ungoverned}[cwd_key]
+    assert run_gate_in(shell(command, cwd=cwd), repo.repos, hook_cwd=cwd) is None
+
+
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        ("newline-joined cd", "cd ../Unrelated\ngit config " + _DISARM),
+        ("subshell cd", "(cd ../Unrelated && git config " + _DISARM + ")"),
+        ("Push-Location", "Push-Location ../Unrelated; git config " + _DISARM),
+        ("heredoc, line-leading body", "python - <<'PY'\ngit config " + _DISARM + "\nPY"),
+        (
+            "heredoc, non-line-leading body",
+            "python - <<'PY'\ntext git config " + _DISARM + " x\nPY",
+        ),
+    ],
+)
+def test_these_text_shapes_are_pinned_as_DENY_and_are_NOT_fixed_here(
+    repo: SimpleNamespace, ungoverned: Path, label: str, command: str
+) -> None:
+    """PINNED, NOT FIXED, and the pin is the deliverable.
+
+    All five DENY on the committed gate and still DENY here, and for the first three that is an
+    OVER-deny: the ``cd`` aims at an ungoverned sibling, the rule cannot follow it across a newline, a
+    subshell or ``Push-Location``, and the session cwd stands. Toward an ungoverned sibling that is a
+    false deny; the opposite topology would be the hole -- which is exactly why the bail-outs are
+    conservative and must not be removed to make composition tidier.
+
+    The two heredoc bodies are the same over-deny in a different shape: writing a disarm-key line into a
+    file is not a config write, and the rule cannot tell. Reproduced live during this lane -- the
+    installed gate refused a commit message that spelled one of these commands out.
+
+    ``ungoverned`` is requested so ``../Unrelated`` exists; the verdict does not depend on it, which is
+    the point."""
+    assert_denied(run_gate_in(shell(command, cwd=repo.primary), repo.repos, hook_cwd=repo.primary))
+
+
 # --------------------------------------------------------------- rule 3d: destroying another worktree
 
 
