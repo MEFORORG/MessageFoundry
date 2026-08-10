@@ -841,6 +841,95 @@ def test_a_quoted_value_cannot_arm_the_READ_exclusion(repo: SimpleNamespace) -> 
     )
 
 
+# -------------------------------- rule 3c: the LOCAL ADMIN SHARE spelling of a root (BACKLOG #1071)
+#
+# Rule 3c makes git resolve path aliases for it, and that works for a junction, a ``\\?\`` prefix,
+# drive-letter case, a trailing slash and ``/./``. It does NOT work for ``\\localhost\C$\...``: git
+# echoes that spelling back unresolved, so the comparison against a governed root never matched and a
+# disarm-key write through it was ALLOWED.
+#
+# The fix is a textual rewrite of the admin-share form to its drive-letter form, on BOTH sides of the
+# comparison. Deliberately not a canonicaliser of our own: per-component link resolution inside a
+# PreToolUse hook opens a handle per component and can block on a dead network path, and a guardrail
+# that hangs the tool call gets uninstalled.
+
+
+def _admin_share(path: Path) -> str:
+    """``C:\\x\\y`` -> ``\\\\localhost\\C$\\x\\y``. Windows-only, and needs local administrator rights on
+    the machine -- the fixture skips rather than pretends when the share is not reachable."""
+    return "\\\\localhost\\" + str(path)[0] + "$" + str(path)[2:]
+
+
+@pytest.fixture
+def admin_share(repo: SimpleNamespace) -> str:
+    if sys.platform != "win32":
+        pytest.skip("the admin share is a Windows object")
+    unc = _admin_share(repo.primary)
+    if not Path(unc).is_dir():
+        pytest.skip(f"the local admin share is not reachable: {unc}")
+    return unc
+
+
+def test_the_ADMIN_SHARE_spelling_of_a_governed_root_is_denied(
+    repo: SimpleNamespace, admin_share: str
+) -> None:
+    """Measured ALLOW on the committed gate: git answers ``//localhost/C$/...`` for this target, and the
+    prefix comparison against a drive-letter root cannot match it."""
+    reason = assert_denied(
+        run_gate_in(
+            shell(f'git -C "{admin_share}" config {_DISARM}', cwd=repo.wt),
+            repo.repos,
+            hook_cwd=repo.wt,
+        )
+    )
+    assert "SHARED git configuration" in reason
+
+
+def test_the_ADMIN_SHARE_spelling_of_an_UNGOVERNED_repo_still_allows(
+    repo: SimpleNamespace, ungoverned: Path, admin_share: str
+) -> None:
+    """The asymmetry. Rewriting the spelling must decide WHICH repository, not make every UNC path
+    governed. ``admin_share`` is requested only for its skip conditions."""
+    unc = _admin_share(ungoverned)
+    assert (
+        run_gate_in(
+            shell(f'git -C "{unc}" config {_DISARM}', cwd=repo.wt), repo.repos, hook_cwd=repo.wt
+        )
+        is None
+    )
+
+
+def test_the_ADMIN_SHARE_spelling_does_not_widen_the_key_list(
+    repo: SimpleNamespace, admin_share: str
+) -> None:
+    assert (
+        run_gate_in(
+            shell(f'git -C "{admin_share}" config user.email me@example.com', cwd=repo.wt),
+            repo.repos,
+            hook_cwd=repo.wt,
+        )
+        is None
+    )
+
+
+def test_an_ALLOWLIST_ENTRY_written_as_an_admin_share_still_governs(
+    repo: SimpleNamespace, tmp_path: Path, admin_share: str
+) -> None:
+    """The MIRROR direction, which the item recorded as unmeasured.
+
+    Rewriting only the candidate side would close the measured spelling and leave this one open: a root
+    written in the UNC form would silently govern nothing when the target is spelled normally. Measured
+    ALLOW on the committed gate; both sides go through the rewrite now."""
+    repos = tmp_path / "unc-repos.txt"
+    repos.write_text(admin_share + "\n", encoding="utf-8")
+    reason = assert_denied(
+        run_gate_in(
+            shell(f'git -C "{repo.primary}" config {_DISARM}', cwd=repo.wt), repos, hook_cwd=repo.wt
+        )
+    )
+    assert "SHARED git configuration" in reason
+
+
 # --------------------------------------------------------------- rule 3d: destroying another worktree
 
 

@@ -158,6 +158,36 @@ function Get-ComparablePath([string]$Path, [string]$Base) {
     ($full -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
 }
 
+# The host names that mean THIS MACHINE in a UNC path. Computed once; the comparison below is against
+# an already-lowercased Get-ComparablePath value.
+$localShareHosts = @('localhost', '127.0.0.1', '.', "$env:COMPUTERNAME".ToLowerInvariant()) |
+    Where-Object { $_ }
+
+# Rewrite a LOCAL ADMIN SHARE spelling of a path to its drive-letter form: //localhost/C$/x -> c:/x
+# (BACKLOG #1071). Rule 3c asks git to resolve aliases for it -- which works for a junction, a `\\?\`
+# prefix, drive-letter case, a trailing slash and `/./`, all measured -- but git echoes this one spelling
+# BACK unresolved, so the comparison against a governed root never matched and a disarm-key write through
+# `\\localhost\C$\...` was ALLOWED (measured on git 2.53).
+#
+# A TEXTUAL rewrite on purpose. The tempting answer is a canonicaliser of our own, and it is the wrong
+# one: per-component link resolution inside a PreToolUse hook opens a handle per path component and can
+# BLOCK on a dead network path -- a guardrail that hangs the tool call gets uninstalled. This costs one
+# regex and touches no filesystem.
+#
+# Only a LOCAL host is rewritten. `\\otherbox\C$\...` is a different machine's disk as far as anything
+# here can tell, and claiming otherwise would be an unmeasured assertion.
+#
+# NOT claimed, and left alone deliberately: a `subst`ed drive letter, a mapped network drive other than
+# the admin share, 8.3 short names, and a WSL `/mnt/c` spelling. None was measured; each would need its
+# own asymmetry pair.
+function ConvertFrom-LocalAdminShare([string]$Cmp) {
+    if (-not $Cmp) { return $Cmp }
+    $m = [regex]::Match($Cmp, '^//([^/]+)/([a-z])\$(/.*)?$')
+    if (-not $m.Success) { return $Cmp }
+    if ($m.Groups[1].Value -notin $localShareHosts) { return $Cmp }
+    return $m.Groups[2].Value + ':' + $m.Groups[3].Value
+}
+
 # Fold a CALLER-SUPPLIED value before it goes into a deny REASON. Write-Deny already does exactly this for
 # the log line, and its note there explains why: "an embedded newline or tab would let a crafted path forge
 # extra records in a log whose whole purpose is counting". The reason needed the same defence and did not
@@ -572,10 +602,14 @@ function Resolve-ConfigTarget([string]$TargetRaw, [string]$CwdRaw) {
         }
     }
 
-    $cmp = Get-ComparablePath $common
+    # BOTH SIDES go through the admin-share rewrite (BACKLOG #1071). Doing only the candidate side would
+    # close the spelling that was measured and leave its mirror -- an allowlist entry written in the UNC
+    # form -- silently governing nothing.
+    $cmp = ConvertFrom-LocalAdminShare (Get-ComparablePath $common)
     $root = $null
     foreach ($r in $roots) {
-        if ($cmp -eq $r.Compare -or $cmp.StartsWith("$($r.Compare)/")) { $root = $r; break }
+        $rc = ConvertFrom-LocalAdminShare $r.Compare
+        if ($cmp -eq $rc -or $cmp.StartsWith("$rc/")) { $root = $r; break }
     }
     [pscustomobject]@{ Raw = $TargetRaw; Rooted = $rooted; CommonCmp = $cmp; Root = $root; Unresolvable = $false }
 }
