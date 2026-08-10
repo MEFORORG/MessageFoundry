@@ -66,17 +66,21 @@ section reference.
 | Outside `[security]` | `[store].aad_bind` | `true` (at-rest values bound to their cell) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
+| | `tls_allow_expired` | `false` on all six outbound connectors that take it (*connection-scoped*) |
+| | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
 
-**Three of these do not live in `[security]`.** `[store].aad_bind` and `[auth].ad_session_recheck_seconds`
-sit in their own sections for cohesion, and `cleartext_accepted` is a per-**connection** field, not a
-service setting at all. They are listed and reported here anyway, because the rule is *one shipped
+**Five of these do not live in `[security]`.** `[store].aad_bind` and `[auth].ad_session_recheck_seconds`
+sit in their own sections for cohesion, and the last three are per-**connection** facts, not service
+settings at all. They are listed and reported here anyway, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
-first two are named by `security_loosenings()` from the loaded `[store]`/`[auth]` sections; the third is
-resolved from the loaded connection graph and passed in by name (see its entry below for exactly which
-surfaces see it, and which cannot).
+first two are named by `security_loosenings()` from the loaded `[store]`/`[auth]` sections; the last
+three are resolved from the loaded connection graph and passed in by name (see their entries below for
+exactly which surfaces see them, and which cannot).
 
 > **Scope, stated plainly.** The registry covers *every* `[security]` switch (a completeness floor in
-> `tests/test_security_posture_defaults.py` fails on an unreported, unexempted one) plus the three
+> `tests/test_security_posture_defaults.py` fails on an unreported, unexempted one), the connection
+> factories' TLS-shaped parameters (a second floor in the same file censuses the factory signatures,
+> because a per-connection deviation is outside `model_fields`' reach by construction) and the
 > enumerated deviations above. It is **not yet** an exhaustive register of every security-relevant
 > switch in every section: `[store].encrypt` / `trust_server_certificate` and
 > `[auth].enabled` / `require_mfa` / `ad_tls_verify` / `ad_allow_insecure_ldap` /
@@ -414,6 +418,59 @@ trail.
   universal statement about verify-off hops and should not be read as one. Nor does this declaration
   reach an SMTP `AUTH` over cleartext, which is refused outright.
 
+### `tls_allow_expired = true` on a connection — an expired certificate accepted indefinitely
+> **Connection-scoped**, like `cleartext_accepted` above: a parameter on one outbound connection —
+> `MLLP`, `Rest`, `Soap`, `FHIR`, `DICOM` C-STORE SCU or `Ftp` (FTPS) — and therefore also a
+> `connections.toml` `[settings]` key. `FhirLookup` does not take it, and no inbound does.
+> [ADR 0094](adr/0094-granular-expiry-only-tls-relaxation.md).
+- **What you lose:** the certificate **validity-period** check on that hop, and nothing else. An expired
+  server certificate is accepted **indefinitely** — the relaxation has no end date, and nothing removes
+  it when the peer renews.
+- **What you keep, and it is most of it:** the chain signature, name constraints, key usage / EKU, basic
+  constraints and the hostname match all still apply — it ORs exactly one flag
+  (`X509_V_FLAG_NO_CHECK_TIME`). A wrong-host or broken-chain peer is still rejected. This is genuinely
+  narrower than `tls_verify = false`, which is the entire point of it: the alternative operators reach
+  for otherwise is the blunt switch.
+- **When acceptable:** a short bridge while a partner renews a lapsed certificate. It should be
+  transitional, and the *only* thing that makes it transitional is you — see the last bullet.
+- **Compensating controls:** none that the engine applies. The hop is still encrypted and still
+  authenticated to the named host, so the residual risk is a certificate whose issuer no longer stands
+  behind it.
+- **It is never silent:** a WARN at each construction naming the host; a `tls-allow-expired` line in
+  `messagefoundry check` naming every declaring connection and its peer; and a `tls_allow_expired` entry
+  in `security_loosenings()`, and so in `GET /security/posture` and the serve-time loosening warning.
+- **What it cannot do — and the one thing you must supply:** it is **advisory only**. No posture gate
+  keys on it, `[security].enforcement = enforce` does not touch it, and no `MEFOR_ALLOW_INSECURE_TLS`
+  is needed to set it. Reported is not gated. The engine will tell you *which* connections have it set,
+  for as long as they have it set; it has no notion of *until when*, so the removal date belongs in your
+  own risk register. Where it is NOT reported is the same list as `cleartext_accepted` above —
+  `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.
+
+### A generic-ODBC `DATABASE` hop with TLS unenforced
+> **Connection-scoped**, and unlike the two above it is not a flag anyone sets — it is the *absence* of a
+> verifying keyword. It applies to a `Database(...)` outbound **or** a `DatabasePoll(...)` inbound with
+> `dialect='generic'`. [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
+> (2026-07-12 amendment).
+- **What you lose:** on `dialect='generic'` MessageFoundry cannot introspect an arbitrary ODBC driver's
+  TLS posture, so the posture-keyed weakened-TLS refusal does not apply and TLS is delegated entirely to
+  the driver's own keyword. With no such keyword — or with one pinned to a no-TLS value — the rows, and
+  the credential in the DSN, may cross in plaintext.
+- **Why it is a delegation rather than a refusal:** the engine cannot enumerate an arbitrary driver's
+  keywords, and a guess-based refusal would break legitimate drivers. The delegation is correct; what
+  was wrong, until #333, was that its only control was a log line.
+- **When acceptable:** never, on a hop carrying PHI. Set the driver's verifying keyword —
+  `SSLmode=verify-full` (psqlODBC), `SSLMODE=VERIFY_IDENTITY` (MySQL), or the equivalent — and treat it
+  as a deployment requirement. The `dialect='sqlserver'` default is unaffected and keeps its refusal.
+- **How it is detected, precisely:** a TLS-shaped `odbc_params` key (`ssl`/`tls`/`encrypt`) whose
+  **value** is not one of the known no-TLS spellings. The value check matters: matching the key alone
+  read `SSLmode=disable` as TLS ownership. **Known residual:** an *encrypted-but-unverified* value
+  (psqlODBC `require`) is not classified — the payload is not in plaintext, and the per-driver spellings
+  for "verified" are not consistent enough to grade without guessing.
+- **It is never silent:** a WARN at each construction naming the connection and the offending keyword;
+  a `generic-db-tls` line in `messagefoundry check`; and a `generic_odbc_tls_unenforced` entry in
+  `security_loosenings()` / `GET /security/posture`. Inbound names are prefixed `inbound:`.
+- **What it cannot do:** it is advisory only, on every posture, in both directions. Nothing refuses it.
+
 ---
 
 ## Standards mapping (ASVS v5.0 · NIST SP 800-53r5 · HIPAA §164.312)
@@ -445,6 +502,8 @@ carried from that drive-to-pass, not re-derived here.**
 | `[store].aad_bind` (at-rest cell binding) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(a)(2)(iv) Encryption and Decryption |
 | `[auth].ad_session_recheck_seconds` (directory revocation propagation) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.312(a)(2)(i) Unique User Identification · §164.308(a)(3)(ii)(C) Termination Procedures |
 | `cleartext_accepted` (per-connection declared cleartext hop) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
+| `tls_allow_expired` (per-connection expiry-only relaxation) | V12 Secure Communication | **SC-8(1)** Cryptographic Protection · **SC-12** Cryptographic Key Establishment and Management | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
+| generic-ODBC `DATABASE` TLS unenforced (per-connection, driver-owned) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 
 > The synthetic-vs-PHI relaxation (a synthetic instance keeps the PHI-only gates relaxed) is **risk-based
 > tailoring** keyed on `handles_real_patient_data`: an instance carrying no ePHI is out of scope for the
