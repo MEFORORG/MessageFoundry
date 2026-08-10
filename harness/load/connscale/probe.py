@@ -7,16 +7,28 @@ Windows/Unix built-ins so no new runtime dep):
 
 * :class:`FdSampler` — the engine's open-handle / socket count (wall #4) **plus** its cumulative
   process CPU-seconds and working-set (RSS) footprint, summed across the engine's process **subtree**.
-  The subtree matters because ``messagefoundry serve`` runs the uvicorn engine as a **child** on
-  Windows, so ``EngineNode.pid`` is a thin idle launcher (~61 handles / ~6 MB) while the real engine is
-  a descendant (hundreds of handles / tens of MB); keying only to the root PID measured the launcher.
-  The sampler resolves the subtree PIDs ONCE (a single process-table walk) and then sums a cheap
+  The subtree matters because ``EngineNode`` spawns the engine as ``sys.executable -m messagefoundry
+  serve``, and on Windows a venv's ``Scripts\\python.exe`` can be a **launcher shim** that re-execs the
+  base interpreter as a CHILD — so ``EngineNode.pid`` is then a thin idle process while the real engine
+  is a descendant, and keying only to the root PID measures the shim. (Note the child is NOT ``serve``
+  spawning uvicorn: ``uvicorn.run`` is in-process, and the child-spawning path in ``serve`` is at least
+  the ``--shards`` supervisor, which the connscale smoke does not use. The shim is a property of the
+  *launching* interpreter, not of ``serve``, so whether the root is thin is environment-dependent —
+  measured on the maintainer's box 2026-08-10, a stdlib venv over a ``pythoncore-3.14`` install: root
+  61 handles / 6.55 MB, its re-exec child 141 handles / 15.2 MB.)
+  The sampler resolves the subtree PIDs periodically (a process-table walk) and then sums a cheap
   per-tick read of each: on Windows ``Get-Process -Id <pids>`` (HandleCount / TotalProcessorTime /
   WorkingSet64); on POSIX ``/proc/<pid>/fd`` + ``/proc/<pid>/stat`` (utime+stime) + ``/proc/<pid>/
-  statm`` (resident pages). On Linux the engine IS the root (no child), so the subtree is just that one
+  statm`` (resident pages). Where the launching interpreter spawns no shim the subtree is just the one
   process — byte-identical to single-process sampling. Every field is ``None`` when nothing in the
   subtree could be read (a dead tree / a missing tool), so the runner records a gap rather than
   crashing.
+
+  The walk is **provenance-checked** (BACKLOG #1210): a candidate that PREDATES the root is not a
+  descendant of it, so it is rejected along with its subtree. Windows never rewrites
+  ``ParentProcessId`` when a parent exits and it recycles PIDs, so an unvalidated ppid walk adopts any
+  live process whose recorded parent PID was later reissued to the engine — summing an unrelated tree
+  into a gauge a merge-blocking SLO then judges.
 * :func:`time_reload` — times one ``EngineClient.reload_config(dir)`` round-trip (wall #5), the
   O(connections) quiesce-and-swap.
 
@@ -44,6 +56,23 @@ _WIN_CPU_TICKS_PER_S = 10_000_000.0
 # workers join the subtree. A full walk is the expensive part of a tick, so amortise it rather than
 # paying it every time; at the runner's poll cadence this re-checks the topology every few seconds.
 _RESOLVE_EVERY_TICKS = 8
+# .NET DateTime.Ticks are 100-ns units on the same scale as TotalProcessorTime.Ticks above, but they
+# mean an INSTANT, not a duration — kept as its own name so the two never get conflated.
+_WIN_DATETIME_TICKS_PER_S = 10_000_000.0
+# #1210: how much older than its root a candidate may look before the walk rejects it. This absorbs
+# CLOCK GRANULARITY, not age. Win32_Process CreationDate is a wall-clock stamp whose kernel source
+# ticks at ~15.6 ms by default; /proc starttime is quantised to SC_CLK_TCK (10 ms typical). A genuinely
+# adopted subtree is old BY CONSTRUCTION — its real parent had to exit and the PID space had to wrap
+# before the root could be issued that PID — so one second sits orders of magnitude below the gap this
+# must catch and far above the gap it must not trip on. Note the tolerance is one-sided: it only ever
+# ADMITS a candidate, so setting it too small would wrongly reject a genuine child (measuring the thin
+# launcher alone), which is why it is not zero.
+_CREATION_SKEW_TOLERANCE_S = 1.0
+
+#: One process-table row: ``(pid, ppid, created_s)``. ``created_s`` is an instant in seconds on an
+#: arbitrary but host-COMMON origin (Windows: .NET UTC ticks / 1e7; POSIX: /proc starttime ticks since
+#: boot / SC_CLK_TCK) — only differences between rows are meaningful. ``None`` = not recorded.
+type ProcRow = tuple[int, int, float | None]
 
 
 @dataclass(frozen=True)
@@ -74,19 +103,20 @@ class FdSampler:
     """Sample the engine process SUBTREE's handle count, CPU-seconds, and working set, psutil-free.
 
     Constructed with the engine subprocess PID (the harness owns the engine, so it has it). The subtree
-    (root + descendants) is resolved ONCE on first use — because ``messagefoundry serve`` runs the
-    uvicorn engine as a child on Windows, so the root PID alone would measure the idle launcher — then
-    each :meth:`sample_proc` sums a cheap per-PID read across it. :meth:`sample` keeps the legacy
-    handle-count-only shape (``int | None``). Every field is ``None`` when nothing in the subtree could
-    be read (a dead tree / a missing tool) so a poll tick records a gap, never raises."""
+    (root + descendants, see the module docstring for why the root alone is not enough on Windows) is
+    resolved periodically and cached in between; each :meth:`sample_proc` sums a cheap per-PID read
+    across it. :meth:`sample` keeps the legacy handle-count-only shape (``int | None``). Every field is
+    ``None`` when nothing in the subtree could be read (a dead tree / a missing tool) so a poll tick
+    records a gap, never raises."""
 
     def __init__(self, pid: int, *, resolve_every: int = _RESOLVE_EVERY_TICKS) -> None:
         self._pid = pid
         self._pids: list[int] | None = None  # [root, *descendants], re-resolved every N ticks
-        # True while the last subtree resolution ERRORED (Windows enumeration failed/timed out) — as
-        # opposed to a genuine no-descendants result. An errored resolution is NOT cached (so a later
-        # tick retries) and its samples are reported probe-degraded (all None) rather than measuring the
-        # thin launcher process, whose footprint is NOT the engine's on Windows.
+        # True while the last subtree resolution ERRORED (Windows enumeration failed/timed out, or the
+        # root's own creation instant was absent so nothing could be validated against it) — as opposed
+        # to a genuine no-descendants result. An errored resolution is NOT cached (so a later tick
+        # retries) and its samples are reported probe-degraded (all None) rather than measuring a root
+        # that may be only the launcher shim.
         self._resolve_errored = False
         # A3: the subtree is NOT stable for a SHARDED engine — ADR 0037's supervisor spawns one
         # `serve --shard` subprocess per shard, and a subtree cached before they appear measures an idle
@@ -110,8 +140,8 @@ class FdSampler:
         calls it in ``run_in_executor`` (off the event loop), like the rest of the sampling."""
         pids = self._resolve_pids()
         if self._resolve_errored:
-            # Subtree resolution ERRORED (a failed/timed-out Windows enumeration). Reading the root PID
-            # alone would report the idle launcher's footprint (~61 handles / ~6 MB / ~0 CPU) as the
+            # Subtree resolution ERRORED (a failed/timed-out Windows enumeration, or no row for the
+            # root). Reading the root PID alone would report a launcher shim's footprint as the
             # engine's — worse than a gap, because it's a plausible-looking WRONG number that could flip
             # a footprint delta. Record a probe-degraded gap (all None) and let a later tick retry.
             return _EMPTY_PROC
@@ -131,12 +161,12 @@ class FdSampler:
         appear pins the sampler to an idle supervisor for the whole run — its CPU counter never advances,
         which used to surface as a plausible ``0.00`` rather than a gap.
 
-        An ERRORED Windows resolution (enumeration failed/timed out under load) is deliberately NOT
-        cached: on Windows the real engine is a CHILD of the thin launcher ``self._pid``, so caching a
-        root-only fallback would measure the launcher for the ENTIRE run. It returns root-only for the
-        current tick, flags ``_resolve_errored`` (so :meth:`sample_proc` emits a degraded gap instead of
-        the launcher footprint), and leaves ``_pids`` unresolved so the next tick retries. A GENUINE
-        no-descendants result (``[]`` — the normal Linux case, engine == root) IS cached and NOT flagged."""
+        An ERRORED Windows resolution (enumeration failed/timed out under load, or a snapshot with no
+        row for the root) is deliberately NOT cached: where ``self._pid`` is only a launcher shim,
+        caching a root-only fallback would measure the shim for the ENTIRE run. It returns root-only for
+        the current tick, flags ``_resolve_errored`` (so :meth:`sample_proc` emits a degraded gap instead
+        of the shim's footprint), and leaves ``_pids`` unresolved so the next tick retries. A GENUINE
+        no-descendants result (``[]``) IS cached and NOT flagged."""
         if self._pids is not None:
             self._ticks_since_resolve += 1
             if self._ticks_since_resolve < self._resolve_every:
@@ -159,14 +189,17 @@ class FdSampler:
         self._pids = ordered
         return self._pids
 
-    # --- subtree resolution (one-time) ---------------------------------------
+    # --- subtree resolution --------------------------------------------------
 
-    def _descendants_windows(self) -> list[int] | None:
-        # Enumerate the process table ONCE (ProcessId, ParentProcessId) and walk every descendant of
-        # the root — messagefoundry serve's real engine is a child of EngineNode.pid on Windows. Returns
-        # ``None`` to signal the enumeration ERRORED (so the caller retries + degrades rather than
-        # caching a root-only fallback that would measure the idle launcher); a list (possibly empty) on
-        # a successful enumeration.
+    def _enumerate_windows(self) -> list[ProcRow] | None:
+        """One process-table snapshot as ``(pid, ppid, created_s)`` rows, or ``None`` if the
+        enumeration ERRORED (so the caller retries + degrades rather than caching a root-only fallback
+        that would measure a thin launcher shim).
+
+        ``created_s`` is the process creation instant in seconds on an arbitrary but COMMON origin
+        (.NET ticks / 1e7, taken in UTC so a DST transition mid-run cannot reorder two processes). It
+        is ``None`` where Windows records no creation date — the walk then refuses to validate that
+        candidate rather than assuming it."""
         try:
             out = subprocess.run(
                 [
@@ -174,8 +207,12 @@ class FdSampler:
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
+                    # $c can be $null (the Idle/System pseudo-processes); emit 0 rather than an empty
+                    # field so the row still parses. DateTime.Ticks == 0 is year 0001, so it can never
+                    # collide with a real creation instant and reads unambiguously as "not recorded".
                     "Get-CimInstance Win32_Process | ForEach-Object "
-                    "{ '{0} {1}' -f $_.ProcessId, $_.ParentProcessId }",
+                    "{ $c = $_.CreationDate; if ($c) { $t = $c.ToUniversalTime().Ticks } "
+                    "else { $t = 0 }; '{0} {1} {2}' -f $_.ProcessId, $_.ParentProcessId, $t }",
                 ],
                 capture_output=True,
                 text=True,
@@ -184,36 +221,34 @@ class FdSampler:
         except (OSError, subprocess.SubprocessError):
             return None  # errored/timed out — NOT "no descendants"
         # Parse whatever rows came back regardless of the exit code (a partial result is still usable).
-        children: dict[int, list[int]] = {}
-        rows = 0
+        rows: list[ProcRow] = []
         for line in out.stdout.splitlines():
             parts = line.split()
-            if len(parts) != 2:
+            if len(parts) != 3:
                 continue
-            pid, ppid = _as_int(parts[0]), _as_int(parts[1])
+            pid, ppid, ticks = _as_int(parts[0]), _as_int(parts[1]), _as_int(parts[2])
             if pid is None or ppid is None:
                 continue
-            children.setdefault(ppid, []).append(pid)
-            rows += 1
+            created = ticks / _WIN_DATETIME_TICKS_PER_S if ticks else None
+            rows.append((pid, ppid, created))
         # A COMPLETED enumeration that yielded zero usable rows is an error, not a genuine empty result:
         # a live Windows box always has many processes, so zero rows means the walk didn't actually run
         # (a silent failure / truncated output). Signal errored so the caller retries + degrades rather
-        # than caching root-only and reporting the launcher's footprint as the engine's.
-        if rows == 0:
+        # than caching root-only and reporting the launcher shim's footprint as the engine's.
+        if not rows:
             return None
-        return _walk_descendants(children, self._pid)
+        return rows
 
-    def _descendants_posix(self) -> list[int]:
-        # Build the ppid→children map from /proc/<pid>/stat (field 4 = ppid), then walk from the root.
-        # ALWAYS a list (never the errored sentinel): on Linux the engine IS the root, so a genuine
-        # no-descendants result (``[]``) is the normal case and must NOT be flagged degraded; and if
-        # /proc is unreadable the per-PID reads of the root also return None, self-degrading honestly
-        # (no launcher confound — there is no separate launcher on Linux).
-        children: dict[int, list[int]] = {}
+    def _enumerate_posix(self) -> list[ProcRow]:
+        """One /proc snapshot as ``(pid, ppid, created_s)`` rows. ALWAYS a list (never the errored
+        sentinel): a genuine no-descendants result is the normal Linux case and must NOT be flagged
+        degraded, and if /proc is unreadable the per-PID reads of the root also return ``None``, which
+        self-degrades honestly."""
+        rows: list[ProcRow] = []
         try:
             entries = os.listdir("/proc")
         except OSError:
-            return []
+            return rows
         for name in entries:
             if not name.isdigit():
                 continue
@@ -221,15 +256,25 @@ class FdSampler:
                 raw = Path(f"/proc/{name}/stat").read_text()
             except OSError:
                 continue
-            after = raw.rpartition(")")[2].split()
-            # after[0] == field 3 (state); ppid is field 4 → index 1.
-            if len(after) < 2:
+            pid = _as_int(name)
+            parsed = _posix_stat_ppid_starttime(raw)
+            if pid is None or parsed is None:
                 continue
-            pid, ppid = _as_int(name), _as_int(after[1])
-            if pid is None or ppid is None:
-                continue
-            children.setdefault(ppid, []).append(pid)
-        return _walk_descendants(children, self._pid)
+            ppid, created = parsed
+            rows.append((pid, ppid, created))
+        return rows
+
+    def _descendants_windows(self) -> list[int] | None:
+        rows = self._enumerate_windows()
+        if rows is None:
+            return None
+        return _validated_descendants(rows, self._pid)
+
+    def _descendants_posix(self) -> list[int]:
+        walked = _validated_descendants(self._enumerate_posix(), self._pid)
+        # A POSIX walk never reports "errored" (see :meth:`_enumerate_posix`): an unknown root
+        # start time means we cannot validate ANY candidate, so adopt none — root-only, fail closed.
+        return [] if walked is None else walked
 
     # --- per-tick sampling (summed across the subtree) -----------------------
 
@@ -372,9 +417,36 @@ class FdSampler:
         return pages * int(page_size)
 
 
-def _walk_descendants(children: dict[int, list[int]], root: int) -> list[int]:
-    """BFS the ppid→children map from ``root``, returning every descendant PID (root excluded).
-    Cycle-guarded (a reused PID can't loop) and root-excluded so the caller prepends it once."""
+def _validated_descendants(rows: list[ProcRow], root: int) -> list[int] | None:
+    """BFS the ppid→children map built from ``rows``, returning every descendant PID that PASSES the
+    provenance check (root excluded, so the caller prepends it once). ``None`` means the ROOT's own
+    creation instant is not in the snapshot, so nothing can be validated against it.
+
+    BACKLOG #1210 — the walk used to be cycle-guarded and nothing else. Windows does not rewrite
+    ``ParentProcessId`` when a parent exits, and it recycles PIDs, so any live process whose recorded
+    parent PID is later reissued to the engine root is adopted along with its whole subtree; its
+    handles and RSS are then summed into a gauge the connscale SLO judges, and ``max()`` latches the
+    result for the step. The check: **a genuine descendant cannot predate its root**, because the
+    parent must already exist to create the child. Reject any candidate that started more than
+    ``_CREATION_SKEW_TOLERANCE_S`` before the root.
+
+    Two deliberate fail-closed choices:
+
+    * A candidate with **no** creation instant is rejected. Unvalidatable is not validated — admitting
+      it would leave exactly the hole this check exists to close.
+    * A rejected candidate's **subtree is pruned**, not re-walked from its children. If the node is not
+      ours, its children are not ours either, and re-entering them is what turns one wrong ppid link
+      into a whole unrelated process tree."""
+    children: dict[int, list[int]] = {}
+    created: dict[int, float] = {}
+    for pid, ppid, started in rows:
+        children.setdefault(ppid, []).append(pid)
+        if started is not None:
+            created[pid] = started
+    root_created = created.get(root)
+    if root_created is None:
+        return None
+    floor = root_created - _CREATION_SKEW_TOLERANCE_S
     out: list[int] = []
     seen = {root}
     queue = list(children.get(root, []))
@@ -383,9 +455,38 @@ def _walk_descendants(children: dict[int, list[int]], root: int) -> list[int]:
         if pid in seen:
             continue
         seen.add(pid)
+        started = created.get(pid)
+        if started is None or started < floor:
+            continue
         out.append(pid)
         queue.extend(children.get(pid, []))
     return out
+
+
+def _posix_stat_ppid_starttime(raw: str) -> tuple[int, float | None] | None:
+    """Parse ``(ppid, starttime_seconds)`` out of one ``/proc/<pid>/stat`` body, or ``None`` if the
+    line is too short to carry them.
+
+    The comm field (2) can contain spaces and parens, so split after the LAST ``)`` — everything after
+    it is field 3 onward, i.e. field N is at index N-3. ppid is field 4 (index 1); **starttime is
+    field 22 (index 19)**, expressed in clock ticks since boot. Ticks-since-boot is the same origin
+    for every process on the host, so it compares directly across the snapshot; it is divided by
+    ``SC_CLK_TCK`` only so the caller's tolerance can be stated in seconds."""
+    after = raw.rpartition(")")[2].split()
+    if len(after) < 2:
+        return None
+    ppid = _as_int(after[1])
+    if ppid is None:
+        return None
+    if len(after) < 20:
+        return ppid, None
+    ticks = _as_int(after[19])
+    if ticks is None:
+        return ppid, None
+    clk = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+    if not clk or clk <= 0:
+        clk = 100
+    return ppid, ticks / float(clk)
 
 
 def _as_int(text: str) -> int | None:
