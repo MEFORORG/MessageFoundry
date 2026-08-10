@@ -103,6 +103,13 @@ Frequently forgotten in discussions of "the gate", but it is the same problem cl
   `-Release` then `-Take` — which drops the claim in between and re-opens the race it exists to close.
   The note is what `announce-session.ps1` broadcasts to every joining session *in preference to the
   worktree name*, so a note that cannot be corrected is announced as current intent indefinitely.
+  Every `-Release` — **`-Force` included** — appends one JSON line to `claims/.history` naming the key,
+  the releasing worktree and branch, the prior holder, its branch and note, and whether `-Force` was
+  used. The flag stays: a claim whose holder's worktree is gone would otherwise be stuck, and the
+  alternative people reach for is hand-deleting the file, which leaves less evidence still. What
+  changed is that the override is no longer invisible. The record is written *before* the claim file
+  is removed, and a release that cannot be recorded is refused rather than performed silently
+  (BACKLOG #1068).
 - **[`scripts/hooks/claim_check.py`](../scripts/hooks/claim_check.py)** — `commit-msg` gate: a commit whose
   *subject* declares `BACKLOG #N` with a code-touching diff must hold a claim on N **for this worktree**.
   Motivated by a recorded incident: three sessions independently fixed one npm advisory; two PRs were

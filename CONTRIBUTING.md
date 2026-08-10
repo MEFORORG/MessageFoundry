@@ -106,6 +106,14 @@ Only the first is a real local scan. Note that the synthetic template is **below
 floor** (`names=7, estate=13, site_prefixes=1`) by design — passing locally with it does not mean you
 would pass CI's gate, only that nothing structural was found.
 
+It also prints a `token source:` line naming **where those counts came from** — the
+`MEFOR_FORBIDDEN_TOKENS` path, that variable carrying the list inline (named, never printed), or
+`scripts/security/scan-tokens.local.txt` — and says `OVERRIDDEN` when the environment won over the
+file the run just installed. That variable takes precedence, so without the line `-Synthetic` could
+install the template and then truthfully report the *real* set as configured, which reads as a
+contradiction. The scanner's exit code is propagated too: a refusal is reported as `VERIFY FAILED`,
+not as `CONFIGURED`.
+
 ## Finding something to work on
 
 Browse issues labeled **`good first issue`** (small, self-contained) and **`help wanted`**. For
