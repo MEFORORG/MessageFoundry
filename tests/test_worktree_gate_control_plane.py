@@ -1257,6 +1257,103 @@ def test_an_allowlist_root_that_is_not_a_repository_still_governs_by_prefix(
     assert "SHARED git configuration" in reason
 
 
+# ------------------- rule 3c: the deny text for a --global / --system write (BACKLOG #1082)
+#
+# THE VERDICT IS CORRECT AND DOES NOT MOVE. An earlier filing of this as a false deny was WITHDRAWN by
+# three independent verifiers who measured it: in a repo with the key unset at every scope, a --global
+# write of core.hooksPath leaves .git/config untouched and the next commit runs with the hook NEVER
+# FIRING. Flipping this rule to allow would have been a fail-open.
+#
+# What was wrong is the sentence. The refusal said the write "would change the SHARED git configuration"
+# of the repo; it does not -- it writes ~/.gitconfig or the machine file. Whether it REACHES this
+# repository depends on whether the repository pins the same key at a more specific scope, and that is
+# not in the command text.
+#
+# TEST IT BY THE WORDING, NOT THE VERDICT. A test ending in a bare ``assert_denied`` cannot see this at
+# all, and a round-4 mutant that reinstated the old self-contradicting bullet survived a fully green
+# suite for exactly that reason.
+
+
+@pytest.mark.parametrize(
+    ("command", "scope", "cwd_key"),
+    [
+        (f"git config --global {_DISARM}", "--global", "primary"),
+        (f"git config --system {_DISARM}", "--system", "primary"),
+        ("git config --global alias.ci 'commit --no-verify'", "--global", "primary"),
+        (f"git config --global {_DISARM}", "--global", "wt"),
+    ],
+)
+def test_a_scoped_disarm_write_is_refused_in_words_that_are_TRUE(
+    repo: SimpleNamespace, command: str, scope: str, cwd_key: str
+) -> None:
+    cwd = {"primary": repo.primary, "wt": repo.wt}[cwd_key]
+    reason = assert_denied(run_gate_in(shell(command, cwd=cwd), repo.repos, hook_cwd=cwd))
+    # Assert against the message with its line wrapping folded out. The claims are what is being
+    # pinned, not where the paragraph happens to break -- otherwise reflowing a sentence silently
+    # unpins it, which is the same "green for the wrong reason" this file keeps running into.
+    flat = " ".join(reason.split())
+
+    # It must not claim the write changes the repository's shared configuration. It does not.
+    assert "would change the SHARED git configuration" not in flat
+    assert "Every worktree of this repository shares one .git directory" not in flat
+
+    # It must not claim the write is harmless either. That was graded BLOCKING on a round-4 candidate:
+    # over a multi-line command whose next segment did a local write, the reader saw a reassurance
+    # printed over a real disarm.
+    assert "does NOT change" not in flat
+    assert "harmless" not in flat
+
+    # It must say what IS true: where the write lands, why it can still reach this checkout, and that
+    # the refusal is because the command alone does not settle it.
+    assert (
+        f"'{scope}' writes your per-user or machine-wide git config, NOT this repository's" in flat
+    )
+    assert "git falls back to those scopes for any key the repository does not set itself" in flat
+    assert "the write can still disarm this checkout's hooks" in flat
+    assert "cannot tell whether this write would disarm" in flat
+
+
+def test_a_LOCAL_disarm_write_still_gets_the_shared_configuration_wording(
+    repo: SimpleNamespace,
+) -> None:
+    """Non-vacuity: the two messages must both be reachable and different.
+
+    A local write really does change the shared configuration -- every worktree shares one .git -- so
+    that sentence is true here and must survive. If the scoped wording leaked onto this case, the fix
+    would have replaced one false statement with another."""
+    for command in (f"git config {_DISARM}", f"git config --local {_DISARM}"):
+        flat = " ".join(
+            assert_denied(
+                run_gate_in(shell(command, cwd=repo.primary), repo.repos, hook_cwd=repo.primary)
+            ).split()
+        )
+        assert "would change the SHARED git configuration" in flat
+        assert "writes your per-user or machine-wide git config" not in flat
+
+
+def test_a_scoped_write_in_an_UNGOVERNED_repo_is_still_allowed(
+    repo: SimpleNamespace, ungoverned: Path
+) -> None:
+    """The rule is about governed checkouts and about the disarm list. Rewording a refusal must create
+    neither a new one nor a wider key list."""
+    assert (
+        run_gate_in(
+            shell(f"git config --global {_DISARM}", cwd=ungoverned),
+            repo.repos,
+            hook_cwd=ungoverned,
+        )
+        is None
+    )
+    assert (
+        run_gate_in(
+            shell("git config --global user.email me@example.com", cwd=repo.primary),
+            repo.repos,
+            hook_cwd=repo.primary,
+        )
+        is None
+    )
+
+
 # --------------------------------------------------------------- rule 3d: destroying another worktree
 
 

@@ -1063,6 +1063,49 @@ What to do instead:
 "@
             }
 
+            # A --global or --system WRITE DOES NOT TOUCH THIS REPOSITORY'S CONFIG, and the message must
+            # not say it does (BACKLOG #1082). The VERDICT is unchanged and is correct: measured, in a
+            # repo with core.hooksPath unset at every scope, a --global write of it leaves .git/config
+            # untouched and the next commit runs with the hook NEVER FIRING. Flipping this to allow
+            # would be a fail-open.
+            #
+            # But whether it takes effect is NOT knowable from the command text. Measured in this
+            # repository: core.hooksPath is set at WORKTREE scope, which beats global, so here a
+            # --global write of that key would not take effect; in a fresh checkout it would. Note the
+            # asymmetry -- a --global alias is far more likely to land than a --global core.hooksPath,
+            # because a repository rarely pins the same alias locally.
+            #
+            # So: say what is true and no more. Not "this changes the shared configuration" (false), and
+            # not "this is harmless" either -- a round-4 candidate printed "This does NOT change the
+            # shared configuration" and three verifiers graded it BLOCKING, because over a multi-line
+            # command whose next segment did a LOCAL write the reader saw a reassurance printed over a
+            # real disarm.
+            #
+            # Detected on the FULLY masked view on purpose. Read off the bare-word key scan, a quoted
+            # VALUE that happens to spell --global would print a scope claim over a plain local write --
+            # inventing a mechanism is worse than falling back to the general message.
+            if ($invScan -match '(?:^|\s)--(?<scope>global|system)(?=\s|$)') {
+                $scope = $Matches['scope']
+                Write-Deny -Rule "3c" -Detail "git config --$scope $badKey" -Reason @"
+BLOCKED: '$badKey' is on the disarm list, and the gate cannot tell whether this write would disarm
+$($govCfg.Display) -- so it refuses rather than assume it would not.
+
+'--$scope' writes your per-user or machine-wide git config, NOT this repository's. But git falls back to
+those scopes for any key the repository does not set itself, so the write can still disarm this
+checkout's hooks -- measured: with the key unset locally, a '--$scope' write of core.hooksPath leaves
+.git/config untouched and the next commit runs with the hook never firing. Whether that happens depends
+on whether this repository pins the same key at a more specific scope, and that is not in the command.
+
+What to do instead:
+  * If a commit hook is failing, FIX THE CAUSE -- the hook output names it. Never route around a gate;
+    that converts a caught problem into an uncaught one.
+  * If you need this at user or machine scope for a genuine reason, STOP and tell the user: "I need to
+    set '$badKey' at --$scope and the worktree gate blocked it."
+  * Ordinary per-user config (user.email, user.name, and anything not on the disarm list) is untouched
+    by this rule at every scope.
+"@
+            }
+
             Write-Deny -Rule "3c" -Detail "git config $badKey" -Reason @"
 BLOCKED: setting '$badKey' would change the SHARED git configuration of $($govCfg.Display).
 
