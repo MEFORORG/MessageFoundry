@@ -37,8 +37,32 @@ Then work in it independently:
 ```powershell
 cd ..\MessageFoundry-alerts
 .\.venv\Scripts\Activate.ps1
-# build / commit / push on branch 'alerts'; open a PR as usual
+# build / commit; the FIRST push is:
+git push -u origin alerts
+# thereafter `git push`; open a PR as usual
 ```
+
+### The first push needs `-u`, and that is the fix, not a rough edge
+
+A new branch is created with **`--no-track`**, so it starts with **no upstream** and `git push -u`
+is what gives it one — pointing at the branch's **own** remote ref, which is the only value that
+answers the question anything keyed on `@{u}` is asking.
+
+It used to inherit the **base**. `git worktree add <path> -b alerts origin/main` plus git's default
+`branch.autoSetupMerge` set `@{u}` to `origin/main`, so **`@{u}..HEAD` reported a branch's own
+commits as unpushed forever, including immediately after a successful push**. A session checking
+whether its worktrees were safe to remove read **2 and 1 unpushed commits** on two branches that
+were byte-identical to their remotes. The loud symptom — `git pull --ff-only` refusing — was the
+harmless half; bare `git pull` did **not** fail, it merged `origin/main` in and produced a merge
+commit. (BACKLOG #1087.)
+
+> **Do not "fix" the extra `-u` with `git config push.default upstream`.** It is the first thing
+> anyone reaches for and it is **strictly worse than the defect it appears to fix**: with the
+> upstream pointing at `origin/main`, a bare `git push` writes the feature branch **onto `main`** —
+> and push to `main` is not blocked server-side here. `push.default` being **unset** is what makes
+> git use `simple`, which refuses when the upstream's name differs from the branch's. Measured under
+> the old configuration, git's own remediation text read `git push origin HEAD:main`.
+> `tests/test_worktree_new_no_track.py` scans every `.ps1` under `scripts/` and fails if one sets it.
 
 Point a second Claude Code chat (or VS Code window / EDH) at that directory and the two sessions build
 in parallel without touching each other's files.
@@ -446,9 +470,11 @@ times the 10-minute `-MinIdleMinutes` default — while its process was alive an
 consults the registry *and* mtime, and **refuses if either says live**, because nothing here can prove a
 session is gone; only the positive answer is trustworthy.
 
-**Creating a worktree is serialised.** `git worktree add -b <name> <base>` writes `.git/config`, so two
-sessions creating worktrees at once race `.git/config.lock` — on Windows that surfaces as `could not
-lock config file .git/config: File exists`, leaving orphaned branches behind. `new.ps1` wraps that call
+**Creating a worktree is serialised.** Two sessions running `git worktree add` at once race
+`.git/config.lock` — on Windows that surfaces as `could not lock config file .git/config: File
+exists`, leaving orphaned branches behind. (That was measured while the add still wrote an upstream,
+which is the write `--no-track` now removes; nobody has re-measured the race without it, so the lock
+stays until someone does.) `new.ps1` wraps that call
 in a cross-session mutex ([../scripts/coord/lock.ps1](../scripts/coord/lock.ps1)), which uses the same
 atomic exclusive-create as `claim.ps1`. It **retries and never steals**: on timeout it fails loudly and
 names the holder, because breaking a lock you cannot prove is abandoned re-opens the very race it exists

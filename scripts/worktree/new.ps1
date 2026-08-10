@@ -15,6 +15,11 @@
     worktree never seeds itself from a stale local `main`. Override with -Base; if you point it at a
     local branch that lags its upstream you get a loud warning.
 
+    A NEW branch is created with --no-track, so it has NO upstream and the first push is
+    `git push -u origin <branch>` (which then sets the upstream to the branch's own remote ref).
+    Deliberate: inheriting the base as the upstream made `@{u}..HEAD` report a fully-pushed branch's
+    own commits as unpushed, forever. BACKLOG #1087.
+
     -Name is the DIRECTORY component and cannot contain '/'; -Branch is the git ref and can. -Branch
     defaults to -Name, which is the ordinary case.
 
@@ -105,13 +110,17 @@ if ($LASTEXITCODE -ne 0) {
 $branchExists = & git -C $RepoRoot branch --list $Branch
 Write-Host "Creating worktree '$WorktreePath' on branch '$Branch'..."
 
-# SERIALIZED ACROSS SESSIONS. `git worktree add -b <name> <base>` writes .git/config (the new
-# branch's upstream), and concurrent adds race .git/config.lock. Reported and reproduced on Windows:
-# parallel adds against one common .git fail with "could not lock config file .git/config: File
-# exists" / "unable to write upstream branch configuration", leaving ORPHANED branches behind and
-# callers that never run. Several worktrees already share this .git, so this is a live hazard, not a
-# theoretical one. 90s is generous for an operation that takes seconds -- if we wait that long,
-# something is genuinely wrong and the throw is the right outcome.
+# SERIALIZED ACROSS SESSIONS. Concurrent `git worktree add` against one common .git races
+# .git/config.lock. Reported and reproduced on Windows: parallel adds fail with "could not lock config
+# file .git/config: File exists" / "unable to write upstream branch configuration", leaving ORPHANED
+# branches behind and callers that never run. Several worktrees already share this .git, so this is a
+# live hazard, not a theoretical one. 90s is generous for an operation that takes seconds -- if we wait
+# that long, something is genuinely wrong and the throw is the right outcome.
+#
+# THAT MEASUREMENT WAS TAKEN WITH TRACKING ON, and the upstream write its error text names is exactly
+# what --no-track below removes (BACKLOG #1087). Nothing has re-measured the race without it, so the
+# lock STAYS: holding one that turns out to be unnecessary costs seconds, whereas dropping one on an
+# unmeasured inference restores a failure whose signature is orphaned branches. Re-measure first.
 . "$PSScriptRoot\..\coord\lock.ps1"
 $addLock = Enter-CoordLock -Name "worktree-add" -TimeoutSeconds 90 -Repo $RepoRoot
 try {
@@ -130,7 +139,20 @@ if ($branchExists) {
                 "-Base $baseUpstream (the default).")
         }
     }
-    & git -C $RepoRoot worktree add $WorktreePath -b $Branch $Base
+    # --no-track: DO NOT let the new branch inherit the BASE as its upstream (BACKLOG #1087). With
+    # git's default branch.autoSetupMerge, `-b <Branch> origin/main` sets branch.<Branch>.merge to
+    # refs/heads/main, so `@{u}` resolves to origin/main rather than to the branch's own remote ref --
+    # and `@{u}..HEAD` then reports a fully-pushed branch's own commits as UNPUSHED, forever. That
+    # number feeds the "is anything at risk if I delete this worktree" check, so the misconfiguration
+    # turns a safety question into a confidently wrong answer with no error anywhere. Measured: a
+    # branch byte-identical to its remote read 1 unpushed commit.
+    #
+    # Leaving @{u} UNRESOLVABLE is the point, not a side effect: an instrument that cannot answer
+    # fails loudly, which is the correct direction. The cost is that the first push needs
+    # `git push -u origin <branch>` (which then sets the upstream to the branch's OWN remote, the
+    # right value). Do NOT "fix" that with push.default -- see docs/WORKTREES.md; with the upstream
+    # wrong, push.default=upstream makes a bare push write this branch onto main.
+    & git -C $RepoRoot worktree add --no-track $WorktreePath -b $Branch $Base
 }
 } finally { Exit-CoordLock $addLock }
 if ($LASTEXITCODE -ne 0) { throw "git worktree add failed (exit $LASTEXITCODE)" }
