@@ -33,7 +33,7 @@ import tomllib
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, get_args
 
 Verdict = Literal["pass", "partial", "fail", "na", "needs-review", "unverified"]
 
@@ -64,12 +64,18 @@ Verdict = Literal["pass", "partial", "fail", "na", "needs-review", "unverified"]
 #:   the label is stated as a label rather than hedged.
 AnchorForm = Literal["code", "doc", "foreign"]
 
+#: Every verdict state, in the order :data:`Verdict` declares them — DERIVED from the type, never
+#: retyped beside it. A hand-written second list is how the gate's summary line came to enumerate five
+#: states against its own stated total of six-states-worth of cells (BACKLOG #1012): the line printed
+#: `pass / partial / fail / na / unverified`, summing to 344 while stating 345, and `needs-review`
+#: simply had no landing site. Deriving the enumeration from the type means a seventh verdict added to
+#: :data:`Verdict` appears in every rendered breakdown on the same commit, or nothing renders at all.
+VERDICT_ORDER: Final[tuple[str, ...]] = get_args(Verdict)
+
 #: The scoring buckets. ``unverified`` is deliberately first-class (ADR 0156 §5): a cell inherited from
 #: an earlier assessment and never re-read against the requirement text is NOT a Pass, and conflating
 #: the two is what let ~219 unchecked verdicts hide inside a headline.
-VERDICTS: Final[frozenset[str]] = frozenset(
-    {"pass", "partial", "fail", "na", "needs-review", "unverified"}
-)
+VERDICTS: Final[frozenset[str]] = frozenset(VERDICT_ORDER)
 
 #: ASVS 5.0 defines only three verdicts — verified, exception, and non-applicable-with-rationale. The
 #: strings "partially implemented" and "not implemented" appear nowhere in it, and the one prominent
@@ -427,6 +433,36 @@ def load_scorecard(path: Path) -> list[Cell]:
 def count(cells: list[Cell]) -> Counter[str]:
     """The count is COMPUTED. No document states one; documents render this (ADR 0156 §2)."""
     return Counter(c.verdict for c in cells)
+
+
+def verdict_breakdown(cells: list[Cell]) -> tuple[list[tuple[str, int]], int]:
+    """Every verdict state with its count, plus the total those counts must close to.
+
+    **The one place a rendered distribution is assembled**, because two places is how the gate's
+    summary and ``--status`` came to disagree: the summary enumerated five states (BACKLOG #1012) and
+    ``--status`` six, over the same population, in the same module. Both now call this.
+
+    The reconciliation is not decorative and it is not an ``assert`` (which ``-O`` deletes): the
+    components come from a :class:`Counter` keyed on whatever verdict each cell CARRIES, the total
+    comes from ``len(cells)``, and they are therefore two independent readings of one population. A
+    cell whose verdict is outside :data:`VERDICT_ORDER` lands in neither component and the totals
+    part, which is exactly the shape #1012 describes — a state present in the data with no landing
+    site in the enumeration. :func:`load_scorecard` refuses such a verdict on the way in, so this is a
+    second fence behind the first, and it is the fence that survives the enumeration being edited.
+    """
+    n = count(cells)
+    parts = [(v, n[v]) for v in VERDICT_ORDER]
+    total = len(cells)
+    rendered = sum(c for _, c in parts)
+    if rendered != total:
+        unplaced = sorted(set(n) - set(VERDICT_ORDER))
+        raise ScorecardError(
+            f"verdict breakdown does not reconcile: the states enumerated sum to {rendered} but "
+            f"there are {total} cells. {len(unplaced)} verdict(s) have no landing site in "
+            f"VERDICT_ORDER: {', '.join(unplaced) or '<none — the arithmetic itself is wrong>'}. "
+            "Refusing to print a distribution that cannot be reconciled against its own total."
+        )
+    return parts, total
 
 
 def check_completeness(cells: list[Cell], corpus: dict[str, int]) -> list[str]:
@@ -1334,6 +1370,55 @@ def _headline_caveat(unexamined: int) -> list[str]:
     ]
 
 
+#: How each verdict state renders in the current-state table: the *State* cell, the emphasis wrapped
+#: around its count, and the *Meaning* cell. Keyed by verdict and consumed by walking
+#: :data:`VERDICT_ORDER`, so the table's rows and the total below them are read off ONE enumeration.
+#: The six rows used to be six hand-written f-strings above a hand-written Total, which is the same
+#: shape as the gate summary line BACKLOG #1012 was filed against — six statements of a distribution
+#: with nothing relating them to each other or to the population.
+_VERDICT_ROW: Final[dict[str, tuple[str, str, str]]] = {
+    "pass": ("Pass", "", "verb satisfied by a shipped default or a refusing gate"),
+    "partial": (
+        "Partial",
+        "",
+        "control exists but ships off, warns, or covers part of the surface",
+    ),
+    "fail": ("Fail", "", "no implementing control in any configuration"),
+    "na": ("N/A", "", "does not apply on the declared scope, with a written rationale"),
+    "needs-review": (
+        "Needs review",
+        "",
+        "examined; verdict contested or blocked on a decision",
+    ),
+    "unverified": (
+        "**Unverified**",
+        "**",
+        "**not re-verified against the requirement text — not a Pass**",
+    ),
+}
+
+
+def _verdict_rows(parts: list[tuple[str, int]]) -> list[str]:
+    """The table body for :func:`render_current`, one row per verdict state, no exceptions.
+
+    A state with no entry in :data:`_VERDICT_ROW` REFUSES rather than being skipped. Skipping is what
+    the old hand-written block did implicitly, and a table whose rows silently stop summing to its own
+    Total is the defect this whole path exists to make impossible.
+    """
+    rows: list[str] = []
+    for verdict, n in parts:
+        row = _VERDICT_ROW.get(verdict)
+        if row is None:
+            raise ScorecardError(
+                f"verdict {verdict!r} is declared in VERDICT_ORDER but has no row in _VERDICT_ROW, "
+                "so the rendered table would omit it while its cells still counted toward the "
+                "Total. Add the row rather than letting the state render nowhere."
+            )
+        label, emphasis, meaning = row
+        rows.append(f"| {label} | {emphasis}{n}{emphasis} | {meaning} |")
+    return rows
+
+
 def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
     """The generated entry point — survey progress FIRST, verdict counts second.
 
@@ -1347,8 +1432,7 @@ def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
     `pass` — which is also what ASVS asks for: a summary of **every requirement checked**, not
     exceptions only.
     """
-    n = count(cells)
-    total = sum(n.values())
+    parts, total = verdict_breakdown(cells)
     # EXAMINED, not DECIDED: a `needs-review` cell was read and then parked, so it is survey progress
     # even though it carries no verdict. Counting it as unread made this line contradict the table
     # below it (see EXAMINED_VERDICTS).
@@ -1374,13 +1458,7 @@ def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
         "",
         "| State | Count | Meaning |",
         "|---|---:|---|",
-        f"| Pass | {n['pass']} | verb satisfied by a shipped default or a refusing gate |",
-        f"| Partial | {n['partial']} | control exists but ships off, warns, or covers part of the surface |",
-        f"| Fail | {n['fail']} | no implementing control in any configuration |",
-        f"| N/A | {n['na']} | does not apply on the declared scope, with a written rationale |",
-        f"| Needs review | {n['needs-review']} | examined; verdict contested or blocked on a decision |",
-        f"| **Unverified** | **{n['unverified']}** | **not re-verified against the requirement text "
-        "— not a Pass** |",
+        *_verdict_rows(parts),
         f"| **Total** | **{total}** | |",
         "",
     ]
@@ -1629,8 +1707,7 @@ def status_lines(cells: list[Cell]) -> list[str]:
     :func:`verify` is for. Printing a structural tally under a heading that implies resolution health
     would be the same overstatement the summary line was just corrected for.
     """
-    n = count(cells)
-    total = sum(n.values())
+    parts, total = verdict_breakdown(cells)
     examined = sum(1 for c in cells if c.verdict in EXAMINED_VERDICTS and c.last_verified)
     inherited = sum(1 for c in cells if c.verdict in DECIDED_VERDICTS and not c.last_verified)
     closed = sum(1 for c in cells if c.decision_closed)
@@ -1644,8 +1721,7 @@ def status_lines(cells: list[Cell]) -> list[str]:
     )
     pct = (100.0 * examined / total) if total else 0.0
     return [
-        f"cells {total}: {n['pass']} pass, {n['partial']} partial, {n['fail']} fail, {n['na']} na, "
-        f"{n['needs-review']} needs-review, {n['unverified']} unverified",
+        f"cells {total}: " + ", ".join(f"{c} {v}" for v, c in parts),
         f"examined {examined} of {total} ({pct:.1f}%) against the pinned text; "
         f"{inherited} decided with no last_verified; {closed} closed by owner decision",
         f"evidence {anchors} anchors in {anchored_cells} cells over {len(paths)} paths; "
@@ -1802,11 +1878,19 @@ def main(argv: list[str] | None = None) -> int:
         return 2  # could not measure — never 0, never confused with "clean"
 
     cells = load_scorecard(args.scorecard)
-    n = count(cells)
+    # EVERY verdict state, derived from the type and reconciled against the cell count before it is
+    # printed (BACKLOG #1012). This line used to enumerate five states and state a sixth-state total --
+    # 344 components against a stated 345 -- because the enumeration was retyped here by hand and
+    # `needs-review` was never added to it. It is the line people quote, so it was quoted wrong all day.
+    try:
+        parts, total = verdict_breakdown(cells)
+    except ScorecardError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2  # could not measure — never 0, never confused with "clean"
+    breakdown = " / ".join(f"{c} {v}" for v, c in parts)
     print(
-        f"scanned {len(cells)} cells "
-        f"({n['pass']} pass / {n['partial']} partial / {n['fail']} fail / {n['na']} na / "
-        f"{n['unverified']} unverified); "
+        f"scanned {total} cells "
+        f"({breakdown}); "
         # "verified" OVERCLAIMED, on the line that IS the record's rendered face. An anchor check
         # proves the token is present and unique in the file. It does not prove the statement still
         # executes under the control flow the cell reasoned about, and it cannot prove the cell's
