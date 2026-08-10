@@ -3626,6 +3626,13 @@ def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
     reading only ``outbound`` would report a live unenforced hop as absent. Inbound names are prefixed
     ``inbound:`` because the two tables are separate namespaces and a name could otherwise collide.
 
+    ``registry.lookups`` is deliberately NOT walked, and the reason is a property of the code rather
+    than a scoping choice: neither ``DatabaseLookup`` nor ``DatabaseRef`` takes a ``dialect`` or
+    ``odbc_params`` parameter, and the ADR 0010 read executor calls ``_build_dsn`` directly, so a live
+    lookup is SQL-Server-only and keeps that preset's posture-keyed refusal. Stated here so that giving
+    a lookup the generic dialect later cannot silently escape this reader — whoever adds it must extend
+    this function.
+
     The classification is :func:`~messagefoundry.transports.database.generic_odbc_tls_unenforced` — the
     same predicate the construction WARNING uses, imported here rather than restated, so this reader and
     that log line can never disagree. Imported lazily inside the function: ``config`` must not take a
