@@ -127,7 +127,7 @@ refused before any message is accepted, never a silent degrade and never a post-
 **Request/response capture ([ADR 0013](adr/0013-query-response-orchestration.md)), PT/`Loopback()`
 re-ingress, and [ADR 0006](adr/0006-external-data-lookups.md) reference sets work on ALL THREE
 backends** — including SQL Server, which has shipped `capture_response` + `reingress_to` at full parity
-since #249 and the reference-snapshot store since [BACKLOG #235](BACKLOG.md) (2026-07-16, CI-proven
+since #249 and the reference-snapshot store since [BACKLOG #235](archive/backlog/BACKLOG-CLOSED.md) (2026-07-16, CI-proven
 against real SQL Server 2022 + 2025). Do not read a backend limitation into any of those rows. (The
 reference-set gate itself stays: a graph declaring a `Reference(...)` on a *future* backend that leaves
 the allow-list default `False` is still refused at `messagefoundry check`, at engine start, and on
@@ -509,7 +509,7 @@ crash-re-run — the same accepted caveat as a code-set hot-reload).
 - **At rest:** snapshot values are AES-GCM-encrypted (they may carry PHI) and covered by key rotation,
   exactly like `state`/message bodies; the fail-closed `[egress].allowed_db` allowlist gates the
   `DatabaseRef` source's dial-out. The snapshot store ships on **all three backends** — SQLite,
-  Postgres, and SQL Server ([BACKLOG #235](BACKLOG.md), 2026-07-16).
+  Postgres, and SQL Server ([BACKLOG #235](archive/backlog/BACKLOG-CLOSED.md), 2026-07-16).
 - **`[reference]` settings:** the sync cadence + startup behaviour — catalogued in
   [`[reference]`](#reference) immediately below.
 - **Dry-run / `check`** resolve file-backed sets best-effort (literal paths) so a reference-using

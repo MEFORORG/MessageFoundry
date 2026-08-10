@@ -177,7 +177,7 @@ it **raises**.)*
 |---|---|---|
 | **SQLite** | ✅ implemented | The reference implementation: the `reference` / `reference_version` tables, build-new-then-atomic-flip, encrypted at rest, read-through cache. |
 | **PostgreSQL** | ✅ implemented | Ported, not stubbed — same tables + flip contract, plus the real multi-node follower read-through (`converge_reference_cache`). |
-| **SQL Server** | ✅ implemented | Ported at SQLite/Postgres parity by [BACKLOG #235](../BACKLOG.md) — see the [2026-07-16 amendment](#amendment-2026-07-16--reference-sets-implemented-on-sql-server-backlog-235) for this port's two recorded divergences (the UTF-16 sizing guard and the BIN2 collation). |
+| **SQL Server** | ✅ implemented | Ported at SQLite/Postgres parity by [BACKLOG #235](../archive/backlog/BACKLOG-CLOSED.md) — see the [2026-07-16 amendment](#amendment-2026-07-16--reference-sets-implemented-on-sql-server-backlog-235) for this port's two recorded divergences (the UTF-16 sizing guard and the BIN2 collation). |
 
 This is advertised as the **`supports_reference_sets`** capability flag on the `QueueStore` protocol
 (`store/base.py`) — **allow-list semantics**: `False` by default, so a future backend that hasn't ported
