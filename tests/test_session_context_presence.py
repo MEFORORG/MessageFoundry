@@ -145,6 +145,60 @@ def test_live_peers_are_rendered_when_presence_reports_them(staged: Path) -> Non
     assert "cannot be reached by" in proc.stdout  # the non-desktop coordination note
 
 
+def test_the_session_id_is_labelled_because_the_same_banner_prints_real_shas(
+    staged: Path,
+) -> None:
+    """BACKLOG #1098: an 8-hex session id printed bare reads as an abbreviated commit SHA.
+
+    It reads that way for a measured reason rather than a vague one, and this test measures it: the
+    ``git worktree list`` block a few lines up prints ``<path> <abbreviated sha> [branch]``, so the same
+    banner already teaches "8 hex before a bracketed branch = commit SHA". The roster then reused the
+    shape for a registry session id, which resolves to no git object at all. A session comparing "is that
+    worktree ahead of mine" against it gets an error at best, and the wrong tree if the prefix resolves.
+
+    The POSITIVE CONTROL is the first half: assert the real SHA is genuinely in this output, keyed to
+    ``rev-parse HEAD`` so it is an object and not a shape. Without it the second assertion would be a
+    claim about an ambiguity nobody had shown to exist.
+    """
+    head = subprocess.run(
+        ["git", "-C", str(staged), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    fake_presence(
+        staged,
+        [
+            {
+                "Short": "deadbeef",
+                "Surface": "desktop",
+                "Worktree": "sibling",
+                "Branch": "second",
+                "IsSelf": False,
+                "IsPrimary": False,
+                "State": "LIVE",
+            }
+        ],
+    )
+    proc = run_context(staged)
+    assert proc.returncode == 0
+
+    sha_rows = [ln for ln in proc.stdout.splitlines() if head[:7] in ln]
+    assert sha_rows, (
+        f"no row carries HEAD ({head[:7]}), so this banner does not in fact print commit SHAs and the "
+        f"ambiguity below is unproven -- fix this control before trusting the assertion after it"
+    )
+    print(f"real SHA rows in the same banner: {sha_rows}")
+
+    row = next(ln for ln in proc.stdout.splitlines() if "deadbeef" in ln)
+    print(f"roster row: {row!r}")
+    assert row.strip().startswith("session deadbeef"), (
+        f"the registry session id is printed bare, in the same shape the worktree rows use for a real "
+        f"abbreviated SHA: {row!r}"
+    )
+
+
 def test_self_is_excluded_from_the_peer_count(staged: Path) -> None:
     fake_presence(
         staged,
