@@ -321,6 +321,7 @@ def DatabaseRef(
     app_name: str = "messagefoundry",
     odbc_driver: str = "ODBC Driver 18 for SQL Server",
     pool_max: int = 5,
+    acquire_timeout: float = 30.0,  # cap this source's pooled-connection borrow (s) — BACKLOG #1052
 ) -> ReferenceSourceSpec:
     """A reference **source** backed by a SQL query (ADR 0006 increment 2; SQL Server via the
     ``[sqlserver]`` extra + ODBC Driver 18 — **production / supported**, like the DATABASE connector).
@@ -330,7 +331,12 @@ def DatabaseRef(
     column's value, else the value is a dict of the remaining columns (the multi-column ``code_set``
     shape). Put secrets (``password``) in :func:`env`. TLS is on by default; weakening it needs
     ``MEFOR_ALLOW_INSECURE_TLS``. The dial-out is gated by the **fail-closed** ``[egress].allowed_db``
-    allowlist, exactly like a DATABASE poll source — point the engine only at allowed hosts."""
+    allowlist, exactly like a DATABASE poll source — point the engine only at allowed hosts.
+
+    ``acquire_timeout`` bounds the borrow from this source's throwaway pool (default 30 s, matching
+    the DATABASE connector and ``[store].acquire_timeout``). On expiry the set's sync fails, the
+    last-good snapshot stays active and the AlertSink fires — the runner syncs sets sequentially, so
+    the bound is what stops one unresponsive server from stalling every other set's refresh."""
     return ReferenceSourceSpec(
         "database",
         {
@@ -349,6 +355,7 @@ def DatabaseRef(
             "app_name": app_name,
             "odbc_driver": odbc_driver,
             "pool_max": pool_max,
+            "acquire_timeout": acquire_timeout,
         },
     )
 

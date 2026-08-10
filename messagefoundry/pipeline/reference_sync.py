@@ -42,6 +42,7 @@ from messagefoundry.config.wiring import ReferenceSpec, resolve_env_settings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.store import Store
+from messagefoundry.store.base import DEFAULT_STORE_ACQUIRE_TIMEOUT, acquire_pooled
 
 __all__ = ["ReferenceSyncRunner", "ReferenceSyncError"]
 
@@ -139,8 +140,15 @@ async def _load_database_source(
         raise ReferenceSyncError("DATABASE reference source requires 'statement' and 'key_column'")
     dsn = _build_dsn(dict(settings))  # fail-loud on weakened TLS / bad auth, before dialing
     pool = await _make_pool(dsn, int(settings.get("pool_max", 5)), autocommit=True)
+    # BACKLOG #1052: bound the borrow. This pool is throwaway (closed in the finally below), but the
+    # acquire was unbounded, so an unresponsive server could hold the reference-sync runner's pass
+    # open indefinitely — and the runner is a single sequential loop over every declared set, so one
+    # wedged source would stall the sync of all the others. A StoreAcquireTimeout is an Exception, so
+    # the runner's existing per-set source-failure handler catches it, keeps the last-good snapshot
+    # and alerts, exactly as it does for any other source error.
+    acquire_timeout = float(settings.get("acquire_timeout", DEFAULT_STORE_ACQUIRE_TIMEOUT))
     try:
-        conn = await pool.acquire()
+        conn = await acquire_pooled(pool, timeout=acquire_timeout, backend="reference:database")
         try:
             cur = await conn.cursor()
             await cur.execute(statement)

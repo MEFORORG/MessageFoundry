@@ -14,9 +14,52 @@ leak). They are pure: no I/O, no crypto — the caller decrypts before and encry
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import Mapping, Sequence
+from datetime import date, datetime, time
+from decimal import Decimal
 from typing import Any
+
+
+def _reference_json_default(value: Any) -> Any:
+    """``json.dumps(default=)`` for a reference-snapshot value: coerce the types JSON cannot encode
+    natively, and raise ``TypeError`` on anything else rather than dropping it.
+
+    Deliberately the SAME coercions as ``transports/database.py::_json_default`` (dates to ISO-8601,
+    ``Decimal`` to its exact decimal string, bytes to base64) so a value encodes identically whichever
+    reference source produced it — a reader cannot tell a FILE-sourced snapshot from a DATABASE-sourced
+    one, so the two must not disagree. ``transports/`` may not import ``store/`` (ADR 0154 AC-17), so
+    the agreement is frozen by a test rather than by sharing the function.
+
+    ``time`` is here and absent there because ``tomllib`` materializes a bare TOML ``09:30:00`` as
+    ``datetime.time`` — a shape no DB column produces.
+    """
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, (bytes, bytearray)):
+        return base64.b64encode(bytes(value)).decode("ascii")
+    raise TypeError(f"reference snapshot cannot serialize a {type(value).__name__} value to JSON")
+
+
+def encode_reference_value(value: Any) -> str:
+    """JSON-encode ONE reference-snapshot value for the ``reference.value`` column (BACKLOG #1090).
+
+    The sink for every reference source on every backend, so it is the one place that decides what a
+    snapshot value may contain. It exists because the guard belongs at the SINK, not at one producer:
+    ``_load_database_source`` coerced its cells through ``_cell`` while ``_load_file_source`` returned
+    ``dict(load_code_set(path))`` uncoerced, and a bare ``json.dumps(v)`` then raised ``TypeError`` on
+    an ordinary reference TOML carrying ``effective = 2026-01-01`` (``tomllib`` materializes a TOML
+    date as ``datetime.date``). Measured on the pre-fix tree, both the flat and the nested-table TOML
+    shapes failed. Hardening the file producer alone would have fixed that one instance and left the
+    next producer — the third serialization boundary nobody has written yet — to rediscover it.
+
+    An unencodable type still raises ``TypeError``: the sync's caller keeps the last-good snapshot
+    rather than committing a set with a value silently replaced by a placeholder (ADR 0006's graceful
+    degradation), which is the same never-accept-and-drop rule the rest of the store follows."""
+    return json.dumps(value, default=_reference_json_default)
 
 
 def encode_response_headers(headers: Mapping[str, str] | None) -> str | None:
