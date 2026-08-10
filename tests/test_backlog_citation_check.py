@@ -20,6 +20,7 @@ than a regex that stopped matching.
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -249,12 +250,27 @@ def _plant_repo(tmp_path: Path) -> Path:
 
 
 def _run(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    # PIN THE CHILD'S ENCODING, NOT JUST THE PARENT'S. `encoding="utf-8"` here governs how THIS
+    # process DECODES; it says nothing about how the child ENCODES. The checker prints an em dash, and
+    # a child inheriting a stock Windows console writes it as cp1252 0x97 -- which is not valid UTF-8,
+    # so the reader thread dies with UnicodeDecodeError and `stdout` arrives as None. The assertions
+    # then fail with `TypeError: argument of type 'NoneType' is not a container`, naming neither the
+    # cause nor the failing property.
+    #
+    # Measured 2026-08-10 on the wave-2 integration branch: without PYTHONIOENCODING these four
+    # diff-scope tests fail 4/23; with it, 23/23 pass. The lane that wrote them had it exported in its
+    # shell, so the file went green there and would have red-ed CI's Windows legs -- a green that
+    # depended on the ambient environment rather than on the code. Setting it in the child's env makes
+    # both sides agree wherever this runs. (This is the #1030 class: a non-cp1252 character in output
+    # that only some environments can carry.)
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     return subprocess.run(
         [sys.executable, str(_SCRIPT), *args],
         cwd=repo,
         capture_output=True,
         text=True,
         encoding="utf-8",
+        env=env,
     )
 
 
