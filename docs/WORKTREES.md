@@ -65,6 +65,12 @@ the two differ. It deletes losslessly: `git branch -d` first, and the forceful `
 re-verifying at that moment that the branch has nothing beyond `origin/main`. A branch holding
 unmerged commits is **kept** and named, with its tip printed so you can act on it deliberately.
 
+`-RepoRoot <path>` points the script at a checkout other than its own. It exists so the most
+destructive script in this directory can be **execution-tested**
+([`tests/test_worktree_remove.py`](../tests/test_worktree_remove.py) drives it against a synthetic
+repo); without it the only repository a test could reach was this one, so the branch-delete path was
+covered by review alone. (BACKLOG #1037.)
+
 ## Prune the finished ones — `prune-merged.ps1`
 
 Worktrees pile up. [`prune-merged.ps1`](../scripts/worktree/prune-merged.ps1) sweeps the finished

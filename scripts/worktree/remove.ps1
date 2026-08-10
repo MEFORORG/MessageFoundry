@@ -12,6 +12,13 @@
     actually has checked out, read from git -- not a branch named after the directory. Since new.ps1
     gained -Branch the two can differ.
 
+    -RepoRoot exists so this script can be EXECUTION-TESTED. It used to derive its root from
+    $PSScriptRoot alone, so the only repository a test could point it at was the real checkout --
+    which no test may drive, because this script force-removes worktrees and force-deletes refs. The
+    branch-delete path was therefore covered by review only, and it is the one place in
+    scripts/worktree/ where being wrong loses commits reachable from no ref and no reflog. Same
+    parameter, same reason, as prune-merged.ps1. See tests/test_worktree_remove.py.
+
 .EXAMPLE
     .\remove.ps1 -Name alerts
     .\remove.ps1 -Name alerts -DeleteBranch
@@ -26,12 +33,19 @@ param(
     [ValidatePattern('\A[A-Za-z0-9._-]+\z')]
     [string]$Name,
     [switch]$Force,         # remove even with uncommitted tracked changes
-    [switch]$DeleteBranch   # also delete the local branch
+    [switch]$DeleteBranch,  # also delete the local branch
+    # Repo to operate on. Defaults to this script's own checkout -- which is what makes an absolute-
+    # path invocation from ANY cwd resolve the checkout that owns the worktree. Tests point it at a
+    # fixture so the real logic is what gets exercised.
+    [string]$RepoRoot
 )
 
 $ErrorActionPreference = "Stop"
 
-$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+if (-not $RepoRoot) { $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path }
+elseif (-not (Test-Path -LiteralPath $RepoRoot)) { throw "RepoRoot does not exist: $RepoRoot" }
+else { $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path }
+
 $Parent = Split-Path $RepoRoot -Parent
 $RepoName = Split-Path $RepoRoot -Leaf
 $WorktreePath = Join-Path $Parent "$RepoName-$Name"
