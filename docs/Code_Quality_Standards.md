@@ -26,7 +26,7 @@ Machine-enforced structure (layer boundaries, strict typing), tests whose assert
 
 ### The MEFOR result
 
-All 11 signals Built and running in CI: enforced boundaries, strict typing, 5,400+ behavior-verifying tests, locked dependencies, 11 security scanners. The one durable gap ever found — the PyPI leak — was caught by this rubric and closed.
+All 11 signals Built and running in CI: enforced boundaries, strict typing, 9,700+ behavior-verifying tests (re-measured 2026-08-10), locked dependencies, at least 11 security scanners. Each of those instruments carries a **recorded scope** (Appendix A.5) — a gate's name is a claim; only its measured output and scope are evidence. The one durable gap ever found — the PyPI leak — was caught by this rubric and closed.
 
 # The 11 Signals at a Glance
 
@@ -69,8 +69,8 @@ The full standard follows: the evidence review, the AI failure-mode map, the com
 | **Applies to** | Any project developed under the SDS. **MessageFoundry (MEFOR)** is the reference implementation (Appendix A); future projects add Appendix B, C, … |
 | **Maintained by** | Project maintainers (open-source). Each deploying/adopting organization assigns its own local owner. |
 | **Status** | Draft for review |
-| **Version** | 0.12 |
-| **Date** | August 5, 2026 |
+| **Version** | 0.13 |
+| **Date** | August 10, 2026 |
 | **License** | Publishable under the project's open-source license; intended to be shared with adopters and reused across projects. |
 | **Review cadence** | At least annually, and on any material change to the metric evidence base or the AI toolchain. |
 | **Aligns to** | **ISO/IEC 25010:2023** (product-quality model — Maintainability = modularity / reusability / analyzability / modifiability / testability) · companion to SDS **PW.7 / PW.8** and the [Secure AI-Assisted Development Standards](Secure_AI_Development_Standards.md) §3 failure-modes / §9 deferred-gates. Evidence base is **peer-reviewed metric-validity studies + DORA 2024 + GitClear + the METR RCT + Stanford CCS'23**, each carried with its honesty caveat (§7). **Confers no certification.** |
@@ -140,7 +140,7 @@ Each signal is a **risk → control → measure**, tagged by **gate type** (dete
 
 | \# | Signal | What "good" looks like | Gate type | Owner |
 |----|----|----|----|----|
-| 1 | **Enforced architecture boundaries** (ISO 25010 modularity / low coupling) | Import/layer rules are *machine-checked in CI*, not just documented | Deterministic | SDS PW.1–2; **checked here** |
+| 1 | **Enforced architecture boundaries** (ISO 25010 modularity / low coupling) | Import/layer rules are *machine-checked in CI*, not just documented — **and the check's scope is recorded next to the verdict**, because a boundary gate certifies only the trees it opens (§4.0 rule 4) | Deterministic | SDS PW.1–2; **checked here** |
 | 2 | **Strict typing** | `mypy --strict`; suppressions carry error codes (no blanket ignores) | Deterministic | AI companion §6.5; **checked here** |
 | 3 | **Tests verify behavior, not mocks** | Value/negative-path assertions; real integrations over mock choreography | Deterministic | SDS PW.8; **checked here** |
 | 4 | **Dependency integrity** (anti-slopsquatting) | Existence-verify + hash-locked lockfile + new-import audit | Deterministic | **AI companion §6.4/§9** (pointer only) |
@@ -161,7 +161,7 @@ Each signal is a **risk → control → measure**, tagged by **gate type** (dete
 >
 > **Evidence & citations for the matrix.** Every signal and claim above maps to its supporting study in [**Appendix B.3**](#b.3-evidence-behind-each-rubric-element) (per-element evidence table), with full bibliographic citations in [**Appendix B.4**](#b.4-references), the derivation method in [**Appendix B.2**](#b.2-how-the-matrix-was-derived), and the claims that *failed* verification in [**Appendix B.5**](#b.5-what-was-refuted-the-verification-worked).
 
-### 4.0 The liveness rule (hard) — a gate that cannot fail is not a control
+### 4.0 The liveness and scope rules (hard) — a gate that cannot fail is not a control, and a gate narrower than its claim is not the control claimed
 
 **Every advisory gate must prove it measured something, or say why it could not.** A gate that reports
 a conclusion without recording that it performed a measurement is indistinguishable from one that
@@ -188,9 +188,21 @@ ran*. That is a distinct failure mode and it needs its own control:
    against a second, independently produced measurement of the same quantity. A sum that includes a
    derived term can be algebraically blind to that term — ours was, and the blindness is now asserted
    by a test rather than assumed away.
+4. **Scope is part of the verdict — a gate's NAME is a claim; only its measured output and scope
+   are evidence.** Rules 1–3 ask whether a gate *ran*. This one asks whether **what it ran on is
+   what the prose says it covers**, which is a distinct failure and the more durable one: a gate
+   that genuinely measures its own narrow tree will pass every liveness check ever written while
+   the scorecard sentence beside it claims something wider. The review that misses this is the
+   review that read what the gate was *called*. So every claim of "machine-checked" or "enforced"
+   in a scorecard must **name its instrument and state that instrument's measured scope**, and the
+   scope must be established the same way §4.0 establishes liveness — **by mutation, not by
+   reading the source**: plant the violation the gate exists to catch, inside the scope and
+   outside it, and record where it goes red and where it stays green. An unmutated scope claim is
+   itself an unverified green check. MEFOR's register is **Appendix A.5**.
 
 Applies to any gate, in any project adopting this rubric — a deferred or advisory gate that silently
-stops measuring is worse than an absent one, because the scorecard still counts it.
+stops measuring is worse than an absent one, because the scorecard still counts it. A gate whose
+scope is narrower than its scorecard sentence is the same defect wearing a different disguise.
 
 ### 4.1 The anti-metric rule (hard)
 
@@ -291,11 +303,11 @@ The five gates this document adds (rubric rows 7–11) are *quality-measurement*
 
 | \# | Signal | Status | Evidence in repo |
 |----|----|----|----|
-| 1 | Enforced architecture boundaries | **Built — Strong** | `tests/test_dependency_boundaries.py` AST-scans engine packages, blocks `fastapi`/`pyside6`/`api`/`console` imports, in the required CI `test` leg |
-| 2 | Strict typing | **Built — Strong** | `[tool.mypy] strict = true`, dual-platform CI; all 33 `# type: ignore` + 100 `# noqa` carry rule codes; no blanket ignores |
-| 3 | Tests verify behavior, not mocks | **Built — Strong** | 5,402 test functions; ~7,600 value-`==` asserts; ~1,000 `pytest.raises`; **0** `assert_called*`; live SQL Server + Postgres integration legs |
+| 1 | Enforced architecture boundaries | **Built — Strong *for the rule it measures*** | `tests/test_dependency_boundaries.py`, required CI `test` leg. Resolves `ast.Import` **and** `ast.ImportFrom` incl. relative imports (pinned by `test_relative_imports_are_resolved_not_skipped`); blocks `fastapi`/`pyside6`/`messagefoundry.api`/`messagefoundry.console`. **Scope is the five engine packages only** — see A.5, which records the mutation that establishes it |
+| 2 | Strict typing | **Built — Strong** | `[tool.mypy] strict = true`, dual-platform CI. **Re-measured 2026-08-10** over `messagefoundry/` (265 files): **38** `# type: ignore`, **277** `# noqa`, **zero** blanket suppressions of either — the "carries a rule code" property holds. Scope in A.5 |
+| 3 | Tests verify behavior, not mocks | **Built — Strong** | **Re-measured 2026-08-10** over `tests/` + `packaging/messagefoundry-webconsole/tests` (637 files): **9,706** test functions; **12,856** asserts carrying a value `==`; **1,608** `pytest.raises`; **0** `assert_called*`/`assert_awaited*`. Live SQL Server + Postgres integration legs (CI-only — they skip silently on a local run) |
 | 4 | Dependency integrity | **Built — Strong** | Hash-locked `requirements.lock` (DEP-1 lock-sync + `--require-hashes` CI); pip-audit; `CLAUDE.md`/AI-companion verify-before-add rule |
-| 5 | Security scanning + threat model | **Built — Strong** *(caveat A.4)* | 11 scanners (CodeQL, semgrep, bandit, gitleaks, pip-audit, crypto-inventory, forbidden-content, Trivy, Scorecard, zizmor, npm-audit); SECURITY.md (735 ln) + PHI.md (688 ln) |
+| 5 | Security scanning + threat model | **Built — Strong** *(caveats A.4 and A.5)* | At least 11 scanners, each **verified present in `.github/workflows/` on 2026-08-10** (CodeQL, semgrep, bandit, gitleaks, pip-audit, crypto-inventory, forbidden-content, Trivy, Scorecard, zizmor, npm-audit); `docs/SECURITY.md` (**1,849** ln) + `docs/PHI.md` (**1,335** ln). **A presence check is not a scope check** — the per-scanner scopes are not stated here, and a scanner's name is not its scope (A.5) |
 | 6 | Published-artifact integrity (supply-chain-*out*) | **Built — found & fixed this cycle** | Was **Failing**: the PyPI **sdist** swept the whole repo, shipping `docs/security/*`, `CLAUDE.md`, `scripts/publish/*` on releases 0.1.0..0.2.15 (the mirror leak-gate never covered the PyPI path — a control-parity miss, §3). **Fixed PR \#1020:** `[tool.hatch.build.targets.sdist] only-include` + a fail-closed "sdist is package-only" gate in `release.yml`; **v0.3.0 verified package-only against the live PyPI artifact** (sha256 download). Historical 0.1.0..0.2.15 sdists remain public (owner-only PyPI deletion). |
 
 **Tier 2 — measurement / lower-signal layer (signals 7–11): all 5 Built (signals 7, 8, 9 and 11 advisory; signal 10 enforced).**
@@ -306,7 +318,7 @@ The five gates this document adds (rubric rows 7–11) are *quality-measurement*
 | 8 | Coverage visibility | **Built (advisory)** — PR \#1040, **surfaced 2026-07-27 (v0.10)** | `quality-advisory.yml` runs `pytest-cov` + `diff-cover` on the PR's changed lines (`--fail-under=0`), PR-only — coverage *of the diff*, never a whole-repo % gate (§4.1). Now emits **inline `::notice` annotations on the Files changed tab** (`--format github-annotations:notice`), adjacent uncovered lines coalesced into ranges. Advisory. |
 | 9 | Duplication / reuse detection | **Built (advisory)** — PR \#1028 | `quality-advisory.yml` runs `jscpd` on `messagefoundry/`, whitelisting the ~21k-LOC justified store-backend parity (`sqlserver.py` / `postgres.py`); surfaces *un*justified copy-paste for triage, non-blocking |
 | 10 | Lint breadth | **Built** — PR \#1047 | `[tool.ruff.lint] extend-select = ["B","C4","SIM","UP","I"]`, enforced by the required `ruff check` leg. B008 (FastAPI DI, ~460 hits) handled via `extend-immutable-calls` + a route-layer per-file ignore (real `x=list()` bugs still caught); **515 violations auto-fixed** (import sort, pyupgrade, safe simplify); **235 non-auto-fixable grandfathered** with per-line `# noqa` → clean baseline, new code must comply |
-| 11 | Complexity triage | **Built (advisory)** — PR \#1028, **sharpened 2026-07-27 (v0.10)** | `quality-advisory.yml` runs `ruff --select C901 --exit-zero` (advisory, never gates), **plus a merge-base-vs-HEAD delta** (`scripts/quality/c901_delta.py`) that reports only functions a PR *introduced* or *made worse*. **Re-measured 2026-07-27: 122 functions exceed** `C901`**\>10** across 43 files (was 85 on 2026-07-13), complexity 11 / 14 median / 320 max. The raw list is unusable as a diff signal — all 122 findings anchor on a single `def` line — which is what the delta exists to fix |
+| 11 | Complexity triage | **Built (advisory)** — PR \#1028, **sharpened 2026-07-27 (v0.10)** | `quality-advisory.yml` runs `ruff --select C901 --exit-zero` (advisory, never gates), **plus a merge-base-vs-HEAD delta** (`scripts/quality/c901_delta.py`) that reports only functions a PR *introduced* or *made worse*. **Re-measured 2026-08-10: 132 functions exceed** `C901`**\>10** across 46 files (122/43 on 2026-07-27; 85 on 2026-07-13) — instrument `ruff check --select C901 --exit-zero`, scanning `messagefoundry/` only. The raw list is unusable as a diff signal — every finding anchors on a single `def` line — which is what the delta exists to fix |
 
 ### A.3 The gaps, ranked → buildable gates
 
@@ -327,6 +339,55 @@ Ordered by anti-slop leverage, not effort (build placement per §5). All five ar
 ### A.4 Documented caveat — solo-maintainer review
 
 Row 5's "human review" is **self-review** (the SDS §A.6 / [AI companion Appendix A.6](Secure_AI_Development_Standards.md#a6-documented-deviations) single-maintainer deviation). The Stanford overconfidence finding (§3) bites hardest exactly when the author reviews their own AI-authored code — which is the strongest argument for the mutation gate (Built this cycle — PR \#1040), since it is the one control that *adversarially* checks whether the tests assert anything, independent of the author's confidence.
+
+### A.5 Instrument scope register (§4.0 rule 4)
+
+*Every "machine-checked" / "enforced" claim above, with the instrument that backs it and that
+instrument's **measured** scope. Re-measured **2026-08-10**; each figure is a measurement with a
+date, not a constant. The signal 1 row is **mutation-verified** — its scope was established by
+planting the violation the gate exists to catch and recording where it went red and where it
+stayed green. Reading the source is not sufficient evidence of scope.*
+
+**Signal 1 — "import/layer rules are machine-checked in CI".** Instrument:
+`tests/test_dependency_boundaries.py`, in the required CI `test` leg.
+
+- **In scope, mutation-verified red:** the five engine packages `pipeline/`, `transports/`,
+  `parsing/`, `store/`, `config/` under `messagefoundry/`. A planted `import fastapi` fails the
+  gate in `transports/` and `store/`.
+- **Out of scope, mutation-verified green:** `messagefoundry/auth/`, `messagefoundry/anon/`,
+  `messagefoundry/checks.py`, and the `harness/`, `tee/` and `scripts/` trees entirely. The gate
+  never opens those files, so a planted violation there ships.
+- **What that means for the claim:** the engine's **one-way dependency rule** is genuinely
+  enforced, and this row is Strong for it. The **client-side** layering convention — CLAUDE.md §4's
+  rule that a client may import `parsing/` and `apiclient/` but no other engine package — has **no
+  instrument at all**, and an unqualified "machine-checked in CI" read as though it did.
+
+| Other claims | Instrument | Measured scope | Beyond that scope |
+|----|----|----|----|
+| Signal 2 — "strict typing" | `mypy` strict, two legs: `mypy messagefoundry messagefoundry_webconsole --exclude 'messagefoundry/tray/'` and `mypy --platform win32 messagefoundry` | `messagefoundry/` (less `tray/`) + `messagefoundry_webconsole/` | `harness/`, `tee/`, `scripts/` and `tests/` are **not** type-checked in CI. The 2 blanket suppressions in the tree both sit in `tests/`, i.e. outside the checked scope — so "no blanket ignores" is true **of the checked scope**, which is the claim now made |
+| Signal 3 — "tests verify behavior" | AST scan for `def test*`, `==`-bearing asserts, `pytest.raises`, `assert_called*` | `tests/` + `packaging/messagefoundry-webconsole/tests` (637 files) | `pytest` collects both paths, so a run naming only `tests` silently skips the web-console suite. The SQL Server and Postgres legs are **CI-only** and skip silently on a local run — a local green is not evidence for them |
+| Signal 5 — "11 scanners" | `.github/workflows/` (22 files) | **Presence** of each of at least 11 named scanners, verified 2026-08-10 | A presence check is **not** a scope check. Each scanner's own path/rule scope is unstated here; the entry claims the instruments exist and run, nothing about what each one reaches |
+| Signal 7 — mutation | `mutmut==3.6.0`, `only_mutate=messagefoundry/parsing/binary.py` against `tests/test_binary_carriage.py` | **One module.** Deliberately bounded | Says nothing about any other module's test signal |
+| Signal 8 — diff-coverage | `pytest --cov=messagefoundry` + `diff-cover`, PR-only | Changed lines in `messagefoundry/` | Coverage of `harness/`, `tee/`, `scripts/` is not measured |
+| Signal 9 — clone detection | `jscpd@4.0.5 messagefoundry` | `messagefoundry/` only | Cannot see the ADR 0030 `tee/anon/` vendoring at all (already noted in §5.1) |
+| Signal 10 — lint breadth | `ruff check .` (required leg) | **Whole repo**, less `docs/benchmarks/results` | The one signal here whose scope genuinely matches an unqualified "enforced" |
+| Signal 11 — complexity | `ruff check --select C901 --exit-zero messagefoundry` | `messagefoundry/` only | Complexity outside the package is unmeasured |
+
+**What this register changed.** Signals 3, 5 and 11's figures were **stale in the same direction** —
+every re-measured count had grown since the 2026-07-13 audit (test functions 5,402 → 9,706;
+`pytest.raises` ~1,000 → 1,608; `docs/SECURITY.md` 735 → 1,849 lines; `C901` 122/43 files → 132/46).
+Dates are now attached to the figures rather than to the appendix.
+
+The **substantive** correction is signal 1, above. That is not a fault in the gate, which does its
+own job well and turned out to be *stronger* than one prior description of it — it resolves
+`ast.ImportFrom` and relative imports, not `ast.Import` alone, and has a test pinning that. It is a
+fault in the **sentence next to it**, which is exactly the class §4.0 rule 4 now names.
+
+**This register is itself pinned.** `tests/test_quality_record_scope_claims.py` imports the gate's
+own `_ENGINE_PACKAGES` and fails if this appendix stops listing every package the gate scans, or
+stops naming the trees it cannot see — so widening the gate without updating this record is a red
+test rather than silent drift. Its guards were each verified red-first against the mutation they
+exist to catch.
 
 ------------------------------------------------------------------------
 
@@ -410,6 +471,7 @@ The evidence caveats in **§7** are part of this appendix's basis: the metric-in
 
 | Version | Date | Change |
 |----|----|----|
+| 0.13 | August 10, 2026 | **Scope audit of the record's own "machine-checked" claims — new §4.0 rule 4 and Appendix A.5.** Every scorecard claim of machine enforcement now names its instrument and that instrument's **measured** scope, established by mutation rather than by reading the source. The substantive correction is **signal 1**: the row read as an unqualified repo-wide guarantee, and `tests/test_dependency_boundaries.py` measures **five** engine packages under `messagefoundry/` — planted forbidden imports go red in `transports/` and `store/` and stay green in `auth/`, `anon/`, `checks.py`, `harness/`, `tee/` and `scripts/`. The gate is sound; the sentence beside it was not, and the **client-side** layering convention it appeared to cover has no instrument. The same pass found one prior description of that gate *understated* it — it resolves `ast.ImportFrom` and relative imports, not `ast.Import` alone — which is why scope is now mutation-verified in both directions rather than read off the code. Signals 3, 5 and 11's figures were re-measured and were **stale in one direction** (test functions 5,402 → 9,706; `pytest.raises` ~1,000 → 1,608; `docs/SECURITY.md` 735 → 1,849 ln; `docs/PHI.md` 688 → 1,335 ln; `C901` 122 across 43 files → 132 across 46), so dates now attach to the figures. Signal 2's "no blanket ignores" **stands** once scoped: zero blanket suppressions inside the mypy-checked tree. `tests/test_quality_record_scope_claims.py` pins A.5 against the gate's own package list, so widening the gate without updating the record fails. No scoring change — A− stands, still 11 signals — because this corrects the record, not the controls. Generalised from BACKLOG #1092, whose reusable finding is that across a 74-element audit **eight verdicts flipped and all eight flipped "covered" to "gap"**; a symmetric process would not do that. |
 | 0.12 | August 5, 2026 | **Removed the status glyphs, and added §5.1 for `/simplify`** — at least the following. All 41 status glyphs are gone, per [`../CLAUDE.md`](../CLAUDE.md) §11: a glyph's meaning is positional and invisible to a reader who learns it from examples, and every table here reads identically without one. Most sat beside the word they decorated (`Built`, `Strong`, `shipped`) and were simply deleted, that word carrying the meaning on its own; only two were rewrites — the red circle in Appendix A.2 row 6 became **Failing**, and the Appendix A.3 legend, where the glyph was the subject rather than a decoration, became prose. The pass also edited **five historical rows of this table in place** (0.11, 0.10, 0.9, 0.8, 0.3), so the record itself moved; only the glyphs in them changed. Added **§5.1** as the single home for `/simplify`, a local, human-invoked review tool that **applies** its fixes: it is not one of the five measurement gates, sits outside the AI companion §6.5 local gate, and carries no **Built** status, because it ships with Claude Code rather than with this project and so leaves no artifact here to score. §5.1's out-of-scope list is an open "at least" class: it names the store-backend parity signal 9 already whitelists and the ADR 0030 `tee/anon/` vendoring that signal 9's `messagefoundry/`-scoped scan cannot see, and it carries the defensive branching tolerant HL7 parsing requires as a separate signal 11 (complexity) concern rather than a duplication one. Corrected a **pre-existing** Appendix A.3 error that the glyph pass surfaced rather than introduced: the legend glossed its status marker as *shipped (advisory; PR \#1028 or PR \#1040)* over a five-item list whose item 5 is blocking and shipped under PR \#1047 — that legend is unchanged in every commit this file has existed in, so it long predates this cycle. No scoring change: A− stands, still 11 signals, still five measurement gates. |
 | 0.11 | July 27, 2026 | **Added the liveness rule (new section 4.0) and built the control.** v0.10 recorded that signal 7 had been scored Built for two versions while its tool crashed before producing a mutant. That is a failure mode this rubric had no defence against: section 4.1 forbids over-trusting a *number*, but nothing forbade over-trusting a *green check that never ran* — and three defects across two of the five Tier 2 gates turned out to have that shape (two measuring nothing, one publishing a wrong derived number). Section 4.0 now requires every advisory gate to prove it measured something (units **examined**, never units found — a clean repo reports zero and must still pass) or to declare explicitly, with a reason, that it had nothing to measure; and any derived headline figure must be cross-checked against an independently produced measurement of the same quantity. Implemented as the `liveness` job in `quality-advisory.yml` — the only job there permitted to go red — with `tests/test_gate_liveness.py` replaying the historical incidents to prove the check catches them, and the good-news cases to prove it does not fire on them. **The control was itself adversarially reviewed before merge, and the review found it carrying the same weakness it was built to catch, in three places** — a dead coverage gate could pass by claiming "not applicable", an empty mutmut results file reported a flawless score, and the reconciliation sum was algebraically blind to the very count it claimed to protect. All three are fixed and regression-tested; rule 3 above was rewritten because of the third. No scoring change (A− stands); the gates were repaired in v0.10, this is the control that keeps them honest. |
 | 0.10 | July 27, 2026 | **Restored to the repo, and corrected three claims that did not survive measurement.** This file had been absent from the repository's entire git history despite being cited by `quality-advisory.yml` and `pyproject.toml`; it is restored here from the maintained copy. Corrections, each measured rather than reasoned: **(a) Signal 7 was scored Built in 0.8 and 0.9 while producing nothing.** `mutmut<3` resolved to 2.5.1, which crashes on Python 3.14 in its pony-ORM cache (`cannot pickle 'itertools.count'`) *before generating a single mutant*; `\|\| true` made the job report success in 37s, so the gate looked green for two versions. Repaired on `mutmut==3.6.0` (+ `pytest-timeout`, and `source_paths` must be the package, not the one file, or the mutant copy cannot import `conftest`). Now genuinely measured: **461 mutants, 87 killed, 19 survived, 3 seconds** — so the "Expensive / never per-PR" cost model in §5 was also wrong, and mutation now runs on PRs. **(b) Signal 11's "85 functions over C901>10" is now 122 across 43 files**, and the raw list was found unusable as a diff signal (every finding anchors on one `def` line), so a merge-base delta was added that reports only PR-caused changes. **(c) Signal 8 now emits inline PR annotations** rather than console-only output. The A− verdict stands, but note that (a) is exactly the failure mode this rubric exists to catch — an advisory gate that reports success while measuring nothing — and it was caught by re-verification, not by the gate itself. |
