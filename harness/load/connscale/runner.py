@@ -97,6 +97,33 @@ class ConnScaleError(RuntimeError):
     """A connection-scale run setup/orchestration failure."""
 
 
+def sweep_step_count(profile: ConnScaleProfile) -> int:
+    """How many sweep steps :func:`run_connscale` runs for ``profile`` -- and therefore how many API
+    ports it consumes, since step ``k`` binds ``engine_api_port_base + k``.
+
+    This is the ONE definition of the loop's cardinality, and it exists so a caller can reserve the
+    range the sweep will ACTUALLY use. Reserving only the base leaves every later step's port merely
+    assumed free, which is BACKLOG #1103: a taken port anywhere in the range kills the engine at
+    startup, reported as ``EADDRINUSE`` on Linux and as the far less obvious *"access forbidden"*
+    ``WinError 10013`` on Windows. Callers reserve ``[base, base + sweep_step_count(profile))``.
+
+    :func:`run_connscale` checks its own step index against this number on every iteration, so the
+    two cannot drift silently: growing the sweep with a new axis without teaching this function about
+    it fails loudly on the first step past the reserved block instead of binding an unreserved port.
+    A pooled-arm miss consumes a step and then abandons the rest of that cell's trials, so the real
+    step count can be LOWER than this -- never higher, which is what makes it a safe reservation
+    width.
+    """
+    return (
+        len(profile.claim_modes)
+        * len(profile.fuse_modes)
+        * len(profile.batch_modes)
+        * len(profile.modes())
+        * len(profile.counts)
+        * profile.trials
+    )
+
+
 async def run_connscale(
     profile: ConnScaleProfile,
     *,
@@ -120,6 +147,11 @@ async def run_connscale(
     shim_installed = install_executor_shim
     api_port = engine_api_port_base
     step = 0
+    # The API-port range the caller was told to reserve (BACKLOG #1103). Every step below is checked
+    # against it before it binds, so a sweep that grew an axis sweep_step_count() does not count
+    # fails LOUDLY on the first unreserved port rather than binding it and dying inside uvicorn with
+    # an errno that does not name a port problem.
+    reserved_api_ports = sweep_step_count(profile)
     # (sweep_mode, count) whose POOLED arm failed to start → the loud reason, surfaced in the A/B.
     missing_detail: dict[tuple[str, int], str] = {}
     # (claim_mode, sweep_mode, count) whose arm failed to start → the loud reason for the fusion A/B
@@ -149,6 +181,16 @@ async def run_connscale(
                     for count in profile.counts:
                         rate = profile.aggregate_rate_for(mode, count)
                         for trial in range(profile.trials):
+                            if step >= reserved_api_ports:
+                                raise ConnScaleError(
+                                    f"sweep step {step} would bind API port {api_port + step}, "
+                                    f"past the reserved range [{api_port}, "
+                                    f"{api_port + reserved_api_ports}) that sweep_step_count() "
+                                    f"sized at {reserved_api_ports} -- the sweep has an axis "
+                                    f"sweep_step_count() does not count, so the caller under-"
+                                    f"reserved and this port was never verified free (BACKLOG "
+                                    f"#1103)"
+                                )
                             try:
                                 record = await _run_one_step(
                                     profile,
