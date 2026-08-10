@@ -816,11 +816,13 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw) {
     # And only a branch that is checked out NOWHERE. The deny text below asserts exactly that ("git
     # allowed it because '$dest' was not checked out anywhere") -- an assertion this rule never actually
     # made, which is a compensating control resting on an unverified premise. Two things follow from
-    # checking it. If the branch IS checked out somewhere, git's own guard refuses the switch without
-    # us, so there is nothing to protect; and the remediation would print `new.ps1 -Branch $dest`, which
-    # dies with "fatal: '$dest' is already checked out at ...". That is the same defect class this
-    # remediation was just fixed for -- a printed command the receiving side rejects. `git checkout main`
-    # from any linked worktree is the common shape. $list is the porcelain already read above.
+    # checking it. If the branch IS checked out somewhere, git's own guard refuses the switch WITH NO
+    # FLAG PRESENT (see the measured table below -- the guard has an off switch and this claim is about
+    # a configuration, not about git), so there is nothing to protect; and the remediation would print
+    # `new.ps1 -Branch $dest`, which dies with "fatal: '$dest' is already checked out at ...". That is
+    # the same defect class this remediation was just fixed for -- a printed command the receiving side
+    # rejects. `git checkout main` from any linked worktree is the common shape. $list is the porcelain
+    # already read above.
     #
     # BUT ONLY WITH NO FLAGS AT ALL, and that is an ALLOWLIST on purpose. "git already refuses this" is
     # a claim about a CONFIGURATION, not about git: a guard you do not own can be switched off by its
@@ -857,9 +859,12 @@ hypothetical: it is exactly the hijack that happened here. A session with no wor
 `git checkout` inside somebody else's worktree; git allowed it because '$dest' was not checked out anywhere.
 
 What to do instead:
-  * To BUILD on '$dest', give it its OWN worktree -- git then refuses to check that branch out twice,
-    which is the protection you actually want. The branch already EXISTS, so this REUSES it rather than
-    forking. -Branch is the git ref; -Name is only the DIRECTORY, which cannot contain '/':
+  * To BUILD on '$dest', give it its OWN worktree. UNLESS YOU PASS A FLAG THAT SWITCHES THE GUARD OFF,
+    git then refuses to check that branch out twice, which is the protection you actually want --
+    measured: `git worktree add --force` overrides it and creates the second checkout anyway, as
+    `checkout`/`switch --ignore-other-worktrees` and `--detach`/`-d` do for the switch path. The branch
+    already EXISTS, so this REUSES it rather than forking. -Branch is the git ref; -Name is only the
+    DIRECTORY, which cannot contain '/':
         pwsh -NoProfile -File "$newHint" -Branch '$destQ' -Name $destSlug
   * To READ '$dest' without touching any working tree, use the plumbing:
         git -C "$selfTopRaw" show $dest`:<path>        git -C "$selfTopRaw" diff HEAD..$dest

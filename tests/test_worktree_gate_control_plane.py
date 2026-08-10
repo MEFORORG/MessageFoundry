@@ -1354,6 +1354,67 @@ def test_a_scoped_write_in_an_UNGOVERNED_repo_is_still_allowed(
     )
 
 
+# ------- "git will refuse this" is a claim about a CONFIGURATION, not about git (BACKLOG #1039)
+#
+# Every deferral to a guard we do not own has to name what switches that guard off. Rule 3b's remediation
+# told the reader to give the branch its own worktree because "git then refuses to check that branch out
+# twice" -- flatly, with no qualifier. ``git worktree add --force`` overrides it.
+#
+# These live here because this lane owns this file; the claim they check is rule 3b's deny text.
+
+
+def test_git_worktree_add_FORCE_really_does_defeat_the_already_checked_out_guard(
+    repo: SimpleNamespace, tmp_path: Path
+) -> None:
+    """MEASURE the premise instead of citing it. The item was filed with this row explicitly unmeasured,
+    and a documentation fix that asserts an unmeasured behaviour is the same defect one level up.
+
+    ``repo.wt`` already has ``wt-branch`` checked out, so a plain add must fail and the forced add must
+    succeed. If a future git closes this, THIS fails and the doc row it backs can be corrected -- which
+    is the point of pinning the measurement rather than writing the sentence down."""
+    target = tmp_path / "ForcedAdd"
+    plain = subprocess.run(
+        ["git", "-C", str(repo.primary), "worktree", "add", str(target), "wt-branch"],
+        capture_output=True,
+        text=True,
+    )
+    assert plain.returncode != 0, f"expected git to refuse the second checkout: {plain.stdout}"
+    assert "already used by worktree" in (plain.stderr + plain.stdout)
+
+    forced = subprocess.run(
+        ["git", "-C", str(repo.primary), "worktree", "add", "--force", str(target), "wt-branch"],
+        capture_output=True,
+        text=True,
+    )
+    assert forced.returncode == 0, f"--force did not override the guard: {forced.stderr}"
+    assert target.is_dir()
+    subprocess.run(
+        ["git", "-C", str(repo.primary), "worktree", "remove", "--force", str(target)],
+        capture_output=True,
+    )
+
+
+def test_the_hijack_remediation_does_not_promise_a_guard_it_does_not_own(
+    repo: SimpleNamespace,
+) -> None:
+    """The deny text must carry the qualifier and name at least one flag that disables the guard.
+
+    An unconditional "git then refuses to check that branch out twice" is exactly the reasoning #1041
+    was filed and fixed for one line away -- a rule deferring to a guard its own caller can switch off.
+    Asserted as a STRING because the verdict does not move: this is a wording defect, and a test ending
+    in a bare ``assert_denied`` cannot see it."""
+    subprocess.run(
+        ["git", "-C", str(repo.primary), "branch", "spare-branch"], check=True, capture_output=True
+    )
+    reason = assert_denied(
+        run_gate_in(shell("git checkout spare-branch", cwd=repo.wt), repo.repos, hook_cwd=repo.wt)
+    )
+    flat = " ".join(reason.split())
+    assert "git then refuses to check that branch out twice" in flat
+    assert "UNLESS YOU PASS A FLAG THAT SWITCHES THE GUARD OFF" in flat
+    assert "git worktree add --force" in flat
+
+
 # --------------------------------------------------------------- rule 3d: destroying another worktree
 
 

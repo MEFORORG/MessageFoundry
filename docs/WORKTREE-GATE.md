@@ -92,8 +92,28 @@ for the checkouts named in its allowlist:
    worktree's *own* branch stay allowed. The gate can't tell a worktree's rightful session from a squatter
    (both share the cwd), so it blocks the move for both; the rightful owner's escape hatch is a **plain
    terminal** (never gated) or a fresh worktree for the other branch (git then refuses the second checkout,
-   which is the protection you wanted). This closes the gap the old rule left open — that a worktree "may
-   switch its own branch freely."
+   which is the protection you wanted — **unless a flag switches that guard off**, see below). This closes
+   the gap the old rule left open — that a worktree "may switch its own branch freely."
+
+   > **"git already refuses this" is a claim about a CONFIGURATION, not about git** (BACKLOG #1039). A guard
+   > you do not own can be switched off by its own caller, so every deferral to git's already-checked-out
+   > guard has to name what disables it. Measured against a branch live in another worktree:
+   >
+   > | command | result |
+   > | --- | --- |
+   > | `checkout`/`switch <b>` | `fatal: already used by worktree at ...` |
+   > | `checkout`/`switch --force <b>`, `switch --discard-changes <b>` | `fatal` — do NOT bypass |
+   > | `switch --no-ignore-other-worktrees <b>` | `fatal` — correctly does NOT bypass |
+   > | `checkout`/`switch --ignore-other-worktrees <b>` | **switches** |
+   > | `checkout`/`switch --detach <b>`, and `-d <b>` | **switches** |
+   > | `git worktree add --force <path> <b>` | **creates the second checkout** |
+   >
+   > `--detach` bypasses by never taking the branch lock, yet it still swaps the other session's files to
+   > that commit, which is the harm. `-d` is a live short form on **both** verbs. The `worktree add --force`
+   > row was the one this item was filed to measure, and it does override the guard.
+   >
+   > This is why rule 3b defers to git's guard only when there is **no flag at all** — an allowlist, not a
+   > denylist. A denylist was written twice here and was wrong twice.
 
 **Everything else is allowed.** Reads are never gated — asking a question or planning in the primary stays
 frictionless. Writes into any worktree, the scratchpad, or any other repo are allowed **from a session
