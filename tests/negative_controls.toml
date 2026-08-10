@@ -375,7 +375,8 @@ number in this repo rather than an item. A gate that failed all four would satis
 block every pull request in the repository.
 """
 green = [
-  "tests/test_merge_gate_controls.py::test_the_backlog_hygiene_gate_leaves_the_benign_shapes_alone"
+  "tests/test_merge_gate_controls.py::test_the_backlog_hygiene_gate_leaves_the_benign_shapes_alone",
+  "tests/test_merge_gate_controls.py::test_the_bash_namespace_probe_rejects_an_interpreter_that_cannot_see_the_fixture",
 ]
 observed = """
 RUN AGAINST THE PRE-FIX GATE, which is what makes this evidence rather than a claim. The identical
@@ -383,4 +384,13 @@ fixture goes RED (exit 1) through the shipped three-dot diff and GREEN (exit 0) 
 reverted to two-dot. That reproduces the recorded defect exactly: the two-dot form reports main-side
 changes as reverse deltas, so any main-side edit to docs/BACKLOG.md credited every PR with an older
 base, and the gate went green while enforcing nothing -- on precisely the population it polices.
+
+AND THE CONTROL ITSELF WAS CAUGHT DEPENDING ON ITS AMBIENT ENVIRONMENT, 2026-08-10, before it shipped.
+Its first version resolved bash from PATH and passed an absolute Windows path; under a Git Bash parent
+it passed, and from PowerShell -- where PATH resolves `bash` to the WSL launcher, a different
+filesystem namespace -- all six hygiene assertions failed with exit 127. bash is now derived from
+`git`, made to read a file this process wrote before any verdict is believed, and handed a RELATIVE
+script path; 126/127 are a hard failure rather than a gate verdict. Re-measured green under a
+deliberately hostile ambient (PYTHONIOENCODING=cp1252, PYTHONUTF8=0, LC_ALL=tr_TR.UTF-8, a global
+core.autocrlf, and PATH ordered so the WSL bash comes first).
 """

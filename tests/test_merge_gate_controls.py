@@ -276,16 +276,64 @@ def _hygiene_script() -> str:
     return script
 
 
-def _require_bash() -> str:
-    bash = shutil.which("bash")
-    if bash is None:  # pragma: no cover - every CI leg has bash
-        pytest.fail(
-            "bash is required to run backlog-hygiene.yml's own script. This is a FAILURE and not a "
-            "skip on purpose: ci.yml sets `defaults.run.shell: bash` on every OS, so a leg without "
-            "bash could not run the gate this control exists to exercise, and a skip there would be a "
-            "green that proves nothing."
-        )
-    return bash
+def _bash_candidates() -> list[Path]:
+    """Every plausible bash, GIT-DERIVED FIRST.
+
+    ``shutil.which("bash")`` alone is a fact about PATH, and on Windows PATH order decides WHICH
+    OPERATING SYSTEM answers: ``C:\\Windows\\System32\\bash.exe`` is the WSL launcher, whose filesystem
+    namespace is not the one this process just wrote a fixture into. Git for Windows always ships bash
+    beside git, so git -- which every test here already requires -- is the deterministic anchor.
+    """
+    found: list[Path] = []
+    git = shutil.which("git")
+    if git:
+        # `<root>/cmd/git.exe`, `<root>/bin/git.exe` and `<root>/mingw64/bin/git.exe` are all shipped
+        # layouts, so walk up and try both bash homes from each level.
+        for parent in Path(git).resolve().parents:
+            for rel in ("bin/bash.exe", "usr/bin/bash.exe", "bin/bash"):
+                found.append(parent / rel)
+    on_path = shutil.which("bash")
+    if on_path:
+        found.append(Path(on_path))
+    return found
+
+
+def _bash_sees(bash: Path, tmp_path: Path) -> bool:
+    """LIVE POSITIVE CONTROL for the namespace, not a guess from the path string.
+
+    Rejecting ``system32`` by name would be a pattern match on a spelling. This writes a token into
+    the directory the fixture will live in and requires the candidate to read it back -- if it cannot,
+    it is looking at a different filesystem and every verdict it returns would be about nothing.
+    """
+    probe = tmp_path / "mf_bash_probe.txt"
+    probe.write_text("MFPROBE-OK\n", encoding="utf-8")
+    try:
+        out = _run([str(bash), "-c", "cat mf_bash_probe.txt"], tmp_path, _child_env())
+    except OSError:
+        return False
+    return out.returncode == 0 and b"MFPROBE-OK" in out.stdout
+
+
+def _require_bash(tmp_path: Path) -> str:
+    """A bash that can see this process's files, or a loud failure -- never a skip.
+
+    ci.yml sets ``defaults.run.shell: bash`` on every OS, so a leg without a usable bash could not run
+    the gate this control exercises, and a skip there would be a green that proves nothing.
+    """
+    tried: list[str] = []
+    for candidate in _bash_candidates():
+        if not candidate.is_file():
+            continue
+        tried.append(str(candidate))
+        if _bash_sees(candidate, tmp_path):
+            print(f"[#1000] bash resolved to {candidate} (namespace probe passed)")
+            return str(candidate)
+    pytest.fail(
+        "no bash on this machine can read a file this process just wrote. Tried: "
+        f"{tried or '(none found)'}. On Windows, `bash` on PATH is often "
+        "C:\\Windows\\System32\\bash.exe -- the WSL launcher, which runs in a different filesystem "
+        "namespace, and a control that ran there would be measuring nothing."
+    )
 
 
 def _fixture_repo(tmp_path: Path, env: dict[str, str]) -> tuple[Path, str, str, str]:
@@ -320,32 +368,92 @@ def _fixture_repo(tmp_path: Path, env: dict[str, str]) -> tuple[Path, str, str, 
 
 
 def _run_hygiene(
-    script: str, repo: Path, env: dict[str, str], *, title: str, body: str, base: str, head: str
+    bash: str,
+    script: str,
+    repo: Path,
+    env: dict[str, str],
+    *,
+    title: str,
+    body: str,
+    base: str,
+    head: str,
 ) -> tuple[int, str]:
-    path = repo / "gate.sh"
-    path.write_text(script, encoding="utf-8", newline="\n")
+    """Run the workflow's own script, and VALIDATE THE SHAPE OF THE RESULT before returning it.
+
+    The script path is passed RELATIVE to ``cwd``. An absolute Windows path is not portable across
+    bash builds -- backslashes are escape characters and a drive letter means nothing outside the
+    Windows namespace -- and the mangling presents as "no such file", i.e. as exit 127, which a caller
+    comparing `code != 0` would happily read as "the gate refused this PR".
+
+    So 126/127 are a hard failure here rather than a verdict. That is the generalisable half of the
+    probe defect recorded in BACKLOG #1000: a probe must validate its own output rather than treating
+    a broken invocation as an answer.
+    """
+    (repo / "gate.sh").write_text(script, encoding="utf-8", newline="\n")
     proc = _run(
-        [_require_bash(), str(path)],
+        [bash, "gate.sh"],
         repo,
         {**env, "PR_TITLE": title, "PR_BODY": body, "BASE_SHA": base, "HEAD_SHA": head},
     )
-    return proc.returncode, _text(proc)
+    out = _text(proc)
+    assert proc.returncode not in (126, 127), (
+        f"bash could not execute the gate script (exit {proc.returncode}): {out.strip()[:300]}. That "
+        "is not a gate verdict -- it is a broken invocation, and reading it as one would make every "
+        "assertion here vacuous."
+    )
+    # Printed ASCII-safe: the gate's own error text carries a status glyph, and a Windows console
+    # under cp1252 would turn printing it into a UnicodeEncodeError -- an assertion about the gate
+    # lost to a property of the terminal.
+    return proc.returncode, out
 
 
 @pytest.fixture
-def hygiene(tmp_path: Path) -> tuple[str, Path, dict[str, str], str, str]:
+def hygiene(tmp_path: Path) -> tuple[str, str, Path, dict[str, str], str, str]:
     env = _child_env(
         HOME=str(tmp_path),
         GIT_CONFIG_GLOBAL=str(tmp_path / "gitconfig"),
         GIT_CONFIG_SYSTEM=str(tmp_path / "gitconfig"),
     )
     (tmp_path / "gitconfig").write_text("", encoding="utf-8")
+    bash = _require_bash(tmp_path)
     repo, base_c, head_b, _base_a = _fixture_repo(tmp_path, env)
-    return _hygiene_script(), repo, env, base_c, head_b
+    return bash, _hygiene_script(), repo, env, base_c, head_b
+
+
+def _ascii(text: str) -> str:
+    """Child output, safe to print under any console code page."""
+    return text.encode("ascii", "backslashreplace").decode("ascii")
+
+
+def test_the_bash_namespace_probe_rejects_an_interpreter_that_cannot_see_the_fixture(
+    tmp_path: Path,
+) -> None:
+    """NEGATIVE CONTROL OF THE RESOLVER, and it is here because this file already shipped the bug once.
+
+    MEASURED 2026-08-10. The first version resolved bash with ``shutil.which("bash")`` and passed it an
+    ABSOLUTE Windows path. Under a Git Bash parent it passed; run from PowerShell, where PATH resolves
+    ``bash`` to ``C:\\Windows\\System32\\bash.exe`` -- the WSL launcher, a different filesystem
+    namespace -- every hygiene control failed with exit 127 and the backslashes eaten. So the control's
+    verdict was a fact about PATH ORDER, which is precisely the ambient-environment green the wave-2
+    incident warned about, one variable over.
+
+    Two things fixed it and both are asserted here rather than described: the candidate is derived from
+    ``git`` (which ships bash beside it) and then made to READ A FILE this process wrote, and the
+    script is invoked by a RELATIVE path so no namespace conversion is involved at all.
+
+    A candidate that cannot read the token must be rejected. ``sys.executable`` stands in for one: it
+    is a real, runnable program that is not a shell, so the probe must refuse it while accepting the
+    resolved bash in the same call.
+    """
+    assert not _bash_sees(Path(sys.executable), tmp_path), (
+        "the namespace probe accepted a non-shell interpreter, so it cannot reject a bash that is "
+        "looking at the wrong filesystem either"
+    )
+    assert _bash_sees(Path(_require_bash(tmp_path)), tmp_path)
 
 
 def test_the_backlog_hygiene_gate_fails_a_code_pr_that_leaves_the_ledger_alone(
-    hygiene: tuple[str, Path, dict[str, str], str, str],
+    hygiene: tuple[str, str, Path, dict[str, str], str, str],
 ) -> None:
     """PLANTED: a PR that claims `BACKLOG #42`, changes engine code, and never touches the ledger --
     while main has separately moved docs/BACKLOG.md since the branch point.
@@ -355,17 +463,24 @@ def test_the_backlog_hygiene_gate_fails_a_code_pr_that_leaves_the_ledger_alone(
     main-side edit to docs/BACKLOG.md credited every PR with an older base. It went green while
     enforcing nothing, on exactly the population it exists to police.
     """
-    script, repo, env, base, head = hygiene
+    bash, script, repo, env, base, head = hygiene
     code, out = _run_hygiene(
-        script, repo, env, title="feat: something (BACKLOG #42)", body="", base=base, head=head
+        bash,
+        script,
+        repo,
+        env,
+        title="feat: something (BACKLOG #42)",
+        body="",
+        base=base,
+        head=head,
     )
-    print(f"[#1000] shipped three-dot gate exit={code}\n{out}")
-    assert code == 1, f"the gate passed a PR it exists to fail. exit={code}\n{out}"
-    assert "does not\ntouch docs/BACKLOG.md" in out or "docs/BACKLOG.md" in out
+    print(f"[#1000] shipped three-dot gate exit={code}\n{_ascii(out)}")
+    assert code == 1, f"the gate passed a PR it exists to fail. exit={code}\n{_ascii(out)}"
+    assert "docs/BACKLOG.md" in out
 
 
 def test_the_two_dot_form_of_the_gate_passes_the_same_planted_pull_request(
-    hygiene: tuple[str, Path, dict[str, str], str, str],
+    hygiene: tuple[str, str, Path, dict[str, str], str, str],
 ) -> None:
     """RUN AGAINST THE PRE-FIX GATE, which is what makes the control above evidence rather than a
     claim. The identical fixture, with only the diff form reverted, must go GREEN.
@@ -373,18 +488,25 @@ def test_the_two_dot_form_of_the_gate_passes_the_same_planted_pull_request(
     If both forms failed, the fixture would be proving something else -- and the recorded defect would
     be unreproduced.
     """
-    script, repo, env, base, head = hygiene
+    bash, script, repo, env, base, head = hygiene
     pre_fix = script.replace('"$BASE_SHA...$HEAD_SHA"', '"$BASE_SHA" "$HEAD_SHA"')
     assert pre_fix != script, (
         "the two-dot substitution matched nothing, so this test compares the shipped gate with itself"
     )
     code, out = _run_hygiene(
-        pre_fix, repo, env, title="feat: something (BACKLOG #42)", body="", base=base, head=head
+        bash,
+        pre_fix,
+        repo,
+        env,
+        title="feat: something (BACKLOG #42)",
+        body="",
+        base=base,
+        head=head,
     )
-    print(f"[#1000] pre-fix two-dot gate exit={code}\n{out}")
+    print(f"[#1000] pre-fix two-dot gate exit={code}\n{_ascii(out)}")
     assert code == 0, (
         "the two-dot form no longer reproduces the recorded defect, so the three-dot assertion above "
-        f"is not measuring what it says. exit={code}\n{out}"
+        f"is not measuring what it says. exit={code}\n{_ascii(out)}"
     )
 
 
@@ -403,7 +525,7 @@ def test_the_two_dot_form_of_the_gate_passes_the_same_planted_pull_request(
     ],
 )
 def test_the_backlog_hygiene_gate_leaves_the_benign_shapes_alone(
-    hygiene: tuple[str, Path, dict[str, str], str, str],
+    hygiene: tuple[str, str, Path, dict[str, str], str, str],
     case: str,
     title: str,
     body: str,
@@ -416,7 +538,7 @@ def test_the_backlog_hygiene_gate_leaves_the_benign_shapes_alone(
     a claim honoured in the ARCHIVE (an item retired between the claim and the PR), and the `#42`
     spelling that is a PR number in this repo rather than an item.
     """
-    script, repo, env, base, head = hygiene
+    bash, script, repo, env, base, head = hygiene
     if touch:
         target = repo / touch
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -424,9 +546,9 @@ def test_the_backlog_hygiene_gate_leaves_the_benign_shapes_alone(
         _run(["git", "add", "-A"], repo, env)
         _run(["git", "commit", "-m", f"branch-side {touch}"], repo, env)
         head = _text(_run(["git", "rev-parse", "HEAD"], repo, env)).strip()
-    code, out = _run_hygiene(script, repo, env, title=title, body=body, base=base, head=head)
+    code, out = _run_hygiene(bash, script, repo, env, title=title, body=body, base=base, head=head)
     print(f"[#1000] benign case {case!r} exit={code}")
-    assert code == 0, f"the gate failed a benign PR shape ({case}). exit={code}\n{out}"
+    assert code == 0, f"the gate failed a benign PR shape ({case}). exit={code}\n{_ascii(out)}"
 
 
 # ===================================================================================================
