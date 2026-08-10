@@ -662,6 +662,43 @@ def test_the_backstop_strips_a_line_whose_quoting_is_unbalanced(tmp_path: Path) 
     assert "'" not in got and "$" not in got, got
 
 
+def _rule_1b_fix_strings() -> list[tuple[str, str]]:
+    """(registry name, remedy command) for every entry in rule 1b's table, read from the gate SOURCE.
+
+    Read rather than restated: a list copied into a test is a second definition that drifts, and the
+    thing under test is precisely whether what the source says is what the reader receives.
+    """
+    src = GATE.read_text(encoding="utf-8")
+    block = src[src.index("$armed = $null") :]
+    block = block[: block.index("# THE BACKSTOP")]
+    pairs = re.findall(
+        r"Name\s*=\s*\"(?P<name>[^\"]+)\"[\s\S]*?Fix\s*=\s*'(?P<fix>(?:[^']|'')*)'", block
+    )
+    return [(n, f.replace("''", "'")) for n, f in pairs]
+
+
+@pytest.mark.parametrize(("name", "fix"), _rule_1b_fix_strings(), ids=lambda v: str(v)[:40])
+def test_rule_1b_prints_its_remedy_exactly_as_the_source_writes_it(
+    repo: SimpleNamespace, name: str, fix: str
+) -> None:
+    """THE BACKSTOP MUST NEVER REWRITE THE GATE'S OWN LITERAL TEXT, and it did.
+
+    `-Kind <adr|backlog>` is a placeholder whose '|' is a PIPE on a command-form line, so the sweep
+    dropped it and the remedy became `-Kind <adrbacklog>`. Nothing caught that: every existing test
+    asserted on the DECISION or on a substring that did not span the placeholder.
+
+    So the assertion is byte equality against the source string, for every entry, which turns any
+    future collision between a literal remedy and the sweep into a failure at the site that caused it.
+    """
+    target = repo.primary / ".git" / "mefor-coord" / name.rstrip("/") / "x.json"
+    reason = assert_denied(
+        run_gate(_payload(repo.primary, "Write", file_path=str(target)), repo.repos)
+    )
+    assert fix in reason, (
+        f"rule 1b's remedy for '{name}' was altered on the way out.\nsource:  {fix}\nemitted:\n{reason}"
+    )
+
+
 def test_every_deny_the_gate_can_emit_goes_through_the_backstop(
     repo: SimpleNamespace, plain_repo: SimpleNamespace
 ) -> None:

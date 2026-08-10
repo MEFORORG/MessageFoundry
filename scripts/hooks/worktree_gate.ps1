@@ -1401,7 +1401,13 @@ foreach ($r in $roots) {
     foreach ($entry in @(
         @{ Name = "alloc"
            What = "the ledger gate's ADR/BACKLOG allocation registry (and its one-way floor ratchets)"
-           Fix  = 'pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind <adr|backlog> -Title "<title>"' }
+           # `<adr-or-backlog>`, NOT `<adr|backlog>`. A '|' on a command-form line is a PIPE in both
+           # shells, so Protect-CommandLines drops it -- correctly, because it cannot tell an author's
+           # placeholder from an injected separator. That turned this remedy into `-Kind <adrbacklog>`:
+           # measured, and caught by inventory rather than by any test, which is why every Fix string in
+           # this table is now pinned against what is actually EMITTED. A placeholder can always be
+           # spelled without a metacharacter; a backstop with an exception carved into it is not one.
+           Fix  = 'pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind <adr-or-backlog> -Title "<title>"' }
         @{ Name = "claims"
            What = "the claim gate's registry of who is building which BACKLOG item"
            Fix  = 'pwsh -NoProfile -File scripts\coord\claim.ps1 -Take <item> -Note "<what>"' }
