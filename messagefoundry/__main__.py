@@ -2794,10 +2794,15 @@ def _serve(args: argparse.Namespace) -> int:
             from messagefoundry.api.tls_client_cert import client_cert_http_protocol_class
 
             run_kwargs["http"] = client_cert_http_protocol_class()
-    from messagefoundry.last_resort import install_excepthook
+    from messagefoundry.last_resort import install_excepthook, install_thread_excepthook
     from messagefoundry.redaction import safe_exc
 
     install_excepthook()  # last-resort main-thread hook: an uncaught exception logs PHI-redacted (16.5.4)
+    # The sibling hook for every OTHER thread (BACKLOG #1055). sys.excepthook does not cover them, and
+    # the engine runs non-asyncio threads whose except clauses are deliberately narrow — the sandbox
+    # session's raw stdout reader catches only OSError — so anything else would otherwise reach the
+    # stdlib default and print an unredacted traceback to the NSSM-captured stderr.
+    install_thread_excepthook()
     try:
         uvicorn.run(app, host=settings.api.host, port=settings.api.port, **run_kwargs)
     except Exception as exc:  # last-resort: log an abnormal server exit PHI-redacted, then re-raise
