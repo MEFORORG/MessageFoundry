@@ -375,6 +375,59 @@ function Test-Governed([string]$Candidate) {
     return $null
 }
 
+# Rule 3c's target resolution, in ONE place (BACKLOG #1061). Every caller that has to answer "which
+# repository would this configure?" goes through here, so the two steps can never drift apart again:
+#
+#   1. ROOT THE TOKEN AGAINST THE SESSION cwd. A relative target must resolve against where the SESSION
+#      stands, not where this hook process happens to have been started. Get-FullPathRaw and NOT
+#      Get-ComparablePath: the rooted path is handed to `git -C`, and a lowercased path passes on Windows
+#      while silently missing the real directory on a case-sensitive filesystem.
+#   2. ASK GIT WHERE THE REPOSITORY IS, and ask for the answer ALREADY ABSOLUTE.
+#      `--path-format=absolute --git-common-dir` (git 2.31+) does BOTH jobs in one call, and the second
+#      one is not cosmetic: git resolves path ALIASES itself. A junction to the primary was measured
+#      ALLOW because `--git-common-dir` answers the bare string ".git" from a main working tree, and
+#      [IO.Path]::GetFullPath does not traverse a reparse point -- so the composed path kept the junction
+#      spelling and matched no governed root. Asked this way git answers with the real directory and the
+#      junction denies. Measured on git 2.53: leaf junction, drive-letter case, trailing slash and `/./`
+#      all normalise to one canonical path. `\\localhost\C$` does NOT (BACKLOG #1071, still open here).
+#
+# THE THREE OUTCOMES ARE DISTINCT AND ARE ANSWERED DIFFERENTLY -- collapsing any two is how this rule
+# shipped open:
+#   Unresolvable = $true   the token could not be made absolute at all. Nothing has been asked of git, so
+#                          nothing has said this is or is not governed. The caller DENIES.
+#   CommonCmp = ""         git ANSWERED and the answer was "not a repository". The caller ALLOWS.
+#   Root                   the governing allowlist entry, or $null for an ungoverned repository.
+function Resolve-ConfigTarget([string]$TargetRaw, [string]$CwdRaw) {
+    $rooted = Get-FullPathRaw $TargetRaw $CwdRaw
+    if (-not $rooted) {
+        return [pscustomobject]@{ Raw = $TargetRaw; Rooted = ""; CommonCmp = ""; Root = $null; Unresolvable = $true }
+    }
+
+    $common = "$(& git -C $rooted rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $common) {
+        # git before 2.31 has no --path-format, and an unknown option is exit 129 -- indistinguishable
+        # here from "not a repository", which is why the plain form is retried rather than assumed. It
+        # answers RELATIVE TO THE TARGET (".git" from a main working tree), so it is rooted against the
+        # target and NOT against the session cwd: ".git" resolved against the session would name a real
+        # path that is not this repository's common dir, and the rule would read as fixed and stay open.
+        $common = "$(& git -C $rooted rev-parse --git-common-dir 2>$null)".Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $common) {
+            return [pscustomobject]@{ Raw = $TargetRaw; Rooted = $rooted; CommonCmp = ""; Root = $null; Unresolvable = $false }
+        }
+        $common = Get-FullPathRaw $common $rooted
+        if (-not $common) {
+            return [pscustomobject]@{ Raw = $TargetRaw; Rooted = $rooted; CommonCmp = ""; Root = $null; Unresolvable = $false }
+        }
+    }
+
+    $cmp = Get-ComparablePath $common
+    $root = $null
+    foreach ($r in $roots) {
+        if ($cmp -eq $r.Compare -or $cmp.StartsWith("$($r.Compare)/")) { $root = $r; break }
+    }
+    [pscustomobject]@{ Raw = $TargetRaw; Rooted = $rooted; CommonCmp = $cmp; Root = $root; Unresolvable = $false }
+}
+
 # ---------------------------------------------------------------------------------------------------
 # Rule 3b -- hijacking a LINKED WORKTREE by switching it onto an ALREADY-EXISTING branch. Rule 3 below
 # protects only the shared PRIMARY; this protects every OTHER governed worktree from the one move that
@@ -599,22 +652,15 @@ if ($tool -in @("Bash", "PowerShell")) {
         # naming a LINKED worktree made git exit 128 and fall through to ALLOW as well. Measured with the
         # two cwds deliberately diverged, `git -C .` and a relative sibling-worktree path both flipped
         # DENY -> ALLOW; the pytest harness does not set the subprocess cwd, so that divergence is the
-        # condition under test, not a hypothetical. Get-FullPathRaw and NOT Get-ComparablePath, because a
-        # Get-ComparablePath value is LOWERCASED and this file warns twice (the rule-3b resolver, and
-        # inside rule 3d) that a lowercased path handed to `git -C` passes on Windows and silently misses
-        # the real directory on a case-sensitive filesystem.
+        # condition under test, not a hypothetical.
         #
-        # THE TWO FAILURE CONDITIONS ARE DIFFERENT AND ARE ANSWERED DIFFERENTLY:
-        #   * THE TARGET CANNOT BE RESOLVED AT ALL -- DENY. Nothing has been asked of git yet, so there is
-        #     no evidence either way about which repository this writes to; "unresolvable means not
-        #     governed" is exactly how this defect shipped, and reinstating it here would leave the fix
-        #     one malformed cwd away from the hole it closes. It takes a payload whose cwd is itself
-        #     non-absolute, so it costs an ordinary session nothing.
-        #   * GIT FAILS ON A RESOLVED TARGET -- ALLOW, unchanged. That is git ANSWERING: the path is not a
-        #     repository. test_a_non_repo_cwd_fails_open pins it, and the reason it pins it is that a
-        #     guardrail which wedges on an unexpected shape gets uninstalled.
-        $whereRaw = Get-FullPathRaw $where[0] $cwdRaw
-        if (-not $whereRaw) {
+        # BOTH STEPS NOW LIVE IN Resolve-ConfigTarget, which also states the three outcomes and why they
+        # are answered differently. The two that matter here: a target that CANNOT BE RESOLVED denies,
+        # because nothing has been asked of git and "unresolvable means not governed" is exactly how this
+        # defect shipped; git ANSWERING "not a repository" on a resolved target allows, unchanged, and
+        # test_a_non_repo_cwd_fails_open pins that because a guardrail which wedges gets uninstalled.
+        $t = Resolve-ConfigTarget $where[0] $cwdRaw
+        if ($t.Unresolvable) {
             Write-Deny -Rule "3c" -Detail "git config $badKey (unresolvable target)" -Reason @"
 BLOCKED: this sets '$badKey', and the gate cannot tell WHICH repository it would set it in.
 
@@ -634,13 +680,7 @@ What to do instead:
 "@
         }
 
-        $common = "$(& git -C $whereRaw rev-parse --git-common-dir 2>$null)".Trim()
-        if ($LASTEXITCODE -ne 0 -or -not $common) { continue }
-        $commonCmp = Get-ComparablePath $common $whereRaw
-        $govCfg = $null
-        foreach ($r in $roots) {
-            if ($commonCmp -eq $r.Compare -or $commonCmp.StartsWith("$($r.Compare)/")) { $govCfg = $r; break }
-        }
+        $govCfg = $t.Root
         if (-not $govCfg) { continue }
 
         Write-Deny -Rule "3c" -Detail "git config $badKey" -Reason @"

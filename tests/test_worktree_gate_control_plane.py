@@ -18,18 +18,36 @@ also blocks ordinary work gets routed around, and then it guards nothing.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from tests.test_worktree_gate import assert_denied, edit, run_gate  # reuse the subprocess harness
+from tests.test_worktree_gate import (  # reuse the subprocess harness
+    GATE,
+    assert_denied,
+    edit,
+    run_gate,
+)
 
 pytestmark = pytest.mark.skipif(
     shutil.which("pwsh") is None, reason="pwsh (PowerShell 7) not on PATH"
+)
+
+# The script under test must be THIS checkout's. ``GATE`` is imported from a sibling module, and pytest
+# resolves ``tests.`` against whatever is first on ``sys.path`` -- which, when it is launched from one
+# worktree with a test path in another, is the OTHER worktree's package. Measured during this file's own
+# red-first A/B: every case then drove an untouched copy of the gate and reported a failure identical in
+# shape to the defect being fixed. A manufactured red is worse than no measurement, because it is
+# indistinguishable from a real one. Assert the instrument before trusting anything it says.
+assert GATE.resolve().parents[2] == Path(__file__).resolve().parents[1], (
+    f"the gate under test ({GATE}) does not belong to this checkout "
+    f"({Path(__file__).resolve().parents[1]}) -- run pytest FROM the worktree you are measuring"
 )
 
 
@@ -41,6 +59,44 @@ def shell(command: str, cwd: Path | str, tool: str = "Bash") -> dict[str, Any]:
         "tool_name": tool,
         "tool_input": {"command": command},
     }
+
+
+def run_gate_in(
+    payload: dict[str, Any], repos_file: Path, hook_cwd: Path | str
+) -> dict[str, Any] | None:
+    """``run_gate``, with the HOOK PROCESS's own cwd pinned explicitly.
+
+    ``run_gate`` passes no ``cwd=``, so the hook inherits pytest's -- an ambient value nobody states and
+    which is not what production supplies. That is not a hypothetical nuisance: rules 3b and 3d resolve a
+    relative token against the process cwd, so the same payload measures ALLOW or DENY depending on where
+    the runner was launched, and one earlier finding in this cluster was retracted for exactly that.
+
+    A green that depends on an unstated ambient value is not a green. Every case below that could be
+    sensitive to it therefore says where the hook stands, and
+    :func:`test_rule_3c_is_invariant_to_where_the_HOOK_PROCESS_stands` proves the invariance rather than
+    assuming it, by re-running a deny and an allow under a deliberately hostile value.
+    """
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(GATE),
+            "-ReposFile",
+            str(repos_file),
+        ],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=str(hook_cwd),
+    )
+    assert proc.returncode == 0, f"gate exited {proc.returncode}: {proc.stderr}"
+    if not proc.stdout.strip():
+        return None
+    decision: dict[str, Any] = json.loads(proc.stdout)
+    return decision
 
 
 @pytest.fixture
@@ -335,6 +391,116 @@ def test_a_target_that_cannot_be_RESOLVED_fails_closed(repo: SimpleNamespace) ->
         )
     )
     assert "could not be resolved" in reason
+
+
+# ------------------------------------- rule 3c: a target spelled through a JUNCTION (BACKLOG #1061)
+#
+# The filed relative-path spelling was closed by rooting the token against the session cwd. That fix
+# cannot see a path ALIAS: `[IO.Path]::GetFullPath` does not traverse a reparse point, so a junction
+# naming the primary rooted to a real-looking path that matched no governed root. The gate now asks git
+# for the common dir ALREADY ABSOLUTE (`--path-format=absolute`), and git de-aliases it itself.
+#
+# Windows-only by construction -- a junction is a Windows object. Skipped elsewhere rather than faked,
+# because a fake would test the fake.
+
+
+@pytest.fixture
+def junctions(repo: SimpleNamespace, tmp_path: Path) -> SimpleNamespace:
+    """A junction onto the GOVERNED primary and one onto an UNGOVERNED repo -- the asymmetry pair."""
+    if sys.platform != "win32":
+        pytest.skip("junctions are a Windows object")
+    other = tmp_path / "Unrelated"
+    subprocess.run(["git", "init", "-b", "main", str(other)], check=True, capture_output=True)
+    gov = tmp_path / "JunctionToPrimary"
+    ung = tmp_path / "JunctionToUnrelated"
+    for link, target in ((gov, repo.primary), (ung, other)):
+        p = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True
+        )
+        if p.returncode != 0 or not link.is_dir():
+            pytest.skip(f"could not create a junction: {p.stdout.strip()} {p.stderr.strip()}")
+        # Non-vacuity, and it earned its place: a junction that does not resolve makes the gate ALLOW,
+        # which is the SAME observation as the defect. Without this, a broken fixture and an unfixed gate
+        # are indistinguishable, and one of them is a false report. Assert the premise the case rests on
+        # -- git itself sees the real repository through the link -- before any verdict is read from it.
+        seen = subprocess.run(
+            ["git", "-C", str(link), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+        )
+        assert seen.returncode == 0, f"git cannot read through the junction {link}: {seen.stderr}"
+        assert Path(seen.stdout.strip()).parent.resolve() == target.resolve(), (
+            f"the junction {link} does not resolve to {target}: git says {seen.stdout.strip()}"
+        )
+    return SimpleNamespace(governed=gov, ungoverned=ung)
+
+
+def test_a_JUNCTION_spelled_target_is_denied(
+    repo: SimpleNamespace, junctions: SimpleNamespace
+) -> None:
+    """The defect. Measured ALLOW on the pre-fix gate: `rev-parse --git-common-dir` answers the bare
+    string `.git` from a main working tree, GetFullPath composed that onto the JUNCTION's path rather
+    than the real one, and the result matched no governed root. Hook process stands in the linked
+    worktree, which is where the payload says the session is."""
+    result = run_gate_in(
+        shell(f'git -C "{junctions.governed}" config core.hooksPath /dev/null', cwd=repo.wt),
+        repo.repos,
+        hook_cwd=repo.wt,
+    )
+    seen = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(junctions.governed),
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result is not None, (
+        "expected a DENY, got allow. Scanned:\n"
+        f"  junction     : {junctions.governed}\n"
+        f"  git says     : {seen.stdout.strip()!r} (rc={seen.returncode})\n"
+        f"  allowlist    : {repo.repos.read_text(encoding='utf-8')!r}\n"
+        f"  payload cwd  : {repo.wt}"
+    )
+    reason = assert_denied(result)
+    assert "SHARED git configuration" in reason
+
+
+def test_a_JUNCTION_to_an_UNGOVERNED_repo_is_still_allowed(
+    repo: SimpleNamespace, junctions: SimpleNamespace
+) -> None:
+    """The other half, and the one that says this is a correction rather than "de-alias everything and
+    deny". Asking git to resolve the alias must not make every junction governed."""
+    assert (
+        run_gate_in(
+            shell(f'git -C "{junctions.ungoverned}" config core.hooksPath /dev/null', cwd=repo.wt),
+            repo.repos,
+            hook_cwd=repo.wt,
+        )
+        is None
+    )
+
+
+def test_rule_3c_is_invariant_to_where_the_HOOK_PROCESS_stands(
+    repo: SimpleNamespace, tmp_path: Path
+) -> None:
+    """Non-vacuity for every cwd claim in this file: prove the invariance, do not assume it.
+
+    Rule 3c roots its target against the PAYLOAD cwd before it shells out, so its verdict must not move
+    when the hook process is started somewhere else. Both directions are re-run under a deliberately
+    HOSTILE ambient value -- a directory that is not a repository and is not related to the rig -- so a
+    green here cannot have been bought by the runner happening to stand in a helpful place."""
+    hostile = tmp_path / "HostileAmbient"
+    hostile.mkdir()
+    deny = shell("git -C ../Primary config core.hooksPath /dev/null", cwd=repo.wt)
+    allow = shell("git -C ../Primary config user.email me@example.com", cwd=repo.wt)
+    for hook_cwd in (repo.wt, repo.primary, hostile):
+        assert_denied(run_gate_in(deny, repo.repos, hook_cwd=hook_cwd))
+        assert run_gate_in(allow, repo.repos, hook_cwd=hook_cwd) is None
 
 
 # --------------------------------------------------------------- rule 3d: destroying another worktree
