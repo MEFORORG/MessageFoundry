@@ -4057,11 +4057,9 @@ def _admin_create(args: argparse.Namespace) -> int:
     if rc != 0:
         print(message, file=sys.stderr)
         return rc
-    # Name the store that was actually written: an --db/[store].path typo otherwise shows up only as a
-    # login failure against the engine's real database, long after the cause.
-    store = settings.store
     # Name the store that was actually written. A --db / [store].path / MEFOR_STORE_* typo otherwise
     # surfaces only as a login failure against the engine's REAL database, long after the cause.
+    store = settings.store
     where = (
         repr(store.path)
         if store.backend is StoreBackend.SQLITE
