@@ -40,6 +40,7 @@ from tests._workflow_contexts import (
     WORKFLOWS,
     context_of,
     jobs_of,
+    load_workflow,
     required_contexts,
     resolve,
 )
@@ -337,6 +338,89 @@ def test_required_jobs_declare_no_skippable_job_level_if() -> None:
         "does with `needs: changes`, keeping the context present and green on a docs-only PR. If the "
         "expression genuinely cannot skip a pull_request run, add it to _JOB_IF_ALLOWLIST with the "
         "reason."
+    )
+
+
+# --- the header must not become a second definition of the trigger set (BACKLOG #1079) ------------
+#
+# A workflow's triggers are defined once, by its `on:` block. `security.yml`'s header carried a second
+# description of them, and the two disagreed: the header denied a push-to-main trigger that the `on:`
+# block declared ten lines beneath it. CI behaved as the `on:` block said, so nothing was broken --
+# what was damaged is the header's credibility, and the rest of that header is load-bearing (it is
+# where the continue-on-error trap is documented, the very trap the tests above enforce).
+#
+# SCOPE, STATED PLAINLY: this catches a DENIAL adjacent to a declared event name -- the shape that
+# actually occurred -- and nothing subtler. No regex can decide whether a paragraph of English
+# contradicts a YAML block, so this is a tripwire on the known shape, not a proof of consistency. The
+# durable rule is the header's own: it defines no triggers at all. _HISTORICAL_DENIAL below is a LIVE
+# positive control, kept verbatim so the detector is re-proved able to fire on every run rather than
+# being trusted to.
+_HEADER_DENIAL = re.compile(r"\bno\s+(pull_request|push|schedule|cron|workflow_dispatch)\b", re.I)
+_HISTORICAL_DENIAL = "# NO push-to-main trigger (dropped for CI cost): every push to main is an"
+
+
+def _header_block(text: str) -> str:
+    """Every line of the workflow before the `on:` key -- the header comment block.
+
+    Located by CONSTRUCT (the first line that is exactly `on:` at column 0), never by line number:
+    this header has been edited repeatedly and any anchor into it would be stale within a release.
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.rstrip() == "on:":
+            return "\n".join(lines[:i])
+    raise AssertionError(
+        "security.yml has no `on:` key at column 0 -- the header cannot be located"
+    )
+
+
+def _declared_events(name: str) -> set[str]:
+    """The event keys of a workflow's `on:` block.
+
+    YAML 1.1 resolves the bare key `on` to the BOOLEAN True, so `wf["on"]` is a KeyError and a lookup
+    that quietly returns nothing would make every assertion below vacuous. Both keys are tried, and an
+    empty result is an error rather than a pass.
+    """
+    wf = load_workflow(name)
+    block = wf.get("on", wf.get(True))
+    assert isinstance(block, dict) and block, f"{name}: could not read its `on:` block ({block!r})"
+    return {str(k) for k in block}
+
+
+def test_the_security_header_does_not_contradict_its_own_triggers() -> None:
+    """The header must not deny a trigger the `on:` block declares.
+
+    Non-vacuous three ways: the header block is located by construct and asserted substantial, the
+    event set is read from the parsed `on:` block and asserted non-empty, and the detector is fired
+    against the historical text in the same run.
+    """
+    events = _declared_events(_SECURITY)
+    assert "push" in events, (
+        "security.yml no longer declares a `push` trigger. That may be correct (a merge-queue move "
+        "would remove it), but this test's positive control assumes it -- re-derive rather than "
+        "deleting the test, or the header is free to drift again in the other direction."
+    )
+
+    header = _header_block((WORKFLOWS / _SECURITY).read_text(encoding="utf-8"))
+    assert len(header.splitlines()) > 10, (
+        f"security.yml's header block came back as {len(header.splitlines())} lines. That is a "
+        "locator failure, not a small header -- this assertion would otherwise pass over nothing."
+    )
+
+    # LIVE POSITIVE CONTROL: the detector must still fire on the text this test was written for. An
+    # absence claim below is evidence only because this line proves the instrument is not blind.
+    assert _HEADER_DENIAL.search(_HISTORICAL_DENIAL), (
+        "the header-denial detector no longer matches the historical claim it was built for, so its "
+        "silence on the current header proves nothing. Fix the pattern, not this assertion."
+    )
+
+    found = _HEADER_DENIAL.search(header)
+    assert found is None, (
+        f"security.yml's header denies the {found.group(1)!r} trigger its own `on:` block declares "
+        f"(events: {sorted(events)}). Two descriptions of the trigger set, free to disagree -- and "
+        "the header is where the continue-on-error trap is documented, so a paragraph a reader can "
+        "check and find false costs the whole block its credibility. DELETE the header claim; do not "
+        "soften it. The `on:` block is the single definition."
     )
 
 
