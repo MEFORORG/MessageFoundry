@@ -48,12 +48,19 @@ in parallel without touching each other's files.
 
 ## Remove one
 
-Run from the **main** checkout (git can't remove the worktree you're standing in):
+**Which copy you run decides which checkout it searches.** `remove.ps1` anchors on its own location,
+not on your cwd, so run the copy that lives in the checkout the worktree was created **from** — which
+is not necessarily the primary, because `new.ps1` anchors the same way and creates its worktree
+beside *itself*. Invoked by absolute path it works from any cwd outside the worktree being removed
+(git can't remove the worktree you're standing in). This page used to say "run from the main
+checkout"; that was false for every worktree created from a linked one, and `new.ps1` now prints the
+exact command with the root already filled in. (BACKLOG #1078.)
 
 ```powershell
 scripts\worktree\remove.ps1 -Name alerts            # refuses if there are uncommitted tracked changes
 scripts\worktree\remove.ps1 -Name alerts -DeleteBranch
 scripts\worktree\remove.ps1 -Name alerts -Force     # discard uncommitted tracked changes too
+pwsh -NoProfile -File <that-checkout>\scripts\worktree\remove.ps1 -Name alerts   # from any cwd
 ```
 
 The untracked `.venv` / `node_modules` are expected and removed automatically; only uncommitted

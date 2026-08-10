@@ -5,8 +5,15 @@
 .DESCRIPTION
     Removes the sibling worktree directory <repo>-<Name>. Refuses if the worktree has uncommitted
     *tracked* changes (so you don't lose work) unless -Force; the untracked .venv / node_modules are
-    expected and removed automatically. Run from the MAIN checkout (git can't remove the worktree
-    you're standing in). See docs/WORKTREES.md.
+    expected and removed automatically.
+
+    WHICH COPY YOU RUN DECIDES WHICH CHECKOUT IT SEARCHES. This anchors on $PSScriptRoot (or -RepoRoot),
+    not on your cwd, so run the copy living in the checkout the worktree was created FROM -- which is
+    not necessarily the primary, since new.ps1 anchors the same way and creates its worktree beside
+    itself. By absolute path it works from any cwd outside the worktree being removed (git can't
+    remove the worktree you're standing in). This header used to name the primary checkout
+    unconditionally, which was false for every worktree created from a linked one; new.ps1 now prints
+    the exact command with the root already filled in (BACKLOG #1078). See docs/WORKTREES.md.
 
     -Name is the DIRECTORY component only. -DeleteBranch deletes whichever branch that worktree
     actually has checked out, read from git -- not a branch named after the directory. Since new.ps1

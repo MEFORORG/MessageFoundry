@@ -177,9 +177,23 @@ function Show-NextSteps {
         Write-Host "  code --extensionDevelopmentPath=`"$WorktreePath\ide`" `"$WorktreePath\mefor.code-workspace`""
     }
     Write-Host "  # ... build/commit/push on branch '$Branch'; open a PR as usual."
-    # -Name here is the DIRECTORY, which is what remove.ps1 takes -- correct as-is even when it differs
-    # from the branch.
-    Write-Host "  # When done (run from the MAIN checkout): scripts\worktree\remove.ps1 -Name $Name"
+    # THE CLEANUP ADVICE NAMES $RepoRoot, NOT "the MAIN checkout" (BACKLOG #1078). This script anchors
+    # on $PSScriptRoot, so run from a linked worktree it creates the new tree beside ITSELF -- and
+    # remove.ps1 anchors on its own location too, so the MAIN checkout's copy would derive
+    # <main-parent>\<main-leaf>-$Name, a path that does not exist, and throw "No such worktree". The
+    # anchoring is correct (#1060); the sentence was not. Both forms below carry the root explicitly,
+    # so they work from any cwd. -Name here is the DIRECTORY, which is what remove.ps1 takes --
+    # correct even when it differs from the branch.
+    #
+    # EXTRACTION CONTRACT: a line beginning "  #   " (hash, THREE spaces) is a command meant to be run
+    # verbatim; "  # " (hash, one space) is prose. tests/test_worktree_new_cleanup_advice.py extracts
+    # the former and EXECUTES it against a synthetic repo, because advice that is only read is advice
+    # nothing checks. Keep the two shapes distinct.
+    Write-Host "  # When done, from any directory OUTSIDE the worktree, either of:"
+    Write-Host "  #   pwsh -NoProfile -File `"$RepoRoot\scripts\worktree\remove.ps1`" -Name $Name"
+    Write-Host "  #   git -C `"$RepoRoot`" worktree remove --force `"$WorktreePath`""
+    # --force because the untracked .venv makes git consider the worktree non-empty. The first form is
+    # the one to reach for: it refuses on uncommitted TRACKED changes, which the bare git call does not.
 }
 
 if ($NoInstall) {
