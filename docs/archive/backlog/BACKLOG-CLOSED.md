@@ -2,10 +2,18 @@
 
 > ## ⛔ Historical. Nothing here is open work, and nothing here is scheduled.
 >
-> These are the **closed** items from [`docs/BACKLOG.md`](../../BACKLOG.md), moved here verbatim on
-> 2026-08-03 so the published backlog is the ~92 items someone can actually act on. Every item keeps
-> the status banner it carried at the moment it closed — ✅ shipped · ⛔ declined · 🪦 retired — and
-> the banner, not this file's title, remains the authority on what happened to it.
+> These are the **closed** items from [`docs/BACKLOG.md`](../../BACKLOG.md), moved here verbatim —
+> first on 2026-08-03, and on each archival pass since — so the published backlog is only what someone
+> can actually act on. Every item keeps the status banner it carried at the moment it closed —
+> ✅ shipped · ⛔ declined · 🪦 retired — and the banner, not this file's title, remains the authority
+> on what happened to it.
+>
+> **Do not quote a count from this paragraph.** It used to read *"the ~92 items someone can actually
+> act on"*, a present-tense figure that was a **measurement taken on 2026-08-03** and drifted from the
+> day it was written; measured 2026-08-10 the live file held **241** open items. Counts here are
+> re-derived, never restated — run `parse_items` from
+> [`scripts/docs/backlog_status_check.py`](../../../scripts/docs/backlog_status_check.py) over **both**
+> files, which is the same single-source rule that section already states for reading the banners.
 >
 > **Moved, not rewritten.** Each block below is byte-identical to the one that left `BACKLOG.md`,
 > including its heading. That is deliberate and load-bearing: GitHub derives a heading's anchor slug
