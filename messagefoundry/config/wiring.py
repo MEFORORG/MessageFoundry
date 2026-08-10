@@ -873,6 +873,50 @@ def connector_secret_env_values(
     return out
 
 
+#: Settings whose value is a URL that may carry `user:password@` userinfo. `proxy` has no `_url`
+#: suffix, which is why this is a NAME set plus a suffix rule rather than a suffix rule alone.
+_URL_SETTING_SUFFIXES = ("url", "_url", "_uri", "endpoint", "_endpoint")
+
+
+def _mask_url_userinfo(value: object) -> object:
+    """Replace the PASSWORD half of a URL's userinfo with ``***``, keeping everything else readable.
+
+    BACKLOG #1207. ``url="https://user:SECRET@host/path"`` was returned verbatim by both serializers
+    while ``proxy_password`` on the SAME object masked -- the credential was safe in the typed field
+    and disclosed in the URL beside it.
+
+    The user half and the host and path are PRESERVED deliberately: an operator diagnosing a
+    connection needs to see which account and which host, and masking the whole URL would destroy the
+    view rather than protect it. Only the secret is removed.
+    """
+    if not isinstance(value, str) or "@" not in value or "//" not in value:
+        return value
+    scheme, _, rest = value.partition("//")
+    userinfo, at, hostpart = rest.rpartition("@")
+    if not at or ":" not in userinfo:
+        return value  # no userinfo, or a user with no password -- nothing secret to remove
+    user, _, _pw = userinfo.partition(":")
+    return f"{scheme}//{user}:***@{hostpart}"
+
+
+def _redact_header_value(name: str, value: object) -> object:
+    """One header's value, scrubbed. Handles the ``EnvRef`` case the headers branch used to miss.
+
+    BACKLOG #1207. The headers branch had no ``EnvRef`` arm, so an ``env()`` ref inside a headers
+    table came back as the RAW OBJECT -- not JSON-safe, and carrying its ``default`` intact. The same
+    ``env()`` on a top-level credential correctly emits ``{"env": key}`` with the default dropped, so
+    the hole was INSIDE the one container this control claims to handle.
+
+    THE DEFAULT IS DROPPED FOR EVERY HEADER, not only credential-shaped ones. A header value sourced
+    from ``env()`` is a credential by intent -- nobody env-refs a ``Content-Type`` -- so the name
+    heuristic is the wrong gate here, and it is exactly the gate that failed: the measured instance
+    used ``X-Vendor-Thing``, which matches no substring rule.
+    """
+    if isinstance(value, EnvRef):
+        return {"env": value.key}
+    return "***" if _is_secret_header(name, value) else value
+
+
 def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     """A JSON-safe, secret-scrubbed view of a connection's settings for the API ``/metadata`` endpoint:
     each EnvRef becomes ``{"env": key}`` (the value is never resolved — only the key is shown), a
@@ -889,8 +933,11 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
             out[name] = ref
         elif is_secret:
             out[name] = "***"
+        elif isinstance(value, str) and name.lower().endswith(_URL_SETTING_SUFFIXES):
+            # BACKLOG #1207 -- a credential in URL userinfo, masked without destroying the view.
+            out[name] = _mask_url_userinfo(value)
         elif name == "headers" and isinstance(value, dict):
-            out[name] = {k: ("***" if _is_secret_header(k, v) else v) for k, v in value.items()}
+            out[name] = {k: _redact_header_value(k, v) for k, v in value.items()}
         elif name == "odbc_params" and isinstance(value, dict):
             # BACKLOG #1206. This bag is documented as carrying "only static driver keywords", and the
             # redactor honoured that by not descending -- so a credential inside it was served verbatim

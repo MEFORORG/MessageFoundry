@@ -525,3 +525,50 @@ def test_a_refusing_connector_actually_refuses_an_inline_credential() -> None:
         "no connector refused an inline credential. Either the env()-only refusals were removed, or "
         "_call_with_sentinels stopped detecting them; a green here proves neither."
     )
+
+
+# --- BACKLOG #1207: two holes INSIDE containers the control claims to handle -----------------------
+
+
+def test_an_env_ref_inside_a_headers_table_does_not_disclose_its_default() -> None:
+    """A hole inside the ONE container the header rule already covered.
+
+    The headers branch had no `EnvRef` arm, so an `env()` ref in a headers table came back as the RAW
+    object -- not JSON-safe, and carrying its `default` intact -- while the same `env()` on a top-level
+    credential correctly emits `{"env": key}` with the default dropped.
+
+    The measured instance used `X-Vendor-Thing`, which matches no credential substring. That is why the
+    default is now dropped for EVERY header rather than only credential-shaped ones: a header value
+    sourced from `env()` is a credential by intent, and the name heuristic is precisely the gate that
+    failed here.
+    """
+    spec = messagefoundry.Rest(
+        url="https://example.invalid/x",
+        headers={"X-Vendor-Thing": messagefoundry.env("acme_key", default=SENTINEL)},
+    )
+    got = redacted_settings(dict(spec.settings))["headers"]["X-Vendor-Thing"]
+    assert got == {"env": "acme_key"}, got
+    assert SENTINEL not in str(got)
+
+
+def test_a_credential_in_url_userinfo_is_masked_on_url_and_proxy_url() -> None:
+    """`url="https://user:SECRET@host"` was returned verbatim while `proxy_password` on the SAME
+    object masked -- safe in the typed field, disclosed in the URL beside it."""
+    spec = messagefoundry.Rest(
+        url=f"https://user:{SENTINEL}@example.invalid/y",
+        proxy=f"http://puser:{SENTINEL}@proxy.invalid:8080",
+        proxy_password="pp",
+    )
+    out = redacted_settings(dict(spec.settings))
+    assert SENTINEL not in str(out.get("url")), out.get("url")
+    assert SENTINEL not in str(out.get("proxy_url")), out.get("proxy_url")
+    # The user, host and path SURVIVE. Masking the whole URL would destroy the operator's view rather
+    # than protect it, and nothing would report that as a loss.
+    assert "user:***@example.invalid/y" in str(out["url"])
+
+
+def test_a_url_without_userinfo_is_left_alone() -> None:
+    """The control half. A masker that rewrites every URL would pass the assertions above while
+    silently mangling ordinary configuration."""
+    spec = messagefoundry.Rest(url="https://plain.invalid/path?q=1&r=2")
+    assert redacted_settings(dict(spec.settings))["url"] == "https://plain.invalid/path?q=1&r=2"
