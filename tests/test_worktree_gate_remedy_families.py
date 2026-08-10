@@ -127,13 +127,20 @@ def _remedy(reason: str) -> str:
 def _remove_ps1_targets(remedy: str, primary: Path) -> list[Path]:
     """Every path a `remove.ps1 -Name X` line would actually act on.
 
-    ``\\S+`` rather than a name charset ON PURPOSE, so the placeholder the gate prints today
+    ``[^'\\s]+`` rather than a name charset ON PURPOSE, so the placeholder the gate prints today
     (``-Name <directory-name>``) is CAUGHT and resolves to a path that does not exist. A remedy the
     caller cannot paste and run is not a remedy; making the regex skip placeholders would define the
     defect out of the test.
+
+    The optional ``'`` on both sides is the SHELL QUOTING the gate now emits (BACKLOG #1035): the line
+    is ``-File '<root>\\...\\remove.ps1' -Name '<dir>'``, so an unquoted-only pattern silently matches
+    NOTHING and every assertion built on this helper goes vacuously green. Strip the quotes here rather
+    than in the caller -- the quotes are shell syntax, and what the caller asks for is the -Name VALUE.
     """
     parent, leaf = primary.parent, primary.name
-    return [parent / f"{leaf}-{m}" for m in re.findall(r"remove\.ps1\s+-Name\s+(\S+)", remedy)]
+    return [
+        parent / f"{leaf}-{m}" for m in re.findall(r"remove\.ps1'?\s+-Name\s+'?([^'\s]+)'?", remedy)
+    ]
 
 
 @pytest.mark.parametrize("standing_in", ["victim", "primary"])
