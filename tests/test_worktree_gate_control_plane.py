@@ -732,6 +732,115 @@ def test_reading_quoted_arguments_does_not_widen_the_rule(
     assert run_gate_in(shell(command, cwd=cwd), repo.repos, hook_cwd=cwd) is None
 
 
+# ------------------------------------------- rule 3c: a QUOTED disarm key was invisible (BACKLOG #1069)
+#
+# The key was matched against the scan string, which blanks every quoted span, so quoting the key erased
+# it before the danger list ran. Quoting an argument is ordinary; the ``-c alias.*`` form MUST be quoted
+# because its value contains a space.
+#
+# Matching the raw text instead is not the fix -- it refuses a commit message that quotes the rule's own
+# name, a shape this workstream writes constantly. The key is now matched against a length-preserving
+# mask that unmasks a span holding a SINGLE BARE WORD: prose has spaces and stays masked, a quoted key
+# does not and is seen.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'git -c "core.hooksPath=/dev/null" commit -m x',
+        "git -c 'core.hooksPath=/dev/null' commit -m x",
+        'git config "core.hooksPath" /dev/null',
+        "git config 'core.hooksPath' '/dev/null'",
+        'git config --add "core.hooksPath" /dev/null',
+        'git -c "include.path=/evil" commit -m x',
+    ],
+)
+def test_a_QUOTED_disarm_key_is_seen(repo: SimpleNamespace, command: str) -> None:
+    """All six measured ALLOW on the committed gate, from the governed primary."""
+    assert_denied(run_gate_in(shell(command, cwd=repo.primary), repo.repos, hook_cwd=repo.primary))
+
+
+def test_a_QUOTED_disarm_key_is_seen_from_a_linked_worktree_too(repo: SimpleNamespace) -> None:
+    """The blast radius is why this matters: a linked worktree's config write lands in the same shared
+    file, so an invisible key there disarms every sibling as completely as one in the primary."""
+    assert_denied(
+        run_gate_in(
+            shell('git config "core.worktree" ../x', cwd=repo.wt), repo.repos, hook_cwd=repo.wt
+        )
+    )
+
+
+def test_a_QUOTED_MULTI_WORD_alias_value_is_still_invisible(repo: SimpleNamespace) -> None:
+    """PINNED AS AN ALLOW, and it is the spelling that motivated the item.
+
+    A quoted span WITH whitespace stays masked, so ``-c 'alias.<name>=<multi-word command>'`` is still
+    not seen -- and because that value contains a space, quoting is its only writable spelling, so the
+    whole class is open. Recorded as an assertion rather than prose so a later change cannot close it
+    silently or claim it was never there.
+
+    The consolation is measured, not assumed: the bare command such an alias exists to smuggle is
+    ALLOWED by this gate anyway, and ``-c`` persists nothing (scope ``command``, in memory). Closing it
+    wants a real argument tokeniser, and the one pass that built one acquired five fail-opens."""
+    assert (
+        run_gate_in(
+            shell("git -c 'alias.ci=commit --no-verify' ci -m x", cwd=repo.primary),
+            repo.repos,
+            hook_cwd=repo.primary,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'git commit -m "explain core.hooksPath handling"',
+        'git commit -m "core.hooksPath"',
+        'git commit -m "rename alias.ci to alias.cim"',
+        'git log --grep "core.hooksPath"',
+        'echo "core.hooksPath" > notes.md',
+        'git config --get "core.hooksPath"',
+    ],
+)
+def test_prose_that_quotes_the_key_is_still_prose(repo: SimpleNamespace, command: str) -> None:
+    """The other half, and the reason the fix is a bare-word mask rather than "match the raw text".
+
+    Every one of these is a thing this repository's own sessions write. A guard that refuses a commit
+    message for naming the key it protects gets routed around, and then it protects nothing. Note the
+    second case: a bare-word span IS unmasked, and it still allows -- because seeing the key is not the
+    same as seeing a write, and no ``config`` subcommand or ``-c`` override precedes it here."""
+    assert run_gate_in(shell(command, cwd=repo.primary), repo.repos, hook_cwd=repo.primary) is None
+
+
+def test_a_quoted_key_in_an_UNGOVERNED_repo_is_untouched(
+    repo: SimpleNamespace, ungoverned: Path
+) -> None:
+    """Seeing the key decides WHICH KEYS, never WHICH REPOSITORY."""
+    assert (
+        run_gate_in(
+            shell('git config "core.hooksPath" /dev/null', cwd=ungoverned),
+            repo.repos,
+            hook_cwd=ungoverned,
+        )
+        is None
+    )
+
+
+def test_a_quoted_value_cannot_arm_the_READ_exclusion(repo: SimpleNamespace) -> None:
+    """The mirror image, pinned so the fix cannot be widened into its own inverse.
+
+    The read exclusion stays on the FULLY masked view. If it were read off the bare-word mask, a quoted
+    VALUE of ``--get`` would excuse the write beside it -- the same defect as this item with the sign
+    reversed. Denies on the committed gate and must go on denying."""
+    assert_denied(
+        run_gate_in(
+            shell('git config core.hooksPath "--get"', cwd=repo.primary),
+            repo.repos,
+            hook_cwd=repo.primary,
+        )
+    )
+
+
 # --------------------------------------------------------------- rule 3d: destroying another worktree
 
 

@@ -312,27 +312,60 @@ function ConvertTo-ScanText([string]$Line) {
     return $s
 }
 
-# A LENGTH-PRESERVING quote mask: every quoted span, INCLUDING its quote characters, becomes spaces and
-# nothing moves. Length preservation is the whole point -- an offset found in the mask indexes the SAME
-# character in the raw text, so a caller can locate a token safely and then read its value back out of
-# the original. ConvertTo-ScanText cannot do this job: it rewrites `"..."` to `""`, which shortens the
-# string and makes every offset past it meaningless.
-function Get-QuoteMask([string]$Text) {
+# A LENGTH-PRESERVING mask over quoted spans: nothing moves, so an offset found in the mask indexes the
+# SAME character in the raw text and a caller can locate a token and then read its value back out of the
+# original. ConvertTo-ScanText cannot do this job -- it rewrites a double-quoted span to an empty one,
+# which shortens the string and makes every offset past it meaningless.
+#
+# $Filler replaces the CONTENT of a masked span; the quote characters themselves always become spaces,
+# so the span stays a token boundary. $KeepBareWords leaves the content of a span that holds a SINGLE
+# BARE WORD visible -- no whitespace, quotes, separators, parentheses or `$` (BACKLOG #1069). Prose has
+# spaces and stays masked; a quoted config KEY does not, and is seen.
+function Get-MaskedText([string]$Text, [char]$Filler, [switch]$KeepBareWords) {
     $sb = [System.Text.StringBuilder]::new($Text.Length)
-    $q = [char]0
-    foreach ($ch in $Text.ToCharArray()) {
-        if ($q -ne [char]0) {
-            if ($ch -eq $q) { $q = [char]0 }
+    $i = 0
+    while ($i -lt $Text.Length) {
+        $ch = $Text[$i]
+        if ($ch -eq '"' -or $ch -eq "'") {
+            $end = $Text.IndexOf($ch, $i + 1)
+            if ($end -lt 0) {
+                # Unterminated quote: mask the remainder rather than guess where it would have closed.
+                [void]$sb.Append(([string]$Filler) * ($Text.Length - $i))
+                break
+            }
+            $content = $Text.Substring($i + 1, $end - $i - 1)
             [void]$sb.Append(' ')
-        } elseif ($ch -eq '"' -or $ch -eq "'") {
-            $q = $ch
+            if ($KeepBareWords -and $content.Length -gt 0 -and $content -notmatch '[\s''"`$()&|;]') {
+                [void]$sb.Append($content)
+            } else {
+                [void]$sb.Append(([string]$Filler) * $content.Length)
+            }
             [void]$sb.Append(' ')
+            $i = $end + 1
         } else {
             [void]$sb.Append($ch)
+            $i++
         }
     }
     return $sb.ToString()
 }
+
+# The mask for LOCATING a token: every quoted span becomes spaces.
+function Get-QuoteMask([string]$Text) { return Get-MaskedText $Text ' ' }
+
+# The mask for deciding whether a DISARM KEY is present (BACKLOG #1069). Rule 3c matched the key against
+# the scan string, which blanks every quoted span, so QUOTING THE KEY ERASED IT before the danger list
+# ran. Six spellings were measured ALLOW on the committed gate, including a `-c <key>=<value>` override
+# in both quoting styles and a quoted key argument to the `config` subcommand.
+#
+# Matching the RAW text instead is not the fix: it refuses a commit message that quotes the rule's own
+# name, which is a shape this workstream writes constantly. A bare-word span is unmasked and prose is
+# not, which separates the two.
+#
+# THE FILLER IS DELIBERATELY NOT WHITESPACE. An erased span made of spaces lets `-c\s+` step straight
+# over it and bind to whatever token follows, which would invent matches that are not there. \x01 cannot
+# appear in a key and cannot be crossed by `\s+`.
+function Get-KeyScanText([string]$Text) { return Get-MaskedText $Text ([char]1) -KeepBareWords }
 
 # Read the ARGUMENT that begins at or after $Index in the RAW text, the way a shell would: leading
 # whitespace is skipped, a QUOTED argument yields its contents with the quotes stripped and any spaces
@@ -736,8 +769,10 @@ if ($tool -in @("Bash", "PowerShell")) {
     foreach ($seg in (Get-ScannableSegments $cmd)) {
         # Cheap pre-filter on the whole line, kept because everything below it costs more: a line with no
         # git token or no disarm key anywhere in it cannot produce a hit from any of its invocations.
+        # The git-token half runs on the scan string (cheapest); the key half must use the KEY SCAN, or a
+        # quoted key would be erased here and never reach the per-invocation check below.
         if ($seg.Scan -cnotmatch $gitToken) { continue }
-        if ($seg.Scan -notmatch $keyMatch) { continue }
+        if ((Get-KeyScanText $seg.Raw) -notmatch $keyMatch) { continue }
 
         # THEN JUDGE EACH INVOCATION ON ITS OWN (BACKLOG #1065). Reading the whole line as one command was
         # two fail-opens, both reachable with an ordinary flag and no intent:
@@ -752,9 +787,11 @@ if ($tool -in @("Bash", "PowerShell")) {
         foreach ($inv in (Split-Invocations $seg.Raw)) {
             $invScan = ConvertTo-ScanText $inv.Text
             if ($invScan -cnotmatch $gitToken) { continue }
-            if ($invScan -notmatch $keyMatch) { continue }
+            if ((Get-KeyScanText $inv.Text) -notmatch $keyMatch) { continue }
             $badKey = $Matches['key']
-            # A read is not a write.
+            # A read is not a write -- and this one stays on the FULLY masked view on purpose. Reading it
+            # off the key scan would let a quoted VALUE of `--get` disarm the exclusion for the write
+            # beside it, which is the same shape as the defect above with the sign reversed.
             if ($invScan -match $readOnly) { continue }
 
             $at = [regex]::Match($inv.Text, $gitToken)
