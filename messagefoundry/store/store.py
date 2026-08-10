@@ -90,6 +90,7 @@ from messagefoundry.store.document_strip import StripResult, cutoff_for
 from messagefoundry.store.gcm_bound import checkpoint_invocations
 from messagefoundry.store.metadata import (
     decode_response_headers,
+    encode_reference_value,
     encode_response_headers,
     merge_user_metadata,
 )
@@ -4005,7 +4006,8 @@ class MessageStore:
                 version,
                 k,
                 self._cipher.encrypt(
-                    json.dumps(v), aad=cell_aad("reference", "value", name, version, k)
+                    encode_reference_value(v),
+                    aad=cell_aad("reference", "value", name, version, k),
                 ),
             )
             for k, v in rows.items()
