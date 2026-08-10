@@ -6166,6 +6166,9 @@ def _source_config(ic: InboundConnection, bind_host: str, env_values: Mapping[st
             settings["source_ip_allowlist"] = list(ic.source_ip_allowlist)
     return Source(
         type=ic.spec.type,
+        # #333: carry the connection name so a connector's operator-facing warning can name itself (the
+        # generic-ODBC TLS reminder was anonymous, and its remedy is per-connection).
+        name=ic.name,
         settings=settings,
         ack_mode=ic.ack_mode,
         # #200 (ADR 0092): surface the per-connection insecure-hop attestation as a typed field so the
