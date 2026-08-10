@@ -259,6 +259,56 @@ def test_the_peer_line_carries_the_full_cwd_and_forbids_prefix_matching(
 
 
 # --------------------------------------------------------------------------------------------------
+# BACKLOG #1077 -- the SKIP rule and its receipt vocabulary.
+#
+# These assert the EMITTED STRING, not a code path, and that is deliberate: the hook's entire product is
+# the text it puts in front of the model. A defect here cannot be observed any other way, and a test that
+# exercised a branch instead of reading the words would have passed throughout the defect's whole life.
+# --------------------------------------------------------------------------------------------------
+
+
+def test_the_skip_rule_turns_on_the_cwd_match_and_not_on_isrunning(
+    repo: Path, tmp_path: Path
+) -> None:
+    """``isRunning`` means "executing a turn right now", so as a REACHABILITY test it reads backwards.
+
+    Measured 2026-08-06: an ``isRunning: false`` peer was delivered to and answered within one turn,
+    while an ``isRunning: true`` peer queued behind its in-flight turn. The hook nonetheless told every
+    session to skip on ``false``, which drops exactly the peers most able to answer -- and it did so
+    while ``scripts/coord/session-registry.ps1`` already documented the opposite reading, so the repo
+    contradicted itself in the one place a model would act on it.
+
+    Asserted as an ABSENCE plus a PRESENCE. The absence alone would be satisfied by a hook that emitted
+    no instruction at all, which is why the surviving rule is pinned in the same test.
+    """
+    sd = tmp_path / "state"
+    p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER])
+    assert "isRunning is false -> SKIP" not in p.stdout, (
+        "the hook still teaches isRunning as a disqualifier"
+    )
+    assert "No exact row -> SKIP that peer." in p.stdout
+    assert "DO NOT also filter on isRunning" in p.stdout
+    # The rule must say WHY, or the next reader re-adds it. Naming the source of record is what keeps
+    # the measurement in one place instead of drifting across three restatements.
+    assert "session-registry.ps1" in p.stdout
+
+
+def test_the_delivery_receipt_vocabulary_has_no_not_running_token(
+    repo: Path, tmp_path: Path
+) -> None:
+    """``NOT_RUNNING`` recorded a delivery that would have succeeded, under a token that reads "gone".
+
+    The token is the half of #1077 that outlives the rule: drop the SKIP condition and leave the
+    vocabulary, and a session still has a slot to file a reachable peer into -- so the receipts keep
+    reporting phantom dead peers and nothing in the file says the rule changed.
+    """
+    sd = tmp_path / "state"
+    p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER])
+    assert "NOT_RUNNING" not in p.stdout
+    assert "TAB <local_ id | NOT_LISTED> TAB <sent | failed>" in p.stdout
+
+
+# --------------------------------------------------------------------------------------------------
 # Silence, and the marker that must NOT be burned.
 # --------------------------------------------------------------------------------------------------
 

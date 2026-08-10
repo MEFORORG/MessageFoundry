@@ -63,6 +63,19 @@
     session is currently EXECUTING A TURN", not "this session is alive" -- an idle session between turns
     reads false while being perfectly reachable. It is not a liveness fence and must not be used as one;
     that is what Get-SessionLiveness above is for, subject to the positive-answer-only rule.
+
+    THIS IS THE SOURCE OF RECORD FOR THAT FIELD, so the measurement lives here rather than being
+    restated in each consumer. Measured 2026-08-06 by sending and getting real replies, not inferred
+    from the field: an `isRunning: false` peer was DELIVERED to and answered within one turn, while an
+    `isRunning: true` peer returned "Message queued ... will be processed after the in-flight turn
+    finishes". As a REACHABILITY test the field therefore reads BACKWARDS, and filtering on it drops
+    exactly the peers most able to answer. announce-session.ps1 instructed every session to do that
+    until BACKLOG #1077.
+
+    AND IT IS NOT UNIFORM ACROSS SURFACES, which is why the safe reading is "not observable" rather
+    than "idle": a VS Code session is never entered into the Desktop app's in-memory session map at
+    all, so it is ABSENT rather than listed-and-quiet, and no value of `isRunning` describes it. The
+    field reports what the Desktop app can observe, and reachability is decided by cwd, not by it.
 #>
 
 # Every config root that actually holds a session registry.
