@@ -905,18 +905,5 @@ def _mtime(p: Path) -> float:
         return 0.0
 
 
-def _unique(target: Path) -> Path:
-    """Return ``target`` or, if it exists, ``name-1.ext``, ``name-2.ext``, …"""
-    if not target.exists():
-        return target
-    stem, suffix = target.stem, target.suffix
-    n = 1
-    while True:
-        candidate = target.with_name(f"{stem}-{n}{suffix}")
-        if not candidate.exists():
-            return candidate
-        n += 1
-
-
 register_destination(ConnectorType.FILE, FileDestination)
 register_source(ConnectorType.FILE, FileSource)
