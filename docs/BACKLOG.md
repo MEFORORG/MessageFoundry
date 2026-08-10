@@ -965,7 +965,7 @@ Corepoint 45M/day spec parity analysis.
 
 ## 64. Throughput parity with Corepoint — measure-first performance roadmap (group-commit + lean-writes, gated on the enterprise-box validation) (P2, owner / measure-gated)
 
-> 🔢 **Re-scored 2026-08-03 → P3.** Value **1/10** · Difficulty **1/10** · _fill-in_. An index over levers that live in #62/#63/#47/#34, so it ships nothing runnable of its own, and the remainder is reconciling roadmap prose against a measurement that has already run and a lever already abandoned — a doc edit. But the gate this item was demand-gated ON has FIRED (ADR 0051 measure-first complete 2026-07-12; ADR 0099 → ABANDON; ADR 0107 closes Phase 4), so the DEMAND-GATE override no longer applies and the tier derives from the score: P3, fill-in. _(was 1/10 · 2/10.)_
+> 🔢 **OPEN — and what survives under this number is ONLY its index role over the storage-efficiency cluster (#62/#63/#47/#34).** Prose reconciled 2026-08-10 (BACKLOG #64). The throughput half of this roadmap is closed **by measurement, not deferred by it**: step 1 RAN, step 2 is **REFUSED rather than gated**, and the 2026-06-28 "honest verdict" figures below are corrected in place against the runs that superseded them. **Nothing schedulable remains here** — the cluster is scheduled under its own numbers, and steps 4–5 are re-read-first. Whether this umbrella is therefore discharged is an **owner decision**, deliberately not taken by the reconciliation. Value **1/10** · Difficulty **1/10** · _fill-in_ (re-scored 2026-08-03 → P3 once the demand-gate fired; _was 1/10 · 2/10_).
 
 > ⚠️ **AMENDED 2026-08-03 — the measure-first gate has RUN, and step 2 of the ordered plan is REFUSED, not gated.** The plan below still reads live — "Nothing builds before it" at step 1, and group-commit as "the #1 unbuilt durable-write lever … when built — *iff* the run shows durable-write-bound" at step 2 — but the measure-first phase completed 2026-07-12 on rig runs C1–C7 ([ADR 0051](adr/0051-corepoint-throughput-parity-strategy.md), banner at `:3`), group-commit itself was withdrawn ([ADR 0055](adr/0055-group-commit-durable-write.md)`:3-4`, "⛔ SUPERSEDED / WITHDRAWN … DO NOT BUILD THIS"), and the one surviving transaction-reduction lever was falsified by the pre-registered P0 run of 2026-07-13 — the intervention engaged (`committed_txns/msg` −28.5%) while throughput moved −0.56%, inside the pre-registered null band — closing Phase 4 ([ADR 0107](adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md)`:3` "Do not build F2 or F3", `:7` terminating ADR 0057 as "⛔ DO NOT PROMOTE", table at `:38-40`). ⚠️ **Do not read step 2 as schedulable.** What survives is at least step 3 — this item's index role over the storage-efficiency cluster (#62/#63/#47/#34), which the throughput measurement does not bear on; **re-read steps 4–5 against [ADR 0098](adr/0098-store-side-scaling-levers-are-exhausted-transaction-amortization-is-the-only-path-to-45m-day.md) before scheduling either**, and read the 2026-06-28 "honest verdict" figures below as pre-measurement history, not as the current state.
 
@@ -978,28 +978,67 @@ leading performance driver**. The strategy + the **no-rewrite / no-broker** deci
 [**ADR 0051**](adr/0051-corepoint-throughput-parity-strategy.md); the engineering note is
 [`THROUGHPUT-IMPROVEMENTS.md`](archive/throughput/THROUGHPUT-IMPROVEMENTS.md) §5.
 
-**Honest verdict (2026-06-28).** NOT at demonstrated parity at 45M/day (the earlier "at parity" claim was vs
+**Honest verdict (2026-06-28) — PRE-MEASUREMENT HISTORY. Two of its six clauses are falsified; corrections
+follow immediately below and are what to read.** Kept dated rather than rewritten, because it is the record
+the plan was built on. NOT at demonstrated parity at 45M/day (the earlier "at parity" claim was vs
 Rhapsody *marketing*, not this spec): **compute** unvalidated (only `E_core ≈ 42 msg/s` measured on an
 under-powered box; 84/400 estimated); **durable-write** behind (~7 commits/msg, group-commit unbuilt);
 **storage** higher but mostly **by construction** — carriage (`NVARCHAR(MAX)` 2 B/char + base64) +
 encrypt-by-default, **not** inefficiency (the "~2× vs Corepoint" was estimate-vs-brochure, **retracted**);
 **HA / multi-DB maturity** behind; **cost / openness** ahead.
 
-**Ordered plan (each step gated on the one before):**
-1. **Measure first (the gate).** Enterprise-hardware `E_core` + sustained durable-write IOPS run — the
+> **CORRECTED 2026-08-10 (BACKLOG #64) — the two clauses the runs falsified.** Figures taken from the ADRs,
+> not restated from this file.
+>
+> - **"compute unvalidated" is no longer true.** The enterprise-hardware run this item gated everything on
+>   **completed 2026-07-12** (rig runs C1–C7,
+>   [ADR 0051](adr/0051-corepoint-throughput-parity-strategy.md) banner). It did not land on the hoped-for
+>   84 or 400: **C5 pins the per-shard ceiling at `R ∈ [2,3)`**, below the **3.62/shard** a cleared N=16
+>   would need, so **N-sizing alone is insufficient** — recorded as
+>   [ADR 0098](adr/0098-store-side-scaling-levers-are-exhausted-transaction-amortization-is-the-only-path-to-45m-day.md).
+>   C6 found **no convoy** (0 of 288 samples): there is **no single blocker to rewrite**.
+> - **"durable-write behind (~7 commits/msg, group-commit unbuilt)" is wrong in both halves.** The measured
+>   figure is **10.4746 `committed_txns/msg`** on P0's control arm
+>   ([ADR 0107](adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md) table). And the
+>   commit tier is **not** where this is behind: the store absorbs **~27–29k commits/s** against **~2,416
+>   commits/s** of demand at the *full* 45M/day target — **~9% utilised**
+>   ([ADR 0055](adr/0055-group-commit-durable-write.md) withdrawal banner). You cannot buy throughput by
+>   consuming less of a resource you are barely touching. Group-commit is not "unbuilt" pending a decision;
+>   it is **WITHDRAWN — DO NOT BUILD**.
+> - **The other four clauses stand as written** — the throughput measurement does not bear on carriage,
+>   HA/multi-DB maturity, or cost/openness, and the "~2× vs Corepoint" retraction was already recorded.
+
+**Ordered plan (each step gated on the one before) — status reconciled 2026-08-10; the step text is the
+2026-06-28 original, each verdict is current:**
+1. **RAN, 2026-07-12 — this gate is discharged.** Measure first: enterprise-hardware `E_core` + sustained
+   durable-write IOPS run — the
    **Windows Server 2025 + SQL Server 2025 box (#40)** via the load harness (#28 / #29) — against the
    **9,200-IOPS / ~11 KB-msg / 20 + 16-core** target. Pins `E_core` (42 vs 84 vs 400) + the binding axis.
-   **Nothing builds before it.**
-2. **Group-commit** — the #1 unbuilt durable-write lever ([`THROUGHPUT-IMPROVEMENTS.md`](archive/throughput/THROUGHPUT-IMPROVEMENTS.md)
-   §2); its **own ADR** when built — *iff* the run shows durable-write-bound.
-3. **Lean-writes / carriage cluster** — **#62** (VARBINARY carriage) / **#63** (`message_events` knob) /
-   **#47** (embedded-doc pruning) / **#34** (retention).
-4. **Multi-DB log split** — **shared-server backend only** (the atomic staged-queue transaction can't be split).
+   **Nothing builds before it.** *(Rig runs C1–C7; see the corrections above for what it returned.)*
+2. **REFUSED — not gated, not deferred. DO NOT BUILD.** Group-commit — the #1 unbuilt durable-write lever
+   ([`THROUGHPUT-IMPROVEMENTS.md`](archive/throughput/THROUGHPUT-IMPROVEMENTS.md)
+   §2); its **own ADR** when built — *iff* the run shows durable-write-bound. **The *iff* resolved FALSE
+   and the lever was then withdrawn on two independent grounds**
+   ([ADR 0055](adr/0055-group-commit-durable-write.md) `:3-4`): its premise is measured false (~9% commit-tier
+   utilisation), and `DELAYED_DURABILITY` would ACK a message that a power failure loses — breaking the
+   CLAUDE.md §2 ACK-after-durable-commit invariant, on PHI. The one surviving transaction-reduction lever was
+   then falsified by the pre-registered P0 run and **Phase 4 closed**
+   ([ADR 0107](adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md) — "Do not build F2
+   or F3", terminating ADR 0057 as "DO NOT PROMOTE"). **A reader who schedules this step is building
+   something two ratified ADRs forbid.**
+3. **THE SURVIVING SCOPE — and it is an index, not a build.** Lean-writes / carriage cluster: **#62**
+   (VARBINARY carriage) / **#63** (`message_events` knob) /
+   **#47** (embedded-doc pruning) / **#34** (retention). Each is scheduled under **its own** number; this
+   item contributes the grouping and nothing runnable.
+4. **RE-READ FIRST, do not schedule from this line.** Multi-DB log split — **shared-server backend only** (the atomic staged-queue transaction can't be split). Both this and step 5 were written **before** the store-side levers were measured; check them against [ADR 0098](adr/0098-store-side-scaling-levers-are-exhausted-transaction-amortization-is-the-only-path-to-45m-day.md) (four store-side dead ends) before either is proposed. Note also that DBSHARD in step 5 is a **database shard** (ADR 0039, shelved), not an engine shard.
 5. **Deferred contingencies** — the scoped native engine-service core, free-threading (ADR 0040), DBSHARD
    (ADR 0039) — revisited only if the measurement shows machinery-bound and/or the single-hot-feed case matters.
 
-**Priority / gating.** P2, **owner / measure-gated** — the roadmap exists; the build of each lever waits on the
-validation run. Sibling to **#52** (Corepoint *capability* parity). Decision:
+**Priority / gating.** P3, **index only** — reconciled 2026-08-10. The heading and the line that stood here
+both read *"P2, owner / measure-gated — the build of each lever waits on the validation run"*; **the
+validation run has been taken**, so nothing here waits on it any longer and no lever under this number is
+awaiting a gate. The heading is left at its original wording because it is this item's anchor. Sibling to
+**#52** (Corepoint *capability* parity). Decision:
 [ADR 0051](adr/0051-corepoint-throughput-parity-strategy.md). Plan doc:
 [`THROUGHPUT-IMPROVEMENTS.md`](archive/throughput/THROUGHPUT-IMPROVEMENTS.md) §5. Surfaced by the 2026-06-28 Corepoint 45M/day spec
 parity analysis.
@@ -2775,7 +2814,7 @@ No test covers it. `tests/test_scan_tokens_source.py:559-583` (`test_absolute_ho
 
 ## 327. No test asserts the private-path `.gitignore` block still ignores anything
 
-> 🔢 **Filed 2026-08-01 — not started.** Value **6/10** · Difficulty **2/10** · _quick win_. Six `.gitignore` rules are the sole control keeping maintainer-internal security material out of a public commit since the publish deny-list was retired, and the repo-wide search for `check-ignore` matches exactly one hand-run script (`scripts/dev/setup-leak-gate.ps1:58`) covering a different file, so the boundary is defended by review attention plus a hook that lives inside the now-ignored `/.claude/` tree and no fresh clone gets; a pinned-literal test with a synthetic probe child, plus dropping `^\.gitignore$` from the `noncode` allowlist at `.github/workflows/ci.yml:658` — without that edit the guard goes green on exactly the PR it exists to catch.
+> ✅ **CLOSED 2026-08-10 — Proposed 1-3 shipped in `dddbdc32`, and the guard was PROVED ABLE TO FAIL rather than merely observed green.** `tests/test_private_paths_stay_ignored.py` pins all six rules in a literal `_PRIVATE_PATHS` list, asserts `git check-ignore -q` on a synthetic probe child plus an empty `git ls-files` per prefix, and carries a `len(_PRIVATE_PATHS) == 6` cardinality assertion so deleting an entry cannot silently delete its coverage. 13 passed. Made to fail on purpose 2026-08-10 by removing `/docs/security/` from `.gitignore`: RED, naming the rule (*"'docs/security/probe-327.md' is NOT ignored"*), restored byte-clean. The CI half is wired — `ci.yml` `alwayscodepath='^(\.gitattributes|\.gitignore)$'`, driven live, classifies a `.gitignore`-only change as **code**, so the guard fires on exactly the PR shape it exists to catch. The prose residual is fixed in the same change as this closure. Filed 2026-08-01. Value **6/10** · Difficulty **2/10** · _quick win_. Six `.gitignore` rules are the sole control keeping maintainer-internal security material out of a public commit since the publish deny-list was retired, and the repo-wide search for `check-ignore` matches exactly one hand-run script (`scripts/dev/setup-leak-gate.ps1:58`) covering a different file, so the boundary is defended by review attention plus a hook that lives inside the now-ignored `/.claude/` tree and no fresh clone gets; a pinned-literal test with a synthetic probe child, plus dropping `^\.gitignore$` from the `noncode` allowlist at `.github/workflows/ci.yml:658` — without that edit the guard goes green on exactly the PR it exists to catch.
 
 **Cluster:** Security / Publishing boundary. **Priority:** P2. **Verdict:** build. **Severity:** medium.
 
@@ -2815,6 +2854,27 @@ The two nearest-looking guards are neither: `tests/test_scaffold.py:51-52` asser
 4. Consider promoting the resulting context per `.github/required-contexts.txt` rather than adding a paths-filtered workflow — a paths-filtered required check is the required-but-absent trap `manifest-lint.yml` documents.
 
 **Also (small, same block):** `docs/SESSION-DRIFT-CONTROLS.md:69-71` links to `[.claude/settings.json](../.claude/settings.json)`, which `/.claude/` now ignores and which is untracked — the link cannot resolve in the public repo, and the paragraph presents the blanket-`git add -A` guard as an active control while pointing at a file no public reader has. Fix in the same commit. The stale comment above the `.claude/settings.local.json` rule ("settings.json is shared/tracked") is contradicted by the later `/.claude/` rule at `:142` and should go with it.
+
+> **DONE 2026-08-10, with one residual named.** The dead link is removed (not repaired — it named a path
+> no reader outside the maintainer's machine has) and the paragraph now states the guard's real reach:
+> the script is tracked, its `PreToolUse` matcher is not, so a fresh clone and every `git worktree add`
+> come up without it.
+>
+> **`scripts/docs/link_check.py` could never have caught this, which is the part worth keeping.**
+> `.claude/` sits in that script's `WITHHELD` tuple, and the exemption `continue`s **before** `checked
+> += 1`. Measured 2026-08-10 by planting two hrefs in a tracked document: a missing **non-withheld**
+> path took the run to `FAIL: 1 unresolved` and the link total from 5359 to 5360; the same missing path
+> under `.claude/` left the run `OK` **and the total unchanged at 5359** — the href was not merely
+> resolved, it was never counted. A green link gate is not evidence about this class. (The same trap is
+> already recorded from the other side in `tests/test_link_resolution.py`, whose first repo-wide
+> measurement undercounted by 7 because `.claude/` was *present* in a long-lived local checkout.)
+>
+> **Residual, not fixed here:** the stale `.gitignore` comment. `.gitignore:84` still reads
+> `# Claude Code: settings.json is shared/tracked; settings.local.json is machine-local (never commit)`,
+> contradicted by `/.claude/` at `:142`. It is a comment with no mechanical effect, and `.gitignore` is
+> outside this lane's file list, so it is carried to the owner rather than edited: replace "settings.json
+> is shared/tracked" with a note that the whole `/.claude/` tree is ignored by the private-paths block
+> below.
 
 **Related:** `.gitignore` (lines 128-146, 160), `scripts/security/scan_forbidden.py`, `scripts/dev/setup-leak-gate.ps1`, `.pre-commit-config.yaml`, `.github/workflows/ci.yml` (`noncode` at :472, pytest gate at :226), `tests/test_release_pipeline.py`, `tests/test_feature_map_claims.py`, `tests/test_scaffold.py`, `scripts/hooks/block-blanket-git-stage.ps1`, [`docs/SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md), [`docs/SESSION-DRIFT-CONTROLS.md`](SESSION-DRIFT-CONTROLS.md), #321, #322.
 
@@ -6446,7 +6506,19 @@ What was unwatched is the **release-lag window**: the interval between a fix lan
 
 **The repo already has the correct form, at scale.** `docs/BACKLOG.md` carries **44** citations shaped `[#52](archive/backlog/BACKLOG-CLOSED.md#52-corepoint-capability-parity-gaps--prioritized-roadmap-input-2026-06-27)`, and [`AOAG-DEPLOYMENT.md`](AOAG-DEPLOYMENT.md) does the same for `#100`/`#101`. So this is a §12 omission, not a missing convention.
 
-**Fix shape.** Repoint the `#26` and `#27` markers at the archive. **Do not hand-write the fragment** — the archival pass generates the anchor, and a pointer with a wrong fragment is worse than one with none, because it looks precise and lands nowhere. Either derive it from the generator or cite the file without a fragment. A marker that must outlive its item is best served naming **both** locations (live now, archive after), which is what [`../CLAUDE.md`](../CLAUDE.md) §12's ISO 5055 marker was corrected to do.
+**Fix shape.** Repoint the `#26` and `#27` markers at the archive. **Do not hand-write the fragment** — a pointer with a wrong fragment is worse than one with none, because it looks precise and lands nowhere. Derive it from the item's own heading text under GitHub's slug rule, or cite the file without a fragment. A marker that must outlive its item is best served naming **both** locations (live now, archive after), which is what [`../CLAUDE.md`](../CLAUDE.md) §12's ISO 5055 marker was corrected to do.
+
+> **CORRECTION 2026-08-10 (BACKLOG #1099) — the sentence above named tooling that does not exist.**
+> It originally read *"the archival pass generates the anchor … Either derive it from the generator or
+> cite the file without a fragment."* **There is no archival tooling in this repository**: closing an
+> item is a manual move of its text from this file into
+> [`archive/backlog/BACKLOG-CLOSED.md`](archive/backlog/BACKLOG-CLOSED.md), and the fragment is
+> GitHub's heading slug, which nothing here generates.
+> [`tests/test_link_resolution.py`](../tests/test_link_resolution.py) states the same thing from the
+> other side — *"The move is manual — no script performs it — so there is nothing to fix upstream"* —
+> and draws the conclusion this sentence pointed away from: a guard at the moment the item lands is
+> the only thing that can catch the rot, because there is no generator to fix. Corrected rather than
+> rewritten silently, since the block around it is closed record.
 
 **The near-miss is the reason this is worth a number.** The 5055 decline marker filed under #1073 cited only the live file, and would have rotted identically the moment #1073 archived — caught in review before merge. The session that wrote it had **already noticed** the #26/#27 staleness earlier that day and judged it not worth chasing, then reproduced it in a marker whose entire purpose is to outlive its item. A rot consciously declined is one you have stopped seeing well enough to avoid repeating.
 
@@ -6507,7 +6579,7 @@ The two "No" rows are the majority and the harder half. Root cause for the ancho
 
 **Scope note — the non-markdown sweep has now RUN, and it found nothing.** The counts as filed read `*.md` only, and this note used to say citations in `harness/`, `ide/src/`, `messagefoundry/` and `.github/workflows/` "rot identically" and must be swept before the class could be called closed. That sweep ran 2026-08-07 across 1,219 tracked non-markdown files. It surfaced 68 distinct repo-relative paths that do not exist and **not one of them is a rotted citation**: they are test fixtures (`docs/adr/0001-collision.md`, `messagefoundry/x.py`, `tests/test_a.py`), targets inside withheld directories, or past-tense historical comments — `.github/workflows/release.yml:51` names the pre-cutover `scripts/publish/publish.ps1` under a heading reading "THIS GUARD WAS INVERTED UNTIL THE CUTOVER". The prediction was wrong, and the reason is worth keeping: citations in code are mostly written *about* the past, where prose citations are written as *pointers*. **Do not re-open this as unswept scope.**
 
-**A gate now covers the catchable half, repo-wide.** `scripts/docs/link_check.py` with `tests/test_archive_link_resolution.py` asserts that every relative markdown link in the repository resolves — 5,327 links across 347 files. Widening it beyond the archive required removing three false-positive classes first, because a gate red on arrival gets suppressed rather than fixed: links inside inline code (a regex whose character class contains `](`, two VS Code `command:` URIs, and ADR 0160 quoting the link it records as removed), and the withheld `docs/releases/` and `.claude/`. **`.claude/` is the one to carry forward** — it is gitignored but *present* in a long-lived local checkout, so the first repo-wide measurement passed there and undercounted by 7; widening on that number would have put the gate red on CI's clean clone. A gate result is a fact about the configuration it ran in. The gate was then proved able to fail, by planting a break in a real document outside the archive and watching it go red.
+**A gate now covers the catchable half, repo-wide.** `scripts/docs/link_check.py` with `tests/test_link_resolution.py` asserts that every relative markdown link in the repository resolves — 5,327 links across 347 files. Widening it beyond the archive required removing three false-positive classes first, because a gate red on arrival gets suppressed rather than fixed: links inside inline code (a regex whose character class contains `](`, two VS Code `command:` URIs, and ADR 0160 quoting the link it records as removed), and the withheld `docs/releases/` and `.claude/`. **`.claude/` is the one to carry forward** — it is gitignored but *present* in a long-lived local checkout, so the first repo-wide measurement passed there and undercounted by 7; widening on that number would have put the gate red on CI's clean clone. A gate result is a fact about the configuration it ran in. The gate was then proved able to fail, by planting a break in a real document outside the archive and watching it go red.
 
 **Related:** #1094 (two instances of this class, closed — already satisfied when filed), #1073 (whose §12 marker prompted the original find, and which is itself the closed-but-not-archived case), #1000 (a control whose green is not evidence about what it appears to cover), #1099 (#1094's claim that an archival pass *generates* the anchor, describing tooling that does not exist), #1100 (the nine sites whose citing claim is dead, split out of this item rather than repointed), [`../CLAUDE.md`](../CLAUDE.md) §11 (state a load-bearing fact once and link to it — which is what makes a link's durability load-bearing).
 
@@ -6677,23 +6749,32 @@ contention; recorded in the #1095 handoff note rather than lost.
 
 ## 1099. BACKLOG #1094 describes an archival pass that generates anchors; no archival tooling exists
 
-> 🔢 **Filed 2026-08-07 - not started.** Value **4/10** · Difficulty **1/10**. #1094 states that "the archival
-> pass generates the anchor". There is **no archival tooling in the repository at all** - closing an
-> item is a manual move of its text from [`BACKLOG.md`](BACKLOG.md) into
-> [`archive/backlog/BACKLOG-CLOSED.md`](archive/backlog/BACKLOG-CLOSED.md). That sentence describes a
-> generator that was never built.
+> ✅ **Closed 2026-08-10 — the sentence is corrected in place, and the absence was re-confirmed by search rather than inherited.** Value **4/10** · Difficulty **1/10**. #1094's *"the archival pass generates the anchor … derive it from the generator"* now carries a dated `CORRECTION` blockquote naming the manual move and GitHub's heading slug, left as a marked correction rather than a silent rewrite because the block is closed record. Filed 2026-08-07.
 
 **Cluster:** Documentation record / instrument accuracy. **Priority:** P3. **Verdict:** build (a
 prose correction). **Severity:** no product effect.
 
-**Why this is not pedantry.** #1094 is closed, so the sentence now sits in the archive as settled
-record, and it points maintenance at the wrong place: it implies the fix for anchor rot belongs in a
-tool, when the only thing that can catch it is a gate at the moment the item lands - which is exactly
-the reasoning `tests/test_archive_link_resolution.py`
+**Why this is not pedantry.** The sentence points maintenance at the wrong place: it implies the fix
+for anchor rot belongs in a tool, when the only thing that can catch it is a gate at the moment the
+item lands - which is exactly the reasoning [`tests/test_link_resolution.py`](../tests/test_link_resolution.py)
 records. A future reader looking for the generator to fix will not find one.
 
-**The work.** Correct the sentence in place in the archive, marked as a correction rather than a
-silent rewrite, since the surrounding text is a closed record.
+**The absence, re-measured 2026-08-10 rather than quoted.** `git ls-files | grep -iE archiv` returns
+**seven** paths and every one is a document — `docs/archive/backlog/BACKLOG-CLOSED.md` and six under
+`docs/archive/throughput/`. No script, no CI job, no hook. The independent corroboration is the gate's
+own docstring: *"The move is manual — no script performs it — so there is nothing to fix upstream."*
+
+**TWO CORRECTIONS TO THIS ITEM'S OWN TEXT, both the class it was filed about.**
+
+- It said the sentence *"now sits in the archive"*. It did not — #1094 was closed-in-live, still in
+  [`BACKLOG.md`](BACKLOG.md), and the correction was therefore applied there. It travels into the
+  archive with #1094's block in the same change.
+- It cited `tests/test_archive_link_resolution.py`, **which is on no merged ref.** PR #281 squash-merged
+  as `6cb34f5f` and the file landed as `tests/test_link_resolution.py`; the pre-squash name survives
+  only on the stale local branch `refs/heads/pr281`. An item about a citation naming a thing that does
+  not exist cited a thing that does not exist. Found by searching every ref, not by trusting the string
+  — the same instrument the file's own Ledger erratum prescribes. The identical stale name in #1095's
+  block was corrected with it.
 
 **Related:** #1094, #1095 (the repo-scale instance of the same class), #1000.
 
@@ -8716,7 +8797,7 @@ filing.
 
 ## 1200. the CI docs-only detector exempts EXECUTABLE files under `docs/` from the entire suite
 
-> 🔢 **Filed 2026-08-09 - FIXED in the same change. Reproduced with the workflow's own regex under real `grep -E`, with a negative control.** Value **7/10** · Difficulty **2/10**. `ci.yml`'s `changes` job short-circuits the required `test` legs when every changed path is docs-only. `^docs/` is an alternation branch in that allowlist, so it matches a **`.py` under `docs/`** and short-circuits before the stated `*.py` rule is ever reached. A PR touching only such a file set `code=false` and skipped install, lint, type-check and the whole of pytest.
+> ✅ **CLOSED 2026-08-10 — confirmed by reading the shipped workflow, not the commit message.** `.github/workflows/ci.yml` carries `alwayscode='\.(py|ps1|sh|ts|js|yml|yaml|toml|lock|cfg|ini)$'` and evaluates it in the FIRST `elif`, ahead of both `alwayscodepath` and `noncode`. Re-driven 2026-08-10 with the regexes read back out of `ci.yml`: `docs/security/asvs-apply-cells.py` -> code, `docs/SECURITY.md` -> NON-CODE, `.gitignore` -> code. `tests/test_ci_docs_only_detector.py` 23 passed. Filed 2026-08-09 - FIXED in the same change. Value **7/10** · Difficulty **2/10**. `ci.yml`'s `changes` job short-circuits the required `test` legs when every changed path is docs-only. `^docs/` is an alternation branch in that allowlist, so it matches a **`.py` under `docs/`** and short-circuits before the stated `*.py` rule is ever reached. A PR touching only such a file set `code=false` and skipped install, lint, type-check and the whole of pytest.
 
 **Cluster:** CI correctness / gate blindness. **Priority:** P2. **Verdict:** build (done).
 **Severity:** no product effect and no PHI effect. The cost is that a defect here does not fail loudly
@@ -8774,7 +8855,7 @@ sibling work), and escalated from instance to class by the parallel `asvs-tracki
 which measured the blast radius in both repos and identified the `#327` precedent.
 ## 1201. `redacted_settings` served credential-bearing HTTP headers outside a five-name list
 
-> 🔢 **Filed 2026-08-09 - FIXED IN THE SAME CHANGE, and the entry is published WITH the fix rather than ahead of it.** Value **8/10** · Difficulty **2/10**. Header redaction was `str(k).lower() in _SECRET_HEADER_NAMES` -- an exact-membership test against **five** strings (`authorization`, `proxy-authorization`, `x-api-key`, `api-key`, `cookie`). Header names are **operator-authored free text**, typed into `connections.toml` or a Handler, so an exhaustive list cannot exist even in principle. Measured against the shipped list: `X-Auth-Token`, `X-Amz-Security-Token` and `Private-Token` were all returned VERBATIM.
+> ✅ **CLOSED 2026-08-10 — confirmed in the shipped code, not from the report.** `messagefoundry/config/wiring.py` `_is_secret_header()` now ends `return any(tok in low for tok in _SECRET_HEADER_SUBSTRINGS)` over `auth|token|secret|credential|password|passphrase|key`, with `_SECRET_HEADER_NAMES` kept as an explicit floor (`cookie` matches no substring rule), a `_NOT_SECRET_HEADER_SUFFIXES` exclusion, and a second VALUE arm (`_looks_like_a_credential_value`: RFC 7235 scheme prefixes + JWT shape) for opaque vendor names. `tests/test_connection_factory_redaction_domain.py` 58 passed. **The route-onward below is NOT closed by this** - see the residual. Filed 2026-08-09 - FIXED IN THE SAME CHANGE, and the entry is published WITH the fix rather than ahead of it. Value **8/10** · Difficulty **2/10**. Header redaction was `str(k).lower() in _SECRET_HEADER_NAMES` -- an exact-membership test against **five** strings (`authorization`, `proxy-authorization`, `x-api-key`, `api-key`, `cookie`). Header names are **operator-authored free text**, typed into `connections.toml` or a Handler, so an exhaustive list cannot exist even in principle. Measured against the shipped list: `X-Auth-Token`, `X-Amz-Security-Token` and `Private-Token` were all returned VERBATIM.
 
 **Cluster:** Security / secret disclosure. **Priority:** P1. **Verdict:** build (done).
 **Severity:** on a first deployment, an operator who configured an outbound connection with a bearer
@@ -8815,11 +8896,19 @@ method: the defect class is *a control whose domain is narrower than its surface
 the next instance is to ask which other control quantifies over a domain it does not derive.
 `tests/test_connection_factory_redaction_domain.py` now covers both.
 
-**Route onward, NOT closed by this.** The shape rule is a heuristic over a free-text domain, so it is a
-floor and not a proof: a header named without any of those substrings (`X-Shared-Signature`, a
-vendor-specific opaque name) still passes. The durable fix is for the header value to never reach a
-serializer resolved -- the `env()`-only treatment `body_secret_value_*` already gets -- and that is a
-larger change than this one.
+**Route onward, NOT closed by this — PENDING OWNER LEDGER DECISION (G28).** The shape rule is a heuristic
+over a free-text domain, so it is a floor and not a proof: a header named without any of those substrings
+(`X-Shared-Signature`, a vendor-specific opaque name) still passes the NAME arm. The durable fix is for the
+header value to never reach a serializer resolved -- the `env()`-only treatment `body_secret_value_*`
+already gets -- and that is a larger change than this one.
+
+> **Residual carried forward 2026-08-10, deliberately un-numbered.** Closing this item closes the
+> five-name membership defect; it does **not** close the route-onward above. Whether that residual becomes
+> its own backlog number, folds into #1206's sibling residual (both are the same *"nested/free-text values
+> are never `env()`-resolved"* shape), or is accepted as-is **is the owner's call, not the archiver's** —
+> so no number was allocated for it here. The mitigation actually shipped is the second (VALUE) arm of
+> `_is_secret_header`, which catches an opaque-named header carrying a `Bearer`/`Basic`/JWT value; a header
+> both opaquely named *and* opaquely valued remains outside both arms by construction.
 
 **Source:** found 2026-08-09 while probing for a second instance of the `#1106` class before building a
 generalised check, on the reasoning that a meta-check built from one instance is shaped like that
@@ -8827,7 +8916,7 @@ instance. Two domains were probed; this one leaked.
 
 ## 1206. `redacted_settings` served ODBC driver credentials sitting in `odbc_params`
 
-> 🔢 **Filed 2026-08-09 - FIXED IN THE SAME CHANGE, entry published WITH the fix.** Value **8/10** · Difficulty **3/10**. `redacted_settings` masks flat scalars and descended into `headers` alone, so a credential inside `odbc_params` was returned VERBATIM by `GET /connections/{name}/metadata` behind `MONITORING_READ` and printed by `graph --json` - on the SAME object whose top-level `password` masked correctly.
+> ✅ **CLOSED 2026-08-10 — confirmed in the shipped code, not from the report.** `messagefoundry/config/wiring.py` `redacted_settings()` now carries an `elif name == "odbc_params" and isinstance(value, dict)` arm emitting `{k: ("***" if _is_secret_odbc_key(k) else v) ...}`, and `_is_secret_odbc_key()` is shape-based and case-insensitive over `pwd|password|passwd|secret|token|credential|passphrase`, with `_NOT_SECRET_ODBC_KEYS` keeping the libpq PATH keywords (`sslkey`/`sslcert`/`sslrootcert`/`sslcrl`) readable. `display_settings` inherits it by delegation. **This is a DISPLAY fix; the storage residual is NOT closed** - see below. Filed 2026-08-09 - FIXED IN THE SAME CHANGE, entry published WITH the fix. Value **8/10** · Difficulty **3/10**. `redacted_settings` masks flat scalars and descended into `headers` alone, so a credential inside `odbc_params` was returned VERBATIM by `GET /connections/{name}/metadata` behind `MONITORING_READ` and printed by `graph --json` - on the SAME object whose top-level `password` masked correctly.
 
 **Cluster:** Security / secret disclosure. **Priority:** P1. **Verdict:** build (done).
 **Severity:** on a first deployment, an ODBC driver password would be served to any monitoring reader
@@ -8851,10 +8940,19 @@ AFTER :  PWD, sslpassword, Password                -> '***'
 the only expressible shape. **A refusal that removes the SAFE expression while leaving the UNSAFE one
 is not a mitigation.**
 
-**THIS IS A DISPLAY FIX, NOT A STORAGE FIX** - stated because the difference matters and is easy to
-lose. The credential remains an inline literal in the config file. Keeping it out of the file needs
-`env()` to work here, which needs nested settings to be env-resolved. That changes the resolution path
-and what the refusal above means, so it is the **route-onward** and is deliberately not folded in.
+**THIS IS A DISPLAY FIX, NOT A STORAGE FIX — and the storage half is PENDING OWNER LEDGER DECISION
+(G28).** Stated because the difference matters and is easy to lose. The credential remains an inline
+literal in the config file. Keeping it out of the file needs `env()` to work here, which needs nested
+settings to be env-resolved. That changes the resolution path and what `_reject_envref_odbc_params`
+means, so it is the **route-onward** and is deliberately not folded in.
+
+> **Residual carried forward 2026-08-10, deliberately un-numbered.** `env()` resolution inside nested
+> settings is the sibling of #1201's route-onward — the same *"a value inside a container is never
+> `env()`-resolved, so the safe expression does not exist there"* shape, which is why they are named
+> together rather than separately. Whether this earns its own number, merges with #1201's, or is accepted
+> is the **owner's decision**; no number was allocated for it here, and it is not being quietly closed as
+> prose. What IS closed is the disclosure: on a first deployment the value would no longer reach
+> `/metadata` or `graph --json`.
 
 **A THIRD PREDICATE, AND THE FIRST ATTEMPT PROVES WHY.** I reached for `_is_secret_setting` - and it
 returns False for every one of `PWD`, `Password` and `sslpassword`, because it matches a fixed
@@ -8890,7 +8988,7 @@ guard written after the previous instance picked a domain narrower than the surf
 
 ## 1207. an `env()` ref in a headers table, and a credential in URL userinfo, both escaped redaction
 
-> 🔢 **Filed 2026-08-09 - FIXED IN THE SAME CHANGE.** Value **7/10** · Difficulty **2/10**. Two holes, both INSIDE surfaces the redactor already claimed to handle. **(b)** the `headers` branch had no `EnvRef` arm, so an `env()` ref in a headers table came back as the RAW object carrying its `default` intact - while the same `env()` on a top-level credential correctly emits `{"env": key}` with the default dropped. **(c)** `url="https://user:SECRET@host"` was returned verbatim by both serializers while `proxy_password` on the SAME object masked.
+> ✅ **CLOSED 2026-08-10 — both arms confirmed in the shipped code, not from the report.** `messagefoundry/config/wiring.py`: `_redact_header_value()` opens `if isinstance(value, EnvRef): return {"env": value.key}` — the default dropped for EVERY header, not only credential-shaped ones — and `_mask_url_userinfo()` returns `f"{scheme}//{user}:***@{hostpart}"`, wired into `redacted_settings()` by `elif isinstance(value, str) and name.lower().endswith(_URL_SETTING_SUFFIXES)`, with `_URL_SETTING_SUFFIXES` a NAME set plus suffix rule so bare `proxy_url` is covered. Both reach `display_settings` by delegation. Filed 2026-08-09 - FIXED IN THE SAME CHANGE. Value **7/10** · Difficulty **2/10**. Two holes, both INSIDE surfaces the redactor already claimed to handle. **(b)** the `headers` branch had no `EnvRef` arm, so an `env()` ref in a headers table came back as the RAW object carrying its `default` intact - while the same `env()` on a top-level credential correctly emits `{"env": key}` with the default dropped. **(c)** `url="https://user:SECRET@host"` was returned verbatim by both serializers while `proxy_password` on the SAME object masked.
 
 **Cluster:** Security / secret disclosure. **Priority:** P1. **Verdict:** build (done).
 **Severity:** on a first deployment, both would be served to any `MONITORING_READ` caller and printed
@@ -8983,7 +9081,7 @@ became the third instance: *"that is not a coincidence to note in a residual; it
 rename boundary itself needs a guard"*. Filed before it was forgotten, per that session's request.
 ## 1209. the dependency advisory guard inverts to FAIL-OPEN when the advisory API errors
 
-> 🔢 **Filed 2026-08-09 - FIXED IN THE SAME CHANGE, entry published WITH the fix.** Value **9/10** · Difficulty **2/10**. Guardrail #2 of `dependabot-auto-merge.yml` reads `count="$(gh api ... || echo "ERR")"`. The `||` runs INSIDE the command substitution, so it APPENDS to stdout rather than replacing it - and `gh api` copies the JSON error BODY to stdout on any HTTP error. The sentinel `[ "$count" = "ERR" ]` therefore misses, and the guard emits `advisory_ok=true` for a lookup that never succeeded.
+> ✅ **CLOSED 2026-08-10 — confirmed in the shipped workflow AND re-executed against a `gh` stub.** `.github/workflows/dependabot-auto-merge.yml` now reads `--jq '[.[] | select(.withdrawn_at == null)] | length' 2>/dev/null)" || count="ERR"` — the `||` binds the ASSIGNMENT, outside the substitution — followed by the shape test `case "$count" in ""|*[!0-9]*)`. Re-run 2026-08-10 under `bash -e` with a stub reproducing the stream split (JSON body to stdout, `gh:` line to stderr, exit 1): the pre-fix form (`|| echo "ERR"` inside + equality sentinel) leaves `count={"message":"API rate limit exceeded",...}ERR`, misses the sentinel, errors "integer expression expected" and emits **advisory_ok=true**; the shipped form leaves `count=ERR` and emits **advisory_ok=false**. Filed 2026-08-09 - FIXED IN THE SAME CHANGE, entry published WITH the fix. Value **9/10** · Difficulty **2/10**. Guardrail #2 of `dependabot-auto-merge.yml` read `count="$(gh api ... || echo "ERR")"`. The `||` runs INSIDE the command substitution, so it APPENDS to stdout rather than replacing it - and `gh api` copies the JSON error BODY to stdout on any HTTP error. The sentinel `[ "$count" = "ERR" ]` therefore misses, and the guard emits `advisory_ok=true` for a lookup that never succeeded.
 
 **Cluster:** CI / supply chain. **Priority:** P1. **Verdict:** build (done).
 **Severity:** unlike the redaction items above, this is not conditional on a first deployment - the
@@ -9016,6 +9114,15 @@ fixed               advisory_ok=false  advisory_ok=true     <- fails closed, hap
 
 **A stub that merely exits non-zero would have proved nothing** - it would pass against the defective
 code too. The defect is that the BODY reached the variable, so the stub has to write the body.
+
+**Where that test actually runs, stated because a skip is not a pass.** The three
+`test_the_advisory_guard_fails_closed_when_the_api_errors` rows execute the shipped `run:` body and
+therefore need `bash` **and `jq`**. On the maintainer's box Git Bash ships no `jq`, so all three
+**SKIP** locally and the file reports `27 passed, 7 skipped` - a green local run that has not exercised
+this guard at all. They run on the ubuntu leg and on the two required `windows-2022`/`windows-2025`
+legs, whose images carry `jq`. The 2026-08-10 closure therefore did not rest on that local green: the
+pre-fix and shipped guards were re-executed by hand under `bash -e` against a body-writing stub, which
+needs no `jq`.
 
 **The comment directly above the defect asserted the opposite:** "Fail closed on any error", and the
 header, "a rate-limit/API error or no-matching-advisory routes to manual review, never auto-merge."
