@@ -63,7 +63,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.08.06.1"
+$GateVersion = "2026.08.10.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -109,11 +109,16 @@ function Write-Deny([string]$Reason, [string]$Rule = "?", [string]$Detail = "") 
 
     # The hookSpecificOutput WRAPPER IS MANDATORY. A bare {"permissionDecision":"deny"} is silently
     # ignored and the tool call proceeds (measured, and reported upstream as #4669 / #37210).
+    #
+    # EVERY reason goes through Protect-CommandLines, at the ONE place every rule already funnels
+    # through, so a rule added later is covered without its author knowing this exists. See the
+    # function for what it does and, more importantly, for what it does NOT do -- it is a backstop
+    # under Get-SafeForCommand, never a replacement for it.
     $payload = @{
         hookSpecificOutput = @{
             hookEventName            = "PreToolUse"
             permissionDecision       = "deny"
-            permissionDecisionReason = $Reason
+            permissionDecisionReason = (Protect-CommandLines $Reason)
         }
     }
     [Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 6))
@@ -179,6 +184,80 @@ function Get-SafeForMessage([string]$Value) {
     $t = ("$Value" -replace '[\r\n\t]', ' ')
     if ($t.Length -gt 400) { return $t.Substring(0, 400) + '...' }
     return $t
+}
+
+# COMMAND-BOUND values -- the OTHER half of the pair, and the half that must never be confused with the
+# fold above (BACKLOG #1040). Get-SafeForMessage neutralises LINE STRUCTURE, which is what a value
+# entering PROSE can abuse; it does not touch '$', a backtick, '&' or a quote, because those do nothing
+# in prose. A value entering a COMMAND has the opposite exposure: `$( )` is command substitution in BOTH
+# pwsh and bash, and both are shells an agent runs these remediations in.
+#
+# QUOTING IS THE FIX, NOT FOLDING. Measured on a branch named `pwn$(hostname)`: bare, both shells execute
+# the substitution; wrapped in single quotes, both yield the literal refname, so the emitted command still
+# NAMES THE REAL BRANCH and still runs. Stripping the metacharacter instead would emit a command for a
+# branch that does not exist, which is the unrunnable-remediation defect of #1032/#1035 arriving from the
+# other side.
+#
+# SINGLE quotes, not double: `"$x"` expands `$( )` and a backtick in pwsh and `$( )` in bash, so the
+# double-quoted spelling that looked safe at several sites here was not. Interior quotes are DOUBLED,
+# which pwsh reads as one escaped quote and bash reads as two adjacent quoted spans -- different values,
+# both inert, neither able to close the span early.
+#
+# $Prefix / $Suffix are AUTHOR-WRITTEN CONSTANTS placed INSIDE the quotes, for the shapes where the value
+# is only part of one shell token (`<ref>:<path>`, `HEAD..<ref>`, `<root>\scripts\...\new.ps1`). They are
+# escaped along with the value, which costs nothing for a constant and removes the need to trust that the
+# caller checked. Measured, and it is why they exist rather than adjacent quoting: pwsh's argument parser
+# splits `'main':README.md` into TWO arguments, so composing outside the quotes is wrong on pwsh even
+# though bash concatenates it.
+#
+# Length is capped by the fold, so a 100KB value cannot bury the rest of the message. A truncated path
+# fails loudly when run; an untruncated hostile one does not fail at all.
+function Get-SafeForCommand([string]$Value, [string]$Prefix = "", [string]$Suffix = "") {
+    $body = "$Prefix" + (Get-SafeForMessage $Value) + "$Suffix"
+    return "'" + ($body -replace "'", "''") + "'"
+}
+
+# THE BACKSTOP, and the reason the two helpers above are not sufficient on their own. Using them is a
+# CONVENTION, and the defect being closed here IS somebody adding an emission line without deciding which
+# class it was in -- twice, in one file, within hours. A guarantee that depends on the next author
+# remembering the convention is not a guarantee. Shape for the guarantee, names for the message: the same
+# split rule 1b already makes for the coordination registries.
+#
+# So the reason is swept on its way OUT, per line, and only on lines that are runnable COMMAND FORMS -- an
+# indented line beginning `pwsh` or `git`. On such a line every shell metacharacter OUTSIDE a single-quoted
+# span is dropped. A value routed through Get-SafeForCommand sits INSIDE single quotes and is therefore
+# untouched, which is the property that makes this safe to run over everything: it cannot make a correctly
+# quoted line wrong, and it can only ever defang one that was not.
+#
+# An ODD number of quotes on such a line means it was not built by the helper (the helper doubles, so it
+# always emits an even count), and an unbalanced quote swallows the remainder of the line in both shells.
+# That line is stripped wholesale rather than partially, because tracking "inside" state through it would
+# be tracking a state the shell itself will not agree with.
+#
+# NOT A SUBSTITUTE FOR QUOTING, and the ordering matters: this runs after interpolation, so it can only
+# remove characters, never restore the value they belonged to. A line it changes is a line that should
+# have used the helper.
+# The character set is LOCAL, not a script-scope constant: this function is unit-tested by extracting its
+# definition from this file and running it, which reaches no script-scope state -- a `$script:` constant
+# would be $null there and the test would exercise a different function than the gate does.
+function Protect-CommandLines([string]$Reason) {
+    $meta = '$`;|&'
+    $out = foreach ($line in ("$Reason" -split "`n")) {
+        if ($line -cnotmatch '^\s{4,}(?:pwsh|git)\s') { $line; continue }
+        $sb = [System.Text.StringBuilder]::new()
+        $inQuote = $false
+        foreach ($ch in $line.ToCharArray()) {
+            if ($ch -eq "'") { $inQuote = -not $inQuote; [void]$sb.Append($ch); continue }
+            if (-not $inQuote -and $meta.Contains($ch)) { continue }
+            [void]$sb.Append($ch)
+        }
+        if ($inQuote) {
+            # Unbalanced: not helper-built, and the shell would read past the end of the line.
+            (-join ($line.ToCharArray() | Where-Object { -not ($meta.Contains($_) -or $_ -eq "'") }))
+        }
+        else { $sb.ToString() }
+    }
+    return ($out -join "`n")
 }
 
 # A git BRANCH name -> a legal worktree DIRECTORY component. Rule 3b hands back a REAL ref, and most of
@@ -324,6 +403,44 @@ $roots = @(
 )
 if ($roots.Count -eq 0) { exit 0 }
 
+# WHICH governed root does the SESSION belong to? Every other rule judges a PATH and takes its root from
+# whatever matched. Rule 4 fires on the TOOL NAME alone and has no path to match, so it named $roots[0] --
+# the FIRST allowlist entry, whichever repo the session was actually in (BACKLOG #1036). With one entry
+# that is trivially right; with two it hands the reader a command in an unrelated checkout, which is worse
+# than printing nothing because the path exists and the command runs.
+#
+# Two questions, in this order, because they answer different populations:
+#   1. Is the cwd INSIDE a governed root, as a string? That covers the primary itself and every nested
+#      .claude/worktrees/<x> beneath it. Deliberately NOT Test-Governed: that function EXEMPTS the nested
+#      worktrees, correctly, because for a TREE SWAP a linked worktree is not the primary. The question
+#      here is the opposite one -- "which repository is this session's" -- and a nested worktree's answer
+#      to that is its primary.
+#   2. Otherwise ask git which repository the cwd belongs to and match its COMMON dir, which is what
+#      resolves a SIBLING worktree (<primary>-<name>): those live outside every root's path entirely.
+#
+# Returns $null when neither answers. THAT IS A RESULT, not a failure to be papered over with $roots[0]:
+# the caller says plainly that it cannot tell, which is the only honest thing to print for a session
+# standing outside every governed checkout.
+function Get-SessionRoot([string]$CwdCmp, [string]$CwdRaw) {
+    foreach ($r in $roots) {
+        if ($CwdCmp -eq $r.Compare -or
+            $CwdCmp.StartsWith("$($r.Compare)/", [System.StringComparison]::Ordinal)) { return $r }
+    }
+    if (-not $CwdRaw) { return $null }
+    # RAW path, never the Get-ComparablePath form: that one is lowercased, and this file warns twice that
+    # a lowercased path handed to `git -C` passes on Windows and misses the real directory on a
+    # case-sensitive filesystem. Any git failure just means "no answer", which is $null.
+    $common = "$(& git -C $CwdRaw rev-parse --git-common-dir 2>$null)".Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $common) { return $null }
+    $commonCmp = Get-ComparablePath $common $CwdRaw
+    if (-not $commonCmp) { return $null }
+    foreach ($r in $roots) {
+        if ($commonCmp -eq $r.Compare -or
+            $commonCmp.StartsWith("$($r.Compare)/", [System.StringComparison]::Ordinal)) { return $r }
+    }
+    return $null
+}
+
 $tool   = [string]$hook.tool_name
 $cwd    = Get-ComparablePath ([string]$hook.cwd)   # canonicalised: allowlist comparison only
 $cwdRaw = [string]$hook.cwd                        # original case: for `git -C` in rule 3b
@@ -349,6 +466,29 @@ $cwdRaw = [string]$hook.cwd                        # original case: for `git -C`
 # effect of re-installing. Rationale: docs/SESSION-DRIFT-CONTROLS.md section 4.
 # ---------------------------------------------------------------------------------------------------
 if ($tool -in @("EnterWorktree")) {
+    $sessionRoot = Get-SessionRoot $cwd $cwdRaw
+    $rehome = if ($sessionRoot) {
+        @"
+  * If a session has already been relocated and vanished, recover it:
+        pwsh -NoProfile -File $(Get-SafeForCommand $sessionRoot.Display -Suffix '\scripts\worktree\sessions.ps1') -Rehome <id-prefix>
+"@
+    }
+    else {
+        # SAY IT PLAINLY. Naming a repo here would be a guess dressed as an answer, and the reader cannot
+        # tell the two apart -- the path would exist and the command would run, against the wrong clone.
+        # No runnable command form is printed here ON PURPOSE. A `pwsh -NoProfile -File ...` line with a
+        # placeholder root reads as an offer, and the reader's cheapest way to fill it in is to pick one
+        # -- which is the guess this branch exists to refuse to make on their behalf.
+        $rootLines = (($roots | ForEach-Object { "        $(Get-SafeForMessage $_.Display)" }) -join "`n")
+        @"
+  * If a session has already been relocated and vanished, scripts\worktree\sessions.ps1 -Rehome recovers
+    it -- but this session's working directory ($(Get-SafeForMessage $cwdRaw)) is not inside a governed
+    checkout and is not a worktree of one, so THIS GATE CANNOT TELL YOU WHICH CHECKOUT'S COPY TO RUN.
+    The governed checkouts are:
+$rootLines
+    Ask the user which one the lost session belongs to, then run that checkout's copy from there.
+"@
+    }
     Write-Deny -Rule "4" -Detail "relocate-session" -Reason @"
 BLOCKED: EnterWorktree relocates this live session into a worktree, which re-files its chat transcript
 under the worktree's slug and drops it from THIS window's session list (nothing is deleted -- it just
@@ -356,8 +496,7 @@ stops appearing where you started). Do not relocate a running session.
 
 Instead:
   * Open a NEW Claude Code window/session directly on the worktree and continue there.
-  * If a session has already been relocated and vanished, recover it:
-        pwsh -NoProfile -File $($roots[0].Display)\scripts\worktree\sessions.ps1 -Rehome <id-prefix>
+$rehome
 "@
 }
 
@@ -469,30 +608,35 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw) {
     $hasFlag = @($after -split '\s+' | Where-Object { $_ -and $_.StartsWith('-') }).Count -gt 0
     if (-not $hasFlag -and ($list -contains ("branch refs/heads/" + $dest))) { return }
 
-    $newHint = "$($gov.Display)\scripts\worktree\new.ps1"
     $destSlug = ConvertTo-WorktreeSlug $dest
-    # Doubled for the SINGLE-quoted emission below. A refname is not a safe shell token: `git
-    # check-ref-format` accepts ';', '$', '|', '"' and "'" (all measured exit 0), and line ~349 trims
-    # quotes only at the ENDS, so an interior one survives. Without the doubling, a legal branch named
-    # `x';calc;#` emits a line that PARSES AS TWO STATEMENTS -- the second being whatever follows the
-    # quote, with '#' commenting out the remainder. That is command injection into text this very
-    # message tells an agent to run. $destSlug needs no such care: it is [A-Za-z0-9._-]+ by construction.
-    $destQ = $dest -replace "'", "''"
+    # EVERY interpolation below goes through one of the two helpers, and which one depends ONLY on
+    # whether the value lands in PROSE or in a COMMAND (BACKLOG #1040/#1076). No per-site reasoning about
+    # a particular value being safe: that reasoning is what left line 477 bare one line under the fix for
+    # line 475, and what left $destSlug bare beside a note explaining why it did not need care. A reader
+    # auditing this block should find ZERO raw interpolations and never have to judge one.
+    #
+    # `git check-ref-format` accepts ';', '$', '|', '"', "'", a backtick, '&', '(' and ')' in a refname
+    # (all measured exit 0), and the destination scanner above trims quotes only at the ENDS, so an
+    # interior one survives. The refname is ATTACKER-CHOSEN from a public fork: `gh pr checkout`,
+    # `git checkout --track` and `git fetch origin <ref>:<ref>` all create refs/heads/<their-name>.
+    $newHintQ = Get-SafeForCommand $gov.Display -Suffix '\scripts\worktree\new.ps1'
+    $selfTopQ = Get-SafeForCommand $selfTopRaw
+    $destMsg  = Get-SafeForMessage $dest
     Write-Deny -Rule "3b" -Detail "git $Verb -> $selfTopRaw" -Reason @"
-BLOCKED: 'git $Verb $dest' would switch a LINKED WORKTREE ($selfTopRaw) onto the existing branch '$dest'.
+BLOCKED: 'git $(Get-SafeForMessage $Verb) $destMsg' would switch a LINKED WORKTREE ($(Get-SafeForMessage $selfTopRaw)) onto the existing branch '$destMsg'.
 
-That worktree belongs to another session, which is building on '$head' right now. Switching it swaps every
+That worktree belongs to another session, which is building on '$(Get-SafeForMessage $head)' right now. Switching it swaps every
 file under that session mid-task -- silently -- and drags two sessions' work onto one branch. This is not
 hypothetical: it is exactly the hijack that happened here. A session with no worktree of its own ran a
-`git checkout` inside somebody else's worktree; git allowed it because '$dest' was not checked out anywhere.
+`git checkout` inside somebody else's worktree; git allowed it because '$destMsg' was not checked out anywhere.
 
 What to do instead:
-  * To BUILD on '$dest', give it its OWN worktree -- git then refuses to check that branch out twice,
+  * To BUILD on '$destMsg', give it its OWN worktree -- git then refuses to check that branch out twice,
     which is the protection you actually want. The branch already EXISTS, so this REUSES it rather than
     forking. -Branch is the git ref; -Name is only the DIRECTORY, which cannot contain '/':
-        pwsh -NoProfile -File "$newHint" -Branch '$destQ' -Name $destSlug
-  * To READ '$dest' without touching any working tree, use the plumbing:
-        git -C "$selfTopRaw" show $dest`:<path>        git -C "$selfTopRaw" diff HEAD..$dest
+        pwsh -NoProfile -File $newHintQ -Branch $(Get-SafeForCommand $dest) -Name $(Get-SafeForCommand $destSlug)
+  * To READ '$destMsg' without touching any working tree, use the plumbing:
+        git -C $selfTopQ show $(Get-SafeForCommand $dest -Suffix ':<path>')        git -C $selfTopQ diff $(Get-SafeForCommand $dest -Prefix 'HEAD..')
   * If you genuinely OWN this worktree and must switch it, do it from a PLAIN terminal -- the gate governs
     agents, not you. Do not route around this with a shell script; that only hides the collision.
 "@
@@ -505,7 +649,7 @@ What to do instead:
 if ($tool -in @("Task", "Agent", "Workflow")) {
     $root = Test-Governed $cwd
     if ($root) {
-        $display = $root.Display
+        $display = Get-SafeForMessage $root.Display
         Write-Deny -Rule "2" -Detail "dispatch $tool" -Reason @"
 BLOCKED: this session is running in the SHARED PRIMARY checkout ($display), so it may not dispatch
 subagents. A subagent inherits this cwd, cannot create a worktree for itself, and its blocked edits do
@@ -513,7 +657,7 @@ not reliably surface back to you -- the fan-out would appear to succeed while wr
 
 Create a worktree first, then dispatch from it:
 
-    pwsh -NoProfile -File $display\scripts\worktree\new.ps1 -Name <short-kebab-task-name>
+    pwsh -NoProfile -File $(Get-SafeForCommand $root.Display -Suffix '\scripts\worktree\new.ps1') -Name <short-kebab-task-name>
 
 That prints a worktree path. Ask the user to start the session there (or continue there yourself), then
 re-dispatch. If you were only going to READ, do it directly -- reads are never blocked.
@@ -760,8 +904,14 @@ What to do instead:
         # path; leaving the caller to substitute a placeholder into a command is a second chance to get
         # it wrong, and it is the reason the own-tree branch was unrunnable for the sibling family too.
         $sibName = if ($isSibling) { (Split-Path $victimTopRaw -Leaf).Substring($govLeaf.Length + 1) } else { $null }
+        # QUOTED, both arguments, through the shared command helper (BACKLOG #1035/#1040). The path comes
+        # from the operator's allowlist and $sibName from a directory leaf, and a space in either -- an
+        # ordinary thing on Windows -- makes this line exit 64 before -Name is ever bound. Measured: with
+        # a primary at `<tmp>/Pri mary` the unquoted form dies with "The argument '<tmp>/Pri' is not
+        # recognized as the name of a script file"; quoted, the identical line exits 0.
         $removeCmd = if ($isSibling) {
-            "pwsh -NoProfile -File $($govWt.Display)\scripts\worktree\remove.ps1 -Name $sibName"
+            "pwsh -NoProfile -File $(Get-SafeForCommand $govWt.Display -Suffix '\scripts\worktree\remove.ps1')" +
+            " -Name $(Get-SafeForCommand $sibName)"
         }
         else {
             "git -C `"$($govWt.Display)`" worktree remove `"$victimTopRaw`""
@@ -774,7 +924,7 @@ What to do instead:
             @"
   * Cleaning up merged worktrees is a maintenance job with its own dry-run-by-default tool. Run it and
     READ what it proposes before applying anything:
-        pwsh -NoProfile -File $($govWt.Display)\scripts\worktree\prune-merged.ps1
+        pwsh -NoProfile -File $(Get-SafeForCommand $govWt.Display -Suffix '\scripts\worktree\prune-merged.ps1')
 "@
         }
         else {
@@ -952,9 +1102,10 @@ $cleanupBullet
         exit 0
     }
 
-    $display = $root.Display
+    $displayQ = Get-SafeForCommand $root.Display
+    $display = Get-SafeForMessage $root.Display
     Write-Deny -Rule "3" -Detail "git $verb" -Reason @"
-BLOCKED: 'git $verb' would change the working tree of the SHARED PRIMARY checkout ($display).
+BLOCKED: 'git $(Get-SafeForMessage $verb)' would change the working tree of the SHARED PRIMARY checkout ($display).
 
 Other sessions are standing in that directory right now. Switching its branch (or resetting, stashing or
 cleaning it) swaps every file under them mid-task -- silently. This has already happened here: a session
@@ -963,13 +1114,13 @@ became a different commit's tree.
 
 You almost never need this:
   * To BUILD, work in your own worktree -- and you can create one from here:
-        pwsh -NoProfile -File $display\scripts\worktree\new.ps1 -Name <short-kebab-task-name>
+        pwsh -NoProfile -File $(Get-SafeForCommand $root.Display -Suffix '\scripts\worktree\new.ps1') -Name <short-kebab-task-name>
   * To READ another branch WITHOUT touching any working tree, use the plumbing:
-        git -C "$display" show <ref>:<path>        git -C "$display" ls-tree <ref>
-        git -C "$display" diff <ref>..<ref>        git -C "$display" log <ref>
+        git -C $displayQ show <ref>:<path>        git -C $displayQ ls-tree <ref>
+        git -C $displayQ diff <ref>..<ref>        git -C $displayQ log <ref>
   * If the primary is genuinely broken (detached HEAD, wrong branch), REPAIR it rather than checking out
     by hand -- this is allowed, and it refuses if the tree is dirty:
-        pwsh -NoProfile -File $display\scripts\worktree\restore-primary.ps1
+        pwsh -NoProfile -File $(Get-SafeForCommand $root.Display -Suffix '\scripts\worktree\restore-primary.ps1')
 
 If none of those fit, STOP and tell the user: "I need to change the primary checkout's branch and the
 worktree gate blocked it." The primary's HEAD belongs to the user, not to a session.
@@ -1250,7 +1401,13 @@ foreach ($r in $roots) {
     foreach ($entry in @(
         @{ Name = "alloc"
            What = "the ledger gate's ADR/BACKLOG allocation registry (and its one-way floor ratchets)"
-           Fix  = 'pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind <adr|backlog> -Title "<title>"' }
+           # `<adr-or-backlog>`, NOT `<adr|backlog>`. A '|' on a command-form line is a PIPE in both
+           # shells, so Protect-CommandLines drops it -- correctly, because it cannot tell an author's
+           # placeholder from an injected separator. That turned this remedy into `-Kind <adrbacklog>`:
+           # measured, and caught by inventory rather than by any test, which is why every Fix string in
+           # this table is now pinned against what is actually EMITTED. A placeholder can always be
+           # spelled without a metacharacter; a backstop with an exception carved into it is not one.
+           Fix  = 'pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind <adr-or-backlog> -Title "<title>"' }
         @{ Name = "claims"
            What = "the claim gate's registry of who is building which BACKLOG item"
            Fix  = 'pwsh -NoProfile -File scripts\coord\claim.ps1 -Take <item> -Note "<what>"' }
@@ -1330,14 +1487,18 @@ with a shell command; that only removes the record of which session did it.
 $root = Test-Governed $targetCmp
 if (-not $root) { exit 0 }
 
-$display = $root.Display
+$display = Get-SafeForMessage $root.Display
 
 # Point the session at worktrees that ALREADY exist before it makes another one. Without this, every retry
 # mints a fresh worktree and the machine fills up with them.
+#
+# $root.Display, NOT $display: `git -C` must take the RAW value. $display is the PROSE fold, which
+# collapses tabs and truncates past 400 characters -- the same class of mistake this file already warns
+# about twice for the LOWERCASING fold, arriving through the other helper.
 $worktrees = @()
 try {
     $worktrees = @(
-        & git -C $display worktree list --porcelain 2>$null |
+        & git -C $root.Display worktree list --porcelain 2>$null |
             Select-String -Pattern '^worktree (.+)$' |
             ForEach-Object { $_.Matches[0].Groups[1].Value } |
             # `$root` is the PSCustomObject from Test-Governed, NOT a string -- comparing a path to it was
@@ -1351,7 +1512,8 @@ try {
 
 $worktreeHint = if ($worktrees.Count -gt 0) {
     "`n`nWorktrees that already exist -- REUSE one if it is yours before creating another:`n" +
-    (($worktrees | Select-Object -First 8 | ForEach-Object { "    $_" }) -join "`n")
+    (($worktrees | Select-Object -First 8 |
+        ForEach-Object { "    $(Get-SafeForMessage $_)" }) -join "`n")
 } else { "" }
 
 Write-Deny -Rule "1" -Detail $target -Reason @"
@@ -1368,13 +1530,13 @@ working tree is off limits. Do one of these:
 
   A) BUILD IN A WORKTREE (the normal path). Create one, then re-issue your edit against an ABSOLUTE path
      inside it:
-         pwsh -NoProfile -File $display\scripts\worktree\new.ps1 -Name <short-kebab-task-name>
+         pwsh -NoProfile -File $(Get-SafeForCommand $root.Display -Suffix '\scripts\worktree\new.ps1') -Name <short-kebab-task-name>
      It prints the worktree path. It gets its own branch off a freshly fetched origin/main, and its own
      .venv, so tests there run against that code.
 
   B) RESCUE WORK ALREADY IN THE PRIMARY. If the primary's tree is already dirty, move it wholesale
      rather than re-doing it:
-         pwsh -NoProfile -File $display\scripts\worktree\rescue.ps1 -Name <short-kebab-task-name>
+         pwsh -NoProfile -File $(Get-SafeForCommand $root.Display -Suffix '\scripts\worktree\rescue.ps1') -Name <short-kebab-task-name>
 
   C) If neither fits -- e.g. the change genuinely belongs in the primary -- STOP and tell the user
      exactly that, in these words: "The worktree gate blocked a write to the primary checkout and I

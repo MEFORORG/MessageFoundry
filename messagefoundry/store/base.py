@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Collection, Iterable, Mapping, Sequence
+from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -2011,6 +2012,89 @@ def pool_over_provisioned_warning(pool_max_size: int, n_inbound: int) -> str | N
             f"See ADR 0062."
         )
     return None
+
+
+# BACKLOG #1052 (ASVS 13.2.6) — bound a STORE pooled-connection borrow, the counterpart of the
+# connector tier's ``transports/database.py::_DEFAULT_DB_ACQUIRE_TIMEOUT``. Same 30 s default, and the
+# same reasoning inverted: the connector's pool is never legitimately exhausted (one worker per
+# connection), whereas the store's pool IS legitimately contended by every lane — so 30 s is chosen to
+# sit far above a healthy wait (the dogfood box measured 340-958 ms cold ODBC acquires; the B11
+# acquire-wait histogram is the live signal) and to mean "the pool is wedged or the DB is
+# unresponsive", not "the pool is busy". Operators retune it with ``[store].acquire_timeout``.
+DEFAULT_STORE_ACQUIRE_TIMEOUT = 30.0
+
+
+class StoreAcquireTimeout(RuntimeError):
+    """A store pooled-connection borrow exceeded ``[store].acquire_timeout``.
+
+    An ordinary ``Exception`` on purpose, so it lands in the store callers' existing ``except
+    Exception`` handling and is treated as a transient stage failure (retry / dead-letter) — never a
+    crashed connection or a lost message. Deliberately NOT a ``TimeoutError``: since Python 3.11 that
+    is a subclass of ``OSError``, and connector-error handling elsewhere keys off ``OSError`` to mean
+    "the network moved", which this is not. The message is numeric + PHI-free."""
+
+
+def _salvage_late_borrow(pool: Any, backend: str, borrow: asyncio.Future[Any]) -> None:
+    """Release a connection that arrived AFTER its borrower gave up (a done-callback on the shielded
+    borrow task). Never raises — it runs on the event loop's callback path.
+
+    Without this the bound would be a slow leak of the very resource it protects: the pool marks a
+    connection in-use before handing it over, so a borrow abandoned mid-flight leaves a connection
+    nobody holds and nobody can return, permanently shrinking a pool that is already wedged. This is
+    the acquire-side counterpart of the leak-freedom invariant :func:`warm_pool_connections`
+    documents, made explicit because ``asyncio.wait_for`` cannot provide it: on expiry it cancels the
+    inner task, and a cancellation that lands in the same loop iteration the borrow resolves discards
+    the already-acquired connection."""
+    if borrow.cancelled() or borrow.exception() is not None:
+        return  # the cancel won the race, or the borrow failed — nothing was handed over
+    conn = borrow.result()
+
+    async def _release() -> None:
+        try:
+            await pool.release(conn)
+        except Exception:  # noqa: BLE001 - hygiene only; there is no caller left to inform
+            log.debug("%s: releasing a late pool borrow failed", backend, exc_info=True)
+
+    asyncio.ensure_future(_release())
+
+
+async def acquire_pooled(pool: Any, *, timeout: float, backend: str) -> Any:
+    """Borrow a pooled connection within ``timeout`` seconds, or raise :class:`StoreAcquireTimeout`.
+
+    The single bounded chokepoint both server backends' ``_acquire`` helpers go through, so there is
+    one place that decides what happens at the limit and the two cannot drift. The caller releases the
+    connection exactly as it did when it used ``async with pool.acquire()``: both drivers' acquire
+    context managers do nothing on exit but ``await pool.release(conn)`` (aioodbc 0.5.0
+    ``utils.py:86-103``, asyncpg 0.31.0 ``pool.py:1059-1068``), so an explicit release is equivalent.
+
+    **The borrow is shielded, then cancelled, then salvaged** — that ordering is the whole point.
+    A bare ``asyncio.wait_for(pool.acquire(), timeout)`` cancels the borrow at the instant the timer
+    fires, which races the pool's own mark-in-use step; ``shield`` moves the cancellation out of that
+    race, and the explicit cancel afterwards keeps a wedged pool from accumulating one detached borrow
+    per retry. Whichever of the two wins, :func:`_salvage_late_borrow` returns the connection if one
+    was actually handed over. The caller's own cancellation takes the same path — it must, or a
+    shutdown mid-borrow would strand a slot the pool never recovers."""
+    borrow: asyncio.Future[Any] = asyncio.ensure_future(_as_awaitable(pool.acquire()))
+    try:
+        return await asyncio.wait_for(asyncio.shield(borrow), timeout)
+    except TimeoutError as exc:
+        borrow.cancel()
+        borrow.add_done_callback(partial(_salvage_late_borrow, pool, backend))
+        raise StoreAcquireTimeout(
+            f"{backend}: store pool acquire timed out after {timeout:g}s "
+            f"(pool exhausted or database unresponsive); retune with [store].acquire_timeout"
+        ) from exc
+    except asyncio.CancelledError:
+        borrow.cancel()
+        borrow.add_done_callback(partial(_salvage_late_borrow, pool, backend))
+        raise
+
+
+async def _as_awaitable(acquire: Any) -> Any:
+    """Await whatever the driver's ``pool.acquire()`` returned. aioodbc hands back a ``_ContextManager``
+    and asyncpg a ``PoolAcquireContext``; neither is a plain coroutine, and only this wrapper makes
+    both safe to pass to ``ensure_future`` regardless of which awaitable shape a driver adopts next."""
+    return await acquire
 
 
 async def warm_pool_connections(pool: Any, *, target: int, timeout: float, backend: str) -> int:

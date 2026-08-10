@@ -7,7 +7,7 @@
   is its design amendment**, superseding the sketch and retiring the
   `MULTISESSION-PLAN-v0.2.md:437` "WP-14b design amendment authored+Accepted" gate) ·
   [ADR 0065](0065-web-ops-dashboard.md) (web console; its AC-2 cookie boundary and AC-6 off-loopback
-  refusal are restated and extended here) · [BACKLOG](../BACKLOG.md) #11 / [#75](../archive/backlog/BACKLOG-CLOSED.md#75-browser--web-operator-monitor) ·
+  refusal are restated and extended here) · BACKLOG [#11](../archive/backlog/BACKLOG-CLOSED.md) / [#75](../archive/backlog/BACKLOG-CLOSED.md#75-browser--web-operator-monitor) ·
   ASVS-L3-ASSESSMENT §2b (both "Deferred (off-loopback / L5)"
   residuals) · [docs/SECURITY.md](../SECURITY.md)
 

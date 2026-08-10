@@ -170,6 +170,11 @@ def run_checks(
         # ADR 0153: name every outbound that declares cleartext_accepted, so the accepted set is visible
         # in review rather than discoverable only by reading each connection. Advisory — see the check.
         _check_cleartext_accepted(config_dir),
+        # #333: the two OTHER connection-scoped TLS deviations, same shape and same reason. Both were
+        # reported by a construction log line and nothing else, and a log line emitted once at startup
+        # is not the surface anyone queries three months later. Advisory — see the checks.
+        _check_expiry_relaxed(config_dir),
+        _check_generic_db_tls(config_dir),
         # #323 layer 3: report whether the [alerts] SMTP hop authenticates the relay. The defect this
         # closes was invisible for exactly as long as nothing reported it. Advisory — see the check.
         _check_alert_smtp_tls(
@@ -1548,6 +1553,97 @@ def _check_cleartext_accepted(
         ok=True,
         required=False,
         detail=(f"{len(accepted)} connection(s) cross a cleartext hop by declaration — {listed}"),
+    )
+
+
+def _check_expiry_relaxed(config_dir: str | Path) -> CheckResult:
+    """Surface every outbound that declares ``tls_allow_expired`` (#129 / ADR 0094), with its peer.
+
+    The sibling of :func:`_check_cleartext_accepted`, built for the same reason (#333): the relaxation
+    was reported by a construction-time WARN and by nothing else, so an operator who set a two-week
+    bridge when a partner's certificate lapsed had nothing that expired it, re-checked it, or listed it.
+    ``check`` runs at commit/CI time and prints the whole set, which is where a stale bridge gets
+    noticed.
+
+    Advisory (``required=False``) on the same reasoning: ADR 0094 built this as the *narrow, honest*
+    alternative to ``tls_verify=False``, and blocking on it would push operators back toward the blunt
+    switch. It exists so the set is visible in review, next to the hosts.
+
+    SKIPs when the graph will not load — same convention and same reason as its sibling."""
+    from messagefoundry.config.wiring import WiringError, expiry_relaxed_hops, load_config
+
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            "tls-allow-expired",
+            ok=True,
+            required=False,
+            skipped=True,
+            detail=f"config did not load: {exc}",
+        )
+    relaxed = expiry_relaxed_hops(registry)
+    if not relaxed:
+        return CheckResult(
+            "tls-allow-expired",
+            ok=True,
+            required=False,
+            detail="no connection declares tls_allow_expired",
+        )
+    listed = "; ".join(f"{name} -> {peer}" for name, peer in relaxed)
+    return CheckResult(
+        "tls-allow-expired",
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(relaxed)} outbound connection(s) accept an EXPIRED server certificate "
+            f"indefinitely — {listed} (chain, hostname and key usage are still verified)"
+        ),
+    )
+
+
+def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
+    """Surface every generic-ODBC ``DATABASE`` connection whose ``odbc_params`` leave TLS unenforced.
+
+    #66 / ADR 0092's 2026-07-12 amendment delegates TLS to the operator's driver keyword on
+    ``dialect='generic'``, because MessageFoundry cannot enumerate an arbitrary driver's keywords — that
+    delegation is right and this check does not challenge it. What #333 fixes is that the delegation's
+    ONLY control was a construction log line, which is not a surface anyone reviews. Covers inbound
+    (``DatabasePoll``) as well as outbound: the poll link crosses the same hop with the same credential
+    in the same DSN.
+
+    Advisory (``required=False``): the engine cannot prove a given driver keyword verifies anything, so
+    a refusal here would be guess-based and would break legitimate drivers — exactly what ADR 0092
+    declined. SKIPs when the graph will not load, same convention as its siblings."""
+    from messagefoundry.config.wiring import WiringError, load_config, unverified_generic_db_hops
+
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            "generic-db-tls",
+            ok=True,
+            required=False,
+            skipped=True,
+            detail=f"config did not load: {exc}",
+        )
+    hops = unverified_generic_db_hops(registry)
+    if not hops:
+        return CheckResult(
+            "generic-db-tls",
+            ok=True,
+            required=False,
+            detail="no generic-ODBC DATABASE connection leaves TLS unenforced",
+        )
+    listed = "; ".join(f"{name}: {reason}" for name, reason in hops)
+    return CheckResult(
+        "generic-db-tls",
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(hops)} generic-ODBC DATABASE connection(s) may cross in plaintext — {listed}; "
+            "set a verifying keyword in odbc_params (e.g. SSLmode=verify-full)"
+        ),
     )
 
 

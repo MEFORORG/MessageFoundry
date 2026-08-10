@@ -14,21 +14,25 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 
 from scripts.asvs.scorecard import (
     _DESCEND_ONLY,
     _TRANSPARENT,
+    VERDICT_ORDER,
+    VERDICTS,
     Absence,
     Anchor,
     Cell,
     Findings,
     ScorecardError,
+    Verdict,
     _copy_scratch,
     _humanise_age,
     anchor_form,
@@ -49,6 +53,7 @@ from scripts.asvs.scorecard import (
     render_current,
     repo_stamp,
     status_lines,
+    verdict_breakdown,
     verify,
 )
 
@@ -134,6 +139,135 @@ def test_count_is_derived_from_the_cells() -> None:
     n = count(cells)
     assert (n["pass"], n["partial"], n["unverified"]) == (1, 1, 1)
     assert sum(n.values()) == len(cells)
+
+
+# --- the printed distribution reconciles against its own total (BACKLOG #1012) --------------------
+#
+# The gate's summary line enumerated FIVE verdict states and stated a total that counted SIX states'
+# worth of cells: 344 components against a stated 345, with `needs-review` omitted. Nothing compared
+# the two numbers, so the line could not be reconciled against itself, and it is the line people quote.
+# These pin the three properties that make the class unrepeatable: the enumeration is derived from the
+# type, every state is printed, and the components are checked against the population before printing.
+
+
+def test_the_verdict_enumeration_is_the_type_and_not_a_second_list() -> None:
+    """`VERDICT_ORDER` is what every breakdown walks. If it were retyped beside `Verdict`, a state
+    added to one and not the other is exactly #1012 again -- so it is derived, and this says so.
+
+    Falsified by replacing the `get_args(Verdict)` derivation with a hand-written tuple missing
+    `needs-review`: this goes RED on the set comparison. Restored.
+    """
+    assert set(VERDICT_ORDER) == set(get_args(Verdict))
+    assert set(VERDICT_ORDER) == set(VERDICTS)
+    assert len(VERDICT_ORDER) == len(set(VERDICT_ORDER))  # order, so no state can appear twice
+    assert "needs-review" in VERDICT_ORDER  # the state that vanished
+
+
+def test_the_breakdown_carries_every_state_and_closes_to_the_cell_count() -> None:
+    """One cell per state, so a dropped state is a dropped 1 -- and the parts must sum to 6."""
+    cells = _cells(*((f"1.1.{i}", 1, v) for i, v in enumerate(VERDICT_ORDER, start=1)))
+    parts, total = verdict_breakdown(cells)
+    assert [v for v, _ in parts] == list(VERDICT_ORDER)
+    assert total == len(cells) == 6
+    assert sum(c for _, c in parts) == total
+
+
+def test_a_state_with_no_landing_site_REFUSES_rather_than_printing_344_of_345() -> None:
+    """The live positive control: a cell carrying a verdict outside the enumeration.
+
+    This is #1012's shape reproduced in the data instead of in the format string -- a state present in
+    the population with nowhere to land -- and the components then sum SHORT of the total. Printing it
+    anyway is what the gate did. `load_scorecard` refuses such a verdict on the way in, so this
+    constructs the Cell directly: the point is that the fence behind the fence also holds.
+    """
+    cells = [
+        *_cells(("1.1.1", 1, "pass")),
+        Cell(id="1.1.2", level=1, verdict="mostly-fine"),  # type: ignore[arg-type]
+    ]
+    with pytest.raises(ScorecardError) as exc:
+        verdict_breakdown(cells)
+    assert "does not reconcile" in str(exc.value)
+    assert "mostly-fine" in str(exc.value)  # names the state, not just the arithmetic
+    assert "1" in str(exc.value) and "2" in str(exc.value)  # the components and the total
+
+
+def test_the_gate_summary_line_prints_all_six_states_and_states_a_total_they_sum_to(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """End-to-end through `main`, because the defect was on the rendered line and not in a helper.
+
+    Falsified by restoring the old hand-written five-state f-string in `main`: the `needs-review`
+    assertion goes RED and the reconciliation below it goes RED with a real arithmetic gap. Restored.
+    """
+    corpus = _corpus_file(tmp_path, {"1.1.1": 1, "1.1.2": 1, "2.1.1": 1})
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text("SIZE = 64\n", encoding="utf-8")
+    sc = _scorecard_file(
+        tmp_path,
+        f'[scorecard]\nasvs_version = "5.0.0"\ncorpus_sha256 = "{corpus_digest(corpus)}"\n'
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\n'
+        "  [[cell.evidence]]\n"
+        '  path = "messagefoundry/m.py"\n  line = 1\n  expect = "SIZE = 64"\n'
+        '[[cell]]\nid = "1.1.2"\nlevel = 1\nverdict = "needs-review"\n'
+        '[[cell]]\nid = "2.1.1"\nlevel = 1\nverdict = "unverified"\n',
+    )
+    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    # Every state named, including the one that used to have no landing site.
+    for verdict in VERDICT_ORDER:
+        assert f" {verdict}" in out, f"{verdict} is missing from the summary line"
+    assert "1 needs-review" in out
+    # And the components reconcile against the stated total, read back off the printed line.
+    line = next(ln for ln in out.splitlines() if ln.startswith("scanned "))
+    stated = int(re.match(r"scanned (\d+) cells", line).group(1))  # type: ignore[union-attr]
+    components = [int(m) for m in re.findall(r"(\d+) [a-z-]+", line.split("(", 1)[1].split(")")[0])]
+    assert len(components) == len(VERDICT_ORDER)
+    assert sum(components) == stated == 3
+
+
+def test_status_and_the_gate_summary_report_the_same_distribution() -> None:
+    """Two renderings of one population must not disagree, which is how the defect stayed invisible:
+    `--status` printed six states and the gate line five, in the same module, over the same cells.
+
+    **What this does NOT pin, said so it is not read as more:** it builds its population FROM
+    `VERDICT_ORDER`, so a state dropped from that tuple is dropped from both sides and this stays
+    green. Measured -- it is the one arm of these five that survives that mutation. The completeness
+    of the enumeration is pinned by `test_the_verdict_enumeration_is_the_type_and_not_a_second_list`;
+    this pins only that the two renderings agree.
+    """
+    cells = _cells(*((f"1.1.{i}", 1, v) for i, v in enumerate(VERDICT_ORDER, start=1)))
+    parts, total = verdict_breakdown(cells)
+    status = "\n".join(status_lines(cells))
+    assert f"cells {total}: " in status
+    for verdict, n in parts:
+        assert f"{n} {verdict}" in status
+
+
+def test_the_rendered_table_rows_sum_to_the_Total_row_it_prints(tmp_path: Path) -> None:
+    """The same class, one file over: six hand-written rows above a hand-written Total. Parsed back
+    out of the rendered markdown rather than asserted of the inputs, so the check reads what a human
+    reads.
+
+    Falsified by deleting the `needs-review` entry from `_VERDICT_ROW`: the render refuses outright
+    (ScorecardError) instead of quietly emitting five rows over a six-state Total. Restored.
+    """
+    cells = _cells(*((f"1.1.{i}", 1, v) for i, v in enumerate(VERDICT_ORDER, start=1)))
+    page = render_current(cells, anchor_sha="deadbeef")
+    rows = [ln for ln in page.splitlines() if ln.startswith("| ") and "---" not in ln]
+    counts = {}
+    total = None
+    for row in rows:
+        cols = [c.strip().strip("*") for c in row.strip("|").split("|")]
+        if len(cols) != 3 or not cols[1].isdigit():
+            continue
+        if cols[0] == "Total":
+            total = int(cols[1])
+        else:
+            counts[cols[0]] = int(cols[1])
+    assert total == len(cells)
+    assert len(counts) == len(VERDICT_ORDER), f"rendered state rows: {sorted(counts)}"
+    assert sum(counts.values()) == total
 
 
 # --- evidence anchors -----------------------------------------------------------------------------

@@ -15,6 +15,14 @@
 #     implement a backlog item (`BACKLOG #N` in its title or body) and touches engine/IDE code, then
 #     it must also update `docs/BACKLOG.md`. That is the step whose omission caused #60.
 #
+# THE JOB BELOW NOW RUNS TWO CHECKS, and its `name:` describes only the first. That is deliberate and
+# must stay: the name is the branch-protection CONTEXT STRING, so renaming it makes the required
+# context stop reporting and wedges every PR (see .github/required-contexts.txt). The second check is
+# the CITATION gate (BACKLOG #1095) — every backlog number this PR adds beside a ledger path must
+# name the file that item actually lives in. It rides this job rather than a new one for the same
+# reason: an unrequired context is decoration, since auto-merge blocks only on required ones, and
+# adding one to branch protection is not an in-repo change.
+#
 # Read-only. No secrets. Workflow expressions are hoisted into `env` and never interpolated into a
 # `run:` body (zizmor: a PR title/body is attacker-controlled on a fork PR and must arrive as data).
 name: backlog-hygiene
@@ -110,3 +118,25 @@ jobs:
           item body — then drop the 'BACKLOG #$n' token from this PR's title/body.
           EOF
           exit 1
+
+      # BACKLOG #1095. Retiring an item MOVES it verbatim from docs/BACKLOG.md into
+      # docs/archive/backlog/, and every citation that named the live file keeps pointing at a file
+      # the item is no longer in. No link checker can see this: docs/BACKLOG.md resolves perfectly,
+      # and only the human-readable number beside it is stale.
+      #
+      # DIFF-SCOPED, and that is the design rather than a convenience. PR #271 declined a gate partly
+      # because "a gate that fails on a legitimate archive is one people delete"; with pre-existing
+      # violations a corpus-wide gate is red on day one and gets suppressed. --base/--head restricts
+      # findings to lines THIS PR added, so it can only be red about something the PR wrote. Run the
+      # script with neither flag for the repo-wide report, which is a measurement, not a merge gate.
+      #
+      # No setup-python: the checker and the parse_items module it imports are stdlib-only, so the
+      # runner's preinstalled python3 is enough and the job stays a checkout plus two scripts.
+      - name: Every backlog citation this PR adds must name the file its item lives in
+        env:
+          # Hoisted, never interpolated into the script body (zizmor: template injection).
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/docs/backlog_citation_check.py --base "$BASE_SHA" --head "$HEAD_SHA"

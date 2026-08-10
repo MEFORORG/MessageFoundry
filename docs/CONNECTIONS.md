@@ -1060,8 +1060,12 @@ The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};]
 > driver's TLS posture — so the weakened-TLS refusal does **not** apply here. Configure **verifying** TLS
 > via the driver's own keyword in `odbc_params` (psqlODBC `SSLmode=verify-full`, MySQL
 > `SSLMODE=VERIFY_IDENTITY`, Oracle wallet). Never point PHI at an unverified generic hop. So the
-> delegation is never *silent*, a generic connection with **no** ssl/tls/encrypt keyword in `odbc_params`
-> logs a **WARNING** at construction (dropped to DEBUG once a TLS keyword is set); this exemption is
+> delegation is never *silent*, a generic connection logs a **WARNING** at construction, naming itself,
+> when `odbc_params` carries **no** ssl/tls/encrypt keyword **or** carries one set to a no-TLS value
+> (`SSLmode=disable`/`allow`/`prefer`, MySQL `DISABLED`/`PREFERRED`, `Encrypt=no`/`0`/`false`/`off`) —
+> dropped to DEBUG only once a keyword is set to something outside that deny-list. It is also reported
+> by `security_loosenings()` / `GET /security/posture` and by `messagefoundry check`'s `generic-db-tls`
+> line, for `DatabasePoll` inbounds as well as `Database` outbounds (#333). This exemption is
 > recorded in the [ADR 0092 amendment (2026-07-12)](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md).
 
 > **Scope / limitations.** Native async DB drivers (`asyncpg`-as-connector, `oracledb`, `mysqlclient`) are
@@ -2212,14 +2216,45 @@ Four facts that are easy to get wrong, stated plainly first:
   `acquire_timeout`, and there is **no** `timeout_seconds` on this connector. A long-running
   statement is therefore unbounded; keep lookup/write statements indexed and narrow. (The *store's*
   own SQL Server / Postgres connections do apply `[store].command_timeout`, default 30 s.)
-- **The store's connection pool has no acquire timeout on either server backend.** Both the SQL
-  Server and Postgres stores call `pool.acquire()` with no timeout argument; the borrow is bounded
-  by `[store].pool_size` (default 40) plus the warm-pool pre-open (`[store].warm_pool`, timeout
-  `[store].warm_pool_timeout` default 15 s), not by an acquire deadline. The `timeout=` the Postgres
-  backend hands `asyncpg.create_pool` is a pool-construction parameter carrying
-  `[store].connect_timeout`; it is **not** relied on here as a bound on waiting for a free
-  connection. **SQLite is the same shape at a smaller scale** — its four-connection read pool
-  (`_READ_POOL_SIZE`) is borrowed with `await pool.get()`, which carries no deadline either.
+- **The store's message-pipeline pool acquire is bounded on both server backends.**
+  `[store].acquire_timeout` (default **30 s**, must be > 0) caps one borrow from the SQL Server or
+  Postgres store pool, and the throwaway pool a `DatabaseRef` reference sync opens takes its own
+  `acquire_timeout` (same default). It is a *distinct* bound from the two either backend already had:
+  `[store].connect_timeout` (default 15 s) bounds the **login** and `[store].command_timeout`
+  (default 30 s) the **statement** — neither bounds the wait for a free pooled connection. The
+  `timeout=` the Postgres backend hands `asyncpg.create_pool` is a pool-construction parameter
+  carrying `[store].connect_timeout`; it is **not** a bound on waiting for a free connection either.
+  `[store].pool_size` (default 40) and the warm-pool pre-open (`[store].warm_pool`, timeout
+  `[store].warm_pool_timeout` default 15 s) size the pool; they are not a deadline.
+
+  **What it covers, stated as a scope rather than a completeness claim.** On **SQL Server**
+  `_acquire` is the sole borrow site, so it bounds every store call. On **Postgres** it bounds at
+  least the message-pipeline borrows — the transactional claim/handoff sites and the internal
+  `_fetchall` / `_fetchone` / `_execute` helpers, which were routed through the same chokepoint for
+  that reason. Take the scope as written; the two backends reach it differently and this setting is
+  not a statement about every code path that can touch a pool.
+
+  **Behaviour at the store-pool acquire limit.** The borrow raises `StoreAcquireTimeout` with a
+  numeric, PHI-free message naming the backend and the knob. It is an ordinary `Exception`, so it
+  reaches the stage worker's existing handling and is treated exactly like any other transient store
+  failure — the row stays claimable, the stage handoff re-runs idempotently, and nothing is
+  accepted-and-dropped. It is deliberately **not** a `TimeoutError` (since Python 3.11 an `OSError`
+  subclass, which connector-error handling reads as a network fault). A borrow abandoned at the limit
+  never strands a pooled connection: if the pool hands one over after the borrower gave up it is
+  released back, so a wedged pool does not shrink by a slot per retry. For a `DatabaseRef` sync the
+  set fails like any other source failure — the last-good snapshot keeps serving reads and the
+  AlertSink fires; because the runner walks the declared sets sequentially, this bound is also what
+  stops one unresponsive reference server from stalling every *other* set's refresh.
+
+  **Sizing.** 30 s sits far above a healthy wait (cold ODBC acquires measured 340–958 ms on the
+  dogfood box), so reaching it means the pool is wedged or the database is unresponsive, not that the
+  pool is busy. Read p95/p99 from the acquire-wait histogram in `pool_status()` before lowering it.
+  There is no "0 disables" value — an unbounded pool wait is what the setting exists to remove.
+
+  **SQLite is out of scope for this setting and does not need it**: its four-connection read pool
+  (`_READ_POOL_SIZE`) is borrowed with `await pool.get()`, which carries no deadline, but it is
+  in-process with no network leg — a borrow waits only for a sibling read to finish, itself bounded by
+  `PRAGMA busy_timeout` (5000 ms) and the query.
 
 *Outbound* concurrency is bounded either way: in `per_lane` mode by **exactly one delivery worker per
 outbound connection**, and in the default `pooled` mode by the per-stage processing-slot budget
@@ -2329,13 +2364,13 @@ for the Router/Handler and the SMB worker — nothing but a restart.
 | EMAIL (SMTP) destination | one SMTP connection per send, bounded by the lane budget | the relay's own limit surfaces as an SMTP error | transient → retry; permanent → dead-letter |
 | DIRECT (S/MIME over SMTP) | one SMTP connection per send, bounded by the lane budget | as EMAIL | as EMAIL |
 | DATABASE destination / poll source / `db_lookup` | `pool_max` default 5 connections per connection definition | a borrow that cannot be satisfied within `acquire_timeout` (default 30 s) fails **transiently** with a PHI-free "pool exhausted or DB unresponsive" error | the row re-queues into the `RetryPolicy` path; the pool self-heals as borrows return |
-| Reference-set sync (`DatabaseRef`) | `pool_max` default 5, in a **throwaway pool built per sync** | **`DatabaseRef` exposes no `acquire_timeout` and its borrow is not wrapped** — this is the one remaining unbounded connector-tier pool acquire | the sync task is isolated per reference set; a wedged sync leaves the previous snapshot serving reads |
+| Reference-set sync (`DatabaseRef`) | `pool_max` default 5, in a **throwaway pool built per sync** | a borrow that cannot be satisfied within `DatabaseRef(acquire_timeout=…)` (default 30 s) raises `StoreAcquireTimeout`, failing that set's sync | the sync task is isolated per reference set; the previous snapshot keeps serving reads and the AlertSink fires. The bound also keeps one wedged source from stalling the sequential pass over the other sets |
 | Internal sources — Timer / Loopback / PassThrough | n/a — they open no socket and reach no external system | n/a | n/a |
 | Engine API + `/ui` + `/ws/stats` (`[api].port`) | uvicorn's own defaults (no `limit_concurrency` / `timeout_keep_alive` is passed); per-actor 429 throttles bound abuse: login 10 per IP and 60 global per 60 s, PHI reads 120 per actor per 60 s, admin writes 12 per actor per second | over a throttle the request gets `429` and an audit row; the connection stays usable | the caller backs off; the window rolls |
 | Reverse proxy → engine segment (`[api].trusted_proxies`) | bounded by the proxy's own connection limits — the engine sets none on this hop | whatever the proxy does at its limit; the engine sees fewer connections | operator-owned (proxy config) |
 | Store — SQLite (`[store].backend = sqlite`) | one writer connection plus a **bounded read pool of 4** read-only WAL connections (`store/store.py` `_READ_POOL_SIZE`; deliberately not a setting); no network | writes serialize behind the single writer lock; a read that finds all four borrowed **waits on the pool queue with no deadline** (`await pool.get()`), and lock contention inside SQLite waits out `PRAGMA busy_timeout` 5000 ms | the borrow is returned in `finally`; every pooled connection is closed on store close |
-| Store — SQL Server (`[store].backend = sqlserver`) | `[store].pool_size` default 40, pre-warmed by `[store].warm_pool` | **no acquire timeout** — a borrow waits for a free connection; sizing plus the warm pool is the bound | a wedged pool surfaces as stalled stage workers; restart re-opens the pool and `reset_stale_inflight` recovers in-flight rows |
-| Store — Postgres (`[store].backend = postgres`) | `[store].pool_size` default 40 (`asyncpg` `max_size`) | as SQL Server — the engine passes **no timeout** to `pool.acquire()`; the `timeout=` given to `asyncpg.create_pool` is a pool-construction parameter, not an engine-owned acquire deadline | as SQL Server |
+| Store — SQL Server (`[store].backend = sqlserver`) | `[store].pool_size` default 40, pre-warmed by `[store].warm_pool` | a borrow that cannot be satisfied within `[store].acquire_timeout` (default 30 s) raises `StoreAcquireTimeout` — an ordinary `Exception`, handled like any other transient store failure | the row stays claimable and the stage handoff re-runs idempotently; a connection handed over after the borrower gave up is released back, so the pool does not shrink per retry; `reset_stale_inflight` recovers in-flight rows on restart |
+| Store — Postgres (`[store].backend = postgres`) | `[store].pool_size` default 40 (`asyncpg` `max_size`) | the same `[store].acquire_timeout` bounds at least the **message-pipeline** borrows (claim/handoff plus the internal `_fetchall`/`_fetchone`/`_execute` helpers) — see the coverage note above, which is a scope, not a completeness claim. The `timeout=` given to `asyncpg.create_pool` is a pool-construction parameter, not an acquire deadline | as SQL Server on the bounded paths |
 | Active Directory — login binds (`[auth].ad_server`) | one `authenticate()` = **two sequential binds** plus 1–2 SUBTREE searches; concurrency is bounded by the API login rate limiter and the thread executor | at the login limiter the request gets `429`; a DC that is at capacity fails the bind | the login fails closed with `LdapError`; the user retries |
 | Active Directory — session reconciler (`ad_session_recheck_seconds`) | one bind per signed-in directory user per pass, capped by `ad_session_recheck_max_users` (200); interval floored at 60 s | the remainder is deferred to later passes (least-recently-probed first), degrading to a longer effective interval rather than a bind storm | the mass-revoke breaker (`ad_session_revoke_max` 5 **and** `ad_session_revoke_max_fraction` 0.34) aborts a pass that would revoke too much |
 | Kerberos / SPNEGO SSO (`kerberos_spn`) | no engine socket — one SPNEGO server step per login against the OS provider | the OS provider's own limits apply | a failed step is an audited login reject; a boot preflight degrades SSO legibly when no provider exists |
@@ -2380,13 +2415,13 @@ for the Router/Handler and the SMB worker — nothing but a restart.
 | EMAIL (SMTP) destination | `timeout_seconds` 30 s passed to the `smtplib` constructor (covers connect and each command) | the SMTP session is closed per send | SMTP errors classified transient vs permanent | `RetryPolicy` |
 | DIRECT (S/MIME over SMTP) | `timeout_seconds` 30 s on the `smtplib` constructor | as EMAIL; key/cert material is loaded once at construction | as EMAIL | `RetryPolicy` |
 | DATABASE destination / poll source / `db_lookup` | `connect_timeout` 15 s (DSN **login** timeout only) and `acquire_timeout` 30 s on the pool borrow — **no per-statement timeout exists on this connector**. For `db_lookup` there is additionally a 30 s Handler-side **result bridge** (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker; it does **not** cancel the statement, which completes on the loop and only then releases its connection | every acquire is paired with a `pool.release()` in `finally`; the pool is closed on connection stop | an acquire expiry raises a **transient** PHI-free `DeliveryError`; SQLSTATE drives transient vs permanent | `RetryPolicy`. `db_lookup` itself is **single-shot** — it raises into the Handler |
-| Reference-set sync (`DatabaseRef`) | `connect_timeout` 15 s; **no `acquire_timeout` — the borrow is unbounded** | the connection is released and the throwaway pool closed in nested `finally` blocks | a sync error is logged and the previous snapshot keeps serving | one attempt per `refresh_seconds` (default 3600) — **no inner retry** |
+| Reference-set sync (`DatabaseRef`) | `connect_timeout` 15 s (DSN login) and `acquire_timeout` 30 s on the pool borrow | the connection is released and the throwaway pool closed in nested `finally` blocks | a sync error (including an acquire expiry) is logged, the AlertSink fires and the previous snapshot keeps serving | one attempt per `refresh_seconds` (default 3600) — **no inner retry** |
 | Internal sources — Timer / Loopback / PassThrough | n/a — no socket, no timeout | the worker task is cooperatively cancelled on stop | n/a | n/a |
 | Engine API + `/ui` + `/ws/stats` (`[api].port`) | uvicorn defaults (the engine passes no `timeout_keep_alive`) | the ASGI lifespan calls `engine.stop()`, cancelling every worker | throttled requests get `429` + an audit row | n/a — the caller retries |
 | Reverse proxy → engine segment (`[api].trusted_proxies`) | **none the engine owns** — the proxy's timeouts govern | connection lifetime is the proxy's | operator-owned | n/a |
 | Store — SQLite (`[store].backend = sqlite`) | `PRAGMA busy_timeout` 5000 ms on the writer and on every read-pool connection; **the pool borrow itself carries no timeout**; no network timeout applies | connections are closed on store close | a busy database retries inside the store layer | n/a |
-| Store — SQL Server (`[store].backend = sqlserver`) | `[store].connect_timeout` 15 s (DSN login) and `[store].command_timeout` 30 s applied per acquire as the pyodbc connection attribute; `[store].warm_pool_timeout` 15 s bounds the warm-up | every acquire releases back to the pool; the pool is closed on shutdown | a driver error propagates to the stage worker and the row stays claimable | stage handoffs re-run idempotently; `reset_stale_inflight` recovers on restart |
-| Store — Postgres (`[store].backend = postgres`) | `[store].connect_timeout` 15 s (`create_pool(timeout=…)`) and `[store].command_timeout` 30 s as `asyncpg`'s per-statement bound | as SQL Server | as SQL Server | as SQL Server |
+| Store — SQL Server (`[store].backend = sqlserver`) | three distinct bounds: `[store].connect_timeout` 15 s (DSN **login**), `[store].command_timeout` 30 s (**statement**, applied per acquire as the pyodbc connection attribute) and `[store].acquire_timeout` 30 s (the **pool borrow**); `[store].warm_pool_timeout` 15 s bounds the warm-up | every acquire releases back to the pool; the pool is closed on shutdown; a borrow the pool satisfies after the borrower gave up is released back rather than stranded | a driver error — or a `StoreAcquireTimeout` — propagates to the stage worker and the row stays claimable | stage handoffs re-run idempotently; `reset_stale_inflight` recovers on restart |
+| Store — Postgres (`[store].backend = postgres`) | `[store].connect_timeout` 15 s (`create_pool(timeout=…)`), `[store].command_timeout` 30 s as `asyncpg`'s per-statement bound, and `[store].acquire_timeout` 30 s on the message-pipeline pool borrows (see the coverage note above) | as SQL Server | as SQL Server | as SQL Server |
 | Active Directory — login binds (`[auth].ad_server`) | `[auth].ad_connect_timeout` 10 s on the LDAP TCP connect and `[auth].ad_receive_timeout` 10 s on every LDAP response read — threaded into **every** `ldap3` `Server`/`Connection` construction | the service-account connection is context-managed; the user bind is unbound in a `finally`, so a **rejected** password releases it too (the common adversarial case) | fails closed with `LdapError`; the login is rejected and audited | **single-shot** — two binds, no retry loop |
 | Active Directory — session reconciler (`ad_session_recheck_seconds`) | the same `ad_connect_timeout` / `ad_receive_timeout` | as the login path — context-managed connections | a pass that fails is retried on the next interval; strike state is process-local | **single-shot per pass**; `ad_session_recheck_strikes` (2) required before a revoke |
 | Kerberos / SPNEGO SSO (`kerberos_spn`) | **none engine-owned** — the OS provider owns any KDC timeout | the SPNEGO context is per-request | a failed step raises `LdapError` and audits a login reject | **single-shot**, single-leg — no NTLM fallback, no multi-leg handshake |

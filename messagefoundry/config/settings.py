@@ -508,6 +508,17 @@ class StoreSettings(_Section):
     pool_size: int = 40
     connect_timeout: int = 15  # seconds
     command_timeout: int = 30  # seconds
+    # Upper bound (seconds) on ONE pooled-connection borrow from the server-DB store pool, and on the
+    # throwaway pool a DatabaseRef reference sync opens (BACKLOG #1052, ASVS 13.2.6). Server-DB only —
+    # SQLite has no pool. `connect_timeout` bounds the LOGIN and `command_timeout` the STATEMENT;
+    # neither bounds the WAIT for a free pooled connection, which was unbounded, so a pool-exhausted or
+    # unresponsive database could block an acquiring task forever with the queue backing up behind it.
+    # At the limit the borrow raises `StoreAcquireTimeout`, which every store caller already handles as
+    # a transient stage failure (retry / dead-letter) — see docs/CONNECTIONS.md "Behaviour at the
+    # store-pool acquire limit". 30 s matches the connector tier's per-connection `acquire_timeout` and
+    # sits far above a healthy wait; watch p95/p99 in the pool_status acquire-wait histogram before
+    # lowering it. Must be > 0: the point of the knob is that the wait is always bounded.
+    acquire_timeout: float = 30.0
     db_schema: str | None = (
         None  # 'db_schema' avoids shadowing BaseModel.schema; env: MEFOR_STORE_DB_SCHEMA
     )
@@ -600,6 +611,15 @@ class StoreSettings(_Section):
     def _positive_warm_pool_timeout(cls, value: float) -> float:
         if value <= 0:
             raise ValueError("warm_pool_timeout must be > 0")
+        return value
+
+    @field_validator("acquire_timeout")
+    @classmethod
+    def _positive_acquire_timeout(cls, value: float) -> float:
+        # No "0 disables" escape hatch, unlike command_timeout: an unbounded pool wait is the defect
+        # this setting exists to remove, so there is deliberately no way to configure it back.
+        if value <= 0:
+            raise ValueError("acquire_timeout must be > 0 (the pool wait is always bounded)")
         return value
 
     @field_validator("warm_pool_target")
@@ -4070,6 +4090,8 @@ def security_loosenings(
     auth: AuthSettings,
     alerts: AlertsSettings,
     cleartext_hops: Sequence[str],
+    expiry_relaxed_hops: Sequence[str],
+    unverified_db_hops: Sequence[str],
 ) -> list[tuple[str, str]]:
     """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
     section, as ``(switch, plain-language risk)``.
@@ -4079,7 +4101,8 @@ def security_loosenings(
     that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
     ``[auth].ad_session_recheck_seconds``, ``[alerts].email_use_tls``/``email_tls_verify`` (#323
-    layer 3), and the per-connection ``cleartext_accepted``. It is NOT yet
+    layer 3), and three per-connection deviations — ``cleartext_accepted``, ``tls_allow_expired``, and a
+    generic-ODBC ``DATABASE`` hop with TLS unenforced (#333). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
     ``ad_tls_verify``, ``ad_allow_insecure_ldap``, ``oidc_require_mfa_claim``,
@@ -4092,14 +4115,17 @@ def security_loosenings(
     posture by the back door. An optional parameter is a detector that silently fails to fire; a required
     one makes omission a type error at every call site.
 
-    ``cleartext_hops`` is the list of CONNECTION NAMES that declare ``cleartext_accepted`` (ADR 0153) —
-    the one connection-scoped deviation in this otherwise settings-scoped registry. It arrives as plain
-    names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the caller
-    resolves them (``config.wiring.accepted_cleartext_hops`` is the shared reader, which walks both
-    outbound connections and ``FhirLookup`` read connections). A caller that genuinely has no graph —
-    ``messagefoundry security show``, which reads a settings file and never loads the connection config
-    — passes an empty sequence and SAYS SO in its output, rather than reporting a subset as if it were
-    everything.
+    The last three parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
+    ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
+    ``tls_allow_expired`` (#129 / ADR 0094), and ``unverified_db_hops`` is a generic-ODBC ``DATABASE``
+    connection whose ``odbc_params`` leave TLS unenforced (#66 / ADR 0092's amendment). They arrive as
+    plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
+    caller resolves them through the shared readers in ``config.wiring``
+    (``accepted_cleartext_hops``, which walks both outbound connections and ``FhirLookup`` read
+    connections; ``expiry_relaxed_hops``; ``unverified_generic_db_hops``, which walks inbound as well as
+    outbound). A caller that genuinely has no graph — ``messagefoundry security show``, which reads a
+    settings file and never loads the connection config — passes empty sequences and SAYS SO in its
+    output, rather than reporting a subset as if it were everything.
 
     Shared by the serve-time loosening warning (``__main__``, ADR 0118 AC-4) and the read-only posture
     view (``GET /security/posture``, AC-5), so the two never drift. This is advisory only — it names what
@@ -4294,8 +4320,8 @@ def security_loosenings(
                 "— the serve gate that would otherwise refuse it is acknowledged away",
             )
         )
-    # --- the one CONNECTION-scoped deviation (ADR 0153 decision 2). It is not a [security] switch, but
-    # it is a declared departure from the one shipped posture, so it belongs in the one registry an
+    # --- the CONNECTION-scoped deviations (ADR 0153 decision 2; #333). None is a [security] switch, but
+    # each is a declared departure from the one shipped posture, so they belong in the one registry an
     # operator reads — a deviation the registry cannot see is a second posture by the back door.
     if cleartext_hops:
         named = ", ".join(sorted(cleartext_hops))
@@ -4305,6 +4331,32 @@ def security_loosenings(
                 f"{len(cleartext_hops)} connection(s) cross a CLEARTEXT hop by declaration "
                 f"({named}) — the payload, and any credential the connection carries, ride those hops "
                 "unencrypted and readable by anything on the path",
+            )
+        )
+    if expiry_relaxed_hops:
+        named = ", ".join(sorted(expiry_relaxed_hops))
+        # BOTH halves, deliberately. Stating only the risk would overstate it (this is not verify-off:
+        # ADR 0094 ORs one flag, X509_V_FLAG_NO_CHECK_TIME) and stating only the mitigation would be the
+        # compensating-control-on-a-false-premise shape. An operator deciding whether to keep a bridge
+        # open needs to know exactly which check is off and that nothing expires it.
+        out.append(
+            (
+                "tls_allow_expired",
+                f"{len(expiry_relaxed_hops)} outbound connection(s) accept an EXPIRED server "
+                f"certificate ({named}) — indefinitely, with nothing that expires the relaxation or "
+                "re-checks it; the chain signature, hostname match and key usage are still fully "
+                "verified, so this is narrower than verify-off",
+            )
+        )
+    if unverified_db_hops:
+        named = ", ".join(sorted(unverified_db_hops))
+        out.append(
+            (
+                "generic_odbc_tls_unenforced",
+                f"{len(unverified_db_hops)} generic-ODBC DATABASE connection(s) leave TLS to the "
+                f"driver with no verifying keyword set ({named}) — MessageFoundry cannot introspect an "
+                "arbitrary driver's TLS posture, so the weakened-TLS refusal does not apply and the "
+                "rows, and the DSN credential, may cross in plaintext",
             )
         )
     return out

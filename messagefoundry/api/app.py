@@ -253,8 +253,10 @@ from messagefoundry.config.wiring import (
     Registry,
     WiringError,
     accepted_cleartext_hops,
+    expiry_relaxed_hops,
     load_config,
     redacted_settings,
+    unverified_generic_db_hops,
 )
 from messagefoundry.integrity import run_startup_attestation
 from messagefoundry.last_resort import install_loop_exception_handler
@@ -1509,30 +1511,39 @@ def create_app(
         # stash-or-default pattern — settings-scoped, so this route reports it completely even with no
         # graph loaded, unlike the connection-scoped cleartext_accepted set below.
         alerts_settings = getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
-        # ADR 0153: the ONE connection-scoped deviation. Read LIVE off the running graph (so a reload is
-        # reflected) — this route is where an operator learns a cleartext hop is being crossed by
-        # declaration, and a stale or absent list would understate the posture. An engine with no
+        # ADR 0153 + #333: the THREE connection-scoped deviations. Read LIVE off the running graph (so a
+        # reload is reflected) — this route is where an operator learns a cleartext hop is being crossed
+        # by declaration, an expired certificate is being honoured, or a generic DB hop has no verifying
+        # TLS keyword, and a stale or absent list would understate the posture. An engine with no
         # registry runner (an embedding, or an app queried before start) cannot see them at all, so it
         # DECLARES that in `loosenings_scope` rather than returning a settings-only subset that reads as
         # the whole posture — the same discipline `messagefoundry security show` follows.
         runner = engine.registry_runner
-        cleartext_hops = (
-            [name for name, _ in accepted_cleartext_hops(runner.registry)]
-            if runner is not None
-            else []
-        )
+        if runner is not None:
+            cleartext_hops = [name for name, _ in accepted_cleartext_hops(runner.registry)]
+            expired_hops = [name for name, _ in expiry_relaxed_hops(runner.registry)]
+            db_hops = [name for name, _ in unverified_generic_db_hops(runner.registry)]
+        else:
+            cleartext_hops, expired_hops, db_hops = [], [], []
         loosenings_scope = (
             None
             if runner is not None
             else (
-                "settings only — no connection graph is loaded on this engine, so per-connection "
-                "cleartext_accepted declarations are NOT included (see `messagefoundry check`)"
+                "settings only — no connection graph is loaded on this engine, so the per-connection "
+                "cleartext_accepted / tls_allow_expired / generic-ODBC-DATABASE-TLS declarations are "
+                "NOT included (see `messagefoundry check`)"
             )
         )
         loosenings = [
             SecurityLoosening(switch=name, risk=risk)
             for name, risk in security_loosenings(
-                security, store, auth_settings, alerts_settings, cleartext_hops
+                security,
+                store,
+                auth_settings,
+                alerts_settings,
+                cleartext_hops,
+                expired_hops,
+                db_hops,
             )
         ]
         synthetic_relaxation = (

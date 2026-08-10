@@ -216,6 +216,62 @@ _ODBC_RESERVED_KEYS = frozenset({"driver", "server", "database"})
 # alter the connection. It cannot prove the value *verifies* the cert, only that TLS was addressed.
 _ODBC_TLS_HINT_RE = re.compile(r"ssl|tls|encrypt", re.IGNORECASE)
 
+# The VALUES of a TLS-ish keyword that mean TLS is NOT REQUIRED on the hop, so the connection may cross
+# in plaintext (#333). Matching the key alone was the whole detector, which read `SSLmode=disable` — the
+# explicit *no TLS* spelling — as "the operator has taken TLS ownership" and dropped the reminder to
+# DEBUG. A deny-list, not an allow-list, and deliberately so: an arbitrary driver's verifying spellings
+# are unbounded (`verify-full`, `VERIFY_IDENTITY`, `yes`, `1`, a numeric level), so demanding a known
+# GOOD value would warn on every legitimate driver this path exists to support. The known BAD values are
+# few, stable and vendor-documented:
+#   psqlODBC `sslmode`  : disable (never) / allow (plaintext first) / prefer (opportunistic, silent fallback)
+#   MySQL    `SSLMODE`  : DISABLED / PREFERRED (same two shapes)
+#   assorted `Encrypt`  : no / 0 / false / off
+#
+# KNOWN RESIDUAL, written down rather than implied: an ENCRYPTED-BUT-UNVERIFIED value — psqlODBC
+# `require`, MySQL `REQUIRED`, `Encrypt=yes` beside a trust-everything keyword — is NOT on this list and
+# stays in the DEBUG branch. It is a real weakening, but a different one: the payload is not in
+# plaintext, so the warning's own sentence ("so PHI is not sent in plaintext") would not be true of it,
+# and the per-driver spellings for "verified" vs "encrypted only" are not consistent enough to classify
+# without guessing. The generic path delegates TLS to the operator by design (ADR 0092); this detector
+# exists to make the PLAINTEXT case impossible to miss, not to grade the operator's cipher policy.
+_ODBC_NO_TLS_VALUE_RE = re.compile(
+    r"^(?:disabled?|allow|prefer(?:red)?|no|off|false|0)$", re.IGNORECASE
+)
+
+
+def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
+    """Every ``odbc_params`` TLS keyword that is set to a value meaning "TLS not required", as
+    ``["KEY=VALUE", ...]`` (#333). Empty when the operator set no such value.
+
+    The SINGLE classifier for the generic-ODBC cleartext-risk question, shared by this module's
+    construction-time reminder (:func:`_warn_generic_tls_unenforced`) and by the posture readers that
+    report the hop to an operator (``config.wiring.unverified_generic_db_hops`` ->
+    ``security_loosenings`` / ``GET /security/posture`` / ``messagefoundry check``). One definition, so a
+    surface can never report a hop as clean that the log warns about, or the reverse.
+
+    Pure — it reads a mapping and touches nothing else."""
+    return [
+        f"{key}={str(value).strip()}"
+        for key, value in params.items()
+        if _ODBC_TLS_HINT_RE.search(str(key)) and _ODBC_NO_TLS_VALUE_RE.match(str(value).strip())
+    ]
+
+
+def generic_odbc_tls_unenforced(params: Mapping[str, Any]) -> str | None:
+    """Why this generic-ODBC hop may cross in plaintext, or ``None`` when the operator addressed TLS.
+
+    Two ways to be at risk, and they read differently to an operator, so they are reported differently:
+    no TLS keyword at all, or a TLS keyword pinned to a no-TLS value (the latter names the offenders).
+    Shares :func:`generic_odbc_no_tls_params` with the construction reminder — see that docstring for
+    why a value deny-list, and for the encrypted-but-unverified residual this deliberately does not
+    classify."""
+    disabling = generic_odbc_no_tls_params(params)
+    if disabling:
+        return "TLS is explicitly not required: " + ", ".join(sorted(disabling))
+    if any(_ODBC_TLS_HINT_RE.search(str(k)) for k in params):
+        return None
+    return "no TLS keyword is set in odbc_params"
+
 
 def _odbc_keyword(key: str, *, what: str) -> str:
     """Validate an ODBC keyword token (STORE-5) and return it, or raise a clear ValueError."""
@@ -227,7 +283,7 @@ def _odbc_keyword(key: str, *, what: str) -> str:
     return key
 
 
-def _build_odbc_dsn(s: dict[str, Any]) -> str:
+def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     """Build a GENERIC ODBC connection string (``dialect='generic'``, #66) — decoupled from the ODBC
     Driver 18 / T-SQL preset so any ODBC-reachable DB (PostgreSQL / Oracle / MySQL via that DB's own ODBC
     driver) works. The operator installs the target ODBC driver at the OS level and names it here.
@@ -279,42 +335,64 @@ def _build_odbc_dsn(s: dict[str, Any]) -> str:
                 "'database' settings instead"
             )
         parts.append(f"{k}={_odbc_brace(str(value))}")
-    _warn_generic_tls_unenforced(params)
+    _warn_generic_tls_unenforced(params, connection=connection)
     return ";".join(parts) + ";"
 
 
-def _warn_generic_tls_unenforced(params: Mapping[str, Any]) -> None:
+def _warn_generic_tls_unenforced(
+    params: Mapping[str, Any], *, connection: str | None = None
+) -> None:
     """Fail-safe visibility for the generic ODBC dialect (#66 review): unlike the SQL Server preset, this
     path **cannot introspect the driver's TLS posture**, so the posture-keyed weakened-TLS refusal
     (#200 / ADR 0092) does not apply and :func:`_build_connection` reports the hop as non-weakened. That
     is a deliberate operator-owned-TLS model — but it must not be *silent*, or a generic PHI connection
     with no TLS keyword would cross in plaintext with no refusal and no trace.
 
-    So at construction we log the delegation loudly: a **WARNING** when no ssl/tls/encrypt-ish keyword is
-    present in ``odbc_params`` (plaintext-PHI is a real risk the operator should see), dropped to
-    **DEBUG** when one is (the operator has taken TLS ownership). This is advisory only — it never gates
-    or changes the connection; enforcement stays the operator's driver keyword (e.g.
-    ``SSLmode=verify-full``)."""
-    if any(_ODBC_TLS_HINT_RE.search(str(k)) for k in params):
+    So at construction we log the delegation loudly: a **WARNING** when :func:`generic_odbc_tls_unenforced`
+    says the hop may cross in plaintext — no ssl/tls/encrypt-ish keyword in ``odbc_params``, or one
+    pinned to a no-TLS value like ``SSLmode=disable`` — dropped to **DEBUG** when the operator has taken
+    TLS ownership. This is advisory only; it never gates or changes the connection.
+
+    ``connection`` names the declaring connection (#333). Without it a site running several generic DB
+    connections gets a line it cannot act on — the remedy is per-connection, so the report must be too.
+    It stays optional because :func:`_build_odbc_dsn` is also called directly (tests, DSN-shape checks)
+    where there is no connection to name; every engine construction path supplies it."""
+    where = (
+        f"DATABASE connection {connection!r} (generic ODBC dialect)"
+        if connection
+        else "DATABASE generic ODBC dialect"
+    )
+    reason = generic_odbc_tls_unenforced(params)
+    if reason is None:
         logger.debug(
-            "DATABASE generic ODBC dialect: TLS is delegated to the driver (a TLS keyword is set in "
-            "odbc_params); MessageFoundry does not enforce or verify it on this path"
+            "%s: TLS is delegated to the driver (a TLS keyword is set in odbc_params); "
+            "MessageFoundry does not enforce or verify it on this path",
+            where,
         )
     else:
         logger.warning(
-            "DATABASE generic ODBC dialect: TLS verification is NOT enforced by MessageFoundry on this "
-            "path and no TLS keyword was found in odbc_params — configure verifying TLS via the "
-            "driver's own keyword (e.g. SSLmode=verify-full) so PHI is not sent in plaintext"
+            "%s: TLS verification is NOT enforced by MessageFoundry on this path and %s — configure "
+            "verifying TLS via the driver's own keyword (e.g. SSLmode=verify-full) so PHI is not sent "
+            "in plaintext",
+            where,
+            reason,
         )
 
 
 def _build_connection(
-    s: dict[str, Any], *, attested: bool = False, read_only: bool = False
+    s: dict[str, Any],
+    *,
+    attested: bool = False,
+    read_only: bool = False,
+    connection: str | None = None,
 ) -> tuple[str, bool]:
     """Dispatch on ``dialect`` and return ``(dsn, weakened_tls)`` (#66). ``dialect='sqlserver'`` (default)
     runs the byte-identical SQL Server preset (:func:`_build_dsn`, weakened-TLS refusal + optional
     read-only intent); ``dialect='generic'`` runs :func:`_build_odbc_dsn` (operator-owned TLS, so never
-    reported weakened — a construction-time WARNING flags the unenforced-TLS delegation instead)."""
+    reported weakened — a construction-time WARNING flags the unenforced-TLS delegation instead).
+
+    ``connection`` names the declaring connection in that WARNING (#333); it is used on the generic path
+    only, since the SQL Server preset refuses rather than warns."""
     dialect = str(s.get("dialect", "sqlserver")).lower()
     if dialect == "sqlserver":
         weakened = bool(s.get("trust_server_certificate", False)) or not bool(
@@ -322,7 +400,7 @@ def _build_connection(
         )
         return _build_dsn(s, read_only=read_only, attested=attested), weakened
     if dialect == "generic":
-        return _build_odbc_dsn(s), False
+        return _build_odbc_dsn(s, connection=connection), False
     raise ValueError(f"DATABASE dialect must be 'sqlserver' or 'generic', got {dialect!r}")
 
 
@@ -569,7 +647,7 @@ class DatabaseDestination(DestinationConnector):
         # send-time byte-crossing re-assertion below.
         self._hop_attested = config.tls_hop_attested
         self._dsn, self._weakened_tls = _build_connection(
-            s, attested=self._hop_attested
+            s, attested=self._hop_attested, connection=config.name
         )  # fail fast on a weakened-TLS / bad-auth / bad-generic config
         self._sql, self._param_names = _parse_named_params(str(s["statement"]))
         self._pool_max = int(s.get("pool_max", 5))
@@ -792,7 +870,7 @@ class DatabaseSource(SourceConnector):
         # Per-connection insecure-hop attestation (#200): the customer-DB poll link rides the same
         # posture-keyed verify-off refusal as the destination (a read still crosses the wire).
         self._dsn, _ = _build_connection(
-            s, attested=config.tls_hop_attested
+            s, attested=config.tls_hop_attested, connection=config.name
         )  # fail fast on a weakened-TLS / bad-auth / bad-generic config
         self._poll_sql = str(s["poll_statement"])
         mark = s.get("mark_statement")

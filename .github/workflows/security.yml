@@ -19,12 +19,15 @@ name: Security
 # it scans on the same run as the other gates rather than relying on native push protection.
 # See docs/SECURITY.md.
 #
-# NO push-to-main trigger (dropped for CI cost): every push to main is an auto-merged PR whose head
-# was JUST scanned by the pull_request run of this same workflow, so the post-merge re-scan re-ran
-# identical scanners on identical content minutes later (~376 runs/month at ~8 billed min each).
-# The drift a push run could in principle catch (a CVE disclosed between the PR scan and the merge)
-# is exactly what the daily cron below exists for — caught within ~24h, the same bound as a CVE
-# against an unchanged main. On-demand full scans: workflow_dispatch.
+# THE TRIGGER SET IS THE `on:` BLOCK BELOW AND NOTHING ELSE. Each arm carries its own reason there,
+# so this header states none of them and must not start. A header paragraph that ALSO describes the
+# triggers is a second definition, free to drift from the first — and one did: for months a paragraph
+# here denied a trigger the `on:` block declared ten lines beneath it, at length and with costings.
+# It was DELETED rather than corrected, because correcting it would have left the second definition
+# in place to drift again. The cost of that drift is not to CI, which behaved as the `on:` block says;
+# it is that the rest of this header is load-bearing (the continue-on-error trap above), and a reader
+# who finds one paragraph of it demonstrably false has no way to tell which of the others still hold.
+# tests/test_security_posture.py refuses the return of a header claim that denies a declared trigger.
 on:
   pull_request:
   # Post-merge re-scan (main only). A fork PR is scanned STRUCTURAL-ONLY by design -- the secret is

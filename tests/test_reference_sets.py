@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from pathlib import Path
 from types import MappingProxyType
@@ -372,6 +373,43 @@ async def test_database_source_whole_row_value(
     await runner.sync_all()
     assert store.reference_view()["provider_npi"]["A"] == {"npi": "9", "flag": "Y"}
     await store.close()
+
+
+class _HangingRefPool(_RefPool):
+    """A reference source whose server never hands over a connection (BACKLOG #1052)."""
+
+    async def acquire(self) -> _RefConn:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+async def test_database_source_acquire_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1052: the DatabaseRef throwaway pool's borrow was unbounded, so one unresponsive
+    reference server would hold the sync pass open forever — and the runner walks the declared sets
+    SEQUENTIALLY, so it would stall every OTHER set's refresh too, not just its own. At the limit
+    the set fails like any other source failure: last-good kept, alert raised, the pass completes.
+
+    The outer ``wait_for`` is the assertion: pre-fix, ``sync_all()`` never returns."""
+    pool = _HangingRefPool(_RefConn(_RefCursor(["provider_id", "npi"], [])))
+
+    async def fake_make_pool(dsn: str, pool_max: int, *, autocommit: bool) -> _RefPool:
+        return pool
+
+    import messagefoundry.transports.database as db
+
+    monkeypatch.setattr(db, "_make_pool", fake_make_pool)
+
+    store = await MessageStore.open(tmp_path / "r.db")
+    try:
+        runner = ReferenceSyncRunner(store, lambda: [_db_spec(acquire_timeout=0.05)], REF)
+        result = await asyncio.wait_for(runner.sync_all(), timeout=10.0)
+        assert result.failed == 1 and result.synced == 0
+        assert "provider_npi" not in store.reference_view()  # nothing was materialized
+        assert pool.closed is True  # the throwaway pool is still torn down
+    finally:
+        await store.close()
 
 
 async def test_database_source_egress_denied_keeps_empty(
