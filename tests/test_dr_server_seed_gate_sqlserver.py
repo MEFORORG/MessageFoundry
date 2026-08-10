@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """Live SQL Server proof of the #102 server-DB DR seed gate (ADR 0048), reproducing the REAL deployment
 path. On a genuinely fresh/unrestored 'mefor' store whose audit_log is NON-EMPTY-but-has-no-dr_backup-row
-(the bootstrap+login signature) + attestation → REFUSED (the data-loss case the config-only archive and
+(the first-admin-creation+login signature) + attestation → REFUSED (the data-loss case the config-only archive and
 the refuted count>0 probe both miss). A store carrying a dr_backup row (restored-primary signature) +
 attestation → PASS. No attestation → REFUSED. run_restore_verify is stubbed to PASS so the test isolates
 the LIVE restore-provenance probe (has_prior_backup_history against a real backend).
@@ -69,15 +69,17 @@ def _coord(store: Any, **dr_over: object) -> tuple[DrCoordinator, dict[str, bool
 
 
 async def _reset_to_fresh_bootstrapped(store: Any) -> None:
-    # Reproduce a FRESH/UNRESTORED but engine-started DB: audit_log NON-EMPTY (bootstrap + login) yet with
-    # NO dr_backup row. This is the exact real-path state the refuted count>0 probe would have PASSED.
+    # Reproduce a FRESH/UNRESTORED but engine-started DB: audit_log NON-EMPTY (first-admin creation +
+    # login) yet with NO dr_backup row. This is the exact real-path state the refuted count>0 probe
+    # would have PASSED. The two actions are the ones a first run actually writes: since BACKLOG #1020
+    # that is `user.created` from `messagefoundry admin-create`, not the retired
+    # `auth.bootstrap_admin_created` — a fixture naming an action the engine can no longer emit is a
+    # fixture describing a state the product cannot reach.
     async with store._pool.acquire() as conn:
         cur = await conn.cursor()
         await cur.execute("DELETE FROM audit_log")
         await conn.commit()
-    await store.record_audit(
-        "auth.bootstrap_admin_created", actor="bootstrap", detail="{}", now=1.0
-    )
+    await store.record_audit("user.created", actor="cli", detail="{}", now=1.0)
     await store.record_audit("auth.login_success", actor="alice", detail="{}", now=2.0)
 
 
