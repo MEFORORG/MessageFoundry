@@ -235,6 +235,63 @@ function ConvertTo-WorktreeSlug([string]$Branch) {
     return "wt-" + (($h[0..3] | ForEach-Object { $_.ToString('x2') }) -join "")
 }
 
+# A `cd`/`pushd` VERB in a prefix. The leading class is not just whitespace: `(cd ../x && ` and
+# `foo;cd ../x && ` both start a directory change, and a pattern anchored on whitespace alone counted
+# ZERO of them -- which made a subshell-wrapped `cd` read as "no directory change at all" and print a
+# confident repository name for a target it had not established (measured while building #1085).
+$cdVerb = '(?:^|[\s;&|(])(?:cd|pushd)(?=\s)'
+
+# Can the `cd` prefix be FOLLOWED statically? Exactly one `cd`/`pushd`, and none of the shapes whose
+# destination is not in the text: `popd` and `cd -` (they name a stack entry), a subshell or brace group
+# (the change may not outlive it), or more than one `cd` (which one won is a runtime question).
+#
+# THESE BAIL-OUTS ARE LOAD-BEARING AND MUST NOT BE REMOVED TO MAKE COMPOSITION TIDIER. They exist because
+# those destinations are genuinely not statically resolvable, and guessing one is how a rule ends up
+# naming a repository the command never touches.
+function Test-CdFollowable([string]$Prefix) {
+    if ($Prefix -imatch '(?:^|[\s;&|(])(?:popd|cd\s+-(?:\s|$))') { return $false }
+    if ($Prefix -match '[({]') { return $false }
+    return ([regex]::Matches((Get-QuoteMask $Prefix), $cdVerb).Count -eq 1)
+}
+
+# Does this text change directory at all? Any verb, followable or not. Push-Location, Set-Location and
+# chdir are DETECTED here but deliberately FOLLOWED nowhere: following them would move a verdict, which
+# is a separate change needing its own controls. Detecting them only moves the words.
+function Test-HasDirChange([string]$Text) {
+    if (-not $Text) { return $false }
+    if ($Text -imatch '(?:^|[\s;&|(])(?:push-location|set-location|chdir|popd)(?=\s|$)') { return $true }
+    if ($Text -imatch '(?:^|[\s;&|(])cd\s+-(?:\s|$)') { return $true }
+    return ([regex]::Matches((Get-QuoteMask $Text), $cdVerb).Count -gt 0)
+}
+
+# Is the directory this command runs in DETERMINED by the text, or did the resolver fall back?
+# (BACKLOG #1085.) The verdict never turns on this -- an undetermined target still resolves to the
+# session cwd, which is the deny-side default. The MESSAGE does: a refusal that asserts a repository
+# name it did not establish is worse than one that says it could not tell, because the reader acts on
+# the name.
+#
+# $Earlier is the text of PRECEDING LINES. The segment splitter is line-based, so a `cd` on an earlier
+# line is never composed -- a real limitation, knowingly kept, because a per-segment rule cannot see
+# across a newline. What must not happen is that limitation being invisible: a directory change up there
+# means the base down here is a fallback, and the message has to say so.
+#
+# An ABSOLUTE `-C` makes the base irrelevant -- git chdirs there whatever it started from -- so the
+# target IS determined however the directory moved before it.
+function Test-TargetDetermined([string]$Line, [string]$Prefix, [string]$Earlier) {
+    $cvals = @(Get-OptionValuesRaw $Line (Get-QuoteMask $Line) '(?:^|\s)-C(?=\s)')
+    if ($cvals.Count -gt 0) {
+        try {
+            if ([System.IO.Path]::IsPathFullyQualified($cvals[-1])) { return $true }
+        } catch { }
+    }
+    if (Test-HasDirChange $Earlier) { return $false }
+    if ($Prefix -imatch '(?:^|[\s;&|(])(?:push-location|set-location|chdir)(?=\s|$)') { return $false }
+    if ($Prefix -imatch '(?:^|[\s;&|(])(?:popd|cd\s+-(?:\s|$))') { return $false }
+    $n = [regex]::Matches((Get-QuoteMask $Prefix), $cdVerb).Count
+    if ($n -eq 0) { return $true }        # no directory change at all: the session cwd IS the answer
+    return (Test-CdFollowable $Prefix)
+}
+
 # Which working tree does a git command act on? ONE resolver, shared by rules 3 and 3b, because they used
 # to have two and a real tree swap fell between them: rule 3 read only `-C` and cwd, so `cd <primary> &&
 # git reset --hard` spelled relatively resolved to the session's own (ungoverned) worktree and it handed
@@ -282,17 +339,35 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     # is what stops a quoted config value containing `-C <x>` from nominating <x> as the repository. A
     # `-C` inside an INTERPRETER argument is EXECUTED and still counts, because Get-ScannableSegments
     # recurses into that argument and hands its contents back as their own line, unquoted.
-    $cvals = @(Get-OptionValuesRaw $Line $mask '(?:^|\s)-C(?=\s)')
-    if ($cvals.Count -gt 0) {
-        $out += $cvals[0]
-    } else {
-        $cd = $null
-        if ($Prefix -notmatch '(?:^|\s)(?:popd|cd\s+-(?:\s|$))' -and $Prefix -notmatch '[({]') {
-            $cds = [regex]::Matches((Get-QuoteMask $Prefix), '(?:^|\s)(?:cd|pushd)(?=\s)')
-            if ($cds.Count -eq 1) { $cd = Read-ArgAt $Prefix ($cds[0].Index + $cds[0].Length) }
+    # COMPOSE, DO NOT PREFER (BACKLOG #1085). This used to take `-C` INSTEAD of a `cd` prefix, and a real
+    # shell does not: it resolves a relative `-C` against the POST-cd directory. That produced the exact
+    # mirror of #1061 -- same root confusion, opposite sign. From a governed primary,
+    #     cd ../Unrelated && git -C . config <disarm>
+    # DENIED and named the primary, while the command configures the ungoverned sibling. A session that
+    # reads that deny and believes it has been actively misinformed.
+    #
+    # The base is a followable single `cd` in the prefix, else the session cwd; every `-C` is then folded
+    # onto it left to right, which is what git documents for repeated `-C` and gets multi-`-C` right for
+    # free. An ABSOLUTE `-C` swallows the base, exactly as a chdir to an absolute path does.
+    $base = $CwdRaw
+    if (Test-CdFollowable $Prefix) {
+        $cds = [regex]::Matches((Get-QuoteMask $Prefix), $cdVerb)
+        $cd = Read-ArgAt $Prefix ($cds[0].Index + $cds[0].Length)
+        if ($cd) {
+            $rooted = Get-FullPathRaw $cd $CwdRaw
+            if ($rooted) { $base = $rooted }
         }
-        $out += $(if ($cd) { $cd } else { $CwdRaw })
     }
+    $cvals = @(Get-OptionValuesRaw $Line $mask '(?:^|\s)-C(?=\s)')
+    $eff = $base
+    foreach ($v in $cvals) {
+        $next = Get-FullPathRaw $v $eff
+        # Unrootable: hand the RAW token on so the caller's unresolvable branch can refuse it, rather
+        # than silently keeping a directory this command does not run in.
+        if (-not $next) { $eff = $v; break }
+        $eff = $next
+    }
+    $out += $eff
 
     # ADDITIONAL, never instead of: see the note above. Same reader, because the same truncation applied
     # to all four and fixing one of four identical spellings is how this file's -- detach/-d denylist got
@@ -483,9 +558,21 @@ function Get-ScannableSegments([string]$Cmd) {
         }
     }
 
-    foreach ($line in @($lines + $inner)) {
-        [pscustomobject]@{ Raw = $line; Scan = (ConvertTo-ScanText $line) }
+    # `Before` is the text of the PRECEDING lines. Nothing resolves a target from it -- this splitter is
+    # line-based and a per-segment rule genuinely cannot compose across a newline -- but a `cd` on an
+    # earlier LINE is still a directory change the resolver did not account for, so a rule that names a
+    # repository needs to know it is guessing (BACKLOG #1085). An interpreter's inner text gets "", since
+    # any `cd` inside it lives on that same inner line and its own prefix carries it.
+    $out = @()
+    $before = ""
+    foreach ($line in $lines) {
+        $out += [pscustomobject]@{ Raw = $line; Scan = (ConvertTo-ScanText $line); Before = $before }
+        $before = $before + $line + "`n"
     }
+    foreach ($line in $inner) {
+        $out += [pscustomobject]@{ Raw = $line; Scan = (ConvertTo-ScanText $line); Before = "" }
+    }
+    return $out
 }
 
 try { $hook = [Console]::In.ReadToEnd() | ConvertFrom-Json } catch { exit 0 }
@@ -903,6 +990,35 @@ What to do instead:
             }
 
             $govCfg = $t.Root
+
+            # THE TARGET WAS NOT DETERMINED: refuse, but do NOT name a repository (BACKLOG #1085). The
+            # verdict is unchanged -- the fallback is the session cwd and it is governed -- but the
+            # ordinary message below asserts that THIS repository's shared configuration would change,
+            # and that is a claim the resolver did not establish when it could not follow the directory
+            # change. A refusal that names the wrong repository actively misinforms the reader, who acts
+            # on the name.
+            if (-not (Test-TargetDetermined $inv.Text $pfx $seg.Before)) {
+                Write-Deny -Rule "3c" -Detail "git config $badKey (target not determined)" -Reason @"
+BLOCKED: this sets '$badKey', and the gate could not work out WHICH repository it would set it in.
+
+The command changes directory first, in a shape whose destination is not in the text -- more than one
+`cd`, a `cd -` or `popd`, a subshell, or a Push-Location/Set-Location. The gate therefore fell back to
+this session's working directory ('$(Get-SafeForMessage $cwdRaw)'), which IS a governed checkout
+($($govCfg.Display)). THAT IS A FALLBACK, NOT A FINDING: the write may well land somewhere else
+entirely, and this refusal does not claim otherwise.
+
+'$badKey' is on the disarm list: set in a governed repository it turns off the ledger, claim and
+secret-leak commit gates for every worktree of it at once. An unanswerable question about that key is
+refused rather than assumed safe.
+
+What to do instead:
+  * Say where it goes: `git -C "<full path>" config ...` with an ABSOLUTE path. Then the gate can see
+    which repository is being configured, and an ordinary non-governed repo is allowed as usual.
+  * Ordinary per-user config (user.email, user.name, and anything not on the disarm list) is untouched
+    by this rule in any spelling.
+"@
+            }
+
             Write-Deny -Rule "3c" -Detail "git config $badKey" -Reason @"
 BLOCKED: setting '$badKey' would change the SHARED git configuration of $($govCfg.Display).
 

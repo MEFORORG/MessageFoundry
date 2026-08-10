@@ -1014,6 +1014,117 @@ def test_these_text_shapes_are_pinned_as_DENY_and_are_NOT_fixed_here(
     assert_denied(run_gate_in(shell(command, cwd=repo.primary), repo.repos, hook_cwd=repo.primary))
 
 
+# --------------------- rule 3c: a cd prefix COMPOSES with a relative -C, and the wording (BACKLOG #1085)
+#
+# The resolver PREFERRED ``-C`` and discarded a ``cd`` prefix; a real shell resolves a relative ``-C``
+# against the POST-cd directory. That is the exact mirror of #1061 -- one root confusion, opposite sign.
+# From a governed primary, ``cd ../Unrelated && git -C . config <disarm>`` DENIED and named the primary
+# while the command configures the ungoverned sibling, so a session that read the refusal and believed
+# it had been actively misinformed.
+#
+# These cases assert the DENY TEXT as well as the verdict. A test ending in a bare ``assert_denied``
+# cannot see this defect at all: the verdict does not move for the wording half, and a round-4 mutant
+# that reinstated a known-false sentence survived a fully green suite for exactly that reason.
+
+_NAMES_A_REPO = "would change the SHARED git configuration of"
+_NAMES_NOTHING = "could not work out WHICH repository"
+
+
+def test_a_cd_to_an_UNGOVERNED_repo_then_a_relative_C_is_allowed(
+    repo: SimpleNamespace, ungoverned: Path
+) -> None:
+    """The filed false deny, and the only case in this lane that moves a verdict from DENY to ALLOW.
+
+    The write lands in ../Unrelated. It is not a governed repository, and refusing it while naming the
+    primary was both wrong and misleading."""
+    assert (
+        run_gate_in(
+            shell(f"cd ../Unrelated && git -C . config {_DISARM}", cwd=repo.primary),
+            repo.repos,
+            hook_cwd=repo.primary,
+        )
+        is None
+    )
+    assert ungoverned.is_dir()  # the fixture built the sibling this command names
+
+
+@pytest.mark.parametrize(
+    ("command", "cwd_key"),
+    [
+        ("cd ../Unrelated && git -C ../Primary config " + _DISARM, "primary"),
+        ("cd ../Primary && git -C . config " + _DISARM, "other"),
+        ("git -C UNGOVERNED -C ../Primary config " + _DISARM, "primary"),
+    ],
+)
+def test_composition_still_reaches_a_governed_repo(
+    repo: SimpleNamespace, ungoverned: Path, command: str, cwd_key: str
+) -> None:
+    """Composition is not a licence to stop looking. Two of these were ALLOW on the committed gate --
+    the second because a `cd` was discarded, the third because only the FIRST `-C` was read although git
+    processes repeated `-C` sequentially, each relative to the previous."""
+    cwd = {"primary": repo.primary, "other": ungoverned}[cwd_key]
+    command = command.replace("UNGOVERNED", str(ungoverned))
+    reason = assert_denied(run_gate_in(shell(command, cwd=cwd), repo.repos, hook_cwd=cwd))
+    assert _NAMES_A_REPO in reason
+
+
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        ("subshell cd", "(cd ../Unrelated && git config " + _DISARM + ")"),
+        ("Push-Location", "Push-Location ../Unrelated; git config " + _DISARM),
+        ("two cds", "cd ../Unrelated && cd ../Primary && git config " + _DISARM),
+        ("popd", "popd && git config " + _DISARM),
+        ("newline-joined cd", "cd ../Unrelated\ngit config " + _DISARM),
+    ],
+)
+def test_an_unfollowable_cd_refuses_WITHOUT_naming_a_repository(
+    repo: SimpleNamespace, ungoverned: Path, label: str, command: str
+) -> None:
+    """The wording half, and it is the whole point of the item.
+
+    Each of these changes directory in a shape whose destination is not in the text -- a subshell, a
+    verb the resolver does not follow, more than one ``cd``, a stack pop, or a newline the line-based
+    splitter cannot compose across. The verdict is unchanged (the fallback is the session cwd and it is
+    governed), but the refusal must NOT assert that this repository's shared configuration would change.
+    It did not establish that."""
+    reason = assert_denied(
+        run_gate_in(shell(command, cwd=repo.primary), repo.repos, hook_cwd=repo.primary)
+    )
+    assert _NAMES_NOTHING in reason
+    assert _NAMES_A_REPO not in reason
+    assert "FALLBACK, NOT A FINDING" in reason
+    assert ungoverned.is_dir()
+
+
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        ("no directory change at all", "git config " + _DISARM),
+        ("a cd AFTER the write", "git config " + _DISARM + " && cd ../Unrelated"),
+        ("an ABSOLUTE -C after a subshell cd", '(cd ../Unrelated && git -C "GOVERNED" config DIS)'),
+        ("a followable cd into the governed repo", "cd ../Primary && git config " + _DISARM),
+    ],
+)
+def test_a_determined_target_is_still_named(
+    repo: SimpleNamespace, ungoverned: Path, label: str, command: str
+) -> None:
+    """Non-vacuity for the pair above: the hedge must be reachable AND avoidable.
+
+    If every refusal said "could not work out which repository", the message would carry no information
+    and the fix would be a regression dressed as caution. Each of these DOES establish the target -- no
+    directory change, a change that happens after the write, an absolute ``-C`` that makes the base
+    irrelevant, or a ``cd`` the resolver can follow -- so each must still name the repository.
+
+    The last case runs from the linked worktree so ``../Primary`` names the governed root."""
+    command = command.replace("GOVERNED", str(repo.primary)).replace("DIS", _DISARM)
+    cwd = repo.wt if command.startswith("cd ../Primary") else repo.primary
+    reason = assert_denied(run_gate_in(shell(command, cwd=cwd), repo.repos, hook_cwd=cwd))
+    assert _NAMES_A_REPO in reason
+    assert _NAMES_NOTHING not in reason
+    assert ungoverned.is_dir()
+
+
 # --------------------------------------------------------------- rule 3d: destroying another worktree
 
 
