@@ -273,6 +273,71 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
 # Each entry carries BOTH forms. Scan is for deciding whether a git verb is present; Raw is for parsing
 # PATHS out of the same line, since the blanking that stops a commit message supplying a verb would also
 # erase the path.
+# The blanking half of Get-ScannableSegments, factored out so rule 3c can produce the SAME scan text for
+# a sub-slice of a line without owning a second copy of these four substitutions. Two copies of "which
+# characters are inert" is precisely the drift that put five separately-disagreeing regexes in this file
+# once already; there is one definition and both callers use it.
+function ConvertTo-ScanText([string]$Line) {
+    # A quoted PROGRAM path must keep its git token -- `"C:\Program Files\Git\bin\git.exe" checkout main`
+    # is a real spelling and blanking it wholesale would be a false NEGATIVE. Collapse that form to a bare
+    # token first, then blank every remaining quoted span.
+    $s = $Line -replace '"[^"]*[\\/](git(?:\.exe)?)"', '$1'
+    $s = $s -replace "'[^']*[\\/](git(?:\.exe)?)'", '$1'
+    $s = $s -replace '"[^"]*"', '""'
+    $s = $s -replace "'[^']*'", "''"
+    return $s
+}
+
+# A LENGTH-PRESERVING quote mask: every quoted span, INCLUDING its quote characters, becomes spaces and
+# nothing moves. Length preservation is the whole point -- an offset found in the mask indexes the SAME
+# character in the raw text, so a caller can locate a token safely and then read its value back out of
+# the original. ConvertTo-ScanText cannot do this job: it rewrites `"..."` to `""`, which shortens the
+# string and makes every offset past it meaningless.
+function Get-QuoteMask([string]$Text) {
+    $sb = [System.Text.StringBuilder]::new($Text.Length)
+    $q = [char]0
+    foreach ($ch in $Text.ToCharArray()) {
+        if ($q -ne [char]0) {
+            if ($ch -eq $q) { $q = [char]0 }
+            [void]$sb.Append(' ')
+        } elseif ($ch -eq '"' -or $ch -eq "'") {
+            $q = $ch
+            [void]$sb.Append(' ')
+        } else {
+            [void]$sb.Append($ch)
+        }
+    }
+    return $sb.ToString()
+}
+
+# Split a scan line into the individual COMMAND INVOCATIONS it chains together, at UNQUOTED `&&`, `||`,
+# `;` and `|` (BACKLOG #1065). Rule 3c judged a whole line at once, and two fail-opens came straight out
+# of that: a `-C` belonging to a DIFFERENT command on the line became "the repository being configured"
+# (`git commit -C HEAD && git config core.hooksPath /nope` -- ALLOWED), and a neighbouring READ armed the
+# rule's own read exclusion for the write beside it (`git config --list && git config core.hooksPath
+# /nope` -- ALLOWED). Both are ordinary spellings; neither needs intent.
+#
+# Each piece carries the text BEFORE it as its Prefix, so a `cd` in an earlier invocation still counts as
+# the prefix of a later one -- `cd <x> && git config ...` must keep resolving against <x>.
+#
+# The separators are found in the QUOTE MASK, so a `;` or `&&` inside a quoted argument does not split a
+# command in two. Alternation order matters: `&&` and `||` are listed before the single `|` so a `||` is
+# never read as two empty pipes.
+function Split-Invocations([string]$Line) {
+    $mask = Get-QuoteMask $Line
+    $out = @()
+    $start = 0
+    foreach ($m in [regex]::Matches($mask, '&&|\|\||;|\|')) {
+        $out += [pscustomobject]@{
+            Text   = $Line.Substring($start, $m.Index - $start)
+            Prefix = $Line.Substring(0, $start)
+        }
+        $start = $m.Index + $m.Length
+    }
+    $out += [pscustomobject]@{ Text = $Line.Substring($start); Prefix = $Line.Substring(0, $start) }
+    return $out
+}
+
 function Get-ScannableSegments([string]$Cmd) {
     # Fold line continuations FIRST, or the per-line split below separates `git \` from its verb and the
     # rule stops seeing the command at all. Prose does not end a line with a continuation character, so
@@ -295,14 +360,7 @@ function Get-ScannableSegments([string]$Cmd) {
     }
 
     foreach ($line in @($lines + $inner)) {
-        # A quoted PROGRAM path must keep its git token -- `"C:\Program Files\Git\bin\git.exe" checkout
-        # main` is a real spelling and blanking it wholesale would be a false NEGATIVE. Collapse that form
-        # to a bare token first, then blank every remaining quoted span.
-        $s = $line -replace '"[^"]*[\\/](git(?:\.exe)?)"', '$1'
-        $s = $s -replace "'[^']*[\\/](git(?:\.exe)?)'", '$1'
-        $s = $s -replace '"[^"]*"', '""'
-        $s = $s -replace "'[^']*'", "''"
-        [pscustomobject]@{ Raw = $line; Scan = $s }
+        [pscustomobject]@{ Raw = $line; Scan = (ConvertTo-ScanText $line) }
     }
 }
 
@@ -611,60 +669,82 @@ if ($tool -in @("Bash", "PowerShell")) {
     # sibling worktrees and the primary alike. Any git failure falls through to ALLOW.
     # -----------------------------------------------------------------------------------------------
     $dangerKeys = 'core\.hookspath|core\.worktree|alias\.[\w.-]+|include\.path|includeif\.'
+    $gitToken = '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)'
+    $keyMatch = "(?:\bconfig\b[^|;&]*?\s|-c\s+)(?<key>$dangerKeys)"
+    $readOnly = '(?:^|\s)--(get|get-all|get-regexp|list|show-origin)(\s|$)'
     foreach ($seg in (Get-ScannableSegments $cmd)) {
-        if ($seg.Scan -cnotmatch '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)') { continue }
-        if ($seg.Scan -notmatch "(?:\bconfig\b[^|;&]*?\s|-c\s+)(?<key>$dangerKeys)") { continue }
-        $badKey = $Matches['key']
-        # A read is not a write.
-        if ($seg.Scan -match '(?:^|\s)--(get|get-all|get-regexp|list|show-origin)(\s|$)') { continue }
+        # Cheap pre-filter on the whole line, kept because everything below it costs more: a line with no
+        # git token or no disarm key anywhere in it cannot produce a hit from any of its invocations.
+        if ($seg.Scan -cnotmatch $gitToken) { continue }
+        if ($seg.Scan -notmatch $keyMatch) { continue }
 
-        $at = [regex]::Match($seg.Raw, '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)')
-        $pfx = $(if ($at.Success) { $seg.Raw.Substring(0, $at.Index) } else { "" })
-        $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw)
-        if ($where.Count -eq 0) { continue }
+        # THEN JUDGE EACH INVOCATION ON ITS OWN (BACKLOG #1065). Reading the whole line as one command was
+        # two fail-opens, both reachable with an ordinary flag and no intent:
+        #   git commit -C HEAD && git config core.hooksPath /nope   -> ALLOWED. `-C HEAD` is the ordinary
+        #     reuse-that-commit's-message flag and belongs to a DIFFERENT command, but it was read as the
+        #     repository being configured; it resolves to a non-repo, git exits 128, and the git-failure
+        #     fail-open swallowed the write.
+        #   git config --list && git config core.hooksPath /nope    -> ALLOWED. The read exclusion is a
+        #     property of ONE invocation and was applied to the line, so a neighbouring read disarmed the
+        #     rule for the write beside it.
+        # Both now resolve against the invocation that actually carries the write.
+        foreach ($inv in (Split-Invocations $seg.Raw)) {
+            $invScan = ConvertTo-ScanText $inv.Text
+            if ($invScan -cnotmatch $gitToken) { continue }
+            if ($invScan -notmatch $keyMatch) { continue }
+            $badKey = $Matches['key']
+            # A read is not a write.
+            if ($invScan -match $readOnly) { continue }
 
-        # ROOT THE TARGET AGAINST THE SESSION CWD BEFORE ASKING GIT ANYTHING (BACKLOG #1061). This block
-        # used to read `& git -C $where[0]` and `Get-ComparablePath $common $where[0]`, and with a
-        # RELATIVE target it failed OPEN. Measured on the installed hook by two sessions independently:
-        #     git -C <primary-absolute> config core.hooksPath /dev/null   -> DENIED
-        #     git -C ../../..           config core.hooksPath /dev/null   -> ALLOWED
-        #     cd ../../.. && git        config core.hooksPath /dev/null   -> ALLOWED
-        # `../../..` is simply how a session in <primary>/.claude/worktrees/<x> names the repo root. It
-        # needs no variable and no intent, and it disarms the ledger, claim and secret-leak commit gates
-        # for every worktree at once -- verbatim what the deny text below says this rule exists to stop.
-        #
-        # THE MECHANISM IS A BASE THAT IS NOT A BASE. `rev-parse --git-common-dir` answers RELATIVE TO
-        # THE TARGET: from the PRIMARY it returns the bare string ".git"; from a linked worktree it
-        # returns an absolute path. Get-ComparablePath then resolved ".git" against $where[0] -- the
-        # target token AS WRITTEN -- and GetFullPath demands a fully qualified base, so it threw, the
-        # catch returned "", no root matched "", and `if (-not $govCfg) { continue }` allowed. The hole
-        # was scoped to the primary precisely BECAUSE only the primary answers relatively, which is also
-        # why the crux test (disarming FROM a linked worktree) stayed green straight over it.
-        #
-        # DO NOT "FIX" THIS WITH ONE TOKEN. `Get-ComparablePath $common $cwdRaw` still ALLOWS: ".git" is
-        # relative to the TARGET, not to the session, so it resolves to <session-worktree>/.git -- a real
-        # path that is not the primary's common dir. The gate would read as fixed and stay open for a
-        # second, harder-to-see reason. Two steps are required: root the TARGET against the session cwd,
-        # then root the common dir against THAT.
-        #
-        # AND THE ROOTED PATH GOES TO `git -C` TOO, not only into the comparison. `& git -C <relative>`
-        # resolved against THIS HOOK PROCESS's cwd, which is not the session's -- so a relative target
-        # naming a LINKED worktree made git exit 128 and fall through to ALLOW as well. Measured with the
-        # two cwds deliberately diverged, `git -C .` and a relative sibling-worktree path both flipped
-        # DENY -> ALLOW; the pytest harness does not set the subprocess cwd, so that divergence is the
-        # condition under test, not a hypothetical.
-        #
-        # BOTH STEPS NOW LIVE IN Resolve-ConfigTarget, which also states the three outcomes and why they
-        # are answered differently. The two that matter here: a target that CANNOT BE RESOLVED denies,
-        # because nothing has been asked of git and "unresolvable means not governed" is exactly how this
-        # defect shipped; git ANSWERING "not a repository" on a resolved target allows, unchanged, and
-        # test_a_non_repo_cwd_fails_open pins that because a guardrail which wedges gets uninstalled.
-        $t = Resolve-ConfigTarget $where[0] $cwdRaw
-        if ($t.Unresolvable) {
-            Write-Deny -Rule "3c" -Detail "git config $badKey (unresolvable target)" -Reason @"
+            $at = [regex]::Match($inv.Text, $gitToken)
+            $pfx = $inv.Prefix + $(if ($at.Success) { $inv.Text.Substring(0, $at.Index) } else { "" })
+            $where = @(Get-GitTargetCandidatesRaw $inv.Text $pfx $cwdRaw)
+            if ($where.Count -eq 0) { continue }
+
+            # ROOT THE TARGET AGAINST THE SESSION CWD BEFORE ASKING GIT ANYTHING (BACKLOG #1061). This
+            # block used to read `& git -C $where[0]` and `Get-ComparablePath $common $where[0]`, and with
+            # a RELATIVE target it failed OPEN. Measured on the installed hook by two sessions
+            # independently:
+            #     git -C <primary-absolute> config core.hooksPath /dev/null   -> DENIED
+            #     git -C ../../..           config core.hooksPath /dev/null   -> ALLOWED
+            #     cd ../../.. && git        config core.hooksPath /dev/null   -> ALLOWED
+            # `../../..` is simply how a session in <primary>/.claude/worktrees/<x> names the repo root.
+            # It needs no variable and no intent, and it disarms the ledger, claim and secret-leak commit
+            # gates for every worktree at once -- verbatim what the deny text below says this rule stops.
+            #
+            # THE MECHANISM WAS A BASE THAT IS NOT A BASE. `rev-parse --git-common-dir` answers RELATIVE
+            # TO THE TARGET: from the PRIMARY it returns the bare string ".git"; from a linked worktree it
+            # returns an absolute path. Get-ComparablePath then resolved ".git" against $where[0] -- the
+            # target token AS WRITTEN -- and GetFullPath demands a fully qualified base, so it threw, the
+            # catch returned "", no root matched "", and the rule allowed. The hole was scoped to the
+            # primary precisely BECAUSE only the primary answers relatively, which is also why the crux
+            # test (disarming FROM a linked worktree) stayed green straight over it.
+            #
+            # AND THE ROOTED PATH GOES TO `git -C` TOO, not only into the comparison. `& git -C
+            # <relative>` resolved against THIS HOOK PROCESS's cwd, which is not the session's -- so a
+            # relative target naming a LINKED worktree made git exit 128 and fall through to ALLOW as
+            # well. Both steps now live in Resolve-ConfigTarget, which also states why an UNRESOLVABLE
+            # target denies while git ANSWERING "not a repository" allows.
+            #
+            # EVERY CANDIDATE IS CHECKED, NOT JUST THE FIRST (BACKLOG #1065). Get-GitTargetCandidatesRaw's
+            # own contract says so -- "It returns a SET, not a winner, and the caller denies if ANY member
+            # is governed" -- and rule 3c was the one consumer that took [0] and stopped, while rule 3 at
+            # the bottom of this file had always iterated. A `--git-dir` or `--work-tree` naming a
+            # governed repository from an ungoverned cwd sat in the tail of that set and was never looked
+            # at: `git --git-dir "<primary>/.git" config core.hooksPath /x` was ALLOWED, measured.
+            #
+            # A GOVERNED ANSWER OUTRANKS AN UNRESOLVABLE ONE. Both are deny-side, so the order only
+            # decides which message is printed -- and naming the repository is strictly more useful than
+            # reporting that a sibling token could not be resolved.
+            $hits = @($where | ForEach-Object { Resolve-ConfigTarget $_ $cwdRaw })
+            $t = @($hits | Where-Object { $_.Root })[0]
+            if (-not $t) {
+                $bad = @($hits | Where-Object { $_.Unresolvable })[0]
+                if (-not $bad) { continue }
+                Write-Deny -Rule "3c" -Detail "git config $badKey (unresolvable target)" -Reason @"
 BLOCKED: this sets '$badKey', and the gate cannot tell WHICH repository it would set it in.
 
-The target path '$(Get-SafeForMessage $where[0])' could not be resolved to an absolute path from this
+The target path '$(Get-SafeForMessage $bad.Raw)' could not be resolved to an absolute path from this
 session's working directory ('$(Get-SafeForMessage $cwdRaw)'), so the check that would normally answer
 "is this the shared configuration of a governed checkout?" cannot run at all.
 
@@ -678,12 +758,10 @@ What to do instead:
   * Ordinary per-user config (user.email, user.name, and anything not on the disarm list) is untouched by
     this rule in any spelling.
 "@
-        }
+            }
 
-        $govCfg = $t.Root
-        if (-not $govCfg) { continue }
-
-        Write-Deny -Rule "3c" -Detail "git config $badKey" -Reason @"
+            $govCfg = $t.Root
+            Write-Deny -Rule "3c" -Detail "git config $badKey" -Reason @"
 BLOCKED: setting '$badKey' would change the SHARED git configuration of $($govCfg.Display).
 
 Every worktree of this repository shares one .git directory, so this is not a local change: it takes
@@ -699,6 +777,7 @@ What to do instead:
   * Ordinary per-user config (user.email, user.name, and anything that is not on the disarm list) is
     untouched and needs no workaround.
 "@
+        }
     }
 
     # -----------------------------------------------------------------------------------------------

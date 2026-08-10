@@ -503,6 +503,140 @@ def test_rule_3c_is_invariant_to_where_the_HOOK_PROCESS_stands(
         assert run_gate_in(allow, repo.repos, hook_cwd=hook_cwd) is None
 
 
+# ------------------------------- rule 3c: one line is SEVERAL commands, and a SET of targets (#1065)
+#
+# The rule judged a whole line at once and then read candidate ``[0]`` of the target set. Three ordinary
+# spellings walked through that, none of them needing intent:
+#
+#   * a ``-C`` belonging to a DIFFERENT command on the line became "the repository being configured".
+#     ``-C HEAD`` is the reuse-that-commit's-message flag; ``git config alias.amend "commit -C HEAD"`` is
+#     written on purpose by people with nothing to evade.
+#   * a neighbouring READ armed the rule's own read exclusion for the write beside it.
+#   * a ``--git-dir`` / ``--work-tree`` naming a governed repository sat in the TAIL of the candidate set
+#     and was never looked at, although the resolver's contract says the caller must deny if ANY member
+#     is governed and rule 3 had always done so.
+#
+# Fourteen deny cases, every one measured ALLOW on the committed gate first. The narrowness block below
+# it is the other half: eleven cases that must stay ALLOW on both sides, plus the pre-existing denies
+# which must keep denying, or this is a rewrite rather than a repair.
+
+_DISARM = "core.hooksPath /nope"
+
+
+@pytest.fixture
+def ungoverned(tmp_path: Path) -> Path:
+    """A real repository that is NOT on the allowlist. Half the cases here are about it staying that
+    way: a rule that sees more targets must not therefore refuse more repositories."""
+    other = tmp_path / "Unrelated"
+    subprocess.run(["git", "init", "-b", "main", str(other)], check=True, capture_output=True)
+    return other
+
+
+def _nested_worktree(repo: SimpleNamespace) -> Path:
+    """A worktree git NESTS under the primary (``.claude/worktrees/<name>``, the first-party mechanism).
+
+    Built on demand rather than in the ``repo`` fixture: only a handful of cases need it, and every other
+    test in this file would pay for it. It matters here because ``Test-Governed`` deliberately EXEMPTS
+    this path shape -- and rule 3c must not inherit that exemption, since a nested worktree's config
+    write lands in the same shared file as the primary's."""
+    nested = repo.primary / ".claude" / "worktrees" / "nested"
+    nested.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "-C", str(repo.primary), "worktree", "add", "-b", "nested-b", str(nested)],
+        check=True,
+        capture_output=True,
+    )
+    return nested
+
+
+@pytest.mark.parametrize(
+    ("command", "cwd_key"),
+    [
+        (f"git commit -C HEAD && git config {_DISARM}", "primary"),
+        (f"git config {_DISARM} && git commit -C HEAD", "primary"),
+        (f"git config {_DISARM} ; git commit -C HEAD", "primary"),
+        (f"git commit -C HEAD || git config {_DISARM}", "primary"),
+        (f"git commit -C HEAD | git config {_DISARM}", "primary"),
+        (f"git config --list && git config {_DISARM}", "primary"),
+        (f"git config {_DISARM} && git config --list", "primary"),
+        (f"git config --get core.hooksPath && git config {_DISARM}", "primary"),
+        (f"git commit -C HEAD && git config {_DISARM}", "wt"),
+        (f"git config --list && git config {_DISARM}", "nested"),
+        ("git commit -C HEAD && git config alias.ci 'x'", "primary"),
+        ("git commit -C HEAD && git -c core.hooksPath=/x commit -m y", "primary"),
+        ("git --git-dir GOVERNED/.git config " + _DISARM, "other"),
+        ("git --work-tree GOVERNED config " + _DISARM, "other"),
+    ],
+)
+def test_a_disarm_beside_another_command_is_denied(
+    repo: SimpleNamespace, ungoverned: Path, command: str, cwd_key: str
+) -> None:
+    """Every one of these was measured ALLOW on the committed gate. The hook process stands where the
+    payload says the session does, which is what production supplies."""
+    cwd = (
+        _nested_worktree(repo)
+        if cwd_key == "nested"
+        else {"primary": repo.primary, "wt": repo.wt, "other": ungoverned}[cwd_key]
+    )
+    command = command.replace("GOVERNED", str(repo.primary))
+    reason = assert_denied(run_gate_in(shell(command, cwd=cwd), repo.repos, hook_cwd=cwd))
+    assert "SHARED git configuration" in reason
+
+
+@pytest.mark.parametrize(
+    ("command", "cwd_key"),
+    [
+        ("git config --list", "primary"),
+        ("git config --get core.hooksPath", "primary"),
+        ("git commit -C HEAD", "primary"),
+        ("git -C UNGOVERNED config " + _DISARM, "primary"),
+        ("git -C ../Unrelated config " + _DISARM, "wt"),
+        ("git config user.email a@b.c && git commit -m x", "primary"),
+        (f"git config {_DISARM}", "other"),
+        ("cd ../Unrelated && git config " + _DISARM, "primary"),
+        ("git config --list && git config user.email a@b.c", "primary"),
+        ('git commit -m "note about core.hooksPath and alias.x" ; git status', "primary"),
+        ("git --git-dir UNGOVERNED/.git config " + _DISARM, "other"),
+    ],
+)
+def test_splitting_the_line_does_not_widen_the_rule(
+    repo: SimpleNamespace, ungoverned: Path, command: str, cwd_key: str
+) -> None:
+    """The narrowness half, and it is the half the previous four attempts at this rule failed.
+
+    Judging each invocation separately and checking every candidate makes the rule see MORE; each of
+    these proves it does not therefore deny more. All eleven are ALLOW on the committed gate and must
+    stay ALLOW here -- a read on its own, a `-C` at an ungoverned repo, a disarm inside an ungoverned
+    repo, a `cd` into one, and a commit message that merely mentions the keys."""
+    cwd = {"primary": repo.primary, "wt": repo.wt, "other": ungoverned}[cwd_key]
+    command = command.replace("UNGOVERNED", str(ungoverned))
+    assert run_gate_in(shell(command, cwd=cwd), repo.repos, hook_cwd=cwd) is None
+
+
+@pytest.mark.parametrize(
+    ("command", "cwd_key"),
+    [
+        (f"git config {_DISARM}", "primary"),
+        (f"git config {_DISARM}", "wt"),
+        ("git -C GOVERNED config " + _DISARM, "wt"),
+        ("git -C ../Primary config " + _DISARM, "wt"),
+        ("cd ../Primary && git config " + _DISARM, "wt"),
+        ("git -c core.hooksPath=/dev/null commit -m x", "primary"),
+        ("git config alias.ci 'commit --no-verify'", "primary"),
+        ("git config include.path ../evil", "primary"),
+    ],
+)
+def test_the_pre_existing_denies_survive_the_split(
+    repo: SimpleNamespace, command: str, cwd_key: str
+) -> None:
+    """The regression guard. These eight DENY on the committed gate; if the split turned any of them into
+    an allow, the rule would have been rewritten rather than repaired -- which is how every earlier
+    attempt at this rule failed verification."""
+    cwd = {"primary": repo.primary, "wt": repo.wt}[cwd_key]
+    command = command.replace("GOVERNED", str(repo.primary))
+    assert_denied(run_gate_in(shell(command, cwd=cwd), repo.repos, hook_cwd=cwd))
+
+
 # --------------------------------------------------------------- rule 3d: destroying another worktree
 
 
