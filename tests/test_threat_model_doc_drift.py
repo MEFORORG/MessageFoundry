@@ -34,19 +34,49 @@ What this guard structurally cannot do is discover *tomorrow's* surface: an enum
 today's rows only (15.1.4 exhibited exactly that failure mode when pydicom/signxml landed later). The
 review checklist carries the "does this change introduce a new dangerous-functionality or
 resource-demanding surface?" question for that half.
+
+**Where the document is not present** (BACKLOG #1043). ``docs/security/**`` is deny-listed from the
+OSS mirror and vaulted, so on a public checkout the doc-CONTENT assertions have nothing to assert.
+They used to answer that with a bare ``pytest.skip``, which in a 12,000-test run is indistinguishable
+from a pass — a control that cannot report its own inertness (ADR 0158's class 2). Three changes:
+
+* the absence is **announced**, once per run, as a :class:`ThreatModelDocUnenforced` warning that
+  names the path it looked for, what stopped enforcing, and what still does. It lands in pytest's
+  warnings summary, which prints even under ``-q``;
+* ``MEFOR_THREAT_MODEL_DOC`` points the whole module at a copy elsewhere (the vault working tree),
+  and ``MEFOR_REQUIRE_THREAT_MODEL_DOC`` makes absence a hard **failure** for any leg that is
+  supposed to have it — so the enforcing posture is fail-closed rather than best-effort;
+* the **checker mechanism** is verified on every tree, doc or no doc, against an in-module stand-in
+  (the ``--- checker self-tests`` section). That is deliberately not a stand-in for the document's
+  *content*: a public copy of the registries would be a green proving only that a fixture matches a
+  fixture. What it proves is that these checkers can go red — including the one trap this module has
+  actually been caught by, a row deleted while the section's prose still carries its anchor.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import warnings
 from pathlib import Path
 
 import pytest
 
 _ROOT = Path(__file__).resolve().parent.parent
-_DOC = _ROOT / "docs" / "security" / "THREAT-MODEL.md"
 _PKG = _ROOT / "messagefoundry"
+
+#: Point this at a copy of the document (e.g. the vault working tree) to enforce the content half
+#: from a checkout that does not carry it.
+_DOC_ENV = "MEFOR_THREAT_MODEL_DOC"
+#: Set truthy where the document is EXPECTED to be present. Absence is then a failure, not a notice.
+_REQUIRE_ENV = "MEFOR_REQUIRE_THREAT_MODEL_DOC"
+
+
+def _doc_path() -> Path:
+    """Where the threat model is read from — the env override, else the in-tree (vault) location."""
+    override = os.environ.get(_DOC_ENV, "").strip()
+    return Path(override) if override else _ROOT / "docs" / "security" / "THREAT-MODEL.md"
+
 
 _RESOURCE_HEADING = "## Resource-demanding functionality (ASVS 15.1.3)"
 _DANGEROUS_HEADING = "## Dangerous functionality (ASVS 15.1.5)"
@@ -240,27 +270,74 @@ _ALLOWED_SHELL_SITES: dict[str, str] = {
 # --- helpers ------------------------------------------------------------------------------------
 
 
+class ThreatModelDocUnenforced(UserWarning):
+    """The threat model is absent from this checkout, so the doc-CONTENT assertions are inert.
+
+    A warning rather than a skip reason because a skip is invisible: it prints as one ``s`` among
+    thousands, and the run still reads as clean. This lands in pytest's warnings summary, which is
+    printed even under ``-q``.
+    """
+
+
+#: Announce once per session, not once per inert test — 80-odd identical entries in the warnings
+#: summary would be its own kind of unreadable.
+_ANNOUNCED = False
+
+
+def _announce_absence(path: Path) -> None:
+    global _ANNOUNCED
+    if _ANNOUNCED:
+        return
+    _ANNOUNCED = True
+    warnings.warn(
+        ThreatModelDocUnenforced(
+            f"{path} is absent from this checkout (docs/security/** is deny-listed from the OSS "
+            "mirror and vaulted), so EVERY doc-content assertion in "
+            "tests/test_threat_model_doc_drift.py is INERT in this run: the heading/table structure, "
+            "the 15.1.3 and 15.1.5 anchor registries, the planted-omission self-tests over the real "
+            "document, the setting-name resolution, the doc side of the numeric parity loop, and the "
+            "absence-claim tripwire. ASVS 15.1.3 and 15.1.5 are scored on that document, so on this "
+            "tree they have no drift enforcement at all. Still enforced here: the checker self-tests, "
+            "the subprocess-site inventory, the shell-execution-site invariant, the registered-source "
+            "coverage decision, and every live-constant lock. Set "
+            f"{_DOC_ENV}=<path to the document> to enforce the content half from this checkout, or "
+            f"{_REQUIRE_ENV}=1 to make its absence a hard failure."
+        ),
+        stacklevel=3,
+    )
+
+
 def _doc_text() -> str:
-    """The threat-model text, or a per-test skip where the document is not published.
+    """The threat-model text, or an ANNOUNCED per-test skip where the document is not published.
 
     ``docs/security/**`` is deny-listed from the OSS mirror (and vaulted after the cutover), so this
-    document is absent there and every assertion about its CONTENT has nothing to say. The skip is
-    deliberately here, at the single accessor, rather than at module level — that distinction is the
-    whole point:
+    document is absent there and every assertion about its CONTENT has nothing to say. Two decisions:
 
-    * A module-level skip would take the FIVE code-only tests down with the 88 doc-anchored ones,
-      including the only inventory of process-spawn sites and the only exact-value lock on ~60 shipped
-      security defaults. Those assert about CODE and are just as valid on the public repo.
-    * Skipping at the accessor also keeps the code half of a MIXED test enforced. ``test_subprocess_
-      sites_are_exactly_the_documented_set`` asserts ``live == known`` over the package and only THEN
-      reads the doc: if that assertion fails you never reach the skip, so the test still fails. Before
-      this, that test failed outright on the mirror and the process-spawn inventory guarded nothing
-      there — a list-form ``subprocess.Popen`` could ship unnoticed, which is the exact defect its
-      docstring records having already happened once.
+    * **The skip is here, at the single accessor, not at module level.** A module-level skip would
+      take the code-only tests down with the doc-anchored ones, including the only inventory of
+      process-spawn sites and the only exact-value lock on the shipped security defaults. Those
+      assert about CODE and are just as valid on the public repo. It also keeps the code half of a
+      MIXED test enforced: ``test_subprocess_sites_are_exactly_the_documented_set`` asserts
+      ``live == known`` over the package and only THEN reads the doc, so if that assertion fails you
+      never reach the skip. Before that, it failed outright on the mirror and the process-spawn
+      inventory guarded nothing there — a list-form ``subprocess.Popen`` could ship unnoticed, which
+      is the exact defect its docstring records having already happened once.
+    * **The skip announces itself** (#1043). Silence here was a green that meant nothing.
     """
-    if not _DOC.exists():
-        pytest.skip("docs/security/THREAT-MODEL.md is private-only (OSS-mirror deny-list / vault)")
-    return _DOC.read_text(encoding="utf-8")
+    path = _doc_path()
+    if not path.exists():
+        if os.environ.get(_REQUIRE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}:
+            pytest.fail(
+                f"{_REQUIRE_ENV} is set, so this run is expected to enforce the threat model's "
+                f"content — but {path} does not exist. Point {_DOC_ENV} at the document, or unset "
+                f"{_REQUIRE_ENV} to run in the announced, non-enforcing posture."
+            )
+        _announce_absence(path)
+        pytest.skip(
+            f"{path} is absent — the doc-content half is NOT enforced in this run; see the "
+            "ThreatModelDocUnenforced entry in the warnings summary for what that costs"
+        )
+    return path.read_text(encoding="utf-8")
 
 
 def _section(text: str, heading: str) -> str:
@@ -834,7 +911,7 @@ def test_relative_links_in_the_scored_sections_resolve(heading: str) -> None:
     missing = [
         target
         for target in _MD_LINK_RE.findall(section)
-        if not (_DOC.parent / target).resolve().exists()
+        if not (_doc_path().parent / target).resolve().exists()
         and not (_ROOT / "docs" / target).resolve().exists()
     ]
     assert not missing, (
@@ -850,7 +927,7 @@ def test_the_open_gap_is_tracked_against_an_artifact_that_exists() -> None:
     targets = _MD_LINK_RE.findall(note)
     assert targets, "the honest-gap note cites no tracking artifact"
     for target in targets:
-        path = (_DOC.parent / target).resolve()
+        path = (_doc_path().parent / target).resolve()
         assert path.exists(), f"the cited tracker {target} does not exist"
         assert "15.2.2" in path.read_text(encoding="utf-8"), (
             f"{target} does not mention 15.2.2, so it does not track the gap this note assigns to it"
@@ -1091,3 +1168,155 @@ def test_every_dangerous_row_is_pinned_by_an_anchor_or_a_row_key() -> None:
         "15.1.5 row(s) with no _DANGEROUS_ANCHORS token and no _DANGEROUS_ROW_KEYS entry — deleting "
         f"them would not red CI: {unpinned}"
     )
+
+
+# --- checker self-tests: the half that must run on EVERY tree (BACKLOG #1043) --------------------
+#
+# Everything above this line asserts about a document that is absent from a public checkout. These
+# assert about the CHECKERS, against a stand-in written here, and therefore never go inert. They are
+# not a stand-in for the document's content — a public copy of the registries would be a green
+# proving only that a fixture matches a fixture. They prove the checkers can go RED, which is the
+# property a skipped run silently stops evidencing.
+
+#: A miniature of the two scored sections. The prose after each table repeats a row's anchor on
+#: purpose: that is the exact shape that once left `_missing` green next to a deleted row, and it is
+#: why `_missing_in_rows` exists.
+_STAND_IN = """\
+# Stand-in threat model
+
+## Resource-demanding functionality (ASVS 15.1.3)
+
+| Surface | Attacker-influenceable input | Bound in force |
+|---|---|---|
+| **Widget parse** | the widget body | capped by `widget_limit` at 4 MiB |
+| **Gadget poll** | the polled row set | capped by `gadget_limit` |
+
+Closing note: `widget_limit` is also named here, in prose, after the table. See
+[CONFIGURATION.md](CONFIGURATION.md) and the `[api].serve_ui` setting.
+
+## Dangerous functionality (ASVS 15.1.5)
+
+| Functionality | Guard |
+|---|---|
+| **Shell hook** | runs via `create_subprocess_shell` behind an operator-only setting |
+
+### First subsection
+
+subprocess.Popen appears here, in prose inside the 15.1.5 section.
+
+### Second subsection
+
+nothing of interest.
+"""
+
+
+def _stand_in_resource_section() -> str:
+    return _section(_STAND_IN, _RESOURCE_HEADING)
+
+
+def test_section_slicing_stops_at_the_next_same_or_higher_heading() -> None:
+    """The contract is *same-or-higher* level, so a `###` subsection stays inside its `##` parent.
+
+    Worth pinning rather than assuming: that inclusion is precisely why the anchor checks are scoped
+    to TABLE ROWS. A `##` slice carries its subsections' prose, so a section-scoped token search can
+    be satisfied by text that is not a row. (This assertion was written the other way round first,
+    and the stand-in caught it — which is the point of having one.)
+    """
+    resource = _stand_in_resource_section()
+    assert "**Widget parse**" in resource
+    assert "**Shell hook**" not in resource, "the 15.1.3 slice swallowed the next `##` section"
+    dangerous = _section(_STAND_IN, _DANGEROUS_HEADING)
+    assert "**Shell hook**" in dangerous
+    assert "First subsection" in dangerous, "a `###` subsection is part of its `##` section"
+    sub = _section(_STAND_IN, "### First subsection")
+    assert "subprocess.Popen" in sub
+    assert "Second subsection" not in sub, "a `###` slice swallowed the next `###`"
+
+
+def test_table_row_extraction_drops_the_header_and_separator() -> None:
+    rows = _table_rows(_stand_in_resource_section())
+    assert len(rows) == 2, f"expected the two body rows, got {rows}"
+    assert _row_first_cells(_stand_in_resource_section()) == ["**Widget parse**", "**Gadget poll**"]
+
+
+def test_a_deleted_row_is_detected_even_though_the_prose_still_carries_its_anchor() -> None:
+    """THE trap this module has already been caught by, proven detectable on every tree.
+
+    RULE: a gate that has never been red is a claim. Here the red is produced on purpose: drop the
+    `widget_limit` ROW while the closing prose keeps naming `widget_limit`, and the row-scoped
+    checker must still report it — while the section-scoped one demonstrably does not.
+    """
+    section = _stand_in_resource_section()
+    assert _missing_in_rows(section, ("widget_limit", "gadget_limit")) == []
+
+    mutated = _drop_one_row_containing(section, "widget_limit")
+    assert _missing_in_rows(mutated, ("widget_limit",)) == ["widget_limit"], (
+        "the row-scoped checker did not notice a deleted row — it is asleep"
+    )
+    # Only ONE row goes: the sibling must still be found, or the mutation is too blunt to model a
+    # realistic single-row regression.
+    assert _missing_in_rows(mutated, ("gadget_limit",)) == []
+    # And the section-scoped checker is blind to it, because the prose still says `widget_limit`.
+    # That is not a defect here; it is the measured reason the row-scoped one exists.
+    assert _missing(mutated, ("widget_limit",)) == []
+
+
+def test_the_row_mutation_helper_refuses_to_silently_do_nothing() -> None:
+    """If the needle is gone, `_drop_one_row_containing` must fail rather than return the text
+    unchanged — otherwise every planted-omission self-test above would pass vacuously."""
+    with pytest.raises(AssertionError, match="no table row containing"):
+        _drop_one_row_containing(_stand_in_resource_section(), "a-token-in-no-row")
+
+
+def test_the_token_and_link_scanners_find_what_they_claim_to() -> None:
+    assert ("api", "serve_ui") in _TOML_TOKEN_RE.findall(_STAND_IN)
+    assert _MD_LINK_RE.findall(_STAND_IN) == ["CONFIGURATION.md"]
+    assert _SUBPROCESS_RE.search("create_subprocess_shell(...)") is not None
+    assert _SUBPROCESS_RE.search("subprocess.Popen([...])") is not None
+    assert _SUBPROCESS_RE.search("a line that spawns nothing") is None
+
+
+# --- the enforcement posture is itself asserted --------------------------------------------------
+
+
+def test_the_doc_content_half_reports_whether_it_is_enforcing() -> None:
+    """Neither posture may be silent (#1043).
+
+    Present: the accessor returns the document, so the assertions above are live. Absent: the
+    accessor emits a ThreatModelDocUnenforced warning naming what stopped enforcing, and only THEN
+    skips. A run that quietly skipped 80-odd assertions and reported green is the defect being fixed,
+    so the announcement is asserted rather than assumed.
+    """
+    global _ANNOUNCED
+    path = _doc_path()
+    if path.exists():
+        assert _doc_text().strip(), f"{path} exists but is empty — the content half asserts nothing"
+        return
+    was_announced, _ANNOUNCED = _ANNOUNCED, False
+    try:
+        with (
+            pytest.warns(ThreatModelDocUnenforced, match=str(_DOC_ENV)),
+            pytest.raises(pytest.skip.Exception),
+        ):
+            _doc_text()
+    finally:
+        _ANNOUNCED = was_announced
+
+
+def test_requiring_the_document_turns_its_absence_into_a_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The fail-closed arm, for a leg that IS supposed to carry the document.
+
+    Both directions are exercised, so neither the env name nor the truthiness test can rot: pointed
+    at a real file the accessor reads it, pointed at a missing one under the require flag it fails.
+    """
+    monkeypatch.setenv(_REQUIRE_ENV, "1")
+    monkeypatch.setenv(_DOC_ENV, str(tmp_path / "absent" / "THREAT-MODEL.md"))
+    with pytest.raises(pytest.fail.Exception, match=_REQUIRE_ENV):
+        _doc_text()
+
+    stand_in = tmp_path / "THREAT-MODEL.md"
+    stand_in.write_text(_STAND_IN, encoding="utf-8")
+    monkeypatch.setenv(_DOC_ENV, str(stand_in))
+    assert _doc_text() == _STAND_IN, "the override is not what the accessor actually reads"
