@@ -295,14 +295,23 @@ async def test_must_change_outranks_the_second_factor_on_the_gate_page(
 ) -> None:
     """RED when: GET /ui/mfa checks mfa before must_change.
 
-    A bootstrap admin is BOTH. Leading with MFA parks it on a page it cannot answer until it has
+    An admin-ISSUED account is BOTH: create_local_user sets must_change_password, and require_mfa
+    covers it un-enrolled. Leading with MFA parks it on a page it cannot answer until it has
     rotated — the cookie-plane twin of the JSON ordering rule.
     """
     service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
-    boot = await service.initialize()  # the FIRST initialize is what mints the bootstrap admin
-    assert boot is not None
+    await service.initialize()
+    temp = "an-issued-temp-passphrase"
+    await service.create_local_user(
+        username="issued",
+        password=temp,
+        display_name=None,
+        email=None,
+        roles=[Role.ADMINISTRATOR.value],
+        actor="test",
+    )
     async with _client(engine, service) as c:
-        r = await c.post("/ui/login", data={"username": boot.username, "password": boot.password})
+        r = await c.post("/ui/login", data={"username": "issued", "password": temp})
         assert r.status_code == 303 and r.headers["location"] == "/ui/account/password"
         r = await c.get("/ui/mfa")
         assert r.status_code == 303 and r.headers["location"] == "/ui/account/password"

@@ -291,18 +291,20 @@ account. Service defaults: name `MessageFoundry`, data dir `C:\ProgramData\Messa
 > upgrade is an explicit, reviewable act. *(A contributor running the **editable** install instead
 > serves whatever branch is checked out — treat that checkout as the release artifact; see §13.)*
 
-### 4.5 First-run admin bootstrap
+### 4.5 Create the first administrator
 
-Auth is **enabled by default**. On the first start against an empty store, MEFOR creates a one-time
-bootstrap admin (`admin`) and writes its password to an **owner-only `bootstrap-admin.txt`** next to
-the store (only the file *location* is logged — never the password). Then:
+Auth is **enabled by default**, and a fresh store has **no accounts at all** — no default username, no
+generated password, nothing written to disk (ASVS 6.3.2). Create the first administrator yourself, on
+the server:
 
-1. Log in as `admin`; you are **forced to change the password** on first use.
-2. **Create a second real administrator** promptly.
-3. **Delete `bootstrap-admin.txt`.**
+1. `messagefoundry admin-create --username <you> --email <your address>` — it prompts for the
+   password (no echo, confirmed) and holds it to your `[auth]` policy.
+2. Sign in to the console at `/ui` with it.
+3. **Create a second administrator** promptly, so no single lost credential strands the estate.
 
-The bootstrap account auto-retires once a second admin exists, or — while still unclaimed — 72h after
-creation.
+The command works whether the engine is running or stopped, and it is also the recovery path if every
+administrator is ever locked out — which is why the server and the store file need the same protection
+as any credential.
 
 ### 4.6 Verify it runs
 
@@ -392,8 +394,8 @@ Full references: **[SECURITY.md](SECURITY.md)**, **[PHI.md](PHI.md)**, and **[DE
       app-encrypted and rely on volume encryption.
 - [ ] **Run under a least-privilege account** (the virtual account from §4.4) and lock down the store
       directory and any File-connector spill directories. **Treat backups as PHI.**
-- [ ] **Finish the bootstrap-admin handoff** (§4.5): change the password, create a second admin,
-      delete `bootstrap-admin.txt`.
+- [ ] **Create the first administrator and a second one** (§4.5), each with an email address so the
+      out-of-band security notices have a mailbox.
 - [ ] **For Active Directory:** use **LDAPS** with a trusted CA, never set `MEFOR_ALLOW_INSECURE_TLS`
       in production, and configure the directory's lockout/complexity policy (the engine's account
       lockout covers local accounts only). AD/Entra MFA is enforced by your directory; **local

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""AuthService — orchestrates authentication, sessions, role resolution, and first-run bootstrap.
+"""AuthService — orchestrates authentication, sessions, and role resolution.
 
 Pure engine-side code (no FastAPI): the API layer composes it. It ties together the store (users,
 roles, sessions, audit), password hashing/policy, opaque session tokens, and the LDAP/Kerberos
@@ -66,9 +66,6 @@ from messagefoundry.store.base import AdminStore
 from messagefoundry.store.store import SessionRecord, UserRecord, WebAuthnCredential
 
 _log = logging.getLogger(__name__)
-
-#: The account created on first run when the store has no users (HIPAA unique-user bootstrap).
-BOOTSTRAP_USERNAME = "admin"
 
 
 def _warn_if_corpus_unreadable(path: str | None) -> None:
@@ -167,18 +164,6 @@ class MfaStatus:
     recovery_codes_remaining: int
     required: bool
     webauthn_enrolled: bool = False
-
-
-@dataclass(frozen=True)
-class BootstrapAdmin:
-    """Credentials for the one-time bootstrap admin (printed once, then must be changed)."""
-
-    username: str
-    password: str
-    # ASVS 6.4.5: the instant an unclaimed bootstrap credential is auto-disabled
-    # (created_at + [auth].bootstrap_expiry_hours), or None when expiry is off (hours=0). Surfaced at
-    # issuance so the renewal instruction ("claim it before <ISO>") ships WITH the credential.
-    expires_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -358,9 +343,6 @@ class AuthService:
         self._reconcile_last_probed: dict[str, float] = {}
         #: Latched mass-revoke circuit-breaker trip, cleared by the next clean pass.
         self._reconcile_alert: str | None = None
-        #: ASVS 6.4.5 arm 2: once-per-process latch so the bootstrap-expiry reminder fires exactly once
-        #: while the unclaimed bootstrap sits inside its warn window (see :meth:`bootstrap_expiry_warning`).
-        self._bootstrap_expiry_warned = False
         # Advisory, NON-STICKY federated-IdP health (ADR 0142 AC-8) — see the oidc_available docstring.
         self._oidc_unavailable_reason: str | None = None
         self._oidc_client_secret: str | None = None
@@ -510,13 +492,14 @@ class AuthService:
 
     # --- lifecycle -----------------------------------------------------------
 
-    async def initialize(self) -> BootstrapAdmin | None:
-        """Seed the built-in roles and, on an empty store, create the bootstrap admin. Also retires an
-        unclaimed bootstrap that became superseded/expired while the service was down (WP-3)."""
+    async def initialize(self) -> None:
+        """Seed the built-in roles. Creates **no account**.
+
+        There is deliberately no implicit first-run administrator (ASVS 6.3.2 — no default accounts,
+        BACKLOG #1020, which closes as superseded by that verb rather than as built). A fresh store
+        therefore has zero users until an operator runs ``messagefoundry admin-create`` on the box,
+        which is the only route that mints the first Administrator and names it themselves."""
         await self._seed_roles()
-        created = await self._ensure_bootstrap_admin()
-        await self._retire_superseded_bootstrap()
-        return created
 
     async def _seed_roles(self) -> None:
         for role in Role:
@@ -525,36 +508,9 @@ class AuthService:
                 role_id=role.value, display_name=label, description=description, builtin=True
             )
 
-    async def _ensure_bootstrap_admin(self) -> BootstrapAdmin | None:
-        if await self._store.count_users() > 0:
-            return None
-        password = self._generate_policy_password()
-        user_id = uuid4().hex
-        await self._store.create_user(
-            user_id=user_id,
-            username=BOOTSTRAP_USERNAME,
-            auth_provider=AuthProvider.LOCAL.value,
-            display_name="Bootstrap Administrator",
-            password_hash=await self._argon2(hash_password, password),
-            must_change_password=True,
-        )
-        await self._store.set_user_roles(
-            user_id, [Role.ADMINISTRATOR.value], assigned_by="bootstrap"
-        )
-        await self._audit("auth.bootstrap_admin_created", actor="bootstrap")
-        # ASVS 6.4.5: derive the expiry from the STORED created_at (the same base
-        # _retire_superseded_bootstrap uses), so the surfaced deadline is exactly the retirement instant.
-        expiry_hours = self._settings.bootstrap_expiry_hours
-        expires_at: float | None = None
-        if expiry_hours > 0:
-            created = await self._store.get_user(user_id)
-            if created is not None:
-                expires_at = created.created_at + expiry_hours * 3600
-        return BootstrapAdmin(username=BOOTSTRAP_USERNAME, password=password, expires_at=expires_at)
-
     def _generate_policy_password(self) -> str:
-        """A random password that satisfies the active policy — so the printed bootstrap credential
-        is held to the same bar operators are. ``token_urlsafe(n)`` yields ~1.33·n chars (so length is
+        """A random password that satisfies the active policy — so a machine-issued credential is held
+        to the same bar operators are. ``token_urlsafe(n)`` yields ~1.33·n chars (so length is
         guaranteed ≥ ``min_length``); the loop covers the astronomically-unlikely breach/context hit
         or an opt-in character-class requirement a given token happens to miss."""
         length = max(16, self._policy.min_length)
@@ -563,68 +519,6 @@ class AuthService:
             if not self._policy.violations(candidate):
                 return candidate
         return secrets.token_urlsafe(length) + "aA1!"  # defensive: satisfies any class requirement
-
-    async def _other_enabled_admin_exists(self, exclude_id: str) -> bool:
-        """True iff some enabled administrator other than ``exclude_id`` exists."""
-        for user in await self._store.list_users():
-            if user.disabled or user.id == exclude_id:
-                continue
-            if Role.ADMINISTRATOR.value in await self._store.get_user_role_ids(user.id):
-                return True
-        return False
-
-    async def _retire_superseded_bootstrap(self, now: float | None = None) -> None:
-        """Disable the first-run bootstrap admin once it's no longer needed (WP-3): when a **second**
-        administrator exists, or — while still **unclaimed** (never password-changed) — once its expiry
-        window lapses. Only ever touches an unclaimed bootstrap (``must_change_password`` still set): if
-        the operator changed its password it is a normal admin account and is left alone, so this can't
-        lock out a legitimate single-admin deployment."""
-        now = time.time() if now is None else now
-        boot = await self._store.get_user_by_username(BOOTSTRAP_USERNAME)
-        if boot is None or boot.disabled or not boot.must_change_password:
-            return  # gone, already disabled, or claimed (a real account now)
-        expiry_hours = self._settings.bootstrap_expiry_hours
-        expired = expiry_hours > 0 and now >= boot.created_at + expiry_hours * 3600
-        superseded = await self._other_enabled_admin_exists(boot.id)
-        if not (expired or superseded):
-            return
-        await self._store.set_user_disabled(boot.id, disabled=True)
-        await self._store.revoke_user_sessions(boot.id)
-        await self._audit(
-            "auth.bootstrap_admin_retired",
-            actor="system",
-            detail=_json({"reason": "superseded" if superseded else "expired"}),
-        )
-
-    async def bootstrap_expiry_warning(self, now: float | None = None) -> tuple[float, int] | None:
-        """ASVS 6.4.5 arm 2: if the first-run bootstrap admin is STILL UNCLAIMED and ``now`` sits inside
-        its warn window ``[expires_at - bootstrap_warn_hours, expires_at)``, return the retirement instant
-        + whole hours remaining ONCE — an in-memory latch means a periodic caller emits exactly one
-        reminder per process. Returns ``None`` when time-expiry is off, the bootstrap is
-        gone/disabled/claimed, ``now`` is before the window (or already at/past it — retirement itself has
-        taken over by then), or a reminder already fired this process. Advisory only: the actual
-        auto-disable is :meth:`_retire_superseded_bootstrap`; this nudges an operator BEFORE it happens.
-
-        ``expires_at`` is derived from the STORED ``created_at`` — the same base
-        :meth:`_retire_superseded_bootstrap` uses — so the surfaced deadline is exactly the retirement
-        instant, not a fresh clock. The caller (the API-lifespan reminder) turns it into an ISO string +
-        the PHI-free ``bootstrap_admin_expiring`` AlertSink event; the password is never surfaced."""
-        if self._bootstrap_expiry_warned:
-            return None
-        expiry_hours = self._settings.bootstrap_expiry_hours
-        if expiry_hours <= 0:
-            return None  # no time-expiry configured → nothing to warn about
-        boot = await self._store.get_user_by_username(BOOTSTRAP_USERNAME)
-        if boot is None or boot.disabled or not boot.must_change_password:
-            return None  # gone, already disabled, or claimed (a real account now)
-        now = time.time() if now is None else now
-        expires_at = boot.created_at + expiry_hours * 3600
-        warn_start = expires_at - max(0, self._settings.bootstrap_warn_hours) * 3600
-        if not (warn_start <= now < expires_at):
-            return None  # not yet in the window, or already at/past the retirement instant
-        self._bootstrap_expiry_warned = True  # latch: exactly one reminder per process
-        hours_remaining = max(0, int((expires_at - now) // 3600))
-        return (expires_at, hours_remaining)
 
     # --- login ---------------------------------------------------------------
 
@@ -643,12 +537,6 @@ class AuthService:
     async def _login_local(
         self, username: str, password: str, *, client: str | None
     ) -> LoginOutcome:
-        # Enforce bootstrap expiry/supersession before the credential check: an unclaimed bootstrap
-        # that lapsed (or was superseded) is disabled here, so the disabled-account path below refuses
-        # it like any other invalid login (WP-3). Scoped to the bootstrap username to keep normal
-        # logins free of the extra lookups.
-        if username == BOOTSTRAP_USERNAME:
-            await self._retire_superseded_bootstrap()
         user = await self._store.get_user_by_username(username)
         if user is None or user.auth_provider != AuthProvider.LOCAL.value or user.disabled:
             # Equalize timing with the real-password path so a missing/disabled/AD account is not
@@ -688,13 +576,13 @@ class AuthService:
         # ASVS 6.4.1: an admin-issued initial/reset credential that was never claimed EXPIRES — the
         # password verified, but a `must_change_password` temp that is older than
         # `initial_password_expiry_hours` is refused like any other invalid login (a generic error, so
-        # it is indistinguishable from a wrong password) and audited. The bootstrap admin has its own
-        # expiry path (handled above) and is carved out; a user who set their own password has
-        # `must_change_password=False` and is never gated here.
+        # it is indistinguishable from a wrong password) and audited. A user who set their own password
+        # has `must_change_password=False` and is never gated here. The retired first-run bootstrap
+        # account used to be carved out of this rule because it had its own expiry path; with no
+        # implicit account left (BACKLOG #1020), every unclaimed temp is now held to the same deadline.
         expiry_hours = self._settings.initial_password_expiry_hours
         if (
-            username != BOOTSTRAP_USERNAME
-            and user.must_change_password
+            user.must_change_password
             and expiry_hours > 0
             and user.password_changed_at is not None
             and now - user.password_changed_at > expiry_hours * 3600.0
@@ -2550,7 +2438,15 @@ class AuthService:
         email: str | None,
         roles: Sequence[str],
         actor: str,
+        must_change_password: bool = True,
     ) -> str:
+        """Create a local account with ``roles``.
+
+        ``must_change_password`` defaults True because the common caller is an ADMIN setting SOMEONE
+        ELSE's credential: that is a one-time temp and first login must rotate it (ASVS 6.4.6 /
+        WP-L3-12). The one caller that passes False is ``messagefoundry admin-create``, where the
+        operator standing at the box is choosing THEIR OWN password — there is no second party the
+        rotation would protect, and forcing it would only add a step to first sign-in."""
         user_id = uuid4().hex
         await self._store.create_user(
             user_id=user_id,
@@ -2559,16 +2455,12 @@ class AuthService:
             display_name=display_name,
             email=email,
             password_hash=await self._argon2(hash_password, password),
-            # Admin-set the credential is a one-time temp: force rotation on first login so the
-            # operator never sets a lasting password the user keeps (ASVS 6.4.6 / WP-L3-12).
-            must_change_password=True,
+            must_change_password=must_change_password,
         )
         await self._store.set_user_roles(user_id, roles, assigned_by=actor)
         await self._audit(
             "user.created", actor=actor, detail=_json({"username": username, "roles": list(roles)})
         )
-        # If this created a second administrator, retire the now-redundant bootstrap admin (WP-3).
-        await self._retire_superseded_bootstrap()
         return user_id
 
     async def update_user(
@@ -2784,7 +2676,9 @@ class AuthService:
         """True iff ``user_id`` is an enabled administrator and the only one remaining.
 
         Guards the role-removal path so the deployment can never be left with no usable admin
-        account (the bootstrap admin only regenerates against a fully empty users table).
+        account. Nothing regenerates one: since BACKLOG #1020 there is no implicit first-run
+        administrator, and ``messagefoundry admin-create`` is an on-the-box command, not a fallback
+        the running engine can reach.
         """
         admins: set[str] = set()
         for user in await self._store.list_users():

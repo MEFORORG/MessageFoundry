@@ -271,3 +271,20 @@ prevent.
   silently revert ADR 0035's SEC-005/CWE-918 machine-scoping. **Refusing to build the form is the security decision.**
 - **Paint "signed out" with a warning background** — rejected: it is the author's harmless steady state; a permanently
   amber item gets ignored, and then it cannot warn when something is actually broken.
+
+
+## Amendment (2026-08-10) — the fork hazard no longer includes an account (BACKLOG #1020)
+
+Nothing decided here changes; two factual premises it rests on do, and a reader would otherwise act on
+stale text. BACKLOG #1020 retired the implicit first-run bootstrap Administrator (ASVS 6.3.2 — no
+default accounts), so:
+
+- **§5's fork hazard is now "a brand-new EMPTY database", with no account at all.** The forked engine is
+  one nobody can sign into until an operator runs `messagefoundry admin-create` against it. That is a
+  *worse* accident to have silently, not a lesser one, so the guard's reason stands unweakened.
+- **The "auto-retired bootstrap admin" explain-only case is gone**, along with `[auth].bootstrap_expiry_hours`.
+  There is no auto-retiring account and no such setting to look up. The RBAC-403 and TLS explain-only
+  cases are unaffected.
+
+Item #1020 lives in [`docs/BACKLOG.md`](../BACKLOG.md) until archived, then
+`docs/archive/backlog/BACKLOG-CLOSED.md`.

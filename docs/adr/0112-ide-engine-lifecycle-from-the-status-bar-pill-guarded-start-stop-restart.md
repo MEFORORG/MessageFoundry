@@ -170,3 +170,16 @@ running here" is the normal state of an authoring checkout.
   (`CMD.openEngineSetup`) and `CMD.startEngine` SHALL NOT be offered from the pill; WHEN `hasStore == true` the plain
   Start is unchanged. → `engine-control.test.ts` (rewritten store-less assertion + the known-CMD sweep),
   `engine-setup.test.ts` (content-model commands ⊆ `Object.values(CMD)`; dev-engine button === `CMD.startEngine`).
+
+
+## Amendment (2026-08-10) — the store-less confirm no longer promises an admin account (BACKLOG #1020)
+
+The guard, its gating and its acceptance criteria are unchanged. What changed is what the guard is
+warning about: BACKLOG #1020 retired the implicit first-run bootstrap Administrator (ASVS 6.3.2), so a
+store-less start creates a **new EMPTY database with no accounts** — an engine nobody can sign into
+until `messagefoundry admin-create` runs against it. The modal, the setup page copy and the two tests
+that pin them now say exactly that; leaving the old wording would have had the IDE promise an account
+the engine no longer creates.
+
+Item #1020 lives in [`docs/BACKLOG.md`](../BACKLOG.md) until archived, then
+`docs/archive/backlog/BACKLOG-CLOSED.md`.

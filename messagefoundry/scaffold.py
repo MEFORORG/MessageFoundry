@@ -231,8 +231,6 @@ _GITIGNORE = """\
 *.db-shm
 *.db-wal
 *.log
-# the one-time bootstrap admin credential the engine writes next to the store
-bootstrap-admin.txt
 .env
 .env.*
 /out/

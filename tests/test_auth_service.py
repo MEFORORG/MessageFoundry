@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""AuthService unit tests: bootstrap, local login + lockout, sessions, AD group->role mapping."""
+"""AuthService unit tests: first-admin provisioning, local login + lockout, sessions, AD group->role mapping."""
 
 from __future__ import annotations
 
 import time
 
 import pytest
+from _first_admin import FIRST_ADMIN, FIRST_ADMIN_PW, create_first_admin
 
 from messagefoundry.auth import Role, hash_password, hash_token
 from messagefoundry.auth.identity import AuthProvider
@@ -43,236 +44,39 @@ async def _store() -> MessageStore:
     return await MessageStore.open(":memory:")
 
 
-async def test_bootstrap_admin_created_once_and_can_log_in() -> None:
+async def test_initialize_seeds_roles_and_creates_no_account() -> None:
+    """BACKLOG #1020 / ASVS 6.3.2: a fresh store has NO users. The implicit first-run Administrator
+    was retired rather than given an email address, because the verb wants that account not to exist;
+    the replacement is the operator-invoked `messagefoundry admin-create` (tests/test_admin_create_cli.py).
+
+    RED when initialize() mints an account again — the exact regression this item closed."""
     store = await _store()
     try:
         service = AuthService(store, AuthSettings())
-        boot = await service.initialize()
-        assert boot is not None and boot.username == "admin" and len(boot.password) >= 15
-        out = await service.login("admin", boot.password)
-        assert out.ok and out.must_change_password is True
-        assert out.identity is not None and Role.ADMINISTRATOR in out.identity.roles
-        # a second service over the same (now non-empty) store does not re-bootstrap
-        assert await AuthService(store, AuthSettings()).initialize() is None
+        await service.initialize()
+        assert await store.count_users() == 0
+        assert await store.get_user_by_username("admin") is None
+        # Roles ARE seeded, so the operator route has something to assign.
+        assert {r["id"] for r in await store.list_roles()} >= {"administrator", "viewer"}
+        # No account means no credential to guess: every sign-in attempt fails, including the name
+        # the retired account used to carry.
+        assert not (await service.login("admin", "a-strong-test-passphrase")).ok
     finally:
         await store.close()
 
 
-async def test_bootstrap_password_satisfies_active_policy() -> None:
-    # The printed bootstrap credential is generated *through* the active policy (WP-3), even a strict one.
-    store = await _store()
-    try:
-        service = AuthService(
-            store, AuthSettings(password_min_length=20, password_require_symbol=True)
-        )
-        boot = await service.initialize()
-        assert boot is not None
-        assert service.policy.violations(boot.password) == [] and len(boot.password) >= 20
-    finally:
-        await store.close()
-
-
-async def test_bootstrap_auto_disabled_when_second_admin_created() -> None:
+async def test_first_admin_from_the_operator_route_can_log_in() -> None:
+    # The replacement path, exercised at the service layer the CLI drives (the CLI's own end-to-end
+    # test is tests/test_admin_create_cli.py). Its password is the operator's, so no forced rotation.
     store = await _store()
     try:
         service = AuthService(store, AuthSettings())
-        boot = await service.initialize()
-        assert boot is not None
-        await service.create_local_user(
-            username="alice",
-            password="a-long-unguessable-passphrase",
-            display_name=None,
-            email=None,
-            roles=[Role.ADMINISTRATOR.value],
-            actor="admin",
-        )
-        # the unclaimed bootstrap admin is retired the moment a real second admin exists
-        assert not (await service.login("admin", boot.password)).ok
-        retired = await store.get_user_by_username("admin")
-        assert retired is not None and retired.disabled
-    finally:
-        await store.close()
-
-
-async def test_bootstrap_expires_when_left_unclaimed() -> None:
-    store = await _store()
-    try:
-        service = AuthService(store, AuthSettings(bootstrap_expiry_hours=72))
-        boot = await service.initialize()
-        assert boot is not None
-        assert (await service.login("admin", boot.password)).ok  # within the window: usable
-        # age the account past the expiry window
-        admin = await store.get_user_by_username("admin")
-        assert admin is not None
-        await store._db.execute(
-            "UPDATE users SET created_at=? WHERE id=?", (time.time() - 73 * 3600, admin.id)
-        )
-        await store._db.commit()
-        assert not (await service.login("admin", boot.password)).ok  # expired → refused
-        expired = await store.get_user_by_username("admin")
-        assert expired is not None and expired.disabled
-    finally:
-        await store.close()
-
-
-async def test_claimed_bootstrap_is_not_retired() -> None:
-    # Once the operator changes the bootstrap password (must_change → False) it's a normal admin
-    # account; neither supersession nor expiry may disable it (no single-admin lockout).
-    store = await _store()
-    try:
-        service = AuthService(store, AuthSettings(bootstrap_expiry_hours=72))
-        await service.initialize()
-        admin = await store.get_user_by_username("admin")
-        assert admin is not None
-        await store.set_password(
-            admin.id,
-            password_hash=hash_password("a-claimed-real-passphrase"),
-            must_change_password=False,
-        )
-        # age it past expiry AND add a second admin — still must not be disabled
-        await store._db.execute(
-            "UPDATE users SET created_at=? WHERE id=?", (time.time() - 99 * 3600, admin.id)
-        )
-        await store._db.commit()
-        await service.create_local_user(
-            username="alice",
-            password="another-long-passphrase",
-            display_name=None,
-            email=None,
-            roles=[Role.ADMINISTRATOR.value],
-            actor="admin",
-        )
-        still = await store.get_user_by_username("admin")
-        assert still is not None and not still.disabled
-    finally:
-        await store.close()
-
-
-# --- ASVS 6.4.5 arm 1: the bootstrap credential carries its own expiry deadline ------------------
-
-
-async def test_bootstrap_admin_carries_its_expiry_deadline() -> None:
-    store = await _store()
-    try:
-        service = AuthService(store, AuthSettings(bootstrap_expiry_hours=72))
-        boot = await service.initialize()
-        assert boot is not None and boot.expires_at is not None
-        admin = await store.get_user_by_username("admin")
-        # exactly created_at + window (same base _retire_superseded_bootstrap uses) — not a fresh clock
-        assert abs(boot.expires_at - (admin.created_at + 72 * 3600)) < 1.0
-    finally:
-        await store.close()
-
-
-async def test_bootstrap_admin_deadline_is_none_when_expiry_off() -> None:
-    store = await _store()
-    try:
-        service = AuthService(store, AuthSettings(bootstrap_expiry_hours=0))
-        boot = await service.initialize()
-        assert boot is not None and boot.expires_at is None
-    finally:
-        await store.close()
-
-
-# --- ASVS 6.4.5 arm 2: an unclaimed bootstrap admin is reminded BEFORE it is auto-disabled --------
-
-
-async def test_bootstrap_expiry_warning_fires_once_in_window() -> None:
-    # An unclaimed bootstrap 24h from auto-disable draws exactly ONE reminder: the in-memory latch
-    # collapses a periodic caller to a single emit per process (the runner re-checks hourly).
-    store = await _store()
-    try:
-        service = AuthService(
-            store, AuthSettings(bootstrap_expiry_hours=72, bootstrap_warn_hours=24)
-        )
-        boot = await service.initialize()
-        assert boot is not None
-        admin = await store.get_user_by_username("admin")
-        assert admin is not None
-        expires_at = admin.created_at + 72 * 3600
-        at_t_minus_24h = expires_at - 24 * 3600  # exactly the window's leading edge
-        first = await service.bootstrap_expiry_warning(now=at_t_minus_24h)
-        assert first is not None
-        surfaced_expires, hours_remaining = first
-        assert (
-            abs(surfaced_expires - expires_at) < 1.0
-        )  # the exact retirement instant, not a fresh clock
-        assert hours_remaining == 24
-        # a second pass anywhere in the window is latched → no second reminder
-        assert await service.bootstrap_expiry_warning(now=at_t_minus_24h + 3600) is None
-    finally:
-        await store.close()
-
-
-async def test_bootstrap_expiry_warning_silent_before_the_window() -> None:
-    # Before [expires_at - warn_hours, expires_at): nothing — and a pre-window pass does NOT consume the
-    # latch, so the real window still fires afterwards.
-    store = await _store()
-    try:
-        service = AuthService(
-            store, AuthSettings(bootstrap_expiry_hours=72, bootstrap_warn_hours=24)
-        )
-        await service.initialize()
-        admin = await store.get_user_by_username("admin")
-        assert admin is not None
-        expires_at = admin.created_at + 72 * 3600
-        assert await service.bootstrap_expiry_warning(now=expires_at - 25 * 3600) is None  # before
-        assert (
-            await service.bootstrap_expiry_warning(now=expires_at - 12 * 3600) is not None
-        )  # inside
-    finally:
-        await store.close()
-
-
-async def test_bootstrap_expiry_warning_silent_when_claimed() -> None:
-    # "claimed fires nothing": once the operator changes the password (must_change → False) it is a
-    # normal admin account and draws no retirement reminder, even inside what would be the window.
-    store = await _store()
-    try:
-        service = AuthService(
-            store, AuthSettings(bootstrap_expiry_hours=72, bootstrap_warn_hours=24)
-        )
-        await service.initialize()
-        admin = await store.get_user_by_username("admin")
-        assert admin is not None
-        await store.set_password(
-            admin.id,
-            password_hash=hash_password("a-claimed-real-passphrase"),
-            must_change_password=False,
-        )
-        expires_at = admin.created_at + 72 * 3600
-        assert await service.bootstrap_expiry_warning(now=expires_at - 1 * 3600) is None
-    finally:
-        await store.close()
-
-
-async def test_bootstrap_expiry_warning_silent_when_expiry_off() -> None:
-    # No time-expiry configured → the credential is never auto-disabled, so there is nothing to warn of,
-    # however far past the (non-existent) deadline the clock is pushed.
-    store = await _store()
-    try:
-        service = AuthService(
-            store, AuthSettings(bootstrap_expiry_hours=0, bootstrap_warn_hours=24)
-        )
-        await service.initialize()
-        assert await service.bootstrap_expiry_warning(now=time.time() + 999 * 3600) is None
-    finally:
-        await store.close()
-
-
-async def test_bootstrap_expiry_warning_silent_after_the_deadline() -> None:
-    # At/after expires_at, retirement itself takes over (_retire_superseded_bootstrap); the pre-warning
-    # does not fire past the deadline.
-    store = await _store()
-    try:
-        service = AuthService(
-            store, AuthSettings(bootstrap_expiry_hours=72, bootstrap_warn_hours=24)
-        )
-        await service.initialize()
-        admin = await store.get_user_by_username("admin")
-        assert admin is not None
-        expires_at = admin.created_at + 72 * 3600
-        assert await service.bootstrap_expiry_warning(now=expires_at + 1) is None
+        await create_first_admin(service, username="alice")
+        out = await service.login("alice", FIRST_ADMIN_PW)
+        assert out.ok and out.identity is not None
+        assert Role.ADMINISTRATOR in out.identity.roles
+        user = await store.get_user_by_username("alice")
+        assert user is not None and user.must_change_password is False
     finally:
         await store.close()
 
@@ -314,7 +118,7 @@ async def test_reset_temp_password_expires_when_unclaimed() -> None:
         out = await service.login("alice", temp)
         assert not out.ok  # expired → refused, even with the CORRECT temp password
         assert out.error == "invalid credentials"  # generic — not distinguishable from a wrong pw
-        # the account is NOT disabled (unlike bootstrap) — an admin can re-issue a fresh temp
+        # the account is NOT disabled — an admin can re-issue a fresh temp
         assert (await store.get_user_by_username("alice")).disabled is False
     finally:
         await store.close()
@@ -361,24 +165,23 @@ async def test_initial_password_expiry_zero_disables_the_gate() -> None:
         await store.close()
 
 
-async def test_bootstrap_admin_is_not_gated_by_initial_password_expiry() -> None:
-    # The bootstrap admin is must_change + carries password_changed_at, but is CARVED OUT of the
-    # 6.4.1 gate (it has its own bootstrap_expiry_hours path). With bootstrap expiry off, an aged,
-    # unclaimed bootstrap still logs in — the initial-password gate must not catch it.
+async def test_operator_created_admin_is_not_gated_by_initial_password_expiry() -> None:
+    # ASVS 6.4.1 gates an admin-ISSUED temp (must_change_password). The operator route sets the
+    # operator's OWN password with must_change_password clear, so an aged first-admin credential is
+    # not caught by that gate. This replaces the carve-out the retired bootstrap account used to need
+    # (BACKLOG #1020): the exemption is now a property of the account, not a username special case.
     store = await _store()
     try:
-        service = AuthService(
-            store, AuthSettings(initial_password_expiry_hours=1, bootstrap_expiry_hours=0)
-        )
-        boot = await service.initialize()
-        assert boot is not None
-        admin = await store.get_user_by_username("admin")
+        service = AuthService(store, AuthSettings(initial_password_expiry_hours=1))
+        await create_first_admin(service)
+        admin = await store.get_user_by_username(FIRST_ADMIN)
+        assert admin is not None
         await store._db.execute(
             "UPDATE users SET password_changed_at=? WHERE id=?",
             (time.time() - 500 * 3600, admin.id),
         )
         await store._db.commit()
-        assert (await service.login("admin", boot.password)).ok  # not gated by the 6.4.1 expiry
+        assert (await service.login(FIRST_ADMIN, FIRST_ADMIN_PW)).ok
     finally:
         await store.close()
 

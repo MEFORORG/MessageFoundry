@@ -80,10 +80,12 @@ suite("engine setup page — the test-only dev engine is separated and context-h
     const dev = SETUP_SECTIONS.find((s) => s.tone === "dev");
     assert.ok(dev, "the dev-engine section is missing");
     const body = dev.body.join(" ");
-    // No-store half: the modal create-DB confirm (runDirHasEngine guards only this case).
+    // No-store half: the modal create-DB confirm (runDirHasEngine guards only this case). BACKLOG
+    // #1020 retired the implicit first-run admin, so the promise is an EMPTY database — a forked
+    // engine nobody can sign into until `messagefoundry admin-create` runs against it.
     assert.ok(
-      /NEW database and a bootstrap admin/i.test(body),
-      "must state that a store-less launch confirms creating a NEW database and a bootstrap admin",
+      /NEW empty database with no accounts/i.test(body),
+      "must state that a store-less launch confirms creating a NEW empty database with no accounts",
     );
     // Has-store half: a launch where a store exists shows no modal — it just starts that engine.
     assert.ok(

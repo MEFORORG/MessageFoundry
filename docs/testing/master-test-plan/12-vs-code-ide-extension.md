@@ -137,7 +137,7 @@ TypeScript and Python, and the **delivery vehicle**.
 | `engineLog.logState`/`logAction` (`engineLog.ts:79-92`) have no test; nothing forbids a caller passing a token/username/server `detail` as `detail` | A bearer token or attacker-controlled FastAPI `detail` lands in a channel users paste into public bug reports | Credential leak into a public issue | No — only `logProbe`'s route allowlist is indirectly anchored | P1 |
 | `home.ts:88-93` executes an **arbitrary** command id posted by the webview — no `CMD` allowlist, unlike `engineSetup.ts` | Any future path that gets attacker-influenced text into that webview escalates to command execution; the pattern gets copied into the next webview | Command execution from webview content | No | P1 |
 | `liveStatus.ts` is a **second, unpinned** poller (`:69-102`) | A regression promoting the background poll to an authenticating call refreshes the engine idle clock on a timer | The 30-minute idle timeout becomes unreachable (CWE-613) — the defect ADR 0110 AC-3 froze for `statusBar` only | No | P1 |
-| `statusBar.ts` shell untested (ADR 0112 concedes it): `controlContext` trust+loopback gate (`:446-462`), trust refusal (`:516`), no-store fork-guard modal (`:524-535`), double-launch guard (`:490-501`), terminal ownership for Stop | Creating a rogue empty engine database with a fresh bootstrap admin; or terminating an engine the IDE does not own | Destructive and operator-invisible | No | P1 |
+| `statusBar.ts` shell untested (ADR 0112 concedes it): `controlContext` trust+loopback gate (`:446-462`), trust refusal (`:516`), no-store fork-guard modal (`:524-535`), double-launch guard (`:490-501`), terminal ownership for Stop | Creating a rogue empty engine database; or terminating an engine the IDE does not own | Destructive and operator-invisible | No | P1 |
 | Activation is `onLanguage:python` + `workspaceContains:**/*.py`, and `validate.ts:29` raises an **error toast** when the CLI is unavailable | Every unrelated Python repo gets three subprocess launches and a red "MessageFoundry: validate failed" toast on open and on every save | The most visible install-quality defect; the most likely one-star review | No | P1 |
 | `debugpy` is an undeclared dependency (`testBench.ts:437` launches `type: "debugpy"`; `ide/package.json` declares no `extensionDependencies`) | Without `ms-python.python`, the advertised Test Bench "Debug" button fails with a raw VS Code error | A broken advertised feature on a fresh install | No | P1 |
 | The `test:unit` `--ignore` list (`package.json:822`) is hand-maintained, and the split is by **transitive** `vscode` import (e.g. `promote-target.test.ts` is excluded only because `promoteTarget.ts` imports a value from `cli.ts`) | A new test file added without an entry reds the ubuntu leg; a file that stops importing `vscode` stays Windows-only forever. On a fork (ubuntu-only matrix) the 86 excluded tests — **including every ADR 0035 test** — run nowhere | Security tests silently stop running | No | P1 |
@@ -460,7 +460,8 @@ synthetic bodies, but the residue itself is the defect to report.
 half is the *unreachable-engine* branch, where the local token must still be forgotten
 (`auth.ts:73-86`'s `finally`). Getting this wrong makes "signed out" a lie on a shared workstation.
 
-**Preconditions.** A real loopback engine with auth enabled and a bootstrap admin:
+**Preconditions.** A real loopback engine with auth enabled and an administrator created by
+`messagefoundry admin-create`:
 `python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev`.
 Credentials come from the environment (`MEFOR_*`), never from a file in the repo.
 
@@ -661,7 +662,7 @@ testable one.
 
 **Services and accounts**
 
-- **A loopback MessageFoundry engine**, auth-enabled with a bootstrap admin, for IDE-10, IDE-52,
+- **A loopback MessageFoundry engine**, auth-enabled with an `admin-create` administrator, for IDE-10, IDE-52,
   IDE-61 and the status-pill/deep-probe paths:
   `python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev`.
   Scratch store only — never a real one.

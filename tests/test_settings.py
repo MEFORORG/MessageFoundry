@@ -212,7 +212,6 @@ def test_auth_password_policy_defaults_are_asvs_aligned() -> None:
     assert a.password_check_breached and a.password_check_context
     assert a.password_check_username  # v2: own-username rejection on by default (6.2.11)
     assert a.password_breach_corpus_file is None  # opt-in larger offline corpus (6.2.12)
-    assert a.bootstrap_expiry_hours == 72
 
 
 def test_auth_breach_corpus_and_username_check_from_env() -> None:

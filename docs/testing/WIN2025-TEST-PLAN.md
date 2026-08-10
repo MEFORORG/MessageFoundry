@@ -324,7 +324,7 @@ These are the rows CI structurally cannot reach and `verify` reports MANUAL. Eac
 
 These are the eight gap-map tests (Tiers 1–3), **S2.1–S2.8** mapping 1:1 to gap-map #1–#8. Each attacks a path that `verify`/`check`/CI reports green (or simply never exercises) but that is unproven under real Windows Server 2025 service identity, real outbound delivery, real crash, real TLS, or real adversarial input. **Tier 1 (S2.1, S2.2) runs first.** Tools used: the functional harness Receive/Compose/Monitor tabs (GUI, desktop session) and the Qt-free headless `--scenario` path, plus `verify` where it applies. All require the box `serve`-ing the matching graph.
 
-> **Auth note for headless harness runs (applies to all of Sections 2–4).** S2.8/S1.AC-API prove the API binds loopback and **requires auth**. Against that production-posture (auth-on) engine the load runner validates the token via `/auth/me` and the scenario runner polls auth-gated `/messages`/`/dead-letters` — so **every headless `--scenario`/`--load`/`--failover` invocation must pass `--token <T>`** (mint a bearer for the service-identity engine via the console/API auth route, or via the runbook's bootstrap-admin flow). The failover orchestrator is the one exception: it spawns its own nodes with `MEFOR_SECURITY_REQUIRE_SIGN_IN=false`, so it needs no `--token`. If you prefer, serve the test engine with auth disabled for the harness runs and re-enable it for the S2.8 attack; the commands below assume auth-on + `--token`.
+> **Auth note for headless harness runs (applies to all of Sections 2–4).** S2.8/S1.AC-API prove the API binds loopback and **requires auth**. Against that production-posture (auth-on) engine the load runner validates the token via `/auth/me` and the scenario runner polls auth-gated `/messages`/`/dead-letters` — so **every headless `--scenario`/`--load`/`--failover` invocation must pass `--token <T>`** (mint a bearer for the service-identity engine via the console/API auth route, for an administrator created with `messagefoundry admin-create`). The failover orchestrator is the one exception: it spawns its own nodes with `MEFOR_SECURITY_REQUIRE_SIGN_IN=false`, so it needs no `--token`. If you prefer, serve the test engine with auth disabled for the harness runs and re-enable it for the S2.8 attack; the commands below assume auth-on + `--token`.
 
 ### S2.1 (gap #1) — Healthy message → PROCESSED UNDER the NSSM service account
 
@@ -1536,7 +1536,6 @@ These have no runnable PASS gate the harness can assert; a human observes and st
 | S4.10 (manual half) | Live DB-restart drill | Bounce the SQL Server/PostgreSQL service mid-flight; engine recovers, no loss | B6 |
 | S2.2 (remedy) | DPAPI boundary remedy confirmation | Chosen remedy (machine-scope DPAPI / env-var key / mint-as-service) lets the svc identity decrypt the key | S2.2 |
 | S4.9 (timing) | Windows port-rebind recovery timing | Record seconds for a killed listener to rebind `:2600` (host-variable; the box-owned number) | S4.9 |
-| M-BOOTSTRAP | `bootstrap-admin.txt` handling | One-time admin password written to repo root on first `serve`; rotate + secure/delete after capture (D11) | runbook |
 
 ### F. Phase-2 (customer-network) backlog
 

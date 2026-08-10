@@ -414,8 +414,8 @@ def test_business_logic_limit_table_states_both_dimensions_for_every_row() -> No
 
 #: Enforcement-scope vocabulary the Scope cell must declare, per row. The blanket claim this
 #: replaces ("All are in-process, per API process — N engine shards multiply every budget by N") was
-#: false for three of the table's own rows: two API processes share ONE lockout counter, ONE session
-#: cap and ONE bootstrap timer, because all three are written through the store.
+#: false for rows of the table's own: two API processes share ONE lockout counter and ONE session
+#: cap, because both are written through the store.
 _SCOPE_TOKENS = ("**in-process**", "**store-backed**", "**stateless**", "**n/a**")
 
 #: Limits whose state lives in the STORE, mapped to the ``self._store`` method that proves it. If a
@@ -423,7 +423,6 @@ _SCOPE_TOKENS = ("**in-process**", "**store-backed**", "**stateless**", "**n/a**
 _STORE_BACKED_LIMITS: dict[str, str] = {
     "lockout_threshold": "record_login_failure",
     "max_sessions_per_user": "enforce_session_cap",
-    "bootstrap_expiry_hours": "set_user_disabled",
 }
 
 #: Reject-when-full caches that are plain in-process objects, mapped to the class ``_bounded_caches``
@@ -472,9 +471,9 @@ def test_business_logic_limit_scope_is_stated_per_row() -> None:
 
     RULE (2.1.3): "N engine shards multiply every budget by N" is a claim an assessor tests. It is
     true of the sliding-window limiters and the two pending-flow caches and FALSE of the account
-    lockout, the session cap and the bootstrap timer, which are written through the one unified
-    store. Blanket-scoping the table inverts exactly the distinction that separates a per-process
-    limiter from a durable one.
+    lockout and the session cap, which are written through the one unified store. Blanket-scoping
+    the table inverts exactly the distinction that separates a per-process limiter from a durable
+    one.
     """
     table = next(t for t in _tables(_section(_H_LIMITS)) if t[0][0] == "Limit")
     scope = table[0].index("Scope")
@@ -1323,7 +1322,6 @@ def test_lockout_is_fed_by_two_legs_but_enforced_on_the_assertion_leg_too() -> N
         ("admin_write_rate_limit_per_actor", 12),
         ("admin_write_rate_limit_window_seconds", 1.0),
         ("max_sessions_per_user", 5),
-        ("bootstrap_expiry_hours", 72),
     ],
 )
 def test_limit_defaults_quoted_in_the_table_match_the_code(field: str, pinned: object) -> None:

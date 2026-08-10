@@ -304,8 +304,6 @@ _CONTEXTUAL_TOKENS = frozenset(
         "oidc_required_acr_values",
         "oidc_allowed_username_domains",
         "oidc_username_strip_domain",
-        # a time attribute x admin-population state that DENIES (disable + revoke + audit)
-        "bootstrap_expiry_hours",
         # DATA PLANE — the binding correction: these are pre-auth, IP-keyed ALLOW/DENY decisions too
         "source_ip_allowlist",
         "calling_ae_allowlist",
@@ -373,7 +371,6 @@ _PINNED_THRESHOLDS: tuple[tuple[str, str, object, str], ...] = (
     ("auth", "ad_session_recheck_max_users", 200, "200 users"),
     ("auth", "ad_session_revoke_max", 5, "**5**"),
     ("auth", "ad_session_revoke_max_fraction", 0.34, "**0.34**"),
-    ("auth", "bootstrap_expiry_hours", 72, "72 h"),
     ("auth", "oidc_require_mfa_claim", True, "on"),
     # These three were documented but unpinned — precisely the defaults the trailing lanes plan to
     # move (#297's 8.3.2 route proposes an ADR-0080-style derived ad_session_recheck_seconds), so a
@@ -397,7 +394,6 @@ _CONTEXTUAL_NAME_MARKERS = (
     "step_up",
     "session_",
     "lockout_",
-    "bootstrap_",
     "_allowlist",
     "_networks",
     "_origins",
@@ -435,11 +431,6 @@ _CONTEXTUAL_REVIEWED_NON_INPUTS = frozenset(
         # WP #285 (ASVS 6.7.1): the optional SHA-256 integrity pin over the OIDC CA anchor above —
         # an integrity control on trust material, not a consumer/environment access-decision input.
         "oidc_tls_ca_cert_pin",
-        # ASVS 6.4.5 arm 2: how long BEFORE the bootstrap deadline to start reminding an operator that
-        # the unclaimed first-run credential is about to be retired. Purely the timing of an advisory
-        # ALERT — no login, session or authorization outcome turns on it (contrast its sibling
-        # `bootstrap_expiry_hours`, which DISABLES the account and is therefore an inventoried input).
-        "bootstrap_warn_hours",
         # ASVS 3.7.3: destinations exempted from the "you are leaving this site" interstitial. It
         # decides whether the operator is SHOWN A NOTIFICATION before an outbound navigation — not
         # whether any request is authorized. No login, session, permission or authorization outcome
@@ -468,7 +459,10 @@ _CONTEXTUAL_PROSE_ONLY = frozenset(
 #: Body-row counts of the two decision tables. Row-scoping alone cannot catch the deletion of a row
 #: whose tokens are shared with a sibling row (Sec-Fetch, bind/exposure, the DICOM construction
 #: gate), so the counts are pinned too: removing ANY row reds CI.
-_CONTEXT_TABLE_A_ROWS = 35
+#: 35 -> 34 on 2026-08-10 (BACKLOG #1020): the "Bootstrap-admin age x admin population" row went with
+#: the account it inventoried. This gate did its job — the row was deleted deliberately, and the count
+#: is moved in the same change rather than after a red.
+_CONTEXT_TABLE_A_ROWS = 34
 _CONTEXT_TABLE_B_ROWS = 9
 
 #: The closed action vocabulary the section declares. Every Action cell in BOTH tables must OPEN with

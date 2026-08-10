@@ -72,7 +72,7 @@ export function classifyPreflight(result: {
 /**
  * Whether a REAL engine store already lives where `serve` would run. Pure over what the shell reads from
  * the run directory. When false, Start must not silently create a store — it confirms it will make a NEW
- * database + bootstrap admin (the ADR 0110 §5 fork hazard, now an explicit, labelled choice).
+ * empty database with no accounts (the ADR 0110 §5 fork hazard, now an explicit, labelled choice).
  *
  * The heuristic is deliberately permissive-of-presence: the service TOML OR any `*.db` file is enough to
  * say "an engine already lives here", because either one means a `serve` run here adopts an existing engine

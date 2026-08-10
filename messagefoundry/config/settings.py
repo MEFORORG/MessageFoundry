@@ -1709,8 +1709,9 @@ class AuthSettings(_Section):
     # secure default over back-compat. It cannot lock a fresh admin out: a required-but-unenrolled
     # Administrator can still reach the factor-enrollment routes (they are gated by a fresh PASSWORD
     # step-up bound to the enroll/confirm action, never by the MFA gate — see
-    # api/security.py:require_reauth_only_action), so the bootstrap admin enrolls TOTP then satisfies
-    # it. Set ``require_mfa = false`` (the documented opt-out) to revert to the single-factor default.
+    # api/security.py:require_reauth_only_action), so the first operator-created Administrator enrolls
+    # TOTP then satisfies it. Set ``require_mfa = false`` (the documented opt-out) to revert to the
+    # single-factor default.
     # An off-loopback bind that serves local accounts MUST keep this on; ``serve`` makes that posture
     # explicit (sec-mfa-on) — on an exposed (non-loopback) PHI bind with this **explicitly opted out**
     # it **refuses to start** on a production instance and **warns** on a non-production one, mirroring
@@ -1772,20 +1773,12 @@ class AuthSettings(_Section):
     password_breach_corpus_file: str | None = None
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
     lockout_minutes: int = 15
-    # First-run bootstrap admin: auto-disabled once a second administrator exists, and (if still
-    # unclaimed — never password-changed) disabled this many hours after creation. 0 = no time expiry.
-    bootstrap_expiry_hours: int = 72
-    # ASVS 6.4.5 arm 2: how many hours BEFORE that auto-disable to start reminding an operator (via the
-    # `bootstrap_admin_expiring` AlertSink event) that the unclaimed first-run credential is about to be
-    # retired. The API-lifespan reminder fires once per process while now sits inside
-    # [expires_at - bootstrap_warn_hours, expires_at). Only meaningful when bootstrap_expiry_hours > 0.
-    bootstrap_warn_hours: int = 24
     # ASVS 6.4.1: an admin-issued initial/reset credential (a `must_change_password` temp password) that
     # is never claimed EXPIRES this many hours after it was set. Without it, an unused reset password
     # grants an authenticated session indefinitely — and the one action it permits is to SET the
     # password, i.e. account takeover. Keyed on `password_changed_at`; a user who set their own password
-    # has `must_change_password=False` and is unaffected. The bootstrap admin has its own
-    # `bootstrap_expiry_hours` path and is exempt. 0 = no expiry (not recommended on a PHI instance).
+    # has `must_change_password=False` and is unaffected. 0 = no expiry (not recommended on a PHI
+    # instance).
     initial_password_expiry_hours: int = 72
 
     # Active Directory / LDAP. The bind password is a secret: MEFOR_AUTH_AD_BIND_PASSWORD.
@@ -2556,9 +2549,6 @@ _ALERT_EVENT_TYPES = frozenset(
         "leadership_acquired",  # #145 (ADR 0014 amendment): a node went non-leader→leader (HA failover / election)
         "dr_activated",  # #145 (ADR 0014 amendment, ADR 0048): a third-tier DR standby was promoted
         "content_match",  # #81 (ADR 0133): a code-first Handler ("Action Point") matched message content (PHI-free)
-        # ASVS 6.4.5 arm 2: an UNCLAIMED first-run bootstrap admin is nearing its auto-disable deadline
-        # (payload is the ISO deadline + whole hours remaining — never the password; PHI-free)
-        "bootstrap_admin_expiring",
         # NOTE: the INVERSE events (leadership_lost / dr_released) are auto-resolve-only (alert_sinks
         # _AUTO_RESOLVE), NOT rule-targetable alert types — a step-down / fail-back needs no page.
     }
@@ -2669,7 +2659,7 @@ class AlertRule(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     # --- match (all conditions must hold) ---
-    event_type: str = "any"  # "any" | connection_stopped | queue_buildup | storage_threshold | cert_expiry | secret_rotation | connection_error | message_stall | saturation | integrity_drift | update_available | backup_failed | lane_stuck | rcsi_off_degraded | bootstrap_admin_expiring
+    event_type: str = "any"  # "any" | connection_stopped | queue_buildup | storage_threshold | cert_expiry | secret_rotation | connection_error | message_stall | saturation | integrity_drift | update_available | backup_failed | lane_stuck | rcsi_off_degraded
     connection: str = "*"  # fnmatch glob over the connection name; "*" = all
     min_depth: int | None = Field(None, ge=1)  # queue_buildup: match only at/over this lane depth
     min_oldest_seconds: float | None = Field(

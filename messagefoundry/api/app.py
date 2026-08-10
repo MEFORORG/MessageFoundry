@@ -24,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-import datetime
 import json
 import logging
 import mimetypes
@@ -182,7 +181,7 @@ from messagefoundry.api.security import (
 # behavior is preserved via three seams the console installs: app.state.ui_csp,
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
 from messagefoundry.auth import Identity, Permission
-from messagefoundry.auth.service import AuthService, BootstrapAdmin
+from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
     TrustAnchorError,
@@ -262,7 +261,7 @@ from messagefoundry.logging_setup import LOG_LEVELS, current_log_level, set_runt
 from messagefoundry.parsing.sniff import attachment_mime_agrees, nontext_upload_reason
 from messagefoundry.pipeline import ConfigReloadDenied, Engine
 from messagefoundry.pipeline.alert_sinks import EmailTransport, notifier_from_settings
-from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.cluster import build_coordinator
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
@@ -289,7 +288,6 @@ from messagefoundry.store.content_search import (
     make_spec,
 )
 from messagefoundry.store.metadata import user_metadata
-from messagefoundry.store.store import _secure_file
 from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -5129,54 +5127,6 @@ def create_app(
     return app
 
 
-def _emit_bootstrap_admin(bootstrap: BootstrapAdmin, store_settings: StoreSettings) -> None:
-    """Persist the one-time bootstrap password to a restricted file — never the rotating log.
-
-    Until rotated it is a standing Administrator credential, so it must not land in NSSM's broadly
-    readable stdout capture. Write it to an owner-only file the operator consumes and deletes; log
-    only the location. Paired with server-side must_change_password enforcement, it dies at first login.
-    """
-    base = Path(store_settings.path or ".").resolve()
-    secret_file = base.parent / "bootstrap-admin.txt"
-    body = f"username: {bootstrap.username}\npassword: {bootstrap.password}\n"
-    # ASVS 6.4.5: state the renewal deadline WITH the credential — an unclaimed bootstrap is
-    # auto-disabled at this instant, so the "sign in and change it before then" instruction ships
-    # alongside the secret rather than being an out-of-band assumption. None when expiry is off.
-    deadline = (
-        datetime.datetime.fromtimestamp(bootstrap.expires_at, tz=datetime.UTC).isoformat()
-        if bootstrap.expires_at is not None
-        else None
-    )
-    if deadline is not None:
-        body += (
-            f"expires: {deadline} — sign in and change this password before then, "
-            "or the unclaimed credential is disabled.\n"
-        )
-    # Create the file owner-only from the instant it exists, closing the POSIX create-then-chmod TOCTOU
-    # (SEC-020): O_EXCL + 0o600 means the secret is never group/world-readable even momentarily, and
-    # O_EXCL also refuses to follow a pre-planted symlink/file at that path. A second service start
-    # before the operator deletes the prior file would hit FileExistsError — remove the stale file we
-    # own, then re-create exclusively.
-    flags = os.O_CREAT | os.O_WRONLY | os.O_EXCL | os.O_TRUNC
-    try:
-        fd = os.open(str(secret_file), flags, 0o600)
-    except FileExistsError:
-        secret_file.unlink()  # the prior owner-only file we wrote; replace it under the same mode
-        fd = os.open(str(secret_file), flags, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(body)
-    # On Windows os.open's mode is minimal, so still apply the icacls owner-only DACL (the store's
-    # platform-correct primitive: chmod on POSIX is a no-op here since O_EXCL already set 0o600).
-    _secure_file(secret_file)
-    _log.warning(
-        "Created bootstrap admin %r; one-time password written to %s — sign in, change it, then "
-        "delete that file%s.",
-        bootstrap.username,
-        secret_file,
-        f" (expires {deadline} unless claimed)" if deadline is not None else "",
-    )
-
-
 _SESSION_REAP_INTERVAL = 3600.0  # purge expired/idle sessions hourly to bound the sessions table
 
 
@@ -5215,34 +5165,6 @@ async def _directory_reconciler(auth: AuthService, interval: float) -> None:
             raise
         except Exception:
             _log.exception("directory reconcile: pass failed; will retry next interval")
-
-
-_BOOTSTRAP_EXPIRY_REMINDER_INTERVAL = 3600.0  # re-check the bootstrap warn window hourly
-
-
-async def _bootstrap_expiry_reminder(auth: AuthService, sink: AlertSink) -> None:
-    """Remind an operator, ONCE, that an UNCLAIMED first-run bootstrap admin is nearing its auto-disable
-    deadline (ASVS 6.4.5 arm 2). API-lifespan-owned (like :func:`_session_reaper`), NOT engine-owned — it
-    reaches the :class:`AuthService` directly. ``auth.bootstrap_expiry_warning()`` evaluates the warn
-    window and latches once-per-process; a non-None result is the fresh reminder to emit as the PHI-free
-    ``bootstrap_admin_expiring`` alert (the ISO deadline + whole hours remaining — never the password).
-
-    A transient store error must not kill the loop for the process lifetime (that would silently drop the
-    reminder) — log and retry next interval, the session-reaper precedent."""
-    while True:
-        try:
-            warning = await auth.bootstrap_expiry_warning()
-            if warning is not None:
-                expires_at, hours_remaining = warning
-                iso = datetime.datetime.fromtimestamp(expires_at, tz=datetime.UTC).isoformat()
-                sink.bootstrap_admin_expiring(
-                    "bootstrap-admin", expires_at=iso, hours_remaining=hours_remaining
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            _log.exception("bootstrap expiry reminder: pass failed; will retry next interval")
-        await asyncio.sleep(_BOOTSTRAP_EXPIRY_REMINDER_INTERVAL)
 
 
 def create_managed_app(
@@ -5332,8 +5254,9 @@ def create_managed_app(
 
     Pass ``store_settings`` for full backend selection (the service path), or ``db_path`` (+optional
     ``synchronous``) as a SQLite shortcut. ``config_dir`` loads the code-first Connection/Router/
-    Handler graph. ``auth_settings`` (when enabled) attaches an :class:`AuthService`, seeds the
-    built-in roles, and creates a bootstrap admin on first run. The store is opened via the
+    Handler graph. ``auth_settings`` (when enabled) attaches an :class:`AuthService` and seeds the
+    built-in roles; it creates NO account (BACKLOG #1020 — the first Administrator comes from
+    ``messagefoundry admin-create``, never from a first run). The store is opened via the
     backend-agnostic :func:`~messagefoundry.store.open_store`. ``api_listener`` is the engine's own
     ``(host, port)`` (from ``[api]``), reserved so no inbound listener can be wired onto the API's port
     — the CLI server passes it; in-process/test callers omit it (no separate API socket is bound).
@@ -5633,7 +5556,6 @@ def create_managed_app(
             upload_retention_runner.start()
         reaper: asyncio.Task[None] | None = None
         reconciler: asyncio.Task[None] | None = None
-        bootstrap_reminder: asyncio.Task[None] | None = None
         security_notifier = None
         # Back the COMPLETE loosening list on GET /security/posture: [auth] carries posture switches
         # (ad_session_recheck_seconds) that security_loosenings() must see. Stashed here, OUTSIDE the
@@ -5676,10 +5598,8 @@ def create_managed_app(
                 # connector-construction gate, so the clamp is inert unless the posture arrives here).
                 hop_posture=_hop_posture,
             )
-            bootstrap = await auth.initialize()
+            await auth.initialize()
             app.state.auth = auth
-            if bootstrap is not None:
-                _emit_bootstrap_admin(bootstrap, resolved)
             if not auth.webauthn_available() and await store.any_webauthn_credentials():
                 # L5b (ADR 0068 decision 5): enrolled passkeys exist but the [webauthn] extra is
                 # not installed (engine moved/reinstalled, same DB) — affected users stay
@@ -5724,14 +5644,6 @@ def create_managed_app(
                     auth_settings.oidc_redirect_path,
                 )
             reaper = asyncio.create_task(_session_reaper(store))
-            if auth_settings.bootstrap_expiry_hours > 0:
-                # ASVS 6.4.5 arm 2: nudge an operator BEFORE an unclaimed first-run bootstrap admin is
-                # auto-disabled. API-lifespan-owned (like the session reaper), NOT engine-owned — it
-                # reaches the AuthService directly. The warn method latches once-per-window; the sink logs
-                # (LoggingAlertSink fallback) or notifies. No task when time-expiry is off (byte-identical).
-                bootstrap_reminder = asyncio.create_task(
-                    _bootstrap_expiry_reminder(auth, notifier or LoggingAlertSink())
-                )
             if auth.directory_reconcile_enabled:
                 # ADR 0079 mechanism 2: propagate an AD disable/delete to live engine sessions.
                 # Default OFF (ad_session_recheck_seconds = 0) — no task, no behaviour change.
@@ -5760,11 +5672,6 @@ def create_managed_app(
                 # previously-died reaper stored, so it can't propagate here and skip engine.stop()
                 # (review M-33).
                 await asyncio.gather(reaper, return_exceptions=True)
-            if bootstrap_reminder is not None:
-                bootstrap_reminder.cancel()
-                # gather(return_exceptions): absorb our cancellation + any stored exception so it can't
-                # propagate here and skip engine.stop() (the reaper precedent).
-                await asyncio.gather(bootstrap_reminder, return_exceptions=True)
             await engine.stop()
             # B11: shut down the harness-only instrumented executor (None in production / other tests).
             # The engine is stopped (no more to_thread work), so a non-blocking shutdown is clean.

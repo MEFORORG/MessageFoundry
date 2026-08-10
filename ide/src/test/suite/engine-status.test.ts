@@ -79,7 +79,7 @@ suite("engineStatusModel — the tokenless /health probe cannot lie", () => {
 
   test("version present ⇒ unverified — NOT ok, and NOT green", () => {
     // The other half of the same bug. `optional_identity` applies no RBAC and no must-change gate, so a
-    // version merely proves that *a* session exists — a bootstrap admin locked out of every route still
+    // version merely proves that *a* session exists — a must-change account locked out of every route still
     // gets one back. Only a protected route can earn `ok` (see classifyDeep).
     const link = classifyHealth({ kind: "ok", body: { status: "ok", version: "0.3.0" } }, T, NOW, false);
     assert.strictEqual(link.state, "unverified");

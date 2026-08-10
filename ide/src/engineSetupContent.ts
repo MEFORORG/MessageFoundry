@@ -98,8 +98,8 @@ export const SETUP_SECTIONS: readonly SetupSection[] = [
       // The amendment's conditional truth, near-verbatim: the command is palette-visible and this page
       // is context-blind, so the copy states BOTH outcomes (runDirHasEngine guards only the store-less
       // launch — a has-store launch shows no modal).
-      "If no engine store exists here, you'll be asked to confirm creating a NEW database and a " +
-        "bootstrap admin; if one exists, this starts that engine.",
+      "If no engine store exists here, you'll be asked to confirm creating a NEW empty database " +
+        "with no accounts; if one exists, this starts that engine.",
     ],
     button: {
       id: "start-dev-engine",

@@ -252,8 +252,7 @@ deliberately fail-closed:
   operator-local profiles tuned to a specific deployment's volume.
 - `scripts/security/scan-tokens.local.txt` — the real customer/vendor token list. Only the
   **synthetic** `.example` is ever committed.
-- `.env`, `.env.*`, `*.key`, `*.pem`, `*.pfx`, `secrets/`, `/docker/secrets.env`, `/docker/tls/`,
-  `bootstrap-admin.txt`.
+- `.env`, `.env.*`, `*.key`, `*.pem`, `*.pfx`, `secrets/`, `/docker/secrets.env`, `/docker/tls/`.
 
 Two CI contexts back this up: **`forbidden-content (customer/PHI leak guard)`**
 ([`security.yml:367`](../../../.github/workflows/security.yml), running

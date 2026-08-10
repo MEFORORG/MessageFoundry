@@ -22,6 +22,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from _first_admin import FIRST_ADMIN, FIRST_ADMIN_PW, create_first_admin
 
 from messagefoundry.api import create_app
 from messagefoundry.auth.service import AuthService
@@ -54,16 +55,13 @@ async def _login(c: httpx.AsyncClient, username: str, password: str) -> httpx.Re
 
 
 async def _admin_session(c: httpx.AsyncClient, service: AuthService) -> tuple[dict[str, str], str]:
-    """Bootstrap the first admin, clear its must-change flag; return (auth-headers, admin-user-id)."""
-    boot = await service.initialize()
-    assert boot is not None
-    h = _auth((await _login(c, "admin", boot.password)).json()["token"])
-    await c.post(
-        "/me/password",
-        headers=h,
-        json={"current_password": boot.password, "new_password": "a-rotated-passphrase-99"},
-    )
-    h = _auth((await _login(c, "admin", "a-rotated-passphrase-99")).json()["token"])
+    """Create the first admin and sign it in; return (auth-headers, admin-user-id).
+
+    BACKLOG #1020 retired the implicit first-run account, so there is no machine-issued password to
+    rotate here — the operator route (`admin-create`, mirrored by `create_first_admin`) sets the
+    password the operator chose, with must_change_password already clear."""
+    await create_first_admin(service)
+    h = _auth((await _login(c, FIRST_ADMIN, FIRST_ADMIN_PW)).json()["token"])
     my_id = (await c.get("/auth/me", headers=h)).json()["user_id"]
     return h, my_id
 
@@ -75,7 +73,7 @@ async def _reauth_update(c: httpx.AsyncClient, h: dict[str, str]) -> None:
     r = await c.post(
         "/me/reauth",
         headers=h,
-        json={"password": "a-rotated-passphrase-99", "purpose": "admin_user_update"},
+        json={"password": FIRST_ADMIN_PW, "purpose": "admin_user_update"},
     )
     assert r.status_code == 200, r.text
 

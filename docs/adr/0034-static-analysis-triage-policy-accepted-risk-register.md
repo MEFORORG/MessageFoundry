@@ -33,7 +33,7 @@ A scanner re-runs on every publish, and a finding dismissed only via a per-alert
 - `py/overly-permissive-file` — the FILE outbound's cross-filesystem **copy fallback** created delivered files `0o644` (world-readable) while the `mkstemp` temp and the `os.link`/`os.replace` paths all yield `0o600`; tightened the fallback to `0o600`.
 
 **Accepted risk (1, `won't fix`):**
-- `py/clear-text-storage-sensitive-data` — the **one-time bootstrap-admin password** is written in cleartext to an **owner-only** file (`_secure_file` → `chmod 0o600` / NTFS owner-only DACL), the log records only its location, and server-side `must_change_password` forces rotation at first login. Conveying a first-run credential to the operator requires writing it somewhere; an owner-only, force-rotated file is the chosen, compensated mechanism. Revisit if the bootstrap flow changes.
+- `py/clear-text-storage-sensitive-data` — **WITHDRAWN 2026-08-10; the accepted risk no longer exists.** It covered the one-time bootstrap-admin password written in cleartext to an owner-only file, compensated by `0o600`/NTFS owner-only perms plus forced first-login rotation. BACKLOG #1020 retired the implicit first-run account outright (ASVS 6.3.2), so nothing writes a credential to disk: `messagefoundry admin-create` takes the operator's own password on a no-echo prompt or stdin and never persists it in cleartext. The finding it accepted has no site left to fire on. Recorded rather than deleted, because a register that silently loses a row cannot be reconciled against a re-scan.
 
 **Dismissed as false positive (11) / used in tests (2)** — class rationale:
 - *Protocol-/format-mandated hashing* — `weak-sensitive-data-hashing` on SHA-256 of a high-entropy session token (not a low-entropy password), SHA-1 for HaveIBeenPwned breach-corpus interop (`usedforsecurity=False`), and SHA-1 mandated by the WS-Security UsernameToken Digest profile.
@@ -83,7 +83,7 @@ Scorecard runs on the same mirror and surfaced **48 findings**. These are **repo
 
 **Positive** — one durable, reviewable record; future scans converge instead of re-litigating; the single accepted risk is logged and revisitable; the dataflow-verification gate (AC-4) is written down, not folklore.
 
-**Negative / risks** — a register can go stale: it MUST be updated whenever new findings are triaged, or it misleads. The accepted risk (#5) remains a cleartext-at-rest credential — mitigated by owner-only perms + forced first-login rotation, but a residual to revisit if the bootstrap flow changes.
+**Negative / risks** — a register can go stale: it MUST be updated whenever new findings are triaged, or it misleads. The cleartext-at-rest credential accepted as #5 was withdrawn on 2026-08-10 when the account that produced it was retired (see the amended row above); that is the shape of maintenance this register needs.
 
 **Out of scope** — enabling GHAS on the private repo; pursuing the *proper* Docker/Fuzzing/badge hardening above (deferred, not warranted now); and the operational mirror **publish** that re-runs CodeQL/Scorecard and auto-closes the fixed/stale findings (`publish.ps1`, owner-run).
 

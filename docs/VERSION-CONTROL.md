@@ -156,7 +156,7 @@ credentials, and the design keeps secrets out of the repo entirely:
   versioned `environments/<env>.toml` files hold only **non-secret** per-environment values.
 - **No real PHI in the repo.** Test fixtures are **synthetic only**. Real message bodies live in the
   engine's message store, never in git. See [PHI.md](PHI.md).
-- **`*.db`, `.env`, captures, and `bootstrap-admin.txt`** are git-ignored by the scaffold.
+- **`*.db`, `.env` and captures** are git-ignored by the scaffold.
 
 This holds regardless of where the repo is stored — a private on-prem remote does not change what may
 be committed. When in doubt, review the diff before you commit.

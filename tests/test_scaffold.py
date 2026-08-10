@@ -46,10 +46,6 @@ def test_scaffold_writes_the_skeleton(tmp_path: Path) -> None:
     # the service settings template carries the new posture model, not the retired enum
     toml = (repo / "messagefoundry.toml").read_text()
     assert 'environment = "dev"' in toml and "data_class" in toml and "production" in toml
-    # D11: the .gitignore must ignore the one-time bootstrap admin credential the engine writes next
-    # to the store, so it is never committed
-    gitignore = (repo / ".gitignore").read_text()
-    assert "bootstrap-admin.txt" in gitignore
     # the template + README teach WS-1's env-anchor so a config repo run under a service (CWD != repo
     # root) still resolves environments/<env>.toml (ADR 0017): base_dir in the toml, --project-root in docs
     assert "base_dir" in toml

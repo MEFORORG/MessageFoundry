@@ -28,7 +28,6 @@ If an exclusion or rule is not justified below for *your* deployment, do not add
 | Rollback journal | **Does not exist** — the store runs `PRAGMA journal_mode=WAL` unconditionally (no setting disables it), so no `-journal` sidecar appears in any supported deployment |
 | Logs | `C:\ProgramData\MessageFoundry\logs\service.out.log`, `...\service.err.log` (rotated at ~10 MiB) |
 | API bind (default) | `127.0.0.1:8765` (loopback) |
-| Bootstrap secret | `C:\ProgramData\MessageFoundry\bootstrap-admin.txt` (owner-only `0o600`, alongside the DB) |
 
 > The service you see in `services.msc` and Task Manager is `messagefoundry.exe`, but the process that actually owns the listening/connecting sockets is the venv **`python.exe`** it launches. That distinction matters for program-scoped firewall rules below.
 
@@ -52,9 +51,8 @@ Exclude these specific paths (substitute your real `DataDir`, repo path, and con
 | `C:\ProgramData\MessageFoundry\messagefoundry.db` | SQLite message store | Live, constantly-written queue/inbox/outbox | Lock contention, **WAL corruption**, quarantine → engine fail-closed |
 | `C:\ProgramData\MessageFoundry\messagefoundry.db-wal` | WAL sidecar | Write-ahead log, written on every commit | Corruption of in-flight messages; lost/duplicated delivery |
 | `C:\ProgramData\MessageFoundry\messagefoundry.db-shm` | Shared-memory index | WAL coordination file | WAL breakage; failed opens |
-| `C:\ProgramData\MessageFoundry` (DataDir folder) | Data dir | Holds DB trio, `bootstrap-admin.txt`, etc. | Misc. data-at-rest quarantine |
+| `C:\ProgramData\MessageFoundry` (DataDir folder) | Data dir | Holds the DB trio, etc. | Misc. data-at-rest quarantine |
 | `C:\ProgramData\MessageFoundry\logs\` | Service logs | High-frequency append + rotation | Rotation failures, scan thrash |
-| `C:\ProgramData\MessageFoundry\bootstrap-admin.txt` | One-time bootstrap admin secret (`0o600`) | Owner-only secret, written next to the DB | **Also exclude from AV cloud-sample upload** — never let it leave the host |
 | **`[store].encryption_key_file`** (operator-configured path — **may sit outside DataDir**) | DPAPI-wrapped store encryption key (for `key_provider=dpapi`/`auto`) | Decrypted into memory at startup to unlock the store | **Quarantine/lock → `DpapiError` (fail-closed) → store key cannot be provisioned → engine won't start and PHI at rest is unreadable.** Exclude its *actual* path. |
 | Connector **key/cert files** referenced by path (operator-configured, **may be anywhere on disk**) | JWS signing key (`signing.py` `private_key`), SMART Backend Services key (`smart_private_key` PEM file path), SOAP mTLS `client_cert_file` / `client_key_file` | Read on demand for outbound signing / SMART token / mTLS | Quarantine → broken outbound **signing / SMART auth / mutual-TLS delivery** to those partners. *(Inline-PEM-via `env()` deployments have no file to exclude.)* |
 | File-connector **inbound (source) directory** + its `.processed` and `.error` subdirs | Watched intake dir (default poll **1.0 s**) and move-aside targets | Constant directory polling + file moves | Scan thrash, file-move races, quarantined intake |
@@ -103,7 +101,6 @@ Add-MpPreference -ExclusionPath 'C:\ProgramData\MessageFoundry\messagefoundry.db
 Add-MpPreference -ExclusionPath 'C:\ProgramData\MessageFoundry\messagefoundry.db-wal'
 Add-MpPreference -ExclusionPath 'C:\ProgramData\MessageFoundry\messagefoundry.db-shm'
 Add-MpPreference -ExclusionPath 'C:\ProgramData\MessageFoundry\logs'
-Add-MpPreference -ExclusionPath 'C:\ProgramData\MessageFoundry\bootstrap-admin.txt'
 Add-MpPreference -ExclusionPath 'C:\Path\To\MessageFoundry\.venv'
 Add-MpPreference -ExclusionPath 'C:\ProgramData\MessageFoundry\bin\nssm.exe'
 # DPAPI store key + connector key/cert files — exclude their ACTUAL configured paths:
@@ -119,7 +116,7 @@ Add-MpPreference -ExclusionProcess 'C:\Path\To\MessageFoundry\.venv\Scripts\mess
 Add-MpPreference -ExclusionProcess 'C:\ProgramData\MessageFoundry\bin\nssm.exe'
 ```
 
-**Third-party EDR (CrowdStrike, SentinelOne, Defender for Endpoint, Sophos, etc.):** create the equivalent **file/folder exclusions** and **process/executable exclusions** for the same paths and processes through your management console, and ensure `bootstrap-admin.txt` and any key/cert files are excluded from **cloud sample submission / upload**, not just on-access scanning.
+**Third-party EDR (CrowdStrike, SentinelOne, Defender for Endpoint, Sophos, etc.):** create the equivalent **file/folder exclusions** and **process/executable exclusions** for the same paths and processes through your management console, and ensure any key/cert files are excluded from **cloud sample submission / upload**, not just on-access scanning.
 
 ---
 
@@ -209,7 +206,7 @@ After applying exclusions and firewall rules:
 - [ ] **API health on loopback** — `Invoke-WebRequest http://127.0.0.1:8765/health` succeeds **without** any inbound firewall rule (proves loopback needs none).
 - [ ] **MLLP round-trip** — send a synthetic test message to a configured inbound port and confirm an `AA` ACK and a `PROCESSED` disposition.
 - [ ] **DB sidecars intact** — `messagefoundry.db`, `messagefoundry.db-wal`, and `messagefoundry.db-shm` all present and untouched; no `-journal` file (expected — WAL mode).
-- [ ] **Clean quarantine log** — AV/EDR quarantine history shows **no** MessageFoundry DB, sidecar, key/cert, `bootstrap-admin.txt`, or interpreter detections.
+- [ ] **Clean quarantine log** — AV/EDR quarantine history shows **no** MessageFoundry DB, sidecar, key/cert, or interpreter detections.
 - [ ] **Outbound reaches partners** — a test delivery to each configured downstream succeeds, and each is covered by both a firewall rule **and** the matching `[egress]` allowlist entry.
 
 ---

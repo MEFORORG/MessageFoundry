@@ -24,6 +24,11 @@ from messagefoundry.auth.notifications import MFA_DISABLED, SecurityEvent  # noq
 from messagefoundry.auth.service import AuthService  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
 from messagefoundry.store.store import MessageStore  # noqa: E402
+from tests._first_admin import (  # noqa: E402
+    FIRST_ADMIN,
+    FIRST_ADMIN_PW,
+    create_first_admin,
+)
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
 
 RP = "t"
@@ -51,11 +56,11 @@ async def _service(
 
 
 async def _bootstrap_login(service: AuthService) -> tuple[Identity, str, str]:
-    boot = await service.initialize()
-    assert boot is not None
-    out = await service.login("admin", boot.password)
+    # BACKLOG #1020: no implicit first-run account — stand one up as `admin-create` does.
+    await create_first_admin(service)
+    out = await service.login(FIRST_ADMIN, FIRST_ADMIN_PW)
     assert out.ok and out.identity is not None and out.token is not None
-    return out.identity, out.token, boot.password
+    return out.identity, out.token, FIRST_ADMIN_PW
 
 
 async def _enroll(

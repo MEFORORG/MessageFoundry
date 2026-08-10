@@ -454,6 +454,37 @@ def main(argv: list[str] | None = None) -> int:
     )
     init.add_argument("--json", action="store_true", help="emit JSON")
 
+    admin_create = sub.add_parser(
+        "admin-create",
+        help="create a local Administrator directly on the engine's store — the explicit, "
+        "operator-invoked route to the FIRST account on a fresh install (there is no implicit "
+        "first-run account: ASVS 6.3.2, BACKLOG #1020). Run it on the box, with the engine stopped "
+        "or running, then sign in to the console",
+    )
+    admin_create.add_argument("--username", required=True, help="the account name to create")
+    admin_create.add_argument("--display-name", default=None, help="optional display name")
+    admin_create.add_argument(
+        "--email",
+        default=None,
+        help="optional address for the out-of-band security notices (lockout, password/roles change). "
+        "Without one those notices have no mailbox to reach and only the audited "
+        "GET /me/security-events feed records them",
+    )
+    admin_create.add_argument(
+        "--db", default=None, help="store path (overrides [store].path for this run)"
+    )
+    admin_create.add_argument(
+        "--service-config",
+        default="messagefoundry.toml",
+        help="service settings TOML the [store] + [auth] sections come from",
+    )
+    admin_create.add_argument(
+        "--password-stdin",
+        action="store_true",
+        help="read the password from stdin (first line) instead of prompting — for an unattended "
+        "install. The password is NEVER an argv flag: argv is readable by every process on the box",
+    )
+
     support_bundle = sub.add_parser(
         "support-bundle",
         help="write a SECRET-FREE / PHI-free support zip (engine version + config summary + a "
@@ -3936,6 +3967,116 @@ def _audit_anchor(args: argparse.Namespace) -> int:
     return 0
 
 
+def _read_new_password(from_stdin: bool) -> str | None:
+    """The password for ``admin-create``: one stdin line, or a confirmed no-echo prompt.
+
+    Never an argv flag. On every supported platform ``/proc/<pid>/cmdline``, ``ps`` or the Windows
+    process list makes another user's argv readable, so a ``--password`` option would publish the
+    engine's most privileged credential to every account on the box for the life of the process.
+    Returns ``None`` (message already printed) when the operator supplied nothing usable."""
+    import getpass
+
+    if from_stdin:
+        password = sys.stdin.readline().rstrip("\r\n")
+    else:
+        password = getpass.getpass("New administrator password: ")
+        if password != getpass.getpass("Confirm password: "):
+            print("error: the two passwords did not match", file=sys.stderr)
+            return None
+    if not password:
+        print("error: no password supplied", file=sys.stderr)
+        return None
+    return password
+
+
+def _admin_create(args: argparse.Namespace) -> int:
+    """Create a local Administrator on the engine's store (BACKLOG #1020).
+
+    This is the ONLY route to the first account. A fresh store has no users at all: the implicit
+    first-run ``admin`` was retired because ASVS 6.3.2 wants no default account to exist, and the two
+    could not both hold. What replaces it is explicit rather than implicit — an operator standing at
+    the box names the account and chooses its password, so nothing privileged exists until somebody
+    decides it should, and no credential is written to disk for a later reader to find.
+
+    Runs against the SAME resolved settings ``serve`` uses, so the password is held to the deployment's
+    own ``[auth]`` policy rather than a CLI-local default. The role is Administrator: the command exists
+    to break the chicken-and-egg (``POST /users`` needs ``users:manage``, which needs an account), and a
+    lesser role would not. Creating further accounts is the API's job, not this command's."""
+    import asyncio
+
+    from pydantic import ValidationError
+
+    from messagefoundry.auth.permissions import Role
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.config.secretprovider import resolve_secret_provider
+    from messagefoundry.config.settings import StoreBackend, load_settings
+    from messagefoundry.store.base import open_store
+
+    cli: dict[str, dict[str, object]] = {}
+    if args.db is not None:
+        cli.setdefault("store", {})["path"] = args.db
+    try:
+        settings = load_settings(config_path=args.service_config, cli=cli)
+    except (FileNotFoundError, ValueError, ValidationError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    password = _read_new_password(args.password_stdin)
+    if password is None:
+        return 2
+
+    async def run() -> tuple[int, str]:
+        # Same provider serve resolves, so an [auth] secret reference (e.g. the AD bind password)
+        # behaves identically here — the CLI must not be a second, laxer configuration path.
+        secret_provider = resolve_secret_provider(settings.secrets)
+        store = await open_store(settings.store)
+        try:
+            auth = AuthService(store, settings.auth, secret_provider=secret_provider)
+            await auth.initialize()  # seeds the built-in roles; creates no account
+            if await store.get_user_by_username(args.username) is not None:
+                return 2, f"error: a user named {args.username!r} already exists"
+            violations = auth.password_violations(password, username=args.username)
+            if violations:
+                return 2, "error: password must " + "; ".join(violations)
+            await auth.create_local_user(
+                username=args.username,
+                password=password,
+                display_name=args.display_name,
+                email=args.email,
+                roles=[Role.ADMINISTRATOR.value],
+                actor="cli",
+                # The operator IS the account holder here, so there is no second party a forced
+                # rotation would protect — unlike an admin-issued credential via POST /users.
+                must_change_password=False,
+            )
+        finally:
+            await store.close()
+        return 0, ""
+
+    rc, message = asyncio.run(run())
+    if rc != 0:
+        print(message, file=sys.stderr)
+        return rc
+    # Name the store that was actually written: an --db/[store].path typo otherwise shows up only as a
+    # login failure against the engine's real database, long after the cause.
+    store = settings.store
+    # Name the store that was actually written. A --db / [store].path / MEFOR_STORE_* typo otherwise
+    # surfaces only as a login failure against the engine's REAL database, long after the cause.
+    where = (
+        repr(store.path)
+        if store.backend is StoreBackend.SQLITE
+        else f"{store.database!r} on {store.server!r}"
+    )
+    print(f"created Administrator {args.username!r} in the {store.backend.value} store at {where}")
+    if not args.email:
+        print(
+            "note: no --email — the out-of-band security notices for this account have no mailbox "
+            "to reach. Set one from the console (Users -> edit) to enable them.",
+            file=sys.stderr,
+        )
+    return 0
+
+
 def _rekey_audit(args: argparse.Namespace) -> int:
     """Enable HMAC keying of an EXISTING keyless audit chain (#190-D migration).
 
@@ -4910,6 +5051,7 @@ _DISPATCH = {
     "supervise": _supervise,
     "import": _import,
     "init": _init,
+    "admin-create": _admin_create,
     "validate": _validate,
     "graph": _graph,
     "dryrun": _dryrun,

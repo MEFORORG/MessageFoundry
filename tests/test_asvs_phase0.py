@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from _first_admin import FIRST_ADMIN, FIRST_ADMIN_PW, create_first_admin
 from pydantic import ValidationError
 
 from messagefoundry.api import create_app
@@ -135,11 +136,10 @@ async def test_logout_emits_audit_event() -> None:
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings())
-        boot = await service.initialize()
-        assert boot is not None
-        out = await service.login("admin", boot.password)
+        await create_first_admin(service)
+        out = await service.login(FIRST_ADMIN, FIRST_ADMIN_PW)
         assert out.ok and out.token is not None
-        await service.logout(out.token, actor="admin")
+        await service.logout(out.token, actor=FIRST_ADMIN)
         actions = [row["action"] for row in await store.list_audit()]
         assert "auth.logout" in actions
     finally:

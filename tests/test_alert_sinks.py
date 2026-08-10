@@ -18,7 +18,6 @@ from messagefoundry.pipeline.alert_sinks import (
     WebhookTransport,
     notifier_from_settings,
 )
-from messagefoundry.pipeline.alerts import LoggingAlertSink
 
 
 class _RecordingTransport:
@@ -70,41 +69,6 @@ async def test_realert_throttle_suppresses_repeats() -> None:
     await _drain(sink)
     keys = [(e["connection"], e["depth"]) for e in t.events]
     assert keys == [("OB_X", 1), ("OB_Y", 1)]
-
-
-async def test_bootstrap_admin_expiring_emits_phi_free() -> None:
-    # ASVS 6.4.5 arm 2: the reminder rides the standard fan-out; its payload is the ISO deadline + whole
-    # hours remaining only — never the password or any secret.
-    t = _RecordingTransport("t")
-    sink = NotifierAlertSink([t])
-    sink.bootstrap_admin_expiring(
-        "bootstrap-admin", expires_at="2026-07-27T12:00:00+00:00", hours_remaining=24
-    )
-    await _drain(sink)
-    assert len(t.events) == 1
-    ev = t.events[0]
-    assert ev["type"] == "bootstrap_admin_expiring"
-    assert ev["connection"] == "bootstrap-admin"
-    assert ev["expires_at"] == "2026-07-27T12:00:00+00:00"
-    assert ev["hours_remaining"] == 24
-    # no credential material ever rides the payload
-    assert not any(k in ev for k in ("password", "secret", "token"))
-
-
-def test_bootstrap_admin_expiring_logging_sink_states_deadline_not_password(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    # The fallback LoggingAlertSink surfaces the deadline + hours at WARNING (so an operator sees it with
-    # no notifier wired) and never a secret — there is no secret in the signature to leak.
-    import logging
-
-    with caplog.at_level(logging.WARNING):
-        LoggingAlertSink().bootstrap_admin_expiring(
-            "bootstrap-admin", expires_at="2026-07-27T12:00:00+00:00", hours_remaining=24
-        )
-    assert "bootstrap_admin_expiring" in caplog.text
-    assert "2026-07-27T12:00:00+00:00" in caplog.text
-    assert "24 hour" in caplog.text
 
 
 async def test_suspend_gate_mutes_notification() -> None:

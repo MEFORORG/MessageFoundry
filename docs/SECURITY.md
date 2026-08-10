@@ -42,23 +42,36 @@ network in cleartext, so it's refused). So there is no way to be accidentally se
 unauthenticated full access — or to silently void the loopback assumption with a stray `[api].host`
 edit (SYS-1).
 
-### First-run bootstrap admin
+### The first administrator (ASVS 6.3.2 — no default account)
 
-On first start against an empty store, the engine creates a single **bootstrap admin**
-(username `admin`, role `Administrator`) with a random one-time password **generated through the
-active password policy**. The password is **written to an owner-only file** (`bootstrap-admin.txt`,
-next to the store) — **never to the log** — and only the file's location is logged, so the credential
-doesn't land in NSSM's broadly-readable stdout capture. Sign in with it, change the password
-immediately (enforced — the account is flagged `must_change_password`), and delete the file. After any
-user exists, no further bootstrap occurs.
+**A fresh store has no users.** Starting the engine seeds the built-in roles and creates **no
+account**: there is no default username, no machine-generated credential, and no credential file
+written next to the store. Nothing privileged exists until an operator decides it should.
 
-**Auto-retirement (WP-3).** The bootstrap account exists only to seed the first real admin, so it
-self-retires while still **unclaimed** (never password-changed): it is **disabled once a second
-administrator exists**, and — if left unclaimed — **disabled `[auth].bootstrap_expiry_hours` after
-creation** (default 72 h; `0` disables the timer). Once you change its password it becomes a normal
-admin account and is never auto-disabled, so a single-admin deployment can't be locked out. A retired
-bootstrap login is refused like any other invalid credential and the retirement is audited
-(`auth.bootstrap_admin_retired`).
+Create the first administrator **on the box**, with the engine stopped or running:
+
+```
+messagefoundry admin-create --username <name> --email <address>
+```
+
+It prompts for the password (no echo, confirmed) — or reads one line from stdin under
+`--password-stdin` for an unattended install. **The password is never an argv flag**, because argv is
+readable by other accounts on the host. The password is held to the deployment's own `[auth]` policy,
+so the CLI is not a laxer second path into the same account store; the account is created with the
+`Administrator` role, `must_change_password` clear (the operator chose the password, so there is no
+second party a forced rotation would protect), and an audited `user.created` row. Every account after
+the first comes from `POST /users` / the console, which is where role assignment belongs.
+
+**Set `--email`.** The out-of-band security notices (lockout, password/roles change, sign-in after
+failures) need a mailbox; without one only the audited `GET /me/security-events` feed records them.
+The command says so at creation time.
+
+An earlier design created an implicit first-run `admin` account with a one-time password in an
+owner-only `bootstrap-admin.txt`, auto-retired on a timer. It was retired outright rather than
+patched: **6.3.2 wants that account not to exist**, and while it existed the engine had to ship a
+standing credential in a file for someone to find, plus a retirement timer, an expiry warning alert
+and a login carve-out to manage its lifetime. None of that is needed once the account is never
+created. (BACKLOG #1020, closed as superseded by 6.3.2 rather than as built.)
 
 ### Admin password reset (WP-L3-12, ASVS 6.4.6)
 
@@ -744,7 +757,7 @@ lost authenticator via `POST /users/{id}/reset-mfa` (which also revokes the user
 bind)** — the **Administrator** role must satisfy MFA before any step-up operation (the gate returns
 `403` + `X-MFA-Required` until verified); other users may opt in by enrolling. A required-but-unenrolled
 admin is never locked out — the enroll/confirm routes sit behind an action-bound **password** step-up,
-not the MFA gate, so the bootstrap admin enrolls then satisfies it. The documented org opt-out is
+not the MFA gate, so the first administrator enrolls then satisfies it. The documented org opt-out is
 `[auth].require_mfa = false`. **AD/Kerberos MFA is delegated to the directory** (Entra Conditional Access
 / an MFA proxy) — a directory login is never prompted for an engine TOTP and is MFA-satisfied at issuance.
 The TOTP secret is stored **encrypted at rest** (the store cipher) and recovery codes are
@@ -1125,7 +1138,6 @@ one-to-one — that is why the bind/exposure posture occupies two rows and the A
 | Declared token class of a federated assertion | the `typ` JOSE header, and the presence of an `events` claim, on a **signature-verified** JWS | `typ` present and — normalised `.strip().lower()` then `application/`-stripped — not `jwt`, so `at+jwt` (RFC 9068 access token), `logout+jwt` and `secevent+jwt` are refused while an **absent** `typ` is allowed (RFC 7519 §5.1 makes the header advisory); or the claim set carries `events`, i.e. an RFC 8417 security event token. Every such token is minted by the **same issuer under the same key**, so no signature or key rung distinguishes it | **DENY** the sign-in — `ClaimsError("wrong_token_type")` at the key-selection rung, `ClaimsError("unexpected_events_claim")` ahead of the nonce compare (a logout token carries no nonce, so a later check would misreport it as a browser-binding failure) | on | (no knob) |
 | Federated authentication-context claims (`amr` / `acr`) | the `amr` list / `acr` string of a **signature-verified** `id_token` | `oidc_require_mfa_claim` on **and** neither an `amr` value in `[auth].oidc_mfa_amr_values` (default `["mfa"]`) nor an `acr` in `oidc_required_acr_values` (default `[]`, so the `amr` arm alone decides) | **DENY** the sign-in — `ClaimsError("mfa_claim_missing")`. An IdP **assertion**, never a proof | on, `["mfa"]` / `[]` | `[auth].oidc_require_mfa_claim`, `oidc_mfa_amr_values`, `oidc_required_acr_values` |
 | UPN suffix of the federated username claim | the suffix after the FIRST `@` of the username claim | `oidc_username_strip_domain` on (default) **and** the suffix is not in `oidc_allowed_username_domains` (or `[auth].ad_domain`). With stripping **off** the claim is used verbatim and no suffix check runs | **DENY** the sign-in — `ClaimsError("username_domain_not_allowed")` | on | `[auth].oidc_allowed_username_domains`, `oidc_username_strip_domain` |
-| Bootstrap-admin age × admin population | `users.created_at` for the built-in bootstrap account × whether a second enabled Administrator exists | still unclaimed (`must_change_password` set) **and** (`now ≥ created_at + bootstrap_expiry_hours × 3600` **or** another enabled admin exists); `0` = no time expiry | **DENY** — the account is disabled, **all** its sessions revoked, `auth.bootstrap_admin_retired` audited. A *claimed* (password-changed) bootstrap account is never touched | 72 h | `[auth].bootstrap_expiry_hours` |
 | Browser `Origin` at the WebSocket handshake | the `Origin` header on the upgrade | absent (a native client) → allowed; present → must be an exact member of the list, whose default `[]` rejects **every** browser Origin | **DENY** before `accept()`, so the route never runs | `[]` | `[api].ws_allowed_origins` |
 | Cross-site request signal on a `/ui` state change | `Sec-Fetch-Site` (preferred) else `Origin` vs our own origin (`[api].public_origin` is authoritative when set; `Host` is the fallback) | `Sec-Fetch-Site` ∈ {cross-site, same-site}, or a non-matching `Origin` | **DENY** 403 — defence-in-depth over the `SameSite=Strict` cookie, deliberately token-free | on | `[api].public_origin` |
 
@@ -1576,8 +1588,8 @@ Every enforced limit, with both dimensions stated even where one is hard-coded o
 **and** globally" is the requirement's own wording. **Enforcement scope is stated per row, because it
 is not uniform.** The four sliding-window limiters (sign-in, credential ceremony, PHI read, admin
 write) and the two pending-flow caches are **in-process, per API process** — N engine shards multiply
-*those* budgets by N. The account lockout, the concurrent-session cap and the bootstrap-admin timer are
-**store-backed** (`record_login_failure` / `enforce_session_cap` / `set_user_disabled` against the one
+*those* budgets by N. The account lockout and the concurrent-session cap are
+**store-backed** (`record_login_failure` / `enforce_session_cap` against the one
 unified store), so they are **shared** by every API process and are **not** multiplied by N. The
 request-body cap is **stateless** — a per-request test that carries no budget at all. An exposed or
 multi-host deployment must additionally front the API with a proxy/WAF limiter and TLS.
@@ -1590,7 +1602,6 @@ multi-host deployment must additionally front the API with a proxy/WAF limiter a
 | PHI reads | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_global`, `phi_read_rate_limit_window_seconds` | on / 120 / **0 = off** / 60.0 s | 60 s | **yes** (120) | off by default | no | **in-process** — 7 JSON routes via `require_phi_read`, 4 bulk-PHI step-up GETs charged at admission, 5 `/ui` views via `require_ui(phi=True)`, and 3 further `/ui` GETs that inherit the charge by delegating into the handler body | 429 + `Retry-After: 10`, logged |
 | Admin writes | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds` | on / 12 / 1.0 s | 1.0 s | **yes** (12) | no (`glob=0`) | no | **in-process** — **non-GET only**, JSON API only, via `require_step_up` **and** `require_paced`; **no `/ui` route charges it** | 429 + `Retry-After: 1`, logged |
 | Concurrent sessions | `[auth].max_sessions_per_user` | 5 (`0` = unlimited) | — | **yes** | no | no | **store-backed** — every login | the user's oldest session is revoked |
-| Bootstrap-admin lifetime | `[auth].bootstrap_expiry_hours` | 72 h (`0` = no timer) | — | n/a | n/a | n/a | **store-backed** — the unclaimed bootstrap account | disabled + audited |
 | Request body | `[store].max_upload_bytes` (the `/uploads` routes only) | 1 MiB elsewhere | per request | no | no | no | **stateless** — every route, in ASGI middleware | **413** over the cap, **400** on ambiguous CL+TE framing or an invalid `Content-Length`, **411** on a chunked body |
 | OIDC pending flows | `[auth].oidc_flow_cache_max` (global), `DEFAULT_PER_IP_CAP` (per-IP, no knob), `oidc_flow_ttl_seconds` | 512 / 16 / 300 s | 300 s TTL | no | **yes** (512) | **yes** (16) | **in-process** — `GET /ui/oidc/start` — reject-when-full, never evict | 303 → `/ui/login?e=rate_limited`, WARNING-logged, **never** audited |
 | WebAuthn pending ceremonies | `GLOBAL_PENDING_CAP`, `PER_USER_PENDING_CAP`, `CHALLENGE_TTL_SECONDS` (module constants, no knobs) | 4096 / 16 / 120 s | 120 s TTL | **yes** (16) | **yes** (4096) | no | **in-process** — every passkey registration + assertion ceremony | per-user: evicts that user's **own** oldest pending ceremony (silent); global: `ChallengeCacheFullError` naming the cause + the `admin_reset_mfa` recovery path |
@@ -1781,8 +1792,9 @@ runs bulk AES-256-GCM. #198 closes the **application-code-feasible** half and ac
 - **Person/entity authentication** (required) — local argon2id and/or AD bind; lockout on brute force.
 - **Audit controls** (required) — durable, user-attributed audit trail (append-only via the store API).
 - **Automatic logoff** (addressable) — idle + absolute session timeouts.
-- **Emergency access** (required) — the bootstrap admin provides break-glass; treat its credential as
-  a sealed secret.
+- **Emergency access** (required) — `messagefoundry admin-create` on the box mints an administrator
+  without needing an existing session, so a locked-out estate is recoverable by whoever holds the
+  host. Protect the host and the store accordingly: filesystem access to them IS this break-glass.
 
 ---
 

@@ -441,7 +441,7 @@ export class EngineStatusBar implements vscode.Disposable {
   // ── Engine lifecycle (ADR 0112 — supersedes ADR 0110 §5) ─────────────────────────────────────────
   // The IDE may now RUN `serve`, not just hand over the command. Two safety properties, both enforced
   // here, keep this from reintroducing ADR 0110 §5's fork hazard (a stray `serve` that creates a rogue
-  // empty database + bootstrap admin): it runs ONLY for a loopback target in a trusted workspace, and it
+  // empty database with no accounts): it runs ONLY for a loopback target in a trusted workspace, and it
   // never SILENTLY creates a store — a run dir with no engine gets an explicit "create a new one" confirm.
   // Stop/Restart act ONLY on a process this IDE owns — never a port-kill of an engine started elsewhere.
 
@@ -530,11 +530,13 @@ export class EngineStatusBar implements vscode.Disposable {
       notify("the engine is already running from here — use Restart to reload it.");
       return;
     }
-    // Fork guard (ADR 0110 §5): with no engine store here, starting would create a NEW database and a fresh
-    // bootstrap admin. That is sometimes exactly what the user wants — but it must be a deliberate choice.
+    // Fork guard (ADR 0110 §5): with no engine store here, starting would create a NEW, EMPTY database
+    // — no accounts (BACKLOG #1020 retired the implicit first-run admin), so the forked engine is one
+    // nobody can sign into until `messagefoundry admin-create` runs against it. That is sometimes
+    // exactly what the user wants — but it must be a deliberate choice.
     if (!this.controlContext().hasStore) {
       const go = await vscode.window.showWarningMessage(
-        `No engine store found in ${ws}. Starting here creates a NEW database and a bootstrap admin. Continue?`,
+        `No engine store found in ${ws}. Starting here creates a NEW empty database with no accounts. Continue?`,
         { modal: true },
         "Create new engine",
       );
@@ -830,7 +832,7 @@ export function registerEngineStatusBar(context: vscode.ExtensionContext): Engin
     vscode.commands.registerCommand("messagefoundry.engineCopyStartCommand", async () => {
       // Deliberately COPY, not run. A terminal spawned here defaults its cwd to the workspace folder —
       // in a git worktree that has no service TOML and no store, so `serve` would quietly create a
-      // BRAND-NEW empty database and a fresh bootstrap admin, forking the user's engine. Handing them
+      // BRAND-NEW empty database with no accounts, forking the user's engine. Handing them
       // the command lets them run it where they mean to. No --db/--env overrides: the service TOML is
       // the authority on which store and which environment this engine is.
       const cmd = `python -m messagefoundry serve --config ${configDir()}`;

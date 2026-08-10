@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from _first_admin import FIRST_ADMIN, FIRST_ADMIN_PW, create_first_admin
 from _totp_clock import fresh_totp, pin_totp_clock
 
 from messagefoundry.auth import totp
@@ -39,12 +40,14 @@ async def _store() -> MessageStore:
 
 
 async def _bootstrap_login(service: AuthService) -> tuple[Identity, str, str]:
-    """Bootstrap the admin and log it in; return (identity, token, password) for the MFA flows."""
-    boot = await service.initialize()
-    assert boot is not None
-    out = await service.login("admin", boot.password)
+    """Create the first Administrator and log it in; return (identity, token, password).
+
+    BACKLOG #1020 retired the implicit first-run account, so this stands one up the way the
+    ``admin-create`` CLI does before signing in."""
+    await create_first_admin(service)
+    out = await service.login(FIRST_ADMIN, FIRST_ADMIN_PW)
     assert out.ok and out.identity is not None and out.token is not None
-    return out.identity, out.token, boot.password
+    return out.identity, out.token, FIRST_ADMIN_PW
 
 
 async def test_enroll_confirm_status_and_recovery_codes() -> None:
@@ -139,9 +142,8 @@ async def test_require_mfa_forces_admin_even_unenrolled() -> None:
     store = await _store()
     try:
         service = AuthService(store, AuthSettings(require_mfa=True))
-        boot = await service.initialize()
-        assert boot is not None
-        out = await service.login("admin", boot.password)
+        await create_first_admin(service)
+        out = await service.login(FIRST_ADMIN, FIRST_ADMIN_PW)
         # Admin must MFA even though not enrolled — they can log in but can't satisfy step-up until
         # they enroll a TOTP authenticator.
         assert out.ok and out.mfa_required is True and out.token is not None

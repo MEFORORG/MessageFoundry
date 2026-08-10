@@ -17,6 +17,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from _first_admin import FIRST_ADMIN, FIRST_ADMIN_PW, create_first_admin
 from _totp_clock import pin_totp_clock
 
 from messagefoundry.api import create_app
@@ -204,9 +205,8 @@ async def test_verify_mfa_reanchors_session_to_the_new_ip(
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
-        boot = await service.initialize()
-        assert boot is not None
-        out = await service.login("admin", boot.password, client="10.1.1.1")
+        await create_first_admin(service)
+        out = await service.login(FIRST_ADMIN, FIRST_ADMIN_PW, client="10.1.1.1")
         assert out.ok and out.identity is not None and out.token is not None
         identity, token = out.identity, out.token
         enroll = await service.begin_mfa_enrollment(identity)

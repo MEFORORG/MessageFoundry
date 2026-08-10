@@ -635,7 +635,7 @@ export const CMD = {
  *   - `canControl` — the target is loopback AND the workspace is trusted AND there is a workspace to run in
  *     (a remote engine reads its OWN filesystem; an untrusted workspace must not exec a repo-supplied venv).
  *   - `hasStore`   — a real engine store already lives where `serve` would run; when false, Start does not
- *     silently create one — the shell confirms it will make a NEW database + bootstrap admin first.
+ *     silently create one — the shell confirms it will make a NEW empty database first.
  *   - `weStartedIt`— the IDE owns a LIVE engine process it launched; only then may Stop/Restart act. We never
  *     kill an engine we did not start (with parallel worktrees a port-kill could down another session's).
  */
