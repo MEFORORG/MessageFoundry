@@ -1,0 +1,68 @@
+# Recorded per-leg maxima for every CI step that carries its own `timeout-minutes`.
+#
+# WHY THIS IS DATA AND NOT PROSE. The same table lived only in a `ci.yml` comment and was published
+# WRONG TWICE (BACKLOG #344): once as a `gh run list` default page reported as a chosen pool, once with
+# an `n` that no pool definition reproduced. The maxima survived both passes; the pools did not. A
+# table nothing reads is a table nobody rechecks, so `scripts/ci/step_margin.py` reads this one on
+# every leg of every run and says out loud when a live step has outgrown the row below it.
+#
+# EVERY ROW IS A MEASUREMENT WITH A DATE, AND ITS POOL IS PART OF THE ROW. `source` is not a citation
+# ornament: a ratio whose pool is not stated cannot be rechecked, and that is the whole finding of the
+# item this file exists for. State the pool with the count.
+#
+# `censored = true` MEANS THE NUMBER IS A LOWER BOUND, and every ratio taken against it flatters
+# itself. A run that wanted longer than the bound in force when the pool was collected was KILLED at
+# that bound and then -- correctly -- dropped for not concluding success, so it is missing from exactly
+# the tail being measured. The script prints the caveat rather than quietly dividing by it.
+#
+# THIS FILE IS NOT THE CAP. The cap is `matrix.step_timeout` / `matrix.webconsole_step_timeout` in
+# ci.yml, sized there with its own arithmetic. This is the observed distribution the cap was sized
+# against, kept separately so a run exceeding the record is visible without anyone re-reading a comment.
+
+[[baseline]]
+step = "Tests (pytest)"
+leg = "ubuntu-latest"
+max_passing = "16:08"
+censored = false
+censored_by = ""
+source = "measured 2026-08-08; pool: every ci.yml run created 2026-08-01T00:00Z..2026-08-09T00:00Z UTC (688 runs, 1,618 leg-executions), jobs fetched with ?filter=all so an attempt killed at the cap is not hidden behind its passing re-run, rows are this leg's `Tests (pytest)` STEP kept when THAT STEP concluded success, executions under 60s dropped; n=441. Uncensored on evidence, not assumption: the largest ubuntu step FAILURE in 535 leg-executions is 14:21, so the leg has never touched its cap."
+
+[[baseline]]
+step = "Tests (pytest)"
+leg = "windows-2022"
+max_passing = "29:23"
+censored = false
+censored_by = ""
+source = "measured 2026-08-08; same pool as the ubuntu row; n=399. Uncensored on evidence: the largest windows-2022 step FAILURE in 542 leg-executions is 25:48. This is also a post-#1027 row."
+
+[[baseline]]
+step = "Tests (pytest)"
+leg = "windows-2025"
+max_passing = "35:47"
+censored = true
+censored_by = "the 36:00 step_timeout in force when the pool was collected: this leg was killed AT the cap seven times in the window (36:08 on runs 31189317409 / 31199321840 / 31202372465, 36:07 on 30955150892 / 31094875320 / 31192717684, 36:01 on 31149117314), three of them push runs on main"
+source = "measured 2026-08-08; same pool as the ubuntu row; n=360. 35:47 is the largest step that FIT in 36:00, and 36:08 is a lower bound on the largest the suite wants. The kills were slowness, not a wedge -- run 31149117314's pytest finished GREEN (0:35:48) and the step was killed 4.85s later, and no faulthandler native-stack dump appears in any kill log."
+
+[[baseline]]
+step = "Web console tests (pytest)"
+leg = "ubuntu-latest"
+max_passing = "2:22"
+censored = true
+censored_by = "the JOB cap, not its own step cap: this step runs second, so a job-level kill lands inside it. Observed on run 30724385719 -- `Tests (pytest)` SUCCESS at 25:51, then this step CANCELLED at 30:14 when job_timeout 30 fired"
+source = "measured 2026-08-08; same pool as the `Tests (pytest)` rows, taken over rows where `Tests` concluded success (NOT over rows where both steps did, which drops the very run that motivates the caveat above); n=441."
+
+[[baseline]]
+step = "Web console tests (pytest)"
+leg = "windows-2022"
+max_passing = "2:51"
+censored = true
+censored_by = "the JOB cap -- same mechanism as the ubuntu row"
+source = "measured 2026-08-08; same pool and same filter as the ubuntu web-console row. n is NOT STATED for this cell in the source table and is not invented here; the leg's same-row overhead count in that pool was 413."
+
+[[baseline]]
+step = "Web console tests (pytest)"
+leg = "windows-2025"
+max_passing = "3:59"
+censored = true
+censored_by = "the JOB cap -- same mechanism as the ubuntu row"
+source = "measured 2026-08-08; same pool and same filter as the ubuntu web-console row; n=360."

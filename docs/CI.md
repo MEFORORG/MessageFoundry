@@ -148,6 +148,17 @@ an unrelated PR without turning the gate red.
   branch protection. It is now a **pre-commit hook** scoped to `.github/workflows/**`, plus a step in
   `zizmor.yml` (which is already paths-filtered). The hook is the load-bearing half —
   `zizmor.yml` is not a required check.
+- **A step's wall-clock cap is now checked against the step, and a low margin reds the leg.** Each
+  gated step in `test` carries its own `timeout-minutes`, and `scripts/ci/step_margin.py` runs after
+  them: it times the **step** (not the job — the job runs minutes longer under its own cap, and
+  misreading one for the other has produced published-then-retracted numbers here more than once),
+  keys on that step's **own** `outcome`, and reds below 1.30x. It prints the elapsed, the
+  percent-of-cap and its own red/green control pair into the job summary. A **skipped** step (a
+  docs-only PR) reports `NO OBSERVATION` in words rather than a healthy-looking ratio. Recorded
+  per-leg maxima — with their pool, their date, and whether they are right-censored — live in
+  `scripts/ci/step_margin_baseline.toml`; a capped step with no row there fails the check closed.
+  **A red here is not a request to raise the cap:** the cap is sized against the work in `ci.yml`,
+  and the underlying Windows slowness is its own backlog item.
 - **Pass matrix/expression values through `env:`, don't inline them in `run:`.** A dynamic
   `matrix: ${{ fromJSON(...) }}` defeats zizmor's static analysis, which then flags its expansion inside
   `run:` as template injection. The fix is to route the value through `env:` — the remedy endorsed in
