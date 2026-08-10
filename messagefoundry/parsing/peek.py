@@ -137,16 +137,37 @@ def parse_path(path: str) -> tuple[str, int, int | None, int | None]:
 
     Component/subcomponent are ``None`` when omitted. Raises :class:`HL7PeekError` on a
     malformed path. Shared by :meth:`Peek.field` (read) and the transform engine (write).
+
+    **Every index is 1-based and an index below 1 is malformed, not a wrap-around** (BACKLOG #1089).
+    The regex above matches ``\\d+``, so ``PID-5.0`` parses; every consumer then indexes ``x[n - 1]``,
+    which for ``0`` is Python's ``x[-1]`` — the *last* part. Measured on the pre-guard code:
+    ``msg.field("PID-5.0")`` returned a component the caller never asked for, ``msg.set("PID-5.0", v)``
+    silently **overwrote the last component**, ``msg.set("PID-5.1.0", v)`` overwrote the last
+    subcomponent, and ``msg.set("PID-0", v)`` **rewrote the segment id itself** (the encoded message
+    carried a segment the receiver has no definition for). None of those raised, so a message would
+    deliver looking successful with a value in the wrong place.
+
+    Rejecting it here — the one path-parsing chokepoint for both the read and the write side — is the
+    guard :func:`messagefoundry.parsing.x12.message._parse_path` has always had; the HL7 side, which
+    is the default content type, did not. :class:`HL7PeekError` is a ``ValueError``, so a bad path
+    from a Router/Handler surfaces as an ordinary message failure on the ``ERROR``/dead-letter path
+    (never a crashed connection), and the one operator-facing caller
+    (:mod:`messagefoundry.store.content_search`, behind the API's ``field_path`` query parameter)
+    already maps it to a 4xx. The path is a structural locator, not PHI, so it is safe to echo.
     """
     m = _PATH_RE.match(path)
     if not m:
         raise HL7PeekError(f"invalid HL7 field path: {path!r}")
-    return (
-        m["seg"],
-        int(m["field"]),
-        int(m["comp"]) if m["comp"] else None,
-        int(m["sub"]) if m["sub"] else None,
-    )
+    field = int(m["field"])
+    if field < 1:
+        raise HL7PeekError(f"HL7 field index is 1-based (>= 1): {path!r}")
+    comp = int(m["comp"]) if m["comp"] else None
+    if comp is not None and comp < 1:
+        raise HL7PeekError(f"HL7 component index is 1-based (>= 1): {path!r}")
+    sub = int(m["sub"]) if m["sub"] else None
+    if sub is not None and sub < 1:
+        raise HL7PeekError(f"HL7 subcomponent index is 1-based (>= 1): {path!r}")
+    return m["seg"], field, comp, sub
 
 
 def normalize(raw: str | bytes, *, encoding: str = "utf-8", errors: str = "replace") -> str:
