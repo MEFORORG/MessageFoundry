@@ -643,6 +643,69 @@ def test_exchange_code_without_id_token_raises() -> None:
         )
 
 
+class _TripwireOpener:
+    """An opener that fails the test if it is ever reached — the shape a "refused before the wire"
+    claim needs. A stub that returned a body could not tell a refusal apart from a completed POST."""
+
+    def open(self, req: Any, timeout: float = 0.0) -> Any:
+        raise AssertionError("an unmeasured token-endpoint request reached the opener")
+
+
+def test_exchange_code_refuses_an_over_length_token_endpoint() -> None:
+    """BACKLOG #1048 (ASVS 4.2.5): the token-exchange POST had no send-time length guard — the whole
+    ``auth`` package carried zero length measurement, so the one outbound request the OIDC relying
+    party makes was the unmeasured limb of the 4.2.5 partial.
+
+    ``token_endpoint`` is operator-static config (validated https at load), so this is the weaker of
+    the two limbs and not attacker-influenced. It still earns the bound: an ``env()`` value that
+    resolved to an unexpected blob surfaces here as a clear refusal instead of a wire-level surprise
+    on the first federated login.
+
+    Mutation: delete the ``find_outbound_length_violation`` call in ``exchange_code``. Red:
+    AssertionError from the tripwire — the over-long request reached the opener."""
+    with pytest.raises(oidc.FlowError, match="over the 8192-char limit"):
+        oidc.exchange_code(
+            token_endpoint="https://idp.example/" + "t" * 9000,
+            client_id="c",
+            client_secret=None,
+            code="x",
+            redirect_uri="http://localhost/cb",
+            code_verifier="v",
+            opener=_TripwireOpener(),  # type: ignore[arg-type]
+        )
+
+
+def test_exchange_code_length_guard_reuses_the_one_outbound_bound() -> None:
+    """The limit is not re-declared in ``auth``: the guard calls the same measurement every other
+    HTTP egress uses, so there is one definition of "too long" and no third constant to drift.
+
+    Live positive control for the refusal above — it proves the number that test matches is the
+    shipped limit rather than a value that merely happens to agree with it."""
+    from messagefoundry.transports.rest import MAX_OUTBOUND_URL_LEN
+
+    assert MAX_OUTBOUND_URL_LEN == 8192, (
+        "the shared outbound URL bound moved; the OIDC guard follows it automatically but the "
+        "message the refusal test matches does not"
+    )
+
+
+def test_exchange_code_still_posts_an_endpoint_that_fits() -> None:
+    """Positive control: a normal endpoint must still reach the opener. Without it, a guard that
+    refused EVERY token exchange would pass the refusal test above."""
+    opener = _FakeOpener(json.dumps({"id_token": "x.y.z"}).encode())
+    payload = oidc.exchange_code(
+        token_endpoint="https://idp.example/token",
+        client_id="c",
+        client_secret=None,
+        code="x",
+        redirect_uri="http://localhost/cb",
+        code_verifier="v",
+        opener=opener,  # type: ignore[arg-type]
+    )
+    assert payload["id_token"] == "x.y.z"
+    assert opener.request is not None, "the request must have been handed to the opener"
+
+
 def test_non_ascii_state_is_a_plain_non_match_not_a_crash() -> None:
     """``state`` is raw query-string input, and ``hmac.compare_digest`` RAISES TypeError on a str
     carrying non-ASCII. Comparing directly would turn ``?state=café`` into an unhandled 500 on an
