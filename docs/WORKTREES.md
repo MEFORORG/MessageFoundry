@@ -64,6 +64,16 @@ commit. (BACKLOG #1087.)
 > the old configuration, git's own remediation text read `git push origin HEAD:main`.
 > `tests/test_worktree_new_no_track.py` scans every `.ps1` under `scripts/` and fails if one sets it.
 
+**The flag only reaches worktrees created after it landed.** Every worktree made before it still
+carries `@{u} = origin/main`, and nothing retroactively corrects them — so a reading taken in one of
+those is still wrong. The same command fixes it, because `-u` overwrites an existing upstream:
+
+```powershell
+git push -u origin <branch>                 # pushed branch: point @{u} at its own remote ref
+git branch --unset-upstream                 # never-pushed branch: leave it unresolvable
+git rev-list --count '@{u}..HEAD'           # confirm: 0, or a loud "no upstream configured"
+```
+
 Point a second Claude Code chat (or VS Code window / EDH) at that directory and the two sessions build
 in parallel without touching each other's files.
 
