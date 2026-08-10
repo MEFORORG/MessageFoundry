@@ -844,9 +844,10 @@ heuristic reminder and never blocks the gate. The existing controls — never lo
 INFO+, the CR/LF log-injection filter, and silencing python-hl7's PHI-prone loggers — remain in
 [logging_setup.py](../messagefoundry/logging_setup.py).
 
-**Global log redaction + prod-DEBUG guard `[BUILT]` (Gate #1).** **Three** handler filters run, **on every record emitted in the engine process**, in this
+**Global log redaction + prod-DEBUG guard `[BUILT]` (Gate #1).** **Three** handler filters run, **on every record emitted by the engine process and by the ADR 0087 sandbox worker child**, in this
 order, on **every** emitted record and on **every** handler — stdout *and* the off-box forwarder —
-installed by `configure_logging`'s `_install_phi_filters`
+installed by `_install_phi_filters`, reached through `configure_logging` in the engine and
+`configure_stderr_logging` in the child
 ([logging_setup.py](../messagefoundry/logging_setup.py)):
 
 1. **`RedactionFilter`** — `redact()`-scrubs both the rendered **message** and the formatted **exception
@@ -983,9 +984,17 @@ WebSocket are **live telemetry, not log records** — neither retains a per-even
 logging (`relay_log` — direction/leg/control id/type/size/outcome/ack code + a sanitized 500-char detail,
 never a body; and `relay_capture`, whose `raw` column holds the **full message** and is written only when
 `--capture-bodies` is passed). Its process logging is a bare `logging.basicConfig` to stderr with **none**
-of the filters above. The **opt-in ADR 0087 sandbox worker** (`[sandbox].mode = "subprocess"`, default `"off"`) has the same shape *inside* the product: the child is spawned with `stderr=None`, i.e. it **inherits the engine's stderr** — stream 1's own sink — and configures itself with a bare `logging.basicConfig(stream=sys.stderr, level=WARNING)`, so a `WARNING`+ record emitted there by admin-authored Router/Handler code (or a library it pulls) lands in `service.err.log` **outside the filter chain**. The compensating controls are the sandbox's own `[egress]` / forbidden-import gates and the never-log-bodies rule. It is **out of scope for this section** and documented with the relay — but treat a
+of the filters above. It is **out of scope for this section** — but treat a
 `--capture-bodies` capture store as a PHI-at-rest location on the terms of
 [§2](#2-where-phi-lives--data-at-rest-inventory).
+
+The **opt-in ADR 0087 sandbox worker** (`[sandbox].mode = "subprocess"`, default `"off"`) is **not** an
+exclusion. The child is spawned with `stderr=None`, so it **inherits the engine's stderr** — stream 1's
+own sink — and it installs the three filters above on that stream itself, via `configure_stderr_logging`
+(BACKLOG #1054). A `WARNING`+ record emitted in the child by admin-authored Router/Handler code, or by a
+library it pulls, is therefore redacted and CR/LF-scrubbed on the same terms as an engine record.
+Redaction is a property of the **handler**, so this is a second installation of the chain rather than
+something the child inherits along with the file descriptor.
 
 ---
 

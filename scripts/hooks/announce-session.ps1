@@ -576,7 +576,11 @@ try {
         $lines += '   extension of the primary checkout''s path, so a prefix match resolves a peer in'
         $lines += '   the primary to some arbitrary worktree session. Measured here: the two rosters'
         $lines += '   print byte-identical cwds, so an exact match is expected to succeed.'
-        $lines += '   No exact row, or isRunning is false -> SKIP that peer. Never guess an id.'
+        $lines += '   No exact row -> SKIP that peer. Never guess an id. The cwd match is the WHOLE'
+        $lines += '   test: DO NOT also filter on isRunning. It means "executing a turn right now",'
+        $lines += '   not "alive" or "reachable", so as a reachability signal it reads BACKWARDS --'
+        $lines += '   false is an idle peer that answers, true is one that queues. Source of record'
+        $lines += '   for the field, with the measurement: scripts\coord\session-registry.ps1.'
         $lines += '3. send_message to the sessionId from that row. It MUST start with ''local_''.'
         $lines += '   The 8-character id in this repo''s coordination banners is the REGISTRY id, a'
         $lines += '   different namespace: measured here, a registry id and an MCP id for ONE session'
@@ -592,7 +596,13 @@ try {
         $lines += '     touching: <one line, if you already know>'
         $lines += '   It lands as a USER turn in their session. Ask nothing, expect no answer.'
         $lines += "5. Append one line per peer to $StateDir/sent/$markerKey.tsv :"
-        $lines += '     <iso8601> TAB <peer cwd> TAB <local_ id | NOT_LISTED | NOT_RUNNING> TAB <sent | failed>'
+        # TWO tokens, not three. The third used to be NOT_RUNNING, and it went with the isRunning SKIP
+        # rule above (BACKLOG #1077): it filed a peer that would have ACCEPTED the message under a word
+        # that reads "gone". The rationale is a comment and not a line of stdout on purpose -- naming a
+        # retired token in the instruction is how a model learns it is available. tests/
+        # test_announce_hook.py asserts the whole announcement is free of it, which is what caught an
+        # earlier draft of this very comment printing it.
+        $lines += '     <iso8601> TAB <peer cwd> TAB <local_ id | NOT_LISTED> TAB <sent | failed>'
         $lines += '   Nothing else records whether anything was delivered.'
         $lines += ''
         $claims = Get-ClaimNotes (Join-Path (Split-Path $StateDir -Parent) 'claims')

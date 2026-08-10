@@ -371,9 +371,16 @@ function Test-Merged {
     }
 
     # 3) Upstream gone: the remote branch was deleted, the usual squash-merge + auto-delete shape. Only
-    #    when the upstream is the branch's OWN remote branch -- `new.ps1 -Base origin/<parent>` leaves a
-    #    child branch pointing at the PARENT's upstream, so a merged parent makes a never-pushed child
-    #    report [gone] and its commits would go with the branch.
+    #    when the upstream is the branch's OWN remote branch -- a branch whose upstream points at a
+    #    PARENT (set by hand, or by any tracking `-b <child> origin/<parent>`) makes a merged parent
+    #    read [gone] on a never-pushed child, and its commits would go with the branch.
+    #    This used to name new.ps1 as the source of that shape. It no longer is: new.ps1 passes
+    #    --no-track since BACKLOG #1087. Two consequences, and the second is worth knowing -- a fresh
+    #    new.ps1 branch now has NO upstream, so this signal cannot fire for it (it could not before
+    #    either, since origin/main is not origin/<branch>); and once it is pushed with `push -u` its
+    #    upstream IS origin/<branch>, so this signal starts working for it, which it never did while
+    #    the upstream was pinned to the base. The guard stays regardless: the parent-upstream shape is
+    #    still reachable by hand and refusing it is cheap.
     #    `gone` means THE REMOTE REF IS ABSENT, never `merged`: a branch whose PR was CLOSED, or that was
     #    deleted with `push --delete`, reports exactly this. So it is a signal to remove the WORKTREE, and
     #    never a licence to delete the branch -- which is why the branch delete re-verifies containment

@@ -4,10 +4,14 @@
 
 Per-request (the API catch-all 500) and per-lane (the pipeline workers + framed listeners) handlers
 already exist; this adds the **process** backstop. Any asyncio task/callback exception that nothing
-awaited, and any uncaught main-thread exception, is routed through
-:func:`~messagefoundry.redaction.safe_exc` to the log — so a genuinely-unhandled error can never escape
-as a raw traceback (which could quote a PHI-bearing argument) or die silently. It only fires for
-otherwise-unhandled errors; normal flow is untouched.
+awaited, any uncaught main-thread exception, and any exception that escapes a **non-main thread's**
+``run()``, is routed through :func:`~messagefoundry.redaction.safe_exc` to the log — so a
+genuinely-unhandled error can never escape as a raw traceback (which could quote a PHI-bearing
+argument) or die silently. It only fires for otherwise-unhandled errors; normal flow is untouched.
+
+The three hooks are separate stdlib surfaces and installing one does not cover another: the asyncio
+loop handler sees only loop tasks/callbacks, ``sys.excepthook`` only the main thread, and
+``threading.excepthook`` only the others.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import threading
 from types import TracebackType
 from typing import Any
 
@@ -53,3 +58,31 @@ def install_excepthook() -> None:
     """Replace ``sys.excepthook`` so an uncaught main-thread exception is logged PHI-redacted instead of
     printed as a raw traceback (which could quote a PHI-bearing value) to stderr."""
     sys.excepthook = _excepthook
+
+
+def _thread_excepthook(args: threading.ExceptHookArgs) -> None:
+    """``threading.excepthook``: log an exception that escaped a **non-main thread's** ``run()``
+    PHI-redacted, instead of letting the stdlib default print a raw traceback to stderr.
+
+    ``sys.excepthook`` does not cover this — the interpreter routes a thread's escaping exception to
+    ``threading.excepthook`` and nowhere else — so the redaction guarantee already in force on the main
+    thread must be installed a second time to reach the others (BACKLOG #1055).
+
+    The concrete engine thread is the sandbox session's raw stdout-reader daemon
+    (``SandboxSession._reader_loop``), whose ``except`` clause catches only ``OSError`` by design;
+    anything else escapes ``run()`` and lands here, and the frame bytes it was mid-read on are
+    message-derived. ``SystemExit`` is ignored exactly as the stdlib default ignores it — a thread
+    calling ``sys.exit()`` is a clean exit, not an error to report.
+    """
+    if args.exc_value is None or issubclass(args.exc_type, SystemExit):
+        return
+    where = args.thread.name if args.thread is not None else "<unknown>"
+    _log.critical(
+        "last-resort: uncaught exception in thread %r: %s", where, safe_exc(args.exc_value)
+    )
+
+
+def install_thread_excepthook() -> None:
+    """Replace ``threading.excepthook`` so an exception escaping a non-main thread is logged
+    PHI-redacted instead of printed as a raw traceback to stderr."""
+    threading.excepthook = _thread_excepthook

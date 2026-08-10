@@ -35,6 +35,7 @@ from messagefoundry.redaction import redact
 
 __all__ = [
     "configure_logging",
+    "configure_stderr_logging",
     "set_runtime_level",
     "current_log_level",
     "silence_phi_prone_dependency_loggers",
@@ -462,6 +463,39 @@ def configure_logging(
 
     silence_phi_prone_dependency_loggers()
     return forwarder_installed
+
+
+def configure_stderr_logging(level: int = logging.WARNING) -> logging.Handler:
+    """Install a **stderr-only** root handler carrying the same PHI-redaction + control-char-scrub
+    filter chain :func:`configure_logging` puts on stdout, and return it.
+
+    For a MessageFoundry child process whose **stdout is a binary channel**: today the ADR 0087 sandbox
+    worker, whose stdout carries the MFW2 IPC frames, so a stray log byte written there would corrupt a
+    frame. The obvious way to express that — ``logging.basicConfig(stream=sys.stderr)`` — gets the
+    stream right and the *filters* wrong. It installs a handler with **no filters at all**, and
+    redaction here is a property of the **handler**, not of the logger or the call site (see
+    :func:`_install_phi_filters`), so a child that builds its own handler builds an unfiltered one
+    unless it asks for the chain: its records would reach the inherited stderr with neither PHI
+    redaction nor CR/LF neutralization (BACKLOG #1054). Every process that logs installs the chain, or
+    it does not have it.
+
+    The text formatter is the shared one, so a child line is byte-compatible with the parent's and
+    :class:`ControlCharScrubFilter`'s "no line may impersonate the record prefix" guarantee is stated
+    against the same prefix on both streams.
+
+    Replaces any handlers already on the root logger, exactly as :func:`configure_logging` does, so it
+    is idempotent and safe to call from a test.
+    """
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(_make_formatter("text"))
+    _install_phi_filters(handler)
+
+    root = logging.getLogger()
+    for existing in list(root.handlers):
+        root.removeHandler(existing)
+    root.addHandler(handler)
+    root.setLevel(level)
+    return handler
 
 
 def set_runtime_level(level: str) -> str:

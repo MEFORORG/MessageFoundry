@@ -242,6 +242,12 @@ def exchange_code(
     confidential client sends ``client_secret_post``; a public client omits it and relies on PKCE.
     Raises :class:`FlowError` on any non-2xx, oversized, or non-JSON response — PHI/secret-safe: the
     secret, the ``code``, and the tokens never enter an exception message.
+
+    The request line and header block are **measured before the POST** (ASVS 4.2.5, BACKLOG #1048).
+    ``token_endpoint`` is operator-static config (validated https at load), so this is the weaker of
+    the two 4.2.5 limbs and not attacker-influenced; it earns the bound because an ``env()`` value
+    that resolved to an unexpected blob then surfaces as a clear refusal here instead of a
+    wire-level surprise on the first federated login.
     """
     form: dict[str, str] = {
         "grant_type": "authorization_code",
@@ -253,13 +259,32 @@ def exchange_code(
     if client_secret is not None:
         form["client_secret"] = client_secret
     data = urllib.parse.urlencode(form).encode("ascii")
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+    }
+    # Reuse the ONE outbound length measurement rather than declaring a third copy of the bound
+    # (transports/rest.py owns it; apiclient's duplicate is pinned equal by a test, and that
+    # duplication is only tolerated because ADR 0088 makes that package engine-free). Imported
+    # lazily so the pure, socket-free ``auth.oidc`` package takes no module-scope transports import
+    # — the same containment ``store/keyprovider_vault.py`` uses for the same helper. The raise is
+    # this module's own FlowError, not a transport exception: the caller maps FlowError to the
+    # audited login-failure path, and a DeliveryError there would escape unmapped. Only the class
+    # and the length are disclosed; the endpoint and every credential stay out of the message.
+    from messagefoundry.transports.rest import (  # noqa: PLC0415  (lazy — see above)
+        find_outbound_length_violation,
+    )
+
+    violation = find_outbound_length_violation(token_endpoint, headers)
+    if violation is not None:
+        raise FlowError(
+            f"the token-endpoint request {violation.kind} is {violation.length} chars, over the "
+            f"{violation.limit}-char limit — check [auth].oidc_token_endpoint / its env() value"
+        )
     req = urllib.request.Request(  # noqa: S310 — scheme is validated https at config load
         token_endpoint,
         data=data,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        },
+        headers=headers,
         method="POST",
     )
     try:

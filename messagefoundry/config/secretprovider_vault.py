@@ -72,7 +72,12 @@ def _build_client(addr: str | None, token: str | None) -> Any:
     Vault. ``addr``/``token`` pass through; when ``None``, hvac falls back to its own VAULT_ADDR/VAULT_TOKEN
     environment conventions."""
     hvac = _import_hvac()
-    client: Any = hvac.Client(url=addr, token=token)
+    # allow_redirects=False (BACKLOG #1042, ASVS 15.3.2/1.3.6): hvac's default is True, and this was
+    # one of the three clients that did not carry the no-redirect policy every other shipped HTTP
+    # egress does. `token` rides as an `X-Vault-Token` header on every KV read, so a 3xx from an
+    # on-path attacker (absent TLS integrity) or a spoofed Vault would otherwise relocate the
+    # request carrying it. See store/keyprovider_vault.py's twin for the measurement.
+    client: Any = hvac.Client(url=addr, token=token, allow_redirects=False)
     return client
 
 

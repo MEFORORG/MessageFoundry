@@ -66,9 +66,21 @@ The gate's own docstring records that 29% of Edit/Write calls came from a sessio
 that wrote *correctly* into a worktree by absolute path; a cwd-keyed gate would have denied all of them.
 Rule 2 is the sole exception, and that exception is the source of the ultracode friction in §4.
 
-**[`scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1)** (project
-scope, [`.claude/settings.json`](../.claude/settings.json)) refuses blanket `git add -A`/`.`/`-u` and
-`git commit -a`, so two sessions in one tree can't sweep each other's files into one commit.
+**[`scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1)** refuses
+blanket `git add -A`/`.`/`-u` and `git commit -a`, so two sessions in one tree can't sweep each other's
+files into one commit.
+
+**It does not travel, and this paragraph used to imply it did** (BACKLOG #327). The script is tracked,
+but the `PreToolUse` matcher that invokes it is project-scope `.claude/settings.json` — untracked, under
+`.gitignore`'s `/.claude/` rule — so a fresh clone and every `git worktree add` come up without it. It is
+a local Claude Code session control, fail-open by design: real and useful inside a configured session,
+and not repo-wide coverage. The publishing boundary it was cited alongside is asserted independently, by
+[`tests/test_private_paths_stay_ignored.py`](../tests/test_private_paths_stay_ignored.py) in CI.
+
+*(The link to that settings file was removed rather than repaired — it named a path no reader outside the
+maintainer's own machine has. `scripts/docs/link_check.py` could not have caught it: `.claude/` is in
+that script's `WITHHELD` set, so such an href is skipped before it is even counted. Measured 2026-08-10 —
+an href to a missing non-withheld path fails the check, the same href under `.claude/` does not.)*
 
 ### Detection — `SessionStart` hooks
 

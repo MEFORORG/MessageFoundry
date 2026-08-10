@@ -19,6 +19,7 @@ import hashlib
 import logging
 import os
 import re
+import shutil
 import tempfile
 import time
 from collections import OrderedDict
@@ -768,11 +769,36 @@ class FileSource(SourceConnector):
 
     @staticmethod
     def _move(path: Path, dest_dir: Path) -> None:
+        """Archive ``path`` into ``dest_dir`` under a name claimed ATOMICALLY (BACKLOG #1046).
+
+        This used to be ``path.replace(_unique(...))`` — a check-then-act pair, where ``_unique``
+        asked ``exists()`` and ``replace`` then overwrote whatever was at the name it chose. Two
+        pollers sharing one ``processed_dir`` (a non-default config; the default is one poller over
+        an engine-owned dir) could both be handed the same free name and the second would silently
+        clobber the first's archived copy. The delivery path had already replaced exactly that
+        pattern with :func:`_claim_unique`'s ``O_EXCL``/``os.link`` claim (FILE-5); the archive move
+        was the one caller left on the racy form.
+
+        Claim-then-unlink rather than a single ``replace``: the claim is the whole point, and it
+        cannot be expressed as a rename (renaming a file over its own hard link is a POSIX no-op, so
+        the original would survive). If the unlink fails after the claim the file is archived AND
+        left in place to be re-read — the same duplicate-read outcome the pre-existing failure arm
+        already had, and logged the same way."""
         try:
-            path.replace(_unique(dest_dir / path.name))
+            _claim_unique(path, dest_dir / path.name)
         except OSError as exc:
             # A stuck file (locked / dest unwritable) stays and is re-read; log it (FILE-4).
             logger.warning("could not move %s to %s: %s", path.name, dest_dir.name, exc)
+            return
+        try:
+            path.unlink()
+        except OSError as exc:
+            logger.warning(
+                "archived %s to %s but could not remove the original (it will be re-read): %s",
+                path.name,
+                dest_dir.name,
+                exc,
+            )
 
 
 # --- helpers -----------------------------------------------------------------
@@ -863,8 +889,12 @@ def _claim_unique(tmp: Path, target: Path) -> Path:
             n += 1
             candidate = target.with_name(f"{stem}-{n}{suffix}")
             continue
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(tmp.read_bytes())
+        # Streamed, not read_bytes(): the archive move claims through here too (#1046), and an
+        # inbound file is only as small as the operator's max_file_bytes (unset by default), so
+        # buffering the whole thing to claim a name would put an arbitrarily large inbound payload
+        # in memory on exactly the filesystems that already can't hard-link.
+        with open(tmp, "rb") as source, os.fdopen(fd, "wb") as handle:
+            shutil.copyfileobj(source, handle)
         return candidate
 
 
@@ -873,19 +903,6 @@ def _mtime(p: Path) -> float:
         return p.stat().st_mtime
     except OSError:
         return 0.0
-
-
-def _unique(target: Path) -> Path:
-    """Return ``target`` or, if it exists, ``name-1.ext``, ``name-2.ext``, …"""
-    if not target.exists():
-        return target
-    stem, suffix = target.stem, target.suffix
-    n = 1
-    while True:
-        candidate = target.with_name(f"{stem}-{n}{suffix}")
-        if not candidate.exists():
-            return candidate
-        n += 1
 
 
 register_destination(ConnectorType.FILE, FileDestination)

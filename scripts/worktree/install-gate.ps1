@@ -84,11 +84,59 @@ $ReposFile = Join-Path $HooksDir "worktree-gate.repos.txt"
 # Marker so we can find (and remove) exactly the entries we added, without disturbing other hooks.
 $Marker = "worktree_gate.ps1"
 
-# Config dirs to wire. Default: ~/.claude + every existing ~/.claude-account-* (the VS Code launchers).
+# The NAME shape of a launcher config dir, and the ONLY thing this script wires. ~/.claude is the Desktop
+# app; every VS Code launcher on this box points CLAUDE_CONFIG_DIR at ~/.claude-account-<N> with N decimal
+# -- not inferred from a directory listing but from how the launchers BUILD the path
+# (~/claude-launchers/Launch-Claude-{1..4}.ps1 assign a literal `.claude-account-<N>`). A suffix after the
+# number is therefore not an account, because nothing can launch from one.
+#
+# ANCHORED, and the anchors are the entire predicate (BACKLOG #1024). The old filter was
+# `-Filter ".claude-account-*"`, which matches any name merely BEGINNING with `.claude-account-`.
+# Measured 2026-08-04: `~/.claude-account-2.lock` IS a directory, so the filter matched it and this
+# installer wrote gate wiring into it on every run -- into a dir with no `.claude.json`, no
+# `.credentials.json` and no sessions, i.e. one nothing has ever launched from.
+#
+# THIS IS THE WRITER. The Python reader (tests/test_gate_installed_parity.py) used the same unanchored
+# glob and read that wiring back as evidence the wiring was correct; the two agreed because both were
+# wrong the same way. #199 anchored the reader as `\A\.claude-account-\d+\Z`; this is the matching half,
+# so the predicate is now the same on both sides.
+#
+# `\z`, NOT `\Z`. Python's `\Z` is the absolute end of the string; .NET's `\Z` also matches BEFORE a
+# trailing newline, and .NET's `\z` is the one that means what Python's `\Z` means. Spelling it `\Z` here
+# would look like the reader and mean something slightly wider.
+#
+# Case-SENSITIVE, matching the reader. `-Filter` is case-insensitive on Windows, so a `.Claude-Account-2`
+# would reach this predicate and be rejected -- leaving that dir unwired. That direction is deliberate:
+# the -Status audit below enumerates independently of this predicate and reports any such dir by name,
+# which is a louder outcome than silently wiring something the reader would refuse to judge.
+$LauncherName = [regex]'\A\.claude-account-\d+\z'
+
+# Every ~/.claude* directory carrying a settings.json, WITHOUT judging what it is. Deliberately wider than
+# the wire set: it is the -Status audit's independent population, and it must not be selected by the same
+# predicate whose correctness it exists to check.
+function Get-ConfigCandidates([string]$Root) {
+    @(
+        Get-ChildItem -LiteralPath $Root -Directory -Filter ".claude*" -Force -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "settings.json") -PathType Leaf }
+    )
+}
+
+# Config dirs to wire. Default: ~/.claude + every existing ~/.claude-account-<N> (the VS Code launchers).
+#
+# -Force IS LOAD-BEARING AND ITS ABSENCE IS INVISIBLE ON WINDOWS. Get-ChildItem omits hidden entries
+# without it. On Windows a dot-prefixed directory carries no hidden ATTRIBUTE, so every ~/.claude-account-N
+# enumerates either way and the omission cannot be reproduced locally. On Linux the dot prefix IS the
+# hidden convention, so this glob returns NOTHING and the wire set collapses to the single explicit
+# ~/.claude candidate on the line above -- which is not a glob and so survives. That is precisely the
+# shape CI reported on the ubuntu leg (writer wired ['.claude']; the reader, anchored by #199, judged
+# ['.claude', '.claude-account-1', '.claude-account-42']), and it is why the parity test caught here what
+# no Windows run could. Get-ConfigCandidates above already passes -Force for the same reason; the two
+# enumerations must agree, and a difference between them is the exact defect #1024 exists to close.
 if (-not $ConfigDir -or $ConfigDir.Count -eq 0) {
     $cands = @( (Join-Path $HomeDir ".claude") )
     $cands += @(
-        Get-ChildItem -LiteralPath $HomeDir -Directory -Filter ".claude-account-*" -ErrorAction SilentlyContinue |
+        Get-ChildItem -LiteralPath $HomeDir -Directory -Filter ".claude-account-*" -Force -ErrorAction SilentlyContinue |
+            Where-Object { $LauncherName.IsMatch($_.Name) } |
             ForEach-Object { $_.FullName }
     )
     $ConfigDir = @($cands | Where-Object { Test-Path -LiteralPath $_ -PathType Container })
@@ -126,6 +174,20 @@ function Remove-GateHooks($Data) {
     if ($kept.Count -gt 0) { $Data.hooks.PreToolUse = $kept }
     else { $null = $Data.hooks.Remove("PreToolUse") }
     return $Data
+}
+
+# Tool names reachable through a PreToolUse entry whose command names the gate. ONE reader, used by both
+# the wire-set scan and the independent audit below -- two copies would drift, and the copy that drifts is
+# the one that decides whether an orphan is reported.
+function Get-WiredMatchers([string]$SettingsPath) {
+    $wired = [System.Collections.Generic.HashSet[string]]::new()
+    $s = Read-Settings $SettingsPath
+    foreach ($e in @($s.hooks.PreToolUse)) {
+        if (@($e.hooks) | Where-Object { "$($_.command)" -like "*$Marker*" }) {
+            foreach ($t in "$($e.matcher)".Split("|")) { if ($t) { $null = $wired.Add($t) } }
+        }
+    }
+    return $wired
 }
 
 function Get-GateVersion([string]$Path) {
@@ -230,13 +292,7 @@ if ($Status) {
     $handled = @(Get-HandledTools $GateDst)
     foreach ($cd in $ConfigDir) {
         $sp = Join-Path $cd "settings.json"
-        $s = Read-Settings $sp
-        $wired = [System.Collections.Generic.HashSet[string]]::new()
-        foreach ($e in @($s.hooks.PreToolUse)) {
-            if (@($e.hooks) | Where-Object { "$($_.command)" -like "*$Marker*" }) {
-                foreach ($t in "$($e.matcher)".Split("|")) { if ($t) { $null = $wired.Add($t) } }
-            }
-        }
+        $wired = Get-WiredMatchers $sp
         # Rules that are deliberately unwired are reported as such, never as UNWIRED. A status line that
         # cries wolf about a known-and-intended state is one a reader learns to skip, which is how a real
         # UNWIRED would go unnoticed -- the exact failure this whole block exists to surface.
@@ -257,6 +313,70 @@ if ($Status) {
             Write-Host "              stray    : $($stray -join ', ')  <- matched but the script ignores it" -ForegroundColor Yellow
         }
     }
+
+    # --- INDEPENDENT AUDIT: break the writer-validates-its-own-writing loop (BACKLOG #1024) ----------
+    # Everything above scans $ConfigDir, which is the set this script WRITES. On its own that can only
+    # ever confirm the installer's own output: if the discovery predicate is wrong, the writer creates
+    # the wiring and the reader reads it back as evidence, and the two agree because they are the same
+    # predicate. That is a validator satisfied by construction (ADR 0158), and it is not hypothetical --
+    # measured 2026-08-04, ~/.claude-account-2.lock held three gate matchers this installer had put
+    # there under the unanchored glob, and the Python reader counted them as correct wiring.
+    #
+    # So enumerate from a DIFFERENT starting point: every ~/.claude* directory that carries a
+    # settings.json, judged by name AFTERWARDS rather than selected by name up front. The names are
+    # printed whether or not anything is wrong, because a count that got smaller looks like an
+    # improvement and only the names say what stopped being looked at.
+    #
+    # Reported, never fixed. Anchoring the writer means -Uninstall no longer reaches an orphan either,
+    # so the remedy has to be a command a human runs deliberately -- and which dir is a stale artifact
+    # versus a config root this box really uses is the owner's call, not this script's.
+    $judged = @($ConfigDir | ForEach-Object {
+            try { (Resolve-Path -LiteralPath $_ -ErrorAction Stop).Path } catch { $_ }
+        })
+    $seen = @(Get-ConfigCandidates $HomeDir)
+    Write-Host ""
+    Write-Host "audit       : $($seen.Count) ~/.claude* dir(s) with a settings.json, enumerated independently"
+    Write-Host "              of the wire set above (so this cannot agree with the writer by construction)"
+    Write-Host "              found    : $(@($seen | ForEach-Object { $_.Name } | Sort-Object) -join ', ')"
+
+    $orphans = @()
+    $notJudged = @($seen | Where-Object { $judged -notcontains $_.FullName })
+    foreach ($d in $notJudged) {
+        $why = if ($d.Name -ieq ".claude" -or $LauncherName.IsMatch($d.Name)) {
+            "outside the -ConfigDir set given on the command line"
+        } else {
+            "not a launcher name"
+        }
+        # An unreadable settings.json must not take -Status down over a directory nobody asked about,
+        # and must not read as "no wiring here" either. Say which it was.
+        $wired = $null
+        try { $wired = Get-WiredMatchers (Join-Path $d.FullName "settings.json") } catch { $wired = $null }
+        if ($null -eq $wired) {
+            Write-Host "              UNREADABLE: $($d.Name)  <- settings.json is not valid JSON; its wiring is unknown" -ForegroundColor Yellow
+        } elseif ($wired.Count -gt 0) {
+            $orphans += $d
+            Write-Host "              ORPHAN GATE WIRING in $($d.Name) ($why)" -ForegroundColor Yellow
+            Write-Host "                matched: $(@($wired | Sort-Object) -join ', ')"
+            Write-Host "                This installer will neither refresh nor remove it. Remove it deliberately:"
+            Write-Host "                  install-gate.ps1 -Uninstall -ConfigDir `"$($d.FullName)`""
+        } else {
+            Write-Host "              not judged: $($d.Name) ($why) -- carries no gate wiring"
+        }
+    }
+    # "I found nothing" and "I found things and they are all fine" are different sentences, and only the
+    # second is reassurance. Collapsing them is the failure this whole audit exists to remove, so an
+    # empty population says NOTHING WAS EXAMINED rather than borrowing the clean verdict below it.
+    if ($seen.Count -eq 0) {
+        Write-Host "              NOTHING EXAMINED -- no ~/.claude* dir under $HomeDir carries a settings.json," -ForegroundColor Yellow
+        Write-Host "              so this audit concluded nothing. That is not the same as 'no orphans'."
+    }
+    elseif ($notJudged.Count -eq 0) {
+        Write-Host "              every dir found is in the wire set above; nothing is unjudged"
+    }
+    elseif ($orphans.Count -eq 0) {
+        Write-Host "              no unjudged dir carries gate wiring"
+    }
+
     Write-Host ""
     Write-Host "scanned $($ConfigDir.Count) config dir(s) against $(@($handled).Count) implemented rule(s)."
     return
