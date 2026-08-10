@@ -348,6 +348,67 @@ def test_the_real_ledger_parses_into_one_namespace_holding_both_files() -> None:
     )
 
 
+def test_the_citation_regex_sees_every_ledger_LINK_the_link_checker_sees() -> None:
+    """An absence claim needs a positive control, and this is the one that matters here.
+
+    The two checkers use different regexes on purpose: ``link_check`` starts at ``](`` because it
+    only needs the href, while this one must capture the display TEXT to read a number out of it --
+    so it additionally requires a well-formed ``[text]`` and would silently skip any ledger link
+    whose text carries a bracket. "No citation defects found" would then be a statement about the
+    regex, not about the docs. Measured 2026-08-10 the two see the SAME 191 ledger links repo-wide,
+    with zero seen by one and missed by the other, and this asserts it keeps being zero.
+    """
+    lc_spec = importlib.util.spec_from_file_location(
+        "_link_check_for_parity", _ROOT / "scripts" / "docs" / "link_check.py"
+    )
+    assert lc_spec is not None and lc_spec.loader is not None
+    link_check = importlib.util.module_from_spec(lc_spec)
+    lc_spec.loader.exec_module(link_check)
+
+    ledgers = {_LIVE, _ARCHIVE}
+    files = subprocess.run(
+        ["git", "-C", str(_ROOT), "ls-files", "*.md"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    ).stdout.split()
+
+    theirs = 0
+    missed: list[str] = []
+    for rel in sorted(files):
+        here = Path(rel).parent.as_posix()
+        base = bcc.PurePosixPath(here)
+        in_fence = False
+        for lineno, line in enumerate((_ROOT / rel).read_text(encoding="utf-8").splitlines(), 1):
+            if bcc._FENCE.match(line):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
+            mine = {
+                m.start("href")
+                for m in bcc._LINK.finditer(line)
+                if bcc._normalise(base, m.group("href")) in ledgers
+            }
+            for m in link_check._LINK.finditer(line):
+                if bcc._normalise(base, m.group("href")) not in ledgers:
+                    continue
+                theirs += 1
+                if m.start("href") not in mine:
+                    missed.append(f"{rel}:{lineno}: {m.group('href')}")
+
+    print(f"[citation-gate] {theirs} ledger links repo-wide, {len(missed)} invisible to the gate")
+    assert theirs > 100, (
+        f"only {theirs} ledger links found repo-wide; the scan itself is broken, and a parity "
+        "assertion over nothing proves nothing"
+    )
+    assert missed == [], (
+        "ledger links the link checker sees and the citation gate does not -- any citation on these "
+        "lines is unguarded:\n  " + "\n  ".join(missed)
+    )
+
+
 def test_a_deliberately_wrong_citation_against_the_REAL_ledger_is_caught() -> None:
     """Live positive control. The item is chosen from the real archive at run time, so this cannot
     rot into a citation of a number that has since moved -- and no number is written down here."""
