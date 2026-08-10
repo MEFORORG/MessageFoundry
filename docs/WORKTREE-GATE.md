@@ -164,7 +164,12 @@ confirm every config dir shows hook entries.
 Two structural choices worth understanding:
 
 - **Every config dir, not just `~/.claude`.** The hook is registered into `~/.claude/settings.json` **and**
-  every `~/.claude-account-*/settings.json` (the VS Code launchers that set `CLAUDE_CONFIG_DIR`), mirroring
+  every `~/.claude-account-<N>/settings.json` (the VS Code launchers that set `CLAUDE_CONFIG_DIR`) — that
+  name shape **exactly**, anchored on a decimal N, because an unanchored `.claude-account-*` also matched
+  `~/.claude-account-2.lock`, a directory the installer then wrote gate wiring into on every run while the
+  wiring check read it back as evidence (BACKLOG #1024). `-Status` now enumerates `~/.claude*`
+  independently of that predicate, so its audit cannot agree with the writer by construction, and it names
+  any dir outside the wire set that still carries gate wiring. This mirrors
   what `install-selfheal.ps1` already does. This is not a detail: the gate originally wired only
   `~/.claude`, which left every account-N session **ungated** — and those are where the parallel VS Code
   chats run. A session under an ungoverned account then checked its own branch out inside another session's
