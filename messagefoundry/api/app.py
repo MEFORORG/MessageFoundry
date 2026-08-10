@@ -161,6 +161,7 @@ from messagefoundry.api.multipart import (
     MultipartTooLargeError,
     parse_single_file_upload,
 )
+from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     authorize_ws,
     client_ip,
@@ -5096,6 +5097,20 @@ def create_app(
     # delegate — without this the route's sandbox CSP would be silently replaced there. Registered
     # OUTSIDE the serve_ui guard so the JSON-only deployment is covered identically.
     app.add_middleware(AttachmentSecurityHeadersMiddleware)
+
+    # ASVS 15.1.3/15.2.2 (BACKLOG #1044) — the server-side deadline on BUILDING a response. Nothing
+    # bounded a handler before this: the only asyncio.wait_for in api/ caps the connection-test
+    # probe, so a slow handler held its worker for as long as it ran and the client's own timeout
+    # was the only thing that ever gave up (which does not free the server).
+    #
+    # Registered here so it lands OUTSIDE every earlier registration — the attachment CSP re-assert,
+    # the console's UiSecurityHeadersMiddleware, the body cap, the security-headers middleware and
+    # every auth dependency are all inside the deadline, which is what makes it a bound on the whole
+    # request rather than on the route function alone. It stays INSIDE ClientNetworkMiddleware
+    # (registered after it, so further out): a refused address must be rejected before it can occupy
+    # a deadline at all. The clock is cancelled at http.response.start, so a response that has begun
+    # streaming is never cut mid-body — see api/request_timeout.py.
+    app.add_middleware(RequestTimeoutMiddleware)
 
     # [security].allowed_client_networks — registered LAST, so Starlette makes it the OUTERMOST user
     # middleware (add_middleware inserts at index 0; the stack is built from reversed(user_middleware)).

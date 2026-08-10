@@ -287,10 +287,19 @@ class EngineClient:
         # engine-free (a GUI/harness process must not pull transports/ in), so the import that would
         # share them is exactly the coupling this package exists to avoid. Kept in step by
         # ``test_apiclient_length_bounds_match_the_transport_constants``.
-        if len(self.base_url) + len(path) > MAX_REQUEST_URL_LEN:
+        #
+        # The request is BUILT first so the bound measures the URL httpx will actually put on the
+        # wire — base_url joined to the path AND the ``params=`` query appended (BACKLOG #1047).
+        # Measuring ``base_url + path`` missed the query entirely, so every ``_get`` filter (a
+        # search needle, a control id) was unmeasured; ``build_request`` is httpx's own resolution
+        # step, so this asks the same question the transport will answer. ``send`` then dispatches
+        # the already-built request, which is exactly what ``request()`` does internally — the auth
+        # and follow-redirects client defaults are unchanged.
+        request = self._http.build_request(method, path, headers=headers, **kw)  # type: ignore[arg-type]
+        resolved_url = str(request.url)
+        if len(resolved_url) > MAX_REQUEST_URL_LEN:
             raise ApiError(
-                f"request URL is {len(self.base_url) + len(path)} chars, over the "
-                f"{MAX_REQUEST_URL_LEN}-char limit"
+                f"request URL is {len(resolved_url)} chars, over the {MAX_REQUEST_URL_LEN}-char limit"
             )
         if headers is not None and len(headers["Authorization"]) > MAX_REQUEST_HEADER_VALUE_LEN:
             # Never echo the value: it is a live session bearer.
@@ -299,7 +308,7 @@ class EngineClient:
                 f"the {MAX_REQUEST_HEADER_VALUE_LEN}-char limit"
             )
         try:
-            response = self._http.request(method, path, headers=headers, **kw)  # type: ignore[arg-type]
+            response = self._http.send(request)
         except httpx.HTTPError as exc:
             raise ApiError(f"could not reach engine at {self.base_url}: {exc}") from exc
         # Second factor (WP-14, ASVS 6.3.3): the engine refuses a sensitive op with 403 +
