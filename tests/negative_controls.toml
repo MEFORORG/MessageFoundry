@@ -1,0 +1,386 @@
+# NEGATIVE CONTROLS FOR THE REQUIRED MERGE CONTEXTS  (BACKLOG #1000)
+#
+# WHY THIS FILE EXISTS. `.github/required-contexts.txt` names the contexts that block merge. It answers
+# "is this check blocking?". It cannot answer the question underneath it -- "has anyone ever seen this
+# check go red?" -- and a gate nobody has watched fail is an assumption wearing a green tick. The class
+# has fired at least four times in this repository, each found by hand and none by CI: a required
+# backlog gate computing a two-dot diff and crediting every PR with an older base; a required SAST gate
+# scanning a two-directory allow-list while its sibling declared 56 more files in scope; a leak gate
+# exiting 0 on content carrying a real site code; the same gate's home-path detector matching one of
+# four spellings of the same Windows path.
+#
+# WHAT A CONTROL IS HERE. Not a re-test of what the gate checks -- the gates' own suites do that. One
+# property per context: THIS GATE IS CAPABLE OF GOING RED, evidenced by a planted violation and an
+# observed refusal.
+#
+# EVERY ENTRY IS ASYMMETRIC, and that field is mandatory. It is not enough that neutering a rule turns
+# a control red: the control must fail for exactly the shapes that rule covers and KEEP PASSING for the
+# shapes some other layer catches, or it cannot tell you which layer does the work. Measured 2026-08-05
+# on a different guard -- a fix believed to cover two NTFS alternate-data-stream spellings turned out to
+# be load-bearing for exactly one, and only an eight-case control that reddened on one of them said so.
+# A uniform red looks stronger and teaches nothing. So `holds` and `green` are as required as `plants`
+# and `red`, and `tests/test_negative_controls.py` fails when either is missing.
+#
+# FORMAT. One `[[control]]` per context (a context may have several).
+#   context  the exact string from .github/required-contexts.txt -- checked against it, both ways
+#   plants   the violation the control introduces
+#   red      pytest node ids that MUST fail if the gate stops catching that violation
+#   holds    what the control deliberately does NOT break, and which layer covers it
+#   green    pytest node ids for that half -- the shapes that must keep passing
+#   observed what was actually seen, and where. Prose only; nothing parses it.
+#   ci       (optional) a command wired into the gate's OWN job, asserted present in that job
+#   workflow (with `ci`) the workflow file the command must appear in
+#
+# THIS FILE IS NOT BRANCH PROTECTION AND DOES NOT TOUCH IT. `.github/required-contexts.txt` is
+# READ-ONLY here: it mirrors the live server, and a context added to it before the server is exactly
+# the lie it exists to prevent. This file only reads it.
+#
+# WHAT THE SCANNER GATES CAN AND CANNOT BE CONTROLLED FOR, said once rather than repeated per entry.
+# bandit, gitleaks, npm-audit, pip-audit and semgrep run third-party binaries the pytest legs do not
+# install. Their DETECTION is exercised where the binary lives -- semgrep against annotated fixtures in
+# its own CI job, pip-audit's slopsquat half by a stdlib script with its own unit suite. What the pytest
+# legs can hold is the property those jobs lose SILENTLY: an enforcement flag removed, a severity floor
+# added, an allowlist widened until it swallows the class, a scan re-narrowed to an allow-list. Those
+# are the controls registered below, and the distinction is recorded rather than blurred.
+
+# --- ci.yml ----------------------------------------------------------------------------------------
+
+[[control]]
+context = "CI gate"
+plants = """
+One gated leg reports `failure`, then `cancelled`, in a synthetic needs-results vector read through the
+roll-up's own `if:` condition. `CI gate` is required BECAUSE the six legs behind it cannot be -- a
+path-gated job does not report on a PR that touches none of its paths -- so this roll-up is the only
+thing that turns a red sqlserver-store, postgres-store, load-test, load-test-sqlserver or
+windows-service-smoke into a blocked merge.
+"""
+red = [
+  "tests/test_merge_gate_controls.py::test_the_ci_gate_rollup_fires_on_a_failed_or_cancelled_leg",
+  "tests/test_merge_gate_controls.py::test_the_ci_gate_rollup_still_covers_every_leg_it_is_required_for",
+]
+holds = """
+An all-`skipped` vector must stay GREEN, and that is the case that actually happens: almost every PR
+touches none of the six gated paths. A control that reddened on `skipped` would block every ordinary PR
+while looking stronger. The reader itself is also controlled -- a condition with `cancelled` removed
+must be reported as no longer firing on it, otherwise "the shipped condition is fine" and "the reader
+matches nothing" are the same green.
+"""
+green = [
+  "tests/test_merge_gate_controls.py::test_the_ci_gate_rollup_stays_green_when_every_gated_leg_skipped",
+  "tests/test_merge_gate_controls.py::test_the_rollup_reader_reports_a_condition_that_dropped_cancelled",
+]
+observed = """
+Live record, quoted in .github/required-contexts.txt: 18 success / 2 failure over 20 runs. One failure
+was a nightly `schedule` run whose sqlserver load-test legs failed; one was a superseded re-push where
+every job was CANCELLED -- both terminal states this control asserts are still named. Restored to
+branch protection 2026-07-30 after checking exactly that record.
+
+RUN AGAINST A NEUTERED GATE, 2026-08-10: with `contains(needs.*.result, 'cancelled')` deleted from
+ci.yml, 2 of the 4 roll-up controls went red and 2 stayed green -- the specific result, not a uniform
+one. ci.yml was restored from the same run.
+"""
+
+[[control]]
+context = "test (ubuntu-latest, py3.14)"
+plants = """
+A test that cannot pass, run by a child pytest outside this repository's rootdir. The assertion is on
+the EXIT CODE alone.
+"""
+red = ["tests/test_merge_gate_controls.py::test_a_failing_test_makes_the_pytest_leg_exit_nonzero"]
+holds = """
+A passing fixture must leave the runner at exit 0 -- a runner that failed unconditionally would satisfy
+the planted case while blocking every PR, and nothing would say which of the two it was. The exit codes
+are additionally re-measured with the child pinned to a HOSTILE encoding, because a control that only
+ever ran under a favourable ambient value proves nothing about the Windows legs.
+"""
+green = [
+  "tests/test_merge_gate_controls.py::test_a_passing_fixture_leaves_the_pytest_leg_green",
+  "tests/test_merge_gate_controls.py::test_the_pytest_exit_code_does_not_depend_on_the_ambient_encoding",
+]
+observed = """
+The planted failure exits non-zero and the passing fixture exits 0, unchanged under
+PYTHONIOENCODING=ascii / PYTHONUTF8=0. This is not hypothetical plumbing: BACKLOG #1000 records the
+measured case one layer over, where `pwsh -File script.ps1` returned 0 although the script inside died
+at parameter binding, making every execution assertion built on that return code vacuously green.
+"""
+
+[[control]]
+context = "test (windows-2022, py3.14)"
+plants = "As the ubuntu leg: a test that cannot pass, asserted on the child's exit code."
+red = ["tests/test_merge_gate_controls.py::test_a_failing_test_makes_the_pytest_leg_exit_nonzero"]
+holds = """
+Same asymmetry, and the encoding half is load-bearing HERE specifically: the Windows legs are where an
+ambient code page differs from the author's shell, which is how a wave-2 lane shipped a test that
+passed ubuntu and would have reddened these two contexts.
+"""
+green = [
+  "tests/test_merge_gate_controls.py::test_a_passing_fixture_leaves_the_pytest_leg_green",
+  "tests/test_merge_gate_controls.py::test_the_pytest_exit_code_does_not_depend_on_the_ambient_encoding",
+]
+observed = "Run on this Windows worktree; exit codes as above, unchanged under a hostile encoding."
+
+[[control]]
+context = "test (windows-2025, py3.14)"
+plants = "As the ubuntu leg: a test that cannot pass, asserted on the child's exit code."
+red = ["tests/test_merge_gate_controls.py::test_a_failing_test_makes_the_pytest_leg_exit_nonzero"]
+holds = "Same asymmetry as the windows-2022 leg; the two differ only in runner image."
+green = [
+  "tests/test_merge_gate_controls.py::test_a_passing_fixture_leaves_the_pytest_leg_green",
+  "tests/test_merge_gate_controls.py::test_the_pytest_exit_code_does_not_depend_on_the_ambient_encoding",
+]
+observed = "Run on this Windows worktree; exit codes as above, unchanged under a hostile encoding."
+
+# --- security.yml ----------------------------------------------------------------------------------
+
+[[control]]
+context = "bandit (Python SAST)"
+plants = """
+`bandit -ll` against the shipped invocation's muting detector. A severity floor keeps the scanner
+running and the exit code intact while discarding a whole severity band -- so the required context goes
+on reporting success, and a neutering scan looking for ADDED idioms (`|| true`, `--exit-zero`) cannot
+see it. The sibling scope control plants the other half: a scan re-narrowed to an allow-list, which is
+BACKLOG #334's shape.
+"""
+red = [
+  "tests/test_merge_gate_controls.py::test_the_bandit_invocation_carries_no_severity_or_confidence_floor",
+  "tests/test_lint_scope_parity.py::test_ci_bandit_scans_the_repo_not_an_allow_list",
+]
+holds = """
+The reviewed `--skip B101,B110,B311,B404,B608` list must NOT be flagged. Each entry there is a per-check
+exclusion with a stated reason, not a severity floor, and a detector that flagged it would be "fixed" by
+deleting a correct annotation. The excludes must also keep matching semgrep's, so widening one gate's
+blind spot cannot pass as tightening the other's.
+"""
+green = [
+  "tests/test_merge_gate_controls.py::test_the_muting_detector_fires_on_a_synthetic_floor",
+  "tests/test_lint_scope_parity.py::test_semgrep_and_bandit_exclude_the_same_paths",
+]
+observed = """
+The detector fires on a synthetic `bandit -r . -ll --skip B101` and stays clean on the shipped command
+in the same call. Detection by bandit itself runs in its own CI job against the pinned scanner lock.
+
+RUN AGAINST A NEUTERED GATE, 2026-08-10: adding `-ll` to security.yml's real bandit invocation turned
+1 of the 4 selected controls red and left 3 green; security.yml was restored from the same run.
+"""
+
+[[control]]
+context = "pip-audit (dependency vulnerabilities)"
+plants = """
+A hallucinated distribution name, a registered-but-empty project, and a freshly registered one, fed to
+`scripts/security/new_dependency_check.py` -- the step in this job that answers what pip-audit
+structurally cannot: a hallucinated name has no advisory, so it resolves, locks, hashes and installs
+through every other DEP-1 control clean.
+"""
+red = [
+  "tests/test_new_dependency_check.py::test_a_nonexistent_name_is_caught",
+  "tests/test_new_dependency_check.py::test_main_exits_1_on_a_hallucinated_name",
+  "tests/test_new_dependency_check.py::test_main_exits_2_when_the_sweep_examines_nothing",
+]
+holds = """
+A clean tree must produce no findings AND a non-zero examined count -- "found nothing" and "did not
+look" are different answers and only one of them is clean. An allowlisted name must be skipped without
+being counted, so the sweep's own liveness number cannot be inflated by entries it never checked.
+"""
+green = [
+  "tests/test_new_dependency_check.py::test_a_clean_tree_produces_no_findings_and_a_nonzero_count",
+  "tests/test_new_dependency_check.py::test_the_allowlist_skips_a_name_and_does_not_count_it",
+]
+observed = """
+The planted names are refused and the clean tree passes with a non-zero count, in this suite. The
+audit half (pip-audit over three locks) needs the network and the scanner lock and runs in its own job;
+its documented blind spot -- a real package that is not the INTENDED one -- is recorded in the script.
+"""
+
+[[control]]
+context = "npm-audit (ide dependency vulnerabilities)"
+plants = """
+`npm audit --audit-level=high` against the shipped invocation's muting detector. That flag exits 0 on
+moderate advisories, which silently contradicts the job's own comment that the default level "fails on
+ANY severity, matching pip-audit's strict posture". The second plant is the quieter one: a missing
+`working-directory`, which leaves `--package-lock-only` auditing a tree with no lockfile.
+"""
+red = [
+  "tests/test_merge_gate_controls.py::test_the_npm_audit_invocation_carries_no_severity_floor",
+  "tests/test_merge_gate_controls.py::test_the_npm_audit_target_lockfile_exists",
+]
+holds = """
+The shipped `npm audit --package-lock-only` must stay clean under the same detector, so the control is
+not simply refusing every flag. `--package-lock-only` is itself an install-free NARROWING of what npm
+does, and it is deliberate -- the control must distinguish it from a severity floor.
+"""
+green = ["tests/test_merge_gate_controls.py::test_the_muting_detector_fires_on_a_synthetic_floor"]
+observed = """
+The detector fires on the synthetic floor and stays clean on the shipped command; ide/package-lock.json
+resolves from the declared working-directory. Detection by npm itself runs in its own CI job.
+"""
+
+[[control]]
+context = "gitleaks (secret scan)"
+plants = """
+Six credential shapes the default ruleset exists to catch -- an AWS access key id, a GitHub PAT, a Slack
+bot token, a PEM private-key header, a 40-hex token and a URL with an inline database password -- all
+ASSEMBLED AT RUNTIME, never committed as literals, and matched against every allowlist regex in
+`.gitleaks.toml`. That allowlist is the one place this required context can be disabled without
+touching a workflow at all.
+"""
+red = [
+  "tests/test_merge_gate_controls.py::test_no_gitleaks_allowlist_regex_swallows_a_fabricated_secret",
+  "tests/test_merge_gate_controls.py::test_the_gitleaks_config_still_extends_the_default_ruleset",
+]
+holds = """
+The shipped allowlist must stay GREEN in the same call that flags two planted broad patterns. The
+control is not demanding an empty allowlist -- the entries there are documented non-secret fixtures (a
+CI container password, a SOAP placeholder class, a pinned audit-chain digest) and deleting them would
+red the gate on correct content, which is how an allowlist gets widened in the first place.
+"""
+green = [
+  "tests/test_merge_gate_controls.py::test_the_allowlist_narrowness_detector_fires_on_a_planted_broad_regex"
+]
+observed = """
+Planted `.{8,}` and `[A-Za-z0-9_/+-]{20,}` are both caught; the shipped entries match none of the six
+shapes. This gate has also been seen red in ordinary use: the redaction suite's first JWT fixture was a
+literal token and the gitleaks pre-commit hook rejected the commit, which is why that fixture is now
+assembled from parts.
+
+RUN AGAINST A NEUTERED GATE, 2026-08-10: replacing one literal allowlist entry in the real
+.gitleaks.toml with `[A-Za-z0-9_/+-]{16,}` turned 2 of the 4 selected controls red and left 2 green;
+.gitleaks.toml was restored from the same run.
+"""
+
+[[control]]
+context = "semgrep (project SAST rules)"
+plants = """
+Annotated handler fixtures carrying inter-statement PHI taint, an aliased import, an ambient subprocess
+call, ambient deserialization, ambient eval/exec, an unparameterized db_lookup and a PHI-to-file write.
+Each rule must fire EXACTLY as annotated.
+"""
+ci = "python scripts/ci/assert_semgrep_handler_taint.py"
+workflow = "security.yml"
+red = [
+  "tests/test_lint_scope_parity.py::test_ci_semgrep_still_fails_the_build_on_a_finding",
+  "tests/test_lint_scope_parity.py::test_ci_semgrep_scans_the_repo_not_an_allow_list",
+]
+holds = """
+The `# ok` cases in the same fixture -- log.debug, msg.control_id, a parameterized db_lookup -- must
+contribute ZERO findings, and the count equality is what asserts it. A rule set that fired on those
+would be indistinguishable from one that fires on everything. On the workflow side, the excludes must
+keep matching bandit's rather than growing independently.
+"""
+green = ["tests/test_lint_scope_parity.py::test_semgrep_and_bandit_exclude_the_same_paths"]
+observed = """
+The fixture asserter is the gate's own step and fails the job on any count mismatch in either
+direction. `--error` is separately asserted here because without it semgrep prints every match across
+the whole scanned tree and exits 0 -- a required context that cannot fail, which is strictly worse than
+the narrow scope it replaced.
+"""
+
+[[control]]
+context = "crypto-inventory (ASVS 11.1.3 discovery gate)"
+plants = """
+A seam-only delegator with no inventory row, a Python file planted under the ide/ TypeScript tree, and
+a provider row deleted from the documented inventory. Each must be reported.
+"""
+red = [
+  "tests/test_crypto_inventory_scanner.py::test_seam_only_delegator_is_reported_undocumented",
+  "tests/test_crypto_inventory_scanner.py::test_ide_invariant_flags_a_planted_python_file",
+  "tests/test_crypto_inventory_doc.py::test_guard_detects_a_removed_provider_row",
+]
+holds = """
+A plain non-crypto store import must NOT be reported, and the real tree must stay clean -- a discovery
+gate that flagged ordinary imports would be silenced by the first person it inconvenienced, which is a
+slower version of switching it off.
+"""
+green = [
+  "tests/test_crypto_inventory_scanner.py::test_a_plain_non_crypto_store_import_is_not_a_false_positive",
+  "tests/test_crypto_inventory_scanner.py::test_gate_is_clean_on_the_real_tree",
+]
+observed = "Each planted shape is reported and the real tree is clean, in this suite."
+
+[[control]]
+context = "forbidden-content (customer/PHI leak guard)"
+plants = """
+A customer name, a case-sensitive site code, a routable host IP, and a file under docs/security/ caught
+by its PATH alone; plus a run that examines zero files, which must refuse rather than report clean.
+"""
+red = [
+  "tests/test_scan_forbidden.py::test_scan_file_flags_customer_name",
+  "tests/test_scan_forbidden.py::test_scan_file_flags_site_code",
+  "tests/test_scan_forbidden.py::test_a_file_under_docs_security_is_flagged_by_its_path_alone",
+  "tests/test_scan_forbidden.py::test_zero_examined_still_refuses_rather_than_reporting_clean",
+]
+holds = """
+Private and documentation IP ranges, ordinary docs paths, and clean text must all pass. This is the
+asymmetry with the most history behind it: BACKLOG #321 and #325 are both this gate failing to fire,
+and a control that reddened on 10.0.0.1 or on docs/CI.md would have been relaxed rather than trusted.
+"""
+green = [
+  "tests/test_scan_forbidden.py::test_scan_file_allows_private_and_doc_ips",
+  "tests/test_scan_forbidden.py::test_the_path_detector_does_not_flag_ordinary_paths",
+  "tests/test_scan_forbidden.py::test_scan_file_clean_text_has_no_hits",
+]
+observed = """
+Every planted shape is flagged and every benign one passes, in this suite. The gate additionally fails
+CLOSED in CI on a per-section detector floor, because a partially-mangled token list once loaded as few
+as 1 of 21 detectors and passed with a green tick.
+"""
+
+# --- cla.yml ---------------------------------------------------------------------------------------
+
+[[control]]
+context = "cla"
+plants = """
+The context STRING, which is the only part of this gate the repository controls -- its detection lives
+entirely in a third-party action. Planted historically rather than synthetically: docs/CI.md and cla.yml
+both told a reader to require "CLA Assistant", the WORKFLOW name, which matches no status check. Adding
+it to branch protection would have wedged every PR forever. A `name:` on the job would do the same
+thing quietly, by moving the context off `cla`.
+"""
+red = [
+  "tests/test_merge_gate_controls.py::test_the_cla_job_still_reports_under_the_job_key_and_not_the_workflow_name",
+  "tests/test_required_contexts.py::test_no_claim_file_names_the_cla_context_by_its_workflow_name",
+]
+holds = """
+The maintainer/bot allowlist must keep WORKING -- emptying it would demand a signature on every
+maintainer push. What is asserted is its SHAPE: an enumeration, never a glob, because `bot*` would let
+any human whose username begins with "bot" skip signing (review low-28). And the context must still
+resolve to a real job, which is the opposite failure from the one planted above.
+"""
+green = [
+  "tests/test_merge_gate_controls.py::test_the_cla_allowlist_is_an_enumeration_and_not_a_glob",
+  "tests/test_required_contexts.py::test_every_required_context_matches_a_real_job",
+]
+observed = """
+The job key is `cla`, it declares no `name:`, it runs on pull_request_target, and the allowlist is a
+three-name enumeration. The wrong string was live in two files for months and is now refused by a test.
+"""
+
+# --- backlog-hygiene.yml ---------------------------------------------------------------------------
+
+[[control]]
+context = "a PR that implements BACKLOG #N must update BACKLOG.md"
+plants = """
+A synthetic repository shaped like the PR this gate exists to police: a branch that claims
+`BACKLOG #42` and changes engine code and nothing else, while `main` has separately moved
+docs/BACKLOG.md since the branch point. The gate's OWN shell is lifted out of the workflow and run
+against it -- not a re-implementation, which would be a second copy free to agree with itself.
+"""
+red = [
+  "tests/test_merge_gate_controls.py::test_the_backlog_hygiene_gate_fails_a_code_pr_that_leaves_the_ledger_alone",
+  "tests/test_merge_gate_controls.py::test_the_two_dot_form_of_the_gate_passes_the_same_planted_pull_request",
+]
+holds = """
+Four benign shapes must stay green: no claim at all, a claim honoured in the live ledger, a claim
+honoured in the ARCHIVE (an item retired between the claim and the PR), and a bare `#42`, which is a PR
+number in this repo rather than an item. A gate that failed all four would satisfy the planted case and
+block every pull request in the repository.
+"""
+green = [
+  "tests/test_merge_gate_controls.py::test_the_backlog_hygiene_gate_leaves_the_benign_shapes_alone"
+]
+observed = """
+RUN AGAINST THE PRE-FIX GATE, which is what makes this evidence rather than a claim. The identical
+fixture goes RED (exit 1) through the shipped three-dot diff and GREEN (exit 0) with only the diff form
+reverted to two-dot. That reproduces the recorded defect exactly: the two-dot form reports main-side
+changes as reverse deltas, so any main-side edit to docs/BACKLOG.md credited every PR with an older
+base, and the gate went green while enforcing nothing -- on precisely the population it polices.
+"""

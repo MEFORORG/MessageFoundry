@@ -161,6 +161,13 @@ def test_extensionless_config_is_code_and_gitattributes_was_not_before(
         ".github/workflows/ci.yml",
         "pyproject.toml",
         ".gitignore",  # BACKLOG #327 — deliberately code, and it has no code-ish extension
+        # BACKLOG #1000. The negative-control reconciliation runs under pytest, which is gated on
+        # `code == 'true'` — the same coupling that let a #320 banner merge without the suite
+        # compiling. Its decay mode is a context arriving in branch protection and being mirrored
+        # into `.github/required-contexts.txt`, so these two paths MUST classify as code or the gate
+        # is skipped on exactly the pull request shape it exists for. The first is extensionless.
+        ".github/required-contexts.txt",
+        "tests/negative_controls.toml",
     ],
 )
 def test_code_paths_run_the_suite(path: str, pats: tuple[str, str, str]) -> None:

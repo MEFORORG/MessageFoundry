@@ -1,0 +1,623 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
+"""Negative controls for the required merge contexts that had none (BACKLOG #1000).
+
+A GATE NOBODY HAS WATCHED FAIL IS AN ASSUMPTION WEARING A GREEN TICK. Thirteen contexts are the entire
+merge gate, and several of them were guarded only by the property that they exist. This file supplies
+the missing plant-and-observe controls; ``tests/negative_controls.toml`` records which control belongs
+to which context and ``tests/test_negative_controls.py`` fails when a context has none.
+
+EVERY CONTROL HERE IS ASYMMETRIC, and that is the part most likely to be skipped. It is not enough that
+neutering a rule turns a control red -- the control must fail for exactly the shapes that rule covers
+and KEEP PASSING for the shapes some other layer catches, or it cannot tell you which layer does the
+work. Measured 2026-08-05 on a different guard: a fix believed to cover two NTFS alternate-data-stream
+spellings turned out to be load-bearing for exactly one, and the eight-case control that reddened on
+only one of them is what said so. A uniform red would have flattered the code and taught nothing.
+
+So each control below is paired: a planted violation the gate must see, and a benign neighbour it must
+leave alone. Where the gate's own detector is what is being checked, the detector is additionally run
+against a synthetic NEUTERED form of the shipped command and observed firing -- otherwise "the shipped
+command is clean" is indistinguishable from "the detector matches nothing".
+
+WHAT IS NOT HERE, said plainly. The scanner gates (bandit, gitleaks, npm-audit, pip-audit, semgrep) run
+third-party binaries that this suite does not install, so what is asserted here is the property those
+jobs can lose SILENTLY: an enforcement flag removed, a severity floor added, an allowlist widened until
+it swallows the class. The scanners' detection itself is exercised inside their own CI jobs -- semgrep
+by ``scripts/ci/assert_semgrep_handler_taint.py`` over annotated fixtures, pip-audit's slopsquat half by
+``tests/test_new_dependency_check.py`` -- and the registry records which is which rather than letting
+the two read as one.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from tests._workflow_contexts import ROOT, jobs_of, load_workflow
+
+_TIMEOUT = 300
+
+
+# ===================================================================================================
+# Child processes. PIN THE CHILD'S ENVIRONMENT -- do not inherit it.
+# ===================================================================================================
+def _child_env(**extra: str) -> dict[str, str]:
+    """A minimal, EXPLICIT environment for a child process.
+
+    Measured in wave 2 of this backlog pass: a lane's new test passed in its author's shell and failed
+    at integration, because that shell happened to export ``PYTHONIOENCODING=utf-8`` while the test
+    pinned only the PARENT's decoding. It would have passed ubuntu and reddened the Windows legs. So
+    nothing is inherited here except what a child genuinely cannot run without, and the two variables
+    that incident turned on are set EXPLICITLY rather than passed through.
+
+    ``LC_ALL=C`` and the ``GIT_CONFIG_*`` overrides exist for the same reason one level over: a global
+    ``core.autocrlf``, a global hooks path, or a locale that reorders ``grep`` output would otherwise
+    make the result a fact about this machine.
+    """
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "LC_ALL": "C",
+        "LANG": "C",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+        "GIT_AUTHOR_NAME": "negative control",
+        "GIT_AUTHOR_EMAIL": "control@example.invalid",
+        "GIT_COMMITTER_NAME": "negative control",
+        "GIT_COMMITTER_EMAIL": "control@example.invalid",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    # Windows: a child python cannot start without these, and they carry no behaviour of their own.
+    for name in ("SYSTEMROOT", "SystemRoot", "COMSPEC", "TEMP", "TMP", "WINDIR", "PATHEXT"):
+        if name in os.environ:
+            env[name] = os.environ[name]
+    env.update(extra)
+    return env
+
+
+def _run(argv: list[str], cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
+    """Run a child and return RAW BYTES.
+
+    Decoding is done by the caller with ``errors="replace"``. A child whose output cannot be decoded
+    under the ambient code page must not be able to turn an assertion about an EXIT CODE into a
+    ``UnicodeDecodeError`` -- that failure mode is a property of the console, not of the gate.
+    """
+    return subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
+        argv, cwd=str(cwd), env=env, capture_output=True, timeout=_TIMEOUT, check=False
+    )
+
+
+def _text(proc: subprocess.CompletedProcess[bytes]) -> str:
+    return (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
+
+
+# ===================================================================================================
+# `CI gate` -- the roll-up that is the ONLY way six path-gated legs reach branch protection.
+# ===================================================================================================
+def _ci_gate_job() -> dict[str, Any]:
+    return jobs_of("ci.yml")["ci-gate"]
+
+
+def _rollup_fail_condition() -> str:
+    for step in _ci_gate_job().get("steps", []):
+        if "if" in step and "needs" in str(step.get("if", "")):
+            return str(step["if"])
+    raise AssertionError(
+        "ci.yml's `ci-gate` job has no step conditioned on `needs.*.result`. The roll-up is the only "
+        "path by which six path-gated legs reach branch protection; without that condition it reports "
+        "success unconditionally."
+    )
+
+
+def _terminal_states(condition: str) -> set[str]:
+    """The `needs.*.result` values the roll-up's condition fires on, read off the workflow."""
+    return set(re.findall(r"contains\(\s*needs\.\*\.result\s*,\s*'([a-z]+)'\s*\)", condition))
+
+
+def _rollup_fires(condition: str, results: list[str]) -> bool:
+    """`contains(needs.*.result, X) || contains(needs.*.result, Y)` over a synthetic results vector."""
+    return any(r in _terminal_states(condition) for r in results)
+
+
+def test_the_ci_gate_rollup_fires_on_a_failed_or_cancelled_leg() -> None:
+    """PLANTED: one gated leg reports `failure`, then `cancelled`. The roll-up must fire on both.
+
+    `CI gate` is required BECAUSE the six legs behind it cannot be: a path-gated job does not report on
+    a PR that touches none of its paths, which wedges every such PR forever. So the roll-up is the only
+    thing that turns a red sqlserver-store, postgres-store, load-test, load-test-sqlserver or
+    windows-service-smoke into a blocked merge.
+    """
+    condition = _rollup_fail_condition()
+    states = _terminal_states(condition)
+    assert states == {"failure", "cancelled"}, (
+        f"the roll-up fires on {sorted(states)}. `failure` alone lets a CANCELLED leg -- which is what a "
+        f"timed-out or infrastructure-killed run reports -- pass the merge gate. Condition: {condition!r}"
+    )
+    for planted in ("failure", "cancelled"):
+        results = ["success", "success", "skipped", "success", "skipped", planted]
+        assert _rollup_fires(condition, results), (
+            f"a gated leg reporting {planted!r} does not fire the roll-up: {condition!r}"
+        )
+    step = next(s for s in _ci_gate_job()["steps"] if s.get("if") == condition)
+    assert "exit 1" in str(step.get("run", "")), (
+        "the roll-up's failing step does not `exit 1`, so the condition fires and the job still "
+        "reports success"
+    )
+
+
+def test_the_ci_gate_rollup_stays_green_when_every_gated_leg_skipped() -> None:
+    """THE ASYMMETRY, and it is the case that actually happens.
+
+    Almost every PR touches none of the six gated paths, so all six SKIP. A roll-up that failed on
+    `skipped` would block every ordinary PR -- .github/required-contexts.txt records the run where all
+    six skipped and `CI gate` still returned success, which is what made requiring it safe. A control
+    that reddened on everything would have destroyed that property while looking stronger.
+    """
+    condition = _rollup_fail_condition()
+    assert not _rollup_fires(condition, ["skipped"] * 6)
+    assert not _rollup_fires(condition, ["success"] * 6)
+    assert not _rollup_fires(condition, ["success", "skipped", "skipped", "success", "skipped"])
+
+
+def test_the_rollup_reader_reports_a_condition_that_dropped_cancelled() -> None:
+    """NEGATIVE CONTROL OF THE CONTROL. Without it, "the shipped condition is fine" and "the reader
+    matches nothing" are the same green."""
+    neutered = "contains(needs.*.result, 'failure')"
+    assert _terminal_states(neutered) == {"failure"}
+    assert not _rollup_fires(neutered, ["cancelled"]), (
+        "the reader cannot see a dropped terminal state"
+    )
+    assert _rollup_fires(_rollup_fail_condition(), ["cancelled"]), (
+        "...and it does see the shipped one, so the assertion above is about the workflow rather than "
+        "about the reader"
+    )
+
+
+def test_the_ci_gate_rollup_still_covers_every_leg_it_is_required_for() -> None:
+    """A leg dropped from `needs:` leaves branch protection with no path to it at all -- the roll-up
+    keeps reporting success and the leg's failures stop mattering, silently."""
+    needs = set(_ci_gate_job().get("needs", []))
+    gated = {
+        "sqlserver-store",
+        "postgres-store",
+        "load-test",
+        "load-test-sqlserver",
+        "windows-service-smoke",
+    }
+    missing = sorted(gated - needs)
+    print(f"[#1000] ci-gate needs: {sorted(needs)}")
+    assert not missing, (
+        f"these gated legs are no longer behind the roll-up: {missing}. They cannot be required "
+        "directly (a path-gated job does not report on a PR that misses its paths), so nothing on the "
+        "merge path would notice them going red."
+    )
+
+
+# ===================================================================================================
+# `test (<os>, py3.14)` -- can the test legs go red at all?
+# ===================================================================================================
+_FAILING_FIXTURE = "def test_planted_failure():\n    assert 1 == 2, 'planted'\n"
+_PASSING_FIXTURE = "def test_planted_pass():\n    assert 1 == 1\n"
+
+
+def _run_pytest_on(fixture: str, tmp_path: Path, **env_extra: str) -> int:
+    """Run a child pytest over ONE fixture file, outside this repository's rootdir.
+
+    The assertion is on the EXIT CODE only. Exit codes are encoding-independent, which is the point:
+    the wave-2 incident this guards against turned on a child's stdout ENCODING, and an assertion that
+    reads the child's text is exactly the assertion that inherits it.
+    """
+    work = tmp_path / f"probe_{abs(hash(fixture)) % 10000}"
+    work.mkdir()
+    (work / "test_probe.py").write_text(fixture, encoding="utf-8")
+    proc = _run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(work)],
+        cwd=work,
+        env=_child_env(**env_extra),
+    )
+    print(f"[#1000] child pytest exit={proc.returncode} env_extra={env_extra}")
+    return proc.returncode
+
+
+def test_a_failing_test_makes_the_pytest_leg_exit_nonzero(tmp_path: Path) -> None:
+    """PLANTED: a test that cannot pass. The runner must exit non-zero, or the three `test` contexts --
+    the largest block of the merge gate -- are decoration.
+
+    This is not hypothetical plumbing. BACKLOG #1000 records the measured case one layer over: running
+    an emitted command via `pwsh -File script.ps1` returns 0 even when the script inside died at
+    parameter binding, so every execution assertion built on that return code was vacuously green. It
+    was found only by writing a control that had to fail and watching it pass.
+    """
+    assert _run_pytest_on(_FAILING_FIXTURE, tmp_path) != 0, (
+        "a deliberately failing test did not make pytest exit non-zero"
+    )
+
+
+def test_a_passing_fixture_leaves_the_pytest_leg_green(tmp_path: Path) -> None:
+    """THE ASYMMETRY. A runner that exited non-zero unconditionally would satisfy the control above
+    while blocking every PR, and nothing would say which of the two it was."""
+    assert _run_pytest_on(_PASSING_FIXTURE, tmp_path) == 0
+
+
+def test_the_pytest_exit_code_does_not_depend_on_the_ambient_encoding(tmp_path: Path) -> None:
+    """PROVEN UNDER A HOSTILE AMBIENT VALUE, not merely a favourable one.
+
+    A control that only ever ran under `PYTHONIOENCODING=utf-8` proves nothing about the Windows legs,
+    where the ambient value is whatever the console code page says. Both probes are re-run with the
+    child pinned to a HOSTILE encoding; the exit codes must be identical, because they are the only
+    thing asserted.
+    """
+    assert _run_pytest_on(_FAILING_FIXTURE, tmp_path, PYTHONIOENCODING="ascii", PYTHONUTF8="0") != 0
+    assert _run_pytest_on(_PASSING_FIXTURE, tmp_path, PYTHONIOENCODING="ascii", PYTHONUTF8="0") == 0
+
+
+# ===================================================================================================
+# `a PR that implements BACKLOG #N must update BACKLOG.md` -- the gate that went green enforcing
+# nothing, run as the SHIPPED SHELL against a synthetic repository.
+# ===================================================================================================
+_HYGIENE_JOB = "banner-on-implementation"
+
+
+def _hygiene_script() -> str:
+    steps = jobs_of("backlog-hygiene.yml")[_HYGIENE_JOB]["steps"]
+    script = next(str(s["run"]) for s in steps if "run" in s)
+    assert "BASE_SHA...$HEAD_SHA" in script or "$BASE_SHA...$HEAD_SHA" in script, (
+        "backlog-hygiene.yml's diff is no longer three-dot. The two-dot form reports main-side changes "
+        "as reverse deltas, which credited every PR with an older base for a docs/BACKLOG.md edit it "
+        "never made -- the gate went green while enforcing nothing."
+    )
+    return script
+
+
+def _require_bash() -> str:
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover - every CI leg has bash
+        pytest.fail(
+            "bash is required to run backlog-hygiene.yml's own script. This is a FAILURE and not a "
+            "skip on purpose: ci.yml sets `defaults.run.shell: bash` on every OS, so a leg without "
+            "bash could not run the gate this control exists to exercise, and a skip there would be a "
+            "green that proves nothing."
+        )
+    return bash
+
+
+def _fixture_repo(tmp_path: Path, env: dict[str, str]) -> tuple[Path, str, str, str]:
+    """A repository shaped like the PR the gate exists to police.
+
+    ``A`` is the merge base. ``B`` is the PR head: it changes engine code and NOTHING else. ``C`` is
+    main moving on AFTER the branch point, touching only ``docs/BACKLOG.md`` -- the shape the archive
+    move produced in bulk, and the shape the two-dot diff mis-credited.
+    """
+    repo = tmp_path / "fixture"
+    (repo / "messagefoundry").mkdir(parents=True)
+    (repo / "docs").mkdir()
+    _run(["git", "init", "-b", "main", "."], repo, env)
+    (repo / "messagefoundry" / "engine.py").write_text("x = 1\n", encoding="utf-8")
+    (repo / "docs" / "BACKLOG.md").write_text("# ledger\n", encoding="utf-8")
+    _run(["git", "add", "."], repo, env)
+    _run(["git", "commit", "-m", "A"], repo, env)
+    base_a = _text(_run(["git", "rev-parse", "HEAD"], repo, env)).strip()
+
+    _run(["git", "checkout", "-b", "pr"], repo, env)
+    (repo / "messagefoundry" / "engine.py").write_text("x = 2\n", encoding="utf-8")
+    _run(["git", "commit", "-am", "B: engine only"], repo, env)
+    head_b = _text(_run(["git", "rev-parse", "HEAD"], repo, env)).strip()
+
+    _run(["git", "checkout", "main"], repo, env)
+    (repo / "docs" / "BACKLOG.md").write_text("# ledger\n\nmain moved on\n", encoding="utf-8")
+    _run(["git", "commit", "-am", "C: main-side ledger edit"], repo, env)
+    base_c = _text(_run(["git", "rev-parse", "HEAD"], repo, env)).strip()
+    _run(["git", "checkout", "pr"], repo, env)
+    assert base_a and head_b and base_c and len({base_a, head_b, base_c}) == 3
+    return repo, base_c, head_b, base_a
+
+
+def _run_hygiene(
+    script: str, repo: Path, env: dict[str, str], *, title: str, body: str, base: str, head: str
+) -> tuple[int, str]:
+    path = repo / "gate.sh"
+    path.write_text(script, encoding="utf-8", newline="\n")
+    proc = _run(
+        [_require_bash(), str(path)],
+        repo,
+        {**env, "PR_TITLE": title, "PR_BODY": body, "BASE_SHA": base, "HEAD_SHA": head},
+    )
+    return proc.returncode, _text(proc)
+
+
+@pytest.fixture
+def hygiene(tmp_path: Path) -> tuple[str, Path, dict[str, str], str, str]:
+    env = _child_env(
+        HOME=str(tmp_path),
+        GIT_CONFIG_GLOBAL=str(tmp_path / "gitconfig"),
+        GIT_CONFIG_SYSTEM=str(tmp_path / "gitconfig"),
+    )
+    (tmp_path / "gitconfig").write_text("", encoding="utf-8")
+    repo, base_c, head_b, _base_a = _fixture_repo(tmp_path, env)
+    return _hygiene_script(), repo, env, base_c, head_b
+
+
+def test_the_backlog_hygiene_gate_fails_a_code_pr_that_leaves_the_ledger_alone(
+    hygiene: tuple[str, Path, dict[str, str], str, str],
+) -> None:
+    """PLANTED: a PR that claims `BACKLOG #42`, changes engine code, and never touches the ledger --
+    while main has separately moved docs/BACKLOG.md since the branch point.
+
+    That last clause is the whole point. The gate computed its changed-file list with a two-dot
+    `git diff "$BASE_SHA" "$HEAD_SHA"`, which reports main-side changes as REVERSE deltas, so any
+    main-side edit to docs/BACKLOG.md credited every PR with an older base. It went green while
+    enforcing nothing, on exactly the population it exists to police.
+    """
+    script, repo, env, base, head = hygiene
+    code, out = _run_hygiene(
+        script, repo, env, title="feat: something (BACKLOG #42)", body="", base=base, head=head
+    )
+    print(f"[#1000] shipped three-dot gate exit={code}\n{out}")
+    assert code == 1, f"the gate passed a PR it exists to fail. exit={code}\n{out}"
+    assert "does not\ntouch docs/BACKLOG.md" in out or "docs/BACKLOG.md" in out
+
+
+def test_the_two_dot_form_of_the_gate_passes_the_same_planted_pull_request(
+    hygiene: tuple[str, Path, dict[str, str], str, str],
+) -> None:
+    """RUN AGAINST THE PRE-FIX GATE, which is what makes the control above evidence rather than a
+    claim. The identical fixture, with only the diff form reverted, must go GREEN.
+
+    If both forms failed, the fixture would be proving something else -- and the recorded defect would
+    be unreproduced.
+    """
+    script, repo, env, base, head = hygiene
+    pre_fix = script.replace('"$BASE_SHA...$HEAD_SHA"', '"$BASE_SHA" "$HEAD_SHA"')
+    assert pre_fix != script, (
+        "the two-dot substitution matched nothing, so this test compares the shipped gate with itself"
+    )
+    code, out = _run_hygiene(
+        pre_fix, repo, env, title="feat: something (BACKLOG #42)", body="", base=base, head=head
+    )
+    print(f"[#1000] pre-fix two-dot gate exit={code}\n{out}")
+    assert code == 0, (
+        "the two-dot form no longer reproduces the recorded defect, so the three-dot assertion above "
+        f"is not measuring what it says. exit={code}\n{out}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "title", "body", "touch"),
+    [
+        ("no claim at all", "chore: tidy", "", None),
+        ("claims and updates the ledger", "feat (BACKLOG #42)", "", "docs/BACKLOG.md"),
+        (
+            "claims and updates an ARCHIVED item",
+            "feat (BACKLOG #42)",
+            "",
+            "docs/archive/backlog/x.md",
+        ),
+        ("a bare #42 is a PR number, not a claim", "fix for #42", "see #42", None),
+    ],
+)
+def test_the_backlog_hygiene_gate_leaves_the_benign_shapes_alone(
+    hygiene: tuple[str, Path, dict[str, str], str, str],
+    case: str,
+    title: str,
+    body: str,
+    touch: str | None,
+) -> None:
+    """THE ASYMMETRY, four shapes wide.
+
+    A gate that failed everything would satisfy the planted case and block every PR in the repo. Each
+    row is a shape the rule deliberately does NOT break: no claim, a claim honoured in the live ledger,
+    a claim honoured in the ARCHIVE (an item retired between the claim and the PR), and the `#42`
+    spelling that is a PR number in this repo rather than an item.
+    """
+    script, repo, env, base, head = hygiene
+    if touch:
+        target = repo / touch
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("banner\n", encoding="utf-8")
+        _run(["git", "add", "-A"], repo, env)
+        _run(["git", "commit", "-m", f"branch-side {touch}"], repo, env)
+        head = _text(_run(["git", "rev-parse", "HEAD"], repo, env)).strip()
+    code, out = _run_hygiene(script, repo, env, title=title, body=body, base=base, head=head)
+    print(f"[#1000] benign case {case!r} exit={code}")
+    assert code == 0, f"the gate failed a benign PR shape ({case}). exit={code}\n{out}"
+
+
+# ===================================================================================================
+# `gitleaks (secret scan)` -- the allowlist is the neutering path a scope test cannot see.
+# ===================================================================================================
+_GITLEAKS = ROOT / ".gitleaks.toml"
+
+
+def _gitleaks_allowlist_regexes() -> list[str]:
+    parsed = tomllib.loads(_GITLEAKS.read_text(encoding="utf-8"))
+    return [str(r) for r in (parsed.get("allowlist") or {}).get("regexes", [])]
+
+
+def _fabricated_secrets() -> list[str]:
+    """Credential-shaped strings ASSEMBLED AT RUNTIME.
+
+    Never committed as literals: gitleaks scans this repository and cannot tell a well-known test
+    vector from a live credential -- the sibling redaction suite already had a fixture rejected for
+    exactly that, correctly. Assembling from parts keeps the scanner useful on this file.
+    """
+    hexish = "0123456789abcdef" * 3
+    return [
+        "AKIA" + "Q" * 16,
+        "ghp_" + "z" * 36,
+        "xoxb-" + "1" * 12 + "-" + "2" * 24,
+        "-----BEGIN " + "RSA PRIVATE KEY-----",
+        hexish[:40],
+        "postgres://svc:" + "P" * 24 + "@db.invalid:5432/x",
+    ]
+
+
+def _swallowing(regexes: list[str], corpus: list[str]) -> list[str]:
+    return [r for r in regexes if any(re.search(r, s) for s in corpus)]
+
+
+def test_no_gitleaks_allowlist_regex_swallows_a_fabricated_secret() -> None:
+    """PLANTED: six credential shapes gitleaks' default ruleset exists to catch.
+
+    ``.gitleaks.toml`` is the one place this required context can be disabled without touching a
+    workflow: an allowlist entry broad enough to match a real credential turns the gate green while it
+    keeps scanning. Every shipped entry is deliberately a LITERAL or a tightly bounded pattern, and
+    this is the assertion that keeps it that way.
+    """
+    regexes = _gitleaks_allowlist_regexes()
+    print(
+        f"[#1000] scanned {len(regexes)} gitleaks allowlist regexes against "
+        f"{len(_fabricated_secrets())} fabricated credential shapes"
+    )
+    assert regexes, (
+        ".gitleaks.toml parsed to ZERO allowlist regexes -- the format changed under this"
+    )
+    swallowed = _swallowing(regexes, _fabricated_secrets())
+    assert not swallowed, (
+        f"these allowlist regexes match a fabricated credential: {swallowed}. NEVER allowlist a real "
+        "secret; a broad entry here neuters a required context with no workflow edit at all."
+    )
+
+
+def test_the_allowlist_narrowness_detector_fires_on_a_planted_broad_regex() -> None:
+    """NEGATIVE CONTROL OF THE CONTROL, and the ASYMMETRY.
+
+    "The shipped allowlist is narrow" and "the detector matches nothing" are the same green. Two broad
+    patterns are planted and must be caught; the shipped entries must stay clean in the same call, so
+    the control is not merely demanding an empty allowlist -- which would delete a legitimate,
+    documented set of non-secret fixtures.
+    """
+    planted = [r".{8,}", r"[A-Za-z0-9_/+-]{20,}"]
+    assert _swallowing(planted, _fabricated_secrets()) == planted, (
+        "the detector cannot see a broad regex"
+    )
+    assert not _swallowing(_gitleaks_allowlist_regexes(), _fabricated_secrets())
+
+
+def test_the_gitleaks_config_still_extends_the_default_ruleset() -> None:
+    """`useDefault = false` empties the ruleset and the job then scans for the project's own rules
+    only -- of which there are none. It reports success in seconds."""
+    parsed = tomllib.loads(_GITLEAKS.read_text(encoding="utf-8"))
+    assert parsed.get("extend", {}).get("useDefault") is True, (
+        ".gitleaks.toml no longer extends the default ruleset; the secret scan has nothing to match"
+    )
+
+
+# ===================================================================================================
+# `bandit (Python SAST)` and `npm-audit` -- a severity floor mutes a gate without touching its scope.
+# ===================================================================================================
+def _step_run(workflow: str, job: str, name_fragment: str) -> str:
+    for step in jobs_of(workflow)[job].get("steps", []):
+        if name_fragment in str(step.get("name", "")):
+            return str(step.get("run", ""))
+    raise AssertionError(f"{workflow}:{job} has no step named like {name_fragment!r}")
+
+
+#: Flags that keep a scanner running while discarding part of what it finds. NOT the `|| true` family
+#: (tests/test_security_posture.py owns that) -- these leave the exit code intact and shrink the input
+#: to it, which a neutering scan looking for added idioms cannot see.
+_MUTING_FLAGS = {
+    "bandit": (
+        r"(?<!\w)-l{1,3}(?!\w)",
+        r"--severity-level(?!\s+low)",
+        r"--confidence-level",
+        r"--exit-zero",
+    ),
+    "npm": (r"--audit-level", r"--omit(?!\s*$)", r"--production"),
+}
+
+
+def _muted(command: str, family: str) -> list[str]:
+    body = "\n".join(line for line in command.splitlines() if not line.lstrip().startswith("#"))
+    return [p for p in _MUTING_FLAGS[family] if re.search(p, body)]
+
+
+def test_the_bandit_invocation_carries_no_severity_or_confidence_floor() -> None:
+    """PLANTED via the detector: `bandit -ll` reports only MEDIUM and above and still exits non-zero
+    on what is left, so the job stays green-looking and blocking while it stops reporting a whole
+    severity band. The scope test next door asks WHAT it is pointed at; this asks what it keeps."""
+    command = _step_run("security.yml", "bandit", "Scan source for insecure patterns")
+    found = _muted(command, "bandit")
+    print(f"[#1000] bandit invocation scanned for {len(_MUTING_FLAGS['bandit'])} muting flags")
+    assert not found, (
+        f"the bandit invocation carries {found}, which discards findings while the required context "
+        f"keeps reporting success. Command: {command!r}"
+    )
+
+
+def test_the_npm_audit_invocation_carries_no_severity_floor() -> None:
+    """`npm audit --audit-level=high` exits 0 on moderate advisories. security.yml's own comment says
+    the default level "fails on ANY severity, matching pip-audit's strict posture" -- this is the
+    assertion that keeps that sentence true."""
+    command = _step_run("security.yml", "npm-audit", "Audit the locked npm dependencies")
+    found = _muted(command, "npm")
+    assert not found, f"the npm audit invocation carries {found}: {command!r}"
+
+
+def test_the_muting_detector_fires_on_a_synthetic_floor() -> None:
+    """NEGATIVE CONTROL OF THE CONTROL, plus the ASYMMETRY that matters here: the detector must NOT
+    fire on the reviewed `--skip B101,...` list, which is a per-check exclusion with a stated reason
+    for each entry -- not a severity floor. A detector that flagged it would be "fixed" by deleting a
+    correct annotation."""
+    assert _muted("bandit -r . -ll --skip B101", "bandit") == [r"(?<!\w)-l{1,3}(?!\w)"]
+    assert _muted("npm audit --package-lock-only --audit-level=high", "npm") == [r"--audit-level"]
+    assert _muted("bandit -r . --skip B101,B110,B311,B404,B608 --exclude ./tests", "bandit") == []
+    assert _muted("npm audit --package-lock-only", "npm") == []
+
+
+# ===================================================================================================
+# `npm-audit` again -- the lockfile it audits has to exist, or `--package-lock-only` audits nothing.
+# ===================================================================================================
+def test_the_npm_audit_target_lockfile_exists() -> None:
+    """`npm audit --package-lock-only` reads the committed lockfile. Without it the job errors or
+    audits an empty tree, and `working-directory: ide` is the only thing pointing it at one."""
+    workflow = load_workflow("security.yml")
+    job = workflow["jobs"]["npm-audit"]
+    workdir = str(((job.get("defaults") or {}).get("run") or {}).get("working-directory", ""))
+    assert workdir, "the npm-audit job lost its working-directory; it would audit the repo root"
+    lock = ROOT / workdir / "package-lock.json"
+    assert lock.is_file(), f"{lock} does not exist, so --package-lock-only has nothing to audit"
+
+
+# ===================================================================================================
+# `cla` -- the context string IS the control surface, and it has been wrong in this repo before.
+# ===================================================================================================
+def test_the_cla_job_still_reports_under_the_job_key_and_not_the_workflow_name() -> None:
+    """PLANTED historically, not synthetically: docs/CI.md and cla.yml both told a reader to require
+    "CLA Assistant" -- the WORKFLOW name, which matches no status check. Adding it to branch
+    protection would have wedged every PR forever.
+
+    The detection this gate performs lives entirely in a third-party action, so what is controllable
+    here is whether the context can report at all: the job must declare no `name:` (making the context
+    its KEY, `cla`) and must run on a pull-request trigger.
+    """
+    jobs = jobs_of("cla.yml")
+    assert "cla" in jobs, f"cla.yml's job key is no longer `cla`: {sorted(jobs)}"
+    assert "name" not in jobs["cla"], (
+        "the cla job declared a `name:`, which changes its status-check context string. Branch "
+        "protection still requires `cla`, so the context would never report and every PR would wedge."
+    )
+    workflow = load_workflow("cla.yml")
+    triggers = workflow.get("on") or workflow.get(True) or {}
+    assert "pull_request_target" in triggers or "pull_request" in triggers, (
+        f"cla.yml has no pull-request trigger ({sorted(triggers)}), so the required `cla` context can "
+        "never report -- the required-but-absent trap"
+    )
+
+
+def test_the_cla_allowlist_is_an_enumeration_and_not_a_glob() -> None:
+    """THE ASYMMETRY, and a recorded finding rather than a hypothetical: a `bot*` glob would let any
+    human whose username begins with "bot" skip signing (review low-28). The allowlist is legitimate
+    and must keep working -- so this asserts its SHAPE, not its absence."""
+    step = next(s for s in jobs_of("cla.yml")["cla"]["steps"] if "with" in s)
+    allowlist = str(step["with"]["allowlist"])
+    assert allowlist.strip(), (
+        "the CLA allowlist emptied; every maintainer push would need a signature"
+    )
+    assert "*" not in allowlist, f"the CLA allowlist contains a glob: {allowlist!r}"
