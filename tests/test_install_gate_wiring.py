@@ -333,3 +333,40 @@ def test_status_prints_a_sha_beside_each_version() -> None:
     assert re.search(r"\bv\d{4}\.\d{2}\.\d{2}\.\d+", src_line), (
         f"version label missing: {src_line!r}"
     )
+
+
+def test_a_hidden_account_dir_is_still_wired(tmp_path: Path) -> None:
+    """BACKLOG #1024, cross-platform arm. The writer's account-dir glob needs ``-Force``, and its
+    absence is INVISIBLE ON WINDOWS.
+
+    ``Get-ChildItem`` omits hidden entries without ``-Force``. On Linux the dot prefix *is* the hidden
+    convention, so the glob returns nothing and the wire set collapses to the single explicit
+    ``~/.claude`` candidate -- which is a ``Join-Path``, not a glob, and so survives. That is what the
+    ubuntu CI leg reported while every Windows run stayed green: on Windows a dot-prefixed directory
+    carries no hidden ATTRIBUTE, so the omission cannot fire.
+
+    This test makes the class reproducible on Windows by setting the attribute explicitly, so the
+    control can go red on the box the code is written on. Without it, the only instrument that can see
+    this defect is a CI leg -- and a check that cannot fail where you work is a claim, not a control.
+    """
+    names = [".claude", ".claude-account-1"]
+    home = _fake_home(tmp_path, names)
+
+    hidden = home / ".claude-account-1"
+    if os.name == "nt":
+        # FILE_ATTRIBUTE_HIDDEN. Fail loudly rather than skipping: a silent no-op here would restore
+        # exactly the blindness this test exists to remove.
+        rc = subprocess.run(
+            ["attrib", "+H", str(hidden)], capture_output=True, text=True, timeout=30
+        )
+        assert rc.returncode == 0, f"could not hide the fixture dir: {rc.stderr or rc.stdout}"
+    # On POSIX the leading dot already makes it hidden to PowerShell; nothing to do.
+
+    out = _status_against(home)
+    wired_lines = [ln for ln in out.splitlines() if ln.startswith("wiring      :")]
+    wired = {Path(ln.split(":", 1)[1].strip()).parent.name for ln in wired_lines}
+    assert ".claude-account-1" in wired, (
+        "a HIDDEN ~/.claude-account-N was not wired -- the writer's Get-ChildItem is missing -Force.\n"
+        f"  wired: {sorted(wired)}\n"
+        "  On Linux every dot-dir is hidden, so this is the whole account population, not an edge case."
+    )
