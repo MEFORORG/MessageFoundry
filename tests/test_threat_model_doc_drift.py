@@ -35,8 +35,8 @@ today's rows only (15.1.4 exhibited exactly that failure mode when pydicom/signx
 review checklist carries the "does this change introduce a new dangerous-functionality or
 resource-demanding surface?" question for that half.
 
-**Where the document is not present** (BACKLOG #1043). ``docs/security/**`` is deny-listed from the
-OSS mirror and vaulted, so on a public checkout the doc-CONTENT assertions have nothing to assert.
+**Where the document is not present** (BACKLOG #1043). ``docs/security/**`` is withheld from public
+checkouts (deny-listed and vaulted), so there the doc-CONTENT assertions have nothing to assert.
 They used to answer that with a bare ``pytest.skip``, which in a 12,000-test run is indistinguishable
 from a pass — a control that cannot report its own inertness (ADR 0158's class 2). Three changes:
 
@@ -291,8 +291,8 @@ def _announce_absence(path: Path) -> None:
     _ANNOUNCED = True
     warnings.warn(
         ThreatModelDocUnenforced(
-            f"{path} is absent from this checkout (docs/security/** is deny-listed from the OSS "
-            "mirror and vaulted), so EVERY doc-content assertion in "
+            f"{path} is absent from this checkout (docs/security/** is withheld from public "
+            "checkouts — deny-listed and vaulted), so EVERY doc-content assertion in "
             "tests/test_threat_model_doc_drift.py is INERT in this run: the heading/table structure, "
             "the 15.1.3 and 15.1.5 anchor registries, the planted-omission self-tests over the real "
             "document, the setting-name resolution, the doc side of the numeric parity loop, and the "
