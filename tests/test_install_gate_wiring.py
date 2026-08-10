@@ -285,6 +285,23 @@ def test_the_audit_stays_quiet_when_no_dir_outside_the_wire_set_carries_wiring(
     assert "scanned 2 config dir(s)" in out
 
 
+def test_an_empty_audit_population_says_nothing_was_examined(tmp_path: Path) -> None:
+    """The clean verdict must not be reachable when nothing was measured.
+
+    "I found nothing" and "I found things and they are all fine" print identically the moment a scan
+    reports only its verdict, and the second is the only one that is reassurance. This is the same
+    distinction presence.ps1 draws between an empty roster and an unavailable one, and the same one
+    #1000 is about, applied to this audit's own output.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    out = _status_against(home)
+    assert "NOTHING EXAMINED" in out
+    assert "That is not the same as 'no orphans'." in out
+    assert "every dir found is in the wire set above" not in out
+    assert "no unjudged dir carries gate wiring" not in out
+
+
 def test_status_prints_a_sha_beside_each_version() -> None:
     """`-Status` is the only way to see whether the RUNNING gate matches this checkout, and nothing
     exercised it. It also shipped a defect worth pinning: `$GateVersion` is bumped by hand, and rules 1a,

@@ -353,7 +353,14 @@ if ($Status) {
             Write-Host "              not judged: $($d.Name) ($why) -- carries no gate wiring"
         }
     }
-    if ($notJudged.Count -eq 0) {
+    # "I found nothing" and "I found things and they are all fine" are different sentences, and only the
+    # second is reassurance. Collapsing them is the failure this whole audit exists to remove, so an
+    # empty population says NOTHING WAS EXAMINED rather than borrowing the clean verdict below it.
+    if ($seen.Count -eq 0) {
+        Write-Host "              NOTHING EXAMINED -- no ~/.claude* dir under $HomeDir carries a settings.json," -ForegroundColor Yellow
+        Write-Host "              so this audit concluded nothing. That is not the same as 'no orphans'."
+    }
+    elseif ($notJudged.Count -eq 0) {
         Write-Host "              every dir found is in the wire set above; nothing is unjudged"
     }
     elseif ($orphans.Count -eq 0) {
