@@ -34,6 +34,8 @@ import {
   codesetList,
   configDir,
   isExecGated,
+  lensParseStdin,
+  lensRewriteStdin,
   lensSchema,
   messageSetsDir,
   runJson,
@@ -343,7 +345,9 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       let parse: LensParseResult | null = null;
       let error: string | null = null;
       try {
-        parse = await runJsonWithStdin<LensParseResult>(["lens", "parse", "-"], source, ws);
+        // At the contract this extension can RENDER, with a one-shot fallback for an older engine that
+        // does not know the flag (ADR 0076 §A.7 / §D.7 — skew is handled, not discovered).
+        parse = await lensParseStdin(source, ws);
       } catch (e) {
         error = e instanceof Error ? e.message : String(e);
       }
@@ -413,8 +417,10 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // send as stdin — that compares the buffer against itself and the guard always passes (the defect).
     const applyOne = async (msg: EditMessage): Promise<void> => {
       const spec = buildEditRequest(msg);
-      const res = await runWithStdin(
-        ["lens", "rewrite", "-", "--edit", JSON.stringify(spec)],
+      // At the SAME contract the rows were projected with — the engine re-locates the row through that
+      // grammar, so sending v2 coordinates into a v1 partition would miss it (or hit a different row).
+      const res = await lensRewriteStdin(
+        spec,
         document.getText(),
         workspaceDir(),
       );
@@ -475,11 +481,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       }
       let applied = false;
       try {
-        const res = await runWithStdin(
-          ["lens", "rewrite", "-", "--edit", JSON.stringify(spec)],
-          document.getText(),
-          workspaceDir(),
-        );
+        const res = await lensRewriteStdin(spec, document.getText(), workspaceDir());
         if (disposed) {
           return false;
         }

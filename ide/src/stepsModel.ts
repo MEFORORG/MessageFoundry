@@ -17,7 +17,19 @@ import type { TraceInvocation, TraceValue } from "./liveDebug";
 
 // ---- the `lens parse --json` contract (ADR 0076 §3; mirror of messagefoundry/lens.py output) --------
 
-export type RowKind = "action" | "lookup" | "control" | "send" | "code" | "diagnostic";
+export type RowKind =
+  | "action"
+  | "lookup"
+  | "control"
+  | "send"
+  | "code"
+  | "diagnostic"
+  // ADR 0076 Amendment A (#248): a run of standalone comment lines. Emitted only at contract 2 -- an
+  // engine asked for contract 1 never sends one, which is how an older IDE can never meet it (A.7).
+  | "note"
+  // ADR 0076 Amendment D (#232): a `@router`'s routing return. Carries HANDLER names, a different
+  // namespace from a send row's outbound-connection names at a different pipeline stage (D.5).
+  | "route";
 
 /** One row of a handler's Steps, exactly as `lens parse` emits it (§3). Fields are per-kind. */
 export interface LensRow {
@@ -61,6 +73,18 @@ export interface LensRow {
   // `return Send(...)`). It is NOT a return, so insert-after is allowed and it is a normal reorderable
   // step. Absent on every returned send + older contract (→ treated as a return, unchanged).
   appended?: boolean;
+  // note rows (Amendment A A.1) -- the comment body without its leading `#`, the physical line(s)
+  // verbatim, and whether it is a read-only pragma (fmt off / lint suppression / region). A run of
+  // lines joins with a newline; editing `text` re-renders each line from its OWN indent and `#` prefix.
+  text?: string;
+  raw?: string;
+  pragma?: boolean;
+  // route rows (Amendment D D.3) -- the selected handler names, and an additive `unrouted` flag for a
+  // routed-NOWHERE return (`return []` / `()` / `None` / bare `return`), which maps to the store
+  // disposition UNROUTED (logged, never dropped). A DYNAMIC return also has empty `handlers` but carries
+  // NO `unrouted`, so the two are distinguishable -- never key "routes nowhere" on emptiness.
+  handlers?: string[];
+  unrouted?: boolean;
   // ADR 0104 fan-out: the accumulator's managed scaffold — `"collector_init"` on `sends = []`,
   // `"return_collector"` on the bare `return sends` footer. A `code` row carrying this stays read-only
   // (the kind is unchanged); the webview renders it muted, and the footer counts as a return (insert-after
@@ -95,12 +119,53 @@ export interface LensHandler {
   // typeless handler / older contract omits them (→ generic, unscoped picker).
   accepts_types?: string[];
   inferred_type?: { code?: string; trigger?: string };
+  // ADR 0076 Amendment D -- which element this projection is. Absent on a contract-1 payload (which only
+  // ever carries handlers), so `role ?? "handler"` is the correct read everywhere.
+  role?: "handler" | "router";
+  // The contract version the engine actually emitted, echoed back so the view can tell a v2 engine from
+  // a v1 one without re-deriving it from the row kinds present.
+  contract_version?: number;
 }
 
 /** The whole-file `lens parse --json` payload: `{ module, handlers }` (see __main__._lens). */
 export interface LensParseResult {
   module: string;
   handlers: LensHandler[];
+}
+
+// ---- contract negotiation (ADR 0076 §A.7 / §D.7) ----------------------------------------------------
+//
+// `lens parse` emits no schema version of its own and the extension shells whatever `messagefoundry` is
+// on PATH, so BOTH skew directions are handled explicitly rather than discovered at render time:
+//
+//  * an OLDER extension meeting a NEWER engine passes no `--contract`, so the engine defaults to the
+//    shipped contract and never sends a kind that extension has no title for (it would render a blank,
+//    titleless row); and
+//  * a NEWER extension meeting an OLDER engine passes `--contract`, which that engine's argument parser
+//    rejects — so the CLI wrapper retries WITHOUT the flag and degrades to the v1 projection (no note
+//    rows, no router Steps) instead of surfacing an argument error.
+//
+// Both the constant and the predicate live here, in the vscode-free model module, so the negotiation is
+// unit-testable without the Extension Host.
+
+/** The row-contract version this extension can RENDER — the `note` + `route` kinds (Amendments A + D). */
+export const LENS_CONTRACT = 2;
+
+const UNKNOWN_ARG_RE = /unrecognized arguments?|no such option|unknown option|invalid choice/i;
+
+/**
+ * Whether CLI output is an argument parser rejecting a flag it does not know (argparse's wording, plus
+ * the common alternatives). Deliberately NARROW: a genuine refusal — a syntax error in the module, an
+ * unknown contract version, a stale row coordinate — must NOT match, or a real error would be silently
+ * retried away and reported as a downgrade.
+ */
+export function looksLikeUnknownArgument(text: string): boolean {
+  return UNKNOWN_ARG_RE.test(text);
+}
+
+/** {@link looksLikeUnknownArgument} over a thrown value (the `runJson*` failure path). */
+export function isUnknownArgumentError(err: unknown): boolean {
+  return looksLikeUnknownArgument(err instanceof Error ? err.message : String(err));
 }
 
 // ---- the row view-model the webview renders ---------------------------------------------------------
@@ -142,6 +207,9 @@ export interface RowViewModel {
   // A `return []` filter send — carried so the per-row "+ dest" button is hidden on it (fanning out a
   // "drop the message" step is not meaningful; use Add→Send). Absent on every other row.
   filtered?: boolean;
+  // A read-only PRAGMA note — carried so the webview greys its edit/delete controls rather than letting
+  // the user discover the engine's refusal as an error toast (F6). Absent on every other row.
+  pragma?: boolean;
   title: string;
   subtitle?: string;
   badge?: string; // e.g. "unrecognized" for a control whose test is outside the bounded grammar (§4)
@@ -284,8 +352,8 @@ function sliceSource(lines: string[], lineStart: number, lineEnd: number): strin
   return lines.slice(from - 1, to).join("\n");
 }
 
-/** The human title for a row (kind-specific). */
-function rowTitle(row: LensRow): string {
+/** The human title for a row (kind-specific). Exported so the kind coverage is directly testable. */
+export function rowTitle(row: LensRow): string {
   switch (row.kind) {
     case "action":
       return row.action ? (ACTION_LABELS[row.action] ?? humanizeIdentifier(row.action)) : "Action";
@@ -302,6 +370,14 @@ function rowTitle(row: LensRow): string {
       return row.filtered ? "Filter" : "Send";
     case "diagnostic":
       return row.call ? (DIAGNOSTIC_LABELS[row.call] ?? humanizeIdentifier(row.call)) : "Diagnostic";
+    case "note":
+      // Titled honestly as what it is. NOT "Note": no heuristic decides whether a comment is prose or
+      // commented-out code (A.5), so the row says "Comment" and shows the text verbatim.
+      return row.pragma ? "Pragma" : "Comment";
+    case "route":
+      // A routed-nowhere return reads as "Unrouted" (the store disposition), never "Filter" -- a router
+      // does not filter, and conflating the two would misdescribe what the engine records.
+      return row.unrouted ? "Unrouted" : "Route";
     case "code":
       // ADR 0104 fan-out scaffold — the managed accumulator boundary reads as a muted, non-actionable
       // step (still a read-only code row underneath).
@@ -356,7 +432,24 @@ function rowParams(row: LensRow): ParamField[] {
  * `_editable_slots` (operands render verbatim / read-only).
  */
 export function isRowEditable(kind: RowKind): boolean {
-  return kind === "action" || kind === "lookup" || kind === "send" || kind === "diagnostic";
+  return (
+    kind === "action" ||
+    kind === "lookup" ||
+    kind === "send" ||
+    kind === "diagnostic" ||
+    kind === "note" ||
+    kind === "route"
+  );
+}
+
+/**
+ * Whether a row is editable IN PRACTICE — {@link isRowEditable} on its kind, minus a PRAGMA note. A
+ * pragma (a formatter or lint suppression, a region marker) is functional code: the engine refuses
+ * set_params, delete_row and move_row on it (ADR 0076 A.4), so offering the controls would guarantee an
+ * error toast (F6). Everything that gates a control on editability keys on this, not on the kind alone.
+ */
+export function isRowMutable(row: { kind: RowKind; pragma?: boolean }): boolean {
+  return isRowEditable(row.kind) && row.pragma !== true;
 }
 
 /**
@@ -369,8 +462,14 @@ export function isRowEditable(kind: RowKind): boolean {
  * draggable + shows ↑/↓ on.
  */
 export function isRowMovable(row: LensRow): boolean {
+  // A `note` is NOT movable in v1: a comment is not a statement, so the engine has nothing to relocate,
+  // and ADR 0076 A.6 records that move/delete of a recognized row ALREADY re-attaches neighbouring
+  // comments to the wrong step — a movable note would render that misattribution as a confident caption.
+  if (row.kind === "note") {
+    return false;
+  }
   return (
-    isRowEditable(row.kind) ||
+    isRowMutable(row) ||
     (row.kind === "control" && (row.control === "if" || row.control === "for" || row.control === "raise"))
   );
 }
@@ -382,7 +481,7 @@ export function isRowMovable(row: LensRow): boolean {
  * (so the webview greys the trash to avoid an error toast, F6).
  */
 export function isRowDeletable(row: LensRow): boolean {
-  return isRowEditable(row.kind) || (row.kind === "control" && (row.control === "if" || row.control === "for"));
+  return isRowMutable(row) || (row.kind === "control" && (row.control === "if" || row.control === "for"));
 }
 
 /**
@@ -408,6 +507,15 @@ export function editableParamNames(row: LensRow): string[] {
   }
   if (row.kind === "send") {
     return (row.outbounds ?? []).length === 1 ? ["to"] : [];
+  }
+  // A note exposes its comment text; a pragma exposes nothing (the engine refuses the edit).
+  if (row.kind === "note") {
+    return row.pragma === true ? [] : ["text"];
+  }
+  // A route exposes its handler list — but only when the selection is STATIC. A dynamic return projects
+  // `handlers: []` with no `unrouted`, and editing that would flatten real code to a literal list.
+  if (row.kind === "route") {
+    return (row.handlers ?? []).length > 0 || row.unrouted === true ? ["handlers"] : [];
   }
   return [];
 }
@@ -458,6 +566,12 @@ export function buildRowViewModel(row: LensRow, index: number, lines: string[]):
   }
   if (row.kind === "code") {
     vm.code = sliceSource(lines, row.line_start, row.line_end);
+  }
+  // A note renders its own verbatim line(s) in the same read-only slot a code row uses, so an IDE that
+  // knows the kind shows the comment rather than a blank row.
+  if (row.kind === "note") {
+    vm.code = row.raw ?? sliceSource(lines, row.line_start, row.line_end);
+    vm.pragma = row.pragma === true;
   }
   return vm;
 }
@@ -1183,7 +1297,13 @@ export interface ContextMenuEnablement {
  * {@link walkMove} returning a destination, so a suite edge / non-movable / sole-child row greys them).
  */
 export function contextMenuEnablement(
-  row: { kind: RowKind; appended?: boolean; scaffold?: string; filtered?: boolean },
+  row: {
+    kind: RowKind;
+    appended?: boolean;
+    scaffold?: string;
+    filtered?: boolean;
+    pragma?: boolean;
+  },
   ctx: { canMoveUp: boolean; canMoveDown: boolean },
 ): ContextMenuEnablement {
   return {
@@ -1191,8 +1311,9 @@ export function contextMenuEnablement(
     // Insert AFTER is suppressed on a terminal return (a returned send OR the `return sends` footer) — a
     // step after it is dead code — but ALLOWED on a mid-body `sends.append(...)` (ADR 0104), which is a
     // normal step, not a return.
-    insertAfter: !isReturnRow(row),
-    deleteRow: isRowEditable(row.kind),
+    // A `route` row is a return too: a step after a routing return is dead code.
+    insertAfter: !isReturnRow(row) && row.kind !== "route",
+    deleteRow: isRowMutable(row),
     moveUp: ctx.canMoveUp,
     moveDown: ctx.canMoveDown,
     // ADR 0104 fan-out: add another destination — on any real send (returned or appended), never the filter.
@@ -2470,6 +2591,9 @@ export function renderRowHtml(row: RowViewModel, handlerName = "", schema?: OpSc
     // `data-scaffold` (the muted init/footer), `data-is-return` (the terminal-return test).
     `data-appended="${row.appended ? "true" : ""}" data-scaffold="${escapeHtml(row.scaffold ?? "")}" ` +
     `data-is-return="${row.isReturn ? "true" : ""}" data-filtered="${row.filtered ? "true" : ""}" ` +
+    // ADR 0076 Amendment A: a PRAGMA note is read-only, so the webview mirror greys its edit/delete/move
+    // controls rather than letting the user discover the engine's refusal as an error toast (F6).
+    `data-pragma="${row.pragma ? "true" : ""}" ` +
     // data-control (control rows only) lets the DnD layer include an elif/else CONTINUATION when it walks a
     // dropped-after block's body to find its visual bottom (the insertion-bar anchor, insertionBarAnchor).
     `data-control="${escapeHtml(row.control ?? "")}">` +
