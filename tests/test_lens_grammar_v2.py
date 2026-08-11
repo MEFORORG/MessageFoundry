@@ -659,9 +659,14 @@ def test_router_parse_and_rewrite_never_import_or_execute_the_module() -> None:
         ROUTER_PREAMBLE + 'raise RuntimeError("importing me would explode")\n\n\n'
         '@router("r")\ndef r(msg):\n    return ["h"]\n'
     )
+    # The top-level ``raise`` IS the proof, and it is the whole proof: if ``parse_source`` imported or
+    # executed this source instead of walking it with ``ast``, the RuntimeError would propagate and
+    # error this test outright. Do not add a ``sys.modules`` probe back here -- the one that stood here
+    # named ``messagefoundry_explosive_probe``, which nothing in the tree ever creates, so it could not
+    # fail; and a before/after snapshot of ``sys.modules`` would red on any unrelated lazy import,
+    # making it ordering-dependent rather than meaningful.
     entries = parse_source(source, module="explosive.py", contract=CONTRACT_V2)
     assert [e["handler"] for e in entries] == ["r"]
-    assert "messagefoundry_explosive_probe" not in sys.modules
     row = entries[0]["rows"][0]
     assert row["kind"] == "route"
     edit = {
