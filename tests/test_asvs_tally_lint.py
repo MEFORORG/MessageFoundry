@@ -271,3 +271,43 @@ def test_the_lint_runs_as_a_bare_script(tmp_path: Path) -> None:
     proc = subprocess.run(cmd, cwd=tmp_path, capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, f"rc={proc.returncode}\n{proc.stderr}"
     assert "--baseline" in proc.stdout
+
+
+# --- emphasis versus quotation: a backticked SPAN is a mention, not a use ------------------------
+#
+# The lint red on docs/BACKLOG.md #1012, whose closing banner QUOTES the falsification transcript
+# proving the bug it fixed. A lint against stale tallies fired on a demonstration that a tally was
+# wrong. These pin the distinction in both directions, because the fix is only correct if it keeps
+# every real idiom firing.
+
+
+def test_a_wholly_quoted_tally_is_a_quotation_not_an_assertion() -> None:
+    """Number AND verdict word inside ONE code span -> the document is quoting, not claiming."""
+    line = (
+        "reproduces the defect in miniature -- `scanned 3 cells "
+        "(1 pass / 0 partial / 0 fail / 0 na / 1 unverified)`, components 2 against a stated 3."
+    )
+    assert idioms_for_line(line) == []
+
+
+def test_backticks_decorating_individual_words_are_still_a_real_tally() -> None:
+    """The case the fix must NOT break, and the reason wholesale span-stripping is wrong.
+
+    Here the NUMBERS sit outside the spans and the backticks decorate only the verdict words -- the
+    V6 chapter report's own idiom, and the reason `_EMPH` tolerates backticks at all. Stripping code
+    spans would delete exactly the words that make this matchable.
+    """
+    idioms = idioms_for_line("the V6 report: 24 `pass`, 15 `partial`, 5 `na`")
+    assert [i for i, _ in idioms] == ["LABELLED_VERDICTS"]
+
+
+def test_an_unquoted_tally_is_unaffected() -> None:
+    assert [
+        i for i, _ in idioms_for_line("168 pass / 105 partial / 3 fail / 65 na / 4 needs-review")
+    ] == ["LABELLED_VERDICTS"]
+
+
+def test_a_backticked_arithmetic_tally_still_fires() -> None:
+    """ARITHMETIC's own documented examples are backticked REAL tallies, so the quotation rule must
+    not reach them -- it is scoped to the counted-verdict pairs alone."""
+    assert [i for i, _ in idioms_for_line("closes: `195 + 89 + 0 + 61 = 345`")] == ["ARITHMETIC"]

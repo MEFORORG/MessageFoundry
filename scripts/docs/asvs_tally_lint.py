@@ -129,15 +129,55 @@ def _normalize_verdict(raw: str) -> str:
     return v.replace("re-verified", "reverified")
 
 
+#: An inline code span. Used ONLY to tell EMPHASIS from QUOTATION -- see :func:`_quoted_whole`.
+_CODE_SPAN = re.compile(r"`[^`]*`")
+
+
+def _quoted_whole(line: str) -> list[tuple[int, int]]:
+    """Half-open ranges of this line's inline code spans."""
+    return [(m.start(), m.end()) for m in _CODE_SPAN.finditer(line)]
+
+
 def _counted_verdicts(line: str) -> set[tuple[int, str]]:
-    """Every (count, verdict-class) pair asserted on one line."""
+    """Every (count, verdict-class) pair ASSERTED on one line.
+
+    A pair whose number AND verdict word both sit inside ONE inline code span is a QUOTATION, not an
+    assertion, and is skipped. The distinction is emphasis-versus-enclosure and it is the whole of the
+    rule:
+
+        24 `pass`, 15 `partial`, 5 `na`        -> the numbers are OUTSIDE the spans; the backticks
+                                                  decorate individual words. A real claim. COUNTED.
+        `scanned 3 cells (1 pass / 0 partial)` -> number and word inside the SAME span. The document
+                                                  is QUOTING output, not asserting it. SKIPPED.
+
+    Found the hard way: this lint red on docs/BACKLOG.md #1012, whose closing banner quotes the
+    falsification transcript that PROVES the bug it fixed -- ``scanned 3 cells (1 pass / 0 partial /
+    0 fail / 0 na / 1 unverified)``, three synthetic cells, and the sentence's own point is that the
+    components DISAGREE with the stated total. A lint against stale tallies fired on a demonstration
+    that a tally was wrong. The precedent for the rule is already in the house style: CLAUDE.md
+    section 11 permits quoting a glyph as a token in backticks and calls that code rather than
+    decoration. A backticked span is a MENTION, not a USE.
+
+    Deliberately NOT done: stripping code spans wholesale before matching. That would blind
+    :data:`_ARITHMETIC`, whose own documented examples are backticked real tallies
+    (``195 + 89 + 0 + 61 = 345``), and it would also delete the very words that make the
+    emphasis case above matchable. The narrow rule is the one that keeps every documented idiom.
+    """
+    spans = _quoted_whole(line)
+
+    def quoted(start: int, end: int) -> bool:
+        return any(lo <= start and end <= hi for lo, hi in spans)
+
     pairs: set[tuple[int, str]] = set()
     for m in _LABELLED.finditer(line):
-        pairs.add((int(m.group(1)), _normalize_verdict(m.group(2))))
+        if not quoted(m.start(), m.end()):
+            pairs.add((int(m.group(1)), _normalize_verdict(m.group(2))))
     for m in _LABELLED_REV.finditer(line):
-        pairs.add((int(m.group(2)), _normalize_verdict(m.group(1))))
+        if not quoted(m.start(), m.end()):
+            pairs.add((int(m.group(2)), _normalize_verdict(m.group(1))))
     for m in _ABBREV.finditer(line):
-        pairs.add((int(m.group(1)), _normalize_verdict(m.group(2))))
+        if not quoted(m.start(), m.end()):
+            pairs.add((int(m.group(1)), _normalize_verdict(m.group(2))))
     return pairs
 
 
