@@ -160,6 +160,19 @@ jobs:
       # relative `(releases/...`, and neither grep form alone finds them all), and a `docs/SECURITY.md`
       # route-table row asserted a refusal `DELETE /me/mfa` does not make.
       #
+      # IT RECURRED ON 2026-08-11, AND THIS STEP WAS ALREADY HERE — the list was simply incomplete.
+      # `tests/test_dast_claims.py` scans documents for prose reading as though the independence gap
+      # were closed, but was never added, so a docs-only PR (#322) merged green and RED MAIN on the push
+      # afterwards. The blind mode is worse than a plain gap because of WHO PAYS: the failure surfaces
+      # on the next PR that touches code, so it is misattributed to whoever opens it. That happened —
+      # the next code PR inherited a red its author had no part in.
+      #
+      # ⇒ THE LESSON IS ABOUT THE LIST, NOT THE GATING. A curated allowlist silently omits; nothing in
+      # a green run says "a doc guard exists that I did not run." When adding a doc-scanning test
+      # module anywhere in `tests/`, add it HERE in the same commit, and confirm it needs no extras —
+      # a module that cannot run on `[dev]` alone would red every docs-only PR, which is the failure
+      # mode the minimal-install note below exists to avoid.
+      #
       # WHY A SEPARATE MINIMAL INSTALL instead of ungating the install below. Unlike the status
       # invariant, these modules import the package (`config.settings`, `config.models`,
       # `parsing.binary`, `auth.service`) and one imports `fastapi.routing`, so they cannot run on
@@ -190,20 +203,27 @@ jobs:
         run: |
           # PRINT WHAT IS SCANNED BEFORE RUNNING IT. A list that silently shrinks is how this class of
           # guard goes quiet, and `-rs` names every skip rather than letting one read as a pass.
+          #
+          # ONE LIST, USED TWICE. It used to be written out twice — once for the printf and once for
+          # pytest — which made the "print what you scanned" defence able to LIE: the two copies could
+          # drift, and then the step prints a module it does not run, or runs one it does not print.
+          # A defence implemented by duplication defeats itself. The variable is the fix, and the
+          # cross-check below turns a drift into a hard failure rather than a quiet one.
+          DOC_GUARDS="tests/test_asvs_file_surface_doc_drift.py tests/test_cloud_phi_hipaa_doc_drift.py
+            tests/test_crit2_inline_doc_drift.py tests/test_doc_ref_handle.py tests/test_docs_db_grants.py
+            tests/test_docs_runbooks.py tests/test_docs_security_pathways.py tests/test_security_doc_drift.py
+            tests/test_security_doc_rate_limits.py tests/test_threat_model_doc_drift.py
+            tests/test_backlog_status_check.py tests/test_sds_rule_ids_are_stable.py
+            tests/test_link_resolution.py tests/test_dast_claims.py"
+          # Every named module must EXIST. A path typo would otherwise make pytest error on an unknown
+          # file, or — worse under a future -k/--ignore form — silently scan nothing and read as a pass.
+          for m in $DOC_GUARDS; do
+            test -f "$m" || { echo "doc-guard list names a missing module: $m"; exit 1; }
+          done
           echo "doc guards, docs-only PR — scanning these modules:"
-          printf '  %s\n' tests/test_asvs_file_surface_doc_drift.py tests/test_cloud_phi_hipaa_doc_drift.py \
-            tests/test_crit2_inline_doc_drift.py tests/test_doc_ref_handle.py tests/test_docs_db_grants.py \
-            tests/test_docs_runbooks.py tests/test_docs_security_pathways.py tests/test_security_doc_drift.py \
-            tests/test_security_doc_rate_limits.py tests/test_threat_model_doc_drift.py \
-            tests/test_backlog_status_check.py tests/test_sds_rule_ids_are_stable.py \
-            tests/test_link_resolution.py
-          pytest -q -rs \
-            tests/test_asvs_file_surface_doc_drift.py tests/test_cloud_phi_hipaa_doc_drift.py \
-            tests/test_crit2_inline_doc_drift.py tests/test_doc_ref_handle.py tests/test_docs_db_grants.py \
-            tests/test_docs_runbooks.py tests/test_docs_security_pathways.py tests/test_security_doc_drift.py \
-            tests/test_security_doc_rate_limits.py tests/test_threat_model_doc_drift.py \
-            tests/test_backlog_status_check.py tests/test_sds_rule_ids_are_stable.py \
-            tests/test_link_resolution.py
+          printf '  %s\n' $DOC_GUARDS
+          echo "  ($(printf '%s\n' $DOC_GUARDS | wc -l) modules)"
+          pytest -q -rs $DOC_GUARDS
 
       # PySide6's offscreen platform plugin needs a few system libraries even
       # headless. Linux-only; Windows runners need no equivalent.
