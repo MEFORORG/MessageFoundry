@@ -213,7 +213,18 @@ class LogWriteGuard:
         )
 
     def record_unwritable(self, sink: str, *, reason: str) -> None:
-        """Stage 2: the replacement could not be written either. Escalates ONCE per break."""
+        """Stage 2: the replacement could not be written either. Escalates ONCE per break.
+
+        **The STOP is asked for only when EVERY guarded sink is unwritable, and that is a
+        correctness point, not a softening.** The ruling is *"we never want to process stuff if the
+        processing cannot be logged"* — so the question the halt must answer is "can this process
+        still log?", not "did a sink break?". With ``[logging].file`` configured there are two sinks;
+        one of them failing while the other keeps accepting writes means the processing IS still
+        logged, and halting there would be a control resting on a false premise. When there is only
+        one sink (the default, stdout-only) the two questions coincide and the halt fires exactly as
+        before. The sink is still recorded unwritable, still alerted and still shown on
+        ``/status`` — visibility is unconditional; only the ENFORCEMENT is conditioned on the thing
+        the enforcement is about."""
         with self._lock:
             previous = self._sinks.get(sink)
             already_down = previous is not None and previous.state == "unwritable"
@@ -225,18 +236,22 @@ class LogWriteGuard:
                 last_event_at=_utc_now(),
                 rolled_aside=previous.rolled_aside if previous else None,
             )
+            all_down = all(s.state == "unwritable" for s in self._sinks.values())
         if already_down:
             # Latched: one page per break, not one per dropped record. Without this a broken disk
             # turns every subsequent log line into an alert AND a stderr line, and the storm buries
             # the one message that mattered.
             return
-        _last_resort(f"LOG SINK {sink} IS UNWRITABLE after a rollover attempt: {reason}")
+        _last_resort(
+            f"LOG SINK {sink} IS UNWRITABLE after a rollover attempt: {reason}"
+            + ("" if all_down else "; another sink is still writable, so nothing is being stopped")
+        )
         self._fire(
             LogSinkEvent(
                 sink=sink,
                 stage="unwritable",
                 reason=reason,
-                stop_requested=self.stop_on_unwritable,
+                stop_requested=self.stop_on_unwritable and all_down,
             )
         )
 
@@ -398,16 +413,36 @@ class GuardedStreamHandler(_GuardedSinkMixin, logging.StreamHandler[TextIO]):
 
     Stage 1 here has **no file to rename** — the engine does not own the file NSSM captures stdout
     into, and renaming a supervisor's file out from under it is how two rotation owners corrupt one
-    log. So the roll degrades to what it honestly can be for a stream we did not open: a re-attempt.
-    That is not a cop-out — the transient this stage exists to absorb (a momentary lock while a
-    supervisor swaps the capture file) is exactly the condition a re-attempt clears. If the stream is
-    genuinely gone, the re-attempt raises and Stage 2 fires with the same fail-closed meaning."""
+    log. The roll is instead a **RE-RESOLVE**: rebind to whatever ``sys.stdout`` is *now* and write
+    to that.
+
+    **A bare re-attempt on the SAME object was the original design and it could never heal, which
+    made this sink a hair trigger on the fail-closed halt.** The handler holds a reference to the
+    stream object it was constructed with; when that object is closed or replaced, every subsequent
+    write raises ``ValueError: I/O operation on closed file`` — including stage 1's own notice write,
+    so stage 1 failed by construction and *every* stdout write failure escalated to stage 2 and
+    stopped the engine. Measured, in the full test suite: a supervisor-like stream swap (pytest's
+    capture teardown) halted a running load engine's seven connections and the run sent zero
+    messages. The same shape in production is an NSSM capture-file swap or a closed pipe — routine
+    events that must not take feeds down.
+
+    Re-resolving is the honest roll for a stream we did not open, and it is what "a re-attempt
+    clears the transient" was always claiming to do: the replacement handle is the live one. If
+    ``sys.stdout`` is itself gone or also refuses the write, the notice write raises and stage 2
+    fires with exactly the fail-closed meaning it should have."""
 
     def __init__(self, stream: TextIO, *, guard: LogWriteGuard, sink: str = "stdout") -> None:
         super().__init__(stream)
         self._init_guard(guard, sink)
 
     def _roll(self) -> str | None:
+        # No rename: nothing here is the engine's file. Rebind to the CURRENT sys.stdout, which is a
+        # different object from the one we were built with precisely in the case worth recovering
+        # from. `is not None` rather than truthiness: a stream object's __bool__ is not a liveness
+        # test. Nothing to return — there is no rolled-aside path for a stream.
+        live = sys.stdout
+        if live is not None and live is not self.stream:
+            self.stream = live
         return None
 
 

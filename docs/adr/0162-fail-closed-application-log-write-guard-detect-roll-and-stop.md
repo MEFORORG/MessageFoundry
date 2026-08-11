@@ -49,7 +49,17 @@ two halves of the invariant. Only the second was missing, and it is the half the
 than lost. A transient — a momentary lock, an antivirus scan, a rotation race — heals here and stops
 nothing.
 
-**Stage 2 — STOP.** Only when the **replacement** also cannot be written does the guard escalate.
+**Stage 2 — STOP.** Only when the **replacement** also cannot be written does the guard escalate —
+and the stop is asked for only when **every** guarded sink is unwritable.
+
+That last clause is a correctness point rather than a softening. The ruling is *"we never want to
+process stuff if the processing cannot be logged"*, so the question the halt must answer is **"can
+this process still log?"**, not "did a sink break?". With `[logging].file` configured there are two
+sinks; one dying while the other keeps accepting every record means the processing **is** still
+logged, and halting there is a control resting on a false premise. With one sink — the default,
+stdout-only — the two questions coincide and the halt fires exactly as it did. Detection, the alert
+and `GET /status` are **unconditional**: only the enforcement is conditioned on the thing the
+enforcement is about.
 
 These do not collapse into one. A single-stage stop takes feeds down on a hiccup, which is an outage
 generator rather than an enforced invariant. The load-bearing detail is *how* stage 1 decides it
@@ -87,11 +97,21 @@ Rolling requires a file the engine may rename. It must never be NSSM's. So `[log
 validator **refuses a `file` inside `[logging].log_dir`**, which is the supervisor's rotation
 territory. One file, one rotation owner; see section 6 and `docs/SERVICE.md`.
 
-The **stdout** sink is guarded too, and its stage 1 is honestly weaker: the engine did not open the
-file behind stdout and must not rename a supervisor's file out from under it, so the roll degrades to
-a re-attempt. That is not a cop-out — the transient stage 1 exists to absorb on that sink (a momentary
-lock while the supervisor swaps the capture file) is exactly what a re-attempt clears — but it is
-weaker, and saying so beats implying a rename that does not happen.
+The **stdout** sink is guarded too, and its stage 1 is necessarily different: the engine did not open
+the file behind stdout and must not rename a supervisor's file out from under it, so the roll is a
+**re-resolve** — rebind to whatever `sys.stdout` is *now*, and write the notice and the failed record
+to that.
+
+**It was originally a bare re-attempt on the same object, and that made the DEFAULT sink a hair
+trigger on the halt.** A handler holds the stream object it was constructed with. When a supervisor
+swaps the capture file that object is closed, and every later write raises — *including stage 1's own
+notice write* — so stage 1 failed by construction and **every** stdout write failure escalated
+straight to stage 2. Measured in the full test suite: a stream swap halted a running load engine's
+seven connections and the run sent zero messages. In production the same shape is an NSSM
+capture-file swap or a closed pipe: routine events that must not take feeds down. Re-resolving is
+what "a re-attempt clears the transient" was always claiming to do — the replacement handle is the
+live one. If `sys.stdout` is itself gone, the notice write raises and stage 2 fires with exactly the
+fail-closed meaning it should have. A paired test pins both directions.
 
 A path the engine cannot open **refuses startup** (`serve` exits 2 with the reason on stderr).
 Starting an engine that cannot log is the silent blindness this item exists to end, so the

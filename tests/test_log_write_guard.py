@@ -365,10 +365,18 @@ def test_the_pin_is_load_bearing_the_stdlib_handler_goes_silent_under_the_same_v
     assert capsys.readouterr().err == ""
 
 
-def test_stdout_sink_is_guarded_and_reports_when_the_stream_is_gone() -> None:
+def test_stdout_sink_is_guarded_and_reports_when_the_stream_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # The default engine sink is stdout, whose file the engine does NOT own (NSSM does). There is
-    # nothing to rename, so the roll is the re-attempt — and a genuinely dead stream still reaches
-    # stage 2 rather than vanishing.
+    # nothing to rename, so the roll RE-RESOLVES ``sys.stdout`` — and a genuinely dead stdout, with
+    # nothing live to rebind to, still reaches stage 2 rather than vanishing.
+    #
+    # sys.stdout is PINNED to the dead stream on purpose. Without the pin this test passed for the
+    # wrong reason: the handler could never heal because it re-attempted the same closed object, so
+    # "stage 2 fires" was true of every stdout failure including the recoverable ones. That is the
+    # hair trigger measured in the full suite (see the swapped-stream test below); the pin is what
+    # makes this assert the UNRECOVERABLE case it names.
     events: list[LogSinkEvent] = []
     guard = LogWriteGuard()
     guard.set_escalation(events.append)
@@ -378,10 +386,12 @@ def test_stdout_sink_is_guarded_and_reports_when_the_stream_is_gone() -> None:
     handler.emit(_record("healthy"))
     assert stream.getvalue() == "healthy\n"
 
+    monkeypatch.setattr("sys.stdout", stream)
     stream.close()
     handler.emit(_record("after the break"))
     assert [e.stage for e in events] == ["unwritable"]
     assert events[0].sink == "stdout"
+    assert events[0].stop_requested is True  # the only sink, and it is gone
 
 
 # --- configure_logging wiring ------------------------------------------------
@@ -728,6 +738,27 @@ async def _until_processed(store: MessageStore, message_id: str, timeout: float 
     return True
 
 
+def _kill_every_sink(logdir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the process genuinely unable to log ANYWHERE — the condition the halt is actually about.
+
+    BOTH sinks, because a stop is asked for only when no guarded sink can accept a record: a healthy
+    stdout beside a dead file means the processing IS still being logged, and halting there would be
+    a control resting on a false premise. ``configure_logging`` installs stdout AND the opt-in file,
+    so a file-only break is not the condition under test.
+
+    The stdout handler is re-pointed at an already-closed stream rather than having pytest's own
+    capture object closed underneath it — killing the sink under test must not also kill the harness
+    that reports the result. ``sys.stdout`` is pinned to the same closed object so the stage-1
+    re-resolve has nothing live to rebind to."""
+    _break_sink_and_replacement(_installed_file_sink(), logdir)
+    dead = io.StringIO()
+    dead.close()
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, GuardedStreamHandler):
+            handler.stream = dead
+    monkeypatch.setattr("sys.stdout", dead)
+
+
 def _e2e_runner(store: MessageStore, outdir: Path, logdir: Path, claim_mode: str) -> RegistryRunner:
     configure_logging("INFO", log_file=LogFile(path=str(logdir / "engine.log")))
     return RegistryRunner(_e2e_registry(outdir), store, poll_interval=0.02, claim_mode=claim_mode)
@@ -762,7 +793,7 @@ async def test_a_healthy_log_lets_the_engine_process_a_committed_row(
 
 @pytest.mark.parametrize("claim_mode", CLAIM_MODES)
 async def test_an_unwritable_log_makes_the_engine_refuse_to_process(
-    store: MessageStore, tmp_path: Path, claim_mode: str
+    store: MessageStore, tmp_path: Path, claim_mode: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # THE TEST THAT MATTERS. Same rig, same message, one difference: the application log is
     # GENUINELY unwritable and so is anything the guard could roll to. The owner's ruling — "we never
@@ -780,7 +811,7 @@ async def test_an_unwritable_log_makes_the_engine_refuse_to_process(
     runner = _e2e_runner(store, outdir, logdir, claim_mode)
     await runner.start()
     try:
-        _break_sink_and_replacement(_installed_file_sink(), logdir)
+        _kill_every_sink(logdir, monkeypatch)
         logging.getLogger("t").warning("a record this engine cannot write anywhere")
         assert await _until(lambda: runner._log_write_stopped), "the halt never fired"
 
@@ -804,7 +835,7 @@ async def test_an_unwritable_log_makes_the_engine_refuse_to_process(
 
 @pytest.mark.parametrize("claim_mode", CLAIM_MODES)
 async def test_restarting_the_connections_re_arms_processing_after_the_halt(
-    store: MessageStore, tmp_path: Path, claim_mode: str
+    store: MessageStore, tmp_path: Path, claim_mode: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # THE RECOVERY HALF, and it is not optional: a fail-closed halt whose re-arm is broken is an
     # engine that stays deaf after the disk is fixed, and nothing above would notice. The ADR promises
@@ -817,7 +848,7 @@ async def test_restarting_the_connections_re_arms_processing_after_the_halt(
     runner = _e2e_runner(store, outdir, logdir, claim_mode)
     await runner.start()
     try:
-        _break_sink_and_replacement(_installed_file_sink(), logdir)
+        _kill_every_sink(logdir, monkeypatch)
         logging.getLogger("t").warning("a record this engine cannot write anywhere")
         assert await _until(lambda: runner._log_write_stopped), "the halt never fired"
         message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
@@ -910,7 +941,7 @@ def test_re_wiring_the_same_responder_is_silent(capsys: pytest.CaptureFixture[st
 
 @pytest.mark.parametrize("claim_mode", CLAIM_MODES)
 async def test_a_reload_re_arms_exactly_the_inbounds_it_re_binds(
-    store: MessageStore, tmp_path: Path, claim_mode: str
+    store: MessageStore, tmp_path: Path, claim_mode: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # MEASURED, because the reload path was read two ways before it was run. reload() quiesces every
     # source and then calls _start_inbound_unsafe for each inbound the new graph re-binds — which is
@@ -925,7 +956,7 @@ async def test_a_reload_re_arms_exactly_the_inbounds_it_re_binds(
     runner = _e2e_runner(store, outdir, logdir, claim_mode)
     await runner.start()
     try:
-        _break_sink_and_replacement(_installed_file_sink(), logdir)
+        _kill_every_sink(logdir, monkeypatch)
         logging.getLogger("t").warning("a record this engine cannot write anywhere")
         assert await _until(lambda: runner._log_write_stopped), "the halt never fired"
         message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
@@ -945,3 +976,86 @@ async def test_a_reload_re_arms_exactly_the_inbounds_it_re_binds(
         assert await _until_processed(store, message_id), "drained but never finalized"
     finally:
         await runner.stop()
+
+
+# --- the hair trigger on the DEFAULT sink, found by running the suite ---------
+
+
+def test_a_swapped_stdout_stream_heals_at_stage_1_and_stops_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # THE REGRESSION THIS FILE EXISTS TO PREVENT REPEATING, and it was found by the full suite rather
+    # than by review. The stdout handler holds the stream OBJECT it was built with. When a supervisor
+    # swaps the capture file — or, identically, when pytest tears its capture down — that object is
+    # closed and every later write raises "I/O operation on closed file", INCLUDING stage 1's own
+    # notice write. Stage 1 therefore failed by construction and every stdout write failure escalated
+    # to stage 2. Measured in the full suite: it halted a running load engine's seven connections and
+    # the load run sent ZERO messages. Re-resolving sys.stdout is the honest roll for a stream the
+    # engine did not open, and it is what "a re-attempt clears the transient" always claimed to do.
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    original, replacement = io.StringIO(), io.StringIO()
+    handler = GuardedStreamHandler(original, guard=guard, sink="stdout")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.emit(_record("before the swap"))
+
+    monkeypatch.setattr("sys.stdout", replacement)
+    original.close()  # the object the handler still points at is now dead
+    handler.emit(_record("after the swap"))
+
+    assert [e.stage for e in events] == ["rolled"]  # healed — NOT a stop
+    assert guard.status()[0].state == "rolled"
+    written = replacement.getvalue()
+    assert "was rolled after a write failure" in written  # the event is recorded on the live stream
+    assert "after the swap" in written  # …and the record that failed is re-written, not dropped
+    handler.emit(_record("and it keeps working"))
+    assert "and it keeps working" in replacement.getvalue()
+
+
+def test_one_dead_sink_beside_a_healthy_one_does_not_ask_for_a_stop(tmp_path: Path) -> None:
+    # "Can this process still log?" is the question the ruling asks, and it is NOT "did a sink
+    # break?". With the opt-in [logging].file configured there are two sinks; stopping every
+    # connection because ONE of them died — while the other is still accepting every record — is a
+    # control resting on a false premise. It is still recorded, still alerted, still on /status:
+    # visibility is unconditional, only the ENFORCEMENT is conditioned on the thing it is about.
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    guard.register("file")  # healthy, never touched
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    handler = GuardedStreamHandler(io.StringIO(), guard=guard, sink="stdout")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.stream.close()
+    handler._roll = lambda: None  # type: ignore[method-assign]  # no live stdout to re-resolve to
+    handler.emit(_record("stdout is gone but the file sink is fine"))
+
+    assert [e.stage for e in events] == ["unwritable"]
+    assert events[0].stop_requested is False  # detected and alerted, but nothing is stopped
+    assert {s.sink: s.state for s in guard.status()} == {"file": "healthy", "stdout": "unwritable"}
+
+
+def test_the_last_sink_dying_does_ask_for_a_stop(tmp_path: Path) -> None:
+    # …and the paired positive: once the OTHER sink is unwritable too, the process genuinely cannot
+    # log and the halt is asked for. Without this the test above would be indistinguishable from
+    # having disarmed the control.
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    file_handler = _file_handler(log_dir / "app.log", guard)
+    stdout_handler = GuardedStreamHandler(io.StringIO(), guard=guard, sink="stdout")
+    stdout_handler.setFormatter(logging.Formatter("%(message)s"))
+    stdout_handler.stream.close()
+    stdout_handler._roll = lambda: None  # type: ignore[method-assign]
+    stdout_handler.emit(_record("stdout first"))
+    assert events[-1].stop_requested is False
+
+    _break_the_open_handle(file_handler)
+    _replace_directory_with_a_file(log_dir)
+    file_handler.emit(_record("and now the file too"))
+
+    assert [e.stage for e in events] == ["unwritable", "unwritable"]
+    assert events[-1].stop_requested is True  # nothing left that can log: HALT
