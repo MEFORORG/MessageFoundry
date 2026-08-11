@@ -2557,3 +2557,95 @@ def test_descent_and_transparency_tables_do_not_drift_apart() -> None:
     lacks. A node in `_DESCEND_ONLY` but not `_TRANSPARENT` would start emitting a chain element
     nobody authored; the reverse would make a transparent node undescendable."""
     assert frozenset(_DESCEND_ONLY) == _TRANSPARENT
+
+
+# --- the structured blocker record (owner ruling, G19 part b, 2026-08-11) ------------------------
+#
+# A `fail` cannot, on its own, distinguish "we have not got to it" from "no correct code can move
+# it". The blocker record says which, and -- the part that matters -- carries a re-probe cadence so
+# the external condition cannot rot invisibly. These tests exist because the ruling was made on a
+# probe that was already three weeks stale with no cadence recorded.
+
+_BLOCKED_CELL = """
+[[cell]]
+id = "1.1.1"
+level = 1
+verdict = "fail"
+residual = "held down by something outside our control"
+  [cell.blocker]
+  blocked_by = "upstream-stdlib"
+  reason = "the interpreter exposes no API for it"
+  evidence = "a ctypes probe found zero symbols, against a live control"
+  unblock_signal = "the stdlib ships the API"
+  unblock_probe = "python -c 'import ssl; print(dir(ssl))'"
+  checked_on = "2026-07-20"
+  recheck_days = 90
+  [[cell.evidence]]
+  path = "messagefoundry/m.py"
+  line = 1
+  expect = "x"
+"""
+
+
+def test_a_well_formed_blocker_loads_and_attaches(tmp_path: Path) -> None:
+    cell = load_scorecard(_scorecard_file(tmp_path, _BLOCKED_CELL))[0]
+    assert cell.blocker is not None
+    assert cell.blocker.blocked_by == "upstream-stdlib"
+    assert cell.blocker.recheck_days == 90
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "blocked_by",
+        "reason",
+        "evidence",
+        "unblock_signal",
+        "unblock_probe",
+        "checked_on",
+        "recheck_days",
+    ],
+)
+def test_a_partial_blocker_record_is_refused(tmp_path: Path, field: str) -> None:
+    """Every field is load-bearing. A reason with no probe, or a probe with no date, reads as
+    diligence and carries none -- the compensating-control-on-a-false-premise shape arriving
+    through the fix."""
+    body = _BLOCKED_CELL.replace(f"  {field} = ", f"  removed_{field} = ", 1)
+    with pytest.raises(ScorecardError, match="partial blocker record is a comment"):
+        load_scorecard(_scorecard_file(tmp_path, body))
+
+
+def test_a_blocker_on_a_non_fail_verdict_is_refused(tmp_path: Path) -> None:
+    """A blocked PARTIAL is a real thing; admitting one is a ruling, not a default."""
+    body = _BLOCKED_CELL.replace('verdict = "fail"', 'verdict = "partial"', 1)
+    with pytest.raises(ScorecardError, match="only meaningful on verdict 'fail'"):
+        load_scorecard(_scorecard_file(tmp_path, body))
+
+
+def test_a_non_iso_checked_on_is_refused(tmp_path: Path) -> None:
+    body = _BLOCKED_CELL.replace('checked_on = "2026-07-20"', 'checked_on = "last July"', 1)
+    with pytest.raises(ScorecardError, match="must be an ISO date"):
+        load_scorecard(_scorecard_file(tmp_path, body))
+
+
+def test_a_cadence_that_never_comes_due_is_refused(tmp_path: Path) -> None:
+    """recheck_days = 0 is indistinguishable from having no cadence, which is the defect."""
+    body = _BLOCKED_CELL.replace("recheck_days = 90", "recheck_days = 0", 1)
+    with pytest.raises(ScorecardError, match="never comes due"):
+        load_scorecard(_scorecard_file(tmp_path, body))
+
+
+def test_overdue_is_computed_not_asserted(tmp_path: Path) -> None:
+    """Overdue is a REPORTING state, not a load error -- a stale probe must not red the gate and
+    block unrelated pull requests on a calendar date. So it loads, and the staleness is a number."""
+    import datetime
+
+    stale = (datetime.date.today() - datetime.timedelta(days=400)).isoformat()
+    body = _BLOCKED_CELL.replace('checked_on = "2026-07-20"', f'checked_on = "{stale}"', 1)
+    cell = load_scorecard(_scorecard_file(tmp_path, body))[0]
+    assert cell.blocker is not None
+    assert cell.blocker.days_overdue(datetime.date.today()) == 400 - 90
+    # And a current one reports zero rather than a negative number.
+    fresh = load_scorecard(_scorecard_file(tmp_path, _BLOCKED_CELL))[0]
+    assert fresh.blocker is not None
+    assert fresh.blocker.days_overdue(datetime.date.fromisoformat("2026-07-21")) == 0

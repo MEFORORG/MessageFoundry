@@ -530,11 +530,24 @@ def test_scope_guard_detects_a_planted_rescoping() -> None:
     )
 
 
-def test_ingest_plane_is_documented_as_having_no_rate_limit() -> None:
-    """A silent omission reads as coverage. The data plane has resource caps only."""
+def test_ingest_plane_rate_limit_is_documented_as_existing_but_off() -> None:
+    """A silent omission reads as coverage, and so does an overstatement in the other direction.
+
+    Until 2026-08-11 this guard asserted the doc said "no message-rate or volume limit exists", which
+    was true and load-bearing. The MLLP pacing build (ASVS 2.4.1 / 15.2.2) falsified it, so the guard
+    had to move with the code and the doc rather than be deleted -- the row must now state BOTH that
+    a control exists and that it ships OFF, because either half alone misleads: "exists" implies the
+    shipped default is bounded, and "none" is now simply false.
+    """
     block = _section(_H_LIMITS)
     assert "Ingest plane" in block
-    assert "no message-rate or volume limit exists" in block
+    assert "max_messages_per_second" in block, (
+        "the ingest row must name the control that now exists"
+    )
+    assert "ships OFF" in block, "and must say it is not on by default, or 'exists' overstates it"
+    # The honest gaps stay named: an off default bounds nothing, and the raw-TCP intake never got it.
+    assert "still no volume bound" in block
+    assert "raw-TCP inbound" in block
     for cap in ("max_connections", "receive_timeout", "max_frame_bytes", "max_message_bytes"):
         assert cap in block, f"the ingest row must name the {cap} resource cap it DOES have"
 

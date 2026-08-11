@@ -86,9 +86,20 @@ class UploadQuotaError(UploadError):
     The uploaded-logs feature caps how many files and how many aggregate bytes a single uploader may
     retain at once (``[store].max_upload_files_per_user`` / ``max_upload_total_bytes_per_user``, both
     defaults-ON). A would-be over-quota upload is refused at the chokepoint before anything is written;
-    the API maps it to HTTP 409 and a metadata-only ``upload.reject_quota`` audit. Residual: the
-    check-then-write is not atomic, so concurrent in-flight uploads can overshoot by at most one file
-    (itself bounded by ``max_upload_bytes``); the quota is per-process per-``uploads_dir``."""
+    the API maps it to HTTP 409 and a metadata-only ``upload.reject_quota`` audit.
+
+    The check and the write it authorises run as ONE critical section per process (ASVS 2.3.4), so
+    concurrent uploads inside an engine cannot double-book the budget. The quota is scoped to the
+    ``uploads_dir``, not to the process: :meth:`UploadStore._scan_metas_sync` re-reads the sidecars
+    with no cache, so engine shards sharing one dir enforce ONE budget between them (measured
+    2026-08-10). Shards pointed at separate dirs get separate budgets, by construction.
+
+    Residual, stated precisely: the critical section is per-process, so N engine shards sharing one
+    dir can still overshoot by at most **N-1 files** — one per shard that is mid-write when another
+    scans, each bounded by ``max_upload_bytes``. On the shipped single-process deployment N is 1 and
+    the overshoot is zero. Closing the multi-shard remainder needs a cross-process mechanism (an
+    advisory lock on the dir, or moving the accounting into the unified store); it is not closed
+    here, and no comment in this module should imply otherwise."""
 
 
 class UploadNotFoundError(UploadError):
@@ -275,6 +286,12 @@ class UploadStore:
         self._max_files_per_user = max(1, int(max_files_per_user))
         self._max_total_bytes_per_user = max(1, int(max_total_bytes_per_user))
         self._retention_days = max(1, int(retention_days))
+        # ASVS 2.3.4: the quota check and the write that consumes it must be ONE critical section, or
+        # concurrent uploads each read a stale count and double-book the budget. Serialising the whole
+        # build-and-write (not just the check) is what makes it atomic — releasing between them is the
+        # race. The throughput cost is acceptable here and nowhere near the data plane: this is the
+        # operator diagnostic-upload surface, and each pass is bounded by max_bytes.
+        self._quota_lock = asyncio.Lock()
 
     @property
     def max_bytes(self) -> int:
@@ -391,8 +408,10 @@ class UploadStore:
         def _build_and_write() -> UploadedFileMeta:
             # Per-uploader quota (ASVS 5.2.4): scan the uploader's existing sidecars and refuse BEFORE
             # writing when this file would exceed their file-count or aggregate-byte cap. Runs in the same
-            # off-loop thread as the write. Residual: the check-then-write is not atomic, so concurrent
-            # in-flight uploads can overshoot by at most one file (bounded by max_bytes).
+            # off-loop thread as the write, and the caller holds _quota_lock across BOTH, so no second
+            # upload in this process can read this count before the write consumes it (ASVS 2.3.4).
+            # The scan is uncached, so shards sharing a dir enforce one budget rather than one each;
+            # the residual that survives the lock is per-shard, not per-upload. See UploadQuotaError.
             mine = [m for m in self._scan_metas_sync() if m.uploader == uploader]
             if len(mine) + 1 > self._max_files_per_user:
                 raise UploadQuotaError(
@@ -425,7 +444,9 @@ class UploadStore:
             _atomic_write_text(root, meta_path, meta_ct)
             return meta
 
-        return await asyncio.to_thread(_build_and_write)
+        # One critical section per process: quota check + write. See _quota_lock in __init__.
+        async with self._quota_lock:
+            return await asyncio.to_thread(_build_and_write)
 
     async def list_files(self) -> list[UploadedFileMeta]:
         """List all uploaded files (newest first). Undecryptable/foreign sidecars are skipped with a

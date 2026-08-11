@@ -7671,6 +7671,25 @@ gate is the wrong shape, validation of the walk is the right one.
 **Cluster:** Connections and Transports. **Priority:** P3. **Verdict:** build. **Severity:** minor.
 
 
+## 1220. `ENGINE_UI_SEAM` collides silently: two branches bump to the same version and the golden gate agrees
+
+> 🔢 **Filed 2026-08-11 -- MEASURED on two live branches, not hypothesised.** Value **7/10** -- Difficulty **3/10** -- _quick win_. `ENGINE_UI_SEAM` is a version integer that must be unique per console-contract change. Two unlanded branches sharing merge-base `751ca08a` both bumped it to the **same value**:
+
+> ```
+> origin/main                     ENGINE_UI_SEAM = 18
+> w3-log-write-failure            ENGINE_UI_SEAM = 19   (for SystemStatus.log_sinks)
+> w3-store-privilege-preflight    ENGINE_UI_SEAM = 19   (for SecurityPosture.store_privilege)
+> ```
+
+> **THE CONFLICT GIT RAISES IS THE COSMETIC HALF; THE SEMANTIC HALF MERGES SILENTLY.** Trial-merging the two conflicts in `messagefoundry/api/_ui_seam.py` **only**, and only in the adjacent **comment blocks** -- two markers. Meanwhile `tests/golden/webconsole_seam.snapshot` **auto-merges CLEAN**: verified independently, the merged tree's snapshot carries **both** `log_sinks` and `store_privilege` with **zero conflict markers**, and `SUPPORTED_ENGINE_SEAMS={19}` accepts it. **So a reviewer who resolves the visible conflict correctly still ships the defect** -- seam 19 now describes two independent contract changes, and the gate whose entire job is catching seam contract changes agrees with it. Whichever branch lands second must re-bump to 20, and **nothing enforces that today**.
+
+> **This is the keep-both-sides shape in a new location, and the nastiest instance recorded here**, because the usual defence fails: the merge is not silent, it raises a conflict, and resolving that conflict *correctly* is what lands the fault. A predicted conflict is not a control when it points at the wrong half.
+
+> **Scope:** make the seam value's uniqueness checkable rather than conventional. Options worth weighing rather than assuming: derive the seam from a hash of the contract surface so two independent changes cannot collide by construction; or gate it -- assert the seam is strictly greater than every value reachable from `origin/main` **and** that the golden snapshot's contract set matches exactly one bump. **The derived form is preferable if it is cheap**, because a gate on a hand-maintained integer is one more thing to remember, and the collision above happened between two sessions that were each individually careful.
+
+> **Verify the fix against THIS pair.** Both branches are unlanded and anchored, so the collision is reproducible on demand: `git merge-tree --write-tree w3-log-write-failure w3-store-privilege-preflight` and read the merged snapshot. A fix that does not red on that pair has not been shown to work.
+
+**Cluster:** Developer tooling / CI. **Priority:** P2. **Verdict:** build. **Severity:** conditional -- no product effect today, but it would ship a console contract whose version does not identify it, which is exactly what the seam exists to prevent.
 ## 1221. A doc lint crashes when printing a hit that contains a glyph, so it is unreadable exactly when it fires
 
 > 🔢 **Filed 2026-08-11 -- found by Session B while fixing an unrelated false positive in the same file.** Value **5/10** -- Difficulty **2/10** -- _quick win_. `scripts/docs/asvs_tally_lint.py` raises `UnicodeEncodeError: 'charmap' codec can't encode character` on a stock Windows **cp1252** console when it prints a hit whose text contains a glyph. It fires **only on the failure path** -- printing the hits -- so it is **INVISIBLE WHILE THE LINT IS GREEN**, and it converts a legible FAIL into a traceback at exactly the moment somebody needs to read which document tripped it. **A gate that is correct until it has something to say, and then unreadable.**
