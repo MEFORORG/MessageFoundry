@@ -58,6 +58,7 @@ from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     SqlAuth,
     StoreBackend,
+    StorePrivilegeStatus,
     StoreSettings,
     weakened_tls_escape_permitted,
 )
@@ -89,6 +90,12 @@ from messagefoundry.store.metadata import (
     merge_user_metadata,
 )
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram, ClaimPoolStatus, PoolStatus
+from messagefoundry.store.privilege import (
+    SQLSERVER_FIXED_DATABASE_ROLES,
+    SQLSERVER_FIXED_SERVER_ROLES,
+    StorePrivilegeReport,
+    sqlserver_excess,
+)
 from messagefoundry.store.store import (
     MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
@@ -2802,6 +2809,84 @@ class SqlServerStore:
                 f" OFF; a DBA must run once: ALTER DATABASE [{db}] SET READ_COMMITTED_SNAPSHOT ON"
                 " WITH ROLLBACK IMMEDIATE — refusing to start pooled claimers (fail closed)"
             )
+
+    async def probe_principal_privileges(self) -> StorePrivilegeReport:
+        """Read this login's EFFECTIVE fixed-server-role and database-role membership (#1008,
+        ASVS 13.2.2) and report what was observed against the grant ``docs/DEPLOY-SERVER-DB.md`` §1.1
+        prescribes (``db_datareader`` + ``db_datawriter`` + ``db_ddladmin``, and **no** server role).
+
+        **Both closed role sets are probed BY NAME, not enumerated from the catalog, and that is the
+        load-bearing choice.** ``sys.server_principals`` / ``sys.database_principals`` are
+        permission-filtered: an enumeration that comes back empty is indistinguishable from *"a member
+        of nothing"*, so a visibility restriction would render as a clean bill of health — the exact
+        false-clean this preflight exists to prevent. ``IS_SRVROLEMEMBER`` / ``IS_ROLEMEMBER`` answer
+        for the CURRENT principal and need no catalog permission, so they are authoritative. The
+        catalog enumeration runs too, but only to ADD user-defined database roles the closed set cannot
+        name, and it is best-effort: it can only widen the finding, never narrow it.
+
+        ``HAS_PERMS_BY_NAME`` covers the grants that are permissions rather than roles (``CONTROL
+        SERVER``, ``CONTROL`` on the database), so a principal over-granted by direct ``GRANT`` rather
+        than by role membership is still seen."""
+        server_cols = [
+            f"IS_SRVROLEMEMBER(?) AS srv_{i}" for i in range(len(SQLSERVER_FIXED_SERVER_ROLES))
+        ]
+        db_cols = [
+            f"IS_ROLEMEMBER(?) AS dbr_{i}" for i in range(len(SQLSERVER_FIXED_DATABASE_ROLES))
+        ]
+        row = await self._fetchone(
+            "SELECT SUSER_SNAME() AS login_name, USER_NAME() AS db_user, DB_NAME() AS db_name,"
+            " HAS_PERMS_BY_NAME(NULL, NULL, 'CONTROL SERVER') AS control_server,"
+            " HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CONTROL') AS control_db, "
+            + ", ".join(server_cols + db_cols),
+            SQLSERVER_FIXED_SERVER_ROLES + SQLSERVER_FIXED_DATABASE_ROLES,
+        )
+        if row is None:
+            return StorePrivilegeReport(
+                backend=self.backend,
+                status=StorePrivilegeStatus.UNOBSERVABLE,
+                detail="the privilege query returned no row",
+            )
+        server_roles = tuple(
+            name for i, name in enumerate(SQLSERVER_FIXED_SERVER_ROLES) if row[f"srv_{i}"] == 1
+        )
+        database_roles = tuple(
+            name for i, name in enumerate(SQLSERVER_FIXED_DATABASE_ROLES) if row[f"dbr_{i}"] == 1
+        )
+        note = (
+            "fixed server + database role membership probed BY NAME (authoritative, catalog-visibility"
+            " independent); user-defined database roles added best-effort from sys.database_principals"
+        )
+        try:
+            extra = await self._fetchall(
+                "SELECT p.name AS role_name FROM sys.database_principals p"
+                " WHERE p.type = 'R' AND p.name <> 'public' AND IS_ROLEMEMBER(p.name) = 1"
+            )
+        except Exception as exc:  # noqa: BLE001 — additive only; the closed-set probe already answered
+            note += (
+                f" (that enumeration failed: {type(exc).__name__} — user-defined roles NOT listed)"
+            )
+        else:
+            # dict.fromkeys preserves order while folding the fixed roles the enumeration repeats.
+            database_roles = tuple(
+                dict.fromkeys(database_roles + tuple(str(r["role_name"]) for r in extra))
+            )
+        database = str(row["db_name"] or self._settings.database or "")
+        return StorePrivilegeReport(
+            backend=self.backend,
+            status=StorePrivilegeStatus.OBSERVED,
+            principal=str(row["login_name"] or ""),
+            database=database,
+            server_roles=server_roles,
+            database_roles=database_roles,
+            excess=sqlserver_excess(
+                server_roles=server_roles,
+                database_roles=database_roles,
+                control_server=row["control_server"] == 1,
+                control_database=row["control_db"] == 1,
+                database=database,
+            ),
+            detail=f"database user {str(row['db_user'] or '')!r}; {note}",
+        )
 
     async def _ensure_schema(self) -> bool:
         """Apply the shipped DDL batch, or skip it entirely when the ``schema_meta`` marker already

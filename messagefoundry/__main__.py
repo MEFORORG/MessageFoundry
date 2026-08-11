@@ -1527,8 +1527,12 @@ def _serve(args: argparse.Namespace) -> int:
     # later — per connection — by the connector's own construction-time WARN (the ADR 0153 acceptance
     # with its reason and an audit record; the #333 generic-ODBC TLS reminder naming the connection),
     # and completely by `messagefoundry check` and GET /security/posture, which both have the graph.
+    # The store is NOT open yet either, so the #1008 store-principal privilege OBSERVATION is passed as
+    # None for the same reason and with the same discipline: it is reported moments later by the
+    # preflight's own log line + audit row once the lifespan opens the store, and completely by
+    # GET /security/posture. None here is "not yet observed", never "observed and clean".
     _loosenings = security_loosenings(
-        settings.security, settings.store, settings.auth, settings.alerts, (), (), ()
+        settings.security, settings.store, settings.auth, settings.alerts, (), (), (), None
     )
     if _loosenings:
         _seclog = logging.getLogger(__name__)
@@ -1538,7 +1542,8 @@ def _serve(args: argparse.Namespace) -> int:
             "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired and generic-ODBC "
             "DATABASE TLS declarations are NOT in this list — the graph is not loaded yet; they are "
             "reported by the connector construction gate, `messagefoundry check` and "
-            "GET /security/posture.",
+            "GET /security/posture. Nor is the store-principal privilege observation (#1008) — the "
+            "store is not open yet; the startup preflight logs and audits it moments from now.",
             len(_loosenings),
             "; ".join(f"{name} ({risk})" for name, risk in _loosenings),
         )
@@ -4815,13 +4820,14 @@ def _security(args: argparse.Namespace) -> int:
             _loosenings_partial = True
 
     def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
-        # This CLI reads a SETTINGS file and never loads the connection graph, so it cannot see ANY of
-        # the three per-connection declarations — it passes empty lists and declares the gap in
-        # `loosenings_scope` below, instead of reporting a settings-only view as if it were the whole
+        # This CLI reads a SETTINGS file and never loads the connection graph — nor does it open the
+        # store — so it can see NEITHER the three per-connection declarations NOR the #1008
+        # store-principal privilege observation. It passes empty lists and None and declares BOTH gaps
+        # in `loosenings_scope` below, instead of reporting a settings-only view as if it were the whole
         # posture. `messagefoundry check` and GET /security/posture are the complete surfaces.
         return [
             {"switch": s, "risk": r}
-            for s, r in security_loosenings(sec, _store, _auth, _alerts, (), (), ())
+            for s, r in security_loosenings(sec, _store, _auth, _alerts, (), (), (), None)
         ]
 
     #: Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
@@ -4834,7 +4840,8 @@ def _security(args: argparse.Namespace) -> int:
         "loosenings_scope": (
             "settings only ([security]/[store]/[auth]/[alerts]); the per-connection "
             "cleartext_accepted, tls_allow_expired and generic-ODBC DATABASE TLS declarations are NOT "
-            "included — see `messagefoundry check` or GET /security/posture"
+            "included, and neither is the store-principal privilege observation (#1008 — this command "
+            "opens no store) — see `messagefoundry check` or GET /security/posture"
         ),
     }
 

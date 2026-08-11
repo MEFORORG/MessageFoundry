@@ -936,6 +936,32 @@ class SecurityLoosening(BaseModel):
     risk: str
 
 
+#: The value ``StorePrivilegeView.status`` carries when no preflight ran in THIS process (an
+#: embedding, or an app built without the managed lifespan). It is deliberately its own value: the
+#: three real statuses are what the probe found, and "nobody looked" must never render as one of them.
+STORE_PRIVILEGE_NOT_PROBED = "not_probed"
+
+
+class StorePrivilegeView(BaseModel):
+    """What the startup preflight OBSERVED about the store principal's effective privileges (#1008,
+    ASVS 13.2.2).
+
+    ``status`` is the load-bearing field and has four values, three of which come straight from
+    ``StorePrivilegeStatus``: ``observed`` (the probe read the principal — ``excess`` then tells you
+    whether it is clean), ``not_applicable`` (SQLite: a local file, no server principal exists),
+    ``unobservable`` (the probe could NOT run) and ``not_probed`` (no preflight ran in this process).
+    Only ``observed`` with an empty ``excess`` is a clean bill of health; the other three are each a
+    DIFFERENT reason there isn't one, and none of them may be read as a pass."""
+
+    status: str
+    #: Privileges the principal holds beyond the documented least-privilege grant, named individually.
+    #: A count would say "3 grants are excessive" without saying which, which is the shape that lets a
+    #: grant nobody intended survive a posture review.
+    excess: list[str] = Field(default_factory=list)
+    #: Why the probe could not observe, or what it observed against. Never secret material.
+    detail: str = ""
+
+
 class SecurityPosture(BaseModel):
     """The instance's **effective** PHI-at-rest security posture (M5), behind the authenticated,
     permission-gated ``GET /security/posture`` route. Surfaces what protection is *actually* in effect
@@ -979,6 +1005,13 @@ class SecurityPosture(BaseModel):
     # settings-only subset with no marker would understate the posture, which is the one thing this
     # route must not do; ``messagefoundry security show`` carries the same marker for the same reason.
     loosenings_scope: str | None = None
+    # #1008 (ASVS 13.2.2): the store principal's OBSERVED effective privileges. Always present — the
+    # default is the explicit ``not_probed`` status, never an empty/clean-looking value, so an app that
+    # never ran the preflight says so rather than reading as observed-and-fine. An over-grant and an
+    # unobservable probe ALSO appear in `loosenings` above; this field is the full observation.
+    store_privilege: StorePrivilegeView = Field(
+        default_factory=lambda: StorePrivilegeView(status=STORE_PRIVILEGE_NOT_PROBED)
+    )
     # Set WHERE handles_real_patient_data=false: the strict PHI-only controls (at-rest-encryption refusal,
     # deny-by-default egress, bounded retention) are relaxed because the instance carries no ePHI (AC-6).
     synthetic_relaxation: str | None = None
