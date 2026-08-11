@@ -662,6 +662,46 @@ that the record no longer carried.)*
 residual above is unchanged either way, and a deployment still needs the host-side control. Rung 3
 (SEV-SNP/TDX plus a verified CPU-signed quote) remains unbuilt.
 
+### 3.x The cryptographic-agility seam — what may be swapped, and what may not
+
+**Ruled 2026-08-11 (ASVS 11.2.2).** The requirement asks that cryptography be "reconfigured, upgraded,
+or swapped at any time". That sentence has two readings and they cost very different things, so the
+project commits to one of them **explicitly** rather than leaving a reader to infer it:
+
+- **What is committed — RELEASE-swappability.** A *release* of MessageFoundry can change an at-rest
+  algorithm without a data migration and without leaving unreadable ciphertext behind.
+- **What is NOT committed — RUNTIME reconfiguration.** An *operator* cannot select an at-rest
+  algorithm on a running instance, and this is a deliberate refusal, not an unbuilt feature. See
+  "Why runtime selection is refused" below.
+
+**The three properties that make release-swappability real** — each verified against the shipped code
+rather than asserted:
+
+| Property | Where | What it means for a swap |
+|---|---|---|
+| The stored value is **self-describing** | `mfenc:v2:<alg>:<key_id>:<b64>` (`store/crypto.py`) | A reader knows which algorithm produced a value without being told out of band, so old and new can coexist in one column during a rollover. |
+| The reader **fails closed** on anything it does not know | `Cipher._parse` raises `CipherError` on an unknown version *or* an unknown `alg` | An unrecognised algorithm is refused, never silently mis-decrypted or skipped. A downgrade cannot pass as a read. |
+| Re-encryption is **driven and resumable** | `messagefoundry rotate-key` | The swap has an executable migration path; an interrupted run accounts for what it already re-encrypted rather than starting over or double-counting. |
+
+`mfenc:v2` is the **shipped default** writer (`[store].aad_bind` defaults `true`), so these properties
+describe the format a new deployment actually writes — not an opt-in path. `mfenc:v1` remains
+decode-only and frozen.
+
+**Why runtime selection is refused, stated as a cost rather than a gap.** An algorithm identifier in
+this system is read from three places: configuration (the *operator* chooses), the wire (a token
+*minter* chooses), and **stored data** — `mfenc:v2`'s `alg` segment, which means *whoever can write a
+store row* chooses. Registering a second at-rest algorithm puts a selector in that third and most
+exposed class, converting a fail-closed one-way dispatch into a two-way one keyed on attacker-writable
+data. The agility the requirement asks for would be bought by creating a downgrade surface, and on
+this trade the project takes the refusal.
+
+**THE HONEST LIMIT, and it is the part a reader should take away:** the seam covers the **at-rest
+value core**. It does **not** cover the **audit MAC or its KDF**, which carry *no version
+discriminator at all* — measured: zero `mfenc`-style markers anywhere on the audit-chain path. So
+changing the audit MAC is not a swap along this seam; it means versioning the tamper-evidence chain
+itself, which is undesigned. Any future claim that this project "has crypto agility" must exclude the
+audit chain or be false.
+
 ---
 
 ## 4. Data in transit
