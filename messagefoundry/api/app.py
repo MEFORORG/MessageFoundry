@@ -506,7 +506,10 @@ def _build_approval_gate(engine: Engine, settings: ApprovalsSettings) -> Approva
         # Load-bearing dual-control guard (findings #1/#4/#11): ApprovalGate.approve runs THIS executor
         # directly (purge_connection is NOT re-entered on the release path), and it flips the row to
         # 'approved' BEFORE executing — so the require-quiesced precondition must be re-checked HERE, and
-        # a failure must NOT raise (a raise would strand the row approved-but-unexecuted). A non-quiesced
+        # a failure should NOT raise. (Since ASVS 2.3.3 the gate compensates a raise by rolling the row
+        # to 'failed' and auditing it, so a raise no longer strands it approved-but-unexecuted; skipping
+        # is still the better outcome HERE, because a non-quiesced outbound is a retryable precondition
+        # miss the operator can clear, not a failed operation.) A non-quiesced
         # (running/stopping) outbound could have an INFLIGHT row cancel_queued cannot cancel, so purging
         # it would mis-fire; skip fail-closed and record cancelled=0/skipped in the approval audit. The
         # operator re-Stops (lets it quiesce) and re-requests.
