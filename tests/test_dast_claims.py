@@ -266,8 +266,18 @@ def test_sds_independent_review_row_is_unchanged(row: str) -> None:
 # No file this change introduces may claim the gap is closed
 # =====================================================================================================
 
+# The `\b` before the closure verb is load-bearing and was added after this guard REPORTED A NEGATION
+# AS AN AFFIRMATION. Without it, `complete` matches inside `INCOMPLETE`, so the sentence
+# "...independent of the gate: the original WIP was INCOMPLETE" -- which asserts the OPPOSITE of a
+# closure -- reddened `main` as though it claimed the independence gap was closed. The same hole
+# accepts "uncovered", "unsatisfied" and "undisclosed": every one of them a word whose meaning is the
+# negation of the verb being hunted.
+#
+# The boundary loses no true positive, because a real closure claim spells the verb as its own word.
+# Verified both directions before the change landed, and pinned by
+# `test_the_closure_pattern_does_not_read_a_negation_as_a_claim` below.
 _CLOSURE_CLAIM = re.compile(
-    r"(pen ?test|penetration test|independen\w*).{0,60}(complete|satisfied|closed|covered|discharg)",
+    r"(pen ?test|penetration test|independen\w*).{0,60}\b(complete|satisfied|closed|covered|discharg)",
     re.IGNORECASE,
 )
 
@@ -305,6 +315,29 @@ def test_the_closure_sweep_can_actually_see_a_claim() -> None:
     assert _CLOSURE_CLAIM.search("the independent verification requirement is now satisfied")
     assert _CLOSURE_CLAIM.search("pentest coverage is complete")
     assert not _CLOSURE_CLAIM.search("the independent engagement has not been performed")
+
+
+def test_the_closure_pattern_does_not_read_a_negation_as_a_claim() -> None:
+    """Regression: this guard once reported a NEGATION as an AFFIRMATION and reddened ``main``.
+
+    Without a word boundary, ``complete`` matches inside ``INCOMPLETE``, so a sentence asserting the
+    exact OPPOSITE of a closure tripped the sweep. The live case is the first fixture below -- it is
+    the real ``docs/BACKLOG.md`` sentence that failed, kept verbatim rather than paraphrased, because a
+    fixture invented to match the fix is not evidence that the fix covers the fault.
+
+    The pre-existing negative above (``has not been performed``) could not have caught this: it passes
+    because ``performed`` is not in the verb list at all, not because the pattern understands negation.
+    A guard needs a negative control per FAILURE MODE, not one per test.
+    """
+    assert not _CLOSURE_CLAIM.search(
+        "independent of the gate:** the original WIP was **INCOMPLETE, not merely unverified"
+    )
+    # The same hole accepted every negating prefix of the hunted verbs.
+    assert not _CLOSURE_CLAIM.search("the independent review left the finding uncovered")
+    assert not _CLOSURE_CLAIM.search("independent testing left the requirement unsatisfied")
+    # ...while the affirmations they negate must still bite.
+    assert _CLOSURE_CLAIM.search("the independent review left the finding covered")
+    assert _CLOSURE_CLAIM.search("independent testing left the requirement satisfied")
 
 
 # =====================================================================================================
