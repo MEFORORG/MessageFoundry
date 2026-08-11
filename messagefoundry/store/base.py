@@ -1486,7 +1486,13 @@ class AuditStore(Protocol):
     async def list_pending_approvals(self, *, now: float, limit: int = 100) -> Sequence[Row]: ...
 
     async def decide_pending_approval(
-        self, approval_id: str, *, status: str, approver: str | None, decided_at: float
+        self,
+        approval_id: str,
+        *,
+        status: str,
+        approver: str | None,
+        decided_at: float,
+        from_status: str = "pending",
     ) -> bool: ...
 
     async def audit_anchor(self) -> tuple[int, str]: ...

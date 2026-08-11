@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import time
 from pathlib import Path
@@ -231,6 +232,70 @@ async def test_quota_is_per_user(tmp_path: Path) -> None:
     b = await store.save(data=b"b\n", filename="b.txt", uploader="bob")  # bob unaffected
     assert b.uploader == "bob"
     assert {m.uploader for m in await store.list_files()} == {"alice", "bob"}
+
+
+async def test_quota_is_shared_by_stores_over_one_dir_not_per_process(tmp_path: Path) -> None:
+    """ASVS 2.3.4 / 5.2.4: the budget is scoped to the uploads_dir, NOT to the process.
+
+    Two UploadStore instances over one directory stand in for two engine shards. The settings
+    comment and the ASVS 2.3.4 residual both used to assert that shards at one dir "multiply the
+    budget"; measured 2026-08-10, they do not -- the sidecar scan is uncached, so the second store
+    sees the first's files. This test pins that, so the corrected claim cannot silently regress
+    back into a per-process budget (which WOULD be the double-booking 2.3.4 forbids).
+    """
+    # The cipher MUST be shared: real engine shards run off one unified store and therefore one
+    # keyring/DEK. Giving each store its own key would make shard B skip shard A's sidecars as
+    # undecryptable and fake a per-process budget -- an artifact of the fixture, not the system.
+    cipher = make_cipher(generate_key())
+
+    def _shard() -> UploadStore:
+        return UploadStore(tmp_path / "uploads", cipher, max_bytes=4096, max_files_per_user=2)
+
+    shard_a, shard_b = _shard(), _shard()  # two processes, ONE uploads dir
+
+    for i in range(2):
+        await shard_a.save(data=f"a{i}\n".encode(), filename=f"a{i}.txt", uploader="alice")
+    # Positive control: the cap engages at all on the store that wrote the files.
+    with pytest.raises(UploadQuotaError):
+        await shard_a.save(data=b"overflow\n", filename="a2.txt", uploader="alice")
+
+    # The question: does the OTHER store grant alice a fresh budget?
+    with pytest.raises(UploadQuotaError):
+        await shard_b.save(data=b"from b\n", filename="b.txt", uploader="alice")
+    assert len(await shard_b.list_files()) == 2  # still exactly the cap, nothing extra written
+
+
+async def test_concurrent_uploads_cannot_double_book_the_quota(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ASVS 2.3.4: the quota check and the write it authorises are ONE critical section.
+
+    Made deterministic rather than timing-dependent: the sidecar scan is slowed so both coroutines
+    are guaranteed to overlap. Without the lock both read a count of 0 and both write, double-booking
+    a quota of 1. With it, the second scan sees the first file and refuses.
+    """
+    store = _quota_store(tmp_path, max_files=1)
+
+    real_scan = store._scan_metas_sync
+
+    def _slow_scan() -> list[UploadedFileMeta]:
+        out = real_scan()
+        time.sleep(0.05)  # widen the window so an unlocked check-then-write WOULD lose the race
+        return out
+
+    monkeypatch.setattr(store, "_scan_metas_sync", _slow_scan)
+
+    results = await asyncio.gather(
+        store.save(data=b"first\n", filename="a.txt", uploader="alice"),
+        store.save(data=b"second\n", filename="b.txt", uploader="alice"),
+        return_exceptions=True,
+    )
+
+    ok = [r for r in results if isinstance(r, UploadedFileMeta)]
+    refused = [r for r in results if isinstance(r, UploadQuotaError)]
+    assert len(ok) == 1, f"exactly one upload may win a quota of 1, got {results}"
+    assert len(refused) == 1, f"the loser must be refused on quota, got {results}"
+    assert len(await store.list_files()) == 1  # and only the winner is on disk
 
 
 async def test_prune_deletes_aged_pairs_and_is_idempotent(tmp_path: Path) -> None:

@@ -16,6 +16,7 @@ module owns only the generic hold/approve/reject mechanics over the ``pending_ap
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -24,6 +25,8 @@ from uuid import uuid4
 
 from messagefoundry.config.settings import ApprovalsSettings
 from messagefoundry.store.base import Store
+
+log = logging.getLogger(__name__)
 
 #: An executor re-runs a captured operation on approval, returning a small JSON-able result summary.
 Executor = Callable[[Mapping[str, Any]], Awaitable[dict[str, Any]]]
@@ -130,7 +133,28 @@ class ApprovalGate:
         ):
             raise ApprovalError(409, "request was already decided")
         params = json.loads(str(row["params"]))
-        result = await op.execute(params)
+        try:
+            result = await op.execute(params)
+        except Exception as exc:
+            # ASVS 2.3.3 COMPENSATING TRANSITION. The row moved to 'approved' BEFORE the executor ran
+            # (that ordering is load-bearing — it guards the double-approve race — and must stay). If
+            # the executor raises, the row would otherwise be stranded asserting an operation that
+            # never happened, and no approval.approved row is written either, so the store would carry
+            # an approval with no outcome at all. Roll it to 'failed' and audit the failure against
+            # both identities, then re-raise so the caller still sees the error.
+            #
+            # `except Exception` is deliberate and is not a swallow: ANY executor failure has to
+            # compensate, and the original is re-raised below. BaseException (notably CancelledError)
+            # is intentionally NOT caught — a cancelled approve must not be recorded as a failure.
+            await self._compensate_failed_execution(
+                approval_id,
+                operation=operation,
+                approver=approver,
+                requester=str(row["requester"]),
+                error=exc,
+                client=client,
+            )
+            raise
         await self._store.record_audit(
             "approval.approved",
             actor=approver,
@@ -153,6 +177,54 @@ class ApprovalGate:
             "approved_by": approver,
             "result": result,
         }
+
+    async def _compensate_failed_execution(
+        self,
+        approval_id: str,
+        *,
+        operation: str,
+        approver: str,
+        requester: str,
+        error: BaseException,
+        client: str | None,
+    ) -> None:
+        """Roll a released-but-unexecuted request back out of ``approved`` (ASVS 2.3.3).
+
+        Best effort by construction: the caller re-raises the ORIGINAL executor error either way, so
+        a store that is itself unreachable here must not mask the error that actually explains the
+        failure. A compensation failure is logged loudly rather than swallowed."""
+        try:
+            # Guarded on 'approved' so this can never clobber a row another caller rejected or
+            # expired, and so a re-drive of the same failure is idempotent (second call moves 0 rows).
+            moved = await self._store.decide_pending_approval(
+                approval_id,
+                status="failed",
+                approver=approver,
+                decided_at=time.time(),
+                from_status="approved",
+            )
+            await self._store.record_audit(
+                "approval.failed",
+                actor=approver,
+                detail=json.dumps(
+                    {
+                        "approval_id": approval_id,
+                        "operation": operation,
+                        "requester": requester,
+                        # The type, never the message: an executor's exception text can carry
+                        # connection names, paths or params, and the audit log is not a PHI sink.
+                        "error": type(error).__name__,
+                        "compensated": moved,
+                    }
+                ),
+                client=client,
+            )
+        except Exception:  # noqa: BLE001 - see the docstring; the original error must win
+            log.exception(
+                "approval %s: executor failed AND the compensating transition failed; the row may "
+                "still read 'approved' for an operation that did not run",
+                approval_id,
+            )
 
     async def reject(
         self, approval_id: str, *, approver: str, client: str | None = None
