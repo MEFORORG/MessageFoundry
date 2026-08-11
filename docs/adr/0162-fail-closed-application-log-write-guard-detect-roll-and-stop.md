@@ -159,6 +159,31 @@ at), so delivery needs an explicit `start_outbound` or a service restart either 
 way round: *a reload alone will not drain the backlog*, and a test pins exactly that — after a reload
 the row moves to the outbound stage and stops there.
 
+**Every one of those recovery paths is CONDITIONED ON THE LOG WORKING AGAIN, and that condition is
+the other half of the enforcement.** Recovery is an operator assertion — *"I fixed the disk"* — and a
+fail-closed control that simply believes it is a control with an off switch. This was a **measured**
+hole, not a hypothetical: with the halt firing correctly, `restart_inbound` + `start_outbound` re-armed
+the whole pipeline while the guard's own state still read `{'file': 'unwritable', 'stdout':
+'unwritable'}`, and the message ran to `PROCESSED` with no application log behind it, in both claim
+modes. It was also unrecoverable by construction — `_log_write_stopped` and the guard's per-sink
+`already_down` latch are both one-shot, so after that first restart nothing in the process could ever
+fail-closed again. So `restart_inbound`, `start_outbound` and a reload's re-bind all pass through
+`_log_recovery_ok`, which asks the guard to **re-validate its dead sinks by writing a real record to
+each**, and a process that still cannot log **stays halted** — the inbound is not re-armed and its
+listener is stopped again rather than left accepting into a lane nothing drains. The refusal is
+announced on `log_write_failed` (the log is the broken thing, so it cannot be a log line) and it is
+**not a raise**: `reload()` rolls the whole graph back on an exception from that path, and one
+unwritable log must not turn a routine reload into a full intake rollback.
+
+Re-validation is **not** the timer polling rejected in section 7. It runs once, on an explicit
+operator recovery action, at the moment the decision is made — never on a schedule, never on the hot
+path. It has to write rather than read, because `unwritable` is only ever set by a failed write and
+nothing clears it on its own: *"repaired"* and *"still broken"* are **identical in memory**, which is
+exactly the distinction recovery has to make. The probe rolls the sink first when its live handle is
+stale — a repaired directory does not un-close a file object — so "writable" means *a record landed*.
+A successful re-validation clears both latches, which matters as much as the refusal: otherwise a
+genuine second break, later, would halt nothing.
+
 ### 5 — The stop is observable, on channels that do not depend on the broken log
 
 A connection that stops silently is a worse failure than the one being prevented, and the obvious
@@ -200,8 +225,10 @@ records, and the two are easy to conflate — hence this clause. An application-
 store failure, and the guard performs **no store I/O at all**. A message already committed to the
 ingress stage was ACKed on receipt; stopping its inbound unbinds the listener and touches no row, and
 pausing an outbound retains its rows PENDING un-errored. Nothing is un-ACKed, lost, or double-
-delivered — fix the disk, reload, and the backlog drains. A test asserts store stats are byte-
-identical across a stage-2 halt and that the committed ingress row is still claimable afterwards.
+delivered — fix the disk, reload, and the backlog drains. **Fix the disk first**: the reload re-arms
+only once the log accepts a record again (section 4), so on a still-broken disk the rows simply stay
+where the halt left them. A test asserts store stats are byte-identical across a stage-2 halt and that
+the committed ingress row is still claimable afterwards.
 
 ### 8 — No PHI on the error path
 
@@ -257,9 +284,16 @@ text the sink would have written had it not failed. Nothing here raises the serv
   `RECEIVED` with no outbound rows — paired with a negative control on the same rig that shows the row
   *is* processed when the log is healthy, and a recovery test that shows the restart drains it. Each
   of the two halting mechanisms was individually disabled and the matching arm confirmed to fail.
+- **The refusal to un-halt is tested the same way, and the recovery tests earn their re-arm.** A
+  paired test restarts both tiers with the sinks still dead and asserts the inbound stays halted, its
+  listener stays down and the row stays `RECEIVED` — then repairs the log, reissues the *same* two
+  calls, and watches it drain, so the test cannot pass against an engine that merely never restarts
+  anything. The recovery tests now repair the log before restarting; previously they did not, which is
+  how the hole shipped looking green. The gate was disabled and that arm confirmed to fail.
 - **Negative, and worth naming.** A stage-2 halt is process-wide (section 4) — a single unwritable
   sink stops every connection this process owns, which is the point of the ruling but is a bigger
   blast radius than "the affected connection" first suggests; `[logging].on_write_failure =
   "continue"` is the documented opt-out. `*.broken-*` files accumulate until an operator removes
   them. The stop is not self-healing: it re-arms on reload/restart, deliberately, so a flapping disk
-  cannot flap the feeds.
+  cannot flap the feeds — and the re-arm is refused while the log is still unwritable, so "restart it
+  again" is not a way around the control.

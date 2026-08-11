@@ -421,6 +421,11 @@ it — the engine refuses to start otherwise, naming the collision.
 
 Recover by fixing the disk or permissions and then **restarting the affected connections** — inbounds
 *and* outbounds — from the web console, or by restarting the service; the retained queue then drains.
+**Fix the disk first — the restart is refused while the log is still unwritable.** The engine
+re-checks by writing a real record to each dead sink at the moment you ask, so a restart issued
+against a still-broken disk leaves the connection halted (and its listener down) and raises another
+`log_write_failed` naming the refusal, rather than quietly resuming with no log. That is deliberate:
+otherwise "restart it again" would be a way around the control.
 A `/config/reload` on its own is **not enough**: it re-arms the inbounds it re-binds, so messages
 start being routed again, but it deliberately never resumes a paused **outbound** (that is an
 operator decision), so the backlog moves one stage and stops. Restarting the service does both.

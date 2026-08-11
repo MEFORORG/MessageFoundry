@@ -1823,9 +1823,19 @@ class RegistryRunner:
     async def start_outbound(self, name: str) -> None:
         """RESUME delivery on one outbound connection (no-op if not paused). The OPPOSITE primitive to
         the inbound stop/start: it un-pauses DELIVERY, keeping the connector WARM. Takes the reload lock
-        so it can't race a concurrent reload/stop (review M-10). Sharded: owner-only (ADR 0073)."""
+        so it can't race a concurrent reload/stop (review M-10). Sharded: owner-only (ADR 0073).
+
+        **REFUSES while a #122 log-failure halt is in force and the log is still unwritable** (ADR
+        0162). Delivery is processing: a paused outbound holds rows the halt retained, and un-pausing
+        it would ship them with no application log behind them — the same violation as re-arming an
+        inbound, reached by the other door. Gated HERE rather than in ``_start_outbound_unsafe`` so a
+        reload's outbound reconciliation is untouched; a reload never un-pauses an operator-paused
+        lane (#115/#233), so this public entry point is the only way delivery resumes."""
         async with self._reload_lock:
             self._require_owned_destination(name)
+            if not self._log_recovery_ok():
+                self._log_write_refused_restart(name)
+                return
             self._start_outbound_unsafe(name)
 
     async def stop_outbound(self, name: str) -> None:
@@ -2295,7 +2305,15 @@ class RegistryRunner:
             # #122 (ADR 0162): BEFORE the spawn, or a worker respawned into a still-halted inbound
             # would hit its loop-top gate and exit again — a restart that reports success and re-arms
             # nothing.
-            self._resume_inbound_processing(name)
+            if not self._resume_inbound_processing(name):
+                # The log is STILL unwritable, so this connection must not come back. The listener is
+                # already bound by the time we get here, so undo that too: leaving intake up with the
+                # internal stages halted would ACK a sender into a lane nothing is draining. Deliberately
+                # not a raise — reload() rolls the WHOLE graph back on an exception from here, and one
+                # unwritable log must not turn a routine reload into a full intake rollback.
+                self._log_write_refused_restart(name)
+                await self._stop_inbound_unsafe(name)
+                return
             self._ensure_inbound_workers(name)
 
     async def _stop_inbound_unsafe(self, name: str) -> None:
@@ -2471,21 +2489,81 @@ class RegistryRunner:
             # via _wake_lane, whose pooled branch is mark_ready() — re-readying a lane we just paused.
             self._wake_all(Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE)
 
-    def _resume_inbound_processing(self, name: str) -> None:
-        """Re-arm one inbound's internal stages after a log-failure halt (#122, ADR 0162).
+    def _log_recovery_ok(self) -> bool:
+        """May this process resume processing? Only if it can LOG again — re-tested by writing.
+
+        **The halt is not the whole control; refusing to un-halt on a false premise is the other
+        half.** Recovery is an operator action ("I fixed the disk"), and a control that simply
+        believes them is a control with an off switch. So every path that would lift the halt asks
+        the guard to re-validate its dead sinks by writing a real record to them, and a process that
+        still cannot log stays halted no matter how many times it is restarted.
+
+        On success the latch is cleared, which matters as much as the refusal: ``_log_write_stopped``
+        is a one-shot, so leaving it set after a genuine recovery would mean a LATER break never
+        halted anything again. Cheap by construction — it does nothing until a halt has fired.
+
+        The re-validation write is SYNCHRONOUS on the calling (event-loop) thread. That is the same
+        posture as every other log write in this engine — stdlib logging is synchronous throughout,
+        including the syslog forwarder — and this one runs at most once per operator recovery action,
+        never on the hot path, so it is not the blocking-the-loop hazard the async rules are about."""
+        if not self._log_write_stopped:
+            return True
+        guard = active_log_guard()
+        if guard is None or guard.revalidate():
+            self._log_write_stopped = False
+            return True
+        return False
+
+    def _log_write_refused_restart(self, name: str) -> None:
+        """Page that a recovery attempt was REFUSED because the application log is still unwritable.
+
+        Through the notifier, not a log line, for the same reason the halt itself alerts that way: the
+        thing that is broken is the log. Without this the refusal is invisible — the operator asked for
+        a restart, got no error (a raise here would roll a reload back), and the connection simply
+        stays down. ``stopped=0``: nothing was newly stopped, the point is that nothing was STARTED."""
+        guard = active_log_guard()
+        dead = (
+            ",".join(s.sink for s in guard.status() if s.state == "unwritable")
+            if guard is not None
+            else "unknown"
+        )
+        try:
+            self._alert_sink.log_write_failed(
+                dead or "unknown",
+                stage="unwritable",
+                reason=(
+                    f"refused to restart connection {name!r}: the application log is still "
+                    "unwritable, so the engine would be processing what it cannot log"
+                ),
+                stopped=0,
+            )
+        except Exception:
+            log.exception("alert sink raised on a refused log-failure restart for %r", name)
+
+    def _resume_inbound_processing(self, name: str) -> bool:
+        """Re-arm one inbound's internal stages after a log-failure halt (#122, ADR 0162). Returns
+        whether it re-armed.
 
         The recovery path the ADR promises — fix the disk, restart the connection, the backlog drains
         — and it must live HERE rather than in a reload: a reload deliberately never rebuilds the
         dispatchers, so a paused ingress lane would otherwise stay paused for the life of the process
         and the halt would be unrecoverable without a restart. Per-inbound, so restarting A leaves B
-        halted until B is restarted too. A no-op when this inbound was never halted."""
+        halted until B is restarted too. A no-op when this inbound was never halted.
+
+        **REFUSES while the log is still unwritable** (:meth:`_log_recovery_ok`). Re-arming there
+        would hand back exactly the state the halt exists to prevent — measured: a restart with the
+        sinks still dead resumed the whole pipeline and drove a message to PROCESSED with no
+        application log behind it, and neither latch could ever fire again."""
         if name not in self._log_halted:
-            return
+            return True
+        if not self._log_recovery_ok():
+            return False
         self._log_halted.discard(name)
         for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
             dispatcher = self._dispatchers.get(stage)
             if dispatcher is not None:
                 dispatcher.resume_lane(name)
+        return True
 
     def _start_outbound(self, name: str, oc: OutboundConnection) -> None:
         """Build one outbound connector + spawn its delivery worker. A build failure (unresolvable

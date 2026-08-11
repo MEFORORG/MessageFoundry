@@ -759,6 +759,20 @@ def _kill_every_sink(logdir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("sys.stdout", dead)
 
 
+def _revive_every_sink(logdir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The operator's ACTUAL repair, and the exact inverse of :func:`_kill_every_sink`: give the log
+    back a real directory and a live stdout.
+
+    Every recovery test must call this, because "the operator fixed the disk" and "the operator
+    restarted and hoped" are different situations with different correct outcomes — and a recovery
+    test that skips it is asserting the second while claiming the first. The handlers are left holding
+    their DEAD handles on purpose: re-opening them is the guard's job (a repaired directory does not
+    un-close a file object), so this also exercises the roll inside the re-validation probe."""
+    logdir.unlink()  # the regular FILE _kill_every_sink left where the directory belongs
+    logdir.mkdir()
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+
+
 def _e2e_runner(store: MessageStore, outdir: Path, logdir: Path, claim_mode: str) -> RegistryRunner:
     configure_logging("INFO", log_file=LogFile(path=str(logdir / "engine.log")))
     return RegistryRunner(_e2e_registry(outdir), store, poll_interval=0.02, claim_mode=claim_mode)
@@ -855,7 +869,8 @@ async def test_restarting_the_connections_re_arms_processing_after_the_halt(
         await asyncio.sleep(0.3)
         assert await store.outbox_for(message_id) == []  # still halted
 
-        await runner.restart_inbound(INBOUND)  # the operator's "I fixed the disk" action
+        _revive_every_sink(logdir, monkeypatch)  # the operator actually fixes the disk
+        await runner.restart_inbound(INBOUND)  # …and only THEN restarts
         await runner.start_outbound(OUTBOUND)
 
         assert await _until(lambda: any(outdir.iterdir())), (
@@ -865,6 +880,87 @@ async def test_restarting_the_connections_re_arms_processing_after_the_halt(
         assert INBOUND not in runner._log_halted
     finally:
         await runner.stop()
+
+
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
+async def test_a_restart_is_refused_while_the_log_is_still_unwritable(
+    store: MessageStore, tmp_path: Path, claim_mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # THE OTHER HALF OF THE ENFORCEMENT, and it was a MEASURED hole rather than a hypothetical: the
+    # halt fired correctly, and then `restart_inbound` + `start_outbound` re-armed the entire pipeline
+    # while the guard's own state still read {'file': 'unwritable', 'stdout': 'unwritable'}. The
+    # message went to PROCESSED with no application log behind it, in BOTH claim modes. Worse, it was
+    # unrecoverable-by-design: `_log_write_stopped` and the guard's per-sink `already_down` latch are
+    # both one-shot, so after that first restart NOTHING could ever fail-closed again in that process.
+    #
+    # A fail-closed control that any restart disarms is a control with an off switch. The recovery
+    # tests above pass because they REPAIR the log first; this one proves the repair is what earns the
+    # re-arm, rather than the restart command by itself.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, claim_mode)
+    await runner.start()
+    try:
+        _kill_every_sink(logdir, monkeypatch)
+        logging.getLogger("t").warning("a record this engine cannot write anywhere")
+        assert await _until(lambda: runner._log_write_stopped), "the halt never fired"
+
+        # The operator restarts WITHOUT fixing anything. Deliberately no _revive_every_sink.
+        await runner.restart_inbound(INBOUND)
+        await runner.start_outbound(OUTBOUND)
+
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        await asyncio.sleep(1.0)  # generous: the repaired path drains far inside this
+
+        assert INBOUND in runner._log_halted  # the re-arm was refused, not silently granted
+        assert INBOUND not in runner._sources  # …and intake did not come back either
+        assert list(outdir.iterdir()) == []
+        assert await store.outbox_for(message_id) == []
+        assert (await store.get_message(message_id))["status"] == MessageStatus.RECEIVED.value
+
+        # The refusal is not permanent — it is conditioned on the log, so the SAME restart works once
+        # the disk is fixed. Without this the test would also pass against an engine that simply never
+        # restarts anything, which is the wrong control for the right reason.
+        _revive_every_sink(logdir, monkeypatch)
+        await runner.restart_inbound(INBOUND)
+        await runner.start_outbound(OUTBOUND)
+        assert await _until(lambda: any(outdir.iterdir())), "the repaired engine never drained"
+        assert await _until_processed(store, message_id), "drained but never finalized"
+    finally:
+        await runner.stop()
+
+
+def test_revalidate_reports_a_process_that_still_cannot_log(tmp_path: Path) -> None:
+    # The guard-level unit behind the refusal above. `unwritable` is set only by a failed write and
+    # nothing clears it, so a cached read cannot tell "fixed" from "still broken" — revalidate answers
+    # by WRITING. Both directions, because a revalidate that always said False would pass the refusal
+    # test for the wrong reason.
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+    guard = LogWriteGuard()
+    handler = _file_handler(logdir / "engine.log", guard)
+    _break_the_open_handle(handler)
+    _replace_directory_with_a_file(logdir)
+    handler.emit(_record("first write after the break"))
+    assert [s.state for s in guard.status()] == ["unwritable"]
+
+    assert guard.revalidate() is False  # still broken: the probe write cannot land
+    assert guard.can_log() is False
+
+    logdir.unlink()
+    logdir.mkdir()
+    assert guard.revalidate() is True  # repaired: the probe rolled to a fresh file and wrote
+    assert guard.can_log() is True
+    assert [s.state for s in guard.status()] == ["healthy"]
+    # The latch is genuinely cleared, so a LATER break pages again instead of being swallowed.
+    events: list[LogSinkEvent] = []
+    guard.set_escalation(events.append)
+    _break_the_open_handle(handler)
+    _replace_directory_with_a_file(logdir)
+    handler.emit(_record("a second, independent break"))
+    assert [e.stage for e in events] == ["unwritable"]
+    assert events[0].stop_requested is True
 
 
 # --- the two observability channels the ADR leans on, each pinned ------------
@@ -963,6 +1059,7 @@ async def test_a_reload_re_arms_exactly_the_inbounds_it_re_binds(
         await asyncio.sleep(0.3)
         assert await store.outbox_for(message_id) == []  # still halted
 
+        _revive_every_sink(logdir, monkeypatch)  # a reload re-arms only once the log works again
         await runner.reload(_e2e_registry(outdir))
 
         assert INBOUND not in runner._log_halted  # re-bound, therefore re-armed

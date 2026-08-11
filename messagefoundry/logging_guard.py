@@ -18,6 +18,13 @@ module is that second half.
 * **Stage 2 — STOP.** Only when the **replacement** also cannot be written does the guard escalate.
   A single-stage stop would take feeds down on a hiccup; that is an outage generator, not an invariant.
 
+**And a third thing, which is not a stage but is half the enforcement: UN-stopping.** Recovery is an
+operator assertion — *"I fixed the disk"* — and a fail-closed control that simply believes it is a
+control with an off switch. :meth:`LogWriteGuard.revalidate` therefore re-tests a dead sink **by
+writing a real record to it**, because ``unwritable`` is only ever set by a failed write and nothing
+clears it on its own: *repaired* and *still broken* are indistinguishable from memory, which is
+exactly the distinction recovery has to make. The engine gates every re-arm path on that answer.
+
 **Scope of the stop is the PROCESS, and the code says so rather than pretending otherwise.** The
 application log is a process-global handler set on the root logger — a write failure is a property of
 the *sink*, not of any one connection, and no per-connection attribution exists to narrow it with. So
@@ -114,6 +121,10 @@ class LogSinkStatus:
 #: cheap, non-blocking and never raise — the guard is already handling a failure.
 EscalationCallback = Callable[[LogSinkEvent], None]
 
+#: One sink's "are you writable again?" self-test. Writes a real record to itself and RAISES if the
+#: sink still refuses it — see :meth:`LogWriteGuard.revalidate`.
+SinkProbe = Callable[[], None]
+
 
 class LogWriteGuard:
     """Process-wide state + escalation seam for the guarded application-log sinks.
@@ -129,16 +140,22 @@ class LogWriteGuard:
         self._sinks: dict[str, LogSinkStatus] = {}
         #: sink -> (window start, rolls in window) — the anti-flap bound, see :meth:`record_rollover`.
         self._roll_flap: dict[str, tuple[float, int]] = {}
+        #: sink -> "write one record to yourself and raise if you still cannot", see :meth:`revalidate`.
+        self._probes: dict[str, SinkProbe] = {}
         self._escalation: EscalationCallback | None = None
         #: ``[logging].on_write_failure == "stop"``. Stamped onto every stage-2 event.
         self.stop_on_unwritable = stop_on_unwritable
 
     # --- registration / wiring ------------------------------------------------
 
-    def register(self, sink: str) -> None:
-        """Declare a guarded sink as healthy so ``GET /status`` can report it before anything breaks."""
+    def register(self, sink: str, probe: SinkProbe | None = None) -> None:
+        """Declare a guarded sink as healthy so ``GET /status`` can report it before anything breaks.
+
+        ``probe`` is how this sink answers "can you accept a record again?" — see :meth:`revalidate`."""
         with self._lock:
             self._sinks.setdefault(sink, LogSinkStatus(sink=sink, state="healthy", rollovers=0))
+            if probe is not None:
+                self._probes[sink] = probe
 
     def set_escalation(self, callback: EscalationCallback | None) -> None:
         """Wire (or clear) the engine-side responder. Cleared by default, so a CLI/test process that
@@ -255,6 +272,63 @@ class LogWriteGuard:
             )
         )
 
+    def record_healthy(self, sink: str) -> None:
+        """``sink`` accepted a record again — clear the unwritable latch so a LATER break pages afresh.
+
+        Without this the ``unwritable`` state is terminal for the life of the process: nothing else
+        ever moves a sink out of it, so a repaired disk would still read as broken and (worse) a
+        genuine second break would be swallowed by :meth:`record_unwritable`'s ``already_down``
+        return. The rollover COUNT is deliberately kept — it is the sink's history, and an operator
+        triaging a flapping disk needs to see that it has been rolled before."""
+        with self._lock:
+            previous = self._sinks.get(sink)
+            self._sinks[sink] = LogSinkStatus(
+                sink=sink,
+                state="healthy",
+                rollovers=previous.rollovers if previous else 0,
+                last_event="the sink accepted a record again",
+                last_event_at=_utc_now(),
+                rolled_aside=previous.rolled_aside if previous else None,
+            )
+            # The flap window is about a sink that keeps needing rescue. One that is writable again
+            # starts a fresh window, or a slow drip of unrelated transients would eventually trip it.
+            self._roll_flap.pop(sink, None)
+
+    def can_log(self) -> bool:
+        """Can this PROCESS still write a log record anywhere? The question the #122 halt is about.
+
+        Not "did a sink break" — with two sinks configured, one dead beside one healthy still means
+        the processing IS logged. A guard with no registered sinks (a process that never called
+        ``configure_logging``) answers True: it has nothing to say about a log it does not own, and
+        answering False would fail closed on a premise it cannot support."""
+        with self._lock:
+            if not self._sinks:
+                return True
+            return not all(s.state == "unwritable" for s in self._sinks.values())
+
+    def revalidate(self) -> bool:
+        """Re-test every unwritable sink BY WRITING TO IT, and report whether the process can log.
+
+        **A cached state cannot answer this, and that is the whole reason this exists.** ``unwritable``
+        is only ever set by a failed write, and nothing clears it on its own — so after an operator
+        fixes the disk the guard still reads "broken", and before they fix it the guard reads "broken"
+        too. The two situations are indistinguishable from memory, which is exactly the distinction the
+        fail-closed recovery path has to make. Each sink's probe writes a real record through the real
+        formatter, rolling the sink first if its live handle is stale (a repaired directory still leaves
+        the old handle closed), so "writable" means *a record landed*, not *a stat call succeeded*.
+
+        This is NOT the timer polling ADR 0162 rejected: it runs once, on an explicit operator recovery
+        action, at the moment the decision is made — never on a schedule and never on the hot path."""
+        with self._lock:
+            dead = [name for name, status in self._sinks.items() if status.state == "unwritable"]
+            probes = [(name, self._probes.get(name)) for name in dead]
+        for name, probe in probes:
+            # A sink registered without a self-test stays exactly as it is: we cannot ask it, and
+            # guessing on its behalf is how a fail-closed control gets talked out of failing closed.
+            if probe is not None and _probe_lands(probe):
+                self.record_healthy(name)
+        return self.can_log()
+
     def _fire(self, event: LogSinkEvent) -> None:
         with self._lock:
             callback = self._escalation
@@ -281,6 +355,21 @@ def set_active_guard(guard: LogWriteGuard | None) -> None:
     global _ACTIVE
     with _ACTIVE_LOCK:
         _ACTIVE = guard
+
+
+def _probe_lands(probe: SinkProbe) -> bool:
+    """Run one sink's self-test and report whether the record LANDED.
+
+    A raise is the answer, not an error: "this sink still refuses writes" is exactly what
+    :meth:`LogWriteGuard.revalidate` needs to learn, and it is called from a recovery path that has
+    to survive every sink being dead. Catching broadly is deliberate and bounded — the probe reaches
+    the filesystem through a handler the guard does not own, so the failure set is whatever the OS
+    and that handler can raise, and any of them mean the same thing here."""
+    try:
+        probe()
+    except Exception:
+        return False
+    return True
 
 
 def _utc_now() -> str:
@@ -331,7 +420,7 @@ class _GuardedSinkMixin(_SinkBase):
         # Per-thread re-entrancy latch. A failure raised WHILE handling a failure must not recurse:
         # the inner call returns immediately and the outer one converts the raise into Stage 2.
         self._reentry = threading.local()
-        guard.register(sink)
+        guard.register(sink, probe=self._probe_write)
 
     # --- subclass seam --------------------------------------------------------
 
@@ -378,6 +467,24 @@ class _GuardedSinkMixin(_SinkBase):
             self._guard.record_rollover(self._sink_label, reason=reason, rolled_aside=rolled_aside)
         finally:
             self._reentry.active = False
+
+    def _probe_write(self) -> None:
+        """:data:`SinkProbe` for this sink: answer "can you take a record again?" BY TAKING ONE.
+
+        Raises when the sink still refuses, which is what :meth:`LogWriteGuard.revalidate` reads. The
+        roll on the retry is load-bearing rather than defensive: after a genuinely repaired
+        destination the handler is still holding the CLOSED handle it died with, so a bare re-write
+        would report the sink dead forever and a fixed disk would never recover. Rolling re-opens at
+        the live path — and if the destination is still broken the roll or the second write raises,
+        which is the correct answer. Deliberately :meth:`_emit_direct`, never ``emit``: an ``emit``
+        failure would route into :meth:`handleError` and be converted into a stage-1/stage-2
+        transition, so the probe would silently mutate the very state it is trying to measure."""
+        message = f"application log sink {self._sink_label!r} accepted a record again"
+        try:
+            self._write_notice(message)
+        except Exception:
+            self._roll()
+            self._write_notice(message)
 
     def _write_notice(self, message: str) -> None:
         """Record the rollover event ON the rolled sink, through the sink's own formatter so a JSON
