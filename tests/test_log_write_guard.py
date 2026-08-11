@@ -492,7 +492,9 @@ async def test_unwritable_log_stops_intake_and_delivery_and_names_the_cause(
     )
 
     assert source.stopped is True  # intake halted — nothing new is accepted that cannot be logged
-    assert OUTBOUND in runner._outbound_paused  # delivery paused, queue RETAINED (not dead-lettered)
+    assert (
+        OUTBOUND in runner._outbound_paused
+    )  # delivery paused, queue RETAINED (not dead-lettered)
     # The WHY, on the channel that does not depend on the broken log.
     assert sink.log_failures == [("file", "unwritable", "disk full", 2)]
     # …and the per-connection stop the operator's existing machinery already understands (ADR 0014),

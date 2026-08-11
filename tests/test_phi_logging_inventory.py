@@ -87,6 +87,12 @@ _RETIRED_CLAIMS = (
     "two handler filters",
     "same two handler filters",
     "[ai].production",
+    # #122 / ADR 0162: the engine DOES install a file handler now, when the opt-in [logging].file is
+    # set. Both spellings the inventory used to carry are retired, so the absence claim cannot creep
+    # back as a copy-edit — a security document asserting an absence that has stopped being true is
+    # precisely what this scanner exists to catch.
+    "installs no file handler",
+    "installs **no file handler**",
 )
 
 
@@ -225,6 +231,10 @@ def test_default_on_wording_matches_the_shipped_defaults() -> None:
         "§7 says the off-box forward format defaults to JSON"
     )
     assert logging_settings.forward_tls_verify is True, "§7 says TLS verification is on by default"
+    assert logging_settings.file is None, (
+        "§7 calls the engine-managed [logging].file sink OPT-IN; a default-on file sink is a new "
+        "at-rest PHI surface and needs its own inventory row (#122, ADR 0162)"
+    )
     assert alerts.security_notifications_required is True, (
         "§7 calls the per-user security-event channel posture-mandatory"
     )

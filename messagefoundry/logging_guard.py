@@ -195,7 +195,9 @@ class LogWriteGuard:
                 ),
             )
             return
-        self._fire(LogSinkEvent(sink=sink, stage="rolled", reason=reason, rolled_aside=rolled_aside))
+        self._fire(
+            LogSinkEvent(sink=sink, stage="rolled", reason=reason, rolled_aside=rolled_aside)
+        )
 
     def record_unwritable(self, sink: str, *, reason: str) -> None:
         """Stage 2: the replacement could not be written either. Escalates ONCE per break."""
@@ -325,7 +327,9 @@ class _GuardedSinkMixin(_SinkBase):
         self._reentry.active = True
         try:
             exc = sys.exception()
-            reason = safe_exc(exc) if exc is not None else "log write failed (no exception recorded)"
+            reason = (
+                safe_exc(exc) if exc is not None else "log write failed (no exception recorded)"
+            )
             try:
                 rolled_aside = self._roll()
                 # STAGE 1 is only complete once the REPLACEMENT has actually accepted a write. Both

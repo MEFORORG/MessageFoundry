@@ -160,6 +160,10 @@ _CITED_SETTINGS = (
     ("retention", "wal_checkpoint_seconds"),
     ("retention", "vacuum_at"),
     ("backup", "config_only_on_server_db"),
+    # #122 / ADR 0162 — the opt-in engine-managed application-log sink the inventory's app-log row
+    # now names, and the fail-closed policy it names beside it.
+    ("logging", "file"),
+    ("logging", "on_write_failure"),
 )
 
 
