@@ -7671,3 +7671,39 @@ gate is the wrong shape, validation of the walk is the right one.
 **Cluster:** Connections and Transports. **Priority:** P3. **Verdict:** build. **Severity:** minor.
 
 
+## 1220. `ENGINE_UI_SEAM` collides silently: two branches bump to the same version and the golden gate agrees
+
+> 🔢 **Filed 2026-08-11 -- MEASURED on two live branches, not hypothesised.** Value **7/10** -- Difficulty **3/10** -- _quick win_. `ENGINE_UI_SEAM` is a version integer that must be unique per console-contract change. Two unlanded branches sharing merge-base `751ca08a` both bumped it to the **same value**:
+
+> ```
+> origin/main                     ENGINE_UI_SEAM = 18
+> w3-log-write-failure            ENGINE_UI_SEAM = 19   (for SystemStatus.log_sinks)
+> w3-store-privilege-preflight    ENGINE_UI_SEAM = 19   (for SecurityPosture.store_privilege)
+> ```
+
+> **THE CONFLICT GIT RAISES IS THE COSMETIC HALF; THE SEMANTIC HALF MERGES SILENTLY.** Trial-merging the two conflicts in `messagefoundry/api/_ui_seam.py` **only**, and only in the adjacent **comment blocks** -- two markers. Meanwhile `tests/golden/webconsole_seam.snapshot` **auto-merges CLEAN**: verified independently, the merged tree's snapshot carries **both** `log_sinks` and `store_privilege` with **zero conflict markers**, and `SUPPORTED_ENGINE_SEAMS={19}` accepts it. **So a reviewer who resolves the visible conflict correctly still ships the defect** -- seam 19 now describes two independent contract changes, and the gate whose entire job is catching seam contract changes agrees with it. Whichever branch lands second must re-bump to 20, and **nothing enforces that today**.
+
+> **This is the keep-both-sides shape in a new location, and the nastiest instance recorded here**, because the usual defence fails: the merge is not silent, it raises a conflict, and resolving that conflict *correctly* is what lands the fault. A predicted conflict is not a control when it points at the wrong half.
+
+> **Scope:** make the seam value's uniqueness checkable rather than conventional. Options worth weighing rather than assuming: derive the seam from a hash of the contract surface so two independent changes cannot collide by construction; or gate it -- assert the seam is strictly greater than every value reachable from `origin/main` **and** that the golden snapshot's contract set matches exactly one bump. **The derived form is preferable if it is cheap**, because a gate on a hand-maintained integer is one more thing to remember, and the collision above happened between two sessions that were each individually careful.
+
+> **Verify the fix against THIS pair.** Both branches are unlanded and anchored, so the collision is reproducible on demand: `git merge-tree --write-tree w3-log-write-failure w3-store-privilege-preflight` and read the merged snapshot. A fix that does not red on that pair has not been shown to work.
+
+**Cluster:** Developer tooling / CI. **Priority:** P2. **Verdict:** build. **Severity:** conditional -- no product effect today, but it would ship a console contract whose version does not identify it, which is exactly what the seam exists to prevent.
+## 1221. A doc lint crashes when printing a hit that contains a glyph, so it is unreadable exactly when it fires
+
+> 🔢 **Filed 2026-08-11 -- found by Session B while fixing an unrelated false positive in the same file.** Value **5/10** -- Difficulty **2/10** -- _quick win_. `scripts/docs/asvs_tally_lint.py` raises `UnicodeEncodeError: 'charmap' codec can't encode character` on a stock Windows **cp1252** console when it prints a hit whose text contains a glyph. It fires **only on the failure path** -- printing the hits -- so it is **INVISIBLE WHILE THE LINT IS GREEN**, and it converts a legible FAIL into a traceback at exactly the moment somebody needs to read which document tripped it. **A gate that is correct until it has something to say, and then unreadable.**
+
+> **WHY THIS IS NOT MORE EVIDENCE UNDER #1030, WHICH WAS THE OBVIOUS CALL AND IS WRONG.** #1030 is *"keep the corpus cp1252-clean, because per-file gating lets the class recur"*. **That cannot fix this, because the corpus this lint reads is REQUIRED to contain cp1252-unsafe characters.** Measured: it walks `base.rglob("*.md")` over `docs/` (`:245`) and explicitly reads `docs/BACKLOG.md` (`:63-64`) -- the file whose **sanctioned banner alphabet** is CLAUDE.md §11's one machine-parsed holdout, every glyph of which is cp1252-unsafe. Its own comment at `:153` records it already redding on backlog content. So a clean corpus is not achievable *here* even in principle, and only making the tool robust addresses it. **#1030 is about the content; this is about the instrument.** Both are needed and neither substitutes.
+
+> **The decision this needs, and it is a real one rather than a patch.** Either a repo script **forces UTF-8 on its own stdout** (the engine CLI already does exactly this -- `messagefoundry/__main__.py` hardens `sys.stdout`/`sys.stderr`, and the harness and a bench script carry the same remedy), **or** the crash is treated as the corpus's problem and the script stays naive. Those have different blast radii: the first makes every repo script robust and is a one-line idiom already proven in-tree; the second is unachievable for any tool that reads the ledger. `PYTHONIOENCODING=utf-8` works around it either way and is **not** a fix, because CI and a developer shell will not both set it.
+
+> **MEASURED, AND IT IS NOT AN EDGE CASE WAITING FOR AN UNLUCKY DOCUMENT.** `main`'s `docs/BACKLOG.md` -- the file this lint names at `:63-64` -- carries **799 cp1252-unsafe codepoints across 29 distinct characters**, including **`U+2192` x140**, `U+1F522` x171, `U+2705` x138, `U+26A0` x91 and `U+26D4` x79. So the crash is reachable from any hit whose line carries one, and there are **140 chances from the arrow alone**. That is a large fraction of the possible failures in the primary corpus, not a corner. *(Count codepoints, not UTF-16 units: a first pass reported `U+D83D` x193, which is a SURROGATE HALF and not a character present in the file -- grepping for it finds nothing.)*
+
+> **FOURTH SURFACE IN ONE DAY**, which is the argument for doing it structurally rather than one file at a time: a `U+21D2` in a `ci.yml` comment, **three pre-existing `U+2192` already on `main` in that same file**, a `U+21D2` in the coordinator playbook, and now this. The first three are #1030's subject; this one is not.
+
+> **Scope note:** the fix belongs with whichever of the two answers is chosen, and the failure path is the place to prove it -- **make the lint FIRE on a document containing a glyph and read the output**, because a green run exercises none of this. That is the whole point of the item.
+
+**Cluster:** Developer tooling / CI. **Priority:** P3. **Verdict:** build. **Severity:** minor -- no product effect; it degrades a working gate into an unreadable one at the moment it matters.
+
+
