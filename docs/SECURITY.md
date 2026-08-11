@@ -1737,15 +1737,25 @@ BACKLOG #190 bundled three integrity residuals; #190 closes with **one built** a
   ask was a *runbook decision* (does the exposure runbook mandate it), not new engine code. Every
   PHI-plane surface already carries integrity: outbound bodies (ADR 0018), the audit trail (the HMAC
   hash-chain), and data at rest (AES-256-GCM AEAD).
-- **ECH (Encrypted Client Hello) for outbound SNI — infeasible, documented risk acceptance
-  (12.1.5).** Hiding the destination hostname in the outbound TLS ClientHello is not buildable here:
-  Python 3.14's stdlib `ssl` exposes **no ECH API**, there is **no SVCB/HTTPS DNS resolver** (ECHConfig
-  is DNS-published) and adding one is out of scope, and a working ECH client would require a
-  **third-party TLS stack** — violating the no-new-dependency rule for a security-core path. The
+- **ECH (Encrypted Client Hello) for outbound SNI — not performed by the engine, documented risk
+  acceptance (12.1.5).** Hiding the destination hostname in the outbound TLS ClientHello is not
+  reachable **in the engine process**: Python 3.14's stdlib `ssl` exposes **no ECH API**, and there is
+  **no SVCB/HTTPS DNS resolver** (ECHConfig is DNS-published) — adding one is out of scope. The
   destination SNI is therefore visible on the outbound handshake. Compensating context: on-prem, a
   trusted network segment, an operator-configured `[egress]`-allowlisted destination, and TLS still
-  protects the payload. Re-open when the stdlib gains a first-class ECH API (no new dep) and an
-  SVCB/HTTPS resolver is in scope.
+  protects the payload. Re-open when the stdlib gains a first-class ECH API and an SVCB/HTTPS
+  resolver is in scope.
+
+  > **Correction, 2026-08-10.** This paragraph previously called ECH *infeasible* and said a working
+  > client "would require a **third-party TLS stack** — violating the no-new-dependency rule". Both
+  > halves are false, and the counter-evidence is in this repository: `tools/ech-sidecar` is a
+  > working out-of-process ECH client whose `go.mod` reads "stdlib-only, no dependencies" and whose
+  > every import is Go stdlib (ADR 0139). A reader weighing this risk acceptance was being told the
+  > control could not be built while the tree contained one. What is actually true is narrower and
+  > is what the paragraph now says: the **engine process** cannot do ECH, and the sidecar is **not
+  > wired into any egress path, not built by CI, and not distributed** (`pyproject.toml` excludes
+  > `tools/` from both sdist and wheel). **The accepted residual is unchanged** — the SNI is visible
+  > either way. Only the premise is corrected.
 
 ### In-use memory protection — best-effort partial + deployment requirement (13.3.3 / 11.7.1 / 11.7.2, #198)
 
