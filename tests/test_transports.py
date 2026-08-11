@@ -21,9 +21,15 @@ from messagefoundry.parsing import RawMessage
 from messagefoundry.parsing.compression import gzip_compress, gzip_decompress
 from messagefoundry.parsing.peek import Peek
 from messagefoundry.transports import build_destination, build_source
-from messagefoundry.transports.base import DeliveryError, NegativeAckError, SourceStartupError
+from messagefoundry.transports.base import (
+    DeliveryError,
+    DestinationStartupError,
+    NegativeAckError,
+    SourceStartupError,
+)
 from messagefoundry.transports.file import (
     DEFAULT_MAX_FILE_BYTES,
+    FileDestination,
     FileSource,
     _claim_unique,
     render_filename,
@@ -676,6 +682,113 @@ async def test_file_validate_directory_leave_mode_requires_only_read(
     )
     with pytest.raises(SourceStartupError):
         await move.validate_startup()  # move mode needs write → the failing probe raises
+
+
+# --- #114 opt-in startup directory validation: the OUTBOUND half -------------
+
+
+def _file_dest(directory: Path, **over: object) -> FileDestination:
+    settings: dict[str, object] = {"directory": str(directory), "filename": "msg.hl7"}
+    settings.update(over)
+    dest = build_destination(
+        Destination(name="OB_FILE", type=ConnectorType.FILE, settings=settings)
+    )
+    assert isinstance(dest, FileDestination)
+    return dest
+
+
+async def test_file_destination_test_probe_creates_the_directory(tmp_path: Path) -> None:
+    # Pins WHY the outbound needs a startup hook of its own: #114's score rested on "a clean workaround
+    # via the on-demand test probe", and in this direction that premise is false. POST
+    # /connections/{name}/test CREATES the target directory, so the act of asking "does this directory
+    # exist?" makes the answer yes. Measured, not inferred — the rest of the design leans on it.
+    missing = tmp_path / "typo"
+    await _file_dest(missing).test_connection()
+    assert missing.is_dir()  # the probe fabricated it
+
+
+async def test_file_destination_validate_directory_off_is_noop(tmp_path: Path) -> None:
+    # Default: validate_startup is a no-op even on a missing directory. That is the item's own trigger
+    # (an intermittently-available target must NOT fail startup), so the toggle defaults to deferral.
+    missing = tmp_path / "nope"
+    await _file_dest(missing).validate_startup()  # no raise
+    assert not missing.exists()  # and the hook itself creates nothing
+
+
+async def test_file_destination_validate_directory_refuses_missing_dir(tmp_path: Path) -> None:
+    # The opt-in arm: a typo'd target directory FAILS startup validation, and the no-mkdir probe never
+    # fabricates it (the same semantic gap the source hook closes — _probe_dir_writable would pass).
+    missing = tmp_path / "nope"
+    dest = _file_dest(missing, validate_directory=True)
+    with pytest.raises(DestinationStartupError):
+        await dest.validate_startup()
+    assert not missing.exists()
+
+
+async def test_file_destination_validate_directory_passes_on_existing_writable_dir(
+    tmp_path: Path,
+) -> None:
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    await _file_dest(outdir, validate_directory=True).validate_startup()  # exists + writable
+
+
+async def test_file_destination_created_directory_is_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Default behaviour is unchanged — the directory is still created on write and the delivery still
+    # succeeds — but the creation is no longer SILENT. Without this line a typo'd directory would be
+    # created on first delivery and every message counted and logged as delivered (it was), into a path
+    # nobody is watching, with nothing anywhere saying so.
+    outdir = tmp_path / "made"
+    dest = _file_dest(outdir)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
+        await dest.send(ADT)
+    assert (outdir / "msg.hl7").exists()
+    assert "CREATED missing directory" in caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
+        await dest.send(ADT)
+    assert "CREATED missing directory" not in caplog.text  # only a real creation is loud
+
+
+async def test_file_destination_non_directory_at_the_path_still_errors(tmp_path: Path) -> None:
+    # A regular FILE sitting at the configured directory path is still a mapped DeliveryError (retried,
+    # never a crash and never a silent success) after the create-detection rework swapped
+    # mkdir(exist_ok=True) for mkdir()+FileExistsError.
+    #
+    # Deliberately NOT claimed as a pin on that swap: sabotaging the re-raise (swallowing the
+    # FileExistsError) was measured and left this test GREEN, because the mkstemp two lines later fails
+    # with NotADirectoryError — another OSError — and maps to the same DeliveryError. That is precisely
+    # why the swap is safe, and why this asserts only the invariant that actually holds either way.
+    clash = tmp_path / "not_a_dir"
+    clash.write_text("i am a file", encoding="utf-8")
+    with pytest.raises(DeliveryError):
+        await _file_dest(clash).send(ADT)
+    assert clash.is_file()  # untouched
+
+
+async def test_file_destination_validate_directory_never_creates_on_write(tmp_path: Path) -> None:
+    # Under the toggle the target is not fabricated at DELIVERY time either: "this directory must
+    # exist" has to keep meaning that after start, or a share that vanished mid-run would be silently
+    # re-created at the mount point. The send fails RETRYABLY (DeliveryError), so the lane backs off and
+    # self-heals when the share returns — the row is never dropped.
+    missing = tmp_path / "gone"
+    dest = _file_dest(missing, validate_directory=True)
+    with pytest.raises(DeliveryError):
+        await dest.send(ADT)
+    assert not missing.exists()
+
+
+async def test_file_destination_validate_directory_test_probe_never_creates(tmp_path: Path) -> None:
+    # ... and the on-demand probe honours the same rule under the toggle, so POST
+    # /connections/{name}/test cannot silently repair the typo the toggle exists to catch (after which
+    # the next restart would validate clean and the operator would never learn the path was wrong).
+    missing = tmp_path / "typo"
+    dest = _file_dest(missing, validate_directory=True)
+    with pytest.raises(DeliveryError):
+        await dest.test_connection()
+    assert not missing.exists()
 
 
 # --- #142 leave-in-place process-in-place disposition -----------------------

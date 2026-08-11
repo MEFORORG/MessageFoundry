@@ -29,7 +29,11 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Ftp, Sftp, WiringError
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed, check_source_allowed
 from messagefoundry.transports import build_destination, build_source, remotefile
-from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.base import (
+    DeliveryError,
+    DestinationStartupError,
+    NegativeAckError,
+)
 from messagefoundry.transports.remotefile import (
     RemoteFileDestination,
     RemoteFileSource,
@@ -55,16 +59,21 @@ class _FakeClient(_RemoteClient):
         store_exc: _RemoteError | None = None,
         rename_exc: _RemoteError | None = None,
         retrieve_exc: _RemoteError | None = None,
+        list_exc: _RemoteError | None = None,
     ) -> None:
         self.files: dict[str, bytes] = dict(files or {})
         self._sizes = sizes or {}
         self.ops: list[tuple[str, str]] = []  # (op, path)
         self.dirs: list[str] = []
+        self._existing_dirs: set[str] = set()  # #114: which dirs ensure_dir has already created
         self._store_exc = store_exc
         self._rename_exc = rename_exc
         self._retrieve_exc = retrieve_exc
+        self._list_exc = list_exc  # #114: an unreachable/missing remote_dir
 
     def list_dir(self, remote_dir: str) -> list[tuple[str, int]]:
+        if self._list_exc is not None:
+            raise self._list_exc
         out: list[tuple[str, int]] = []
         for path, data in self.files.items():
             if posixpath.dirname(path) == remote_dir:
@@ -94,8 +103,14 @@ class _FakeClient(_RemoteClient):
         self.ops.append(("remove", path))
         self.files.pop(path, None)
 
-    def ensure_dir(self, remote_dir: str) -> None:
+    def ensure_dir(self, remote_dir: str) -> bool:
+        # #114: the contract now reports whether THIS call created the directory, so the caller can log
+        # a delivery that landed in a directory the engine just invented.
         self.dirs.append(remote_dir)
+        if remote_dir in self._existing_dirs:
+            return False
+        self._existing_dirs.add(remote_dir)
+        return True
 
 
 def _install_client(monkeypatch: pytest.MonkeyPatch, client: _FakeClient) -> None:
@@ -1032,3 +1047,100 @@ def test_ftps_encrypted_client_key_wrong_password_raises(tmp_path: Path) -> None
         _ftps_ssl_context(
             {"host": "h", "tls_cert_file": cert, "tls_key_file": key, "tls_key_password": "WRONG"}
         )
+
+
+# --- #114 opt-in startup directory validation: the OUTBOUND half -------------
+
+_UPLOAD_BODY = "MSH|^~\\&|A|B|C|D|20260810||ADT^A01|MSGX|P|2.5"
+
+
+async def test_remote_destination_test_probe_creates_the_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The REMOTEFILE half of the same measured claim as the File sibling: the on-demand probe ENSURES
+    # (creates) remote_dir, so it cannot answer the question a startup-validation toggle asks.
+    client = _FakeClient()
+    await _dest(monkeypatch, client).test_connection()
+    assert client.dirs == ["/in"]  # ensure_dir, not a listing — the probe creates
+
+
+async def test_remote_destination_validate_directory_off_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The item's own trigger: an intermittently-available remote directory (a listing fails right now)
+    # must NOT fail startup with the toggle off. Default = defer to run time, exactly as before.
+    client = _FakeClient(list_exc=_RemoteError("no such dir", permanent=True))
+    await _dest(monkeypatch, client).validate_startup()  # no raise
+    assert client.dirs == []  # and the hook created nothing
+
+
+async def test_remote_destination_intermittent_dir_starts_and_then_delivers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The item's trigger end to end, on the default (lenient) setting: remote_dir is unreachable at
+    # start, so startup validation must NOT refuse the lane — and once the share comes back the upload
+    # goes through. This is why the toggle is opt-in rather than the default.
+    client = _FakeClient(list_exc=_RemoteError("share is down", permanent=False))
+    dest = _dest(monkeypatch, client, filename="msg.hl7")
+    await dest.validate_startup()  # start is not blocked by a share that is down right now
+    client._list_exc = None  # the mount returns
+    await dest.send(_UPLOAD_BODY)
+    assert client.files["/in/msg.hl7"] == _UPLOAD_BODY.encode("utf-8")
+
+
+async def test_remote_destination_validate_directory_refuses_unreachable_dir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeClient(list_exc=_RemoteError("no such dir", permanent=True))
+    dest = _dest(monkeypatch, client, validate_directory=True)
+    with pytest.raises(DestinationStartupError):
+        await dest.validate_startup()
+    assert client.dirs == []  # LIST is the no-create probe — ensure_dir is never called
+
+
+async def test_remote_destination_validate_directory_passes_when_listable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeClient()
+    await _dest(monkeypatch, client, validate_directory=True).validate_startup()
+    assert client.dirs == []
+
+
+async def test_remote_destination_created_directory_is_logged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Default arm, unchanged except that a CREATED upload directory is now loud.
+    client = _FakeClient()
+    dest = _dest(monkeypatch, client)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.remotefile"):
+        await dest.send(_UPLOAD_BODY)
+    assert "CREATED missing directory" in caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.remotefile"):
+        await dest.send(_UPLOAD_BODY)
+    assert "CREATED missing directory" not in caplog.text  # only a real creation is loud
+
+
+async def test_remote_destination_validate_directory_upload_never_creates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Under the toggle the upload directory is never created at delivery time either, and the failure is
+    # deliberately RECLASSIFIED as transient: an SFTP/FTP no-such-dir is a PERMANENT error, so letting
+    # the upload fail naturally would dead-letter live traffic over a merely-unmounted share.
+    client = _FakeClient(list_exc=_RemoteError("no such dir", permanent=True))
+    dest = _dest(monkeypatch, client, validate_directory=True)
+    with pytest.raises(DeliveryError) as exc:
+        await dest.send(_UPLOAD_BODY)
+    assert not isinstance(exc.value, NegativeAckError)  # retried, never dead-lettered
+    assert client.dirs == []  # never created
+    assert client.ops == []  # and nothing was stored
+
+
+async def test_remote_destination_validate_directory_test_probe_never_creates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeClient(list_exc=_RemoteError("no such dir", permanent=True))
+    dest = _dest(monkeypatch, client, validate_directory=True)
+    with pytest.raises(DeliveryError):
+        await dest.test_connection()
+    assert client.dirs == []

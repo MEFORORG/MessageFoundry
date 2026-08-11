@@ -543,13 +543,12 @@ def test_streaming_knobs_accepted() -> None:
     assert ic.max_message_bytes == 100 * 1024 * 1024
 
 
-# --- #114: validate_directory is inbound-only ---------------------------------
+# --- #114: validate_directory works in BOTH directions ------------------------
 #
-# File()/Sftp()/Ftp() are single factories serving BOTH directions, so they cannot reject the option
-# themselves — only the bind knows the direction. Before this guard an outbound carrying
-# validate_directory=True was accepted and silently ignored (no destination reads it, and
-# DestinationConnector has no validate_startup hook), so an operator asking for fail-fast validation
-# got none and saw no error.
+# It was inbound-only for one reason — no destination read it, and DestinationConnector had no
+# validate_startup hook — so an outbound carrying validate_directory=True was first silently ignored
+# and then (2026-08-03) rejected outright. Both halves are built now, so the rejection is gone and the
+# option is honoured on an outbound: the destination hook fails start on a missing target directory.
 
 
 def _spec_with_validate_directory(kind: str, directory: str) -> ConnectionSpec:
@@ -561,11 +560,10 @@ def _spec_with_validate_directory(kind: str, directory: str) -> ConnectionSpec:
 
 
 @pytest.mark.parametrize("kind", ["file", "sftp", "ftp"])
-def test_outbound_validate_directory_is_rejected(kind: str, tmp_path: Path) -> None:
+def test_outbound_validate_directory_now_builds(kind: str, tmp_path: Path) -> None:
     spec = _spec_with_validate_directory(kind, str(tmp_path / "out"))
-    with pytest.raises(WiringError, match="validate_directory is an inbound-only option") as exc:
-        build_outbound_connection("OB_X", spec)
-    assert "'OB_X'" in str(exc.value)  # the message names the offending connection
+    oc = build_outbound_connection("OB_X", spec)
+    assert oc.spec.settings["validate_directory"] is True  # reaches the connector, not rejected
 
 
 @pytest.mark.parametrize("kind", ["file", "sftp", "ftp"])
@@ -578,7 +576,7 @@ def test_inbound_validate_directory_still_builds(kind: str, tmp_path: Path) -> N
 
 @pytest.mark.parametrize("kind", ["file", "sftp", "ftp"])
 def test_outbound_without_validate_directory_is_unaffected(kind: str, tmp_path: Path) -> None:
-    # The factories write validate_directory=False into settings unconditionally, so the guard has to
+    # The factories write validate_directory=False into settings unconditionally, so the toggle has to
     # be truthy-only — every outbound authored today must keep building byte-identically.
     directory = str(tmp_path / "out")
     spec = (
