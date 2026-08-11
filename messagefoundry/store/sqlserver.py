@@ -9015,16 +9015,23 @@ class SqlServerStore:
         )
 
     async def decide_pending_approval(
-        self, approval_id: str, *, status: str, approver: str | None, decided_at: float
+        self,
+        approval_id: str,
+        *,
+        status: str,
+        approver: str | None,
+        decided_at: float,
+        from_status: str = "pending",
     ) -> bool:
-        """Atomically move a still-``pending`` request to ``status`` (approved/rejected/expired).
-        Returns ``True`` iff this call made the transition — guards against a double decision."""
+        """Atomically move a request in ``from_status`` to ``status``.
+        Returns ``True`` iff this call made the transition — guards against a double decision.
+        The SQLite twin documents why the guard is a parameter (ASVS 2.3.3)."""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?"
-                    " WHERE id = ? AND status = 'pending'",
-                    (status, approver, decided_at, approval_id),
+                    " WHERE id = ? AND status = ?",
+                    (status, approver, decided_at, approval_id, from_status),
                 )
                 count = cur.rowcount
                 await self._commit(conn)
