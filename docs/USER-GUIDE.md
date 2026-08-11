@@ -567,7 +567,7 @@ The key operator shift under the staged pipeline: **an `AA` ACK means "received 
 
 A delivery dead-letters when its retries are exhausted. Retry behavior is per-outbound (defaults in `[delivery]` — see [CONFIGURATION.md](CONFIGURATION.md)):
 
-- `retry_max_attempts` **unset = retry forever** (the conservative default; under FIFO the failing head blocks its lane until it succeeds or is purged). Set a finite value to opt into retry-then-dead-letter.
+- `retry_max_attempts` **defaults to 100 — finite** (about 7 h 50 m under the default backoff). Attempts are counted per row, so a long outage dead-letters roughly the lane heads rather than the backlog, and every exhausted row lands in the replayable dead-letter queue below. A code-first `retry=RetryPolicy(max_attempts=None)` still means retry forever for a partner that must never be advanced past — under FIFO that head blocks its lane until it succeeds or is purged.
 - A partner **`AR` reject fails fast** (no retry); an **`AE` NAK / transient transport failure is retried** with backoff.
 
 To recover:
@@ -607,7 +607,7 @@ The SMTP password is a secret — supply it via `MEFOR_ALERTS_EMAIL_PASSWORD`, n
 - **Sender got AA but nothing was delivered.** Expected under ACK-on-receipt: routing/transform/delivery failures happen *after* the ACK. Look at the message's disposition (`UNROUTED`/`FILTERED`/`NOT_DEPLOYED`/`ERROR`) and the AlertSink — **not** the ACK — for the outcome.
 - **A lane stopped processing.** A `connection_stopped` alert means an outbound's worker halted on an internal/code error (`internal_error = stop`). The messages are preserved for replay; fix the cause, then reload/restart the connection.
 - **A connection shows `failed`.** A connection that can't build or bind **at startup** (bad settings, a port already in use) is isolated as a degraded `failed` status instead of taking the engine down — every other lane keeps running ([ADR 0031](adr/0031-startup-connection-fault-isolation.md)). Fix the config/bind, then recover it: restart an inbound (`POST /connections/{name}/start`), or reload to rebuild a failed outbound. (Reload itself stays fail-fast — a broken config is rejected whole, never partially applied.)
-- **Backlog growing.** A `queue_buildup` alert usually means a retry-forever head is blocking its FIFO lane, or the downstream is down. Check the destination, then inspect/purge or replay the blocking row.
+- **Backlog growing.** A `queue_buildup` alert usually means a head is retrying its way toward the cap and blocking its FIFO lane, or the downstream is down. Check the destination, then inspect/purge or replay the blocking row.
 - **Console can't reach the engine.** The API binds `127.0.0.1:8765` by default and requires auth; confirm the engine is serving (`python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev`), that `[api].serve_ui` is on with the `messagefoundry-webconsole` distribution installed, and that your browser is pointed at that host/port's `/ui`.
 - **Low disk / store growing.** `GET /status` reports DB size and free disk; a `storage_threshold` alert fires past `[retention].max_db_mb`. Tune retention in `[retention]` ([CONFIGURATION.md](CONFIGURATION.md)) — purges null PHI bodies while keeping the message/disposition rows, so counts and audit stay intact. The row is kept; its PHI columns — operator-attached `metadata` included — are blanked.
 

@@ -2,8 +2,9 @@
 
 **Status:** Phase 1 **complete (Layers 1–4 built & merged).** Layer 1 (global+per-connection
 settings), Layer 2 (FIFO-per-outbound with head-of-line blocking), Layer 3 (failure classification +
-policy — partner-NAK vs transport vs internal-error split, the **retry-forever default** with finite
-`max_attempts` opt-in, and **AR fail-fast**), Layer 4a (the configurable *stop-connection* override
+policy — partner-NAK vs transport vs internal-error split, a **finite `max_attempts` default of 100**
+since BACKLOG #1051 with `max_attempts=None` (retry forever) as the opt-in, and **AR fail-fast**),
+Layer 4a (the configurable *stop-connection* override
 `internal_error = continue | stop`, the `AlertSink` abstraction
 [`pipeline/alerts.py`](../messagefoundry/pipeline/alerts.py) defaulting to `WARNING` logs, and the
 `connection_stopped` emit-point), and Layer 4b (the `queue_buildup` detector + its `buildup_max_depth`
@@ -105,6 +106,13 @@ Changes to the delivery worker + claim, behind the per-connection `ordering.mode
 
 Per-stage / per-connection setting with a global default. The split is by **failure kind** — a
 *code* failure (our bug) is treated differently from a *partner* rejection.
+
+> **This section records the Phase-1 proposal, not today's shipped default.** The retry-forever
+> default it argues for was shipped and has since been reversed: `max_attempts` defaults to a finite
+> **100** (BACKLOG #1051), with `max_attempts=None` the opt-in. The default is stated once, in the
+> Status header above and in [`CONFIGURATION.md`](CONFIGURATION.md) `[delivery]`; read the rows below
+> as the reasoning that produced the *knob*, not as the current value. The "default 5 today" in the
+> paragraph after them was already stale when this doc was written.
 
 | Failure | Default | Override examples |
 |---|---|---|

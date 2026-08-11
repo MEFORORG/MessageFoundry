@@ -241,15 +241,15 @@ async def test_exhausting_retries_dead_letters_and_errors_message(store: Message
     assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
 
 
-async def test_default_retry_policy_retries_forever(store: MessageStore) -> None:
-    # The built-in default (max_attempts=None) never dead-letters via mark_failed — it reschedules
-    # with backoff indefinitely, so a transient failure is never silently lost (the conservative
-    # posture). Only a finite max_attempts opts back into dead-lettering.
-    assert RetryPolicy().max_attempts is None
-    retry = RetryPolicy(backoff_seconds=1, backoff_multiplier=1)  # default (None) max_attempts
+async def test_explicit_none_max_attempts_retries_forever(store: MessageStore) -> None:
+    # max_attempts=None never dead-letters via mark_failed — it reschedules with backoff
+    # indefinitely, so a transient failure is never lost. Since #1051 that is an EXPLICIT choice:
+    # the built-in default is the finite 100 (tests/test_retry_cap_default.py owns that assertion),
+    # and this covers the escape hatch a never-advance-past-this partner still needs.
+    retry = RetryPolicy(max_attempts=None, backoff_seconds=1, backoff_multiplier=1)
     mid = await store.enqueue_message(channel_id="c1", raw="x", deliveries=[("d1", "p1")], now=0.0)
     t = 0.0
-    for _ in range(20):  # far past the old default of 5
+    for _ in range(20):
         claimed = await store.claim_ready(now=t)
         if claimed:
             await store.mark_failed(claimed[0].id, "boom", retry, now=t)
