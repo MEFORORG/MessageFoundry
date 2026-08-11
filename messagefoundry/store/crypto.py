@@ -93,7 +93,12 @@ _log = logging.getLogger(__name__)
 # the other version's rows.
 MARKER_PREFIX = "mfenc:"
 PREFIX = "mfenc:v1:"  # the v1 writer marker — FROZEN (CRYPTO-1); v1 output stays byte-identical
-_V2_PREFIX = "mfenc:v2:"  # additive, decode-capable; not written by default
+# The DEFAULT writer since ADR 0148 GIVEN 1: `[store].aad_bind` ships true, so make_cipher gets
+# write_v2=True and a new deployment writes v2. (This comment previously said "not written by
+# default", which the module docstring already contradicted 60 lines above — corrected 2026-08-11.
+# It matters because the ASVS 11.2.2 agility seam rests on v2's self-describing `alg` segment being
+# what the engine actually WRITES, not an opt-in path.)
+_V2_PREFIX = "mfenc:v2:"  # additive, decode-capable, and the shipped default writer
 # Transit-wrapped marker (ADR 0138). The value after the prefix is Vault/OpenBao Transit's own
 # `vault:v1:…` ciphertext — the plaintext DEK lives ONLY inside the isolated module, never in engine
 # heap (ASVS 13.3.3). Written/decoded by `store/crypto_transit.py`'s TransitCipher, NEVER by
