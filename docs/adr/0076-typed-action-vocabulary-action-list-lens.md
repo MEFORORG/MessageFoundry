@@ -550,7 +550,7 @@ Acceptance Criteria bucket. Promote to the block above if and when the owner acc
 > counted bucket under the plain heading below, as Amendment A's and Amendment D's did on ratification.
 > Ratification covers this amendment only: whether to relax the save gate itself stays open (see §C.4).
 >
-> **What it claims:** it **strengthens** the §5 "sync on save only" guardrail and does **not** relax it.
+> **What it does:** it **strengthens** the §5 "sync on save only" guardrail and does **not** relax it.
 > The projection still syncs on save and on save only. What changes is what happens to a save that
 > arrives while a `lens rewrite` holds the single edit slot: it is now **deferred to slot release**
 > instead of being **silently discarded**. Nothing here widens the sync trigger, adds a keystroke path,
