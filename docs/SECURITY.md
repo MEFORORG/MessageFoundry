@@ -1737,15 +1737,23 @@ BACKLOG #190 bundled three integrity residuals; #190 closes with **one built** a
   ask was a *runbook decision* (does the exposure runbook mandate it), not new engine code. Every
   PHI-plane surface already carries integrity: outbound bodies (ADR 0018), the audit trail (the HMAC
   hash-chain), and data at rest (AES-256-GCM AEAD).
-- **ECH (Encrypted Client Hello) for outbound SNI — infeasible, documented risk acceptance
-  (12.1.5).** Hiding the destination hostname in the outbound TLS ClientHello is not buildable here:
-  Python 3.14's stdlib `ssl` exposes **no ECH API**, there is **no SVCB/HTTPS DNS resolver** (ECHConfig
-  is DNS-published) and adding one is out of scope, and a working ECH client would require a
-  **third-party TLS stack** — violating the no-new-dependency rule for a security-core path. The
-  destination SNI is therefore visible on the outbound handshake. Compensating context: on-prem, a
+- **ECH (Encrypted Client Hello) for outbound SNI — buildable, deliberately not owned; accepted
+  residual (12.1.5).** The destination hostname is visible in the outbound TLS ClientHello. CPython's
+  stdlib `ssl` cannot hide it — ECH is an **OpenSSL 4.0** feature and the bundled OpenSSL 3.5.x
+  exports no ECH symbols (CPython PR #135435 is still open) — but it **is** buildable off-stdlib (Go
+  `crypto/tls`, rustls, sing-box), and one such terminating re-originator was written here and proven
+  against a real ECH endpoint. So "infeasible" is **not** the reason and must not be offered as one.
+  The reason is that it would hide nothing: a 2026-07-20 DoH probe found **no** partner endpoint
+  publishing an `ECHConfig`. The engine therefore ships only the opt-in, fail-closed **routing** half
+  (per-connection `ech_egress` / `ech_sidecar`, refused when the sidecar is non-loopback or paired
+  with `proxy_url`), and the re-originator was retired from the tree on 2026-08-10 rather than carried
+  as a second language nothing builds, tests or pins. Evidence, the retrieval SHA and the re-score
+  trigger: [ADR 0139](adr/0139-ech-egress-sidecar-sni-hiding-for-asvs-12-1-5-demand-gated.md);
+  operator contract: [`samples/ech-sidecar/`](../samples/ech-sidecar/README.md). The residual is
+  metadata only — which partner, how often — with at least these compensating conditions: on-prem, a
   trusted network segment, an operator-configured `[egress]`-allowlisted destination, and TLS still
-  protects the payload. Re-open when the stdlib gains a first-class ECH API (no new dep) and an
-  SVCB/HTTPS resolver is in scope.
+  protecting the payload. Re-open when a destination begins publishing an `ECHConfig`, or when CPython
+  ships a first-class ECH API.
 
 ### In-use memory protection — best-effort partial + deployment requirement (13.3.3 / 11.7.1 / 11.7.2, #198)
 
