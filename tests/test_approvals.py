@@ -9,13 +9,16 @@ The replay endpoint stands in for a gated high-value action (it needs no configu
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+import json
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.api.approvals import ApprovalGate
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType
@@ -260,3 +263,87 @@ async def test_purge_dual_control_skips_running_outbound(engine: Engine, tmp_pat
 def test_settings_validator_rejects_unknown_operation() -> None:
     with pytest.raises(ValueError, match="unknown operation"):
         ApprovalsSettings(operations=["not_a_real_op"])
+
+
+# --- ASVS 2.3.3: the released-but-unexecuted compensating transition ---------------------------
+#
+# approve() moves the row to 'approved' BEFORE running the executor, and that ordering is
+# load-bearing (it guards the double-approve race). The gap this closes is what happens when the
+# executor then raises: without compensation the row is left asserting an operation that never
+# happened, AND no approval.approved row is written either, so the store carries a released
+# approval with no recorded outcome at all.
+
+
+async def _gate_with_failing_op(engine: Engine) -> tuple[ApprovalGate, RuntimeError]:
+    gate = ApprovalGate(engine.store, ON)
+    boom = RuntimeError("executor exploded")
+
+    async def _raises(_p: Mapping[str, Any]) -> dict[str, Any]:
+        raise boom
+
+    gate.register("dead_letter_replay", "Replay dead-lettered deliveries", _raises)
+    return gate, boom
+
+
+async def test_raising_executor_rolls_the_row_out_of_approved(engine: Engine) -> None:
+    """The row must NOT be left at 'approved' for an operation that did not run."""
+    gate, boom = await _gate_with_failing_op(engine)
+    approval_id = await gate.guard("dead_letter_replay", {}, requester="maker")
+    assert approval_id is not None
+
+    # The original executor error still reaches the caller -- compensation must not swallow it.
+    with pytest.raises(RuntimeError) as caught:
+        await gate.approve(approval_id, approver="checker")
+    assert caught.value is boom
+
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None
+    assert str(row["status"]) == "failed"  # pre-fix this read 'approved'
+
+
+async def test_raising_executor_audits_the_failure_against_both_identities(
+    engine: Engine,
+) -> None:
+    gate, _ = await _gate_with_failing_op(engine)
+    approval_id = await gate.guard("dead_letter_replay", {}, requester="maker")
+    assert approval_id is not None
+    with pytest.raises(RuntimeError):
+        await gate.approve(approval_id, approver="checker")
+
+    rows = await engine.store.list_audit(limit=50)
+    audited = {(str(r["action"]), str(r["actor"])) for r in rows}
+    assert ("approval.requested", "maker") in audited  # the maker's half survives
+    assert ("approval.failed", "checker") in audited  # the checker's half records the failure
+    # A success row must NOT be written for an operation that raised.
+    assert ("approval.approved", "checker") not in audited
+
+    failed = next(r for r in rows if str(r["action"]) == "approval.failed")
+    detail = json.loads(str(failed["detail"]))
+    assert detail["operation"] == "dead_letter_replay"
+    assert detail["requester"] == "maker"
+    assert detail["compensated"] is True
+    # The exception TYPE is recorded, never its message: executor text can carry connection names,
+    # paths or params, and the audit log is not a PHI sink.
+    assert detail["error"] == "RuntimeError"
+    assert "exploded" not in str(failed["detail"])
+
+
+async def test_compensation_cannot_clobber_an_already_rejected_row(engine: Engine) -> None:
+    """The compensating transition is guarded on 'approved', so it can only ever move a row this
+    gate itself released -- never one another caller rejected or expired."""
+    gate, _ = await _gate_with_failing_op(engine)
+    approval_id = await gate.guard("dead_letter_replay", {}, requester="maker")
+    assert approval_id is not None
+    await gate.reject(approval_id, approver="checker")
+
+    moved = await engine.store.decide_pending_approval(
+        approval_id,
+        status="failed",
+        approver="checker",
+        decided_at=0.0,
+        from_status="approved",
+    )
+    assert moved is False
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None
+    assert str(row["status"]) == "rejected"
