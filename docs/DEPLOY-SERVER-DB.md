@@ -159,6 +159,16 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA mefor TO mefor;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA mefor TO mefor;         -- the BIGSERIAL sequences
 ```
 
+> **Posture B has a prerequisite that "pre-create the objects" does not spell out: the `schema_meta`
+> marker must already record the current DDL batch.** The engine skips its batch only on that marker
+> (§2); with the marker absent or stale it runs `CREATE TABLE IF NOT EXISTS`, and on PostgreSQL that
+> is **refused for a role holding only `USAGE`** — measured on 16.14, `CREATE TABLE IF NOT EXISTS`
+> against an already-existing table fails with *permission denied for schema*, because the schema ACL
+> is checked **before** the existence skip. `IF NOT EXISTS` does not rescue it. So hand-creating the
+> tables is not enough: bootstrap by running the engine once as a DDL-capable principal (which writes
+> the marker), then hand over to the `USAGE`-only role — and re-grant for the first start of any build
+> whose schema moved, exactly as §2 says. If that sequencing is awkward, use posture A.
+
 > **Why nothing wider, derived from the store rather than asserted.** The Postgres store issues
 > `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` inside its own schema, then only
 > `SELECT` / `INSERT` / `UPDATE` / `DELETE`. Its concurrency primitives are `pg_advisory_xact_lock`
@@ -200,6 +210,16 @@ The grants in §1.1 and §1.2 used to be prescriptions the engine could not chec
   **never** rendered as a clean result. Under `require_least_privilege` an unobservable probe refuses,
   because a declared refusal that passed a principal it could not read would be a control in name only.
 
+> **Two things it reports that a site may not expect, both by construction.** On SQL Server, a
+> **user-defined database role** is named as excess even when it wraps exactly the three prescribed
+> ones: the probe reads *membership*, not a role's contents, and it cannot expand a site role without
+> catalog permission it deliberately does not depend on. Grant the three fixed roles directly, or
+> accept the entry. On PostgreSQL, a role **attribute** is reported when it sits on any role the
+> principal may assume, not only on the principal itself — attributes are never inherited, but a
+> member may `SET ROLE` to the holder and exercise them, so the wrapper is named alongside the
+> attribute (`CREATEROLE via role site_ops`). Neither is a false positive; both are grants beyond what
+> §1.1/§1.2 prescribe.
+
 ---
 
 ## 2. Schema bootstrap & evolution
@@ -223,12 +243,12 @@ The grants in §1.1 and §1.2 used to be prescriptions the engine could not chec
   The engine login's grants are §1.1 — `db_datareader` + `db_datawriter` + `db_ddladmin`, and never
   `db_owner` or `sysadmin`.
 
-> _Filled by staging:_ the **PostgreSQL** bootstrap role grants + the pre-create DDL per backend. The
-> SQL Server set is settled in §1.1 and is **not** transferable: Postgres has no equivalent of SQL Server's fixed **database** roles
-> (`db_datareader`/`db_datawriter`/`db_ddladmin`),
-> the schema uses `BIGSERIAL` sequences rather than `IDENTITY`, and there is no stored-procedure path
-> (`fifo_claim_proc` is SQL Server only), so the Postgres grants are a role/schema-ownership question
-> this doc does not yet answer.
+> **The PostgreSQL role grants are now answered in §1.2** — the two supported postures, why nothing
+> wider, and posture B's marker prerequisite. The SQL Server set (§1.1) never transferred and does not
+> now: Postgres has no equivalent of SQL Server's fixed **database** roles
+> (`db_datareader`/`db_datawriter`/`db_ddladmin`), the schema uses `BIGSERIAL` sequences rather than
+> `IDENTITY`, and there is no stored-procedure path (`fifo_claim_proc` is SQL Server only), which is
+> why §1.2 answers it as a role-attribute / schema-ownership question instead.
 
 ---
 

@@ -5,7 +5,7 @@
 # This is a GOLDEN gate: any diff means the seam contract changed - see the test's failure hint.
 
 ## ENGINE_UI_SEAM
-18
+19
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -170,7 +170,7 @@ MetricsHistorySample: outbox_by_status, ts
 PendingApprovalResponse: approval_id, detail, operation, status
 ReloadRequest: config_dir, dry_run
 ReloadResult: dry_run, handlers, inbound, outbound, routers, running
-SecurityPosture: allow_unencrypted_phi, backend, client_address_monoculture, client_denied_last, client_network_denials, data_class, encryption_enabled, enforcement, environment, fips_mode, kex_groups, key_id, key_source, loosenings, loosenings_scope, memory_encryption_note, memory_encryption_operator_declared, memory_encryption_readout_contradicts_declaration, memory_encryption_readout_source, memory_encryption_self_reported_active, memory_encryption_self_reported_capability, memory_encryption_self_reported_mechanism, openssl_version, plaintext_columns, production, require_encryption, security, synthetic_relaxation
+SecurityPosture: allow_unencrypted_phi, backend, client_address_monoculture, client_denied_last, client_network_denials, data_class, encryption_enabled, enforcement, environment, fips_mode, kex_groups, key_id, key_source, loosenings, loosenings_scope, memory_encryption_note, memory_encryption_operator_declared, memory_encryption_readout_contradicts_declaration, memory_encryption_readout_source, memory_encryption_self_reported_active, memory_encryption_self_reported_capability, memory_encryption_self_reported_mechanism, openssl_version, plaintext_columns, production, require_encryption, security, store_privilege, synthetic_relaxation
 ServiceStatusInfo: enabled, service_name, state
 StatsResetRequest: all, targets
 StatsResetTarget: channel_id, destination, role

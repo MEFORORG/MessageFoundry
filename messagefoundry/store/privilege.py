@@ -155,9 +155,15 @@ def sqlserver_excess(
 class PostgresRoleFacts:
     """One role the store principal can assume, with the ATTRIBUTES that role carries.
 
-    Attributes are read per role rather than only for the principal itself so a user-defined wrapper
-    role that is itself ``SUPERUSER`` is caught by what it grants, not by whether its name happens to
-    be on a list. A denylist of role NAMES cannot see that; this can."""
+    Attributes are read per role rather than only for the principal itself, so a user-defined wrapper
+    role is caught by what it grants rather than by whether its name happens to be on a list. A
+    denylist of role NAMES cannot see that; this can.
+
+    **Why a role the principal is merely a MEMBER of still counts.** Measured on PostgreSQL 16.14: a
+    member of a ``CREATEROLE`` role is refused ``CREATE ROLE`` outright — attributes are never
+    inherited — and succeeds immediately after ``SET ROLE`` to that role. ``pg_has_role(current_user,
+    oid, 'MEMBER')``, the predicate the probe reads with, is exactly "may ``SET ROLE`` to it", so an
+    attribute on any assumable role is one the principal can exercise at will."""
 
     name: str
     is_self: bool
@@ -190,6 +196,16 @@ POSTGRES_EXCESSIVE_ROLES: frozenset[str] = frozenset(
 )
 
 
+def _attribute_finding(label: str, holders: Sequence[PostgresRoleFacts]) -> str:
+    """``LABEL`` when the principal carries the attribute on its own row, else ``LABEL via role x``.
+
+    The wrapper is NAMED because it is the object an operator has to change: a bare ``CREATEROLE``
+    against a principal whose own attributes are all clean sends them looking in the wrong place."""
+    if any(r.is_self for r in holders):
+        return label
+    return f"{label} via role {', '.join(sorted(r.name for r in holders))}"
+
+
 def postgres_excess(
     *,
     roles: Sequence[PostgresRoleFacts],
@@ -201,24 +217,31 @@ def postgres_excess(
 
     Pure, like :func:`sqlserver_excess`.
 
+    **Every attribute is read across every assumable role, not only the principal's own row** — see
+    :class:`PostgresRoleFacts` for the measurement that settles why membership is enough. Reading the
+    four non-superuser attributes on the principal alone let a wrapper role carrying ``CREATEROLE`` /
+    ``CREATEDB`` / ``REPLICATION`` / ``BYPASSRLS`` read as a clean least-privilege role. Mere
+    membership is still silent: a wrapper with no attribute and no ``pg_*`` name produces nothing, or
+    every site that groups its grants behind a role would carry a finding it cannot act on.
+
     ``SUPERUSER`` short-circuits the rest: a superuser is implicitly a member of every role and holds
     every database privilege, so enumerating them would bury the one finding that matters under a
-    dozen restatements of it. Its own role attributes are still listed — they say *how* the identity
-    is configured, which is what an operator has to change."""
+    dozen restatements of it. The role attributes are still listed — they say *how* the identity is
+    configured, which is what an operator has to change."""
     out: list[str] = []
-    superuser = any(r.superuser for r in roles)
-    if superuser:
-        out.append("SUPERUSER")
-    self_rows = [r for r in roles if r.is_self]
+    superusers = [r for r in roles if r.superuser]
+    if superusers:
+        out.append(_attribute_finding("SUPERUSER", superusers))
     for attr, label in (
         ("createrole", "CREATEROLE"),
         ("createdb", "CREATEDB"),
         ("replication", "REPLICATION"),
         ("bypassrls", "BYPASSRLS"),
     ):
-        if any(getattr(r, attr) for r in self_rows):
-            out.append(label)
-    if superuser:
+        holders = [r for r in roles if getattr(r, attr)]
+        if holders:
+            out.append(_attribute_finding(label, holders))
+    if superusers:
         return tuple(out)
     for role in roles:
         if role.name in POSTGRES_EXCESSIVE_ROLES:

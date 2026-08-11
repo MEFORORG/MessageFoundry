@@ -17,7 +17,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   therefore have gone unobserved. `serve` now reads fixed **server**-role and **database**-role
   membership plus `CONTROL SERVER` / database `CONTROL` on SQL Server, and role attributes
   (`SUPERUSER`, `CREATEROLE`, `CREATEDB`, `REPLICATION`, `BYPASSRLS`), assumable predefined roles and
-  database ownership on PostgreSQL — before any listener binds.
+  database ownership on PostgreSQL — before any listener binds. The PostgreSQL attributes are read
+  across **every role the principal may assume**, not only its own row: attributes are never
+  inherited, but a member may `SET ROLE` to the holder and exercise them, so a wrapper role carrying
+  `CREATEROLE` is named (`CREATEROLE via role site_ops`) instead of reading clean.
   **It observes and warns; it does not refuse by default** — refusing on an over-grant could block a
   legitimate deployment mid-setup, and the engine does not own the grant. Every start logs what it saw,
   writes a `store_privilege_preflight` audit row, and names each excess grant in
@@ -32,6 +35,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   there is the filesystem ACL. The PostgreSQL least-privilege grant is now documented
   ([`DEPLOY-SERVER-DB.md`](docs/DEPLOY-SERVER-DB.md) §1.2), which it previously was not.
   ([BACKLOG #1008](docs/BACKLOG.md))
+
+### Changed
+- **Web console engine UI seam `18` -> `19`.** `SecurityPosture` gained the additive `store_privilege`
+  object above. Additive with a default, so an older console ignores it; the seam still bumps because
+  the golden seam contract introspects that model's field set.
+- **`DEPLOY-SERVER-DB.md` §1.2 posture B now states its prerequisite.** "A DBA pre-creates the objects"
+  is not sufficient on its own: the engine skips its DDL batch only when the `schema_meta` marker
+  records the current batch, and on PostgreSQL `CREATE TABLE IF NOT EXISTS` against an existing table
+  is still refused for a role holding only `USAGE` (the schema ACL is checked before the existence
+  skip, measured on 16.14). Bootstrap once with a DDL-capable principal, then hand over.
 - **`messagefoundry audit-anchor`, and `audit-verify --expected-anchor` / `--expected-anchor-file` to
   check one back.** The audit hash chain links each row to its predecessor, so deleting the *newest*
   rows leaves a shorter chain that still walks cleanly — `audit-verify` on its own reports OK after a

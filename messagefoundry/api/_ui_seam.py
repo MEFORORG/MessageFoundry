@@ -94,7 +94,14 @@ from typing import Any
 #: API). Report-only, reflects/changes NO live TLS behaviour; additive with a default, so an older
 #: console simply ignores it. Bumped because the golden seam snapshot introspects SecurityPosture's
 #: field set, so any added field trips the handshake even when it is purely additive.
-ENGINE_UI_SEAM: int = 18
+#: seam v19 (ASVS 13.2.2, BACKLOG #1008): SecurityPosture gained the additive `store_privilege` object —
+#: what the startup preflight OBSERVED about the store principal's effective privileges. Its `status`
+#: has FOUR values and only `observed` with an empty `excess` is a clean bill of health; the console
+#: must not render `unobservable` (the probe could not run) or `not_probed` (none ran in this process)
+#: as one, which is why this is a structured field and not a bool. Additive with a default, so an
+#: older console simply ignores it — bumped for the same reason v18 was, the golden snapshot
+#: introspects SecurityPosture's field set.
+ENGINE_UI_SEAM: int = 19
 
 
 @dataclass(frozen=True, slots=True)

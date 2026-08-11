@@ -928,7 +928,7 @@ jobs:
           # are declared there (ADR 0013), and SQL Server / Postgres both declare supports_response_capture
           # + supports_pt_reingress True — so a regression in that surface is a SERVER-DB regression and must
           # pull these legs, not just the SQLite suite.
-          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/pipeline/(cluster|wiring_runner|stage_dispatcher)|messagefoundry/config/(settings|wiring)|messagefoundry/transports/(base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner)|\.github/workflows/ci\.yml)'; then
+          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/pipeline/(cluster|wiring_runner|stage_dispatcher)|messagefoundry/config/(settings|wiring)|messagefoundry/transports/(base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege)|\.github/workflows/ci\.yml)'; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
@@ -1340,6 +1340,34 @@ jobs:
           tests/test_backup_runner_server_db_sqlserver.py
           tests/test_dr7_server_config_only_backup_sqlserver.py
 
+      - name: Run the store-principal privilege preflight on real SQL Server
+        env:
+          MEFOR_TEST_SQLSERVER: "1"
+          MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "1433"
+          MEFOR_STORE_DATABASE: MessageFoundry
+          MEFOR_STORE_AUTH: sql
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+          PYTHONFAULTHANDLER: "1"
+        # BACKLOG #1008 (ASVS 13.2.2). The preflight's POLICY is backend-free and runs on every leg;
+        # its SQL is not, and `IS_SRVROLEMEMBER` / `IS_ROLEMEMBER` / `HAS_PERMS_BY_NAME` execute
+        # against a real server or nowhere. This file gates those legs PER TEST rather than at module
+        # level (its SQLite cases must still run everywhere), so tests/test_serverdb_ci_coverage.py
+        # deliberately does not see it and would not have flagged its absence here — the file's own
+        # test_the_live_legs_of_this_file_are_run_by_a_server_db_ci_step does, and it was failed on
+        # purpose against this workflow before this step existed.
+        # This leg connects as `sa`, which is `sysadmin` by construction, so it is also the standing
+        # POSITIVE control: a probe that stopped seeing an over-grant reds here.
+        # Same pyodbc 5.3.0 + py3.14 native-crash retry as the steps above (upstream pyodbc#1459).
+        run: >-
+          bash scripts/ci/retry-native-crash.sh
+          pytest -v
+          tests/test_store_privilege_preflight.py
+
   # Postgres store backend (Track B): run the gated store suite against a real PostgreSQL service
   # container (Linux, so 1x minutes). Runs NIGHTLY + on-demand (workflow_dispatch — use
   # `gh workflow run ci.yml --ref <branch>` to exercise it on a feature branch) + on PRs that touch
@@ -1528,6 +1556,27 @@ jobs:
           tests/test_dr_server_seed_gate_postgres.py
           tests/test_backup_runner_server_db_postgres.py
           tests/test_dr7_server_config_only_backup_postgres.py
+
+      - name: Run the store-principal privilege preflight on real Postgres
+        env:
+          MEFOR_TEST_POSTGRES: "1"
+          MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "5432"
+          MEFOR_STORE_DATABASE: messagefoundry
+          MEFOR_STORE_USERNAME: postgres
+          MEFOR_STORE_PASSWORD: mefor
+          MEFOR_STORE_ENCRYPT: "false"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        # BACKLOG #1008 (ASVS 13.2.2), the Postgres twin of the SQL Server step — see its comment for
+        # why this file needs naming here even though tests/test_serverdb_ci_coverage.py does not flag
+        # it. `pg_has_role` / `rolsuper` / `has_database_privilege` execute against a real server or
+        # nowhere. This leg connects as `postgres`, a SUPERUSER owning the database, so it is the
+        # standing POSITIVE control; the both-directions case additionally creates a purpose-made
+        # least-privilege role and asserts the probe stays SILENT on it.
+        run: >-
+          pytest -v
+          tests/test_store_privilege_preflight.py
 
   # Headless load test (Track B / throughput): serve the synthetic high-fan-out load config (auth
   # off, small fan-out) and drive the smoke profile through the real `python -m harness --load` CLI,
