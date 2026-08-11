@@ -105,6 +105,15 @@ CR = 0x0D  # carriage return
 DEFAULT_MAX_FRAME_BYTES = 16 * 1024 * 1024  # 16 MiB — fits embedded base64 docs, bounds OOM
 DEFAULT_MAX_CONNECTIONS = 256  # bound concurrent inbound clients (connection-flood guard)
 DEFAULT_RECEIVE_TIMEOUT = 60.0  # seconds — close inbound sockets idle this long (slowloris guard)
+
+#: Message-rate pacing ships OFF, and that is a DELIBERATE DEVIATION from this module's
+#: "key absent -> secure default" convention, ruled 2026-08-11 (ASVS 2.4.1 / 15.2.2). A rate limit
+#: on a clinical interface is only safe at a number derived from a real feed profile, and this
+#: project has no site data to derive one from — shipping a guessed default would throttle real
+#: traffic, which is a worse failure than the unbounded intake it would be guarding. So the
+#: mechanism exists and an operator opts in with their own number. The cell stays `partial` on the
+#: shipped default and the record says why; that is the honest outcome, not a disappointing one.
+DEFAULT_MAX_MESSAGES_PER_SECOND: float | None = None
 # On stop()/reload, established clients are closed and their handlers given this long to finish an
 # in-flight commit before the connection tasks are cancelled — bounds shutdown so a peer holding a
 # connection open can't hang it (review H-2).
@@ -1296,6 +1305,55 @@ def _peer_host(writer: asyncio.StreamWriter) -> str | None:
     return None
 
 
+class _MessagePacer:
+    """Per-connection message-rate pacing for the MLLP data plane (ASVS 2.4.1, and the availability
+    bound of 15.2.2 — one control, because building them apart yields two halves that interact).
+
+    Charges one token per DECODED message and answers ONE question: how long to wait before
+    consuming more from the socket.
+
+    **It never drops, never NAKs and never refuses, and that is the whole design.** The count-and-log
+    invariant forbids accept-and-drop, so a limiter that discards is not available. NAKing would mean
+    refusing clinical messages the engine is able to process. Closing the connection moves the loss
+    outside our boundary, where we cannot count it. Pacing the READ is the only option that satisfies
+    the invariant *by construction*: the excess is never framed, so it never becomes a received
+    message that the invariant would then oblige us to account for. Back-pressure is applied by TCP
+    itself once we stop consuming.
+
+    **Why a bounded delay rather than a hard stop.** Refusing to read at all holds the connection open
+    and keeps consuming a ``max_connections`` slot, so a flood of paced peers could exhaust the slot
+    budget and *become* the denial of service this exists to prevent. A delay bounded by the deficit
+    paces the peer without pinning capacity.
+
+    Scoped per connection, deliberately. MLLP peers are unauthenticated and identified only by
+    address, so a per-IP budget collapses under NAT or a shared integration host — it would throttle
+    unrelated feeds that happen to share an egress address. A per-connection budget is honest about
+    what it bounds; a peer opening more connections is bounded by ``max_connections`` instead.
+    """
+
+    __slots__ = ("_capacity", "_last", "_rate", "_tokens", "pending_wait")
+
+    def __init__(self, rate: float, burst: float, *, now: float) -> None:
+        self._rate = rate
+        self._capacity = max(burst, 1.0)
+        self._tokens = self._capacity
+        self._last = now
+        #: Debt owed before the next read, in seconds. Carried on the pacer rather than in a local so
+        #: the read loop has exactly one place to consult and one place to clear.
+        self.pending_wait = 0.0
+
+    def charge(self, messages: int, *, now: float) -> float:
+        """Charge ``messages`` and return the seconds to wait before reading again (0.0 if none).
+
+        The returned delay is exactly the time for the bucket to return to non-negative, so it is
+        bounded by ``messages / rate`` and cannot grow without limit.
+        """
+        self._tokens = min(self._capacity, self._tokens + (now - self._last) * self._rate)
+        self._last = now
+        self._tokens -= messages
+        return 0.0 if self._tokens >= 0 else -self._tokens / self._rate
+
+
 class MLLPSource(SourceConnector):
     """Listen for inbound MLLP connections, hand each message to the pipeline handler,
     and frame whatever the handler returns back to the sender as the ACK."""
@@ -1315,6 +1373,14 @@ class MLLPSource(SourceConnector):
         self.receive_timeout: float | None = float(rt) if rt else None
         mf = s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
         self.max_frame_bytes: int | None = int(mf) if mf else None
+        # Message-rate pacing. Absent -> OFF, unlike the caps above; see
+        # DEFAULT_MAX_MESSAGES_PER_SECOND for why that deviation is deliberate and ruled.
+        mps = s.get("max_messages_per_second", DEFAULT_MAX_MESSAGES_PER_SECOND)
+        self.max_messages_per_second: float | None = float(mps) if mps else None
+        # Burst defaults to one second's worth, so a peer that sends in bursts is not paced until it
+        # exceeds the SUSTAINED rate. Meaningless when pacing is off.
+        mb = s.get("message_burst") or self.max_messages_per_second or 0.0
+        self.message_burst: float = float(mb)
         # Per-connection peer-IP allowlist (Tier 4 operability): when set, a connecting peer whose IP
         # is not listed is refused at accept time. Absent/empty = no restriction.
         sa = s.get("source_ip_allowlist")
@@ -1430,7 +1496,24 @@ class MLLPSource(SourceConnector):
             await self._emit_event("established", peer_host=peer_host)
             try:
                 decoder = MLLPDecoder(max_frame_bytes=self.max_frame_bytes)
+                pacer = (
+                    _MessagePacer(
+                        self.max_messages_per_second,
+                        self.message_burst,
+                        now=time.monotonic(),
+                    )
+                    if self.max_messages_per_second
+                    else None
+                )
                 while True:
+                    # ASVS 2.4.1 / 15.2.2. The wait happens BEFORE the read and never around the
+                    # handler: stopping consumption lets TCP back-pressure the sender, so the excess
+                    # is never framed and never becomes a received message. Delaying anything AFTER
+                    # decode would pace a message the count-and-log invariant has already obliged us
+                    # to account for -- which is the same control with none of the property.
+                    if pacer is not None and (wait := pacer.pending_wait) > 0.0:
+                        pacer.pending_wait = 0.0
+                        await asyncio.sleep(wait)
                     if self.receive_timeout:
                         try:
                             chunk = await asyncio.wait_for(reader.read(4096), self.receive_timeout)
@@ -1442,11 +1525,17 @@ class MLLPSource(SourceConnector):
                     if not chunk:
                         break
                     try:
+                        decoded = 0
                         for message in decoder.feed(chunk):
+                            decoded += 1
                             reply = await self._handler(message)
                             if reply is not None:
                                 writer.write(frame(reply, self.encoding))
                                 await writer.drain()
+                        # Charge AFTER the messages in this chunk are fully handled and ACKed. The
+                        # debt is settled before the NEXT read, never by withholding an ACK.
+                        if pacer is not None and decoded:
+                            pacer.pending_wait = pacer.charge(decoded, now=time.monotonic())
                     except MLLPFrameError as exc:
                         peer = writer.get_extra_info("peername")
                         logger.warning(

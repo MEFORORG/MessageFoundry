@@ -46,7 +46,13 @@ DEFAULT_PERIOD = 30  # seconds per time step
 #: ± steps of clock skew tolerated at verify time (one step each side ≈ 30 s).
 DEFAULT_WINDOW = 1
 
-_SECRET_BYTES = 20  # 160 bits — RFC 4226 recommends ≥ 128 bits, 160 for HMAC-SHA1
+# 160 bits. RFC 4226 requires >= 128 and recommends 160. RFC 6238 R6 additionally says the key
+# SHOULD match the HMAC output length -- 32 bytes now that the digest is SHA-256 (see _TOTP_DIGEST).
+# Kept at 20 DELIBERATELY: that clause is about interoperability convention rather than strength, 160
+# bits is ample against HMAC-SHA256, and 32 bytes would lengthen manual entry from 32 to 52 base32
+# characters on a screen an operator types from. Revisit only with a real interop failure, not on the
+# SHOULD alone.
+_SECRET_BYTES = 20
 
 # Recovery codes: human-legible groups from an unambiguous alphabet (no 0/O/1/I/L confusion).
 _RECOVERY_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
@@ -66,9 +72,25 @@ def _decode_secret(secret: str) -> bytes:
     return base64.b32decode(cleaned + padding, casefold=True)
 
 
+#: The HOTP MAC. RFC 6238 permits SHA-1, SHA-256 and SHA-512; SHA-1 is the RFC default and was the
+#: shipped choice until 2026-08-11, when it was retired under the G18 ruling.
+#:
+#: THIS CONSTANT AND THE ADVERTISED ALGORITHM MUST NEVER DIVERGE. The authenticator computes with
+#: whatever ``otpauth_uri`` told it and the engine computes with this — so a change to one alone does
+#: not fail loudly, it silently produces codes that never match, for every user, with no diagnostic.
+#: That is why :data:`_TOTP_ALGORITHM` is DERIVED from this rather than written beside it: the two
+#: cannot be edited apart. ``hashlib.sha256().name.upper()`` is exactly the otpauth spelling, and the
+#: same derivation is correct for all three permitted digests.
+_TOTP_DIGEST = hashlib.sha256
+_TOTP_ALGORITHM = _TOTP_DIGEST().name.upper()
+
+
 def _hotp(key: bytes, counter: int, digits: int) -> str:
-    """RFC 4226 HOTP: HMAC-SHA1 over the 8-byte counter, dynamically truncated to ``digits`` decimals."""
-    mac = hmac.new(key, counter.to_bytes(8, "big"), hashlib.sha1).digest()
+    """RFC 4226 HOTP over the 8-byte counter, dynamically truncated to ``digits`` decimals.
+
+    The MAC is :data:`_TOTP_DIGEST` (SHA-256 since 2026-08-11), not RFC 4226's SHA-1.
+    """
+    mac = hmac.new(key, counter.to_bytes(8, "big"), _TOTP_DIGEST).digest()
     offset = mac[-1] & 0x0F
     truncated = int.from_bytes(mac[offset : offset + 4], "big") & 0x7FFFFFFF
     return str(truncated % (10**digits)).zfill(digits)
@@ -170,14 +192,23 @@ def otpauth_uri(
     period: int = DEFAULT_PERIOD,
     digits: int = DEFAULT_DIGITS,
 ) -> str:
-    """Build the ``otpauth://totp/…`` URI an authenticator app scans (the UI renders it as a QR code)."""
+    """Build the ``otpauth://totp/…`` URI an authenticator app scans (the UI renders it as a QR code).
+
+    **Advertises SHA-256, and enrolling apps must honour it.** Most modern authenticators do (1Password,
+    Bitwarden, Aegis, FreeOTP, Authy). **Google Authenticator historically IGNORES the ``algorithm``
+    parameter and computes SHA-1 regardless** — against which this engine's codes will simply never
+    match, with no error to explain why. That is the known cost of the 2026-08-11 SHA-1 retirement
+    (G18), accepted while there are zero enrolled users; it is a support burden, not a security one.
+    An operator hitting it needs an app that honours the parameter, not a re-enrolment.
+    """
     # The "issuer:account" colon is the conventional literal label separator (keep it; encode the rest).
     label = quote(f"{issuer}:{account}", safe=":")
     params = urlencode(
         {
             "secret": secret,
             "issuer": issuer,
-            "algorithm": "SHA1",
+            # DERIVED, never a literal — see _TOTP_DIGEST for why these two cannot be edited apart.
+            "algorithm": _TOTP_ALGORITHM,
             "digits": digits,
             "period": period,
         }

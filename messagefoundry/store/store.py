@@ -1579,7 +1579,9 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     params       TEXT NOT NULL,        -- JSON args captured at request time, replayed on approval
     requester    TEXT NOT NULL,        -- who initiated; can never self-approve (dual-control, 2.3.5)
     requested_at REAL NOT NULL,
-    status       TEXT NOT NULL DEFAULT 'pending',  -- pending | approved | rejected | expired
+    status       TEXT NOT NULL DEFAULT 'pending',  -- pending | approved | rejected | expired | failed
+                                       -- 'failed': the gate released it but the executor raised, so
+                                       -- the operation did NOT happen (ASVS 2.3.3 compensation)
     approver     TEXT,                 -- the distinct second user who released/declined it
     decided_at   REAL,
     expires_at   REAL                  -- NULL = never; past this a pending request can't be approved
@@ -7455,15 +7457,26 @@ class MessageStore:
             return list(await cur.fetchall())
 
     async def decide_pending_approval(
-        self, approval_id: str, *, status: str, approver: str | None, decided_at: float
+        self,
+        approval_id: str,
+        *,
+        status: str,
+        approver: str | None,
+        decided_at: float,
+        from_status: str = "pending",
     ) -> bool:
-        """Atomically move a still-``pending`` request to ``status`` (approved/rejected/expired).
-        Returns ``True`` iff this call made the transition — guards against a double decision."""
+        """Atomically move a request in ``from_status`` to ``status``.
+        Returns ``True`` iff this call made the transition — guards against a double decision.
+
+        ``from_status`` defaults to ``pending`` (the request/decide path: approved/rejected/expired).
+        The approval gate also uses it for the ASVS 2.3.3 compensating transition ``approved`` ->
+        ``failed``, which must NOT be able to move a row some other caller already rejected or
+        expired — hence the guard is a parameter rather than a hardcoded literal."""
         async with self._lock:
             cur = await self._db.execute(
                 "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?"
-                " WHERE id = ? AND status = 'pending'",
-                (status, approver, decided_at, approval_id),
+                " WHERE id = ? AND status = ?",
+                (status, approver, decided_at, approval_id, from_status),
             )
             await self._commit()
             return cur.rowcount > 0

@@ -5985,17 +5985,25 @@ class PostgresStore:
         )
 
     async def decide_pending_approval(
-        self, approval_id: str, *, status: str, approver: str | None, decided_at: float
+        self,
+        approval_id: str,
+        *,
+        status: str,
+        approver: str | None,
+        decided_at: float,
+        from_status: str = "pending",
     ) -> bool:
-        """Atomically move a still-``pending`` request to ``status`` (approved/rejected/expired).
-        Returns ``True`` iff this call made the transition — guards against a double decision."""
+        """Atomically move a request in ``from_status`` to ``status``.
+        Returns ``True`` iff this call made the transition — guards against a double decision.
+        The SQLite twin documents why the guard is a parameter (ASVS 2.3.3)."""
         result = await self._pool.execute(
             "UPDATE pending_approvals SET status = $1, approver = $2, decided_at = $3"
-            " WHERE id = $4 AND status = 'pending'",
+            " WHERE id = $4 AND status = $5",
             status,
             approver,
             decided_at,
             approval_id,
+            from_status,
         )
         return _rowcount(result) > 0
 
