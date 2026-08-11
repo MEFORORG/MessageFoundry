@@ -402,14 +402,34 @@ suite("Steps #234 invariant 3 — refreshing more often adds no second state of 
   test("the projection is re-derived from the live buffer on every render, deferred or not", () => {
     // The other half of "no second state of record": there is exactly one projection input, and it is
     // the open document's text. A deferred refresh therefore cannot show anything the .py does not say.
+    // Matched loosely on the argv so a later flag (a contract-version gate, say) does not fail this
+    // test for the wrong reason: the property under test is that the LIVE BUFFER is what gets parsed,
+    // not which flags `lens parse` is given. Loose is not toothless — the sample below proves it still
+    // refuses the disk read, which is the exact premise Amendment C §C.4 had to correct.
+    const PIPES_BUFFER_RE =
+      /runJsonWithStdin<LensParseResult>\(\s*\[[^\]]*"lens",\s*"parse",\s*"-"[^\]]*\],\s*source\s*,/;
+    assert.ok(
+      !PIPES_BUFFER_RE.test(
+        'parse = await runJson<LensParseResult>(["lens", "parse", document.uri.fsPath], ws);',
+      ),
+      "the pattern must NOT accept a parse of the on-disk path, or it asserts nothing",
+    );
+    assert.ok(
+      PIPES_BUFFER_RE.test(
+        'parse = await runJsonWithStdin<LensParseResult>(["lens", "parse", "-", "--contract", "2"], source, ws);',
+      ),
+      "…while still tolerating a later flag, so it fails on substance rather than on argv churn",
+    );
+
     const src = fs.readFileSync(STEPS_VIEW_TS, "utf8");
     assert.ok(
       /const source = document\.getText\(\);/.test(src),
-      "render() must take its source from the live buffer",
+      `scanned ${STEPS_VIEW_TS}: render() must take its source from the live buffer`,
     );
     assert.ok(
-      /runJsonWithStdin<LensParseResult>\(\["lens", "parse", "-"\], source, ws\)/.test(src),
-      "…and pipe that same snapshot to `lens parse -`, never re-read the file from disk",
+      PIPES_BUFFER_RE.test(src),
+      `scanned ${STEPS_VIEW_TS}: render() must pipe that same snapshot to \`lens parse -\` over ` +
+        `stdin, never re-read the file from disk`,
     );
   });
 });
