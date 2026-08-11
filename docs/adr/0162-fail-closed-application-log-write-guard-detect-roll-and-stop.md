@@ -128,10 +128,16 @@ default pooled claim mode by `pause_lane` on each stage dispatcher, under `per_l
 gate that returns out of the worker before its next claim. A lane already mid-episode finishes **at
 most its one in-flight head** — bounded, and strictly better than stranding the row.
 
-**Recovery is per-connection and explicit.** `restart_inbound` re-arms that inbound's stages (resume
-the paused lanes / respawn the workers) and `start_outbound` resumes its delivery; a `/config/reload`
-deliberately does **not**, because a reload never rebuilds the dispatchers and must not resume a lane
-the operator has not looked at. Restarting one connection leaves the others halted.
+**Recovery, measured rather than assumed — the two tiers recover differently and an operator needs
+both halves.** The inbound re-arm rides `_start_inbound_unsafe`, so **anything that starts an inbound
+re-arms it**: `restart_inbound` for one connection, and a `/config/reload` for every inbound it
+re-binds (reload quiesces every source and re-binds from the new graph). The inbounds a reload
+declines to bind — `deployed=False`, `auto_start=False` and not previously listening, DR-filtered —
+stay halted, as do the connections a per-connection restart does not name. The outbound **pause is
+operator-owned in both cases** (#115/#233: a reload never resumes a lane an operator has not looked
+at), so delivery needs an explicit `start_outbound` or a service restart either way. Stated the other
+way round: *a reload alone will not drain the backlog*, and a test pins exactly that — after a reload
+the row moves to the outbound stage and stops there.
 
 ### 5 — The stop is observable, on channels that do not depend on the broken log
 

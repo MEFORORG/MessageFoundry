@@ -701,6 +701,17 @@ async def _until(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
     return True
 
 
+async def _until_outbound_row(store: MessageStore, message_id: str, timeout: float = 5.0) -> bool:
+    """Wait for the message to reach the OUTBOUND stage — i.e. the router and transform ran."""
+    elapsed = 0.0
+    while not await store.outbox_for(message_id):
+        if elapsed > timeout:
+            return False
+        await asyncio.sleep(0.02)
+        elapsed += 0.02
+    return True
+
+
 async def _until_processed(store: MessageStore, message_id: str, timeout: float = 5.0) -> bool:
     """Wait for the TERMINAL disposition, not for the delivered file.
 
@@ -895,3 +906,42 @@ def test_re_wiring_the_same_responder_is_silent(capsys: pytest.CaptureFixture[st
     guard.set_escalation(None)
 
     assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
+async def test_a_reload_re_arms_exactly_the_inbounds_it_re_binds(
+    store: MessageStore, tmp_path: Path, claim_mode: str
+) -> None:
+    # MEASURED, because the reload path was read two ways before it was run. reload() quiesces every
+    # source and then calls _start_inbound_unsafe for each inbound the new graph re-binds — which is
+    # where the re-arm lives — so a reload DOES resume the inbounds it re-binds, and leaves the ones
+    # it declines to bind (deployed=False / auto_start=False+not-previously-listening / DR-filtered)
+    # halted. Both halves matter: "a reload fixes it" and "a reload fixes nothing" are each half
+    # right, and shipping either sentence alone would send an operator the wrong way during an
+    # incident.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, claim_mode)
+    await runner.start()
+    try:
+        _break_sink_and_replacement(_installed_file_sink(), logdir)
+        logging.getLogger("t").warning("a record this engine cannot write anywhere")
+        assert await _until(lambda: runner._log_write_stopped), "the halt never fired"
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        await asyncio.sleep(0.3)
+        assert await store.outbox_for(message_id) == []  # still halted
+
+        await runner.reload(_e2e_registry(outdir))
+
+        assert INBOUND not in runner._log_halted  # re-bound, therefore re-armed
+        # …and it re-armed the STAGES, not just the flag: the row moves again. The OUTBOUND pause is
+        # operator-owned and a reload must NOT resume it (#115/#233), so the row reaches the outbound
+        # stage and waits there — the honest reach of a reload, and why the docs still say restart.
+        assert await _until_outbound_row(store, message_id), "the reload re-armed nothing"
+        assert list(outdir.iterdir()) == []  # …but delivery is still paused
+        await runner.start_outbound(OUTBOUND)
+        assert await _until(lambda: any(outdir.iterdir())), "never drained after reload + resume"
+        assert await _until_processed(store, message_id), "drained but never finalized"
+    finally:
+        await runner.stop()

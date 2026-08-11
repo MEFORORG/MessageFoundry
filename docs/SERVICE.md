@@ -419,9 +419,11 @@ it — the engine refuses to start otherwise, naming the collision.
    `connection_stopped` alert per halted connection naming the log as the cause, and `GET /status`'s
    `log_sinks` block, which is read from memory and still answers when the disk does not.
 
-Recover by fixing the disk or permissions and then **restarting the affected connections** (from the
-web console, or by restarting the service); the retained queue drains. A `/config/reload` is
-deliberately **not** enough — it does not resume a lane an operator has not looked at.
+Recover by fixing the disk or permissions and then **restarting the affected connections** — inbounds
+*and* outbounds — from the web console, or by restarting the service; the retained queue then drains.
+A `/config/reload` on its own is **not enough**: it re-arms the inbounds it re-binds, so messages
+start being routed again, but it deliberately never resumes a paused **outbound** (that is an
+operator decision), so the backlog moves one stage and stops. Restarting the service does both.
 Set `[logging].on_write_failure = "continue"` if you would rather the engine keep
 running with no log — it still rolls and still alerts, it just does not stop. The `*.broken-*` files
 are incident evidence and are deliberately left for you to review and remove; nothing rotates them
