@@ -1052,9 +1052,11 @@ class DeliverySettings(_Section):
     """
 
     # Key names match docs/CONFIGURATION.md's [delivery] catalog (retry_-prefixed so the section can
-    # also grow non-retry keys like outbox_workers/dead_letter later). max_attempts unset (None) =
-    # retry forever (the conservative default — see RetryPolicy); set a finite value to dead-letter.
-    retry_max_attempts: int | None = None
+    # also grow non-retry keys like outbox_workers/dead_letter later). Mirrors RetryPolicy's finite
+    # 100 default (#1051) — a test guards the sync, and the two MUST move together: leaving this at
+    # None would restore retry-forever for every outbound that declares no retry= of its own, which
+    # is the overwhelmingly common shape.
+    retry_max_attempts: int | None = 100
     retry_backoff_seconds: float = 5.0
     retry_backoff_multiplier: float = 2.0
     retry_max_backoff_seconds: float = 300.0

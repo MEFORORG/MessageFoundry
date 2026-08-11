@@ -261,14 +261,22 @@ class Source(BaseModel):
 
 class RetryPolicy(BaseModel):
     """Outbound delivery retry/backoff. ``max_attempts`` is the number of delivery attempts before a
-    failure dead-letters; ``None`` (the default) means **retry forever** — the conservative posture
-    for transient failures (transport errors, ``AE`` NAKs), so nothing is silently lost. Under FIFO a
-    forever-retrying head blocks its lane until it succeeds or an operator purges it (a permanent
-    ``AR`` reject is the exception — it fails fast, see
-    :class:`~messagefoundry.transports.base.NegativeAckError`). Set a finite ``max_attempts`` to opt
-    back into retry-then-dead-letter."""
+    failure dead-letters.
 
-    max_attempts: int | None = None
+    **The default is 100 — finite** (BACKLOG #1051). Under the shipped backoff below that is a
+    28,215 s (7 h 50 m 15 s) window before a row gives up, which is long enough to ride out a partner
+    outage and short enough that a lane cannot wedge indefinitely. It is safe as a default because of
+    two properties, both asserted in ``tests/test_retry_cap_default.py``: attempts are counted **per
+    row**, so a long outage burns the cap on roughly the lane heads rather than the whole backlog;
+    and an exhausted row **dead-letters into the replayable DLQ**, so nothing is discarded.
+
+    ``max_attempts=None`` is still expressible and still means **retry forever** — now a written
+    decision for a partner that must never advance past a message, rather than what you get by saying
+    nothing. Under FIFO a forever-retrying head blocks its lane until it succeeds or an operator
+    purges it. A permanent ``AR`` reject is the exception to all of this — it fails fast without
+    consuming the budget (see :class:`~messagefoundry.transports.base.NegativeAckError`)."""
+
+    max_attempts: int | None = 100
     backoff_seconds: float = 5.0
     backoff_multiplier: float = 2.0
     max_backoff_seconds: float = 300.0
@@ -276,7 +284,9 @@ class RetryPolicy(BaseModel):
 
 class BuildupThreshold(BaseModel):
     """When to raise a ``queue_buildup`` alert for an outbound lane (its backlog is not draining — a
-    retry-forever head blocking the lane is the classic cause).
+    head retrying its way toward :attr:`RetryPolicy.max_attempts` is the classic cause; the cap
+    eventually unblocks the lane, but hours later and only by dead-lettering, so the alert is what an
+    operator actually acts on).
 
     A lane crosses the threshold when its **pending depth** reaches ``max_depth`` *or* its **oldest
     pending message's age** reaches ``max_oldest_seconds``. ``None`` disables that dimension; both

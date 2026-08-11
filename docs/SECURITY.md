@@ -1737,33 +1737,23 @@ BACKLOG #190 bundled three integrity residuals; #190 closes with **one built** a
   ask was a *runbook decision* (does the exposure runbook mandate it), not new engine code. Every
   PHI-plane surface already carries integrity: outbound bodies (ADR 0018), the audit trail (the HMAC
   hash-chain), and data at rest (AES-256-GCM AEAD).
-- **ECH (Encrypted Client Hello) for outbound SNI — not performed by the engine, documented risk
-  acceptance (12.1.5).** Hiding the destination hostname in the outbound TLS ClientHello is not
-  reachable **in the engine process**: Python 3.14's stdlib `ssl` exposes **no ECH API**, and there is
-  **no SVCB/HTTPS DNS resolver** (ECHConfig is DNS-published) — adding one is out of scope. The
-  destination SNI is therefore visible on the outbound handshake. Compensating context: on-prem, a
+- **ECH (Encrypted Client Hello) for outbound SNI — buildable, deliberately not owned; accepted
+  residual (12.1.5).** The destination hostname is visible in the outbound TLS ClientHello. CPython's
+  stdlib `ssl` cannot hide it — ECH is an **OpenSSL 4.0** feature and the bundled OpenSSL 3.5.x
+  exports no ECH symbols (CPython PR #135435 is still open) — but it **is** buildable off-stdlib (Go
+  `crypto/tls`, rustls, sing-box), and one such terminating re-originator was written here and proven
+  against a real ECH endpoint. So "infeasible" is **not** the reason and must not be offered as one.
+  The reason is that it would hide nothing: a 2026-07-20 DoH probe found **no** partner endpoint
+  publishing an `ECHConfig`. The engine therefore ships only the opt-in, fail-closed **routing** half
+  (per-connection `ech_egress` / `ech_sidecar`, refused when the sidecar is non-loopback or paired
+  with `proxy_url`), and the re-originator was retired from the tree on 2026-08-10 rather than carried
+  as a second language nothing builds, tests or pins. Evidence, the retrieval SHA and the re-score
+  trigger: [ADR 0139](adr/0139-ech-egress-sidecar-sni-hiding-for-asvs-12-1-5-demand-gated.md);
+  operator contract: [`samples/ech-sidecar/`](../samples/ech-sidecar/README.md). The residual is
+  metadata only — which partner, how often — with at least these compensating conditions: on-prem, a
   trusted network segment, an operator-configured `[egress]`-allowlisted destination, and TLS still
-  protects the payload. Re-open when the stdlib gains a first-class ECH API and an SVCB/HTTPS
-  resolver is in scope.
-
-  > **Correction, 2026-08-10, amended 2026-08-11.** This paragraph previously called ECH
-  > *infeasible* and said a working client "would require a **third-party TLS stack** — violating
-  > the no-new-dependency rule". Both halves were false **when written**, and the counter-evidence
-  > was in the tree at the time: `tools/ech-sidecar` was a working out-of-process ECH client whose
-  > `go.mod` read "stdlib-only, no dependencies" and whose every import was Go stdlib (ADR 0139). A
-  > reader weighing this risk acceptance was being told the control could not be built while the
-  > repository contained one.
-  >
-  > **That tree was retired on 2026-08-11** under the G19 ruling — nothing built, tested, linted or
-  > version-pinned it, and there is no Go toolchain in CI. It survives in git history and in the
-  > private vault, so the refutation above remains checkable; it is simply no longer checkable from
-  > the working tree. What is true now is narrower and is what the paragraph says: the **engine
-  > process** cannot do ECH, and the engine ships **no sidecar** — an operator supplying their own
-  > loopback ECH terminator is the only route, and the engine's fail-closed routing for that case
-  > stays (`transports/rest.py`, `tests/test_ech_egress.py`).
-  >
-  > **The accepted residual is unchanged throughout** — the destination SNI is visible on the
-  > outbound handshake under every one of these states. Only the premise moved.
+  protecting the payload. Re-open when a destination begins publishing an `ECHConfig`, or when CPython
+  ships a first-class ECH API.
 
 ### In-use memory protection — best-effort partial + deployment requirement (13.3.3 / 11.7.1 / 11.7.2, #198)
 

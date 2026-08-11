@@ -2,8 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """Operational alert emit-points for the delivery pipeline.
 
-The conservative ordering defaults (FIFO head-of-line blocking, retry-forever, stop-connection on
-internal error) are only *safe* if an operator is told when a lane stalls — a stopped connection or a
+The conservative ordering defaults (FIFO head-of-line blocking, a ~7 h 50 m retry cap before a row
+dead-letters, stop-connection on internal error) are only *safe* if an operator is told when a lane
+stalls — the cap bounds the wedge, it does not report it, so a stopped connection or a
 building backlog needs a human. A full alerting/notification framework is future work
 (``docs/BACKLOG.md`` item 5); until it lands, the delivery worker emits these events to an
 :class:`AlertSink` whose default implementation simply **logs** them at ``WARNING``. Wiring a real

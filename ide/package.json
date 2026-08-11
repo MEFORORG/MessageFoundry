@@ -301,7 +301,7 @@
       "editor/title": [
         {
           "command": "messagefoundry.openSteps",
-          "when": "messagefoundry.isConfigFile && messagefoundry.activeFileHasHandler && activeCustomEditorId != messagefoundry.stepsEditor",
+          "when": "messagefoundry.isConfigFile && messagefoundry.activeFileHasSteps && activeCustomEditorId != messagefoundry.stepsEditor",
           "group": "navigation@1"
         },
         {
@@ -351,7 +351,7 @@
         },
         {
           "command": "messagefoundry.openSteps",
-          "when": "messagefoundry.activeFileHasHandler",
+          "when": "messagefoundry.activeFileHasSteps",
           "group": "3_view@1"
         }
       ],
