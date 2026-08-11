@@ -63,7 +63,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.08.11.1"
+$GateVersion = "2026.08.11.2"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -406,6 +406,15 @@ function Get-ScannableSegments([string]$Cmd) {
     #     the bound above. A stated residual beats a matcher that has stopped describing a family.
     #   * `-File <script>`: the code is not in the command at all -- the shell-write blind spot the
     #     docstring already names.
+    #   * NO FLAG AT ALL. Measured in the #1097 second pass: `powershell "<script>"` RUNS on Windows
+    #     PowerShell 5.1, which treats its first unrecognised argument as the command. (pwsh 7 does not
+    #     -- it reports the argument as a script-file name -- and neither does bash or cmd.) That span is
+    #     quoted, so it is blanked below and every rule is blind to it. NO FLAG MATCHER CLOSES THIS, and
+    #     it is recorded rather than half-fixed for that reason: catching it needs a matcher keyed on the
+    #     INTERPRETER'S NAME instead of on a flag, which is a different rule with a different false-deny
+    #     profile (it would have to decide what counts as an interpreter, and `ssh box "git checkout
+    #     main"` is the shape sitting next to it that must keep allowing). It is the one residual this
+    #     audit ADDED to this list rather than inherited.
     #   * More than one level of nesting, unchanged from before (BACKLOG #1066/#1067 record it).
     #   * A quoted argument SPANNING LINES, because the split above is per line. Both multi-line forms
     #     deny today anyway: every line of such a span reaches the scanner RAW and the payload line
@@ -420,21 +429,75 @@ function Get-ScannableSegments([string]$Cmd) {
     # git command -- `grep -vc "git checkout main"` now denies where it did not. That class already
     # existed for `-c` (`grep -c "git checkout main"` has always denied), so this adds members to it
     # rather than creating it.
-    $word = 'command'
-    # Longest prefix first: `-Command` must match as `command`, not as `c` with `ommand` left over.
-    $psPrefixes = (($word.Length)..1 | ForEach-Object { $word.Substring(0, $_) }) -join '|'
-    $psFlag     = "[-/](?:$psPrefixes|encodedcommand)"
+    #
+    # ---------------------------------------------------------------------------------------------
+    #
+    # THE SIGIL IS GENERATED TOO, and it was not (BACKLOG #1097, second pass). The rule above generated
+    # the PREFIX and then hard-coded `[-/]` beside it -- a hand-typed two-member class inside a fix whose
+    # whole purpose was to stop hand-typing enumerations. Measured on the same binaries:
+    #   * `pwsh --command`, `--Com` and `--c` all RUN. The double dash is the ORDINARY POSIX spelling on
+    #     the platform this repo targets, so it is the sigil reached for by habit rather than by intent,
+    #     and every prefix and case worked under it while the gate saw none of them.
+    #   * PowerShell's argument parser treats three UNICODE dashes as dash-equivalents: U+2013 (en),
+    #     U+2014 (em) and U+2015 (horizontal bar). All three bind the parameter -- singly on both hosts,
+    #     and DOUBLED on pwsh 7.
+    #   * A dash-family character may be doubled only WITH ITSELF. Three or more is refused, a mixed pair
+    #     (`-` then U+2013) is refused, and a slash never doubles. That is why the sigil below is spelled
+    #     with a BACKREFERENCE and not `{1,2}`: `{1,2}` would admit the twelve mixed DASH-FAMILY pairs
+    #     and `+` would admit every length, and both describe a family that does not exist. Both
+    #     widenings were RUN as mutants, and each reddens the bounded-ness test and nothing else.
+    # Spelled with \u escapes rather than literals so this file stays pure ASCII -- U+2015 does not
+    # encode in cp1252 at all, and this gate is read on a stock Windows console (CLAUDE.md section 11).
+    $sigil = '(?:(?<sg>[-\u2013\u2014\u2015])\k<sg>?|/)'
+
+    # WHICH PARAMETERS INTRODUCE CODE, and HOW EACH ONE BINDS -- both measured, never read off docs.
+    # A generated prefix family cannot generate a parameter it was never told about, and `pwsh -h` lists
+    # a SECOND one: `-CommandWithArgs | -cwa`. `-cwa`, `-CWA` and the full name each run arbitrary code
+    # and NONE is reachable from prefixes of `command` (`-Command` needs whitespace next; the full name
+    # continues with `W`). So the set is carried explicitly and the binding rule is per member.
+    $psPrefixWords = @('command')                                   # binds on ANY prefix: -c .. -command
+    # EXACT only, and the negative is what keeps it that way: `-cw` is one character short and refuses,
+    # `-cwar` one over and refuses, and every prefix between `-Command` and `-CommandWithArgs` refuses.
+    # A second generated ladder here would sweep in `-cw` and, through it, any two-letter flag in c.
+    # `encodedcommand` stays exact for the older reason recorded below -- expanding it means matching
+    # `-e`, which sweeps in `sed -e "s/git checkout/x/"` for a payload no rule can read anyway.
+    $psExactWords = @('commandwithargs', 'cwa', 'encodedcommand')
+    # Longest first: `-Command` must match as `command`, not as `c` with `ommand` left over.
+    $psNames = @(
+        $psPrefixWords | ForEach-Object { $w = $_; 1..$w.Length | ForEach-Object { $w.Substring(0, $_) } }
+    ) + $psExactWords | Sort-Object -Property Length -Descending
+    $psFlag     = "$sigil(?:$($psNames -join '|'))"
     $shFlag     = '-[a-z]*c'
     $cmdExeFlag = '(?:/[^/\s]+)*/[ck]'
-    $flag       = "(?:$psFlag|$shFlag|$cmdExeFlag)"
 
+    # THE SEPARATOR IS PER HOST, because the hosts disagree and only one of them was measured before.
+    # cmd.exe does NOT require whitespace: `cmd /c"echo ran"` and `cmd /cecho ran` both execute, so the
+    # `\s+` demanded of every branch was a PowerShell fact applied to a host that does not share it.
+    # PowerShell and a POSIX shell DO require it -- `-CommandWrite-Output ran`, `-Command:x`, `-Command=x`
+    # and `bash -cecho ran` were each measured to REFUSE -- so their `\s+` is untouched. That matters
+    # beyond tidiness: the mandatory whitespace-then-quote is the ONLY thing refusing `-Cm`/`-Cmd`/`-Cnd`/
+    # `-Comd`, so relaxing it across the board (rather than on cmd's alternative alone) would delete the
+    # bound that keeps the prefix family honest.
+    #
+    # THE PROBE THAT CATCHES THE OVER-BROAD EDIT IS THE ATTACHED FORM, `pwsh -Com"<code>"` -- and finding
+    # that took a mutant, because the obvious probe does not work. `pwsh -Comd"<code>"` was written here
+    # first and was measured to be a NO-OP: relaxing `\s+` to `\s*` on all three branches left the entire
+    # suite GREEN, since the quote in `-Comd"` does not sit immediately after any prefix of `command`. In
+    # the attached form it does, so the across-the-board relaxation reddens it and the per-host split does
+    # not. Recorded because the useless probe LOOKED like the bound: it named the right risk, asserted the
+    # right verdict, and could not fail.
+    $flagThenSep = "(?:(?:$psFlag|$shFlag)\s+|$cmdExeFlag\s*)"
+
+    # The payload is a NAMED group. It was Groups[1], which still resolves correctly (.NET numbers
+    # unnamed groups before named ones) -- but only by an ordering rule no reader should have to know,
+    # now that $sigil contributes a named group of its own.
     $inner = @()
     foreach ($ln in $lines) {
         foreach ($pat in @(
-            "(?i)(?:^|\s)$flag\s+`"([^`"]*)`""
-            "(?i)(?:^|\s)$flag\s+'([^']*)'"
+            "(?i)(?:^|\s)$flagThenSep`"(?<code>[^`"]*)`""
+            "(?i)(?:^|\s)$flagThenSep'(?<code>[^']*)'"
         )) {
-            foreach ($m in [regex]::Matches($ln, $pat)) { $inner += $m.Groups[1].Value }
+            foreach ($m in [regex]::Matches($ln, $pat)) { $inner += $m.Groups['code'].Value }
         }
     }
 
