@@ -544,11 +544,11 @@ Acceptance Criteria bucket. Promote to the block above if and when the owner acc
 
 ## Amendment C (2026-08-04) — the update-loop guard DEFERS a save-triggered re-projection instead of dropping it (BACKLOG #234)
 
-> **Status of this amendment: PROPOSED — not ratified.** It is written and built because BACKLOG #234
-> requires the guardrail it touches to be re-argued in a dated amendment in the same change, not because
-> the owner has ruled on it; ratification is an owner decision, and until it lands this section follows
-> Amendment B's convention (its acceptance criteria sit under a distinct heading, outside this ADR's
-> counted Acceptance Criteria bucket).
+> **Status of this amendment: ACCEPTED — owner-ratified 2026-08-10.** It was written and built ahead of
+> ratification because BACKLOG #234 requires the guardrail it touches to be re-argued in a dated
+> amendment in the same change; the owner has now ruled, so its acceptance criteria join this ADR's
+> counted bucket under the plain heading below, as Amendment A's and Amendment D's did on ratification.
+> Ratification covers this amendment only: whether to relax the save gate itself stays open (see §C.4).
 >
 > **What it claims:** it **strengthens** the §5 "sync on save only" guardrail and does **not** relax it.
 > The projection still syncs on save and on save only. What changes is what happens to a save that
@@ -633,11 +633,7 @@ BACKLOG #234's remaining half. It stays open, and it should be decided against t
 above rather than the false one. This amendment lands the race fix **first**, on purpose: the dropped
 refresh is a defect under the current gate and would widen materially under any relaxation.
 
-## Acceptance Criteria (Amendment C — proposed, not ratified; deliberately outside the counted block)
-
-*(Same convention as Amendment B: kept under a distinct heading so unratified criteria do not merge into
-this ADR's accepted Acceptance Criteria bucket. Promote to the block above if and when the owner
-accepts. The criteria are nonetheless **built and tested** — the amendment lands with its gate.)*
+## Acceptance Criteria
 
 - **AC-C1** — WHILE an edit holds the single edit slot, WHEN a document save for the projected document
   is observed, THE SYSTEM SHALL record it and SHALL NOT re-project immediately → guard unit test refs.
