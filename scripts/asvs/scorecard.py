@@ -208,6 +208,59 @@ class Absence:
 
 
 @dataclass(frozen=True)
+class Blocker:
+    """Why a ``fail`` cannot be closed by our own work, and WHEN that was last actually true.
+
+    A bare ``fail`` cannot distinguish two very different states: one we have not got to, and one no
+    amount of correct code can move. Prose in ``residual`` can say which, but prose carries no date,
+    so the second kind rots invisibly — the blocking condition is external and can lift without
+    anyone noticing. That is not hypothetical here: the ASVS 12.1.5 retirement decision (G19,
+    2026-08-11) rested on a DoH probe finding no counterparty publishing an ECHConfig, and at ruling
+    time that measurement was three weeks old with **no recorded cadence for re-running it**. The one
+    fact that would reverse the decision was going stale with nobody watching.
+
+    So the unblock half is mandatory, not optional. ``unblock_signal`` states what would change in
+    the world; ``unblock_probe`` is the executable procedure that detects it; ``checked_on`` is when
+    that probe last ran; ``recheck_days`` is how long that answer stays good. Together they make
+    staleness a computable property rather than something a reader has to notice.
+
+    **Deliberately NOT a seventh verdict value.** A new verdict would change the denominator and
+    every renderer, and every existing count in every document would silently mean something else.
+    **Deliberately not ``na`` either:** ASVS 5.0 dropped 4.0's clause that let a documented exclusion
+    preserve a compliance claim, so ``na`` buys nothing here and misdescribes what was assessed — the
+    requirement applies, it was assessed, and it failed.
+
+    **Honest limit, stated so it is not overclaimed:** overdue blockers are REPORTED, not enforced.
+    Making a stale probe red the gate would block unrelated pull requests on a calendar date, which
+    buys attention at a cost nobody agreed to. The count is printed by ``--status`` so it is visible
+    where humans and CI already look. Promoting it to a hard failure is a one-line change in
+    :func:`verify` and a deliberate decision, not an oversight.
+    """
+
+    #: Short slug for the external thing that blocks it, e.g. ``cpython-stdlib``, ``no-counterparty``.
+    blocked_by: str
+    #: Prose: why our own work cannot close it.
+    reason: str
+    #: The measurement or citation backing ``reason`` — not an assertion.
+    evidence: str
+    #: What would have to change in the world for this to become closable.
+    unblock_signal: str
+    #: The executable procedure that detects ``unblock_signal``. A signal nobody can test is a wish.
+    unblock_probe: str
+    #: ISO date ``unblock_probe`` last ran. This is the field that makes staleness computable.
+    checked_on: str
+    #: How many days ``checked_on`` stays good before the probe owes a re-run.
+    recheck_days: int
+
+    def days_overdue(self, today: datetime.date) -> int:
+        """Days past the re-probe deadline; 0 when still current. Never negative."""
+        due = datetime.date.fromisoformat(self.checked_on) + datetime.timedelta(
+            days=self.recheck_days
+        )
+        return max(0, (today - due).days)
+
+
+@dataclass(frozen=True)
 class Cell:
     id: str
     level: int
@@ -224,6 +277,9 @@ class Cell:
     decision_closed: bool = False
     decision_closed_on: str = ""
     decision_closed_by: str = ""
+    #: Set when this cell's verdict is held down by something outside the project's control. See
+    #: :class:`Blocker` — the point of it is the re-probe cadence, not the excuse.
+    blocker: Blocker | None = None
     evidence: tuple[Anchor, ...] = ()
     absence: tuple[Absence, ...] = ()
 
@@ -382,11 +438,65 @@ def load_scorecard(path: Path) -> list[Cell]:
                     "the thing came back; do NOT derive it from the pattern, which makes the check "
                     "vacuous. See the Absence docstring for a worked example"
                 )
+        # A blocker record is admissible ONLY as a complete set. A partial one -- a reason with no
+        # probe, or a probe with no date -- reads as diligence and carries none: it is exactly the
+        # "compensating control resting on a false premise" shape, arriving through the fix. So every
+        # field is required, and the two computable ones are type-checked here rather than at the
+        # point of use, where a bad value would surface as a traceback in a renderer.
+        blocker: Blocker | None = None
+        if (rb := raw.get("blocker")) is not None:
+            if verdict != "fail":
+                raise ScorecardError(
+                    f"cell {raw.get('id')!r}: a `blocker` is only meaningful on verdict 'fail' (got "
+                    f"{verdict!r}). A blocked PARTIAL is a real thing, but admitting one here needs "
+                    "its own ruling -- widening this is a decision, not a default"
+                )
+            missing = [
+                k
+                for k in (
+                    "blocked_by",
+                    "reason",
+                    "evidence",
+                    "unblock_signal",
+                    "unblock_probe",
+                    "checked_on",
+                    "recheck_days",
+                )
+                if not str(rb.get(k, "")).strip()
+            ]
+            if missing:
+                raise ScorecardError(
+                    f"cell {raw.get('id')!r}: `blocker` is missing {missing} -- a partial blocker "
+                    "record is a comment, not a control. The unblock half is the whole point: a "
+                    "signal nobody can probe, or a probe with no date, cannot go stale visibly"
+                )
+            try:
+                datetime.date.fromisoformat(str(rb["checked_on"]))
+            except ValueError as exc:
+                raise ScorecardError(
+                    f"cell {raw.get('id')!r}: `blocker.checked_on` must be an ISO date "
+                    f"(YYYY-MM-DD), got {rb['checked_on']!r}"
+                ) from exc
+            if int(rb["recheck_days"]) < 1:
+                raise ScorecardError(
+                    f"cell {raw.get('id')!r}: `blocker.recheck_days` must be >= 1; a cadence of "
+                    "zero or less never comes due, which is the same as having none"
+                )
+            blocker = Blocker(
+                blocked_by=str(rb["blocked_by"]),
+                reason=str(rb["reason"]),
+                evidence=str(rb["evidence"]),
+                unblock_signal=str(rb["unblock_signal"]),
+                unblock_probe=str(rb["unblock_probe"]),
+                checked_on=str(rb["checked_on"]),
+                recheck_days=int(rb["recheck_days"]),
+            )
         cells.append(
             Cell(
                 id=str(raw["id"]),
                 level=int(raw["level"]),
                 verdict=verdict,  # type: ignore[arg-type]
+                blocker=blocker,
                 residual=str(raw.get("residual", "")),
                 posture=str(raw.get("posture", "single")),
                 decision_closed=raw.get("decision_closed") is True,
@@ -1720,8 +1830,26 @@ def status_lines(cells: list[Cell]) -> list[str]:
         1 for c in cells if c.verdict in DECIDED_VERDICTS and not c.evidence and not c.absence
     )
     pct = (100.0 * examined / total) if total else 0.0
+    # Externally-blocked fails, and -- the part that matters -- whether anyone has re-probed the
+    # thing blocking them lately. Printed even when the count is zero, so "no blockers" and "the
+    # blocker section was dropped from the renderer" cannot look alike.
+    blocked = [c for c in cells if c.blocker is not None]
+    today = datetime.date.today()
+    overdue = [
+        (c.id, c.blocker.days_overdue(today))
+        for c in blocked
+        if c.blocker is not None and c.blocker.days_overdue(today) > 0
+    ]
+    blocker_line = f"blocked {len(blocked)} fail cell(s) held by an external condition"
+    if overdue:
+        blocker_line += "; RE-PROBE OVERDUE: " + ", ".join(
+            f"{cid} by {n}d" for cid, n in sorted(overdue, key=lambda x: -x[1])
+        )
+    elif blocked:
+        blocker_line += "; all re-probes current"
     return [
         f"cells {total}: " + ", ".join(f"{c} {v}" for v, c in parts),
+        blocker_line,
         f"examined {examined} of {total} ({pct:.1f}%) against the pinned text; "
         f"{inherited} decided with no last_verified; {closed} closed by owner decision",
         f"evidence {anchors} anchors in {anchored_cells} cells over {len(paths)} paths; "
