@@ -270,6 +270,17 @@ class SourceStartupError(Exception):
     that logs-and-retries every poll). Distinct from :class:`DeliveryError` (a delivery outcome)."""
 
 
+class DestinationStartupError(Exception):
+    """The outbound mirror of :class:`SourceStartupError`: a destination's **opt-in at-start
+    validation** (:meth:`DestinationConnector.validate_startup`) failed — a File/RemoteFile outbound
+    whose ``validate_directory`` toggle is on, pointed at a target directory that is **missing or
+    unusable** at start (BACKLOG #114). Raised from the runner's outbound start path so ADR 0031
+    isolates the lane as ``failed`` (no live connector, its delivery worker still spawned so routed rows
+    are retried, never dropped) instead of the default run-time deferral — which on an outbound means
+    the target directory is silently ``mkdir``ed on the first write. Distinct from
+    :class:`DeliveryError` so a start-time refusal is never mistaken for a retryable send failure."""
+
+
 def encode_wire_body(payload: str, encoding: str, *, transport: str) -> bytes:
     """Encode an outbound payload to the bytes that go on the wire (or to disk), failing CONTENT-FREE.
 
@@ -482,6 +493,22 @@ class DestinationConnector(abc.ABC):
     ) -> DeliveryResponse | None: ...
 
     async def aclose(self) -> None:
+        return None
+
+    async def validate_startup(self) -> None:
+        """Optional **opt-in** at-start validity check for the destination's external resource, run by
+        the runner in ``_start_outbound`` right after the connector is built (BACKLOG #114) — the
+        outbound mirror of :meth:`SourceConnector.validate_startup`. The **default is a no-op**, so
+        every connector that does not override it (and every File/RemoteFile outbound that leaves
+        ``validate_directory`` off) is byte-identical: validation stays deferred to run time. The FILE
+        and REMOTEFILE destinations override it to **fail-fast** when ``validate_directory`` is on — a
+        missing/unusable target directory raises :class:`DestinationStartupError`, which the runner
+        isolates as an ADR-0031 ``failed`` lane.
+
+        Like the source hook, this must **not** create anything — a merely-missing directory has to
+        FAIL. That is the whole reason it exists on an outbound: :meth:`test_connection` (the on-demand
+        ``POST /connections/{name}/test`` probe) **creates** the target directory on both FILE and
+        REMOTEFILE, so asking it whether the directory exists makes the answer yes."""
         return None
 
     async def test_connection(self) -> None:
