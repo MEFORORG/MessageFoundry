@@ -5,7 +5,7 @@
 # This is a GOLDEN gate: any diff means the seam contract changed - see the test's failure hint.
 
 ## ENGINE_UI_SEAM
-18
+19
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -174,7 +174,7 @@ SecurityPosture: allow_unencrypted_phi, backend, client_address_monoculture, cli
 ServiceStatusInfo: enabled, service_name, state
 StatsResetRequest: all, targets
 StatsResetTarget: channel_id, destination, role
-SystemStatus: claim_proc, db, engine, kpis, logs, pool, update
+SystemStatus: claim_proc, db, engine, kpis, log_sinks, logs, pool, update
 
 ## api.auth_models DTO fields rendered by the console
 AdGroupMap: entries

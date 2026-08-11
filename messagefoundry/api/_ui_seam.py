@@ -94,7 +94,17 @@ from typing import Any
 #: API). Report-only, reflects/changes NO live TLS behaviour; additive with a default, so an older
 #: console simply ignores it. Bumped because the golden seam snapshot introspects SecurityPosture's
 #: field set, so any added field trips the handshake even when it is purely additive.
-ENGINE_UI_SEAM: int = 18
+#: seam v19 (BACKLOG #122, ADR 0162): SystemStatus gained the additive `log_sinks` — per-sink
+#: application-log WRITE health (healthy / rolled / unwritable, a rollover count, a `safe_exc`
+#: reason and the path a broken file was rolled aside to), which the status page renders beside
+#: the existing `logs` byte metering. The two answer DIFFERENT questions and that is the point:
+#: `logs` meters the SUPERVISOR's directory from the filesystem, so it cannot observe a sink the
+#: engine failed to write; `log_sinks` is read from process memory, so it still answers when the
+#: disk does not. Additive with a default of `[]`, so the payload is unchanged when logging was
+#: not configured through `configure_logging`; bumped because the golden seam snapshot
+#: introspects SystemStatus's field set, so any added field trips the handshake even when it is
+#: purely additive.
+ENGINE_UI_SEAM: int = 19
 
 
 @dataclass(frozen=True, slots=True)
