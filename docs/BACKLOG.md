@@ -5797,7 +5797,7 @@ than closed.
 
 ## 1106. `redacted_settings` does not redact the JWS signing key or its passphrase
 
-> 🔢 **Filed 2026-08-08 - not started. EXECUTED against `main` 166634c9, not inferred.** Value **8/10** · Difficulty **2/10**. `_is_secret_setting` (`messagefoundry/config/wiring.py:686`) matches `_SECRET_SETTING_KEYS` plus the `body_secret_value_` prefix. It does **not** match `sign_private_key` or `sign_private_key_password` -- the exact names `with_signing` writes into `spec.settings` at `messagefoundry/transports/signing.py:505-506`. Both are therefore returned **verbatim** by `redacted_settings`, which is the scrubber for `GET /connections/{name}/metadata` and for `graph --json`. The `private_key` that IS in the registry (`wiring.py:623`) is the **SFTP** key -- a different setting.
+> ✅ **SHIPPED 2026-08-09 (`e7566082`, PR #300) -- this banner read "not started" until 2026-08-11 and was WRONG for two days.** Value **8/10** -- Difficulty **2/10**. `_is_secret_setting` now names `sign_private_key` and `sign_private_key_password` explicitly (`config/wiring.py:830`), so both return `***` from **both** serializers while `sign_key_id` and `sign_algorithm` correctly stay readable. **Verified pinned rather than incidentally green:** reverting that arm turns **four** tests red, including the redaction-domain case and two credential-parameter-mapping cases. **The stale banner cost a dispatched lane.** A session read *"not started"*, believed it, and sent a worker to build something already on `main` for two days -- the same error class as filing a duplicate, one level up: **a status field believed instead of measured.** The lane recovered the cost by finding **#1223** while proving this item was already done, but that was luck, not design.
 
 **Cluster:** Security / secret disclosure. **Priority:** P1. **Verdict:** build. **Severity:** on first
 deployment this would return a **private signing key and its passphrase** to any caller holding
@@ -7704,5 +7704,43 @@ gate is the wrong shape, validation of the walk is the right one.
 > **Scope note:** the fix belongs with whichever of the two answers is chosen, and the failure path is the place to prove it -- **make the lint FIRE on a document containing a glyph and read the output**, because a green run exercises none of this. That is the whole point of the item.
 
 **Cluster:** Developer tooling / CI. **Priority:** P3. **Verdict:** build. **Severity:** minor -- no product effect; it degrades a working gate into an unreadable one at the moment it matters.
+
+
+## 1222. A fail-closed contract is pinned through a C-stack-dependent trigger, so the test measures the runner
+
+> 🔢 **Filed 2026-08-11 -- live: it reds two PRs while `main` PASSES it, and the test is byte-identical across the range.** Value **6/10** -- Difficulty **3/10** -- _fill-in_. `tests/test_sandbox_codec.py::test_recursion_error_is_not_a_value_error` builds **100,000-deep** nested JSON and requires `json.loads` to raise `RecursionError`. On the CI ubuntu leg it now reports **`Failed: DID NOT RAISE RecursionError`** on `#302` and `#328` -- two entirely unrelated changes, a ledger merge and a crypto doc contract -- while `origin/main` `8077a033`, the commit they are cut from, **passes the full suite 11,199 / 0**.
+
+> **THE CONTRACT IT PINS IS REAL AND MUST NOT BE LOST.** `decode_frame` catches `RecursionError` **explicitly**, because `RecursionError` is a `RuntimeError` and **not** a `ValueError` -- so an `except ValueError` would let a deep-nesting rejection **escape the fail-closed path**. That is worth a test. The defect is the INSTRUMENT, not the intent.
+
+> **MEASURED: THE TRIGGER IS ENVIRONMENT-DEPENDENT BY A FACTOR OF AT LEAST SIX.** On a Windows box (CPython 3.14.6, AMD64) the shallowest depth at which `json.loads` raises is **16,914** -- so the test's 100,000 carries **5.9x margin there**. On the failing runner, 100,000 **does not raise at all**, so its threshold is *above* 100,000. Same trigger, same bytes, thresholds differing by more than 6x. **The mechanism is visible in the numbers: `sys.getrecursionlimit()` is 1000, yet `json.loads` reaches 16,914 -- the C accelerator does not use Python's recursion limit, it consumes the C STACK, which no Python-level knob controls.** Interpreter build, thread stack size and runner image all move it; nothing in this repository does.
+
+> **RULED OUT, so nobody re-derives it.** Across `48f8712d..8077a033` (the range between a passing main and the current one): **908 added lines** and **zero** occurrences of `setrecursionlimit`, `sys.setrecursion`, `threading.stack_size`, `stack_size` or `RecursionError`; `tests/test_sandbox_codec.py` **unchanged**, its blob `24807e73e152` byte-identical at both ends; and no recursion or stack knob in `conftest.py`, `pyproject.toml` or the sandbox modules. **Cause UNKNOWN and recorded as unknown** -- the runner image is the remaining candidate and is outside this repository. Note it does not cleanly explain main passing, and no mechanism is invented here to reconcile that.
+
+> **DO NOT FIX THIS BY RAISING THE DEPTH.** That buys a green on today's image and re-fires on the next roll, and it makes the test *more* environment-coupled rather than less. **The contract can be pinned directly without blowing any stack:** assert the type relationship (`not issubclass(RecursionError, ValueError)`, and that it IS a `RuntimeError`), and assert `decode_frame`'s handler catches `RecursionError` -- by driving the handler with a raised `RecursionError` rather than by manufacturing one from real recursion. **A test whose pass depends on the C stack tests the runner as much as the code.**
+
+> **How to prove a fix:** the replacement must still FAIL if `decode_frame`'s `except RecursionError` is narrowed to `except ValueError` -- break it on purpose and watch it red. And it must pass on a box whose `json.loads` threshold is 16,914 *and* on one where it exceeds 100,000, because covering only one of those is what produced this item.
+
+**Cluster:** Testing / instruments. **Priority:** P2. **Verdict:** build. **Severity:** conditional -- no product effect; the shipped `decode_frame` behaviour is correct. It is a red that blocks unrelated PRs and cannot be attributed to any of them.
+
+
+## 1223. `http_auth_user` leaks verbatim: the sixth member of a five-member class, and the injector's vocabulary cannot see it
+
+> 🔢 **Filed 2026-08-11 -- MEASURED by executing the shipped redactor on `main`, not inferred.** Value **7/10** -- Difficulty **2/10** -- _quick win_. `with_http_digest` writes `http_auth_user` into `spec.settings` (`transports/http_auth.py:477`), and `_is_secret_setting` does not name it. Run against `origin/main`:
+
+> ```
+> basic_user          -> ***          proxy_user     -> ***
+> username            -> ***          http_auth_password -> ***
+> http_auth_user      -> SYNTHETIC-ACCOUNT          <- verbatim, BOTH serializers
+> ```
+
+> **It is the SIXTH member of a FIVE-member class.** `config/wiring.py:847` carries the engine's own username set -- `{"username", "basic_user", "proxy_user", "ws_username", "credential_username"}` -- masked defence-in-depth on the stated ground that *a username names a principal and can leak directory structure*. `http_auth_user` is the same kind of thing, written across the **same parameter-to-setting boundary** that `#1106` was entirely about (`with_signing` renaming `private_key` to `sign_private_key`; `with_http_digest` renaming `user` to `http_auth_user`). On a first deployment it would return a **Digest auth username** to any caller holding `Permission.MONITORING_READ`, and print it to stdout, a CI log and the IDE graph view.
+
+> **WHY BOTH GUARDS WERE GREEN OVER IT, AND THIS IS THE STRUCTURAL HALF.** `CREDENTIAL_ISH` -- the tuple deciding **where a sentinel is injected** -- was `("password","secret","token","key","credential","passphrase")`. So `_is_credential_param("user")`, `("username")` and `("proxy_user")` all return **False**, and **no guard had ever injected into a username parameter at all**; `credential_username` matched only by accident, via `"credential"`. `test_credential_parameter_mapping.py` **inherits the same blindness by importing the same predicate**, so two independent-looking checks share one blind spot. Proved by mutation rather than by reading: widening the tuple by the single word `user`, changing nothing else, turns the guard red on **exactly `with_http_digest -> http_auth_user` and nothing else**.
+
+> **THE ALLOWLIST WAS EXAMINED AND KEPT, ON EVIDENCE.** Running the obvious inversion (`key|secret|password|passphrase|token|credential`) over the real 189-key set is **worse in both directions at once**: it **over-redacts 14** -- four file paths, two URLs, a DB column name, and the keyword-name indirections `odbc_password_key` / `odbc_user_key` -- which is how an operator's diagnostic view dies and the control gets switched off; and it **under-redacts 4** it currently masks, reopening `username`, `basic_user`, `proxy_user`, `ws_username`. **Decisively: the inversion would NOT have caught this defect** -- `http_auth_user` contains none of those six substrings. Allowlist and shape rule fail on the *same* key, because the defect was never *"the list is a list"*; it was that **nobody derived the domain**.
+
+> **Scope:** classify `http_auth_user`, and widen `CREDENTIAL_ISH` so the injector can see username-shaped parameters. **What stops the next omission** is the guard already written for this: a test deriving the injection vocabulary **from `_SECRET_SETTING_KEYS` itself**, failing if the engine ever classifies a key whose shape the injector cannot reach. It is red today without the widening and names all six usernames. **How to prove a fix:** it must red when `http_auth_user`'s classification is reverted, AND the vocabulary test must red when a classified key's shape is removed from the tuple -- two directions, because this defect lived in the gap between them.
+
+**Cluster:** Security / secret disclosure. **Priority:** P2. **Verdict:** build. **Severity:** conditional -- a credential-adjacent disclosure in a shipped default path; no PHI, and zero deployments, so nothing is exposed today.
 
 
