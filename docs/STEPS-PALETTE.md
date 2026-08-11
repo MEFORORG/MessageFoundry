@@ -69,6 +69,20 @@ recognizes back as an editable step, so the `.py` file stays the only artifact a
   sends` scaffold render as muted, read-only rows.
 - **If / For Each** seed a `pass` body; insert steps into it to fill the block.
 - **Everything is editable after insert** — each inserted step is a recognized row whose params you edit in
-  place; the code stays the source of truth.
+  place; the code stays the source of truth. This now includes **Comment**: an inserted comment reads back
+  as its own editable `note` row (ADR 0076 Amendment A), where it used to disappear, merge into a
+  neighbouring Code row, or be frozen as read-only. **One documented exception:** a comment matching the
+  pragma allowlist (`fmt: off` / `fmt: on`, a `noqa` or `ruff: noqa` suppression, `type: ignore`, `region`
+  / `endregion`) is functional code — it changes what ruff and mypy do to the file — so it is shown but
+  read-only. Editing one is a text-editor job.
+- **Routers get Steps too (ADR 0076 Amendment D).** A `@router` opens as Steps, its returns projected as
+  **Route** rows (or **Unrouted** for a `return []` / `return None` / bare `return`, which the store logs
+  as UNROUTED — routed nowhere, never dropped). A Router's palette offers routing constructs only —
+  **Route To**, **If** / **Else If** / **Else**, **For Each**, **Raise**, **Comment** — because a Router
+  selects destinations rather than transforming the message; the transform verbs, lookups, diagnostics and
+  Send are greyed out there, and the engine refuses them.
+- **Escape hatch.** Anything the Steps view will not edit — a pragma comment, a `code` row, a control
+  test — is edited by dropping to the `.py` (Reopen With → Python). That is awkward, and it is deliberate:
+  the lens refuses what it cannot reproduce byte-for-byte rather than guessing.
 - **Recognized but not in the menu:** `convert_case`, `append_to_field` (valid if hand-written; just not
   offered as Add items).

@@ -84,7 +84,8 @@
       const ext = blockExtent(rws, blockStartLine);
       if (!ext) { return null; }
       const start = rws[ext.startIndex];
-      if (start.kind === 'code') { return null; } // a Code step is read-only — never copied
+      // A Code step is read-only and a note (Comment) is not a statement — neither is ever copied.
+      if (start.kind === 'code' || start.kind === 'note') { return null; }
       const parts = [];
       for (let i = ext.startIndex; i <= ext.endIndex; i++) { parts.push(rws[i].expectSrc); }
       return {
@@ -282,8 +283,20 @@
         // ADR 0104 fan-out: the precomputed isReturnRow — the toolbar Add derives its insert position from
         // it (a return / scaffold footer → before; a mid-body append → after).
         isReturn: el.dataset.isReturn === 'true',
+        // ADR 0076 Amendment D: the enclosing element's role, so an Add item outside that role is greyed.
+        role: el.dataset.role || 'handler',
       };
       updateAddState();
+    }
+
+    // Whether an Add item (an <option> or a .ctx-item) may be authored into an element of `role`. Mirrors
+    // itemAllowedInRole: an absent data-role-scope means handler-only, the safe default, because every
+    // pre-Amendment-D item authors a transform verb, a lookup, a diagnostic or an outbound send — none of
+    // which belongs in a Router, and all of which the engine refuses there (ADR 0076 D.6).
+    function inRole(el, role) {
+      if (!el) { return true; }
+      const scope = el.dataset.roleScope || 'handler';
+      return scope.split(' ').indexOf(role || 'handler') !== -1;
     }
 
     // Enable the toolbar Add only for a valid (item, selected row) pair: a chosen item, AND — for an
@@ -294,7 +307,7 @@
       const opt = sel.selectedOptions && sel.selectedOptions[0];
       const needsIfChain = !!(opt && opt.dataset.anchor === 'if_chain');
       const isIfChain = selected.kind === 'control' && (selected.control === 'if' || selected.control === 'elif');
-      addBtn.disabled = needsIfChain && !isIfChain;
+      addBtn.disabled = (needsIfChain && !isIfChain) || !inRole(opt, selected.role);
     }
 
     // ---- Steps block clipboard (webview-owned via vscode.setState — survives re-projection) ------------
@@ -389,7 +402,8 @@
       // Widened from same-suite to: same handler, not self, target draggable, and target NOT inside the
       // dragged block's own [start, end] span (so a block can't be dropped into itself). No suite check.
       if (!dragSrc || target === dragSrc || target.getAttribute('draggable') !== 'true') { return false; }
-      if (target.dataset.kind === 'code') { return false; } // a Code step is read-only — never a drop target
+      // A Code step is read-only and a note is not movable (ADR 0076 A.6) — never a drop target.
+      if (target.dataset.kind === 'code' || target.dataset.kind === 'note') { return false; }
       if (target.dataset.handler !== dragSrc.dataset.handler) { return false; }
       const ds = Number(dragSrc.dataset.lineStart), de = Number(dragSrc.dataset.lineEnd);
       const ts = Number(target.dataset.lineStart);
@@ -470,8 +484,8 @@
     for (const el of rows) {
       if (el.getAttribute('draggable') === 'true') {
         el.addEventListener('dragstart', (ev) => {
-          if (el.dataset.kind === 'code') {
-            // A Code step is read-only in the Steps view — cancel the drag and point at the code editor.
+          if (el.dataset.kind === 'code' || el.dataset.kind === 'note') {
+            // A Code step is read-only and a note is not movable — cancel the drag and point at the editor.
             ev.preventDefault();
             vscode.postMessage({ command: 'codeLocked' });
             return;
@@ -689,7 +703,12 @@
             setDisabled(p, p.dataset.sub === 'after' && isReturn);
           }
           const control = el.dataset.control;
-          setDisabled(delItem, !(kind === 'action' || kind === 'lookup' || kind === 'send' || kind === 'diagnostic'));
+          // Mirror isRowMutable: note + route join the editable kinds, and a PRAGMA note is read-only
+          // (the engine refuses set_params/delete_row/move_row on one, ADR 0076 A.4).
+          const mutable =
+            (kind === 'action' || kind === 'lookup' || kind === 'send' || kind === 'diagnostic' ||
+             kind === 'note' || kind === 'route') && el.dataset.pragma !== 'true';
+          setDisabled(delItem, !mutable);
           // ADR 0104 fan-out: "Add destination" only on a real send row (never the `return []` filter).
           setDisabled(addDestItem, !(kind === 'send' && el.dataset.filtered !== 'true'));
           // ADR 0106: Else / Else If (data-anchor="if_chain") only apply to an if-chain anchor (an if/elif row).
@@ -697,11 +716,17 @@
           for (const c of menu.querySelectorAll('.ctx-item[data-anchor="if_chain"]')) {
             setDisabled(c, !isIfChain);
           }
+          // ADR 0076 Amendment D: grey every Add item outside the enclosing element's role, so a Router's
+          // menu offers routing constructs only and the engine's refusal is never met as an error toast.
+          const rowRole = el.dataset.role || 'handler';
+          for (const c of menu.querySelectorAll('.ctx-item[data-item-id]')) {
+            if (!inRole(c, rowRole)) { setDisabled(c, true); }
+          }
           // Mirror isRowMovable: a code row (and an elif/else header) is NOT movable, even though walkMove
           // finds an adjacent slot for it (it is draggable only as a drag-interception marker). Gate the
           // ↑/↓ on the row's own movability so the menu agrees with the per-row buttons + the read-only contract.
           const rowMovable =
-            kind === 'action' || kind === 'lookup' || kind === 'send' || kind === 'diagnostic' ||
+            (mutable && kind !== 'note') ||
             (kind === 'control' && (control === 'if' || control === 'for' || control === 'raise'));
           setDisabled(upItem, !rowMovable || !walkMove(ctxRows, ls, 'up'));
           setDisabled(downItem, !rowMovable || !walkMove(ctxRows, ls, 'down'));
@@ -842,5 +867,6 @@
         scopeLabel: scopeLabel,
         resolveDrop: resolveDrop,
         barAnchor: barAnchor,
+        inRole: inRole,
       };
     }

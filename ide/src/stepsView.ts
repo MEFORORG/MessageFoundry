@@ -34,6 +34,8 @@ import {
   codesetList,
   configDir,
   isExecGated,
+  lensParseStdin,
+  lensRewriteStdin,
   lensSchema,
   messageSetsDir,
   runJson,
@@ -53,6 +55,8 @@ import {
   buildAddDestinationRequest,
   buildAddMenuRequest,
   buildDeleteRequest,
+  itemAllowedInRole,
+  roleScopeAttr,
   buildEditRequest,
   buildHandlerViewModels,
   buildLensTraceArgs,
@@ -180,6 +184,10 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     string,
     { acceptsTypes?: string[]; inferredType?: { code?: string; trigger?: string } }
   >();
+  // ADR 0076 Amendment D: each projected element's ROLE, stashed by render() from the same parse (a
+  // projection of THIS parse, never persisted state). The webview greys the out-of-role Add items; this
+  // is the provider-side half of the same rule, because inbound webview data is untrusted.
+  private handlerRoles = new Map<string, "handler" | "router">();
 
   constructor(
     private readonly version: string,
@@ -343,7 +351,9 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       let parse: LensParseResult | null = null;
       let error: string | null = null;
       try {
-        parse = await runJsonWithStdin<LensParseResult>(["lens", "parse", "-"], source, ws);
+        // At the contract this extension can RENDER, with a one-shot fallback for an older engine that
+        // does not know the flag (ADR 0076 §A.7 / §D.7 — skew is handled, not discovered).
+        parse = await lensParseStdin(source, ws);
       } catch (e) {
         error = e instanceof Error ? e.message : String(e);
       }
@@ -364,6 +374,9 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           h.handler,
           { acceptsTypes: h.accepts_types, inferredType: h.inferred_type },
         ]),
+      );
+      this.handlerRoles = new Map(
+        (parse as LensParseResult).handlers.map((h) => [h.handler, h.role ?? "handler"]),
       );
       // Live values come from a SECOND `dryrun --trace` that reads the module FROM DISK, but the rows
       // above are projected from the LIVE buffer. While the buffer is dirty (an unsaved structural edit
@@ -413,8 +426,10 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // send as stdin — that compares the buffer against itself and the guard always passes (the defect).
     const applyOne = async (msg: EditMessage): Promise<void> => {
       const spec = buildEditRequest(msg);
-      const res = await runWithStdin(
-        ["lens", "rewrite", "-", "--edit", JSON.stringify(spec)],
+      // At the SAME contract the rows were projected with — the engine re-locates the row through that
+      // grammar, so sending v2 coordinates into a v1 partition would miss it (or hit a different row).
+      const res = await lensRewriteStdin(
+        spec,
         document.getText(),
         workspaceDir(),
       );
@@ -475,11 +490,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       }
       let applied = false;
       try {
-        const res = await runWithStdin(
-          ["lens", "rewrite", "-", "--edit", JSON.stringify(spec)],
-          document.getText(),
-          workspaceDir(),
-        );
+        const res = await lensRewriteStdin(spec, document.getText(), workspaceDir());
         if (disposed) {
           return false;
         }
@@ -828,6 +839,15 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           // The ADR 0106 grouped Add menu: look up the catalog item, gather any picker inputs, then build
           // + apply the matching lens op via the SAME byte-stable applyStructural path as every other insert.
           const item = ADD_MENU_BY_ID[m.itemId];
+          // A router stays pure destination-selection (ADR 0076 D.6): refuse an item that authors a
+          // transform verb, a lookup, a diagnostic or an outbound send inside one. The engine refuses it
+          // too; this stops the request before it becomes an error toast the user has to read.
+          if (!itemAllowedInRole(item, this.handlerRoles.get(m.handler) ?? "handler")) {
+            void vscode.window.showWarningMessage(
+              `MessageFoundry: "${item.label}" is not available in a Router — a Router selects destinations, it does not transform the message.`,
+            );
+            return;
+          }
           const anchor = {
             handler: m.handler,
             lineStart: m.lineStart,
@@ -974,6 +994,7 @@ function pageHtml(
               (item) =>
                 `<option value="${escapeHtml(item.id)}"` +
                 (item.anchorConstraint ? ` data-anchor="${escapeHtml(item.anchorConstraint)}"` : "") +
+                ` data-role-scope="${escapeHtml(roleScopeAttr(item))}"` +
                 `>${escapeHtml(item.label)}</option>`,
             )
             .join("") +

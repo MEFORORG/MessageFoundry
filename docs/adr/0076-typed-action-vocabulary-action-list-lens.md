@@ -139,11 +139,17 @@ Phase 2b shipped the lens with the live-value slot **stubbed** (each row rendere
 > The evidence in §A.3 was verified against `main` before ratification.
 >
 > **In force means the grammar changed, not that the build is done.** §3's row enum now includes `note`
-> and `diagnostic`; §4's ladder gains `note` as a sibling of the typed rows. BACKLOG #248 is the build
-> and is now unblocked. The invariants in §A.4 are **build gates, not caveats** — in particular the
-> pragma allowlist, the `_merge_code_rows` docstring exclusion, and the rule that a note edit takes its
-> indentation and `#` prefix form from the existing line rather than the insert normalizer. §A.6's two
-> known-wrong behaviours are **not** fixed by this amendment and must not be reported as fixed.
+> and `diagnostic`; §4's ladder gains `note` as a sibling of the typed rows. The invariants in §A.4 are
+> **build gates, not caveats** — in particular the pragma allowlist, the `_merge_code_rows` docstring
+> exclusion, and the rule that a note edit takes its indentation and `#` prefix form from the existing
+> line rather than the insert normalizer. §A.6's two known-wrong behaviours are **not** fixed by this
+> amendment and must not be reported as fixed.
+>
+> **Build status: BACKLOG #248 is BUILT** (branch `steps-grammar`, not yet merged). The `note` kind is
+> emitted at `lens parse --contract 2` and threaded through both IDE implementations; every AC-N below
+> carries the node id that proves it. §A.6's two known-wrong behaviours remain unfixed **by design** —
+> the build discharges §A.6's requirement by making notes non-movable rather than by landing the extent
+> fix. §A.8's #239 re-run is **still owed** and is NOT part of this build.
 
 §3's row enum ends at `{ "kind": "code", … } // verbatim, unrecognized`, and §4's ladder sends
 "everything else" there. A standalone comment is therefore projected as an opaque `Code` step. This
@@ -346,24 +352,48 @@ New residual: pragma notes are visible but read-only, an intentional and documen
 
 ## Acceptance Criteria
 
-- **AC-N1** — WHEN a handler def body contains a run of standalone comment lines, THE SYSTEM SHALL emit
-  a `note` row spanning exactly those lines at the enclosing suite's nesting, and the emitted rows SHALL
-  still exactly partition the def body → coverage-partition property test, extended with
-  comment/blank/pragma corpora.
-- **AC-N2** — WHEN a Comment is inserted after the last statement of a handler, THE SYSTEM SHALL either
-  render it as a `note` row or refuse the insert with a clean error; it SHALL NOT accept the insert and
-  render nothing → regression test for the vanishing-comment defect, written failing first.
-- **AC-N3** — WHEN a `note` row's text is set to its current value, THE SYSTEM SHALL produce a
+- [x] **AC-N1** — WHEN a handler def body contains a run of standalone comment lines, THE SYSTEM SHALL
+  emit a `note` row spanning exactly those lines at the enclosing suite's nesting, and the emitted rows
+  SHALL still exactly partition the def body →
+  `tests/test_lens_grammar_v2.py::test_note_runs_split_on_blank_indent_and_pragma`,
+  `::test_adversarial_partition_is_total`, `::test_samples_partition_is_total_at_every_contract`.
+- [x] **AC-N2** — WHEN a Comment is inserted after the last statement of a handler, THE SYSTEM SHALL
+  either render it as a `note` row or refuse the insert with a clean error; it SHALL NOT accept the insert
+  and render nothing →
+  `tests/test_lens_grammar_v2.py::test_comment_after_the_last_statement_projects_as_a_note_row`. The
+  defect was reproduced against the shipped parser first: the row set covered line 6 only, with the
+  comment on line 7 in no row at all.
+- [x] **AC-N3** — WHEN a `note` row's text is set to its current value, THE SYSTEM SHALL produce a
   byte-identical file; WHEN it is set to a new value, THE SYSTEM SHALL change only that row's line
   range, SHALL preserve the original indentation and `#` prefix form, and the result SHALL re-parse to
-  the same kind, span, nesting, and suite → byte-stability + round-trip test refs.
-- **AC-N4** — WHERE a comment matches the pragma allowlist, THE SYSTEM SHALL emit `"pragma": true` and
-  SHALL refuse `set_params`, `delete_row`, and `move_row` on that row → pragma-immutability test refs.
-- **AC-N5** — THE SYSTEM SHALL NOT emit a `note` row at module scope, for a handler docstring, or for a
-  comment sharing a line with a statement; a trailing `# noqa` SHALL survive a `set_params` on its
-  statement byte-for-byte → negative test refs.
-- **AC-N6** — WHEN a construct is unrecognized, THE SYSTEM SHALL emit a `code` row; a whole-file refusal
-  SHALL occur only on `ast.parse` failure → unchanged ladder assertion, re-run over the note corpus.
+  the same kind, span, nesting, and suite →
+  `tests/test_lens_grammar_v2.py::test_note_edit_preserves_indent_and_hash_form_and_round_trips`,
+  `::test_setting_a_row_to_its_current_value_is_byte_identical`,
+  `::test_byte_stability_survives_crlf_and_a_bom`. A text with a different line count is refused rather
+  than silently shifting every row below it (`::test_note_edit_refuses_a_line_count_change`).
+- [x] **AC-N4** — WHERE a comment matches the pragma allowlist, THE SYSTEM SHALL emit `"pragma": true`
+  and SHALL refuse `set_params`, `delete_row`, and `move_row` on that row →
+  `tests/test_lens_grammar_v2.py::test_pragma_note_refuses_edit_delete_and_move`; the client greys the
+  controls rather than surfacing the refusal as a toast (`ide/src/test/suite/steps-contract.test.ts`,
+  "a PRAGMA note is read-only in every op"). **No** note is movable in v1
+  (`::test_no_note_is_movable_in_v1`) — A.6's misattribution is why.
+- [x] **AC-N5** — THE SYSTEM SHALL NOT emit a `note` row at module scope, for a handler docstring, or for
+  a comment sharing a line with a statement; a trailing lint-suppression pragma SHALL survive a
+  `set_params` on its statement byte-for-byte →
+  `tests/test_lens_grammar_v2.py::test_note_never_covers_the_docstring_module_scope_or_a_trailing_comment`,
+  `::test_module_scope_comment_after_a_handler_is_not_a_note`,
+  `::test_trailing_pragma_on_a_statement_survives_a_param_edit_byte_for_byte`.
+- [x] **AC-N6** — WHEN a construct is unrecognized, THE SYSTEM SHALL emit a `code` row; a whole-file
+  refusal SHALL occur only on `ast.parse` failure →
+  `tests/test_lens_grammar_v2.py::test_unrecognized_construct_is_still_a_code_row_and_only_a_syntax_error_refuses`.
+
+**Not claimed by this build, stated so it is not read as done.** A.6's two known-wrong behaviours are
+unfixed: a move/delete of a *recognized* row still re-attaches a neighbouring comment to the wrong step,
+and a comment at the END of an `if`/`for` body still projects at the PARENT nesting. A.6 required v1 to
+either land the extent fix or keep notes explicitly positional; this build takes the second option — **no
+note is movable**, in the engine and in the client — so the lens never renders a confidently
+mis-positioned caption. A.8's measurement discipline (the BACKLOG #239 re-run with `note` in its own
+bucket, excluded from the editable-share numerator) is **not** part of this build and is still owed.
 
 ## Amendment B (DECLINED, 2026-07-30) — ADR 0089 Phase D "helper descent"
 
@@ -662,11 +692,14 @@ accepts. The criteria are nonetheless **built and tested** — the amendment lan
 > kind and §4's recognition grammar gains one router-return rule. The evidence below was verified
 > against `main` before ratification.
 >
-> **In force means the grammar changed, not that the build is done.** The shipped `lens parse` emits no
-> `route` row yet — the BACKLOG #232 build is handed off in
-> `HANDOFF-232-router-steps.md`, a maintainer-internal document, which carries the
-> files, the verified anchors, and the falsifications. The Acceptance Criteria in §D.6 are **build gates,
-> not caveats**.
+> **In force means the grammar changed, not that the build is done.** The design was handed off in
+> `HANDOFF-232-router-steps.md`, a maintainer-internal document carrying the files, the verified anchors
+> and the falsifications. The Acceptance Criteria below are **build gates, not caveats**.
+>
+> **Build status: BACKLOG #232 is BUILT** (branch `steps-grammar`, not yet merged). A `@router` projects
+> at `lens parse --contract 2`; every AC-R below carries the node id that proves it. The Acceptance
+> Criteria are the counted block at the end of this amendment — the §D.6 reference above pointed at the
+> non-goals section, and is corrected here.
 
 ### D.1 What this widens, and the §2 rule it widens under
 
@@ -791,24 +824,42 @@ compatibility story.
 
 ## Acceptance Criteria
 
-- **AC-R1** — WHEN `lens parse` encounters a `@router` def body, THE SYSTEM SHALL emit rows whose line
-  ranges exactly partition the def body (`route` / `control` / `note` / `code`) — never dropped, reordered,
-  or synthesized → router coverage-partition property test over the sample and adversarial router corpus.
-- **AC-R2** — WHEN a `@router` returns string-literal handler names (list, tuple, or a bare string), THE
-  SYSTEM SHALL emit a `route` row whose `handlers` is exactly those names; WHEN it returns `[]` / `()` /
-  `None` or a bare `return`, THE SYSTEM SHALL emit `handlers: []` with `unrouted: true`; WHEN any element
-  is non-literal, THE SYSTEM SHALL emit `handlers: []` WITHOUT `unrouted` → route-return classification
-  test.
-- **AC-R3** — WHERE the enclosing decorator is `@handler`, a `return []` SHALL remain byte-identical to the
-  current `send` / `filtered` projection — no `route` row, no `unrouted` — so the role branch never
-  regresses the handler path → handler-vs-router disambiguation test, the handler leg asserted first as the
-  guard.
-- **AC-R4** — WHEN a `route` row's handler list is set to its current value THE SYSTEM SHALL produce a
-  byte-identical file, and WHEN set to a new list THE SYSTEM SHALL change only that row's line range and
-  re-parse to the same kind, span, nesting, and suite → byte-stability + round-trip test.
-- **AC-R5** — THE SYSTEM SHALL NOT offer transform verbs (action / lookup / send / diagnostic) in a
+- [x] **AC-R1** — WHEN `lens parse` encounters a `@router` def body, THE SYSTEM SHALL emit rows whose
+  line ranges exactly partition the def body (`route` / `control` / `note` / `code`) — never dropped,
+  reordered, or synthesized →
+  `tests/test_lens_grammar_v2.py::test_samples_routers_are_projected_and_partitioned`,
+  `::test_adversarial_partition_is_total`. The assertion COUNTS each covered line, so a doubled line fails
+  as loudly as a dropped one, and the def-body range is derived independently of the parser.
+- [x] **AC-R2** — WHEN a `@router` returns string-literal handler names (list, tuple, or a bare string),
+  THE SYSTEM SHALL emit a `route` row whose `handlers` is exactly those names; WHEN it returns `[]` / `()`
+  / `None` or a bare `return`, THE SYSTEM SHALL emit `handlers: []` with `unrouted: true`; WHEN any
+  element is non-literal, THE SYSTEM SHALL emit `handlers: []` WITHOUT `unrouted` →
+  `tests/test_lens_grammar_v2.py::test_router_return_classification` (the whole D.4 table, in one test).
+- [x] **AC-R3** — WHERE the enclosing decorator is `@handler`, a `return []` SHALL remain byte-identical
+  to the current `send` / `filtered` projection — no `route` row, no `unrouted` — so the role branch never
+  regresses the handler path →
+  `tests/test_lens_grammar_v2.py::test_handler_return_empty_list_is_unchanged_by_the_role_branch`, which
+  asserts the handler leg FIRST and then asserts the two contracts' handler payloads are equal.
+- [x] **AC-R4** — WHEN a `route` row's handler list is set to its current value THE SYSTEM SHALL produce
+  a byte-identical file, and WHEN set to a new list THE SYSTEM SHALL change only that row's line range and
+  re-parse to the same kind, span, nesting, and suite →
+  `tests/test_lens_grammar_v2.py::test_setting_a_row_to_its_current_value_is_byte_identical`,
+  `::test_route_edit_changes_only_its_own_line_and_reparses_the_same`. The no-op is compared
+  SEMANTICALLY, which is also what stops a dynamic `return [pick(msg)]` (projected `handlers: []`) being
+  flattened to a literal `[]` (`::test_route_edit_never_flattens_a_dynamic_return`).
+- [x] **AC-R5** — THE SYSTEM SHALL NOT offer transform verbs (action / lookup / send / diagnostic) in a
   `@router`'s Add-palette, and a `db_lookup` / `fhir_lookup` call inside a router body SHALL project as a
-  `code` row, never a `lookup` row → router-palette scope test.
-- **AC-R6** — WHERE the consuming IDE predates the `route` kind, THE SYSTEM SHALL gate `route` emission
-  behind a flag or contract version so an older IDE never renders a blank, titleless router row →
-  contract-version-skew test.
+  `code` row, never a `lookup` row → `ide/src/test/suite/steps-mirror.test.ts`, "the router palette offers
+  routing constructs ONLY (AC-R5)"; `tests/test_lens_grammar_v2.py::test_router_body_recognizes_routing_constructs_only`,
+  `::test_router_refuses_ops_that_author_transform_verbs_or_sends`. Enforced in three places because each
+  covers a different failure: the palette greys the item, the provider refuses the item id (webview input
+  is untrusted, so client-side greying is not a control), and the engine refuses the op.
+- [x] **AC-R6** — WHERE the consuming IDE predates the `route` kind, THE SYSTEM SHALL gate `route`
+  emission behind a flag or contract version so an older IDE never renders a blank, titleless router row →
+  `lens parse --contract` (default 1), asserted in
+  `tests/test_lens_grammar_v2.py::test_an_older_consumer_never_receives_a_v2_kind`,
+  `::test_the_v1_payload_is_unchanged_across_the_whole_samples_corpus`,
+  `::test_cli_contract_flag_gates_the_new_kinds_and_refuses_an_unknown_version`. The OTHER direction — a
+  newer IDE meeting an older engine — is a one-shot retry without the flag, asserted in
+  `ide/src/test/suite/steps-contract.test.ts` under "contract negotiation", including the negative case
+  that a genuine refusal is never retried away as an argument problem.
