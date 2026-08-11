@@ -1815,7 +1815,7 @@ class RegistryRunner:
         so it can't race a concurrent reload/stop (review M-10). Sharded: owner-only (ADR 0073)."""
         async with self._reload_lock:
             self._require_owned_destination(name)
-            self._start_outbound_unsafe(name)
+            await self._start_outbound_unsafe(name)
 
     async def stop_outbound(self, name: str) -> None:
         """PAUSE delivery on one outbound connection while RETAINING its queued rows PENDING (the
@@ -1836,7 +1836,7 @@ class RegistryRunner:
         async with self._reload_lock:
             self._require_owned_destination(name)
             self._stop_outbound_unsafe(name)
-            self._start_outbound_unsafe(name)
+            await self._start_outbound_unsafe(name)
 
     def _stop_outbound_unsafe(self, name: str) -> None:
         """stop_outbound body without the reload lock (callers hold it). Sync + returns fast: it flags
@@ -1934,7 +1934,7 @@ class RegistryRunner:
         else:
             self._outbound_resume.setdefault(name, asyncio.Event()).set()
 
-    def _ensure_destination_built(self, name: str) -> None:
+    async def _ensure_destination_built(self, name: str) -> None:
         """Build ``name``'s connector into ``_destinations`` if the lane has none — the missing half of
         an operator start (#115). The ``auto_start=False`` boot gate leaves a CONNECTOR-LESS lane, so a
         resume alone could never deliver a single byte: the advertised ``POST /connections/{name}/start``
@@ -1961,6 +1961,7 @@ class RegistryRunner:
         oc = self.registry.outbound.get(name)
         if oc is None or not oc.deployed:
             return
+        connector: DestinationConnector | None = None
         try:
             dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
             check_egress_allowed(dest, self._egress)  # fail-closed egress allowlist (WP-11c)
@@ -1969,14 +1970,30 @@ class RegistryRunner:
             # (fail-closed/no-op default) posture.
             with active_hop_posture(self._hop_posture):
                 connector = build_destination(dest)
+            # Opt-in at-start directory validation (#114) — the same hook _start_outbound awaits, so an
+            # operator START of a File/RemoteFile outbound with validate_directory=true gets the same
+            # refusal the engine start path gives it, isolated the same way (this method never raises).
+            await connector.validate_startup()
         except Exception as exc:
+            await self._aclose_quietly(connector, name)
             self._destinations.pop(name, None)
             self._record_failed(name, exc, kind="outbound")
             return
         self._destinations[name] = connector
         self._failed.pop(name, None)
 
-    def _start_outbound_unsafe(self, name: str) -> None:
+    async def _aclose_quietly(self, connector: DestinationConnector | None, name: str) -> None:
+        """Release whatever a BUILT-but-rejected connector allocated (a File alternate-credential worker
+        thread + token, ADR 0132; an HTTP client) — the lane is not going live, so it must not outlive
+        the failure. A close error is logged, never allowed to mask the failure that caused it."""
+        if connector is None:
+            return
+        try:
+            await connector.aclose()
+        except Exception:
+            log.exception("closing the rejected connector for outbound %r raised", name)
+
+    async def _start_outbound_unsafe(self, name: str) -> None:
         """start_outbound body without the reload lock. RESUMES delivery for a paused outbound, BUILDING
         its connector first if the lane has none (a start-disabled / DR-parked / failed lane is
         connector-less — see :meth:`_ensure_destination_built`). A connector that IS live is kept WARM (a
@@ -1989,7 +2006,7 @@ class RegistryRunner:
         self._validate_outbound(name)
         if not self._deployed(name, "outbound"):
             raise NotDeployedError(name)
-        self._ensure_destination_built(name)
+        await self._ensure_destination_built(name)
         self._outbound_paused.discard(name)
         # The OPERATOR now owns this lane's UP state — the engine park (if any) is spent, and a reload
         # must respect the start (#115): drop the marker so _unpark_outbound_lane can't re-park it.
@@ -2310,7 +2327,7 @@ class RegistryRunner:
         except Exception:
             log.exception("alert sink raised on connection_stopped for %r", name)
 
-    def _start_outbound(self, name: str, oc: OutboundConnection) -> None:
+    async def _start_outbound(self, name: str, oc: OutboundConnection) -> None:
         """Build one outbound connector + spawn its delivery worker. A build failure (unresolvable
         ``env()`` / cert, an egress-allowlist refusal, a capture/backend mismatch) is ISOLATED
         (ADR 0031): the connection is recorded failed and the worker is STILL spawned, but with no
@@ -2378,6 +2395,7 @@ class RegistryRunner:
         self._filtered.pop(
             name, None
         )  # at/above threshold this run — clear any prior parked marker
+        connector: DestinationConnector | None = None
         try:
             dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
             check_egress_allowed(dest, self._egress)  # fail-closed egress allowlist (WP-11c)
@@ -2401,7 +2419,18 @@ class RegistryRunner:
                     "support request/response capture (ADR 0013) — SQLite, Postgres, and SQL Server "
                     "all do"
                 )
+            # Opt-in at-start directory validation (#114) — the outbound mirror of the source hook
+            # awaited in _start_inbound_unsafe. A File/RemoteFile outbound with validate_directory=true
+            # fails-fast HERE on a missing/unusable target directory; the default is a no-op on every
+            # connector, so every lane authored today starts byte-identically. Deliberately INSIDE this
+            # try: a DestinationStartupError then takes the SAME ADR-0031 isolation path as a build
+            # failure — the lane is recorded failed with NO connector and its worker is STILL spawned,
+            # so rows routed to it are retried + buildup-alerted, never dropped. On an outbound that
+            # degraded-lane state IS "invalid means not-started". Placed at start, NOT build_check: an
+            # intermittently-available directory must still let the graph BUILD.
+            await connector.validate_startup()
         except Exception as exc:
+            await self._aclose_quietly(connector, name)
             self._destinations.pop(name, None)  # no live connector for a failed lane
             self._record_failed(name, exc, kind="outbound")
             self._spawn_worker(name)  # drains→retries routed rows via the connector-None path
@@ -2451,7 +2480,7 @@ class RegistryRunner:
                 # stays a backstop for genuinely fatal, graph-wide startup errors (the store, the
                 # lookup executor), which still unwind + raise.
                 for name, oc in self.registry.outbound.items():
-                    self._start_outbound(name, oc)
+                    await self._start_outbound(name, oc)
                 # Build the live-lookup executor from the graph (env-resolved + egress-checked here);
                 # None when no DatabaseLookup is declared, keeping the transform path byte-identical. A
                 # failure here is graph-wide (not one connection), so let it hit the backstop below.
