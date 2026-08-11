@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import time
 from pathlib import Path
@@ -262,6 +263,39 @@ async def test_quota_is_shared_by_stores_over_one_dir_not_per_process(tmp_path: 
     with pytest.raises(UploadQuotaError):
         await shard_b.save(data=b"from b\n", filename="b.txt", uploader="alice")
     assert len(await shard_b.list_files()) == 2  # still exactly the cap, nothing extra written
+
+
+async def test_concurrent_uploads_cannot_double_book_the_quota(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ASVS 2.3.4: the quota check and the write it authorises are ONE critical section.
+
+    Made deterministic rather than timing-dependent: the sidecar scan is slowed so both coroutines
+    are guaranteed to overlap. Without the lock both read a count of 0 and both write, double-booking
+    a quota of 1. With it, the second scan sees the first file and refuses.
+    """
+    store = _quota_store(tmp_path, max_files=1)
+
+    real_scan = store._scan_metas_sync
+
+    def _slow_scan() -> list[UploadedFileMeta]:
+        out = real_scan()
+        time.sleep(0.05)  # widen the window so an unlocked check-then-write WOULD lose the race
+        return out
+
+    monkeypatch.setattr(store, "_scan_metas_sync", _slow_scan)
+
+    results = await asyncio.gather(
+        store.save(data=b"first\n", filename="a.txt", uploader="alice"),
+        store.save(data=b"second\n", filename="b.txt", uploader="alice"),
+        return_exceptions=True,
+    )
+
+    ok = [r for r in results if isinstance(r, UploadedFileMeta)]
+    refused = [r for r in results if isinstance(r, UploadQuotaError)]
+    assert len(ok) == 1, f"exactly one upload may win a quota of 1, got {results}"
+    assert len(refused) == 1, f"the loser must be refused on quota, got {results}"
+    assert len(await store.list_files()) == 1  # and only the winner is on disk
 
 
 async def test_prune_deletes_aged_pairs_and_is_idempotent(tmp_path: Path) -> None:
