@@ -3,7 +3,7 @@
 
 # ADR 0139 — ECH egress sidecar: SNI hiding on outbound TLS for ASVS 12.1.5 (demand-gated)
 
-- **Status:** Accepted (2026-07-20) — **Increment 1 (engine-side routing) built + verified** (see *Implementation status*); the sidecar + live ECH stay demand-gated
+- **Status:** Accepted (2026-07-20) — **Increment 1 (engine-side routing) built + verified**; the in-tree Go re-originator was written, then **retired 2026-08-10** by owner ruling (BACKLOG **#1011**); live ECH stays demand-gated. See *Implementation status* and *Disposition*.
 - **Date:** 2026-07-20
 - **Related:** [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) (transport security) · [ADR 0093](0093-pinned-internal-ca-trust-anchor.md) §3 (ECH/stdlib gap note) · ASVS-L3-ASSESSMENT-2026-07-20.md §3 (12.1.5 Fail) · ASVS-L3-RISK-ACCEPTANCE-REGISTER.md theme 7 · solutions research (`ASVS-L3-FAILS-SOLUTIONS-RESEARCH-2026-07-20.md`) · BACKLOG **#272**
 
@@ -24,11 +24,45 @@
 **Honest limit — this increment does NOT itself originate ECH.** ECH lives in the ClientHello; a generic
 proxy **tunnels** an `https://` destination (CONNECT), so the engine's own non-ECH TLS still reaches the
 partner. Hiding the SNI requires the sidecar to **terminate the loopback hop and re-originate** a fresh
-ECH-bearing TLS connection (over DoH). **Deferred (the real ECH work):** that terminating re-originator
-sidecar + its packaging (no Go toolchain ships in the wheel), the cleartext-to-sidecar hand-off for `https`
+ECH-bearing TLS connection (over DoH). **Still deferred:** the cleartext-to-sidecar hand-off for `https`
 destinations so the sidecar can terminate, native CPython ECH once OpenSSL 4.0 + CPython PR #135435 GA, and
-a live ECH handshake. **Inert today regardless:** the 2026-07-20 DoH probe found no partner endpoint
-publishes an `ECHConfig`.
+any live ECH handshake exercised by an automated check. **Inert today regardless:** the 2026-07-20 DoH probe
+found no partner endpoint publishes an `ECHConfig`.
+
+## Disposition (2026-08-10) — the terminating re-originator was BUILT, then RETIRED
+
+The *Implementation status* block above filed the terminating re-originator under *"Deferred (the real ECH
+work)"*. That was wrong at HEAD and is corrected here: it was **written**, it lived in the tree, and it has
+now been **removed by decision** rather than never attempted.
+
+- **What existed.** `tools/ech-sidecar/` — a **stdlib-only Go** loopback re-originator (`main.go`, 312
+  lines, + `go.mod` + `README.md`): resolves the destination's `ECHConfigList` from its DNS HTTPS record
+  (RR type 65) over DoH, dials with `EncryptedClientHelloConfigList` set, never sets `InsecureSkipVerify`,
+  refuses `CONNECT`, and fails closed twice over (no `ECHConfig` published, or `ECHAccepted == false` →
+  refuse, never a silent non-ECH completion).
+- **What proved it, and how far that goes.** A **recorded manual observation** against
+  `crypto.cloudflare.com` (`/cdn-cgi/trace` reporting `sni=encrypted` through the sidecar, and `502` for a
+  host publishing no `ECHConfig`). That is a real result and it settles the *"a working ECH client would
+  require a third-party TLS stack"* claim — it did not. It is **not** a repeatable gate: no workflow ever
+  ran it, and none does now.
+- **Why it is retired (owner ruling, BACKLOG #1011).** Nothing built, tested, linted or version-pinned it —
+  a grep for `setup-go|go build|go vet|golangci|GOPROXY|gofmt|GOTOOLCHAIN` across every workflow, `ci/`,
+  `scripts/`, `.pre-commit-config.yaml` and `tests/` returned zero hits — and `pyproject.toml:21`'s
+  `only-include` kept `tools/` out of both sdist and wheel, so it reached no user. Keeping it is a standing
+  second-language obligation (a pinned toolchain, a build/test/lint leg, a signing and distribution answer)
+  bought for an artefact with **no beneficiary**: no partner endpoint publishes an `ECHConfig`. The ASVS
+  12.1.5 cell is `fail` either way — keeping it buys no cell and deleting it costs none.
+- **Retrieval, so the work is not lost.** `git show 62fd628d:tools/ech-sidecar/main.go` (and
+  `:tools/ech-sidecar/README.md` for the proof transcript). The tree was byte-identical from `62fd628d`
+  until its deletion.
+- **What replaces it.** Nothing in-tree, deliberately. The sidecar is **operator-supplied** and the
+  contract it must satisfy is published at
+  [`samples/ech-sidecar/`](../../samples/ech-sidecar/README.md); sing-box remains the off-the-shelf
+  candidate, and the retired binary is a worked example of the same contract. The engine-side routing +
+  fail-closed refusals (Increment 1) and `tests/test_ech_egress.py` are untouched by this ruling.
+- **What would reverse it.** The build trigger below — a real partner endpoint begins publishing an
+  `ECHConfig`. Reversal starts from the retrieval SHA plus the ownership costs listed above, taken
+  deliberately.
 
 ## Context
 
@@ -86,9 +120,11 @@ Rationale for the components (all verified):
 **Positive** — moves 12.1.5 Fail → Pass-when-configured for ECH-publishing endpoints; fail-closed avoids a
 false sense of protection.
 
-**Negative / risks** — ships a **Go binary** inside an AGPL Python product (packaging, signing, update
-story); an extra egress hop to operate; **near-nil value today** (no partner endpoint supports ECH — the
-probe must be re-run before any build); the DNS half requires DoH configuration or the leak persists.
+**Negative / risks** — would put a **Go binary** inside an AGPL Python product (packaging, signing, update
+story) *if the project ever shipped one*; the 2026-08-10 ruling avoids that cost by keeping the sidecar
+**operator-supplied** (*Disposition*). Also: an extra egress hop to operate; **near-nil value today** (no
+partner endpoint supports ECH — the probe must be re-run before any build); the DNS half requires DoH
+configuration or the leak persists.
 
 **Out of scope** — building it now (demand-gated, zero current beneficiary); server-side ECH; the in-engine
 native path (revisit when OpenSSL 4.0 + CPython PR #135435 GA); 13.3.3 ([ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)).
@@ -96,6 +132,6 @@ native path (revisit when OpenSSL 4.0 + CPython PR #135435 GA); 13.3.3 ([ADR 013
 ## To resolve on acceptance
 
 - [ ] **Re-run the DoH type-65 probe** of the deployment's actual egress allowlist — build only if a real partner now publishes ECH.
-- [ ] Decide the sidecar (sing-box vs a ~500-line purpose-built Go binary) and its packaging/signing in the wheel/installer.
-- [ ] Define per-connection opt-in config, the DoH resolver, and fail-closed routing for non-ECH endpoints.
+- [x] **Decide the sidecar and its packaging/signing** — resolved 2026-08-10 (#1011): the sidecar is **operator-supplied and not shipped**, so there is no wheel/installer packaging or signing question left to answer. sing-box and the retired reference implementation (*Disposition*) each satisfy the published contract.
+- [x] **Define the per-connection opt-in config and fail-closed routing for non-ECH endpoints** — built in Increment 1 (`ech_egress` / `ech_sidecar`; a missing, non-loopback or `proxy_url`-paired sidecar is refused at construction, and a down sidecar errors rather than falling back). The **DoH resolver is the sidecar's**, by design — it is part of the contract, not engine code.
 - [ ] Reassess against the native CPython path once OpenSSL 4.0 GA + PR #135435 land (may supersede the sidecar).

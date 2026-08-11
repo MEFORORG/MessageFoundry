@@ -20,25 +20,62 @@ from __future__ import annotations
 
 import argparse
 import ast
+import datetime
+import io
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import tokenize
 import tomllib
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, get_args
 
 Verdict = Literal["pass", "partial", "fail", "na", "needs-review", "unverified"]
+
+#: What KIND of artifact an evidence anchor resolves INTO. Derived at check time from where the token
+#: lands, never authored: it is a property of the landing site, not a judgement about the cell.
+#:
+#: - ``code``  — a Python file, outside every docstring and ``#`` comment.
+#: - ``doc``   — a Python file, inside a docstring (the first statement of a module, class or
+#:   function) or inside a ``#`` comment.
+#: - ``foreign`` — not a Python file at all: ``.md``, ``.ts``, ``.js``, ``.yml``, ``.toml``, …
+#:
+#: **``doc`` is a LABEL, never a demotion**, and nothing here consumes it as one. The split is
+#: rendered so the record stops presenting every anchor as if it were code evidence; it is
+#: deliberately NOT wired into :func:`check_completeness`, into any verdict, or into the exit code.
+#:
+#: Measured 2026-08-09, vault ``origin/main`` 1a59e4a1's scorecard against engine tree c383eeab —
+#: quoted as a (file x ref) pair because a count is a fact about one, and this programme has already
+#: produced three wrong-base errors by dropping the qualifier:
+#:
+#: - 1,980 anchors; 1,979 located; **1,479 code, 233 doc (173 docstring + 60 comment), 267 foreign**
+#:   (197 ``.md``, 17 ``.ts``, 16 ``.js``, 13 ``.yml``, 8 ``.toml``, the rest scattered).
+#: - So **500 of 1,979 (25.3%) resolve into prose or a non-Python file**, which no structural or
+#:   executable scheme reaches, ever.
+#: - **17 of 343 evidenced cells carry NO code anchor at all** and rest entirely on documentation,
+#:   which for a documentation requirement is the correct ground: 1.4.3, 2.1.2, 3.1.1, 3.5.5, 11.1.1,
+#:   12.2.2, 13.1.1-13.1.4, 13.4.3, 14.1.2, 15.1.1, 15.1.2, 15.1.4, 15.2.1, 16.1.1. That figure was
+#:   derived here independently and agrees exactly with the 2026-08-09 recut analysis, which is why
+#:   the label is stated as a label rather than hedged.
+AnchorForm = Literal["code", "doc", "foreign"]
+
+#: Every verdict state, in the order :data:`Verdict` declares them — DERIVED from the type, never
+#: retyped beside it. A hand-written second list is how the gate's summary line came to enumerate five
+#: states against its own stated total of six-states-worth of cells (BACKLOG #1012): the line printed
+#: `pass / partial / fail / na / unverified`, summing to 344 while stating 345, and `needs-review`
+#: simply had no landing site. Deriving the enumeration from the type means a seventh verdict added to
+#: :data:`Verdict` appears in every rendered breakdown on the same commit, or nothing renders at all.
+VERDICT_ORDER: Final[tuple[str, ...]] = get_args(Verdict)
 
 #: The scoring buckets. ``unverified`` is deliberately first-class (ADR 0156 §5): a cell inherited from
 #: an earlier assessment and never re-read against the requirement text is NOT a Pass, and conflating
 #: the two is what let ~219 unchecked verdicts hide inside a headline.
-VERDICTS: Final[frozenset[str]] = frozenset(
-    {"pass", "partial", "fail", "na", "needs-review", "unverified"}
-)
+VERDICTS: Final[frozenset[str]] = frozenset(VERDICT_ORDER)
 
 #: ASVS 5.0 defines only three verdicts — verified, exception, and non-applicable-with-rationale. The
 #: strings "partially implemented" and "not implemented" appear nowhere in it, and the one prominent
@@ -94,11 +131,22 @@ class ScorecardError(Exception):
 
 @dataclass(frozen=True)
 class Anchor:
-    """A claim that some token exists in the tree, at roughly a known place."""
+    """A claim that some token exists in the tree, at roughly a known place.
+
+    ``sym`` and ``ctx`` are OPTIONAL and additive. ``None`` means *not asserted*; an empty string means
+    *asserted to be nothing* — module level for ``sym``, unnested for ``ctx``. Those are different
+    claims and a single ``str`` default would silently merge them, turning every un-backfilled anchor
+    into an assertion that it sits at module level and unnested. See :func:`derive_sym_ctx`.
+    """
 
     path: str
     line: int
     expect: str
+    #: Enclosing symbol, dotted (``ClassName.method``). ``""`` = module level, ``None`` = not asserted.
+    sym: str | None = None
+    #: Block-node chain from the symbol inward (``Try.body``, ``Try.body>If.orelse``). ``""`` =
+    #: unnested, ``None`` = not asserted.
+    ctx: str | None = None
 
 
 @dataclass(frozen=True)
@@ -195,12 +243,38 @@ class Findings:
     #: recorded line numbers rot; they just do not red the gate.
     advisories: list[str] = field(default_factory=list)
     checked_anchors: int = 0
+    #: The POPULATION of absence claims a pass looked at. Set by BOTH :func:`check_absences` and
+    #: :func:`prove_absences` — the two passes read the same population, and without it neither one's
+    #: outcome counters can be reconciled against anything. A run that scanned 276 claims and a run
+    #: that scanned zero otherwise print counter sets that look equally plausible.
     checked_absences: int = 0
     skipped_anchors: int = 0
+    #: Derived :data:`AnchorForm` of every anchor that LOCATED, plus an ``undetermined`` bucket for a
+    #: Python file that would not parse or tokenize. Anchors that did not locate (GONE or AMBIGUOUS)
+    #: are absent from this counter entirely — there is no landing site to classify — so its total is
+    #: ``checked_anchors`` minus those, and the summary prints both numbers rather than either alone.
+    anchor_forms: Counter[str] = field(default_factory=Counter)
+    #: Anchors carrying a ``sym`` or a ``ctx``, so the summary can say how much of the record the
+    #: structural check actually reached. Backfill is Stream D's; until it lands this is small, and a
+    #: check that silently covers 3 of 1,980 anchors while printing like a whole-corpus result is the
+    #: exact overstatement this pass has been correcting everywhere else.
+    checked_sym_ctx: int = 0
     #: Populated only by :func:`prove_absences`. ``proved_absences`` counts claims whose observable
     #: went red under the applied mutation (a live proof); ``static_screened`` counts claims that took
     #: the static backstop (a screen, not a proof); ``skipped_absences`` counts claims carrying no
-    #: ``mutation_path`` (nothing to apply). UNPROVEN and PROVE-ERROR outcomes go into ``problems``.
+    #: ``mutation_path`` (nothing to apply).
+    #:
+    #: **These three do NOT sum to the population, and that is why ``checked_absences`` above must be
+    #: printed beside them.** FIVE outcomes raise a problem and increment no counter at all — a
+    #: ``mutation_path`` that escapes the tree, one that is not a file, a baseline that is not green,
+    #: an UNPROVEN mutated-green, and a mutated run that errored rather than failed. The arithmetic
+    #: that closes is::
+    #:
+    #:     checked_absences - proved_absences - static_screened - skipped_absences
+    #:         == claims that ended in a problem-only branch
+    #:
+    #: and note that ``len(problems)`` is NOT that number: a SUSPECT finding rides along with a claim
+    #: already counted in ``static_screened``, so problems and claims are different populations.
     proved_absences: int = 0
     static_screened: int = 0
     skipped_absences: int = 0
@@ -322,7 +396,17 @@ def load_scorecard(path: Path) -> list[Cell]:
                 verified_at=str(raw.get("verified_at", "")),
                 reviewed_by=str(raw.get("reviewed_by", "")),
                 evidence=tuple(
-                    Anchor(path=str(e["path"]), line=int(e["line"]), expect=str(e["expect"]))
+                    Anchor(
+                        path=str(e["path"]),
+                        line=int(e["line"]),
+                        expect=str(e["expect"]),
+                        # `.get(...)` WITHOUT a "" default, deliberately: absent must stay None. An
+                        # empty string is the assertion "module level" / "unnested", so defaulting to
+                        # it would turn all 1,980 un-backfilled anchors into that claim overnight and
+                        # light up every anchor that is legitimately inside a function.
+                        sym=None if e.get("sym") is None else str(e["sym"]),
+                        ctx=None if e.get("ctx") is None else str(e["ctx"]),
+                    )
                     for e in raw.get("evidence", [])
                 ),
                 absence=tuple(
@@ -349,6 +433,36 @@ def load_scorecard(path: Path) -> list[Cell]:
 def count(cells: list[Cell]) -> Counter[str]:
     """The count is COMPUTED. No document states one; documents render this (ADR 0156 §2)."""
     return Counter(c.verdict for c in cells)
+
+
+def verdict_breakdown(cells: list[Cell]) -> tuple[list[tuple[str, int]], int]:
+    """Every verdict state with its count, plus the total those counts must close to.
+
+    **The one place a rendered distribution is assembled**, because two places is how the gate's
+    summary and ``--status`` came to disagree: the summary enumerated five states (BACKLOG #1012) and
+    ``--status`` six, over the same population, in the same module. Both now call this.
+
+    The reconciliation is not decorative and it is not an ``assert`` (which ``-O`` deletes): the
+    components come from a :class:`Counter` keyed on whatever verdict each cell CARRIES, the total
+    comes from ``len(cells)``, and they are therefore two independent readings of one population. A
+    cell whose verdict is outside :data:`VERDICT_ORDER` lands in neither component and the totals
+    part, which is exactly the shape #1012 describes — a state present in the data with no landing
+    site in the enumeration. :func:`load_scorecard` refuses such a verdict on the way in, so this is a
+    second fence behind the first, and it is the fence that survives the enumeration being edited.
+    """
+    n = count(cells)
+    parts = [(v, n[v]) for v in VERDICT_ORDER]
+    total = len(cells)
+    rendered = sum(c for _, c in parts)
+    if rendered != total:
+        unplaced = sorted(set(n) - set(VERDICT_ORDER))
+        raise ScorecardError(
+            f"verdict breakdown does not reconcile: the states enumerated sum to {rendered} but "
+            f"there are {total} cells. {len(unplaced)} verdict(s) have no landing site in "
+            f"VERDICT_ORDER: {', '.join(unplaced) or '<none — the arithmetic itself is wrong>'}. "
+            "Refusing to print a distribution that cannot be reconciled against its own total."
+        )
+    return parts, total
 
 
 def check_completeness(cells: list[Cell], corpus: dict[str, int]) -> list[str]:
@@ -404,6 +518,259 @@ def check_completeness(cells: list[Cell], corpus: dict[str, int]) -> list[str]:
     return problems
 
 
+#: Suffixes this module will submit to Python structural analysis. Everything else is ``foreign`` by
+#: construction — no `ast` and no `tokenize` reaches a `.md`, `.ts`, `.yml` or `.toml` file, ever.
+PYTHON_SUFFIXES: Final[frozenset[str]] = frozenset({".py", ".pyi"})
+
+
+def _prose_spans(text: str) -> list[tuple[int, int]] | None:
+    """Character-offset spans of the docstrings and ``#`` comments in one Python source.
+
+    ``None`` means the source could not be analysed — it does not parse, or does not tokenize. The
+    caller must report that as UNDETERMINED rather than defaulting, because the default that feels
+    natural is ``code`` and it would silently inflate the one number this split exists to deflate.
+
+    **A docstring is identified STRUCTURALLY — the first statement of a module, class or function, via
+    ``ast`` — and never by looking at the string's contents.** That is the whole design, and the
+    alternative was measured and rejected: a token mask ("does this text look like code?") misfiles the
+    Content-Security-Policy fragments in ``messagefoundry_webconsole/_security.py`` and the entire SQL
+    Server and Postgres DDL as prose. Those are long, quoted, space-separated strings that read as
+    English to a mask while being the literal subject of the control their cell cites. Position cannot
+    make that mistake, and not because it is a better mask — because it never asks the question. A
+    string that is not the first statement of a scope is not a docstring, whatever it reads like.
+
+    Comments come from ``tokenize`` rather than a ``#`` scan, so a ``#`` inside a string literal is
+    not mistaken for one — which the CSP and URL fragments in the live record depend on.
+    """
+    line_starts = [0]
+    for i, ch in enumerate(text):
+        if ch == "\n":
+            line_starts.append(i + 1)
+
+    def offset(row: int, col: int) -> int:
+        return line_starts[row - 1] + col
+
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return None
+    # Row pairs, not character columns: `ast` reports `col_offset` as a UTF-8 BYTE offset, which
+    # disagrees with the character offsets everything else here uses the moment a line holds a
+    # non-ASCII character. So `ast` is asked only WHICH string is a docstring, and `tokenize` — whose
+    # columns are characters — supplies the span.
+    doc_rows: set[tuple[int, int]] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not node.body:
+            continue
+        first = node.body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+            and first.end_lineno is not None
+        ):
+            doc_rows.add((first.lineno, first.end_lineno))
+
+    spans: list[tuple[int, int]] = []
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type == tokenize.COMMENT or (
+                tok.type == tokenize.STRING and (tok.start[0], tok.end[0]) in doc_rows
+            ):
+                spans.append((offset(*tok.start), offset(*tok.end)))
+    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
+        return None
+    return spans
+
+
+def _form_from_spans(
+    path: str, spans: list[tuple[int, int]] | None, start: int
+) -> AnchorForm | None:
+    """Classify one landing site against pre-computed spans (see :func:`anchor_form`)."""
+    if Path(path).suffix not in PYTHON_SUFFIXES:
+        return "foreign"
+    if spans is None:
+        return None
+    # The token's START decides, not any overlap. An `expect` that begins in code and runs into a
+    # trailing lint-suppression comment is code; the OVERLAP rule calls it doc and reclassified 57 of
+    # 1,712 live Python anchors that way when both were measured on 2026-08-09. (The suppression
+    # directive is named in words, not written literally: ruff parses one in any comment, and this
+    # module is also inside the corpus that absence patterns grep over.)
+    return "doc" if any(lo <= start < hi for lo, hi in spans) else "code"
+
+
+def anchor_form(path: str, text: str, start: int) -> AnchorForm | None:
+    """The derived ``form`` of one anchor: where does its token actually land?
+
+    ``path`` is the anchor's repo-relative path, ``text`` the file's contents as the anchor check read
+    them, ``start`` the character offset of the match. ``None`` means undetermined — a Python file
+    that would not parse — and is never silently folded into ``code``.
+
+    This answers a question the record has been getting wrong by omission: **a quarter of its anchors
+    resolve into prose or a non-Python file, and no structural or executable check reaches any of them,
+    ever.** The record presented all of them as code evidence. Naming the form does not change a single
+    verdict and must not: see :data:`AnchorForm` for the measurement and for why ``doc`` is a label
+    rather than a demotion.
+    """
+    if Path(path).suffix not in PYTHON_SUFFIXES:
+        return "foreign"
+    return _form_from_spans(path, _prose_spans(text), start)
+
+
+# --- sym + ctx: WHERE in the file's structure the token sits ---------------------------------------
+
+#: The block-bearing fields of every statement that can nest another, and **the single source of truth
+#: for both derivation and validation.** A `ctx` value is well-formed exactly when every element names
+#: a key here and one of its fields, so a typo cannot produce a chain that silently never matches.
+#: One table, two consumers — the alternative is a validator and a deriver that disagree, which is the
+#: same defect shape as a gate whose check and whose error message were written separately.
+_BLOCK_FIELDS: Final[dict[str, tuple[str, ...]]] = {
+    "Try": ("body", "handlers", "orelse", "finalbody"),
+    "TryStar": ("body", "handlers", "orelse", "finalbody"),
+    "If": ("body", "orelse"),
+    "For": ("body", "orelse"),
+    "AsyncFor": ("body", "orelse"),
+    "While": ("body", "orelse"),
+    "With": ("body",),
+    "AsyncWith": ("body",),
+    "Match": ("cases",),
+}
+
+#: Nodes that nest a statement but are never reached by a name of their own: an ``ExceptHandler``
+#: comes only via ``Try.handlers``, a ``match_case`` only via ``Match.cases``.
+#:
+#: **Kept separate from :data:`_TRANSPARENT` on purpose, and the separation was earned by a failed
+#: injection.** "Can the walk descend into this?" and "does it contribute a chain element?" are two
+#: questions, and a first cut answered both from one set. That made the second one UNTESTABLE:
+#: deleting ``ExceptHandler`` from the transparent set silently stopped the walk DESCENDING rather
+#: than starting to RECORD, the chain came out identical by a different route, and an injection that
+#: should have reddened a test changed nothing observable. Two tables, two behaviours, both drivable.
+_DESCEND_ONLY: Final[dict[str, tuple[str, ...]]] = {
+    "ExceptHandler": ("body",),
+    "match_case": ("body",),
+}
+
+#: Nodes descended through WITHOUT contributing an element — recording them would double every
+#: handler chain (``Try.handlers>ExceptHandler.body``) for no added discrimination. Must name every
+#: key of :data:`_DESCEND_ONLY`; a test asserts that, because the two are independent by design and
+#: nothing else would notice them drifting apart.
+_TRANSPARENT: Final[frozenset[str]] = frozenset({"ExceptHandler", "match_case"})
+
+#: Nodes that OPEN A SYMBOL: they contribute a name to ``sym`` and RESET ``ctx``, because a block
+#: chain is meaningful only within the symbol that contains it.
+_SCOPE_NODES: Final = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+_SYM_RE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z_]\w*(\.[A-Za-z_]\w*)*")
+
+
+def _block_fields(node: ast.AST) -> tuple[str, ...]:
+    """Which fields the walk may descend into. DESCENT ONLY — whether the step is recorded is
+    :data:`_TRANSPARENT`'s question, asked separately in :func:`sym_ctx_at`."""
+    if isinstance(node, (ast.Module, *_SCOPE_NODES)):
+        return ("body",)
+    name = type(node).__name__
+    return _BLOCK_FIELDS.get(name) or _DESCEND_ONLY.get(name, ())
+
+
+def _next_block(node: ast.AST, line: int) -> tuple[str, ast.AST] | None:
+    """The (field, child) one level in that contains `line`, or ``None`` at the innermost node."""
+    for fieldname in _block_fields(node):
+        for child in getattr(node, fieldname, None) or []:
+            lo = getattr(child, "lineno", None)
+            hi = getattr(child, "end_lineno", None)
+            if lo is not None and hi is not None and lo <= line <= hi:
+                return fieldname, child
+    return None
+
+
+def derive_sym_ctx(text: str, line: int) -> tuple[str, str] | None:
+    """The enclosing symbol and block chain at `line`. ``None`` when the source will not parse.
+
+    ``sym`` is dotted and outermost-first (``SqlServerStore.route_handoff``), ``""`` at module level.
+    ``ctx`` is the chain of block statements between the symbol and the line, joined by ``>``
+    (``Try.body``, ``Try.body>If.orelse``), ``""`` when unnested.
+
+    **``ctx``, NOT raw indentation, and the difference is the whole reason this field is shaped this
+    way.** Cell 12.3.5 carries the identical 4-versus-8 indent mismatch as 10.5.4 and is a non-event —
+    a hand-trimming slip, with ``ctx`` unchanged at both ends. Indentation flags it and would have to
+    be triaged; ``ctx`` correctly does not fire, because nothing about the statement's position in the
+    control flow changed. An indentation check would have spent a person's attention on a whitespace
+    edit while claiming to be a structural signal.
+
+    Containment is decided by LINE, so a one-line compound (``if x: y = 1``) attributes the line to the
+    ``If`` rather than to the assignment inside it. `ast` reports ``col_offset`` as a UTF-8 BYTE offset,
+    which disagrees with the character offsets the rest of this module uses the moment a line holds a
+    non-ASCII character; line granularity has no such failure mode and every real anchor is a statement
+    on its own line.
+
+    **For a multi-line ``expect`` the line is the token's FIRST line**, matching what the drift
+    advisory reports. Any backfill must derive at the same line or the 42 multi-line tokens in the
+    record will mismatch by construction — not because anything moved, but because the two ends
+    measured different lines.
+    """
+    tree = parse_or_none(text)
+    return None if tree is None else sym_ctx_at(tree, line)
+
+
+def parse_or_none(text: str) -> ast.Module | None:
+    """``ast.parse`` that reports failure as a value. Callers must surface it, never default it."""
+    try:
+        return ast.parse(text)
+    except (SyntaxError, ValueError):
+        return None
+
+
+def sym_ctx_at(tree: ast.Module, line: int) -> tuple[str, str]:
+    """The symbol/chain walk itself, split from parsing so a file is parsed once per run and not
+    once per anchor — ``settings.py`` alone carries 218 anchors."""
+    sym: list[str] = []
+    ctx: list[str] = []
+    node: ast.AST = tree
+    while True:
+        step = _next_block(node, line)
+        if step is None:
+            break
+        fieldname, child = step
+        name = type(node).__name__
+        if not isinstance(node, (ast.Module, *_SCOPE_NODES)) and name not in _TRANSPARENT:
+            ctx.append(f"{name}.{fieldname}")
+        if isinstance(child, _SCOPE_NODES):
+            sym.append(child.name)
+            ctx.clear()  # a block chain is meaningful only INSIDE the symbol that holds it
+        node = child
+    return ".".join(sym), ">".join(ctx)
+
+
+def malformed_sym_ctx(sym: str | None, ctx: str | None) -> str | None:
+    """Why these values could never match anything, or ``None`` if they are well-formed.
+
+    Well-formedness is checked against :data:`_BLOCK_FIELDS`, the same table the deriver walks, so a
+    chain that is accepted here is one the deriver can actually produce. This is the only part of the
+    sym/ctx feature that is FATAL rather than advisory, and the reason is that it is a defect in the
+    RECORD rather than a fact about the code: no amount of engine movement can cause it, the fix is
+    unambiguous, and an unmatchable chain otherwise sits there advising forever.
+    """
+    if sym is not None and sym and not _SYM_RE.fullmatch(sym):
+        return f"sym {sym!r} is not a dotted Python identifier path"
+    if ctx is None or not ctx:
+        return None
+    for element in ctx.split(">"):
+        node, _, fieldname = element.partition(".")
+        if node not in _BLOCK_FIELDS:
+            return (
+                f"ctx element {element!r} names {node!r}, which is not a block statement this "
+                f"deriver can produce (known: {', '.join(sorted(_BLOCK_FIELDS))})"
+            )
+        if fieldname not in _BLOCK_FIELDS[node]:
+            return (
+                f"ctx element {element!r} names field {fieldname!r}, which {node} does not have "
+                f"(known: {', '.join(_BLOCK_FIELDS[node])})"
+            )
+    return None
+
+
 def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
     """Open every evidence anchor and assert its token still resolves, and resolves UNAMBIGUOUSLY.
 
@@ -434,14 +801,26 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
     this file, once* — not *this control operates on the path the cell describes*. A cell can therefore
     be green here and wrong: measured 2026-08-09 on 15.3.1, which was ``pass`` with every anchor
     resolving while the control it named had a hole, found only by executing the code.
+
+    Each anchor that LOCATES is also given a derived :data:`AnchorForm` (:func:`anchor_form`) and
+    counted into ``findings.anchor_forms``. That is reporting only — no branch here reads it, and no
+    verdict depends on it.
     """
+    # Per-run caches. 1,980 live anchors concentrate onto ~224 distinct files (`settings.py` alone
+    # carries 218), so both the read and the parse are re-done an order of magnitude more often than
+    # there are files to do them on.
+    text_cache: dict[Path, str] = {}
+    spans_cache: dict[Path, list[tuple[int, int]] | None] = {}
+    ast_cache: dict[Path, ast.Module | None] = {}
     for c in cells:
         for a in c.evidence:
             target = root / a.path
             if not target.is_file():
                 findings.problems.append(f"{c.id}: evidence path {a.path} does not exist")
                 continue
-            text = target.read_text(encoding="utf-8", errors="replace")
+            if target not in text_cache:
+                text_cache[target] = target.read_text(encoding="utf-8", errors="replace")
+            text = text_cache[target]
             findings.checked_anchors += 1
             occurrences = text.count(a.expect)
             if occurrences > 1:
@@ -490,13 +869,108 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
             # tokens span a newline, because the old check matched against joined text and nothing
             # forbade it. A per-line scan finds none of those and raises on the lookup; counting
             # newlines before the match handles a multi-line token as naturally as a single-line one.
-            actual = text.count("\n", 0, text.index(a.expect)) + 1
+            start = text.index(a.expect)
+            # Derived form of the landing site. Only anchors that reached here are classified: a GONE
+            # or AMBIGUOUS token has no single landing site, so inventing a form for it would be a
+            # made-up number in a split whose whole purpose is to stop the record overstating itself.
+            if target not in spans_cache:
+                spans_cache[target] = (
+                    _prose_spans(text) if Path(a.path).suffix in PYTHON_SUFFIXES else None
+                )
+            findings.anchor_forms[
+                _form_from_spans(a.path, spans_cache[target], start) or "undetermined"
+            ] += 1
+            actual = text.count("\n", 0, start) + 1
             if actual != a.line:
                 findings.advisories.append(
                     f"{c.id}: {a.path} — {a.expect!r} is unique and present, recorded at line "
                     f"{a.line} but actually at {actual} (offset {actual - a.line:+d}). "
                     "Advisory: the line is a navigation aid, not the proof"
                 )
+            _check_sym_ctx(c.id, a, text, actual, ast_cache, target, findings)
+
+
+def _check_sym_ctx(
+    cell_id: str,
+    a: Anchor,
+    text: str,
+    actual: int,
+    ast_cache: dict[Path, ast.Module | None],
+    target: Path,
+    findings: Findings,
+) -> None:
+    """Validate a recorded ``sym``/``ctx`` against where the token now sits.
+
+    **THIS IS A DISPLACEMENT SIGNAL, NOT A DEFECT DETECTOR; its security-relevant precision measured
+    0 of 1 on the only datum the corpus offers, because 10.5.4's red was a HARDENING.** The change
+    that moved that statement into a ``try`` made the code safer, and a structural check fired on it.
+    Read this field as "your reasoning about this cell is stale, go re-read it" — never as "something
+    is wrong here". A signal described as a defect detector, in the place people read it, will be
+    quoted as one, and this one would then be quoted at 0% precision.
+
+    That is why a mismatch is an ADVISORY and not a problem. The only fatal outcome is a value that is
+    malformed (:func:`malformed_sym_ctx`) — a defect in the record, which no engine movement can cause.
+
+    **ADDITIVE to the line-drift advisory, never a replacement.** The two catch different things and
+    neither dominates: a token can move hundreds of lines without leaving its symbol (drift fires,
+    sym/ctx does not), and a token can be welded into a new ``try`` or ``if`` without moving at all
+    (sym/ctx fires, drift does not).
+
+    Measured 2026-08-09, vault ``origin/main`` 1a59e4a1's anchors against engine tree ``4667e945``,
+    over the 1,712 Python anchors that locate and parse. **The region is the innermost node the
+    ``(sym, ctx)`` PAIR pins** — both fields must match, so the pair is only as loose as its tighter
+    half:
+
+    - **536 of 1,712 (31.3%)** sit in a region spanning MORE than the 81 lines the retired +/-40
+      window covered. For those, sym/ctx alone is the LOOSER of the two signals.
+    - Region spans: median 33, p90 567, max 9,799.
+    - 1,403 of 1,712 are unnested (``ctx == ""``) and 280 are at module level (``sym == ""``), so for
+      most anchors the pair reduces to "which function is this in".
+
+    **The 38.4% / 639 figure this work was briefed with is reproducible, under a LOOSER definition:**
+    scoring the region as the enclosing SYMBOL only, ignoring the ``ctx`` refinement, gives **634** at
+    this ref against that brief's 639. Both definitions support the same conclusion and it is the only
+    one that matters here — replacing drift with sym/ctx would lose detection on roughly a third of
+    the record — so this stays additive either way.
+    """
+    if a.sym is None and a.ctx is None:
+        return  # not asserted. Absence of the field is not an assertion that the region is empty.
+    findings.checked_sym_ctx += 1
+    problem = malformed_sym_ctx(a.sym, a.ctx)
+    if problem:
+        findings.problems.append(
+            f"{cell_id}: {a.path}:{a.line} {problem}. A chain this deriver cannot produce would "
+            "advise forever without ever matching, so it is refused rather than left to rot"
+        )
+        return
+    if Path(a.path).suffix not in PYTHON_SUFFIXES:
+        findings.problems.append(
+            f"{cell_id}: {a.path}:{a.line} records sym/ctx on a non-Python file, which has no "
+            "enclosing symbol and no block structure — no derivation can ever confirm or deny it"
+        )
+        return
+    if target not in ast_cache:
+        ast_cache[target] = parse_or_none(text)
+    tree = ast_cache[target]
+    if tree is None:
+        findings.advisories.append(
+            f"{cell_id}: {a.path} — sym/ctx recorded but the file will not parse, so neither could "
+            "be derived. Advisory: UNDETERMINED, which is not the same as agreeing"
+        )
+        return
+    got_sym, got_ctx = sym_ctx_at(tree, actual)
+    if a.sym is not None and a.sym != got_sym:
+        findings.advisories.append(
+            f"{cell_id}: {a.path} — {a.expect!r} recorded sym={a.sym!r} but now sits in "
+            f"sym={got_sym!r} (line {actual}). Advisory: DISPLACEMENT, not a defect — re-read the "
+            "cell's reasoning, do not assume anything is wrong"
+        )
+    if a.ctx is not None and a.ctx != got_ctx:
+        findings.advisories.append(
+            f"{cell_id}: {a.path} — {a.expect!r} recorded ctx={a.ctx!r} but now sits in "
+            f"ctx={got_ctx!r} (line {actual}). Advisory: DISPLACEMENT, not a defect — the control "
+            "flow around this token changed, which may be a HARDENING (10.5.4 was)"
+        )
 
 
 def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
@@ -772,6 +1246,9 @@ def prove_absences(
         for c in cells:
             for a in c.absence:
                 i += 1
+                # The POPULATION, recorded before any outcome branch, so it is right whichever branch
+                # this claim takes. Without it the outcome counters float free of what was scanned.
+                findings.checked_absences += 1
                 _prove_one(
                     a,
                     c.id,
@@ -893,6 +1370,55 @@ def _headline_caveat(unexamined: int) -> list[str]:
     ]
 
 
+#: How each verdict state renders in the current-state table: the *State* cell, the emphasis wrapped
+#: around its count, and the *Meaning* cell. Keyed by verdict and consumed by walking
+#: :data:`VERDICT_ORDER`, so the table's rows and the total below them are read off ONE enumeration.
+#: The six rows used to be six hand-written f-strings above a hand-written Total, which is the same
+#: shape as the gate summary line BACKLOG #1012 was filed against — six statements of a distribution
+#: with nothing relating them to each other or to the population.
+_VERDICT_ROW: Final[dict[str, tuple[str, str, str]]] = {
+    "pass": ("Pass", "", "verb satisfied by a shipped default or a refusing gate"),
+    "partial": (
+        "Partial",
+        "",
+        "control exists but ships off, warns, or covers part of the surface",
+    ),
+    "fail": ("Fail", "", "no implementing control in any configuration"),
+    "na": ("N/A", "", "does not apply on the declared scope, with a written rationale"),
+    "needs-review": (
+        "Needs review",
+        "",
+        "examined; verdict contested or blocked on a decision",
+    ),
+    "unverified": (
+        "**Unverified**",
+        "**",
+        "**not re-verified against the requirement text — not a Pass**",
+    ),
+}
+
+
+def _verdict_rows(parts: list[tuple[str, int]]) -> list[str]:
+    """The table body for :func:`render_current`, one row per verdict state, no exceptions.
+
+    A state with no entry in :data:`_VERDICT_ROW` REFUSES rather than being skipped. Skipping is what
+    the old hand-written block did implicitly, and a table whose rows silently stop summing to its own
+    Total is the defect this whole path exists to make impossible.
+    """
+    rows: list[str] = []
+    for verdict, n in parts:
+        row = _VERDICT_ROW.get(verdict)
+        if row is None:
+            raise ScorecardError(
+                f"verdict {verdict!r} is declared in VERDICT_ORDER but has no row in _VERDICT_ROW, "
+                "so the rendered table would omit it while its cells still counted toward the "
+                "Total. Add the row rather than letting the state render nowhere."
+            )
+        label, emphasis, meaning = row
+        rows.append(f"| {label} | {emphasis}{n}{emphasis} | {meaning} |")
+    return rows
+
+
 def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
     """The generated entry point — survey progress FIRST, verdict counts second.
 
@@ -906,8 +1432,7 @@ def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
     `pass` — which is also what ASVS asks for: a summary of **every requirement checked**, not
     exceptions only.
     """
-    n = count(cells)
-    total = sum(n.values())
+    parts, total = verdict_breakdown(cells)
     # EXAMINED, not DECIDED: a `needs-review` cell was read and then parked, so it is survey progress
     # even though it carries no verdict. Counting it as unread made this line contradict the table
     # below it (see EXAMINED_VERDICTS).
@@ -933,13 +1458,7 @@ def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
         "",
         "| State | Count | Meaning |",
         "|---|---:|---|",
-        f"| Pass | {n['pass']} | verb satisfied by a shipped default or a refusing gate |",
-        f"| Partial | {n['partial']} | control exists but ships off, warns, or covers part of the surface |",
-        f"| Fail | {n['fail']} | no implementing control in any configuration |",
-        f"| N/A | {n['na']} | does not apply on the declared scope, with a written rationale |",
-        f"| Needs review | {n['needs-review']} | examined; verdict contested or blocked on a decision |",
-        f"| **Unverified** | **{n['unverified']}** | **not re-verified against the requirement text "
-        "— not a Pass** |",
+        *_verdict_rows(parts),
         f"| **Total** | **{total}** | |",
         "",
     ]
@@ -986,6 +1505,281 @@ def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
     return chr(10).join(lines) + chr(10)
 
 
+# --- provenance: every answer carries the refs it was measured at ---------------------------------
+#
+# A count is a fact about a (file x ref) PAIR. Drop the ref and two readings taken from different
+# places print identically — which is exactly how this programme produced three wrong-base errors in
+# one working thread on 2026-08-08/09: one in an adjudication, one in the correction of that
+# adjudication, and one in a DAG-ancestry check that cannot answer "did this land" under squash-merge.
+# Each cost a full re-measurement cycle. A query tool without ref stamping would INDUSTRIALISE that
+# failure, because cheap answers get quoted more, not less.
+#
+# THE REQUIREMENT IS NOT FRESHNESS. IT IS THAT THE FRESHNESS CLAIM IS NEVER SILENT. Those come apart,
+# and separating them dissolves the problem with zero network: the error that motivated this was not
+# reading a stale ref, it was reading a stale ref while the output said nothing about it.
+
+#: Seconds any single git probe may take before it is abandoned. `--status` is meant to be run in a
+#: loop; a probe that can hang is a probe that gets removed.
+_GIT_TIMEOUT: Final[float] = 5.0
+
+
+@dataclass(frozen=True)
+class RepoStamp:
+    """Where a tree actually is, and how much it knows about where it should be.
+
+    Every field is ALWAYS POPULATED. Degradation is a loud labelled value in the field, never an
+    omitted field — an absent qualifier is what produced all three wrong-base errors, where the number
+    was right and the ref was unnamed.
+    """
+
+    #: Short commit, or ``NO-GIT`` when the path is not inside a work tree.
+    sha: str
+    #: Whole-tree dirty. A measurement taken against uncommitted changes is not reproducible and must
+    #: not look like one that is.
+    dirty: bool
+    #: ``CURRENT`` | ``BEHIND <n>`` | ``AHEAD <n>`` | ``DIVERGED`` | ``NO-UPSTREAM`` | ``NO-GIT`` |
+    #: ``UNRESOLVED``. The last two are extensions and they exist BECAUSE of the never-silent rule:
+    #: calling a non-repo ``NO-UPSTREAM`` would be a false statement (it implies a repo), and calling a
+    #: comparison that git refused ``CURRENT`` would be the exact silence this field exists to break.
+    freshness: str
+    #: The ref the freshness was measured AGAINST, or ``none``. Named because "BEHIND 37" is not a
+    #: claim until you know behind WHAT: on a feature branch the branch's own upstream and the
+    #: canonical line are different questions with different answers.
+    upstream: str
+    #: Humanised age of ``FETCH_HEAD``, or ``NEVER-FETCHED``. NOT decoration: ``BEHIND 0`` from a
+    #: six-hour-old fetch and ``BEHIND 0`` from a one-minute-old fetch are different claims and must
+    #: not print identically.
+    remote_knowledge: str
+
+    def ref(self) -> str:
+        return f"{self.sha}+dirty" if self.dirty else self.sha
+
+
+def _git(repo: Path, *args: str) -> str | None:
+    """One read-only git probe. ``None`` on any failure — missing git, not a repo, non-zero, timeout.
+
+    NEVER runs a command that writes. There is deliberately no ``--fetch`` mode in this module: a
+    fetch mutates remote-tracking refs, which a query tool run in a loop has no business doing, and on
+    this machine the vault remote is intermittently unauthenticated, so a network dependency here
+    would fire constantly and the tool would be bypassed inside a day. A bypassed tool is worse than
+    none, because its absence gets read as nobody needing it. Refreshing is ``git fetch``, by hand,
+    which is a different act performed on purpose.
+    """
+    try:
+        proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; every subcommand is read-only
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_GIT_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def _humanise_age(seconds: float) -> str:
+    if seconds < 90:
+        return f"{int(seconds)}s"
+    if seconds < 90 * 60:
+        return f"{int(seconds / 60)}m"
+    if seconds < 48 * 3600:
+        return f"{int(seconds / 3600)}h"
+    return f"{int(seconds / 86400)}d"
+
+
+def _remote_knowledge(repo: Path, now: float) -> str:
+    """How old the last-fetched remote knowledge is, from the mtime of ``FETCH_HEAD``. No network.
+
+    ``FETCH_HEAD`` can live in either the per-worktree git dir or the common one depending on git
+    version and who last fetched, so both are probed and the NEWEST is reported. Reporting the older
+    of the two would overstate staleness; reporting only one would miss a fetch entirely, and a missed
+    fetch reads as ``NEVER-FETCHED``, which is the loudest possible wrong answer.
+    """
+    newest: float | None = None
+    for which in ("--git-dir", "--git-common-dir"):
+        # `--path-format` is git 2.31+. Falling back to the relative form matters more than it looks:
+        # without it an older git would yield no path, `NEVER-FETCHED`, and a confidently wrong
+        # "nobody has ever fetched here" — the loudest possible wrong answer from this field.
+        out = _git(repo, "rev-parse", "--path-format=absolute", which) or _git(
+            repo, "rev-parse", which
+        )
+        if not out:
+            continue
+        try:
+            mtime = (repo / out / "FETCH_HEAD").stat().st_mtime
+        except OSError:
+            continue
+        newest = mtime if newest is None else max(newest, mtime)
+    if newest is None:
+        return "NEVER-FETCHED"
+    return _humanise_age(max(0.0, now - newest))
+
+
+def _freshness(repo: Path) -> tuple[str, str]:
+    """``(freshness, upstream)`` for a work tree, using ZERO network.
+
+    ``git rev-list --left-right --count HEAD...<upstream>`` counts against the LAST-FETCHED
+    remote-tracking ref, which is a purely local object. Measured against the vault checkout whose
+    stale ref caused the original error in this programme: ``BEHIND 37``, remote knowledge 23 minutes
+    old. That pair would have stopped the error dead, with no network call.
+
+    The upstream is the branch's own ``@{upstream}`` when it has one, and ``origin/main`` otherwise —
+    and WHICHEVER was used is returned, because on a feature branch those are different questions.
+    """
+    upstream = _git(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+    if not upstream:
+        upstream = "origin/main" if _git(repo, "rev-parse", "--verify", "origin/main") else ""
+    if not upstream:
+        return "NO-UPSTREAM", "none"
+    counts = _git(repo, "rev-list", "--left-right", "--count", f"HEAD...{upstream}")
+    parts = counts.split() if counts else []
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        # The ref name exists but git would not compare against it (a pruned or corrupt
+        # remote-tracking ref). Labelled, never quietly rendered as CURRENT.
+        return "UNRESOLVED", upstream
+    ahead, behind = int(parts[0]), int(parts[1])
+    if ahead and behind:
+        return "DIVERGED", upstream
+    if behind:
+        return f"BEHIND {behind}", upstream
+    if ahead:
+        return f"AHEAD {ahead}", upstream
+    return "CURRENT", upstream
+
+
+def repo_stamp(path: Path, *, now: float | None = None) -> RepoStamp:
+    """Stamp the work tree containing `path`. Pure read: no fetch, no write, no network."""
+    repo = path if path.is_dir() else path.parent
+    sha = _git(repo, "rev-parse", "--short", "HEAD")
+    if sha is None:
+        # Not a work tree at all. NOT reported as NO-UPSTREAM: that would imply a repo exists and is
+        # simply untracked, which is a different and false statement.
+        return RepoStamp("NO-GIT", False, "NO-GIT", "none", "NEVER-FETCHED")
+    porcelain = _git(repo, "status", "--porcelain")
+    freshness, upstream = _freshness(repo)
+    return RepoStamp(
+        sha=sha,
+        dirty=bool(porcelain),
+        freshness=freshness,
+        upstream=upstream,
+        remote_knowledge=_remote_knowledge(repo, time.time() if now is None else now),
+    )
+
+
+def provenance_lines(scorecard: Path, root: Path, *, now: float | None = None) -> list[str]:
+    """The non-suppressible provenance header. Every query answer carries the refs it was measured at.
+
+    **One deviation from the spec's literal shape, and it is deliberate — do not "fix" it back.** The
+    spec draws ONE ``freshness`` and ONE ``remote-knowledge`` under a line naming TWO repositories.
+    The scorecard and the engine are separate checkouts (the vault's own CI checks out the engine into
+    a subdirectory and runs with ``--root engine``), and a single freshness field covering both would
+    itself be an unnamed qualifier — the reader could not tell which repo it described. That is the
+    precise defect the field exists to prevent, so the group is emitted PER REPO and labelled. No
+    mandated field is renamed, dropped, or given a value outside its stated set.
+
+    ``upstream=`` is likewise additive: "BEHIND 37" is not a claim until you know behind what.
+    """
+    sc = repo_stamp(scorecard, now=now)
+    en = repo_stamp(root, now=now)
+    generated = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+    return [
+        f"# asvs-status scorecard={sc.ref()} engine={en.ref()}",
+        f"#   scorecard: freshness={sc.freshness} upstream={sc.upstream} "
+        f"remote-knowledge={sc.remote_knowledge}",
+        f"#   engine:    freshness={en.freshness} upstream={en.upstream} "
+        f"remote-knowledge={en.remote_knowledge}",
+        f"#   generated={generated}",
+    ]
+
+
+def status_lines(cells: list[Cell]) -> list[str]:
+    """``--status`` proper: what the scorecard SAYS, computed on every call and cached nowhere.
+
+    Nothing here is persisted, because a cached query result would be document number 69 in a corpus
+    where 68 documents assert a tally and approximately one is correct — stale in the same way, for
+    the same reason, with more authority because a tool produced it.
+
+    **This is a pure read of the scorecard and it names what it therefore cannot see.** Whether an
+    anchor still RESOLVES is a fact about the engine tree, costs a 40-second pass, and is what
+    :func:`verify` is for. Printing a structural tally under a heading that implies resolution health
+    would be the same overstatement the summary line was just corrected for.
+    """
+    parts, total = verdict_breakdown(cells)
+    examined = sum(1 for c in cells if c.verdict in EXAMINED_VERDICTS and c.last_verified)
+    inherited = sum(1 for c in cells if c.verdict in DECIDED_VERDICTS and not c.last_verified)
+    closed = sum(1 for c in cells if c.decision_closed)
+    anchors = sum(len(c.evidence) for c in cells)
+    anchored_cells = sum(1 for c in cells if c.evidence)
+    paths = {a.path for c in cells for a in c.evidence}
+    absences = sum(len(c.absence) for c in cells)
+    provable = sum(1 for c in cells for a in c.absence if a.observable)
+    unevidenced = sum(
+        1 for c in cells if c.verdict in DECIDED_VERDICTS and not c.evidence and not c.absence
+    )
+    pct = (100.0 * examined / total) if total else 0.0
+    return [
+        f"cells {total}: " + ", ".join(f"{c} {v}" for v, c in parts),
+        f"examined {examined} of {total} ({pct:.1f}%) against the pinned text; "
+        f"{inherited} decided with no last_verified; {closed} closed by owner decision",
+        f"evidence {anchors} anchors in {anchored_cells} cells over {len(paths)} paths; "
+        f"{unevidenced} decided cells carry neither an anchor nor an absence claim",
+        f"absence {absences} claims, {provable} of them carrying an observable "
+        "(the rest cannot be proved by execution)",
+        "NOT CHECKED here: whether any anchor still resolves, whether any absence claim is still "
+        "true, and completeness against the corpus. --status is a pure read of the scorecard; run "
+        "verify for those",
+    ]
+
+
+def form_summary(findings: Findings) -> list[str]:
+    """The derived-``form`` split, printed beside the resolved count — WITH its denominator.
+
+    A bare "1,479 code" is unreadable: unreadable against what? So this prints the population it
+    classified, the population it could not, and the population it never saw, on the principle that a
+    broken run and a clean run must not look alike. The parts sum to ``checked_anchors`` by
+    construction and the reader can check that without leaving the line.
+
+    **Nothing downstream consumes this.** It is the record's rendered face telling the truth about
+    what its evidence is made of, which is not the same act as scoring it. ``doc`` and ``foreign``
+    anchors are not weaker claims — they are claims no structural or executable check can ever reach,
+    which is a fact about the CHECK, not about the cell.
+    """
+    n = findings.anchor_forms
+    located = sum(n.values())
+    unlocated = findings.checked_anchors - located
+    prose = n["doc"] + n["foreign"]
+    pct = (100.0 * prose / located) if located else 0.0
+    out = [
+        f"  form of the {located} anchor(s) that located: {n['code']} code, "
+        f"{n['doc']} doc (docstring or # comment), {n['foreign']} foreign (not a Python file), "
+        f"{n['undetermined']} undetermined (Python that would not parse)"
+    ]
+    if unlocated:
+        out.append(
+            f"  {unlocated} further anchor(s) did NOT locate (GONE or AMBIGUOUS, reported below) and "
+            "carry no form: there is no landing site to classify"
+        )
+    covered = findings.checked_sym_ctx
+    out.append(
+        f"  sym/ctx asserted on {covered} of {findings.checked_anchors} anchor(s)"
+        + (
+            "; the rest assert neither, and absence of the field is NOT agreement"
+            if covered < findings.checked_anchors
+            else ""
+        )
+    )
+    out.append(
+        f"  {prose} of {located} ({pct:.1f}%) resolve into prose or a non-Python file, which no "
+        "structural or executable check reaches, ever. That is a LABEL and not a demotion -- "
+        "documentation is legitimate ground for a documentation requirement -- and it feeds no "
+        "verdict, no completeness check and no exit code here"
+    )
+    return out
+
+
 def _run_prove_absences(scorecard: Path, root: Path) -> int:
     """The ``--prove-absences`` entry point: execute-prove every absence claim (see
     :func:`prove_absences`). Needs no corpus — it applies mutations, it does not grep for patterns."""
@@ -995,14 +1789,40 @@ def _run_prove_absences(scorecard: Path, root: Path) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2  # could not measure — never 0, never confused with "clean"
     findings = prove_absences(cells, root)
+    # `saw N` is the denominator, and it comes FIRST because the parts are unreadable without it: a
+    # run over 276 claims and a run over zero otherwise print counter sets that look equally
+    # plausible. The three outcome counters deliberately do not sum to it -- five problem-only
+    # outcomes increment nothing -- so the remainder is derivable and the gap is the point rather
+    # than a rounding error. See `Findings.proved_absences` for the closing arithmetic.
     print(
-        f"prove-absences: proved {findings.proved_absences} by mutation; "
+        f"prove-absences: saw {findings.checked_absences} absence claim(s); "
+        f"proved {findings.proved_absences} by mutation; "
         f"{findings.static_screened} static-screened; {findings.skipped_absences} skipped; "
         f"{len(findings.problems)} problem(s)"
     )
     for p in findings.problems:
         print(f"  FAIL {p}", file=sys.stderr)
     return 0 if findings.ok else 1
+
+
+def _run_status(scorecard: Path, root: Path) -> int:
+    """The ``--status`` entry point: provenance first, then what the scorecard says. No corpus needed.
+
+    Exit 0 on a successful read and 2 when the scorecard cannot be loaded. NEVER 1 — this is a query,
+    not a gate, and a query that borrows the gate's failure code will eventually be wired into CI as
+    one. The gate is :func:`verify`.
+    """
+    for line in provenance_lines(scorecard, root):
+        print(line)
+    try:
+        cells = load_scorecard(scorecard)
+    except ScorecardError as exc:
+        # The provenance header is already out, so even this failure is attributable to a ref.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    for line in status_lines(cells):
+        print(line)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1023,11 +1843,23 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="execute-prove absence claims (apply mutation to a scratch tree, require observable red)",
     )
+    # A QUERY, not a gate: a ref-stamped read of the scorecard, no corpus, no engine tree, no network,
+    # nothing cached to disk. It exists because the dominant token cost of ASVS work is not reading
+    # the record, it is reconciling two readings of it that were taken at different refs and printed
+    # identically. There is deliberately NO --fetch: see `_git` on why a query must not mutate.
+    ap.add_argument(
+        "--status",
+        action="store_true",
+        help="print the provenance line and the scorecard's own counts, then exit (no corpus needed)",
+    )
     # NO --anchor-sha injected by CI. The anchor is the commit the EVIDENCE was read on — a property
     # of the assessment, recorded in [scorecard].anchor_commit. Passing ${{ github.sha }} made the
     # rendered file differ on every run, so the drift check could never pass: a gate that cannot go
     # green is as useless as one that cannot go red, and this one shipped that way.
     args = ap.parse_args(argv)
+
+    if args.status:
+        return _run_status(args.scorecard, args.root)
 
     if args.prove_absences:
         return _run_prove_absences(args.scorecard, args.root)
@@ -1046,11 +1878,19 @@ def main(argv: list[str] | None = None) -> int:
         return 2  # could not measure — never 0, never confused with "clean"
 
     cells = load_scorecard(args.scorecard)
-    n = count(cells)
+    # EVERY verdict state, derived from the type and reconciled against the cell count before it is
+    # printed (BACKLOG #1012). This line used to enumerate five states and state a sixth-state total --
+    # 344 components against a stated 345 -- because the enumeration was retyped here by hand and
+    # `needs-review` was never added to it. It is the line people quote, so it was quoted wrong all day.
+    try:
+        parts, total = verdict_breakdown(cells)
+    except ScorecardError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2  # could not measure — never 0, never confused with "clean"
+    breakdown = " / ".join(f"{c} {v}" for v, c in parts)
     print(
-        f"scanned {len(cells)} cells "
-        f"({n['pass']} pass / {n['partial']} partial / {n['fail']} fail / {n['na']} na / "
-        f"{n['unverified']} unverified); "
+        f"scanned {total} cells "
+        f"({breakdown}); "
         # "verified" OVERCLAIMED, on the line that IS the record's rendered face. An anchor check
         # proves the token is present and unique in the file. It does not prove the statement still
         # executes under the control flow the cell reasoned about, and it cannot prove the cell's
@@ -1063,6 +1903,11 @@ def main(argv: list[str] | None = None) -> int:
         f"(token present and unique -- NOT proof the control operates) "
         f"and checked {findings.checked_absences} absence claims"
     )
+    # Beside the resolved count, and deliberately not folded into it: WHAT those anchors resolve into.
+    # "Resolved 1,980" reads as 1,980 pieces of code evidence; roughly a quarter of them are prose or a
+    # non-Python file that no structural or executable check will ever reach. See `form_summary`.
+    for line in form_summary(findings):
+        print(line)
     for a in findings.advisories:
         print(f"  DRIFT {a}", file=sys.stderr)
     if findings.advisories:

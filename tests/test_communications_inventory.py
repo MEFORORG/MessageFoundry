@@ -278,6 +278,11 @@ RETIRED_PHRASES: tuple[str, ...] = (
     # X12 and DICOM emit NO connection event at all, so a blanket per-listener at_capacity claim is
     # false; the merged Raw-TCP/X12 row concealed it.
     "Raw TCP / X12 listener",
+    # #1051: the retry DEFAULT is finite (100) since the cap landed. Both forms the section used to
+    # disclose it in — "is `None` = retry forever" and "is unset = retry forever" — end in this.
+    # Naming `max_attempts=None` as an available CHOICE stays allowed; it is the sentence that makes
+    # retry-forever the DEFAULT that must not come back.
+    "= retry forever",
 )
 
 #: The corrected replacements for :data:`RETIRED_PHRASES` — asserted PRESENT, so deleting the false
@@ -306,6 +311,11 @@ REQUIRED_TRUTHS: tuple[str, ...] = (
     "_LOOKUP_RESULT_TIMEOUT_SECONDS",
     # 13.1.3: the hvac-inherited Vault timeout, named with its value and its provenance.
     "hvac.adapters.Adapter",
+    # 13.1.3 (#1051): the finite cap, and the property that makes it safe as a default. Deleting the
+    # retired disclosure without stating the cap would leave the section silent on the one number an
+    # assessor scores the retry posture on.
+    "`retry_max_attempts` is 100",
+    "attempts are counted **per row**",
 )
 
 
@@ -451,6 +461,10 @@ def _import_code_defaults() -> list[tuple[str, float | int, str]]:
         ("retry_backoff_seconds", _default(RetryPolicy, "backoff_seconds"), "config.models"),
         # max_backoff is stated on the same prose line as the backoff base ("capped at 300 s").
         ("multiplier", _default(RetryPolicy, "max_backoff_seconds"), "config.models"),
+        # The retry CAP itself (#1051). Unpinnable while it was None — `_default` requires a number —
+        # so the section could and did state a default the code no longer had. Now that it is finite
+        # the doc is pinned to it like every other bound in these tables.
+        ("retry_max_attempts", _default(RetryPolicy, "max_attempts"), "config.models"),
     ]
 
 

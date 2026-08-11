@@ -903,6 +903,15 @@ one place — [`api/field_authz.py`](../messagefoundry/api/field_authz.py) — a
 `redact_unauthorized()` helper applied to every returned row, rather than re-implemented inline per
 endpoint (where a new endpoint or field could silently leak PHI — the BOPLA risk, ASVS 8.1.2 / 8.2.3).
 
+**The default for a mapped model denies.** Each of the six response models below is a `PhiGatedModel`
+([`api/phi_gate.py`](../messagefoundry/api/phi_gate.py)) that withholds every gated property from JSON
+until an authorization decision is recorded on the instance; `redact_unauthorized()` is what records
+one, releasing exactly the properties the caller's permissions unlock. A route that never calls it
+therefore returns `null` — a functional defect its author sees — rather than the whole model in the
+clear. The gate is on JSON serialization, which is every path by which one of these models reaches a
+client; a python-mode `model_dump()` stays ungated by design, because the engine composes
+`MessageDetail` from a `MessageSummary` dump before any authorization decision exists.
+
 **Read rules — one row per (response object, property).** This table is 1:1 with `PHI_FIELDS`: eleven
 entries over six response models. Keying on the *object* (not just the property name) is what makes it
 mechanically comparable to the map — a CI guard asserts set equality in **both** directions, so the
@@ -1024,9 +1033,13 @@ this gate can be forgotten (the previous claim here was overstated: the old pinn
   load-bearing: keyed on names, `last_error` looked covered by `DeadLetterRow.last_error` on
   `/dead-letters` while `OutboxInfo.last_error` had **zero** coverage, because the only message whose
   outbox row carries a non-null `last_error` is the dead-lettered one and its detail route was not in
-  the surface list. It is now, and the coverage assertion is keyed on `(model, property)` pairs. This
-  is the only guard that catches a future PHI route shipped without its `redact_unauthorized` call —
-  which, given the fail-open default, no map-level test can.
+  the surface list. It is now, and the coverage assertion is keyed on `(model, property)` pairs.
+- **The default is fail-closed** — `tests/test_field_authz_fail_closed.py` mounts a PHI-returning
+  route that *omits* the `redact_unauthorized` call and asserts the response carries `null` for every
+  gated property, each assertion paired with a released positive control. It also pins `PHI_FIELDS`
+  against each model's own `phi_gated_properties` in both directions, and proves class creation
+  refuses a gated name the serializer does not cover. The enumeration of call sites above keeps the
+  *shipped* surfaces honest; this is what makes the route nobody has written yet safe.
 
 **Write side (engine → store).** Exception/disposition text is also scrubbed *before* it is stored: a
 Router/Handler is user code that can `raise ValueError(f"...{raw}")`, so every value written to
@@ -1724,15 +1737,23 @@ BACKLOG #190 bundled three integrity residuals; #190 closes with **one built** a
   ask was a *runbook decision* (does the exposure runbook mandate it), not new engine code. Every
   PHI-plane surface already carries integrity: outbound bodies (ADR 0018), the audit trail (the HMAC
   hash-chain), and data at rest (AES-256-GCM AEAD).
-- **ECH (Encrypted Client Hello) for outbound SNI — infeasible, documented risk acceptance
-  (12.1.5).** Hiding the destination hostname in the outbound TLS ClientHello is not buildable here:
-  Python 3.14's stdlib `ssl` exposes **no ECH API**, there is **no SVCB/HTTPS DNS resolver** (ECHConfig
-  is DNS-published) and adding one is out of scope, and a working ECH client would require a
-  **third-party TLS stack** — violating the no-new-dependency rule for a security-core path. The
-  destination SNI is therefore visible on the outbound handshake. Compensating context: on-prem, a
+- **ECH (Encrypted Client Hello) for outbound SNI — buildable, deliberately not owned; accepted
+  residual (12.1.5).** The destination hostname is visible in the outbound TLS ClientHello. CPython's
+  stdlib `ssl` cannot hide it — ECH is an **OpenSSL 4.0** feature and the bundled OpenSSL 3.5.x
+  exports no ECH symbols (CPython PR #135435 is still open) — but it **is** buildable off-stdlib (Go
+  `crypto/tls`, rustls, sing-box), and one such terminating re-originator was written here and proven
+  against a real ECH endpoint. So "infeasible" is **not** the reason and must not be offered as one.
+  The reason is that it would hide nothing: a 2026-07-20 DoH probe found **no** partner endpoint
+  publishing an `ECHConfig`. The engine therefore ships only the opt-in, fail-closed **routing** half
+  (per-connection `ech_egress` / `ech_sidecar`, refused when the sidecar is non-loopback or paired
+  with `proxy_url`), and the re-originator was retired from the tree on 2026-08-10 rather than carried
+  as a second language nothing builds, tests or pins. Evidence, the retrieval SHA and the re-score
+  trigger: [ADR 0139](adr/0139-ech-egress-sidecar-sni-hiding-for-asvs-12-1-5-demand-gated.md);
+  operator contract: [`samples/ech-sidecar/`](../samples/ech-sidecar/README.md). The residual is
+  metadata only — which partner, how often — with at least these compensating conditions: on-prem, a
   trusted network segment, an operator-configured `[egress]`-allowlisted destination, and TLS still
-  protects the payload. Re-open when the stdlib gains a first-class ECH API (no new dep) and an
-  SVCB/HTTPS resolver is in scope.
+  protecting the payload. Re-open when a destination begins publishing an `ECHConfig`, or when CPython
+  ships a first-class ECH API.
 
 ### In-use memory protection — best-effort partial + deployment requirement (13.3.3 / 11.7.1 / 11.7.2, #198)
 

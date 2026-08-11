@@ -91,6 +91,14 @@ cla
 #
 # The quoting in backlog-hygiene.yml is load-bearing: the job name contains " #", which YAML would
 # truncate at the comment marker, and the job NAME is the context string.
+#
+# THIS CONTEXT STRING NOW UNDER-DESCRIBES ITS JOB, deliberately. Since BACKLOG #1095 the job also runs
+# the diff-scoped CITATION gate: every backlog number a PR adds beside a ledger path must name the
+# file that item actually lives in. It rides this context rather than taking its own because a new
+# context would be UNREQUIRED and therefore decoration -- the promotion note above is that reasoning
+# -- and because renaming a job to describe both checks CHANGES the context string, which is the
+# required-but-absent trap and would wedge every PR. The name is frozen; what the job covers is
+# documented in backlog-hygiene.yml's header and here.
 a PR that implements BACKLOG #N must update BACKLOG.md
 
 # (Historical note, kept because it is the reasoning that made the promotion safe: it triggers on

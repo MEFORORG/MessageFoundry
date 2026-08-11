@@ -66,9 +66,21 @@ The gate's own docstring records that 29% of Edit/Write calls came from a sessio
 that wrote *correctly* into a worktree by absolute path; a cwd-keyed gate would have denied all of them.
 Rule 2 is the sole exception, and that exception is the source of the ultracode friction in §4.
 
-**[`scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1)** (project
-scope, [`.claude/settings.json`](../.claude/settings.json)) refuses blanket `git add -A`/`.`/`-u` and
-`git commit -a`, so two sessions in one tree can't sweep each other's files into one commit.
+**[`scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1)** refuses
+blanket `git add -A`/`.`/`-u` and `git commit -a`, so two sessions in one tree can't sweep each other's
+files into one commit.
+
+**It does not travel, and this paragraph used to imply it did** (BACKLOG #327). The script is tracked,
+but the `PreToolUse` matcher that invokes it is project-scope `.claude/settings.json` — untracked, under
+`.gitignore`'s `/.claude/` rule — so a fresh clone and every `git worktree add` come up without it. It is
+a local Claude Code session control, fail-open by design: real and useful inside a configured session,
+and not repo-wide coverage. The publishing boundary it was cited alongside is asserted independently, by
+[`tests/test_private_paths_stay_ignored.py`](../tests/test_private_paths_stay_ignored.py) in CI.
+
+*(The link to that settings file was removed rather than repaired — it named a path no reader outside the
+maintainer's own machine has. `scripts/docs/link_check.py` could not have caught it: `.claude/` is in
+that script's `WITHHELD` set, so such an href is skipped before it is even counted. Measured 2026-08-10 —
+an href to a missing non-withheld path fails the check, the same href under `.claude/` does not.)*
 
 ### Detection — `SessionStart` hooks
 
@@ -91,6 +103,13 @@ Frequently forgotten in discussions of "the gate", but it is the same problem cl
   `-Release` then `-Take` — which drops the claim in between and re-opens the race it exists to close.
   The note is what `announce-session.ps1` broadcasts to every joining session *in preference to the
   worktree name*, so a note that cannot be corrected is announced as current intent indefinitely.
+  Every `-Release` — **`-Force` included** — appends one JSON line to `claims/.history` naming the key,
+  the releasing worktree and branch, the prior holder, its branch and note, and whether `-Force` was
+  used. The flag stays: a claim whose holder's worktree is gone would otherwise be stuck, and the
+  alternative people reach for is hand-deleting the file, which leaves less evidence still. What
+  changed is that the override is no longer invisible. The record is written *before* the claim file
+  is removed, and a release that cannot be recorded is refused rather than performed silently
+  (BACKLOG #1068).
 - **[`scripts/hooks/claim_check.py`](../scripts/hooks/claim_check.py)** — `commit-msg` gate: a commit whose
   *subject* declares `BACKLOG #N` with a code-touching diff must hold a claim on N **for this worktree**.
   Motivated by a recorded incident: three sessions independently fixed one npm advisory; two PRs were

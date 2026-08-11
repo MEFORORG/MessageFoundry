@@ -567,11 +567,21 @@ async def test_file_source_move_failure_leaves_file_in_place(
     # catches OSError, logs it, and swallows — the file stays in place (re-read next scan, a bounded
     # duplicate) rather than crashing the poller or vanishing unrecorded. Monkeypatch (not POSIX chmod)
     # because this runs on Windows.
+    from messagefoundry.transports import file as file_mod
+
     inbox = tmp_path / "in"
     inbox.mkdir()
+    # The archive dir MUST exist, so the injected failure is the ONLY reason the move can fail. It
+    # did not before, and a missing destination failed the move on its own — which meant this test
+    # passed whether or not the injection was still on the code path. It stopped being on it the
+    # moment _move left Path.replace behind (BACKLOG #1046), and nothing said so.
+    (inbox / ".processed").mkdir()
     (inbox / "m.hl7").write_bytes(ADT.encode("utf-8"))
     src = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(inbox)}))
-    monkeypatch.setattr(Path, "replace", _raise_locked)  # every move raises
+    # The atomic destination-name claim is the seam now (#1046): _move claims the name with
+    # os.link/O_EXCL instead of exists()-then-replace, so a locked/unwritable destination surfaces
+    # there rather than at Path.replace.
+    monkeypatch.setattr(file_mod, "_claim_unique", _raise_locked)  # every move raises
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
         src._after_processing(inbox / "m.hl7")  # default after_read="move"
     assert (inbox / "m.hl7").exists()  # left in place, not lost

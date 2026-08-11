@@ -47,11 +47,32 @@ _ROOT = Path(__file__).resolve().parents[1]
 _PUBLIC = "MEFORORG/MessageFoundry"
 
 #: Records by construction — a changelog/ADR/backlog entry SHOULD describe the topology of its day.
+#:
+#: ``docs/archive/backlog/BACKLOG-CLOSED.md`` was MISSING here, and the omission made this ratchet
+#: breachable by an ordinary archival pass with no new prose written (BACKLOG #327/#1099 wave,
+#: 2026-08-10). Closing an item moves its block **byte-identically** out of ``docs/BACKLOG.md`` —
+#: which this tuple already excludes — into the archive, which it did not. So the same sentence
+#: counted or did not purely by which of the two ledger files it sat in, and moving 41 closed blocks
+#: took the count 54 -> 55 and failed CI on a documentation-only branch. That is the same shape as the
+#: ``private repo`` substring false positives recorded below: a hit that is not rot.
+#:
+#: It is also UNFIXABLE where it lands. The archive's stated invariant is that every block is
+#: byte-identical to the one that left ``BACKLOG.md``, which is what keeps its ``#<n>-<slug>`` anchors
+#: resolving — so an archive hit can never be edited away, only counted. A ratchet that can fire and
+#: can never be cleared is a gate that must eventually be suppressed, which is the outcome this
+#: module's own docstring warns about. Excluding the archive is the honest form of the same rule
+#: ``docs/BACKLOG.md`` is already here for.
+#:
+#: Verified before changing (2026-08-10): the three archive hits are all false positives of the
+#: existing kind — "0 downloads on a private repo" (a DIFFERENT project's release channel), "the
+#: mirror-nightly run" (a CI job name), and "the mirror branch does not exist" (a git branch in the
+#: scorecard repo). None claims this repository is a mirror. No genuine hit is lost.
 _HISTORICAL = (
     "CHANGELOG.md",
     "docs/adr/",
     "docs/releases/",
     "docs/BACKLOG.md",
+    "docs/archive/backlog/BACKLOG-CLOSED.md",
     "docs/reviews/",
     "docs/benchmarks/results",
 )
@@ -81,7 +102,13 @@ _RETROSPECTIVE = re.compile(
 #: 2026-07-30: 55 -> 54. Not slack being taken: the ``private repo`` word-boundary fix above removed
 #: two SUBSTRING false positives, so the honest count fell and the ceiling follows it DOWN. Measured
 #: at 54 across 1412 tracked files. The rule is unchanged — this number may fall again, never rise.
-_PROSE_CEILING = 54
+#:
+#: 2026-08-10: 54 -> 52, and this one is worth reading as a WARNING about the number itself. The
+#: archive exclusion added to ``_HISTORICAL`` above dropped three false positives, so the honest count
+#: fell to 52 across 1533 tracked files and the ceiling follows it DOWN. **The ceiling is NOT left at
+#: 54 to bank the two.** Slack is what turns a ratchet into a rubber stamp: real rot would have to
+#: exceed the slack before anything reds, and nothing would report that the gate had gone quiet.
+_PROSE_CEILING = 52
 
 
 #: This module, excluded from its own scan. Its taxonomy above necessarily SPELLS every phrase it

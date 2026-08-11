@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-06 · **Status:** research / findings (no code) · **Owner action:** none required — informational vocabulary map.
 
-This is BACKLOG **[#238](../BACKLOG.md)**. It reads Windmill's **OpenFlow** step-attribute vocabulary
+This is BACKLOG **[#238](../archive/backlog/BACKLOG-CLOSED.md)**. It reads Windmill's **OpenFlow** step-attribute vocabulary
 (Apache-2.0, safe to read and cite) as a **completeness checklist** against MessageFoundry's own
 step/connector semantics, and records, per attribute, whether the engine already covers it (and where),
 covers it partially, or does not have it — and why. **OpenFlow is explicitly NOT a compatibility

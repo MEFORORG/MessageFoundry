@@ -160,6 +160,19 @@ jobs:
       # relative `(releases/...`, and neither grep form alone finds them all), and a `docs/SECURITY.md`
       # route-table row asserted a refusal `DELETE /me/mfa` does not make.
       #
+      # IT RECURRED ON 2026-08-11, AND THIS STEP WAS ALREADY HERE — the list was simply incomplete.
+      # `tests/test_dast_claims.py` scans documents for prose reading as though the independence gap
+      # were closed, but was never added, so a docs-only PR (#322) merged green and RED MAIN on the push
+      # afterwards. The blind mode is worse than a plain gap because of WHO PAYS: the failure surfaces
+      # on the next PR that touches code, so it is misattributed to whoever opens it. That happened —
+      # the next code PR inherited a red its author had no part in.
+      #
+      # => THE LESSON IS ABOUT THE LIST, NOT THE GATING. A curated allowlist silently omits; nothing in
+      # a green run says "a doc guard exists that I did not run." When adding a doc-scanning test
+      # module anywhere in `tests/`, add it HERE in the same commit, and confirm it needs no extras —
+      # a module that cannot run on `[dev]` alone would red every docs-only PR, which is the failure
+      # mode the minimal-install note below exists to avoid.
+      #
       # WHY A SEPARATE MINIMAL INSTALL instead of ungating the install below. Unlike the status
       # invariant, these modules import the package (`config.settings`, `config.models`,
       # `parsing.binary`, `auth.service`) and one imports `fastapi.routing`, so they cannot run on
@@ -190,20 +203,27 @@ jobs:
         run: |
           # PRINT WHAT IS SCANNED BEFORE RUNNING IT. A list that silently shrinks is how this class of
           # guard goes quiet, and `-rs` names every skip rather than letting one read as a pass.
+          #
+          # ONE LIST, USED TWICE. It used to be written out twice — once for the printf and once for
+          # pytest — which made the "print what you scanned" defence able to LIE: the two copies could
+          # drift, and then the step prints a module it does not run, or runs one it does not print.
+          # A defence implemented by duplication defeats itself. The variable is the fix, and the
+          # cross-check below turns a drift into a hard failure rather than a quiet one.
+          DOC_GUARDS="tests/test_asvs_file_surface_doc_drift.py tests/test_cloud_phi_hipaa_doc_drift.py
+            tests/test_crit2_inline_doc_drift.py tests/test_doc_ref_handle.py tests/test_docs_db_grants.py
+            tests/test_docs_runbooks.py tests/test_docs_security_pathways.py tests/test_security_doc_drift.py
+            tests/test_security_doc_rate_limits.py tests/test_threat_model_doc_drift.py
+            tests/test_backlog_status_check.py tests/test_sds_rule_ids_are_stable.py
+            tests/test_link_resolution.py tests/test_dast_claims.py"
+          # Every named module must EXIST. A path typo would otherwise make pytest error on an unknown
+          # file, or — worse under a future -k/--ignore form — silently scan nothing and read as a pass.
+          for m in $DOC_GUARDS; do
+            test -f "$m" || { echo "doc-guard list names a missing module: $m"; exit 1; }
+          done
           echo "doc guards, docs-only PR — scanning these modules:"
-          printf '  %s\n' tests/test_asvs_file_surface_doc_drift.py tests/test_cloud_phi_hipaa_doc_drift.py \
-            tests/test_crit2_inline_doc_drift.py tests/test_doc_ref_handle.py tests/test_docs_db_grants.py \
-            tests/test_docs_runbooks.py tests/test_docs_security_pathways.py tests/test_security_doc_drift.py \
-            tests/test_security_doc_rate_limits.py tests/test_threat_model_doc_drift.py \
-            tests/test_backlog_status_check.py tests/test_sds_rule_ids_are_stable.py \
-            tests/test_link_resolution.py
-          pytest -q -rs \
-            tests/test_asvs_file_surface_doc_drift.py tests/test_cloud_phi_hipaa_doc_drift.py \
-            tests/test_crit2_inline_doc_drift.py tests/test_doc_ref_handle.py tests/test_docs_db_grants.py \
-            tests/test_docs_runbooks.py tests/test_docs_security_pathways.py tests/test_security_doc_drift.py \
-            tests/test_security_doc_rate_limits.py tests/test_threat_model_doc_drift.py \
-            tests/test_backlog_status_check.py tests/test_sds_rule_ids_are_stable.py \
-            tests/test_link_resolution.py
+          printf '  %s\n' $DOC_GUARDS
+          echo "  ($(printf '%s\n' $DOC_GUARDS | wc -l) modules)"
+          pytest -q -rs $DOC_GUARDS
 
       # PySide6's offscreen platform plugin needs a few system libraries even
       # headless. Linux-only; Windows runners need no equivalent.
@@ -312,12 +332,13 @@ jobs:
       # the silent cap). Keep the gap: the step must expire BEFORE the job, or the failure surfaces as
       # an uninformative job-level kill with no step attribution.
       #
-      # THAT GUARANTEE COVERS THE FIRST GATED STEP ONLY, and saying otherwise would be a control resting
-      # on a false premise. `Web console tests (pytest)` carries the SAME `step_timeout` but runs after
-      # `Tests (pytest)`, so reaching it has already spent setup + `Tests`; its own cap cannot fire first
-      # at any job_timeout worth setting (it would take ~55 min on ubuntu, ~114 min on Windows). A hang
-      # THERE is still an unattributed job-level kill. Measured under `Tests (pytest)` below; the
-      # structural fix is BACKLOG #344 proposal 5.
+      # THAT GUARANTEE NOW COVERS BOTH GATED STEPS, and it did not until BACKLOG #344 proposal 5 landed.
+      # `Web console tests (pytest)` used to carry the SAME `step_timeout` while running AFTER
+      # `Tests (pytest)`, so reaching it had already spent setup + `Tests` and its own cap could not
+      # fire first at any job_timeout worth setting (~55 min on ubuntu, ~114 on Windows) -- a hang there
+      # was an unattributed job-level kill with no step conclusion. It now carries
+      # `matrix.webconsole_step_timeout`, sized to its own work, and the nesting arithmetic holds on all
+      # three legs; the derivation is in the note above that step.
       #
       # It only works while the cap stays clear of a HEALTHY run. On 2026-07-31 the ubuntu leg finished
       # green in 775s against a 780s cap -- 5s of margin -- and the step was killed anyway, reported as
@@ -471,10 +492,16 @@ jobs:
       # worse of the pair" without qualification -- that is FALSE for the job cap.
       #
       # THE JOB CAP IS NOT A ROUNDING-UP OF THE STEP CAP, AND IT HAS FIRED. Two steps in this job carry
-      # `step_timeout` -- `Tests (pytest)` and `Web console tests (pytest)` -- so the job can contain
-      # 2 x step_timeout of gated work that step_timeout cannot bound. Note the caps here do NOT cover
-      # that worst case and are not sized to (2 x 19 = 38 > 26 on ubuntu, 2 x 36 = 72 > 46 on Windows);
-      # they are sized against the OBSERVED sum, which is a weaker guarantee. See the closing paragraph.
+      # a `timeout-minutes`, so the job must contain the SUM of two gated budgets plus setup -- a
+      # quantity neither step cap can bound on its own.
+      #
+      # UNTIL BACKLOG #344 PROPOSAL 5 THAT SUM WAS UNBOUNDABLE, because both steps drew on the SAME
+      # `step_timeout`: the worst case the caps admitted was 2 x step_timeout + setup, which no
+      # job_timeout worth setting could cover (2 x 25 = 50 > 37 on ubuntu, 2 x 55 = 110 > 66 on
+      # Windows). The caps were sized against the OBSERVED sum instead, which is a weaker guarantee and
+      # was recorded here as such. The web console step now carries `webconsole_step_timeout`, so the
+      # worst case the caps admit is finite and positive on every leg -- the arithmetic is in the note
+      # above that step, and it is the first time this file has been able to state it.
       # Observed for real on run 30724385719 (main @ 8f01cef8, 2026-08-01):
       #
       #   Tests (pytest)              00:01:21 -> 00:27:12   25:51   SUCCESS   (9s under the 26:00 cap)
@@ -531,6 +558,12 @@ jobs:
       # destroyed exactly when it is needed. Max measured post-step teardown is 0:24, so all three new
       # rows stay positive with room.
       #
+      # THE THIRD ADDEND ABOVE IS THE OBSERVED web-console maximum, which is a DIFFERENT QUANTITY from
+      # the worst case the caps now admit -- one describes what has happened, the other what is
+      # permitted. Capping that step (BACKLOG #344 proposal 5) does not change how long it takes, so the
+      # rows above stand and `job_timeout` is UNCHANGED by it. The cap-based worst case is stated once,
+      # in the note above the `Web console tests (pytest)` step, and it is positive on every leg.
+      #
       # NESTING INVARIANT, first gated step -- setup(max) + step_timeout must stay under job_timeout, so a
       # `Tests` kill is a NAMED STEP failure rather than an unattributed job cancellation:
       #   ubuntu  5:22 + 25:00 = 30:22 < 37:00  (gap 6:38)
@@ -552,16 +585,16 @@ jobs:
       # it went 15/13 to 22/19, so +2 then +3. Either way the number was derived from the OTHER BOUND
       # rather than from the work, which is the defect, not the particular constant.
       #
-      # WHAT THIS DOES NOT FIX. The nesting invariant at the top of this note holds for `Tests (pytest)`
-      # on every leg and for `Web console tests (pytest)` on NONE of them: reaching that step already
-      # spends setup plus `Tests`, so its own cap can never fire first. Guaranteeing it would need
-      # job_timeout above setup + 2 x step_timeout -- about 39:20 on ubuntu and 73:20 on Windows at the
-      # measured setup maxima above, i.e. far beyond anything worth setting. A hang in the web-console
-      # step therefore still surfaces as an unattributed job-level kill, which is the very failure the
-      # invariant is there to prevent. The structural fix is to stop
-      # the two steps sharing one budget (a 3:33 suite has no business holding 36:00) and is filed as
-      # BACKLOG #344; this sizing only makes the job cap cover the sum. Re-derive it if either suite's
-      # duration moves.
+      # WHAT THIS SIZING DID NOT FIX, AND WHAT SINCE FIXED IT. This sizing only made the job cap cover
+      # the OBSERVED sum. The nesting invariant held for `Tests (pytest)` on every leg and for
+      # `Web console tests (pytest)` on NONE of them, because both steps drew on one `step_timeout`:
+      # guaranteeing the second would have needed job_timeout above setup + 2 x step_timeout -- about
+      # 55:22 on ubuntu and 114:05 on Windows -- so a hang in the web console step surfaced as an
+      # unattributed job-level kill, the very failure the invariant is there to prevent. BACKLOG #344
+      # proposal 5 closed it the other way round: the web console step now has `webconsole_step_timeout`
+      # sized to its own work (a 2-to-4-minute suite has no business holding 55:00), which brings
+      # setup + step_timeout + webconsole_step_timeout under job_timeout on all three legs. The
+      # arithmetic, and the trigger for re-deriving it, live in the note above that step.
       #
       # AND KNOW WHAT IS NOT CAPPED AT ALL. `test` is the ONLY one of this file's ten jobs carrying any
       # `timeout-minutes`; the other nine -- `changes`, `ide`, `sqlserver-store`, `postgres-store`,
@@ -574,10 +607,29 @@ jobs:
       # above a healthy run. Sizing it tight buys no detection and costs false failures on green suites,
       # twice now.
       #
-      # The remaining margin is a SHARED budget across every PR that lands and nothing accounts for it:
-      # three PRs each adding a minute of Windows time reproduce #119's kill, individually blameless.
-      # A mechanical guard for that is BACKLOG #344 item 1; the underlying slowness is #320.
+      # The remaining margin is a SHARED budget across every PR that lands, and it is now ACCOUNTED
+      # FOR: `scripts/ci/step_margin.py` runs after both gated steps below and reds the leg when a
+      # step's own duration comes within 1.30x of its own cap (BACKLOG #344 proposal 1). Three PRs
+      # each adding a minute of Windows time is still individually blameless -- the difference is that
+      # the third one now says so instead of the fourth one dying at the cap with zero failing
+      # assertions. It is NOT a request to raise a cap; the underlying slowness is #320.
+      #
+      # THE CLOCK IS TAKEN IN ITS OWN STEP so neither gated `run:` body has to carry timing code that
+      # a kill would skip anyway. Elapsed is therefore the step plus its two transitions -- an UPPER
+      # bound on the step, so the reported margin is a LOWER bound on the true margin, and the error
+      # runs toward firing early rather than toward a false green.
+      #
+      # It marks THROUGH THE SCRIPT rather than `echo ... >> "$GITHUB_ENV"`, deliberately. That
+      # spelling routes a Windows path through a bash redirection on two of the three legs -- a
+      # construct no local run can exercise, whose failure mode is a silently absent variable, i.e. a
+      # check that stops measuring while still printing a verdict. Marking in Python keeps the path
+      # handling where the tests reach it, and a missing mark is a REFUSAL (exit 2), never a zero.
+      - name: Step margin -- start the clock
+        if: always()
+        run: python scripts/ci/step_margin.py --mark before-tests
+
       - name: Tests (pytest)
+        id: tests
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         timeout-minutes: ${{ matrix.step_timeout }}
         env:
@@ -603,6 +655,10 @@ jobs:
         # `tests/test_ci_engine_step_excludes_webconsole.py` pins all three of those decisions.
         run: pytest -q --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
 
+      - name: Step margin -- boundary between the two gated steps
+        if: always()
+        run: python scripts/ci/step_margin.py --mark between
+
       # The web console's OWN suite (Option B, ADR 0065): the moved /ui tests live in the package's
       # tests/. They ARE in the root `testpaths` since BACKLOG #1027, so a bare local `pytest` collects
       # them -- the engine step above subtracts them explicitly via `--ignore-glob` rather than relying
@@ -618,9 +674,57 @@ jobs:
       # RANGE (SUPPORTED_ENGINE_SEAMS), so the back-compat claim that an older engine still renders
       # is NOT exercised anywhere. Closing it means installing the MIN and MAX supported engine
       # builds and running the package suite against each.
+      #
+      # THIS STEP HAS ITS OWN CAP AS OF BACKLOG #344 PROPOSAL 5, and that is a structural change, not a
+      # tidy-up. It used to carry `matrix.step_timeout` -- the same 25/55 the engine suite holds -- so a
+      # 2-to-4-minute suite sat behind a budget it could never reach: reaching this step has already
+      # spent setup plus `Tests`, so its cap could not fire first at any `job_timeout` worth setting
+      # (~55 min on ubuntu, ~114 on Windows). A hang HERE was therefore an unattributed JOB-level kill
+      # with no step conclusion at all, which is exactly the failure the nesting invariant exists to
+      # prevent, arriving by the one path that invariant did not cover.
+      #
+      # SIZING. Same rule as `step_timeout` -- ceil_minute(1.35 x the leg's measured max) -- then
+      # FLOORED at 5:00, because at these absolute durations 1.35x is under a minute of real headroom
+      # and hosted-runner provisioning noise alone has been observed at 4:30 (`Set up job`, ubuntu run
+      # 31109989006). Maxima are the 2026-08-08 pool recorded above and in
+      # `scripts/ci/step_margin_baseline.toml`:
+      #
+      #   leg      measured max   x1.35   floored   cap    margin over the measured max
+      #   ubuntu   2:22 (n=441)   3:12    5:00      5      2.113x
+      #   W22      2:51           3:51    5:00      6      2.105x  (takes the shared Windows value)
+      #   W25      3:59 (n=360)   5:23    6:00      6      1.506x
+      #
+      # THOSE MAXIMA ARE THEMSELVES RIGHT-CENSORED, and by the JOB cap rather than by a step cap: this
+      # step runs second, so a job-level kill lands inside it. Run 30724385719 is the exhibit -- `Tests`
+      # SUCCESS at 25:51, then this step CANCELLED at 30:14. So the numbers above are lower bounds, and
+      # the floor is doing real work rather than being generosity.
+      #
+      # NESTING INVARIANT, SECOND GATED STEP -- setup(max) + step_timeout + webconsole_step_timeout must
+      # stay under job_timeout. This is the line that could not be satisfied before, on ANY leg:
+      #   ubuntu  5:22 + 25:00 + 5:00 = 35:22 < 37:00  (gap 1:38)
+      #   W22     4:05 + 55:00 + 6:00 = 65:05 < 66:00  (gap 0:55)
+      #   W25     2:32 + 55:00 + 6:00 = 63:32 < 66:00  (gap 2:28)
+      # It now holds on all three, so a hang in the web console suite fails as a NAMED STEP.
+      #
+      # WORST CASE THE CAPS ADMIT, with both gated steps passing one second under their own caps --
+      # the quantity the job paragraph above could not previously bound at all, because the second
+      # gated step's cap was the first one's:
+      #   ubuntu  5:22 + 24:59 + 4:59 = 35:20 vs 37:00  (+1:40)   was 5:22 + 24:59 + 24:59 = 55:20  NEGATIVE
+      #   W22     4:05 + 54:59 + 5:59 = 65:03 vs 66:00  (+0:57)   was 4:05 + 54:59 + 54:59 = 114:03 NEGATIVE
+      #   W25     2:32 + 54:59 + 5:59 = 63:30 vs 66:00  (+2:30)   was 2:32 + 54:59 + 54:59 = 112:30 NEGATIVE
+      # The old table stated a worst case built from the MEASURED web-console maxima, which is a
+      # different quantity: it described what had been observed, not what the caps permitted.
+      #
+      # THE RE-DERIVE TRIGGER IS THE MARGIN CHECK ITSELF, not a second number written here to drift
+      # against it. The check below reds at 1.30x of the cap -- 3:51 on ubuntu, 4:37 on Windows -- and
+      # a run reaching that is 1.6x to 1.9x this leg's maximum over hundreds of observations, which is
+      # an event rather than a slow morning. It also prints the percent-of-cap on every run, so the
+      # approach is visible before the refusal. The old habit of writing a separate trigger into this
+      # file is exactly what produced a permanently-tripped 28:00 alarm nobody could act on.
       - name: Web console tests (pytest)
+        id: webconsole
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        timeout-minutes: ${{ matrix.step_timeout }}
+        timeout-minutes: ${{ matrix.webconsole_step_timeout }}
         env:
           QT_QPA_PLATFORM: offscreen
           PYTHONFAULTHANDLER: "1"
@@ -628,6 +732,39 @@ jobs:
           FAULT_TIMEOUT: ${{ matrix.fault_timeout }}
           PYTEST_TIMEOUT: ${{ matrix.pytest_timeout }}
         run: pytest packaging/messagefoundry-webconsole/tests -q -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
+
+      # THE MARGIN CHECK (BACKLOG #344 proposal 1). Last in the job so a LOW margin cannot skip a suite
+      # that has not run yet -- a step `if:` with no status function carries an implicit `success()`,
+      # so a failing check placed between the two gated steps would silently skip the second one.
+      #
+      # It keys on `steps.<id>.outcome` -- THE STEP'S OWN CONCLUSION, never the job's. That substitution
+      # is not pedantry: a step that nearly exhausts its cap is the most likely to push its job into
+      # `job_timeout`, so filtering on the job deletes the tightest rows by construction, and doing
+      # exactly that reproduced a published maximum of 24:35 where the truth was 25:51.
+      #
+      # A skipped step (docs-only PR) reports NO OBSERVATION in words rather than a healthy-looking
+      # ratio, and the script runs its own red/green control pair on every invocation and prints both
+      # into the job summary -- a gate that has never been red is a claim, not a control.
+      - name: Step margin -- both gated steps
+        if: always()
+        env:
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
+          WEBCONSOLE_OUTCOME: ${{ steps.webconsole.outcome }}
+          STEP_CAP: ${{ matrix.step_timeout }}
+          WEBCONSOLE_CAP: ${{ matrix.webconsole_step_timeout }}
+          LEG: ${{ matrix.os }}
+        run: |
+          rc=0
+          # `|| rc=$?` OUTSIDE the command, so a non-zero exit is captured rather than swallowed by
+          # `set -e` or absorbed into a pipeline. Both checks always run: reporting only the first
+          # would hide the leg that is actually tight.
+          python scripts/ci/step_margin.py --step "Tests (pytest)" --leg "$LEG" \
+            --cap-minutes "$STEP_CAP" --outcome "$TESTS_OUTCOME" \
+            --since before-tests --until between || rc=$?
+          python scripts/ci/step_margin.py --step "Web console tests (pytest)" --leg "$LEG" \
+            --cap-minutes "$WEBCONSOLE_CAP" --outcome "$WEBCONSOLE_OUTCOME" \
+            --since between --until now || rc=$?
+          exit $rc
 
   # Build + type-check the VS Code extension, and run its integration tests. The Python jobs never
   # touch ide/, so a dep bump or IDE code change that breaks the bundle or the types would otherwise
@@ -747,9 +884,13 @@ jobs:
           # $GITHUB_REPOSITORY is a built-in runner env var, read here as plain shell (NOT a workflow-
           # expression interpolation into the run body), so it is zizmor-safe and cannot be misparsed as
           # an Actions expression the way a literal double-brace token in a run: block would be.
-          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":37,"step_timeout":25,"pytest_timeout":60,"fault_timeout":90}'
-          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"pytest_timeout":120,"fault_timeout":150}'
-          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"pytest_timeout":120,"fault_timeout":150}'
+          # `webconsole_step_timeout` is the web console suite's OWN cap (BACKLOG #344 proposal 5). It
+          # used to take `step_timeout` -- a 2-to-4-minute suite holding a 25-to-55-minute budget --
+          # which is why the nesting invariant could not hold for it on any leg. Derived in the note
+          # above the `Web console tests (pytest)` step, which is also where to re-derive it.
+          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":37,"step_timeout":25,"webconsole_step_timeout":5,"pytest_timeout":60,"fault_timeout":90}'
+          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":6,"pytest_timeout":120,"fault_timeout":150}'
+          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":6,"pytest_timeout":120,"fault_timeout":150}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
             echo "matrix={\"include\":[$U,$W22,$W25]}" >> "$GITHUB_OUTPUT"
           else

@@ -380,8 +380,8 @@ def main(argv: list[str] | None = None) -> int:
     lens_sub = lens.add_subparsers(dest="lens_command", required=True)
     lens_parse = lens_sub.add_parser(
         "parse",
-        help="statically parse one config module into its @handler row contract (never imports or "
-        "executes the module; routers are out of v1 scope)",
+        help="statically parse one config module into its element row contract (never imports or "
+        "executes the module; @router defs are projected at --contract 2 and above)",
     )
     lens_parse.add_argument(
         "module",
@@ -389,6 +389,15 @@ def main(argv: list[str] | None = None) -> int:
         "the live buffer this way after a structural edit)",
     )
     lens_parse.add_argument("--json", action="store_true", help="emit JSON")
+    lens_parse.add_argument(
+        "--contract",
+        type=int,
+        default=1,
+        help="the row-contract version to emit (default 1). 1 is the shipped grammar; 2 adds the "
+        "'note' and 'route' row kinds and projects @router defs (ADR 0076 Amendments A + D). A "
+        "consumer asks for the version it can RENDER, so a client that omits this can never be handed "
+        "a kind it has no renderer for",
+    )
 
     lens_rewrite = lens_sub.add_parser(
         "rewrite",
@@ -411,6 +420,14 @@ def main(argv: list[str] | None = None) -> int:
         '"params":{"path":"MSH-3","value":"MEFOR"}}\', '
         '\'{"line_start":7,"line_end":7,"op":"move_row","direction":"up"}\'; '
         "omit to read the edit spec from stdin (only when 'module' is a file path, not '-')",
+    )
+    lens_rewrite.add_argument(
+        "--contract",
+        type=int,
+        default=1,
+        help="the row-contract version the row coordinates were PROJECTED with (default 1) - it must "
+        "match the 'lens parse --contract' that produced them, so a v1 client's coordinates resolve "
+        "against the v1 partition and a v2 client's against the v2 one",
     )
 
     lens_schema = lens_sub.add_parser(
@@ -1522,20 +1539,23 @@ def _serve(args: argparse.Namespace) -> int:
     # still refuse a production-PHI weakening (the ADR 0092 clamp is unchanged). The shared
     # security_loosenings() feeds both this warning and the read-only GET /security/posture view.
     # The connection graph is NOT loaded yet here (the Engine loads it inside the ASGI lifespan, well
-    # below), so this early warning covers the SETTINGS-scoped switches only and passes an empty
-    # cleartext-hop list. That is not a silent subset: every ADR 0153 acceptance is reported moments
-    # later — per connection, with its reason — by the construction gate's own loud WARN + audit record,
+    # below), so this early warning covers the SETTINGS-scoped switches only and passes empty lists for
+    # all THREE connection-scoped deviations. That is not a silent subset: each is reported moments
+    # later — per connection — by the connector's own construction-time WARN (the ADR 0153 acceptance
+    # with its reason and an audit record; the #333 generic-ODBC TLS reminder naming the connection),
     # and completely by `messagefoundry check` and GET /security/posture, which both have the graph.
     _loosenings = security_loosenings(
-        settings.security, settings.store, settings.auth, settings.alerts, ()
+        settings.security, settings.store, settings.auth, settings.alerts, (), (), ()
     )
     if _loosenings:
         _seclog = logging.getLogger(__name__)
         _seclog.warning(
             "[security] posture loosened from the secure defaults (%d): %s — see "
             "docs/SECURITY-LOOSENING.md. Production-PHI weakenings are still refused below. "
-            "Per-connection cleartext_accepted declarations (ADR 0153) are reported separately by "
-            "the connector construction gate.",
+            "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired and generic-ODBC "
+            "DATABASE TLS declarations are NOT in this list — the graph is not loaded yet; they are "
+            "reported by the connector construction gate, `messagefoundry check` and "
+            "GET /security/posture.",
             len(_loosenings),
             "; ".join(f"{name} ({risk})" for name, risk in _loosenings),
         )
@@ -2794,10 +2814,15 @@ def _serve(args: argparse.Namespace) -> int:
             from messagefoundry.api.tls_client_cert import client_cert_http_protocol_class
 
             run_kwargs["http"] = client_cert_http_protocol_class()
-    from messagefoundry.last_resort import install_excepthook
+    from messagefoundry.last_resort import install_excepthook, install_thread_excepthook
     from messagefoundry.redaction import safe_exc
 
     install_excepthook()  # last-resort main-thread hook: an uncaught exception logs PHI-redacted (16.5.4)
+    # The sibling hook for every OTHER thread (BACKLOG #1055). sys.excepthook does not cover them, and
+    # the engine runs non-asyncio threads whose except clauses are deliberately narrow — the sandbox
+    # session's raw stdout reader catches only OSError — so anything else would otherwise reach the
+    # stdlib default and print an unredacted traceback to the NSSM-captured stderr.
+    install_thread_excepthook()
     try:
         uvicorn.run(app, host=settings.api.host, port=settings.api.port, **run_kwargs)
     except Exception as exc:  # last-resort: log an abnormal server exit PHI-redacted, then re-raise
@@ -3155,10 +3180,14 @@ def _lens_parse(args: argparse.Namespace) -> int:
         if args.module == "-":
             # Raw UTF-8 (never the Windows locale codepage) so the buffer's non-ASCII round-trips exactly.
             module_label = "<stdin>"
-            handlers = parse_source(sys.stdin.buffer.read().decode("utf-8"), module=module_label)
+            handlers = parse_source(
+                sys.stdin.buffer.read().decode("utf-8"),
+                module=module_label,
+                contract=args.contract,
+            )
         else:
             module_label = args.module
-            handlers = parse_module(args.module)
+            handlers = parse_module(args.module, contract=args.contract)
     except LensParseError as exc:
         return _emit_error(str(exc), as_json=args.json)
     _print_json({"module": module_label, "handlers": handlers}, compact=args.json)
@@ -3199,9 +3228,11 @@ def _lens_rewrite(args: argparse.Namespace) -> int:
 
     try:
         if args.module == "-":
-            rewritten = rewrite_source(_read_stdin(), edit, module="<stdin>")
+            rewritten = rewrite_source(
+                _read_stdin(), edit, module="<stdin>", contract=args.contract
+            )
         else:
-            rewritten = rewrite_module(args.module, edit)
+            rewritten = rewrite_module(args.module, edit, contract=args.contract)
     except (LensParseError, LensRewriteError) as exc:
         return _emit_error(str(exc), as_json=True)
     # The rewritten module source is file content, not a JSON report — write the exact UTF-8 bytes to
@@ -4807,23 +4838,26 @@ def _security(args: argparse.Namespace) -> int:
             _loosenings_partial = True
 
     def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
-        # This CLI reads a SETTINGS file and never loads the connection graph, so it cannot see the ADR
-        # 0153 per-connection cleartext_accepted declarations — it passes an empty list and declares the
-        # gap in `loosenings_scope` below, instead of reporting a settings-only view as if it were the
-        # whole posture. `messagefoundry check` and GET /security/posture are the complete surfaces.
+        # This CLI reads a SETTINGS file and never loads the connection graph, so it cannot see ANY of
+        # the three per-connection declarations — it passes empty lists and declares the gap in
+        # `loosenings_scope` below, instead of reporting a settings-only view as if it were the whole
+        # posture. `messagefoundry check` and GET /security/posture are the complete surfaces.
         return [
             {"switch": s, "risk": r}
-            for s, r in security_loosenings(sec, _store, _auth, _alerts, ())
+            for s, r in security_loosenings(sec, _store, _auth, _alerts, (), (), ())
         ]
 
     #: Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
     #: degraded or settings-only report for a complete one. `partial` means [store]/[auth] could not be
-    #: read at all (the file did not load); `connections_not_loaded` is the standing limitation above.
+    #: read at all (the file did not load); the scope string is the standing limitation above. It names
+    #: ALL THREE connection-scoped deviations (#333) — naming only cleartext_accepted made the DECLARED
+    #: scope itself incomplete, which is the same defect one level up.
     _loosenings_scope = {
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
-            "settings only ([security]/[store]/[auth]/[alerts]); per-connection cleartext_accepted "
-            "declarations are NOT included — see `messagefoundry check` or GET /security/posture"
+            "settings only ([security]/[store]/[auth]/[alerts]); the per-connection "
+            "cleartext_accepted, tls_allow_expired and generic-ODBC DATABASE TLS declarations are NOT "
+            "included — see `messagefoundry check` or GET /security/posture"
         ),
     }
 

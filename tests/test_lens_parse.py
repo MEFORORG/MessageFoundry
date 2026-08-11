@@ -432,7 +432,14 @@ def test_unparseable_file_is_a_lens_refusal() -> None:
         parse_source("def broken(:\n    pass\n", module="broken.py")
 
 
-def test_routers_are_out_of_scope() -> None:
+def test_routers_are_out_of_scope_at_the_default_contract() -> None:
+    """A ``@router`` is projected only when the caller ASKS for the newer grammar.
+
+    This test used to be named ``test_routers_are_out_of_scope`` and asserted an unconditional
+    exclusion. ADR 0076 Amendment D (BACKLOG #232) widened the grammar with a ``route`` row kind, so the
+    exclusion is now contract-scoped rather than absolute — and that scoping is exactly what protects an
+    older IDE from a kind it cannot render (§D.7). The v2 leg is asserted in
+    ``tests/test_lens_grammar_v2.py``; this one holds the DEFAULT's line."""
     src = """\
 from messagefoundry import router, handler, Send
 
@@ -447,7 +454,7 @@ def handle(msg):
     return Send("OB_H", msg)
 """
     contracts = parse_source(src, module="mixed_router.py")
-    assert [c["handler"] for c in contracts] == ["h"]  # router excluded
+    assert [c["handler"] for c in contracts] == ["h"]  # router excluded at the default contract
 
 
 def test_module_with_no_handlers_returns_empty() -> None:

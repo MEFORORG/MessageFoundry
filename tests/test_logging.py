@@ -25,7 +25,12 @@ from messagefoundry.logging_setup import (
     SyslogForward,
     _make_formatter,
     configure_logging,
+    configure_stderr_logging,
 )
+
+#: Synthetic HL7 (never real PHI) embedded in a log record so a redaction assertion has something to
+#: find. HL7-shaped, so ``redact`` rewrites the span rather than passing it through.
+SYNTHETIC_PHI = "PID|1||100^^^H^MR||DOE^JANE^Q||19800101|F"
 
 
 @pytest.fixture(autouse=True)
@@ -720,6 +725,60 @@ def test_configure_logging_tls_forwarder_roundtrip(tmp_path: Any) -> None:
         assert b"tls_marker_OB_ACME" in bytes(server.received)
     finally:
         server.close()
+
+
+# --- configure_stderr_logging (BACKLOG #1054) ---------------------------------
+# The child-process variant: same filter chain as configure_logging, bound to stderr because the
+# caller's stdout is a binary IPC channel. A bare basicConfig gets the stream right and the filters
+# wrong, which is the defect these cover.
+
+
+def test_configure_stderr_logging_installs_the_filter_chain() -> None:
+    handler = configure_stderr_logging()
+    root = logging.getLogger()
+    assert root.handlers == [handler]  # replaces, never stacks (same contract as configure_logging)
+    assert root.level == logging.WARNING
+    assert isinstance(handler, logging.StreamHandler)
+    # Bound to stderr: a child whose stdout carries binary frames must never get a stdout handler.
+    assert handler.stream is sys.stderr
+    assert [type(f) for f in handler.filters] == [
+        RedactionFilter,
+        CredentialQueryScrubFilter,
+        ControlCharScrubFilter,
+    ]
+
+
+def test_configure_stderr_logging_redacts_phi_and_scrubs_crlf(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configure_stderr_logging()
+    logging.getLogger("mefor.child").warning(
+        "request failed on %s", SYNTHETIC_PHI + "\r\nWARNING mefor.child: forged-record"
+    )
+    err = capsys.readouterr().err
+
+    assert "[redacted]" in err  # the HL7 span was rewritten...
+    for token in ("DOE", "JANE", "19800101", "100^^^H^MR"):
+        assert token not in err
+    # ...and the CR/LF was escaped rather than emitted raw, so the injected text cannot start its own
+    # physical line and impersonate a record. One record on the wire is one line on the stream.
+    assert "\\r\\n" in err
+    assert "forged-record" in err  # kept and diagnosable, just not at column 0
+    assert len([line for line in err.splitlines() if line.strip()]) == 1
+
+
+def test_configure_stderr_logging_redacts_an_exception_traceback(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The realistic child vector: a raise that quoted the message body, rendered by log.exception.
+    configure_stderr_logging()
+    try:
+        raise ValueError(SYNTHETIC_PHI)
+    except ValueError:
+        logging.getLogger("mefor.child").exception("dispatch failed")
+    err = capsys.readouterr().err
+    assert "ValueError" in err  # the exception TYPE survives — the log stays diagnosable
+    assert "DOE" not in err and "JANE" not in err
 
 
 # --- ADR 0080: SNTP probe (query_sntp_offset) ---------------------------------

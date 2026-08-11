@@ -219,6 +219,60 @@ def test_malformed_record_does_not_break_the_roster(repo: Path, config_root: Pat
     assert [r["Short"] for r in rows] == ["12121212"]
 
 
+def test_the_human_table_names_its_columns_so_the_id_cannot_read_as_a_sha(
+    repo: Path, config_root: Path
+) -> None:
+    """BACKLOG #1098. The default (non-``-Json``) output is a fixed-width table with no header, whose
+    leading cell is an 8-hex REGISTRY SESSION ID -- the same shape ``git worktree list`` uses for an
+    abbreviated commit SHA, in a banner (``session-context.ps1``) that points readers straight here.
+
+    Asserts the EMITTED TEXT, which is the only place this defect can exist: every other test in this
+    file reads ``-Json``, where the field is named ``Short`` and no ambiguity is possible. That is
+    precisely how a reporting defect survives a green suite.
+    """
+    write_session(config_root, pid=os.getpid(), cwd=repo, session_id="abcdef01-1111")
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(PRESENCE),
+            "-Repo",
+            str(repo),
+            "-ConfigRoot",
+            str(config_root),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, f"presence.ps1 failed: {proc.stderr}"
+    print(proc.stdout)
+
+    lines = proc.stdout.splitlines()
+    header = next((ln for ln in lines if "sess-id" in ln), None)
+    assert header is not None, (
+        f"the table prints no column header, so its leading 8-hex cell has no stated meaning:\n"
+        f"{proc.stdout}"
+    )
+    assert "surface" in header and "worktree" in header and "branch" in header, (
+        f"a header naming only the ambiguous column leaves the rest unnamed: {header!r}"
+    )
+
+    # The header must sit above the row it governs, or it labels a different table.
+    row = next(ln for ln in lines if "abcdef01" in ln)
+    assert lines.index(header) < lines.index(row)
+    # And the id must land UNDER its own column rather than merely somewhere on the line. A header
+    # whose cells do not line up with the data is a label pointing at the wrong value, which is the
+    # same class of defect this test exists to close.
+    assert row.index("abcdef01") == header.index("sess-id"), (
+        f"header and row are not aligned, so the label points at the wrong cell:\n"
+        f"{header!r}\n{row!r}"
+    )
+
+
 def _find_free_pid() -> int:
     """A pid that is not currently running -- start a process, note its pid, wait for it to exit."""
     proc = subprocess.Popen(

@@ -1080,8 +1080,11 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
 
     ECH hides the outbound SNI, but stdlib ``ssl`` (OpenSSL 3.5.x) has no ECH — it is an OpenSSL 4.0
     feature (a local ``ctypes`` probe found zero ECH symbols in the bundled ``libssl``). So an
-    ``ech_egress`` connection routes through a **loopback ECH sidecar** — the TLS-**terminating**
-    re-originator at ``tools/ech-sidecar/`` (proven to hide the SNI against a real ECH endpoint). It is
+    ``ech_egress`` connection routes through a **loopback ECH sidecar** — an operator-supplied,
+    TLS-**terminating** re-originator; the contract it must satisfy is ``samples/ech-sidecar/README.md``.
+    (A stdlib-only Go implementation of that contract was written here and retired from the tree on
+    2026-08-10 because nothing built, tested or pinned it; ``git show 62fd628d:tools/ech-sidecar/main.go``
+    recovers it — ADR 0139.) It is
     NOT a forward proxy: a proxy would tunnel ``https`` via CONNECT and the engine's own non-ECH
     ClientHello would still leak the SNI. Instead the REST destination sends its request to the sidecar
     over **cleartext loopback** with the real destination in the ``Host`` header (see

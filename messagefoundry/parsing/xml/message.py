@@ -12,6 +12,13 @@ demand** against a :class:`~messagefoundry.parsing.message.RawMessage` (``conten
 XPath is namespace-aware: pass a ``namespaces=`` prefix→URI map and use those prefixes in expressions
 (lxml requires a prefix for every namespaced element; a default ``xmlns`` still needs a bound prefix).
 
+**Never interpolate message data into an expression.** Every query method takes ``$name`` variable
+bindings as keyword arguments — ``msg.get("//record[@mrn=$mrn]/note/text()", mrn=untrusted)`` — and a
+bound value is compared as a *value*, never parsed as expression syntax. Handlers are authored by
+users and all HL7/XML content is untrusted data, so an f-string into an XPath predicate is an
+injection: ``mrn = "nope' or @mrn!='"`` closes the author's quote and turns a one-record lookup into
+every record, which for a Handler gating on the match is a filter bypass (BACKLOG #1049, ASVS 1.2.7).
+
 Pure: no I/O to disk/network, no engine imports.
 """
 
@@ -24,7 +31,12 @@ from messagefoundry.parsing.xml._deps import load_lxml
 from messagefoundry.parsing.xml.errors import XmlError, XmlPathError
 from messagefoundry.parsing.xml.harden import parse_bytes
 
-__all__ = ["XmlMessage"]
+__all__ = ["XPathValue", "XmlMessage"]
+
+#: What may be bound to an XPath ``$variable``. Scalars only, deliberately: lxml also accepts a node
+#: set (an element list, or an ``XPath`` result), which would let a caller feed the result of one
+#: expression back in as a sub-expression — the shape this parameterized API exists to remove.
+XPathValue = str | int | float | bool
 
 
 class XmlMessage:
@@ -32,7 +44,12 @@ class XmlMessage:
     (``msg.set("//ns:Patient/ns:status", "active")``), and namespace-aware re-encode (``msg.encode()``).
 
     Construct via :meth:`parse`. ``namespaces`` (prefix→URI) is bound for every XPath call so
-    expressions can address namespaced elements."""
+    expressions can address namespaced elements.
+
+    Every query method also takes ``$name`` variable bindings as keyword arguments — the safe way to
+    put message-derived data in a path (see the module docstring). The expression itself is
+    positional-only, so a binding may be named ``expression``/``value``/``name`` without colliding
+    with the parameter."""
 
     def __init__(self, root: Any, namespaces: Mapping[str, str] | None = None) -> None:
         self._root = root
@@ -53,22 +70,31 @@ class XmlMessage:
 
     # --- read ----------------------------------------------------------------
 
-    def _xpath(self, expression: str) -> list[Any]:
+    def _xpath(self, expression: str, variables: Mapping[str, XPathValue]) -> list[Any]:
         etree = load_lxml()
+        for name, value in variables.items():
+            if not isinstance(value, (str, int, float, bool)):
+                # PHI-safe: names the variable and its TYPE, never the value.
+                raise XmlPathError(
+                    f"XPath variable ${name} must be a str/int/float/bool, got "
+                    f"{type(value).__name__}"
+                )
         try:
-            result = self._root.xpath(expression, namespaces=self._ns or None)
+            result = self._root.xpath(expression, namespaces=self._ns or None, **variables)
         except etree.XPathError as exc:
-            # PHI-safe: names the expression, not the matched content.
+            # PHI-safe: names the expression, not the matched content. An unbound $variable lands
+            # here too (lxml raises XPathEvalError), so a Handler's typo is this codec's data error
+            # rather than a bare lxml traceback out of a transform.
             raise XmlPathError(f"invalid XPath {expression!r}: {exc}") from exc
         if isinstance(result, list):
             return result
         # A scalar XPath (e.g. count(), string()) — wrap so callers see a uniform list.
         return [result]
 
-    def find(self, expression: str) -> list[Any]:
+    def find(self, expression: str, /, **variables: XPathValue) -> list[Any]:
         """Every node/value matching ``expression`` (raw lxml nodes or scalar results). Use
         :meth:`get`/:meth:`get_all` for text extraction."""
-        return self._xpath(expression)
+        return self._xpath(expression, variables)
 
     def _node_text(self, node: Any) -> str:
         # A scalar XPath result (bool/float/str) or an attribute/text node stringifies directly; an
@@ -82,32 +108,32 @@ class XmlMessage:
             return "".join(node.itertext())
         return text if text is not None else ""
 
-    def get(self, expression: str) -> str | None:
+    def get(self, expression: str, /, **variables: XPathValue) -> str | None:
         """Text of the **first** node matching ``expression``, or None if nothing matches. For an
         element, its direct text; for ``.../text()`` or ``@attr``, the string value."""
-        nodes = self._xpath(expression)
+        nodes = self._xpath(expression, variables)
         if not nodes:
             return None
         return self._node_text(nodes[0])
 
-    def get_all(self, expression: str) -> list[str]:
+    def get_all(self, expression: str, /, **variables: XPathValue) -> list[str]:
         """Text of **every** node matching ``expression`` (empty list if none)."""
-        return [self._node_text(node) for node in self._xpath(expression)]
+        return [self._node_text(node) for node in self._xpath(expression, variables)]
 
-    def exists(self, expression: str) -> bool:
+    def exists(self, expression: str, /, **variables: XPathValue) -> bool:
         """True iff ``expression`` matches at least one node."""
-        return bool(self._xpath(expression))
+        return bool(self._xpath(expression, variables))
 
     # --- mutate --------------------------------------------------------------
 
-    def set(self, expression: str, value: str) -> None:
+    def set(self, expression: str, value: str, /, **variables: XPathValue) -> None:
         """Set the text content of the **single** element matching ``expression`` to ``value``.
 
         ``value`` is assigned as text (lxml escapes it on serialize, so it cannot inject markup).
         Raises :class:`~messagefoundry.parsing.xml.errors.XmlPathError` if the expression matches zero
         or more than one node, or matches a non-element (e.g. a ``text()``/attribute result — set those
         via :meth:`set_attribute`)."""
-        nodes = self._xpath(expression)
+        nodes = self._xpath(expression, variables)
         if len(nodes) != 1:
             raise XmlPathError(
                 f"set requires exactly one matched element for {expression!r}, matched {len(nodes)}"
@@ -117,11 +143,13 @@ class XmlMessage:
             raise XmlPathError(f"set targets an element; {expression!r} matched a non-element node")
         node.text = value
 
-    def set_attribute(self, expression: str, name: str, value: str) -> None:
+    def set_attribute(
+        self, expression: str, name: str, value: str, /, **variables: XPathValue
+    ) -> None:
         """Set attribute ``name`` to ``value`` on the **single** element matching ``expression``.
         Raises :class:`~messagefoundry.parsing.xml.errors.XmlPathError` if it doesn't match exactly one
         element."""
-        nodes = self._xpath(expression)
+        nodes = self._xpath(expression, variables)
         if len(nodes) != 1 or not hasattr(nodes[0], "set"):
             raise XmlPathError(
                 f"set_attribute requires exactly one matched element for {expression!r}"

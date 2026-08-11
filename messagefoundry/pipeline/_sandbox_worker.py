@@ -24,9 +24,12 @@ direction, in either process.
    The reply echoes the request's ``id``, ``phase`` and ``name`` so the parent can prove the frame
    answers the call it made.
 
-stdout is the binary IPC channel — **nothing else may write to it**. Logging and any diagnostics go
-to stderr (inherited by the engine). The engine parent enforces the wall-clock cap and kills a
-runaway child, so this process never needs its own watchdog.
+stdout is the binary IPC channel — **nothing else may write to it**. Logging and any diagnostics go to
+stderr (inherited by the engine) through the **same PHI-redaction + control-char-scrub filter chain the
+engine installs on its own handlers** (:func:`~messagefoundry.logging_setup.configure_stderr_logging`),
+so a child log line carrying message-derived content is redacted and CR/LF-neutralized here rather than
+arriving raw on the inherited stream. The engine parent enforces the wall-clock cap and kills a runaway
+child, so this process never needs its own watchdog.
 """
 
 from __future__ import annotations
@@ -37,8 +40,13 @@ import sys
 from dataclasses import replace
 from typing import Any
 
-# stdout is the IPC channel; keep the root logger on stderr so a stray log line can't corrupt a frame.
-logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
+from messagefoundry.logging_setup import configure_stderr_logging
+
+# stdout is the IPC channel, so the root logger goes to stderr — a stray log line there cannot corrupt
+# a frame. It is `configure_stderr_logging` rather than a bare `basicConfig` because redaction is a
+# property of the HANDLER: basicConfig's handler carries no filters, so this child's records would
+# reach the engine's stderr with neither PHI redaction nor CR/LF scrubbing (BACKLOG #1054).
+configure_stderr_logging()
 log = logging.getLogger("messagefoundry.sandbox.worker")
 
 

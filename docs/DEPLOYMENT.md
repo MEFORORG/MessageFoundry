@@ -248,7 +248,8 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
    **not**, including the SQL Server store hop and the TLS DICOM SCU: see
    [Revocation-guard behavior](#revocation-guard-behavior). And check every connection for
    [`tls_allow_expired`](#tls_allow_expired--the-weakening-with-no-posture-gate-at-all), which no posture
-   gate, escape variable or loosening register covers.
+   gate or escape variable covers — it is **reported** (`security_loosenings()` /
+   `GET /security/posture` / `messagefoundry check`) but never refused, so the list is yours to act on.
 6. **Lock down egress** — populate the relevant `[egress].allowed_*` allow-lists so **the engine's own
    outbound connectors** (and the sanctioned read-only `db_lookup` / `fhir_lookup`) can only reach
    approved destinations — **all eight**, plus the separate `[alerts]` allow-lists for the
@@ -297,7 +298,7 @@ authentication on the channel · **Egress gate** = the `[egress]` allow-list tha
 | **DICOM C-STORE SCU** (`DICOM()`, ADR 0025) | dials host:port (default `104`) | **Yes** — per-connection opt-in `tls=true`; **chain and hostname are always verified** (there is no `tls_verify=false` on this connector), but **expiry checking is relaxable per connection** via `tls_allow_expired` — see the note below; opt-in client-cert mTLS. **Plaintext by default** | calling / called AE title (DIMSE has no transport auth of its own) | `[egress].allowed_tcp` (a raw socket) |
 | **EMAIL destination** (SMTP, ADR 0029) | dials host:port (default `587`) | **STARTTLS by default** (`use_tls=true`; implicit TLS on `465`). `use_tls=false` routes through the cleartext-hop authority; SMTP AUTH credentials are refused over cleartext **either way** | optional SMTP AUTH | `[egress].allowed_smtp` |
 | **Direct destination** (S/MIME HISP relay, ADR 0085) | dials HISP relay host:port (default `587`) | **STARTTLS by default** (`use_tls=true`); the body is S/MIME signed + encrypted regardless. ⚠️ `use_tls=false` is gated by the **raw** `MEFOR_ALLOW_INSECURE_TLS` — it does **not** route through the cleartext-hop authority and is **not clamped** by `enforcement` (AUTH credentials stay refused) | S/MIME cert trust + optional SMTP AUTH | `[egress].allowed_direct` |
-| **DATABASE destination** | dials server:port | **Dialect-dependent** — `dialect='sqlserver'` (default): `Encrypt=yes` **default**, `TrustServerCertificate=false` default (weakened only via the escape). ⚠️ `dialect='generic'` (ODBC to Postgres/Oracle/MySQL): TLS is the **driver's** own keyword in `odbc_params` and is **never engine-enforced or verified** — a hop with no TLS keyword logs a WARNING at construction and connects anyway, on any posture | ODBC `sql` / `integrated` / `entra` | `[egress].allowed_db` |
+| **DATABASE destination** | dials server:port | **Dialect-dependent** — `dialect='sqlserver'` (default): `Encrypt=yes` **default**, `TrustServerCertificate=false` default (weakened only via the escape). ⚠️ `dialect='generic'` (ODBC to Postgres/Oracle/MySQL): TLS is the **driver's** own keyword in `odbc_params` and is **never engine-enforced or verified** — a hop with no TLS keyword, **or one pinned to a no-TLS value** (`SSLmode=disable`/`allow`/`prefer`, `Encrypt=no`), logs a WARNING naming the connection at construction, is **reported** by `security_loosenings()` / `GET /security/posture` / `messagefoundry check`, and connects anyway, on any posture | ODBC `sql` / `integrated` / `entra` | `[egress].allowed_db` |
 | **File destination** | local filesystem | n/a (no network) | n/a | `[egress].allowed_file_dirs` |
 | **RemoteFile destination + source** (SFTP / FTPS / FTP) | dials remote host | **Protocol-dependent** — **SFTP** encrypted (SSH host-key verify on by default); **FTPS** explicit TLS; **FTP** plaintext (credentials refused without the escape) | username/password or SSH key | `[egress].allowed_remote` |
 
@@ -313,9 +314,13 @@ REST obey the authority does not settle these:
 
 - **`dialect='generic'` DATABASE** — the connector cannot introspect an arbitrary ODBC driver's TLS, so
   it reports the hop as **non-weakened by construction** and it never reaches the authority. A plaintext
-  PHI hop to a Postgres / Oracle / MySQL ODBC target crosses with a **log WARNING and no refusal, on any
-  posture**. TLS here is operator-owned: set the driver's keyword in `odbc_params`
-  (`SSLmode=verify-full`, `SSLMODE=VERIFY_IDENTITY`, …) and treat it as a deployment requirement.
+  PHI hop to a Postgres / Oracle / MySQL ODBC target crosses with **no refusal, on any posture** — it is
+  reported, not gated: a construction WARNING naming the connection, plus an entry in
+  `security_loosenings()` / `GET /security/posture` and a `generic-db-tls` line from
+  `messagefoundry check`. The reporting covers **inbound `DatabasePoll` as well as outbound**, and reads
+  the keyword's **value**, so `SSLmode=disable` is reported rather than mistaken for TLS ownership. TLS
+  here is operator-owned: set the driver's keyword in `odbc_params` (`SSLmode=verify-full`,
+  `SSLMODE=VERIFY_IDENTITY`, …) and treat it as a deployment requirement.
 - **Direct (S/MIME) cleartext SMTP** — `use_tls=false` consults the **raw** `MEFOR_ALLOW_INSECURE_TLS`
   directly rather than the authority, which is why the escape-hatch list below marks it *Not clamped*.
   `[security].enforcement` does not reach it. (SMTP AUTH credentials are refused over cleartext either
@@ -338,18 +343,21 @@ verified** (ADR 0094). It is genuinely narrower than `tls_verify=false` — that
 - it needs **no** `MEFOR_ALLOW_INSECURE_TLS`;
 - it is **not clamped** by `[security].enforcement` — `enforce` does not touch it;
 - it does **not** route through `InsecureHopGuard`, because verification stays on, so **no
-  cleartext/verify-off refusal keys on it**;
-- it is **absent from `security_loosenings()`**, and therefore from `GET /security/posture` and the
-  serve-time loosening warning. **Nothing reports that a connection has it set** except the WARNING it
-  logs at each construction.
+  cleartext/verify-off refusal keys on it**.
+
+It **is reported**: `security_loosenings()`, and therefore `GET /security/posture` on a running engine,
+plus a `tls-allow-expired` line from `messagefoundry check` naming each connection and its peer,
+alongside the WARNING each construction logs. Like every connection-scoped declaration it is **not** in
+the serve-time loosening warning, which fires before the graph is loaded and says so. Reported is not
+gated — nothing refuses it, and nothing takes it away again.
 
 Two consequences worth stating plainly. **(1)** Combined with the ungated revocation hops in
 [Revocation-guard behavior](#revocation-guard-behavior), a PHI hop can be pinned to a certificate that
-is **both long-expired and revoked** with nothing refusing it, warning at posture level, or reporting
-it. **(2)** A two-week bridge set when a partner's certificate lapses has **nothing that expires it or
-surfaces it** — it survives in config until someone reads the connection. If you use it, put the
-connection name and a removal date in your own risk register; the engine will not keep that list for
-you. **DICOMweb is deliberately not in the list above** — it reuses the REST client but does *not* honour
+is **both long-expired and revoked**, and nothing refuses it. **(2)** A two-week bridge set when a
+partner's certificate lapses has **nothing that expires it** — it is listed for as long as it is set,
+and it stays set until someone removes it. So put the removal **date** in your own risk register; the
+engine will keep the list of *which connections* have it, but it has no notion of *until when*.
+**DICOMweb is deliberately not in the list above** — it reuses the REST client but does *not* honour
 `tls_allow_expired`, so a DICOMweb hop always enforces expiry.
 
 ### Internal
@@ -372,12 +380,14 @@ there is for MLLP:
   and file contents cross the wire in the clear (the connector refuses credentials over plain FTP unless
   the escape is set).
 
-**Two more channels can carry PHI in cleartext even though they are not "no-TLS" by protocol** — list
-them in the same risk register, because the engine will not refuse either one for you:
+**Two more channels can carry PHI in cleartext even though they are not "no-TLS" by protocol** — the
+engine will not refuse either one for you:
 
 - **`dialect='generic'` DATABASE** (source *or* destination) — TLS is the ODBC driver's own keyword in
   `odbc_params`, which MessageFoundry cannot introspect. It is **never engine-enforced**: with no TLS
-  keyword the connection logs a construction WARNING and proceeds, on any posture. Set
+  keyword — or with one set to a no-TLS value — the connection logs a construction WARNING naming
+  itself and proceeds, on any posture. It **is** reported (`security_loosenings()` /
+  `GET /security/posture` / `messagefoundry check`'s `generic-db-tls`), for **both** directions. Set
   `SSLmode=verify-full` (psqlODBC) / `SSLMODE=VERIFY_IDENTITY` (MySQL) / the equivalent, and treat it as
   a deployment requirement rather than a default.
 - **Direct (S/MIME) with `use_tls = false`** — the message body is S/MIME signed and encrypted, but the
@@ -442,7 +452,8 @@ declaration — warned, audited and reported); **`[security].enforcement = warn`
 **`handles_real_patient_data = false`** (instance-wide, and they downgrade or silence the gates
 themselves); and per-connection
 **[`tls_allow_expired`](#tls_allow_expired--the-weakening-with-no-posture-gate-at-all)**, which no
-environment variable, posture clamp or loosening register covers at all.
+environment variable or posture clamp covers at all — the loosening register **does** report it, so the
+posture read-out is where to audit it.
 
 ---
 
@@ -629,8 +640,9 @@ a connector that does **not** route through `InsecureHopGuard` must be named as 
 covered by the "one authority" paragraph; **the same discipline applies to `RevocationHopGuard`** — the
 gated set is enumerable (grep the constructions) and every *other* verifying TLS hop must be named as
 ungated, never covered by an "every verifying hop" sentence; a weakening with no posture gate
-(`tls_allow_expired`) must be listed even though no refusal keys on it and
-`security_loosenings()` never reports it; and a field with no factory parameter and no `connections.toml`
+(`tls_allow_expired`, the `dialect='generic'` DATABASE hop) must be listed even though no refusal keys
+on it — **reported is not gated**, and the two must never be written as if either implied the other;
+and a field with no factory parameter and no `connections.toml`
 key (`tls_hop_attested`, `tls_revocation_attested`) must never be offered as an operator lever.
 Two more rules of thumb: state a control **with its default and its off-switch** (`require_sign_in`,
 `enforcement`, `handles_real_patient_data`), and never describe `[egress]` as bounding a *transform* —

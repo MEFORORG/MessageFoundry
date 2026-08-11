@@ -6,14 +6,22 @@ These are the wire contract the console (and any other client) sees — delibera
 separate from the internal SQLite rows and channel-config models so storage/runtime
 changes don't leak into the API. Message *list* responses carry metadata only; the raw
 body (PHI) appears only in the single-message detail view, which is audited.
+
+A model that carries a PHI *property* subclasses :class:`~messagefoundry.api.phi_gate.PhiGatedModel`
+and declares it in ``phi_gated_properties``: the property is then withheld from JSON until
+:func:`~messagefoundry.api.field_authz.redact_unauthorized` releases what the caller may see, so a
+route that forgets that call denies rather than exposes (BACKLOG #1045). Which permission unlocks
+which property stays in :mod:`messagefoundry.api.field_authz`; the two are pinned to each other by
+``tests/test_field_authz_fail_closed.py``.
 """
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
+from messagefoundry.api.phi_gate import PhiGatedModel
 from messagefoundry.config.ai_policy import (
     AiDataScope,
     AiMode,
@@ -31,7 +39,11 @@ class ChannelInfo(BaseModel):
     destinations: list[str]
 
 
-class MessageSummary(BaseModel):
+class MessageSummary(PhiGatedModel):
+    # Withheld from JSON until released (BACKLOG #1045). MessageDetail INHERITS this declaration,
+    # which is deliberate: a future subclass of a PHI-bearing model is gated by default.
+    phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"summary", "error", "metadata"})
+
     id: str
     channel_id: str
     received_at: float
@@ -67,7 +79,9 @@ class MessageSearchResults(BaseModel):
     scan_limit: int
 
 
-class OutboxInfo(BaseModel):
+class OutboxInfo(PhiGatedModel):
+    phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"last_error"})
+
     id: str
     destination_name: str
     status: str
@@ -76,7 +90,9 @@ class OutboxInfo(BaseModel):
     last_error: str | None
 
 
-class EventInfo(BaseModel):
+class EventInfo(PhiGatedModel):
+    phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"detail"})
+
     ts: float
     event: str
     destination: str | None
@@ -107,10 +123,12 @@ class MessageDetail(MessageSummary):
     attachments: list[AttachmentInfo] = Field(default_factory=list)
 
 
-class CapturedResponseInfo(BaseModel):
+class CapturedResponseInfo(PhiGatedModel):
     """One captured request/response reply (ADR 0013). ``outcome``/``detail`` are visible with the
     message-read permission; ``body`` is PHI and populated only when the caller also holds the raw-body
     permission (``None`` otherwise, and ``None`` once retention has purged it)."""
+
+    phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"detail"})
 
     destination_name: str
     response_seq: int
@@ -213,8 +231,10 @@ class PurgeResult(BaseModel):
     cancelled: int
 
 
-class DeadLetterRow(BaseModel):
+class DeadLetterRow(PhiGatedModel):
     """One dead-lettered delivery (a message→destination that exhausted its retries)."""
+
+    phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"summary", "last_error"})
 
     outbox_id: str
     message_id: str

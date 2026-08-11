@@ -190,6 +190,13 @@ if ($rows.Count -eq 0) {
 
 Write-Host ""
 Write-Host "Live Claude sessions in this repo ($($rows.Count)):"
+# NAME EVERY COLUMN (BACKLOG #1098). The leading token is an 8-hex REGISTRY SESSION ID and reads exactly
+# like an abbreviated commit SHA: session-context.ps1's banner, which points readers here, prints a real
+# one in the same shape (`git worktree list` = path, sha, branch). Unlabelled, a reader resolves it
+# against git and gets an error at best, the wrong tree if the prefix happens to resolve. A header row
+# rather than a per-row word because this is a fixed-width table -- the header governs every row, which
+# is the property the item asks for.
+Write-Host ("  {0,-8} {1,-7} {2,-34} {3}" -f "sess-id", "surface", "worktree", "branch")
 foreach ($r in $rows) {
     $me = if ($r.IsSelf) { "  <-- THIS session" } else { "" }
     $warn = if ($r.IsPrimary -and -not $r.IsSelf) { "  [in the SHARED PRIMARY]" } else { "" }

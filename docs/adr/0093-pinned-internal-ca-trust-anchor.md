@@ -25,8 +25,9 @@ built here. A prior design pass plus a security-critic review settled the split;
    PHI-plane surface already carries integrity: outbound bodies via ADR 0018, the audit log via the
    #899 HMAC hash-chain, at-rest data via GCM AEAD. #190's JWS ask was a *runbook decision* (does the
    exposure runbook mandate it), not new engine code — there is nothing to build.
-3. **SCOPE OUT — ECH (Encrypted Client Hello) for outbound SNI.** Empirically **not buildable** under
-   the project constraints (see *Decision* below). Recorded as a documented risk acceptance.
+3. **SCOPE OUT — ECH (Encrypted Client Hello) for outbound SNI.** Recorded as a documented risk
+   acceptance. The *ground* offered here — "empirically not buildable" — was **refuted nine days
+   later** and is corrected in §3 of *Decision*; the scope-out itself stands, on a different premise.
 
 ## Decision
 
@@ -101,7 +102,22 @@ exposure **runbook** mandates it — a documentation decision, not engine work. 
 no code is owed. Integrity on every PHI-plane surface is already present (bodies = ADR 0018; audit =
 #899 HMAC chain; at-rest = GCM AEAD), so this is not an integrity gap.
 
-### 3. ECH for outbound SNI (scope out — infeasible)
+### 3. ECH for outbound SNI (scope out — no beneficiary, not infeasibility)
+
+> **CORRECTION 2026-08-10 (BACKLOG #1011). The third bullet below is REFUTED; the scope-out stands on
+> other ground.** Nine days after this ADR was accepted,
+> [ADR 0139](0139-ech-egress-sidecar-sni-hiding-for-asvs-12-1-5-demand-gated.md) established that ECH
+> **is** buildable off-stdlib (Go `crypto/tls`, rustls, sing-box), and a stdlib-only Go re-originator
+> doing exactly this was then written in this repository and observed hiding the SNI against a real
+> ECH endpoint — no third-party *Python* TLS stack, and no new dependency on a security-core path.
+> What survives is the first bullet: CPython's stdlib cannot originate ECH, because it is an OpenSSL
+> 4.0 feature. **The operative reason nothing is built is that it would hide nothing** — a 2026-07-20
+> DoH probe found no partner endpoint publishing an `ECHConfig`. Same accepted residual; a premise
+> that survives inspection. Current statement of record: [`docs/SECURITY.md`](../SECURITY.md) (12.1.5)
+> and ADR 0139's *Disposition*.
+>
+> The original text is kept below **as authored** — it records what was believed on 2026-07-11 and is
+> the reason this correction exists. Read it as history, not as the current ground.
 
 ECH (Encrypted Client Hello) would hide the destination hostname (partner/EHR identity) in the outbound
 TLS ClientHello SNI. It is **not buildable** under the project's constraints, empirically:
@@ -118,6 +134,10 @@ Recorded as a **documented risk acceptance** (12.1.5): the destination SNI is vi
 handshake. Compensating context: on-prem deployment on a trusted network segment; the destination is
 already an operator-configured, `[egress]`-allowlisted host; and TLS still protects the payload. Re-open
 when the stdlib gains a first-class ECH API (no new dep) **and** an SVCB/HTTPS resolver is in scope.
+
+*(End of the 2026-07-11 text. Per the correction above, the re-open trigger is now the one ADR 0139
+records — **a destination begins publishing an `ECHConfig`** — which fires before, and independently
+of, anything CPython ships.)*
 
 ## Consequences
 

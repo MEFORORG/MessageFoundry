@@ -21,12 +21,12 @@ leaving ``/status`` enough acquire slack to answer within the poll timeout.
 from __future__ import annotations
 
 import os
-import socket
 
 import pytest
 
 from harness.load.connscale.profile import load_connscale_profile_text
 from harness.load.connscale.runner import run_connscale
+from tests._connscale_ports import reserve_api_and_sink_bases
 
 pytestmark = [
     pytest.mark.skipif(
@@ -35,16 +35,6 @@ pytestmark = [
     ),
     pytest.mark.timeout(300),
 ]
-
-
-def _free_port() -> int:
-    s = socket.socket()
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("127.0.0.1", 0))
-    try:
-        return int(s.getsockname()[1])
-    finally:
-        s.close()
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
@@ -82,12 +72,14 @@ corpus_count_per_trigger = 5
 zero_loss = true
 """)
 
-    # Draw the sink port FIRST, then the API base — same safe order as the SQLite smoke. The runner
-    # uses ``engine_api_port_base + step`` per sweep step, and back-to-back ephemeral allocations are
-    # adjacent (X, X+1); drawing the sink first keeps it BELOW the whole API block, so step 1's API
-    # port (api_base+1) can never land on the sink port (the deterministic-on-Windows 10048 collision).
-    sink_port = _free_port()
-    api_port = _free_port()
+    # Reserve the WHOLE API and sink ranges, not just their bases (BACKLOG #1103). The runner binds
+    # ``engine_api_port_base + step`` for every sweep step, so a single ephemeral probe verified one
+    # port and assumed the rest. The ordering trick this replaced -- draw the sink first so the API
+    # block increments away from it -- only ever separated these two families from EACH OTHER, and
+    # only because back-to-back ephemeral draws happen to be adjacent; it said nothing about the rest
+    # of the machine. The families now come from disjoint windows below the OS ephemeral floors and
+    # every port in both ranges is probed.
+    api_port, sink_port = reserve_api_and_sink_bases(profile, sink_ports=1)
     report = await run_connscale(
         profile,  # type: ignore[arg-type]
         engine_api_port_base=api_port,

@@ -135,6 +135,8 @@ __all__ = [
     "load_config",
     "validate_config",
     "accepted_cleartext_hops",
+    "expiry_relaxed_hops",
+    "unverified_generic_db_hops",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -319,6 +321,7 @@ def DatabaseRef(
     app_name: str = "messagefoundry",
     odbc_driver: str = "ODBC Driver 18 for SQL Server",
     pool_max: int = 5,
+    acquire_timeout: float = 30.0,  # cap this source's pooled-connection borrow (s) — BACKLOG #1052
 ) -> ReferenceSourceSpec:
     """A reference **source** backed by a SQL query (ADR 0006 increment 2; SQL Server via the
     ``[sqlserver]`` extra + ODBC Driver 18 — **production / supported**, like the DATABASE connector).
@@ -328,7 +331,12 @@ def DatabaseRef(
     column's value, else the value is a dict of the remaining columns (the multi-column ``code_set``
     shape). Put secrets (``password``) in :func:`env`. TLS is on by default; weakening it needs
     ``MEFOR_ALLOW_INSECURE_TLS``. The dial-out is gated by the **fail-closed** ``[egress].allowed_db``
-    allowlist, exactly like a DATABASE poll source — point the engine only at allowed hosts."""
+    allowlist, exactly like a DATABASE poll source — point the engine only at allowed hosts.
+
+    ``acquire_timeout`` bounds the borrow from this source's throwaway pool (default 30 s, matching
+    the DATABASE connector and ``[store].acquire_timeout``). On expiry the set's sync fails, the
+    last-good snapshot stays active and the AlertSink fires — the runner syncs sets sequentially, so
+    the bound is what stops one unresponsive server from stalling every other set's refresh."""
     return ReferenceSourceSpec(
         "database",
         {
@@ -347,6 +355,7 @@ def DatabaseRef(
             "app_name": app_name,
             "odbc_driver": odbc_driver,
             "pool_max": pool_max,
+            "acquire_timeout": acquire_timeout,
         },
     )
 
@@ -873,6 +882,50 @@ def connector_secret_env_values(
     return out
 
 
+#: Settings whose value is a URL that may carry `user:password@` userinfo. `proxy` has no `_url`
+#: suffix, which is why this is a NAME set plus a suffix rule rather than a suffix rule alone.
+_URL_SETTING_SUFFIXES = ("url", "_url", "_uri", "endpoint", "_endpoint")
+
+
+def _mask_url_userinfo(value: object) -> object:
+    """Replace the PASSWORD half of a URL's userinfo with ``***``, keeping everything else readable.
+
+    BACKLOG #1207. ``url="https://user:SECRET@host/path"`` was returned verbatim by both serializers
+    while ``proxy_password`` on the SAME object masked -- the credential was safe in the typed field
+    and disclosed in the URL beside it.
+
+    The user half and the host and path are PRESERVED deliberately: an operator diagnosing a
+    connection needs to see which account and which host, and masking the whole URL would destroy the
+    view rather than protect it. Only the secret is removed.
+    """
+    if not isinstance(value, str) or "@" not in value or "//" not in value:
+        return value
+    scheme, _, rest = value.partition("//")
+    userinfo, at, hostpart = rest.rpartition("@")
+    if not at or ":" not in userinfo:
+        return value  # no userinfo, or a user with no password -- nothing secret to remove
+    user, _, _pw = userinfo.partition(":")
+    return f"{scheme}//{user}:***@{hostpart}"
+
+
+def _redact_header_value(name: str, value: object) -> object:
+    """One header's value, scrubbed. Handles the ``EnvRef`` case the headers branch used to miss.
+
+    BACKLOG #1207. The headers branch had no ``EnvRef`` arm, so an ``env()`` ref inside a headers
+    table came back as the RAW OBJECT -- not JSON-safe, and carrying its ``default`` intact. The same
+    ``env()`` on a top-level credential correctly emits ``{"env": key}`` with the default dropped, so
+    the hole was INSIDE the one container this control claims to handle.
+
+    THE DEFAULT IS DROPPED FOR EVERY HEADER, not only credential-shaped ones. A header value sourced
+    from ``env()`` is a credential by intent -- nobody env-refs a ``Content-Type`` -- so the name
+    heuristic is the wrong gate here, and it is exactly the gate that failed: the measured instance
+    used ``X-Vendor-Thing``, which matches no substring rule.
+    """
+    if isinstance(value, EnvRef):
+        return {"env": value.key}
+    return "***" if _is_secret_header(name, value) else value
+
+
 def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     """A JSON-safe, secret-scrubbed view of a connection's settings for the API ``/metadata`` endpoint:
     each EnvRef becomes ``{"env": key}`` (the value is never resolved — only the key is shown), a
@@ -889,8 +942,11 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
             out[name] = ref
         elif is_secret:
             out[name] = "***"
+        elif isinstance(value, str) and name.lower().endswith(_URL_SETTING_SUFFIXES):
+            # BACKLOG #1207 -- a credential in URL userinfo, masked without destroying the view.
+            out[name] = _mask_url_userinfo(value)
         elif name == "headers" and isinstance(value, dict):
-            out[name] = {k: ("***" if _is_secret_header(k, v) else v) for k, v in value.items()}
+            out[name] = {k: _redact_header_value(k, v) for k, v in value.items()}
         elif name == "odbc_params" and isinstance(value, dict):
             # BACKLOG #1206. This bag is documented as carrying "only static driver keywords", and the
             # redactor honoured that by not descending -- so a credential inside it was served verbatim
@@ -3506,6 +3562,110 @@ def accepted_cleartext_hops(registry: Registry) -> list[tuple[str, str]]:
         if spec.settings.get("cleartext_accepted"):
             reason = spec.settings.get("cleartext_reason")
             out.append((f"fhir_lookup:{spec.name}", str(reason) if reason else "(none recorded)"))
+    return sorted(out)
+
+
+def _peer_label(settings: Mapping[str, Any]) -> str:
+    """A readable, secret-free peer address for a connection's settings — the ``url`` if it has one,
+    else ``host``/``server`` with its ``port``, else ``"(unknown peer)"``.
+
+    Three keys because the connectors genuinely use three: ``url`` (Rest/FHIR/Soap), ``host``
+    (MLLP/DICOM/Ftp) and ``server`` (Database, which is also the ``[egress].allowed_db`` allowlist key).
+
+    An unresolved :class:`EnvRef` renders as ``env(<key>)``: the KEY, never the value, because these
+    labels land in a posture report and a resolved value can be a credentialed URL. A resolved ``url``
+    is passed through :func:`_mask_url_userinfo` for the same reason — the password half of
+    ``https://user:SECRET@host/`` must not ride into ``GET /security/posture``."""
+
+    def one(value: object) -> str | None:
+        if isinstance(value, EnvRef):
+            return f"env({value.key})"
+        return str(_mask_url_userinfo(value)) if value else None
+
+    url = one(settings.get("url"))
+    if url:
+        return url
+    host = one(settings.get("host")) or one(settings.get("server"))
+    if not host:
+        return "(unknown peer)"
+    port = one(settings.get("port"))
+    return f"{host}:{port}" if port else host
+
+
+def expiry_relaxed_hops(registry: Registry) -> list[tuple[str, str]]:
+    """Every OUTBOUND connection that declares ``tls_allow_expired``, as ``(name, peer)`` (#129 /
+    ADR 0094, surfaced by #333).
+
+    The sibling of :func:`accepted_cleartext_hops`, and the same contract: the SINGLE reader, so
+    ``messagefoundry check``, ``security_loosenings()`` and ``GET /security/posture`` can never report
+    different sets. Sorted by connection name for a stable, diffable list.
+
+    The flag lands in the connection's ``spec.settings`` dict (the six outbound factories that take it
+    — ``MLLP``/``Rest``/``FHIR``/``DICOM``/``Soap``/``Ftp``) rather than in a typed
+    ``OutboundConnection`` field like ``cleartext_accepted``, so this reads the dict.
+
+    **Outbound only, and that is a fact about the graph rather than a scoping choice.** ``FhirLookup``
+    exposes ``verify_tls`` but no ``tls_allow_expired``, and no inbound factory takes it (an inbound
+    verifies a CLIENT cert, which is a different question). Said here explicitly so that ADDING the
+    parameter to a lookup or an inbound later cannot silently escape this reader: whoever adds it must
+    extend this function, exactly as ``accepted_cleartext_hops`` had to grow its ``fhir_lookups`` arm.
+
+    Pure — it reads the loaded graph and touches nothing else."""
+    return sorted(
+        (oc.name, _peer_label(oc.spec.settings))
+        for oc in registry.outbound.values()
+        if oc.spec.settings.get("tls_allow_expired")
+    )
+
+
+def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
+    """Every generic-ODBC ``DATABASE`` connection whose ``odbc_params`` leave TLS unenforced, as
+    ``(name, reason)`` (#66 / ADR 0092 amendment, surfaced by #333).
+
+    On ``dialect='generic'`` MessageFoundry cannot introspect an arbitrary driver's TLS posture, so the
+    posture-keyed weakened-TLS refusal does not apply and TLS is delegated to the operator's own driver
+    keyword. ADR 0092 accepted that exemption on the strength of ONE mitigation — construction logs it —
+    and a log line emitted once at startup is not the surface anyone queries three months later. This is
+    that surface.
+
+    It walks **both** connection tables, unlike :func:`accepted_cleartext_hops`: a ``DatabasePoll``
+    inbound crosses the same hop in the same dialect with the same credential in the same DSN, so
+    reading only ``outbound`` would report a live unenforced hop as absent. Inbound names are prefixed
+    ``inbound:`` because the two tables are separate namespaces and a name could otherwise collide.
+
+    ``registry.lookups`` is deliberately NOT walked, and the reason is a property of the code rather
+    than a scoping choice: neither ``DatabaseLookup`` nor ``DatabaseRef`` takes a ``dialect`` or
+    ``odbc_params`` parameter, and the ADR 0010 read executor calls ``_build_dsn`` directly, so a live
+    lookup is SQL-Server-only and keeps that preset's posture-keyed refusal. Stated here so that giving
+    a lookup the generic dialect later cannot silently escape this reader — whoever adds it must extend
+    this function.
+
+    The classification is :func:`~messagefoundry.transports.database.generic_odbc_tls_unenforced` — the
+    same predicate the construction WARNING uses, imported here rather than restated, so this reader and
+    that log line can never disagree. Imported lazily inside the function: ``config`` must not take a
+    module-import dependency on ``transports`` (the one-way rule), and this reader runs on operator
+    surfaces, never on the hot path.
+
+    Pure — it reads the loaded graph and touches nothing else."""
+    from messagefoundry.transports.database import generic_odbc_tls_unenforced
+
+    def unenforced(settings: Mapping[str, Any]) -> str | None:
+        if str(settings.get("dialect", "sqlserver")).lower() != "generic":
+            return None
+        params = settings.get("odbc_params") or {}
+        return generic_odbc_tls_unenforced(params) if isinstance(params, Mapping) else None
+
+    out: list[tuple[str, str]] = []
+    for label, table in (
+        ("", registry.outbound),
+        ("inbound:", registry.inbound),
+    ):
+        for conn in table.values():
+            if conn.spec.type is not ConnectorType.DATABASE:
+                continue
+            reason = unenforced(conn.spec.settings)
+            if reason is not None:
+                out.append((f"{label}{conn.name}", f"{reason} ({_peer_label(conn.spec.settings)})"))
     return sorted(out)
 
 

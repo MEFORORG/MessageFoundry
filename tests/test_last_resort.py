@@ -2,23 +2,28 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """WP-L3-19: process-level last-resort error handling (ASVS 16.5.4).
 
-Verifies the asyncio loop handler + sys.excepthook route an otherwise-unhandled exception through
-``safe_exc`` (PHI-redacted, type-preserving) → the log, and that a framed listener (MLLP) survives a
-handler that raises — the error is logged redacted, the connection drops, the server stays up.
+Verifies the asyncio loop handler + sys.excepthook + threading.excepthook route an otherwise-unhandled
+exception through ``safe_exc`` (PHI-redacted, type-preserving) → the log, and that a framed listener
+(MLLP) survives a handler that raises — the error is logged redacted, the connection drops, the server
+stays up.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+from collections.abc import Iterator
 
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.last_resort import (
     _excepthook,
+    _thread_excepthook,
     install_excepthook,
     install_loop_exception_handler,
+    install_thread_excepthook,
 )
 from messagefoundry.transports.mllp import MLLPSource, frame
 
@@ -74,6 +79,74 @@ def test_install_excepthook_sets_sys_hook() -> None:
         assert sys.excepthook is _excepthook
     finally:
         sys.excepthook = original
+
+
+# --- threading.excepthook (BACKLOG #1055) -------------------------------------
+# sys.excepthook covers the MAIN thread only; an exception escaping any other thread's run() goes to
+# threading.excepthook and nowhere else. The engine's concrete case is the sandbox session's raw
+# stdout-reader daemon, whose except clause catches only OSError by design.
+
+
+@pytest.fixture
+def _restore_thread_excepthook() -> Iterator[None]:
+    original = threading.excepthook
+    try:
+        yield
+    finally:
+        threading.excepthook = original
+
+
+def test_thread_excepthook_redacts_an_exception_escaping_a_real_thread(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    _restore_thread_excepthook: None,
+) -> None:
+    """The end-to-end shape: a live thread raises, the interpreter dispatches to the hook."""
+    install_thread_excepthook()
+
+    def boom() -> None:
+        raise ValueError(PHI)  # a non-OSError escaping run() — what the reader loop does not catch
+
+    with caplog.at_level(logging.CRITICAL):
+        worker = threading.Thread(target=boom, name="mefor-sandbox-reader")
+        worker.start()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "uncaught exception in thread" in logged
+    assert "mefor-sandbox-reader" in logged  # which thread died stays diagnosable
+    assert "ValueError" in logged  # ...and so does the type
+    assert "DOE" not in logged and "JANE" not in logged  # PHI redacted by safe_exc
+
+    # The stdlib default would have printed a raw traceback quoting the exception's argument straight
+    # to stderr, bypassing the handler filter chain entirely. Nothing reaches stderr now.
+    captured = capsys.readouterr()
+    assert "DOE" not in captured.err and "JANE" not in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_thread_excepthook_ignores_system_exit(caplog: pytest.LogCaptureFixture) -> None:
+    # Parity with the stdlib default, which silently ignores SystemExit: a thread calling sys.exit()
+    # is a clean exit, and reporting it as a CRITICAL last-resort error would be a false alarm.
+    exc = SystemExit(0)
+    with caplog.at_level(logging.CRITICAL):
+        _thread_excepthook(
+            threading.ExceptHookArgs((SystemExit, exc, None, threading.current_thread()))
+        )
+    assert not caplog.records
+
+
+def test_thread_excepthook_tolerates_a_missing_exc_value(caplog: pytest.LogCaptureFixture) -> None:
+    # threading.ExceptHookArgs types exc_value as optional; the hook must not raise inside the hook.
+    with caplog.at_level(logging.CRITICAL):
+        _thread_excepthook(threading.ExceptHookArgs((ValueError, None, None, None)))
+    assert not caplog.records
+
+
+def test_install_thread_excepthook_sets_hook(_restore_thread_excepthook: None) -> None:
+    install_thread_excepthook()
+    assert threading.excepthook is _thread_excepthook
 
 
 async def test_mllp_handler_exception_is_caught_and_redacted(

@@ -18,82 +18,28 @@ A small N (12 → 24) keeps it inside the pytest-timeout budget; the shipped ``c
 
 from __future__ import annotations
 
-import random
-import socket
 import sys
 
 import pytest
 
 from harness.load.connscale.profile import load_connscale_profile_text
 from harness.load.connscale.runner import run_connscale
+from tests._connscale_ports import (
+    INBOUND_PORT_HI,
+    INBOUND_PORT_LO,
+    require_contiguous,
+    reserve_api_and_sink_bases,
+    reserve_contiguous_ports,
+)
 
 pytestmark = pytest.mark.timeout(120)  # the per-test 60s default is too tight for two engine spawns
 
 # The connection-count sweep; its max sets the contiguous inbound-port width (BACKLOG #1014).
 _SMOKE_COUNTS = (12, 24)
 
-# Contiguous inbound-port window for the random anchor (BACKLOG #1014). Both bounds are
-# chosen to keep the block clear of ports OTHER tests bind, so a concurrent worktree's
-# connscale block cannot land on a sibling's fixed listener:
-#   - LOWER bound sits ABOVE the sibling fixed-port MLLP band. Sibling tests bind fixed
-#     inbound ports in the 11xxx-19xxx range (e.g. 15099, 19601); anchoring at 20000+ keeps
-#     the connscale block entirely above them. [20000,30000) is empty of fixed test binds.
-#   - UPPER bound stays BELOW the OS ephemeral floors (Linux 32768+, Windows/macOS 49152+)
-#     so a kernel-assigned ephemeral port -- the sink/API ports from _free_port(), or any
-#     unrelated connection -- can never land inside the block after it is probed.
-# The upper bound is exclusive.
-_INBOUND_PORT_LO = 20000
-_INBOUND_PORT_HI = 30000
-
-
-def _free_port() -> int:
-    s = socket.socket()
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("127.0.0.1", 0))
-    try:
-        return int(s.getsockname()[1])
-    finally:
-        s.close()
-
-
-def _free_contiguous_ports(n: int, *, tries: int = 200) -> list[int]:
-    """Reserve ``n`` contiguous free inbound ports anchored at a RANDOM base.
-
-    The random anchor is the concurrency fix (BACKLOG #1014): it de-correlates worktrees so
-    two suites rarely pick overlapping blocks. The old fixed ``base_port = 41000`` guaranteed
-    a collision whenever two checkouts ran the suite at once. Probe/bind-and-release only holds
-    the block momentarily, so it cannot truly reserve it against a concurrent engine -- the
-    random anchor over a wide window is the real defense, and a genuine future collision now
-    surfaces as a RED rather than a masked retry.
-    """
-    if _INBOUND_PORT_HI - n <= _INBOUND_PORT_LO:
-        raise RuntimeError(
-            f"cannot reserve {n} contiguous ports in [{_INBOUND_PORT_LO},{_INBOUND_PORT_HI})"
-        )
-    for _ in range(tries):
-        base = random.randint(_INBOUND_PORT_LO, _INBOUND_PORT_HI - n)
-        socks: list[socket.socket] = []
-        try:
-            for i in range(n):
-                s = socket.socket()
-                # No SO_REUSEADDR on purpose: honest free-detection. A live listener must make
-                # bind FAIL here, unlike SO_REUSEADDR's Windows steal semantics. The block is
-                # released before the engine binds, so REUSEADDR would only add false-frees.
-                try:
-                    s.bind(("127.0.0.1", base + i))
-                except OSError:
-                    s.close()
-                    break
-                socks.append(s)
-            if len(socks) == n:
-                return list(range(base, base + n))
-        finally:
-            for sock in socks:
-                sock.close()
-    raise RuntimeError(
-        f"could not reserve {n} contiguous free ports in "
-        f"[{_INBOUND_PORT_LO},{_INBOUND_PORT_HI}) after {tries} tries"
-    )
+# The three port families this run consumes -- inbound, API and sink -- are all reserved as whole
+# contiguous ranges by tests/_connscale_ports.py, which is where the windows and the rationale for
+# them live (BACKLOG #1014 for the inbound family, #1103 for the other two).
 
 
 def _smoke_profile(base_port: int) -> object:
@@ -124,20 +70,24 @@ empty_claims_monotonic = true
 
 
 async def test_connscale_smoke_end_to_end() -> None:
-    # Dynamically reserve a contiguous inbound-port block (BACKLOG #1014). The sweep's max
-    # connection count needs that many contiguous inbound ports, and the engine binds
-    # base_port + i for each. A RANDOM anchor de-correlates concurrent worktrees so they no
-    # longer contend for one fixed block; contiguity is asserted at the acquisition site, and
-    # the allocator fails loudly if no free block can be found (never a silent fixed fallback).
-    # The sink/API ports stay ephemeral (above the inbound window) and won't hit the block.
-    inbound_ports = _free_contiguous_ports(max(_SMOKE_COUNTS))
-    assert inbound_ports == list(range(inbound_ports[0], inbound_ports[0] + max(_SMOKE_COUNTS))), (
-        inbound_ports
+    # Reserve a contiguous inbound-port block (BACKLOG #1014). The sweep's max connection count
+    # needs that many contiguous inbound ports, and the engine binds base_port + i for each. A
+    # RANDOM anchor de-correlates concurrent worktrees so they no longer contend for one fixed
+    # block; contiguity is asserted at the acquisition site, and the allocator fails loudly if no
+    # free block can be found (never a silent fixed fallback).
+    inbound_ports = reserve_contiguous_ports(
+        max(_SMOKE_COUNTS), lo=INBOUND_PORT_LO, hi=INBOUND_PORT_HI
     )
-    base_port = inbound_ports[0]
-    sink_port = _free_port()
-    api_port = _free_port()
+    base_port = require_contiguous(inbound_ports, max(_SMOKE_COUNTS), "inbound")
     profile = _smoke_profile(base_port)
+
+    # ... and reserve the API and sink RANGES the same way (BACKLOG #1103). Both are derived by
+    # increment from their base -- the runner binds api_port + step for EVERY sweep step, the sink
+    # binds sink_port + i for every sink port -- so reserving only the base, as this test used to,
+    # left every port after the first merely assumed free. Two CI reds came of that assumption, on
+    # PRs that could not reach this code at all. All three families now come from disjoint windows
+    # below the OS ephemeral floors, so the kernel cannot hand one out after it is probed.
+    api_port, sink_port = reserve_api_and_sink_bases(profile, sink_ports=1)  # type: ignore[arg-type]
 
     report = await run_connscale(
         profile,  # type: ignore[arg-type]
@@ -212,27 +162,6 @@ def test_fd_sampler_reads_self() -> None:
     assert dead is None
 
 
-def test_free_contiguous_ports_are_contiguous_and_in_window() -> None:
-    # The allocator returns exactly n ascending, contiguous ports inside the window. It
-    # deliberately does NOT re-bind to "prove free" -- that is TOCTOU-racy and would reintroduce
-    # the exact flake class BACKLOG #1014 removes.
-    ports = _free_contiguous_ports(8)
-    assert len(ports) == 8
-    assert ports == list(range(ports[0], ports[0] + 8))
-    assert ports[0] >= _INBOUND_PORT_LO
-    assert ports[-1] < _INBOUND_PORT_HI
-
-
-def test_free_contiguous_ports_fails_loud_when_unsatisfiable() -> None:
-    # tries=0 hits the post-loop exhaustion branch deterministically (without occupying the
-    # whole window) and must raise -- never fall back silently to a fixed port (BACKLOG #1014).
-    with pytest.raises(RuntimeError, match="could not reserve"):
-        _free_contiguous_ports(8, tries=0)
-
-
-def test_free_contiguous_ports_fails_loud_when_window_too_narrow() -> None:
-    # The width guard fires BEFORE any probing when the requested block cannot fit the window
-    # at all: asking for one more port than the window holds can never be satisfied, so it
-    # raises up front rather than looping (BACKLOG #1014 -- fail loud, never a silent fallback).
-    with pytest.raises(RuntimeError, match="cannot reserve"):
-        _free_contiguous_ports(_INBOUND_PORT_HI - _INBOUND_PORT_LO + 1)
+# The port-allocator's own guards (contiguity, fail-loud exhaustion, the too-narrow window, and
+# #1103's "every port the sweep will use was reserved") live in tests/test_connscale_ports.py,
+# beside the allocator they cover.

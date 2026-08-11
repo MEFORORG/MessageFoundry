@@ -200,7 +200,10 @@ def test_generic_dsn_warns_when_no_tls_keyword(caplog: pytest.LogCaptureFixture)
 
 
 def test_generic_dsn_no_warn_when_tls_keyword_present(caplog: pytest.LogCaptureFixture) -> None:
-    # An operator who set a TLS keyword (SSLmode) has taken ownership → no WARNING (DEBUG only).
+    # An operator who set a TLS keyword AT A VERIFYING VALUE has taken ownership → no WARNING (DEBUG).
+    # The other half of the pair is below: a TLS keyword at a NO-TLS value must still WARN. Before #333
+    # the detector matched the regex against KEYS ONLY, so this test passed for `disable` too — which is
+    # why the pair, not this test alone, is the control.
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
         _build_odbc_dsn(
             {
@@ -210,6 +213,44 @@ def test_generic_dsn_no_warn_when_tls_keyword_present(caplog: pytest.LogCaptureF
             }
         )
     assert not any("TLS verification is NOT enforced" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("SSLmode", "disable"),  # psqlODBC: explicit NO TLS
+        ("SSLmode", "allow"),  # psqlODBC: plaintext first, TLS only on refusal
+        ("SSLmode", "prefer"),  # psqlODBC: opportunistic, silently falls back to plaintext
+        ("SSLMODE", "DISABLED"),  # MySQL Connector/ODBC
+        ("SSLMODE", "PREFERRED"),  # MySQL Connector/ODBC: opportunistic
+        ("Encrypt", "no"),
+        ("Encrypt", "0"),
+        ("Encrypt", "false"),
+        ("Encrypt", "  Off  "),  # value classification tolerates case + surrounding whitespace
+    ],
+)
+def test_generic_dsn_warns_when_tls_keyword_is_at_a_no_tls_value(
+    key: str, value: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#333 step 1 — the detector must read the VALUE, not just the key.
+
+    ``_ODBC_TLS_HINT_RE`` matched against ``params`` KEYS only, so ``odbc_params={"SSLmode": "disable"}``
+    — psqlODBC's explicit *no TLS* spelling — was read as "the operator has taken TLS ownership" and the
+    reminder dropped to DEBUG. That is the worst real case reported as the quiet one, and every surface
+    built on top of it inherits the false negative."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        _build_odbc_dsn(
+            {
+                "odbc_driver": "PostgreSQL Unicode",
+                "server": "db.example",
+                "odbc_params": {key: value},
+            }
+        )
+    warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("TLS verification is NOT enforced" in m for m in warned), warned
+    # It must name the offending keyword AND its value: "a TLS keyword is set to a no-TLS value" is not
+    # actionable when several are set, and the remedy is per-keyword.
+    assert any(f"{key}={value.strip()}" in m for m in warned), warned
 
 
 def test_build_odbc_dsn_custom_credential_keywords() -> None:
@@ -279,6 +320,50 @@ def test_generic_destination_builds_without_database() -> None:
     assert isinstance(d, DatabaseDestination)
     assert d._dialect == "generic"
     assert d._weakened_tls is False  # generic never crosses the weakened-TLS machinery
+
+
+def test_generic_destination_warning_names_the_connection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#333 step 2 — with several generic DB connections an anonymous line is not actionable."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        build_destination(
+            Destination(
+                name="OB_DB_GEN",
+                type=ConnectorType.DATABASE,
+                settings=Database(
+                    server="db.example",
+                    dialect="generic",
+                    odbc_driver="PostgreSQL Unicode",
+                    statement=INSERT,
+                    odbc_params={"SSLmode": "disable"},
+                ).settings,
+            )
+        )
+    warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("'OB_DB_GEN'" in m and "SSLmode=disable" in m for m in warned), warned
+
+
+def test_generic_source_warning_names_the_connection(caplog: pytest.LogCaptureFixture) -> None:
+    """The inbound half. `Source` carries no name of its own until the runner fills it (#333), so this
+    also pins that the model field exists and reaches the connector — without it the poll link would
+    warn anonymously while the destination named itself, which is the drift that makes a report
+    untrustworthy."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        build_source(
+            Source(
+                name="IB_DB_GEN",
+                type=ConnectorType.DATABASE,
+                settings=DatabasePoll(
+                    server="db.example",
+                    dialect="generic",
+                    odbc_driver="PostgreSQL Unicode",
+                    poll_statement="SELECT 1",
+                ).settings,
+            )
+        )
+    warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("'IB_DB_GEN'" in m and "no TLS keyword" in m for m in warned), warned
 
 
 def test_sqlserver_destination_still_requires_database() -> None:

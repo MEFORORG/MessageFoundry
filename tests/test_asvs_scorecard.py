@@ -13,28 +13,47 @@ while the vault runs the same code against the real posture data.
 from __future__ import annotations
 
 import json
+import os
+import re
+import subprocess
+import time
 from pathlib import Path
+from typing import Any, get_args
 
 import pytest
 
 from scripts.asvs.scorecard import (
+    _DESCEND_ONLY,
+    _TRANSPARENT,
+    VERDICT_ORDER,
+    VERDICTS,
     Absence,
     Anchor,
     Cell,
     Findings,
     ScorecardError,
+    Verdict,
     _copy_scratch,
+    _humanise_age,
+    anchor_form,
     check_absences,
     check_anchors,
     check_completeness,
     check_pinning,
     corpus_digest,
     count,
+    derive_sym_ctx,
+    form_summary,
     load_corpus,
     load_scorecard,
     main,
+    malformed_sym_ctx,
     prove_absences,
+    provenance_lines,
     render_current,
+    repo_stamp,
+    status_lines,
+    verdict_breakdown,
     verify,
 )
 
@@ -120,6 +139,135 @@ def test_count_is_derived_from_the_cells() -> None:
     n = count(cells)
     assert (n["pass"], n["partial"], n["unverified"]) == (1, 1, 1)
     assert sum(n.values()) == len(cells)
+
+
+# --- the printed distribution reconciles against its own total (BACKLOG #1012) --------------------
+#
+# The gate's summary line enumerated FIVE verdict states and stated a total that counted SIX states'
+# worth of cells: 344 components against a stated 345, with `needs-review` omitted. Nothing compared
+# the two numbers, so the line could not be reconciled against itself, and it is the line people quote.
+# These pin the three properties that make the class unrepeatable: the enumeration is derived from the
+# type, every state is printed, and the components are checked against the population before printing.
+
+
+def test_the_verdict_enumeration_is_the_type_and_not_a_second_list() -> None:
+    """`VERDICT_ORDER` is what every breakdown walks. If it were retyped beside `Verdict`, a state
+    added to one and not the other is exactly #1012 again -- so it is derived, and this says so.
+
+    Falsified by replacing the `get_args(Verdict)` derivation with a hand-written tuple missing
+    `needs-review`: this goes RED on the set comparison. Restored.
+    """
+    assert set(VERDICT_ORDER) == set(get_args(Verdict))
+    assert set(VERDICT_ORDER) == set(VERDICTS)
+    assert len(VERDICT_ORDER) == len(set(VERDICT_ORDER))  # order, so no state can appear twice
+    assert "needs-review" in VERDICT_ORDER  # the state that vanished
+
+
+def test_the_breakdown_carries_every_state_and_closes_to_the_cell_count() -> None:
+    """One cell per state, so a dropped state is a dropped 1 -- and the parts must sum to 6."""
+    cells = _cells(*((f"1.1.{i}", 1, v) for i, v in enumerate(VERDICT_ORDER, start=1)))
+    parts, total = verdict_breakdown(cells)
+    assert [v for v, _ in parts] == list(VERDICT_ORDER)
+    assert total == len(cells) == 6
+    assert sum(c for _, c in parts) == total
+
+
+def test_a_state_with_no_landing_site_REFUSES_rather_than_printing_344_of_345() -> None:
+    """The live positive control: a cell carrying a verdict outside the enumeration.
+
+    This is #1012's shape reproduced in the data instead of in the format string -- a state present in
+    the population with nowhere to land -- and the components then sum SHORT of the total. Printing it
+    anyway is what the gate did. `load_scorecard` refuses such a verdict on the way in, so this
+    constructs the Cell directly: the point is that the fence behind the fence also holds.
+    """
+    cells = [
+        *_cells(("1.1.1", 1, "pass")),
+        Cell(id="1.1.2", level=1, verdict="mostly-fine"),  # type: ignore[arg-type]
+    ]
+    with pytest.raises(ScorecardError) as exc:
+        verdict_breakdown(cells)
+    assert "does not reconcile" in str(exc.value)
+    assert "mostly-fine" in str(exc.value)  # names the state, not just the arithmetic
+    assert "1" in str(exc.value) and "2" in str(exc.value)  # the components and the total
+
+
+def test_the_gate_summary_line_prints_all_six_states_and_states_a_total_they_sum_to(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """End-to-end through `main`, because the defect was on the rendered line and not in a helper.
+
+    Falsified by restoring the old hand-written five-state f-string in `main`: the `needs-review`
+    assertion goes RED and the reconciliation below it goes RED with a real arithmetic gap. Restored.
+    """
+    corpus = _corpus_file(tmp_path, {"1.1.1": 1, "1.1.2": 1, "2.1.1": 1})
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text("SIZE = 64\n", encoding="utf-8")
+    sc = _scorecard_file(
+        tmp_path,
+        f'[scorecard]\nasvs_version = "5.0.0"\ncorpus_sha256 = "{corpus_digest(corpus)}"\n'
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\n'
+        "  [[cell.evidence]]\n"
+        '  path = "messagefoundry/m.py"\n  line = 1\n  expect = "SIZE = 64"\n'
+        '[[cell]]\nid = "1.1.2"\nlevel = 1\nverdict = "needs-review"\n'
+        '[[cell]]\nid = "2.1.1"\nlevel = 1\nverdict = "unverified"\n',
+    )
+    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    # Every state named, including the one that used to have no landing site.
+    for verdict in VERDICT_ORDER:
+        assert f" {verdict}" in out, f"{verdict} is missing from the summary line"
+    assert "1 needs-review" in out
+    # And the components reconcile against the stated total, read back off the printed line.
+    line = next(ln for ln in out.splitlines() if ln.startswith("scanned "))
+    stated = int(re.match(r"scanned (\d+) cells", line).group(1))  # type: ignore[union-attr]
+    components = [int(m) for m in re.findall(r"(\d+) [a-z-]+", line.split("(", 1)[1].split(")")[0])]
+    assert len(components) == len(VERDICT_ORDER)
+    assert sum(components) == stated == 3
+
+
+def test_status_and_the_gate_summary_report_the_same_distribution() -> None:
+    """Two renderings of one population must not disagree, which is how the defect stayed invisible:
+    `--status` printed six states and the gate line five, in the same module, over the same cells.
+
+    **What this does NOT pin, said so it is not read as more:** it builds its population FROM
+    `VERDICT_ORDER`, so a state dropped from that tuple is dropped from both sides and this stays
+    green. Measured -- it is the one arm of these five that survives that mutation. The completeness
+    of the enumeration is pinned by `test_the_verdict_enumeration_is_the_type_and_not_a_second_list`;
+    this pins only that the two renderings agree.
+    """
+    cells = _cells(*((f"1.1.{i}", 1, v) for i, v in enumerate(VERDICT_ORDER, start=1)))
+    parts, total = verdict_breakdown(cells)
+    status = "\n".join(status_lines(cells))
+    assert f"cells {total}: " in status
+    for verdict, n in parts:
+        assert f"{n} {verdict}" in status
+
+
+def test_the_rendered_table_rows_sum_to_the_Total_row_it_prints(tmp_path: Path) -> None:
+    """The same class, one file over: six hand-written rows above a hand-written Total. Parsed back
+    out of the rendered markdown rather than asserted of the inputs, so the check reads what a human
+    reads.
+
+    Falsified by deleting the `needs-review` entry from `_VERDICT_ROW`: the render refuses outright
+    (ScorecardError) instead of quietly emitting five rows over a six-state Total. Restored.
+    """
+    cells = _cells(*((f"1.1.{i}", 1, v) for i, v in enumerate(VERDICT_ORDER, start=1)))
+    page = render_current(cells, anchor_sha="deadbeef")
+    rows = [ln for ln in page.splitlines() if ln.startswith("| ") and "---" not in ln]
+    counts = {}
+    total = None
+    for row in rows:
+        cols = [c.strip().strip("*") for c in row.strip("|").split("|")]
+        if len(cols) != 3 or not cols[1].isdigit():
+            continue
+        if cols[0] == "Total":
+            total = int(cols[1])
+        else:
+            counts[cols[0]] = int(cols[1])
+    assert total == len(cells)
+    assert len(counts) == len(VERDICT_ORDER), f"rendered state rows: {sorted(counts)}"
+    assert sum(counts.values()) == total
 
 
 # --- evidence anchors -----------------------------------------------------------------------------
@@ -343,6 +491,286 @@ def test_anchor_goes_red_when_the_file_is_gone(tmp_path: Path) -> None:
     f = Findings()
     check_anchors(cells, tmp_path, f)
     assert not f.ok and "does not exist" in f.problems[0]
+
+
+# --- derived anchor `form`: what does the evidence actually resolve INTO? --------------------------
+#
+# Measured 2026-08-09, vault `origin/main` (1a59e4a1) scorecard against engine tree `c383eeab`:
+# 1,980 anchors, 1,979 located, split 1,479 code / 233 doc / 267 foreign / 0 undetermined. So 500 of
+# the located 1,979 (25.3%) resolve into prose or a non-Python file that no structural or executable
+# check reaches, and the record presented all 1,980 as code evidence.
+#
+# Every test below names the classification rule it pins, because the rule is where the judgement is.
+# The load-bearing one is `..._that_is_not_a_docstring_stays_code`: it is the case a token mask gets
+# wrong, and it is the reason this classifies by POSITION rather than by what the text looks like.
+
+_CSP_MODULE = '''\
+"""Security headers for the web console."""
+
+# The report path is public; the nonce is not.
+CSP_REPORT_PATH = "/ui/csp-report"
+
+_POLICY = (
+    "default-src 'self'; script-src 'nonce-{nonce}' 'strict-dynamic'; "
+    "base-uri 'none'; form-action 'self'; object-src 'none'; "
+    "img-src 'self' data:; connect-src 'self'; font-src 'self'"
+)
+
+
+def header(nonce: str) -> str:
+    """Return the Content-Security-Policy header value."""
+    return _POLICY.format(nonce=nonce)
+'''
+
+_DDL_MODULE = '''\
+"""SQL Server store."""
+
+
+def _schema() -> str:
+    return """
+        CREATE TABLE sessions (
+            token_hash NVARCHAR(64) NOT NULL PRIMARY KEY,
+            user_id NVARCHAR(255) NOT NULL,
+            revoked_at DATETIME2 NULL
+        )
+    """
+'''
+
+
+def test_form_classifies_module_class_and_function_docstrings_as_doc() -> None:
+    src = '"""Module prose here."""\n\n\nclass C:\n    """Class prose here."""\n\n    def m(self):\n        """Method prose here."""\n        return 1\n'
+    for token in ("Module prose", "Class prose", "Method prose"):
+        assert anchor_form("messagefoundry/m.py", src, src.index(token)) == "doc", token
+
+
+def test_form_classifies_a_hash_comment_as_doc() -> None:
+    src = "# why this constant is 64 and not 32\nSIZE = 64\n"
+    assert anchor_form("messagefoundry/m.py", src, src.index("why this constant")) == "doc"
+    assert anchor_form("messagefoundry/m.py", src, src.index("SIZE = 64")) == "code"
+
+
+def test_form_keeps_a_prose_shaped_string_that_is_not_a_docstring_as_code() -> None:
+    """THE case that decides the classification rule, and the reason a token mask was rejected.
+
+    A Content-Security-Policy fragment and a block of SQL DDL are long, quoted, space-separated and
+    operator-free, so a "does this look like code?" mask reads them as English -- while they are the
+    literal subject of the control the cell cites. Measured, a token mask misfiled every CSP fragment
+    in `messagefoundry_webconsole/_security.py` and the whole SQL Server and Postgres DDL as prose.
+
+    Position cannot make that mistake: neither string is the first statement of any scope, so neither
+    is a docstring, whatever it reads like. Falsified by relaxing `_prose_spans` to treat ANY string
+    token as a docstring (drop the `doc_rows` membership test): all four assertions here go RED while
+    the docstring tests above stay green. Restored.
+    """
+    for token in (
+        "script-src 'nonce-{nonce}' 'strict-dynamic'",
+        "base-uri 'none'; form-action 'self'; object-src 'none'; ",
+    ):
+        assert (
+            anchor_form(
+                "messagefoundry_webconsole/_security.py", _CSP_MODULE, _CSP_MODULE.index(token)
+            )
+            == "code"
+        ), token
+    for token in ("token_hash NVARCHAR(64) NOT NULL PRIMARY KEY", "CREATE TABLE sessions"):
+        assert (
+            anchor_form("messagefoundry/store/sqlserver.py", _DDL_MODULE, _DDL_MODULE.index(token))
+            == "code"
+        ), token
+
+
+def test_form_does_not_mistake_a_hash_inside_a_string_for_a_comment() -> None:
+    """`#` is a comment character to a `#`-scan and an ordinary byte to `tokenize`.
+
+    A CSP fragment or a URL fragment carries `#` routinely. Comments therefore come from `tokenize`,
+    which knows it is inside a string literal, rather than from a scan of the line.
+    """
+    src = 'URL = "https://example.test/page#anchor-name"\nVALUE = 1\n'
+    assert anchor_form("messagefoundry/m.py", src, src.index("anchor-name")) == "code"
+
+
+def test_form_classifies_a_non_python_file_as_foreign_without_parsing_it() -> None:
+    """198 `.md`, 17 `.ts`, 16 `.js` and 13 `.yml` anchors are in the live record. No `ast` reaches
+    any of them, ever, so the honest label is `foreign` rather than a Python verdict about them."""
+    md = "# SECURITY.md\n\nThe engine binds 127.0.0.1 by default.\n"
+    assert anchor_form("docs/SECURITY.md", md, md.index("binds 127")) == "foreign"
+    # It is the SUFFIX that decides, not the content: this would parse as Python and must not be tried.
+    assert anchor_form("scripts/x.yml", "VALUE = 1\n", 0) == "foreign"
+
+
+def test_form_is_undetermined_when_the_python_will_not_parse_never_code() -> None:
+    """The dangerous default is `code`, because it inflates the exact number this split deflates.
+
+    Falsified by changing `_form_from_spans` to `return "code"` when `spans is None`: this test goes
+    RED and the "no prose" negative control below stays green. Restored.
+    """
+    broken = "def f(\n"  # unterminated: neither ast nor tokenize can complete it
+    assert anchor_form("messagefoundry/m.py", broken, 0) is None
+
+
+def test_form_is_decided_by_the_tokens_start_not_by_any_overlap() -> None:
+    """An `expect` that begins in code and runs into a trailing comment is CODE.
+
+    Measured on the live record: a START rule and an OVERLAP rule disagree on 57 of 1,712 Python
+    anchors, and every one of those is a code statement whose recorded token happens to run past the
+    end of the statement. Falsified by dropping the LOWER bound from `_form_from_spans` --
+    `any(start < hi ...)`, the left-overlap rule, and a plausible slip -- which classifies this
+    fixture as `doc`: this test goes RED. Restored.
+    """
+    src = "VALUE = 64  # tuned against the 2026-08 bench\n"
+    token = "VALUE = 64  # tuned"
+    assert src.count(token) == 1  # the token really does straddle the boundary
+    assert anchor_form("messagefoundry/m.py", src, src.index(token)) == "code"
+
+
+def test_form_negative_control_a_file_with_no_prose_yields_no_doc(tmp_path: Path) -> None:
+    """The count's negative control: a form that CANNOT occur must come back zero.
+
+    A classifier that returned `doc` on some fixed fraction, or that leaked spans between files
+    through the per-run cache, would show up here and nowhere else -- the positive tests above only
+    assert that `doc` appears.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        "SIZE = 64\nNAME = 'x'\n\n\ndef f():\n    return SIZE\n", encoding="utf-8"
+    )
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(
+                Anchor("messagefoundry/m.py", 1, "SIZE = 64"),
+                Anchor("messagefoundry/m.py", 2, "NAME = 'x'"),
+                Anchor("messagefoundry/m.py", 5, "def f():"),
+            ),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert f.anchor_forms["code"] == 3
+    assert f.anchor_forms["doc"] == 0
+    assert f.anchor_forms["foreign"] == 0
+    assert f.anchor_forms["undetermined"] == 0
+
+
+def test_check_anchors_counts_a_form_for_every_anchor_that_located(tmp_path: Path) -> None:
+    """The split's parts must sum to the located population, or the printed denominator is a fiction."""
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        '"""Prose about the gate."""\n\nSIZE = 64\n', encoding="utf-8"
+    )
+    (tmp_path / "docs" / "SECURITY.md").write_text(
+        "The gate is deny-by-default.\n", encoding="utf-8"
+    )
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(
+                Anchor("messagefoundry/m.py", 3, "SIZE = 64"),
+                Anchor("messagefoundry/m.py", 1, "Prose about the gate"),
+                Anchor("docs/SECURITY.md", 1, "deny-by-default"),
+            ),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert f.ok
+    assert dict(f.anchor_forms) == {"code": 1, "doc": 1, "foreign": 1}
+    assert sum(f.anchor_forms.values()) == f.checked_anchors
+
+
+def test_an_anchor_that_did_not_locate_gets_no_form_at_all(tmp_path: Path) -> None:
+    """GONE and AMBIGUOUS anchors have no landing site, so classifying them would be an invented
+    number inside the one figure whose whole purpose is to stop the record overstating itself.
+
+    Falsified by moving the `anchor_forms` increment above the occurrence guards in `check_anchors`:
+    the sum then reaches 3 and both assertions here go RED. Restored.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        "SIZE = 64\ndupe\nfiller\ndupe\n", encoding="utf-8"
+    )
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(
+                Anchor("messagefoundry/m.py", 1, "SIZE = 64"),
+                Anchor("messagefoundry/m.py", 2, "dupe"),  # AMBIGUOUS
+                Anchor("messagefoundry/m.py", 3, "vanished_token"),  # GONE
+            ),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert len(f.problems) == 2
+    assert sum(f.anchor_forms.values()) == 1
+    assert f.checked_anchors == 3  # scanned three; classified one. Both numbers get printed.
+
+
+def test_form_doc_is_a_label_and_never_a_demotion(tmp_path: Path) -> None:
+    """17 cells rest genuinely on documentation, which is legitimate ground for a documentation
+    requirement. A cell evidenced ONLY by prose must therefore stay green and stay complete.
+
+    This is the fence against the obvious next move -- wiring `form` into the gate. If someone adds
+    `if form != "code": problems.append(...)`, or teaches `check_completeness` that a doc-only cell
+    is unevidenced, this test goes RED and says why.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        '"""Session records are never written to the general log."""\n', encoding="utf-8"
+    )
+    (tmp_path / "docs" / "PHI.md").write_text(
+        "Full payloads go only to the store.\n", encoding="utf-8"
+    )
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(
+                Anchor("messagefoundry/m.py", 1, "never written to the general log"),
+                Anchor("docs/PHI.md", 1, "Full payloads go only to the store"),
+            ),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert f.ok and f.problems == [] and f.advisories == []
+    assert f.anchor_forms["code"] == 0 and f.anchor_forms["doc"] + f.anchor_forms["foreign"] == 2
+    # ... and the completeness check, which decides what counts as evidence, is untouched by form.
+    assert check_completeness(cells, {"1.1.1": 1}) == []
+
+
+def test_form_summary_prints_its_denominator_and_the_population_it_never_saw() -> None:
+    """A broken run and a clean run must not look alike, so the split prints what it SCANNED.
+
+    Parts, the located total, the unlocated remainder, and the derived percentage all appear. A bare
+    "1,479 code" is unreadable: unreadable against what?
+    """
+    f = Findings(checked_anchors=10)
+    f.anchor_forms.update({"code": 5, "doc": 2, "foreign": 2})
+    text = "\n".join(form_summary(f))
+    assert "form of the 9 anchor(s) that located" in text
+    assert "5 code" in text and "2 doc" in text and "2 foreign" in text
+    assert "1 further anchor(s) did NOT locate" in text
+    assert "4 of 9 (44.4%)" in text
+    assert "LABEL and not a demotion" in text
+
+
+def test_form_summary_negative_control_says_zero_rather_than_dividing_by_zero() -> None:
+    """Nothing located: every part is zero, the percentage is 0.0, and no line is silently omitted."""
+    text = "\n".join(form_summary(Findings()))
+    assert "form of the 0 anchor(s) that located" in text
+    assert "0 code" in text and "0 doc" in text and "0 foreign" in text
+    assert "0 of 0 (0.0%)" in text
+    assert "did NOT locate" not in text  # nothing was scanned, so nothing went unclassified
 
 
 # --- absence claims: the class this project is worst at -------------------------------------------
@@ -1210,6 +1638,49 @@ def test_main_prove_absences_returns_1_on_a_nonbiting_claim(tmp_path: Path) -> N
     assert rc == 1
 
 
+def test_main_summary_says_RESOLVED_not_VERIFIED_and_carries_the_form_split(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The rendered face of the record must not assert something the check does not establish.
+
+    The summary line used to read "verified N evidence anchors". The run did not verify them; it
+    RESOLVED them -- the token is present and unique in the file, which is not evidence that the
+    control operates. Measured instance: 15.3.1 sat at `pass` with every anchor resolving while the
+    control it named had a hole, found only by executing the code. That distinction lives on the one
+    line most readers will ever read, so it is pinned here end-to-end through `main`, not asserted of
+    a helper.
+
+    The split rides beside it for the same reason: "resolved 1,980" reads as 1,980 pieces of code
+    evidence, and roughly a quarter of them are prose or a non-Python file.
+
+    Falsified by restoring the word "verified" in `main`'s summary: the first two assertions go RED.
+    Falsified independently by deleting the `for line in form_summary(findings)` loop: the split
+    assertions go RED while the wording ones stay green. Both restored.
+    """
+    corpus = _corpus_file(tmp_path, {"1.1.1": 1})
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        '"""Prose about the gate."""\n\nSIZE = 64\n', encoding="utf-8"
+    )
+    sc = _scorecard_file(
+        tmp_path,
+        f'[scorecard]\nasvs_version = "5.0.0"\ncorpus_sha256 = "{corpus_digest(corpus)}"\n'
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\n'
+        "  [[cell.evidence]]\n"
+        '  path = "messagefoundry/m.py"\n  line = 3\n  expect = "SIZE = 64"\n'
+        "  [[cell.evidence]]\n"
+        '  path = "messagefoundry/m.py"\n  line = 1\n  expect = "Prose about the gate"\n',
+    )
+    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "resolved 2 evidence anchors" in out
+    assert "verified 2 evidence anchors" not in out
+    assert "NOT proof the control operates" in out
+    assert "form of the 2 anchor(s) that located: 1 code, 1 doc" in out
+    assert "1 of 2 (50.0%) resolve into prose or a non-Python file" in out
+
+
 def test_main_verify_without_corpus_returns_exit_2(tmp_path: Path) -> None:
     """Verify mode needs the corpus; omitting `--corpus` (without `--prove-absences`) must exit 2 --
     could-not-measure, never confused with a clean 0. Proves the argparse-independent guard in `main`.
@@ -1229,3 +1700,860 @@ def test_main_verify_without_corpus_returns_exit_2(tmp_path: Path) -> None:
     )
     rc = main(["--scorecard", str(sc), "--root", str(tmp_path)])
     assert rc == 2
+
+
+# --- provenance and `--status`: a count is a fact about a (file x ref) PAIR -----------------------
+#
+# Three wrong-base errors occurred in one working thread on 2026-08-08/09. In every one the NUMBER was
+# right and the REF was unnamed, so two readings taken from different places printed identically.
+# These tests exist to make that specific silence impossible, and they lean on real git repositories
+# rather than a mocked one: the failure being prevented is a fact about remote-tracking refs, fetch
+# recency and worktree layout, so a stub would reproduce my assumptions instead of git's behaviour.
+
+_GIT_ID = ("-c", "user.name=t", "-c", "user.email=t@t.invalid", "-c", "commit.gpgsign=false")
+
+
+def _git(repo: Path, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), *_GIT_ID, *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return proc.stdout.strip()
+
+
+def _commit(repo: Path, name: str) -> None:
+    (repo / name).write_text(name, encoding="utf-8")
+    _git(repo, "add", name)
+    _git(repo, "commit", "-m", name)
+
+
+def _origin_and_clone(tmp_path: Path) -> tuple[Path, Path]:
+    """A real bare origin plus a real clone tracking `origin/main`, both on disk."""
+    origin = tmp_path / "origin.git"
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init", "--quiet")
+    _git(seed, "checkout", "--quiet", "-b", "main")
+    _commit(seed, "a.txt")
+    subprocess.run(
+        ["git", "init", "--bare", "--quiet", str(origin)], check=True, capture_output=True
+    )
+    _git(seed, "remote", "add", "origin", str(origin))
+    _git(seed, "push", "--quiet", "-u", "origin", "main")
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", "--quiet", str(origin), str(clone)], check=True, capture_output=True
+    )
+    _git(clone, "checkout", "--quiet", "main")
+    return seed, clone
+
+
+def test_git_is_available_so_no_provenance_test_can_silently_skip() -> None:
+    """None of the tests below is marked skipif, on purpose. A provenance guard that quietly
+    evaporates on a machine without git is the same class of defect as a gate that cannot go red."""
+    assert subprocess.run(["git", "--version"], capture_output=True, check=True).returncode == 0
+
+
+def test_provenance_stamps_a_clean_checkout_with_its_sha_and_a_named_upstream(
+    tmp_path: Path,
+) -> None:
+    _, clone = _origin_and_clone(tmp_path)
+    stamp = repo_stamp(clone)
+    assert stamp.sha == _git(clone, "rev-parse", "--short", "HEAD")
+    assert stamp.dirty is False
+    assert stamp.ref() == stamp.sha and "+dirty" not in stamp.ref()
+    assert stamp.freshness == "CURRENT"
+    assert stamp.upstream == "origin/main"  # named, because BEHIND n is not a claim without it
+
+
+def test_provenance_marks_a_dirty_tree_so_it_cannot_pass_for_a_reproducible_one(
+    tmp_path: Path,
+) -> None:
+    """A measurement taken against uncommitted changes is not reproducible and must not look like one
+    that is. Falsified by hardcoding `dirty=False` in `repo_stamp`: this goes RED. Restored."""
+    _, clone = _origin_and_clone(tmp_path)
+    assert repo_stamp(clone).dirty is False  # control: clean first, so the flag means something
+    (clone / "a.txt").write_text("edited", encoding="utf-8")
+    stamp = repo_stamp(clone)
+    assert stamp.dirty is True
+    assert stamp.ref().endswith("+dirty")
+
+
+def test_freshness_reports_BEHIND_with_its_count_and_needs_no_network(tmp_path: Path) -> None:
+    """THE measured case. The vault checkout that caused the original wrong-base error in this
+    programme reads BEHIND 37 with remote knowledge 23 minutes old; re-measured while building this,
+    the same checkout read BEHIND 38 at 36 minutes. Either line stops the error dead.
+
+    The count comes from `git rev-list --left-right --count HEAD...origin/main`, which counts against
+    the LAST-FETCHED remote-tracking ref -- a purely local object. The fetch below is the test setting
+    up remote knowledge; the tool itself never fetches (see the no-mutation test further down).
+    """
+    seed, clone = _origin_and_clone(tmp_path)
+    _commit(seed, "b.txt")
+    _commit(seed, "c.txt")
+    _git(seed, "push", "--quiet", "origin", "main")
+    _git(clone, "fetch", "--quiet", "origin")
+    stamp = repo_stamp(clone)
+    assert stamp.freshness == "BEHIND 2"
+    assert stamp.upstream == "origin/main"
+
+
+def test_freshness_reports_AHEAD_with_its_count(tmp_path: Path) -> None:
+    _, clone = _origin_and_clone(tmp_path)
+    _commit(clone, "local.txt")
+    assert repo_stamp(clone).freshness == "AHEAD 1"
+
+
+def test_freshness_reports_DIVERGED_when_both_sides_moved(tmp_path: Path) -> None:
+    """DIVERGED is its own value and must not collapse into AHEAD or BEHIND: a branch that is both is
+    the state in which "am I on the right base?" is hardest and most often answered wrongly."""
+    seed, clone = _origin_and_clone(tmp_path)
+    _commit(seed, "remote.txt")
+    _git(seed, "push", "--quiet", "origin", "main")
+    _git(clone, "fetch", "--quiet", "origin")
+    _commit(clone, "local.txt")
+    assert repo_stamp(clone).freshness == "DIVERGED"
+
+
+def test_freshness_is_NO_UPSTREAM_and_is_never_an_omitted_field(tmp_path: Path) -> None:
+    """A repo with no remote at all. The field is POPULATED, not dropped: an absent qualifier is
+    exactly what produced all three wrong-base errors.
+
+    Falsified by returning an empty string from `_freshness` in this branch: the emptiness assertion
+    goes RED and the printed line silently loses its qualifier. Restored.
+    """
+    solo = tmp_path / "solo"
+    solo.mkdir()
+    _git(solo, "init", "--quiet")
+    _git(solo, "checkout", "--quiet", "-b", "main")
+    _commit(solo, "a.txt")
+    stamp = repo_stamp(solo)
+    assert stamp.freshness == "NO-UPSTREAM"
+    assert stamp.upstream == "none"
+    assert stamp.freshness != "" and stamp.remote_knowledge != ""
+
+
+def test_a_path_outside_any_work_tree_is_NO_GIT_and_not_NO_UPSTREAM(tmp_path: Path) -> None:
+    """The two are different statements and conflating them is a lie in the safer-sounding direction.
+
+    NO-UPSTREAM says "this repo tracks nothing"; NO-GIT says "this is not a repo, so no ref exists to
+    quote at all". A copy of the scorecard extracted by `git show` into a temp directory reads the
+    second, and reporting it as the first would let it pass for a checkout.
+    """
+    loose = tmp_path / "loose"
+    loose.mkdir()
+    stamp = repo_stamp(loose)
+    assert stamp.sha == "NO-GIT"
+    assert stamp.freshness == "NO-GIT"
+    assert stamp.upstream == "none"
+
+
+def test_remote_knowledge_is_NEVER_FETCHED_before_any_fetch_has_happened(tmp_path: Path) -> None:
+    solo = tmp_path / "solo"
+    solo.mkdir()
+    _git(solo, "init", "--quiet")
+    _git(solo, "checkout", "--quiet", "-b", "main")
+    _commit(solo, "a.txt")
+    assert repo_stamp(solo).remote_knowledge == "NEVER-FETCHED"
+
+
+def test_remote_knowledge_reports_the_AGE_of_the_last_fetch_not_merely_that_one_happened(
+    tmp_path: Path,
+) -> None:
+    """BEHIND 0 from a six-hour-old fetch and BEHIND 0 from a one-minute-old fetch are DIFFERENT
+    CLAIMS and must not print identically. That is the whole reason this field sits beside the count.
+
+    Falsified by returning a constant from `_remote_knowledge`: the two ages below become equal and
+    this goes RED. Restored.
+    """
+    seed, clone = _origin_and_clone(tmp_path)
+    _git(clone, "fetch", "--quiet", "origin")
+    fresh = repo_stamp(clone).remote_knowledge
+    assert fresh.endswith("s")  # seconds old, just now
+
+    head = Path(_git(clone, "rev-parse", "--path-format=absolute", "--git-dir")) / "FETCH_HEAD"
+    assert head.is_file()
+    old = time.time() - 6 * 3600
+    os.utime(head, (old, old))
+    stale = repo_stamp(clone).remote_knowledge
+    assert stale == "6h"
+    assert stale != fresh
+
+
+def test_humanise_age_covers_each_unit_boundary() -> None:
+    assert _humanise_age(0) == "0s"
+    assert _humanise_age(89) == "89s"
+    assert _humanise_age(90) == "1m"
+    assert _humanise_age(23 * 60) == "23m"
+    assert _humanise_age(90 * 60) == "1h"
+    assert _humanise_age(47 * 3600) == "47h"
+    assert _humanise_age(48 * 3600) == "2d"
+
+
+def test_status_issues_no_write_and_no_network_git_subcommand(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """THE NEGATIVE CONTROL, and the one that matters most here.
+
+    A query tool that fetches mutates repo state as a side effect of being asked a question, and on
+    this machine the vault remote is intermittently unauthenticated, so a network dependency would
+    fire constantly and the tool would be bypassed inside a day. So every git subcommand this mode
+    issues is captured and checked against a read-only allowlist, and the mutating verbs must appear
+    ZERO times: a pattern that cannot occur must come back zero.
+
+    It also checks the OUTCOME and not only the intent -- the remote-tracking refs and the FETCH_HEAD
+    mtime are compared across the run. Asserting on the argv alone would pass a tool that reached the
+    network some other way.
+
+    Falsified by adding a fetch to `repo_stamp`: the allowlist assertion goes RED naming the verb, and
+    the FETCH_HEAD mtime assertion goes RED independently of it. Restored.
+    """
+    seed, clone = _origin_and_clone(tmp_path)
+    _commit(seed, "b.txt")
+    _git(seed, "push", "--quiet", "origin", "main")
+    _git(clone, "fetch", "--quiet", "origin")
+
+    refs_before = _git(clone, "for-each-ref", "refs/remotes")
+    head = Path(_git(clone, "rev-parse", "--path-format=absolute", "--git-dir")) / "FETCH_HEAD"
+    mtime_before = head.stat().st_mtime
+
+    seen: list[list[str]] = []
+    real_run = subprocess.run
+
+    def spy(cmd: Any, *a: Any, **kw: Any) -> Any:
+        seen.append(list(cmd))
+        return real_run(cmd, *a, **kw)
+
+    # Patched on the `subprocess` module itself, which is the same object the verifier imported. That
+    # also means the helper `_git` below is spied, so `verbs` is snapshotted before any helper call.
+    monkeypatch.setattr(subprocess, "run", spy)
+
+    sc = _scorecard_file(clone, '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "unverified"\n')
+    rc = main(["--status", "--scorecard", str(sc), "--root", str(clone)])
+    capsys.readouterr()
+
+    assert rc == 0
+    assert seen, "the spy captured nothing -- this test would otherwise pass vacuously"
+    verbs = {cmd[3] for cmd in seen if len(cmd) > 3}
+    assert verbs <= {"rev-parse", "status", "rev-list"}, f"non-read-only git verb: {verbs}"
+    for forbidden in ("fetch", "pull", "push", "remote", "gc", "prune", "commit", "checkout"):
+        assert forbidden not in verbs
+
+    assert _git(clone, "for-each-ref", "refs/remotes") == refs_before
+    assert head.stat().st_mtime == mtime_before
+
+
+def test_provenance_lines_always_carry_every_mandated_field(tmp_path: Path) -> None:
+    """Non-suppressible and never partially populated. Each field is checked by NAME, so dropping one
+    is a red rather than a shorter line nobody notices."""
+    _, clone = _origin_and_clone(tmp_path)
+    sc = _scorecard_file(clone, '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "unverified"\n')
+    text = "\n".join(provenance_lines(sc, clone))
+    assert text.startswith("# asvs-status scorecard=")
+    assert " engine=" in text
+    assert "scorecard: freshness=" in text and "engine:" in text
+    assert text.count("freshness=") == 2  # one per repo: a single field could not say WHICH repo
+    assert text.count("upstream=") == 2
+    assert text.count("remote-knowledge=") == 2
+    assert "generated=" in text
+
+
+def test_two_readings_of_the_same_filename_at_different_refs_do_not_print_identically(
+    tmp_path: Path,
+) -> None:
+    """THE POINT OF THE WHOLE FEATURE, reproduced in miniature.
+
+    Live instance measured 2026-08-09 while building this: the vault working tree and vault
+    `origin/main` both hold a file called `asvs-scorecard.toml`, and they disagree -- 105 partial /
+    3 fail / 1,978 anchors against 106 partial / 2 fail / 1,980 anchors. Without a ref stamp those are
+    two plausible readings of "the scorecard" and nothing in either output says which is which. That
+    is exactly how three wrong-base errors happened in one thread.
+
+    Here the same file name is read from a stale checkout and a current one. The COUNTS are identical
+    by construction; only the provenance differs, which is the property under test.
+    """
+    seed, clone = _origin_and_clone(tmp_path)
+    body = '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "unverified"\n'
+    sc_current = _scorecard_file(seed, body)
+    sc_stale = _scorecard_file(clone, body)
+    _commit(seed, "b.txt")
+    _git(seed, "push", "--quiet", "origin", "main")
+    _git(clone, "fetch", "--quiet", "origin")
+
+    current = "\n".join(provenance_lines(sc_current, seed))
+    stale = "\n".join(provenance_lines(sc_stale, clone))
+
+    assert sc_current.name == sc_stale.name  # identical file names, as in the live instance
+    assert status_lines(load_scorecard(sc_current)) == status_lines(load_scorecard(sc_stale))
+    assert "BEHIND 1" in stale
+    assert "BEHIND" not in current
+    assert current != stale
+
+
+def test_status_reports_every_verdict_including_needs_review() -> None:
+    """`needs-review` is absent from the verify summary line and present here. A cell that was read
+    and then parked on purpose is not a cell that does not exist, and the record's own renderer once
+    contradicted itself over exactly this distinction."""
+    cells = [
+        Cell(id="1.1.1", level=1, verdict="pass", last_verified="2026-08-09"),
+        Cell(id="1.1.2", level=2, verdict="needs-review", last_verified="2026-08-09"),
+        Cell(id="2.1.1", level=3, verdict="unverified"),
+    ]
+    text = "\n".join(status_lines(cells))
+    assert "cells 3: 1 pass, 0 partial, 0 fail, 0 na, 1 needs-review, 1 unverified" in text
+    assert "examined 2 of 3 (66.7%)" in text
+
+
+def test_status_names_what_it_did_NOT_check() -> None:
+    """A cheap answer that looks like a full one is worse than no answer. `--status` never opens the
+    engine tree, so it must say so rather than let a structural tally read as anchor health.
+
+    Falsified by deleting the final line of `status_lines`: this goes RED. Restored.
+    """
+    text = "\n".join(status_lines([Cell(id="1.1.1", level=1, verdict="unverified")]))
+    assert "NOT CHECKED here" in text
+    assert "whether any anchor still resolves" in text
+    assert "run verify" in text
+
+
+def test_main_status_needs_no_corpus_and_prints_provenance_first(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--status` is a pure scorecard read, so requiring `--corpus` would be friction with no purpose,
+    and the provenance header is the FIRST thing on stdout -- before any number it qualifies."""
+    _, clone = _origin_and_clone(tmp_path)
+    sc = _scorecard_file(
+        clone,
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\nlast_verified = "2026-08-09"\n',
+    )
+    rc = main(["--status", "--scorecard", str(sc), "--root", str(clone)])
+    out = capsys.readouterr().out.splitlines()
+    assert rc == 0
+    assert out[0].startswith("# asvs-status scorecard=")
+    assert any(line.startswith("cells 1:") for line in out)
+
+
+def test_main_status_exits_2_on_an_unreadable_scorecard_and_still_prints_provenance(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Exit 2 is could-not-measure. NEVER 1: a query that borrows the gate's failure code gets wired
+    into CI as a gate, and this one checks nothing about the posture.
+
+    The header still prints, so even the failure is attributable to a ref.
+    """
+    _, clone = _origin_and_clone(tmp_path)
+    rc = main(["--status", "--scorecard", str(clone / "absent.toml"), "--root", str(clone)])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.out.startswith("# asvs-status scorecard=")
+    assert "refusing to report a pass on a missing file" in captured.err
+
+
+def test_status_does_not_run_the_gate_and_cannot_return_the_gates_exit_code(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Negative control on the exit code: a scorecard whose anchor is broken still exits 0 under
+    `--status`, because `--status` does not check anchors. If someone later wires verification into
+    this path, the 41-second cost and this assertion land at the same moment."""
+    _, clone = _origin_and_clone(tmp_path)
+    sc = _scorecard_file(
+        clone,
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\n'
+        "  [[cell.evidence]]\n"
+        '  path = "nowhere/absent.py"\n  line = 1\n  expect = "token_that_does_not_exist"\n',
+    )
+    rc = main(["--status", "--scorecard", str(sc), "--root", str(clone)])
+    capsys.readouterr()
+    assert rc == 0
+
+
+# --- prove-absences: the counters must be reconcilable against the population they came from ------
+
+
+def test_prove_absences_records_the_population_it_saw(tmp_path: Path) -> None:
+    """`checked_absences` is set BEFORE any outcome branch, so it is right whichever branch is taken.
+
+    Falsified by moving the increment inside `_prove_one` after the `mutation_path` guard: the skipped
+    claim then goes uncounted and the first assertion goes RED. Restored.
+    """
+    _module(tmp_path, "scanner.py", _SCANNER)
+    _obs_test(tmp_path, "test_scanner.py", _OBS_TEST)
+    proved = _live_claim(
+        'def scan(p): return "infected"', "scanner.py", "test_scanner.py::test_clean"
+    )
+    skipped = Cell(
+        id="1.1.2",
+        level=1,
+        verdict="fail",
+        absence=(Absence(pattern="x", positive_control="y", mutation="import x"),),
+    )
+    findings = prove_absences([proved, skipped], tmp_path)
+    assert findings.checked_absences == 2
+    assert findings.proved_absences == 1
+    assert findings.skipped_absences == 1
+
+
+def test_prove_absences_counters_close_against_the_population(tmp_path: Path) -> None:
+    """The arithmetic that makes the summary readable, asserted rather than asserted-in-prose.
+
+    FIVE outcomes raise a problem and increment no counter (an escaping `mutation_path`, one that is
+    not a file, a baseline that is not green, an UNPROVEN mutated-green, and a mutated run that
+    errored). So the closing identity is population minus the three counters, and this fixture drives
+    one claim into each of four different branches to check it holds across them.
+
+    Note what is NOT asserted: that `len(problems)` equals the problem-only count. It does not, and
+    cannot -- a SUSPECT finding rides along with a claim already counted in `static_screened`, so
+    problems and claims are different populations. Asserting that equality would pin a false identity.
+    """
+    _module(tmp_path, "scanner.py", _SCANNER)
+    _module(tmp_path, "quiet.py", "VALUE = 1\n")
+    _obs_test(tmp_path, "test_scanner.py", _OBS_TEST)
+
+    proved = _live_claim(
+        'def scan(p): return "infected"', "scanner.py", "test_scanner.py::test_clean"
+    )
+    skipped = Cell(
+        id="1.1.2",
+        level=1,
+        verdict="fail",
+        absence=(Absence(pattern="x", positive_control="y", mutation="import x"),),
+    )
+    screened = Cell(
+        id="1.1.3",
+        level=1,
+        verdict="fail",
+        absence=(
+            Absence(
+                pattern="x", positive_control="y", mutation="VALUE = 2", mutation_path="quiet.py"
+            ),
+        ),
+    )
+    problem_only = Cell(
+        id="1.1.4",
+        level=1,
+        verdict="fail",
+        absence=(
+            Absence(
+                pattern="x",
+                positive_control="y",
+                mutation="import x",
+                mutation_path="not_a_file.py",
+            ),
+        ),
+    )
+
+    f = prove_absences([proved, skipped, screened, problem_only], tmp_path)
+    assert f.checked_absences == 4
+    remainder = f.checked_absences - f.proved_absences - f.static_screened - f.skipped_absences
+    assert remainder == 1  # exactly the PROVE-ERROR claim, derived rather than counted
+    assert f.proved_absences == 1 and f.skipped_absences == 1 and f.static_screened == 1
+
+
+def test_prove_absences_summary_prints_the_population_before_the_parts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A run that scanned N claims and a run that scanned zero must not print equally plausible
+    counter sets. Without `saw N` they do: all four numbers are zero in both.
+
+    Falsified by deleting the `saw ... absence claim(s);` term from `_run_prove_absences`: both
+    assertions go RED. Restored.
+    """
+    _module(tmp_path, "scanner.py", _SCANNER)
+    _obs_test(tmp_path, "test_scanner.py", _OBS_TEST)
+    sc = tmp_path / "sc.toml"
+    _biting_scorecard(sc, "scanner.py")
+    rc = main(["--scorecard", str(sc), "--root", str(tmp_path), "--prove-absences"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "prove-absences: saw 1 absence claim(s);" in out
+    assert "proved 1 by mutation" in out
+
+
+def test_prove_absences_summary_negative_control_an_empty_run_says_saw_zero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The negative control: a scorecard with NO absence claims must say so, not print four zeroes
+    that read like a clean pass over a real population."""
+    sc = tmp_path / "sc.toml"
+    sc.write_text(
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "unverified"\n',
+        encoding="utf-8",
+    )
+    rc = main(["--scorecard", str(sc), "--root", str(tmp_path), "--prove-absences"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "saw 0 absence claim(s)" in out
+
+
+# --- sym + ctx: WHERE in the structure, and it is a DISPLACEMENT signal ---------------------------
+#
+# Measured 2026-08-09, vault origin/main 1a59e4a1's anchors against engine tree 4667e945: over the
+# 1,712 Python anchors that locate and parse, 536 (31.3%) sit in a (sym, ctx) region wider than the
+# 81 lines the retired +/-40 window covered -- so sym/ctx alone is LOOSER for those, and this is
+# additive to the drift advisory rather than a replacement for it. The brief's 38.4%/639 reproduces
+# at 634 under the looser symbol-only region definition; both support the same conclusion.
+
+_NESTED = '''\
+"""Module docstring."""
+
+TOP = 1
+
+
+class Store:
+    """A store."""
+
+    def revoke(self, keep):
+        rows = []
+        try:
+            rows = self.query()
+        except OSError:
+            rows = []
+        if keep:
+            for r in rows:
+                if r.stale:
+                    self.drop(r)
+        return rows
+
+
+def loose():
+    return TOP
+'''
+
+
+def _sym_ctx(text: str, token: str) -> tuple[str, str] | None:
+    return derive_sym_ctx(text, text.count("\n", 0, text.index(token)) + 1)
+
+
+def test_sym_ctx_derives_module_level_as_two_empty_strings() -> None:
+    """`""` is the assertion "module level, unnested" -- a real claim, not a missing value."""
+    assert _sym_ctx(_NESTED, "TOP = 1") == ("", "")
+
+
+def test_sym_ctx_derives_the_enclosing_symbol_dotted() -> None:
+    assert _sym_ctx(_NESTED, "rows = self.query()") == ("Store.revoke", "Try.body")
+    assert _sym_ctx(_NESTED, "return TOP") == ("loose", "")
+
+
+def test_sym_ctx_names_the_handler_limb_not_the_body_limb() -> None:
+    """`Try.body` and `Try.handlers` are different regions and a statement moving between them is
+    exactly the displacement this field exists to notice.
+
+    The handler's own `ExceptHandler.body` is deliberately NOT a second chain element: it is reachable
+    only through `Try.handlers`, so recording it would double every handler chain for no added
+    discrimination.
+    """
+    assert _sym_ctx(_NESTED, "rows = self.query()") == ("Store.revoke", "Try.body")
+    assert _sym_ctx(_NESTED, "except OSError") == ("Store.revoke", "Try.handlers")
+
+
+def test_sym_ctx_chains_nested_blocks_outermost_first() -> None:
+    assert _sym_ctx(_NESTED, "self.drop(r)") == ("Store.revoke", "If.body>For.body>If.body")
+
+
+def test_sym_ctx_resets_the_chain_at_a_symbol_boundary() -> None:
+    """A block chain is meaningful only inside the symbol holding it. A nested function inside a
+    `try` must not inherit `Try.body`, or every helper defined in a guarded block reads as guarded.
+
+    Falsified by deleting the `ctx.clear()` in `sym_ctx_at`: the inner function's ctx becomes
+    `Try.body` and this goes RED. Restored.
+    """
+    src = "def outer():\n    try:\n        def inner():\n            return 1\n    except OSError:\n        pass\n"
+    assert derive_sym_ctx(src, 4) == ("outer.inner", "")
+
+
+def test_sym_ctx_is_None_when_the_file_will_not_parse() -> None:
+    assert derive_sym_ctx("def f(\n", 1) is None
+
+
+def test_sym_ctx_is_not_indentation_the_12_3_5_non_event(tmp_path: Path) -> None:
+    """CELL 12.3.5's SHAPE, and the reason this field is `ctx` rather than an indent check.
+
+    12.3.5 carries the identical 4-versus-8 indent mismatch as 10.5.4 and is a NON-EVENT: a
+    hand-trimming slip, with the statement's position in the control flow unchanged at both ends.
+    Here the same statement is re-indented under a block that already contained it. Indentation
+    changed; `ctx` did not, and correctly does not fire.
+
+    Falsified by deriving from `len(line) - len(line.lstrip())` instead of the block chain: the two
+    derivations differ and this goes RED. Restored.
+    """
+    before = "def f():\n    if x:\n        do_it()\n"
+    after = "def f():\n    if x:\n            do_it()\n"  # slipped indent, same block
+    assert _sym_ctx(before, "do_it()") == _sym_ctx(after, "do_it()") == ("f", "If.body")
+
+
+def test_sym_ctx_DOES_fire_when_a_statement_is_welded_into_a_try_the_10_5_4_shape() -> None:
+    """The other half: 10.5.4's shape, where the statement really did change control-flow region.
+
+    And the honest reading of it -- that change was a HARDENING. The signal fired correctly and the
+    finding was "your reasoning is stale", not "something is broken". Its security-relevant precision
+    on the only datum the corpus offers is 0 of 1.
+    """
+    before = "def f():\n    conn.rollback()\n"
+    after = "def f():\n    try:\n        conn.rollback()\n    except OSError:\n        pass\n"
+    assert _sym_ctx(before, "conn.rollback()") == ("f", "")
+    assert _sym_ctx(after, "conn.rollback()") == ("f", "Try.body")
+
+
+# --- validation: malformed is FATAL, mismatched is ADVISORY ---------------------------------------
+
+
+def test_malformed_ctx_names_an_unknown_node_type() -> None:
+    assert "not a block statement" in (malformed_sym_ctx(None, "Tyr.body") or "")
+
+
+def test_malformed_ctx_names_a_field_the_node_does_not_have() -> None:
+    """`With` has no `orelse`. The table that validates is the table the deriver walks, so an accepted
+    chain is one the deriver can actually produce."""
+    assert "does not have" in (malformed_sym_ctx(None, "With.orelse") or "")
+
+
+def test_malformed_sym_rejects_a_non_identifier() -> None:
+    assert "dotted Python identifier" in (malformed_sym_ctx("Store revoke()", None) or "")
+
+
+def test_wellformed_sym_and_ctx_pass_validation() -> None:
+    assert malformed_sym_ctx("Store.revoke", "Try.body>If.orelse") is None
+    assert malformed_sym_ctx("", "") is None  # module level, unnested: a claim, and a valid one
+    assert malformed_sym_ctx(None, None) is None  # not asserted
+
+
+def test_a_malformed_ctx_is_FATAL_because_no_code_movement_can_cause_it(tmp_path: Path) -> None:
+    """The only fatal outcome in this feature. A chain the deriver cannot produce would advise
+    forever without ever matching, and the fix is unambiguous.
+
+    Falsified by downgrading the `malformed_sym_ctx` branch in `_check_sym_ctx` to an advisory:
+    `not f.ok` goes RED. Restored.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text("def f():\n    do_it()\n", encoding="utf-8")
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(Anchor("messagefoundry/m.py", 2, "do_it()", ctx="Nope.body"),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert not f.ok
+    assert "not a block statement" in f.problems[0]
+
+
+def test_sym_ctx_on_a_non_python_file_is_FATAL(tmp_path: Path) -> None:
+    """Markdown has no enclosing symbol. Recording one is an authoring error no derivation can ever
+    confirm or deny, so it is refused rather than left as a permanent silent pass."""
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "SECURITY.md").write_text("deny by default\n", encoding="utf-8")
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(Anchor("docs/SECURITY.md", 1, "deny by default", sym="f"),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert not f.ok and "non-Python file" in f.problems[0]
+
+
+def test_a_MISMATCHED_ctx_is_ADVISORY_never_fatal(tmp_path: Path) -> None:
+    """THE severity decision, and it is load-bearing.
+
+    A mismatch means the token moved into a different control-flow region. On the only datum the
+    corpus offers -- 10.5.4 -- that movement was a HARDENING. A check that redded the gate on it
+    would have demanded a rollback of a security improvement. So: advisory.
+
+    Falsified by appending to `problems` instead of `advisories` in `_check_sym_ctx`: `f.ok` goes RED.
+    Restored.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        "def f():\n    try:\n        conn.rollback()\n    except OSError:\n        pass\n",
+        encoding="utf-8",
+    )
+    cells = [
+        Cell(
+            id="10.5.4",
+            level=3,
+            verdict="pass",
+            evidence=(Anchor("messagefoundry/m.py", 3, "conn.rollback()", sym="f", ctx=""),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert f.ok and f.problems == []
+    assert len(f.advisories) == 1
+    assert "DISPLACEMENT, not a defect" in f.advisories[0]
+    assert "HARDENING" in f.advisories[0]
+    assert "ctx=''" in f.advisories[0] and "ctx='Try.body'" in f.advisories[0]
+
+
+def test_sym_and_ctx_are_validated_INDEPENDENTLY(tmp_path: Path) -> None:
+    """An anchor may assert one and not the other, and asserting neither is not agreement."""
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        "def f():\n    if x:\n        do_it()\n", encoding="utf-8"
+    )
+    sym_only = Anchor("messagefoundry/m.py", 3, "do_it()", sym="WRONG")
+    ctx_only = Anchor("messagefoundry/m.py", 3, "do_it()", ctx="If.body")
+    neither = Anchor("messagefoundry/m.py", 3, "do_it()")
+
+    f = Findings()
+    check_anchors([Cell(id="1.1.1", level=1, verdict="pass", evidence=(sym_only,))], tmp_path, f)
+    assert len(f.advisories) == 1 and "sym=" in f.advisories[0]
+
+    g = Findings()
+    check_anchors([Cell(id="1.1.1", level=1, verdict="pass", evidence=(ctx_only,))], tmp_path, g)
+    assert g.advisories == []  # ctx is right, so nothing to say
+
+    h = Findings()
+    check_anchors([Cell(id="1.1.1", level=1, verdict="pass", evidence=(neither,))], tmp_path, h)
+    assert h.advisories == [] and h.checked_sym_ctx == 0
+
+
+def test_sym_ctx_is_ADDITIVE_to_the_drift_advisory_and_neither_replaces_the_other(
+    tmp_path: Path,
+) -> None:
+    """THE MANDATED PROPERTY, asserted rather than asserted-in-prose. Three anchors, three outcomes:
+
+      - moved a long way, same region        -> drift only    (sym/ctx would have missed it)
+      - did not move, region changed         -> sym/ctx only  (drift would have missed it)
+      - moved AND region changed             -> both
+
+    Measured, 536 of 1,712 Python anchors sit in a (sym, ctx) region wider than the retired 81-line
+    window, so replacing drift with this loses detection on roughly a third of the record.
+
+    Falsified by making `_check_sym_ctx` return early whenever the line drifted (i.e. treating them as
+    alternatives): the second and third counts go RED. Restored.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    body = (
+        "def f():\n"
+        + "".join(f"    pad_{i} = {i}\n" for i in range(200))
+        + "    moved_far = 1\n"
+        + "def g():\n    try:\n        welded = 2\n    except OSError:\n        pass\n"
+    )
+    (tmp_path / "messagefoundry" / "m.py").write_text(body, encoding="utf-8")
+
+    # moved a long way, still in `f` and still unnested: drift fires, sym/ctx does not.
+    drift_only = Anchor("messagefoundry/m.py", 3, "moved_far = 1", sym="f", ctx="")
+    # Recorded at its TRUE line, so drift stays silent and only the region change speaks.
+    # def f=1, 200 pads=2..201, moved_far=202, def g=203, try=204, welded=205.
+    region_only = Anchor("messagefoundry/m.py", 205, "welded = 2", sym="g", ctx="")
+
+    f1 = Findings()
+    check_anchors([Cell(id="1.1.1", level=1, verdict="pass", evidence=(drift_only,))], tmp_path, f1)
+    assert len(f1.advisories) == 1 and "navigation aid" in f1.advisories[0]
+
+    f2 = Findings()
+    check_anchors(
+        [Cell(id="1.1.2", level=1, verdict="pass", evidence=(region_only,))], tmp_path, f2
+    )
+    assert len(f2.advisories) == 1 and "DISPLACEMENT" in f2.advisories[0]
+
+    both = Anchor("messagefoundry/m.py", 1, "welded = 2", sym="g", ctx="")
+    f3 = Findings()
+    check_anchors([Cell(id="1.1.3", level=1, verdict="pass", evidence=(both,))], tmp_path, f3)
+    assert len(f3.advisories) == 2
+    assert any("navigation aid" in x for x in f3.advisories)
+    assert any("DISPLACEMENT" in x for x in f3.advisories)
+
+
+def test_load_reads_sym_and_ctx_and_absent_stays_None(tmp_path: Path) -> None:
+    """ABSENT and EMPTY are different claims. Defaulting absent to `""` would turn every one of the
+    1,980 un-backfilled anchors into an assertion of "module level, unnested" overnight.
+
+    Falsified by changing the loader to `str(e.get("sym", ""))`: the `is None` assertions go RED.
+    Restored.
+    """
+    sc = _scorecard_file(
+        tmp_path,
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\n'
+        "  [[cell.evidence]]\n"
+        '  path = "m.py"\n  line = 1\n  expect = "x"\n'
+        "  [[cell.evidence]]\n"
+        '  path = "m.py"\n  line = 2\n  expect = "y"\n  sym = "f"\n  ctx = "Try.body"\n'
+        "  [[cell.evidence]]\n"
+        '  path = "m.py"\n  line = 3\n  expect = "z"\n  sym = ""\n  ctx = ""\n',
+    )
+    absent, filled, empty = load_scorecard(sc)[0].evidence
+    assert absent.sym is None and absent.ctx is None
+    assert filled.sym == "f" and filled.ctx == "Try.body"
+    assert empty.sym == "" and empty.ctx == ""
+
+
+def test_the_summary_reports_how_much_of_the_record_sym_ctx_actually_reached(
+    tmp_path: Path,
+) -> None:
+    """Coverage is printed because backfill has not happened yet. A structural check that reaches 1 of
+    3 anchors while printing like a whole-corpus result is the overstatement this pass keeps fixing.
+
+    Falsified by deleting the `sym/ctx asserted on` line from `form_summary`: this goes RED. Restored.
+    """
+    f = Findings(checked_anchors=3, checked_sym_ctx=1)
+    f.anchor_forms.update({"code": 3})
+    text = "\n".join(form_summary(f))
+    assert "sym/ctx asserted on 1 of 3 anchor(s)" in text
+    assert "absence of the field is NOT agreement" in text
+
+
+def test_summary_sym_ctx_negative_control_says_nothing_extra_at_full_coverage() -> None:
+    """The qualifier appears only when coverage is partial, so it cannot become wallpaper."""
+    f = Findings(checked_anchors=2, checked_sym_ctx=2)
+    f.anchor_forms.update({"code": 2})
+    text = "\n".join(form_summary(f))
+    assert "sym/ctx asserted on 2 of 2 anchor(s)" in text
+    assert "NOT agreement" not in text
+
+
+def test_the_walk_descends_THROUGH_a_handler_into_its_nested_blocks() -> None:
+    """DESCENT, which is a different property from whether the handler is RECORDED.
+
+    Added after an injection that should have failed did not: deleting `ExceptHandler` from
+    `_TRANSPARENT` silently stopped the walk descending instead of starting to record, so the chain
+    came out identical by a different route and no test could tell. Descent and recording now come
+    from two tables, and this test drives descent -- a statement nested inside an `if` inside an
+    `except` body is only reachable if the walk goes THROUGH the handler.
+
+    Falsified by removing `ExceptHandler` from `_DESCEND_ONLY`: the chain truncates to
+    `Try.handlers` and this goes RED. Restored.
+    """
+    src = (
+        "def f():\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except OSError:\n"
+        "        if retry:\n"
+        "            recover()\n"
+    )
+    assert derive_sym_ctx(src, 6) == ("f", "Try.handlers>If.body")
+
+
+def test_a_handler_contributes_no_chain_element_of_its_own() -> None:
+    """RECORDING, the other half. `ExceptHandler.body` would double every handler chain for no added
+    discrimination, because a handler is reachable by exactly one route its parent already names.
+
+    Falsified by removing `ExceptHandler` from `_TRANSPARENT`: the chain becomes
+    `Try.handlers>ExceptHandler.body>If.body` and this goes RED. Restored.
+    """
+    src = (
+        "def f():\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except OSError:\n"
+        "        if retry:\n"
+        "            recover()\n"
+    )
+    _, ctx = derive_sym_ctx(src, 6) or ("", "")
+    assert "ExceptHandler" not in ctx
+
+
+def test_descent_and_transparency_tables_do_not_drift_apart() -> None:
+    """They are separate by design, so nothing else would notice one gaining an entry the other
+    lacks. A node in `_DESCEND_ONLY` but not `_TRANSPARENT` would start emitting a chain element
+    nobody authored; the reverse would make a transparent node undescendable."""
+    assert frozenset(_DESCEND_ONLY) == _TRANSPARENT

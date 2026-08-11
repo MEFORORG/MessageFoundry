@@ -29,6 +29,12 @@
     original signal and it was actively misleading: a 21h claim whose holder had committed two minutes
     earlier was labelled STALE and recommended for release.
 
+    EVERY RELEASE IS RECORDED, `-Force` included, as one JSON line appended to
+    <git-common-dir>/mefor-coord/claims/.history: the key, the releasing worktree and branch, the
+    prior holder, its branch and note, when the claim was taken, and whether -Force was used. The
+    record is written BEFORE the claim file is removed and the release is refused if it cannot be
+    written -- a release nobody can trace is the outcome this will not produce (BACKLOG #1068).
+
 .EXAMPLE
     pwsh -NoProfile -File scripts\coord\claim.ps1 -Take 105 -Note "corepoint xml importer"
     pwsh -NoProfile -File scripts\coord\claim.ps1 -List
@@ -65,6 +71,24 @@ $common = (& git -C $repo rev-parse --path-format=absolute --git-common-dir).Tri
 $claims = Join-Path $common "mefor-coord/claims"
 New-Item -ItemType Directory -Force -Path $claims | Out-Null
 
+# THE RELEASE LEDGER (BACKLOG #1068). A release used to be `Remove-Item` and nothing else, so a
+# `-Force` takeover -- one session releasing a claim held by another -- left no record of who released
+# whose claim, when, or why. `-Force` has a real job and stays: a claim whose holder's worktree is
+# gone would otherwise be stuck forever, and hand-deleting the file leaves even less evidence. The
+# answer is a RECORD, not a refusal.
+#
+# Measured 2026-08-10. A coordinator force-released a claim after establishing on evidence that the
+# holder's worktree was gone and that the work its note guarded had already merged, while the note
+# still read "UNPUSHED, NO PR, GitHub finds NOTHING". That release was CORRECT and it left nothing
+# behind to find, which is the whole gap: the registry is a shared coordination artifact, and a stale
+# note in it has already blocked a lane from claiming an item.
+#
+# JSON Lines, LF-terminated, one object per release. It sits INSIDE the claims directory, which is
+# safe because every reader of that directory keys on a file NAME -- `-List` and prune-merged.ps1 glob
+# `*.json`, scripts/hooks/claim_check.py opens `<item>.json` -- and ConvertTo-KeyFile always appends
+# ".json", so no key can ever fold onto this name.
+$history = Join-Path $claims ".history"
+
 # A key is free text but becomes a FILENAME, so fold it to a safe, case-insensitive form. The original is
 # kept inside the json so `-List` can show what the human actually typed.
 function ConvertTo-KeyFile([string]$Key) {
@@ -88,6 +112,32 @@ function Get-Mine([string]$Path) {
     $held = ($c.worktree -replace '\\', '/').TrimEnd('/')
     $me = ($repo -replace '\\', '/').TrimEnd('/')
     [pscustomobject]@{ Claim = $c; IsMine = ($held -ieq $me) }
+}
+
+# ONE record, appended exclusively, retried. FileMode::Append + FileShare::Read excludes a second
+# WRITER -- two worktrees can release in the same instant -- while leaving readers alone, and the whole
+# line goes out in a SINGLE Write to a handle already positioned at end-of-file, so a concurrent
+# release cannot interleave half a record into another's.
+#
+# LF, not the platform newline: this is a machine-readable ledger read from PowerShell, python and
+# git-bash on the same clone, and a mixed-newline JSONL file is one of those things nothing complains
+# about until a parser splits differently from the writer.
+#
+# The catch is deliberately UNTYPED, for the reason written out at the claim-refresh Move below:
+# PowerShell wraps an exception thrown by a .NET METHOD in a MethodInvocationException, so a typed
+# `catch [System.IO.IOException]` here would never match and the failure would escape to
+# $ErrorActionPreference = "Stop" instead of being retried.
+function Add-HistoryLine([string]$Line) {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Line + "`n")
+    foreach ($attempt in 1..5) {
+        try {
+            $fs = [System.IO.File]::Open($history, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+            try { $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Dispose() }
+            return $true
+        }
+        catch { Start-Sleep -Milliseconds (20 * $attempt) }
+    }
+    return $false
 }
 
 # ONE liveness rule, three call sites (BACKLOG #345 Half B).
@@ -165,6 +215,12 @@ function Show-List {
     Write-Host ""
 }
 
+# Resolved for BOTH paths, not just -Take. A release record that names who released the claim is only
+# half an answer without the branch they were standing on -- the same question -Take records.
+$branch = & git -C $repo branch --show-current
+if ([string]::IsNullOrWhiteSpace($branch)) { $branch = "detached@" + (& git -C $repo rev-parse --short HEAD) }
+$branch = $branch.Trim()
+
 if ($Release) {
     $file = Join-Path $claims ((ConvertTo-KeyFile $Release) + ".json")
     if (-not (Test-Path $file)) { Write-Host "No claim on '$Release' -- nothing to release."; exit 0 }
@@ -199,8 +255,58 @@ if ($Release) {
         }
         exit 1
     }
-    Remove-Item -LiteralPath $file -Force
+    # RECORD FIRST, then act. Both orders can lie once and only one lie is recoverable: removing first
+    # and recording after reproduces this item exactly (a completed release with no trace, and nothing
+    # left to write the record from), whereas recording first can at worst claim a release that then
+    # failed -- which the catch below corrects in the same ledger. Refusing when the record cannot be
+    # written is safe because a release is always retryable: the claim stays where it was.
+    #
+    # ConvertTo-Stamp on every field carried over from the claim file, not just the timestamp:
+    # ConvertFrom-Json date-coerces ANY ISO-8601-shaped string, and note/branch/worktree are free text.
+    $record = [ordered]@{
+        ts              = (Get-Date).ToString("o")
+        event           = "release"
+        key             = $Release
+        released_by     = $repo
+        released_branch = $branch
+        prior_holder    = ConvertTo-Stamp $info.Claim.worktree
+        prior_branch    = ConvertTo-Stamp $info.Claim.branch
+        # The note is what a later reader judges the release BY -- it is the field that was stale and
+        # wrong in the incident above -- so the record keeps it rather than pointing at a deleted file.
+        prior_note      = ConvertTo-Stamp $info.Claim.note
+        claimed         = ConvertTo-Stamp $info.Claim.claimed
+        # The flag AS PASSED. Whether this was a takeover is already readable from prior_holder against
+        # released_by, and a record should not restate a fact it already carries.
+        force           = [bool]$Force
+    } | ConvertTo-Json -Compress
+    if (-not (Add-HistoryLine $record)) {
+        Write-Host ""
+        Write-Host "REFUSING to release '$Release': the release record could not be written." -ForegroundColor Yellow
+        Write-Host "  ledger : $history"
+        Write-Host "  Your claim is UNCHANGED and still yours. Retry in a moment -- an untraceable"
+        Write-Host "  release is the one outcome this refuses to produce."
+        exit 1
+    }
+    try {
+        Remove-Item -LiteralPath $file -Force
+    }
+    catch {
+        # The line above says a release happened; it did not. Correct it in the same ledger rather than
+        # leave a record that is now false.
+        Add-HistoryLine ([ordered]@{
+                ts          = (Get-Date).ToString("o")
+                event       = "release-failed"
+                key         = $Release
+                released_by = $repo
+                reason      = $_.Exception.Message
+            } | ConvertTo-Json -Compress) | Out-Null
+        throw
+    }
     Write-Host "Released claim on '$Release'." -ForegroundColor Green
+    if (-not $info.IsMine) {
+        Write-Host "  TOOK OVER a claim held by $($info.Claim.worktree) [$($info.Claim.branch)]." -ForegroundColor Yellow
+    }
+    Write-Host "  recorded in $history"
     exit 0
 }
 
@@ -209,10 +315,6 @@ if ($List) { Show-List; exit 0 }
 
 $safe = ConvertTo-KeyFile $Take
 $file = Join-Path $claims "$safe.json"
-
-$branch = & git -C $repo branch --show-current
-if ([string]::IsNullOrWhiteSpace($branch)) { $branch = "detached@" + (& git -C $repo rev-parse --short HEAD) }
-$branch = $branch.Trim()
 
 try {
     # ATOMIC test-and-set -- identical to alloc.ps1. 'CreateNew' + FileShare::None throws IOException if a
