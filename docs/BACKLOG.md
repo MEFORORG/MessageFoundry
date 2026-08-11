@@ -7707,3 +7707,20 @@ gate is the wrong shape, validation of the walk is the right one.
 **Cluster:** Developer tooling / CI. **Priority:** P3. **Verdict:** build. **Severity:** minor -- no product effect; it degrades a working gate into an unreadable one at the moment it matters.
 
 
+## 1222. A fail-closed contract is pinned through a C-stack-dependent trigger, so the test measures the runner
+
+> 🔢 **Filed 2026-08-11 -- live: it reds two PRs while `main` PASSES it, and the test is byte-identical across the range.** Value **6/10** -- Difficulty **3/10** -- _fill-in_. `tests/test_sandbox_codec.py::test_recursion_error_is_not_a_value_error` builds **100,000-deep** nested JSON and requires `json.loads` to raise `RecursionError`. On the CI ubuntu leg it now reports **`Failed: DID NOT RAISE RecursionError`** on `#302` and `#328` -- two entirely unrelated changes, a ledger merge and a crypto doc contract -- while `origin/main` `8077a033`, the commit they are cut from, **passes the full suite 11,199 / 0**.
+
+> **THE CONTRACT IT PINS IS REAL AND MUST NOT BE LOST.** `decode_frame` catches `RecursionError` **explicitly**, because `RecursionError` is a `RuntimeError` and **not** a `ValueError` -- so an `except ValueError` would let a deep-nesting rejection **escape the fail-closed path**. That is worth a test. The defect is the INSTRUMENT, not the intent.
+
+> **MEASURED: THE TRIGGER IS ENVIRONMENT-DEPENDENT BY A FACTOR OF AT LEAST SIX.** On a Windows box (CPython 3.14.6, AMD64) the shallowest depth at which `json.loads` raises is **16,914** -- so the test's 100,000 carries **5.9x margin there**. On the failing runner, 100,000 **does not raise at all**, so its threshold is *above* 100,000. Same trigger, same bytes, thresholds differing by more than 6x. **The mechanism is visible in the numbers: `sys.getrecursionlimit()` is 1000, yet `json.loads` reaches 16,914 -- the C accelerator does not use Python's recursion limit, it consumes the C STACK, which no Python-level knob controls.** Interpreter build, thread stack size and runner image all move it; nothing in this repository does.
+
+> **RULED OUT, so nobody re-derives it.** Across `48f8712d..8077a033` (the range between a passing main and the current one): **908 added lines** and **zero** occurrences of `setrecursionlimit`, `sys.setrecursion`, `threading.stack_size`, `stack_size` or `RecursionError`; `tests/test_sandbox_codec.py` **unchanged**, its blob `24807e73e152` byte-identical at both ends; and no recursion or stack knob in `conftest.py`, `pyproject.toml` or the sandbox modules. **Cause UNKNOWN and recorded as unknown** -- the runner image is the remaining candidate and is outside this repository. Note it does not cleanly explain main passing, and no mechanism is invented here to reconcile that.
+
+> **DO NOT FIX THIS BY RAISING THE DEPTH.** That buys a green on today's image and re-fires on the next roll, and it makes the test *more* environment-coupled rather than less. **The contract can be pinned directly without blowing any stack:** assert the type relationship (`not issubclass(RecursionError, ValueError)`, and that it IS a `RuntimeError`), and assert `decode_frame`'s handler catches `RecursionError` -- by driving the handler with a raised `RecursionError` rather than by manufacturing one from real recursion. **A test whose pass depends on the C stack tests the runner as much as the code.**
+
+> **How to prove a fix:** the replacement must still FAIL if `decode_frame`'s `except RecursionError` is narrowed to `except ValueError` -- break it on purpose and watch it red. And it must pass on a box whose `json.loads` threshold is 16,914 *and* on one where it exceeds 100,000, because covering only one of those is what produced this item.
+
+**Cluster:** Testing / instruments. **Priority:** P2. **Verdict:** build. **Severity:** conditional -- no product effect; the shipped `decode_frame` behaviour is correct. It is a red that blocks unrelated PRs and cannot be attributed to any of them.
+
+
