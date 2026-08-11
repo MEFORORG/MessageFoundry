@@ -43,6 +43,7 @@ from messagefoundry.transports import wincred
 from messagefoundry.transports.base import (
     DeliveryError,
     DestinationConnector,
+    DestinationStartupError,
     InboundHandler,
     SourceConnector,
     SourceStartupError,
@@ -206,6 +207,11 @@ class FileDestination(DestinationConnector):
         if "directory" not in s:
             raise ValueError("file destination requires a 'directory' setting")
         self.directory = Path(s["directory"])
+        # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
+        # run-time deferral, which on an outbound means the target dir is created on the first write.
+        # When on, the directory must already exist at start AND `_write` never creates it — an operator
+        # who said "never invent this path" gets that at delivery time too, not only at start.
+        self.validate_directory: bool = bool(s.get("validate_directory", False))
         self.filename_template: str = s.get("filename", "{MSH-10}.hl7")
         # When two messages resolve to the same name, append a counter rather than clobber.
         self._overwrite: bool = bool(s.get("overwrite", False))
@@ -234,9 +240,34 @@ class FileDestination(DestinationConnector):
         except OSError as exc:
             raise DeliveryError(f"file write failed: {exc}") from exc
 
-    async def test_connection(self) -> None:
+    async def validate_startup(self) -> None:
+        """Opt-in at-start directory validation (#114) — the outbound mirror of
+        :meth:`FileSource.validate_startup`. No-op unless ``validate_directory`` is set; then the target
+        directory must already exist (no mkdir — a merely-missing dir FAILS) and accept a write, since a
+        delivery writes there. A failure raises :class:`DestinationStartupError` so the runner isolates
+        the lane as ADR-0031 ``failed``: no live connector, the delivery worker still spawned, routed
+        rows retried rather than delivered into a directory the engine invented.
+
+        The probe runs under the alternate credential when one is configured (#111), so it validates the
+        share under the same identity the delivery will use."""
+        if not self.validate_directory:
+            return
         try:
-            await self._run_fs(_probe_dir_writable, self.directory)
+            await self._run_fs(_probe_dir_startup, self.directory, require_write=True)
+        except OSError as exc:
+            raise DestinationStartupError(
+                f"file destination directory {self.directory} failed startup validation: {exc}"
+            ) from exc
+
+    async def test_connection(self) -> None:
+        # Under validate_directory the probe must NOT create either: otherwise POST
+        # /connections/{name}/test would silently repair the very typo the toggle exists to catch, and
+        # the next restart would then validate clean with nobody the wiser.
+        try:
+            if self.validate_directory:
+                await self._run_fs(_probe_dir_startup, self.directory, require_write=True)
+            else:
+                await self._run_fs(_probe_dir_writable, self.directory)
         except OSError as exc:
             raise DeliveryError(f"file directory {self.directory} not writable: {exc}") from exc
 
@@ -246,8 +277,42 @@ class FileDestination(DestinationConnector):
         if self._cred_ctx is not None:
             await self._cred_ctx.close()
 
+    def _ensure_directory(self) -> None:
+        """Make the target directory usable for this write — and make a CREATION observable (#114).
+
+        Default (``validate_directory`` off): the unchanged create-if-missing, except that a directory
+        this call actually created now logs a WARNING naming it. That silence is the defect: a typo'd
+        ``directory`` would otherwise be created on the first delivery and every message counted and
+        logged as delivered — because it was — into a path nobody is watching, with no error anywhere.
+
+        ``validate_directory`` on: never create. The directory was validated at start; if it has since
+        vanished the write raises, and ``send`` maps that to a retryable :class:`DeliveryError`, so the
+        lane backs off and self-heals when the share returns instead of fabricating a local directory at
+        the mount point and delivering into it.
+
+        The syscall count on the default path is unchanged: ``mkdir(parents=True, exist_ok=True)``
+        already probed ``is_dir()`` on its ``FileExistsError`` branch, which is the common one."""
+        if self.validate_directory:
+            if not self.directory.is_dir():
+                raise FileNotFoundError(
+                    f"destination directory {self.directory} does not exist and validate_directory is "
+                    "on, so it is never created on write"
+                )
+            return
+        try:
+            self.directory.mkdir(parents=True)
+        except FileExistsError:
+            if not self.directory.is_dir():
+                raise  # a non-directory sits at the configured path — the same OSError as before
+        else:
+            logger.warning(
+                "file destination CREATED missing directory %s — this delivery is landing in a "
+                "directory the engine just made; verify the configured path is the intended one",
+                self.directory,
+            )
+
     def _write(self, payload: str) -> None:
-        self.directory.mkdir(parents=True, exist_ok=True)
+        self._ensure_directory()
         name = render_filename(self.filename_template, payload, fallback="message.hl7")
         if self.compress == "gzip" and not name.endswith(".gz"):
             # Signal the on-disk format so a downstream reader (or a gunzip source) knows to unpack.

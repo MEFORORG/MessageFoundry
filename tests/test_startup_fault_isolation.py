@@ -10,6 +10,7 @@ backstop) and test_response_capture.py (capture/backend isolation)."""
 from __future__ import annotations
 
 import asyncio
+import logging
 import socket
 from pathlib import Path
 
@@ -285,6 +286,77 @@ async def test_file_validate_directory_off_defers_missing_dir(
         assert runner.inbound_running("file_in")  # bound; validation deferred to run time
     finally:
         await runner.stop()
+
+
+def _file_outbound_validate(outdir: Path, *, validate: bool) -> OutboundConnection:
+    settings: dict[str, object] = {"directory": str(outdir), "filename": "{MSH-10}.hl7"}
+    if validate:
+        settings["validate_directory"] = True
+    return OutboundConnection(
+        "file_out",
+        ConnectionSpec(ConnectorType.FILE, settings),
+        retry=RetryPolicy(backoff_seconds=0.05),
+    )
+
+
+async def test_file_outbound_validate_directory_isolates_missing_dir(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # #114 remainder: an OUTBOUND File connection with validate_directory=true, pointed at a typo'd
+    # (missing) directory, is REFUSED at start — the lane is reported `failed` with no live connector
+    # while the engine stays up, and the directory is never fabricated. "Invalid means not-started" on
+    # an outbound IS the ADR-0031 degraded-lane state: the delivery worker still runs, so a message
+    # routed there is RETAINED pending and retried rather than delivered into an invented path.
+    inbox, missing = tmp_path / "in", tmp_path / "typo"
+    inbox.mkdir()
+    reg = Registry()
+    reg.add_inbound(_file_inbound(inbox))
+    reg.add_outbound(_file_outbound_validate(missing, validate=True))
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", lambda m: Send("file_out", m))
+    sink = _RecordingAlertSink()
+    runner = RegistryRunner(reg, store, poll_interval=0.02, alert_sink=sink)
+    await runner.start()
+    try:
+        assert runner.running  # isolated, not fatal
+        assert "file_out" in runner.degraded_connections()
+        assert "DestinationStartupError" in (runner.connection_failed("file_out") or "")
+        assert "file_out" not in runner._destinations  # no live connector
+        assert sink.stopped and sink.stopped[0][0] == "file_out"  # alerted at start
+        assert not missing.exists()  # the no-mkdir probe never fabricated it
+        (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
+        await _wait_pending(store, "file_out")  # retained + retried, never dropped
+        assert not missing.exists()  # and nothing was written into an invented directory
+    finally:
+        await runner.stop()
+
+
+async def test_file_outbound_validate_directory_off_defers_missing_dir(
+    store: MessageStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The default, and the item's ACTUAL trigger: a target directory that is not there at start must NOT
+    # fail startup. The lane comes up clean and the first delivery creates the directory — unchanged
+    # behaviour — except that the creation now emits a WARNING naming the path, so it is
+    # distinguishable from a normal delivery.
+    inbox, outdir = tmp_path / "in", tmp_path / "late"
+    inbox.mkdir()
+    reg = Registry()
+    reg.add_inbound(_file_inbound(inbox))
+    reg.add_outbound(_file_outbound_validate(outdir, validate=False))
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", lambda m: Send("file_out", m))
+    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
+        await runner.start()
+        try:
+            assert runner.degraded_connections() == {}  # validation deferred — the lane is clean
+            assert "file_out" in runner._destinations
+            (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
+            await _until(lambda: (outdir / "MSG1.hl7").exists())
+            await _wait_processed(store, "file_in")
+        finally:
+            await runner.stop()
+    assert "CREATED missing directory" in caplog.text
 
 
 async def test_valid_graph_starts_without_degradation(store: MessageStore, tmp_path: Path) -> None:
