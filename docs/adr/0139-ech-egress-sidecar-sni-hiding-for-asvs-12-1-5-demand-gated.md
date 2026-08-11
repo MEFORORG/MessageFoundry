@@ -31,9 +31,9 @@ found no partner endpoint publishes an `ECHConfig`.
 
 ## Disposition (2026-08-10) — the terminating re-originator was BUILT, then RETIRED
 
-This block previously filed the terminating re-originator under *"Deferred (the real ECH work)"*. That was
-wrong at HEAD and is corrected here: it was **written**, it lived in the tree, and it has now been
-**removed by decision** rather than never attempted.
+The *Implementation status* block above filed the terminating re-originator under *"Deferred (the real ECH
+work)"*. That was wrong at HEAD and is corrected here: it was **written**, it lived in the tree, and it has
+now been **removed by decision** rather than never attempted.
 
 - **What existed.** `tools/ech-sidecar/` — a **stdlib-only Go** loopback re-originator (`main.go`, 312
   lines, + `go.mod` + `README.md`): resolves the destination's `ECHConfigList` from its DNS HTTPS record
