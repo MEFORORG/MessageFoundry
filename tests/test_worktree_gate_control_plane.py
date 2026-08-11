@@ -827,7 +827,7 @@ def test_a_quoted_key_in_an_UNGOVERNED_repo_is_untouched(
 
 
 def test_a_quoted_value_cannot_arm_the_READ_exclusion(repo: SimpleNamespace) -> None:
-    """The mirror image, pinned so the fix cannot be widened into its own inverse.
+    """The same defect with the sign reversed, pinned so the fix cannot be widened into its own inverse.
 
     The read exclusion stays on the FULLY masked view. If it were read off the bare-word mask, a quoted
     VALUE of ``--get`` would excuse the write beside it -- the same defect as this item with the sign
@@ -915,7 +915,7 @@ def test_the_ADMIN_SHARE_spelling_does_not_widen_the_key_list(
 def test_an_ALLOWLIST_ENTRY_written_as_an_admin_share_still_governs(
     repo: SimpleNamespace, tmp_path: Path, admin_share: str
 ) -> None:
-    """The MIRROR direction, which the item recorded as unmeasured.
+    """THE REVERSE DIRECTION, which the item recorded as unmeasured.
 
     Rewriting only the candidate side would close the measured spelling and leave this one open: a root
     written in the UNC form would silently govern nothing when the target is spelled normally. Measured
