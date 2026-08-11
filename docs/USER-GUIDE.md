@@ -567,7 +567,7 @@ The key operator shift under the staged pipeline: **an `AA` ACK means "received 
 
 A delivery dead-letters when its retries are exhausted. Retry behavior is per-outbound (defaults in `[delivery]` — see [CONFIGURATION.md](CONFIGURATION.md)):
 
-- `retry_max_attempts` **unset = retry forever** (the conservative default; under FIFO the failing head blocks its lane until it succeeds or is purged). Set a finite value to opt into retry-then-dead-letter.
+- `retry_max_attempts` **defaults to 100 — finite** (about 7 h 50 m under the default backoff). Attempts are counted per row, so a long outage dead-letters roughly the lane heads rather than the backlog, and every exhausted row lands in the replayable dead-letter queue below. A code-first `retry=RetryPolicy(max_attempts=None)` still means retry forever for a partner that must never be advanced past — under FIFO that head blocks its lane until it succeeds or is purged.
 - A partner **`AR` reject fails fast** (no retry); an **`AE` NAK / transient transport failure is retried** with backoff.
 
 To recover:

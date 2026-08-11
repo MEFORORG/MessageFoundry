@@ -4990,7 +4990,12 @@ class RegistryRunner:
             # never-attempted message purely for being removed) so the message is never
             # dropped. The unprocessed batch tail stays INFLIGHT and is recovered in order by
             # reset_stale_inflight on the next start/reload (ADR 0058 INV-3).
-            await self.store.mark_failed(item.id, "inbound not in registry", RetryPolicy())
+            # max_attempts=None is EXPLICIT (#1051): RetryPolicy's own default is now the finite 100,
+            # so a bare RetryPolicy() here would dead-letter an ACKed-but-never-attempted message
+            # purely for outliving a reload — the one thing these three sites exist to prevent.
+            await self.store.mark_failed(
+                item.id, "inbound not in registry", RetryPolicy(max_attempts=None)
+            )
             return _ItemOutcome.STOPPED, None
         inline = self._inline_ok.get(name, False)
         if inline:
@@ -5224,7 +5229,12 @@ class RegistryRunner:
             # The loopback was removed by a reload but residual tokens remain. Revert the claim
             # (retry-FOREVER, never dropped) and EXIT; a reload restoring the loopback re-arms
             # this worker and drains the backlog — mirrors the router worker's missing-inbound exit.
-            await self.store.mark_failed(item.id, "inbound not in registry", RetryPolicy())
+            # max_attempts=None is EXPLICIT (#1051): RetryPolicy's own default is now the finite 100,
+            # so a bare RetryPolicy() here would dead-letter an ACKed-but-never-attempted message
+            # purely for outliving a reload — the one thing these three sites exist to prevent.
+            await self.store.mark_failed(
+                item.id, "inbound not in registry", RetryPolicy(max_attempts=None)
+            )
             return _ItemOutcome.STOPPED, None
         # Peek the reply body for the loopback's content_type (in pipeline/, not the store), then
         # hand off in one atomic transaction. response_body_for_work_row reads the same immutable
@@ -5403,7 +5413,12 @@ class RegistryRunner:
             # router worker), so the ACKed-but-unprocessed message is never dropped. The
             # unprocessed batch tail stays INFLIGHT and is recovered in order by
             # reset_stale_inflight on the next start/reload (ADR 0058 INV-3).
-            await self.store.mark_failed(item.id, "inbound not in registry", RetryPolicy())
+            # max_attempts=None is EXPLICIT (#1051): RetryPolicy's own default is now the finite 100,
+            # so a bare RetryPolicy() here would dead-letter an ACKed-but-never-attempted message
+            # purely for outliving a reload — the one thing these three sites exist to prevent.
+            await self.store.mark_failed(
+                item.id, "inbound not in registry", RetryPolicy(max_attempts=None)
+            )
             return _ItemOutcome.STOPPED, None
         hname = item.handler_name
         if hname is None or hname not in self.registry.handlers:

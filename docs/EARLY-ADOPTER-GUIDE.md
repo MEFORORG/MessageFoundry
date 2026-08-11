@@ -446,21 +446,25 @@ Key semantics to internalize:
   - Transient (`AE`/`CE`) or transport error → **retry per `RetryPolicy`**.
   - Internal/code error → either **STOP** the lane and raise a `connection_stopped` alert, or
     **CONTINUE** (auto-dead-letter the bad message and keep flowing).
-  - **`RetryPolicy.max_attempts` unset = retry forever** (nothing silently lost) with exponential
-    backoff. Under the default **FIFO** ordering, a permanently-failing head **blocks its lane** until
-    it succeeds or is purged.
+  - **`RetryPolicy.max_attempts` defaults to 100 — finite** (about 7 h 50 m under the default
+    exponential backoff), then the row dead-letters into the replayable DLQ. Attempts are per row, so
+    an outage costs roughly the lane heads, not the backlog. Set `max_attempts=None` to retry forever
+    instead; under the default **FIFO** ordering that head then **blocks its lane** until it succeeds
+    or is purged.
 
 **Mandatory before go-live:**
 
 - [ ] **Wire real alerts.** Configure the `[alerts]` **webhook and/or email** notifier — do **not**
       rely on the default logging-only sink. The conservative defaults (FIFO head-of-line blocking,
-      retry-forever, STOP-on-internal-error) are only safe if a human gets paged when a lane stalls.
+      a ~7 h 50 m retry cap, STOP-on-internal-error) are only safe if a human gets paged when a lane
+      stalls.
 - [ ] **Set `[delivery]` buildup thresholds** (`max_oldest_seconds` defaults to 300s; set a `max_depth`
       sized to each connection's throughput) so `queue_buildup` fires before a stuck lane silently
       backs up. Buildup detection now covers the ingress and routed stages too, not just outbound.
-- [ ] **Choose `RetryPolicy` per outbound deliberately:** retry-forever for partners that must never
-      lose a message (accept head-of-line blocking + rely on buildup alerts), or a finite `max_attempts`
-      where stale data is worse than a replayable dead-letter.
+- [ ] **Choose `RetryPolicy` per outbound deliberately:** the finite default where a replayable
+      dead-letter beats a wedged lane, a *shorter* `max_attempts` where stale data is worse still, or
+      `max_attempts=None` (retry forever) for partners that must never be advanced past — the last
+      one accepts head-of-line blocking and depends on buildup alerts reaching a human.
 - [ ] **Choose `InternalErrorPolicy` intentionally:** `CONTINUE` (default) for high-volume feeds where
       uptime matters most; `STOP` for low-volume feeds where ordering/no-loss matters more than uptime.
 - [ ] **Code routers/handlers as pure and idempotent.** At-least-once means a message can re-run after
