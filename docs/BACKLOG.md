@@ -232,7 +232,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 | 53 | **#236** | Test-this-step and test-up-to-step with pinned upstream values | 5 | 4 | _fill-in_ | P2 | Real debug breadth — whole-handler traced values already fold onto rows (`mergeLiveValues`, ide/src/stepsModel.ts:544) so partial runs are a convenience, but pinning an expensive `db_lookup`/`fhir_lookup` has no equivalent at all; largely a stop condition plus state dump on ADR 0072's shipped trace, with the lookup mock and keeping `buildLensTraceArgs` (:674) incapable of emitting `--show-phi` the real work. |
 | 54 | **#1022** | disable_mfa has no last-factor guard where delete_webauthn_credential does, so the two removal paths can be ordered to reach zero factors | 5 | 4 | _fill-in_ | P2 | `delete_webauthn_credential` computes `last_second_factor` and refuses when MFA is required (`auth/service.py:2426-2432`); `disable_mfa` does nothing between `get_user` and `disable_totp` (`:2086-2087`), so a user holding TOTP plus one passkey can delete the passkey (permitted while `totp_enabled` is True) and then disable TOTP, arriving at zero enrolled factors — the state ADR 0068 AC-10 says the system shall refuse. (Corrected: the false doc claim was the `DELETE /me/mfa` **route-table row** at `docs/SECURITY.md:329`, since fixed to state the absence; `:752` is passkey-scoped and defensible, so the remaining doc obligation is ADR 0068 line 140.) The consequence is overstated in the obvious reading and the body corrects it: login enforcement is NOT missing, since `mfa_verified=not mfa_required` (`:718`) plus the ASVS 6.3.3 access gate in `require()` (`api/security.py:224-234`) make the outcome a forced re-enrollment rather than single-factor access. Value 5: genuine, demonstrable, defeats a numbered acceptance criterion by ordering and makes a shipped doc guarantee untrue, but no bypass and no PHI consequence. Difficulty 4 because the raise needs mapping at two call sites that would otherwise 500, one existing test breaks by construction (`tests/test_mfa.py:189`), and two docs move with it. Filed because ADR 0068 line 140 promised this parity follow-up and no item carries it. |
 | 55 | **#165** | DB schema browser + ad-hoc query runner | 5 | 5 | _fill-in_ | DEMAND-GATE | Corepoint-parity authoring aid whose external-SQL-client workaround is fully clean — the only DB reach today is the `SELECT 1` reachability probe (`messagefoundry/transports/database.py:484-501`) and dry-run refuses `db_lookup` (`messagefoundry/pipeline/dryrun.py:570`); the build is a net-new API surface plus per-dialect introspection, read-only statement gating, a permission, audit and a console pane. |
-| 56 | **#232** | Steps view for routers | 5 | 5 | _fill-in_ | P2 | Real Steps-view breadth gap exactly where destination selection is decided, with a workaround — read a five-line guard-and-return — clean enough to hold it off the top; a `route` row kind widens the ADR 0076 §3 grammar, so an amendment lands first, then `return []` disambiguation in a lens that skips routers outright today (messagefoundry/lens.py:306, :344-347), a router palette, and byte-stable rewrite parity. |
+| 56 | **#232** | Steps view for routers | 5 | 5 | _fill-in_ | P2 | Real Steps-view breadth gap exactly where destination selection is decided, with a workaround — read a five-line guard-and-return — clean enough to hold it off the top; a `route` row kind widens the ADR 0076 §3 enum + §4 grammar, so an amendment lands first, then `return []` disambiguation in a lens that skips routers outright today (messagefoundry/lens.py:306, :344-347), a router palette, and byte-stable rewrite parity. |
 | 57 | **#78** | Custom message-definition data model + conformance validator; NCPDP codec | 5 | 6 | _money pit_ | DEMAND-GATE | Corepoint-parity persisted-definition model plus a report-only validator and an additive NCPDP codec, all cleanly worked around today by a code-first Handler, so useful breadth rather than a blocker; the whole scope is still remainder — NCPDP appears nowhere in `messagefoundry/` and `profile` is merely "reserved for a conformance-profile" (`messagefoundry/parsing/validate.py:56`) — spanning a new stored model the code reads, a validator, and a new codec class. |
 | 58 | **#85** | Cloud object-store + generic message-bus destinations | 5 | 6 | _money pit_ | DEMAND-GATE | Corepoint-parity transport breadth with a clean workaround — the pluggable destination registry lets an adopter write the connector code-first — and nothing exists today (`transports/` carries no object-store or bus driver; `pyproject.toml` names no boto3/azure/google-cloud/kafka dependency). But the scored remainder is the whole scope: four-plus drivers, four vetted dependencies through the hash-locked lock file, plus credential sourcing and egress allow-listing on each, which exceeds the single-connector band 5. Quadrant becomes money pit. |
 | 59 | **#127** | Web-proxy credential types (Basic / Digest / NTLM / Windows) | 5 | 6 | _money pit_ | DEMAND-GATE | Breadth with a clean, ADR-ratified workaround — `cntlm` in front of the engine covers the enterprise NTLM proxy, and Basic already tunnels through `CONNECT`; the remainder is not a knob but a keep-alive HTTP client under `transports/rest.py`, because `urllib.request` opens a new connection per `open()` and the NTLM type1/2/3 handshake is connection-bound — the refusal is asserted at `messagefoundry/transports/rest.py:993-997` for the same reason #65 scoped it out (`transports/http_auth.py:27-31`), across four connector factories plus an ADR 0126 amendment. |
@@ -4719,7 +4719,7 @@ against the gate **as it will ship**, not as it is.
 
 ## 1051. Async-delivery `retry_max_attempts=None` (retry forever) contradicts the engine's own documented sync-HTTP guidance
 
-> 🔢 **Filed 2026-08-05 — not started.** Value **3/10** · Difficulty **2/10** · _fill-in_. `CONNECTIONS.md:2240` discloses the shipped async-delivery default `retry_max_attempts=None` as "retry forever", while `:2242` mandates a finite retry with a short timeout for synchronous HTTP. The default and the guidance disagree.
+> 🔢 **Filed 2026-08-05 — not started.** Value **3/10** · Difficulty **2/10** · _fill-in_. `CONNECTIONS.md:2277` discloses the shipped async-delivery default `retry_max_attempts=None` as "retry forever", while `:2279` mandates a finite retry with a short timeout for synchronous HTTP. The default and the guidance disagree.
 
 **Cluster:** Availability / delivery. **Priority:** P3. **Verdict:** build (small). **Severity:** no exposure on the shipping config (localhost + auth, single worker). On first deployment a forever-retrying FIFO lane head would block its lane until an operator purges it -- a behavioural DoS residual, honestly disclosed in-tree (the doc discloses the default and instructs the safe override), which is why it does not lower the ASVS 13.1.x documentation cells.
 
@@ -7576,5 +7576,54 @@ gate is the wrong shape, validation of the walk is the right one.
 > **On-trigger / demand-gate.** Trigger: **a real NCPDP feed appears.** Pharmacy claims are outside the HL7/FHIR/X12/DICOM scope the project has taken on, so this waits for a genuine feed rather than being built on parity grounds.
 
 **Cluster:** Codecs & Parsing. **Priority:** P3. **Verdict:** demand-gate. **Severity:** minor.
+
+
+## 1214. The threat-model numeric-parity gate compares live constants to a hardcoded transcription, not to the document it names
+
+> 🔢 **Filed 2026-08-11 -- found by Session C, MEASURED not argued.** Value **5/10** -- Difficulty **3/10** -- _fill-in_. `tests/test_threat_model_doc_drift.py::test_documented_bounds_match_the_live_constants` compares each live constant to a **hardcoded literal in the test file**, then reports a mismatch as `"doc says {expected!r}, code says {actual!r}"`. **"doc says" is not true of any value it compares** -- the literal is a human transcription, and nothing binds the transcription to the document. All of the roughly 60 rows in the `checks` list share the shape, so the gate catches *code drifting from the transcription* and can never catch *the transcription drifting from the document*.
+
+> **The proof it does not work is that it PASSES when fully wired.** Session C set `MEFOR_THREAT_MODEL_DOC` and `MEFOR_REQUIRE_THREAT_MODEL_DOC` and ran it against the real vault document: **90 passed, 11 skipped**. A gate that passes against the artefact it claims to compare against is measuring something else.
+
+> **This is SDS-3.8 -- the instrument answering the adjacent question -- inside the very module built to prevent that class.** It is the sibling of `#1043`, which made this module's doc-absent skip LOUD: the skip is now honest, and the comparison underneath it is still not the one the name promises. Fixing the skip did not fix the measurement.
+
+> **Scope:** bind the comparison to the DOCUMENT -- parse the value out of the named document at run time and compare that to the live constant -- or rename the check and its failure message to say what it actually asserts. Either is honest; the present state is not.
+
+**Cluster:** Testing and instruments. **Priority:** P2. **Verdict:** build. **Severity:** conditional -- no product effect; it is a security-record instrument reporting a comparison it does not perform.
+
+---
+
+## 1215. ADR 0161 and `mail-drain.ps1` describe the pre-wiring channel, and the script contradicts itself about markers
+
+> 🔢 **Filed 2026-08-11 -- found by Session C at HEAD while verifying #1028; reported, not fixed.** Value **4/10** -- Difficulty **2/10** -- _fill-in_. Three defects in one record. (1) ADR 0161's Status line and its "Status and what gates wiring" section still call the code an **unwired prototype** with *"nothing live in any session"* -- **false at HEAD on both counts**. (2) `scripts/hooks/mail-drain.ps1:71-73` still says *"THIS DOES NOT WIRE ANYTHING"*, but commit `fdec72ca` introduced both hook rows itself, so **the sentence was false in the commit that added it**. (3) The same file **CONTRADICTS ITSELF ABOUT MARKERS**: `:37-42` and `:57-64` assert a marker gates a consume; the shipped code at `:802`, `:809` and `:875-886` says the opposite.
+
+> **The third is the dangerous one, and it is the design-doc vocabulary trap by name:** a reader who trusts the header gets the INVERTED model, and **re-reading the header only confirms the error**. Only reading the running code catches it. That is why this carries weight despite being documentation-only.
+
+> **Also:** `docs/adr/0161-*.md:408` carries a warning glyph added by PR #239 on 2026-08-07. CLAUDE.md section 11 forbids introducing new glyph vocabulary outside the two backlog files, and its variation selector is exactly the regex-handling problem that section cites.
+
+**Cluster:** Developer tooling and coordination. **Priority:** P3. **Verdict:** build (documentation-only). **Severity:** minor -- no product effect.
+
+---
+
+## 1216. The `bash` skipif cannot see the defect it guards: a WRONG bash is found, not absent, so 19 failures are manufactured
+
+> 🔢 **Filed 2026-08-11 -- root cause of a puzzle this programme carried for a full day.** Value **6/10** -- Difficulty **2/10** -- _quick win_. **`bash` means two different programs on this box.** `C:\Program Files\Git\bin\bash.exe` (Git Bash) gives **0 failures**; `C:\windows\system32\bash.exe` (the WSL launcher) gives **19**. `C:\Program Files\Git\cmd` is on `PATH` and carries `git.exe` ONLY -- `C:\Program Files\Git\bin`, which carries `bash.exe`, is **not**. So `shutil.which("bash")` finds the WSL launcher, which strips the backslashes out of a Windows path and cannot open the file.
+
+> **`tests/test_workflow_shell_syntax.py`'s `skipif(shutil.which("bash") is None)` asks whether A bash EXISTS, not whether the one it found CAN DO THE JOB.** So the wrong interpreter is found rather than absent, the skip never fires, and 19 honest skips become 19 manufactured failures.
+
+> **The tell was printed on every run and nobody read it: it reports "154 shell blocks; 154 failed". A 100 PERCENT FAILURE RATE IS AN INSTRUMENT FAULT, NOT 154 CONTENT FAULTS.** Isolated to a single variable inside one PowerShell session -- same shell, same commit, same venv, only PATH order changed: WSL bash gave 1 failed; Git Bash gave 47 passed, 7 skipped. Three independent lanes reached it separately.
+
+> **Scope:** probe whether the discovered `bash` can actually open a temp file, rather than whether one exists, and skip honestly when it cannot -- naming which interpreter was found. **Consequence beyond this one test:** every baseline measured on this box is only a baseline FOR THE SHELL IT WAS MEASURED IN, which is why two lanes measuring one commit on one day reported 1 failure and 19.
+
+**Cluster:** Testing and instruments. **Priority:** P2. **Verdict:** build. **Severity:** conditional -- no product effect; it manufactures failures that mask real ones.
+
+---
+
+## 1217. `retry_max_attempts` has no `>=1` floor, and retry-forever has no TOML or env spelling
+
+> 🔢 **Filed 2026-08-11 -- found by Session C while building #1051; measured and documented rather than fixed, because a floor changes the accepted-configuration set.** Value **4/10** -- Difficulty **2/10** -- _fill-in_. Two halves. (1) **`0` or a negative value loads clean and dead-letters on the FIRST failure** -- the check is `attempts >= max_attempts` against a post-increment count, so `0` means "give up immediately" while reading like "no limit". (2) **There is no TOML or env spelling for retry-forever**: `""`, `none` and `null` all raise `ValidationError`, so that posture is reachable **per-outbound in code-first configuration only**.
+
+> Both are conditional on a first deployment: an operator who wrote `retry_max_attempts = 0` intending "unlimited" would get single-attempt dead-lettering, silently. Nothing is misconfigured today; there are zero deployments. Note the interaction with **#1051**, which set the finite default to 100 -- a floor should be decided alongside whether retry-forever needs a config spelling at all.
+
+**Cluster:** Connections and Transports. **Priority:** P3. **Verdict:** build. **Severity:** minor.
 
 
