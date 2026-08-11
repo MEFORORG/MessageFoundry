@@ -2,13 +2,19 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """Tests for the ECH SNI-hiding send-path (transports/rest.py, ADR 0139, ASVS 12.1.5).
 
-An `ech_egress` REST connection re-addresses each request to a loopback **terminating** sidecar
-(`tools/ech-sidecar/`) over cleartext http with the real destination in the `Host` header; the sidecar
-re-originates the https + ECH connection (hiding the SNI). These tests cover the resolver
-(`ech_sidecar_url_from_settings`), the fail-closed refusal on non-REST connectors
-(`egress_route_from_settings`), the connector wiring (`_ech_request` / opener / mutual exclusion), and a
-**stub-sidecar `_post` behavioral test** proving the request actually lands on the sidecar naming the
-upstream in `Host`. The real Go sidecar + a live ECH endpoint are proven separately (tools/ech-sidecar).
+An `ech_egress` REST connection re-addresses each request to a loopback **terminating** sidecar over
+cleartext http with the real destination in the `Host` header; the sidecar re-originates the https +
+ECH connection (hiding the SNI). **The engine ships no sidecar** — the operator supplies one (recipe:
+`samples/ech-sidecar/README.md`). A reference Go implementation lived at `tools/ech-sidecar/` and was
+retired 2026-08-11 under the G19 ruling; nothing built, tested or version-pinned it, and it survives
+in git history.
+
+These tests cover the resolver (`ech_sidecar_url_from_settings`), the fail-closed refusal on non-REST
+connectors (`egress_route_from_settings`), the connector wiring (`_ech_request` / opener / mutual
+exclusion), and a **stub-sidecar `_post` behavioral test** proving the request actually lands on the
+sidecar naming the upstream in `Host`. That is the whole of what this file proves: the engine's
+ROUTING and its fail-closed behaviour. **It does not prove that any SNI is concealed** — no ECH is
+originated anywhere in this suite, and no claim of SNI hiding rests on it.
 """
 
 from __future__ import annotations

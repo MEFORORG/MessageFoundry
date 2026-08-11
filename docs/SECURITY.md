@@ -1746,16 +1746,24 @@ BACKLOG #190 bundled three integrity residuals; #190 closes with **one built** a
   protects the payload. Re-open when the stdlib gains a first-class ECH API and an SVCB/HTTPS
   resolver is in scope.
 
-  > **Correction, 2026-08-10.** This paragraph previously called ECH *infeasible* and said a working
-  > client "would require a **third-party TLS stack** — violating the no-new-dependency rule". Both
-  > halves are false, and the counter-evidence is in this repository: `tools/ech-sidecar` is a
-  > working out-of-process ECH client whose `go.mod` reads "stdlib-only, no dependencies" and whose
-  > every import is Go stdlib (ADR 0139). A reader weighing this risk acceptance was being told the
-  > control could not be built while the tree contained one. What is actually true is narrower and
-  > is what the paragraph now says: the **engine process** cannot do ECH, and the sidecar is **not
-  > wired into any egress path, not built by CI, and not distributed** (`pyproject.toml` excludes
-  > `tools/` from both sdist and wheel). **The accepted residual is unchanged** — the SNI is visible
-  > either way. Only the premise is corrected.
+  > **Correction, 2026-08-10, amended 2026-08-11.** This paragraph previously called ECH
+  > *infeasible* and said a working client "would require a **third-party TLS stack** — violating
+  > the no-new-dependency rule". Both halves were false **when written**, and the counter-evidence
+  > was in the tree at the time: `tools/ech-sidecar` was a working out-of-process ECH client whose
+  > `go.mod` read "stdlib-only, no dependencies" and whose every import was Go stdlib (ADR 0139). A
+  > reader weighing this risk acceptance was being told the control could not be built while the
+  > repository contained one.
+  >
+  > **That tree was retired on 2026-08-11** under the G19 ruling — nothing built, tested, linted or
+  > version-pinned it, and there is no Go toolchain in CI. It survives in git history and in the
+  > private vault, so the refutation above remains checkable; it is simply no longer checkable from
+  > the working tree. What is true now is narrower and is what the paragraph says: the **engine
+  > process** cannot do ECH, and the engine ships **no sidecar** — an operator supplying their own
+  > loopback ECH terminator is the only route, and the engine's fail-closed routing for that case
+  > stays (`transports/rest.py`, `tests/test_ech_egress.py`).
+  >
+  > **The accepted residual is unchanged throughout** — the destination SNI is visible on the
+  > outbound handshake under every one of these states. Only the premise moved.
 
 ### In-use memory protection — best-effort partial + deployment requirement (13.3.3 / 11.7.1 / 11.7.2, #198)
 

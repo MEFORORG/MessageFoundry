@@ -11,6 +11,26 @@
 
 ## Implementation status
 
+> **Amendment 2026-08-11 (G19 ruling) — the sidecar tree is RETIRED.** This block previously filed
+> the terminating re-originator under "Deferred (the real ECH work)" while a complete Go
+> implementation was tracked at `tools/ech-sidecar/`, so the record contradicted HEAD in the
+> direction of understating what shipped. That has now been resolved in the other direction: the
+> tree was **removed** on 2026-08-11. Measured at the time of the ruling — four tracked files,
+> `main.go` 312 lines, zero module dependencies, and **no Go toolchain anywhere in CI** (zero
+> matches for `setup-go`/`go-version`/`go build` across `.github/`, against a live positive control
+> of 14 files matching `setup-python`). Keeping it would have bought a fourth Dependabot ecosystem,
+> the first compiled-language CodeQL leg, a toolchain pin with no hash-lock analogue, and a
+> fourteenth required context — for a control that no measurement has ever shown to be reachable:
+> the 2026-07-20 DoH type-65 probe found **no** healthcare counterparty publishing an ECHConfig,
+> against a working Cloudflare control.
+>
+> **The decision below is unchanged and Increment 1 still stands.** The engine-side routing and
+> fail-closed plumbing remain shipped and tested. What changed is only that the engine no longer
+> carries a reference implementation of the far end — an operator supplies their own loopback ECH
+> terminator, per [`samples/ech-sidecar/`](../../samples/ech-sidecar/README.md). The retired code
+> survives in git history and in the private vault. **ASVS 12.1.5 remains an accepted `fail`
+> either way**; retirement changed no verdict.
+
 **Increment 1 — built + verified (commit `a0c336ce`): the engine-side routing + fail-closed plumbing only.**
 - `transports/rest.py` — `ech_sidecar_url_from_settings` (an opt-in per-connection route to a **loopback** sidecar,
   reusing the ADR 0126 opener plumbing) + `egress_route_from_settings`, the single ECH-or-proxy resolver
