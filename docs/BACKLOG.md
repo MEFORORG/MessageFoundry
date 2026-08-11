@@ -7773,3 +7773,37 @@ gate is the wrong shape, validation of the walk is the right one.
 **Cluster:** Security / secret disclosure. **Priority:** P2. **Verdict:** build. **Severity:** conditional -- a credential-adjacent disclosure in a shipped default path; no PHI, and zero deployments, so nothing is exposed today.
 
 
+## 1224. The `upload.prune` audit row names the file's owner as the actor of an automated sweep
+
+> 🔢 **Filed 2026-08-11 -- read off `origin/main`, TWO sites not one.** Value **6/10** -- Difficulty **2/10** -- _quick win_. The retention sweep is **automated and owner-blind**, but its audit row attributes the deletion to the pruned file's uploader:
+
+> ```
+> api/app.py:3806   actor=pruned.uploader or None      client=client_ip(request)
+> api/app.py:5640   actor=meta.uploader   or None      (no client)
+> ```
+
+> **The first site is the worse of the two:** it pairs the FILE OWNER'S NAME with the TRIGGERING OPERATOR'S IP, so the row asserts that operator X deleted their own file **from operator Y's address**. Nobody deleted it -- retention did. The second site, reached from the background `UploadRetentionRunner`, names the owner with no client at all. **A fix that closes only the first closes half the defect**, which is why both are recorded here.
+
+> **In the conditional (§0):** on a first deployment this would write a **FALSE ACTOR ATTRIBUTION into the permanent record**, and the person named has no way to disprove it.
+
+> **WHY IT OUTRANKS ITS OWN SEVERITY.** Audit integrity is the control other controls are reviewed *through*. Any scorecard cell resting on *"every PHI access is audited with the acting user"* is resting on this. A record that misattributes an automated action is worse than one that omits it, because it reads as positive evidence.
+
+> **Scope:** attribute an automated sweep to the **system**, and carry the file's owner as **data in the detail** -- where it already is (`detail=json.dumps({"file_id": ..., "uploader": ...})`), so the information is not lost, only correctly placed. Fix both sites. **How to prove it:** assert the emitted row's `actor` is the system principal and its `uploader` detail is unchanged, for both the request-path prune and the background runner -- the second is the one a single-site fix leaves behind.
+
+**Cluster:** Security / Audit integrity. **Priority:** P2. **Verdict:** build. **Severity:** conditional -- no PHI is disclosed; the defect is a false attribution in the tamper-evident record.
+
+---
+
+## 1225. Saved search presets are owner-scoped by the reassignable username, not the immutable `user_id`
+
+> 🔢 **Filed 2026-08-11 -- the same class just fixed for uploads, in the surface the uploads decision CITED AS ITS PRECEDENT.** Value **5/10** -- Difficulty **3/10** -- _fill-in_. Presets are keyed on `identity.username` as an **access key** at `api/app.py:4009` (`list_search_presets`), `:4084` (delete) and `:4119` (get). `Identity` already carries an **immutable `user_id`** as its first field (`auth/identity.py:30`). A username is reassignable -- by delete-and-recreate, or by AD auto-provision -- so **a recycled account name inherits a departed operator's saved presets**.
+
+> **THE PART THAT MAKES IT MORE THAN ITS SEVERITY:** the master test plan's open question **Q6 named SEARCH PRESETS AS THE PRECEDENT** for the uploads owner-scoping decision -- *"should it be owner-scoped like search presets?"* So **the precedent cited to justify the uploads model carries the exact defect the uploads model was built to remove.** Anyone who copies the precedent copies the bug. Q6 is annotated; the code is not fixed.
+
+> **SCOPE DATUM, and it is a warning rather than a measure of size:** `identity.username` appears **59 times** in `api/app.py`. **Most are audit `actor=` fields, where a NAME is the right thing to record** -- an audit row should say who, in the form a human reads. The defect exists only where the username is used as an **ACCESS KEY**. **Do not sweep all 59.** The three call sites above are the surface; anything else must be judged individually.
+
+> **How to prove a fix:** create a preset as user A, delete and recreate an account with A's username, and assert the new identity sees **no** presets -- the recycled-name case is the whole item, and a test that only checks "A sees A's presets" passes on the defective code.
+
+**Cluster:** Security / Access control. **Priority:** P3. **Verdict:** build. **Severity:** minor -- a preset is a saved FILTER rather than PHI at rest, though its layered compose surface carries a PHI-shaped content term.
+
+
