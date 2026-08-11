@@ -283,8 +283,20 @@
         // ADR 0104 fan-out: the precomputed isReturnRow — the toolbar Add derives its insert position from
         // it (a return / scaffold footer → before; a mid-body append → after).
         isReturn: el.dataset.isReturn === 'true',
+        // ADR 0076 Amendment D: the enclosing element's role, so an Add item outside that role is greyed.
+        role: el.dataset.role || 'handler',
       };
       updateAddState();
+    }
+
+    // Whether an Add item (an <option> or a .ctx-item) may be authored into an element of `role`. Mirrors
+    // itemAllowedInRole: an absent data-role-scope means handler-only, the safe default, because every
+    // pre-Amendment-D item authors a transform verb, a lookup, a diagnostic or an outbound send — none of
+    // which belongs in a Router, and all of which the engine refuses there (ADR 0076 D.6).
+    function inRole(el, role) {
+      if (!el) { return true; }
+      const scope = el.dataset.roleScope || 'handler';
+      return scope.split(' ').indexOf(role || 'handler') !== -1;
     }
 
     // Enable the toolbar Add only for a valid (item, selected row) pair: a chosen item, AND — for an
@@ -295,7 +307,7 @@
       const opt = sel.selectedOptions && sel.selectedOptions[0];
       const needsIfChain = !!(opt && opt.dataset.anchor === 'if_chain');
       const isIfChain = selected.kind === 'control' && (selected.control === 'if' || selected.control === 'elif');
-      addBtn.disabled = needsIfChain && !isIfChain;
+      addBtn.disabled = (needsIfChain && !isIfChain) || !inRole(opt, selected.role);
     }
 
     // ---- Steps block clipboard (webview-owned via vscode.setState — survives re-projection) ------------
@@ -704,6 +716,12 @@
           for (const c of menu.querySelectorAll('.ctx-item[data-anchor="if_chain"]')) {
             setDisabled(c, !isIfChain);
           }
+          // ADR 0076 Amendment D: grey every Add item outside the enclosing element's role, so a Router's
+          // menu offers routing constructs only and the engine's refusal is never met as an error toast.
+          const rowRole = el.dataset.role || 'handler';
+          for (const c of menu.querySelectorAll('.ctx-item[data-item-id]')) {
+            if (!inRole(c, rowRole)) { setDisabled(c, true); }
+          }
           // Mirror isRowMovable: a code row (and an elif/else header) is NOT movable, even though walkMove
           // finds an adjacent slot for it (it is draggable only as a drag-interception marker). Gate the
           // ↑/↓ on the row's own movability so the menu agrees with the per-row buttons + the read-only contract.
@@ -849,5 +867,6 @@
         scopeLabel: scopeLabel,
         resolveDrop: resolveDrop,
         barAnchor: barAnchor,
+        inRole: inRole,
       };
     }

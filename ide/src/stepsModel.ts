@@ -246,6 +246,11 @@ export interface RowViewModel {
 export interface HandlerViewModel {
   handler: string;
   defLine: number;
+  // The element's role (ADR 0076 Amendment D). Every row of this element is stamped with it so the
+  // Add-palette can grey the items that role may not author, instead of letting the user pick one and
+  // meet the engine's refusal as an error toast (F6). Optional only so a hand-built test view-model may
+  // omit it; buildHandlerViewModel always populates it, defaulting to "handler".
+  role?: "handler" | "router";
   rows: RowViewModel[];
 }
 
@@ -581,6 +586,8 @@ export function buildHandlerViewModel(handler: LensHandler, lines: string[]): Ha
   return {
     handler: handler.handler,
     defLine: handler.def_line,
+    // A contract-1 payload carries only handlers, so an absent `role` reads as "handler" everywhere.
+    role: handler.role ?? "handler",
     rows: handler.rows.map((row, i) => buildRowViewModel(row, i, lines)),
   };
 }
@@ -1000,6 +1007,11 @@ export interface AddMenuItem {
   seed?: Record<string, ParamValue>; // op === "insert_row": default params for a no-prompt inline-fill
   prompts: PromptSpec[];
   anchorConstraint?: "if_chain"; // Else / Else If: only valid on an if-chain anchor
+  // Which element ROLE the item may be inserted into (ADR 0076 D.6). Absent means HANDLER ONLY -- the
+  // safe default, since every pre-Amendment-D item authors a transform verb, a lookup, a diagnostic or an
+  // outbound send, none of which belongs in a router. A router stays pure destination-selection, and the
+  // engine refuses those ops inside one; scoping the palette means the user never meets that refusal.
+  roles?: readonly ("handler" | "router")[];
 }
 
 const IF_OPERATORS = ["exists", "equals", "not_equals", "contains"] as const;
@@ -1080,6 +1092,7 @@ export const ADD_MENU_CATALOG: readonly AddMenuItem[] = [
   // --- Structure & flow ---
   {
     id: "if", label: "If", group: "Structure & flow", op: "template", template: "if",
+    roles: ["handler", "router"],
     prompts: [
       { field: "field", label: "Field path", kind: "text", placeholder: "PID-3.1" },
       { field: "operator", label: "Condition", kind: "choice", choices: IF_OPERATORS },
@@ -1088,20 +1101,31 @@ export const ADD_MENU_CATALOG: readonly AddMenuItem[] = [
   },
   {
     id: "elif", label: "Else If", group: "Structure & flow", op: "insert_clause", clause: "elif", anchorConstraint: "if_chain",
+    roles: ["handler", "router"],
     prompts: [
       { field: "field", label: "Field path", kind: "text", placeholder: "PID-3.1" },
       { field: "operator", label: "Condition", kind: "choice", choices: IF_OPERATORS },
       { field: "value", label: "Value", kind: "text", optional: true },
     ],
   },
-  { id: "else", label: "Else", group: "Structure & flow", op: "insert_clause", clause: "else", anchorConstraint: "if_chain", prompts: [] },
+  { id: "else", label: "Else", group: "Structure & flow", op: "insert_clause", clause: "else", anchorConstraint: "if_chain", roles: ["handler", "router"], prompts: [] },
   {
     id: "for_each", label: "For Each", group: "Structure & flow", op: "template", template: "for_each",
+    roles: ["handler", "router"],
     prompts: [{ field: "segment_id", label: "Segment id", kind: "text", placeholder: "OBX" }],
   },
   { id: "filter", label: "Filter", group: "Structure & flow", op: "template", template: "filter", prompts: [] },
   {
+    // ADR 0076 Amendment D: the router's routing return. It carries HANDLER names -- a different
+    // namespace from Send's outbound-connection names, at a different pipeline stage (D.5) -- so it is a
+    // separate item with its own prompt, never a re-labelled Send.
+    id: "route", label: "Route To", group: "Structure & flow", op: "template", template: "route",
+    roles: ["router"],
+    prompts: [{ field: "handlers", label: "Handler name(s), comma-separated", kind: "text", placeholder: "oru_relay" }],
+  },
+  {
     id: "raise", label: "Raise", group: "Structure & flow", op: "template", template: "raise",
+    roles: ["handler", "router"],
     prompts: [
       { field: "exc_type", label: "Exception", kind: "choice", choices: ["ValueError", "RuntimeError"] },
       { field: "message", label: "Message", kind: "text", placeholder: "bad MRN" },
@@ -1116,6 +1140,7 @@ export const ADD_MENU_CATALOG: readonly AddMenuItem[] = [
   },
   {
     id: "comment", label: "Comment", group: "Structure & flow", op: "insert_comment",
+    roles: ["handler", "router"],
     prompts: [{ field: "text", label: "Comment", kind: "text" }],
   },
   // --- Diagnostics (editable after insert, ADR 0106 §5 K — filled inline) ---
@@ -1128,10 +1153,32 @@ export const ADD_MENU_BY_ID: Readonly<Record<string, AddMenuItem>> = Object.from
   ADD_MENU_CATALOG.map((item) => [item.id, item]),
 );
 
-/** The catalog grouped in stable order — for the grouped <optgroup> select + the right-click submenu. */
+/** Whether an Add-menu item may be inserted into an element of `role` (see {@link AddMenuItem.roles}). */
+export function itemAllowedInRole(item: AddMenuItem, role: "handler" | "router"): boolean {
+  return (item.roles ?? ["handler"]).includes(role);
+}
+
+/**
+ * The catalog grouped in stable order — for the grouped <optgroup> select + the right-click submenu.
+ *
+ * The palette is rendered once per DOCUMENT but a document may hold both handlers and routers, so every
+ * item is emitted and the ones outside the selected row's role are marked (`roleScope`) for the webview
+ * to disable — the same shape the `if_chain` anchor constraint already uses. Groups that end up entirely
+ * out of scope are still emitted, so the menu's shape does not jump as the selection moves.
+ */
 export function addMenuGroups(): { group: AddMenuGroup; items: AddMenuItem[] }[] {
   const order: AddMenuGroup[] = ["Transform", "Translate & lookup", "Structure & flow", "Diagnostics"];
   return order.map((group) => ({ group, items: ADD_MENU_CATALOG.filter((i) => i.group === group) }));
+}
+
+/** The catalog restricted to what `role` may author — the pure answer AC-R5 asserts against. */
+export function paletteFor(role: "handler" | "router"): AddMenuItem[] {
+  return ADD_MENU_CATALOG.filter((item) => itemAllowedInRole(item, role));
+}
+
+/** The `data-role-scope` attribute value for an item: the roles it is valid in, space-separated. */
+export function roleScopeAttr(item: AddMenuItem): string {
+  return (item.roles ?? ["handler"]).join(" ");
 }
 
 /**
@@ -1198,6 +1245,15 @@ export function buildAddMenuRequest(
       if (values.exc_type) req.exc_type = values.exc_type;
       if (values.message !== undefined && values.message !== "") req.message = values.message;
       if (values.destination) req.destination = values.destination;
+      // `route` gathers its handler names as one comma-separated field; split + trim here so the engine
+      // receives the list its template validates, and drop empties so a trailing comma is not a name.
+      if (values.handlers !== undefined) {
+        const names = values.handlers
+          .split(",")
+          .map((h) => h.trim())
+          .filter((h) => h.length > 0);
+        if (names.length > 0) req.handlers = names;
+      }
       return withExpect(req);
     }
     case "insert_clause": {
@@ -1407,6 +1463,7 @@ export interface TemplateRequest {
   exc_type?: string; // raise
   message?: string;
   destination?: string; // send
+  handlers?: string[]; // route (ADR 0076 Amendment D) — HANDLER names, never outbound connections
   expect_src?: string;
 }
 
@@ -2553,7 +2610,12 @@ function renderRowActionsHtml(row: RowViewModel, handlerName: string): string {
 /** Render one row as a nested list item. Pure — every dynamic value is escaped. `handlerName` scopes an
  * editable field's edit coordinates + the structural affordances (phase 3); omit it (read-only callers)
  * to keep every field disabled and hide the structural buttons. */
-export function renderRowHtml(row: RowViewModel, handlerName = "", schema?: OpSchema): string {
+export function renderRowHtml(
+  row: RowViewModel,
+  handlerName = "",
+  schema?: OpSchema,
+  role: "handler" | "router" = "handler",
+): string {
   const indent = `style="margin-left:${row.nesting * INDENT_PX}px"`;
   const badge = row.badge ? `<span class="badge">${escapeHtml(row.badge)}</span>` : "";
   const subtitle = row.subtitle ? `<span class="subtitle">${escapeHtml(row.subtitle)}</span>` : "";
@@ -2594,6 +2656,9 @@ export function renderRowHtml(row: RowViewModel, handlerName = "", schema?: OpSc
     // ADR 0076 Amendment A: a PRAGMA note is read-only, so the webview mirror greys its edit/delete/move
     // controls rather than letting the user discover the engine's refusal as an error toast (F6).
     `data-pragma="${row.pragma ? "true" : ""}" ` +
+    // ADR 0076 Amendment D: the enclosing element's role, so the Add-palette can grey the items this
+    // role may not author rather than letting the user meet the engine's refusal as an error toast (F6).
+    `data-role="${escapeHtml(role)}" ` +
     // data-control (control rows only) lets the DnD layer include an elif/else CONTINUATION when it walks a
     // dropped-after block's body to find its visual bottom (the insertion-bar anchor, insertionBarAnchor).
     `data-control="${escapeHtml(row.control ?? "")}">` +
@@ -2613,7 +2678,10 @@ export function renderRowHtml(row: RowViewModel, handlerName = "", schema?: OpSc
 
 /** Render one handler's Steps (header + ordered nested rows). Pure. */
 export function renderHandlerHtml(handler: HandlerViewModel, schema?: OpSchema): string {
-  const rows = handler.rows.map((r) => renderRowHtml(r, handler.handler, schema)).join("");
+  const role = handler.role ?? "handler";
+  const rows = handler.rows
+    .map((r) => renderRowHtml(r, handler.handler, schema, role))
+    .join("");
   return (
     `<section class="handler">` +
     `<h2>${escapeHtml(handler.handler)}` +
@@ -2658,6 +2726,7 @@ export function renderStepsContextMenuHtml(): string {
                 `<button type="button" class="ctx-item" role="menuitem" ` +
                 `data-cmd="insert" data-position="${position}" data-item-id="${escapeHtml(item.id)}"` +
                 (item.anchorConstraint ? ` data-anchor="${escapeHtml(item.anchorConstraint)}"` : "") +
+                ` data-role-scope="${escapeHtml(roleScopeAttr(item))}"` +
                 `>${escapeHtml(item.label)}</button>`,
             )
             .join(""),
