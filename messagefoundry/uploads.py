@@ -87,8 +87,11 @@ class UploadQuotaError(UploadError):
     retain at once (``[store].max_upload_files_per_user`` / ``max_upload_total_bytes_per_user``, both
     defaults-ON). A would-be over-quota upload is refused at the chokepoint before anything is written;
     the API maps it to HTTP 409 and a metadata-only ``upload.reject_quota`` audit. Residual: the
-    check-then-write is not atomic, so concurrent in-flight uploads can overshoot by at most one file
-    (itself bounded by ``max_upload_bytes``); the quota is per-process per-``uploads_dir``."""
+    check-then-write is not atomic, so each concurrently in-flight upload can overshoot by at most one
+    file (itself bounded by ``max_upload_bytes``). The quota is scoped to the ``uploads_dir``, not to
+    the process: :meth:`UploadStore._scan_metas_sync` re-reads the sidecars with no cache, so engine
+    shards sharing one dir enforce ONE budget between them and the race above is the only thing they
+    compound. Shards pointed at separate dirs get separate budgets, by construction."""
 
 
 class UploadNotFoundError(UploadError):
@@ -391,8 +394,10 @@ class UploadStore:
         def _build_and_write() -> UploadedFileMeta:
             # Per-uploader quota (ASVS 5.2.4): scan the uploader's existing sidecars and refuse BEFORE
             # writing when this file would exceed their file-count or aggregate-byte cap. Runs in the same
-            # off-loop thread as the write. Residual: the check-then-write is not atomic, so concurrent
-            # in-flight uploads can overshoot by at most one file (bounded by max_bytes).
+            # off-loop thread as the write. Residual: the check-then-write is not atomic, so each
+            # concurrently in-flight upload can overshoot by at most one file (bounded by max_bytes).
+            # The scan is uncached, so this is the ONLY thing engine shards sharing a dir compound —
+            # they do not each get a fresh budget. See UploadQuotaError for the measurement.
             mine = [m for m in self._scan_metas_sync() if m.uploader == uploader]
             if len(mine) + 1 > self._max_files_per_user:
                 raise UploadQuotaError(

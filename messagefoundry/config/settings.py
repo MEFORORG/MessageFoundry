@@ -436,8 +436,12 @@ class StoreSettings(_Section):
     # PHI-at-rest is age-pruned. Enforced in `UploadStore.save` (a would-be over-quota upload is refused
     # HTTP 409 before any write, audited `upload.reject_quota`) and by an age-based prune sweep (blob+meta
     # pairs older than `uploads_retention_days` are deleted, opportunistically at save time plus a periodic
-    # task, each prune audited `upload.prune`). Quotas are per-process per-`uploads_dir` (multiple engine
-    # shards at one dir multiply the budget — a documented residual, same shape as the summary-rate cap).
+    # task, each prune audited `upload.prune`). Quotas are enforced per-`uploads_dir`, NOT per-process:
+    # the check reads the sidecars off disk with no cache, so engine shards sharing one dir see each
+    # other's files and the budget does NOT multiply (measured 2026-08-10 — two UploadStores over one
+    # dir, the second refused the same uploader at quota, against a live positive control). What IS
+    # shared across them is the check-then-write race below, which overshoots by at most one file per
+    # concurrently in-flight upload. Shards given SEPARATE dirs get separate budgets, by construction.
     max_upload_files_per_user: int = Field(
         default=100,
         ge=1,

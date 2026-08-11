@@ -233,6 +233,37 @@ async def test_quota_is_per_user(tmp_path: Path) -> None:
     assert {m.uploader for m in await store.list_files()} == {"alice", "bob"}
 
 
+async def test_quota_is_shared_by_stores_over_one_dir_not_per_process(tmp_path: Path) -> None:
+    """ASVS 2.3.4 / 5.2.4: the budget is scoped to the uploads_dir, NOT to the process.
+
+    Two UploadStore instances over one directory stand in for two engine shards. The settings
+    comment and the ASVS 2.3.4 residual both used to assert that shards at one dir "multiply the
+    budget"; measured 2026-08-10, they do not -- the sidecar scan is uncached, so the second store
+    sees the first's files. This test pins that, so the corrected claim cannot silently regress
+    back into a per-process budget (which WOULD be the double-booking 2.3.4 forbids).
+    """
+    # The cipher MUST be shared: real engine shards run off one unified store and therefore one
+    # keyring/DEK. Giving each store its own key would make shard B skip shard A's sidecars as
+    # undecryptable and fake a per-process budget -- an artifact of the fixture, not the system.
+    cipher = make_cipher(generate_key())
+
+    def _shard() -> UploadStore:
+        return UploadStore(tmp_path / "uploads", cipher, max_bytes=4096, max_files_per_user=2)
+
+    shard_a, shard_b = _shard(), _shard()  # two processes, ONE uploads dir
+
+    for i in range(2):
+        await shard_a.save(data=f"a{i}\n".encode(), filename=f"a{i}.txt", uploader="alice")
+    # Positive control: the cap engages at all on the store that wrote the files.
+    with pytest.raises(UploadQuotaError):
+        await shard_a.save(data=b"overflow\n", filename="a2.txt", uploader="alice")
+
+    # The question: does the OTHER store grant alice a fresh budget?
+    with pytest.raises(UploadQuotaError):
+        await shard_b.save(data=b"from b\n", filename="b.txt", uploader="alice")
+    assert len(await shard_b.list_files()) == 2  # still exactly the cap, nothing extra written
+
+
 async def test_prune_deletes_aged_pairs_and_is_idempotent(tmp_path: Path) -> None:
     # ASVS 5.2.4: files older than retention_days are deleted (blob AND meta), and a re-run is a no-op.
     store = _quota_store(tmp_path, retention_days=30)
