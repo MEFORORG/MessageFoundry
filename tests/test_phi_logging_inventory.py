@@ -564,6 +564,15 @@ def test_every_diagnostics_field_is_named_in_the_inventory() -> None:
 #: which is how ``tray.log`` shipped undocumented.
 _ALLOWED_SINK_MODULES: dict[str, str] = {
     "messagefoundry/logging_setup.py": "streams 1 + 2 (stdout/stderr, the off-box syslog forwarder)",
+    # #122 / ADR 0162. This module defines the guarded handler CLASSES for stream 1 —
+    # GuardedStreamHandler (stdout) and GuardedFileHandler (the opt-in `[logging].file`, a
+    # RotatingFileHandler subclass) — which logging_setup constructs, filters and installs. No new
+    # DESTINATION: stream 1's row names both, and the same three PHI filters are installed on each.
+    # LISTED rather than excluded, because the class that opens and rolls the file genuinely lives
+    # here, so a future sink added beside it must still trip this gate.
+    "messagefoundry/logging_guard.py": (
+        "stream 1 — the guarded handler classes for stdout and the opt-in `[logging].file`"
+    ),
     "messagefoundry/tray/__main__.py": (
         "the tray's RotatingFileHandler — named in 'Not in this inventory, and why'"
     ),
