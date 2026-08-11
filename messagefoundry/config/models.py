@@ -284,7 +284,9 @@ class RetryPolicy(BaseModel):
 
 class BuildupThreshold(BaseModel):
     """When to raise a ``queue_buildup`` alert for an outbound lane (its backlog is not draining — a
-    retry-forever head blocking the lane is the classic cause).
+    head retrying its way toward :attr:`RetryPolicy.max_attempts` is the classic cause; the cap
+    eventually unblocks the lane, but hours later and only by dead-lettering, so the alert is what an
+    operator actually acts on).
 
     A lane crosses the threshold when its **pending depth** reaches ``max_depth`` *or* its **oldest
     pending message's age** reaches ``max_oldest_seconds``. ``None`` disables that dimension; both

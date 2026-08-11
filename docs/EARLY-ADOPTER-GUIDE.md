@@ -683,7 +683,7 @@ lifespan to call `engine.stop()` for a clean drain. Always **drain → stop → 
 
 | Symptom | First moves |
 |---|---|
-| **Stuck FIFO lane** (retry-forever head) | `queue_buildup` alert → inspect `/messages` for the head → fix-and-`replay`, or `dead_letter_now` to unblock the lane (the dead row stays replayable). |
+| **Stuck FIFO lane** (a head retrying toward the cap) | `queue_buildup` alert → inspect `/messages` for the head → fix-and-`replay`, or `dead_letter_now` to unblock the lane (the dead row stays replayable). |
 | **Poison message** | It dead-letters under `CONTINUE` (or stops the lane under `STOP`) → triage via `/dead-letters` → fix the transform → replay. |
 | **Full disk / `storage_threshold`** | Free space / tighten `[retention]` / VACUUM → confirm `/status` disk-free recovers. |
 | **Crash / unexpected restart** | Startup auto-recovers in-flight rows → verify `/health`, the "wiring started" banner, and that backlog drains. |

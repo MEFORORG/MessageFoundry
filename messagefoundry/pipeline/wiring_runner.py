@@ -4573,7 +4573,8 @@ class RegistryRunner:
                 await self._maybe_alert_stall(name)
         except DeliveryError as exc:
             # Transport failure (connect/IO/timeout/unparseable ACK) — transient; retry
-            # per policy (retry-forever by default, so nothing is silently lost).
+            # per policy (the shipped cap is 100 attempts, then the row dead-letters into the
+            # replayable DLQ — bounded, not discarded).
             retry_until = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
             await self._maybe_alert_buildup(name)
             await self._maybe_alert_stall(name)
