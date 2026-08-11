@@ -52,12 +52,20 @@ Candidate implementations (operator-supplied, downloaded beside the engine like 
 sidecar): **sing-box** (Go `crypto/tls` client ECH since 1.23) configured as a TLS-terminating proxy, or a
 purpose-built ~500-line Go re-originator. A generic CONNECT-tunneling proxy is **not** conforming.
 
+**A reference implementation exists in history, not in the tree.** A 312-line stdlib-only Go
+re-originator satisfying all three points above was written here and, on 2026-08-10, retired from the
+repository (BACKLOG #1011): nothing built, tested, linted or version-pinned it, and it shipped in no
+sdist or wheel. Recover it with `git show 62fd628d:tools/ech-sidecar/main.go` (its own README, at
+`62fd628d:tools/ech-sidecar/README.md`, carries the recorded manual proof against
+`crypto.cloudflare.com` — a one-off observation, never re-run by any automated check). Treat it as a
+worked example of the contract, not as supported software.
+
 ## Wire it in MessageFoundry
 
 Per outbound connection (opt-in; off by default → byte-identical):
 
-⛔ **This is NOT expressible in `connections.toml` today, and the recipe that used to sit here could not
-load.** Two independent reasons, both verified by execution:
+**DO NOT reach for `connections.toml` — this is NOT expressible there today, and the recipe that used
+to sit here could not load.** Two independent reasons, both verified by execution:
 
 1. The loader accepts only `[[inbound]]` / `[[outbound]]` arrays of tables, so a
    `[connections.<NAME>.settings]` table fails with *"unknown top-level key(s) connections"*
@@ -97,13 +105,13 @@ outbound(
 )
 ```
 
-⚠️ **That is a raw-settings escape hatch, not a supported surface.** These keys get no factory
+**WARNING: that is a raw-settings escape hatch, not a supported surface.** These keys get no factory
 validation, cannot be authored as data, and are invisible to the connection editor. Giving them a
 factory parameter (and therefore a `connections.toml` form) is tracked as **BACKLOG #NNN**.
 
 `ech_sidecar` must be a loopback address and is **mutually exclusive** with the `proxy_url` settings key
 (the sidecar *is* that connection's egress proxy) — refused at construction,
-[`transports/rest.py:1189-1193`](../../messagefoundry/transports/rest.py). It composes with the
+[`transports/rest.py:1192-1196`](../../messagefoundry/transports/rest.py). It composes with the
 connection's TLS verify/allowlist/signing posture.
 
 ## Verify before trusting a partner

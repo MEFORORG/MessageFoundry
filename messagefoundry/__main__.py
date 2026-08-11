@@ -380,8 +380,8 @@ def main(argv: list[str] | None = None) -> int:
     lens_sub = lens.add_subparsers(dest="lens_command", required=True)
     lens_parse = lens_sub.add_parser(
         "parse",
-        help="statically parse one config module into its @handler row contract (never imports or "
-        "executes the module; routers are out of v1 scope)",
+        help="statically parse one config module into its element row contract (never imports or "
+        "executes the module; @router defs are projected at --contract 2 and above)",
     )
     lens_parse.add_argument(
         "module",
@@ -389,6 +389,15 @@ def main(argv: list[str] | None = None) -> int:
         "the live buffer this way after a structural edit)",
     )
     lens_parse.add_argument("--json", action="store_true", help="emit JSON")
+    lens_parse.add_argument(
+        "--contract",
+        type=int,
+        default=1,
+        help="the row-contract version to emit (default 1). 1 is the shipped grammar; 2 adds the "
+        "'note' and 'route' row kinds and projects @router defs (ADR 0076 Amendments A + D). A "
+        "consumer asks for the version it can RENDER, so a client that omits this can never be handed "
+        "a kind it has no renderer for",
+    )
 
     lens_rewrite = lens_sub.add_parser(
         "rewrite",
@@ -411,6 +420,14 @@ def main(argv: list[str] | None = None) -> int:
         '"params":{"path":"MSH-3","value":"MEFOR"}}\', '
         '\'{"line_start":7,"line_end":7,"op":"move_row","direction":"up"}\'; '
         "omit to read the edit spec from stdin (only when 'module' is a file path, not '-')",
+    )
+    lens_rewrite.add_argument(
+        "--contract",
+        type=int,
+        default=1,
+        help="the row-contract version the row coordinates were PROJECTED with (default 1) - it must "
+        "match the 'lens parse --contract' that produced them, so a v1 client's coordinates resolve "
+        "against the v1 partition and a v2 client's against the v2 one",
     )
 
     lens_schema = lens_sub.add_parser(
@@ -3163,10 +3180,14 @@ def _lens_parse(args: argparse.Namespace) -> int:
         if args.module == "-":
             # Raw UTF-8 (never the Windows locale codepage) so the buffer's non-ASCII round-trips exactly.
             module_label = "<stdin>"
-            handlers = parse_source(sys.stdin.buffer.read().decode("utf-8"), module=module_label)
+            handlers = parse_source(
+                sys.stdin.buffer.read().decode("utf-8"),
+                module=module_label,
+                contract=args.contract,
+            )
         else:
             module_label = args.module
-            handlers = parse_module(args.module)
+            handlers = parse_module(args.module, contract=args.contract)
     except LensParseError as exc:
         return _emit_error(str(exc), as_json=args.json)
     _print_json({"module": module_label, "handlers": handlers}, compact=args.json)
@@ -3207,9 +3228,11 @@ def _lens_rewrite(args: argparse.Namespace) -> int:
 
     try:
         if args.module == "-":
-            rewritten = rewrite_source(_read_stdin(), edit, module="<stdin>")
+            rewritten = rewrite_source(
+                _read_stdin(), edit, module="<stdin>", contract=args.contract
+            )
         else:
-            rewritten = rewrite_module(args.module, edit)
+            rewritten = rewrite_module(args.module, edit, contract=args.contract)
     except (LensParseError, LensRewriteError) as exc:
         return _emit_error(str(exc), as_json=True)
     # The rewritten module source is file content, not a JSON report — write the exact UTF-8 bytes to

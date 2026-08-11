@@ -3,12 +3,18 @@
 """Tests for the ECH SNI-hiding send-path (transports/rest.py, ADR 0139, ASVS 12.1.5).
 
 An `ech_egress` REST connection re-addresses each request to a loopback **terminating** sidecar
-(`tools/ech-sidecar/`) over cleartext http with the real destination in the `Host` header; the sidecar
-re-originates the https + ECH connection (hiding the SNI). These tests cover the resolver
+(operator-supplied; contract in `samples/ech-sidecar/README.md`) over cleartext http with the real
+destination in the `Host` header; the sidecar re-originates the https + ECH connection (hiding the
+SNI). These tests cover the resolver
 (`ech_sidecar_url_from_settings`), the fail-closed refusal on non-REST connectors
 (`egress_route_from_settings`), the connector wiring (`_ech_request` / opener / mutual exclusion), and a
 **stub-sidecar `_post` behavioral test** proving the request actually lands on the sidecar naming the
-upstream in `Host`. The real Go sidecar + a live ECH endpoint are proven separately (tools/ech-sidecar).
+upstream in `Host`.
+
+Scope limit, stated so it is not mistaken for more: **nothing here originates or observes ECH.** The
+far end is always a stub. A Go re-originator was proven by hand against a live ECH endpoint and then
+retired from the tree on 2026-08-10 (`git show 62fd628d:tools/ech-sidecar/`, ADR 0139); no automated
+check has ever re-run that proof, before or after the retirement.
 """
 
 from __future__ import annotations
