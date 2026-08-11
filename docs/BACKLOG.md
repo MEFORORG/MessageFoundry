@@ -7671,3 +7671,18 @@ gate is the wrong shape, validation of the walk is the right one.
 **Cluster:** Connections and Transports. **Priority:** P3. **Verdict:** build. **Severity:** minor.
 
 
+## 1221. A doc lint crashes when printing a hit that contains a glyph, so it is unreadable exactly when it fires
+
+> 🔢 **Filed 2026-08-11 -- found by Session B while fixing an unrelated false positive in the same file.** Value **5/10** -- Difficulty **2/10** -- _quick win_. `scripts/docs/asvs_tally_lint.py` raises `UnicodeEncodeError: 'charmap' codec can't encode character` on a stock Windows **cp1252** console when it prints a hit whose text contains a glyph. It fires **only on the failure path** -- printing the hits -- so it is **INVISIBLE WHILE THE LINT IS GREEN**, and it converts a legible FAIL into a traceback at exactly the moment somebody needs to read which document tripped it. **A gate that is correct until it has something to say, and then unreadable.**
+
+> **WHY THIS IS NOT MORE EVIDENCE UNDER #1030, WHICH WAS THE OBVIOUS CALL AND IS WRONG.** #1030 is *"keep the corpus cp1252-clean, because per-file gating lets the class recur"*. **That cannot fix this, because the corpus this lint reads is REQUIRED to contain cp1252-unsafe characters.** Measured: it walks `base.rglob("*.md")` over `docs/` (`:245`) and explicitly reads `docs/BACKLOG.md` (`:63-64`) -- the file whose **sanctioned banner alphabet** is CLAUDE.md §11's one machine-parsed holdout, every glyph of which is cp1252-unsafe. Its own comment at `:153` records it already redding on backlog content. So a clean corpus is not achievable *here* even in principle, and only making the tool robust addresses it. **#1030 is about the content; this is about the instrument.** Both are needed and neither substitutes.
+
+> **The decision this needs, and it is a real one rather than a patch.** Either a repo script **forces UTF-8 on its own stdout** (the engine CLI already does exactly this -- `messagefoundry/__main__.py` hardens `sys.stdout`/`sys.stderr`, and the harness and a bench script carry the same remedy), **or** the crash is treated as the corpus's problem and the script stays naive. Those have different blast radii: the first makes every repo script robust and is a one-line idiom already proven in-tree; the second is unachievable for any tool that reads the ledger. `PYTHONIOENCODING=utf-8` works around it either way and is **not** a fix, because CI and a developer shell will not both set it.
+
+> **FOURTH SURFACE IN ONE DAY**, which is the argument for doing it structurally rather than one file at a time: a `U+21D2` in a `ci.yml` comment, **three pre-existing `U+2192` already on `main` in that same file**, a `U+21D2` in the coordinator playbook, and now this. The first three are #1030's subject; this one is not.
+
+> **Scope note:** the fix belongs with whichever of the two answers is chosen, and the failure path is the place to prove it -- **make the lint FIRE on a document containing a glyph and read the output**, because a green run exercises none of this. That is the whole point of the item.
+
+**Cluster:** Developer tooling / CI. **Priority:** P3. **Verdict:** build. **Severity:** minor -- no product effect; it degrades a working gate into an unreadable one at the moment it matters.
+
+
