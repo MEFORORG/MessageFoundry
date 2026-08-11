@@ -76,6 +76,25 @@ class AlertSink(Protocol):
         the connection name + queue-shape derivative only. Emitted by the ``RegistryRunner``."""
         ...
 
+    def log_write_failed(
+        self, name: str, *, stage: str, reason: str, stopped: int | None = None
+    ) -> None:
+        """An **application-log sink** failed a write (BACKLOG #122, ADR 0162). ``name`` labels the sink
+        (``"stdout"`` / ``"file"``); ``stage`` is ``"rolled"`` (stage 1 — the broken file was renamed
+        aside and a fresh one opened, nothing stopped) or ``"unwritable"`` (stage 2 — the replacement
+        failed too); ``reason`` is a ``safe_exc``-scrubbed cause; ``stopped`` is how many connections
+        the fail-closed stop halted (None when nothing was stopped).
+
+        **This alert is the operator's channel of last resort, and that is the point:** the sink it
+        reports on is the one that just broke, so a log line about it may never land. The notifier's
+        email/webhook transports do not go through the application log, so the page survives the failure
+        the page is about. Carries the sink label, stage, reason and a count — never message content (no
+        PHI), and never the record whose write failed. Dedicated rather than reusing
+        :meth:`connection_stopped` so an operator can route "the engine went deaf" apart from one
+        stalled lane; the stage-2 stop ALSO emits :meth:`connection_stopped` per halted connection, so
+        the existing per-connection stop machinery still sees the stop and names its cause."""
+        ...
+
     def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
         """An outbound connection's delivery lane went **down** — the first transport failure
         (``DeliveryError``) after the lane was healthy, edge-triggered so a retry storm fires at most
@@ -273,6 +292,21 @@ class LoggingAlertSink:
 
     def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
         log.warning("ALERT connection_error: outbound %r %s: %s", name, kind, detail or "")
+
+    def log_write_failed(
+        self, name: str, *, stage: str, reason: str, stopped: int | None = None
+    ) -> None:
+        # The honest caveat, stated once where it lives: this default sink LOGS, and the thing that
+        # just failed is a log sink. If the failure is process-wide this line goes nowhere — which is
+        # exactly why the guard also writes a PHI-free stderr line of last resort, and why an operator
+        # who wants to be told routes this event to the email/webhook notifier instead.
+        log.warning(
+            "ALERT log_write_failed: application-log sink %r %s (%s)%s",
+            name,
+            stage,
+            reason,
+            "" if stopped is None else f"; {stopped} connection(s) stopped",
+        )
 
     def storage_threshold(self, path: str, *, size_bytes: int, limit_bytes: int) -> None:
         log.warning(

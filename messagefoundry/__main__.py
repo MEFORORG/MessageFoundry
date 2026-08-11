@@ -34,6 +34,7 @@ from typing import Any
 from messagefoundry import __version__
 from messagefoundry.logging_setup import (
     LOG_LEVELS,
+    LogFile,
     SyslogForward,
     configure_logging,
     query_sntp_offset,
@@ -1034,6 +1035,7 @@ def _serve(args: argparse.Namespace) -> int:
         platform_memory_encryption_readout,
     )
     from messagefoundry.config.settings import (
+        LogWriteFailurePolicy,
         StoreBackend,
         SyslogProtocol,
         forward_hop_disposition,
@@ -1475,9 +1477,37 @@ def _serve(args: argparse.Namespace) -> int:
                 settings.logging.forward_port,
                 _forward_why,
             )
-    forwarder_live = configure_logging(
-        settings.logging.level, fmt=settings.logging.format.value, forward=log_forward
+    # #122 (ADR 0162): the OPT-IN engine-managed application-log file + the fail-closed write guard.
+    # `file` unset (the default) leaves this None and the engine stdout-only, exactly as before; the
+    # guard still wraps stdout, so the two-stage roll/stop applies either way.
+    _log_file = (
+        LogFile(
+            path=settings.logging.file,
+            max_bytes=settings.logging.file_max_bytes,
+            backup_count=settings.logging.file_backup_count,
+        )
+        if settings.logging.file is not None
+        else None
     )
+    try:
+        forwarder_live = configure_logging(
+            settings.logging.level,
+            fmt=settings.logging.format.value,
+            forward=log_forward,
+            log_file=_log_file,
+            stop_on_write_failure=settings.logging.on_write_failure is LogWriteFailurePolicy.STOP,
+        )
+    except OSError as exc:
+        # FAIL CLOSED at configuration time: the operator named an application-log path this process
+        # cannot open. Starting anyway is precisely the silent blindness #122 exists to end, so refuse
+        # — and say so on stderr, since the log we would normally warn on is the thing that failed.
+        print(
+            f"error: [logging].file ({settings.logging.file!r}) cannot be opened for writing: {exc}. "
+            "The engine refuses to start rather than run unable to log (BACKLOG #122, ADR 0162); fix "
+            "the path/permissions, or unset [logging].file to run stdout-only.",
+            file=sys.stderr,
+        )
+        return 2
     if forwarder_live and log_forward is not None:
         # Only announce forwarding when configure_logging actually installed the handler — a TCP
         # collector that is down at startup is skipped (it warns), so this must not contradict it.

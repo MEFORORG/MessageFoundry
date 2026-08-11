@@ -1,0 +1,599 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
+"""Fail-closed application-log write guard (BACKLOG #122, ADR 0162).
+
+The control is fail-closed, so a passing test proves nothing on its own — a guard that never fires
+passes every "nothing broke" assertion. Every stage here is therefore driven by a **genuinely broken
+sink** (a real closed OS handle; a real path whose parent directory has been replaced by a file), and
+each direction carries its negative control:
+
+* stage 1 rolls and heals, and a HEALTHY run rolls nothing and stops nothing;
+* stage 2 stops, and the ``continue`` policy under the SAME failure stops nothing;
+* the error path writes no record content to the last-resort channel, and the stdlib handler it
+  replaces demonstrably DOES — so the assertion is proven able to see that class of leak.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import logging
+import shutil
+from pathlib import Path
+
+import pytest
+
+from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.settings import LoggingSettings, LogWriteFailurePolicy
+from messagefoundry.config.wiring import (
+    ConnectionSpec,
+    InboundConnection,
+    OutboundConnection,
+    Registry,
+)
+from messagefoundry.logging_guard import (
+    _MAX_ROLLS_PER_WINDOW,
+    GuardedFileHandler,
+    GuardedStreamHandler,
+    LogSinkEvent,
+    LogWriteGuard,
+    active_guard,
+    set_active_guard,
+)
+from messagefoundry.logging_setup import LogFile, configure_logging
+from messagefoundry.pipeline.alerts import LoggingAlertSink
+from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.store import MessageStore
+from messagefoundry.store.store import Stage
+
+RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
+INBOUND = "IB_TEST"
+OUTBOUND = "OB_TEST"
+
+
+# --- helpers -----------------------------------------------------------------
+
+
+def _record(message: str, *args: object) -> logging.LogRecord:
+    return logging.LogRecord("t", logging.INFO, "caller.py", 1, message, args, None)
+
+
+def _file_handler(path: Path, guard: LogWriteGuard) -> GuardedFileHandler:
+    handler = GuardedFileHandler(str(path), guard=guard, sink="file")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    return handler
+
+
+def _break_the_open_handle(handler: logging.FileHandler) -> None:
+    """Make the sink GENUINELY unwritable, not stubbed: close the real file object the handler holds,
+    so the next write raises out of CPython's io layer exactly as a yanked handle would."""
+    assert handler.stream is not None
+    handler.stream.close()
+
+
+def _replace_directory_with_a_file(directory: Path) -> None:
+    """Make the REPLACEMENT genuinely impossible to open: put a regular FILE where the log's parent
+    directory belongs. Both the rename-aside and the fresh open then fail at the OS, on Windows and
+    POSIX alike, with no permission fixture and no monkeypatching of the code under test."""
+    shutil.rmtree(directory)
+    directory.write_text("not a directory", encoding="utf-8")
+
+
+# --- stage 1: RECOVER --------------------------------------------------------
+
+
+def test_healthy_sink_never_rolls_and_never_escalates(tmp_path: Path) -> None:
+    # THE NEGATIVE CONTROL. An ordinary run must not roll a file, must not stop anything, and must
+    # leave every sink 'healthy' — a guard that fires on a working log is an outage generator.
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = _file_handler(tmp_path / "app.log", guard)
+
+    for i in range(25):
+        handler.emit(_record("ordinary line %d", i))
+    handler.close()
+
+    assert events == []
+    assert [s.state for s in guard.status()] == ["healthy"]
+    assert [s.rollovers for s in guard.status()] == [0]
+    assert list(tmp_path.iterdir()) == [tmp_path / "app.log"]  # nothing rolled aside
+    assert "ordinary line 24" in (tmp_path / "app.log").read_text(encoding="utf-8")
+
+
+def test_stage1_renames_the_broken_file_aside_rolls_fresh_and_keeps_running(tmp_path: Path) -> None:
+    # A write failure on a sink whose DIRECTORY is still writable heals: the broken file is renamed
+    # aside (its prior content preserved for the operator), a fresh file takes the live path, the
+    # rollover event is RECORDED in it, and the record whose write failed is re-written rather than
+    # lost (count-and-log). Nothing stops.
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    log_path = tmp_path / "app.log"
+    handler = _file_handler(log_path, guard)
+    handler.emit(_record("before the break"))
+
+    _break_the_open_handle(handler)
+    handler.emit(_record("after the break"))
+
+    assert [e.stage for e in events] == ["rolled"]
+    assert events[0].stop_requested is False  # stage 1 stops NOTHING, ever
+    status = guard.status()[0]
+    assert status.state == "rolled" and status.rollovers == 1
+
+    aside = [p for p in tmp_path.iterdir() if ".broken-" in p.name]
+    assert len(aside) == 1
+    assert aside[0].read_text(encoding="utf-8") == "before the break\n"  # evidence preserved
+    assert str(aside[0]) == status.rolled_aside
+
+    fresh = log_path.read_text(encoding="utf-8")
+    assert "was rolled after a write failure" in fresh  # the rollover event is RECORDED
+    assert aside[0].name in fresh  # …and it names where the evidence went
+    assert "after the break" in fresh  # the failed record is re-written, not dropped
+
+    # And the sink KEEPS WORKING afterwards — a heal that leaves a dead handler is not a heal.
+    handler.emit(_record("after the heal"))
+    assert "after the heal" in log_path.read_text(encoding="utf-8")
+
+
+def test_stage1_heals_the_latch_so_a_later_break_escalates_again(tmp_path: Path) -> None:
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = _file_handler(tmp_path / "app.log", guard)
+
+    for _ in range(3):
+        _break_the_open_handle(handler)
+        handler.emit(_record("break"))
+
+    assert [e.stage for e in events] == ["rolled", "rolled", "rolled"]
+    assert guard.status()[0].rollovers == 3
+
+
+def test_a_sink_that_keeps_needing_a_roll_is_declared_unwritable(tmp_path: Path) -> None:
+    # "Heals" and "keeps needing to be healed" are not the same sink. Rolling per record would mean
+    # one rename, one fresh file and one page per log line forever; past the flap bound the honest
+    # verdict is stage 2. Driven by real rolls, not by poking the counter.
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = _file_handler(tmp_path / "app.log", guard)
+
+    for _ in range(_MAX_ROLLS_PER_WINDOW + 1):
+        _break_the_open_handle(handler)
+        handler.emit(_record("break"))
+
+    assert [e.stage for e in events[:-1]] == ["rolled"] * _MAX_ROLLS_PER_WINDOW
+    assert events[-1].stage == "unwritable"
+    assert "is a failing log rather than a transient" in events[-1].reason
+    assert guard.status()[0].state == "unwritable"
+
+
+def test_the_flap_bound_does_not_fire_on_an_ordinary_transient(tmp_path: Path) -> None:
+    # …and the bound is loose enough that a genuine one-off never trips it (the negative control for
+    # the test above — otherwise a bound of 1 would pass it and be an outage generator).
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = _file_handler(tmp_path / "app.log", guard)
+    _break_the_open_handle(handler)
+    handler.emit(_record("break"))
+
+    assert [e.stage for e in events] == ["rolled"]
+
+
+# --- stage 2: STOP -----------------------------------------------------------
+
+
+def test_stage2_fires_only_when_the_replacement_is_also_unwritable(tmp_path: Path) -> None:
+    # The whole point of the two-stage split: this is the SAME initial failure as the stage-1 test,
+    # and it escalates only because the replacement cannot be written either.
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    handler = _file_handler(log_dir / "app.log", guard)
+    handler.emit(_record("before the break"))
+
+    _break_the_open_handle(handler)
+    _replace_directory_with_a_file(log_dir)
+    handler.emit(_record("after the break"))
+
+    assert [e.stage for e in events] == ["unwritable"]
+    assert events[0].stop_requested is True  # the default policy asks for the fail-closed stop
+    assert "the replacement failed too" in events[0].reason
+    assert guard.status()[0].state == "unwritable"
+
+
+def test_stage2_escalation_is_latched_to_one_page_per_break(tmp_path: Path) -> None:
+    # A broken disk emits a log line per message; without the latch that is one page per message.
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    handler = _file_handler(log_dir / "app.log", guard)
+    _break_the_open_handle(handler)
+    _replace_directory_with_a_file(log_dir)
+
+    for i in range(10):
+        handler.emit(_record("line %d", i))
+
+    assert len(events) == 1
+
+
+def test_continue_policy_reports_the_same_failure_without_asking_for_a_stop(tmp_path: Path) -> None:
+    # The documented opt-out, driven by the IDENTICAL genuine failure: still detected, still alerted,
+    # simply not asked to stop.
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard(stop_on_unwritable=False)
+    guard.set_escalation(events.append)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    handler = _file_handler(log_dir / "app.log", guard)
+    _break_the_open_handle(handler)
+    _replace_directory_with_a_file(log_dir)
+    handler.emit(_record("after the break"))
+
+    assert [e.stage for e in events] == ["unwritable"]
+    assert events[0].stop_requested is False
+
+
+# --- PHI on the error path ---------------------------------------------------
+
+PHI_TOKEN = "DOE^JANE^Q^^^^L"
+
+
+def test_the_stdlib_handler_this_guard_replaces_does_write_record_content_to_stderr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # RED FIRST, in the "prove the instrument can see it" direction. logging.Handler.handleError
+    # writes 'Message: %r' / 'Arguments: %s' straight to stderr, BELOW the handler's filter chain.
+    # Without this test, the assertion in the next one could pass because the token never reaches
+    # stderr at all — this proves stderr is exactly where such a leak WOULD land.
+    unguarded = logging.FileHandler(tmp_path / "plain.log", encoding="utf-8")
+    unguarded.setFormatter(logging.Formatter("%(message)s"))
+    assert unguarded.stream is not None
+    unguarded.stream.close()
+    unguarded.emit(_record("patient %s admitted", PHI_TOKEN))
+
+    assert PHI_TOKEN in capsys.readouterr().err
+
+
+def test_the_guard_writes_no_record_content_to_the_last_resort_channel(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The guarded sink's stage-2 path must name the SINK and the CAUSE and nothing from the record.
+    guard = LogWriteGuard()
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    handler = _file_handler(log_dir / "app.log", guard)
+    _break_the_open_handle(handler)
+    _replace_directory_with_a_file(log_dir)
+    handler.emit(_record("patient %s admitted", PHI_TOKEN))
+
+    captured = capsys.readouterr().err
+    assert PHI_TOKEN not in captured
+    assert "admitted" not in captured
+    assert "IS UNWRITABLE" in captured  # the operator still learns the sink is down
+
+
+def test_stage1_rewrites_the_failed_record_through_the_handlers_filter_chain(
+    tmp_path: Path,
+) -> None:
+    # The re-write on the stage-1 path goes through self.format on a record the handler's filters
+    # already mutated in place, so the rolled-to file carries the REDACTED rendering — the same text
+    # the sink would have written had it not failed, never the raw one.
+    from messagefoundry.logging_setup import RedactionFilter
+
+    guard = LogWriteGuard()
+    log_path = tmp_path / "app.log"
+    handler = _file_handler(log_path, guard)
+    handler.addFilter(RedactionFilter())
+    _break_the_open_handle(handler)
+    handler.handle(_record("received %s", RAW))
+
+    rolled_to = log_path.read_text(encoding="utf-8")
+    assert "DOE^JANE" not in rolled_to
+    assert guard.status()[0].state == "rolled"
+
+
+# --- hostile ambient environment --------------------------------------------
+
+
+def test_the_guard_fires_with_logging_raiseexceptions_switched_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # AMBIENT PIN. logging.raiseExceptions is a process-global that any library (or a deployment
+    # convention) can flip to False, and the stdlib handleError is a NO-OP when it is. Our override
+    # deliberately does not consult it, so the two-stage control cannot be silently disabled by an
+    # ambient setting we do not own. Run the whole stage-1 path under the hostile value.
+    monkeypatch.setattr(logging, "raiseExceptions", False)
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = _file_handler(tmp_path / "app.log", guard)
+    handler.emit(_record("before"))
+    _break_the_open_handle(handler)
+    handler.emit(_record("after"))
+
+    assert [e.stage for e in events] == ["rolled"]
+    assert "after" in (tmp_path / "app.log").read_text(encoding="utf-8")
+
+
+def test_the_pin_is_load_bearing_the_stdlib_handler_goes_silent_under_the_same_value(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # …and the pin above is load-bearing rather than decorative: the handler it replaces reports
+    # NOTHING AT ALL under the same ambient value. That is the failure mode the guard removes.
+    monkeypatch.setattr(logging, "raiseExceptions", False)
+    unguarded = logging.FileHandler(tmp_path / "plain.log", encoding="utf-8")
+    unguarded.setFormatter(logging.Formatter("%(message)s"))
+    assert unguarded.stream is not None
+    unguarded.stream.close()
+    unguarded.emit(_record("dropped without a trace"))
+
+    assert capsys.readouterr().err == ""
+
+
+def test_stdout_sink_is_guarded_and_reports_when_the_stream_is_gone() -> None:
+    # The default engine sink is stdout, whose file the engine does NOT own (NSSM does). There is
+    # nothing to rename, so the roll is the re-attempt — and a genuinely dead stream still reaches
+    # stage 2 rather than vanishing.
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    stream = io.StringIO()
+    handler = GuardedStreamHandler(stream, guard=guard, sink="stdout")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.emit(_record("healthy"))
+    assert stream.getvalue() == "healthy\n"
+
+    stream.close()
+    handler.emit(_record("after the break"))
+    assert [e.stage for e in events] == ["unwritable"]
+    assert events[0].sink == "stdout"
+
+
+# --- configure_logging wiring ------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _restore_process_logging():  # type: ignore[no-untyped-def]
+    """configure_logging replaces the ROOT handlers and publishes a process-wide guard. Snapshot and
+    restore both, so a test here cannot leak a rolled/unwritable sink into the rest of the suite."""
+    root = logging.getLogger()
+    handlers = list(root.handlers)
+    level = root.level
+    guard = active_guard()
+    yield
+    root.handlers[:] = handlers
+    root.setLevel(level)
+    set_active_guard(guard)
+
+
+def test_configure_logging_installs_a_guarded_file_sink_beside_stdout(tmp_path: Path) -> None:
+    path = tmp_path / "engine.log"
+    configure_logging("INFO", log_file=LogFile(path=str(path)))
+    logging.getLogger("t").info("a line the engine wrote")
+
+    assert "a line the engine wrote" in path.read_text(encoding="utf-8")
+    guard = active_guard()
+    assert guard is not None
+    assert sorted(s.sink for s in guard.status()) == ["file", "stdout"]
+    assert all(s.state == "healthy" for s in guard.status())
+
+
+def test_configure_logging_refuses_a_log_file_it_cannot_open(tmp_path: Path) -> None:
+    # FAIL CLOSED AT CONFIGURATION TIME, on a genuinely impossible path (the parent is a file).
+    # Starting an engine that cannot log is the silent blindness #122 exists to end.
+    parent = tmp_path / "not-a-dir"
+    parent.write_text("regular file", encoding="utf-8")
+    with pytest.raises(OSError):
+        configure_logging("INFO", log_file=LogFile(path=str(parent / "engine.log")))
+
+
+def test_configure_logging_threads_the_stop_policy_onto_the_guard() -> None:
+    configure_logging("INFO", stop_on_write_failure=False)
+    guard = active_guard()
+    assert guard is not None and guard.stop_on_unwritable is False
+
+
+# --- settings: one file, one rotation owner ----------------------------------
+
+
+def test_settings_refuse_an_engine_log_file_inside_the_supervisor_rotation_dir(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="rotates"):
+        LoggingSettings(log_dir=str(tmp_path), file=str(tmp_path / "engine.log"))
+
+
+def test_settings_accept_an_engine_log_file_outside_the_supervisor_rotation_dir(
+    tmp_path: Path,
+) -> None:
+    supervisor = tmp_path / "nssm"
+    supervisor.mkdir()
+    settings = LoggingSettings(log_dir=str(supervisor), file=str(tmp_path / "engine.log"))
+    assert settings.on_write_failure is LogWriteFailurePolicy.STOP  # fail-closed by default
+
+
+def test_settings_refuse_the_legacy_planned_rotation_key_names(tmp_path: Path) -> None:
+    # `[logging]` is pydantic extra="ignore", and CONFIGURATION.md carried `max_bytes`/`backups` as
+    # accepted-but-ignored planned keys. Silently ignoring them now that the sink is REAL would give
+    # an operator the 50 MB / 5-backup defaults while their file said otherwise — a control that
+    # reports success while doing something else. Refuse, naming the real keys.
+    with pytest.raises(ValueError, match="file_max_bytes"):
+        LoggingSettings(file=str(tmp_path / "engine.log"), max_bytes=1000)
+    with pytest.raises(ValueError, match="file_backup_count"):
+        LoggingSettings(file=str(tmp_path / "engine.log"), backups=2)
+
+
+# --- the engine response: stop this process's connections, and say why -------
+
+
+class _RecordingSink(LoggingAlertSink):
+    def __init__(self) -> None:
+        self.stopped: list[tuple[str, str]] = []
+        self.log_failures: list[tuple[str, str, str, int | None]] = []
+
+    def connection_stopped(self, name: str, *, detail: str) -> None:
+        self.stopped.append((name, detail))
+
+    def log_write_failed(
+        self, name: str, *, stage: str, reason: str, stopped: int | None = None
+    ) -> None:
+        self.log_failures.append((name, stage, reason, stopped))
+
+
+class _StubSource:
+    def __init__(self) -> None:
+        self.stopped = False
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+def _graph(store: MessageStore, sink: _RecordingSink) -> tuple[RegistryRunner, _StubSource]:
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            INBOUND,
+            ConnectionSpec(ConnectorType.MLLP, {"host": "127.0.0.1", "port": 0}),
+            router="r",
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    reg.add_outbound(
+        OutboundConnection(OUTBOUND, ConnectionSpec(ConnectorType.MLLP, {"host": "h", "port": 1}))
+    )
+    runner = RegistryRunner(reg, store, poll_interval=0.02, alert_sink=sink)
+    source = _StubSource()
+    runner._sources[INBOUND] = source  # type: ignore[assignment]
+    return runner, source
+
+
+@pytest.fixture
+async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+    s = await MessageStore.open(tmp_path / "guard.db")
+    yield s
+    await s.close()
+
+
+async def test_unwritable_log_stops_intake_and_delivery_and_names_the_cause(
+    store: MessageStore,
+) -> None:
+    sink = _RecordingSink()
+    runner, source = _graph(store, sink)
+
+    await runner._respond_to_log_sink_event(
+        LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=True)
+    )
+
+    assert source.stopped is True  # intake halted — nothing new is accepted that cannot be logged
+    assert OUTBOUND in runner._outbound_paused  # delivery paused, queue RETAINED (not dead-lettered)
+    # The WHY, on the channel that does not depend on the broken log.
+    assert sink.log_failures == [("file", "unwritable", "disk full", 2)]
+    # …and the per-connection stop the operator's existing machinery already understands (ADR 0014),
+    # now actually DRIVEN by a log-write failure and carrying the cause.
+    assert sorted(name for name, _ in sink.stopped) == [INBOUND, OUTBOUND]
+    assert all("application log sink 'file' is unwritable" in d for _, d in sink.stopped)
+
+
+async def test_stage1_roll_alerts_but_stops_nothing(store: MessageStore) -> None:
+    # THE NEGATIVE CONTROL at the engine level: a transient that healed must not take feeds down.
+    sink = _RecordingSink()
+    runner, source = _graph(store, sink)
+
+    await runner._respond_to_log_sink_event(
+        LogSinkEvent(
+            sink="file", stage="rolled", reason="momentary lock", rolled_aside="/x/a.broken"
+        )
+    )
+
+    assert source.stopped is False
+    assert OUTBOUND not in runner._outbound_paused
+    assert sink.stopped == []
+    assert sink.log_failures == [("file", "rolled", "momentary lock", None)]
+
+
+async def test_continue_policy_alerts_but_stops_nothing(store: MessageStore) -> None:
+    sink = _RecordingSink()
+    runner, source = _graph(store, sink)
+
+    await runner._respond_to_log_sink_event(
+        LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=False)
+    )
+
+    assert source.stopped is False
+    assert OUTBOUND not in runner._outbound_paused
+    assert sink.stopped == []
+    assert sink.log_failures == [("file", "unwritable", "disk full", None)]
+
+
+async def test_the_halt_is_latched_so_a_second_event_does_not_restop(store: MessageStore) -> None:
+    sink = _RecordingSink()
+    runner, _source = _graph(store, sink)
+    event = LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=True)
+
+    await runner._respond_to_log_sink_event(event)
+    await runner._respond_to_log_sink_event(event)
+
+    assert len(sink.log_failures) == 1
+
+
+async def test_the_escalation_bridges_from_a_worker_thread_onto_the_engine_loop(
+    store: MessageStore,
+) -> None:
+    # The failure surfaces inside logging.Handler.emit, on WHATEVER thread logged — a handler worker
+    # thread, a connector thread, the loop itself. The bridge must hand the event to the loop rather
+    # than mutate runner state off-loop, and it must not block the thread that was logging.
+    sink = _RecordingSink()
+    runner, source = _graph(store, sink)
+    runner._loop = asyncio.get_running_loop()
+
+    await asyncio.to_thread(
+        runner._on_log_sink_event,
+        LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=True),
+    )
+    for _ in range(200):
+        if source.stopped:
+            break
+        await asyncio.sleep(0.01)
+
+    assert source.stopped is True
+    assert [f[1] for f in sink.log_failures] == ["unwritable"]
+
+
+async def test_the_runner_subscribes_at_start_and_unsubscribes_at_stop(store: MessageStore) -> None:
+    # Without this the whole control is inert in the shipped engine while every unit test above
+    # still passes — the "green signal that means nothing" shape (ADR 0158).
+    guard = LogWriteGuard()
+    set_active_guard(guard)
+    runner = RegistryRunner(Registry(), store, poll_interval=0.02)
+    await runner.start()
+    try:
+        assert guard._escalation == runner._on_log_sink_event
+    finally:
+        await runner.stop()
+    assert guard._escalation is None
+
+
+async def test_the_store_is_untouched_so_ack_on_receipt_still_holds(store: MessageStore) -> None:
+    # ACK-ON-RECEIPT BOUNDARY. A message already durably committed to the ingress stage was ACKed to
+    # its sender. The application log and the message STORE are different durable records, and an
+    # application-log failure is not a store failure: the row must survive the halt exactly as it was
+    # — still pending, still claimable, never dead-lettered and never re-enqueued.
+    message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW, now=0.0)
+    before = await store.stats()
+
+    sink = _RecordingSink()
+    runner, _source = _graph(store, sink)
+    await runner._respond_to_log_sink_event(
+        LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=True)
+    )
+
+    assert await store.stats() == before
+    claimed = await store.claim_next_fifo(INBOUND, stage=Stage.INGRESS.value, now=1.0)
+    assert claimed is not None and claimed.message_id == message_id

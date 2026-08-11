@@ -731,6 +731,25 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # retry storm on one lane collapses to one notification per cooldown. detail is safe_exc-scrubbed.
         self._emit({"type": "connection_error", "connection": name, "kind": kind, "detail": detail})
 
+    def log_write_failed(
+        self, name: str, *, stage: str, reason: str, stopped: int | None = None
+    ) -> None:
+        # #122 (ADR 0162): an application-log sink was rolled (stage 1) or is unwritable (stage 2). The
+        # sink LABEL stands in for "connection" so the realert throttle + ADR 0044 dedup key per sink,
+        # exactly like storage_threshold does with a DB path. The payload is the sink label, the stage,
+        # a safe_exc reason and a count — never message content, and never the record that failed to
+        # write. This is the one alert whose delivery path must not depend on the application log, which
+        # is why it goes through the notifier's transports rather than a log line.
+        self._emit(
+            {
+                "type": "log_write_failed",
+                "connection": name,
+                "stage": stage,
+                "detail": reason,
+                "stopped": stopped,
+            }
+        )
+
     def content_match(self, connection: str, *, label: str, rule_id: str | None = None) -> None:
         # #81 (ADR 0133): a code-first Handler ("Action Point") inspected a message and decided to alert.
         # PHI-FREE BY CONTRACT: there is NO value parameter — the event carries ONLY the connection, an
