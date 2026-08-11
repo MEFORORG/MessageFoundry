@@ -30,7 +30,7 @@ import json
 import logging
 import time
 import urllib.parse
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -1107,6 +1107,10 @@ class RegistryRunner:
         # makes the stop fire once per break rather than once per dropped record.
         self._log_guard_tasks: set[asyncio.Task[None]] = set()
         self._log_write_stopped = False
+        # Inbounds whose INTERNAL stages (router / transform / loopback response) the halt shut down.
+        # Per-inbound rather than one process-wide flag because the RE-ARM is per-connection: a
+        # restart of inbound A must not silently re-arm B's processing while B's listener stays down.
+        self._log_halted: set[str] = set()
         self._running = False
         self._reload_lock = asyncio.Lock()  # serialize concurrent reloads
         # B11 read-only worker-loop instrumentation: empty-claim counts (router/transform/delivery),
@@ -2288,6 +2292,10 @@ class RegistryRunner:
         # ACK-on-receipt into an ingress/routed backlog with nothing draining it. Idempotent (same guard
         # reload() uses); only runs once the runner is up so start()'s own spawn loop owns first boot.
         if self._running:
+            # #122 (ADR 0162): BEFORE the spawn, or a worker respawned into a still-halted inbound
+            # would hit its loop-top gate and exit again — a restart that reports success and re-arms
+            # nothing.
+            self._resume_inbound_processing(name)
             self._ensure_inbound_workers(name)
 
     async def _stop_inbound_unsafe(self, name: str) -> None:
@@ -2356,7 +2364,11 @@ class RegistryRunner:
     async def _stop_all_for_log_failure(self, *, sink: str, reason: str) -> None:
         """FAIL CLOSED (the #122 ruling): the application log cannot be written, so this process stops
         processing. CLAUDE.md §1 counts and logs every message a connection takes in or puts out;
-        processing a message that cannot be logged IS the violation, so intake and delivery both halt.
+        processing a message that cannot be logged IS the violation, so **all three tiers** halt —
+        intake (the listener unbinds), the INTERNAL stages (router / transform / loopback response,
+        via :meth:`_halt_inbound_processing`), and delivery (each owned outbound is paused). Stopping
+        only the first and last is what a listener-only halt looks like, and it leaves the backlog
+        being routed and transformed with no application log behind it.
 
         **Scope is the process, and pretending otherwise would be a lie.** The application log is a
         process-global handler set on the root logger — the failure is a property of the SINK, and no
@@ -2390,6 +2402,15 @@ class RegistryRunner:
             stopped=len(inbounds) + len(outbounds),
         )
         async with self._reload_lock:
+            # THE INTERNAL STAGES FIRST, and they are not an afterthought — they are the half that
+            # makes this an enforcement. See :meth:`_halt_inbound_processing`.
+            #
+            # EVERY REGISTRY INBOUND, deliberately wider than `inbounds` above (which is the BOUND
+            # ones, for the alert count and the per-connection stop): an inbound whose listener never
+            # bound — isolated by ADR 0031, stopped by an operator, outside its active window — still
+            # has router/transform workers draining whatever is already in its lanes. Halting only
+            # the bound ones would leave exactly those backlogs processing unlogged.
+            self._halt_inbound_processing(self.registry.inbound)
             for name in inbounds:
                 try:
                     await self._stop_inbound_unsafe(name)
@@ -2411,6 +2432,60 @@ class RegistryRunner:
                 self._alert_sink.connection_stopped(name, detail=detail)
             except Exception:
                 log.exception("alert sink raised on connection_stopped for %r", name)
+
+    def _halt_inbound_processing(self, names: Iterable[str]) -> None:
+        """Shut down the INTERNAL stages — router, transform, and a loopback's response re-ingress —
+        for these inbounds. Sync + await-free; callers hold the reload lock.
+
+        **This is the half of "refuse to process" that stopping the listener does not cover, and its
+        absence was measured rather than reasoned about.** The router/transform workers are
+        registry-tied, not source-tied (see :meth:`_ensure_inbound_workers`), and ``stop_inbound`` is
+        documented as halting intake *while delivery keeps draining*. So with only the listener
+        stopped, a message already durably on the ingress stage still flowed ingress -> routed ->
+        outbound with no application log behind it: a message that reached the outbound stage after
+        the halt, which is exactly "processing stuff that cannot be logged". The outbound pause meant
+        it was never delivered, which makes the gap quiet rather than harmless.
+
+        **Cooperative in both claim modes, and NEVER a ``task.cancel``** — a cancelled mid-item worker
+        strands its claimed row INFLIGHT and ``reset_stale_inflight`` is startup/DR-only:
+
+        * **pooled** (the default): ``pause_lane`` per stage, the same primitive
+          :meth:`_stop_outbound_unsafe` uses. A lane mid-episode reaches PAUSED at its quiesce point,
+          so **at most the one in-flight head completes** — bounded, and strictly better than
+          stranding its row.
+        * **per_lane**: the loop-top gate in the router/transform/response workers reads
+          :attr:`_log_halted` and returns at the worker's next turn, the same terminal state a
+          STOP-policy halt leaves behind. The wake below is why "next turn" is immediate rather than
+          up to a whole ``poll_interval`` of further processing.
+        """
+        halted = list(names)  # materialised: registry.inbound is a live dict we iterate twice
+        self._log_halted.update(halted)
+        for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
+            dispatcher = self._dispatchers.get(stage)
+            if dispatcher is None:
+                continue  # not pooled, or no loopback inbound => no RESPONSE dispatcher
+            for name in halted:
+                dispatcher.pause_lane(name)
+        if self._claim_mode != "pooled":
+            # per_lane only: a worker parked in _wait_for_work must be woken to reach its gate. NOT
+            # via _wake_lane, whose pooled branch is mark_ready() — re-readying a lane we just paused.
+            self._wake_all(Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE)
+
+    def _resume_inbound_processing(self, name: str) -> None:
+        """Re-arm one inbound's internal stages after a log-failure halt (#122, ADR 0162).
+
+        The recovery path the ADR promises — fix the disk, restart the connection, the backlog drains
+        — and it must live HERE rather than in a reload: a reload deliberately never rebuilds the
+        dispatchers, so a paused ingress lane would otherwise stay paused for the life of the process
+        and the halt would be unrecoverable without a restart. Per-inbound, so restarting A leaves B
+        halted until B is restarted too. A no-op when this inbound was never halted."""
+        if name not in self._log_halted:
+            return
+        self._log_halted.discard(name)
+        for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
+            dispatcher = self._dispatchers.get(stage)
+            if dispatcher is not None:
+                dispatcher.resume_lane(name)
 
     def _start_outbound(self, name: str, oc: OutboundConnection) -> None:
         """Build one outbound connector + spawn its delivery worker. A build failure (unresolvable
@@ -2535,6 +2610,7 @@ class RegistryRunner:
             guard = active_log_guard()
             if guard is not None:
                 self._log_write_stopped = False  # a restart re-arms the halt
+                self._log_halted.clear()  # …and un-halts every inbound's internal stages
                 guard.set_escalation(self._on_log_sink_event)
             # Connection-event drain task (#46): created before any source binds so an early accept's
             # enqueued event has a consumer. Skipped entirely when capture is off (no sink, no queue).
@@ -4981,6 +5057,11 @@ class RegistryRunner:
             self._lane_event(Stage.INGRESS, name) if self._per_lane_wake else self._ingress_work
         )
         while not self._stop.is_set():
+            # #122 (ADR 0162): the application log is unwritable and this process has fail-closed.
+            # Return BEFORE the claim so no row is left INFLIGHT — the same terminal state a
+            # STOP-policy halt leaves, re-armed by restarting this inbound.
+            if name in self._log_halted:
+                return
             try:
                 # FIFO per inbound: claim the due head (ingress rows never back off, so this is
                 # effectively the oldest pending row for this inbound). Under active-passive HA the graph
@@ -5310,6 +5391,8 @@ class RegistryRunner:
             self._lane_event(Stage.RESPONSE, name) if self._per_lane_wake else self._response_work
         )
         while not self._stop.is_set():
+            if name in self._log_halted:  # #122 (ADR 0162) — see _router_worker's gate
+                return
             try:
                 item = await self.store.claim_next_fifo(name, stage=Stage.RESPONSE.value)
                 if item is None:
@@ -5386,6 +5469,8 @@ class RegistryRunner:
         # shared singleton (byte-identical). Resolved once.
         wait_ev = self._lane_event(Stage.ROUTED, name) if self._per_lane_wake else self._routed_work
         while not self._stop.is_set():
+            if name in self._log_halted:  # #122 (ADR 0162) — see _router_worker's gate
+                return
             try:
                 # FIFO per inbound at the routed stage. Under active-passive HA the graph runs on the
                 # leader ONLY, so a single node drains this lane. ADR 0058: single head when

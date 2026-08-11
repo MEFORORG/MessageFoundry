@@ -108,10 +108,30 @@ own handlers, so a log failure on one shard stops that shard's connections and l
 running — the narrowest honest scope available, and a property of the deployment topology rather than
 of this design.
 
-"Stop" means both directions, because count-and-log counts both: every inbound is **stopped** (the
-listener unbinds; intake ceases) and every owned outbound is **paused** (`stop_outbound`, which
-**retains** its queued rows PENDING and un-errored rather than dead-lettering them). Delivering a
-message you cannot log is as much a violation as accepting one.
+"Stop" means **all three tiers**, because count-and-log counts all three: every inbound is
+**stopped** (the listener unbinds; intake ceases), every inbound's **internal stages** are halted
+(router, transform, and a loopback's response re-ingress), and every owned outbound is **paused**
+(`stop_outbound`, which **retains** its queued rows PENDING and un-errored rather than
+dead-lettering them). Delivering a message you cannot log is as much a violation as accepting one,
+and so is routing or transforming it.
+
+**The middle tier is the one that is easy to miss, and it was missed.** Stopping the listener stops
+*new* arrivals only. The router and transform workers are registry-tied, not source-tied, and
+`stop_inbound` is documented as halting intake *while delivery keeps draining* — so a message already
+durably committed to the ingress stage kept flowing ingress → routed → outbound with no application
+log behind it. Measured on a running engine with a genuinely unwritable sink: the committed row
+reached the **outbound** stage after the halt and was held there only by the outbound pause. That is
+processing something that cannot be logged; the pause merely made it quiet. The halt therefore also
+shuts the internal stages down, **cooperatively and never by `task.cancel`** (a cancelled mid-item
+worker strands its claimed row INFLIGHT, and `reset_stale_inflight` is startup/DR-only): under the
+default pooled claim mode by `pause_lane` on each stage dispatcher, under `per_lane` by a loop-top
+gate that returns out of the worker before its next claim. A lane already mid-episode finishes **at
+most its one in-flight head** — bounded, and strictly better than stranding the row.
+
+**Recovery is per-connection and explicit.** `restart_inbound` re-arms that inbound's stages (resume
+the paused lanes / respawn the workers) and `start_outbound` resumes its delivery; a `/config/reload`
+deliberately does **not**, because a reload never rebuilds the dispatchers and must not resume a lane
+the operator has not looked at. Restarting one connection leaves the others halted.
 
 ### 5 — The stop is observable, on channels that do not depend on the broken log
 
@@ -183,6 +203,17 @@ text the sink would have written had it not failed. Nothing here raises the serv
 - **Guard `configure_stderr_logging` too** (the ADR 0087 sandbox worker). Left alone deliberately: it
   is a child process whose only sink **is** the last-resort channel, with no second sink to roll to
   and no connection to stop.
+- **Detect a *corrupted but still writable* log.** BACKLOG #122's scope line says "corrupted or
+  unwritable", and this ADR covers only the second. Deliberate, and the boundary is worth stating
+  rather than blurring: the item's own **trigger** is a log that "silently stops recording engine
+  activity", and a file that still accepts writes is still recording. Detecting corruption means
+  reading the log back — a PHI read of the one artifact §8 exists to keep record content out of, on
+  the hot path, to catch a condition with no defined signature. If a corrupted file ever *does* refuse
+  a write, `handleError` sees it like any other failure.
+- **Cancel the router/transform tasks instead of gating them.** Faster to write and wrong: a
+  cancelled worker mid-item strands its claimed row INFLIGHT, and `reset_stale_inflight` only runs at
+  startup/DR — so the fail-closed halt would create the strand that count-and-log forbids. The
+  cooperative pause/gate costs at most one already-claimed head.
 - **Halt the whole engine rather than its connections.** Exceeds the item's scope and destroys the
   operator's ability to read `/status` and the alert state — the surfaces section 5 relies on to
   explain the halt.
@@ -191,9 +222,15 @@ text the sink would have written had it not failed. Nothing here raises the serv
 
 - **Positive.** The count-and-log invariant is now enforced on the application log, not merely
   observable. A transient self-heals with the evidence preserved and the failed record re-written. A
-  genuine failure stops both intake and delivery, pages on channels independent of the failure, and
-  leaves the store untouched. The stdlib error path's record-content-to-stderr write is gone, as is
-  its silence under `raiseExceptions = False`.
+  genuine failure stops intake, the internal routing/transform stages, and delivery; pages on channels
+  independent of the failure; and leaves the store untouched. The stdlib error path's
+  record-content-to-stderr write is gone, as is its silence under `raiseExceptions = False`.
+- **The enforcement is tested end to end, over a genuinely unwritable sink, in both claim modes.** A
+  test breaks the real file handle, replaces the log's parent directory with a regular file so the
+  roll cannot succeed either, and then asserts that a row committed to the ingress stage is still
+  `RECEIVED` with no outbound rows — paired with a negative control on the same rig that shows the row
+  *is* processed when the log is healthy, and a recovery test that shows the restart drains it. Each
+  of the two halting mechanisms was individually disabled and the matching arm confirmed to fail.
 - **Negative, and worth naming.** A stage-2 halt is process-wide (section 4) — a single unwritable
   sink stops every connection this process owns, which is the point of the ruling but is a bigger
   blast radius than "the affected connection" first suggests; `[logging].on_write_failure =

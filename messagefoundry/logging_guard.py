@@ -143,9 +143,22 @@ class LogWriteGuard:
     def set_escalation(self, callback: EscalationCallback | None) -> None:
         """Wire (or clear) the engine-side responder. Cleared by default, so a CLI/test process that
         configures logging without an engine degrades to the stderr last-resort line and stops
-        nothing."""
+        nothing.
+
+        ONE RESPONDER, and a second one SAYS SO. A process runs one engine, so this is a single-slot
+        seam by design — but a second `RegistryRunner` starting in the same process would take the
+        slot and leave the first silently unguarded, which is the shape where a fail-closed control
+        disappears with every check still green. It is not made an error (a test process legitimately
+        starts runners back to back), so the honest handling is to be loud about it. The last-resort
+        channel rather than ``logging``: this class must not depend on the tree it guards."""
         with self._lock:
+            previous = self._escalation
             self._escalation = callback
+        if callback is not None and previous is not None and previous != callback:
+            _last_resort(
+                "a second log-sink escalation responder replaced the first; the engine that "
+                "registered first is no longer guarded by this process's log write guard"
+            )
 
     def clear_escalation(self, callback: EscalationCallback) -> None:
         """Unwire ``callback`` — but ONLY if it is still the installed one. A runner tearing down must

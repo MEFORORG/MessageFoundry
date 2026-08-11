@@ -411,14 +411,18 @@ it — the engine refuses to start otherwise, naming the collision.
    file at the live path, records the rollover event in it and re-writes the record that failed. A
    momentary lock or an antivirus scan heals here and **stops nothing**.
 2. **Stop.** If the **replacement** cannot be written either, every connection this engine process
-   owns is stopped: inbounds stop accepting, outbounds pause with their queued messages **retained**
-   (not dead-lettered). You are told three ways — a `log_write_failed` alert through the notifier
-   (email/webhook, which does not go through the log that broke), a `connection_stopped` alert per
-   halted connection naming the log as the cause, and `GET /status`'s `log_sinks` block, which is read
-   from memory and still answers when the disk does not.
+   owns is stopped, in **all three tiers**: inbounds stop accepting, messages already accepted stop
+   being routed and transformed, and outbounds pause with their queued messages **retained** (not
+   dead-lettered). All three, because processing a message you cannot log is the thing being
+   prevented — not just accepting or sending one. You are told three ways — a `log_write_failed`
+   alert through the notifier (email/webhook, which does not go through the log that broke), a
+   `connection_stopped` alert per halted connection naming the log as the cause, and `GET /status`'s
+   `log_sinks` block, which is read from memory and still answers when the disk does not.
 
-Recover by fixing the disk or permissions and then reloading or restarting the service; the retained
-queue drains. Set `[logging].on_write_failure = "continue"` if you would rather the engine keep
+Recover by fixing the disk or permissions and then **restarting the affected connections** (from the
+web console, or by restarting the service); the retained queue drains. A `/config/reload` is
+deliberately **not** enough — it does not resume a lane an operator has not looked at.
+Set `[logging].on_write_failure = "continue"` if you would rather the engine keep
 running with no log — it still rolls and still alerts, it just does not stop. The `*.broken-*` files
 are incident evidence and are deliberately left for you to review and remove; nothing rotates them
 away.

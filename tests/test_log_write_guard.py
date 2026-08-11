@@ -11,6 +11,15 @@ each direction carries its negative control:
 * stage 2 stops, and the ``continue`` policy under the SAME failure stops nothing;
 * the error path writes no record content to the last-resort channel, and the stdlib handler it
   replaces demonstrably DOES — so the assertion is proven able to see that class of leak.
+
+**The last block is the one that decides the item.** Everything before it drives the guard directly
+or hands the runner a synthesized ``LogSinkEvent``; neither shows that the ENGINE refuses to process.
+``test_an_unwritable_log_makes_the_engine_refuse_to_process`` runs the whole chain — a real
+unwritable file, the real handler ``configure_logging`` installs, the real guard, a real running
+``RegistryRunner`` — and asserts a committed ingress row is still ``RECEIVED`` with no outbound rows,
+against a negative control on the identical rig that shows the row IS processed when the log is
+healthy, and a recovery test that shows a restart drains it. Both claim modes, because pooled and
+per_lane halt the internal stages by different mechanisms.
 """
 
 from __future__ import annotations
@@ -19,6 +28,7 @@ import asyncio
 import io
 import logging
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -30,6 +40,7 @@ from messagefoundry.config.wiring import (
     InboundConnection,
     OutboundConnection,
     Registry,
+    Send,
 )
 from messagefoundry.logging_guard import (
     _MAX_ROLLS_PER_WINDOW,
@@ -44,7 +55,7 @@ from messagefoundry.logging_setup import LogFile, configure_logging
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
-from messagefoundry.store.store import Stage
+from messagefoundry.store.store import MessageStatus, Stage
 
 RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 INBOUND = "IB_TEST"
@@ -246,12 +257,21 @@ PHI_TOKEN = "DOE^JANE^Q^^^^L"
 
 
 def test_the_stdlib_handler_this_guard_replaces_does_write_record_content_to_stderr(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # RED FIRST, in the "prove the instrument can see it" direction. logging.Handler.handleError
     # writes 'Message: %r' / 'Arguments: %s' straight to stderr, BELOW the handler's filter chain.
     # Without this test, the assertion in the next one could pass because the token never reaches
     # stderr at all — this proves stderr is exactly where such a leak WOULD land.
+    #
+    # PIN raiseExceptions=True, and the pin is the whole reason this test is trustworthy. THIS SUITE
+    # sets it to False for the entire session (tests/conftest.py
+    # `_tolerate_logging_on_closed_capture_streams`, a session-scoped autouse fixture), under which the
+    # stdlib handleError is a NO-OP and this assertion could never pass — measured: it failed here
+    # exactly that way. Reading the ambient value would have made the leak-detector look broken; the
+    # honest reading is that a control asserting what a mechanism DOES must pin the setting that
+    # enables the mechanism, or it is measuring the fixture rather than the stdlib.
+    monkeypatch.setattr(logging, "raiseExceptions", True)
     unguarded = logging.FileHandler(tmp_path / "plain.log", encoding="utf-8")
     unguarded.setFormatter(logging.Formatter("%(message)s"))
     assert unguarded.stream is not None
@@ -302,14 +322,20 @@ def test_stage1_rewrites_the_failed_record_through_the_handlers_filter_chain(
 # --- hostile ambient environment --------------------------------------------
 
 
+@pytest.mark.parametrize("raise_exceptions", [False, True])
 def test_the_guard_fires_with_logging_raiseexceptions_switched_off(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raise_exceptions: bool
 ) -> None:
     # AMBIENT PIN. logging.raiseExceptions is a process-global that any library (or a deployment
     # convention) can flip to False, and the stdlib handleError is a NO-OP when it is. Our override
     # deliberately does not consult it, so the two-stage control cannot be silently disabled by an
     # ambient setting we do not own. Run the whole stage-1 path under the hostile value.
-    monkeypatch.setattr(logging, "raiseExceptions", False)
+    #
+    # PARAMETRIZED OVER BOTH VALUES, because this suite's own session fixture sets it to False for
+    # every test in this file: pinning only False would re-assert the ambient value and never
+    # exercise the default True at all. "The guard is indifferent to this flag" is a claim about
+    # both settings, so both are measured.
+    monkeypatch.setattr(logging, "raiseExceptions", raise_exceptions)
     events: list[LogSinkEvent] = []
     guard = LogWriteGuard()
     guard.set_escalation(events.append)
@@ -327,6 +353,8 @@ def test_the_pin_is_load_bearing_the_stdlib_handler_goes_silent_under_the_same_v
 ) -> None:
     # …and the pin above is load-bearing rather than decorative: the handler it replaces reports
     # NOTHING AT ALL under the same ambient value. That is the failure mode the guard removes.
+    # The monkeypatch is deliberately explicit even though this suite's session fixture already
+    # sets False — a control must state the value it is asserting under, not inherit it.
     monkeypatch.setattr(logging, "raiseExceptions", False)
     unguarded = logging.FileHandler(tmp_path / "plain.log", encoding="utf-8")
     unguarded.setFormatter(logging.Formatter("%(message)s"))
@@ -599,3 +627,271 @@ async def test_the_store_is_untouched_so_ack_on_receipt_still_holds(store: Messa
     assert await store.stats() == before
     claimed = await store.claim_next_fifo(INBOUND, stage=Stage.INGRESS.value, now=1.0)
     assert claimed is not None and claimed.message_id == message_id
+
+
+# --- THE END-TO-END CONTROL: does the engine actually REFUSE TO PROCESS? -----
+#
+# Everything above this line either drives the guard directly or hands the runner a hand-built
+# LogSinkEvent. Both are necessary and neither is sufficient: a synthesized event proves the
+# RESPONSE, not that a genuinely broken sink ever produces one, and none of it proves the outcome
+# the owner's ruling is actually about — "we never want to process stuff if the processing cannot be
+# logged". These two tests close that gap as a PAIR, over the whole chain (real unwritable file ->
+# real GuardedFileHandler installed by configure_logging -> real guard -> real running
+# RegistryRunner -> the pipeline), and the negative control is what makes the positive one mean
+# anything: a rig where nothing ever drains would pass the "nothing was processed" assertion for the
+# wrong reason.
+
+
+def _installed_file_sink() -> GuardedFileHandler:
+    """The guarded file handler configure_logging just put on the root logger."""
+    sinks = [h for h in logging.getLogger().handlers if isinstance(h, GuardedFileHandler)]
+    assert len(sinks) == 1, f"expected one guarded file sink, found {len(sinks)}"
+    return sinks[0]
+
+
+def _break_sink_and_replacement(handler: GuardedFileHandler, directory: Path) -> None:
+    """Make the sink AND everything it could roll to genuinely unwritable, at the OS.
+
+    Closes the live handle and puts a regular FILE where the log's parent directory belongs, so the
+    rename-aside and the fresh open both fail. Deliberately ONE call with no await and no I/O between
+    the two steps: a stage-1 roll landing in the gap would open a fresh handle inside the directory
+    and make the rmtree fail on Windows, turning a race into a confusing error instead of the
+    condition under test."""
+    stream = handler.stream
+    if stream is not None:
+        stream.close()
+    shutil.rmtree(directory)
+    directory.write_text("not a directory", encoding="utf-8")
+
+
+def _e2e_registry(outdir: Path) -> Registry:
+    """A real graph: MLLP inbound -> router -> handler -> FILE outbound writing into ``outdir``.
+
+    The inbound binds an ephemeral port and is never connected to; every message in these tests is
+    put on the ingress stage directly, because the question is what the ROUTER and TRANSFORM workers
+    do with a message that is already durably in the store — the listener stopping is the easy half."""
+    reg = Registry()
+    reg.add_outbound(
+        OutboundConnection(
+            OUTBOUND,
+            ConnectionSpec(
+                ConnectorType.FILE, {"directory": str(outdir), "filename": "{MSH-10}.hl7"}
+            ),
+        )
+    )
+    reg.add_inbound(
+        InboundConnection(
+            INBOUND,
+            ConnectionSpec(ConnectorType.MLLP, {"host": "127.0.0.1", "port": 0}),
+            router="r",
+        )
+    )
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", lambda m: Send(OUTBOUND, m))
+    return reg
+
+
+async def _until(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
+    elapsed = 0.0
+    while not predicate():
+        if elapsed > timeout:
+            return False
+        await asyncio.sleep(0.02)
+        elapsed += 0.02
+    return True
+
+
+async def _until_processed(store: MessageStore, message_id: str, timeout: float = 5.0) -> bool:
+    """Wait for the TERMINAL disposition, not for the delivered file.
+
+    The file appearing means the connector wrote it; ``PROCESSED`` means the store finalizer has since
+    resolved every stage's rows, and it lands strictly later. Asserting the status right after the
+    file appears is a race, and it is one this test hit: measured 'routed' where 'processed' was
+    expected, three times out of four, on a rig that had passed on the first run."""
+    elapsed = 0.0
+    while (await store.get_message(message_id))["status"] != MessageStatus.PROCESSED.value:
+        if elapsed > timeout:
+            return False
+        await asyncio.sleep(0.02)
+        elapsed += 0.02
+    return True
+
+
+def _e2e_runner(store: MessageStore, outdir: Path, logdir: Path, claim_mode: str) -> RegistryRunner:
+    configure_logging("INFO", log_file=LogFile(path=str(logdir / "engine.log")))
+    return RegistryRunner(_e2e_registry(outdir), store, poll_interval=0.02, claim_mode=claim_mode)
+
+
+# BOTH CLAIM MODES, because the halt reaches the internal stages by two DIFFERENT mechanisms and a
+# single-mode test would leave one of them unexercised: pooled (the shipped default) pauses each
+# stage dispatcher's lane; per_lane returns out of the router/transform worker at its loop-top gate.
+# "The engine refuses to process" is a claim about the engine, not about one claim mode.
+CLAIM_MODES = ["pooled", "per_lane"]
+
+
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
+async def test_a_healthy_log_lets_the_engine_process_a_committed_row(
+    store: MessageStore, tmp_path: Path, claim_mode: str
+) -> None:
+    # THE NEGATIVE CONTROL, and it is the load-bearing half of the pair. It proves this rig DOES
+    # process a row put on the ingress stage — so when the hostile test asserts the row was NOT
+    # processed, that assertion is capable of failing.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, claim_mode)
+    await runner.start()
+    try:
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        assert await _until(lambda: any(outdir.iterdir())), "the healthy engine never delivered"
+        assert await _until_processed(store, message_id), "delivered but never finalized"
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
+async def test_an_unwritable_log_makes_the_engine_refuse_to_process(
+    store: MessageStore, tmp_path: Path, claim_mode: str
+) -> None:
+    # THE TEST THAT MATTERS. Same rig, same message, one difference: the application log is
+    # GENUINELY unwritable and so is anything the guard could roll to. The owner's ruling — "we never
+    # want to process stuff if the processing cannot be logged" — is an ENFORCEMENT claim, so the
+    # assertion is about the message, not about a warning: after the halt the committed ingress row
+    # must still be sitting there, unrouted and undelivered, rather than quietly flowing through a
+    # pipeline with no application log behind it.
+    #
+    # MEASURED RED before the runner learned to halt its internal stages: the row reached the
+    # OUTBOUND stage anyway, because stopping the listener leaves the router and transform workers
+    # draining the backlog. Only the outbound pause kept it from being delivered.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, claim_mode)
+    await runner.start()
+    try:
+        _break_sink_and_replacement(_installed_file_sink(), logdir)
+        logging.getLogger("t").warning("a record this engine cannot write anywhere")
+        assert await _until(lambda: runner._log_write_stopped), "the halt never fired"
+
+        # A message durably committed to the ingress stage — the ACK-on-receipt state a sender was
+        # already told AA for. The engine must now leave it alone.
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        # Generous next to the control above, which delivers in well under this at poll_interval 0.02.
+        await asyncio.sleep(1.0)
+
+        assert list(outdir.iterdir()) == []  # nothing was delivered
+        assert await store.outbox_for(message_id) == []  # nothing even reached the outbound stage
+        # RECEIVED, not ROUTED/FILTERED/UNROUTED/PROCESSED: the router never ran on it.
+        assert (await store.get_message(message_id))["status"] == MessageStatus.RECEIVED.value
+        # …and the row is intact and still claimable, so fixing the disk and restarting drains it.
+        claimed = await store.claim_next_fifo(INBOUND, stage=Stage.INGRESS.value)
+        assert claimed is not None and claimed.message_id == message_id
+        await store.release_claimed([claimed.id])  # leave it exactly as the halt left it
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
+async def test_restarting_the_connections_re_arms_processing_after_the_halt(
+    store: MessageStore, tmp_path: Path, claim_mode: str
+) -> None:
+    # THE RECOVERY HALF, and it is not optional: a fail-closed halt whose re-arm is broken is an
+    # engine that stays deaf after the disk is fixed, and nothing above would notice. The ADR promises
+    # "fix the disk, restart, and the backlog drains" — this is that sentence, measured. It also
+    # covers the ordering trap in _start_inbound_unsafe: resume BEFORE the worker respawn, or the
+    # respawned worker hits its own gate and exits while the restart reports success.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, claim_mode)
+    await runner.start()
+    try:
+        _break_sink_and_replacement(_installed_file_sink(), logdir)
+        logging.getLogger("t").warning("a record this engine cannot write anywhere")
+        assert await _until(lambda: runner._log_write_stopped), "the halt never fired"
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        await asyncio.sleep(0.3)
+        assert await store.outbox_for(message_id) == []  # still halted
+
+        await runner.restart_inbound(INBOUND)  # the operator's "I fixed the disk" action
+        await runner.start_outbound(OUTBOUND)
+
+        assert await _until(lambda: any(outdir.iterdir())), (
+            "the backlog never drained after the restart"
+        )
+        assert await _until_processed(store, message_id), "drained but never finalized"
+        assert INBOUND not in runner._log_halted
+    finally:
+        await runner.stop()
+
+
+# --- the two observability channels the ADR leans on, each pinned ------------
+
+
+def test_the_alert_type_is_operator_rule_targetable() -> None:
+    # ADR 0162 §5 claims an operator can route "the engine went deaf" APART from one stalled lane.
+    # That claim is only true if `log_write_failed` is in settings._ALERT_EVENT_TYPES — a name added
+    # to alert_sinks but omitted there is silently un-targetable (AlertRule rejects it), which is
+    # precisely the defect ALERT-12 records for lane_stuck and rcsi_off_degraded.
+    from messagefoundry.config.settings import AlertRule, AlertSeverity
+    from messagefoundry.pipeline.alert_sinks import AlertRuleSet
+
+    rules = AlertRuleSet(
+        [AlertRule(event_type="log_write_failed", severity=AlertSeverity.CRITICAL)]
+    )
+    assert rules.decide({"type": "log_write_failed", "connection": "file"}).severity == "critical"
+    # …and a different event still falls through to the default, so the rule is targeted, not global.
+    assert rules.decide({"type": "connection_stopped", "connection": "IB_X"}).severity == "warning"
+
+
+def test_status_reports_per_sink_health_from_process_memory(tmp_path: Path) -> None:
+    # The THIRD channel, and the ADR's reason for having it: a log line about a broken log sink may
+    # never land and an engine with no notifier configured pages nobody, but /status answers from
+    # process memory. So it must report the break WITHOUT touching the filesystem it is reporting on.
+    from messagefoundry.api.app import _log_sink_health
+
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+    configure_logging("INFO", log_file=LogFile(path=str(logdir / "engine.log")))
+    assert {s.sink: s.state for s in _log_sink_health()} == {"stdout": "healthy", "file": "healthy"}
+
+    _break_sink_and_replacement(_installed_file_sink(), logdir)
+    logging.getLogger("t").warning("a record this engine cannot write anywhere")
+
+    reported = {s.sink: s for s in _log_sink_health()}
+    assert reported["file"].state == "unwritable"
+    assert reported["stdout"].state == "healthy"  # the break is per-sink, not global
+    # Metadata only — a scrubbed reason and a timestamp, never a line of the log.
+    assert reported["file"].last_event and reported["file"].last_event_at
+    assert "a record this engine cannot write anywhere" not in (reported["file"].last_event or "")
+
+
+def test_a_second_responder_taking_the_slot_is_announced(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The escalation seam holds ONE responder. A second RegistryRunner in the same process takes the
+    # slot and the first engine is silently unguarded from then on — a fail-closed control that
+    # disappears with every assertion in this file still green. One process runs one engine, so this
+    # is not made an error; it is made AUDIBLE, which is the difference between a known limit and a
+    # silent one.
+    guard = LogWriteGuard()
+    guard.set_escalation(lambda event: None)
+    capsys.readouterr()  # discard anything from the first wiring
+    guard.set_escalation(lambda event: None)
+
+    assert "no longer guarded" in capsys.readouterr().err
+
+
+def test_re_wiring_the_same_responder_is_silent(capsys: pytest.CaptureFixture[str]) -> None:
+    # …and the negative control, because a warning that fires on the ordinary case gets ignored:
+    # re-installing the SAME callback (a restart re-subscribing) displaces nobody and says nothing.
+    def responder(event: LogSinkEvent) -> None:
+        return None
+
+    guard = LogWriteGuard()
+    guard.set_escalation(responder)
+    capsys.readouterr()
+    guard.set_escalation(responder)
+    guard.set_escalation(None)
+
+    assert capsys.readouterr().err == ""
