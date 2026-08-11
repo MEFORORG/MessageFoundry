@@ -31,6 +31,7 @@ keeps working on a shallow CI clone.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -153,6 +154,16 @@ def test_no_first_party_source_names_the_retired_tree_as_a_live_path() -> None:
         f = _ROOT / rel
         if not f.is_file():
             continue
+        if f.name == Path(__file__).name:
+            # This module is the ONE file whose job is to name the retired tree: it holds the
+            # constant, the planted fixtures and the prose explaining the retirement. Matched by
+            # basename rather than by path so moving the module cannot silently widen the exemption.
+            #
+            # This exemption exists because the guard CAUGHT ITSELF. It passed while the module was
+            # untracked -- `git ls-files` could not see it -- and went red the moment it was
+            # committed. A green that depended on the file not yet existing is exactly the shape
+            # "a check that cannot fail looks identical to one that passed" warns about.
+            continue
         try:
             body = f.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
@@ -200,12 +211,24 @@ _REFUTED = (
 )
 
 
+def _flat(text: str) -> str:
+    """Collapse whitespace so a claim split across a line wrap still matches.
+
+    Not cosmetic. The first draft of this module missed ADR 0093's "would require a third-party\\n
+    TLS stack" entirely, because markdown had wrapped the phrase -- and the SECURITY.md check matched
+    only by the luck of where ITS wrap fell. A phrase check over hard-wrapped prose is a decaying
+    budget without this.
+    """
+    return re.sub(r"\s+", " ", text)
+
+
 def refuted_premise_claims(paragraph: str) -> list[str]:
     """Refuted claims the ECH risk acceptance still asserts, plus a missing denial.
 
     A bare quotation of "infeasible" is allowed only when the paragraph also denies it, so the record
     can name the corrected premise without re-adopting it.
     """
+    paragraph = _flat(paragraph)
     found = [claim for claim in _REFUTED if claim in paragraph]
     if "infeasible" in paragraph and "is **not** the reason" not in paragraph:
         found.append("infeasible (quoted without the denial that makes it a correction)")
@@ -256,3 +279,100 @@ def test_the_ech_risk_acceptance_rests_on_a_premise_the_tree_does_not_refute() -
 def test_the_premise_check_fires_on_the_paragraph_that_actually_shipped(expected: str) -> None:
     """Positive control against the real historical text, not a synthetic one."""
     assert expected in refuted_premise_claims(_ORIGINAL_12_1_5_PARAGRAPH)
+
+
+# --- invariant 1, widened: the SAME premise had THREE carriers, not one ---------------------------
+#
+# Guarding only docs/SECURITY.md would have been the narrow fix. A repo-wide grep during #1011 found
+# the identical refuted claim live in two further security records: ADR 0093 section 3 ("empirically
+# not buildable ... would require a third-party TLS stack"), which is where the SECURITY.md paragraph
+# came from, and chapter 19's standing-risk-acceptance table ("documented infeasibility, not a
+# deferral"), which a reader re-confirms at EVERY release sign-off. So the guard is scoped to the
+# document set where a premise is load-bearing, not to the one file that was named in the item.
+#
+# docs/BACKLOG.md and the closed-item archive are deliberately OUT of scope: a ledger's job is to
+# QUOTE a defect as evidence, so an asserting phrase there is correct usage, not a live claim.
+
+#: Records where a risk acceptance's premise is load-bearing.
+_RECORD_ROOTS = ("docs/SECURITY.md", "docs/PHI.md", "docs/adr/", "docs/testing/master-test-plan/")
+
+#: The refuted claim in ASSERTING form. "infeasible" alone is absent for the reason given above.
+_ASSERTING = ("not buildable", "third-party TLS stack", "documented infeasibility")
+
+#: A correction marker. Its presence in the SAME section is what turns a quotation into a denial --
+#: the section, not a character window, because a correction block sits above the text it corrects.
+_DENIALS = ("is **not** the reason", "it did not", "refuted", "REFUTED", "as authored")
+
+_ECH_TOKEN = re.compile(r"\bECH\b")
+
+
+def unretracted_ech_claims(body: str) -> list[str]:
+    """Markdown sections that assert the refuted premise about ECH without correcting it.
+
+    A section qualifies only when it actually discusses ECH -- ``\\bECH\\b`` deliberately does NOT
+    match ``ECHConfig`` or DICOM's ``C-ECHO``, so an unrelated "not buildable" elsewhere in the corpus
+    (ADR 0015's WSDL note, ADR 0142's on-prem AD note) cannot red this guard.
+    """
+    out: list[str] = []
+    for section in re.split(r"\n(?=#{1,6} )", body):
+        flat = _flat(section)
+        if not _ECH_TOKEN.search(flat):
+            continue
+        asserted = [phrase for phrase in _ASSERTING if phrase in flat]
+        if asserted and not any(d in flat for d in _DENIALS):
+            head = section.splitlines()[0][:80]
+            out.append(f"{head!r}: {asserted}")
+    return out
+
+
+def test_no_security_record_still_asserts_that_ech_is_unbuildable() -> None:
+    scanned = 0
+    offenders: list[str] = []
+    for rel in _tracked():
+        if not rel.startswith(_RECORD_ROOTS) or not rel.endswith(".md"):
+            continue
+        f = _ROOT / rel
+        if not f.is_file():
+            continue
+        scanned += 1
+        offenders.extend(f"{rel} -> {hit}" for hit in unretracted_ech_claims(f.read_text("utf-8")))
+
+    assert scanned > 100, f"expected the record corpus, scanned only {scanned} markdown files"
+    assert not offenders, (
+        f"scanned {scanned} markdown records under {list(_RECORD_ROOTS)}; these still assert the "
+        f"premise ADR 0139 and this repository's own history refute: {offenders}. SDS-3.7 -- a "
+        f"compensating control must not rest on a false premise (BACKLOG #1011)."
+    )
+
+
+#: ADR 0093 section 3 as it stood before the 2026-08-10 correction. The second positive control, and
+#: the reason this guard is section-scoped: the correction that retracts it sits ABOVE it, far outside
+#: any plausible character window.
+_ORIGINAL_ADR_0093_SECTION_3 = """### 3. ECH for outbound SNI (scope out — infeasible)
+
+ECH (Encrypted Client Hello) would hide the destination hostname (partner/EHR identity) in the outbound
+TLS ClientHello SNI. It is **not buildable** under the project's constraints, empirically:
+
+- **It would violate the no-new-dependency rule** — a working ECH client would require a third-party
+  TLS stack (a `cryptography`-external library), which the project's dependency discipline rejects for
+  a security-core path."""
+
+
+def test_the_record_wide_check_fires_on_adr_0093_as_it_stood() -> None:
+    """Positive control 2, and the negative controls that keep the guard from being a blanket ban."""
+    hits = unretracted_ech_claims(_ORIGINAL_ADR_0093_SECTION_3)
+    assert len(hits) == 1 and "not buildable" in hits[0] and "third-party TLS stack" in hits[0], (
+        hits
+    )
+
+    # A section that quotes the claim IN ORDER TO RETRACT it is not an offender.
+    assert (
+        unretracted_ech_claims(_ORIGINAL_ADR_0093_SECTION_3 + "\n\nThat claim is refuted.\n") == []
+    )
+
+    # An unrelated "not buildable" is not an ECH claim. ADR 0015 and ADR 0142 both carry one, and a
+    # guard that reddened on those would be a blanket ban on a common English phrase.
+    assert unretracted_ech_claims("## WSDL\n\nNot buildable against an unread WSDL.\n") == []
+    # ...including in text that mentions C-ECHO or an ECHConfig, neither of which is the token ECH.
+    assert unretracted_ech_claims("## DICOM\n\nC-ECHO is not buildable here.\n") == []
+    assert unretracted_ech_claims("## DNS\n\nECHConfig lookups are not buildable here.\n") == []
