@@ -295,6 +295,25 @@ ci-quality = [
     "pytest-cov>=7.0",
     "pytest-timeout>=2.3",
 ]
+# The release-SIGNING toolchain (release.yml's sigstore step). The SHARPEST install in the repo: that
+# step is unconditional (every tag AND every dispatch) and the very next command signs the wheel, sdist,
+# SBOM and VEX with the job's OIDC identity — the same identity that then writes the SLSA attestation and
+# publishes to PyPI. An unhashed resolve there would take whatever PyPI serves at tag time, so any of
+# sigstore's ~30 floating transitives could inject code that runs at the highest-privilege point in the
+# build — a supply-chain gap a deploying project would first expose at its first published tag. Routing
+# `sigstore` through uv.lock and out to `ci/locks/release-tools.lock` WITH hashes closes that, and puts it
+# on the SAME DEP-1 export/resync machinery that keeps the other locks fresh (so it cannot rot into a
+# pinned-but-unpatched toolchain — the failure ADR 0034 §3 names as "worse posture than floating").
+#   sigstore  Exact `==`, and 4.4.0 deliberately — NOT the newer 4.5.x. `.github/dependabot.yml` sets a
+#             5-day supply-chain cooldown; pinning the SIGNING toolchain fresher than the repo's own
+#             update policy allows would invert that policy at its highest-privilege point. The defect
+#             this closes is the floating TRANSITIVES, not the top pin, so the recorded ADR 0034 4.4.0
+#             signing-version decision is preserved. Re-evaluate to 4.5.x once it ages past the window.
+# Non-default (there is no `[tool.uv] default-groups`), so it stays out of the four runtime DEP-1 exports
+# — out of the release SBOM, the image locks, and what pip-audit audits AS RUNTIME.
+release-tools = [
+    "sigstore==4.4.0",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -86,7 +86,10 @@ jobs:
           # stay out of the four exports above (and out of the SBOM / image locks / audited runtime).
           uv export --only-group ci-scanners --format requirements.txt -o ci/locks/ci-scanners.lock
           uv export --only-group ci-quality --format requirements.txt -o ci/locks/ci-quality.lock
-          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock
+          # The release-SIGNING toolchain lock (sigstore + its ~30 transitives). release.yml installs it
+          # with --require-hashes; same lockstep rule as the two above.
+          uv export --only-group release-tools --format requirements.txt -o ci/locks/release-tools.lock
+          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock
       - name: Install from the hashed lockfile (DEP-1)
         run: |
           # --require-hashes enforces a hash for every requirement (the lockfile carries them): a

@@ -250,9 +250,13 @@ jobs:
           # after publish, and 4.5.0 is <48h old — hard-pinning the SIGNING toolchain to a fresher
           # artifact than the repo's own routine-update policy allows inverts that policy at the highest-
           # privilege point in the pipeline. Re-evaluate to 4.5.0 once it has aged past the window.
-          # NOTE: this pins the TOP only; sigstore's ~30 transitive deps still float at signing time.
-          # Closing the Scorecard alert outright needs the hashed release-tools lock (ADR 0034 option B).
-          python -m pip install "sigstore==4.4.0"
+          # HASH-PINNED via the release-tools lock (ADR 0034 option B, BACKLOG #332): this closes the
+          # whole closure, not just the top pin — sigstore AND its ~30 transitives are `==`-pinned and
+          # hash-verified, so a compromised or typosquatted transitive can no longer be pulled at signing
+          # time. The lock still resolves sigstore==4.4.0 (the pyproject group preserves that version), and
+          # it rides the DEP-1 export/resync machinery so it stays fresh rather than rotting into a pinned-
+          # but-unpatched toolchain.
+          python -m pip install --require-hashes -r ci/locks/release-tools.lock
           # Sign the wheel + sdist AND the SBOM + VEX, so an operator can verify the provenance of the
           # bill-of-materials and the exploitability assessment too — not just the code artifacts (ADR 0149).
           python -m sigstore sign dist/*.tar.gz dist/*.whl \

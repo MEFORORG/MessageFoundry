@@ -102,6 +102,25 @@ def test_constraints_lock_is_in_the_set() -> None:
     )
 
 
+def test_release_tools_lock_is_in_the_set() -> None:
+    """Regression pin for BACKLOG #332: the release-signing lock must be in BOTH export sets.
+
+    `ci/locks/release-tools.lock` hash-pins the sigstore closure the release job signs with. The other
+    lockstep tests here are data-driven and would pass the moment both workflows export SOMETHING; this
+    pins the specific lock by name, the same way `test_constraints_lock_is_in_the_set` guards the #1193
+    incident. If the gate exports it but the resync does not (or vice versa), a Dependabot uv PR that
+    moved the sigstore closure inside uv.lock would leave this lock stale with no bot-reachable path to
+    green — precisely the failure mode that gets a hash-pinned toolchain called "worse than floating".
+    """
+    assert "ci/locks/release-tools.lock" in _exports(_GATE), (
+        "DEP-1 (security.yml) stopped diffing ci/locks/release-tools.lock"
+    )
+    assert "ci/locks/release-tools.lock" in _exports(_RESYNC), (
+        "dependabot-lock-resync.yml stopped re-exporting ci/locks/release-tools.lock — a Dependabot uv "
+        "PR touching the sigstore closure would be red with no bot-reachable path to green"
+    )
+
+
 def test_the_resync_gate_keeps_its_immutable_author_conjunct() -> None:
     """The zizmor ``bot-conditions`` suppression is sound only while clause 1 is present.
 

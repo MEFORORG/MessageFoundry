@@ -23,13 +23,17 @@ workflow — they need a tag push, a schedule, or GitHub OIDC):
    visible dismissal-with-reason beats an invisible filter.
 
 The lock-only venvs are one half. The other half is every OTHER `pip install` on the release path —
-`build`, `sigstore`, `cyclonedx-bom`, `packaging`, and the `pip` bootstraps — which resolved whatever
-PyPI served at tag time. `sigstore` is the sharp one: its step is unconditional and the very next
-command signs the release artifacts with the job's OIDC identity, the same identity that publishes to
-PyPI. Those are now version-pinned, and the second half of this module keeps them that way — nothing
-else can see the regression, because Dependabot has no updater for an inline `pip install X==Y` in a
-workflow (its `uv` ecosystem only reads pyproject.toml + uv.lock), so a stale pin rots invisibly and a
-DELETED pin is invisible twice over.
+`build`, `cyclonedx-bom`, `packaging`, and the `pip` bootstraps — which resolved whatever PyPI served
+at tag time. `sigstore` WAS the sharp one: its step is unconditional and the very next command signs the
+release artifacts with the job's OIDC identity, the same identity that publishes to PyPI — so an
+unpinned transitive there ran at the pipeline's highest-privilege point. It is now HASH-pinned through
+the `release-tools` dependency group and `ci/locks/release-tools.lock` (BACKLOG #332), closing the whole
+~30-package closure rather than only the top pin; it is checked by the second half of this module the
+same way the other group-locked tools are (`LOCK_INSTALLED_TOOLCHAINS` + `MOVED_TO_A_GROUP`), NOT by
+`RELEASE_PINNED_TOOLS`. The remaining inline installs are version-pinned, and the second half of this
+module keeps them that way — nothing else can see the regression, because Dependabot has no updater for
+an inline `pip install X==Y` in a workflow (its `uv` ecosystem only reads pyproject.toml + uv.lock), so a
+stale pin rots invisibly and a DELETED pin is invisible twice over.
 
 `/tmp/relsmoke` (`release.yml`) stays out of the hash-verified rule — it exists to prove the freshly
 built wheel's own declared closure resolves, so feeding it a lock would defeat its purpose — but its
@@ -92,6 +96,18 @@ group names LEAKING into the four runtime exports (`--no-dev` only filters the g
 with the project's own `[otel]` extra, and the only resolution (`[tool.uv] conflicts`) would declare a
 shipped product extra and a CI scanner permanently mutually exclusive. Recorded as a reasoned residual
 in ADR 0034 §3, which is why it is still in `RELEASE_PINNED_TOOLS`.
+
+**Amendment, 2026-08-06 — `sigstore` joined the group-locked toolchain (BACKLOG #332).** The release
+signing step (`release.yml`) was an inline `pip install "sigstore==4.4.0"` — the ADR 0034 §3 residual
+called "the highest residual in the group", because it pinned only the top while ~30 transitives floated
+at signing time under the OIDC identity that publishes to PyPI. `sigstore` now lives in a third
+`[dependency-groups]` group (`release-tools`), exported to `ci/locks/release-tools.lock` and installed
+with `--require-hashes`, so its whole closure is hash-verified. The version stays `4.4.0` (the recorded
+signing-version decision — see `EXACT_GROUP_PINS`), and the group rides the DEP-1 export/resync
+machinery like the other two. Consequently `("release.yml", "sigstore")` left `RELEASE_PINNED_TOOLS`
+(its install site is a lock now, not an inline pin), and `sigstore` joined `LOCK_INSTALLED_TOOLCHAINS`,
+`MOVED_TO_A_GROUP` and `EXACT_GROUP_PINS`. `build` and `cyclonedx-bom` are NOT folded in here — they
+stay inline version-pins, reported as a follow-on.
 """
 
 from __future__ import annotations
@@ -202,7 +218,6 @@ _REMOTE_SCHEMES = ("git+", "hg+", "svn+", "bzr+")
 #: Tools whose release-path pin must EXIST — the non-vacuity backstop for the scan above. Deleting a
 #: step would otherwise make the scan pass by finding nothing left to check.
 RELEASE_PINNED_TOOLS = (
-    ("release.yml", "sigstore"),
     ("release.yml", "build"),
     ("release.yml", "pip"),
     ("release.yml", "cyclonedx-bom"),
@@ -215,8 +230,12 @@ RELEASE_PINNED_TOOLS = (
     # `uv` is the resolver that produces every lock this repo commits, so it cannot be hash-locked BY
     # that lock (circular by construction) and stays an inline `==` pin. `semgrep` stays inline by
     # decision (the `[otel]` conflict — see the amendment). `bandit` and `pip-audit` were HERE until
-    # 2026-07-29 and are now installed from `ci/locks/ci-scanners.lock` instead; they are checked by
-    # `LOCK_INSTALLED_TOOLCHAINS` + `MOVED_TO_A_GROUP` below, not by this table.
+    # 2026-07-29, and `sigstore` was HERE until BACKLOG #332; all three are now installed from a
+    # `ci/locks/*.lock` (`ci-scanners.lock` for the first two, `release-tools.lock` for sigstore) and are
+    # checked by `LOCK_INSTALLED_TOOLCHAINS` + `MOVED_TO_A_GROUP` below, not by this table. Leaving
+    # sigstore's row here after its install became a lock would red `test_release_toolchain_pin_is_present`
+    # — there is no inline `pip install sigstore==` left to find — which is exactly why the row is dropped
+    # in the same commit, as this check's own failure message instructs.
     ("security.yml", "uv"),
     ("security.yml", "semgrep"),
 )
@@ -266,13 +285,26 @@ LOCK_INSTALLED_TOOLCHAINS = (
     ("security.yml", "ci/locks/ci-scanners.lock", 2),
     ("zizmor.yml", "ci/locks/ci-scanners.lock", 1),
     ("quality-advisory.yml", "ci/locks/ci-quality.lock", 2),
+    # The release-SIGNING toolchain (BACKLOG #332). One site: release.yml's sigstore step, which was an
+    # inline `pip install "sigstore==4.4.0"` (pinning the TOP only, ~30 transitives floating) until this
+    # change routed it through `ci/locks/release-tools.lock` with `--require-hashes`.
+    ("release.yml", "ci/locks/release-tools.lock", 1),
 )
 
 #: Tools that MOVED from an inline `pip install <tool>==<version>` into a PEP 735 dependency group. Two
 #: directions need guarding, and neither is visible to anything else: the declaration silently
 #: disappearing from `pyproject.toml` while the lock still carries the name as somebody else's
 #: transitive, and a future edit re-adding an inline `pip install bandit` beside the lock install.
-MOVED_TO_A_GROUP = ("bandit", "pip-audit", "zizmor", "mutmut", "diff-cover", "pytest-cov")
+#: `sigstore` joined the set with BACKLOG #332 (release.yml's signing step, `release-tools` group).
+MOVED_TO_A_GROUP = (
+    "bandit",
+    "pip-audit",
+    "zizmor",
+    "mutmut",
+    "diff-cover",
+    "pytest-cov",
+    "sigstore",
+)
 
 #: Moved tools whose `[dependency-groups]` spec must be an EXACT `==` pin, and why the exactness is the
 #: contract rather than a preference. This exists because moving `bandit` and `pip-audit` out of
@@ -285,7 +317,12 @@ MOVED_TO_A_GROUP = ("bandit", "pip-audit", "zizmor", "mutmut", "diff-cover", "py
 #: The failure that buys: a floor means Dependabot's weekly `uv` PR moves a blocking gate's version
 #: inside `uv.lock` with NO `pyproject.toml` diff to review, `dependabot-lock-resync.yml` re-exports and
 #: stages the new lock automatically, and a required gate's findings baseline changes GREEN.
-EXACT_GROUP_PINS = ("bandit", "pip-audit", "zizmor", "diff-cover", "mutmut")
+#:
+#: `sigstore` is exact for a different reason (BACKLOG #332): 4.4.0 is the recorded ADR 0034 signing-
+#: version decision — held BELOW the newer 4.5.x deliberately, to respect the repo's own 5-day supply-
+#: chain cooldown at the pipeline's highest-privilege point. A floor here would let a re-lock resolve the
+#: signing toolchain fresher than that policy allows, inverting the very decision the pin preserves.
+EXACT_GROUP_PINS = ("bandit", "pip-audit", "zizmor", "diff-cover", "mutmut", "sigstore")
 
 #: The counterpart: moved tools deliberately declared as a FLOOR. Enumerated so "floor by design" and
 #: "floor nobody noticed" cannot look the same.

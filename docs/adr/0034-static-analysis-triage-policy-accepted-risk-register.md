@@ -203,17 +203,26 @@ make them PR-visible instead. The `dependabot-auto-merge.yml` scope row is still
 
 | Where | Recommendation | Status | Why it matters |
 |---|---|---|---|
-| `release.yml` `pip install sigstore` | Pin `sigstore==<version>` | **Done** — `sigstore==4.4.0`. Deliberately *not* the newer 4.5.0: `.github/dependabot.yml` sets `cooldown.default-days: 5`, 4.5.0 was <48 h old, and pinning the *signing* toolchain fresher than the repo's own update policy allows would invert that policy at the highest-privilege point. Re-evaluate once it ages out. | The **highest residual in the group**: a completely unpinned install inside the job holding `contents: write` + `id-token: write` + `attestations: write`, resolved immediately before it signs the wheel, sdist, SBOM and VEX. A malicious release fetched at that moment runs with the OIDC identity used to publish. |
+| `release.yml` `pip install sigstore` | Pin `sigstore==<version>`; then **Option B** to close the transitives | **AMENDED 2026-08-06 (BACKLOG #332) — Option B is now BUILT for `sigstore`.** It was `**Done** — sigstore==4.4.0` as a top pin only; it is now installed with `pip install --require-hashes -r ci/locks/release-tools.lock`, so `sigstore` AND its ~30 transitives are `==`-pinned and hash-verified, on the DEP-1 export/resync machinery. The version stays `4.4.0` deliberately — NOT the newer 4.5.x: `.github/dependabot.yml` sets `cooldown.default-days: 5`, and pinning the *signing* toolchain fresher than the repo's own update policy allows would invert that policy at the highest-privilege point. The `release-tools` group preserves `4.4.0` and closes only the floating transitives; re-evaluate the version once 4.5.x ages out. | The **(formerly) highest residual in the group**: a completely unpinned install inside the job holding `contents: write` + `id-token: write` + `attestations: write`, resolved immediately before it signs the wheel, sdist, SBOM and VEX. A malicious release fetched at that moment would run with the OIDC identity used to publish — which is why closing the transitives, not just the top pin, was the point. |
 | `release.yml` `pip install --upgrade pip build` | Pin `build==<version>` | **Done** — `pip==26.1.2 build==1.5.0`, in **both** the engine and harness build steps. | Unpinned PEP 517 frontend that produces the published wheel/sdist. |
 | `release.yml` `pip install --quiet packaging` (harness job) | Pin `packaging==<version>`; install into a throwaway venv as the engine job already does | **Done, both halves** — pin *derived from `constraints.lock`* (it is a DEP-1 transitive, so a literal would rot), and moved into `/tmp/harnesssmoke` mirroring `/tmp/relsmoke`. | Resolved into the **publishing** job's main interpreter rather than a scratch venv. |
 | `release.yml` `pip install --quiet packaging` (`/tmp/relsmoke`) | Pin `packaging==<version>` | **Done** — same `constraints.lock`-derived pin. | Contained (disposable venv, version-compare only), but free to pin. |
 | `dependabot-auto-merge.yml` `security-events: read` | Remove the scope | **Open** | Dead. Its comment claims it reads Dependabot alerts, but the gate calls the **global** `/advisories` endpoint, which is repo-scope-independent. Verified; least-privilege hygiene only. |
 
-Two things the pins deliberately do **not** do. They pin only the **top** of each install —
-`sigstore`'s ~30 transitive dependencies still float at signing time — and, per §3, they move the
-Scorecard finding not at all. **Option B (a PEP 735 `release-tools` group flowing into `uv.lock` and a
-fifth hashed export) remains the only thing that closes the alert**, and remains an owner decision
-because it adds a lock artifact to the DEP-1 machinery.
+Two things the pins deliberately do **not** do. They pin only the **top** of each install — the
+transitive dependencies still float at signing time — and, per §3, they move the Scorecard finding not
+at all. **Option B (a PEP 735 `release-tools` group flowing into `uv.lock` and a hashed export) is what
+closes the alert.**
+
+> **AMENDED 2026-08-06 (BACKLOG #332) — Option B is BUILT for `sigstore`, the sharpest of the three.**
+> `sigstore` now lives in a `release-tools` PEP 735 group, is exported to
+> `ci/locks/release-tools.lock` (a hashed 31-requirement closure), and `release.yml` installs it with
+> `pip install --require-hashes -r ci/locks/release-tools.lock`. The Scorecard `PinnedDependenciesID`
+> alert on that line is therefore closable as *fixed*. **`build` and `cyclonedx-bom` still float** —
+> they remain top-only `==`/`~=` pins and are the follow-on that folds them into the same group (it
+> must move the SBOM install in lockstep across `release.yml` + `security.yml`, and the two `build`
+> sites, so it is its own item). The lock rides the DEP-1 export/resync machinery, so it stays fresh
+> rather than rotting into a pinned-but-unpatched toolchain.
 
 The `packaging` pins are **fail-closed on a tag**: `release.yml` `sed`s the version out of
 `constraints.lock` and `exit 1`s if the line is gone. `packaging` is not a declared dependency — it
@@ -270,7 +279,8 @@ inserted above line 146. Re-dismiss with this rationale rather than re-triaging 
 is to route CI tooling through a `pyproject` dependency group so it flows into `uv.lock` and the
 exports."* That is now built. **This section supersedes §3's "Deferred, recorded here as the convergence
 target" and the "Option B … remains the only thing that closes the alert" sentence in *Recommended
-hardening*, and it retires the "four committed lock artifacts" count — there are now six.**
+hardening*, and it retires the "four committed lock artifacts" count — there are now seven (six as of
+this 2026-07-29 amendment; `ci/locks/release-tools.lock` was added 2026-08-06, BACKLOG #332).**
 
 ### What is now genuinely hash-pinned
 
@@ -295,10 +305,11 @@ posture:
    with these groups non-default, all four re-export byte-identically (`git diff --exit-code` → 0).
 3. **The locks are inside the DEP-1 machinery, not beside it.** §3's own objection to a fifth lock was
    that a hand-maintained one "would rot into a pinned, **stale, unpatched** toolchain — worse posture
-   than floating". So both are `uv export`ed by `security.yml`'s DEP-1 step, diff-gated there, and
-   re-exported + staged by `dependabot-lock-resync.yml`. `tests/test_dep1_lock_resync_lockstep.py`
-   enforces the six-place lockstep; `test_lock_installed_toolchain_locks_are_in_the_dep1_set` enforces
-   that a lock the workflows install is one the gate regenerates.
+   than floating". So all three group locks (the two here plus `release-tools`, added 2026-08-06 for
+   BACKLOG #332) are `uv export`ed by `security.yml`'s DEP-1 step, diff-gated there, and re-exported +
+   staged by `dependabot-lock-resync.yml`. `tests/test_dep1_lock_resync_lockstep.py` enforces the
+   seven-place lockstep; `test_lock_installed_toolchain_locks_are_in_the_dep1_set` enforces that a lock
+   the workflows install is one the gate regenerates.
 4. **`pip-audit` now audits the toolchain locks too** (`pip-audit -r ci/locks/*.lock --desc`). This is
    the load-bearing half of decision 3: hash-pinning makes a toolchain *sticky*, so without this a CVE
    in a pinned scanner would be invisible to every gate. `--ignore-vuln <ID>` is the escape hatch, as
@@ -355,7 +366,7 @@ implied:
 
 | Residual | Why it is not fixed here |
 |---|---|
-| **`release.yml`'s `sigstore==4.4.0`** | **Not a gap — an owner decision this change must not invert.** Routing `sigstore` through the lock **would** resolve it to **4.5.0** — stated counterfactually because that is what it is: `sigstore` is deliberately **absent** from `uv.lock` and from all six exports (0 hits), and the 4.5.0 figure was measured in a scratch resolve. A reader who greps `uv.lock`, finds nothing, and concludes this row is stale would re-open the very decision it exists to preserve. ADR 0034 pins 4.4.0 because `.github/dependabot.yml` sets `cooldown.default-days: 5` and 4.5.0 was <48 h old. Routing `sigstore` through the lock would pin the *signing* toolchain fresher than the repo's own update policy allows — inverting that policy at the highest-privilege point in the build (the job holding `contents`/`id-token`/`attestations: write`). Left exactly as it is. Re-evaluate when 4.5.0 ages out. |
+| **`release.yml`'s `sigstore==4.4.0`** | **AMENDED 2026-08-06 (BACKLOG #332) — no longer a residual; Option B is BUILT, with the version decision preserved.** This row previously read *"Not a gap — an owner decision this change must not invert … `sigstore` is deliberately absent from `uv.lock` and from all six exports (0 hits) … routing it through the lock would resolve it to 4.5.0."* That premise no longer holds: `sigstore` is now declared in a `release-tools` PEP 735 group **pinned to `4.4.0`**, so `uv lock` resolves it AT that version (not 4.5.x) and `ci/locks/release-tools.lock` carries it and its ~30 transitives `==`-pinned + hashed. The concern the old row protected — a lock that would pull the signing toolchain fresher than the 5-day cooldown allows — is answered by the exact pin in `pyproject.toml`, not by keeping `sigstore` out of the lock. So `grep -c sigstore uv.lock` is now **non-zero by design**; a reader who finds it there is seeing the fix, not drift. Re-evaluate the version (`4.4.0` → `4.5.x`) once it ages past the cooldown, by editing the group pin. |
 | **The `uv` bootstrap** (`security.yml`, `python -m pip install --upgrade pip "uv==0.12.0"`) | **Permanently circular: you cannot hash-lock `uv` with `uv`.** That install produces every lock this repo commits. `uv` stays an inline `==` pin, and `pip` remains the sole registered *name* in `SECURITY_YML_ACCEPTED_UNPINNED`. Note it is also the pip that runs the **six exports and the diff gate** — the `--require-hashes` install two steps later *downgrades* pip to the locked version afterwards, so the DEP-1 step's own posture is unchanged by this work. *Cheap out-of-band fix that removes it entirely:* `astral-sh/setup-uv@c771a70e…` is already SHA-pinned and used in 9 places (`ci.yml` ×6, `quality-advisory.yml` ×2, the resync ×1); swapping it in deletes the install. Separate change. |
 | **`security.yml`'s unpinned `pip` in the `semgrep` step** — `python -m pip install --upgrade pip "semgrep==1.172.0"` | **The SECOND surviving bootstrap, named because an undercounted inventory is how a real finding goes invisible.** The semgrep row below explains only the `[otel]` conflict that keeps *semgrep* inline; this row records that the same line is also an **unpinned `pip` fetch**. So two `--upgrade pip` bootstraps remain in the file, not one — now asserted as an exact count by `test_security_yml_pip_bootstrap_count_is_exact`, since `SECURITY_YML_ACCEPTED_UNPINNED` registers the *name* `pip` and cannot tell two accepted bootstraps from twenty. **Mitigation WITHDRAWN 2026-08-04 (BACKLOG #334) — it rested on a false premise.** This row previously read *"Mitigating: `semgrep` is not a required context (`tests/test_required_contexts.py`), so this one does not sit on the merge path."* That is false in the repo's own records: `semgrep (project SAST rules)` is at `.github/required-contexts.txt:78`, and `tests/test_security_posture.py`'s `_BLOCKING_SECURITY_JOBS` names `semgrep` and asserts that membership. `tests/test_required_contexts.py` never claimed the opposite — it pins the required *set*, which contains it; the citation was to a file that says the reverse of what it was cited for. So this bootstrap **does** sit on the merge path, and #334 widened that same step's scan from a two-directory allow-list to the whole repo, which *increases* what rides on it. Re-accepted with that known, on the `uv` row's grounds (a bootstrap `pip` cannot hash-lock itself). It disappears whenever the semgrep row's `[tool.uv] conflicts` recipe is taken. |
 | **`quality-advisory.yml`'s `pipx install ruff`** | **Outside the guard's regex and outside Scorecard's.** `test_ci_venv_pinning.py`'s `_PIP_INSTALL` matches `pip`/`pip3`/`python -m pip` only, so the unpinned fallback branch is invisible to every existing guard — and because it is not a `pip install`, **no alert exists to close**. `pipx` has no `--require-hashes`, so fixing it means changing the install mechanism, not the pin. Recorded, not done. |
