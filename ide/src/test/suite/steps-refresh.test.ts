@@ -34,6 +34,9 @@ import {
 
 const IDE_ROOT = path.join(__dirname, "..", "..", "..");
 const STEPS_VIEW_TS = path.join(IDE_ROOT, "src", "stepsView.ts");
+//: `render()`'s parse call moved behind `lensParseStdin` here (BACKLOG #232), so the "live buffer, never
+//: a disk read" invariant now spans both files and both are scanned.
+const CLI_TS = path.join(IDE_ROOT, "src", "cli.ts");
 
 /** Mirrors `RERENDER_DEBOUNCE_MS` in `stepsView.ts`; only the relative ordering matters here. */
 const DEBOUNCE_MS = 250;
@@ -406,16 +409,32 @@ suite("Steps #234 invariant 3 — refreshing more often adds no second state of 
     // test for the wrong reason: the property under test is that the LIVE BUFFER is what gets parsed,
     // not which flags `lens parse` is given. Loose is not toothless — the sample below proves it still
     // refuses the disk read, which is the exact premise Amendment C §C.4 had to correct.
-    const PIPES_BUFFER_RE =
+    // THE PROPERTY SPANS TWO FILES, SO THE SCAN MUST TOO. This originally matched the piped call
+    // INLINE in stepsView.ts. BACKLOG #232 then moved that call behind a named helper in cli.ts
+    // (`lensParseStdin`, which also negotiates the contract version), and a scan of stepsView.ts alone
+    // could no longer see through the indirection — so it failed while the property it names still
+    // HELD. That is an instrument fault, not a regression, and loosening the pattern until it passed
+    // would have thrown the invariant away to make the red go away. Instead each LINK is asserted:
+    //   stepsView.ts:  source = document.getText()  ->  handed to lensParseStdin(source, …)
+    //   cli.ts:        lensParseStdin  ->  runJsonWithStdin(["lens","parse","-",…], source, …)
+    // A disk read anywhere in that chain still reds this test.
+    const HANDS_BUFFER_TO_HELPER_RE = /lensParseStdin\(\s*source\s*[,)]/;
+    const HELPER_PIPES_STDIN_RE =
       /runJsonWithStdin<LensParseResult>\(\s*\[[^\]]*"lens",\s*"parse",\s*"-"[^\]]*\],\s*source\s*,/;
+
+    // Negative controls FIRST: a pattern that cannot refuse the disk read asserts nothing.
     assert.ok(
-      !PIPES_BUFFER_RE.test(
+      !HELPER_PIPES_STDIN_RE.test(
         'parse = await runJson<LensParseResult>(["lens", "parse", document.uri.fsPath], ws);',
       ),
-      "the pattern must NOT accept a parse of the on-disk path, or it asserts nothing",
+      "the helper pattern must NOT accept a parse of the on-disk path, or it asserts nothing",
     );
     assert.ok(
-      PIPES_BUFFER_RE.test(
+      !HANDS_BUFFER_TO_HELPER_RE.test("parse = await lensParseStdin(document.uri.fsPath, ws);"),
+      "the call-site pattern must NOT accept handing the helper a PATH instead of the buffer",
+    );
+    assert.ok(
+      HELPER_PIPES_STDIN_RE.test(
         'parse = await runJsonWithStdin<LensParseResult>(["lens", "parse", "-", "--contract", "2"], source, ws);',
       ),
       "…while still tolerating a later flag, so it fails on substance rather than on argv churn",
@@ -427,9 +446,19 @@ suite("Steps #234 invariant 3 — refreshing more often adds no second state of 
       `scanned ${STEPS_VIEW_TS}: render() must take its source from the live buffer`,
     );
     assert.ok(
-      PIPES_BUFFER_RE.test(src),
-      `scanned ${STEPS_VIEW_TS}: render() must pipe that same snapshot to \`lens parse -\` over ` +
-        `stdin, never re-read the file from disk`,
+      HANDS_BUFFER_TO_HELPER_RE.test(src) || HELPER_PIPES_STDIN_RE.test(src),
+      `scanned ${STEPS_VIEW_TS}: render() must hand that same snapshot to \`lensParseStdin\` (or pipe ` +
+        `it inline to \`lens parse -\`), never re-read the file from disk`,
     );
+
+    // Follow the call through. If render() delegates, the helper is where the disk read would hide.
+    if (!HELPER_PIPES_STDIN_RE.test(src)) {
+      const cli = fs.readFileSync(CLI_TS, "utf8");
+      assert.ok(
+        HELPER_PIPES_STDIN_RE.test(cli),
+        `scanned ${CLI_TS}: render() delegates its parse to \`lensParseStdin\`, so THAT is what must ` +
+          `pipe the buffer to \`lens parse -\` over stdin — otherwise the projection input is a disk read`,
+      );
+    }
   });
 });
