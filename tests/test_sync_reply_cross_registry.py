@@ -77,7 +77,7 @@ def test_a_serviceable_graph_passes() -> None:
 
 def test_an_inbound_without_reply_from_is_untouched() -> None:
     reg, ic = _graph(reply_from=None)
-    check_http_sync_reply(ic, reg, delivery=DeliverySettings())  # the FIFO/forever default: fine
+    check_http_sync_reply(ic, reg, delivery=DeliverySettings())  # returns before any arm: fine
 
 
 def test_an_unknown_or_undeployed_target_is_refused() -> None:
@@ -148,12 +148,19 @@ def test_an_effective_fifo_lane_is_refused_even_when_nothing_is_declared() -> No
 
 def test_effective_retry_forever_is_refused_even_when_nothing_is_declared() -> None:
     # Same shape: no RetryPolicy object at all, so the declared value is None and the naive test
-    # passes, while the lane really does resolve to retry-forever.
+    # passes, while the lane really does resolve to whatever [delivery] says.
+    # `retry_max_attempts=None` is EXPLICIT since #1051 — the shipped [delivery] default is the
+    # finite 100, so `DeliverySettings()` no longer reaches this refusal. Leaving it implicit here
+    # would have made the arm unreachable and this test green for the wrong reason.
     reg, ic = _graph(ordering=OrderingMode.UNORDERED)  # retry left unset
     assert reg.outbound["OB_PARTNER"].retry is None, "the test lost its own premise"
 
     with pytest.raises(WiringError, match="EFFECTIVE max_attempts"):
-        check_http_sync_reply(ic, reg, delivery=DeliverySettings(ordering=OrderingMode.UNORDERED))
+        check_http_sync_reply(
+            ic,
+            reg,
+            delivery=DeliverySettings(ordering=OrderingMode.UNORDERED, retry_max_attempts=None),
+        )
 
     # ... and inheriting a FINITE global default is fine.
     check_http_sync_reply(ic, reg, delivery=SERVICEABLE)

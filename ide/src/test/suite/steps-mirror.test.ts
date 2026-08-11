@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 
 import {
+  ADD_MENU_CATALOG,
   addMenuGroups,
   blockExtent,
   blockLabel,
@@ -13,6 +14,9 @@ import {
   contextMenuEnablement,
   insertionBarAnchor,
   isReturnRow,
+  itemAllowedInRole,
+  paletteFor,
+  roleScopeAttr,
   renderHandlersHtml,
   renderStepsContextMenuHtml,
   resolveDrop,
@@ -1300,6 +1304,48 @@ suite("Steps mirror — the webview script under jsdom (STEPS-06)", () => {
   });
 });
 
+// ---- Amendment D: the Add-palette's role scope, mirrored -------------------------------------------
+
+suite("Steps mirror — inRole parity (webview inRole vs model itemAllowedInRole)", () => {
+  test("every catalog item agrees, in both roles, and an absent scope means handler-only", () => {
+    const L = loadCase(CORPUS[0]);
+    for (const item of ADD_MENU_CATALOG) {
+      // The webview reads the attribute the server rendered; the model reads the catalog entry itself.
+      const el = { dataset: { roleScope: roleScopeAttr(item) } };
+      for (const role of ["handler", "router"] as const) {
+        assert.strictEqual(
+          L.harness.hook.inRole(el, role),
+          itemAllowedInRole(item, role),
+          `role scope diverged for "${item.id}" in a ${role}`,
+        );
+      }
+    }
+    // An item rendered by an OLDER provider carries no data-role-scope; both sides must read that as
+    // handler-only, so a stale render can never smuggle a transform verb into a router.
+    assert.strictEqual(L.harness.hook.inRole({ dataset: {} }, "handler"), true);
+    assert.strictEqual(L.harness.hook.inRole({ dataset: {} }, "router"), false);
+    // No selected option at all (the placeholder) is not a role problem — the Add button has its own gate.
+    assert.strictEqual(L.harness.hook.inRole(null, "router"), true);
+  });
+
+  test("the router palette offers routing constructs ONLY (AC-R5)", () => {
+    const router = paletteFor("router").map((i) => i.id);
+    assert.deepStrictEqual(
+      router.sort(),
+      ["comment", "elif", "else", "for_each", "if", "raise", "route"].sort(),
+      "a Router may author guards, loops, a raise, a comment and a routing return — nothing else",
+    );
+    // Not one transform verb, lookup, diagnostic or outbound send survives the filter.
+    for (const id of ["set_field", "copy_field", "db_lookup", "code_lookup", "log_note", "send"]) {
+      assert.ok(!router.includes(id), `"${id}" must not be offered inside a @router`);
+    }
+    // ...and the handler palette is unchanged apart from not offering the router's own item.
+    const handler = paletteFor("handler").map((i) => i.id);
+    assert.ok(!handler.includes("route"), "a Handler does not select handlers");
+    assert.strictEqual(handler.length, ADD_MENU_CATALOG.length - 1);
+  });
+});
+
 // ---- T12: mirror inventory guard --------------------------------------------------------------------
 
 /** Every top-level `function <name>(` in stepsWebview.js that is a MIRROR of a stepsModel function and
@@ -1315,6 +1361,7 @@ const MIRRORED = new Set([
   "scopeLabel",
   "resolveDrop",
   "barAnchor",
+  "inRole",
 ]);
 
 /** Top-level functions that are NOT mirrors — DOM/wiring helpers with no pure model counterpart. Each

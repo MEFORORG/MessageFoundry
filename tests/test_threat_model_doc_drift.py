@@ -635,7 +635,14 @@ def test_documented_bounds_match_the_live_constants() -> None:
         ("15.1.3 sandbox cpu cap = 2.0 s (POSIX)", s.sandbox.cpu_seconds, 2.0),
         ("15.1.3 sandbox mem cap = 512 MiB (POSIX)", s.sandbox.mem_mb, 512),
         ("15.1.3 live-lookup bridge = 30.0 s", wiring_runner._LOOKUP_RESULT_TIMEOUT_SECONDS, 30.0),
-        ("15.1.3 outbound retry = forever by default", RetryPolicy().max_attempts, None),
+        # BACKLOG #1051 flipped this from None (retry forever) to a finite 100. This is a COUPLED
+        # edit — `docs/security/THREAT-MODEL.md` lives in the vault (gitignored, absent from every
+        # checkout, so the doc-CONTENT half of this module is inert here and in CI) and its 15.1.3
+        # row must be rewritten to state the finite cap. The `retry forever` entry in
+        # _RESOURCE_ANCHORS above is deliberately left alone: it names a token that must appear in
+        # the vault document, and re-picking it blind from a checkout that cannot read that
+        # document would trade a stale row for an unverifiable anchor.
+        ("15.1.3 outbound retry cap = 100 attempts by default", RetryPolicy().max_attempts, 100),
         ("15.1.3 retry backoff = 5.0 s", RetryPolicy().backoff_seconds, 5.0),
         ("15.1.3 retry backoff cap = 300.0 s", RetryPolicy().max_backoff_seconds, 300.0),
         ("15.1.3 queue_buildup depth dimension OFF", BuildupThreshold().max_depth, None),

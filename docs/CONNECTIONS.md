@@ -2273,13 +2273,17 @@ none (filesystem I/O is unbounded by design). The MLLP/TCP/X12/HTTP listeners ex
 `receive_timeout`; the DICOM SCP instead applies `timeout_seconds` to its three pynetdicom timers. For
 **synchronous** request→response feeds (REST/SOAP, X12 270/271) set a **short** `timeout_seconds`.
 
-**Retry strategy (13.1.3).** Delivery failures retry per the connection's `RetryPolicy`. **Note the
-default `retry_max_attempts` is `None` = retry forever** (with backoff: `retry_backoff_seconds` 5 s,
-multiplier 2.0, capped at 300 s). Under strict FIFO a forever-retrying head blocks its lane until it
-succeeds or an operator purges it. For synchronous HTTP (REST/SOAP) **set a finite
-`retry_max_attempts` and a short `timeout_seconds`** to prevent cascading delays / resource
+**Retry strategy (13.1.3).** Delivery failures retry per the connection's `RetryPolicy`. **The
+default `retry_max_attempts` is 100 — finite** (with backoff: `retry_backoff_seconds` 5 s,
+multiplier 2.0, capped at 300 s), which is a 28,215 s (7 h 50 m 15 s) window before a row gives up.
+Two properties make that safe as a default: attempts are counted **per row**, so an outage burns the
+cap on roughly the lane heads rather than the whole backlog; and an exhausted row **dead-letters into
+the replayable DLQ** rather than being discarded. For synchronous HTTP (REST/SOAP) **keep the finite
+`retry_max_attempts` and set a short `timeout_seconds`** to prevent cascading delays / resource
 exhaustion; failures classified *permanent* (e.g. an MLLP `AR` reject) go straight to the
-dead-letter path rather than retrying. **Every infrastructure hop in Table B that performs a
+dead-letter path rather than retrying. `retry_max_attempts=None` remains expressible and still means
+retry forever, for a partner that must never be advanced past — under strict FIFO that head blocks
+its lane until it succeeds or an operator purges it, so it is a written decision, not a default. **Every infrastructure hop in Table B that performs a
 synchronous request/response is single-shot** — AD, OIDC, SMART, generic OAuth2, the AI broker, both
 Vault clients, both SMTP sinks, the webhook sink, syslog and SNTP: one attempt, no retry loop, which
 is what the requirement's "disable or strictly limit retries" clause asks for. The **store backends
@@ -2396,7 +2400,7 @@ for the Router/Handler and the SMB worker — nothing but a restart.
 | Service/hop | Timeout setting + default | Release procedure | Failure handling | Retry posture |
 |---|---|---|---|---|
 | MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace | a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row | n/a — the sender retries |
-| MLLP destination | `connect_timeout` 10 s, `timeout_seconds` 30 s (drain + ACK read) | the socket is closed per delivery, or reused and aged out via `idle_timeout_seconds` / `max_connection_age_seconds` when `persistent` | transient errors re-queue; a `NegativeAckError` (AR) dead-letters immediately | `RetryPolicy` — **default `retry_max_attempts` is unset = retry forever**; set a finite limit |
+| MLLP destination | `connect_timeout` 10 s, `timeout_seconds` 30 s (drain + ACK read) | the socket is closed per delivery, or reused and aged out via `idle_timeout_seconds` / `max_connection_age_seconds` when `persistent` | transient errors re-queue; a `NegativeAckError` (AR) dead-letters immediately | `RetryPolicy` — **default `retry_max_attempts` is 100, finite**; lower it, or set `None` to retry forever |
 | Raw TCP listener (inbound) | `receive_timeout` 60 s | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path | n/a |
 | X12 listener (inbound) | `receive_timeout` 60 s; `max_interchange_bytes` bounds one ISA/IEA frame | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; an allow-list refusal is **log-only** (no connection_event) and a **capacity refusal is silent — no event and no log** | n/a |
 | Raw TCP / X12 destination | `connect_timeout` 10 s, `timeout_seconds` 30 s | a fresh connection per delivery, closed in `finally` | transient vs permanent classification as MLLP | `RetryPolicy` |
@@ -2406,7 +2410,7 @@ for the Router/Handler and the SMB worker — nothing but a restart.
 | SFTP (remote-file) | 30 s on the **TCP connect only** — the hard-coded module fallback in `transports/remotefile.py` is passed to `paramiko.SSHClient.connect(timeout=…)`. The SSH banner and auth legs ride paramiko's own defaults (the engine sets neither `banner_timeout` nor `auth_timeout`), and the SFTP **channel read/write has no timeout at all**, so a server that stalls after connect blocks its `to_thread` worker until the engine restarts. `Sftp()` exposes no timeout argument, so none of this is operator-configurable | the `paramiko` session is closed in `finally` per poll or delivery | SSH failures map to transient | `RetryPolicy` |
 | FTP / FTPS (remote-file) | 30 s **whole-socket** — the same hard-coded module fallback, handed to `ftplib.FTP_TLS(timeout=…)` / `ftplib.FTP(timeout=…)`, which sets it on the control **and** data connections. `Ftp()` exposes no timeout argument, so it is **not** operator-configurable | the `ftplib` session is closed in `finally` per poll or delivery | `ftplib.all_errors` maps to transient | `RetryPolicy` |
 | Reference-set sync (`FileRef`) | **none engine-owned** — filesystem / SMB-redirector I/O, the same posture as the File connector | the file handle is context-managed and closed per pass | a load error is logged and the previous encrypted snapshot is retained | one attempt per `refresh_seconds` (default 3600) — **no inner retry** |
-| REST destination | `timeout_seconds` 30 s — the **only** timeout (no separate connect timeout on the HTTP family) | the `urllib` response is context-managed and closed per request | HTTP status is classified transient vs permanent; redirects are never followed | `RetryPolicy`; **set a finite `retry_max_attempts` + a short `timeout_seconds` for synchronous feeds** |
+| REST destination | `timeout_seconds` 30 s — the **only** timeout (no separate connect timeout on the HTTP family) | the `urllib` response is context-managed and closed per request | HTTP status is classified transient vs permanent; redirects are never followed | `RetryPolicy`; the finite `retry_max_attempts` default is what a synchronous feed needs — **keep it and set a short `timeout_seconds`** |
 | SOAP destination | `timeout_seconds` 30 s | as REST | as REST | as REST |
 | FHIR destination + `fhir_lookup` | `timeout_seconds` 30 s on both (the lookup carries its own per-connection value), plus the same 30 s Handler-side result bridge (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker without cancelling the in-flight request | as REST; the lookup runs on the thread executor and returns the connection immediately | a lookup failure raises into the Handler and fails the message — never a silent empty result | destination: `RetryPolicy`. `fhir_lookup`: **single-shot, no retry** |
 | DICOMweb STOW-RS destination | `timeout_seconds` 30 s | as REST | STOW-RS status classified transient vs permanent | `RetryPolicy` |
