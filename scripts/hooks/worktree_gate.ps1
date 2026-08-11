@@ -63,7 +63,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.08.10.1"
+$GateVersion = "2026.08.11.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -361,13 +361,78 @@ function Get-ScannableSegments([string]$Cmd) {
 
     $lines = @($folded -split '\r?\n')
 
-    # One level of interpreter recursion. `-c`/`-lc`/`-Command`/`/c`/`/k` and their quoted argument.
+    # ONE LEVEL of interpreter recursion -- and the flag is recognised by a RULE, never by a list of
+    # spellings. What stood here was a fixed list of literals (`-c|-lc|-ec|-Command|-EncodedCommand` plus
+    # `/[ckCK]`, matched case-SENSITIVELY), and it carried a small minority of the family it was naming.
+    # Every spelling it missed was a route around the WHOLE gate: the argument reverted to an ordinary
+    # quoted span, was blanked below, and its contents became invisible to rules 3, 3b, 3c and 3d alike --
+    # so whatever a session could not do directly, it could do inside `pwsh -Com '...'`. BACKLOG #1097.
+    #
+    # MEASURED BY DRIVING THE REAL BINARIES on this box (pwsh 7.6.4, Windows PowerShell 5.1, Git Bash
+    # 5.2.37, cmd.exe on Windows 10.0.26200) rather than read off documentation:
+    #   * PowerShell binds a parameter by any unambiguous PREFIX of its name, so EVERY spelling from `-C`
+    #     to `-Command` runs, on BOTH hosts. `-Com` and `-Comm` were working spellings the list omitted.
+    #   * `-Cm`, `-Cmd`, `-Cnd` and `-Comd` do NOT run: each is reported as a script-file name. That
+    #     negative BOUNDS the family -- it is the prefixes of the parameter name, never any letter
+    #     cluster -- which is why the mandatory `\s+` after the flag is load-bearing and why a matcher
+    #     spelled `-C[a-z]*` would be a widening this must not make.
+    #   * Matching is case-INsensitive: `-command`, `-COM` and `-CoMmAnD` all run. The old patterns went
+    #     through [regex]::Matches with no options, i.e. case-SENSITIVELY, so plain lowercase `-command`
+    #     was a bypass sitting immediately beside the one spelling that was covered.
+    #   * Both hosts take the same parameter under the `/` sigil: `/c`, `/Com`, `/COMMAND` run. The old
+    #     `/[ckCK]` pattern reached `/c` alone and only DOUBLE-quoted, so `/c '...'` allowed while
+    #     `/c "..."` denied -- the verdict turned on the quote character rather than on what ran.
+    #   * A POSIX shell takes its command in a short-option CLUSTER and the cluster is open-ended: Git
+    #     Bash runs `-c`, `-lc`, `-ec`, `-xc`, `-euc`, `-euxc` and `-ic`. The list held three of those.
+    #   * cmd.exe accepts its switches CONCATENATED: `/Q/C`, `/q/c`, `/s/c` and `/V:ON/C` all run.
+    #
+    # WHY A RULE AND NOT A LONGER LIST. A longer list has the same shape as the defect and decays the same
+    # way; this one had already lost `-Com`, `-command`, `/Com`, `-xc` and `/Q/C`. What is written below
+    # is the GENERATING RULE for the family -- a sigil then a prefix of the parameter name in any case; a
+    # shell cluster ending in the command letter; a cmd switch run ending in /c or /k -- so a spelling
+    # nobody enumerated is covered the day someone types it. That is CLAUDE.md section 11's "prefer 'at
+    # least' to an enumeration" applied to a matcher, and the same move rule 1b makes with its shape
+    # backstop. The prefix alternation is BUILT rather than typed for the same reason: a hand-typed one is
+    # the list again, and it would drift from the word it is supposed to describe.
+    #
+    # WHAT IT DELIBERATELY DOES NOT REACH -- stated here so the next reader infers no stronger claim:
+    #   * `-EncodedCommand` stays a LITERAL and is NOT prefix-expanded. Its argument is base64, so
+    #     recursing into it yields nothing any rule can read and the entry has never changed a verdict.
+    #     Expanding it would mean matching `-e`, which sweeps in `sed -e "s/git checkout/x/"` -- a real
+    #     command shape -- for no gain. A base64 payload is a fail-open in EVERY spelling: a different
+    #     defect, and no flag matcher closes it.
+    #   * A cluster with letters AFTER the command letter (`bash -cl`, measured to run). The only rule
+    #     that catches it is "a cluster CONTAINING c", and that also matches `-Comd`, which would delete
+    #     the bound above. A stated residual beats a matcher that has stopped describing a family.
+    #   * `-File <script>`: the code is not in the command at all -- the shell-write blind spot the
+    #     docstring already names.
+    #   * More than one level of nesting, unchanged from before (BACKLOG #1066/#1067 record it).
+    #   * A quoted argument SPANNING LINES, because the split above is per line. Both multi-line forms
+    #     deny today anyway: every line of such a span reaches the scanner RAW and the payload line
+    #     carries the git token and the verb by itself. That is an accident of the raw scan rather than a
+    #     property of this function, and a change that blanks message bodies removes it (BACKLOG #1086).
+    #     It is left alone here because no test on THIS gate could tell the two mechanisms apart, and a
+    #     fix whose green nobody could watch fail is not evidence.
+    #
+    # COST, measured rather than assumed: recursion only ADDS a scan line, and a line still needs a git
+    # token AND a gated verb to deny, so a path argument behind a family flag (`git -C "<path>"`,
+    # `tar -C "<dir>"`) changes no verdict. The one class that widens is a search whose PATTERN spells a
+    # git command -- `grep -vc "git checkout main"` now denies where it did not. That class already
+    # existed for `-c` (`grep -c "git checkout main"` has always denied), so this adds members to it
+    # rather than creating it.
+    $word = 'command'
+    # Longest prefix first: `-Command` must match as `command`, not as `c` with `ommand` left over.
+    $psPrefixes = (($word.Length)..1 | ForEach-Object { $word.Substring(0, $_) }) -join '|'
+    $psFlag     = "[-/](?:$psPrefixes|encodedcommand)"
+    $shFlag     = '-[a-z]*c'
+    $cmdExeFlag = '(?:/[^/\s]+)*/[ck]'
+    $flag       = "(?:$psFlag|$shFlag|$cmdExeFlag)"
+
     $inner = @()
     foreach ($ln in $lines) {
         foreach ($pat in @(
-            '(?:^|\s)(?:-c|-lc|-ec|-Command|-EncodedCommand)\s+"([^"]*)"',
-            "(?:^|\s)(?:-c|-lc|-ec|-Command|-EncodedCommand)\s+'([^']*)'",
-            '(?:^|\s)/[ckCK]\s+"([^"]*)"'
+            "(?i)(?:^|\s)$flag\s+`"([^`"]*)`""
+            "(?i)(?:^|\s)$flag\s+'([^']*)'"
         )) {
             foreach ($m in [regex]::Matches($ln, $pat)) { $inner += $m.Groups[1].Value }
         }
