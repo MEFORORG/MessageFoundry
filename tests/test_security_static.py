@@ -1023,6 +1023,10 @@ _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     # ADR 0155: the DAST scan target mints a throwaway per-run password for the two ephemeral scan
     # identities it provisions into a temp-directory store it destroys with the run.
     "scripts/security/dast_target.py": frozenset({"secrets"}),
+    # BACKLOG #1220: SHA-256 over the discovered engine/console seam surface, giving ENGINE_UI_SEAM an
+    # identity nobody picks by hand. A change detector over public type signatures and field names --
+    # no key, no secret, nothing user- or PHI-derived.
+    "scripts/webconsole_seam_snapshot.py": frozenset({"hashlib"}),
 }
 
 

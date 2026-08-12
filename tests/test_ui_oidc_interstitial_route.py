@@ -21,7 +21,7 @@ import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
-from messagefoundry.api._ui_seam import UiDeps
+from messagefoundry.api._ui_seam import ENGINE_UI_SEAM, UiDeps
 from messagefoundry_webconsole.routes import oidc as oidc_routes
 
 
@@ -41,7 +41,7 @@ class _FakeAuth:
 def _client(**policy: Any) -> TestClient:
     app = FastAPI()
     deps = UiDeps(
-        engine_seam=0,
+        engine_seam=ENGINE_UI_SEAM,
         get_engine=lambda: None,
         get_gate=lambda: None,
         cookie_secure=lambda *_a, **_k: False,

@@ -2284,6 +2284,22 @@ _KNOWN_ENV_POSTURE: dict[str, tuple[DataClass, bool]] = {
     "prod": (DataClass.PHI, True),
 }
 
+#: BACKLOG #95 -- the ``[ai].provider`` values the engine can actually SERVICE.
+#:
+#: **Its source of truth is ``AiBroker.chat``**
+#: (:mod:`messagefoundry.transports.ai_broker`), which builds ONE wire shape unconditionally: an
+#: Anthropic Messages body with ``x-api-key`` and ``anthropic-version`` headers, and an
+#: ``_extract_text`` that assumes Anthropic's content-block list. There is no provider registry, no
+#: dispatch, and ``AiBroker.provider`` has zero readers -- so the serviceable set is exactly one entry
+#: and NOTHING can derive it. That makes this list hand-maintained, which is a real cost: it decays
+#: the moment a second wire shape is added and nobody widens it.
+#:
+#: **The failure to avoid is the inverse one, and it is the tempting one:** listing aspirational names
+#: (``azure_openai``, ``bedrock``, ``ollama``) would ACCEPT configurations the broker still cannot
+#: service, turning a clean config-time refusal back into the opaque runtime 502 this validator exists
+#: to eliminate. The list must describe what ``chat()`` can send, never what the roadmap intends.
+_SERVICEABLE_AI_PROVIDERS = frozenset({"claude"})
+
 
 class AiSettings(_Section):
     """Central AI-assistance policy plus the instance's active **environment name** and security
@@ -2327,6 +2343,27 @@ class AiSettings(_Section):
     # is REFUSED. Deliberately independent of [egress].allowed_http, which is permissive-when-empty and so
     # cannot be the gate for this new egress surface.
     allowed_endpoints: list[str] = []
+
+    @field_validator("provider")
+    @classmethod
+    def _serviceable_provider(cls, v: str) -> str:
+        # BACKLOG #95: refuse an unserviced provider at CONFIG time. Previously any string was
+        # accepted and the mistake surfaced later as an opaque provider-side failure, or as nothing
+        # at all -- the value is recorded in the per-use audit either way, so a config naming a
+        # provider the engine cannot service made the audit trail assert something untrue.
+        #
+        # FIELD-level, so it refuses in EVERY mode rather than only under managed_endpoint. A
+        # mode-gated model_validator would be narrower and is the defensible alternative, but the
+        # value is audit-visible regardless of mode, and "the engine cannot service this name" is
+        # true independently of whether this instance happens to call the broker today.
+        if v not in _SERVICEABLE_AI_PROVIDERS:
+            allowed = ", ".join(sorted(_SERVICEABLE_AI_PROVIDERS))
+            raise ValueError(
+                f"[ai].provider must be one of [{allowed}]; got {v!r}. The engine brokers exactly "
+                "one wire shape (the Anthropic Messages body in transports/ai_broker.py); a "
+                "provider it cannot service is refused here rather than failing at request time."
+            )
+        return v
 
     @field_validator("environment")
     @classmethod
