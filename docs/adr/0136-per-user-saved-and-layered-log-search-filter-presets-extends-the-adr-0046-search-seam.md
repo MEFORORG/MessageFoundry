@@ -57,9 +57,26 @@ layering are **step-up-gated + audited**, and the content term **never round-tri
    `rotate-key` re-encrypts it for free (ASVS 11.3.3 / [ADR 0019](0019-pluggable-keyprovider-hsm-kms-vault.md)).
    No-key ⇒ identity (plaintext), exactly like every other cipher column.
 
-3. **Per-user, owner-scoped.** Every store method is keyed by `owner = identity.username`. A user sees,
+3. **Per-user, owner-scoped.** Every store method is keyed by `owner = identity.user_id`. A user sees,
    recalls, and deletes **only their own** presets; `UNIQUE(owner, name)` makes a save-by-name a
    create-or-replace that **preserves the row id** (so the cell-AAD binding stays stable across a replace).
+
+   > **Amendment A (BACKLOG #1225).** This originally read `owner = identity.username`, and that was a
+   > defect rather than a simplification. A username is **reassignable**: `delete_user` removes
+   > user_roles, sessions and webauthn_credentials but never preset rows, so a departed operator's
+   > presets outlived the account under a name free to reissue, and a recreated account of the same
+   > name inherited them — including the PHI-shaped `criteria` the layered compose returns. The key is
+   > now the immutable `Identity.user_id`, matching the uploads model (ADR 0134 Amendment A / #1152),
+   > which abandoned username-keying for exactly this reason.
+   >
+   > **It is a NARROWING, not a closure.** `_upsert_ad_user` re-binds a surviving mirror row's
+   > `user_id` when a directory-side sAMAccountName is recycled without a MessageFoundry
+   > `delete_user`, so a user_id-keyed check is still defeated on that path. This closes local
+   > accounts and the AD-with-delete path; **BACKLOG #1143 is the real close.**
+   >
+   > Note also that `UNIQUE(owner, name)` now collides on a different thing: two accounts that once
+   > shared a recycled name previously collided on save-by-name and no longer do. That is the intended
+   > behaviour, but it is a change to the **upsert**, not only to the reads.
    The CRUD methods live on the `AuthStore` protocol (beside roles/sessions).
 
 4. **Step-up + audit on the PHI-shaped surfaces.** Preset **create** (persists a possibly-PHI criteria)

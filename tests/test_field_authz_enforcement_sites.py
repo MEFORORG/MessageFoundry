@@ -191,12 +191,16 @@ async def seeded(tmp_path: Path) -> AsyncIterator[_Seed]:
         assert dead, "the dead-letter seed did not claim its outbox row"
         await engine.store.dead_letter_now(dead[0].id, error="handler blew up on MRN9002")
 
-        # Layered search is OWNER-scoped, so every caller needs a preset of their own.
+        # Layered search is OWNER-scoped, so every caller needs a preset of their own. The owner key
+        # is the immutable Identity.user_id, never the reassignable username (BACKLOG #1225), so the
+        # seed has to resolve the id -- seeding by name writes a row no route can reach.
         presets: dict[str, str] = {}
         for username in ("viewer", "rawonly", "boss"):
+            seeded_user = await engine.store.get_user_by_username(username)
+            assert seeded_user is not None, f"seed user {username!r} was not created"
             preset_id, _replaced = await engine.store.upsert_search_preset(
                 preset_id=f"preset-{username}",
-                owner=username,
+                owner=seeded_user.id,
                 name="jane",
                 criteria=json.dumps({"content": "JANE", "target": "both", "limit": 50}),
             )
