@@ -7995,4 +7995,29 @@ gate is the wrong shape, validation of the walk is the right one.
 
 **Cluster:** Security / Access control. **Priority:** P3. **Verdict:** build. **Severity:** minor as a screen -- it ships no fix; its value is that the NEXT instance is caught rather than found by accident.
 
+## 1227. Console resend POST bypasses the engine's step-up requirement across the CoreHandlers seam
+
+> 🔢 **Filed 2026-08-11 -- PRE-EXISTING and measured as such, not inferred.** Value **5/10** -- Difficulty **5/10** -- _fill-in_. The engine declares its resend handler step-up-gated; the console route that calls it does not, and because the console invokes the handler **by reference across the `CoreHandlers` seam**, the engine's `Depends` gate never runs:
+
+> ```
+> engine   messagefoundry/api/app.py:4023            require_step_up(Permission.FILES_BROWSE)
+> console  messagefoundry_webconsole/routes/uploaded_logs.py   require_ui(Permission.FILES_BROWSE)
+> ```
+
+> **PRE-EXISTING, VERIFIED BY MEASUREMENT RATHER THAN BY MEMORY** (the word is load-bearing and is the one nobody re-checks once written): the console `Depends` line is **byte-identical on `origin/main`** and appears in **neither the `+` nor the `-` side** of the #1152 diff -- its line number moved only by offset from additions above it. Confirmed independently by extracting the **route-to-gate PAIRING** for all seven `/ui/uploaded-logs` routes, byte-identical on both refs. That instrument was chosen deliberately: a *count* of gates is identical on both refs too, and **a multiset cannot see a SWAP** -- totals never move if step-up is relocated from one route to another, so "unchanged" would read clean while being false. When the load-bearing word is *unchanged*, the instrument has to be able to see the change being ruled out.
+
+> **STATUS OF THE GAP: DOCUMENTED, NOT CLOSED -- and the item is claiming exactly that.** #1152 adds a comment at `routes/uploaded_logs.py:55` recording the no-step-up property (*"no step-up, and no registered action -- so the flag survives"*). It was written to justify the list page as a safe redirect target, and its side effect is that **the gap is now documented in the code while remaining unenforced**. A documented gap is better than an undocumented one and worse than a closed one. Stated here so the next reader who finds that comment does not read it as a reviewed decision and conclude this item is already handled.
+
+> **THE SEAM IS THE MECHANISM, AND IT GENERALIZES.** This is the same property that forced #1152's object-level check into the handler **body**: anything expressed as a `Depends` on an engine handler is **not enforced for console callers**. So the engine's own declaration of what an operation requires is not binding on the `/ui` plane. Any future gate written as a dependency inherits this, silently.
+
+> **THE EXISTING RATIONALE, AND WHY IT IS A PREMISE RATHER THAN A CONTROL.** The module docstring states it: *"Resend is a same-origin POST on top of the already-stepped-up browse page."* Nothing enforces that arrival path -- `assert_same_origin` checks the Origin header, not where the operator came from -- so a form left open past the step-up window still posts successfully. That is a compensating control resting on an unenforced premise (CLAUDE.md section 11, SDS-3.7).
+
+> **WHY IT IS A DESIGN DECISION AND NOT A PATCH.** The same docstring names the obstacle: **a body-carrying POST cannot survive the re-auth redirect**, which is exactly why `upload` has no step-up either. Delete works only because it is body-less and auto-retryable behind a confirm step. So closing this needs a chosen shape -- stash-and-replay the body across re-auth, convert resend to a confirm step like delete, or accept and document it as a bounded exception -- not a one-line gate change.
+
+> **#1152 NARROWED ITS BLAST RADIUS WITHOUT CLOSING IT.** Before #1152, an operator whose step-up had gone stale could resend **any** operator's file. #1152 put the owner check in the handler body, which the console **does** get, so the same operator can now only resend **their own**. The bypass is unchanged; its consequence shrank.
+
+> **How to prove a fix:** drive the console resend POST with a deliberately stale step-up window (`AuthSettings(step_up_max_age_seconds=-1)`, the idiom the console suite already uses) and assert it does **not** inject. A test that only checks a fresh operator can resend passes on the defective code.
+
+**Cluster:** Security / Access control. **Priority:** P3. **Verdict:** build. **Severity:** minor -- reaches only the operator's OWN files since #1152, needs an authenticated session with `files:browse`, and same-origin still holds; the value is closing the seam-bypass class rather than this instance.
+
 
