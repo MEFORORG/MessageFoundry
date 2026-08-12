@@ -13,6 +13,8 @@ surface). Resend is a same-origin POST on top of the already-stepped-up browse p
 
 from __future__ import annotations
 
+import logging
+import re
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -40,6 +42,87 @@ register_ui_action(
 )
 register_ui_action(r"^/ui/uploaded-logs/file/[^/?#]+/delete$", Permission.FILES_DELETE)
 
+_log = logging.getLogger(__name__)
+
+#: Where a REFUSED mutation lands: the uploaded-logs LIST page, never the detail page the POST came
+#: from. Two properties make it the only correct target, and both are load-bearing.
+#:
+#: 1. The detail GET is step-up-gated AND registered as an unlock action above, so once the step-up
+#:    window goes stale it 303s to /ui/reauth — which deliberately does NOT carry the query string
+#:    back (the browse filter is a GET query that can hold PHI-shaped search terms). A flag aimed at
+#:    the detail page is therefore DROPPED in exactly that window, landing the operator on a plain
+#:    detail page: byte-identical to what a SUCCESSFUL resend produces. The list route is a plain
+#:    ``require_ui(FILES_BROWSE)`` — no step-up, and no registered action — so the flag survives.
+#: 2. Success never goes here. A resend's success 303s to the detail page and a delete's success 303s
+#:    to the bare list URL, so neither can be confused with a flagged failure.
+_FAILED_TARGET = "/ui/uploaded-logs"
+
+#: The outcome codes the LIST page accepts (console convention: ``?e=<code>``, allow-listed and mapped
+#: to fixed text, exactly as the login page does). Each is a BOOLEAN FLAG naming one cause, nothing
+#: more. Every cause below is caller-influenced — the target inbound name and the message index come
+#: from the resend form body, the file id from the path, and ``exc.detail`` quotes them back — so
+#: reflecting any of it into the query string would put attacker-supplied text in the URL, the referrer
+#: chain, every proxy log, and finally the rendered HTML. A fixed code cannot carry a payload.
+RESEND_FAILED_CODE = "resend_failed"
+RESEND_DENIED_CODE = "resend_denied"
+RESEND_STOPPED_CODE = "resend_stopped"
+DELETE_FAILED_CODE = "delete_failed"
+
+#: The fixed text each code maps to. The 404 one names the three causes the operator can act on WITHOUT
+#: distinguishing an owner denial (ASVS 8.2.2) from an absent file — the engine answers 404 for both
+#: deliberately, so this one sentence has to cover both and must not split them.
+RESEND_FAILED_NOTICE = (
+    "That resend did not run — nothing was injected. The file, the message number or the target "
+    "inbound connection was not found. Check them and try again."
+)
+RESEND_DENIED_NOTICE = (
+    "That resend did not run — nothing was injected. You are not authorized to inject into that "
+    "inbound connection."
+)
+RESEND_STOPPED_NOTICE = (
+    "That resend did not run — nothing was injected. The target inbound connection is registered but "
+    "not running. Start it, then try again."
+)
+DELETE_FAILED_NOTICE = (
+    "That delete did not run — nothing was removed. The file was not found. It may already be gone."
+)
+
+#: The allow-list itself: an EXACT-match lookup from code to fixed module text. ``e`` is compared, never
+#: rendered — an unrecognized value maps to no banner at all rather than being echoed.
+_LIST_NOTICES: dict[str, str] = {
+    RESEND_FAILED_CODE: RESEND_FAILED_NOTICE,
+    RESEND_DENIED_CODE: RESEND_DENIED_NOTICE,
+    RESEND_STOPPED_CODE: RESEND_STOPPED_NOTICE,
+    DELETE_FAILED_CODE: DELETE_FAILED_NOTICE,
+}
+
+#: Which code each refused-resend status becomes. The engine distinguishes a denied TARGET channel
+#: (403) from a registered-but-stopped inbound (409) from a not-found file/inbound/index (404), and
+#: each is separately actionable — collapsing them would tell the operator something untrue for two of
+#: the three. Anything outside this map is not a refusal this route knows how to explain, so it is
+#: re-raised rather than reported as one of these.
+_RESEND_CODES: dict[int, str] = {
+    403: RESEND_DENIED_CODE,
+    404: RESEND_FAILED_CODE,
+    409: RESEND_STOPPED_CODE,
+}
+
+#: A file id is minted as ``secrets.token_hex(16)``. The path segment reaching these routes is
+#: CALLER-SUPPLIED and percent-decoded, so it can carry CR/LF and forge a log line; the engine rejects
+#: a malformed id but only after this module has already decided to log. So a value that is not the
+#: minted shape is logged as a fixed placeholder instead. This is a log-injection guard, not a second
+#: copy of the path-traversal rule — that one stays in ``UploadStore._paths``.
+_MINTED_FILE_ID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
+
+
+def _log_file_id(file_id: str) -> str:
+    return file_id if _MINTED_FILE_ID_RE.match(file_id) else "malformed"
+
+
+def _refused(code: str) -> RedirectResponse:
+    """The 303 a refused mutation answers with: :data:`_FAILED_TARGET` carrying one allow-listed code."""
+    return RedirectResponse(f"{_FAILED_TARGET}?e={code}", status_code=303)
+
 
 def register(app: FastAPI, deps: UiDeps) -> None:
     core = deps.core
@@ -49,9 +132,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.FILES_BROWSE)),
+        e: str | None = Query(None, max_length=32),
     ) -> HTMLResponse:
         data = await core.list_uploaded_files(request, engine=engine, identity=identity)
-        return HTMLResponse(pages.uploaded_logs(data))
+        # The refused-mutation banner. An EXACT-key lookup in the allow-list, so the rendered string is
+        # always one this module wrote — `e` itself is never rendered, echoed, or passed on, and an
+        # unrecognized value yields no banner rather than reflected text.
+        return HTMLResponse(pages.uploaded_logs(data, error=_LIST_NOTICES.get(e or "", "")))
 
     @app.get("/ui/uploaded-logs/upload", response_class=HTMLResponse)
     async def ui_uploaded_logs_upload_form(
@@ -90,6 +177,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         control_id: str | None = Query(None, max_length=256),
         limit: int = Query(200, ge=1, le=500),
     ) -> Response:
+        # No outcome banner here: this page is step-up-gated, so a flag aimed at it is dropped whenever
+        # the window is stale (see :data:`_FAILED_TARGET`). Every refused mutation reports on the list.
         shared = dict(  # noqa: C408
             content=content or "",
             field_path=field_path or "",
@@ -120,7 +209,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if exc.status_code == 404:  # bad/absent id (incl. path-traversal) → back to the list
                 return RedirectResponse("/ui/uploaded-logs", status_code=303)
             if exc.status_code == 400:  # bad content criteria → re-render metadata-only + the error
-                result = await _browse(None, None, None)
+                # The engine parses the criteria BEFORE it authorizes the file, so this arm is reached
+                # without the file ever having been reachable. The retry drops the criteria and so runs
+                # far enough to 404 — on a denied owner check (ASVS 8.2.2) or an absent/traversal id —
+                # and that 404 must take the SAME 303 as above rather than escaping this except block
+                # as raw JSON in the HTML plane.
+                try:
+                    result = await _browse(None, None, None)
+                except HTTPException as retry_exc:
+                    if retry_exc.status_code == 404:
+                        return RedirectResponse("/ui/uploaded-logs", status_code=303)
+                    raise
                 return HTMLResponse(
                     pages.uploaded_log_detail(result, error=str(exc.detail), **shared),
                     status_code=400,
@@ -142,9 +241,31 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             body = UploadResendRequest(index=int(form.get("index", "")), to=form.get("to", ""))
         except (ValueError, TypeError):
             raise HTTPException(400, "index and to are required") from None
-        await core.resend_uploaded_message(
-            request, file_id=file_id, body=body, engine=engine, identity=identity
-        )
+        try:
+            await core.resend_uploaded_message(
+                request, file_id=file_id, body=body, engine=engine, identity=identity
+            )
+        except HTTPException as exc:
+            # A refused resend must not answer with the SUCCESS response, which is a bare 303 to the
+            # detail page. Failing with the byte-identical answer to succeeding tells the operator a
+            # message was injected when none was. So a refusal goes to :data:`_FAILED_TARGET` carrying
+            # one allow-listed code, and the code is all that travels: `exc.detail` quotes the caller's
+            # own inbound name and index back, and reflecting that into the URL or the HTML is an XSS
+            # sink fed by the form body. All three of 403/404/409 are handled rather than re-raised
+            # because an escaping HTTPException renders as application/json inside the HTML console,
+            # with that same caller-supplied name quoted in it.
+            code = _RESEND_CODES.get(exc.status_code)
+            if code is None:
+                raise
+            # And the refusal is recorded SERVER-SIDE, so it survives whatever the browser does with
+            # the redirect. file_id (shape-checked) + status only: the inbound name, the index and
+            # `exc.detail` are caller-supplied text, and putting those in a log is log injection.
+            _log.warning(
+                "uploaded-log resend refused: file_id=%s status=%d",
+                _log_file_id(file_id),
+                exc.status_code,
+            )
+            return _refused(code)
         return RedirectResponse(f"/ui/uploaded-logs/file/{file_id}", status_code=303)
 
     @app.get("/ui/uploaded-logs/file/{file_id}/delete-confirm", response_class=HTMLResponse)
@@ -175,7 +296,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 request, file_id=file_id, engine=engine, identity=identity
             )
         except HTTPException as exc:
+            # Same shape as the resend refusal one function up: the success is a bare 303 to the list,
+            # so answering a REFUSED delete with that same 303 tells the operator the file was deleted
+            # when it was not — including on an ASVS 8.2.2 owner denial, which the engine answers 404
+            # so it stays indistinguishable from an absent file. The flag is what separates the two,
+            # and the WARNING carries the record server-side (file_id shape-checked + status only).
             if exc.status_code == 404:
-                return RedirectResponse("/ui/uploaded-logs", status_code=303)
+                _log.warning(
+                    "uploaded-log delete refused: file_id=%s status=%d",
+                    _log_file_id(file_id),
+                    exc.status_code,
+                )
+                return _refused(DELETE_FAILED_CODE)
             raise
         return RedirectResponse("/ui/uploaded-logs", status_code=303)

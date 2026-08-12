@@ -7,6 +7,7 @@ guard. Postgres/SQL Server parity is CI's job; these run on SQLite."""
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -14,6 +15,13 @@ import httpx
 import pytest
 
 from messagefoundry.auth import Role
+from messagefoundry.auth.permissions import (
+    BUILTIN_ROLE_PERMISSIONS,
+    CUSTOM_ROLE_FORBIDDEN_PERMISSIONS,
+    CustomRoleError,
+    Permission,
+    validate_custom_role_permissions,
+)
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import ConnectorType
@@ -64,6 +72,26 @@ async def _make_user(engine: Engine, role: Role, *, name: str) -> AuthService:
         uid, password_hash=user.password_hash, must_change_password=False
     )
     return service
+
+
+async def _add_user(service: AuthService, role: Role, *, name: str) -> str:
+    """Add a SECOND user to an existing AuthService (the cross-operator tests need two principals on
+    one app) and return its user_id. Mirrors _make_user's must-change-password clearing, which every
+    route depends on."""
+    uid = await service.create_local_user(
+        username=name,
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[role.value],
+        actor="test",
+    )
+    user = await service.store.get_user(uid)
+    assert user is not None and user.password_hash is not None
+    await service.store.set_password(
+        uid, password_hash=user.password_hash, must_change_password=False
+    )
+    return uid
 
 
 async def _login(c: httpx.AsyncClient, name: str) -> dict[str, str]:
@@ -475,3 +503,232 @@ async def test_browse_requires_step_up_and_audits_shape(engine: Engine, tmp_path
     assert browse, "browse must be audited"
     joined = " ".join(str(a["detail"] or "") for a in browse)
     assert "MRN123" not in joined and "alnum" in joined
+
+
+# --- object-level authorization: owner-only uploaded files (ASVS 8.2.2, BACKLOG #1152) --------------
+
+
+def test_cross_operator_override_is_granted_to_administrator_only() -> None:
+    # The override is the ONLY way past owner-only, so which roles hold it IS the control. Administrator
+    # gets it for free (the role is literally frozenset(Permission)); no other built-in role may.
+    granting = {
+        role
+        for role, perms in BUILTIN_ROLE_PERMISSIONS.items()
+        if Permission.FILES_ACCESS_ANY in perms
+    }
+    assert granting == {Role.ADMINISTRATOR}, granting
+    assert Permission.FILES_ACCESS_ANY not in BUILTIN_ROLE_PERMISSIONS[Role.OPERATOR]
+
+
+def test_the_override_cannot_be_minted_onto_a_custom_role() -> None:
+    # Walking BUILTIN_ROLE_PERMISSIONS above is NOT enough to make "Administrator only" true: the
+    # custom-role builder is a second minting path over the same catalogue (ADR 0045), so unless the
+    # override is carved out there, an admin could mint `custom:` with it and hand every operator's
+    # uploaded PHI to a non-administrator while docs/SECURITY.md says the grant is admin-only.
+    assert Permission.FILES_ACCESS_ANY in CUSTOM_ROLE_FORBIDDEN_PERMISSIONS
+    with pytest.raises(CustomRoleError):
+        validate_custom_role_permissions([Permission.FILES_ACCESS_ANY.value])
+    # Carved out on its own, not by poisoning the whole set: browse+delete stay mintable.
+    assert validate_custom_role_permissions(
+        [Permission.FILES_BROWSE.value, Permission.FILES_DELETE.value]
+    ) == [Permission.FILES_BROWSE, Permission.FILES_DELETE]
+    with pytest.raises(CustomRoleError):
+        validate_custom_role_permissions(
+            [Permission.FILES_BROWSE.value, Permission.FILES_ACCESS_ANY.value]
+        )
+
+
+async def test_uploaded_files_are_owner_only_across_operators(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # ASVS 8.2.2: a file belongs to the operator who uploaded it. A SECOND operator holding the SAME
+    # files:* permissions must not see it in the listing, browse it (the matched/scanned counts are a
+    # content oracle over another operator's decrypted PHI), resend it into an inbound they can reach
+    # (a two-step path to the body), or delete it. Every denial is a 404 — the same answer as an absent
+    # id — so the by-id routes cannot enumerate another operator's file ids.
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()  # so a resend denial is the OWNER check, not "inbound not running" (409)
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    op2_id = await _add_user(service, Role.OPERATOR, name="op2")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h1 = await _login(c, "op")
+        fid = (
+            await c.post("/uploads", files={"file": ("acme.hl7", BATCH, "text/plain")}, headers=h1)
+        ).json()["file_id"]
+
+        h2 = await _login(c, "op2")
+        lst = await c.get("/uploads", headers=h2)
+        assert lst.status_code == 200
+        assert lst.json() == {"total": 0, "files": [], "scope": "own"}
+        assert (await c.get(f"/uploads/{fid}/messages", headers=h2)).status_code == 404
+        rs = await c.post(f"/uploads/{fid}/resend", json={"index": 0, "to": "in1"}, headers=h2)
+        assert rs.status_code == 404, rs.text
+        assert (await c.delete(f"/uploads/{fid}", headers=h2)).status_code == 404
+
+        # The owner is unaffected on every route.
+        assert [f["file_id"] for f in (await c.get("/uploads", headers=h1)).json()["files"]] == [
+            fid
+        ]
+        assert (await c.get(f"/uploads/{fid}/messages", headers=h1)).status_code == 200
+        own = await c.post(f"/uploads/{fid}/resend", json={"index": 0, "to": "in1"}, headers=h1)
+        assert own.status_code == 200, own.text
+        assert (await c.delete(f"/uploads/{fid}", headers=h1)).status_code == 200
+
+    denied = [a for a in await engine.store.list_audit() if a["action"] == "upload.denied"]
+    assert {json.loads(str(a["detail"]))["operation"] for a in denied} == {
+        "browse",
+        "resend",
+        "delete",
+    }
+    assert {a["actor"] for a in denied} == {"op2"}
+    joined = " ".join(str(a["detail"] or "") for a in denied)
+    assert fid in joined  # the denial names the object it refused
+    # ...and the PRINCIPAL it refused, by the immutable id, because the actor column's username is the
+    # very value this control established is not an identity (see the recycled-username test below).
+    assert {json.loads(str(a["detail"]))["actor_user_id"] for a in denied} == {op2_id}
+    # ...and nothing else: the detail carries exactly those four keys, so no filename, no owner
+    # username and no body content can ride along (the audit log is not a PHI sink).
+    for row in denied:
+        assert set(json.loads(str(row["detail"]))) == {
+            "file_id",
+            "operation",
+            "reason",
+            "actor_user_id",
+        }
+    assert "acme.hl7" not in joined and "MSH" not in joined and "MRN123" not in joined
+
+
+async def test_administrator_override_reaches_another_operators_upload(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # ASVS 8.2.2: files:access_any is the explicit cross-operator override. It restores the oversight
+    # path owner-only otherwise closes (reviewing or cleaning up a departed operator's uploads), and an
+    # administrator holds it with no extra grant because the role is the whole catalogue.
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    await _add_user(service, Role.ADMINISTRATOR, name="root")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h1 = await _login(c, "op")
+        fid = (
+            await c.post("/uploads", files={"file": ("acme.hl7", BATCH, "text/plain")}, headers=h1)
+        ).json()["file_id"]
+
+        ha = await _login(c, "root")
+        lst = await c.get("/uploads", headers=ha)
+        assert lst.status_code == 200
+        assert [(f["file_id"], f["uploader"]) for f in lst.json()["files"]] == [(fid, "op")]
+        assert (await c.get(f"/uploads/{fid}/messages", headers=ha)).status_code == 200
+        assert (await c.delete(f"/uploads/{fid}", headers=ha)).status_code == 200
+
+    # An allowed cross-operator access is not a denial: nothing is recorded as upload.denied, and the
+    # listing audit says which scope the count was taken over.
+    audits = await engine.store.list_audit()
+    assert not [a for a in audits if a["action"] == "upload.denied"]
+    scopes = {json.loads(str(a["detail"]))["scope"] for a in audits if a["action"] == "upload.list"}
+    assert scopes == {"any_owner"}
+
+
+async def test_upload_with_no_owner_id_is_reachable_only_with_the_override(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # FAIL CLOSED on a sidecar carrying no owner id. save() refuses to write one, but UploadStore's
+    # tolerant sidecar loader yields uploader_id == "" when the key is absent, and a hand-placed sidecar
+    # can be in that state because with no configured key the cipher is the identity cipher and the
+    # sidecar is plaintext JSON on disk. Such a file matches NOBODY: it disappears for every operator —
+    # including the one who originally uploaded it — and only files:access_any reaches it. Note the
+    # DISPLAY name survives here: stripping it is not what makes the file unreachable, which is the
+    # whole point of keying authorization on the id. Synthetic HL7 only.
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    await _add_user(service, Role.ADMINISTRATOR, name="root")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h1 = await _login(c, "op")
+        fid = (
+            await c.post("/uploads", files={"file": ("acme.hl7", BATCH, "text/plain")}, headers=h1)
+        ).json()["file_id"]
+
+        sidecar = tmp_path / "uploads" / f"{fid}.meta"
+        stored = json.loads(sidecar.read_text(encoding="utf-8"))
+        assert stored.pop("uploader_id")  # plaintext under the identity cipher
+        assert stored["uploader"] == "op"  # the display label is deliberately left in place
+        sidecar.write_text(json.dumps(stored), encoding="utf-8")
+
+        assert (await c.get("/uploads", headers=h1)).json() == {
+            "total": 0,
+            "files": [],
+            "scope": "own",
+        }
+        assert (await c.get(f"/uploads/{fid}/messages", headers=h1)).status_code == 404
+        assert (await c.delete(f"/uploads/{fid}", headers=h1)).status_code == 404
+
+        ha = await _login(c, "root")
+        lst = await c.get("/uploads", headers=ha)
+        assert [(f["file_id"], f["uploader"]) for f in lst.json()["files"]] == [(fid, "op")]
+        assert lst.json()["scope"] == "any_owner"  # the override holder's listing says so
+        assert (await c.get(f"/uploads/{fid}/messages", headers=ha)).status_code == 200
+        assert (await c.delete(f"/uploads/{fid}", headers=ha)).status_code == 200
+
+
+async def test_a_recreated_username_cannot_reach_the_departed_operators_upload(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """ASVS 8.2.2: ownership keys on the IMMUTABLE account id, never on the username.
+
+    A username is unique among live accounts but it is reusable: ``delete_user`` frees it and
+    ``create_local_user`` takes it back, minting a DIFFERENT ``user_id``. (The AD leg is worse — the
+    upsert resolves by username and auto-provisions the new row with no admin action at all.) Keying
+    on the name would hand that new principal — which holds no ``files:access_any`` — the departed
+    operator's uploaded PHI: 200 on the listing, 200 on the decrypting browse, 200 on delete, and no
+    ``upload.denied`` row, because the engine would consider it the owner. Synthetic HL7 only.
+    """
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    departed = await service.store.get_user_by_username("op")
+    assert departed is not None
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h1 = await _login(c, "op")
+        fid = (
+            await c.post("/uploads", files={"file": ("acme.hl7", BATCH, "text/plain")}, headers=h1)
+        ).json()["file_id"]
+
+        # The operator leaves; the name is recycled onto a brand-new account.
+        await service.delete_user(departed.id, actor="test")
+        successor = await _add_user(service, Role.OPERATOR, name="op")
+        assert successor != departed.id, "the premise: same username, different account"
+
+        h2 = await _login(c, "op")
+        assert (await c.get("/uploads", headers=h2)).json() == {
+            "total": 0,
+            "files": [],
+            "scope": "own",
+        }
+        assert (await c.get(f"/uploads/{fid}/messages", headers=h2)).status_code == 404
+        assert (await c.delete(f"/uploads/{fid}", headers=h2)).status_code == 404
+
+    denied = [a for a in await engine.store.list_audit() if a["action"] == "upload.denied"]
+    assert {json.loads(str(a["detail"]))["operation"] for a in denied} == {"browse", "delete"}
+    # The audit's actor COLUMN names the username, which here is the same string for both accounts —
+    # so on that column alone the successor's denials are indistinguishable from anything the departed
+    # operator ever did. This is the scenario that makes the point: the row therefore also carries the
+    # acting user_id, and it names the SUCCESSOR, not the account that owns the file.
+    assert {a["actor"] for a in denied} == {"op"}
+    actor_ids = {json.loads(str(a["detail"]))["actor_user_id"] for a in denied}
+    assert actor_ids == {successor}
+    assert departed.id not in actor_ids
