@@ -104,7 +104,19 @@ param(
     [Parameter(ParameterSetName = 'Send')][string]$ToSessionId,
     # How long the message stays deliverable. Past this it is swept to expired/ rather than shown, so a
     # session that starts next week is not told to act on something from last Tuesday.
-    [Parameter(ParameterSetName = 'Send')][int]$TtlMinutes = 720,
+    #
+    # RAISED 720 -> 4320 (12h -> 72h) on 2026-08-11, because 12h was measured to be SHORTER THAN THE GAP
+    # IT HAD TO SURVIVE. The delivery points are SessionStart and Stop, so a recipient that is closed --
+    # or idle -- overnight receives nothing until someone opens it. At 720 an ordinary overnight gap
+    # expired the mail, and EXPIRY IS SILENT IN BOTH DIRECTIONS: the recipient is never told a message
+    # existed, and the sender is never told it went unread. That is the only place in this transport
+    # where a message is genuinely LOST rather than merely late, and it was reachable by doing nothing.
+    #
+    # 72h is chosen to span a weekend, which is the longest gap a working session is expected to sit
+    # through. It does NOT abandon the staleness argument above -- a three-day-old instruction is still
+    # refused rather than acted on. If you need longer, pass -TtlMinutes explicitly and say why; do not
+    # raise this default again without re-stating what gap it now has to cover.
+    [Parameter(ParameterSetName = 'Send')][int]$TtlMinutes = 4320,
     [Parameter(ParameterSetName = 'Send')][ValidateSet('note', 'handoff', 'alert', 'broadcast')][string]$Kind = 'note',
 
     [Parameter(ParameterSetName = 'List', Mandatory)][switch]$List,
@@ -200,7 +212,10 @@ function New-Message {
         [Parameter(Mandatory)][string]$ToCwd,
         [string]$ToSessionId,
         [string]$Kind = 'note',
-        [int]$TtlMinutes = 720
+        # Kept in step with the parameter default above deliberately: every caller passes -TtlMinutes
+        # explicitly, so this is the value a FUTURE caller that forgets to would silently get. Two
+        # defaults that disagree is the shape where the tested path and the shipped path diverge.
+        [int]$TtlMinutes = 4320
     )
     $now = [DateTime]::UtcNow
     return @{

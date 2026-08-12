@@ -8065,3 +8065,34 @@ gate is the wrong shape, validation of the walk is the right one.
 > **Provenance, because it bears on how much to trust the framing:** the TTL raise was mine, and the observation that it treated the symptom came from the reviewer of the doc change, not from me. **I had written "expiry is silent in both directions" in the commit message and still concluded that raising the duration was the fix.** The words were in front of me and the inference was not drawn.
 
 **Cluster:** Tooling / session coordination. **Priority:** P3. **Verdict:** build. **Severity:** minor -- coordination infrastructure, no product or PHI effect. It costs a lost hand-off and, worse, an unattributable one.
+## 1229. the worktree gate blanks double-quoted spans FIRST, so a stray quote inside single-quoted words straddles and deletes the live command between them
+
+> 🔢 **Filed 2026-08-12 -- a LIVE FAIL-OPEN in the shipped gate on `main`, found by the gate-family lane while adjudicating a different item and REPRODUCED INDEPENDENTLY here before filing.** Value **6/10** -- Difficulty **2/10** -- _quick win_. `scripts/hooks/worktree_gate.ps1:382-383` blanks quoted spans per line, **double quotes first**:
+
+> ```powershell
+> $s = $s -replace '"[^"]*"', '""'
+> $s = $s -replace "'[^']*'", "''"
+> ```
+
+> Inside a **single**-quoted shell word a `"` is an ordinary literal, so the shell sees two harmless arguments and leaves everything between them as live code. The gate's `"[^"]*"` pairs those two literal quotes **across** that live code and deletes it, so the command in the middle is never presented to any rule.
+
+> **Reproduced here against the two lines as they stand on `origin/main`**, substituting an inert marker for the gated command so no dangerous string was ever built or run. The marker was confirmed present before blanking in all three arms, so a deletion cannot be an artifact of a missing marker:
+
+> ```
+> shape                                          marker survives blanking?   gate can see it
+> plain single-quoted words (control)            yes                         yes  -> DENY
+> stray double-quote inside single-quoted words  NO                          no   -> ALLOW
+> stray apostrophe inside double-quoted words    yes                         yes  -> DENY
+> ```
+
+> **The asymmetry is the proof, and it is why this is invisible from one direction.** The mirrored shape still denies, because the double-quote pass runs first and consumes those spans before the single-quote pass can straddle. So the cause is the **blanking ORDER**, not any message-flag or command classifier -- a fix aimed at the classifiers would not touch it.
+
+> **Scope, stated deliberately rather than left to inference.** The gate's own `.SYNOPSIS` says it is a guardrail against the accidental primary edit and explicitly **not** a security boundary. This is a **local developer guardrail on a maintainer workstation**: a bypass would weaken a working-tree control there. It is **not** a MessageFoundry product exposure -- nothing here touches the engine, and per section 0 there are no deployments for it to affect. Reachability is nonetheless ordinary rather than exotic: it needs only a shell command echoing text that contains a double quote on either side of a gated git command.
+
+> **How to prove a fix, in both directions.** A single-pass tokeniser that respects shell quoting rules (a `"` inside a single-quoted word is a literal, and vice versa) rather than two ordered regex passes. The test must assert **both** that the straddling shape now DENIES **and** that the three currently-denying controls still DENY -- a fix that simply reverses the pass order moves the hole to the mirrored shape instead of closing it, and a one-arm test would call that a pass.
+
+> **Provenance:** the defect and its mechanism came from the gate-family lane; the reproduction above, the negative control and the ordering argument were re-derived here from the shipped source rather than taken on report. Filed separately on the lane's explicit instruction that it must **not** be closed with the item whose adjudication surfaced it.
+
+**Cluster:** Tooling / developer guardrail. **Priority:** P3. **Verdict:** build. **Severity:** minor -- a local
+workstation guardrail that its own synopsis declines to call a security boundary; no product, engine or PHI
+effect. It costs the guardrail's reliability on exactly the shape a developer reaches for by habit.
