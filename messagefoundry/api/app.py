@@ -3887,13 +3887,23 @@ def create_app(
         # ASVS 5.2.4: opportunistic age-based retention sweep at save time (off-loop, best-effort). A prune
         # error must never fail the upload the operator just made — it is logged and retried by the
         # periodic task. Each pruned file is audited (file_id + uploader, never content).
+        #
+        # BACKLOG #1224: the sweep is AUTOMATED and owner-blind, so it is attributed to the system,
+        # not to the pruned file's uploader. `prune_expired()` is deliberately UNSCOPED (it has to be:
+        # the per-uploader quota and the sweep both need to see every file), so the operator whose
+        # upload triggered this pass is in general NOT the owner of what it prunes. Naming the owner
+        # as actor while stamping the TRIGGERING operator's address made the row assert that X deleted
+        # their own file from Y's host. `client` is dropped for the same reason rather than as tidying:
+        # _record_reload_audit's contract is that `client` is the address OF THE ACTOR NAMED IN THE
+        # ROW, and once the actor is the system principal no address is in scope (ADR 0150 decision 4
+        # rejects exactly this pairing for dual-control config reload). The owner survives as DATA in
+        # `detail.uploader`, which is where it belongs.
         try:
             for pruned in await us.prune_expired():
                 await engine.store.record_audit(
                     "upload.prune",
-                    actor=pruned.uploader or None,
+                    actor="system",
                     detail=json.dumps({"file_id": pruned.file_id, "uploader": pruned.uploader}),
-                    client=client_ip(request),
                 )
         except OSError:
             _log.warning("opportunistic uploaded-logs retention prune failed", exc_info=True)
@@ -5757,9 +5767,15 @@ def create_managed_app(
         if _upload_store is not None:
 
             async def _audit_upload_prune(meta: UploadedFileMeta) -> None:
+                # BACKLOG #1224: the retention runner has no operator and no request behind it, so
+                # the row is attributed to the system principal (matching pipeline/retention.py's
+                # `retention_purge`) rather than to the pruned file's uploader. The uploader is
+                # carried as DATA in `detail`, where a reader can still see whose file went. Both
+                # this site and the request-path sweep had to change together: fixing one would have
+                # left the same false attribution reachable by the other path.
                 await store.record_audit(
                     "upload.prune",
-                    actor=meta.uploader or None,
+                    actor="system",
                     detail=json.dumps({"file_id": meta.file_id, "uploader": meta.uploader}),
                 )
 

@@ -738,3 +738,70 @@ async def test_a_recreated_username_cannot_reach_the_departed_operators_upload(
     actor_ids = {json.loads(str(a["detail"]))["actor_user_id"] for a in denied}
     assert actor_ids == {successor}
     assert departed.id not in actor_ids
+
+
+async def test_the_prune_audit_row_names_the_system_not_the_pruned_files_owner(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #1224: the save-time retention sweep is automated and owner-blind.
+
+    The defect this reds on is a CROSS-OWNER one, and it is structural rather than incidental:
+    ``prune_expired()`` is deliberately unscoped, so the operator whose upload happens to trigger the
+    sweep is in general NOT the owner of what it prunes. The old row paired the pruned file's owner as
+    ``actor`` with the TRIGGERING operator's address as ``client`` -- asserting that op deleted their
+    own file from op2's host, which is true of neither of them.
+
+    A test that only checked the actor string would pass a fix that left ``client`` in place, so the
+    NULL client is asserted too.
+    """
+    import dataclasses
+    import time
+
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    await _add_user(service, Role.OPERATOR, name="op2")
+    settings = StoreSettings(
+        uploads_dir=str(tmp_path / "uploads"),
+        max_upload_bytes=1_000_000,
+        uploads_retention_days=30,
+    )
+    app = create_app(engine, auth=service, store_settings=settings)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h1 = await _login(c, "op")
+        fid = (
+            await c.post("/uploads", files={"file": ("acme.hl7", BATCH, "text/plain")}, headers=h1)
+        ).json()["file_id"]
+
+        # Age op's file past the window by rewriting its sidecar (re-encrypted under the same cipher
+        # + file_id AAD), so the NEXT upload's opportunistic sweep collects it.
+        us = app.state.upload_store
+        meta = next(m for m in await us.list_files() if m.file_id == fid)
+        aged = dataclasses.replace(meta, uploaded_at=time.time() - 31 * 86_400)
+        (tmp_path / "uploads" / f"{fid}.meta").write_text(
+            us._encrypt_meta(aged),  # noqa: SLF001 -- mirrors tests/test_uploads.py's backdating
+            encoding="utf-8",
+        )
+
+        # A DIFFERENT operator uploads. Their save-time sweep prunes op's aged file.
+        h2 = await _login(c, "op2")
+        assert (
+            await c.post("/uploads", files={"file": ("b.hl7", BATCH, "text/plain")}, headers=h2)
+        ).status_code == 200
+
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "upload.prune"]
+    assert len(rows) == 1, f"expected exactly one prune row, got {rows}"
+    row = rows[0]
+
+    assert row["actor"] == "system", (
+        "the sweep is automated and owner-blind; naming the pruned file's uploader attributes an "
+        "action they did not take"
+    )
+    assert not row["client"], (
+        "no address is in scope once the actor is the system principal -- stamping the TRIGGERING "
+        "operator's address here is the half that made the row a false attribution"
+    )
+    # The owner is not lost: it survives as data, which is where it belongs.
+    assert json.loads(str(row["detail"])) == {"file_id": fid, "uploader": "op"}
