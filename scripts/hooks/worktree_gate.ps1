@@ -454,10 +454,39 @@ function Get-ScannableSegments([string]$Cmd) {
     #     So on that path this gate DENIES `/Command`, which cannot run, and ALLOWS `//Command`, `//c`
     #     and `//Com`, which do -- including `pwsh //Command "git config core.hooksPath /dev/null"`.
     #     INHERITED from the matcher this replaces and UNCHANGED here, so it is disclosed rather than
-    #     closed: matching a leading `//` opens a UNC-shaped false-deny surface (`ls //server/share/c
-    #     "..."`) that needs its own measurement. The must-ALLOW row that used to assert `//` was
-    #     REMOVED from tests/test_worktree_gate_interpreter_sigils.py, because asserting it made the
-    #     inversion a requirement and would have forced a later fix to delete a green test.
+    #     closed. The must-ALLOW row that used to assert `//` was REMOVED from
+    #     tests/test_worktree_gate_interpreter_sigils.py, because asserting it made the inversion a
+    #     requirement and would have forced a later fix to delete a green test; a residual tripwire
+    #     row replaces it, pinning the ALLOW as KNOWN rather than as correct.
+    #
+    #     WHAT CLOSING IT WOULD COST, measured rather than assumed -- and the first version of this
+    #     note got this WRONG, which is why the number is here instead of an adjective. It claimed a
+    #     "UNC-shaped false-deny surface (`ls //server/share/c "..."`)". That is FALSE: rebuilt the
+    #     pattern with a `//?` sigil and drove it -- `ls //server/share/c "..."`,
+    #     `ls //fileserver/c$/logs "..."` and `ls //nas/backup/c "..."` match under NEITHER the
+    #     shipped sigil NOR the widened one, because `(?:^|\s)` anchors before the first slash and
+    #     `$sigil` feeds `$psFlag` only, so what follows must be a prefix of `command`. The real new
+    #     surface is a bare `//c` / `//com` / `//command` / `//cwa` token followed by a quoted span --
+    #     narrow, not UNC. So the deferral rests on it being a BEHAVIOUR CHANGE to a security control
+    #     that wants its own adversarial verification, NOT on a false-deny cost. Stated plainly
+    #     because a compensating control resting on a false premise is itself the defect.
+    #
+    #     THE cmd.exe HALF IS A DIFFERENT SHAPE, and naming only the `//` spellings above would make
+    #     this list read as complete when it is not. Measured through Git Bash with an inert payload:
+    #         cmd /c    -> does NOT run      cmd //c    -> RUNS
+    #         cmd ///c  -> does NOT run      cmd ////c  -> RUNS
+    #     i.e. cmd runs on the EVEN slash counts, because MSYS strips one and cmd.exe tolerates the
+    #     rest, while pwsh runs only on exactly `//` (`pwsh ///Command` and `////Command` were both
+    #     measured NOT to run, which is why `///` is still a must-ALLOW row on the PWSH test). All the
+    #     executing cmd spellings are ALLOWed here and on the matcher this replaces. Read this list as
+    #     "AT LEAST these", never as an enumeration.
+    #
+    #     PRECONDITION, because the table above is a fact about a CONFIGURATION and not about the
+    #     characters: it assumes DEFAULT MSYS path conversion. With `MSYS_NO_PATHCONV=1` or
+    #     `MSYS2_ARG_CONV_EXCL='*'` the child receives `/Command` verbatim and THAT runs while
+    #     `//Command` does not -- the whole table inverts. Both were verified unset on this box.
+    #     Neither the removal of the `//` must-ALLOW row nor the keeping of `///` changes under either
+    #     configuration, so the conclusions hold; the SPELLINGS do not.
     #   * A dash-family character may be doubled only WITH ITSELF. Three or more is refused, a mixed pair
     #     (`-` then U+2013) is refused, and a slash never doubles ON A POWERSHELL PARENT (see the
     #     inversion above for the Bash-tool path). That is why the sigil below is spelled
@@ -512,6 +541,25 @@ function Get-ScannableSegments([string]$Cmd) {
     # the attached form it does, so the across-the-board relaxation reddens it and the per-host split does
     # not. Recorded because the useless probe LOOKED like the bound: it named the right risk, asserted the
     # right verdict, and could not fail.
+    # A KNOWN FALSE DENY THIS RULE COSTS, recorded HERE because this script is what gets installed to
+    # %USERPROFILE%\.claude\hooks and it travels without the tests -- a note that lives only in a test
+    # file is invisible to whoever is reading the installed copy:
+    #
+    #     ls /usr/src/c "git checkout main"      DENIES, and should not
+    #     ls /usr/src/lib "git checkout main"    ALLOWs  (control: the `/c` ending is the trigger)
+    #
+    # THE CAUSE IS THE `(?:/[^/\s]+)*` CLUSTER PREFIX IN $cmdExeFlag, not the `\s*` separator beside
+    # it. The prefix exists so cmd's CONCATENATED switch runs (`/Q/C`, `/V:ON/C`) are recognised, and
+    # it lets an ordinary POSIX path walk in one component at a time: `/usr` `/src` `/c`. Measured by
+    # rebuilding the pattern -- the row matches under `\s*` AND under `\s+` (there is a literal space
+    # before the quote, so the separator is irrelevant to it), and matches under NEITHER once the
+    # cluster prefix is dropped.
+    #
+    # DO NOT "FIX" IT BY DROPPING THE `\s*`. That does not remove this false deny and it REGRESSES
+    # `cmd /c"git checkout main"` from DENY to ALLOW -- the attached form is precisely what `\s*`
+    # exists to catch. The narrowing that works is to require a cmd-like PROGRAM token before the
+    # switch run; dropping the cluster prefix also works but loses `/Q/C`. Left as the owner's call.
+    # tests/test_worktree_gate_interpreter_sigils.py pins the deny so the cost cannot be lost.
     $flagThenSep = "(?:(?:$psFlag|$shFlag)\s+|$cmdExeFlag\s*)"
 
     # The payload is a NAMED group. It was Groups[1], which still resolves correctly (.NET numbers

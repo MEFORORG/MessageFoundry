@@ -344,7 +344,18 @@ def test_the_sigil_run_is_bounded(primary: Path, repos_file: Path, sigil: str) -
     "..."``) that needs its own measurement -- a separate change with a separate risk profile, not a
     line to slip into this one.
 
-    ``///`` STAYS, because it was measured on the same path and does not run."""
+    ``///`` STAYS, because ``pwsh ///Command`` and ``pwsh ////Command`` were both measured on the same
+    path NOT to run. That is a statement about PWSH and this row drives pwsh, so the row is right --
+    but do not read it as a fact about the sigil, because cmd.exe differs: ``cmd //c`` and
+    ``cmd ////c`` RUN while ``cmd /c`` and ``cmd ///c`` do not. Those cmd spellings are ALLOWed here
+    and on the matcher this replaces, and they are recorded in the gate's residual list.
+
+    The table assumes DEFAULT MSYS path conversion. Under ``MSYS_NO_PATHCONV=1`` or
+    ``MSYS2_ARG_CONV_EXCL='*'`` it inverts back; both were verified unset on this box, and neither
+    the removal of ``//`` nor the keeping of ``///`` changes under either configuration.
+
+    Removing the row left NO coverage of ``//`` in either direction, so
+    :func:`test_the_double_slash_sigil_is_a_known_open_residual` below replaces it as a tripwire."""
     assert (
         run_gate(shell(f'pwsh -NoProfile {sigil}Command "{PAYLOAD}"', cwd=primary), repos_file)
         is None
@@ -417,8 +428,9 @@ def test_the_separator_relaxation_is_scoped_to_cmd(
         # $cmdExeFlag. It used to sit here labelled "the shape the relaxed cmd separator has to
         # survive", which is a bound that cannot fail.
         'ls /usr/src/c "some file.txt"',
-        # The same path shape with a NON-git quoted payload, i.e. the trigger isolated to the `/c`
-        # ending rather than to the path.
+        # The SAME payload as the pinned false deny below, behind a path that does NOT end in `c`.
+        # What varies from that row is the PATH, which is what isolates the trigger to the `/c`
+        # ending. (The row above varies the PAYLOAD instead, and on its own is vacuous.)
         'ls /usr/src/lib "git checkout main"',
         # Already-paid-for false positives, re-asserted against the wider matcher.
         'ssh box "git checkout main"',
@@ -438,15 +450,71 @@ def test_the_widened_matcher_does_not_create_false_denies(
     assert run_gate(shell(command, cwd=primary), repos_file) is None
 
 
-def test_the_relaxed_cmd_separator_costs_a_posix_path_false_deny(
+@pytest.mark.parametrize("spelling", ["//Command", "//c", "//Com", "//cwa"])
+def test_the_double_slash_sigil_is_a_known_open_residual(
+    primary: Path, repos_file: Path, spelling: str
+) -> None:
+    """A TRIPWIRE OVER AN OPEN BYPASS. It asserts ALLOW, and that is NOT an endorsement -- read this
+    before you conclude the row blesses the hole, because the distinction is the whole point.
+
+    A must-ALLOW row that asserts a spelling is SAFE is a specification change wearing the clothes of
+    coverage; that is why the ``//`` row was deleted from
+    :func:`test_the_sigil_run_is_bounded`. But deleting it left ZERO coverage of ``//`` anywhere in
+    the repo, in EITHER direction -- proven, not argued: under a minimal ``//?`` sigil closure the
+    three gate suites stay entirely green, so the suite can see this bypass neither open nor closed.
+    Silence is not disclosure.
+
+    So this row exists to make the residual FAIL-VISIBLE. Each spelling below was measured to EXECUTE
+    through Git Bash, because MSYS argument conversion delivers ``//Command`` to the child as
+    ``-Command``'s slash form while ``/Command`` arrives as a path and does nothing::
+
+        typed  //c        -> child gets  /c        RUNS
+        typed  //Command  -> child gets  /Command  RUNS
+        typed  /c         -> child gets  C:/       does NOT run
+
+    The gate ALLOWs all of them today, and so did the matcher this change replaced -- the exposure is
+    INHERITED and UNCHANGED, which is why it is disclosed here rather than closed inside a commit
+    whose subject is something else.
+
+    WHEN THIS TEST REDS, that is the SUCCESS signal, not a regression: somebody closed the bypass.
+    Delete this test and the residual note in ``Get-ScannableSegments``; do not restore the ALLOW.
+    The measured cost of closing is narrow -- a bare ``//c``/``//com``/``//command``/``//cwa`` token
+    before a quoted span. It is NOT the UNC-shaped surface an earlier version of that note claimed;
+    ``ls //server/share/c "..."`` matches under neither sigil, because ``(?:^|\\s)`` anchors before
+    the first slash."""
+    assert (
+        run_gate(shell(f'pwsh -NoProfile {spelling} "{PAYLOAD}"', cwd=primary), repos_file) is None
+    ), (
+        f"{spelling} now DENIES. If you closed the double-slash sigil deliberately, that is the "
+        "intended outcome -- delete this test and the residual note in Get-ScannableSegments. Do "
+        "NOT restore the ALLOW to make this pass."
+    )
+
+
+def test_the_cmd_switch_cluster_prefix_costs_a_posix_path_false_deny(
     primary: Path, repos_file: Path
 ) -> None:
     """A DISCLOSED COST OF THIS CHANGE, pinned so it cannot be lost, and NOT an endorsement.
 
-    ``$cmdExeFlag`` is ``(?:/[^/\\s]+)*/[ck]`` and its separator was relaxed to ``\\s*`` because
-    cmd.exe accepts an attached argument. A POSIX path whose last component is ``c`` matches that
-    shape, so a quoted span after it is recursed into as if it were cmd's command argument. Measured
-    against both gates::
+    THE CAUSE IS THE CLUSTER PREFIX, NOT THE SEPARATOR. This test was first written as
+    ``test_the_relaxed_cmd_separator_costs_...`` and that name, and the four places that repeated it,
+    were WRONG -- caught by an adversarial re-read of the commit that introduced them. ``$cmdExeFlag``
+    is ``(?:/[^/\\s]+)*/[ck]``. The leading ``(?:/[^/\\s]+)*`` was added so cmd's CONCATENATED switch
+    runs (``/Q/C``, ``/V:ON/C``) are recognised, and it is that prefix which lets an ordinary POSIX
+    path walk into the matcher: ``/usr`` then ``/src`` then ``/c``. Rebuilt the pattern and measured
+    the row directly::
+
+        cluster prefix + \\s*   -> MATCH, captures `git checkout main`
+        cluster prefix + \\s+   -> MATCH, captures `git checkout main`     <-- separator irrelevant
+        no cluster     + \\s*   -> no match
+        no cluster     + \\s+   -> no match
+
+    The line has a literal space before the quote, so the ``\\s*`` relaxation was never involved. It
+    was blamed because it was the newest thing nearby -- the same mistake as the separator claim this
+    lane corrected one commit earlier, made while correcting it.
+
+    A POSIX path whose last component is ``c`` matches that shape, so a quoted span after it is
+    recursed into as if it were cmd's command argument. Measured against both gates::
 
         ls /usr/src/c   "some file.txt"      main ALLOW   this build ALLOW    (no git token: vacuous)
         ls /usr/src/c   "git checkout main"  main ALLOW   this build DENY     <-- the new false deny
@@ -464,13 +532,31 @@ def test_the_relaxed_cmd_separator_costs_a_posix_path_false_deny(
     narrows ``$cmdExeFlag`` so this ALLOWs again, this test reds, and that is the intended signal to come
     and read this docstring rather than a regression to paper over.
 
-    NOT YET DECIDED, and deliberately left to the owner rather than settled here: whether the cmd
-    attached-form support is worth this cost at all. Narrowing ``$cmdExeFlag`` to require a
-    cmd-like program token, or dropping the ``\\s*`` relaxation, would both remove it."""
-    denied = run_gate(shell('ls /usr/src/c "git checkout main"', cwd=primary), repos_file)
-    assert denied is not None, (
-        "the POSIX-path false deny has changed. If you narrowed $cmdExeFlag on purpose, delete this "
-        "test and its note in the residual list; do not simply flip the assertion."
+    NOT YET DECIDED, and deliberately left to the owner rather than settled here: whether cmd's
+    concatenated-switch support is worth this cost. The two candidate narrowings, both MEASURED::
+
+      1. Require a cmd-like PROGRAM token before the switch run. Removes this false deny and keeps
+         every cmd shape denying, including ``/Q/C`` and the quoted-program form. This is the one
+         that works.
+      2. Drop the ``(?:/[^/\\s]+)*`` cluster prefix. Removes this false deny, but LOSES the ``/Q/C``
+         and ``/V:ON/C`` recognition the prefix was added for -- measured: ``cmd /Q/C "..."`` stops
+         matching entirely.
+
+    AND ONE NON-REMEDY, RECORDED SO NOBODY REACHES FOR IT: dropping the ``\\s*`` relaxation does NOT
+    remove this false deny (see the table above -- it matches under ``\\s+`` too) and it REGRESSES
+    ``cmd /c"git checkout main"`` from DENY to ALLOW, because the attached form is exactly what
+    ``\\s*`` exists to catch. That advice was printed here in the first version of this docstring. It
+    would have cost a real DENY-to-ALLOW and bought nothing."""
+    reason = assert_denied(
+        run_gate(shell('ls /usr/src/c "git checkout main"', cwd=primary), repos_file)
+    )
+    # ATTRIBUTE the deny, do not merely count it. Asserting "something denied" would keep this
+    # tripwire green if some future unrelated rule denied the same string, and it would then hold
+    # green straight through a $cmdExeFlag narrowing -- the tripwire silently measuring nothing.
+    # Today the deny is fully attributable: removing the cluster prefix ALLOWs this outright.
+    assert "checkout" in reason, (
+        "the POSIX-path false deny is still a deny, but no longer for the gated verb -- so this "
+        f"tripwire is no longer measuring the cluster-prefix path. Reason was: {reason}"
     )
     # The control: the same payload behind a path NOT ending in `c` must still ALLOW, or the cause is
     # something wider than the cmd branch and this test is measuring the wrong thing.
