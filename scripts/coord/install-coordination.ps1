@@ -132,6 +132,13 @@ $ANNOUNCE_MARKER = "mefor-announce"
 #   mefor-coord / mefor-announce / mefor-mail   -- pairwise non-containing.
 $MAIL_MARKER = "mefor-mail"
 
+# A FOURTH marker, for the URGENT mail tier (scripts/hooks/mail-watch.ps1). The comment above names
+# "mefor-mail-urgent" as the exact mistake to avoid -- it CONTAINS "mefor-mail", so installing it would
+# make Test-IsOurs strip the drain's row and the second installer to run would silently disarm the
+# first. "mefor-wake" is contained by none of the other three and contains none of them:
+#   mefor-coord / mefor-announce / mefor-mail / mefor-wake   -- pairwise non-containing, checked.
+$WAKE_MARKER = "mefor-wake"
+
 # The shim. No installed copy: it locates the script in a checkout and runs it, so a `git pull` updates
 # the hook everywhere with nothing to fall stale. Silent and exit-0 outside a repo, because this file is
 # user-global and runs in every unrelated project on the machine.
@@ -153,6 +160,34 @@ function New-ShimCommand([string]$RelativeScript, [string]$Marker = $MARKER) {
         'if (-not $b) { continue } ' +
         "`$s = Join-Path `$b.Trim() '$RelativeScript'; " +
         'if (Test-Path -LiteralPath $s) { & $s; break } } }'
+    )
+}
+
+# The WAKE shim, for the asyncRewake tier. It differs from the shared shim in exactly one way, and that
+# one way is the whole reason it is a separate builder: IT PROPAGATES THE SCRIPT'S EXIT CODE.
+#
+# WHY THAT IS LOAD-BEARING RATHER THAN TIDY. A rewake fires on exit code 2 and ONLY on exit code 2. The
+# shared shim ends `& $s; break`, which runs the script and then lets the hook process exit 0 -- so a
+# watcher that found mail and exited 2 is reported as a clean no-op and its payload is DISCARDED. The
+# failure is completely silent from the session's side: the hook ran, the output was captured, nothing
+# arrived. scripts/hooks/mail-watch.ps1 records that this cost a full debug cycle to find, and states
+# that the installer is the component responsible for emitting the suffix. This is that emission.
+#
+# `exit $LASTEXITCODE` sits INSIDE the Test-Path branch, immediately after the call, rather than at the
+# end of the command. Outside a repo, or with no checkout carrying the script, nothing ran and there is
+# no exit code to forward -- so the fall-through `exit 0` is reached instead. Forwarding an unset or
+# stale $LASTEXITCODE from a hook that never ran is how a rewake fires on a session with no mail.
+function New-WakeShimCommand([string]$RelativeScript, [string]$Marker = $WAKE_MARKER) {
+    return (
+        "# $Marker`n" +
+        '$c = (& git rev-parse --path-format=absolute --git-common-dir 2>$null); ' +
+        'if ($LASTEXITCODE -eq 0 -and $c) { ' +
+        '$bases = @((Split-Path $c.Trim() -Parent), (& git rev-parse --path-format=absolute --show-toplevel 2>$null)); ' +
+        'foreach ($b in $bases) { ' +
+        'if (-not $b) { continue } ' +
+        "`$s = Join-Path `$b.Trim() '$RelativeScript'; " +
+        'if (Test-Path -LiteralPath $s) { & $s; exit $LASTEXITCODE } } }' + "`n" +
+        'exit 0'
     )
 }
 
@@ -202,6 +237,28 @@ $WIRING = @(
     # exactly the standing tax that keeps steer-inject opt-in. Stop pays it once.
     @{ Event = "SessionStart"; Matcher = $null; Script = "scripts/hooks/mail-drain.ps1"; Timeout = 20; Msg = "Checking session mail"; Marker = $MAIL_MARKER; Shim = "std" }
     @{ Event = "Stop"; Matcher = $null; Script = "scripts/hooks/mail-drain.ps1"; Timeout = 20; Msg = "Checking session mail"; Marker = $MAIL_MARKER; Shim = "std" }
+
+    # The URGENT tier: mail-watch.ps1, armed at Stop, which is the moment the session goes IDLE.
+    #
+    # WHY Stop AND NOT SessionStart. The drain above already covers arrival-before-you-got-here. The gap
+    # this closes is mail landing while a session sits at a prompt with nobody typing -- measured, the
+    # drain's next delivery point is the END of the session's NEXT turn, so mail waits for a human to
+    # interact before it is shown. Arming at Stop puts the watcher live exactly across the idle window.
+    #
+    # THE TWO FLAGS ARE BOTH REQUIRED AND FOR DIFFERENT REASONS. `asyncRewake` is what injects the
+    # output on exit 2. `async` must be set ALONGSIDE it rather than relied on as implied: the binary
+    # gates backgrounding on `isInteractive || hasStreamingInput`, so in a non-interactive run
+    # (claude -p) asyncRewake alone falls through to the SYNCHRONOUS path and this watcher would block
+    # the session for its full timeout. Setting async forces the background branch unconditionally.
+    #
+    # TIMEOUT 1200 AGAINST THE SCRIPT'S OWN 900s WAIT. The script requires its wait to stay comfortably
+    # under the hook timeout, because a watcher killed at timeout is indistinguishable from one that
+    # found nothing. 300s of headroom, not a round number chosen to look tidy.
+    #
+    # ONE-SHOT, STATED RATHER THAN PAPERED OVER: the rewake belongs to the process Claude Code spawned
+    # and is tracked by hook id, so the watcher cannot re-arm itself. Each Stop arms one. After a
+    # delivery the session falls back to the drain until its next turn boundary.
+    @{ Event = "Stop"; Matcher = $null; Script = "scripts/hooks/mail-watch.ps1"; Timeout = 1200; Msg = "Watching for urgent mail"; Marker = $WAKE_MARKER; Shim = "wake"; Async = $true }
 )
 
 # The unfiltered table, kept so a filter that matches nothing can tell the operator what DOES exist.
@@ -318,12 +375,26 @@ foreach ($path in $SettingsPath) {
                 $entry.hooks = @(
                     [ordered]@{
                         type          = "command"
-                        command       = $(if ($w.Shim -eq "announce") { New-AnnounceShimCommand } else { New-ShimCommand $w.Script $w.Marker })
+                        command       = $(
+                            switch ($w.Shim) {
+                                "announce" { New-AnnounceShimCommand }
+                                "wake" { New-WakeShimCommand $w.Script $w.Marker }
+                                default { New-ShimCommand $w.Script $w.Marker }
+                            }
+                        )
                         shell         = "powershell"
                         timeout       = $w.Timeout
                         statusMessage = $w.Msg
                     }
                 )
+                # The async/rewake pair is emitted ONLY for rows that ask for it, so every existing row
+                # keeps its exact previous shape and a re-install is a no-op for them. Adding the keys
+                # unconditionally would rewrite four hooks that have no business being backgrounded --
+                # a PreToolUse gate that returns asynchronously is a gate that does not gate.
+                if ($w.Async) {
+                    $entry.hooks[0].async = $true
+                    $entry.hooks[0].asyncRewake = $true
+                }
                 $existing = @($settings.hooks[$w.Event])
                 $settings.hooks[$w.Event] = @($existing | Where-Object { $_ }) + @($entry)
             }
