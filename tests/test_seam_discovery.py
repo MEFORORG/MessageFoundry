@@ -181,13 +181,26 @@ def test_the_engine_package_does_not_import_the_discovery(surface: Any) -> None:
 
     ``messagefoundry/`` must not import the console (the one-way dependency rule) and must not import
     ``scripts/``. Computing the seam at import time would also make every proof condition pass
-    vacuously, because a stored value could never disagree with a derived one."""
-    hits = [
-        path
-        for path in (_REPO_ROOT / "messagefoundry").rglob("*.py")
-        if "seam_discovery" in path.read_text(encoding="utf-8")
-        or "webconsole_seam_snapshot" in path.read_text(encoding="utf-8")
-    ]
+    vacuously, because a stored value could never disagree with a derived one.
+
+    Checked by parsing IMPORTS, not by substring. A substring scan reports the regenerate-with
+    comment in ``_ui_seam.py`` as a violation -- naming a tool is not importing it, and a guard that
+    cannot tell those apart would push the next author to delete the instruction rather than the
+    dependency.
+    """
+    banned = {"seam_discovery", "webconsole_seam_snapshot"}
+    hits: list[str] = []
+    for path in (_REPO_ROOT / "messagefoundry").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module or ""]
+            else:
+                continue
+            if any(part in banned for name in names for part in name.split(".")):
+                hits.append(f"{path.relative_to(_REPO_ROOT).as_posix()}:{node.lineno}")
     assert hits == []
 
 

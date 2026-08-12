@@ -1,13 +1,13 @@
 # messagefoundry-webconsole ENGINE SEAM CONTRACT SNAPSHOT
 #
 # Deterministic serialization of the engine-side contract the web console depends on (ADR 0065).
-# Regenerate with: python scripts/webconsole_seam_snapshot.py
+# Regenerate with: python scripts/webconsole_seam_snapshot.py --write
 # This is a GOLDEN gate: any diff means the seam contract changed - see the test's failure hint.
 # The surface below is DISCOVERED from the console's own imports and uses, never enumerated
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-20
+494a51230dce5730
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam

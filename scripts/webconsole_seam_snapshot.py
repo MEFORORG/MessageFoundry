@@ -33,15 +33,22 @@ The snapshot captures:
      ``_SCOPE_NOTES[data.scope]``, so renaming a literal would KeyError at runtime while a
      field-name-only snapshot stayed byte-identical.
 
-Run ``python scripts/webconsole_seam_snapshot.py`` to print the current snapshot; redirect it over the
-golden to refresh it after an intentional, seam-bumped contract change.
+Usage:
+  ``python scripts/webconsole_seam_snapshot.py``           print the snapshot
+  ``python scripts/webconsole_seam_snapshot.py --digest``  print the derived seam value only
+  ``python scripts/webconsole_seam_snapshot.py --write``   rewrite ENGINE_UI_SEAM AND the golden
+
+Use ``--write``, never a shell redirect over the golden: PowerShell's ``>`` emits UTF-16LE with a
+BOM, which corrupts a file the test reads as UTF-8.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import importlib.util
 import inspect
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -84,7 +91,7 @@ _HEADER = (
     "# messagefoundry-webconsole ENGINE SEAM CONTRACT SNAPSHOT",
     "#",
     "# Deterministic serialization of the engine-side contract the web console depends on (ADR 0065).",
-    "# Regenerate with: python scripts/webconsole_seam_snapshot.py",
+    "# Regenerate with: python scripts/webconsole_seam_snapshot.py --write",
     "# This is a GOLDEN gate: any diff means the seam contract changed - see the test's failure hint.",
     "# The surface below is DISCOVERED from the console's own imports and uses, never enumerated",
     "# by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.",
@@ -128,51 +135,161 @@ def _member(obj: Any) -> str:
     return f"attribute: {type(obj).__name__}"
 
 
-def build_snapshot() -> str:
-    """Assemble the full deterministic snapshot text (newline-terminated)."""
+def contract_sections() -> list[tuple[str, list[tuple[str, str]]]]:
+    """``(section title, [(key, value)])`` for the CONTRACT surface.
+
+    **This function never reads ``ENGINE_UI_SEAM``.** That is what keeps the derived seam out of its
+    own digest input, and it is an exclusion BY CONSTRUCTION rather than by filtering -- there is no
+    "strip the seam line" step that could quietly stop matching. A reader checks the property by
+    confirming the name does not appear in this function, not by trusting a regex.
+
+    Keys are section-qualified and sorted within their section, because discovered names arrive in
+    AST and filesystem order and that is the one place a derived value could move without the
+    contract changing.
+    """
     discovery = _load_discovery()
     surface = discovery.discover(_CONSOLE_DIR, _ENGINE_DIR)
     dto_classes = discovery.discover_dto_classes(_CONSOLE_DIR)
     by_name = {f"{d.__module__}.{d.__qualname__}": d for d in dto_classes}
 
-    lines: list[str] = list(_HEADER)
-
-    lines += ["", "## ENGINE_UI_SEAM", str(ENGINE_UI_SEAM)]
+    sections: list[tuple[str, list[tuple[str, str]]]] = []
 
     for name, dc in (
         ("UiDeps", UiDeps),
         ("CoreHandlers", CoreHandlers),
         ("AdminHandlers", AdminHandlers),
     ):
-        lines += ["", f"## dataclass messagefoundry.api._ui_seam.{name}"]
-        lines += _dataclass_fields(dc)
+        # Declaration order, NOT sorted: the injected bundle's field order is part of its shape.
+        sections.append(
+            (
+                f"dataclass messagefoundry.api._ui_seam.{name}",
+                [(f, "") for f in _dataclass_fields(dc)],
+            )
+        )
 
-    lines += ["", "## api.security surface (imported directly by the console, outside UiDeps)"]
-    for symbol in surface.security_symbols:
-        lines.append(f"{symbol}: {_member(getattr(security, symbol))}")
+    sections.append(
+        (
+            "api.security surface (imported directly by the console, outside UiDeps)",
+            [(s, _member(getattr(security, s))) for s in surface.security_symbols],
+        )
+    )
+    sections.append(
+        (
+            "AuthService members reached by the console",
+            [(m, _member(getattr(AuthService, m))) for m in surface.auth_service_methods],
+        )
+    )
+    sections.append(
+        (
+            "app.state attributes the console sets/reads",
+            [(a, "") for a in surface.app_state_attrs],
+        )
+    )
+    sections.append(
+        (
+            "DTO fields rendered by the console (closed over nested models)",
+            [(q, ", ".join(_dto_fields(by_name[q]))) for q in surface.dtos],
+        )
+    )
+    sections.append(
+        (
+            "enum members reachable from those DTOs",
+            [(n, ", ".join(v)) for n, v in sorted(discovery.enums_in_surface(dto_classes).items())],
+        )
+    )
+    sections.append(
+        (
+            "Literal value sets on those DTOs",
+            [
+                (n, ", ".join(v))
+                for n, v in sorted(discovery.literals_in_surface(dto_classes).items())
+            ],
+        )
+    )
+    return sections
 
-    lines += ["", "## AuthService members reached by the console"]
-    for name in surface.auth_service_methods:
-        lines.append(f"{name}: {_member(getattr(AuthService, name))}")
 
-    lines += ["", "## app.state attributes the console sets/reads"]
-    lines += list(surface.app_state_attrs)
+def contract_digest() -> str:
+    """The seam value: a 16-hex-character SHA-256 of the discovered contract surface.
 
-    lines += ["", "## DTO fields rendered by the console (closed over nested models)"]
-    for qualname in surface.dtos:
-        fields = ", ".join(_dto_fields(by_name[qualname]))
-        lines.append(f"{qualname}: {fields}")
+    NOT a security control -- it is a change detector, so what is needed is accidental-collision
+    avoidance across the distinct contract surfaces this project will ever produce, not preimage
+    resistance. Anyone able to craft a colliding surface already has commit access to ``_ui_seam.py``,
+    where writing the constant directly is strictly easier.
 
-    lines += ["", "## enum members reachable from those DTOs"]
-    for name, members in sorted(discovery.enums_in_surface(dto_classes).items()):
-        lines.append(f"{name}: {', '.join(members)}")
+    64 bits, by the birthday bound ``N^2 / 2^(b+1)``: at N = 10,000 distinct surfaces (about 500x the
+    ~20 seam moves to date) the collision probability is 2.7e-12. 32 bits would be 1 in 86, which is
+    why this is not truncated further. SHA-256 rather than a non-approved digest because the engine
+    renders a ``fips_mode`` attestation and a non-approved hash in the shipped surface invites a FIPS
+    question for no benefit.
+    """
+    payload = "\n".join(
+        f"{title}\t{key}\t{value}"
+        for title, records in contract_sections()
+        for key, value in records
+    )
+    return hashlib.sha256((payload + "\n").encode("utf-8")).hexdigest()[:16]
 
-    lines += ["", "## Literal value sets on those DTOs"]
-    for name, values in sorted(discovery.literals_in_surface(dto_classes).items()):
-        lines.append(f"{name}: {', '.join(values)}")
 
+def build_snapshot() -> str:
+    """Assemble the full deterministic snapshot text (newline-terminated)."""
+    lines: list[str] = list(_HEADER)
+    lines += ["", "## ENGINE_UI_SEAM", str(ENGINE_UI_SEAM)]
+    for title, records in contract_sections():
+        lines += ["", f"## {title}"]
+        lines += [f"{key}: {value}" if value else key for key, value in records]
     return "\n".join(lines) + "\n"
 
 
+_SEAM_FILE = _REPO_ROOT / "messagefoundry" / "api" / "_ui_seam.py"
+_GOLDEN_FILE = _REPO_ROOT / "tests" / "golden" / "webconsole_seam.snapshot"
+_SEAM_LINE = re.compile(r'^ENGINE_UI_SEAM: str = "[0-9a-f]{16}"$', re.MULTILINE)
+
+
+def write_seam_and_golden() -> str:
+    """Rewrite the constant and the golden to the current derived digest. Returns the digest.
+
+    Deliberately does NOT touch ``messagefoundry_webconsole.SUPPORTED_ENGINE_SEAMS``. That constant
+    is the independent half of a two-wheel handshake, and a tool that writes both sides turns the
+    handshake into a self-consistent tautology -- it would remove the one place a human states "this
+    console build is compatible with this engine contract". The failure message spells out the
+    one-line edit instead.
+
+    Refuses rather than guesses if the constant line does not match EXACTLY once: a source-rewriting
+    tool that guesses is worse than one that stops.
+    """
+    source = _SEAM_FILE.read_text(encoding="utf-8")
+    matches = _SEAM_LINE.findall(source)
+    if len(matches) != 1:
+        raise SystemExit(
+            f"refusing to rewrite {_SEAM_FILE}: expected exactly one line matching "
+            f"{_SEAM_LINE.pattern!r}, found {len(matches)}"
+        )
+
+    digest = contract_digest()
+    _SEAM_FILE.write_text(
+        _SEAM_LINE.sub(f'ENGINE_UI_SEAM: str = "{digest}"', source), encoding="utf-8", newline="\n"
+    )
+
+    # Rebuild with the NEW value in scope. The digest itself does not depend on the seam (see
+    # contract_sections), but the snapshot's first section prints it.
+    globals()["ENGINE_UI_SEAM"] = digest
+    # Written explicitly rather than via a shell redirect: PowerShell's `>` emits UTF-16LE with a
+    # BOM, which corrupts a golden the test reads as UTF-8.
+    _GOLDEN_FILE.write_text(build_snapshot(), encoding="utf-8", newline="\n")
+    return digest
+
+
 if __name__ == "__main__":
-    print(build_snapshot(), end="")
+    if "--digest" in sys.argv:
+        print(contract_digest())
+    elif "--write" in sys.argv:
+        value = write_seam_and_golden()
+        print(f"ENGINE_UI_SEAM = {value}")
+        print(f"  rewrote {_SEAM_FILE.relative_to(_REPO_ROOT).as_posix()}")
+        print(f"  rewrote {_GOLDEN_FILE.relative_to(_REPO_ROOT).as_posix()}")
+        print("  NOW SET THE CONSOLE SIDE BY HAND, in the same commit:")
+        print("    messagefoundry_webconsole/__init__.py")
+        print(f'      SUPPORTED_ENGINE_SEAMS: frozenset[str] = frozenset({{"{value}"}})')
+    else:
+        print(build_snapshot(), end="")
