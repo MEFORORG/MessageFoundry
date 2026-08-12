@@ -14,6 +14,7 @@ test file is not a place to put them. Each fixture carries the shape it stands f
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -311,3 +312,46 @@ def test_a_backticked_arithmetic_tally_still_fires() -> None:
     """ARITHMETIC's own documented examples are backticked REAL tallies, so the quotation rule must
     not reach them -- it is scoped to the counted-verdict pairs alone."""
     assert [i for i, _ in idioms_for_line("closes: `195 + 89 + 0 + 61 = 345`")] == ["ARITHMETIC"]
+
+
+def test_a_finding_carrying_a_glyph_survives_a_cp1252_console(tmp_path: Path) -> None:
+    """BACKLOG #1221: the gate prints DOCUMENT CONTENT, so a hit whose line carries a glyph used to
+    kill the run with UnicodeEncodeError before the finding could be read.
+
+    The defect is invisible until the gate has something to say: against a clean corpus it exits 0
+    and looks healthy, so it failed exactly when it was needed.
+
+    Driven as a SUBPROCESS with PYTHONIOENCODING=cp1252, deliberately. Forcing the encoding
+    in-process is NOT the same instrument -- pytest's capture wrapper is one of the objects the
+    hardening explicitly guards against (it may lack `reconfigure` or reject it), so an in-process
+    test could pass having measured nothing at all. A child process gets a real stream.
+
+    PYTHONIOENCODING is set without an error handler, so the child starts at errors='strict' and only
+    the hardening can save it -- which is what makes this a test of the fix rather than of the
+    environment.
+    """
+    doc = tmp_path / "docs"
+    doc.mkdir()
+    # A NEW (ungrandfathered) tally whose line also carries a non-cp1252 codepoint.
+    (doc / "x.md").write_text("Score moved 205 of 345 cells \u2192 re-scored.\n", encoding="utf-8")
+
+    cmd = [sys.executable, str(REPO_ROOT / LINT_REL), "--repo", str(tmp_path), "docs"]
+    print(f"SCANNED: {' '.join(cmd)} with PYTHONIOENCODING=cp1252")
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+    )
+
+    assert "UnicodeEncodeError" not in proc.stderr, (
+        "the gate died printing its own finding on a cp1252 console -- the defect is that this "
+        f"happens only when the gate has something to say:\n{proc.stderr}"
+    )
+    assert proc.returncode == 1, f"expected the ungrandfathered tally to FAIL; rc={proc.returncode}"
+    # The finding is readable: path, line and the matched token all survive the lossy re-encode.
+    assert "docs/x.md:1" in proc.stdout
+    assert "AGAINST_TOTAL" in proc.stdout

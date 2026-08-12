@@ -1681,7 +1681,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user
 
 CREATE TABLE IF NOT EXISTS search_presets (
     id         TEXT PRIMARY KEY,                 -- uuid4 hex; the cell-AAD pk for the encrypted criteria
-    owner      TEXT NOT NULL,                    -- the owning username (per-user; every read is owner-scoped)
+    owner      TEXT NOT NULL,                    -- the owning Identity.user_id (BACKLOG #1225: NOT the
+                                                 -- reassignable username); every read is owner-scoped
     name       TEXT NOT NULL,                    -- operator-chosen label, unique per owner
     criteria   TEXT,                             -- JSON of the typed search params; AES-256-GCM at rest
                                                  -- (content/field_value are PHI-shaped) — ADR 0136/0019

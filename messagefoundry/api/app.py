@@ -3887,13 +3887,35 @@ def create_app(
         # ASVS 5.2.4: opportunistic age-based retention sweep at save time (off-loop, best-effort). A prune
         # error must never fail the upload the operator just made — it is logged and retried by the
         # periodic task. Each pruned file is audited (file_id + uploader, never content).
+        #
+        # BACKLOG #1224: the sweep is AUTOMATED and owner-blind, so it is attributed to the system,
+        # not to the pruned file's uploader. `prune_expired()` is deliberately UNSCOPED (it has to be:
+        # the per-uploader quota and the sweep both need to see every file), so the operator whose
+        # upload triggered this pass is in general NOT the owner of what it prunes. Naming the owner
+        # as actor while stamping the TRIGGERING operator's address made the row assert that X deleted
+        # their own file from Y's host. `client` is dropped for the same reason rather than as tidying:
+        # _record_reload_audit's contract is that `client` is the address OF THE ACTOR NAMED IN THE
+        # ROW, and once the actor is the system principal no address is in scope (ADR 0150 decision 4
+        # rejects exactly this pairing for dual-control config reload). The owner survives as DATA in
+        # `detail.uploader`, which is where it belongs.
         try:
             for pruned in await us.prune_expired():
                 await engine.store.record_audit(
                     "upload.prune",
-                    actor=pruned.uploader or None,
-                    detail=json.dumps({"file_id": pruned.file_id, "uploader": pruned.uploader}),
-                    client=client_ip(request),
+                    actor="system",
+                    detail=json.dumps(
+                        {
+                            "file_id": pruned.file_id,
+                            "uploader": pruned.uploader,
+                            # The IMMUTABLE owner key beside the display name. A prune row is a
+                            # permanent record of a deletion whose subject cannot be recovered
+                            # afterwards -- the file is gone -- and a username is reassignable
+                            # (BACKLOG #1225), so a row read later could name a different person
+                            # than it meant. UploadedFileMeta carries both deliberately
+                            # (uploads.py:116); this records both.
+                            "uploader_id": pruned.uploader_id,
+                        }
+                    ),
                 )
         except OSError:
             _log.warning("opportunistic uploaded-logs retention prune failed", exc_info=True)
@@ -4128,7 +4150,7 @@ def create_app(
     ) -> SearchPresetList:
         """List the caller's saved presets — names + timestamps only (NEVER the criteria; the
         PHI-shaped content term is returned only by the step-up-gated layered compose). Audited."""
-        rows = await engine.store.list_search_presets(identity.username)
+        rows = await engine.store.list_search_presets(identity.user_id)
         await engine.store.record_audit(
             "preset.list",
             actor=identity.username,
@@ -4173,7 +4195,10 @@ def create_app(
             needle_shape = _needle_shape(crit.content) if crit.content else "field_path"
         effective_id, replaced = await engine.store.upsert_search_preset(
             preset_id=uuid4().hex,
-            owner=identity.username,
+            # BACKLOG #1225: the OWNER KEY is the immutable Identity.user_id, never the reassignable
+            # username. This is the WRITE the other three sites read; re-keying only the readers
+            # would make every newly created preset invisible to its own creator.
+            owner=identity.user_id,
             name=body.name,
             criteria=crit.model_dump_json(),
         )
@@ -4203,7 +4228,7 @@ def create_app(
     ) -> SearchPresetDeleteResult:
         """Delete one of the caller's presets (owner-scoped). Audited."""
         deleted = await engine.store.delete_search_preset(
-            preset_id=preset_id, owner=identity.username
+            preset_id=preset_id, owner=identity.user_id
         )
         if not deleted:
             raise HTTPException(404, f"no such preset: {preset_id}")
@@ -4238,7 +4263,7 @@ def create_app(
             raise HTTPException(400, f"at most {_MAX_PRESET_LAYERS} presets may be layered")
         criterias: list[dict[str, Any]] = []
         for preset_id in ids:
-            row = await engine.store.get_search_preset(preset_id=preset_id, owner=identity.username)
+            row = await engine.store.get_search_preset(preset_id=preset_id, owner=identity.user_id)
             if row is None:
                 raise HTTPException(404, f"no such preset: {preset_id}")
             try:
@@ -5757,10 +5782,22 @@ def create_managed_app(
         if _upload_store is not None:
 
             async def _audit_upload_prune(meta: UploadedFileMeta) -> None:
+                # BACKLOG #1224: the retention runner has no operator and no request behind it, so
+                # the row is attributed to the system principal (matching pipeline/retention.py's
+                # `retention_purge`) rather than to the pruned file's uploader. The uploader is
+                # carried as DATA in `detail`, where a reader can still see whose file went. Both
+                # this site and the request-path sweep had to change together: fixing one would have
+                # left the same false attribution reachable by the other path.
                 await store.record_audit(
                     "upload.prune",
-                    actor=meta.uploader or None,
-                    detail=json.dumps({"file_id": meta.file_id, "uploader": meta.uploader}),
+                    actor="system",
+                    detail=json.dumps(
+                        {
+                            "file_id": meta.file_id,
+                            "uploader": meta.uploader,
+                            "uploader_id": meta.uploader_id,
+                        }
+                    ),
                 )
 
             upload_retention_runner = UploadRetentionRunner(

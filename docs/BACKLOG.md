@@ -7886,7 +7886,15 @@ gate is the wrong shape, validation of the walk is the right one.
 
 ## 1220. `ENGINE_UI_SEAM` collides silently: two branches bump to the same version and the golden gate agrees
 
-> 🔢 **Filed 2026-08-11 -- MEASURED on two live branches, not hypothesised.** Value **7/10** -- Difficulty **3/10** -- _quick win_. `ENGINE_UI_SEAM` is a version integer that must be unique per console-contract change. Two unlanded branches sharing merge-base `751ca08a` both bumped it to the **same value**:
+> ✅ **SHIPPED 2026-08-12 -- the DERIVED form, which is the option this item itself preferred.** Value **7/10** -- Difficulty **3/10** -- _quick win_. `ENGINE_UI_SEAM` is no longer a hand-maintained integer: it is a **16-hex SHA-256 of a RUNTIME-DISCOVERED contract surface**, and the five hand-maintained tuples are deleted. Two independent contract changes can no longer collide by construction, which is what the Scope below asked for -- *"derive the seam from a hash of the contract surface so two independent changes cannot collide by construction"* -- rather than the gate-a-hand-maintained-integer alternative it warned would be *"one more thing to remember"*. **Discovered, not enumerated**, which was the owner's stated condition on this scope choice.
+>
+> **REPORTED BY THE BUILDING LANE, not re-measured here:** all three acceptance criteria proven, each against an `origin/main` control, including against the very pair this item names -- which is the item's own verification requirement. The lane also reports the real coverage hole was **25 DTOs, not the 7 recorded below**; the 7 stands as filed and the 25 is the corrected figure.
+>
+> **THE NUMBERS IN THIS ITEM ARE NOW VOID, and that is recorded rather than deleted (section 17 rule 3).** The table below reads `origin/main = 18` and the prose says the second branch to land re-bumps to 20. Measured 2026-08-12: `origin/main` reached **20** when #1152 landed, so **both** held branches sat at **19 -- BELOW main**, and the "second one re-bumps" rule had already inverted before anyone applied it. Do not hand-pick a value from this item.
+>
+> **WHAT THIS BREAKS, stated because a banner naming only what it closed is half a record.** The seam is now a **str digest**, so the two held branches (`w3-log-write-failure`, `w3-store-privilege-preflight`) no longer carry a stale *integer* -- they carry a **mypy-strict TYPE error**. Their bumps are not a renumber after this lands; they are a rewrite. Sequence any further seam-touching work (including #1227's class fix) **after** this, never concurrently -- two branches moving the seam at once is the exact defect this closes.
+>
+> **Filed 2026-08-11 -- MEASURED on two live branches, not hypothesised.** `ENGINE_UI_SEAM` is a version integer that must be unique per console-contract change. Two unlanded branches sharing merge-base `751ca08a` both bumped it to the **same value**:
 
 > ```
 > origin/main                     ENGINE_UI_SEAM = 18
