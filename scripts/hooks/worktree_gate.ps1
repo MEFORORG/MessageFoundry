@@ -557,8 +557,30 @@ function Get-ScannableSegments([string]$Cmd) {
     #
     # DO NOT "FIX" IT BY DROPPING THE `\s*`. That does not remove this false deny and it REGRESSES
     # `cmd /c"git checkout main"` from DENY to ALLOW -- the attached form is precisely what `\s*`
-    # exists to catch. The narrowing that works is to require a cmd-like PROGRAM token before the
-    # switch run; dropping the cluster prefix also works but loses `/Q/C`. Left as the owner's call.
+    # exists to catch.
+    #
+    # AND THE CLUSTER PREFIX IS NOT THE SLOPPY PART. An earlier version of this note said "the
+    # narrowing that works is to require a cmd-like PROGRAM token before the switch run". That was
+    # MEASURED FALSE and it is corrected here, because it is the sentence that sends the next reader
+    # at an impossible target. cmd.exe ITSELF accepts arbitrary `/junk` components in a switch run and
+    # then executes the quoted payload. Driven against the real binary with a payload that COMPUTES
+    # its answer (`set /a 111*3` -> 333, so an echo-back cannot be mistaken for a run), controls in
+    # the same batch (`cmd /c` must run, `cmdd /c` must not):
+    #     cmd /usr/src/c "<payload>"   RUNS      cmd /zzz/c "<payload>"    RUNS   (z is not a switch)
+    #     cmd /mnt/c "<payload>"       RUNS      cmd /usr/lib/k "<payload>" RUNS
+    # `/usr` binds as `/U`, `/src` as `/S`, `/zzz` is ignored. So `(?:/[^/\s]+)*/[ck]` is very nearly
+    # EXACTLY the family cmd accepts, not an over-match.
+    #
+    # WHICH MAKES THIS A PROGRAM-IDENTITY PROBLEM, and that is why it is not fixed here. The only
+    # thing separating `ls /usr/src/c "..."` from `cmd /usr/src/c "..."` is the program token -- but
+    # every program-token spelling tried was defeated by something that EXECUTES: `echo hi;cmd /k`
+    # and `(cmd /mnt/c` (the `;` and `(` are not whitespace, and the outer `(?:^|\s)` anchor sits
+    # before this whole alternation), an alias, a renamed copy of cmd.exe, and `cmd /d /Q/C` where the
+    # program is not adjacent to the switch run. Five candidates were built and driven as real gate
+    # mutants; each traded this one disclosed false deny for four or more measured DENY-to-ALLOW
+    # regressions. At this rule's threat model the two directions are not symmetric -- a false DENY
+    # stops legitimate work loudly and has a workaround; a false ALLOW lets a reset land in the shared
+    # primary silently -- so the false deny is KEPT and disclosed.
     # tests/test_worktree_gate_interpreter_sigils.py pins the deny so the cost cannot be lost.
     $flagThenSep = "(?:(?:$psFlag|$shFlag)\s+|$cmdExeFlag\s*)"
 

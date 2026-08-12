@@ -532,15 +532,35 @@ def test_the_cmd_switch_cluster_prefix_costs_a_posix_path_false_deny(
     narrows ``$cmdExeFlag`` so this ALLOWs again, this test reds, and that is the intended signal to come
     and read this docstring rather than a regression to paper over.
 
-    NOT YET DECIDED, and deliberately left to the owner rather than settled here: whether cmd's
-    concatenated-switch support is worth this cost. The two candidate narrowings, both MEASURED::
+    DECIDED, AND THE DECISION REVERSED THE PREMISE. This docstring previously said the narrowing that
+    works is "require a cmd-like PROGRAM token before the switch run". That was MEASURED FALSE and is
+    corrected here, because it is the sentence a future reader would act on.
 
-      1. Require a cmd-like PROGRAM token before the switch run. Removes this false deny and keeps
-         every cmd shape denying, including ``/Q/C`` and the quoted-program form. This is the one
-         that works.
-      2. Drop the ``(?:/[^/\\s]+)*`` cluster prefix. Removes this false deny, but LOSES the ``/Q/C``
-         and ``/V:ON/C`` recognition the prefix was added for -- measured: ``cmd /Q/C "..."`` stops
-         matching entirely.
+    THE CLUSTER PREFIX IS NOT THE SLOPPY PART. cmd.exe itself accepts arbitrary ``/junk`` components
+    in a switch run and then executes the quoted payload. Driven against the real binary with a
+    payload that COMPUTES its answer (``set /a 111*3`` -> 333, so an echo-back cannot be mistaken for
+    a run), with controls in the same batch -- ``cmd /c`` must run, ``cmdd /c`` must not::
+
+        cmd /usr/src/c  "<payload>"   RUNS        cmd /zzz/c      "<payload>"  RUNS  (z is no switch)
+        cmd /mnt/c      "<payload>"   RUNS        cmd /usr/lib/k  "<payload>"  RUNS
+        cmd /a:/c       "<payload>"   RUNS        cmd /d /usr/src/c "<p>"      RUNS
+
+    ``/usr`` binds as ``/U``, ``/src`` as ``/S``, ``/zzz`` is ignored. So ``(?:/[^/\\s]+)*/[ck]`` is
+    very nearly EXACTLY the family cmd accepts, and dropping it would lose real coverage rather than
+    trim an over-match.
+
+    SO THIS IS A PROGRAM-IDENTITY PROBLEM, and it is not solvable at this layer. The only thing
+    separating ``ls /usr/src/c "..."`` from ``cmd /usr/src/c "..."`` is the program token -- but every
+    program-token spelling tried was defeated by something that EXECUTES: ``echo hi;cmd /k`` and
+    ``(cmd /mnt/c`` (neither ``;`` nor ``(`` is whitespace, and the outer ``(?:^|\\s)`` anchor sits
+    before the whole alternation), an alias, a renamed copy of cmd.exe, and ``cmd /d /Q/C`` where the
+    program is not adjacent to the switch run. Five candidates were built and driven as real gate
+    mutants; each traded this one disclosed false deny for four or more measured DENY-to-ALLOW
+    regressions on shapes that run.
+
+    The false deny is therefore KEPT. At this rule's threat model the two directions are not
+    symmetric: a false DENY stops legitimate work loudly and has a workaround, while a false ALLOW
+    lets a reset land in the shared primary silently.
 
     AND ONE NON-REMEDY, RECORDED SO NOBODY REACHES FOR IT: dropping the ``\\s*`` relaxation does NOT
     remove this false deny (see the table above -- it matches under ``\\s+`` too) and it REGRESSES
