@@ -7981,6 +7981,24 @@ gate is the wrong shape, validation of the walk is the right one.
 
 > 🔢 **Filed 2026-08-11 -- the DEFECT THE TTL RAISE DID NOT FIX, named by an outside reader reviewing the change.** Value **6/10** -- Difficulty **3/10** -- _fill-in_. Session mail past its TTL is swept to `expired/` rather than shown. **Nothing reports it at either end**: the recipient is never told a message existed, and the sender is never told its message went unread. The send call already returned success, so **every observable on both sides says the message was delivered.**
 
+> **AMENDED 2026-08-11 -- CANDIDATE (a) WAS MEASURED AND IS NOT THE DEFECT. The item narrows.** The scope above proposed checking, cheapest first, whether a message swept for AGE actually reaches the drain's `expired` tally or is removed on a path that never increments it. **It reaches the tally.** Driven twice against the live drain, each run with a NEGATIVE CONTROL so the counter had to discriminate rather than merely be non-zero -- one message written already past its expiry (`-TtlMinutes -1`, no timing race) and one fresh message that had to be SHOWN instead:
+
+> ```
+> run 1   1 shown, 1 expired     expired/ on disk 0 -> 1
+> run 2   1 shown, 1 expired     expired/ on disk 1 -> 2
+> ```
+
+> The counter increments **only** for the swept message, the fresh control is shown and not swept, and the file lands in `expired/` on disk. `mail-drain.ps1:758` increments it on the age path and `:900` renders it. **So the recipient-side half of this item was already built and already correct**, and the guess that it might not be was mine.
+
+> **WHAT SURVIVES IS NARROWER AND BETTER LOCATED, and it is still worth building:**
+> - **The SENDER is told nothing, ever.** This is the whole remaining defect and no recipient-side counter can close it. The send call returned success; nothing afterwards contradicts it.
+> - **The recipient is told HOW MANY expired, never WHICH.** The count carries no id, no sender and no subject, so *"1 expired"* cannot be turned into *"whose message did I lose"* without reading `expired/` by hand.
+> - **A recipient who never runs a drain is told nothing either**, because the count lives in drain output. That is the case the TTL raise was about in the first place.
+
+> **So do not re-check the tally.** Scope is now the sender-side signal plus naming the swept message in the recipient's count. **How to prove a fix is unchanged and still two-directional** -- a test that only asserts the recipient half leaves the sender blind, which is the direction that made this invisible.
+
+> **Recorded because the process is the point:** the code was read first and predicted this outcome, and it was measured anyway, with a control that could have returned the opposite. A reading that agrees with the code is not a measurement, and a counter that reads non-zero is not proof it discriminates -- the negative control is what separates *"the counter works"* from *"the counter counts everything"*.
+
 > **THIS ITEM EXISTS BECAUSE THE OBVIOUS FIX WAS THE WRONG ONE, AND THAT IS THE USEFUL PART.** The TTL was raised 720 -> 4320 minutes (12h -> 72h) in `scripts/coord/mail.ps1` because an ordinary overnight gap was expiring messages. That change is correct and should stand -- but **it lowers the FREQUENCY of the failure and does not touch the SILENCE.** A 72-hour gap still loses mail exactly as invisibly as a 12-hour one did; it just happens less often, which makes the residual failure rarer and therefore **harder to attribute when it does occur.**
 
 > **THE ARGUMENT AGAINST TTLs, APPLIED TO THIS ONE.** The multisession design corpus rejects TTLs across the board on the ground that a TTL **trades a visible failure for one nobody observes** -- a wedged lock is *"visible, one command from fixed"*, whereas the TTL failure mode is *"a concurrent double-write nobody observes"*. Mail's expiry has precisely that shape. **So the mail TTL is the one TTL in this system, and it currently has the property that reasoning condemns.** The reconciliation that makes it legitimate is **state versus message**: no expiry on HELD STATE (locks, claims), because expiry re-opens the race it exists to prevent; mandatory expiry on MESSAGES, because a stale instruction acted on is worse than one refused. That rule is already written -- every broadcast must carry a hard expiry or a recipient-checkable condition -- so the TTL is **right to exist**. Only its silence is the defect.
