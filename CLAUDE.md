@@ -537,6 +537,24 @@ harness process only.)
   ([ADR 0039](docs/adr/0039-database-tier-sharding-l5.md), L5 — **shelved**). The two axes are different
   (e.g. "cross-shard reads span K stores" is true only of *database* shards; *engine* shards share one
   store), and conflating them causes real errors.
+- **ASVS vocabulary: the SUBJECT is the engine, and the record lives elsewhere — never let the storage
+  location name the thing.** An **ASVS cell** is one requirement's graded row (verdict + reasoning +
+  citations; the scorecard is literally `[[cell]]`). An **anchor** is a citation from a cell to a line
+  of engine code. The **verifier** is `scripts/asvs/scorecard.py` — the INSTRUMENT, not the record.
+  When a cell's anchor points at code that has moved or gone, say **"the cell has a stale anchor"**:
+  the engine is not insecure and the vault is not broken, the *evidence* went stale — usually
+  **because the code got better and the fix deleted the line the anchor quoted**.
+  - **Never say "vault cell", "gate cell", or "vault gate cell".** All three name the filing cabinet
+    instead of the subject, and the third also fuses the checker with the checked — a cell exists
+    whether or not any job is running. Measured 2026-08-12: that phrasing sent a reader looking at the
+    vault, where nothing was wrong, for a defect that lived in engine code.
+  - **Keep "verifier" and "verification" apart.** *Verifier drift* = a copy of the tool differs from
+    the engine's. *Stale anchors* = the evidence moved. Different failures with adjacent names; the
+    gate's own comment says the two "are easy to confuse", and instrument drift once made the gate
+    **not run at all** on every matching pull request.
+  - **The VOCABULARY is public; the CONTENT is not.** Cell ids, coverage and gaps stay vaulted — a
+    path-to-cell map enumerates what IS covered over a closed public domain, so it hands out what is
+    NOT by subtraction. Naming the terms discloses nothing; pasting the scorecard does.
 
 **Don't**
 - Don't manipulate HL7 with raw string slicing.
