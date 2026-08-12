@@ -7977,4 +7977,22 @@ gate is the wrong shape, validation of the walk is the right one.
 
 **Cluster:** Security / Access control. **Priority:** P3. **Verdict:** build. **Severity:** minor -- a preset is a saved FILTER rather than PHI at rest, though its layered compose surface carries a PHI-shaped content term.
 
+## 1226. Screen for username-as-access-key (identity.username scoping a resource instead of labelling an audit row)
+
+> 🔢 **Filed 2026-08-11 -- a PATTERN claim with FOUR known instances across three subsystems, not a fifth instance.** Value **6/10** -- Difficulty **3/10** -- _quick win_. `Identity` carries an **immutable `user_id`** (`auth/identity.py:30`) and a **reassignable `username`**. A username is freed by delete-and-recreate, and the AD leg auto-provisions a returning name with **no administrator action at all**, so anywhere the username is used as an **ACCESS KEY** a recycled account name inherits the previous holder's objects. Known instances: **#1015** (OIDC RP identity, `auth/claims.py`), **#1152** (uploaded files -- FIXED, keyed on `uploader_id`), **#1225** (saved search presets, four sites), and at least one unjudged candidate at `api/auth_routes.py:463` (`security_events_for(identity.username)`). **Nothing screens for it.**
+
+> **WHY A SCREEN AND NOT A SWEEP.** A sweep fixes today's instances; a screen catches the next one. The justification is the independent confirmation, not the count: **two sessions found this class in two different subsystems on the same day, by different routes, neither looking for it** -- and the ledger already held an older third (#1015) that both missed. A defect class that is found three times by accident and zero times on purpose is one nothing is watching for.
+
+> **SCOPE -- this is what makes it filable rather than vague.** **NOT** the audit `actor=` sites: `identity.username` appears **59 times** in `api/app.py` and **most are audit fields, where recording a NAME is correct** -- an audit row should say who, in the form a human reads. The defect is the username reaching a **WHERE clause, a dict key, an equality against a stored owner field, or a store method's scoping parameter**. Mechanically findable, and the two populations are cleanly separable.
+
+> **A PROTOTYPE EXISTS AND ITS RESULT IS THE SPEC.** An AST screen (walk `Call` keywords + positional args, `Compare` equality, `Subscript` keys; classify `actor`/`acting_user`/`by` as labels and `owner`/`uploader`/`user`/`key` as access keys) run over the two API modules reported: `api/app.py` **5939 lines scanned, 46 label sites excluded, 13 access-key candidates**; `api/auth_routes.py` **17 excluded, 2 candidates**. It found **all four** #1225 preset sites and the unjudged `security_events_for` candidate.
+
+> **TWO PROPERTIES THE SCREEN MUST HAVE, both learned the expensive way.** (1) **It must catch WRITE sites, not only read scoping.** #1225 was filed enumerating **three** preset sites when there are **four** -- the missed one was `upsert_search_preset(owner=...)`, the WRITE key that sets what the other three read, and a fix to only the readers would not have held. The search was read-shaped and returned read-shaped results. (2) **It must emit CANDIDATES FOR JUDGEMENT, never verdicts.** Several of the 15 are correct code -- including `us.save(uploader=identity.username)`, where the username is deliberately the display label while `uploader_id` carries the access key. A screen that auto-classified would be wrong on its own author's code.
+
+> **And it must print WHAT IT MATCHED, not a count.** `13` looks identical whether it caught the write key or missed it.
+
+> **How to prove a fix:** the screen must go **red on a known site before it is fixed** -- run it against `#1225`'s four preset sites at a commit where they are unfixed and confirm all four are reported, then confirm it reports **zero** for the uploads family at `#1152`'s commit, where the same shape is correctly keyed. A screen that has not been made to fire on a real instance is not evidence. Cite the greppable **store-method name**, never a line number: the same defect site is `create_search_preset` (the route) or `upsert_search_preset` (the store call) depending on where you stand, at two different line numbers depending on your base.
+
+**Cluster:** Security / Access control. **Priority:** P3. **Verdict:** build. **Severity:** minor as a screen -- it ships no fix; its value is that the NEXT instance is caught rather than found by accident.
+
 
