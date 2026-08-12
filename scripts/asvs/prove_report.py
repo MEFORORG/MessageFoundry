@@ -121,8 +121,12 @@ def census(scorecard: Path) -> Census:
             cells_with_claims += 1
         for a in absences:
             claims += 1
-            # `str(...)` with no strip, matching the loader at scorecard.py:339-340 exactly -- the
-            # classification has to agree with what the prover will actually branch on.
+            # `str(...)` with no strip, matching `load_scorecard` in scorecard.py exactly -- the
+            # classification has to agree with what the prover will actually branch on. Named, not
+            # cited by line: this comment previously pinned `scorecard.py:339-340`, which resolved in
+            # PR #304 and resolves to unrelated docstring prose here, because the port moved the
+            # loader. An anchor that has to be re-checked by hand decays the first time either file
+            # moves, and nothing in the repo checks a line citation inside a Python comment.
             raw_path = str(a.get("mutation_path", ""))
             raw_obs = str(a.get("observable", ""))
             if raw_path and not raw_path.strip():

@@ -1723,6 +1723,67 @@ def test_prove_absences_runs_one_baseline_per_observable_and_one_tree_copy(
     assert any("UNPROVEN" in p for p in findings.problems), findings.problems
 
 
+def test_prove_absences_keys_the_baseline_cache_on_the_OBSERVABLE_not_the_claim(
+    tmp_path: Path,
+) -> None:
+    """The baseline cache must be keyed on the observable NODE ID. Coarsening that key does not slow
+    the prover down -- it manufactures a FALSE PROOF, which is the worst outcome this tool has.
+
+    The mechanism: a claim whose observable is already red on the pristine tree must be refused,
+    because a red that was already there cannot be attributed to the mutation. That refusal is
+    reached only via the claim's OWN baseline. Under a coarser key the second claim below inherits
+    the first's green baseline, sails past the refusal, mutates, watches an already-failing test fail,
+    and books it as proof of a control that never fired.
+
+    The fixture is one cell carrying two claims with the SAME `mutation_path` and DIFFERENT
+    observables, so it collides under every coarsening that was actually plausible here -- a constant
+    slot, `cell_id` (`_live_claim` hardcodes 1.1.1, so cell id does not separate claims at all), and
+    `mutation_path`. Only the node id separates them.
+
+    Falsified by re-keying the cache to a constant (`baselines.get("k")` / `baselines["k"] = ...`):
+    MEASURED RED here, `proved_absences` 2 instead of 1 and no "not green on the pristine tree"
+    problem -- i.e. the false proof, observed. The whole rest of the prover suite stayed GREEN under
+    that same injection, which is what makes this test worth its lines. Restored, `git status` clean.
+    """
+    _module(tmp_path, "scanner.py", _SCANNER)
+    _obs_test(tmp_path, "test_scanner.py", _OBS_TEST)
+    # Red on the PRISTINE tree, before any mutation is applied.
+    _obs_test(tmp_path, "test_broken.py", "def test_already_red():\n    assert False\n")
+
+    two_observables = Cell(
+        id="1.1.1",
+        level=1,
+        verdict="fail",
+        absence=(
+            Absence(
+                pattern="x",
+                positive_control="y",
+                mutation='def scan(p):\n    return "infected"',
+                mutation_path="scanner.py",
+                observable="test_scanner.py::test_clean",  # green: baseline 0, caches under ITS id
+            ),
+            Absence(
+                pattern="x2",
+                positive_control="y2",
+                mutation="UNUSED_CONSTANT = 1",
+                mutation_path="scanner.py",  # same path on purpose: a path key would collide
+                observable="test_broken.py::test_already_red",  # red: must be refused, not proved
+            ),
+        ),
+    )
+
+    findings = prove_absences([two_observables], tmp_path)
+
+    assert findings.proved_absences == 1, (
+        "the already-red observable was scored as a proof, so the baseline cache handed it a "
+        f"baseline belonging to a different node: {findings.problems}"
+    )
+    assert any(
+        "not green on the pristine tree" in p and "test_broken.py::test_already_red" in p
+        for p in findings.problems
+    ), findings.problems
+
+
 def test_prove_absences_restores_the_scratch_target_between_claims(tmp_path: Path) -> None:
     """One shared tree is only sound while it stays pristine, so the restore is asserted rather than
     assumed. Two claims against the SAME file: the second must see the original bytes.
@@ -2298,8 +2359,11 @@ def test_prove_absences_counters_close_against_the_population(tmp_path: Path) ->
 
     The derivation is valid only while no claim is BOTH counted and problem-bearing -- the static
     backstop's SUSPECT finding is precisely that shape -- so the screened claim here deliberately
-    carries no `raise`, and the assertion below pins that it stayed out of `problems`. Every cell
-    carries exactly one absence claim, so a cell id names a claim.
+    carries no `raise`, and the assertion below pins that it stayed out of `problems`. Cell 1.1.2
+    carries TWO claims and every other cell carries one; because both of 1.1.2's end in a COUNTED
+    branch, no cell id can reach `problems` twice, so a cell id still names at most one problem-only
+    claim and the set-dedupe below stays exact. A cell with two PROBLEM-only claims would break that
+    derivation silently, which is why the multi-claim cell is a counted one on purpose.
 
     What is NOT asserted, and must not be: that `len(problems)` is the right-hand side. It is not,
     for the SUSPECT reason above; asserting that equality would pin a false identity.
@@ -2310,7 +2374,12 @@ def test_prove_absences_counters_close_against_the_population(tmp_path: Path) ->
     again by guarding the `checked_absences` increment on `a.mutation_path`, which undercounts the
     population: MEASURED RED at the fixture-shape assertion below (5 != 6), and the identity would
     have caught it a line later (remainder 2 against 3 problem-only claims) had the shape check not
-    named it first. Both injections applied to the code and removed after measuring.
+    named it first. Falsified a third time, independently, by giving the not-a-file PROVE-ERROR a
+    counter (`skipped_absences += 1`): MEASURED RED at the identity assertion, "counters leave 2
+    unaccounted for, but 3 claim(s) ended in a problem-only branch: ['1.1.4', '1.1.5', '1.1.6']".
+    Falsified a fourth time by degenerating the prover's inner loop to `c.absence[:1]`, which is what
+    the two-claim cell exists to catch: MEASURED RED at the fixture-shape assertion (6 != 7). All
+    injections applied to the code and removed after measuring, each verified by a clean `git status`.
     """
     _module(tmp_path, "scanner.py", _SCANNER)
     _module(tmp_path, "quiet.py", "VALUE = 1\n")
@@ -2331,7 +2400,22 @@ def test_prove_absences_counters_close_against_the_population(tmp_path: Path) ->
         mutation_path="scanner.py",
         observable="test_scanner.py::test_clean",
     )
-    skipped = _cell("1.1.2", mutation="import x")  # no mutation_path: nothing to apply
+    # 1.1.2 carries TWO claims, and it is the only fixture in this file that carries more than one:
+    # every other `absence=` tuple in the suite has length 1, so the prover's inner `for a in
+    # c.absence` loop is otherwise never driven past its first element and `checked_absences`
+    # counting CLAIMS is indistinguishable from it counting CELLS. That is the one property of
+    # #304's `test_the_prove_summary_reports_the_total_it_saw` this test did not supersede when it
+    # replaced it. Both claims are `skipped` (no `mutation_path`) so the cell stays out of
+    # `problems` -- see the docstring on why the multi-claim cell must be a counted one.
+    skipped = Cell(
+        id="1.1.2",
+        level=1,
+        verdict="fail",
+        absence=(
+            Absence(pattern="x", positive_control="y", mutation="import x"),
+            Absence(pattern="x2", positive_control="y2", mutation="import y"),
+        ),
+    )
     screened = _cell("1.1.3", mutation="VALUE = 2", mutation_path="quiet.py")  # no `raise`
 
     # Three of the eight problem-only branches, chosen to span the pre-existing and the new: a
@@ -2353,8 +2437,9 @@ def test_prove_absences_counters_close_against_the_population(tmp_path: Path) ->
     f = prove_absences([proved, skipped, screened, not_a_file, escapes, refused], tmp_path)
 
     # Non-vacuity: the identity holds trivially over an empty population, so pin the fixture shape
-    # before asserting anything derived from it.
-    assert f.checked_absences == 6
+    # before asserting anything derived from it. SEVEN claims across SIX cells -- the inequality is
+    # the point, and it is what makes a claim/cell confusion in the prover reddable.
+    assert f.checked_absences == 7
 
     # THE IDENTITY, asserted before the per-counter checks below so that it -- and not a narrower
     # assertion that happens to sit earlier in the file -- is what a miscount reddens.
@@ -2369,8 +2454,10 @@ def test_prove_absences_counters_close_against_the_population(tmp_path: Path) ->
         f"{len(problem_claims)} claim(s) ended in a problem-only branch: {sorted(problem_claims)}"
     )
 
-    # Attribution, not the identity: which counter moved, so a break names itself.
-    assert f.proved_absences == 1 and f.skipped_absences == 1 and f.static_screened == 1
+    # Attribution, not the identity: which counter moved, so a break names itself. `skipped` is 2,
+    # not 1, because cell 1.1.2 carries two claims -- a prover that iterated cells instead of claims
+    # would read 1 here even with the identity closing, since it would undercount both sides.
+    assert f.proved_absences == 1 and f.skipped_absences == 2 and f.static_screened == 1
 
 
 def test_prove_absences_summary_prints_the_population_before_the_parts(
