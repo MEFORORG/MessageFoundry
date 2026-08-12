@@ -298,7 +298,8 @@ def test_the_prefix_family_is_bounded_under_every_sigil(
         "----",
         f"{EN_DASH * 3}",
         f"{EM_DASH * 4}",
-        "//",
+        # NOTE `//` IS DELIBERATELY ABSENT -- see the docstring. `///` stays because it was measured
+        # not to run: `pwsh ///Command "<code>"` through Git Bash does nothing.
         "///",
         f"-{EN_DASH}",
         f"{EN_DASH}-",
@@ -310,15 +311,40 @@ def test_the_prefix_family_is_bounded_under_every_sigil(
 def test_the_sigil_run_is_bounded(primary: Path, repos_file: Path, sigil: str) -> None:
     """THE FALSE-DENY DIRECTION FOR THIS CHANGE, and no bypass test can surface it.
 
-    Measured: a run of THREE or more sigil characters is refused by both hosts, a slash never doubles,
-    and a MIXED pair is refused even when both halves are individually binding. So the sigil is "a
-    dash-family character, optionally doubled with ITSELF, or one slash" -- which is why the gate spells
-    it with a backreference rather than ``{1,2}``.
+    Measured: a run of THREE or more sigil characters is refused by both hosts, and a MIXED pair is
+    refused even when both halves are individually binding. So the sigil is "a dash-family character,
+    optionally doubled with ITSELF, or one slash" -- which is why the gate spells it with a
+    backreference rather than ``{1,2}``.
 
     Both widenings were RUN, not argued: replacing the backreference with ``{1,2}`` reddens exactly the
     3 dash-family mixed pairs here and nothing else in the suite, and replacing it with ``+`` over a
-    class including the slash reddens all 11 rows and nothing else. Each reads as the more thorough
-    matcher and each describes a family that does not exist."""
+    class including the slash reddens the remaining rows and nothing else. Each reads as the more
+    thorough matcher and each describes a family that does not exist.
+
+    ``//`` WAS REMOVED FROM THIS LIST, and the removal is the point. It was here on the ground that "a
+    slash never doubles" -- true of a pwsh spawned FROM a PowerShell parent, and FALSE of the delivery
+    path this hook actually governs. A Bash tool call goes through Git Bash, which applies MSYS argument
+    conversion before the child ever sees the string. Measured with an argv printer through Git Bash
+    5.2.37::
+
+        typed  /c         -> child receives  C:/                          does NOT run
+        typed  //c        -> child receives  /c                           RUNS
+        typed  /Command   -> child receives  C:/Program Files/Git/Command  does NOT run
+        typed  //Command  -> child receives  /Command                     RUNS
+        typed  ///Command -> child receives  //Command                    does NOT run
+
+    So the slash sigil is INVERTED for this path: the gate DENIES ``/Command``, which cannot run, and
+    ALLOWS ``//Command``, ``//c`` and ``//Com``, which do. Asserting ``//`` as a must-ALLOW made that
+    inversion a REQUIREMENT -- a new permit in a security test is a specification change wearing the
+    clothes of coverage, and it would have forced a later fix to delete a green test.
+
+    The BYPASS itself is inherited from the previous matcher and is unchanged by this commit, so it is
+    disclosed rather than closed here: see the residual list in ``Get-ScannableSegments``. Closing it
+    means matching a leading ``//``, which opens a UNC-shaped false-deny surface (``ls //server/share/c
+    "..."``) that needs its own measurement -- a separate change with a separate risk profile, not a
+    line to slip into this one.
+
+    ``///`` STAYS, because it was measured on the same path and does not run."""
     assert (
         run_gate(shell(f'pwsh -NoProfile {sigil}Command "{PAYLOAD}"', cwd=primary), repos_file)
         is None
@@ -385,9 +411,15 @@ def test_the_separator_relaxation_is_scoped_to_cmd(
         # An en dash inside ordinary prose, which is where a Unicode dash actually turns up.
         f'git commit -m "perf: cut latency 5{EN_DASH}10 ms"',
         f'echo "sprint 3 {EM_DASH} git checkout was discussed"',
-        # A POSIX path whose last component is `c`, adjacent to a quoted span: the shape the relaxed
-        # cmd separator has to survive.
+        # A POSIX path whose last component is `c`, adjacent to a quoted span WITH NO GIT TOKEN. Kept
+        # only as the CONTROL for test_the_relaxed_cmd_separator_costs_a_posix_path_false_deny below --
+        # on its own it proves nothing, because a line with no git token cannot deny under any width of
+        # $cmdExeFlag. It used to sit here labelled "the shape the relaxed cmd separator has to
+        # survive", which is a bound that cannot fail.
         'ls /usr/src/c "some file.txt"',
+        # The same path shape with a NON-git quoted payload, i.e. the trigger isolated to the `/c`
+        # ending rather than to the path.
+        'ls /usr/src/lib "git checkout main"',
         # Already-paid-for false positives, re-asserted against the wider matcher.
         'ssh box "git checkout main"',
         'git commit -m "chore: clean up dead code"',
@@ -404,6 +436,45 @@ def test_the_widened_matcher_does_not_create_false_denies(
     first six: each is a genuine long option starting with ``c``, i.e. exactly what a hand-typed
     ``[-/]`` was implicitly protecting against, and each is refused by the ``\\s+`` bound instead."""
     assert run_gate(shell(command, cwd=primary), repos_file) is None
+
+
+def test_the_relaxed_cmd_separator_costs_a_posix_path_false_deny(
+    primary: Path, repos_file: Path
+) -> None:
+    """A DISCLOSED COST OF THIS CHANGE, pinned so it cannot be lost, and NOT an endorsement.
+
+    ``$cmdExeFlag`` is ``(?:/[^/\\s]+)*/[ck]`` and its separator was relaxed to ``\\s*`` because
+    cmd.exe accepts an attached argument. A POSIX path whose last component is ``c`` matches that
+    shape, so a quoted span after it is recursed into as if it were cmd's command argument. Measured
+    against both gates::
+
+        ls /usr/src/c   "some file.txt"      main ALLOW   this build ALLOW    (no git token: vacuous)
+        ls /usr/src/c   "git checkout main"  main ALLOW   this build DENY     <-- the new false deny
+        ls /usr/src/lib "git checkout main"  main ALLOW   this build ALLOW    (control: the `/c` ending
+                                                                              is the trigger, not the path)
+
+    THIS TEST ASSERTS THE DENY, which is a deliberate and uncomfortable choice, so read why. The row it
+    replaced asserted ALLOW on a payload with no git token -- green under any matcher, including one
+    widened to match everything. A guard that cannot fail is not a guard, and this file's own
+    neighbouring docstring congratulates itself for removing exactly that defect elsewhere.
+
+    So the choice was between deleting the row (losing the record) and pinning the real behaviour. It is
+    pinned. A false DENY is a cost, not a hole: it stops legitimate work rather than admitting illegitimate
+    work, and the rule-3 direction that matters -- DENY becoming ALLOW -- is unaffected. If someone later
+    narrows ``$cmdExeFlag`` so this ALLOWs again, this test reds, and that is the intended signal to come
+    and read this docstring rather than a regression to paper over.
+
+    NOT YET DECIDED, and deliberately left to the owner rather than settled here: whether the cmd
+    attached-form support is worth this cost at all. Narrowing ``$cmdExeFlag`` to require a
+    cmd-like program token, or dropping the ``\\s*`` relaxation, would both remove it."""
+    denied = run_gate(shell('ls /usr/src/c "git checkout main"', cwd=primary), repos_file)
+    assert denied is not None, (
+        "the POSIX-path false deny has changed. If you narrowed $cmdExeFlag on purpose, delete this "
+        "test and its note in the residual list; do not simply flip the assertion."
+    )
+    # The control: the same payload behind a path NOT ending in `c` must still ALLOW, or the cause is
+    # something wider than the cmd branch and this test is measuring the wrong thing.
+    assert run_gate(shell('ls /usr/src/lib "git checkout main"', cwd=primary), repos_file) is None
 
 
 def test_a_context_flag_with_a_count_is_still_not_an_interpreter_flag(

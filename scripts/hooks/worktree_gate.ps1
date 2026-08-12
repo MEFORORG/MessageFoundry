@@ -63,7 +63,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.08.11.2"
+$GateVersion = "2026.08.12.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -441,8 +441,26 @@ function Get-ScannableSegments([string]$Cmd) {
     #   * PowerShell's argument parser treats three UNICODE dashes as dash-equivalents: U+2013 (en),
     #     U+2014 (em) and U+2015 (horizontal bar). All three bind the parameter -- singly on both hosts,
     #     and DOUBLED on pwsh 7.
+    #   * THE SLASH SIGIL IS INVERTED ON THE BASH-TOOL PATH, and the line below ("a slash never doubles")
+    #     is true only of a pwsh spawned FROM a PowerShell parent. This hook scans BOTH tool names
+    #     through one matcher (see the tool_name dispatch further down), and a Bash tool call goes
+    #     through Git Bash, which applies MSYS argument conversion BEFORE the child sees the string.
+    #     Measured with an argv printer through Git Bash 5.2.37:
+    #         typed `/c`         -> child gets `C:/`                          does NOT run
+    #         typed `//c`        -> child gets `/c`                           RUNS
+    #         typed `/Command`   -> child gets `C:/Program Files/Git/Command`  does NOT run
+    #         typed `//Command`  -> child gets `/Command`                     RUNS
+    #         typed `///Command` -> child gets `//Command`                    does NOT run
+    #     So on that path this gate DENIES `/Command`, which cannot run, and ALLOWS `//Command`, `//c`
+    #     and `//Com`, which do -- including `pwsh //Command "git config core.hooksPath /dev/null"`.
+    #     INHERITED from the matcher this replaces and UNCHANGED here, so it is disclosed rather than
+    #     closed: matching a leading `//` opens a UNC-shaped false-deny surface (`ls //server/share/c
+    #     "..."`) that needs its own measurement. The must-ALLOW row that used to assert `//` was
+    #     REMOVED from tests/test_worktree_gate_interpreter_sigils.py, because asserting it made the
+    #     inversion a requirement and would have forced a later fix to delete a green test.
     #   * A dash-family character may be doubled only WITH ITSELF. Three or more is refused, a mixed pair
-    #     (`-` then U+2013) is refused, and a slash never doubles. That is why the sigil below is spelled
+    #     (`-` then U+2013) is refused, and a slash never doubles ON A POWERSHELL PARENT (see the
+    #     inversion above for the Bash-tool path). That is why the sigil below is spelled
     #     with a BACKREFERENCE and not `{1,2}`: `{1,2}` would admit the twelve mixed DASH-FAMILY pairs
     #     and `+` would admit every length, and both describe a family that does not exist. Both
     #     widenings were RUN as mutants, and each reddens the bounded-ness test and nothing else.
@@ -474,10 +492,18 @@ function Get-ScannableSegments([string]$Cmd) {
     # cmd.exe does NOT require whitespace: `cmd /c"echo ran"` and `cmd /cecho ran` both execute, so the
     # `\s+` demanded of every branch was a PowerShell fact applied to a host that does not share it.
     # PowerShell and a POSIX shell DO require it -- `-CommandWrite-Output ran`, `-Command:x`, `-Command=x`
-    # and `bash -cecho ran` were each measured to REFUSE -- so their `\s+` is untouched. That matters
-    # beyond tidiness: the mandatory whitespace-then-quote is the ONLY thing refusing `-Cm`/`-Cmd`/`-Cnd`/
-    # `-Comd`, so relaxing it across the board (rather than on cmd's alternative alone) would delete the
-    # bound that keeps the prefix family honest.
+    # and `bash -cecho ran` were each measured to REFUSE -- so their `\s+` is untouched.
+    #
+    # WHAT THE `\s+` DOES NOT DO, corrected after this claim was checked and found false. It used to say
+    # the mandatory whitespace was "the ONLY thing refusing `-Cm`/`-Cmd`/`-Cnd`/`-Comd`". It is not.
+    # Measured by rebuilding this pattern with `\s*` on all three branches and running the four flags
+    # through it: all four still fail to match, captured group empty. They are refused because no prefix
+    # of `command` ENDS where those flags end -- `cm`, `cn` and `com`+`d` are not prefixes, so the
+    # alternation never reaches the separator at all. The separator is irrelevant to that bound, and the
+    # paragraph directly below already gives the correct reason to keep the split. Left as a worked
+    # example rather than deleted: the false version was persuasive because it named a real bound and a
+    # real risk, and only tying it to an instrument -- rebuild the regex, run the four strings -- showed
+    # it was attached to the wrong mechanism.
     #
     # THE PROBE THAT CATCHES THE OVER-BROAD EDIT IS THE ATTACHED FORM, `pwsh -Com"<code>"` -- and finding
     # that took a mutant, because the obvious probe does not work. `pwsh -Comd"<code>"` was written here
