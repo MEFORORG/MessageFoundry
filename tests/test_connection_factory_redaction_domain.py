@@ -55,7 +55,22 @@ SENTINEL = "MFTEST-CREDENTIAL-MUST-NOT-SURVIVE"
 
 #: Substrings that make a settings KEY look like it carries a credential. Deliberately broad: a false
 #: positive here costs one explicit declaration, a false negative costs a served secret.
-CREDENTIAL_ISH = ("password", "secret", "token", "key", "credential", "passphrase")
+#:
+#: ``user`` was ADDED after this vocabulary was measured against the engine's own classification
+#: (BACKLOG #1106 follow-up). It is not cosmetic: this tuple decides WHERE a sentinel is injected, so a
+#: word missing from it makes every assertion in this file blind to that parameter -- and the engine
+#: already classifies five usernames as secret (``username``, ``basic_user``, ``proxy_user``,
+#: ``ws_username``, ``credential_username``) on the stated defence-in-depth ground that a username leaks
+#: directory structure. Four of those five contain no substring above, so this file had never probed a
+#: username parameter at all. ``with_http_digest(user=...)`` -> ``http_auth_user`` was the sixth member
+#: of that class and the one nobody had classified; it was served verbatim by ``/metadata`` and printed
+#: by ``graph --json`` beside a ``proxy_user`` that masked correctly on the SAME object.
+#:
+#: THE DOMAIN LESSON REPEATS ONE LEVEL DOWN. Defect 3 below was a hand-chosen domain of FACTORIES;
+#: this was a hand-chosen domain of WORDS, inside the file written to fix defect 3. So the vocabulary
+#: is no longer only asserted by review -- see
+#: ``test_the_injection_vocabulary_covers_every_key_the_engine_itself_classifies``.
+CREDENTIAL_ISH = ("password", "secret", "token", "key", "credential", "passphrase", "user")
 
 #: Keys that contain a credential-ish substring but are NOT secrets, each needing a stated reason.
 #: This is the only allowlist in the file and it is about KEYS, not about values.
@@ -506,6 +521,83 @@ def test_the_domain_covers_every_spec_returning_function() -> None:
         f"domain shrank to {len(covered)}; it was 23 when #1206 was fixed. A shrinking domain is how "
         "this defect class recurs -- it has done so four times."
     )
+
+
+def test_the_injection_vocabulary_covers_every_key_the_engine_itself_classifies() -> None:
+    """THE FIFTH INSTANCE OF THE CLASS, one level below where the previous four lived.
+
+    Defects 1-3 above were domains of THINGS -- a frozenset of keys, a set of parameter names, a
+    filtered set of factories. This is a domain of WORDS: :data:`CREDENTIAL_ISH` decides which
+    parameters get a sentinel, so a word missing from it makes every other assertion in this file
+    silently blind to that parameter. It was hand-written, and it omitted ``user``.
+
+    Measured at engine ``48f8712d``, before the fix: widening this tuple by the single word ``user``
+    and changing nothing else turned the parametrised assertion above red on exactly
+    ``with_http_digest -> http_auth_user`` and on nothing else. One factory, one setting -- a specific
+    red, which is the kind worth having.
+
+    DERIVED, NOT LISTED. The engine's own ``_SECRET_SETTING_KEYS`` is the statement of what it believes
+    is a credential. If it classifies a key this file's vocabulary cannot see, then a parameter feeding
+    that key can never be probed here, and the guard is narrower than the thing it guards. That is
+    checkable against the running code rather than by review, so it is checked.
+    """
+    from messagefoundry.config.wiring import _SECRET_SETTING_KEYS
+
+    blind = sorted(k for k in _SECRET_SETTING_KEYS if not _is_credential_param(k))
+    assert not blind, (
+        "the engine classifies these settings as credentials, but this file's injection vocabulary "
+        f"(CREDENTIAL_ISH / NOT_CREDENTIAL_SUFFIX) does not recognise their shape: {blind}. A "
+        "parameter that feeds one of them is never given a sentinel, so every assertion in this file "
+        "is blind to it -- which is exactly how http_auth_user leaked past a guard written for this "
+        "class. Widen CREDENTIAL_ISH; do not narrow the engine."
+    )
+
+
+def test_the_digest_username_is_masked_like_every_other_username() -> None:
+    """BACKLOG #1106 follow-up, measured at ``48f8712d`` before the fix.
+
+    ``with_http_digest`` crosses the same parameter-to-setting boundary ``with_signing`` crosses:
+    parameter ``user`` becomes setting ``http_auth_user``, parameter ``password`` becomes
+    ``http_auth_password``. Only the password half was classified::
+
+        http_auth_user      -> 'SYNTHETIC-...-DIGEST'    <-- verbatim, both serializers
+        http_auth_password  -> '***'
+        proxy_user          -> '***'                      <-- the SAME object, the SAME class
+        proxy_password      -> '***'
+
+    and the ``env()`` FALLBACK DEFAULT rode along with it, while the identical ``env()`` on
+    ``proxy_user`` correctly emitted a bare ``{'env': key}``.
+
+    This is pinned by NAME as well as by the derived probe above, because the two fail for different
+    reasons: the derived probe dies if the vocabulary regresses, this one dies if the classification
+    does. A username is masked here defence-in-depth on the engine's own stated ground -- it names a
+    principal and can leak directory structure, which is why the other five are masked.
+    """
+    from messagefoundry.transports.http_auth import with_http_digest
+
+    inline = with_http_digest(
+        messagefoundry.Rest(
+            url="https://example.invalid/x",
+            proxy="http://proxy.invalid:8080",
+            proxy_user=SENTINEL,
+            proxy_password="pw",
+        ),
+        user=SENTINEL,
+        password="pw2",
+    )
+    out = redacted_settings(dict(inline.settings))
+    assert out["http_auth_user"] == "***", out["http_auth_user"]
+    assert out["proxy_user"] == "***"  # the control: its sibling was already right
+    assert out["http_auth"] == "digest"  # and the MODE stays readable -- it is not a credential
+
+    fallback = with_http_digest(
+        messagefoundry.Rest(url="https://example.invalid/x"),
+        user=messagefoundry.env("probe_digest_user", default=SENTINEL),
+        password=messagefoundry.env("probe_digest_password", default="pw"),
+    )
+    got = redacted_settings(dict(fallback.settings))["http_auth_user"]
+    assert got == {"env": "probe_digest_user"}, got
+    assert SENTINEL not in str(got)
 
 
 def test_a_refusing_connector_actually_refuses_an_inline_credential() -> None:
