@@ -451,3 +451,168 @@ def test_a_nonexistent_path_fails_open(repo: SimpleNamespace, tmp_path: Path) ->
         run_gate(shell(f'git worktree remove "{tmp_path / "nope"}"', cwd=repo.primary), repo.repos)
         is None
     )
+
+
+# ------------------------------------------------- rule 3d: WHICH path, and resolved against WHAT
+#
+# BACKLOG #1064. Two independent defects, and closing either alone leaves the other open.
+#
+#   A. THE VICTIM TOKEN IS PICKED BY A SPLIT THAT CANNOT READ QUOTES. `$after -split '\s+'` then
+#      `.Trim('"', "'")`. A quoted path containing a space becomes two tokens, the first is taken,
+#      the quotes are trimmed, `git -C` fails on the truncated path, and the rule falls through to
+#      ALLOW. Quoting does not help, because the tokeniser never reads the quotes.
+#
+#   B. THE VICTIM IS RESOLVED AGAINST THE WRONG DIRECTORY. git resolves a relative path against the
+#      EFFECTIVE working directory, which a `-C` flag or a prefix `cd` changes. Rule 3d resolved it
+#      against the hook process's cwd; the rejected `g1064` attempt changed that to the SESSION cwd,
+#      which is also wrong. Those two answers COINCIDE when the session cwd happens to sit at the
+#      same depth under the same parent as the `-C` target -- which is the ordinary sibling-worktree
+#      shape, so a rig built that way reports a broken fix as working. The same-depth row is kept
+#      below and LABELLED BLIND for exactly that reason.
+#
+# Every case here carries a CONTROL that must hold. A control that does not hold undermines
+# everything measured beside it, and the `g1064` attempt broke its own.
+
+
+@pytest.fixture
+def spaced_repo(tmp_path: Path) -> SimpleNamespace:
+    """The same rig as :func:`repo`, differing in ONE character: a space in the repo's leaf name.
+
+    A path with a space is ordinary on Windows. This defect is latent on this machine only because
+    the primary checkout happens to have no space in its path, and "latent because of an accident of
+    this machine's paths" is an unexercised precondition, not a mitigation.
+    """
+    if shutil.which("git") is None:
+        pytest.skip("needs git on PATH")
+
+    def git(*args: str, cwd: Path | None = None) -> None:
+        subprocess.run(
+            ["git", *args],
+            cwd=str(cwd) if cwd else None,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    primary = tmp_path / "Pri mary"
+    git("init", "-b", "main", str(primary))
+    git("config", "user.email", "t@example.com", cwd=primary)
+    git("config", "user.name", "t", cwd=primary)
+    (primary / "seed.txt").write_text("seed\n", encoding="utf-8")
+    git("add", "-A", cwd=primary)
+    git("commit", "-m", "seed", cwd=primary)
+    wt = tmp_path / "Pri mary-wt"
+    git("worktree", "add", "-b", "wt-branch", str(wt), cwd=primary)
+    repos = tmp_path / "repos.txt"
+    repos.write_text(f"{primary}\n", encoding="utf-8")
+    foreign = tmp_path / "Foreign"
+    foreign.mkdir()
+    return SimpleNamespace(primary=primary, wt=wt, repos=repos, foreign=foreign)
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        'git worktree remove "{wt}"',
+        "git worktree remove '{wt}'",
+        'git -C "{primary}" worktree remove "{wt}"',
+        'git worktree move "{wt}" ../elsewhere',
+    ],
+)
+def test_a_victim_path_containing_a_space_is_still_governed(
+    spaced_repo: SimpleNamespace, spelling: str
+) -> None:
+    """DEFECT A. Measured before the fix: every one of these ALLOWed, and the identical rig with the
+    space removed DENIED all of them -- so the space is the whole cause and nothing else varied."""
+    command = spelling.format(wt=spaced_repo.wt, primary=spaced_repo.primary)
+    assert_denied(run_gate(shell(command, cwd=spaced_repo.foreign), spaced_repo.repos))
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        'git worktree remove "{wt}"',
+        "git worktree remove '{wt}'",
+        'git -C "{primary}" worktree remove "{wt}"',
+        'git worktree move "{wt}" ../elsewhere',
+    ],
+)
+def test_the_no_space_control_denies_the_same_spellings(
+    repo: SimpleNamespace, tmp_path: Path, spelling: str
+) -> None:
+    """THE CONTROL for the test above, and it is the reason that one means anything.
+
+    It is the same four spellings against a rig whose only difference is the absent space. If this
+    ever reds, the test above is measuring something other than the space and its result must not be
+    trusted."""
+    foreign = tmp_path / "ForeignControl"
+    foreign.mkdir(exist_ok=True)
+    command = spelling.format(wt=repo.wt, primary=repo.primary)
+    assert_denied(run_gate(shell(command, cwd=foreign), repo.repos))
+
+
+@pytest.fixture
+def cwd_positions(tmp_path: Path) -> SimpleNamespace:
+    """Three session cwds. Only two of them can discriminate a correct fix from a broken one."""
+    same_depth = tmp_path / "SameDepth"
+    deeper = tmp_path / "Elsewhere" / "deep" / "deeper"
+    other_parent = tmp_path / "Other" / "branch"
+    for p in (same_depth, deeper, other_parent):
+        p.mkdir(parents=True, exist_ok=True)
+    return SimpleNamespace(same_depth=same_depth, deeper=deeper, other_parent=other_parent)
+
+
+@pytest.mark.parametrize("position", ["same_depth", "deeper", "other_parent"])
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        'git -C "{primary}" worktree remove ../Primary-wt',
+        'cd "{primary}" && git worktree remove ../Primary-wt',
+    ],
+)
+def test_a_relative_victim_resolves_against_the_effective_directory(
+    repo: SimpleNamespace, cwd_positions: SimpleNamespace, position: str, spelling: str
+) -> None:
+    """DEFECT B, and the parametrisation is the point.
+
+    Both spellings move git's working directory -- one with `-C`, one with a prefix `cd` -- so
+    `../Primary-wt` names the governed worktree in every row. The rule must therefore deny from ALL
+    THREE session positions, because where the SESSION stands has nothing to do with where GIT will
+    stand.
+
+    ``same_depth`` is the BLIND row: there the session cwd and the `-C` target share a parent, so
+    resolving against either gives the same answer and the row passes even on a gate that resolves
+    against the wrong one. It is kept because it is the row that looks like a fix -- a rig built only
+    from sibling worktrees, which is the ordinary shape here, would consist entirely of blind rows.
+    ``deeper`` and ``other_parent`` are the rows that discriminate."""
+    command = spelling.format(primary=repo.primary)
+    cwd = getattr(cwd_positions, position)
+    assert_denied(run_gate(shell(command, cwd=cwd), repo.repos))
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'p="{wt}"; git worktree remove "$p"',
+        'p=../Primary-wt; git worktree remove "$p"',
+    ],
+)
+def test_indirection_through_a_shell_variable_is_a_KNOWN_open_residual(
+    repo: SimpleNamespace, tmp_path: Path, command: str
+) -> None:
+    """A PINNED RESIDUAL, asserting ALLOW, and that is NOT an endorsement.
+
+    The victim token here is ``$p``. Its value is a runtime fact, and this hook inspects a tool
+    ARGUMENT before anything runs -- no static resolver can follow it, and the gate's own .SYNOPSIS
+    already says it is a guardrail rather than a security boundary. So this is a limit of the shape,
+    not an oversight, and the #1064 fix does not close it.
+
+    It is pinned because the alternative is silence, and silence reads as coverage. If this ever
+    reds, somebody taught the gate to follow a variable: delete this test and the residual note in
+    the gate. Do NOT restore the ALLOW."""
+    foreign = tmp_path / "ForeignInd"
+    foreign.mkdir(exist_ok=True)
+    assert run_gate(shell(command.format(wt=repo.wt), cwd=foreign), repo.repos) is None, (
+        "indirection now DENIES. If that was deliberate, delete this test and the residual note in "
+        "the gate; do not restore the ALLOW to make it pass."
+    )

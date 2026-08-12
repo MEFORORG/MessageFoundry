@@ -63,7 +63,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.08.12.1"
+$GateVersion = "2026.08.12.2"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -1037,20 +1037,66 @@ What to do instead:
         if ($seg.Scan -cnotmatch '\bworktree\s+(?<wtverb>remove|move)(?=\s|$)') { continue }
         $wtVerb = $Matches['wtverb']
 
-        # First positional (non-flag) token after the subcommand is the worktree being acted on.
+        # First positional (non-flag) token after the subcommand is the worktree being acted on, read
+        # QUOTE-AWARE (BACKLOG #1064, defect A). This was `$after -split '\s+'` followed by
+        # `.Trim('"', "'")` -- a tokeniser that never reads the quotes it strips. A quoted path
+        # containing a SPACE became two tokens, the first was taken, `git -C` failed on the truncated
+        # path, and the `continue` below fell through to ALLOW. Measured on a rig whose primary is
+        # `<tmp>\Pri mary`: all four spellings (double-quoted, single-quoted, unquoted, and the `-C`
+        # form) ALLOWed, while the identical rig with the one space removed DENIED all four. Quoting
+        # the path did not help, which is the tell that the quotes were never being parsed.
+        #
+        # It is latent on THIS machine only because the primary checkout happens to have no space in
+        # its path. A path with a space is ordinary on Windows, and "latent because of an accident of
+        # this machine's paths" is an unexercised precondition rather than a mitigation.
+        #
+        # The alternation relies on .NET permitting DUPLICATE named groups, so `$m.Groups['q']` is
+        # whichever branch matched. That is unusual enough to be worth naming: most engines reject the
+        # pattern outright. Validated against the flag, both quote styles, an embedded space, an
+        # unterminated quote and empty input before it was written here.
         $after = ($seg.Raw -replace ('(?s)^.*?\bworktree\s+' + $wtVerb + '\b'), '')
         $after = ($after -split '(?:&&|\|\||;|\|)', 2)[0]
         $victimRaw = $null
-        foreach ($tok in @($after -split '\s+' | Where-Object { $_ })) {
-            if ($tok.StartsWith('-')) { continue }
-            $victimRaw = $tok.Trim('"', "'")
+        foreach ($m in [regex]::Matches($after, '"(?<q>[^"]*)"|''(?<q>[^'']*)''|(?<q>[^\s"''][^\s]*)')) {
+            if ($m.Value.StartsWith('-')) { continue }
+            if (-not $m.Groups['q'].Value) { continue }
+            $victimRaw = $m.Groups['q'].Value
             break
         }
         if (-not $victimRaw) { continue }
 
-        $victimCommon = "$(& git -C $victimRaw rev-parse --git-common-dir 2>$null)".Trim()
+        # RESOLVE THE VICTIM AGAINST THE DIRECTORY GIT WILL ACTUALLY STAND IN (defect B), by calling
+        # the resolver rules 3 and 3c already use rather than growing a fourth. This read
+        # `& git -C $victimRaw`, which resolves a relative token against THIS HOOK PROCESS's cwd; the
+        # rejected #1064 attempt changed it to the SESSION cwd, which is also wrong. git resolves it
+        # against the EFFECTIVE working directory, and both a `-C` flag and a prefix `cd` change that.
+        #
+        # THE TWO ANSWERS COINCIDE WHEN THE SESSION CWD SITS AT THE SAME DEPTH UNDER THE SAME PARENT
+        # as the `-C` target -- which is the ordinary sibling-worktree shape here. So a rig built only
+        # from sibling worktrees reports a gate that resolves against the wrong directory as working,
+        # and the attempt that did exactly that was measured green. The test file keeps a same-depth
+        # row LABELLED BLIND beside a deeper row and an other-parent row for that reason.
+        #
+        # Get-GitTargetCandidatesRaw reads a `-C` case-sensitively and otherwise follows exactly one
+        # followable `cd`/`pushd` in the prefix, falling back to the cwd. Its first candidate is the
+        # effective directory. Rooting it against $cwdRaw first is #1061's fix, unchanged.
+        #
+        # RESIDUAL, disclosed rather than implied closed: main's resolver PREFERS `-C` and discards a
+        # `cd` prefix, where a shell COMPOSES them and resolves a relative `-C` against the post-`cd`
+        # directory. So `cd ../Unrelated && git -C . worktree remove <victim>` still resolves wrongly.
+        # That is BACKLOG #1085 and it belongs to the resolver, not to this rule -- fixing it here
+        # would be the fourth resolver this comment exists to avoid.
+        $at = [regex]::Match($seg.Raw, '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)')
+        $pfx = $(if ($at.Success) { $seg.Raw.Substring(0, $at.Index) } else { "" })
+        $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw)
+        $base = $(if ($where.Count -gt 0) { Get-FullPathRaw $where[0] $cwdRaw } else { "" })
+        if (-not $base) { $base = $cwdRaw }
+        $victimAbs = Get-FullPathRaw $victimRaw $base
+        if (-not $victimAbs) { $victimAbs = $victimRaw }
+
+        $victimCommon = "$(& git -C $victimAbs rev-parse --git-common-dir 2>$null)".Trim()
         if ($LASTEXITCODE -ne 0 -or -not $victimCommon) { continue }
-        $victimCmp = Get-ComparablePath $victimCommon $victimRaw
+        $victimCmp = Get-ComparablePath $victimCommon $victimAbs
         $govWt = $null
         foreach ($r in $roots) {
             if ($victimCmp -eq $r.Compare -or $victimCmp.StartsWith("$($r.Compare)/")) { $govWt = $r; break }
@@ -1068,8 +1114,13 @@ What to do instead:
         # leg, where the lookup returned nothing, $isSelf went false, and BOTH branches emitted the
         # generic deny -- byte-identical, which is exactly what the non-vacuity test below asserts
         # against. Platform-masked, and caught only because that test compares the two denies.
-        $victimTopRaw = "$(& git -C $victimRaw rev-parse --show-toplevel 2>$null)".Trim()
-        if (-not $victimTopRaw) { $victimTopRaw = $victimRaw }
+        # $victimAbs, NOT $victimRaw (BACKLOG #1064). This asks git the same question the common-dir
+        # lookup above asks, so it must be handed the same ROOTED path -- with the raw token it
+        # resolved against the hook process's cwd and returned nothing for every relative spelling,
+        # leaving $isSelf false and both branches emitting the generic deny. That is the identical
+        # defect the note above this line already records for the $cwd/$cwdRaw case, one call down.
+        $victimTopRaw = "$(& git -C $victimAbs rev-parse --show-toplevel 2>$null)".Trim()
+        if (-not $victimTopRaw) { $victimTopRaw = $victimAbs }
         $victimTop = Get-ComparablePath $victimTopRaw
         $selfTop = Get-ComparablePath "$(& git -C $cwdRaw rev-parse --show-toplevel 2>$null)".Trim()
         $isSelf = $victimTop -and $selfTop -and ($victimTop -eq $selfTop)
@@ -1139,9 +1190,17 @@ What to do instead:
 "@
         }
 
+        # FOLD THE OPERATOR'S SPELLING BEFORE IT ENTERS A REASON, which every other rule in this file
+        # already does and this one did not. It matters MORE after the quote-aware tokeniser above:
+        # the old `-split '\s+'` could not produce a token containing whitespace, so the interpolation
+        # was accidentally safe; a quoted token can now carry spaces AND TABS, and a tab is one of the
+        # three characters Get-SafeForMessage exists to neutralise. This change widened what reaches
+        # the reason, so it owns the fold. (A newline still cannot arrive here -- segments are split
+        # per line above -- so this closes the reachable half, not a whole class.)
+        $victimMsg = Get-SafeForMessage $victimRaw
         if ($isSelf) {
             Write-Deny -Rule "3d" -Detail "git worktree $wtVerb (own worktree)" -Reason @"
-BLOCKED: 'git worktree $wtVerb $victimRaw' acts on THE WORKTREE THIS SESSION IS RUNNING IN.
+BLOCKED: 'git worktree $wtVerb $victimMsg' acts on THE WORKTREE THIS SESSION IS RUNNING IN.
 
 This is not somebody else's tree and nothing here says it is. git would refuse it too -- you cannot remove
 the worktree you are standing in -- but this gate runs BEFORE git, so you would have got a confusing
@@ -1153,7 +1212,7 @@ files you are working on, and the removal has to happen from OUTSIDE this tree, 
 What to do instead:
   * Finish and COMMIT anything you still want. A commit survives the tree being deleted; a dirty tree
     does not.
-  * Then ask the user, in these words: "I am finished in $victimRaw and it can be removed once this
+  * Then ask the user, in these words: "I am finished in $victimMsg and it can be removed once this
     session ends." Removal is theirs to run from OUTSIDE this tree:
         $removeCmd
   * If you only wanted to leave it, just stop using it -- an unused worktree costs disk, not correctness.
@@ -1161,7 +1220,7 @@ What to do instead:
         }
         else {
             Write-Deny -Rule "3d" -Detail "git worktree $wtVerb" -Reason @"
-BLOCKED: 'git worktree $wtVerb $victimRaw' acts on a worktree of $($govWt.Display) that is NOT the tree
+BLOCKED: 'git worktree $wtVerb $victimMsg' acts on a worktree of $($govWt.Display) that is NOT the tree
 this session is running in. This gate cannot tell whether another session is using it -- it has no
 occupancy or authorship signal -- so it refuses rather than guess.
 
@@ -1174,7 +1233,7 @@ $cleanupBullet
   * To find out whether a worktree is still in use, look rather than delete:
         git -C "$($govWt.Display)" worktree list
   * If you are certain it is abandoned and must go now, that is the user's call, not yours. Say so:
-    "I want to remove the worktree $victimRaw and I need you to confirm it is not in use."
+    "I want to remove the worktree $victimMsg and I need you to confirm it is not in use."
 "@
         }
     }
