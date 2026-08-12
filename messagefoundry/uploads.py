@@ -111,11 +111,26 @@ class UploadedFileMeta:
     """Non-body metadata about one uploaded file (persisted encrypted in the ``.meta`` sidecar).
 
     ``filename`` is the operator-supplied name, sanitized for display; it is never a filesystem path.
-    ``content_type`` is the format tag (``hl7v2``/``xml``/``text``), not an HTTP MIME type."""
+    ``content_type`` is the format tag (``hl7v2``/``xml``/``text``), not an HTTP MIME type.
+
+    TWO owner fields, and the split is deliberate. ``uploader_id`` is the account's **immutable**
+    identifier (``Identity.user_id``, a ``uuid4`` hex minted once per account row) and is the ONLY
+    value ownership and the per-uploader quota key on. ``uploader`` is the username, which is a
+    **display label**: it is unique among live accounts but it is *reusable* — deleting an account
+    frees the name, and recreating it mints a different ``user_id``. Keying either the ownership
+    check or the budget on the name would hand a recycled account the departed operator's files.
+
+    **The id is immutable per ROW, which is not the same as per PERSON on AD.** ``_upsert_ad_user``
+    resolves by ``sAMAccountName`` and mints a new ``user_id`` only when no mirror row survives, so a
+    directory-side rename/recycle WITHOUT a MessageFoundry ``delete_user`` re-binds the EXISTING id
+    to the new principal. A deploying site on AD would need the directory-immutable binding tracked
+    as BACKLOG #1143 for that case; this field closes the local-account path and the AD path that
+    goes through a delete."""
 
     file_id: str
     filename: str
     uploader: str
+    uploader_id: str
     content_type: str
     size: int
     sha256: str
@@ -353,6 +368,12 @@ class UploadStore:
             file_id=str(d["file_id"]),
             filename=str(d.get("filename", "upload")),
             uploader=str(d.get("uploader", "")),
+            # Tolerant, like every other optional field — a sidecar without the key yields "", which
+            # matches NOBODY at the ownership check (api/app.py ``_may_access_upload``) and buckets
+            # into no operator's quota. That is the fail-closed end state, not a migration gap: there
+            # is deliberately no fallback to ``uploader`` here, because a name fallback would
+            # reintroduce exactly the recycled-username reachability this field exists to close.
+            uploader_id=str(d.get("uploader_id", "")),
             content_type=str(d.get("content_type", "hl7v2")),
             size=int(d.get("size", 0)),
             sha256=str(d.get("sha256", "")),
@@ -384,12 +405,26 @@ class UploadStore:
     # --- public API (all disk/crypto/split work off the event loop) --------------------------------
 
     async def save(
-        self, *, data: bytes, filename: str, uploader: str, content_type: str | None = None
+        self,
+        *,
+        data: bytes,
+        filename: str,
+        uploader: str,
+        uploader_id: str,
+        content_type: str | None = None,
     ) -> UploadedFileMeta:
-        """Persist an uploaded file (encrypted at rest) and return its metadata. Raises
-        :class:`UploadTooLargeError` if it exceeds ``max_bytes``, :class:`UploadContentError` on a
-        disallowed extension / content mismatch (ASVS 5.2.2), or :class:`UploadQuotaError` when the
-        uploader's file-count or aggregate-byte quota would be exceeded (ASVS 5.2.4)."""
+        """Persist an uploaded file (encrypted at rest) and return its metadata.
+
+        ``uploader_id`` is the owning account's immutable ``Identity.user_id``; ``uploader`` is its
+        username, kept for display and the audit rows only. Both are required — a file written with
+        no ``uploader_id`` would be readable by nobody but a ``files:access_any`` holder while still
+        billing to nobody's quota, so an empty one is a programming error and is refused here.
+
+        Raises :class:`UploadTooLargeError` if it exceeds ``max_bytes``, :class:`UploadContentError`
+        on a disallowed extension / content mismatch (ASVS 5.2.2), or :class:`UploadQuotaError` when
+        the uploader's file-count or aggregate-byte quota would be exceeded (ASVS 5.2.4)."""
+        if not uploader_id:
+            raise ValueError("uploader_id is required (an upload with no owner id is unreachable)")
         # Only the cheap size check runs on the loop; the sha256, the whole-file split, the cipher, and
         # the disk writes are ALL bounded by max_bytes (25 MiB default), so they run OFF the event loop
         # (a large upload must never stall the shared engine loop — ADR 0134 / CLAUDE.md §6).
@@ -412,7 +447,11 @@ class UploadStore:
             # upload in this process can read this count before the write consumes it (ASVS 2.3.4).
             # The scan is uncached, so shards sharing a dir enforce one budget rather than one each;
             # the residual that survives the lock is per-shard, not per-upload. See UploadQuotaError.
-            mine = [m for m in self._scan_metas_sync() if m.uploader == uploader]
+            # The bucket key is the IMMUTABLE uploader_id, the same value the ownership check uses, so
+            # the budget and the ownership rule can never disagree about who a file belongs to: a
+            # recycled username is never billed for files it cannot read. The message text below still
+            # names the human username, because an operator reading a 409 needs a name, not a uuid.
+            mine = [m for m in self._scan_metas_sync() if m.uploader_id == uploader_id]
             if len(mine) + 1 > self._max_files_per_user:
                 raise UploadQuotaError(
                     f"uploader {uploader!r} has {len(mine)} uploaded files; the limit is "
@@ -428,6 +467,7 @@ class UploadStore:
                 file_id=file_id,
                 filename=display,
                 uploader=uploader,
+                uploader_id=uploader_id,
                 content_type=ctype,
                 size=len(data),
                 sha256=hashlib.sha256(data).hexdigest(),

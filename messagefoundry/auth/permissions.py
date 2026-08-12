@@ -64,6 +64,16 @@ class Permission(str, Enum):  # noqa: UP042
     FILES_UPLOAD = "files:upload"  # import an external message file (writes PHI at rest)
     FILES_BROWSE = "files:browse"  # list/browse/resend an uploaded file's messages (PHI read)
     FILES_DELETE = "files:delete"  # delete an uploaded file from the server (destructive)
+    # Object-level override for the uploaded-file subsystem (ASVS 8.2.2). Uploaded files are OWNER-ONLY:
+    # `files:browse`/`files:delete` reach only the files the caller uploaded, because the channel axis
+    # (Identity.allowed_channels) defaults to "every channel" and so would protect nobody on a default
+    # install. This permission widens that object scope to every uploader's files, for administrative
+    # oversight and cleanup after a departed operator. It is NOT a capability of its own — a holder
+    # still needs `files:browse` / `files:delete` for the route itself — and no built-in role but
+    # ADMINISTRATOR (which is the whole catalogue) grants it. Never assignable to a custom role
+    # (CUSTOM_ROLE_FORBIDDEN_PERMISSIONS), so "Administrator only" is enforced on every minting path
+    # rather than only observed of the built-ins.
+    FILES_ACCESS_ANY = "files:access_any"  # reach ANOTHER operator's uploaded files
     APPROVALS_APPROVE = (
         "approvals:approve"  # release a pending high-value action (dual-control, 2.3.5)
     )
@@ -118,7 +128,10 @@ _OPERATOR_PERMISSIONS: frozenset[Permission] = frozenset(
         Permission.LOGS_VIEW,
         # Offline uploaded-logs (BACKLOG #125/#126) — inspecting a partner-supplied file is an operator
         # troubleshooting action; the operator already holds messages:view_raw, so browsing an uploaded
-        # body is a same-tier PHI surface for the same role.
+        # body is a same-tier PHI surface for the same role. These three reach the operator's OWN
+        # uploads only (ASVS 8.2.2): FILES_ACCESS_ANY, the cross-operator override, is deliberately NOT
+        # granted here — one operator troubleshooting their own file is not a reason to read, re-inject
+        # or delete another operator's.
         Permission.FILES_UPLOAD,
         Permission.FILES_BROWSE,
         Permission.FILES_DELETE,
@@ -174,9 +187,17 @@ CUSTOM_ROLE_ID_PREFIX = "custom:"
 #: ``ADMINISTRATOR`` deliberately gates (ADR 0045 D1). ``USERS_MANAGE`` is the permission that mints
 #: roles (a custom role holding it could grant itself admin-equivalent power); ``APPROVALS_APPROVE`` is
 #: dual-control release; ``DR_OPERATE`` (ADR 0048) promotes/releases a whole third-tier DR standby box
-#: (a site-failover-grade action). All stay admin-only.
+#: (a site-failover-grade action); ``FILES_ACCESS_ANY`` (ASVS 8.2.2) is the override that defeats
+#: owner-only on every uploaded file, so leaving it mintable would let a custom role read, re-inject
+#: and delete every operator's uploaded PHI while docs/SECURITY.md says it is Administrator-only.
+#: All stay admin-only.
 CUSTOM_ROLE_FORBIDDEN_PERMISSIONS: frozenset[Permission] = frozenset(
-    {Permission.USERS_MANAGE, Permission.APPROVALS_APPROVE, Permission.DR_OPERATE}
+    {
+        Permission.USERS_MANAGE,
+        Permission.APPROVALS_APPROVE,
+        Permission.DR_OPERATE,
+        Permission.FILES_ACCESS_ANY,
+    }
 )
 
 

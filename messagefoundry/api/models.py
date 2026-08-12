@@ -1160,8 +1160,17 @@ class UploadedFileInfo(BaseModel):
 
 
 class UploadedFileList(BaseModel):
+    """The caller's visible uploaded files (metadata only).
+
+    ``scope`` says WHOSE files ``total`` counted (ASVS 8.2.2): ``own`` for the owner-scoped default,
+    ``any_owner`` when the caller holds ``files:access_any``. It is the same value the ``upload.list``
+    audit row records, computed once at the route — so a reader of the response and a reader of the
+    audit interpret the same count the same way, and a UI can state which listing it is showing
+    instead of asserting one of the two unconditionally. It is a fixed enum, never operator text."""
+
     total: int
     files: list[UploadedFileInfo]
+    scope: Literal["own", "any_owner"]
 
 
 class UploadedMessageSummary(BaseModel):
