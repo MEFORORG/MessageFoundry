@@ -18,10 +18,12 @@ talks to the engine.
 > The two share the word "AI" and nothing else.
 
 > **Status (MVP).** The policy model + config + RBAC + the engine policy endpoint + the CLI + gating
-> of the existing **provider-agnostic, bring-your-own** IDE chat assistant are built. **No
-> model-provider or engine broker integration exists yet** — `managed_claude` / `managed_claude_baa`
-> are accepted as policy values but the IDE cannot service them, and the `deidentified` / `phi`
-> scopes are not reachable in the MVP (see *Future direction*).
+> of the existing **provider-agnostic, bring-your-own** IDE chat assistant are built. **One engine
+> broker IS built:** `managed_endpoint` ([ADR 0135](adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md))
+> brokers a single `code_only` prompt to a customer-managed / self-hosted LLM over `POST /ai/chat`,
+> audited per use; it never reaches `phi` scope. `managed_claude` / `managed_claude_baa` are accepted
+> as policy values but the IDE cannot service them, and the `deidentified` / `phi` scopes are not
+> reachable in the MVP (see *Future direction*).
 
 ---
 
@@ -36,6 +38,7 @@ The policy is two independent axes, then **clamped** by the instance's **product
   |---|---|
   | `off` | No AI assistance at all. |
   | `byo` | **Bring-your-own** provider, configured in the IDE; the engine never sees the traffic. Code-only by construction (PHI-safe). |
+  | `managed_endpoint` | **BUILT** ([ADR 0135](adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md)) — the engine brokers one `code_only` prompt to a **customer-managed / self-hosted** LLM over `POST /ai/chat`, audited per use, behind a fail-closed SSRF allowlist. Never reaches `phi` scope. |
   | `managed_claude` | Engine-brokered managed provider. **Future** — not serviceable by this IDE version. |
   | `managed_claude_baa` | Engine-brokered managed provider under a **BAA** + zero-data-retention connection — the only mode that can reach `phi` scope. **Future.** |
 
@@ -104,12 +107,12 @@ Set in `messagefoundry.toml`, with the usual `MEFOR_AI_*` env overrides
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `mode` | enum | `byo` | `off` · `byo` · `managed_claude` · `managed_claude_baa` |
+| `mode` | enum | `byo` | `off` · `byo` · `managed_endpoint` (**built**, ADR 0135) · `managed_claude` · `managed_claude_baa` |
 | `data_scope` | enum | `code_only` | `code_only` · `synthetic` · `deidentified` · `phi` |
 | `environment` | str | — | free-form active-environment **name** (ADR 0017); selects `environments/<name>.toml` + `current_environment()`. **Required** for `serve` (no default). |
 | `data_class` | enum | derived | `synthetic` · `phi` — does this instance carry real PHI (drives the at-rest/egress advisories). Derived from a built-in name (`dev`→synthetic, `staging`/`prod`→phi) when unset; **required** for a custom name. |
 | `production` | bool | derived | production-tier posture (drives the AI ceiling + prod DEBUG refusal), decoupled from the name. Derived (`dev`/`staging`→false, `prod`→true) when unset; **required** for a custom name. |
-| `provider` | str | `claude` | **forward-compat, unused in MVP** (P1 broker) |
+| `provider` | str | `claude` | names the provider the broker addresses; recorded in the per-use audit. Does **not** select a request shape (the broker builds one wire shape unconditionally). **Validated at config load** — only a serviceable provider is accepted (BACKLOG #95) |
 | `model` | str | `claude-opus-4-8` | **forward-compat, unused in MVP** |
 | `baa_attested` | bool | `false` | **forward-compat, unused in MVP** |
 | `endpoint` | str | — | **forward-compat, unused in MVP** |
