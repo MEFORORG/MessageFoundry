@@ -364,6 +364,13 @@ INVENTORY: dict[str, frozenset[str]] = {
     # recorded and recomputed rather than assumed. Non-cryptographic alternatives were rejected only
     # because SHA-256 is already the tree's convention for file pinning.
     "scripts/asvs/scorecard.py": frozenset({"hashlib"}),
+    # Same class as the line above, registered for the same reason: SHA-256 over the SCORECARD FILE,
+    # printed truncated so a run states WHICH revision of the record it read. Two runs reporting
+    # different counts are otherwise indistinguishable from one run whose input changed underneath
+    # it. No secret, no key, no message authentication, nothing user- or PHI-derived — the digest is
+    # an identifier in a log line. It covers the record itself rather than a build input, which is
+    # the only way it differs from the entry above.
+    "scripts/asvs/prove_report.py": frozenset({"hashlib"}),
     "scripts/security/dast_target.py": frozenset({"secrets"}),
 }
 

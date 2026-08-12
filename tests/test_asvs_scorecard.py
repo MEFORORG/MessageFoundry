@@ -12,6 +12,7 @@ while the vault runs the same code against the real posture data.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -22,6 +23,7 @@ from typing import Any, get_args
 
 import pytest
 
+import scripts.asvs.scorecard as scorecard_module
 from scripts.asvs.scorecard import (
     _DESCEND_ONLY,
     _TRANSPARENT,
@@ -35,6 +37,7 @@ from scripts.asvs.scorecard import (
     Verdict,
     _copy_scratch,
     _humanise_age,
+    _signature,
     anchor_form,
     check_absences,
     check_anchors,
@@ -1560,6 +1563,191 @@ def test_prove_absences_refuses_a_mutation_path_that_escapes_the_scratch_tree(
     assert findings.proved_absences == 0
 
 
+# --- pre-flight screens: a red observable is not a proof unless the MUTATION is what reddened it ---
+#
+# Application is append-based, so a reintroduction bites by redefinition shadowing. Two mutations that
+# shadow nothing semantic still redden the observable at exit 1 -- indistinguishable from a surgical
+# proof to every check that existed before these screens. Both holes were MEASURED with the screen
+# neutered, and both reported `proved=1, problems=0`: a clean green false proof.
+
+
+def test_prove_absences_refuses_a_mutation_whose_signature_does_not_match_the_symbol(
+    tmp_path: Path,
+) -> None:
+    """A wrong-arity reintroduction raises TypeError at every call site. Every test touching the
+    symbol fails, exit 1, and the claim would be counted as PROVED -- having demonstrated that calling
+    a function with the wrong number of arguments breaks it, which is true of every function in the
+    repository and is evidence about no control at all.
+
+    This is not a hypothetical shape: the mutation is authored in a TOML file in a DIFFERENT
+    REPOSITORY from the signature it copies, and nothing keeps the two in step.
+
+    Falsified by making `_screen_mutation` return True unconditionally (the pre-change behaviour):
+    `proved_absences` becomes 1 and `problems` empty, so `not findings.ok` and the
+    `proved_absences == 0` assertion both go RED. Measured, not reasoned. Restored.
+    """
+    _module(tmp_path, "scanner.py", _SCANNER)
+    _obs_test(tmp_path, "test_scanner.py", _OBS_TEST)
+    claim = _live_claim(
+        'def scan():\n    return "infected"',  # real symbol is scan(p)
+        "scanner.py",
+        "test_scanner.py::test_clean",
+    )
+    findings = prove_absences([claim], tmp_path)
+    assert not findings.ok
+    assert any("PROVE-ERROR" in p and "different signature" in p for p in findings.problems), (
+        findings.problems
+    )
+    assert findings.proved_absences == 0
+
+
+def test_prove_absences_refuses_a_mutation_that_is_not_valid_python(tmp_path: Path) -> None:
+    """Appending invalid Python breaks IMPORT of the target rather than reintroducing anything.
+
+    When the observable imports at module scope pytest reports a collection error (exit 2) and the
+    shipped fail-closed branch already catches it. This fixture imports INSIDE the test body, where
+    the same breakage surfaces as an ordinary test failure at exit 1 -- and was counted as a proof.
+    That difference is the whole reason the screen is static rather than left to exit codes.
+
+    Falsified by making `_screen_mutation` return True unconditionally: `proved_absences` becomes 1
+    with no problems recorded. Restored.
+    """
+    _module(tmp_path, "scanner.py", _SCANNER)
+    _obs_test(
+        tmp_path,
+        "test_scanner.py",
+        "def test_clean():\n    from scanner import scan\n\n    assert scan('x') == 'clean'\n",
+    )
+    claim = _live_claim(
+        'def scan(p) return "infected"',  # missing colon
+        "scanner.py",
+        "test_scanner.py::test_clean",
+    )
+    findings = prove_absences([claim], tmp_path)
+    assert not findings.ok
+    assert any("PROVE-ERROR" in p and "not valid Python" in p for p in findings.problems), (
+        findings.problems
+    )
+    assert findings.proved_absences == 0
+
+
+def test_the_screens_do_not_refuse_an_honest_claim(tmp_path: Path) -> None:
+    """The negative control the two tests above need. A screen that refused everything would satisfy
+    both of them while destroying the mode, and neither would notice.
+
+    A matching signature and valid Python must still prove. Falsified by making `_screen_mutation`
+    return False unconditionally: this goes RED while both refusal tests stay green.
+    """
+    _module(tmp_path, "scanner.py", _SCANNER)
+    _obs_test(tmp_path, "test_scanner.py", _OBS_TEST)
+    claim = _live_claim(
+        'def scan(p):\n    return "infected"', "scanner.py", "test_scanner.py::test_clean"
+    )
+    findings = prove_absences([claim], tmp_path)
+    assert findings.ok, findings.problems
+    assert findings.proved_absences == 1
+
+
+def test_signature_compares_names_not_only_counts() -> None:
+    """A parameter RENAME breaks every keyword call, the same wrecking-ball failure as a wrong count
+    and invisible to an arity-only comparison. Defaults are compared by COUNT, never by value: a
+    mutation legitimately changes what a default IS, which can be the entire reintroduction.
+
+    Falsified by reducing `_signature` to argument counts: the rename pair compares EQUAL and the
+    first assertion goes RED, while the default-value pair stays equal either way.
+    """
+
+    def sig(src: str) -> tuple[object, ...]:
+        fn = ast.parse(src).body[0]
+        assert isinstance(fn, ast.FunctionDef)
+        return _signature(fn.args)
+
+    assert sig("def f(path): ...") != sig("def f(p): ...")
+    assert sig("def f(a, *, b): ...") != sig("def f(a, b): ...")
+    assert sig("def f(a, timeout=1): ...") == sig("def f(a, timeout=999): ...")
+
+
+def test_prove_absences_runs_one_baseline_per_observable_and_one_tree_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two claims naming the same observable pay for ONE baseline and ONE tree copy.
+
+    The baseline is a property of the pristine tree and the node, so re-measuring it per claim spent a
+    pytest subprocess re-deriving a constant; the tree was re-copied per claim to apply a few lines and
+    then thrown away. Both are counted here rather than asserted in prose.
+
+    Falsified by reverting to a `_copy_scratch` per claim: `copies` becomes 2. Falsified separately by
+    dropping the `baselines` cache: the run count becomes 4. Each moves ONE counter, so the two
+    changes are independently pinned.
+    """
+    _module(tmp_path, "scanner.py", _SCANNER)
+    _module(tmp_path, "other.py", "def other(q):\n    return 'clean'\n")
+    _obs_test(tmp_path, "test_scanner.py", _OBS_TEST)
+
+    copies = 0
+    real_copy = scorecard_module._copy_scratch
+
+    def counting_copy(root: Path, dest: Path) -> Path:
+        nonlocal copies
+        copies += 1
+        return real_copy(root, dest)
+
+    runs: list[str] = []
+    real_run = scorecard_module._run_node
+
+    def counting_run(scratch: Path, node: str, python: str, timeout: float) -> int:
+        runs.append(node)
+        return real_run(scratch, node, python, timeout)
+
+    monkeypatch.setattr(scorecard_module, "_copy_scratch", counting_copy)
+    monkeypatch.setattr(scorecard_module, "_run_node", counting_run)
+
+    claims = [
+        _live_claim(
+            'def scan(p):\n    return "infected"', "scanner.py", "test_scanner.py::test_clean"
+        ),
+        _live_claim(
+            'def other(q):\n    return "infected"', "other.py", "test_scanner.py::test_clean"
+        ),
+    ]
+    findings = prove_absences(claims, tmp_path)
+
+    assert copies == 1, f"expected one pristine copy, saw {copies}"
+    # 1 baseline + 2 mutated runs. The second claim reuses the cached baseline.
+    assert len(runs) == 3, runs
+    assert findings.proved_absences == 1, findings.problems
+    # The SECOND claim mutates a module the observable never imports, so it is honestly UNPROVEN --
+    # and that verdict is only trustworthy if claim one's mutation was restored before it ran. This
+    # assertion is therefore the restore check: a leaked mutation would keep the observable red and
+    # claim two would come back PROVED.
+    assert any("UNPROVEN" in p for p in findings.problems), findings.problems
+
+
+def test_prove_absences_restores_the_scratch_target_between_claims(tmp_path: Path) -> None:
+    """One shared tree is only sound while it stays pristine, so the restore is asserted rather than
+    assumed. Two claims against the SAME file: the second must see the original bytes.
+
+    Falsified by deleting the `finally:` restore: claim two's baseline is taken on an already-mutated
+    tree, comes back red, and the run reports PROVE-ERROR "not green on the pristine tree" instead of
+    the expected UNPROVEN -- so this test's assertion goes RED and names exactly what leaked.
+    """
+    _module(tmp_path, "scanner.py", _SCANNER)
+    _obs_test(tmp_path, "test_scanner.py", _OBS_TEST)
+    # First mutates scanner.py and bites; second appends something inert to the same file.
+    claims = [
+        _live_claim(
+            'def scan(p):\n    return "infected"', "scanner.py", "test_scanner.py::test_clean"
+        ),
+        _live_claim("UNUSED_CONSTANT = 1", "scanner.py", "test_scanner.py::test_clean"),
+    ]
+    findings = prove_absences(claims, tmp_path)
+    assert findings.proved_absences == 1, findings.problems
+    assert any("UNPROVEN" in p for p in findings.problems), findings.problems
+    assert not any("not green on the pristine tree" in p for p in findings.problems), (
+        findings.problems
+    )
+
+
 def test_copy_scratch_excludes_secrets_store_and_vault_posture(tmp_path: Path) -> None:
     """The scratch copy the vault mutation-run reads must never carry secrets, the local store, or the
     vault posture tree -- CLAUDE.md §9 forbids this module reading them at all. `_copy_scratch` skips
@@ -2096,58 +2284,92 @@ def test_prove_absences_records_the_population_it_saw(tmp_path: Path) -> None:
 
 
 def test_prove_absences_counters_close_against_the_population(tmp_path: Path) -> None:
-    """The arithmetic that makes the summary readable, asserted rather than asserted-in-prose.
+    """The accounting identity on `Findings`, with BOTH sides computed from a real run::
 
-    FIVE outcomes raise a problem and increment no counter (an escaping `mutation_path`, one that is
-    not a file, a baseline that is not green, an UNPROVEN mutated-green, and a mutated run that
-    errored). So the closing identity is population minus the three counters, and this fixture drives
-    one claim into each of four different branches to check it holds across them.
+        checked_absences - proved_absences - static_screened - skipped_absences
+            == claims that ended in a problem-only branch
 
-    Note what is NOT asserted: that `len(problems)` equals the problem-only count. It does not, and
-    cannot -- a SUSPECT finding rides along with a claim already counted in `static_screened`, so
-    problems and claims are different populations. Asserting that equality would pin a false identity.
+    The left side is the counters. The right side is DERIVED FROM `problems` -- the set of distinct
+    cell ids that raised one -- rather than typed in as a constant, and that difference is the whole
+    point of this test. The version it replaces asserted `remainder == 1` against a hand-chosen
+    fixture: true of that fixture, silent about the identity. It is exactly why three more
+    problem-only branches could be added (the two mutation screens and the restore verification)
+    while the prose enumerating them went stale, and nothing moved.
+
+    The derivation is valid only while no claim is BOTH counted and problem-bearing -- the static
+    backstop's SUSPECT finding is precisely that shape -- so the screened claim here deliberately
+    carries no `raise`, and the assertion below pins that it stayed out of `problems`. Every cell
+    carries exactly one absence claim, so a cell id names a claim.
+
+    What is NOT asserted, and must not be: that `len(problems)` is the right-hand side. It is not,
+    for the SUSPECT reason above; asserting that equality would pin a false identity.
+
+    Falsified by giving a `_screen_mutation` refusal a counter (`static_screened += 1` beside the
+    PROVE-ERROR -- the fold this design rejected): MEASURED RED at the identity assertion, reporting
+    "counters leave 2 unaccounted for, but 3 claim(s) ended in a problem-only branch". Falsified
+    again by guarding the `checked_absences` increment on `a.mutation_path`, which undercounts the
+    population: MEASURED RED at the fixture-shape assertion below (5 != 6), and the identity would
+    have caught it a line later (remainder 2 against 3 problem-only claims) had the shape check not
+    named it first. Both injections applied to the code and removed after measuring.
     """
     _module(tmp_path, "scanner.py", _SCANNER)
     _module(tmp_path, "quiet.py", "VALUE = 1\n")
     _obs_test(tmp_path, "test_scanner.py", _OBS_TEST)
 
-    proved = _live_claim(
-        'def scan(p): return "infected"', "scanner.py", "test_scanner.py::test_clean"
+    def _cell(cell_id: str, **absence: str) -> Cell:
+        return Cell(
+            id=cell_id,
+            level=1,
+            verdict="fail",
+            absence=(Absence(pattern="x", positive_control="y", **absence),),
+        )
+
+    # Three counted outcomes, one per counter.
+    proved = _cell(
+        "1.1.1",
+        mutation='def scan(p): return "infected"',
+        mutation_path="scanner.py",
+        observable="test_scanner.py::test_clean",
     )
-    skipped = Cell(
-        id="1.1.2",
-        level=1,
-        verdict="fail",
-        absence=(Absence(pattern="x", positive_control="y", mutation="import x"),),
+    skipped = _cell("1.1.2", mutation="import x")  # no mutation_path: nothing to apply
+    screened = _cell("1.1.3", mutation="VALUE = 2", mutation_path="quiet.py")  # no `raise`
+
+    # Three of the eight problem-only branches, chosen to span the pre-existing and the new: a
+    # mutation_path that is not a file, one that escapes the tree, and a screen refusal.
+    not_a_file = _cell("1.1.4", mutation="import x", mutation_path="not_a_file.py")
+    escapes = _cell(
+        "1.1.5",
+        mutation='def scan(p): return "infected"',
+        mutation_path="../escape.py",
+        observable="test_scanner.py::test_clean",
     )
-    screened = Cell(
-        id="1.1.3",
-        level=1,
-        verdict="fail",
-        absence=(
-            Absence(
-                pattern="x", positive_control="y", mutation="VALUE = 2", mutation_path="quiet.py"
-            ),
-        ),
-    )
-    problem_only = Cell(
-        id="1.1.4",
-        level=1,
-        verdict="fail",
-        absence=(
-            Absence(
-                pattern="x",
-                positive_control="y",
-                mutation="import x",
-                mutation_path="not_a_file.py",
-            ),
-        ),
+    refused = _cell(
+        "1.1.6",
+        mutation='def scan():\n    return "infected"',  # real symbol is scan(p)
+        mutation_path="scanner.py",
+        observable="test_scanner.py::test_clean",
     )
 
-    f = prove_absences([proved, skipped, screened, problem_only], tmp_path)
-    assert f.checked_absences == 4
+    f = prove_absences([proved, skipped, screened, not_a_file, escapes, refused], tmp_path)
+
+    # Non-vacuity: the identity holds trivially over an empty population, so pin the fixture shape
+    # before asserting anything derived from it.
+    assert f.checked_absences == 6
+
+    # THE IDENTITY, asserted before the per-counter checks below so that it -- and not a narrower
+    # assertion that happens to sit earlier in the file -- is what a miscount reddens.
+    problem_claims = {p.split(":", 1)[0] for p in f.problems}
+    assert "1.1.3" not in problem_claims, (
+        "the screened claim raised a problem too, so it is counted AND problem-bearing and the "
+        f"right-hand side below is no longer derivable this way: {f.problems}"
+    )
     remainder = f.checked_absences - f.proved_absences - f.static_screened - f.skipped_absences
-    assert remainder == 1  # exactly the PROVE-ERROR claim, derived rather than counted
+    assert remainder == len(problem_claims), (
+        f"identity broken: counters leave {remainder} unaccounted for, but "
+        f"{len(problem_claims)} claim(s) ended in a problem-only branch: {sorted(problem_claims)}"
+    )
+
+    # Attribution, not the identity: which counter moved, so a break names itself.
     assert f.proved_absences == 1 and f.skipped_absences == 1 and f.static_screened == 1
 
 
