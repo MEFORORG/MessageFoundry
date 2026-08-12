@@ -487,13 +487,42 @@ def test_hostile_frames_fail_closed(case: str, body: bytes) -> None:
     assert EXECUTED == []
 
 
-def test_recursion_error_is_not_a_value_error() -> None:
+def test_recursion_error_is_not_a_value_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pins the reason ``decode_frame`` catches ``RecursionError`` explicitly: it is a ``RuntimeError``,
     so a ``except ValueError`` would have let a deep-nesting rejection escape the fail-closed contract
-    exactly as the old bare ``KeyError`` did."""
+    exactly as the old bare ``KeyError`` did.
+
+    THE TRIGGER IS A RAISED ``RecursionError``, NOT REAL RECURSION (BACKLOG #1222). Manufacturing one by
+    parsing ``"[" * 100000`` measured the RUNNER as much as the code: json's C accelerator consumes the
+    C stack, which no Python-level knob reaches -- ``sys.getrecursionlimit()`` is 1000 while
+    ``json.loads`` gets to ~16,900, so ``sys.setrecursionlimit`` cannot move it either. Measured: first
+    raise at depth 16,913 on one box and NO raise at 100,000 on a CI runner, a 6x spread on identical
+    bytes. That reddened ``main`` and two unrelated pull requests, on a file byte-identical to the one
+    that had passed hours earlier.
+
+    Do NOT "fix" a future recurrence by raising the depth: that buys a green on today's runner image,
+    re-fires on the next roll, and makes the test MORE environment-coupled rather than less. What the
+    contract needs is the type relationship and the handler, and neither needs a real stack overflow.
+    """
+    # (1) the type facts the handler's except-tuple depends on. Environment-independent.
     assert not issubclass(RecursionError, ValueError)
-    with pytest.raises(RecursionError):
-        json.loads(_deep_json(100000))
+    assert issubclass(RecursionError, RuntimeError)
+
+    # (2) drive the handler itself: a RecursionError out of the header parse must be converted into the
+    # fail-closed SandboxCodecError. Narrowing that tuple to ValueError lets it escape, which is exactly
+    # what this pins -- so this arm reds if the RecursionError is dropped from decode_frame.
+    frame = encode_frame({"v": 1, "t": "ready"}, ())
+
+    class _RecursingJson:
+        """Stands in for the codec's ``json`` only for ``loads``; ``dumps`` is untouched and unused here."""
+
+        @staticmethod
+        def loads(*_args: object, **_kwargs: object) -> object:
+            raise RecursionError("simulated deep nesting")
+
+    monkeypatch.setattr(codec, "json", _RecursingJson)
+    with pytest.raises(SandboxCodecError, match="RecursionError"):
+        decode_frame(frame)
 
 
 # --- (5) the value grammar round-trips exactly -------------------------------

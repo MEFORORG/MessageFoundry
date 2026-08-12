@@ -67,6 +67,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.transports.base import (
     DeliveryError,
     DestinationConnector,
+    DestinationStartupError,
     InboundHandler,
     NegativeAckError,
     SourceConnector,
@@ -147,8 +148,11 @@ class _RemoteClient(abc.ABC):
         """Delete the file at ``path``."""
 
     @abc.abstractmethod
-    def ensure_dir(self, remote_dir: str) -> None:
-        """Best-effort create ``remote_dir`` (ignore "already exists")."""
+    def ensure_dir(self, remote_dir: str) -> bool:
+        """Best-effort create ``remote_dir`` (ignore "already exists"). Returns **True only when THIS
+        call created it** (#114) — the destination logs that, so a delivery landing in a directory the
+        engine just invented is distinguishable from a normal one. A best-effort failure (no permission,
+        a racing creator) returns False: nothing was created here."""
 
 
 def _ftps_ssl_context(
@@ -304,14 +308,17 @@ class _FtpClient(_RemoteClient):
     def remove(self, path: str) -> None:
         self._op(lambda ftp: ftp.delete(path))
 
-    def ensure_dir(self, remote_dir: str) -> None:
-        def run(ftp: ftplib.FTP) -> None:
-            try:  # noqa: SIM105
+    def ensure_dir(self, remote_dir: str) -> bool:
+        def run(ftp: ftplib.FTP) -> bool:
+            try:
                 ftp.mkd(remote_dir)
             except ftplib.error_perm:
-                pass  # already exists (or no permission) — best-effort, like File's mkdir(exist_ok)
+                # already exists (or no permission) — best-effort, like File's mkdir(exist_ok); either
+                # way THIS call did not create it, so the caller must not report a creation.
+                return False
+            return True
 
-        self._op(run)
+        return self._op(run)
 
     def _op(self, fn: Callable[[ftplib.FTP], _T]) -> _T:
         """Connect, run ``fn(ftp)``, always close. Maps ``ftplib`` failures to :class:`_RemoteError`:
@@ -450,17 +457,19 @@ class _SftpClient(_RemoteClient):
     def remove(self, path: str) -> None:
         self._op(lambda sftp: sftp.remove(path))
 
-    def ensure_dir(self, remote_dir: str) -> None:
-        def run(sftp: Any) -> None:
+    def ensure_dir(self, remote_dir: str) -> bool:
+        def run(sftp: Any) -> bool:
             try:
                 sftp.stat(remote_dir)
             except FileNotFoundError:
-                try:  # noqa: SIM105
+                try:
                     sftp.mkdir(remote_dir)
                 except OSError:
-                    pass  # racing creator / no permission — best-effort
+                    return False  # racing creator / no permission — best-effort
+                return True
+            return False  # already there — nothing created
 
-        self._op(run)
+        return self._op(run)
 
     def _op(self, fn: Callable[[Any], _T]) -> _T:
         """Connect, open an SFTP channel, run ``fn(sftp)``, always close. Maps a host-key rejection
@@ -631,6 +640,10 @@ class RemoteFileDestination(DestinationConnector):
         self._filename_template = str(s.get("filename", "{MSH-10}.hl7"))
         self._overwrite = bool(s.get("overwrite", False))
         self._encoding: str = s.get("encoding", "utf-8")
+        # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
+        # run-time deferral (ensure_dir creates the upload dir on the first send). When on, remote_dir
+        # must be listable at start AND _upload never creates it.
+        self._validate_directory: bool = bool(s.get("validate_directory", False))
 
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
@@ -651,10 +664,60 @@ class RemoteFileDestination(DestinationConnector):
                 ) from exc
             raise DeliveryError(str(exc)) from exc
 
+    async def validate_startup(self) -> None:
+        """Opt-in at-start directory validation (#114) — the outbound mirror of
+        :meth:`RemoteFileSource.validate_startup`. No-op unless ``validate_directory`` is set; then
+        ``remote_dir`` must be reachable and listable now. A listing is the only **no-create** probe
+        this client contract has (``ensure_dir`` creates, which is exactly what must not happen here),
+        so a no-such-dir / connect / auth failure raises :class:`DestinationStartupError` and the runner
+        isolates the lane as ADR-0031 ``failed``. Listing proves reachability and existence, not
+        writability — a share that lists but refuses a write still fails at the first delivery, where it
+        is retried and never dropped."""
+        if not self._validate_directory:
+            return
+        try:
+            await asyncio.to_thread(self._client.list_dir, self._remote_dir)
+        except _RemoteError as exc:
+            raise DestinationStartupError(
+                f"REMOTEFILE destination directory {_redact(self._host, self._remote_dir)} failed "
+                f"startup validation: {exc}"
+            ) from exc
+
+    def _prepare_remote_dir(self) -> None:
+        """Make ``remote_dir`` usable for this upload — and make a CREATION observable (#114).
+
+        Default (``validate_directory`` off): the unchanged ``ensure_dir`` create-if-missing, except
+        that a directory this call actually created now logs a WARNING. That silence is the defect: a
+        typo'd ``remote_dir`` would otherwise be created on the partner's server and every message
+        counted and logged as delivered — because it was — into a path nobody is watching.
+
+        ``validate_directory`` on: never create. The directory was validated at start, so a LIST is the
+        pre-flight check and its failure is re-raised as **transient**, which ``send`` maps to a
+        retryable :class:`DeliveryError`. The reclassification is the point: an SFTP/FTP no-such-dir is
+        a **permanent** error, so letting the upload fail on its own would dead-letter live traffic over
+        a share that is merely unmounted. It costs one extra round trip per delivery, on the opt-in
+        path only."""
+        if self._validate_directory:
+            try:
+                self._client.list_dir(self._remote_dir)
+            except _RemoteError as exc:
+                raise _RemoteError(
+                    f"REMOTEFILE upload directory {_redact(self._host, self._remote_dir)} is not "
+                    f"available, and validate_directory is on so it is never created on send: {exc}",
+                    permanent=False,
+                ) from exc
+            return
+        if self._client.ensure_dir(self._remote_dir):
+            logger.warning(
+                "REMOTEFILE destination CREATED missing directory %s — this delivery is landing in a "
+                "directory the engine just made; verify the configured remote_dir is the intended one",
+                _redact(self._host, self._remote_dir),
+            )
+
     def _upload(self, payload: str) -> None:
         name = render_filename(self._filename_template, payload, fallback="message.hl7")
         data = payload.encode(self._encoding)
-        self._client.ensure_dir(self._remote_dir)
+        self._prepare_remote_dir()
         final = posixpath.join(self._remote_dir, name)
         if not self._overwrite:
             final = self._unique(final)
@@ -693,9 +756,14 @@ class RemoteFileDestination(DestinationConnector):
 
     async def test_connection(self) -> None:
         # Connect + authenticate + ensure the upload dir (the destination's normal first step) — no
-        # message data written. A failure is mapped like send()'s.
+        # message data written. A failure is mapped like send()'s. Under validate_directory the probe
+        # LISTS instead of ensuring: "never invent this path" has to hold for the on-demand probe too,
+        # or POST /connections/{name}/test would silently repair the typo the toggle exists to catch.
         try:
-            await asyncio.to_thread(self._client.ensure_dir, self._remote_dir)
+            if self._validate_directory:
+                await asyncio.to_thread(self._client.list_dir, self._remote_dir)
+            else:
+                await asyncio.to_thread(self._client.ensure_dir, self._remote_dir)
         except _RemoteError as exc:
             if exc.permanent:
                 raise NegativeAckError(
