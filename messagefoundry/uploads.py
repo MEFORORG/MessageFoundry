@@ -117,9 +117,15 @@ class UploadedFileMeta:
     identifier (``Identity.user_id``, a ``uuid4`` hex minted once per account row) and is the ONLY
     value ownership and the per-uploader quota key on. ``uploader`` is the username, which is a
     **display label**: it is unique among live accounts but it is *reusable* — deleting an account
-    frees the name, and recreating it (or an AD auto-provision under the same
-    ``sAMAccountName``) mints a different ``user_id``. Keying either the ownership check or the
-    budget on the name would hand a recycled account the departed operator's files."""
+    frees the name, and recreating it mints a different ``user_id``. Keying either the ownership
+    check or the budget on the name would hand a recycled account the departed operator's files.
+
+    **The id is immutable per ROW, which is not the same as per PERSON on AD.** ``_upsert_ad_user``
+    resolves by ``sAMAccountName`` and mints a new ``user_id`` only when no mirror row survives, so a
+    directory-side rename/recycle WITHOUT a MessageFoundry ``delete_user`` re-binds the EXISTING id
+    to the new principal. A deploying site on AD would need the directory-immutable binding tracked
+    as BACKLOG #1143 for that case; this field closes the local-account path and the AD path that
+    goes through a delete."""
 
     file_id: str
     filename: str

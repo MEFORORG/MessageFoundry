@@ -458,11 +458,20 @@ tuple: they act only on the caller's own account.
 > **Object-level authorization for uploaded files (ASVS 8.2.2).** An uploaded file belongs to the
 > **account** that uploaded it — `UploadedFileMeta.uploader_id`, which is `Identity.user_id` (an
 > immutable `uuid4` hex), and *not* the username. A username is unique among live accounts but it is
-> reusable: deleting a user frees the name and recreating it mints a different `user_id` (the AD leg
-> auto-provisions on the same `sAMAccountName` with no admin action), so a name-keyed rule would hand
-> the recycled account the departed operator's files. `UploadedFileMeta.uploader` is retained as the
-> **display/audit label** only. The per-uploader quota (ASVS 5.2.4) bills the same `uploader_id`, so
-> ownership and the budget can never disagree about who a file belongs to.
+> reusable: deleting a user frees the name and recreating it mints a different `user_id`, so a
+> name-keyed rule would hand the recycled account the departed operator's files.
+> `UploadedFileMeta.uploader` is retained as the **display/audit label** only. The per-uploader quota
+> (ASVS 5.2.4) bills the same `uploader_id`, so ownership and the budget can never disagree about who
+> a file belongs to.
+>
+> **Bound, and stated because the bound is the load-bearing part.** This closes local accounts and any
+> AD account that goes through a MessageFoundry `delete_user`. It does **not** close a
+> `sAMAccountName` recycled in the directory *without* one: `_upsert_ad_user` resolves by username and
+> mints a new `user_id` only when no mirror row survives, so on the default AD path the surviving row
+> is adopted and **its `user_id` is re-bound to the new principal**. A deploying site on AD would
+> therefore still need the directory-immutable binding — AD to `objectGUID`/`objectSid`, the way OIDC
+> binds `(issuer, sub)` — tracked as BACKLOG #1143. `AdPrincipal` carries no such identifier today, so
+> `user_id` is the strongest key currently available, not a complete one.
 >
 > **Owner-only** is the whole rule: list, browse, resend and delete reach the caller's own files.
 > `files:access_any` is the explicit cross-operator override, granted to **Administrator** only (it is

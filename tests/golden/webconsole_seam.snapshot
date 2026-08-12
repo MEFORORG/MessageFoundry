@@ -5,7 +5,7 @@
 # This is a GOLDEN gate: any diff means the seam contract changed - see the test's failure hint.
 
 ## ENGINE_UI_SEAM
-18
+20
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam

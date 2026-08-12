@@ -3704,11 +3704,20 @@ def create_app(
 
         The owner key is ``Identity.user_id`` — the account's immutable ``uuid4`` hex — and NOT the
         username. A username is unique among live accounts but reusable: deleting a user frees the
-        name, and recreating it (or an AD auto-provision under the same ``sAMAccountName``) mints a
-        NEW ``user_id``, so a name comparison would hand the recycled account the departed operator's
-        uploaded PHI with no admin action. The exact same value keys the per-uploader quota
+        name, and recreating it mints a NEW ``user_id``, so a name comparison would hand the recycled
+        account the departed operator's uploaded PHI. The exact same value keys the per-uploader quota
         (``uploads.py`` ``save()``), so ownership and the budget can never disagree about who a file
         belongs to — a recycled account is neither billed for nor able to read the old files.
+
+        **WHAT THIS DOES NOT REACH, and it is the primary enterprise path.** ``_upsert_ad_user``
+        (``auth/service.py``) resolves an AD principal by ``sAMAccountName`` and mints a fresh
+        ``user_id`` ONLY when no mirror row survives — i.e. only after a MessageFoundry
+        ``delete_user``. On the DEFAULT path the surviving row is adopted and **its ``user_id`` is
+        re-bound**, so a deploying site that recycles a ``sAMAccountName`` in the directory without
+        also deleting the MessageFoundry user would give the new person the old person's id, and this
+        check would match. No better key exists here: ``AdPrincipal`` carries no ``objectGUID`` or
+        ``objectSid``. Closing it means binding AD to a directory-immutable id the way OIDC binds
+        ``(issuer, sub)`` — tracked as BACKLOG #1143, not solvable inside this function.
 
         The channel axis is deliberately NOT used: ``Identity.allowed_channels`` defaults to ``None``
         (= every channel) and an uploaded file carries no channel at all, so a channel-scoped rule

@@ -688,11 +688,17 @@ async def test_a_recreated_username_cannot_reach_the_departed_operators_upload(
     """ASVS 8.2.2: ownership keys on the IMMUTABLE account id, never on the username.
 
     A username is unique among live accounts but it is reusable: ``delete_user`` frees it and
-    ``create_local_user`` takes it back, minting a DIFFERENT ``user_id``. (The AD leg is worse — the
-    upsert resolves by username and auto-provisions the new row with no admin action at all.) Keying
-    on the name would hand that new principal — which holds no ``files:access_any`` — the departed
-    operator's uploaded PHI: 200 on the listing, 200 on the decrypting browse, 200 on delete, and no
-    ``upload.denied`` row, because the engine would consider it the owner. Synthetic HL7 only.
+    ``create_local_user`` takes it back, minting a DIFFERENT ``user_id``. Keying on the name would
+    hand that new principal — which holds no ``files:access_any`` — the departed operator's uploaded
+    PHI: 200 on the listing, 200 on the decrypting browse, 200 on delete, and no ``upload.denied``
+    row, because the engine would consider it the owner. Synthetic HL7 only.
+
+    SCOPE OF THIS TEST, stated so a green is not over-read. It pins the LOCAL delete-and-recreate
+    path, where a new ``user_id`` is genuinely minted. ``_upsert_ad_user`` mints one only when NO
+    mirror row survives — i.e. also only after a delete — so on the DEFAULT AD path (a
+    ``sAMAccountName`` recycled in the directory with the MessageFoundry row left in place) the
+    existing row is adopted and its ``user_id`` is RE-BOUND. That case is NOT covered here and is not
+    closeable by this key; it needs the directory-immutable binding tracked as BACKLOG #1143.
     """
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
