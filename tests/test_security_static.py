@@ -1013,6 +1013,9 @@ def test_xml_import_scanner_sees_indented_imports() -> None:
 _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     # ADR 0156: SHA-256 over the ASVS corpus FILE to pin it to the tagged release. No key.
     "scripts/asvs/scorecard.py": frozenset({"hashlib"}),
+    # ADR 0156: SHA-256 over the ASVS SCORECARD file, printed truncated so a --prove-absences run
+    # states which revision of the record it read. No key.
+    "scripts/asvs/prove_report.py": frozenset({"hashlib"}),
     "messagefoundry_webconsole/_security.py": frozenset({"secrets"}),
     "tee/__main__.py": frozenset({"ssl"}),
     "tee/anon/keying.py": frozenset({"hashlib"}),
@@ -1020,6 +1023,10 @@ _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     # ADR 0155: the DAST scan target mints a throwaway per-run password for the two ephemeral scan
     # identities it provisions into a temp-directory store it destroys with the run.
     "scripts/security/dast_target.py": frozenset({"secrets"}),
+    # BACKLOG #1220: SHA-256 over the discovered engine/console seam surface, giving ENGINE_UI_SEAM an
+    # identity nobody picks by hand. A change detector over public type signatures and field names --
+    # no key, no secret, nothing user- or PHI-derived.
+    "scripts/webconsole_seam_snapshot.py": frozenset({"hashlib"}),
 }
 
 

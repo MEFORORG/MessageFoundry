@@ -15,16 +15,33 @@ from __future__ import annotations
 
 import difflib
 import importlib.util
+import sys
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO_ROOT / "scripts" / "webconsole_seam_snapshot.py"
 _GOLDEN = _REPO_ROOT / "tests" / "golden" / "webconsole_seam.snapshot"
 
+# Pure ASCII, deliberately. The previous text carried U+2014, which renders as a replacement
+# character on a cp1252 console -- the developer-facing half of BACKLOG #1221. It also said "bump
+# ENGINE_UI_SEAM", which is no longer a thing anyone does: the seam is DERIVED (#1220), so the
+# remediation is to regenerate it, and a message naming an action that no longer exists is how a
+# gate teaches the wrong repair.
 _FAILURE_HINT = (
-    "the webconsole seam contract changed — bump ENGINE_UI_SEAM in api/_ui_seam.py AND "
-    "messagefoundry_webconsole.SUPPORTED_ENGINE_SEAMS, then refresh "
-    "tests/golden/webconsole_seam.snapshot via scripts/webconsole_seam_snapshot.py."
+    "webconsole seam drift: the engine/console contract changed but ENGINE_UI_SEAM did not.\n"
+    "\n"
+    "If the change is INTENTIONAL, do BOTH of these in the SAME commit:\n"
+    "  1. python scripts/webconsole_seam_snapshot.py --write\n"
+    "       (rewrites ENGINE_UI_SEAM in messagefoundry/api/_ui_seam.py and refreshes\n"
+    "        tests/golden/webconsole_seam.snapshot)\n"
+    "  2. set the console's accepted seam to the SAME value, BY HAND:\n"
+    "       messagefoundry_webconsole/__init__.py\n"
+    '         SUPPORTED_ENGINE_SEAMS: frozenset[str] = frozenset({"<the new value>"})\n'
+    "     The console is a separately built wheel holding exactly ONE seam (BACKLOG #279), so a\n"
+    "     forgotten update is not a warning: a deploying site gets a hard startup refusal.\n"
+    "\n"
+    "If you did NOT intend a contract change, this gate is doing its job. Fix the change.\n"
+    "Never hand-edit the constant to silence it."
 )
 
 
@@ -76,15 +93,102 @@ def test_console_supports_exactly_the_engine_seam() -> None:
     )
 
 
-def test_assert_engine_seam_refuses_a_neighbouring_seam() -> None:
-    """The gate must reject an engine one seam older AND one newer — the older direction is what the
-    old {2..N} range silently accepted without ever testing it."""
+def test_assert_engine_seam_refuses_any_other_seam() -> None:
+    """The gate must reject ANY seam that is not this engine's.
+
+    This replaces a ``ENGINE_UI_SEAM +/- 1`` test that could not survive #1220: the seam is a digest
+    now, so "one older" and "one newer" do not exist. That test is the reason the constant is a
+    ``str`` rather than a truncated integer -- under an int digest ``ENGINE_UI_SEAM - 1`` would still
+    evaluate, the assertion would still PASS, and its own docstring ("one seam older AND one newer")
+    would have quietly become false. A passing test making a claim the value no longer supports is
+    the same defect class #1220 was filed against.
+
+    The intent BACKLOG #279 put in the original survives: exactly one seam is accepted, and every
+    other value is refused in both directions of the handshake."""
     import pytest
 
     from messagefoundry.api._ui_seam import ENGINE_UI_SEAM
     from messagefoundry_webconsole import UiSeamMismatch, assert_engine_seam
 
     assert_engine_seam(ENGINE_UI_SEAM)  # the matching engine mounts
-    for skew in (ENGINE_UI_SEAM - 1, ENGINE_UI_SEAM + 1):
+
+    truncated = ENGINE_UI_SEAM[:-1]
+    for skew in ("", "0", truncated, ENGINE_UI_SEAM + "0", "f" * len(ENGINE_UI_SEAM)):
         with pytest.raises(UiSeamMismatch):
             assert_engine_seam(skew)
+
+
+def test_the_stored_seam_equals_the_derived_digest() -> None:
+    """THE GATE. ``ENGINE_UI_SEAM`` is a digest of the discovered contract surface, so a contract
+    change that forgets the constant fails here.
+
+    This is what removes the hand-chosen number: two branches changing different parts of the surface
+    derive different values, and their MERGED surface derives a third matching neither, so the merge
+    reds instead of auto-merging clean under one seam (BACKLOG #1220)."""
+    from messagefoundry.api._ui_seam import ENGINE_UI_SEAM
+
+    spec = importlib.util.spec_from_file_location("_seam_gen_gate", _SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["_seam_gen_gate"] = module
+    spec.loader.exec_module(module)
+
+    assert module.contract_digest() == ENGINE_UI_SEAM, _FAILURE_HINT
+
+
+def test_the_digest_does_not_depend_on_the_seam_it_produces() -> None:
+    """ANTI-CIRCULARITY. The seam must not feed its own digest, or the gate is vacuous.
+
+    Asserted by MOVING the constant and requiring the digest to hold still -- not by checking that
+    the seam's text is absent from the digest input. A substring check would be defeated by a short
+    or coincidental value (the snapshot header already contains the literal ``0065``), which is
+    exactly the kind of check that looks like proof and is not."""
+    import messagefoundry.api._ui_seam as seam_module
+
+    spec = importlib.util.spec_from_file_location("_seam_gen_circ", _SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["_seam_gen_circ"] = module
+    spec.loader.exec_module(module)
+
+    before = module.contract_digest()
+    original = seam_module.ENGINE_UI_SEAM
+    try:
+        seam_module.ENGINE_UI_SEAM = "deadbeefdeadbeef"  # type: ignore[misc]
+        module.ENGINE_UI_SEAM = "deadbeefdeadbeef"
+        assert module.contract_digest() == before
+    finally:
+        seam_module.ENGINE_UI_SEAM = original  # type: ignore[misc]
+        module.ENGINE_UI_SEAM = original
+
+
+def test_the_digest_moves_when_a_rendered_dto_gains_a_field() -> None:
+    """MADE TO FAIL ON PURPOSE. The gate is evidence only if it can see the class of change it
+    exists to catch.
+
+    The historical control is commit 40a4d5d9: it added a REQUIRED ``scope`` field to
+    ``UploadedFileList``, which the console renders unconditionally, and the seam did NOT move.
+    Adding a field must move the digest now."""
+    from pydantic import create_model
+
+    from messagefoundry.api import models
+
+    spec = importlib.util.spec_from_file_location("_seam_gen_mutate", _SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["_seam_gen_mutate"] = module
+    spec.loader.exec_module(module)
+
+    before = module.contract_digest()
+    original = models.UploadedFileList
+    try:
+        models.UploadedFileList = create_model(  # type: ignore[misc]
+            "UploadedFileList",
+            __base__=original,
+            proof_field=(str, "x"),
+        )
+        assert module.contract_digest() != before
+    finally:
+        models.UploadedFileList = original  # type: ignore[misc]
+
+    assert module.contract_digest() == before  # and it restores exactly

@@ -63,8 +63,15 @@ _NOT_KEY_MATERIAL: dict[str, str] = {
     "WebAuthn credentials": "COSE PUBLIC keys supplied by the authenticator; the engine holds no "
     "private half and the row already says they are verification material, not a secret",
     "Config fingerprint": "a keyless content hash for change attribution",
+    "Engine/console seam identity": "a keyless content hash over PUBLIC type signatures, field "
+    "names, enum members and Literal values -- a change detector for the engine/console handshake "
+    "(BACKLOG #1220), not a key, a secret, or a message authenticator. Nothing user- or PHI-derived "
+    "is hashed, and the digest is committed in source on both sides of the seam",
     "ASVS corpus pin": "a keyless content hash over a build input (the OWASP ASVS corpus file), "
     "not a key, a secret, or a message authenticator",
+    "ASVS scorecard revision identifier": "a keyless content hash over the scorecard file, printed "
+    "truncated so a --prove-absences run states which revision of the record it read; not a key, a "
+    "secret, or a message authenticator, and unlike the corpus pin above nothing is gated on it",
     "Engine wheel attestation": "a keyless digest over the installed distribution, verified against "
     "a recorded value; no key is involved on either side",
     "AD transport": "a TLS hop whose key material is the OS/directory trust store, not engine-held",

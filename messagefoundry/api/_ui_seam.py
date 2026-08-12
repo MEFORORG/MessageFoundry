@@ -24,10 +24,27 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-#: The contract version the engine ships. Bump on ANY incompatible change to the injected surface
-#: (a CoreHandlers/AdminHandlers field, a rendered DTO field set, the app.state attributes the
-#: console reads, the ``api.security`` deps it imports directly, or the ``/ws`` push shape). The
-#: console declares ``SUPPORTED_ENGINE_SEAMS`` and refuses a skew at startup (``assert_engine_seam``).
+#: The contract identity the engine ships: a 16-hex-character SHA-256 DIGEST of the discovered seam
+#: surface, produced by ``scripts/webconsole_seam_snapshot.py --write``. The console declares
+#: ``SUPPORTED_ENGINE_SEAMS`` and refuses a skew at startup (``assert_engine_seam``).
+#:
+#: **NOBODY CHOOSES THIS VALUE, AND IT IS NOT ORDERED.** It was a hand-picked incrementing integer
+#: until BACKLOG #1220, which is the defect the two entries below record: two unlanded branches both
+#: bumped to 19 for two independent contract changes, git raised a COSMETIC conflict in this comment
+#: block, and the golden snapshot AUTO-MERGED CLEAN carrying both changes under one seam. Resolving
+#: the visible conflict correctly still shipped the fault. A digest cannot collide that way -- two
+#: branches changing different surfaces derive different values, and their MERGED surface derives a
+#: third that matches neither, so the merge reds.
+#:
+#: It is a ``str`` rather than a truncated integer on purpose. An integer seam stays hand-typable
+#: (someone can write ``21`` and it looks legitimate) and lets ordering assumptions survive silently:
+#: the skew test used to assert ``ENGINE_UI_SEAM - 1`` is refused, which under an int digest would
+#: keep PASSING while its own docstring became false. Nobody types a hex digest by hand and believes
+#: it, and the type change makes every arithmetic site fail loudly instead.
+#:
+#: The history below is kept because it is what made #1220 visible, and because "why did the contract
+#: change" is a question a digest cannot answer. The ``vN`` labels are RETIRED as identifiers -- they
+#: no longer name the shipped value, they date the change.
 #: seam v4: MessageDetail gained the additive `attachments` list + a `download_attachment` handler
 #: (the streaming-attachment operator read surface, BACKLOG #149 / ADR 0105 Phase 3b).
 #: seam v5: SecurityPosture gained the additive report-only `fips_mode` + `openssl_version` fields
@@ -100,14 +117,18 @@ from typing import Any
 #: with a default: a console carrying that render against an engine without the field would pass the
 #: handshake and then AttributeError, which is exactly the skew this constant exists to refuse.
 #:
-#: **v19 IS DELIBERATELY SKIPPED, and the reason is a defect rather than an accident.** Two unlanded
+#: **v19 WAS DELIBERATELY SKIPPED, and the reason was a defect rather than an accident.** Two unlanded
 #: branches — ``w3-log-write-failure`` (``SystemStatus.log_sinks``, #122) and
-#: ``w3-store-privilege-preflight`` (``SecurityPosture.store_privilege``, #1008) — BOTH already bump to
-#: 19, for two independent contract changes. That collision is BACKLOG #1220. Main is still 18, so 19
-#: merely looks free; taking it would have made a third claimant on one number. A seam value needs
-#: uniqueness and monotonicity, not density, so skipping to 20 costs nothing and leaves 19 to whichever
-#: of those two lands first. See #1220 for the derived-hash fix that removes hand-chosen numbers.
-ENGINE_UI_SEAM: int = 20
+#: ``w3-store-privilege-preflight`` (``SecurityPosture.store_privilege``, #1008) — BOTH bumped to 19,
+#: for two independent contract changes. Skipping to 20 bought room but fixed nothing: the next pair
+#: of branches would collide identically. BACKLOG #1220 removed the hand-chosen number entirely.
+#:
+#: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
+#: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
+#: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
+#: unconditionally while touching no seam file at all. Regenerate with
+#: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
+ENGINE_UI_SEAM: str = "494a51230dce5730"
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,7 +251,7 @@ class UiDeps:
     scope even so (a re-signature there is seam-bumping).
     """
 
-    engine_seam: int
+    engine_seam: str
     get_engine: Callable[..., Any]
     get_gate: Callable[..., Any]
     cookie_secure: Callable[..., Any]

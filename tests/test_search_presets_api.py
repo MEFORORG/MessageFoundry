@@ -187,3 +187,77 @@ async def test_layered_requires_read_permission(engine: Engine) -> None:
                 "/search/presets", json={"name": "x", "criteria": {"content": "y"}}, headers=h
             )
         ).status_code == 403
+
+
+async def test_a_recreated_username_does_not_inherit_the_departed_operators_presets(
+    engine: Engine,
+) -> None:
+    """BACKLOG #1225: preset ownership binds to the immutable ``Identity.user_id``.
+
+    The existing owner-scoping test compares two operators who are BOTH live, and it passes on the
+    defective code -- so it was never evidence about this. The defect needs an account to go away and
+    its name to come back, and the enabling half is that ``delete_user`` deletes user_roles, sessions
+    and webauthn_credentials but NEVER preset rows, so a departed operator's presets outlive the
+    account under a name that is now free to reissue.
+
+    Copies the uploads model (#1152), which abandoned username-keying for exactly this reason.
+    """
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _user(engine, Role.OPERATOR, "alice")
+    app = create_app(engine, auth=service)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "alice")
+        created = await c.post(
+            "/search/presets",
+            json={"name": "mine", "criteria": {"content": "MRN999", "target": "raw"}},
+            headers=h,
+        )
+        assert created.status_code == 200, created.text
+        pid = created.json()["id"]
+        assert [
+            p["name"] for p in (await c.get("/search/presets", headers=h)).json()["presets"]
+        ] == ["mine"]
+
+        # alice leaves. Her preset row survives the account -- that is the enabling half.
+        alice = await service.store.get_user_by_username("alice")
+        assert alice is not None
+        await service.store.delete_user(alice.id)
+        # Key-AGNOSTIC on purpose: the point of the precondition is that the ROW outlives the
+        # account, whichever column value it was written under. Asserting it by user_id would make a
+        # username-keyed build fail HERE, masking the substantive assertion below -- the test would
+        # go red for the wrong reason and prove nothing about who can read the preset.
+        survived = await engine.store.list_search_presets(
+            alice.id
+        ) or await engine.store.list_search_presets("alice")
+        assert survived, (
+            "precondition: delete_user does not purge preset rows, which is why the KEY has to be "
+            "the one thing that cannot be reissued"
+        )
+
+        # A NEW person is given the freed username.
+        new_id = await service.create_local_user(
+            username="alice",
+            password=PW,
+            display_name=None,
+            email=None,
+            roles=[Role.OPERATOR.value],
+            actor="t",
+        )
+        fresh = await service.store.get_user(new_id)
+        assert fresh is not None and fresh.password_hash is not None
+        await service.store.set_password(
+            new_id, password_hash=fresh.password_hash, must_change_password=False
+        )
+        assert new_id != alice.id, "same name, different principal -- that is the whole point"
+
+        h2 = await _login(c, "alice")
+        assert (await c.get("/search/presets", headers=h2)).json()["presets"] == [], (
+            "the recycled account must not inherit the departed operator's saved searches"
+        )
+        assert (await c.delete(f"/search/presets/{pid}", headers=h2)).status_code == 404
+        # ...and the layered compose, which is the route that returns the PHI-shaped criteria.
+        layered = await c.get("/search/layered", params={"presets": pid}, headers=h2)
+        assert layered.status_code == 404, layered.text

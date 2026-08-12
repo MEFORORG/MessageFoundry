@@ -129,6 +129,11 @@ MIRRORED_TOOLS = (
     # This one has NO engine-side subject at all -- the record it reads exists only in the vault --
     # so this list is the only thing standing between it and a dependency nothing here would notice.
     "scripts/docs/asvs_residual_lint.py",
+    # The CI wrapper around `--prove-absences`. docs/CI.md states it "ships here and is mirrored into
+    # the vault, on the same footing as scorecard.py"; this entry is what makes that a checked claim
+    # rather than a sentence. It passes today because the module is stdlib-only, which is exactly the
+    # moment the comment above says to add it -- BEFORE it acquires a dependency.
+    "scripts/asvs/prove_report.py",
 )
 
 
