@@ -7473,6 +7473,172 @@ filing.
 
 **Source:** filed 2026-08-08 from the ASVS ledger-coverage sweep of the partial and fail cells that carried no backlog item at all; this cell was one of them. The scorecard is the record of record for the verdict; this item tracks the research toward changing it.
 
+## 1202. the vault ASVS gate runs a verifier this repo owns, on a bare interpreter, and nothing here checked it would run
+
+> 🔢 **Filed 2026-08-09 - FIXED in the same change. Proved by injecting four contract violations into `scripts/asvs/scorecard.py` and confirming each landed before believing the red.** Value **6/10** · Difficulty **2/10**. The ASVS gate lives in the vault and measures THIS tree. Two of its three claims about this tree need no private data -- that `scripts/asvs/scorecard.py` exists at that literal path, and that it runs as a bare script on stdlib alone -- and neither repo checked either of them.
+
+**Cluster:** CI correctness / gate blindness. **Priority:** P2. **Verdict:** build (done).
+**Severity:** no product effect and no PHI effect. The cost is that the ASVS record would go on being
+verified by a stale instrument while every check stayed green.
+
+**The shape.** The vault executes the verifier twice, and neither job installs anything:
+`asvs-scorecard.yml` runs `python scripts/asvs/scorecard.py` after a bare `actions/setup-python`, and
+`asvs-verifier-drift.yml`'s `preflight` job runs the INCOMING engine copy as
+`python ../engine/scripts/asvs/scorecard.py` from the vault checkout -- so `sys.path[0]` is
+`scripts/asvs`, not either repo root. `asvs-scorecard.yml` states the invariant in as many words:
+"No install step and no dependency: the verifier is stdlib-only (tomllib, json, re) precisely so this
+job cannot rot on a lockfile it does not own." **Asserted in a comment, enforced nowhere** -- which is
+the compensating-control-on-a-false-premise defect Secure_Development_Standards SDS-3.7 names.
+
+**Why this repo's own tests could not see it.** `tests/test_asvs_scorecard.py` imports the module --
+`from scripts.asvs.scorecard import ...` -- inside a pytest session with the repo root on `sys.path`
+and the project's full extras installed. That is a different import context from the one the vault
+uses, so the invocation that actually matters was never exercised here.
+
+**Measured.** With a USED `import httpx` appended to `scripts/asvs/scorecard.py` (httpx is a real
+engine dependency, so this is not dead code a linter rejects anyway), every pre-existing gate returned
+a verdict IDENTICAL to its unmutated verdict: `ruff check .` PASS -> PASS, `ruff format --check .`
+unchanged, `mypy` unchanged (it types `messagefoundry` and `messagefoundry_webconsole`, not
+`scripts/`), and `tests/test_asvs_scorecard.py` 54 tests PASS -> PASS. `python -I -S -c "import httpx"`
+returns 1, confirming the mutation models the vault runner and not a lint opinion.
+
+**What breaking it would cost, stated exactly.** Not a red gate. The mirror job opens its pull request
+as a DRAFT when the incoming verifier does not run, and a draft is never merged -- so the vault keeps
+verifying the record with its PREVIOUS copy while reporting drift as a warning. That is the recurring
+condition (six hand-made mirror commits, the last found 326 lines behind) that splitting
+`asvs-verifier-drift.yml` out was written to end.
+
+**The guard.** `tests/test_asvs_verifier_vault_contract.py`: the file exists at the hardcoded path; a
+stdlib-only `ast` scan over EVERY import including deferred ones; and a `python -I -S <script> --help`
+run from an unrelated working directory. Four injected violations were each confirmed to land (by
+digest) before their red was believed. A module-level third-party import, a first-party import and a
+rename red both the scan and the smoke run; **a third-party import DEFERRED into a function body reds
+only the `ast` scan and passes the smoke run**, which is why the scan is the load-bearing half.
+
+**Trigger, checked rather than assumed.** Extracting the live `noncode` regex out of `ci.yml` and
+running real `grep -E`: a PR touching only `scripts/asvs/scorecard.py` classifies `code=true`, as does
+one touching only the guard's own file -- so the gate is inside its own trigger -- while a
+`docs/SECURITY.md`-only PR correctly stays `code=false`. No new workflow and no new required context
+were needed; the trigger was already right and the check was what did not exist.
+
+**Not in scope, and not fixable here.** The gate's third claim -- that the recorded evidence anchors
+still resolve -- needs the private assessment record, so it can only run where that record is. No
+credential-free cross-repo trigger exists for it; the vault's daily cron remains its only authority.
+
+---
+
+## 1204. a forward-only lint refusing a NEW hard-coded ASVS tally, with the idiom set rebuilt from the corpus
+
+> 🔢 **Filed 2026-08-09 - FIXED in the same change. Every idiom is driven from both sides, and the eight documents that motivated it were confirmed RED before it landed.** Value **7/10** · Difficulty **3/10**. ADR 0156 made the ASVS count computed. It did not stop anyone writing one down: 44 documents assert a whole-corpus tally, roughly fifty distinct tallies exist, and approximately one is correct.
+
+**Cluster:** Documentation correctness / gate blindness. **Priority:** P2. **Verdict:** build (done).
+**Severity:** no product effect and no PHI effect. The cost is a security record whose published
+numbers disagree with each other and with the tool that derives them.
+
+**Why a lint and not a sweep.** A one-time banner sweep over a file list was tried on the assessment
+corpus. It cost roughly 850 net lines, needed its own repair commit, and the defect regenerated
+inside four days because eight new documents were written after it. **A pass over a file list cannot
+constrain what is written next.** This lint is therefore forward-only: existing tallies are RECORDED
+in `scripts/docs/asvs_tally_baseline.txt`, not edited, and the baseline may only shrink -- it stores
+an occurrence count per claim, so adding a copy of an already-grandfathered tally fails, and removing
+one fails until the entry comes down with it.
+
+**The idiom set was rebuilt from the corpus, and the previous attempt's recall was reproduced first.**
+That attempt matched two shapes, an `N / N / N / N` tuple and `N of 345`. Re-implementing exactly
+those two and running them over the corpus reds **2 of the 8 chapter reports** -- matching the
+register's independent finding that it missed 6 of 8. The five idioms here red **8 of 8**. Two of them
+are shapes the old set could not see at all: a **Markdown table row** whose cells close to the corpus
+total, which is the shape the one CORRECT record is written in, and an **arithmetic assertion** that
+closes to it. A third, markdown-emphasis tolerance, is worth naming on its own: one chapter report
+writes its tally with the verdict words in backticks, and a detector using a bare `\s*` walks past it.
+
+**The discriminator, and why the previous attempt produced 73 false hits.** A run of integers counts
+as a tally only when it SUMS TO THE PINNED CORPUS TOTAL. An unbounded slash tuple matches HL7 field
+notation (`MSH-9/10/12`, `PID-3/4/18`), X12 transaction sets, HTTP status-code lists and config
+defaults; every one of those is now a permanent negative-control test. Corpus STRUCTURE is also
+deliberately not flagged -- the requirement count and the level split are pinned constants that cannot
+go stale, and flagging them is what made the previous attempt red the method document's own worked
+example, which is a literal letter rather than a count.
+
+**Proved on real files, both directions.** Eight mutations, one per idiom, appended to a real document
+in this repo: all eight RED, each confirmed to have landed by digest before its red was believed.
+Five controls appended through the identical path: all five stayed GREEN.
+
+**Trigger, and why it is a separate workflow.** The defect is written into DOCUMENTS, so the pull
+request carrying it is usually docs-only -- and a docs-only pull request sets `code=false` and skips
+the entire pytest suite. A guard reachable only through pytest would not run on the shape it exists
+to police, which is the same defect two guards in `ci.yml` were ungated to fix. Measured with the live
+globs and the live regex: a docs-only pull request FIRES the new workflow and ran no pytest at all
+before. The workflow includes its own file, the lint and the baseline in its trigger.
+
+**Scope, stated plainly.** The engine can only lint the documents it holds. The bulk of the affected
+corpus lives in the assessment repo and can only be linted there; the tool is stdlib-only and
+mirrorable for that reason, and `tests/test_asvs_verifier_vault_contract.py` now holds that property
+over a LIST of mirrored tools rather than the single one it was written for. Wiring it in on that side
+is a change in that repo, not this one. **Retiring the existing 44 documents is explicitly not part of
+this item** -- that is a sweep, it was costed and refused, and it is the owner's decision.
+
+---
+
+## 1205. half the ASVS record is prose nothing checks: ~2,000 `file:line` citations, none verified
+
+> 🔢 **Filed 2026-08-09 - the FORWARD-ONLY gate is built; the existing population is grandfathered and NOT swept.** Value **7/10** · Difficulty **3/10**. Roughly two thousand `file:line` citations live inside `residual` prose across about 250 cells. Nothing checks any of them, and a sample measured 44.9% stale.
+
+**Cluster:** Documentation correctness / gate blindness. **Priority:** P2. **Verdict:** build (gate done; the population is a separate decision).
+**Severity:** no product effect and no PHI effect. The cost is that the part of the record a reviewer
+actually reads is the part with no gate behind it.
+
+**The demonstration case, verified against public engine code at this commit.** Cell 6.3.3's gated
+`[[cell.evidence]]` anchor for the exposure check points at `messagefoundry/__main__.py:1125`, and
+that line reads `instance_exposed = not settings.api.is_loopback or ...` -- correct, and the only
+occurrence of that statement in the file. The prose in the SAME CELL cites `__main__.py:1917`, which
+is the middle of a warning string about the browser console. **The gated half is right and the read
+half is wrong, in one cell, about one control.**
+
+**Measured at the pinned record.** 2,052 citations across 247 cells; 1,086 name a bare basename with
+no directory. On the "cannot resolve even in principle" claim the honest split is finer than the
+round number suggests: resolved against this worktree, 129 of those basenames match no file at all,
+276 match two or more, and 677 happen to match exactly one. So *unresolvable in practice* is 405; the
+remaining 677 resolve only by luck of there being one candidate, which is not a property the citation
+format guarantees. Both figures are recorded rather than one being quoted.
+
+**Bulk promotion into gated anchors was refused and is not attempted.** Roughly a thousand
+hand-authored tokens, it doubles the gated surface, and it makes *delete the citation* the cheapest
+compliant act on the basenames.
+
+**THE KEY IS THE DESIGN.** A citation is identified by `cell id + field + FILE`, never by its line
+number. Three consequences: the population of (cell, field, file) pairs cannot grow; the occurrence
+count in the frozen baseline stops an existing pair growing either, so the total can only shrink; and
+**repairing a stale line number is FREE and needs no baseline edit, while adding a citation is
+refused and deleting one costs an edit.** That ordering is chosen deliberately -- it makes correction
+the cheapest compliant act, which is the exact inverse of the incentive the rejected approach created.
+
+**It refuses to succeed on an empty scan.** The tool runs where the data is, which is not this repo,
+so the dangerous failure is the silent one: pointed at a renamed field or a document with no cells,
+"no new citations" and "nothing was examined" would otherwise share an exit code. Both now exit 2, and
+the scan inventory prints before the verdict.
+
+**Proved at scale against the real record, locally.** Baseline of 1,233 claims over 2,052
+occurrences; a new path-qualified citation REDs, a new bare basename REDs, deleting a citation without
+lowering the baseline REDs, a renamed field and a missing baseline both exit 2 -- and repairing 6.3.3's
+stale line stays GREEN with no baseline edit. Every mutation confirmed to have landed before its
+verdict was believed.
+
+**Where it can run, stated plainly.** The record exists only in the assessment repo, so unlike the
+tally lint this one has NO engine-side subject at all. What ships here is the tool, stdlib-only and
+mirrorable on the ADR 0156 section 7 footing, with fixture tests; the baseline and the wiring belong
+beside the data. **No engine workflow is added, deliberately** -- a gate pointed at nothing is the
+failure this tool refuses to commit itself.
+
+**One hypothesis I held and measurement refuted.** I expected a baseline keyed on cell id to leak
+verdicts, since residuals sound like a property of unresolved cells. Measured: cited residuals occur
+across every verdict class, including a large majority of the passing ones, and the split of
+cited-residual cells is close to even between pass and not-pass. **The verdict-leak argument does not
+hold** and is withdrawn. The baseline still belongs beside the data, on the stronger ground that a
+frozen list is unverifiable from a repo that cannot see what it grandfathers.
+
+---
+
 ## 1208. no guard asserts that a credential factory PARAMETER maps to a SETTING name the redactor covers
 
 > ✅ **SHIPPED (test-only; `messagefoundry/config/wiring.py` unchanged).** `tests/test_credential_parameter_mapping.py` follows the VALUE across the rename boundary: a unique sentinel is injected into ONE factory parameter at a time, the factory is called, and the destination setting is read off the emitted settings - so no rename has to be taught to it, which is the fourth name list this item forbids. The real redactor is then asked about whatever key the sentinel was found under. A parameter that reaches no setting, or that cannot be built at all, is a FAILURE with a declared reason rather than a silent pass, and every declared exemption is asserted REACHED so the tables cannot go stale. Domain re-derived rather than inherited: 23 spec-returning factories (asserted `>= 23`), 58 credential- and URL-bearing parameters probed, 3 followed through an `env()`-only refusal. Watched fail: pre-#1106 reddens exactly the 2 renamed `with_signing` parameters and leaves 56 green; pre-#1207 reddens exactly the 10 URL-bearing ones and leaves 48 green; shipped code reddens none. It reaches surfaces the outcome-level sibling cannot: de-classifying `intake_api_key`, `intake_api_key_next`, `credential_password`, `ws_password` and `client_key_password` reddens this file on all five and `test_connection_factory_redaction_domain.py` on none, because that file drops a connector's credential arguments when the connector refuses to be built with them. `proxy` -> `proxy_url` is now covered BY DESIGN rather than by luck: URL-bearing parameters are selected by a suffix rule whose own coverage is checked against the destinations the redactor's URL rule owns.
