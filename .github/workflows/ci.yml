@@ -365,7 +365,23 @@ jobs:
       # n below is per leg, passing rows only. Measured 2026-08-08 (BACKLOG #1096).
       #
       #   leg              max passing step   n     old cap   old margin   new cap   new margin
-      #   ubuntu-latest    16:08              441   19:00     1.178x       25:00     1.550x
+      #   ubuntu-latest    20:28              35    25:00     1.221x       31:00     1.515x   <- RE-DERIVED 2026-08-12
+      #
+      # THE UBUNTU ROW WAS RE-DERIVED 2026-08-12 AND THE OLD ONE IS KEPT ABOVE IN THE PROSE, NOT DELETED.
+      # Pool: every run of this workflow created after 2026-08-10 that contributed an ubuntu
+      # `Tests (pytest)` STEP -- 58 runs, 63 rows, 35 passing. Max passing 20:28; next highest 17:18;
+      # min 14:47; max non-success 17:01. Smaller pool than the 441-row original and stated as such.
+      #
+      # WHAT TRIGGERED IT, and the ordering matters: `main` ALREADY exceeded the old 16:08 anchor at
+      # 17:07 BEFORE the PR that reddened the gate. The record had rotted on its own; PR #343 (+274
+      # tests, +3:12) only carried the MARGIN across the 1.30x floor. So this is not "one PR was too
+      # big" -- the anchor was stale and the floor did its job by saying so. #1096 stays OPEN: the caps
+      # are re-derived, the DRIFT underneath them is still not fixed, and raising a cap is not fixing it.
+      #
+      # 20:28 IS PR #343's OWN RUN, and that is deliberate rather than an outlier being smuggled in: its
+      # 274 tests land on `main` when it merges, so 20:28 is the next baseline, not a one-off. Sizing on
+      # the pre-merge population would re-break the cap on contact -- the "three PRs each adding a
+      # minute" death this note already records.
       #   windows-2022     29:23              399   36:00     1.225x       55:00     1.872x
       #   windows-2025     35:47  CENSORED    360   36:00     1.006x       55:00     1.537x
       #
@@ -452,13 +468,13 @@ jobs:
       # maximum (29:23) IS a post-#1027 row. One shared value, two code states, until this is fixed.
       #
       #   leg      largest observed Tests   + largest observed web-console  = post-#1027 anchor
-      #   ubuntu   16:08  (uncensored)        2:22   (n=441)                  18:30
+      #   ubuntu   20:28  (uncensored)        2:22   (n=441)                  22:50  <- RE-DERIVED 2026-08-12
       #   W22      29:23  (uncensored; already a post-#1027 row)              29:23
       #   W25      36:08  (RIGHT-CENSORED)    3:59   (n=360)                  40:07  lower bound
       #
       # SIZING RULE: step_timeout = ceil_minute(1.35 x that leg's post-#1027 anchor). 1.35 is the multiple
       # #131 used when it set 36:00 (1.364x over 26:23, the largest execution then observed).
-      #   ubuntu  18:30 x 1.35 = 24:59 -> 25:00   (1.351x over the anchor, 1.550x over max passing)
+      #   ubuntu  22:50 x 1.35 = 30:50 -> 31:00   (1.358x over the anchor, 1.515x over max passing)
       #   W22     29:23 x 1.35 = 39:40 -> 40:00   (takes the shared Windows value below)
       #   W25     40:07 x 1.35 = 54:09 -> 55:00   (1.371x over the anchor, 1.537x over max passing)
       #
@@ -541,14 +557,14 @@ jobs:
       # 31109989006, inside a 5:22 setup).
       #
       #   leg      worst same-row   setup(max)+wc(max)   overhead used   x1.5    room   job
-      #   ubuntu   7:12 (n=451)     5:22 + 2:22 = 7:44   7:44            11:36   12:00  25+12 = 37
+      #   ubuntu   7:12 (n=451)     5:22 + 2:22 = 7:44   7:44            11:36   12:00  31+12 = 43
       #   W22      6:16 (n=413)     4:05 + 2:51 = 6:56   6:56            10:24   11:00  55+11 = 66
       #   W25      6:29 (n=372)     2:32 + 3:59 = 6:31   6:31             9:47   10:00  (takes W22's 66)
       #
       # INSTRUMENT PRESERVATION, the whole point of the pairing -- worst-case job wall built from
       # independent maxima with `Tests` passing one second under its cap, new values against old:
       #
-      #   ubuntu  5:22 + 24:59 + 2:22 = 32:43 vs 37:00  +4:17   |  old: 26:43 vs 26:00  -0:43  NEGATIVE
+      #   ubuntu  5:22 + 30:59 + 2:22 = 38:43 vs 43:00  +4:17   |  old: 32:43 vs 37:00  +4:17  (band held)
       #   W22     4:05 + 54:59 + 2:51 = 61:55 vs 66:00  +4:05   |  old: 42:55 vs 46:00  +3:04
       #   W25     2:32 + 54:59 + 3:59 = 61:30 vs 66:00  +4:30   |  old: 42:30 vs 46:00  +3:30
       #
@@ -709,7 +725,7 @@ jobs:
       # WORST CASE THE CAPS ADMIT, with both gated steps passing one second under their own caps --
       # the quantity the job paragraph above could not previously bound at all, because the second
       # gated step's cap was the first one's:
-      #   ubuntu  5:22 + 24:59 + 4:59 = 35:20 vs 37:00  (+1:40)   was 5:22 + 24:59 + 24:59 = 55:20  NEGATIVE
+      #   ubuntu  5:22 + 30:59 + 4:59 = 41:20 vs 43:00  (+1:40)   was 5:22 + 24:59 + 24:59 = 55:20  NEGATIVE
       #   W22     4:05 + 54:59 + 5:59 = 65:03 vs 66:00  (+0:57)   was 4:05 + 54:59 + 54:59 = 114:03 NEGATIVE
       #   W25     2:32 + 54:59 + 5:59 = 63:30 vs 66:00  (+2:30)   was 2:32 + 54:59 + 54:59 = 112:30 NEGATIVE
       # The old table stated a worst case built from the MEASURED web-console maxima, which is a
@@ -888,7 +904,7 @@ jobs:
           # used to take `step_timeout` -- a 2-to-4-minute suite holding a 25-to-55-minute budget --
           # which is why the nesting invariant could not hold for it on any leg. Derived in the note
           # above the `Web console tests (pytest)` step, which is also where to re-derive it.
-          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":37,"step_timeout":25,"webconsole_step_timeout":5,"pytest_timeout":60,"fault_timeout":90}'
+          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":43,"step_timeout":31,"webconsole_step_timeout":5,"pytest_timeout":60,"fault_timeout":90}'
           W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":6,"pytest_timeout":120,"fault_timeout":150}'
           W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":6,"pytest_timeout":120,"fault_timeout":150}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
