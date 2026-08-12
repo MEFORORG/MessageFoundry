@@ -8115,6 +8115,12 @@ effect. It costs the guardrail's reliability on exactly the shape a developer re
 
 
 ## 1230. worktree venvs install five fewer extras than CI, so 120 tests never collect and the gap reads as ~8 skips
+> ⚠️ **SCOPE RULED BY THE OWNER 2026-08-12: build the LOUD-OMISSION half ONLY.** The item offers three options and marks making the omission loud as the non-optional one; the owner chose that and **not** the wider fix of installing the five extras into every worktree venv. Recorded here so the choice sits beside the work rather than being re-decided by whoever picks it up -- and because an unstated choice tends to become the cheapest one silently, which is the very shape this item names.
+>
+> **What that means concretely:** a local run must STATE what it could not collect, so an incomplete run stops rendering as a clean one. It does **not** mean making worktree venvs match CI -- they stay deliberately lighter, which is a defensible trade against ~66 worktrees.
+>
+> **What this does NOT close, stated so the fix is not over-read:** the SQL Server and Postgres store legs also skip locally, and that is a **different mechanism** -- path-gated CI jobs, not missing extras. Making extras loud will not make those loud. That gap cost real time on 2026-08-12, when a store-touching PR's SQL Server failure was invisible to every local run.
+
 
 > 🔢 **Filed 2026-08-12 -- measured while verifying the `--prove-absences` port (PR #304), after a main-only baseline run built to attribute a pass-count delta turned out to be comparing two ENVIRONMENTS rather than two trees.** Value **6/10** -- Difficulty **2/10** -- _quick win_. `scripts/worktree/new.ps1:232` provisions a worktree venv with `$extras = if ($Sqlserver) { "dev,harness,sqlserver" } else { "dev,harness" }`. `.github/workflows/ci.yml:272` provisions the CI test leg with `-e ".[dev,harness,fhir,dicom,x12,xml,webauthn]"`. The five-extra difference is not theoretical: `pydicom`, `pynetdicom`, `lxml`, `xmlschema`, `signxml`, `webauthn`, `fhirpathpy` and `pyx12` are each absent from a worktree venv, confirmed by import.
 
