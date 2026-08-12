@@ -3725,6 +3725,10 @@ and scoped this sweep out of itself. Every count above was measured against the 
 > prerequisite has fired** (engine `1e9cc4c1`, 2026-08-04, PR #173 removed the `db_owner`
 > instruction), but the **owner's ruling of record is still *defer the startup preflight***, so
 > the tier override applies and this stays DEMAND-GATE at any score.
+> ⚠️ **PUT TO THE OWNER 2026-08-12; HE DELEGATED THE CALL AND THE GATE STANDS. Recorded precisely, because this item is the repo's own example of over-reading an authorization.** The owner did **not** rule on the substance -- asked to choose, he answered *do what you judge best*. **That is a delegation, not a ruling**, and it must not later be cited as *"the owner decided the gate stands"*. The coordinator kept the gate on these grounds: the item's own Verdict is *build the runbook fix only; defer the startup preflight*, and **that runbook fix has LANDED**, so the item's stated scope is complete; the fix addressed the **cause** (a runbook instructing `db_owner`) while the preflight detects the **symptom**; and with the cause removed and zero deployments, demand for the detector is weak. **Two lanes arguing from a sequencing technicality is not demand.** The substantive question -- should the engine observe the store principal's privileges at startup at all -- remains **open and unanswered**, and an owner ruling on it is still what lifts this gate.
+>
+> **The probe defect below is now BACKLOG #1234 and is NOT gated by this item.**
+>
 > ⚠️ **RE-RAISED AND RE-REJECTED 2026-08-12, ON THE SAME ARGUMENT. Recorded so a fourth pass does not re-derive it.** A lane relayed that the owner had lifted the gate, reasoning that the 2026-08-03 defer was **sequencing** rather than siting -- it waited on the runbook fix, which landed `1e9cc4c1` on 2026-08-04. The coordinator **verified that commit against the repo** (it exists, it is on `main`, it is the AOAG `db_owner` removal) and initially recommended lifting on that basis.
 >
 > **That recommendation was WRONG, and the item itself is why.** The paragraph above ALREADY records the prerequisite as fired, and already states that the ruling of record is separately still *defer*. **The sequencing argument is not new evidence; it is the inference this item pre-rejects.** Verifying the commit measured a premise the item never disputed, and produced confidence about a conclusion it had already ruled on -- a correct measurement aimed one question to the left. **The prerequisite firing has now been offered as grounds for the lift twice, by different lanes, and rejected twice.**
@@ -8111,6 +8115,12 @@ effect. It costs the guardrail's reliability on exactly the shape a developer re
 
 
 ## 1230. worktree venvs install five fewer extras than CI, so 120 tests never collect and the gap reads as ~8 skips
+> ⚠️ **SCOPE RULED BY THE OWNER 2026-08-12: build the LOUD-OMISSION half ONLY.** The item offers three options and marks making the omission loud as the non-optional one; the owner chose that and **not** the wider fix of installing the five extras into every worktree venv. Recorded here so the choice sits beside the work rather than being re-decided by whoever picks it up -- and because an unstated choice tends to become the cheapest one silently, which is the very shape this item names.
+>
+> **What that means concretely:** a local run must STATE what it could not collect, so an incomplete run stops rendering as a clean one. It does **not** mean making worktree venvs match CI -- they stay deliberately lighter, which is a defensible trade against ~66 worktrees.
+>
+> **What this does NOT close, stated so the fix is not over-read:** the SQL Server and Postgres store legs also skip locally, and that is a **different mechanism** -- path-gated CI jobs, not missing extras. Making extras loud will not make those loud. That gap cost real time on 2026-08-12, when a store-touching PR's SQL Server failure was invisible to every local run.
+
 
 > 🔢 **Filed 2026-08-12 -- measured while verifying the `--prove-absences` port (PR #304), after a main-only baseline run built to attribute a pass-count delta turned out to be comparing two ENVIRONMENTS rather than two trees.** Value **6/10** -- Difficulty **2/10** -- _quick win_. `scripts/worktree/new.ps1:232` provisions a worktree venv with `$extras = if ($Sqlserver) { "dev,harness,sqlserver" } else { "dev,harness" }`. `.github/workflows/ci.yml:272` provisions the CI test leg with `-e ".[dev,harness,fhir,dicom,x12,xml,webauthn]"`. The five-extra difference is not theoretical: `pydicom`, `pynetdicom`, `lxml`, `xmlschema`, `signxml`, `webauthn`, `fhirpathpy` and `pyx12` are each absent from a worktree venv, confirmed by import.
 
@@ -8172,3 +8182,33 @@ every worker session's handoff, which is the sentence the next session bases its
 > **How to prove a fix:** create a preset as user A, delete A, and assert the preset row is gone -- then assert the SAME on a database opened from a pre-existing file, because the migration path is where the first attempt broke.
 
 **Cluster:** Store / retention / PHI lifecycle. **Priority:** P2. **Verdict:** build. **Severity:** conditional -- on a first deployment, encrypted PHI-shaped search criteria outlives the account it belonged to, with the default purge off.
+
+## 1234. the store-privilege probe reports OBSERVED having read nothing: NULL role results fold to False on SQL Server
+
+> 🔢 **Filed 2026-08-12 -- reported by the lane that REVIEWED the branch, not by the lane that wrote it, which is why it was found.** Value **6/10** -- Difficulty **2/10** -- _quick win_. On the held `w3-store-privilege-preflight` branch, the SQL Server arm of the store-privilege preflight returns **`OBSERVED` unconditionally**, while a NULL role result folds to **`False`**. So a probe that read nothing reports a clean bill of health, and reports it in the one word an operator would take as proof the check ran.
+
+> **WHY THIS IS THE WHOLE CONTROL AND NOT AN EDGE CASE.** The refusal arm is keyed on the opt-in `[store].require_least_privilege`, which **defaults to false**. So on a default install the refusal never fires and **WARN is the only arm anybody sees** -- and WARN is exactly what this defect silences. A control whose only reachable arm is the one that mis-reports is not a weakened control; it is an absent one wearing the label of a present one.
+
+> **THIS IS THE PROJECT'S NAMED FAILURE SHAPE, in a control written to prevent it.** An empty scan and a clean scan must not render alike; a green that is a statement about the ENVIRONMENT rather than the SUBJECT is worse than an untested control, because it closes the question instead of inviting it. `OBSERVED` from a probe that read zero rows is precisely that -- and it is the same class the ASVS work has been chasing all week, appearing inside the privilege checker itself.
+
+> **Scope:** make the SQL Server arm distinguish **read-and-clean** from **read-nothing**, and give the second its own outcome that is not `OBSERVED`. A NULL role result must not fold into a boolean that reads as safe. **How to prove a fix:** it must go red against a fixture returning NULL role rows, AND stay green on a genuine least-privilege principal -- two arms, because a fix that reports UNKNOWN for everything trades a false clean for a useless one and would pass a single-arm test.
+
+> **Independent of BACKLOG #1008 and deliberately filed separately.** #1008 is DEMAND-GATE on whether the engine should perform a startup privilege preflight **at all**; this item is that a written probe mis-reports. A code defect should not be hostage to a policy decision, and if #1008 is never lifted this still wants fixing before that branch is reused for anything.
+
+**Cluster:** Security / observability. **Priority:** P2. **Verdict:** build. **Severity:** conditional per CLAUDE.md section 0 -- on a first deployment an over-granted store principal would be reported as observed-and-clean; **zero deployments, so nothing is mis-reported today.**
+
+## 1235. a citation to an unallocated backlog number is a trap that arms itself the day the number is issued
+
+> 🔢 **Filed 2026-08-12 -- found by scanning, and one instance was live and unnoticed at the moment of filing.** Value **6/10** -- Difficulty **2/10** -- _quick win_. Documents in this project's PRIVATE companion repository cite public `BACKLOG #N` numbers that **were never allocated**. While the number is unissued the citation resolves to **nothing**, which is honest and harmless. The day someone legitimately allocates it, that citation begins resolving -- **to unrelated work, plausibly, and with nothing anywhere reporting a problem.**
+
+> **THE LEDGER'S OWN ERRATUM ALREADY NAMES THIS AS THE WORSE OUTCOME.** `scripts/hooks/ledger_check.py`'s header, explaining why the overlapping number space was recorded rather than renumbered, states that renumbering *"would only make stale citations resolve uniquely and WRONGLY, which is worse than resolving ambiguously."* A dangling reference advertises its own brokenness. A wrongly-resolving one advertises nothing, and reads as a working cross-reference forever.
+
+> **TWO LIVE TRAPS, both currently defused only by an accident of timing.** `#1203` is cited in a private-repo document dated **2026-07-24** describing retention-purge behaviour, and is unissued. `#1231` is cited in another and is likewise unissued -- **it was allocated on 2026-08-12 and released without being filed**, because the item it was allocated for turned out to be a duplicate of `#1229`. Had that duplicate not been caught, filing `#1231` would have made a stale citation start resolving to a completely unrelated item. **The duplicate check prevented this instance by accident, not by design**, which is precisely why the practice needs a rule rather than vigilance.
+
+> **A SCAN, WITH ITS FALSE POSITIVES DISCLOSED RATHER THAN TRIMMED.** Resolving every `#N` in [1000,9000) found in that repository's Markdown against **both** ledgers (this one and that repository's own, 499 and 285 headings respectively -- checking only one would have mis-scored the other's namespace): **23 tokens resolve in neither.** That is an **upper bound on citations, not a count of defects** -- several are near-certainly not backlog references at all (a four-digit token in a research evaluation, another in a diagram). The genuine-looking cluster sits in the security handoff documents. **Stating 23 without that caveat would be a completeness claim the scan cannot support.**
+
+> **Scope:** a rule, not a sweep. **Either allocate the number before citing it, or write the reference so it CANNOT resolve** -- naming the subject instead of a number (*"the retention runbook step, unallocated"*) is enough, and costs nothing. The sweep of existing instances is a separate, owner-present task in that repository, deliberately not folded in here.
+
+> **What makes this filable rather than a style note:** there is **no gate on either side**. The allocator answers *"is this number free"*; nothing asks *"is anything already pointing at it."* And a citation in another repository is invisible to every check this one runs. The two halves are each individually correct and the gap between them is the defect.
+
+**Cluster:** Process / ledger integrity. **Priority:** P3. **Verdict:** build (the rule). **Severity:** minor and self-inflicted -- it corrupts cross-references between maintainer documents, touches no shipped code, and no deployment can observe it.
