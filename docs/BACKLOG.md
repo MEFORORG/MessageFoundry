@@ -3725,6 +3725,14 @@ and scoped this sweep out of itself. Every count above was measured against the 
 > prerequisite has fired** (engine `1e9cc4c1`, 2026-08-04, PR #173 removed the `db_owner`
 > instruction), but the **owner's ruling of record is still *defer the startup preflight***, so
 > the tier override applies and this stays DEMAND-GATE at any score.
+> ⚠️ **RE-RAISED AND RE-REJECTED 2026-08-12, ON THE SAME ARGUMENT. Recorded so a fourth pass does not re-derive it.** A lane relayed that the owner had lifted the gate, reasoning that the 2026-08-03 defer was **sequencing** rather than siting -- it waited on the runbook fix, which landed `1e9cc4c1` on 2026-08-04. The coordinator **verified that commit against the repo** (it exists, it is on `main`, it is the AOAG `db_owner` removal) and initially recommended lifting on that basis.
+>
+> **That recommendation was WRONG, and the item itself is why.** The paragraph above ALREADY records the prerequisite as fired, and already states that the ruling of record is separately still *defer*. **The sequencing argument is not new evidence; it is the inference this item pre-rejects.** Verifying the commit measured a premise the item never disputed, and produced confidence about a conclusion it had already ruled on -- a correct measurement aimed one question to the left. **The prerequisite firing has now been offered as grounds for the lift twice, by different lanes, and rejected twice.**
+>
+> **WHAT WOULD ACTUALLY LIFT IT:** an owner ruling on the SUBSTANCE -- build the startup preflight, or not -- recorded here. Not a prerequisite, not a relay, not a coordinator's judgement. **Nothing short of that should flip this banner**, and a session that finds itself reasoning from `1e9cc4c1` to a lift has re-derived a rejected argument.
+>
+> **SEPARATE FROM THE GATE, and true whichever way it goes:** the held branch carries a correctness defect reported by its reviewing lane -- the SQL Server probe returns `OBSERVED` unconditionally while NULL role results fold to `False`, i.e. a clean bill of health from a probe that read nothing. With refusal gated off by default, WARN is the only arm most installs would ever see, so that false-clean is the whole control silently doing nothing. **That needs fixing regardless of the demand gate, and does not need it lifted to be worth fixing.**
+>
 > ⚠️ **AMENDED 2026-08-11 — A BUILT, VERIFIED BRANCH EXISTS, AND ITS AUTHORIZATION IS UNVERIFIED. The item STAYS OPEN and the DEMAND-GATE STANDS.** `w3-store-privilege-preflight` (`94cb72e6`, pushed, **deliberately unlanded**) ships the startup preflight: `messagefoundry/store/privilege.py` reads the store principal's effective privileges after the store opens and before any listener binds. Full quartet green — `ruff format` 1086 files, `ruff check` clean, **mypy strict clean on 266 files**, `pytest` **11,676 passed / 834 skipped / 0 failed** across both testpaths with the web-console package confirmed collected at 356. Baseline measured at the merge-base by the building lane, delta reconciling to exactly its own new file. Red-first evidence for every new check, each failure printing what it scanned.
 
 > **THE PROBLEM IS NOT THE CODE.** One lane recorded that *"the owner lifted the defer"*; a second lane, verifying the same branch, refused to flip this banner because it had *"not seen"* such a decision. **The second lane was right, and the disagreement is resolved against the first: no record reachable from this repo supports the lift.** This item's own **Verdict** line still reads *"build the runbook fix only; defer the startup preflight"*, the banner above still says the owner's ruling of record is **defer**, and the item states in terms that a prerequisite clearing is *"a fact about the world, not a decision by the owner"*. The demand-gate decision packet, the G26 sitting records and the pending-ledger-edit register were all searched: **none mentions #1008 at all.** So the branch was built against a gate that, on every checkable record, is still closed. **Do not read the existence of working code as authorization** — that inference is what this amendment exists to block.
@@ -8101,6 +8109,42 @@ gate is the wrong shape, validation of the walk is the right one.
 workstation guardrail that its own synopsis declines to call a security boundary; no product, engine or PHI
 effect. It costs the guardrail's reliability on exactly the shape a developer reaches for by habit.
 
+
+## 1230. worktree venvs install five fewer extras than CI, so 120 tests never collect and the gap reads as ~8 skips
+
+> 🔢 **Filed 2026-08-12 -- measured while verifying the `--prove-absences` port (PR #304), after a main-only baseline run built to attribute a pass-count delta turned out to be comparing two ENVIRONMENTS rather than two trees.** Value **6/10** -- Difficulty **2/10** -- _quick win_. `scripts/worktree/new.ps1:232` provisions a worktree venv with `$extras = if ($Sqlserver) { "dev,harness,sqlserver" } else { "dev,harness" }`. `.github/workflows/ci.yml:272` provisions the CI test leg with `-e ".[dev,harness,fhir,dicom,x12,xml,webauthn]"`. The five-extra difference is not theoretical: `pydicom`, `pynetdicom`, `lxml`, `xmlschema`, `signxml`, `webauthn`, `fhirpathpy` and `pyx12` are each absent from a worktree venv, confirmed by import.
+
+> **What it costs, measured by diffing COLLECTED NODE ID SETS rather than counts** -- `pytest --collect-only -q` in each venv, ids sorted and compared, because a count answers "how many" and never "which". **120 tests across 11 files never collect in a worktree venv:**
+
+> ```
+> tests/test_dicom_codec.py                       20
+> tests/test_xml_message.py                       18
+> tests/test_webauthn.py                          16
+> tests/test_dicom_scp.py                         15
+> tests/test_wsdl_import.py                       14
+> tests/test_fhir_resource.py                     12
+> tests/test_dicom_scu.py                         11
+> tests/test_x12_validate.py                       7
+> tests/test_xml_schema_signature.py               4
+> tests/test_dependabot_automerge_guardrails.py    2
+> tests/test_x12_deps.py                           1
+> ```
+
+> **THE DEFECT IS THE SILENCE, NOT THE ABSENCE.** Skipping an uninstalled optional extra is correct and intended. What is wrong is that the omission is **invisible in the numbers a session actually reads**: these skip at MODULE scope via `pytest.importorskip`, so 120 absent tests surface as roughly **8 skip entries**. Collected totals differ by 95 on an ~12,800-test suite, and the pass count moves in the same direction and rough magnitude as ordinary churn, so a session comparing two runs sees a delta that looks like normal movement. This is the shape `docs/Code_Quality_Standards.md` and the SDS reviewing rules already name: a silent cap reads as full coverage.
+
+> **A SECOND, ALREADY-PROPAGATING CONSEQUENCE.** The "**21 pre-existing environmental mypy errors in 4 files**" (`messagefoundry/parsing/fhir/_deps.py`, `messagefoundry/parsing/dicom/_deps.py`, `messagefoundry/auth/webauthn.py`, `messagefoundry/transports/dicom.py`) that successive ASVS handoffs instruct the next session to treat as inherent are **this same gap**. CI installs those extras and does not have those errors. Reporting "delta zero against the 21" stays correct; describing them as unavoidable is not, and that description has now been carried across at least three handoffs without being re-derived -- an unverified claim compiled into an instruction stops being a sentence and becomes a premise nothing re-examines.
+
+> **What is NOT claimed.** No product, engine or PHI effect, and per section 0 there is nothing deployed for this to affect. This is a **local measurement-fidelity** defect on a maintainer workstation: it would cause a worker session to report a verification as broader than it was. It is additive to the already-documented silent SQL Server and Postgres skips, not a restatement of them -- those skip at TEST scope and are individually visible in a `-rs` listing, whereas these never collect at all.
+
+> **Options, with the trade-off stated rather than assumed.** (a) Add the five extras to `new.ps1`'s default -- one line, but `pydicom`/`pynetdicom`/`lxml`/`xmlschema` are heavy and every worktree pays disk and install time, which is a real cost at the number of worktrees this repo runs. (b) An `-AllExtras` switch beside the existing `-Sqlserver` one, defaulting off -- cheap, but leaves the default silent, which is the defect. (c) Make the omission LOUD instead of installing anything: have `new.ps1` print exactly which test files will not collect in the venv it just built, and/or have a session-visible check state it. (c) addresses the actual defect at near-zero cost and composes with either of the others. Whoever builds this should decide (a)-vs-(b) on the disk cost and treat (c) as the part that is not optional.
+
+> **How to prove a fix, in both directions.** The passing direction: after the change, a `--collect-only` node-id diff between a fresh worktree venv and the CI extra set is EMPTY. The negative control, which is the half that matters: deliberately drop one extra and confirm the check names the files that stop collecting -- a fix that merely installs more packages without making a future omission visible is untested against the failure mode this item is about, and would look identical to a passing one.
+
+> **Source:** found 2026-08-12 while verifying the #304 `--prove-absences` port. The baseline that exposed it was itself the error -- it compared the primary checkout's venv against a worktree venv and was withdrawn rather than reported. Also measured in the same pass, and NOT part of this item: the primary checkout carries a stale editable install, so `tests/test_version.py::test_installed_metadata_matches_dunder_version` fails there deterministically at metadata `0.3.0` against `__version__` `0.3.2`. That is the venv rather than `main`, it is fixed by re-running `pip install -e .` there, and it is recorded here only so the next session that sees one red in a primary-checkout run does not chase it.
+
+**Cluster:** Tooling / developer measurement fidelity. **Priority:** P3. **Verdict:** build. **Severity:** minor
+-- no product, engine or PHI effect. It costs the trustworthiness of the phrase "the full suite is green" in
+every worker session's handoff, which is the sentence the next session bases its own scope on.
 
 ## 1232. `search_presets.owner` holds an `Identity.user_id` after #1225, so the column name is now misleading
 
