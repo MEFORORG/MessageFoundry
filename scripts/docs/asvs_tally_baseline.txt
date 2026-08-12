@@ -1,0 +1,30 @@
+# Grandfathered ASVS tallies -- FROZEN, and this list may only SHRINK.
+#
+# Format:  <path> TAB <idiom> TAB <tally token> TAB <occurrence count>
+# Produced by:  python scripts/docs/asvs_tally_lint.py docs --print-keys
+#
+# These are the hard-coded ASVS verdict tallies already in this repo's documents when the lint
+# landed. They are RECORDED, not edited. A one-time sweep was tried on the assessment corpus: it
+# cost about 850 net lines, needed its own repair commit, and the defect regenerated inside four
+# days because new documents were written after it. This file is what makes the lint forward-only.
+#
+# To retire one: delete the tally from the document AND lower or delete its line here, in the same
+# change. A line left behind over-counts the tree and FAILS the lint. That is the ratchet.
+docs/BACKLOG.md	SLASH_RUN	192/20/0/133	1
+docs/BACKLOG.md	SLASH_RUN	212/0/0/133	2
+docs/Secure_Build_Scorecard_MEFOR.md	LABELLED_VERDICTS	5fail,46partial,179pass	1
+docs/Secure_Build_Scorecard_MEFOR.md	SLASH_RUN	175/50/2/118	1
+docs/Secure_Build_Scorecard_MEFOR.md	SLASH_RUN	179/46/5/115	3
+docs/Secure_Build_Scorecard_MEFOR.md	SLASH_RUN	192/20/0/133	1
+docs/Secure_Build_Scorecard_MEFOR.md	SLASH_RUN	199/51/2/93	1
+docs/Secure_Build_Scorecard_MEFOR.md	SLASH_RUN	212/0/0/133	1
+docs/Secure_Build_Scorecard_MEFOR.md	SLASH_RUN	214/0/0/131	1
+docs/adr/0019-pluggable-keyprovider-hsm-kms-vault.md	SLASH_RUN	178/20/6/141	1
+docs/adr/0019-pluggable-keyprovider-hsm-kms-vault.md	SLASH_RUN	189/20/3/133	2
+docs/adr/0019-pluggable-keyprovider-hsm-kms-vault.md	SLASH_RUN	192/20/0/133	2
+docs/archive/backlog/BACKLOG-CLOSED.md	AGAINST_TOTAL	68of345	1
+docs/archive/backlog/BACKLOG-CLOSED.md	LABELLED_VERDICTS	0fail,0partial,131na,214pass	1
+docs/archive/backlog/BACKLOG-CLOSED.md	SLASH_RUN	179/46/5/115	1
+docs/archive/backlog/BACKLOG-CLOSED.md	SLASH_RUN	189/52/10/94	1
+docs/archive/backlog/BACKLOG-CLOSED.md	TABLE_ROW	179|51|5|110	1
+docs/archive/backlog/BACKLOG-CLOSED.md	TABLE_ROW	189|57|10|89	1
