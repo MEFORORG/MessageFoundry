@@ -94,7 +94,20 @@ from typing import Any
 #: API). Report-only, reflects/changes NO live TLS behaviour; additive with a default, so an older
 #: console simply ignores it. Bumped because the golden seam snapshot introspects SecurityPosture's
 #: field set, so any added field trips the handshake even when it is purely additive.
-ENGINE_UI_SEAM: int = 18
+#: seam v20 (ASVS 8.2.2, BACKLOG #1152): ``UploadedFileList`` gained a REQUIRED
+#: ``scope: Literal["own", "any_owner"]`` naming which population the listing actually contains, and
+#: ``pages/uploaded_logs.py`` reads it unconditionally to render the matching sentence. NOT additive
+#: with a default: a console carrying that render against an engine without the field would pass the
+#: handshake and then AttributeError, which is exactly the skew this constant exists to refuse.
+#:
+#: **v19 IS DELIBERATELY SKIPPED, and the reason is a defect rather than an accident.** Two unlanded
+#: branches — ``w3-log-write-failure`` (``SystemStatus.log_sinks``, #122) and
+#: ``w3-store-privilege-preflight`` (``SecurityPosture.store_privilege``, #1008) — BOTH already bump to
+#: 19, for two independent contract changes. That collision is BACKLOG #1220. Main is still 18, so 19
+#: merely looks free; taking it would have made a third claimant on one number. A seam value needs
+#: uniqueness and monotonicity, not density, so skipping to 20 costs nothing and leaves 19 to whichever
+#: of those two lands first. See #1220 for the derived-hash fix that removes hand-chosen numbers.
+ENGINE_UI_SEAM: int = 20
 
 
 @dataclass(frozen=True, slots=True)

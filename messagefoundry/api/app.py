@@ -35,7 +35,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import (
@@ -3698,6 +3698,85 @@ def create_app(
             raise HTTPException(503, "uploaded logs are not configured (set [store].uploads_dir)")
         return us
 
+    def _may_access_upload(identity: Identity, meta: UploadedFileMeta) -> bool:
+        """Object-level authorization for ONE uploaded file (ASVS 8.2.2): owner-only, plus an explicit
+        cross-operator override (``files:access_any``, an ADMINISTRATOR grant).
+
+        The owner key is ``Identity.user_id`` — the account's immutable ``uuid4`` hex — and NOT the
+        username. A username is unique among live accounts but reusable: deleting a user frees the
+        name, and recreating it mints a NEW ``user_id``, so a name comparison would hand the recycled
+        account the departed operator's uploaded PHI. The exact same value keys the per-uploader quota
+        (``uploads.py`` ``save()``), so ownership and the budget can never disagree about who a file
+        belongs to — a recycled account is neither billed for nor able to read the old files.
+
+        **WHAT THIS DOES NOT REACH, and it is the primary enterprise path.** ``_upsert_ad_user``
+        (``auth/service.py``) resolves an AD principal by ``sAMAccountName`` and mints a fresh
+        ``user_id`` ONLY when no mirror row survives — i.e. only after a MessageFoundry
+        ``delete_user``. On the DEFAULT path the surviving row is adopted and **its ``user_id`` is
+        re-bound**, so a deploying site that recycles a ``sAMAccountName`` in the directory without
+        also deleting the MessageFoundry user would give the new person the old person's id, and this
+        check would match. No better key exists here: ``AdPrincipal`` carries no ``objectGUID`` or
+        ``objectSid``. Closing it means binding AD to a directory-immutable id the way OIDC binds
+        ``(issuer, sub)`` — tracked as BACKLOG #1143, not solvable inside this function.
+
+        The channel axis is deliberately NOT used: ``Identity.allowed_channels`` defaults to ``None``
+        (= every channel) and an uploaded file carries no channel at all, so a channel-scoped rule
+        would protect nobody on a default install and would deny every scoped operator their own file.
+
+        FAIL CLOSED on a sidecar with no ``uploader_id``. ``save()`` refuses to write one, but the
+        tolerant loader yields ``""`` for a sidecar missing the key (a hand-placed one under the no-key
+        identity cipher), and ``""`` matches no real ``user_id``. Such a file is reachable ONLY by an
+        override holder — never by "everyone", which is what an equality test alone would give it if
+        the caller's id were ever empty too."""
+        if identity.has(Permission.FILES_ACCESS_ANY):
+            return True
+        return bool(meta.uploader_id) and meta.uploader_id == identity.user_id
+
+    async def _authorized_upload_meta(
+        request: Request, engine: Engine, us: UploadStore, identity: Identity, file_id: str, op: str
+    ) -> UploadedFileMeta:
+        """Load one uploaded file's metadata and enforce :func:`_may_access_upload` (ASVS 8.2.2).
+
+        A denial answers **404 "no such uploaded file"** — the same status and the same response BODY
+        as a malformed or absent id. That is a bound on the response, not on the whole observation: the
+        denied path additionally reads and decrypts the sidecar and writes an ``upload.denied`` audit
+        row, so it is distinguishable by timing and permanently distinguishable in the audit log. What
+        makes the by-id routes non-enumerable is the id itself — a ``file_id`` is 128 bits of
+        ``secrets.token_hex(16)`` and the listing no longer hands out another operator's — not the
+        indistinguishability of the answer. The denial is audited: the acting username, the acting
+        ``user_id``, the ``file_id`` and the operation — never the filename, the owner or any content.
+
+        Every by-id route calls this BEFORE it decrypts a body or unlinks anything, which is the point:
+        the check has to sit in the handler BODY, not in a ``Depends`` gate, because the web console
+        invokes these handlers directly through the CoreHandlers seam and never runs their gates."""
+        try:
+            meta = await us.get_meta(file_id)
+        except (UploadPathError, UploadNotFoundError):
+            raise HTTPException(404, "no such uploaded file") from None
+        if not _may_access_upload(identity, meta):
+            await engine.store.record_audit(
+                "upload.denied",
+                actor=identity.username,
+                # ``actor`` stays the username — that is the codebase-wide audit convention and every
+                # reader/query already assumes it. But this control exists precisely BECAUSE a username
+                # is reusable, so the column alone cannot say WHICH principal was refused: after a name
+                # is recycled, two different accounts wear the same string and the departed operator's
+                # denials read as the successor's. The immutable id disambiguates them, and it is an
+                # account identifier, not PHI. Nothing else joins it: no filename, no owner name, no
+                # content — the audit is not a PHI sink.
+                detail=json.dumps(
+                    {
+                        "file_id": file_id,
+                        "operation": op,
+                        "reason": "not_owner",
+                        "actor_user_id": identity.user_id,
+                    }
+                ),
+                client=client_ip(request),
+            )
+            raise HTTPException(404, "no such uploaded file")
+        return meta
+
     def _upload_info(meta: UploadedFileMeta) -> UploadedFileInfo:
         return UploadedFileInfo(
             file_id=meta.file_id,
@@ -3726,7 +3805,9 @@ def create_app(
         (EXIF/XMP/docProps) can ever be stored.
 
         **Consent (ASVS 14.2.8).** The original filename you supply and your username are stored and shown
-        to authorized operators, and recorded in the audit log; submitting an upload is your consent."""
+        to you and to authorized operators holding ``files:access_any`` (administrators), and recorded in
+        the audit log; submitting an upload is your consent. The file itself is **owner-only** (ASVS
+        8.2.2): only you and an override holder can list, browse, resend or delete it."""
         us = _require_upload_store(request)
         body = await request.body()
         try:
@@ -3754,7 +3835,14 @@ def create_app(
             )
             raise HTTPException(415, nontext) from None
         try:
-            meta = await us.save(data=part.data, filename=part.filename, uploader=identity.username)
+            # uploader_id (the immutable account id) is the ownership + quota key; uploader (the
+            # username) rides along as the display/audit label. See uploads.UploadedFileMeta.
+            meta = await us.save(
+                data=part.data,
+                filename=part.filename,
+                uploader=identity.username,
+                uploader_id=identity.user_id,
+            )
         except UploadTooLargeError as exc:
             raise HTTPException(413, str(exc)) from None
         except UploadContentError as exc:
@@ -3817,16 +3905,32 @@ def create_app(
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.FILES_BROWSE)),
     ) -> UploadedFileList:
-        """List uploaded files (metadata only — no bodies). Audited."""
+        """List the caller's OWN uploaded files (metadata only — no bodies). Audited.
+
+        Object-level authorization (ASVS 8.2.2): the listing is owner-scoped, so one operator never
+        sees another's filenames, sizes, digests or ``file_id`` s — the ``file_id`` being the token the
+        browse/resend/delete routes accept. ``files:access_any`` widens it to every uploader's files.
+        The scope is returned in the response AND recorded in the audit row — computed once, here — so
+        a count means the same thing to every reader and no consumer has to re-derive whose files it
+        is holding. The web console renders the sentence that matches it rather than asserting the
+        owner-scoped case at an override holder, for whom it is false."""
         us = _require_upload_store(request)
-        files = await us.list_files()
+        # Filtered HERE, not in UploadStore.list_files(): the store's unscoped scan is what the
+        # per-uploader quota and the age-based retention sweep are built on, and both must keep seeing
+        # every uploader's sidecars (uploads.py save()/prune_expired()).
+        files = [m for m in await us.list_files() if _may_access_upload(identity, m)]
+        scope: Literal["own", "any_owner"] = (
+            "any_owner" if identity.has(Permission.FILES_ACCESS_ANY) else "own"
+        )
         await engine.store.record_audit(
             "upload.list",
             actor=identity.username,
-            detail=json.dumps({"count": len(files)}),
+            detail=json.dumps({"count": len(files), "scope": scope}),
             client=client_ip(request),
         )
-        return UploadedFileList(total=len(files), files=[_upload_info(m) for m in files])
+        return UploadedFileList(
+            total=len(files), files=[_upload_info(m) for m in files], scope=scope
+        )
 
     @app.get("/uploads/{file_id}/messages", response_model=UploadedMessagesResult)
     async def browse_uploaded_file(
@@ -3845,7 +3949,12 @@ def create_app(
     ) -> UploadedMessagesResult:
         """Browse an uploaded file's split messages as a filterable log (BACKLOG #125). Decrypts + splits
         real PHI, so it is step-up-gated + PHI-read-hop-guarded (like content search) and audited with the
-        needle SHAPE only (never its value). Returns metadata only — never a decrypted body."""
+        needle SHAPE only (never its value). Returns metadata only — never a decrypted body.
+
+        Owner-only (ASVS 8.2.2): a file the caller did not upload answers 404. The response shape does
+        not bound what this route releases — ``matched`` plus the per-message metadata answer "does this
+        needle occur in that file", so an unscoped browse is a content oracle over another operator's
+        PHI, which is why the check runs BEFORE the body is decrypted."""
         enforce_phi_read_hop(request)
         enforce_phi_read_pacing(request, identity)  # bulk decrypt+split on a step-up GET
         us = _require_upload_store(request)
@@ -3860,8 +3969,8 @@ def create_app(
                 )
             except ContentSearchError as exc:
                 raise HTTPException(400, str(exc)) from exc
+        meta = await _authorized_upload_meta(request, engine, us, identity, file_id, "browse")
         try:
-            meta = await us.get_meta(file_id)
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
@@ -3926,7 +4035,12 @@ def create_app(
         the DISTINCT inject path ``engine.inject_message`` (``enqueue_ingress``) — a fresh ``RECEIVED`` on
         the target inbound's channel — NOT ``reingress`` (which presupposes an origin row an uploaded file
         never had). The target inbound must be registered + running, and the caller channel-scoped to it.
-        Step-up-gated + audited."""
+        Step-up-gated + audited.
+
+        TWO authorization axes, both enforced: the TARGET (per-channel ``can_access_channel`` on the
+        inbound, 403) and the SOURCE file (owner-only, ASVS 8.2.2, 404). Without the source check the
+        route is a two-step read of another operator's bodies — inject their message into an inbound you
+        are authorized for, then read it as an ordinary message on your own channel."""
         us = _require_upload_store(request)
         # Cross-channel authorization: the inbound name is treated as a channel for per-channel RBAC, so a
         # scoped operator cannot inject PHI into an inbound they can't reach. 403 (target denied).
@@ -3943,6 +4057,8 @@ def create_app(
                 )
         except KeyError:
             raise HTTPException(404, f"no such inbound connection: {body.to}") from None
+        # Object-level authorization on the SOURCE file, in ADDITION to the target-channel check above.
+        await _authorized_upload_meta(request, engine, us, identity, file_id, "resend")
         try:
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
@@ -3979,9 +4095,15 @@ def create_app(
         identity: Identity = Depends(require_step_up(Permission.FILES_DELETE)),
     ) -> UploadDeleteResult:
         """Delete an uploaded file from the server (BACKLOG #126) — destructive + irreversible. Guarded
-        by the path-traversal-safe ``file_id`` (a bad id 404s without a filesystem touch), step-up, and an
-        ``upload.delete`` audit row."""
+        by the path-traversal-safe ``file_id`` (a bad id 404s without a filesystem touch), step-up, an
+        owner-only object check (ASVS 8.2.2 — another operator's file answers 404, and is never
+        unlinked), and an ``upload.delete`` audit row.
+
+        The check reads the metadata FIRST, because ``UploadStore.delete`` returns the metadata only
+        after it has already unlinked both sidecars — a check bolted onto that call would fire too
+        late. The age-based retention sweep is deliberately owner-blind and unaffected."""
         us = _require_upload_store(request)
+        await _authorized_upload_meta(request, engine, us, identity, file_id, "delete")
         try:
             meta = await us.delete(file_id)
         except (UploadPathError, UploadNotFoundError):

@@ -32,9 +32,27 @@ def _human_size(n: int) -> str:
     return f"{n} B"  # unreachable
 
 
-def uploaded_logs(data: UploadedFileList) -> Markup:
+#: What the listing is scoped to, keyed by ``UploadedFileList.scope`` (ASVS 8.2.2). The engine computes
+#: that value once, at the route, from the caller's ``files:access_any`` grant; rendering a fixed
+#: sentence per value is what keeps this page from telling an override holder — whose listing DOES carry
+#: other operators' files — that it shows only their own. Re-deriving the grant here would put a second
+#: copy of the rule in the console, which is how the sentence went stale in the first place.
+_SCOPE_NOTES = {
+    "own": (
+        "This list shows the files you uploaded; reaching another operator's requires "
+        "files:access_any."
+    ),
+    "any_owner": "You hold files:access_any, so this list shows every operator's uploaded files.",
+}
+
+
+def uploaded_logs(data: UploadedFileList, *, error: str = "") -> Markup:
     """The uploaded-files list: an upload link + a table of files (metadata only), each linking to the
-    offline browse view and a guarded delete."""
+    offline browse view and a guarded delete.
+
+    ``error`` is the refused-mutation banner (a resend or delete that did NOT run). The route resolves
+    it from an allow-list of fixed module text, so nothing caller-supplied reaches here — but it goes
+    through ``text()`` like every other dynamic value regardless."""
     rows = [
         [
             el("a", f.filename, href=f"/ui/uploaded-logs/file/{f.file_id}"),
@@ -52,23 +70,29 @@ def uploaded_logs(data: UploadedFileList) -> Markup:
         ]
         for f in data.files
     ]
-    return page(
-        "Uploaded logs",
+    parts: list[object] = [
         el("h1", "Uploaded logs"),
         el(
             "p",
             "Import a partner-supplied message file and browse it offline — decoupled from any live "
-            "connection. Uploaded files are PHI at rest; access is audited.",
+            "connection. Uploaded files are PHI at rest; access is audited. "
+            + _SCOPE_NOTES[data.scope],
             class_="muted",
         ),
-        el("p", el("a", "Upload a file →", href="/ui/uploaded-logs/upload", class_="btn-link")),
-        rows_table(
-            ["File", "Uploaded by", "Format", "Size", "Messages", "When", ""],
-            rows,
-        ),
-        el("p", text(f"{data.total} file(s)"), class_="pager"),
-        active="uploaded-logs",
+    ]
+    if error:
+        parts.append(el("p", text(error), class_="banner"))
+    parts.extend(
+        [
+            el("p", el("a", "Upload a file →", href="/ui/uploaded-logs/upload", class_="btn-link")),
+            rows_table(
+                ["File", "Uploaded by", "Format", "Size", "Messages", "When", ""],
+                rows,
+            ),
+            el("p", text(f"{data.total} file(s)"), class_="pager"),
+        ]
     )
+    return page("Uploaded logs", *parts, active="uploaded-logs")
 
 
 def uploaded_logs_upload(*, error: str = "") -> Markup:
@@ -95,8 +119,9 @@ def uploaded_logs_upload(*, error: str = "") -> Markup:
             el(
                 "p",
                 "The original filename and your username are stored with this upload and shown to "
-                "authorized operators, and recorded in the audit log. Submitting this form is your "
-                "consent. Only plain-text .hl7 / .txt / .xml logs are accepted.",
+                "you and to authorized operators holding files:access_any (administrators), and "
+                "recorded in the audit log. Submitting this form is your consent. Only plain-text "
+                ".hl7 / .txt / .xml logs are accepted.",
                 class_="muted",
             ),
             el("button", "Upload", type="submit", class_="primary"),

@@ -196,7 +196,7 @@ apply. What each **adds** over plain `require()`:
 validates the handshake `Origin` against `[api].ws_allowed_origins` **before** `accept()`, then the
 bearer token, the must-change lockout and the permission.
 
-### Permission catalogue (27)
+### Permission catalogue (28)
 
 The catalogue is `Permission` in [`auth/permissions.py`](../messagefoundry/auth/permissions.py); the
 enum value **is** the wire/storage string. "Routes" counts engine route objects gated on that permission
@@ -230,6 +230,7 @@ under `create_app()` (they sum to 88, not 87, because `GET /messages/export` req
 | `FILES_UPLOAD` | `files:upload` | **PHI** | 1 | `POST /uploads` — writes real HL7 PHI at rest |
 | `FILES_BROWSE` | `files:browse` | **PHI** | 3 | `GET /uploads` (metadata), `GET /uploads/{id}/messages` (bulk decrypt+split), `POST /uploads/{id}/resend` |
 | `FILES_DELETE` | `files:delete` | | 1 | `DELETE /uploads/{id}` — destructive, audited cleanup |
+| `FILES_ACCESS_ANY` | `files:access_any` | **PHI** | 0 | no route — an **object-level** override (ASVS 8.2.2), enforced in the uploaded-files handler bodies rather than at a gate (the console calls those handlers directly over the seam, so a gate would not cover it). Uploaded files are **owner-only**: without this, `files:browse`/`files:delete` reach only what the caller uploaded; with it, every uploader's. It is not a capability of its own — the holder still needs `files:browse` / `files:delete` for the route. Never assignable to a custom role |
 | `APPROVALS_APPROVE` | `approvals:approve` | | 3 | `GET /approvals`, `POST /approvals/{id}/approve`, `/reject` (dual control, ASVS 2.3.5). Never assignable to a custom role |
 
 `config:validate` and `code:edit` have **no API endpoint yet**; they are defined so
@@ -245,7 +246,7 @@ inheritance — where a permission came from is invisible downstream.
 
 | Role | Count | Permissions |
 |---|:--:|---|
-| **Administrator** | 27 | **every permission** — literally `frozenset(Permission)`, so a newly added permission is granted to it automatically |
+| **Administrator** | 28 | **every permission** — literally `frozenset(Permission)`, so a newly added permission is granted to it automatically |
 | **Operator** | 16 | `monitoring:read`, `monitoring:diagnose`, `messages:read`, `messages:view_summary`, `messages:view_raw`, `messages:replay`, `messages:resend`, `messages:edit`, `messages:export`, `messages:purge`, `connections:control`, `connections:test`, `logs:view`, `files:upload`, `files:browse`, `files:delete` |
 | **Deployment** | 4 | `monitoring:read`, `config:deploy`, `config:validate`, `connections:test` |
 | **Coding** | 4 | `monitoring:read`, `code:edit`, `config:validate`, `ai:assist` |
@@ -267,11 +268,11 @@ permission at all, so every gated property comes back `null` for them.
 The custom-role builder **is built** and is an *additive overlay* on the six built-ins, not a
 replacement:
 
-- A custom role is a named **subset of the existing 27-permission catalogue** — it can never define a
+- A custom role is a named **subset of the existing 28-permission catalogue** — it can never define a
   new permission kind.
 - Its id must carry the `custom:` prefix (`CUSTOM_ROLE_ID_PREFIX`), so it can never collide with a
   built-in role value or be mis-routed to the built-in resolver.
-- It may **never** grant `users:manage`, `approvals:approve` or `dr:operate`
+- It may **never** grant `users:manage`, `approvals:approve`, `dr:operate` or `files:access_any`
   (`CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`) — the escalation primitives stay admin-only.
 - An empty set or an unknown permission string is rejected on write (`CustomRoleError`); a
   malformed/hand-edited persisted `roles.permissions` row decodes **defensively to the empty set**, and
@@ -449,10 +450,47 @@ tuple: they act only on the caller's own account.
 | Method | Path | Permission | Gate | Extra constraints |
 |---|---|---|---|---|
 | `POST` | `/uploads` | `files:upload` | `require_step_up` | stdlib multipart parse (no `python-multipart`) |
-| `GET` | `/uploads` | `files:browse` | `require` | metadata only — no body, no summary |
-| `GET` | `/uploads/{file_id}/messages` | `files:browse` | `require_step_up` | explicit `enforce_phi_read_hop` + `enforce_phi_read_pacing` (bulk decrypt + split) |
-| `POST` | `/uploads/{file_id}/resend` | `files:browse` | `require_step_up` | per-channel `can_access_channel` check on the target inbound |
-| `DELETE` | `/uploads/{file_id}` | `files:delete` | `require_step_up` | destructive, audited |
+| `GET` | `/uploads` | `files:browse` | `require` | metadata only — no body, no summary; **owner-scoped** (ASVS 8.2.2) — the caller sees only the files they uploaded unless they hold `files:access_any` |
+| `GET` | `/uploads/{file_id}/messages` | `files:browse` | `require_step_up` | explicit `enforce_phi_read_hop` + `enforce_phi_read_pacing` (bulk decrypt + split); **owner-only** — another operator's file answers **404**, before the decrypt |
+| `POST` | `/uploads/{file_id}/resend` | `files:browse` | `require_step_up` | per-channel `can_access_channel` check on the target inbound (403) **and** an owner check on the source file (404) |
+| `DELETE` | `/uploads/{file_id}` | `files:delete` | `require_step_up` | destructive, audited; **owner-only** — another operator's file answers **404** and is never unlinked |
+
+> **Object-level authorization for uploaded files (ASVS 8.2.2).** An uploaded file belongs to the
+> **account** that uploaded it — `UploadedFileMeta.uploader_id`, which is `Identity.user_id` (an
+> immutable `uuid4` hex), and *not* the username. A username is unique among live accounts but it is
+> reusable: deleting a user frees the name and recreating it mints a different `user_id`, so a
+> name-keyed rule would hand the recycled account the departed operator's files.
+> `UploadedFileMeta.uploader` is retained as the **display/audit label** only. The per-uploader quota
+> (ASVS 5.2.4) bills the same `uploader_id`, so ownership and the budget can never disagree about who
+> a file belongs to.
+>
+> **Bound, and stated because the bound is the load-bearing part.** This closes local accounts and any
+> AD account that goes through a MessageFoundry `delete_user`. It does **not** close a
+> `sAMAccountName` recycled in the directory *without* one: `_upsert_ad_user` resolves by username and
+> mints a new `user_id` only when no mirror row survives, so on the default AD path the surviving row
+> is adopted and **its `user_id` is re-bound to the new principal**. A deploying site on AD would
+> therefore still need the directory-immutable binding — AD to `objectGUID`/`objectSid`, the way OIDC
+> binds `(issuer, sub)` — tracked as BACKLOG #1143. `AdPrincipal` carries no such identifier today, so
+> `user_id` is the strongest key currently available, not a complete one.
+>
+> **Owner-only** is the whole rule: list, browse, resend and delete reach the caller's own files.
+> `files:access_any` is the explicit cross-operator override, granted to **Administrator** only (it is
+> the whole catalogue), never to Operator, and never mintable onto a custom role
+> (`CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`). The channel axis is deliberately **not** used here —
+> `Identity.allowed_channels` defaults to `null` (= every channel) and an uploaded file carries no
+> channel, so a channel-scoped rule would protect nobody on a default install and would deny every
+> scoped operator their own file. A denied by-id request answers **404** with the same body as a
+> malformed or absent id; what makes the by-id routes non-enumerable is that a `file_id` is 128 bits
+> of `secrets.token_hex(16)` and the listing no longer hands out another operator's — the denial is
+> still distinguishable by timing and by its audit row. That denial is audited as `upload.denied` with
+> the acting username, the acting `user_id`, the `file_id` and the operation — never the filename, the
+> owner or any content. The id is there because the username is the value this rule exists to distrust:
+> recycle a name and the actor column can no longer say which principal was refused, but the id can. The
+> checks live in the **handler bodies**, not in the route gates, because the console invokes those
+> same handlers over the seam and never runs their `Depends`. A sidecar with no `uploader_id` (a
+> hand-placed one; `save()` refuses to write one) matches nobody and is reachable **only** by an
+> override holder — fail closed. The age-based retention sweep stays owner-blind by design: it
+> deletes by age, for every uploader.
 
 #### Logs & AI
 
@@ -485,7 +523,7 @@ rather than shown a body its permission set does not authorize.
 
 When the console is served, the `/ui` plane adds **95 routes + one `/ui/static` mount** (federation off,
 the default — the two `/ui/oidc/*` routes are registered only when `[auth].oidc_enabled`). They are
-functions too, and they gate on the **same 27-permission catalogue** through parallel wrappers —
+functions too, and they gate on the **same 28-permission catalogue** through parallel wrappers —
 `require_ui`, `require_ui_step_up`, `require_ui_reauth_only`, `require_ui_step_up_action`,
 `require_ui_reauth_only_action` — but authenticate by the `/ui`-confined `SameSite=Strict` **session
 cookie** rather than a bearer token, and refuse cross-site state changes on `Sec-Fetch-Site`/`Origin`.
