@@ -818,9 +818,18 @@ upload chokepoint enforces a fixed policy independent of the directory-source po
   (There is **no** antivirus/content-malware scan on the upload path — the `ScanRejected` pre-ingest
   scan-hook seam applies only to the `File(...)`/remote directory sources above, not to HTTP uploads.)
 - **Consent affordance (ASVS 14.2.8).** The `/ui/uploaded-logs/upload` form states, above its submit
-  button, that the original filename and the uploader's username are stored and shown to authorized
-  operators and recorded in the audit log — **submitting the form is the consent**; the POST `/uploads`
-  OpenAPI docstring states the same for programmatic callers.
+  button, that the original filename and the uploader's username are stored and shown to the uploader
+  and to authorized operators holding `files:access_any`, and recorded in the audit log — **submitting
+  the form is the consent**; the POST `/uploads` OpenAPI docstring states the same for programmatic
+  callers.
+- **Owner-only access (ASVS 8.2.2).** An uploaded file is reachable only by the **account** that
+  uploaded it — keyed on the immutable `Identity.user_id`, not the reusable username: the listing is
+  filtered to the caller, and browse / resend / delete answer **404** for anyone else, audited as
+  `upload.denied` (which principal was refused, which file, which operation — never a filename or
+  content). `files:access_any` (Administrator) is the explicit cross-operator override. The rule and
+  its rationale live in
+  [SECURITY.md](SECURITY.md#uploaded-files-phi-at-rest); the age-based retention prune above is
+  deliberately owner-blind.
 
 **Downloads are made safe at serve (ASVS 1.3.4).** The attachment download route (GET
 `/messages/{message_id}/attachments/{attachment_id}`, and its `/ui` delegate) serves the stored bytes
