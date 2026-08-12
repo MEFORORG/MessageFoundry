@@ -640,6 +640,15 @@ _SECRET_SETTING_KEYS = frozenset(
         # HTTP Digest / NTLM password). The minted bearer / digest response are runtime-only.
         "oauth2_client_secret",
         "http_auth_password",
+        # BACKLOG #1106 follow-up — the HTTP Digest USERNAME, redacted defence-in-depth alongside
+        # `basic_user`/`proxy_user`/`ws_username`/`credential_username`/`username` on the ground stated
+        # there: a username names a principal and can leak directory structure. It was the sixth member
+        # of a five-member class and the only one unclassified, because `with_http_digest` renames
+        # parameter `user` into setting `http_auth_user` — the SAME parameter-to-setting boundary
+        # `with_signing` crosses (`private_key` -> `sign_private_key`), which is the whole of #1106.
+        # Measured before the fix: served verbatim by /metadata and printed by `graph --json`, with its
+        # env() FALLBACK DEFAULT intact, beside a `proxy_user` that masked on the same object.
+        "http_auth_user",
         # ADR 0126 (#127) — the forward/egress web-proxy credential. The Basic Proxy-Authorization header /
         # Digest response are runtime-only; the password + username inputs are redacted in /metadata (the
         # username alongside `basic_user`/`ws_username`, defence-in-depth).
@@ -844,7 +853,14 @@ def _is_secret_setting(name: str) -> bool:
 #: proves every registered connector secret is reachable by the fingerprinter — the direction a
 #: hand-added registry entry (the SOAP ``body_secret_value`` class) had slipped through.
 _NON_ROTATABLE_SECRET_SETTING_KEYS: frozenset[str] = frozenset(
-    {"username", "basic_user", "proxy_user", "ws_username", "credential_username"}
+    {
+        "username",
+        "basic_user",
+        "proxy_user",
+        "ws_username",
+        "credential_username",
+        "http_auth_user",  # BACKLOG #1106 follow-up — the HTTP Digest principal; you rotate its password
+    }
 )
 
 
