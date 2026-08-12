@@ -247,7 +247,10 @@ _NO_PHI_RESPONSE_MODELS: dict[str, str] = {
     "UploadDeleteResult": "file_id/filename/deleted",
     "UploadResendResult": "file_id/index/message_id/status/to",
     "UploadedFileInfo": "file metadata: name/size/sha256/uploader/count — never content",
-    "UploadedFileList": "envelope: files + total",
+    "UploadedFileList": (
+        "envelope: files + total + scope, the fixed own/any_owner enum saying whose files the count "
+        "was taken over (never operator text)"
+    ),
     "UploadedMessageSummary": "index/message_type/control_id/size only — no body, no summary",
     "UploadedMessagesResult": "envelope: counters + UploadedMessageSummary rows",
 }

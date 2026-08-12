@@ -7,14 +7,24 @@ end (upload → list → browse → delete) and the RBAC/off-by-default gates.""
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import httpx
+import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
+from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import AuthSettings, StoreSettings
+from messagefoundry.config.wiring import (
+    ConnectionSpec,
+    InboundConnection,
+    OutboundConnection,
+    Registry,
+    Send,
+)
 from messagefoundry.pipeline import Engine
 
 PW = "Correct-Horse-Battery-Staple-9"
@@ -23,22 +33,42 @@ ADT2 = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A04|MSG2|P|2.5.1\rPID|1||MRN999\r"
 BATCH = ADT + ADT2
 
 
-async def _service(engine: Engine, *users: tuple[str, Role], per_actor: int = 120) -> AuthService:
+async def _add_user(
+    service: AuthService, name: str, role: Role, *, channels: list[str] | None = None
+) -> str:
+    """Create a sign-in-ready local user. ``channels`` sets the per-channel RBAC scope (None = all);
+    it is applied BEFORE the first login because set_channel_scope revokes the user's sessions."""
+    uid = await service.create_local_user(
+        username=name, password=PW, display_name=None, email=None, roles=[role.value], actor="t"
+    )
+    user = await service.store.get_user(uid)
+    assert user is not None and user.password_hash is not None
+    await service.store.set_password(
+        uid, password_hash=user.password_hash, must_change_password=False
+    )
+    if channels is not None:
+        await service.set_channel_scope(uid, channels, actor="t")
+    return uid
+
+
+async def _service(
+    engine: Engine, *users: tuple[str, Role], per_actor: int = 120, step_up_max_age: int = 300
+) -> AuthService:
     # per_actor mirrors AuthSettings' default (120); pass a smaller value to exercise the per-actor
     # PHI-read budget in a single test (see test_webui.py:616 test_edit_editor_charges_the_phi_read_budget).
+    # step_up_max_age mirrors AuthSettings' default (300); pass -1 to make every step-up window stale
+    # on arrival, the idiom the rest of the console suite uses to exercise the /ui/reauth bounce.
     service = AuthService(
-        engine.store, AuthSettings(require_mfa=False, phi_read_rate_limit_per_actor=per_actor)
+        engine.store,
+        AuthSettings(
+            require_mfa=False,
+            phi_read_rate_limit_per_actor=per_actor,
+            step_up_max_age_seconds=step_up_max_age,
+        ),
     )
     await service.initialize()
     for name, role in users:
-        uid = await service.create_local_user(
-            username=name, password=PW, display_name=None, email=None, roles=[role.value], actor="t"
-        )
-        user = await service.store.get_user(uid)
-        assert user is not None and user.password_hash is not None
-        await service.store.set_password(
-            uid, password_hash=user.password_hash, must_change_password=False
-        )
+        await _add_user(service, name, role)
     return service
 
 
@@ -54,6 +84,18 @@ def _app(engine: Engine, service: AuthService, tmp_path: Path, *, uploads: bool 
 async def _login(c: httpx.AsyncClient, name: str) -> None:
     r = await c.post("/ui/login", data={"username": name, "password": PW})
     assert r.status_code in (200, 303), r.text
+
+
+async def _upload(c: httpx.AsyncClient, name: str = "acme.hl7") -> str:
+    """Upload BATCH and return its file_id, read back off the listing's browse link."""
+    up = await c.post(
+        "/ui/uploaded-logs/upload", files={"file": (name, BATCH, "application/octet-stream")}
+    )
+    assert up.status_code in (200, 303), up.text
+    listing = await c.get("/ui/uploaded-logs")
+    fid = listing.text.split("/ui/uploaded-logs/file/", 1)[1].split('"', 1)[0].split("/")[0]
+    assert len(fid) == 32
+    return fid
 
 
 async def test_uploaded_logs_ui_flow(engine: Engine, tmp_path: Path) -> None:
@@ -106,6 +148,438 @@ def test_upload_form_states_consent_affordance() -> None:
     assert "Submitting this form is your consent" in html
     # The consent notice sits inside the form, ABOVE the submit button.
     assert html.index("your consent") < html.index("Upload</button>")
+
+
+async def test_uploaded_logs_ui_is_owner_scoped(engine: Engine, tmp_path: Path) -> None:
+    # ASVS 8.2.2 (BACKLOG #1152): the object-level check lives in the ENGINE HANDLER bodies, so the
+    # console inherits it over the seam — a /ui gate could not, because these /ui routes call the
+    # handlers directly and never run their Depends. A second operator sees an empty list, and a deep
+    # link to the browse page 303s back to the list (the console's own 404 arm), never the file.
+    service = await _service(engine, ("op", Role.OPERATOR), ("op2", Role.OPERATOR))
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        up = await c.post(
+            "/ui/uploaded-logs/upload",
+            files={"file": ("acme.hl7", BATCH, "application/octet-stream")},
+        )
+        assert up.status_code in (200, 303), up.text
+        listing = await c.get("/ui/uploaded-logs")
+        marker = "/ui/uploaded-logs/file/"
+        fid = listing.text.split(marker, 1)[1].split('"', 1)[0].split("/")[0]
+        assert len(fid) == 32
+
+    # A SECOND client, because the console authenticates by session cookie (no per-request header).
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c2:
+        await _login(c2, "op2")
+        mine = await c2.get("/ui/uploaded-logs")
+        assert mine.status_code == 200 and "acme.hl7" not in mine.text
+        browse = await c2.get(f"/ui/uploaded-logs/file/{fid}", follow_redirects=False)
+        assert browse.status_code == 303 and browse.headers["location"] == "/ui/uploaded-logs"
+        confirm = await c2.get(
+            f"/ui/uploaded-logs/file/{fid}/delete-confirm", follow_redirects=False
+        )
+        assert confirm.status_code == 303
+        gone = await c2.post(f"/ui/uploaded-logs/file/{fid}/delete", follow_redirects=False)
+        assert gone.status_code == 303
+
+    # The file is still there for its owner — the denied delete unlinked nothing.
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c3:
+        await _login(c3, "op")
+        assert "acme.hl7" in (await c3.get("/ui/uploaded-logs")).text
+
+
+async def test_browse_with_bad_criteria_never_answers_json_in_the_html_plane(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # The engine parses the content criteria BEFORE it authorizes the file, so a malformed filter 400s
+    # first. The route's 400 arm re-invokes the browse with the criteria dropped, which now runs far
+    # enough to 404 — and that 404 is raised INSIDE the except block, so without its own arm it escapes
+    # the /ui route and renders as application/json in the HTML console. Two ways in, one fix: a
+    # non-owner's file, and (pre-existing, not introduced by the owner check) an absent id.
+    service = await _service(engine, ("op", Role.OPERATOR), ("op2", Role.OPERATOR))
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        await c.post(
+            "/ui/uploaded-logs/upload",
+            files={"file": ("acme.hl7", BATCH, "application/octet-stream")},
+        )
+        listing = await c.get("/ui/uploaded-logs")
+        marker = "/ui/uploaded-logs/file/"
+        fid = listing.text.split(marker, 1)[1].split('"', 1)[0].split("/")[0]
+        # Positive control: the OWNER still gets the rendered 400 page, so the arm is not simply dead.
+        bad = await c.get(f"/ui/uploaded-logs/file/{fid}?content=MSH&field_path=PID-3")
+        assert bad.status_code == 400
+        assert bad.headers["content-type"].startswith("text/html")
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c2:
+        await _login(c2, "op2")
+        for target in (fid, "0" * 32):  # not yours, and does not exist
+            r = await c2.get(
+                f"/ui/uploaded-logs/file/{target}?content=MSH&field_path=PID-3",
+                follow_redirects=False,
+            )
+            assert r.status_code == 303, r.text
+            assert r.headers["location"] == "/ui/uploaded-logs"
+            assert "application/json" not in r.headers.get("content-type", "")
+
+
+async def test_uploaded_logs_ui_resend_is_owner_scoped(engine: Engine, tmp_path: Path) -> None:
+    # The resend POST was the one uploaded-logs route with no 404 arm, so an ASVS 8.2.2 denial came
+    # back as application/json inside the HTML console. It needs a REGISTERED, RUNNING inbound: the
+    # engine handler rejects an unknown target (404) or a stopped one (409) BEFORE the owner check, so
+    # without a started pipeline this would assert against "no such inbound connection" and prove
+    # nothing about ownership.
+    for d in ("in", "o1"):
+        (tmp_path / d).mkdir(exist_ok=True)
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "in1",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(tmp_path / "in"), "pattern": "*.hl7", "poll_seconds": 0.05},
+            ),
+            router="r",
+        )
+    )
+    reg.add_outbound(
+        OutboundConnection(
+            "OB1", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "o1")})
+        )
+    )
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", lambda m: Send("OB1", m))
+    engine.add_registry(reg)
+    await engine.start()
+
+    service = await _service(engine, ("op", Role.OPERATOR), ("op2", Role.OPERATOR))
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        await c.post(
+            "/ui/uploaded-logs/upload",
+            files={"file": ("acme.hl7", BATCH, "application/octet-stream")},
+        )
+        listing = await c.get("/ui/uploaded-logs")
+        marker = "/ui/uploaded-logs/file/"
+        fid = listing.text.split(marker, 1)[1].split('"', 1)[0].split("/")[0]
+        # Positive control: the owner's resend of the same message into the same inbound succeeds,
+        # and the SUCCESS response is a bare 303 carrying no outcome flag.
+        mine = await c.post(
+            f"/ui/uploaded-logs/file/{fid}/resend",
+            data={"index": "0", "to": "in1"},
+            follow_redirects=False,
+        )
+        assert mine.status_code == 303, mine.text
+        assert mine.headers["location"] == f"/ui/uploaded-logs/file/{fid}"
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c2:
+        await _login(c2, "op2")
+        denied = await c2.post(
+            f"/ui/uploaded-logs/file/{fid}/resend",
+            data={"index": "0", "to": "in1"},
+            follow_redirects=False,
+        )
+        # In the HTML plane — never a JSON error body.
+        assert denied.status_code == 303, denied.text
+        assert "application/json" not in denied.headers.get("content-type", "")
+        # A REFUSED resend must not be the byte-identical answer to a successful one, or the operator
+        # is told a message was injected when none was. It goes where success never goes, flagged.
+        assert denied.headers["location"] == "/ui/uploaded-logs?e=resend_failed"
+        assert denied.headers["location"] != mine.headers["location"]
+        # ...and it lands on op2's own listing — which the ownership check keeps empty — carrying the
+        # fixed notice. Nothing about the file is disclosed by the refusal itself.
+        landed = await c2.get(denied.headers["location"], follow_redirects=False)
+        assert landed.status_code == 200, landed.text
+        assert "That resend did not run" in landed.text
+        assert "acme.hl7" not in landed.text
+
+
+async def test_listing_states_the_scope_it_is_actually_showing(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # The page used to tell EVERY operator "this list shows the files you uploaded". That is false for
+    # a files:access_any holder, whose listing does carry other operators' files — and it is false
+    # exactly for the reader most likely to act on it. The sentence now follows the engine-computed
+    # scope (UploadedFileList.scope), which is the same value the upload.list audit row records.
+    service = await _service(engine, ("op", Role.OPERATOR), ("root", Role.ADMINISTRATOR))
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        await c.post(
+            "/ui/uploaded-logs/upload",
+            files={"file": ("acme.hl7", BATCH, "application/octet-stream")},
+        )
+        mine = await c.get("/ui/uploaded-logs")
+        assert mine.status_code == 200
+        assert "This list shows the files you uploaded" in mine.text
+        assert "You hold files:access_any" not in mine.text
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as admin:
+        await _login(admin, "root")
+        theirs = await admin.get("/ui/uploaded-logs")
+        assert theirs.status_code == 200
+        # The premise: the administrator's listing really does carry the other operator's file, so the
+        # owner-scoped sentence would be a false statement to this reader.
+        assert "acme.hl7" in theirs.text
+        assert "You hold files:access_any" in theirs.text
+        assert "This list shows the files you uploaded" not in theirs.text
+
+
+async def test_failed_resend_is_not_shaped_like_a_successful_one(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # The 404 arm used to answer with the SUCCESS response itself — the same bare 303 to the same URL —
+    # so an operator whose resend injected NOTHING was redirected exactly as if it had worked: no
+    # banner, no log line, nothing to tell the two apart. The refusal now carries a fixed flag to a
+    # target success never reaches, and the list page renders it as fixed text.
+    #
+    # The second half pins the constraint ON that flag. The resend body is caller-supplied and the
+    # engine's 404 quotes the target inbound name straight back in its detail, so putting that text in
+    # the query string or the page would be an XSS sink fed by the form. The flag is a boolean.
+    service = await _service(engine, ("op", Role.OPERATOR))
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    # A target that does not exist, carrying a payload. The name reaches the engine's 404 detail; the
+    # test's question is whether any of it comes back out.
+    bogus = "IB_NOPEZQX<script>alert(1)</script>"
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        fid = await _upload(c)
+
+        # Control: the same operator, same file, a resend that WORKS is not available here (no inbound
+        # is registered in this fixture), so the success shape is pinned in the owner-scoped test
+        # above. What this asserts is that the failure is NOT that shape.
+        failed = await c.post(
+            f"/ui/uploaded-logs/file/{fid}/resend",
+            data={"index": "0", "to": bogus},
+            follow_redirects=False,
+        )
+        assert failed.status_code == 303, failed.text
+        assert failed.headers["location"] == "/ui/uploaded-logs?e=resend_failed"
+        assert failed.headers["location"] != f"/ui/uploaded-logs/file/{fid}"
+
+        landed = await c.get(failed.headers["location"], follow_redirects=False)
+        assert landed.status_code == 200, landed.text
+        assert "That resend did not run" in landed.text
+
+        # ...and NOTHING caller-supplied rode along, into the URL or the HTML.
+        assert "IB_NOPEZQX" not in failed.headers["location"]
+        assert "IB_NOPEZQX" not in landed.text and "alert(1)" not in landed.text
+
+        # An unrecognized code renders no banner at all (allow-list, not reflection).
+        clean = await c.get("/ui/uploaded-logs?e=nope", follow_redirects=False)
+        assert clean.status_code == 200 and "That resend did not run" not in clean.text
+        assert "nope" not in clean.text
+        # The bare list — where a SUCCESSFUL delete lands — carries no banner either.
+        bare = await c.get("/ui/uploaded-logs", follow_redirects=False)
+        assert bare.status_code == 200 and "did not run" not in bare.text
+
+
+async def test_refused_resend_signal_survives_a_stale_step_up_window(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # The flag used to be aimed at the browse DETAIL page, which is step-up-gated AND registered as an
+    # unlock action. Once the step-up window goes stale that page 303s to /ui/reauth, which deliberately
+    # does not carry the query string back (the browse filter is a GET query that can hold PHI-shaped
+    # search terms) — so the flag was dropped and the operator landed on a plain detail page, the exact
+    # shape a SUCCESSFUL resend produces. The refusal now reports on the ungated list page instead.
+    #
+    # step_up_max_age_seconds=-1 is the console suite's idiom for a window that is stale on arrival
+    # (test_webui.py test_stale_stepup_bounces_body_less_action_via_reauth and friends).
+    service = await _service(engine, ("op", Role.OPERATOR), step_up_max_age=-1)
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        # upload + list are plain require_ui, so neither needs a fresh step-up window.
+        fid = await _upload(c)
+
+        # THE PROPERTY, asserted end to end: follow the WHOLE chain a browser would follow. Wherever
+        # the route chooses to send the operator, the refusal must still be legible on arrival. This
+        # is the assertion the old target fails — it lands on /ui/reauth with the flag stripped.
+        # Nothing was injected, so a second identical POST is safe.
+        chased = await c.post(
+            f"/ui/uploaded-logs/file/{fid}/resend",
+            data={"index": "0", "to": "IB_NOPEZQX"},
+            follow_redirects=True,
+        )
+        assert chased.status_code == 200, chased.text
+        assert "That resend did not run" in chased.text
+
+        # ...and THE CHOICE that makes it hold: an ungated target, so no re-auth bounce intervenes.
+        refused = await c.post(
+            f"/ui/uploaded-logs/file/{fid}/resend",
+            data={"index": "0", "to": "IB_NOPEZQX"},
+            follow_redirects=False,
+        )
+        assert refused.status_code == 303, refused.text
+        assert refused.headers["location"] == "/ui/uploaded-logs?e=resend_failed"
+        landed = await c.get(refused.headers["location"], follow_redirects=False)
+        assert landed.status_code == 200, landed.headers.get("location", landed.text)
+
+        # Positive control for the premise: the window really IS stale, and the OLD target really does
+        # lose the flag. The detail page bounces to /ui/reauth and the query string does not survive.
+        stale = await c.get(f"/ui/uploaded-logs/file/{fid}?e=resend_failed", follow_redirects=False)
+        assert stale.status_code == 303, stale.text
+        assert stale.headers["location"] == f"/ui/reauth?next=/ui/uploaded-logs/file/{fid}"
+        assert "resend_failed" not in stale.headers["location"]
+
+
+async def test_resend_refusal_names_a_distinct_cause_per_status(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # Only the 404 arm used to be handled; 403 (target channel denied) and 409 (inbound registered but
+    # not running) escaped the /ui route and rendered as application/json inside the HTML console —
+    # with the caller-supplied inbound name quoted back in exc.detail. All three are now allow-listed
+    # codes on the ungated list page, and they are DISTINCT so each notice is actionable and true.
+    #
+    # The engine is deliberately NOT started: add_registry sets the registry_runner, so "in1" is a
+    # registered inbound that inbound_running() reports as stopped — which is the 409 precondition.
+    for d in ("in", "o1"):
+        (tmp_path / d).mkdir(exist_ok=True)
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "in1",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(tmp_path / "in"), "pattern": "*.hl7", "poll_seconds": 0.05},
+            ),
+            router="r",
+        )
+    )
+    reg.add_outbound(
+        OutboundConnection(
+            "OB1", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "o1")})
+        )
+    )
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", lambda m: Send("OB1", m))
+    engine.add_registry(reg)
+
+    service = await _service(engine, ("op", Role.OPERATOR))
+    # Scoped to a DIFFERENT connection, so can_access_channel("in1") is False and the target check
+    # 403s before anything about the file is consulted. Set before the first login (it revokes).
+    await _add_user(service, "scoped", Role.OPERATOR, channels=["IB_SOMETHING_ELSE"])
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        fid = await _upload(c)
+        stopped = await c.post(
+            f"/ui/uploaded-logs/file/{fid}/resend",
+            data={"index": "0", "to": "in1"},
+            follow_redirects=False,
+        )
+        assert stopped.status_code == 303, stopped.text
+        assert "application/json" not in stopped.headers.get("content-type", "")
+        assert stopped.headers["location"] == "/ui/uploaded-logs?e=resend_stopped"
+        landed = await c.get(stopped.headers["location"], follow_redirects=False)
+        assert landed.status_code == 200 and "registered but not running" in landed.text
+        assert "in1" not in landed.text  # the target name is caller-supplied and never travels
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as sc:
+        await _login(sc, "scoped")
+        own = await _upload(sc, "scoped.hl7")  # its own file, so ONLY the target is wrong
+        denied = await sc.post(
+            f"/ui/uploaded-logs/file/{own}/resend",
+            data={"index": "0", "to": "in1"},
+            follow_redirects=False,
+        )
+        assert denied.status_code == 303, denied.text
+        assert "application/json" not in denied.headers.get("content-type", "")
+        assert denied.headers["location"] == "/ui/uploaded-logs?e=resend_denied"
+        landed = await sc.get(denied.headers["location"], follow_redirects=False)
+        assert landed.status_code == 200 and "not authorized to inject" in landed.text
+        assert "in1" not in landed.text
+        # The two causes are told apart — and neither is the 404 code, nor the success shape.
+        assert denied.headers["location"] != stopped.headers["location"]
+        assert "resend_failed" not in denied.headers["location"]
+
+
+async def test_refused_delete_is_not_shaped_like_a_completed_one(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # The delete POST's 404 arm answered with its OWN success response — the byte-identical bare 303 to
+    # the list — so a delete that was REFUSED (including an ASVS 8.2.2 owner denial) told the operator
+    # the file was deleted. The refusal now carries a flag; the success stays bare.
+    service = await _service(engine, ("op", Role.OPERATOR), ("op2", Role.OPERATOR))
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        fid = await _upload(c)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c2:
+        await _login(c2, "op2")
+        refused = await c2.post(f"/ui/uploaded-logs/file/{fid}/delete", follow_redirects=False)
+        assert refused.status_code == 303, refused.text
+        assert refused.headers["location"] == "/ui/uploaded-logs?e=delete_failed"
+        landed = await c2.get(refused.headers["location"], follow_redirects=False)
+        assert landed.status_code == 200, landed.text
+        assert "That delete did not run" in landed.text
+        assert "acme.hl7" not in landed.text  # still not disclosed to a non-owner
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c3:
+        await _login(c3, "op")
+        # The premise: the refusal unlinked nothing, so the owner's delete is the one that works.
+        assert "acme.hl7" in (await c3.get("/ui/uploaded-logs")).text
+        done = await c3.post(f"/ui/uploaded-logs/file/{fid}/delete", follow_redirects=False)
+        assert done.status_code == 303, done.text
+        assert done.headers["location"] == "/ui/uploaded-logs"
+        assert done.headers["location"] != refused.headers["location"]
+        after = await c3.get(done.headers["location"], follow_redirects=False)
+        assert after.status_code == 200
+        assert "acme.hl7" not in after.text and "That delete did not run" not in after.text
+
+
+_ROUTE_LOGGER = "messagefoundry_webconsole.routes.uploaded_logs"
+
+
+async def test_refusals_are_recorded_server_side(
+    engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The second, independent half of the fix: a refusal is recorded server-side, so it survives even
+    # if every browser-visible signal is lost (the operator closes the tab, a proxy eats the redirect,
+    # the flag is stripped). file_id + status ONLY — the target inbound name, the message index and
+    # exc.detail are all caller-supplied text, and writing those to a log is log injection.
+    service = await _service(engine, ("op", Role.OPERATOR), ("op2", Role.OPERATOR))
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    bogus = "IB_NOPEZQX<script>alert(1)</script>"
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        fid = await _upload(c)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c2:
+        await _login(c2, "op2")
+        with caplog.at_level(logging.WARNING, logger=_ROUTE_LOGGER):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                await _login(c, "op")
+                r = await c.post(
+                    f"/ui/uploaded-logs/file/{fid}/resend",
+                    data={"index": "0", "to": bogus},
+                    follow_redirects=False,
+                )
+                assert r.status_code == 303
+                # A file_id the CALLER invented, carrying an encoded newline: the target is unknown, so
+                # the engine 404s before it ever validates the id, and the console still has to log
+                # something. The minted-shape guard makes it a fixed placeholder rather than a forged
+                # second log line.
+                forged = await c.post(
+                    f"/ui/uploaded-logs/file/{'0' * 32}%0AWARNING-forged-line/resend",
+                    data={"index": "0", "to": bogus},
+                    follow_redirects=False,
+                )
+                assert forged.status_code == 303
+            d = await c2.post(f"/ui/uploaded-logs/file/{fid}/delete", follow_redirects=False)
+            assert d.status_code == 303
+
+    lines = [r.getMessage() for r in caplog.records if r.name == _ROUTE_LOGGER]
+    assert f"uploaded-log resend refused: file_id={fid} status=404" in lines
+    assert f"uploaded-log delete refused: file_id={fid} status=404" in lines
+    assert "uploaded-log resend refused: file_id=malformed status=404" in lines
+    # Nothing caller-supplied reached the log: not the inbound name, not the payload, not a newline.
+    assert not any("IB_NOPEZQX" in line or "alert(1)" in line for line in lines)
+    assert not any("forged" in line or "\n" in line for line in lines)
 
 
 async def test_uploaded_logs_ui_denied_for_viewer(engine: Engine, tmp_path: Path) -> None:
