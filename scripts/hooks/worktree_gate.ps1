@@ -63,7 +63,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.08.10.1"
+$GateVersion = "2026.08.12.3"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -361,15 +361,239 @@ function Get-ScannableSegments([string]$Cmd) {
 
     $lines = @($folded -split '\r?\n')
 
-    # One level of interpreter recursion. `-c`/`-lc`/`-Command`/`/c`/`/k` and their quoted argument.
+    # ONE LEVEL of interpreter recursion -- and the flag is recognised by a RULE, never by a list of
+    # spellings. What stood here was a fixed list of literals (`-c|-lc|-ec|-Command|-EncodedCommand` plus
+    # `/[ckCK]`, matched case-SENSITIVELY), and it carried a small minority of the family it was naming.
+    # Every spelling it missed was a route around the WHOLE gate: the argument reverted to an ordinary
+    # quoted span, was blanked below, and its contents became invisible to rules 3, 3b, 3c and 3d alike --
+    # so whatever a session could not do directly, it could do inside `pwsh -Com '...'`. BACKLOG #1097.
+    #
+    # MEASURED BY DRIVING THE REAL BINARIES on this box (pwsh 7.6.4, Windows PowerShell 5.1, Git Bash
+    # 5.2.37, cmd.exe on Windows 10.0.26200) rather than read off documentation:
+    #   * PowerShell binds a parameter by any unambiguous PREFIX of its name, so EVERY spelling from `-C`
+    #     to `-Command` runs, on BOTH hosts. `-Com` and `-Comm` were working spellings the list omitted.
+    #   * `-Cm`, `-Cmd`, `-Cnd` and `-Comd` do NOT run: each is reported as a script-file name. That
+    #     negative BOUNDS the family -- it is the prefixes of the parameter name, never any letter
+    #     cluster -- which is why the mandatory `\s+` after the flag is load-bearing and why a matcher
+    #     spelled `-C[a-z]*` would be a widening this must not make.
+    #   * Matching is case-INsensitive: `-command`, `-COM` and `-CoMmAnD` all run. The old patterns went
+    #     through [regex]::Matches with no options, i.e. case-SENSITIVELY, so plain lowercase `-command`
+    #     was a bypass sitting immediately beside the one spelling that was covered.
+    #   * Both hosts take the same parameter under the `/` sigil: `/c`, `/Com`, `/COMMAND` run. The old
+    #     `/[ckCK]` pattern reached `/c` alone and only DOUBLE-quoted, so `/c '...'` allowed while
+    #     `/c "..."` denied -- the verdict turned on the quote character rather than on what ran.
+    #   * A POSIX shell takes its command in a short-option CLUSTER and the cluster is open-ended: Git
+    #     Bash runs `-c`, `-lc`, `-ec`, `-xc`, `-euc`, `-euxc` and `-ic`. The list held three of those.
+    #   * cmd.exe accepts its switches CONCATENATED: `/Q/C`, `/q/c`, `/s/c` and `/V:ON/C` all run.
+    #
+    # WHY A RULE AND NOT A LONGER LIST. A longer list has the same shape as the defect and decays the same
+    # way; this one had already lost `-Com`, `-command`, `/Com`, `-xc` and `/Q/C`. What is written below
+    # is the GENERATING RULE for the family -- a sigil then a prefix of the parameter name in any case; a
+    # shell cluster ending in the command letter; a cmd switch run ending in /c or /k -- so a spelling
+    # nobody enumerated is covered the day someone types it. That is CLAUDE.md section 11's "prefer 'at
+    # least' to an enumeration" applied to a matcher, and the same move rule 1b makes with its shape
+    # backstop. The prefix alternation is BUILT rather than typed for the same reason: a hand-typed one is
+    # the list again, and it would drift from the word it is supposed to describe.
+    #
+    # WHAT IT DELIBERATELY DOES NOT REACH -- stated here so the next reader infers no stronger claim:
+    #   * `-EncodedCommand` stays a LITERAL and is NOT prefix-expanded. Its argument is base64, so
+    #     recursing into it yields nothing any rule can read and the entry has never changed a verdict.
+    #     Expanding it would mean matching `-e`, which sweeps in `sed -e "s/git checkout/x/"` -- a real
+    #     command shape -- for no gain. A base64 payload is a fail-open in EVERY spelling: a different
+    #     defect, and no flag matcher closes it.
+    #   * A cluster with letters AFTER the command letter (`bash -cl`, measured to run). The only rule
+    #     that catches it is "a cluster CONTAINING c", and that also matches `-Comd`, which would delete
+    #     the bound above. A stated residual beats a matcher that has stopped describing a family.
+    #   * `-File <script>`: the code is not in the command at all -- the shell-write blind spot the
+    #     docstring already names.
+    #   * NO FLAG AT ALL. Measured in the #1097 second pass: `powershell "<script>"` RUNS on Windows
+    #     PowerShell 5.1, which treats its first unrecognised argument as the command. (pwsh 7 does not
+    #     -- it reports the argument as a script-file name -- and neither does bash or cmd.) That span is
+    #     quoted, so it is blanked below and every rule is blind to it. NO FLAG MATCHER CLOSES THIS, and
+    #     it is recorded rather than half-fixed for that reason: catching it needs a matcher keyed on the
+    #     INTERPRETER'S NAME instead of on a flag, which is a different rule with a different false-deny
+    #     profile (it would have to decide what counts as an interpreter, and `ssh box "git checkout
+    #     main"` is the shape sitting next to it that must keep allowing). It is the one residual this
+    #     audit ADDED to this list rather than inherited.
+    #   * More than one level of nesting, unchanged from before (BACKLOG #1066/#1067 record it).
+    #   * A quoted argument SPANNING LINES, because the split above is per line. Both multi-line forms
+    #     deny today anyway: every line of such a span reaches the scanner RAW and the payload line
+    #     carries the git token and the verb by itself. That is an accident of the raw scan rather than a
+    #     property of this function, and a change that blanks message bodies removes it (BACKLOG #1086).
+    #     It is left alone here because no test on THIS gate could tell the two mechanisms apart, and a
+    #     fix whose green nobody could watch fail is not evidence.
+    #
+    # COST, measured rather than assumed: recursion only ADDS a scan line, and a line still needs a git
+    # token AND a gated verb to deny, so a path argument behind a family flag (`git -C "<path>"`,
+    # `tar -C "<dir>"`) changes no verdict. The one class that widens is a search whose PATTERN spells a
+    # git command -- `grep -vc "git checkout main"` now denies where it did not. That class already
+    # existed for `-c` (`grep -c "git checkout main"` has always denied), so this adds members to it
+    # rather than creating it.
+    #
+    # ---------------------------------------------------------------------------------------------
+    #
+    # THE SIGIL IS GENERATED TOO, and it was not (BACKLOG #1097, second pass). The rule above generated
+    # the PREFIX and then hard-coded `[-/]` beside it -- a hand-typed two-member class inside a fix whose
+    # whole purpose was to stop hand-typing enumerations. Measured on the same binaries:
+    #   * `pwsh --command`, `--Com` and `--c` all RUN. The double dash is the ORDINARY POSIX spelling on
+    #     the platform this repo targets, so it is the sigil reached for by habit rather than by intent,
+    #     and every prefix and case worked under it while the gate saw none of them.
+    #   * PowerShell's argument parser treats three UNICODE dashes as dash-equivalents: U+2013 (en),
+    #     U+2014 (em) and U+2015 (horizontal bar). All three bind the parameter -- singly on both hosts,
+    #     and DOUBLED on pwsh 7.
+    #   * THE SLASH SIGIL IS INVERTED ON THE BASH-TOOL PATH, and the line below ("a slash never doubles")
+    #     is true only of a pwsh spawned FROM a PowerShell parent. This hook scans BOTH tool names
+    #     through one matcher (see the tool_name dispatch further down), and a Bash tool call goes
+    #     through Git Bash, which applies MSYS argument conversion BEFORE the child sees the string.
+    #     Measured with an argv printer through Git Bash 5.2.37:
+    #         typed `/c`         -> child gets `C:/`                          does NOT run
+    #         typed `//c`        -> child gets `/c`                           RUNS
+    #         typed `/Command`   -> child gets `C:/Program Files/Git/Command`  does NOT run
+    #         typed `//Command`  -> child gets `/Command`                     RUNS
+    #         typed `///Command` -> child gets `//Command`                    does NOT run
+    #     So on that path this gate DENIES `/Command`, which cannot run, and ALLOWS `//Command`, `//c`
+    #     and `//Com`, which do -- including `pwsh //Command "git config core.hooksPath /dev/null"`.
+    #     INHERITED from the matcher this replaces and UNCHANGED here, so it is disclosed rather than
+    #     closed. The must-ALLOW row that used to assert `//` was REMOVED from
+    #     tests/test_worktree_gate_interpreter_sigils.py, because asserting it made the inversion a
+    #     requirement and would have forced a later fix to delete a green test; a residual tripwire
+    #     row replaces it, pinning the ALLOW as KNOWN rather than as correct.
+    #
+    #     WHAT CLOSING IT WOULD COST, measured rather than assumed -- and the first version of this
+    #     note got this WRONG, which is why the number is here instead of an adjective. It claimed a
+    #     "UNC-shaped false-deny surface (`ls //server/share/c "..."`)". That is FALSE: rebuilt the
+    #     pattern with a `//?` sigil and drove it -- `ls //server/share/c "..."`,
+    #     `ls //fileserver/c$/logs "..."` and `ls //nas/backup/c "..."` match under NEITHER the
+    #     shipped sigil NOR the widened one, because `(?:^|\s)` anchors before the first slash and
+    #     `$sigil` feeds `$psFlag` only, so what follows must be a prefix of `command`. The real new
+    #     surface is a bare `//c` / `//com` / `//command` / `//cwa` token followed by a quoted span --
+    #     narrow, not UNC. So the deferral rests on it being a BEHAVIOUR CHANGE to a security control
+    #     that wants its own adversarial verification, NOT on a false-deny cost. Stated plainly
+    #     because a compensating control resting on a false premise is itself the defect.
+    #
+    #     THE cmd.exe HALF IS A DIFFERENT SHAPE, and naming only the `//` spellings above would make
+    #     this list read as complete when it is not. Measured through Git Bash with an inert payload:
+    #         cmd /c    -> does NOT run      cmd //c    -> RUNS
+    #         cmd ///c  -> does NOT run      cmd ////c  -> RUNS
+    #     i.e. cmd runs on the EVEN slash counts, because MSYS strips one and cmd.exe tolerates the
+    #     rest, while pwsh runs only on exactly `//` (`pwsh ///Command` and `////Command` were both
+    #     measured NOT to run, which is why `///` is still a must-ALLOW row on the PWSH test). All the
+    #     executing cmd spellings are ALLOWed here and on the matcher this replaces. Read this list as
+    #     "AT LEAST these", never as an enumeration.
+    #
+    #     PRECONDITION, because the table above is a fact about a CONFIGURATION and not about the
+    #     characters: it assumes DEFAULT MSYS path conversion. With `MSYS_NO_PATHCONV=1` or
+    #     `MSYS2_ARG_CONV_EXCL='*'` the child receives `/Command` verbatim and THAT runs while
+    #     `//Command` does not -- the whole table inverts. Both were verified unset on this box.
+    #     Neither the removal of the `//` must-ALLOW row nor the keeping of `///` changes under either
+    #     configuration, so the conclusions hold; the SPELLINGS do not.
+    #   * A dash-family character may be doubled only WITH ITSELF. Three or more is refused, a mixed pair
+    #     (`-` then U+2013) is refused, and a slash never doubles ON A POWERSHELL PARENT (see the
+    #     inversion above for the Bash-tool path). That is why the sigil below is spelled
+    #     with a BACKREFERENCE and not `{1,2}`: `{1,2}` would admit the twelve mixed DASH-FAMILY pairs
+    #     and `+` would admit every length, and both describe a family that does not exist. Both
+    #     widenings were RUN as mutants, and each reddens the bounded-ness test and nothing else.
+    # Spelled with \u escapes rather than literals so this file stays pure ASCII -- U+2015 does not
+    # encode in cp1252 at all, and this gate is read on a stock Windows console (CLAUDE.md section 11).
+    $sigil = '(?:(?<sg>[-\u2013\u2014\u2015])\k<sg>?|/)'
+
+    # WHICH PARAMETERS INTRODUCE CODE, and HOW EACH ONE BINDS -- both measured, never read off docs.
+    # A generated prefix family cannot generate a parameter it was never told about, and `pwsh -h` lists
+    # a SECOND one: `-CommandWithArgs | -cwa`. `-cwa`, `-CWA` and the full name each run arbitrary code
+    # and NONE is reachable from prefixes of `command` (`-Command` needs whitespace next; the full name
+    # continues with `W`). So the set is carried explicitly and the binding rule is per member.
+    $psPrefixWords = @('command')                                   # binds on ANY prefix: -c .. -command
+    # EXACT only, and the negative is what keeps it that way: `-cw` is one character short and refuses,
+    # `-cwar` one over and refuses, and every prefix between `-Command` and `-CommandWithArgs` refuses.
+    # A second generated ladder here would sweep in `-cw` and, through it, any two-letter flag in c.
+    # `encodedcommand` stays exact for the older reason recorded below -- expanding it means matching
+    # `-e`, which sweeps in `sed -e "s/git checkout/x/"` for a payload no rule can read anyway.
+    $psExactWords = @('commandwithargs', 'cwa', 'encodedcommand')
+    # Longest first: `-Command` must match as `command`, not as `c` with `ommand` left over.
+    $psNames = @(
+        $psPrefixWords | ForEach-Object { $w = $_; 1..$w.Length | ForEach-Object { $w.Substring(0, $_) } }
+    ) + $psExactWords | Sort-Object -Property Length -Descending
+    $psFlag     = "$sigil(?:$($psNames -join '|'))"
+    $shFlag     = '-[a-z]*c'
+    $cmdExeFlag = '(?:/[^/\s]+)*/[ck]'
+
+    # THE SEPARATOR IS PER HOST, because the hosts disagree and only one of them was measured before.
+    # cmd.exe does NOT require whitespace: `cmd /c"echo ran"` and `cmd /cecho ran` both execute, so the
+    # `\s+` demanded of every branch was a PowerShell fact applied to a host that does not share it.
+    # PowerShell and a POSIX shell DO require it -- `-CommandWrite-Output ran`, `-Command:x`, `-Command=x`
+    # and `bash -cecho ran` were each measured to REFUSE -- so their `\s+` is untouched.
+    #
+    # WHAT THE `\s+` DOES NOT DO, corrected after this claim was checked and found false. It used to say
+    # the mandatory whitespace was "the ONLY thing refusing `-Cm`/`-Cmd`/`-Cnd`/`-Comd`". It is not.
+    # Measured by rebuilding this pattern with `\s*` on all three branches and running the four flags
+    # through it: all four still fail to match, captured group empty. They are refused because no prefix
+    # of `command` ENDS where those flags end -- `cm`, `cn` and `com`+`d` are not prefixes, so the
+    # alternation never reaches the separator at all. The separator is irrelevant to that bound, and the
+    # paragraph directly below already gives the correct reason to keep the split. Left as a worked
+    # example rather than deleted: the false version was persuasive because it named a real bound and a
+    # real risk, and only tying it to an instrument -- rebuild the regex, run the four strings -- showed
+    # it was attached to the wrong mechanism.
+    #
+    # THE PROBE THAT CATCHES THE OVER-BROAD EDIT IS THE ATTACHED FORM, `pwsh -Com"<code>"` -- and finding
+    # that took a mutant, because the obvious probe does not work. `pwsh -Comd"<code>"` was written here
+    # first and was measured to be a NO-OP: relaxing `\s+` to `\s*` on all three branches left the entire
+    # suite GREEN, since the quote in `-Comd"` does not sit immediately after any prefix of `command`. In
+    # the attached form it does, so the across-the-board relaxation reddens it and the per-host split does
+    # not. Recorded because the useless probe LOOKED like the bound: it named the right risk, asserted the
+    # right verdict, and could not fail.
+    # A KNOWN FALSE DENY THIS RULE COSTS, recorded HERE because this script is what gets installed to
+    # %USERPROFILE%\.claude\hooks and it travels without the tests -- a note that lives only in a test
+    # file is invisible to whoever is reading the installed copy:
+    #
+    #     ls /usr/src/c "git checkout main"      DENIES, and should not
+    #     ls /usr/src/lib "git checkout main"    ALLOWs  (control: the `/c` ending is the trigger)
+    #
+    # THE CAUSE IS THE `(?:/[^/\s]+)*` CLUSTER PREFIX IN $cmdExeFlag, not the `\s*` separator beside
+    # it. The prefix exists so cmd's CONCATENATED switch runs (`/Q/C`, `/V:ON/C`) are recognised, and
+    # it lets an ordinary POSIX path walk in one component at a time: `/usr` `/src` `/c`. Measured by
+    # rebuilding the pattern -- the row matches under `\s*` AND under `\s+` (there is a literal space
+    # before the quote, so the separator is irrelevant to it), and matches under NEITHER once the
+    # cluster prefix is dropped.
+    #
+    # DO NOT "FIX" IT BY DROPPING THE `\s*`. That does not remove this false deny and it REGRESSES
+    # `cmd /c"git checkout main"` from DENY to ALLOW -- the attached form is precisely what `\s*`
+    # exists to catch.
+    #
+    # AND THE CLUSTER PREFIX IS NOT THE SLOPPY PART. An earlier version of this note said "the
+    # narrowing that works is to require a cmd-like PROGRAM token before the switch run". That was
+    # MEASURED FALSE and it is corrected here, because it is the sentence that sends the next reader
+    # at an impossible target. cmd.exe ITSELF accepts arbitrary `/junk` components in a switch run and
+    # then executes the quoted payload. Driven against the real binary with a payload that COMPUTES
+    # its answer (`set /a 111*3` -> 333, so an echo-back cannot be mistaken for a run), controls in
+    # the same batch (`cmd /c` must run, `cmdd /c` must not):
+    #     cmd /usr/src/c "<payload>"   RUNS      cmd /zzz/c "<payload>"    RUNS   (z is not a switch)
+    #     cmd /mnt/c "<payload>"       RUNS      cmd /usr/lib/k "<payload>" RUNS
+    # `/usr` binds as `/U`, `/src` as `/S`, `/zzz` is ignored. So `(?:/[^/\s]+)*/[ck]` is very nearly
+    # EXACTLY the family cmd accepts, not an over-match.
+    #
+    # WHICH MAKES THIS A PROGRAM-IDENTITY PROBLEM, and that is why it is not fixed here. The only
+    # thing separating `ls /usr/src/c "..."` from `cmd /usr/src/c "..."` is the program token -- but
+    # every program-token spelling tried was defeated by something that EXECUTES: `echo hi;cmd /k`
+    # and `(cmd /mnt/c` (the `;` and `(` are not whitespace, and the outer `(?:^|\s)` anchor sits
+    # before this whole alternation), an alias, a renamed copy of cmd.exe, and `cmd /d /Q/C` where the
+    # program is not adjacent to the switch run. Five candidates were built and driven as real gate
+    # mutants; each traded this one disclosed false deny for four or more measured DENY-to-ALLOW
+    # regressions. At this rule's threat model the two directions are not symmetric -- a false DENY
+    # stops legitimate work loudly and has a workaround; a false ALLOW lets a reset land in the shared
+    # primary silently -- so the false deny is KEPT and disclosed.
+    # tests/test_worktree_gate_interpreter_sigils.py pins the deny so the cost cannot be lost.
+    $flagThenSep = "(?:(?:$psFlag|$shFlag)\s+|$cmdExeFlag\s*)"
+
+    # The payload is a NAMED group. It was Groups[1], which still resolves correctly (.NET numbers
+    # unnamed groups before named ones) -- but only by an ordering rule no reader should have to know,
+    # now that $sigil contributes a named group of its own.
     $inner = @()
     foreach ($ln in $lines) {
         foreach ($pat in @(
-            '(?:^|\s)(?:-c|-lc|-ec|-Command|-EncodedCommand)\s+"([^"]*)"',
-            "(?:^|\s)(?:-c|-lc|-ec|-Command|-EncodedCommand)\s+'([^']*)'",
-            '(?:^|\s)/[ckCK]\s+"([^"]*)"'
+            "(?i)(?:^|\s)$flagThenSep`"(?<code>[^`"]*)`""
+            "(?i)(?:^|\s)$flagThenSep'(?<code>[^']*)'"
         )) {
-            foreach ($m in [regex]::Matches($ln, $pat)) { $inner += $m.Groups[1].Value }
+            foreach ($m in [regex]::Matches($ln, $pat)) { $inner += $m.Groups['code'].Value }
         }
     }
 
@@ -835,20 +1059,103 @@ What to do instead:
         if ($seg.Scan -cnotmatch '\bworktree\s+(?<wtverb>remove|move)(?=\s|$)') { continue }
         $wtVerb = $Matches['wtverb']
 
-        # First positional (non-flag) token after the subcommand is the worktree being acted on.
+        # First positional (non-flag) token after the subcommand is the worktree being acted on, read
+        # QUOTE-AWARE (BACKLOG #1064, defect A). This was `$after -split '\s+'` followed by
+        # `.Trim('"', "'")` -- a tokeniser that never reads the quotes it strips. A quoted path
+        # containing a SPACE became two tokens, the first was taken, `git -C` failed on the truncated
+        # path, and the `continue` below fell through to ALLOW. Measured on a rig whose primary is
+        # `<tmp>\Pri mary`: all four spellings (double-quoted, single-quoted, unquoted, and the `-C`
+        # form) ALLOWed, while the identical rig with the one space removed DENIED all four. Quoting
+        # the path did not help, which is the tell that the quotes were never being parsed.
+        #
+        # It is latent on THIS machine only because the primary checkout happens to have no space in
+        # its path. A path with a space is ordinary on Windows, and "latent because of an accident of
+        # this machine's paths" is an unexercised precondition rather than a mitigation.
+        #
+        # The alternation relies on .NET permitting DUPLICATE named groups, so `$m.Groups['q']` is
+        # whichever branch matched. That is unusual enough to be worth naming: most engines reject the
+        # pattern outright. Validated against the flag, both quote styles, an embedded space, an
+        # unterminated quote and empty input before it was written here.
         $after = ($seg.Raw -replace ('(?s)^.*?\bworktree\s+' + $wtVerb + '\b'), '')
         $after = ($after -split '(?:&&|\|\||;|\|)', 2)[0]
         $victimRaw = $null
-        foreach ($tok in @($after -split '\s+' | Where-Object { $_ })) {
+        # THE BARE ALTERNATIVE MUST STOP AT A QUOTE, and the first version of this scan did not. It
+        # was `[^\s"''][^\s]*`, whose tail admits quote characters -- so `git worktree remove
+        # <path>""` carried the trailing `""` into the token, `git -C` failed on it, and the rule
+        # fell through to ALLOW. That is the EXACT fail-open this block exists to close,
+        # reintroduced by its own fix: the `.Trim('"', "'")` being replaced had stripped them.
+        # Measured across three gate versions to separate a regression from an inherited defect:
+        # main DENY, parent DENY, this-before-the-correction ALLOW.
+        #
+        # AND THE FLAG SKIP MUST TEST THE CAPTURED VALUE, not the raw match text. `$m.Value` for a
+        # QUOTED flag begins with the quote character, so `"--force"` was never skipped and became
+        # the victim: `git worktree remove "--force" "<governed wt>"` ALLOWed, with the worktree
+        # really destroyed when the command was run. That one is INHERITED -- it allows on main and
+        # on the parent too -- but the note above claimed this scan was "validated against the flag",
+        # and only the UNQUOTED spelling had been.
+        foreach ($m in [regex]::Matches($after, '"(?<q>[^"]*)"|''(?<q>[^'']*)''|(?<q>[^\s"''][^\s"'']*)')) {
+            $tok = $m.Groups['q'].Value
+            if (-not $tok) { continue }
             if ($tok.StartsWith('-')) { continue }
-            $victimRaw = $tok.Trim('"', "'")
+            $victimRaw = $tok
             break
         }
         if (-not $victimRaw) { continue }
 
-        $victimCommon = "$(& git -C $victimRaw rev-parse --git-common-dir 2>$null)".Trim()
+        # RESOLVE THE VICTIM AGAINST THE BEST AVAILABLE ESTIMATE OF THE DIRECTORY GIT WILL STAND IN
+        # (defect B) -- an ESTIMATE, and the residual list below names where it is wrong -- by calling
+        # the resolver rules 3 and 3c already use rather than growing a fourth. This read
+        # `& git -C $victimRaw`, which resolves a relative token against THIS HOOK PROCESS's cwd; the
+        # rejected #1064 attempt changed it to the SESSION cwd, which is also wrong. git resolves it
+        # against the EFFECTIVE working directory, and both a `-C` flag and a prefix `cd` change that.
+        #
+        # THE TWO ANSWERS COINCIDE WHEN THE SESSION CWD SITS AT THE SAME DEPTH UNDER THE SAME PARENT
+        # as the `-C` target -- which is the ordinary sibling-worktree shape here. So a rig built only
+        # from sibling worktrees reports a gate that resolves against the wrong directory as working,
+        # and the attempt that did exactly that was measured green. The test file keeps a same-depth
+        # row LABELLED BLIND beside a deeper row and an other-parent row for that reason.
+        #
+        # Get-GitTargetCandidatesRaw reads a `-C` case-sensitively and otherwise follows exactly one
+        # followable `cd`/`pushd` in the prefix, falling back to the cwd. Its first candidate is the
+        # effective directory. Rooting it against $cwdRaw first is #1061's fix, unchanged.
+        #
+        # RESIDUALS -- READ THIS AS "AT LEAST THESE", NOT AS AN ENUMERATION. The first version of this
+        # comment listed two and asserted the new base "equals the directory git will actually stand
+        # in". That is FALSE for every shape below, and an adversarial re-read found them in an hour,
+        # which is the reason for the hedge rather than a longer list (CLAUDE.md section 11, SDS-3.6).
+        #
+        #   * A `-C` VALUE CONTAINING A SPACE. Get-GitTargetCandidatesRaw matches `-C\s+"?([^"\s]+)"?`,
+        #     and `[^"\s]+` stops at the space: measured, `git -C "C:/Pri mary" ...` captures
+        #     `C:/Pri`. This is the SAME space family the victim scan above now handles, so this rule
+        #     is quote-aware on one operand and not the other. It belongs to the resolver.
+        #   * CUMULATIVE `-C`. git documents repeated `-C` as composing; the resolver reads the first
+        #     match only, and this rule takes $where[0].
+        #   * A `-C` BELONGING TO A LATER COMMAND on the same line, which the first match may find.
+        #   * A `cd` WHOSE TARGET LEAF IS LITERALLY `git`. The `$at` git-token regex below matches
+        #     inside that PATH, so $pfx is truncated and the prefix is misread. A `~/git` or
+        #     `C:\git` directory is ordinary on a developer's box, so this is the most reachable of
+        #     the set.
+        #   * A FAILED `cd`, and a SUBSHELL prefix `( cd x && git ... )`.
+        #   * COMPOSE vs PREFER: the resolver PREFERS `-C` and discards a `cd` prefix, where a shell
+        #     COMPOSES them and resolves a relative `-C` against the post-`cd` directory. That is
+        #     BACKLOG #1085.
+        #   * THE PRE-SPLITTER ONE LINE ABOVE, `-split '(?:&&|\|\||;|\|)'`, is NOT quote-aware. A
+        #     quoted victim path containing `;` or `&&` is truncated before the quote-aware scan ever
+        #     runs, so the awareness gained above does not extend to that character class.
+        #
+        # All of these belong to the RESOLVER rather than to this rule; fixing them here would be the
+        # fourth resolution rule in one file, which is what calling the shared helper exists to avoid.
+        $at = [regex]::Match($seg.Raw, '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)')
+        $pfx = $(if ($at.Success) { $seg.Raw.Substring(0, $at.Index) } else { "" })
+        $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw)
+        $base = $(if ($where.Count -gt 0) { Get-FullPathRaw $where[0] $cwdRaw } else { "" })
+        if (-not $base) { $base = $cwdRaw }
+        $victimAbs = Get-FullPathRaw $victimRaw $base
+        if (-not $victimAbs) { $victimAbs = $victimRaw }
+
+        $victimCommon = "$(& git -C $victimAbs rev-parse --git-common-dir 2>$null)".Trim()
         if ($LASTEXITCODE -ne 0 -or -not $victimCommon) { continue }
-        $victimCmp = Get-ComparablePath $victimCommon $victimRaw
+        $victimCmp = Get-ComparablePath $victimCommon $victimAbs
         $govWt = $null
         foreach ($r in $roots) {
             if ($victimCmp -eq $r.Compare -or $victimCmp.StartsWith("$($r.Compare)/")) { $govWt = $r; break }
@@ -866,8 +1173,13 @@ What to do instead:
         # leg, where the lookup returned nothing, $isSelf went false, and BOTH branches emitted the
         # generic deny -- byte-identical, which is exactly what the non-vacuity test below asserts
         # against. Platform-masked, and caught only because that test compares the two denies.
-        $victimTopRaw = "$(& git -C $victimRaw rev-parse --show-toplevel 2>$null)".Trim()
-        if (-not $victimTopRaw) { $victimTopRaw = $victimRaw }
+        # $victimAbs, NOT $victimRaw (BACKLOG #1064). This asks git the same question the common-dir
+        # lookup above asks, so it must be handed the same ROOTED path -- with the raw token it
+        # resolved against the hook process's cwd and returned nothing for every relative spelling,
+        # leaving $isSelf false and both branches emitting the generic deny. That is the identical
+        # defect the note above this line already records for the $cwd/$cwdRaw case, one call down.
+        $victimTopRaw = "$(& git -C $victimAbs rev-parse --show-toplevel 2>$null)".Trim()
+        if (-not $victimTopRaw) { $victimTopRaw = $victimAbs }
         $victimTop = Get-ComparablePath $victimTopRaw
         $selfTop = Get-ComparablePath "$(& git -C $cwdRaw rev-parse --show-toplevel 2>$null)".Trim()
         $isSelf = $victimTop -and $selfTop -and ($victimTop -eq $selfTop)
@@ -937,9 +1249,17 @@ What to do instead:
 "@
         }
 
+        # FOLD THE OPERATOR'S SPELLING BEFORE IT ENTERS A REASON, which every other rule in this file
+        # already does and this one did not. It matters MORE after the quote-aware tokeniser above:
+        # the old `-split '\s+'` could not produce a token containing whitespace, so the interpolation
+        # was accidentally safe; a quoted token can now carry spaces AND TABS, and a tab is one of the
+        # three characters Get-SafeForMessage exists to neutralise. This change widened what reaches
+        # the reason, so it owns the fold. (A newline still cannot arrive here -- segments are split
+        # per line above -- so this closes the reachable half, not a whole class.)
+        $victimMsg = Get-SafeForMessage $victimRaw
         if ($isSelf) {
             Write-Deny -Rule "3d" -Detail "git worktree $wtVerb (own worktree)" -Reason @"
-BLOCKED: 'git worktree $wtVerb $victimRaw' acts on THE WORKTREE THIS SESSION IS RUNNING IN.
+BLOCKED: 'git worktree $wtVerb $victimMsg' acts on THE WORKTREE THIS SESSION IS RUNNING IN.
 
 This is not somebody else's tree and nothing here says it is. git would refuse it too -- you cannot remove
 the worktree you are standing in -- but this gate runs BEFORE git, so you would have got a confusing
@@ -951,7 +1271,7 @@ files you are working on, and the removal has to happen from OUTSIDE this tree, 
 What to do instead:
   * Finish and COMMIT anything you still want. A commit survives the tree being deleted; a dirty tree
     does not.
-  * Then ask the user, in these words: "I am finished in $victimRaw and it can be removed once this
+  * Then ask the user, in these words: "I am finished in $victimMsg and it can be removed once this
     session ends." Removal is theirs to run from OUTSIDE this tree:
         $removeCmd
   * If you only wanted to leave it, just stop using it -- an unused worktree costs disk, not correctness.
@@ -959,7 +1279,7 @@ What to do instead:
         }
         else {
             Write-Deny -Rule "3d" -Detail "git worktree $wtVerb" -Reason @"
-BLOCKED: 'git worktree $wtVerb $victimRaw' acts on a worktree of $($govWt.Display) that is NOT the tree
+BLOCKED: 'git worktree $wtVerb $victimMsg' acts on a worktree of $($govWt.Display) that is NOT the tree
 this session is running in. This gate cannot tell whether another session is using it -- it has no
 occupancy or authorship signal -- so it refuses rather than guess.
 
@@ -972,7 +1292,7 @@ $cleanupBullet
   * To find out whether a worktree is still in use, look rather than delete:
         git -C "$($govWt.Display)" worktree list
   * If you are certain it is abandoned and must go now, that is the user's call, not yours. Say so:
-    "I want to remove the worktree $victimRaw and I need you to confirm it is not in use."
+    "I want to remove the worktree $victimMsg and I need you to confirm it is not in use."
 "@
         }
     }
