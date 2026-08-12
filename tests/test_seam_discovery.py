@@ -303,3 +303,22 @@ def test_literal_values_are_extracted() -> None:
     byte-identical."""
     lits = sd.literals_in_surface(sd._closure({"_Root"}, _fake_module(), "synthetic"))
     assert lits[f"{_Root.__module__}._Root.mode"] == ("a", "b")
+
+
+def test_an_unresolved_forward_ref_fails_loud() -> None:
+    """A ForwardRef pydantic never resolved is a HOLE, not a leaf.
+
+    Found by the #1220 acceptance proof rather than by review: a nested-only DTO reached through a
+    string annotation whose target is defined later in the module stayed invisible, so renaming its
+    field moved nothing. ``typing.get_args`` returns ``()`` on a ForwardRef, so the closure walked
+    past it and reported full coverage -- the silent skip this module exists to prevent, reproduced
+    inside the walk that warns about it."""
+    unresolved = types.ModuleType("fake.unresolved")
+
+    class _Dangling(BaseModel):
+        later: _DefinedLater | None = None  # noqa: F821 -- deliberately never resolved
+
+    unresolved._Dangling = _Dangling  # type: ignore[attr-defined]
+
+    with pytest.raises(sd.SeamDiscoveryError, match="UNRESOLVED ForwardRef"):
+        sd._closure({"_Dangling"}, unresolved, "synthetic")

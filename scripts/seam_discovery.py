@@ -203,10 +203,39 @@ def _field_annotations(dto: type) -> list[object]:
                 f"{dto.__module__}.{dto.__name__}: model fields are unresolvable ({exc}); "
                 "the closure cannot be completed, so the surface would be under-covered"
             ) from exc
-        return [f.annotation for f in fields.values()]
+        annotations: list[object] = [f.annotation for f in fields.values()]
+        _refuse_unresolved(dto, annotations)
+        return annotations
     # Reached only for a dataclass DTO -- _is_dto() gates every caller, and mypy cannot carry that
     # narrowing across the call boundary.
     return [f.type for f in dataclasses.fields(typing.cast("Any", dto))]
+
+
+def _refuse_unresolved(dto: type, annotations: list[object]) -> None:
+    """Raise if any annotation is still a ``ForwardRef``.
+
+    Pydantic resolves string annotations at class-build time, but NOT when the referenced class is
+    defined later in the module and nobody called ``model_rebuild()``. The field's annotation then
+    stays a ``ForwardRef``, ``typing.get_args`` returns ``()``, and the closure walks straight past a
+    nested DTO whose field set belongs in the contract.
+
+    Found by the #1220 acceptance proof, which is the point of running it: a nested-only model
+    reached through such a field was NOT covered, so renaming its field moved nothing -- the exact
+    silent-skip this module's docstring forbids, reproduced inside the walk it warns about. Loud,
+    because a skip here is indistinguishable from full coverage at every downstream vantage point.
+    """
+    for annotation in annotations:
+        stack = [annotation]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, typing.ForwardRef):
+                raise SeamDiscoveryError(
+                    f"{dto.__module__}.{dto.__qualname__}: field annotation {current!r} is an "
+                    "UNRESOLVED ForwardRef, so the nested-model closure cannot see through it and "
+                    "the contract would be silently under-covered. Define the referenced model "
+                    "BEFORE this one, or call model_rebuild() on it."
+                )
+            stack.extend(typing.get_args(current))
 
 
 def _closure(seeds: set[str], module: ModuleType, path_hint: str) -> set[type]:
