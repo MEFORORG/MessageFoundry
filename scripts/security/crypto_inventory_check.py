@@ -364,7 +364,25 @@ INVENTORY: dict[str, frozenset[str]] = {
     # recorded and recomputed rather than assumed. Non-cryptographic alternatives were rejected only
     # because SHA-256 is already the tree's convention for file pinning.
     "scripts/asvs/scorecard.py": frozenset({"hashlib"}),
+    # Same class as the line above, registered for the same reason: SHA-256 over the SCORECARD FILE,
+    # printed truncated so a run states WHICH revision of the record it read. Two runs reporting
+    # different counts are otherwise indistinguishable from one run whose input changed underneath
+    # it. No secret, no key, no message authentication, nothing user- or PHI-derived — the digest is
+    # an identifier in a log line. It covers the record itself rather than a build input, which is
+    # the only way it differs from the entry above.
+    "scripts/asvs/prove_report.py": frozenset({"hashlib"}),
     "scripts/security/dast_target.py": frozenset({"secrets"}),
+    # BACKLOG #1220: SHA-256 over the DISCOVERED engine/console seam surface, truncated to 16 hex
+    # characters, to give ENGINE_UI_SEAM an identity nobody chooses by hand. A CHANGE DETECTOR, not a
+    # security control: no secret, no key, no message authentication, and nothing user- or PHI-derived
+    # is hashed -- the input is a serialization of public type signatures and field names. What it
+    # needs is accidental-collision avoidance across the distinct contract surfaces this project will
+    # ever produce, and 64 bits gives 2.7e-12 at 10,000 surfaces (about 500x the ~20 seam moves to
+    # date). Preimage resistance buys nothing here: anyone who could craft a colliding surface already
+    # has commit access to _ui_seam.py, where writing the constant directly is strictly easier.
+    # SHA-256 rather than BLAKE2 or a non-approved digest only because the engine renders a fips_mode
+    # attestation, and a non-approved hash in the shipped surface invites a FIPS question for no gain.
+    "scripts/webconsole_seam_snapshot.py": frozenset({"hashlib"}),
 }
 
 

@@ -27,9 +27,14 @@ the vetted network call.
 * **One-way deps.** This module MUST NOT import ``api/`` (CLAUDE.md §4): the API depends on the engine,
   not the reverse.
 
-MVP is code_only + non-streaming (ADR 0135). The Anthropic Messages wire shape is used when the provider
-is ``claude`` (the default) — the customer-managed endpoint is expected to speak it (a real Claude
-subscription, an Azure/Bedrock-style gateway, or a self-hosted Anthropic-compatible server).
+MVP is code_only + non-streaming (ADR 0135). The Anthropic Messages wire shape is built
+UNCONDITIONALLY -- nothing here dispatches on ``provider``, which is carried for addressing and for the
+per-use audit only. ``claude`` is therefore the sole serviceable value, and ``[ai].provider`` is
+validated at config load to refuse anything else (BACKLOG #95) rather than let it fail at request
+time. The customer-managed endpoint is expected to speak that shape (a real Claude subscription, an
+Azure/Bedrock-style gateway, or a self-hosted Anthropic-compatible server). If a second wire shape is
+ever added here, widen ``_SERVICEABLE_AI_PROVIDERS`` in ``config/settings.py`` with it -- and only
+then.
 """
 
 from __future__ import annotations

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -274,7 +275,38 @@ def counted(hits: Iterable[Hit]) -> dict[str, int]:
     return out
 
 
+def _harden_stdout() -> None:
+    """Make this tool's own output survive a cp1252 console (BACKLOG #1221).
+
+    The gate prints DOCUMENT CONTENT, and the corpus it scans is documentation, so a hit whose line
+    carries a glyph killed the run with ``UnicodeEncodeError`` before the finding could be read. The
+    defect is invisible until the gate has something to say: with a clean corpus it exits 0 and looks
+    healthy, so it fails exactly when it is needed.
+
+    STREAM-LEVEL rather than a targeted safe-print at the one obvious site, and that is not a style
+    preference. Python's ``\\d`` is Unicode-aware, so ``_AGAINST_TOTAL`` / ``_ARITHMETIC`` take
+    ``m.group(0)`` VERBATIM into the token -- ``idioms_for_line("34 of 345 cells")`` with Arabic-Indic
+    digits yields a token carrying non-ASCII. That token flows into the ``--print-keys`` output, the
+    stale-baseline report AND the baseline file, so a fix at the findings loop alone leaves the class
+    open in three other places.
+
+    Copied rather than imported: this file is on ``MIRRORED_TOOLS`` and is contractually stdlib-only
+    (tests/test_asvs_verifier_vault_contract.py), so it cannot reach for a shared helper. The guard
+    mirrors messagefoundry/__main__.py's shape, including its reason for being guarded: some stream
+    wrappers (PYTHONLEGACYWINDOWSSTDIO, pytest capture) lack ``reconfigure`` or reject it, and
+    hardening must never itself crash the tool.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:  # noqa: SIM105
+                reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _harden_stdout()
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("roots", nargs="*", default=["docs"], help="files or directories to scan")
     ap.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[2])

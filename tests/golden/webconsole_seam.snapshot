@@ -1,11 +1,13 @@
 # messagefoundry-webconsole ENGINE SEAM CONTRACT SNAPSHOT
 #
 # Deterministic serialization of the engine-side contract the web console depends on (ADR 0065).
-# Regenerate with: python scripts/webconsole_seam_snapshot.py
+# Regenerate with: python scripts/webconsole_seam_snapshot.py --write
 # This is a GOLDEN gate: any diff means the seam contract changed - see the test's failure hint.
+# The surface below is DISCOVERED from the console's own imports and uses, never enumerated
+# by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-20
+494a51230dce5730
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -98,14 +100,13 @@ user_summary
 current_user
 
 ## api.security surface (imported directly by the console, outside UiDeps)
-authorize_ws: (websocket: 'WebSocket', *permissions: 'Permission') -> 'Identity | None'
+client_ip: (request: 'Request') -> 'str | None'
+enforce_phi_read_pacing: (request: 'Request', identity: 'Identity') -> 'None'
 get_auth: (request: 'Request') -> 'AuthService | None'
-require: (*permissions: 'Permission', mfa_gate: 'bool' = True) -> 'Callable[[Request], Awaitable[Identity]]'
-require_reauth_only: (*permissions: 'Permission') -> 'Callable[[Request], Awaitable[Identity]]'
-require_step_up: (*permissions: 'Permission') -> 'Callable[[Request], Awaitable[Identity]]'
-ws_token: (websocket: 'WebSocket') -> 'str | None'
 
-## AuthService methods called by the console
+## AuthService members reached by the console
+action_step_up_required: property -> 'bool'
+ad_enabled: property -> 'bool'
 allow_login_attempt: (self, client: 'str | None') -> 'bool'
 allow_phi_read: (self, actor: 'str') -> 'bool'
 audit_kerberos_reject: (self, reason: 'str') -> 'None'
@@ -121,16 +122,21 @@ delete_webauthn_credential: (self, identity: 'Identity', credential_id_hash: 'st
 finish_webauthn_assertion: (self, token: 'str | None', response_json: 'str', *, client: 'str | None' = None, rp_id: 'str', origin: 'str') -> 'bool'
 finish_webauthn_registration: (self, identity: 'Identity', response_json: 'str', *, label: 'str', token: 'str', client: 'str | None' = None, rp_id: 'str', origin: 'str') -> 'bool'
 flag_new_client_ip: (self, token: 'str | None', client_ip: 'str | None', *, path: 'str') -> 'bool'
+has_action_step_up: (self, token: 'str | None', action: 'str') -> 'bool'
 has_recent_step_up: (self, token: 'str | None') -> 'bool'
 identity_for_token: (self, token: 'str | None', *, activity: 'bool' = True) -> 'Identity | None'
+kerberos_available: property -> 'bool'
 list_sessions: (self, user_id: 'str') -> 'list[SessionRecord]'
 login: (self, username: 'str', password: 'str', *, provider: 'AuthProvider' = <AuthProvider.LOCAL: 'local'>, client: 'str | None' = None) -> 'LoginOutcome'
 logout: (self, token: 'str | None', *, actor: 'str | None' = None) -> 'None'
 mfa_satisfied: (self, token: 'str | None') -> 'bool'
 mfa_status: (self, identity: 'Identity') -> 'MfaStatus'
+oidc_enabled: property -> 'bool'
+oidc_flow_ttl_seconds: property -> 'int'
 reauth: (self, identity: 'Identity', password: 'str', *, token: 'str', client: 'str | None' = None, purpose: 'str | None' = None) -> 'bool'
 revoke_other_sessions: (self, identity: 'Identity', current_token_hash: 'str', *, actor: 'str') -> 'int'
 revoke_own_session: (self, identity: 'Identity', session_id: 'str', *, actor: 'str') -> 'bool'
+store: property -> 'AdminStore'
 verify_mfa: (self, token: 'str | None', code: 'str', *, client: 'str | None' = None) -> 'bool'
 webauthn_available: (self) -> 'bool'
 
@@ -144,53 +150,88 @@ ui_csp
 ui_ws_authorize
 webauthn_rp_from_request
 
-## api.models DTO fields rendered by the console
-AlertInstanceInfo: acked_at, acked_by, connection, count, event_type, first_seen, id, last_seen, reason, resolved_at, severity, status, suspended_until
-AlertInstanceList: alerts
-AlertsConfig: email_body_template_configured, email_configured, email_html_template_configured, email_recipient_count, email_smtp_port, email_subject_template_configured, email_use_tls, realert_seconds, rules, smtp_allowed_hosts, webhook_allowed_hosts, webhook_configured, webhook_timeout
-AttachmentInfo: content_type, id, total_bytes
-ClusterNodeList: leader_node_id, lease_expires_at, lease_owner, nodes
-ClusterStatus: clustered, config_version, is_leader, node_id, role
-ConfigProvenance: drift, files, fingerprint, git_head, loaded
-ConnectionEventInfo: connection, direction, id, kind, message_id, peer_host, reason, transport, ts
-ConnectionFlagRequest: direction, flagged
-ConnectionRow: alerts_active, backlog_seconds, channel_id, channel_name, delivered_age_seconds, destination, direction, error, errored, flagged, idle_seconds, method, name, owner_shard, paused, peer, port, queue_depth, read, role, simulated, status, toml_managed, waiting_for_reply, written
-DeadLetterList: dead_letters, limit, offset, total
-DeadLetterReplayRequest: channel_id, destination_name
-DrStatus: activation_mode, active, enabled, threshold
-GraphEdge: provenance, source, source_kind, target, target_kind
-GraphNode: kind, name, status
-GraphResponse: dynamic, edges, nodes
-IntegrityResult: detail, ok
-MessageDetail: attachments, channel_id, control_id, error, event, events, id, message_type, metadata, outbox, raw, received_at, source_type, status, summary
-MessageList: limit, messages, offset, total
-MessageSearchResults: limit, matched, messages, scan_limit, scanned, truncated
-MetricsHistoryResponse: capacity, samples
-MetricsHistorySample: outbox_by_status, ts
-PendingApprovalResponse: approval_id, detail, operation, status
-ReloadRequest: config_dir, dry_run
-ReloadResult: dry_run, handlers, inbound, outbound, routers, running
-SecurityPosture: allow_unencrypted_phi, backend, client_address_monoculture, client_denied_last, client_network_denials, data_class, encryption_enabled, enforcement, environment, fips_mode, kex_groups, key_id, key_source, loosenings, loosenings_scope, memory_encryption_note, memory_encryption_operator_declared, memory_encryption_readout_contradicts_declaration, memory_encryption_readout_source, memory_encryption_self_reported_active, memory_encryption_self_reported_capability, memory_encryption_self_reported_mechanism, openssl_version, plaintext_columns, production, require_encryption, security, synthetic_relaxation
-ServiceStatusInfo: enabled, service_name, state
-StatsResetRequest: all, targets
-StatsResetTarget: channel_id, destination, role
-SystemStatus: claim_proc, db, engine, kpis, logs, pool, update
+## DTO fields rendered by the console (closed over nested models)
+messagefoundry.api.auth_models.AdGroupMap: entries
+messagefoundry.api.auth_models.AdGroupMapEntry: ad_group, role
+messagefoundry.api.auth_models.AdGroupScopeEntry: ad_group, channel
+messagefoundry.api.auth_models.AdGroupScopeMap: entries
+messagefoundry.api.auth_models.AuditEntry: action, actor, channel_id, client, detail, ts
+messagefoundry.api.auth_models.AuditList: entries
+messagefoundry.api.auth_models.ChannelScope: channels
+messagefoundry.api.auth_models.CurrentUser: auth_provider, permissions, roles, user_id, username
+messagefoundry.api.auth_models.CustomRoleInfo: description, display_name, id, permissions
+messagefoundry.api.auth_models.CustomRoleRequest: description, display_name, permissions
+messagefoundry.api.auth_models.MfaStatusResponse: enabled, enrolled_at, recovery_codes_remaining, required, webauthn_enrolled
+messagefoundry.api.auth_models.PasswordChangeRequest: current_password, new_password
+messagefoundry.api.auth_models.RoleInfo: builtin, description, display_name, id, permissions
+messagefoundry.api.auth_models.RolesUpdateRequest: roles
+messagefoundry.api.auth_models.SecurityEventInfo: action, detail, ts
+messagefoundry.api.auth_models.SecurityEventsList: events
+messagefoundry.api.auth_models.UserCreateRequest: display_name, email, password, roles, username
+messagefoundry.api.auth_models.UserSummary: auth_provider, channel_scope, disabled, display_name, email, id, roles, username
+messagefoundry.api.auth_models.UserUpdateRequest: disabled, display_name, email
+messagefoundry.api.models.AlertInstanceInfo: acked_at, acked_by, connection, count, event_type, first_seen, id, last_seen, reason, resolved_at, severity, status, suspended_until
+messagefoundry.api.models.AlertInstanceList: alerts
+messagefoundry.api.models.AlertRuleInfo: connection, content_label, control_action, control_target, cooldown_seconds, escalate_tiers, event_type, id, min_depth, min_oldest_seconds, mute, recipient_count, schedule_configured, severity, transports
+messagefoundry.api.models.AlertSuspendRequest: minutes
+messagefoundry.api.models.AlertsConfig: email_body_template_configured, email_configured, email_html_template_configured, email_recipient_count, email_smtp_port, email_subject_template_configured, email_use_tls, realert_seconds, rules, smtp_allowed_hosts, webhook_allowed_hosts, webhook_configured, webhook_timeout
+messagefoundry.api.models.AttachmentInfo: content_type, id, total_bytes
+messagefoundry.api.models.ClaimPoolInfo: discarded_total, idle, open, opened_total
+messagefoundry.api.models.ClaimProcInfo: degraded_reason, effective, head_forms
+messagefoundry.api.models.ClusterNode: acquire_delay_seconds, host, is_leader, last_seen, node_id, pid, promotable, started_at, status
+messagefoundry.api.models.ClusterNodeList: leader_node_id, lease_expires_at, lease_owner, nodes
+messagefoundry.api.models.ClusterStatus: clustered, config_version, is_leader, node_id, role
+messagefoundry.api.models.ConfigProvenance: drift, files, fingerprint, git_head, loaded
+messagefoundry.api.models.ConnectionEventInfo: connection, direction, id, kind, message_id, peer_host, reason, transport, ts
+messagefoundry.api.models.ConnectionFlagRequest: direction, flagged
+messagefoundry.api.models.ConnectionRow: alerts_active, backlog_seconds, channel_id, channel_name, delivered_age_seconds, destination, direction, error, errored, flagged, idle_seconds, method, name, owner_shard, paused, peer, port, queue_depth, read, role, simulated, status, toml_managed, waiting_for_reply, written
+messagefoundry.api.models.DbInfo: audit, disk_free_bytes, events, journal_mode, messages, path, size_bytes, synchronous
+messagefoundry.api.models.DeadLetterList: dead_letters, limit, offset, total
+messagefoundry.api.models.DeadLetterReplayRequest: channel_id, destination_name
+messagefoundry.api.models.DeadLetterRow: attempts, channel_id, control_id, destination_name, failed_at, last_error, message_id, message_type, outbox_id, received_at, summary
+messagefoundry.api.models.DrStatus: activation_mode, active, enabled, threshold
+messagefoundry.api.models.EditResendRequest: idempotency_key, raw, reroute, to
+messagefoundry.api.models.EngineInfo: channels_running, channels_stopped, channels_total, outbox_by_status, pid, uptime_seconds, version
+messagefoundry.api.models.EngineKpis: connections_not_deployed, connections_running, connections_stopped, connections_total, messages_per_second, messages_total
+messagefoundry.api.models.EventInfo: destination, detail, event, ts
+messagefoundry.api.models.GraphEdge: provenance, source, source_kind, target, target_kind
+messagefoundry.api.models.GraphNode: kind, name, status
+messagefoundry.api.models.GraphResponse: dynamic, edges, nodes
+messagefoundry.api.models.IntegrityResult: detail, ok
+messagefoundry.api.models.LogInfo: disk_free_bytes, path, size_bytes
+messagefoundry.api.models.MessageDetail: attachments, channel_id, control_id, error, event, events, id, message_type, metadata, outbox, raw, received_at, source_type, status, summary
+messagefoundry.api.models.MessageList: limit, messages, offset, total
+messagefoundry.api.models.MessageSearchResults: limit, matched, messages, scan_limit, scanned, truncated
+messagefoundry.api.models.MessageSummary: channel_id, control_id, error, event, id, message_type, metadata, received_at, source_type, status, summary
+messagefoundry.api.models.MetricsHistoryResponse: capacity, samples
+messagefoundry.api.models.MetricsHistorySample: outbox_by_status, ts
+messagefoundry.api.models.OutboxInfo: attempts, destination_name, id, last_error, next_attempt_at, status
+messagefoundry.api.models.PendingApprovalResponse: approval_id, detail, operation, status
+messagefoundry.api.models.PoolInfo: acquire_wait, backend, claim_pool, idle, max_size, size
+messagefoundry.api.models.PoolWaitInfo: count, max_ms, mean_ms, p50_ms, p95_ms, p99_ms
+messagefoundry.api.models.ReloadRequest: config_dir, dry_run
+messagefoundry.api.models.ReloadResult: dry_run, handlers, inbound, outbound, routers, running
+messagefoundry.api.models.SearchPresetCreateRequest: criteria, name
+messagefoundry.api.models.SearchPresetCriteria: channel_id, content, control_id, field_path, field_value, limit, message_type, status, target
+messagefoundry.api.models.SecurityLoosening: risk, switch
+messagefoundry.api.models.SecurityPosture: allow_unencrypted_phi, backend, client_address_monoculture, client_denied_last, client_network_denials, data_class, encryption_enabled, enforcement, environment, fips_mode, kex_groups, key_id, key_source, loosenings, loosenings_scope, memory_encryption_note, memory_encryption_operator_declared, memory_encryption_readout_contradicts_declaration, memory_encryption_readout_source, memory_encryption_self_reported_active, memory_encryption_self_reported_capability, memory_encryption_self_reported_mechanism, openssl_version, plaintext_columns, production, require_encryption, security, synthetic_relaxation
+messagefoundry.api.models.ServiceStatusInfo: enabled, service_name, state
+messagefoundry.api.models.StatsResetRequest: all, targets
+messagefoundry.api.models.StatsResetTarget: channel_id, destination, role
+messagefoundry.api.models.SystemStatus: claim_proc, db, engine, kpis, logs, pool, update
+messagefoundry.api.models.UpdateInfo: current_version, pinned_version, update_available
+messagefoundry.api.models.UploadResendRequest: index, to
+messagefoundry.api.models.UploadedFileInfo: content_type, file_id, filename, message_count, sha256, size, uploaded_at, uploader
+messagefoundry.api.models.UploadedFileList: files, scope, total
+messagefoundry.api.models.UploadedMessageSummary: control_id, index, message_type, size
+messagefoundry.api.models.UploadedMessagesResult: file_id, filename, matched, messages, scanned, total_messages, truncated
 
-## api.auth_models DTO fields rendered by the console
-AdGroupMap: entries
-AdGroupMapEntry: ad_group, role
-AdGroupScopeEntry: ad_group, channel
-AdGroupScopeMap: entries
-AuditList: entries
-ChannelScope: channels
-CurrentUser: auth_provider, permissions, roles, user_id, username
-CustomRoleInfo: description, display_name, id, permissions
-CustomRoleRequest: description, display_name, permissions
-MfaStatusResponse: enabled, enrolled_at, recovery_codes_remaining, required, webauthn_enrolled
-PasswordChangeRequest: current_password, new_password
-RoleInfo: builtin, description, display_name, id, permissions
-RolesUpdateRequest: roles
-SecurityEventsList: events
-UserCreateRequest: display_name, email, password, roles, username
-UserSummary: auth_provider, channel_scope, disabled, display_name, email, id, roles, username
-UserUpdateRequest: disabled, display_name, email
+## enum members reachable from those DTOs
+messagefoundry.config.ai_policy.DataClass: PHI, SYNTHETIC
+messagefoundry.config.ai_policy.SecurityEnforcement: ENFORCE, WARN
+
+## Literal value sets on those DTOs
+messagefoundry.api.models.ConnectionFlagRequest.direction: inbound, outbound
+messagefoundry.api.models.SearchPresetCriteria.target: both, raw, summary
+messagefoundry.api.models.StatsResetTarget.role: destination, source
+messagefoundry.api.models.UploadedFileList.scope: any_owner, own

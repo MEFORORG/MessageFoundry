@@ -634,7 +634,7 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 | `environment` | str | — | free-form active-environment **name** (ADR 0017); selects `environments/<name>.toml` + `current_environment()`. **Required** for `serve` (no default) |
 | `data_class` | | | **→ moved to `[security].handles_real_patient_data`** (ADR 0118) — set it there; no longer accepted in `[ai]`. |
 | `production` | | | **→ moved to `[security].production_instance`** (ADR 0118) — set it there; no longer accepted in `[ai]`. |
-| `provider` | str | `claude` | the broker's request shape; **read** under `mode = managed_endpoint` (and recorded in the per-use audit) |
+| `provider` | str | `claude` | names the provider the broker addresses, and is recorded in the per-use audit. It does **NOT** select a request shape — the broker builds one wire shape unconditionally (the Anthropic Messages body), and nothing dispatches on this value. **Validated at config load (BACKLOG #95):** only a provider the engine can actually service is accepted, so an unserviceable name is refused up front rather than failing at request time |
 | `model` | str | `claude-opus-4-8` | the model the broker asks for; **read** under `mode = managed_endpoint` (also echoed on the reply) |
 | `baa_attested` | bool | `false` | **accepted-but-ignored** — an operator attestation carried for the future `managed_claude_baa` path |
 | `endpoint` | str | — | the customer-managed LLM URL. **Required** for `mode = managed_endpoint`; `http`/`https` only, and a cleartext `http` endpoint is **refused** (it would expose `api_key`) |
