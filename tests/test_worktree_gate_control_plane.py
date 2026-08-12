@@ -130,9 +130,15 @@ def repo(tmp_path: Path) -> SimpleNamespace:
     git("commit", "-m", "seed", cwd=primary)
     wt = tmp_path / "Primary-wt"
     git("worktree", "add", "-b", "wt-branch", str(wt), cwd=primary)
+    # A SECOND registered worktree, used by the rule-3d rows as the session cwd. It matters that this
+    # is a real worktree and not a bare directory: from outside any repository `git worktree remove`
+    # exits "fatal: not a git repository", so a row driven from there pins the VERDICT and never the
+    # CONSEQUENCE -- it would pass equally against a rule that could not reach the victim at all.
+    other = tmp_path / "Primary-other"
+    git("worktree", "add", "-b", "other-branch", str(other), cwd=primary)
     repos = tmp_path / "repos.txt"
     repos.write_text(f"{primary}\n", encoding="utf-8")
-    return SimpleNamespace(primary=primary, wt=wt, repos=repos)
+    return SimpleNamespace(primary=primary, wt=wt, other=other, repos=repos)
 
 
 @pytest.mark.parametrize(
@@ -505,8 +511,13 @@ def spaced_repo(tmp_path: Path) -> SimpleNamespace:
     git("worktree", "add", "-b", "wt-branch", str(wt), cwd=primary)
     repos = tmp_path / "repos.txt"
     repos.write_text(f"{primary}\n", encoding="utf-8")
-    foreign = tmp_path / "Foreign"
-    foreign.mkdir()
+    # THE SESSION CWD IS A SECOND REGISTERED WORKTREE, not a bare directory, so the command each row
+    # models is one git would really execute. From a cwd outside any repository `git worktree remove`
+    # exits "fatal: not a git repository", and a row driven from there pins the VERDICT while never
+    # pinning the CONSEQUENCE -- it would pass just as happily against a rule that could not reach the
+    # victim at all. From here the same command really would destroy the victim tree.
+    foreign = tmp_path / "Pri mary-other"
+    git("worktree", "add", "-b", "other-branch", str(foreign), cwd=primary)
     return SimpleNamespace(primary=primary, wt=wt, repos=repos, foreign=foreign)
 
 
@@ -545,8 +556,7 @@ def test_the_no_space_control_denies_the_same_spellings(
     It is the same four spellings against a rig whose only difference is the absent space. If this
     ever reds, the test above is measuring something other than the space and its result must not be
     trusted."""
-    foreign = tmp_path / "ForeignControl"
-    foreign.mkdir(exist_ok=True)
+    foreign = repo.other
     command = spelling.format(wt=repo.wt, primary=repo.primary)
     assert_denied(run_gate(shell(command, cwd=foreign), repo.repos))
 
@@ -590,6 +600,79 @@ def test_a_relative_victim_resolves_against_the_effective_directory(
     assert_denied(run_gate(shell(command, cwd=cwd), repo.repos))
 
 
+@pytest.mark.parametrize("trailer", ['""', "''", '"', "'"])
+def test_a_quote_glued_to_the_victim_path_does_not_disarm_the_rule(
+    repo: SimpleNamespace, tmp_path: Path, trailer: str
+) -> None:
+    """A REGRESSION THIS LANE INTRODUCED AND THEN CLOSED. Pinned so it cannot come back.
+
+    The quote-aware scan replaced a ``.Trim('"', "'")``, and its first bare alternative was
+    ``[^\\s"'][^\\s]*`` -- a tail that ADMITS quote characters. So ``git worktree remove <path>""``
+    carried the trailing quotes into the token, ``git -C`` failed on the malformed path, and the rule
+    fell through to ALLOW: the exact fail-open the quote-awareness was added to close, reintroduced
+    by the fix for it.
+
+    Measured across three gate versions, which is what separates a regression from an inherited
+    defect: main DENY, the parent commit DENY, and the fix-before-this-correction ALLOW. The whole
+    gate suite was blind to it, which is why this is a row and not a comment.
+    """
+    foreign = repo.other
+    assert_denied(
+        run_gate(shell(f"git worktree remove {repo.wt}{trailer}", cwd=foreign), repo.repos)
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'git worktree remove "--force" "{wt}"',
+        "git worktree remove '--force' '{wt}'",
+        'git worktree remove "-f" "{wt}"',
+    ],
+)
+def test_a_QUOTED_flag_is_skipped_like_an_unquoted_one(
+    repo: SimpleNamespace, tmp_path: Path, command: str
+) -> None:
+    """INHERITED, not a regression -- and the note claiming otherwise was itself the defect.
+
+    The flag skip tested ``$m.Value``, the RAW match text. A quoted flag begins with the quote
+    character, so ``"--force"`` was never skipped and became the victim path. It ALLOWed on main and
+    on the parent too, so this closes a pre-existing hole rather than a regression -- but the fix's
+    own comment said the scan had been "validated against the flag", and only the UNQUOTED spelling
+    had been. The skip now tests the CAPTURED value.
+    """
+    foreign = repo.other
+    assert_denied(run_gate(shell(command.format(wt=repo.wt), cwd=foreign), repo.repos))
+
+
+def test_the_victim_is_folded_before_it_reaches_the_deny_reason(
+    repo: SimpleNamespace, tmp_path: Path
+) -> None:
+    """PINS THE FOLD, which until now was asserted by review alone.
+
+    A mutant setting ``$victimMsg = $victimRaw`` passed every test in this section AND the whole
+    thirteen-file gate suite, so the fold was entirely unguarded. Get-SafeForMessage exists because a
+    deny REASON is an instruction an agent acts on and it carries a literal command block: a tab or
+    newline smuggled into an interpolated value can forge a second "Do this instead:" block that a
+    model reading top-down reaches first.
+
+    A newline cannot arrive here -- segments are split per line above -- so the reachable character is
+    the TAB, and the quoted branch of the victim scan admits one where the old whitespace split could
+    not.
+    """
+    foreign = repo.other
+    # A quoted victim carrying a TAB, which resolves via `..` back to the real worktree so the rule
+    # still fires and still interpolates the operator's spelling into the reason.
+    victim = f"{repo.wt}\t/../{repo.wt.name}"
+    reason = assert_denied(
+        run_gate(shell(f'git worktree remove "{victim}"', cwd=foreign), repo.repos)
+    )
+    assert "\t" not in reason, (
+        "the victim path reached the deny reason unfolded -- a tab survived. Route it through "
+        "Get-SafeForMessage; a reason is an instruction, not a log line."
+    )
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -610,8 +693,7 @@ def test_indirection_through_a_shell_variable_is_a_KNOWN_open_residual(
     It is pinned because the alternative is silence, and silence reads as coverage. If this ever
     reds, somebody taught the gate to follow a variable: delete this test and the residual note in
     the gate. Do NOT restore the ALLOW."""
-    foreign = tmp_path / "ForeignInd"
-    foreign.mkdir(exist_ok=True)
+    foreign = repo.other
     assert run_gate(shell(command.format(wt=repo.wt), cwd=foreign), repo.repos) is None, (
         "indirection now DENIES. If that was deliberate, delete this test and the residual note in "
         "the gate; do not restore the ALLOW to make it pass."

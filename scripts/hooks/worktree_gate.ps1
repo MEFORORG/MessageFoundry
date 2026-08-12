@@ -63,7 +63,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.08.12.2"
+$GateVersion = "2026.08.12.3"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -1057,15 +1057,31 @@ What to do instead:
         $after = ($seg.Raw -replace ('(?s)^.*?\bworktree\s+' + $wtVerb + '\b'), '')
         $after = ($after -split '(?:&&|\|\||;|\|)', 2)[0]
         $victimRaw = $null
-        foreach ($m in [regex]::Matches($after, '"(?<q>[^"]*)"|''(?<q>[^'']*)''|(?<q>[^\s"''][^\s]*)')) {
-            if ($m.Value.StartsWith('-')) { continue }
-            if (-not $m.Groups['q'].Value) { continue }
-            $victimRaw = $m.Groups['q'].Value
+        # THE BARE ALTERNATIVE MUST STOP AT A QUOTE, and the first version of this scan did not. It
+        # was `[^\s"''][^\s]*`, whose tail admits quote characters -- so `git worktree remove
+        # <path>""` carried the trailing `""` into the token, `git -C` failed on it, and the rule
+        # fell through to ALLOW. That is the EXACT fail-open this block exists to close,
+        # reintroduced by its own fix: the `.Trim('"', "'")` being replaced had stripped them.
+        # Measured across three gate versions to separate a regression from an inherited defect:
+        # main DENY, parent DENY, this-before-the-correction ALLOW.
+        #
+        # AND THE FLAG SKIP MUST TEST THE CAPTURED VALUE, not the raw match text. `$m.Value` for a
+        # QUOTED flag begins with the quote character, so `"--force"` was never skipped and became
+        # the victim: `git worktree remove "--force" "<governed wt>"` ALLOWed, with the worktree
+        # really destroyed when the command was run. That one is INHERITED -- it allows on main and
+        # on the parent too -- but the note above claimed this scan was "validated against the flag",
+        # and only the UNQUOTED spelling had been.
+        foreach ($m in [regex]::Matches($after, '"(?<q>[^"]*)"|''(?<q>[^'']*)''|(?<q>[^\s"''][^\s"'']*)')) {
+            $tok = $m.Groups['q'].Value
+            if (-not $tok) { continue }
+            if ($tok.StartsWith('-')) { continue }
+            $victimRaw = $tok
             break
         }
         if (-not $victimRaw) { continue }
 
-        # RESOLVE THE VICTIM AGAINST THE DIRECTORY GIT WILL ACTUALLY STAND IN (defect B), by calling
+        # RESOLVE THE VICTIM AGAINST THE BEST AVAILABLE ESTIMATE OF THE DIRECTORY GIT WILL STAND IN
+        # (defect B) -- an ESTIMATE, and the residual list below names where it is wrong -- by calling
         # the resolver rules 3 and 3c already use rather than growing a fourth. This read
         # `& git -C $victimRaw`, which resolves a relative token against THIS HOOK PROCESS's cwd; the
         # rejected #1064 attempt changed it to the SESSION cwd, which is also wrong. git resolves it
@@ -1081,11 +1097,32 @@ What to do instead:
         # followable `cd`/`pushd` in the prefix, falling back to the cwd. Its first candidate is the
         # effective directory. Rooting it against $cwdRaw first is #1061's fix, unchanged.
         #
-        # RESIDUAL, disclosed rather than implied closed: main's resolver PREFERS `-C` and discards a
-        # `cd` prefix, where a shell COMPOSES them and resolves a relative `-C` against the post-`cd`
-        # directory. So `cd ../Unrelated && git -C . worktree remove <victim>` still resolves wrongly.
-        # That is BACKLOG #1085 and it belongs to the resolver, not to this rule -- fixing it here
-        # would be the fourth resolver this comment exists to avoid.
+        # RESIDUALS -- READ THIS AS "AT LEAST THESE", NOT AS AN ENUMERATION. The first version of this
+        # comment listed two and asserted the new base "equals the directory git will actually stand
+        # in". That is FALSE for every shape below, and an adversarial re-read found them in an hour,
+        # which is the reason for the hedge rather than a longer list (CLAUDE.md section 11, SDS-3.6).
+        #
+        #   * A `-C` VALUE CONTAINING A SPACE. Get-GitTargetCandidatesRaw matches `-C\s+"?([^"\s]+)"?`,
+        #     and `[^"\s]+` stops at the space: measured, `git -C "C:/Pri mary" ...` captures
+        #     `C:/Pri`. This is the SAME space family the victim scan above now handles, so this rule
+        #     is quote-aware on one operand and not the other. It belongs to the resolver.
+        #   * CUMULATIVE `-C`. git documents repeated `-C` as composing; the resolver reads the first
+        #     match only, and this rule takes $where[0].
+        #   * A `-C` BELONGING TO A LATER COMMAND on the same line, which the first match may find.
+        #   * A `cd` WHOSE TARGET LEAF IS LITERALLY `git`. The `$at` git-token regex below matches
+        #     inside that PATH, so $pfx is truncated and the prefix is misread. A `~/git` or
+        #     `C:\git` directory is ordinary on a developer's box, so this is the most reachable of
+        #     the set.
+        #   * A FAILED `cd`, and a SUBSHELL prefix `( cd x && git ... )`.
+        #   * COMPOSE vs PREFER: the resolver PREFERS `-C` and discards a `cd` prefix, where a shell
+        #     COMPOSES them and resolves a relative `-C` against the post-`cd` directory. That is
+        #     BACKLOG #1085.
+        #   * THE PRE-SPLITTER ONE LINE ABOVE, `-split '(?:&&|\|\||;|\|)'`, is NOT quote-aware. A
+        #     quoted victim path containing `;` or `&&` is truncated before the quote-aware scan ever
+        #     runs, so the awareness gained above does not extend to that character class.
+        #
+        # All of these belong to the RESOLVER rather than to this rule; fixing them here would be the
+        # fourth resolution rule in one file, which is what calling the shared helper exists to avoid.
         $at = [regex]::Match($seg.Raw, '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)')
         $pfx = $(if ($at.Success) { $seg.Raw.Substring(0, $at.Index) } else { "" })
         $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw)
