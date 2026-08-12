@@ -803,5 +803,13 @@ async def test_the_prune_audit_row_names_the_system_not_the_pruned_files_owner(
         "no address is in scope once the actor is the system principal -- stamping the TRIGGERING "
         "operator's address here is the half that made the row a false attribution"
     )
-    # The owner is not lost: it survives as data, which is where it belongs.
-    assert json.loads(str(row["detail"])) == {"file_id": fid, "uploader": "op"}
+    # The owner is not lost: it survives as data, which is where it belongs -- and it is recorded
+    # BOTH ways. The username is what a human reads; the immutable uploader_id is what still
+    # identifies the account after the name is reassigned, which matters because this row outlives
+    # the file it describes.
+    detail = json.loads(str(row["detail"]))
+    assert detail["file_id"] == fid
+    assert detail["uploader"] == "op"
+    assert detail["uploader_id"] and detail["uploader_id"] != "op", (
+        "the prune row must carry the immutable owner key, not only the reassignable username"
+    )

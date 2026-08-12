@@ -3903,7 +3903,19 @@ def create_app(
                 await engine.store.record_audit(
                     "upload.prune",
                     actor="system",
-                    detail=json.dumps({"file_id": pruned.file_id, "uploader": pruned.uploader}),
+                    detail=json.dumps(
+                        {
+                            "file_id": pruned.file_id,
+                            "uploader": pruned.uploader,
+                            # The IMMUTABLE owner key beside the display name. A prune row is a
+                            # permanent record of a deletion whose subject cannot be recovered
+                            # afterwards -- the file is gone -- and a username is reassignable
+                            # (BACKLOG #1225), so a row read later could name a different person
+                            # than it meant. UploadedFileMeta carries both deliberately
+                            # (uploads.py:116); this records both.
+                            "uploader_id": pruned.uploader_id,
+                        }
+                    ),
                 )
         except OSError:
             _log.warning("opportunistic uploaded-logs retention prune failed", exc_info=True)
@@ -5779,7 +5791,13 @@ def create_managed_app(
                 await store.record_audit(
                     "upload.prune",
                     actor="system",
-                    detail=json.dumps({"file_id": meta.file_id, "uploader": meta.uploader}),
+                    detail=json.dumps(
+                        {
+                            "file_id": meta.file_id,
+                            "uploader": meta.uploader,
+                            "uploader_id": meta.uploader_id,
+                        }
+                    ),
                 )
 
             upload_retention_runner = UploadRetentionRunner(
