@@ -6,21 +6,32 @@
 This is the enforced version-skew HANDSHAKE. The console is separately versioned and pins itself
 against ``api._ui_seam.ENGINE_UI_SEAM``; a silent, incompatible change to the injected contract
 (a renamed handler field, a re-signatured ``api.security`` dep, a DTO field the console renders that
-was renamed) would break the console at RUNTIME within a supported seam — mypy at the engine's
+was renamed) would break the console at RUNTIME within a supported seam -- mypy at the engine's
 ``deps = UiDeps(...)`` site catches builder-signature drift, but NOT a Pydantic DTO field rename
 (that breaks render, not import). The engine test ``tests/test_webconsole_seam_snapshot.py``
 regenerates this snapshot and diffs it against the golden ``tests/golden/webconsole_seam.snapshot``,
 failing CI on any unbumped incompatible change.
 
-The snapshot captures four things:
-  1. ``ENGINE_UI_SEAM`` (the integer both sides pin against);
+**The surface is DISCOVERED, not curated** (BACKLOG #1220). It used to be five hand-maintained
+tuples, and three of them had drifted: 25 rendered DTOs were unlisted, ``api.security`` was missing
+two symbols while carrying five stale ones, and an ``AuthService`` member the console calls was
+absent. A hand-maintained list cannot detect its own omissions -- the gate's coverage IS the list, so
+there is no outside vantage point from which a missing entry looks like anything. See
+``scripts/seam_discovery.py`` for the walk and the fail-loud boundary.
+
+The snapshot captures:
+  1. ``ENGINE_UI_SEAM``, the value both sides pin against;
   2. the ``api._ui_seam`` dataclass field names (``UiDeps`` / ``CoreHandlers`` / ``AdminHandlers``)
-     via ``dataclasses.fields`` — the injected handler/reference bundle shape;
-  3. a CURATED, explicit list (kept below) of the cross-seam surface the console consumes OUTSIDE the
-     injected bundle: the ``api.security`` deps it imports (names + signatures), the ``AuthService``
-     methods it calls (names + signatures), and the ``app.state`` attributes it sets/reads;
-  4. the ``api.models`` / ``api.auth_models`` DTO FIELD SETS the console renders (introspected live,
-     so a field rename on exactly those DTOs changes the snapshot).
+     via ``dataclasses.fields`` -- the injected handler/reference bundle shape;
+  3. the cross-seam surface the console consumes OUTSIDE the injected bundle, discovered from its own
+     imports and uses: ``api.security`` deps, ``AuthService`` members (methods AND properties), and
+     the ``app.state`` attributes it sets/reads;
+  4. the DTO FIELD SETS the console renders, closed over nested models -- one level of field names
+     was not enough, because a nested model's fields never appeared at all;
+  5. the ENUM MEMBER sets and ``Literal`` VALUE sets those DTOs expose. Field names alone are not the
+     contract: ``UploadedFileList.scope`` is a ``Literal`` the console renders as
+     ``_SCOPE_NOTES[data.scope]``, so renaming a literal would KeyError at runtime while a
+     field-name-only snapshot stayed byte-identical.
 
 Run ``python scripts/webconsole_seam_snapshot.py`` to print the current snapshot; redirect it over the
 golden to refresh it after an intentional, seam-bumped contract change.
@@ -29,12 +40,13 @@ golden to refresh it after an intentional, seam-bumped contract change.
 from __future__ import annotations
 
 import dataclasses
+import importlib.util
 import inspect
+import sys
+from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
-
-from messagefoundry.api import auth_models, models, security
+from messagefoundry.api import security
 from messagefoundry.api._ui_seam import (
     ENGINE_UI_SEAM,
     AdminHandlers,
@@ -43,129 +55,30 @@ from messagefoundry.api._ui_seam import (
 )
 from messagefoundry.auth.service import AuthService
 
-# --- CURATED seam surface (item 3) -------------------------------------------------------------
-# These lists are the explicit, reviewed contract the console consumes OUTSIDE the injected UiDeps
-# bundle. Adding/removing an entry here is itself a deliberate seam change (bump ENGINE_UI_SEAM +
-# SUPPORTED_ENGINE_SEAMS, refresh the golden). Kept in sync with the package's actual imports/usage.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_CONSOLE_DIR = _REPO_ROOT / "messagefoundry_webconsole"
+_ENGINE_DIR = _REPO_ROOT / "messagefoundry"
 
-# api.security's public dep surface the console imports DIRECTLY (not via UiDeps) — a re-signature
-# here breaks the console outside the type-checked construction site, so it is seam-scoped.
-_API_SECURITY_SYMBOLS: tuple[str, ...] = (
-    "authorize_ws",
-    "get_auth",
-    "require",
-    "require_reauth_only",
-    "require_step_up",
-    "ws_token",
-)
 
-# AuthService methods the console calls on the service returned by get_auth(request) / require_ui*.
-_AUTH_SERVICE_METHODS: tuple[str, ...] = (
-    "allow_login_attempt",
-    "allow_phi_read",
-    "audit_kerberos_reject",
-    "audit_oidc_reject",
-    "audit_permission_denied",
-    "authenticate_kerberos",
-    "begin_oidc_login",
-    "begin_webauthn_assertion",
-    "begin_webauthn_registration",
-    "complete_oidc_login",
-    "confirm_mfa_enrollment",
-    "delete_webauthn_credential",
-    "finish_webauthn_assertion",
-    "finish_webauthn_registration",
-    "flag_new_client_ip",
-    "has_recent_step_up",
-    "identity_for_token",
-    "list_sessions",
-    "login",
-    "logout",
-    "mfa_satisfied",
-    "mfa_status",
-    "reauth",
-    "revoke_other_sessions",
-    "revoke_own_session",
-    "verify_mfa",
-    "webauthn_available",
-)
+def _load_discovery() -> Any:
+    """Load the sibling discovery module by path.
 
-# app.state attributes the console SETS in mount_ui (ui_*) and READS via get_auth / _auth.py.
-# ``exposure_protected`` and ``loopback`` are READ-ONLY, backward-compatible SOFT dependencies: the
-# console reads them via ``getattr(app.state, "<attr>", False)`` in ``_auth.effective_https`` /
-# ``_auth.security_headers_context`` (proxy-TLS cookie-name keying + the ADR 0143 loopback secure-
-# context /ui header hardening), so an engine lacking either degrades gracefully rather than breaking.
-# They are curated here so a future engine RENAME becomes a reviewed seam change — but they do NOT bump
-# ``ENGINE_UI_SEAM``: a graceful-default read cannot break on a missing attribute, and a bump would
-# make a newer engine REFUSE this console wheel outright — ``SUPPORTED_ENGINE_SEAMS`` holds exactly
-# one seam (BACKLOG #279), so any bump is a hard refusal, which is precisely why a merely-additive
-# app.state read must not trigger one.
-_APP_STATE_ATTRS: tuple[str, ...] = (
-    "auth",
-    "exposure_protected",
-    "loopback",
-    "public_origin",
-    "ui_connections_render",
-    "ui_csp",
-    "ui_ws_authorize",
-    "webauthn_rp_from_request",
-)
+    ``scripts/`` is not an importable package. Registering in ``sys.modules`` BEFORE
+    ``exec_module`` is required, not cosmetic: ``@dataclass(slots=True)`` resolves its own module
+    through ``sys.modules`` while the decorator runs, and an unregistered module makes that lookup
+    return ``None`` and raise.
+    """
+    name = "_mf_seam_discovery"
+    cached = sys.modules.get(name)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).parent / "seam_discovery.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
-# api.models DTOs the console renders (import sites in messagefoundry_webconsole/**). Field sets are
-# introspected live below, so a rename on one of these breaks the snapshot (the silent-drift guard).
-_API_MODELS_DTOS: tuple[str, ...] = (
-    "AlertInstanceInfo",
-    "AlertInstanceList",
-    "AlertsConfig",
-    "AttachmentInfo",
-    "ClusterNodeList",
-    "ClusterStatus",
-    "ConfigProvenance",
-    "ConnectionEventInfo",
-    "ConnectionFlagRequest",
-    "ConnectionRow",
-    "DeadLetterList",
-    "DeadLetterReplayRequest",
-    "DrStatus",
-    "GraphEdge",
-    "GraphNode",
-    "GraphResponse",
-    "IntegrityResult",
-    "MessageDetail",
-    "MessageList",
-    "MessageSearchResults",
-    "MetricsHistoryResponse",
-    "MetricsHistorySample",
-    "PendingApprovalResponse",
-    "ReloadRequest",
-    "ReloadResult",
-    "SecurityPosture",
-    "ServiceStatusInfo",
-    "StatsResetRequest",
-    "StatsResetTarget",
-    "SystemStatus",
-)
-
-# api.auth_models DTOs the console renders.
-_API_AUTH_MODELS_DTOS: tuple[str, ...] = (
-    "AdGroupMap",
-    "AdGroupMapEntry",
-    "AdGroupScopeEntry",
-    "AdGroupScopeMap",
-    "AuditList",
-    "ChannelScope",
-    "CurrentUser",
-    "CustomRoleInfo",
-    "CustomRoleRequest",
-    "MfaStatusResponse",
-    "PasswordChangeRequest",
-    "RoleInfo",
-    "RolesUpdateRequest",
-    "SecurityEventsList",
-    "UserCreateRequest",
-    "UserSummary",
-    "UserUpdateRequest",
-)
 
 _HEADER = (
     "# messagefoundry-webconsole ENGINE SEAM CONTRACT SNAPSHOT",
@@ -173,6 +86,8 @@ _HEADER = (
     "# Deterministic serialization of the engine-side contract the web console depends on (ADR 0065).",
     "# Regenerate with: python scripts/webconsole_seam_snapshot.py",
     "# This is a GOLDEN gate: any diff means the seam contract changed - see the test's failure hint.",
+    "# The surface below is DISCOVERED from the console's own imports and uses, never enumerated",
+    "# by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.",
 )
 
 
@@ -182,20 +97,44 @@ def _dataclass_fields(dc: type) -> list[str]:
 
 
 def _dto_fields(dto: type) -> list[str]:
-    """Sorted field names of a rendered DTO (Pydantic model or dataclass)."""
+    """Sorted field names of a rendered DTO (Pydantic model or dataclass).
+
+    ``model_computed_fields`` is unioned in because a computed field is rendered exactly like a
+    declared one; omitting it would be the same class of blind spot as the curated tuples.
+    """
+    from pydantic import BaseModel
+
     if isinstance(dto, type) and issubclass(dto, BaseModel):
-        return sorted(dto.model_fields)
+        return sorted(set(dto.model_fields) | set(dto.model_computed_fields))
     if dataclasses.is_dataclass(dto):
         return sorted(f.name for f in dataclasses.fields(dto))
     raise TypeError(f"unsupported DTO type for {dto!r}: not a Pydantic model or dataclass")
 
 
-def _signature(obj: Any) -> str:
-    return str(inspect.signature(obj))
+def _member(obj: Any) -> str:
+    """Render a seam member.
+
+    Properties are rendered rather than skipped. ``inspect.signature`` RAISES on a property, and that
+    limitation is why the retired ``_AUTH_SERVICE_METHODS`` tuple held methods only -- the renderer's
+    capability had silently defined what counted as the contract, while the console read
+    ``auth.action_step_up_required`` and five other properties across the seam.
+    """
+    if isinstance(obj, property):
+        if obj.fget is None:
+            return "property (write-only)"
+        return f"property -> {inspect.signature(obj.fget).return_annotation!r}"
+    if callable(obj):
+        return str(inspect.signature(obj))
+    return f"attribute: {type(obj).__name__}"
 
 
 def build_snapshot() -> str:
     """Assemble the full deterministic snapshot text (newline-terminated)."""
+    discovery = _load_discovery()
+    surface = discovery.discover(_CONSOLE_DIR, _ENGINE_DIR)
+    dto_classes = discovery.discover_dto_classes(_CONSOLE_DIR)
+    by_name = {f"{d.__module__}.{d.__qualname__}": d for d in dto_classes}
+
     lines: list[str] = list(_HEADER)
 
     lines += ["", "## ENGINE_UI_SEAM", str(ENGINE_UI_SEAM)]
@@ -209,25 +148,28 @@ def build_snapshot() -> str:
         lines += _dataclass_fields(dc)
 
     lines += ["", "## api.security surface (imported directly by the console, outside UiDeps)"]
-    for symbol in _API_SECURITY_SYMBOLS:
-        lines.append(f"{symbol}: {_signature(getattr(security, symbol))}")
+    for symbol in surface.security_symbols:
+        lines.append(f"{symbol}: {_member(getattr(security, symbol))}")
 
-    lines += ["", "## AuthService methods called by the console"]
-    for method in _AUTH_SERVICE_METHODS:
-        lines.append(f"{method}: {_signature(getattr(AuthService, method))}")
+    lines += ["", "## AuthService members reached by the console"]
+    for name in surface.auth_service_methods:
+        lines.append(f"{name}: {_member(getattr(AuthService, name))}")
 
     lines += ["", "## app.state attributes the console sets/reads"]
-    lines += list(_APP_STATE_ATTRS)
+    lines += list(surface.app_state_attrs)
 
-    lines += ["", "## api.models DTO fields rendered by the console"]
-    for name in _API_MODELS_DTOS:
-        fields = ", ".join(_dto_fields(getattr(models, name)))
-        lines.append(f"{name}: {fields}")
+    lines += ["", "## DTO fields rendered by the console (closed over nested models)"]
+    for qualname in surface.dtos:
+        fields = ", ".join(_dto_fields(by_name[qualname]))
+        lines.append(f"{qualname}: {fields}")
 
-    lines += ["", "## api.auth_models DTO fields rendered by the console"]
-    for name in _API_AUTH_MODELS_DTOS:
-        fields = ", ".join(_dto_fields(getattr(auth_models, name)))
-        lines.append(f"{name}: {fields}")
+    lines += ["", "## enum members reachable from those DTOs"]
+    for name, members in sorted(discovery.enums_in_surface(dto_classes).items()):
+        lines.append(f"{name}: {', '.join(members)}")
+
+    lines += ["", "## Literal value sets on those DTOs"]
+    for name, values in sorted(discovery.literals_in_surface(dto_classes).items()):
+        lines.append(f"{name}: {', '.join(values)}")
 
     return "\n".join(lines) + "\n"
 

@@ -45,12 +45,56 @@ def _load(name: str, path: Path) -> Any:
 
 
 sd = _load("_seam_discovery", _REPO_ROOT / "scripts" / "seam_discovery.py")
-_gen = _load("_seam_snapshot_for_test", _REPO_ROOT / "scripts" / "webconsole_seam_snapshot.py")
 
 
 @pytest.fixture(scope="module")
 def surface() -> Any:
     return sd.discover(_REPO_ROOT / "messagefoundry_webconsole", _REPO_ROOT / "messagefoundry")
+
+
+# The RETIRED hand-maintained tuples, frozen at the commit that deleted them (ebf4882a's generator).
+# They are literals here on purpose. The calibration below is the evidence that discovery measures
+# the contract, and that evidence has to outlive the lists it was measured against -- reading them
+# from the generator would make these tests vacuous the moment the generator stopped carrying them.
+# Discovery must never DROP one of these names; if it does, the fix swapped one blind spot for
+# another and the superset test is what says so.
+_RETIRED_APP_STATE = (
+    "auth",
+    "exposure_protected",
+    "loopback",
+    "public_origin",
+    "ui_connections_render",
+    "ui_csp",
+    "ui_ws_authorize",
+    "webauthn_rp_from_request",
+)
+
+_RETIRED_MODELS = (
+    "AlertInstanceInfo", "AlertInstanceList", "AlertsConfig", "AttachmentInfo", "ClusterNodeList",
+    "ClusterStatus", "ConfigProvenance", "ConnectionEventInfo", "ConnectionFlagRequest",
+    "ConnectionRow", "DeadLetterList", "DeadLetterReplayRequest", "DrStatus", "GraphEdge",
+    "GraphNode", "GraphResponse", "IntegrityResult", "MessageDetail", "MessageList",
+    "MessageSearchResults", "MetricsHistoryResponse", "MetricsHistorySample",
+    "PendingApprovalResponse", "ReloadRequest", "ReloadResult", "SecurityPosture",
+    "ServiceStatusInfo", "StatsResetRequest", "StatsResetTarget", "SystemStatus",
+)  # fmt: skip
+
+_RETIRED_AUTH_MODELS = (
+    "AdGroupMap", "AdGroupMapEntry", "AdGroupScopeEntry", "AdGroupScopeMap", "AuditList",
+    "ChannelScope", "CurrentUser", "CustomRoleInfo", "CustomRoleRequest", "MfaStatusResponse",
+    "PasswordChangeRequest", "RoleInfo", "RolesUpdateRequest", "SecurityEventsList",
+    "UserCreateRequest", "UserSummary", "UserUpdateRequest",
+)  # fmt: skip
+
+_RETIRED_AUTH_SERVICE = (
+    "allow_login_attempt", "allow_phi_read", "audit_kerberos_reject", "audit_oidc_reject",
+    "audit_permission_denied", "authenticate_kerberos", "begin_oidc_login",
+    "begin_webauthn_assertion", "begin_webauthn_registration", "complete_oidc_login",
+    "confirm_mfa_enrollment", "delete_webauthn_credential", "finish_webauthn_assertion",
+    "finish_webauthn_registration", "flag_new_client_ip", "has_recent_step_up",
+    "identity_for_token", "list_sessions", "login", "logout", "mfa_satisfied", "mfa_status",
+    "reauth", "revoke_other_sessions", "revoke_own_session", "verify_mfa", "webauthn_available",
+)  # fmt: skip
 
 
 # --- calibration against the real tree ---------------------------------------------------------
@@ -60,17 +104,17 @@ def test_app_state_discovery_reproduces_the_undrifted_curated_list(surface: Any)
     """The calibration. ``_APP_STATE_ATTRS`` was measured to have ZERO drift in either direction, so
     an exact match is the strongest available evidence that the two-sided rule (console reads
     intersected with engine writes, plus console writes) measures the real contract."""
-    assert surface.app_state_attrs == tuple(sorted(_gen._APP_STATE_ATTRS))
+    assert surface.app_state_attrs == _RETIRED_APP_STATE
 
 
 def test_nothing_curated_is_lost(surface: Any) -> None:
     """Discovery must be a SUPERSET of every curated list. A fix that merely swapped one blind spot
     for another would show up here as a dropped name."""
-    assert {f"messagefoundry.api.models.{n}" for n in _gen._API_MODELS_DTOS} <= set(surface.dtos)
-    assert {f"messagefoundry.api.auth_models.{n}" for n in _gen._API_AUTH_MODELS_DTOS} <= set(
+    assert {f"messagefoundry.api.models.{n}" for n in _RETIRED_MODELS} <= set(surface.dtos)
+    assert {f"messagefoundry.api.auth_models.{n}" for n in _RETIRED_AUTH_MODELS} <= set(
         surface.dtos
     )
-    assert set(_gen._AUTH_SERVICE_METHODS) <= set(surface.auth_service_methods)
+    assert set(_RETIRED_AUTH_SERVICE) <= set(surface.auth_service_methods)
 
 
 def test_the_measured_coverage_hole_is_closed(surface: Any) -> None:
@@ -89,9 +133,7 @@ def test_the_measured_coverage_hole_is_closed(surface: Any) -> None:
         "UploadedMessagesResult",
     ):
         assert f"messagefoundry.api.models.{name}" in surface.dtos
-        assert (
-            name not in _gen._API_MODELS_DTOS
-        )  # still absent from the curated tuple in this layer
+        assert name not in _RETIRED_MODELS  # it was absent from the curated tuple: the hole itself
 
 
 def test_nested_only_models_are_covered(surface: Any) -> None:
