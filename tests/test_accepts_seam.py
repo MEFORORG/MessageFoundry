@@ -401,7 +401,7 @@ def test_accepts_lookup_raises(tmp_path: Path) -> None:
         return True
 
     def _fhir(msg: Any) -> bool:
-        fhir_lookup("SOME_FHIR", "Patient?identifier=1")
+        fhir_lookup("SOME_FHIR", "Patient/1")  # #1243: read-by-id; the flat '?'-query form is gone
         return True
 
     reg = _reg(

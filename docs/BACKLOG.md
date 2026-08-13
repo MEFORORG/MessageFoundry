@@ -8370,6 +8370,10 @@ Both compute `any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in ...)`.
 
 **Source:** observed during #1107's dynamic-URL surface enumeration, 2026-08-13, while establishing that `fhir.py` context-encodes the path and structured-query contexts but not the flat-query one. Recorded because "two hand-rolled treatments of one threat class in one file" is a drift shape worth tracking -- **and recorded with its current-identity measured**, so a later reader does not mistake it for a live divergence.
 
+> **AMENDED 2026-08-13 -- RESOLVED AS A SIDE EFFECT OF #1243, AND STAYS OPEN UNTIL THAT LANDS.** #1243 limb A deletes the flat `?`-query path, whose two screens (`_has_control_char(search_part)` and the same call over the percent-decoded string) were the **only** callers of `_has_control_char`. With them gone the function has no callers and is removed, leaving `_reject_control_chars` as the single control-char predicate in the file -- so the duplication this item records ceases to exist and there is nothing left to drift.
+>
+> **This item is NOT closed here on purpose.** The fix is unmerged at the time of writing, and a closed banner over an unmerged fix asserts a state that does not exist. It closes in the commit that lands #1243. Recorded now rather than at merge so a reader arriving in between does not go hunting for a duplication that the same branch already removes.
+
 ## 1240. the FHIR grammar gates use `match` with a `$` anchor, so a trailing newline passes
 
 > 🔢 **Filed 2026-08-13 - not started. NOT EXPLOITABLE TODAY -- the reachability analysis is in the item and it is honest about that.** Value **5/10** · Difficulty **1/10**. Both FHIR grammar gates accept a value with a trailing newline, so on the `fhir_lookup` read path the gate does not enforce the grammar it advertises. Found during #1107 (ASVS 1.2.2).
