@@ -8313,3 +8313,51 @@ Both compute `any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in ...)`.
 **Test.** Assert the two predicates agree across a shared character corpus, so a future widening of one without the other fails. That test is the durable control here and is worth more than the extraction itself.
 
 **Source:** observed during #1107's dynamic-URL surface enumeration, 2026-08-13, while establishing that `fhir.py` context-encodes the path and structured-query contexts but not the flat-query one. Recorded because "two hand-rolled treatments of one threat class in one file" is a drift shape worth tracking -- **and recorded with its current-identity measured**, so a later reader does not mistake it for a live divergence.
+
+## 1240. the FHIR grammar gates use `match` with a `$` anchor, so a trailing newline passes
+
+> 🔢 **Filed 2026-08-13 - not started. NOT EXPLOITABLE TODAY -- the reachability analysis is in the item and it is honest about that.** Value **5/10** · Difficulty **1/10**. Both FHIR grammar gates accept a value with a trailing newline, so on the `fhir_lookup` read path the gate does not enforce the grammar it advertises. Found during #1107 (ASVS 1.2.2).
+
+**Cluster:** Security / input validation. **Priority:** P2. **Verdict:** build (small).
+**Severity:** Conditional and currently **none** -- see reachability below. The defect is that a control does not do what it claims, which matters independently of whether another control happens to cover for it.
+
+**The defect.** `messagefoundry/transports/fhir.py:104-105`:
+```
+_FHIR_TYPE_RE = re.compile(r"^[A-Za-z]+$")
+_FHIR_ID_RE   = re.compile(r"^[A-Za-z0-9.\-]{1,64}$")
+```
+Python's `$` matches **before a trailing newline**. Measured on 3.14.6:
+```
+_FHIR_ID_RE.match("abc\n")        -> True     ACCEPTED
+_FHIR_TYPE_RE.match("Patient\n")  -> True     ACCEPTED
+_FHIR_ID_RE.match("ab\nc")        -> False    (embedded newline correctly refused)
+_FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
+```
+
+**Reachability, stated plainly because an item that overstates it gets discounted.** Not exploitable on this tree. On the **write** path `_reject_control_chars` runs *before* the gate (`:424`, `:463`), so a newline never reaches it. On **both** paths `urllib.parse.quote(value, safe="")` encodes it to `%0A` (`:428`, `:450`, `:454`, `:712`, `:718`), so no request splitting or header injection follows. **But** the `fhir_lookup` **read** path (`_resolve_read_url`, `:705-718`) has the gate and `quote` and **no** control-char screen, so there the gate is the sole grammar control and it admits a value its own grammar excludes.
+
+**The fix.** `match` to `fullmatch` on both regexes, and add `_reject_control_chars` to the read path so it matches the write path's two-control posture. Both are one-line changes.
+
+**Test.** Assert each regex refuses a trailing-newline value directly, not through the URL builder -- routing the assertion through `quote` would pass for the wrong reason and certify nothing, which is the same trap #1238 records for `basename`.
+
+**Source:** #1107's ASVS 1.2.2 dynamic-URL surface enumeration, 2026-08-13.
+
+## 1241. operator-config values reach URL and header sinks with no construction-time screen
+
+> 🔢 **Filed 2026-08-13 - not started.** Value **5/10** · Difficulty **3/10**. Several operator-configured values are interpolated into URL paths, query strings and an HTTP header with weaker treatment than the message-derived values beside them -- in one case with no screen at all. Found during #1107 (ASVS 1.2.2). **The subject is the asymmetry**, so fixing one site without the others misses the point.
+
+**Cluster:** Security / input validation. **Priority:** P2. **Verdict:** build.
+**Severity:** Conditional and lower than the message-derived sites, because these values come from operator config rather than from an inbound message -- an operator can already choose the endpoint. It is filed because the treatment is *inconsistent within the same file*, which is how the weaker one survives review.
+
+**The sites.**
+- `transports/fhir.py:431` -- `f"{base}/{type_seg}?{self.conditional_query}"`. `conditional_query` is read at `:231` and reaches the URL query with **no screen and no encoding at all** -- weaker than the flat-search path 300 lines below, which at least screens.
+- `transports/fhir.py:436` -- the same value into the `If-None-Exist` **HTTP header**, also unscreened. **The asymmetry is in the same file:** the `meta.versionId` limb at `:446`/`:449` deliberately *rejects rather than encodes* for exactly this threat, with the reason in-comment ("quoting is wrong for a header value, so reject rather than encode").
+- `transports/dicomweb.py:241` -- `f"{base}/studies/{self.study_uid}"`. `study_uid` gets a control-char screen at `:153` but **no grammar gate and no percent-encode**, asymmetric with `fhir.py:428` which does both.
+
+**Encoding is the WRONG fix for `conditional_query`, and this is the trap.** The value is *meant* to carry FHIR search syntax: `docs/CONNECTIONS.md:1479` documents `identifier=sys|val` as the intended shape and `tests/test_fhir_transport.py:220` pins `assert url == f"{BASE}/Patient?identifier=sys|val"`. Percent-encoding it would break the documented feature and fail that test. **The right control is a construction-time screen** (at `:231`, where the value is read) covering both sinks -- rejecting control characters and header-splitting sequences while leaving FHIR search syntax intact. For `study_uid`, a DICOM UID grammar gate plus `quote(safe="")` matches the `fhir.py:428` treatment.
+
+**What would NOT be an honest fix.** Screening only `:431` and leaving `:436`. The header sink is the one with the sharper failure mode and it is the one the existing `versionId` precedent already tells us how to handle.
+
+**Test.** One test per sink per site, asserting refusal at construction time rather than at the URL layer.
+
+**Source:** #1107's ASVS 1.2.2 dynamic-URL surface enumeration, 2026-08-13. Related: #1240 (the grammar gates on the message-derived path), #1239 (duplicated control-char predicate in the same file).
