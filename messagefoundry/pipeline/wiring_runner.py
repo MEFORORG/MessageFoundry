@@ -1540,9 +1540,7 @@ class RegistryRunner:
         # the executor here outside build_check_registry's active_hop_posture scope, so an unstamped build
         # would either fail-closed a legit dev read or (via the send-time re-assertion) mis-key the hop.
         with active_hop_posture(self._hop_posture):
-            return FhirLookupExecutor(
-                resolved, require_structured=self._egress.fhir_require_structured_params
-            )
+            return FhirLookupExecutor(resolved)
 
     def _run_fhir_lookup(
         self,
@@ -6462,9 +6460,7 @@ def _build_check_connectors(
         resolved_fhir_lookups[fname] = fsettings
     if resolved_fhir_lookups:
         # Construct (and discard): validates each FHIR URL/TLS/SMART-auth without issuing a read.
-        FhirLookupExecutor(
-            resolved_fhir_lookups, require_structured=egress.fhir_require_structured_params
-        )
+        FhirLookupExecutor(resolved_fhir_lookups)
 
 
 def check_pt_backend_supported(registry: Registry, store: QueueStore) -> None:

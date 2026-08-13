@@ -20,9 +20,11 @@
          parent (measured: the parent's result came back with an EMPTY permission_denials list). Blocking
          the fan-out costs one second; letting it run costs the whole workflow.
 
-    KEYED ON THE TARGET PATH, NEVER ON THE SESSION'S cwd. Over 30 days, 29% of this repo's Edit/Write
-    calls came from a session sitting in the primary but wrote into a sibling worktree by absolute path --
-    i.e. already correct. A cwd-keyed gate would have denied all of them. Only the DESTINATION matters.
+    KEYED ON THE TARGET PATH, NEVER ON THE SESSION'S cwd. Over 30 days, 29% of the Edit/Write calls
+    made by sessions sitting in the primary wrote into a sibling worktree by absolute path -- i.e.
+    already correct. A cwd-keyed gate would have denied all 4,010 of them. Only the DESTINATION
+    matters. That 29% is a share of those primary-seated sessions' own calls, NOT of every call in
+    the repo; the counts and the population are in docs/WORKTREE-GATE.md.
 
     FAILS OPEN on every error path (bad JSON, missing fields, unreadable allowlist). A guardrail that
     wedges all work gets uninstalled, and then it protects nothing.
@@ -63,7 +65,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.08.12.3"
+$GateVersion = "2026.08.13.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"

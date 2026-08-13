@@ -252,6 +252,59 @@ that *some* ref reaches it — not that `origin/main` does. **The check that set
 the general form is not. Name the question, name what the tool returns, and check they are the same
 sentence (CLAUDE.md §11).
 
+## Editing an item *body* — the open-count control
+
+Everything above governs **numbers**. Nothing above governs an item's **status**, which is encoded as a
+banner glyph and read by `parse_items` (`scripts/docs/backlog_status_check.py`). There is no hook for
+that, and the failure it admits is worse than a collision.
+
+**The trap, measured 2026-08-13 on BACKLOG #1245.** A glyph from the closed alphabet
+(`_CLOSED = "✅⛔🪦"`) used as **emphasis inside an item body** is read as a **status banner**. A
+live, just-filed defect parsed as **CLOSED**. The open count went **200 to 199 on a pure prose
+insertion** that added no item and closed nothing.
+
+**Care does not prevent it, and knowing the rule does not either.** The glyph in that draft was doing
+the same job it does throughout root `CLAUDE.md` — marking a "do not do this" paragraph. A banner and
+an emphasis marker are the *same character in the same file*; only position distinguishes them, and
+`parse_items` cannot see intent. This is `CLAUDE.md` §11's argument arriving as a defect rather than a
+principle.
+
+**The direction is what makes it dangerous.** A false OPEN is noise — someone re-reads a closed item.
+A false **CLOSED removes the item from the queue**, so nobody looks again. The failure is silent *and*
+semantically inverted: an unresolved defect recorded as resolved.
+
+### The control
+
+Run `parse_items` **before and after** every `docs/BACKLOG.md` edit and **diff the counts**:
+
+```bash
+python -c "import importlib.util,pathlib; s=importlib.util.spec_from_file_location('b','scripts/docs/backlog_status_check.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); i=m.parse_items(pathlib.Path('docs/BACKLOG.md').read_text(encoding='utf-8')); print(f'{len(i)} items, {sum(1 for x in i if x.is_open)} open')"
+```
+
+Expected deltas, and **an edit that produces anything else is the tell**:
+
+| edit | items | open | closed |
+|---|---:|---:|---:|
+| filing N new items | +N | +N | 0 |
+| amending an item body | 0 | 0 | 0 |
+| closing one item | 0 | −1 | +1 |
+
+- **It must run *after* the edit.** Running it only beforehand catches nothing — the whole failure is
+  in what the edit did.
+- **"Does the file still parse?" is not the control.** The file parses perfectly. It simply means
+  something else.
+- **Run it every time, not when something feels off.** A control that only runs when you already
+  suspect a problem is not a control. Applied blind to an unrelated item the same day, it correctly
+  reported no change — which is the point.
+- **The control was attacked before being written down.** A stray `⛔` was injected into a *copy* of
+  the live file inside an open item's body: the count moved `201 open` to `200 open`, with the item
+  total unchanged at `275`. So it demonstrably **sees this class**, rather than merely having been
+  green on the day. A gate nobody has made fail on purpose is an assertion, not evidence.
+
+**Safest habit:** never use `✅ ⛔ 🪦 🔢 🚧` anywhere in an item body — not as emphasis, not in a
+nested blockquote. Say the word (`WARNING`, `DO NOT`). `⚠️` and `⭐` are outside both alphabets and
+are safe.
+
 ## Limits
 
 - **`--no-verify` bypasses the pre-commit hook.** It is a guardrail, not a security boundary. The `--ci`
