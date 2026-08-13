@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import sqlite3
 import time
+from pathlib import Path
 
 import pytest
 
@@ -265,6 +267,77 @@ async def test_claimed_bootstrap_survives_user_creation_after_an_admin_reset() -
         assert (await service.login("admin", temp)).ok
     finally:
         await store.close()
+
+
+async def test_the_upgrade_backfill_restores_a_claim_a_pre_column_database_cannot_carry(
+    tmp_path: Path,
+) -> None:
+    # BACKLOG #1245: the one-time backfill is the arm that can disable the only administrator of an
+    # UPGRADED database, and until this test it was executed by nothing. Every other test opens
+    # ``:memory:``, which creates ``users`` WITH the column from _SCHEMA, so the guarded migration
+    # branch is never entered and deleting the backfill outright reds no test at all.
+    #
+    # This drives the real path: claim the bootstrap, drop the column to manufacture a pre-#1245
+    # database, reopen, and assert the claim came back. Without the backfill the reopened row reads
+    # NULL, which the gate reads as "never claimed", and the next trigger disables an account whose
+    # holder claimed it long ago -- the defect, re-introduced by its own fix.
+    db = tmp_path / "mefor.db"
+    store = await MessageStore.open(str(db))
+    try:
+        service = AuthService(store, AuthSettings(bootstrap_expiry_hours=72))
+        boot = await service.initialize()
+        assert boot is not None
+        await _claim_bootstrap(service, boot.password)
+        claimed = await store.get_user_by_username("admin")
+        assert claimed is not None and claimed.password_claimed_at is not None
+    finally:
+        await store.close()
+
+    # Manufacture the legacy shape, and PROVE it was manufactured -- a green below would otherwise be
+    # consistent with the column never having been dropped.
+    # Rebuilt rather than ALTER ... DROP COLUMN: SQLite re-parses the stored CREATE TABLE text after
+    # a drop, and the trailing ``--`` comment this change puts on the final column makes that
+    # reconstruction "incomplete input". The column list is DERIVED from the live table, so this does
+    # not hard-code a schema that will drift.
+    con = sqlite3.connect(db)
+    try:
+        keep = [
+            row[1]
+            for row in con.execute("PRAGMA table_info(users)")
+            if row[1] != "password_claimed_at"
+        ]
+        assert "password_changed_at" in keep  # the column the backfill reads from
+        cols = ", ".join(keep)
+        con.executescript(
+            "PRAGMA foreign_keys=OFF;\n"
+            f"CREATE TABLE users_legacy AS SELECT {cols} FROM users;\n"
+            "DROP TABLE users;\n"
+            "ALTER TABLE users_legacy RENAME TO users;\n"
+        )
+        con.commit()
+        after = {row[1] for row in con.execute("PRAGMA table_info(users)")}
+        assert "password_claimed_at" not in after  # the legacy shape really was manufactured
+        assert "password_changed_at" in after
+    finally:
+        con.close()
+
+    reopened = await MessageStore.open(str(db))
+    try:
+        healed = await reopened.get_user_by_username("admin")
+        assert healed is not None
+        assert healed.password_claimed_at is not None  # the backfill ran on open
+        # And it restored the ORIGINAL claim instant, not "now" -- the stamp is evidence about when
+        # the holder took the account, so a backfill that merely wrote a non-NULL value would satisfy
+        # a not-None assertion while destroying the fact.
+        assert healed.password_claimed_at == healed.password_changed_at
+    finally:
+        await reopened.close()
+
+    # SCOPE, stated rather than implied: this pins that the backfill RESTORES THE STAMP on an
+    # upgraded database. The consequence of a restored stamp -- the account surviving a retirement
+    # trigger -- is pinned by the sibling tests above and is deliberately not re-tested here, because
+    # the rebuilt legacy table is created without its primary key and cannot carry the user_roles
+    # foreign key a second administrator needs.
 
 
 async def test_a_directory_provisioned_admin_is_not_retired_by_wp3() -> None:
