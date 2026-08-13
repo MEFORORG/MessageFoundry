@@ -552,8 +552,14 @@ _DATETIME_NOW_ATTRS = frozenset({"now", "utcnow", "today"})
 # (``time.gmtime(0)`` is deterministic; ``time.gmtime()`` reads the current clock).
 _TIME_WALLCLOCK_NOARG = frozenset({"time.localtime", "time.gmtime", "time.ctime", "time.asctime"})
 
-# db_lookup/fhir_lookup: the SQL statement / FHIR query is the 2nd positional or the
-# statement=/query= keyword; the params dict (parameterized / percent-encoded) is safe.
+# db_lookup/fhir_lookup: this rule inspects the SQL statement / FHIR query-or-path argument ONLY --
+# the 2nd positional or the statement=/query= keyword. The params dict is NOT inspected at all. That is
+# a statement of SCOPE, not a clearance: params values are bound (SQL) or percent-encoded (FHIR,
+# urlencode(quote_via=quote, safe="")), which defeats STRUCTURE injection -- an extra parameter -- and
+# nothing else. It does NOT defeat FHIR VALUE-layer injection: ',' '|' '$' are FHIR search-value
+# separators, not URL delimiters, so they survive percent-decoding with their meaning intact
+# (BACKLOG #1243 limb B). Since #1243 removed the flat '?'-query, the inspected argument on a
+# fhir_lookup is the PATH, and interpolating into it is still flagged.
 _LOOKUP_NAMES = frozenset({"db_lookup", "fhir_lookup"})
 _LOOKUP_QUERY_KW = frozenset({"statement", "query"})
 
