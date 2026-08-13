@@ -8284,3 +8284,36 @@ every worker session's handoff, which is the sentence the next session bases its
 > **How to prove a fix:** lock the sole administrator, then recover **without** editing the database by hand and **without** an already-authenticated second admin -- and assert the recovery path is itself gated, since an unlock affordance is a control an attacker wants. A fix that only lengthens the docs, or that opens an ungated reset, fails on opposite sides.
 
 **Cluster:** Security / availability. **Priority:** P2. **Verdict:** build. **Severity:** conditional per CLAUDE.md section 0 -- on a first deployment with one administrator, a lockout would be unrecoverable without direct database access; **zero deployments, so nobody is locked out today.**
+
+## 1242. `asvs-apply-cells.py` is a lossy writer in four distinct ways, and its own preservation guard is blind to three of them
+
+> 🔢 **Filed 2026-08-13 -- PENDING ACTIVE DATA LOSS, not a latent hazard. The next routine `--apply` destroys a whole commit's worth of structural evidence and prints a clean bill of health.** Value **8/10** -- Difficulty **4/10**. Vault-only security tooling, so there is no deployment axis; what it destroys is the **evidence record** the ASVS cells rest on. Findings below were adversarially verified (4 of 4 lenses), which corrected two errors in the original framing -- see the amendment note.
+
+> **THE TAXONOMY IS FOUR-WAY, not the clean scalar-versus-anchor split it first appears to be.** `render()` handles four kinds of key and gets exactly one right:
+> ```
+> live-only top-level SCALAR   carried through by the loop over the live cell    PRESERVED
+> live-only top-level TABLE    not in _SUBTABLES, so it falls to _scalar(),
+>                              whose last branch is toml_str(str(value))
+>                              -> a dict is written out as a TOML STRING          TYPE-MANGLED
+> payload-only top-level key   the loop's third skip is `key in cell`, i.e.
+>                              PAYLOAD membership, so a genuinely new field
+>                              is never emitted at all                            DROPPED
+> key inside a sub-table       [[cell.evidence]] re-emitted as exactly
+> entry                        path/line/expect; [[cell.absence]] as exactly
+>                              pattern/positive_control/mutation                  DROPPED
+> ```
+> The writer's own comment claims forward compatibility for "anything a future schema adds that this writer has never heard of." That is true of exactly the first row.
+
+> **WHY THE GUARD CANNOT SEE IT.** The preservation block computes `lost = set(was) - set(now)` over **top-level** keys, then asserts sub-table **cardinality** only. A re-render that keeps every entry and hollows each one out passes both limbs: the top-level key set is unchanged and the counts are unchanged. The table-mangling passes too -- `blocker` is still a key, it is merely no longer a table. The payload-only drop is invisible by construction, because the guard diffs against the **live** cell and that key was never there. **The guard's own comment states the invariant it fails to hold one level down.** The original block text is captured and bound at the rewrite loop, then never used; there is no hash, diff, or schema check anywhere, and no test in the repo references the script.
+
+> **REACHABILITY IS TOTAL -- re-render is the tool's ONLY mode.** It hard-refuses any cell id not already present in the scorecard, so it can never append. Every rescore and every anchor repair goes through it by design, and the handoff docs mandate it over a hand edit. There is no path that touches a cell without re-rendering it.
+
+> **THE TRIGGER.** Until 2026-08-13 every evidence entry carried exactly three keys, so the sub-table limb could not fire. The D3 backfill merged that morning and put `sym` and `ctx` on **1,710 of 1,998** evidence anchors. **The backfill is correct and does not touch the writer** -- landing it is simply what armed a writer that was already lossy. Its own "zero lines modified" is true of the anchor triples, and is exactly why the interaction went unnoticed.
+
+> **THE LOSS REMOVES A CHECK RATHER THAN TRIPPING ONE -- it fails silent AND green.** `scripts/asvs/scorecard.py` documents `sym`/`ctx` as optional and additive, where `None` means *not asserted*. So an erased pin does not fail verification; it downgrades an asserted structural claim to an unasserted one, and the verifier reports green having checked strictly less. A separate live top-level table is meanwhile sitting stringified with the guard reporting no loss.
+
+> **How to prove a fix:** put a key the writer has never heard of inside an evidence entry, re-render, and assert **both** that it survives **and** that the guard REFUSES when it is deliberately dropped -- the second half is the real test, since a green from a guard that cannot see the failure class is worth nothing (`docs/Secure_Development_Standards.md` SDS-3.8). Cover all four rows: a payload-only new field, a live top-level table, and an absence-entry key, not just `sym`/`ctx`. A fix that special-cases `sym` and `ctx` by name **fails** -- the defect is the handling of *unknown* keys, and naming these two rebuilds the same trap for the next field added. Match entries by `(path, expect)` when comparing, not by index or count.
+
+> ⚠️ **Amendment, same day, recording what the adversarial pass corrected.** The item was first written as "latent, and a clean scalar/sub-table asymmetry." Both halves were wrong. It is **active**, because the measurement was taken one commit before the backfill landed and the parent revision genuinely has zero `sym` keys -- a stale checkout reproduces the wrong answer perfectly and reads as confirmation. And the asymmetry is four-way, not two-way; the clean framing concealed the table-mangling and the payload-only drop entirely. A fifth limb about line-ending rewriting was **investigated and rejected**: the tool does rewrite the working tree to LF, but `core.autocrlf=true` normalizes it back in the index, so the blob is unchanged and the claimed review-diff consequence does not occur.
+
+**Cluster:** Security tooling / evidence integrity. **Priority:** P1. **Verdict:** build. **Severity:** no deployment axis -- vault tooling, ships to nobody. P1 rather than P2 because the loss is **pending on the next routine operation**, is **silent in both directions** (the writer reports success, the verifier reports green having checked less), and destroys evidence that cost a dedicated backfill to produce.
