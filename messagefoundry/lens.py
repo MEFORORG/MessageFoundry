@@ -116,7 +116,10 @@ _ACTION_PARAMS: dict[str, list[str]] = {
 # as DBSelect-style ``lookup`` rows (ADR 0076 §3). db_lookup/fhir_lookup take no ``msg`` argument.
 _LOOKUP_PARAMS: dict[str, list[str]] = {
     "db_lookup": ["connection", "statement", "params"],
-    "fhir_lookup": ["connection", "query"],
+    # ``params`` is not optional garnish here: since #1243 removed the flat '?'-query, the structured
+    # params= form is the ONLY way to express a fhir_lookup SEARCH, so without it a Steps row could
+    # only ever emit a read-by-id. Same shape db_lookup already uses.
+    "fhir_lookup": ["connection", "query", "params"],
     "code_lookup": ["msg", "path", "table"],  # default is keyword-only
 }
 

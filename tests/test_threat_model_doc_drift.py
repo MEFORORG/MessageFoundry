@@ -704,11 +704,14 @@ def test_documented_bounds_match_the_live_constants() -> None:
             s.egress.deny_by_default,
             False,
         ),
-        (
-            "15.1.5 fhir_require_structured_params default off",
-            s.egress.fhir_require_structured_params,
-            False,
-        ),
+        # BACKLOG #1243 removed `[egress].fhir_require_structured_params` along with the flat
+        # '?'-query it gated, so its row is gone from here. This is a COUPLED edit —
+        # `docs/security/THREAT-MODEL.md` lives in the vault (gitignored, absent from every checkout,
+        # so these tests cannot enforce it here or in CI) and its 15.1.5 sentence at :256 must be
+        # rewritten to match: the structured `params=` form is now the ONLY search form, and the
+        # rewrite must also say what percent-encoding does NOT cover — it defeats structure injection,
+        # not FHIR value-layer injection (',' '|' '$' survive percent-decoding as separators, #1243
+        # limb B). Without that clause the threat model asserts a broader control than ships.
     ]
 
     drifted = [
