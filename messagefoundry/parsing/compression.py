@@ -21,12 +21,22 @@ Two invariants shape the surface:
   embeds a *wall-clock* mtime → different bytes every second → a silent purity break) and
   :func:`zip_compress` fixes each entry's ZIP date. Compression output is a pure function of its input.
 
-* **Decompression-bomb DoS** ([CLAUDE.md](../../CLAUDE.md) §9). Every decompress accepts an optional
-  ``max_output_bytes`` ceiling, enforced **incrementally** (bounded reads) so a bomb is refused after
-  producing *at most* the ceiling — never after fully expanding in memory. Every corrupt / truncated /
-  over-ceiling / bad-argument failure raises exactly one type, :class:`CompressionError` (a
-  ``ValueError``), whose message names the codec and the byte ceiling only — **never any decompressed
-  content** (it is PHI).
+* **Decompression-bomb DoS** ([CLAUDE.md](../../CLAUDE.md) §9). Every decompress **requires** a
+  ``max_output_bytes`` ceiling — it is keyword-only with **no default**, so a caller who has not
+  thought about the bound cannot silently get an unbounded one. Passing ``None`` still means "no
+  ceiling" and stays available to a caller who has bounded the input upstream, but it becomes a
+  deliberate, greppable act rather than the default. The ceiling is enforced **incrementally**
+  (bounded reads) so a bomb is refused after producing *at most* the ceiling — never after fully
+  expanding in memory. Every corrupt / truncated / over-ceiling / bad-argument failure raises exactly
+  one type, :class:`CompressionError` (a ``ValueError``), whose message names the codec and the byte
+  ceiling only — **never any decompressed content** (it is PHI).
+
+  Why a required keyword rather than a safer default (BACKLOG #1237): a default is a value the author
+  never had to think about. A parameter with **no default** is a gate that refuses when the
+  precondition is absent, which is a different construct from a stricter default and the reason this
+  is not merely ``= 64 * 1024 * 1024``. The in-tree precedent is
+  :func:`messagefoundry.parsing.dicom._inflate.bounded_inflate_or_error`, which takes its bound the
+  same way. ``max_entries`` on :func:`zip_decompress` keeps its default because it already ships ON.
 """
 
 from __future__ import annotations
@@ -88,8 +98,11 @@ def gzip_compress(data: bytes, *, level: int = 6) -> bytes:
     return gzip.compress(data, compresslevel=level, mtime=0)
 
 
-def gzip_decompress(data: bytes, *, max_output_bytes: int | None = None) -> bytes:
+def gzip_decompress(data: bytes, *, max_output_bytes: int | None) -> bytes:
     """Decompress a gzip stream, refusing a **decompression bomb** at ``max_output_bytes``.
+
+    ``max_output_bytes`` is **required** (BACKLOG #1237) — pass an explicit ``None`` to mean "no
+    ceiling". See the module docstring for why it has no default.
 
     Enforced incrementally via :meth:`gzip.GzipFile.read`, which only inflates enough to satisfy each
     read, so a bomb is stopped after producing at most the ceiling (never fully expanded). Multi-member
@@ -122,8 +135,11 @@ def deflate_compress(data: bytes, *, level: int = 6) -> bytes:
     return zlib.compress(data, level)
 
 
-def deflate_decompress(data: bytes, *, max_output_bytes: int | None = None) -> bytes:
+def deflate_decompress(data: bytes, *, max_output_bytes: int | None) -> bytes:
     """Decompress a zlib-wrapped DEFLATE stream, refusing a bomb at ``max_output_bytes``.
+
+    ``max_output_bytes`` is **required** (BACKLOG #1237) — pass an explicit ``None`` to mean "no
+    ceiling". See the module docstring for why it has no default.
 
     Enforced incrementally with a :func:`zlib.decompressobj` ``max_length`` loop. A corrupt / truncated
     stream or an over-ceiling size raises :class:`CompressionError`."""
@@ -177,9 +193,14 @@ def zip_compress(entries: Mapping[str, bytes], *, level: int | None = None) -> b
 
 
 def zip_decompress(
-    data: bytes, *, max_output_bytes: int | None = None, max_entries: int = 1024
+    data: bytes, *, max_output_bytes: int | None, max_entries: int = 1024
 ) -> dict[str, bytes]:
     """Extract every member of a ZIP archive to ``{name: bytes}``, refusing a bomb.
+
+    ``max_output_bytes`` is **required** (BACKLOG #1237) — pass an explicit ``None`` to mean "no
+    ceiling". See the module docstring for why it has no default. ``max_entries`` keeps its default
+    because it already ships ON, and is checked against the central directory before any member is
+    extracted.
 
     ``max_entries`` caps the member count (a many-entry archive is a bomb axis too). ``max_output_bytes``
     caps the **total** decompressed size across all members, enforced with per-member bounded reads so a
