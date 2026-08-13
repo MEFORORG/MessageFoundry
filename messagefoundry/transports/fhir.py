@@ -101,8 +101,12 @@ _TRANSIENT_ISSUE_CODES = frozenset(
 # the message-derived path segments so a crafted resource can't smuggle '/', '..', '?', '#', or '@'
 # into the request path and redirect a PHI-bearing write to a different resource/operation on the same
 # allow-listed host (the [egress].allowed_http gate pins the host, not the path).
-_FHIR_TYPE_RE = re.compile(r"^[A-Za-z]+$")
-_FHIR_ID_RE = re.compile(r"^[A-Za-z0-9.\-]{1,64}$")
+# `\Z`, never `$`: Python's `$` also matches immediately BEFORE a final newline, so `^[A-Za-z]+$`
+# accepted "Patient\n" and the gate did not enforce the grammar it advertises. Anchoring the pattern
+# fixes every caller at once -- `match` vs `fullmatch` is a property of the CALL, and there are three
+# call sites (:189, :698, :704), so a per-call fix leaves the next one to re-introduce it.
+_FHIR_TYPE_RE = re.compile(r"^[A-Za-z]+\Z")
+_FHIR_ID_RE = re.compile(r"^[A-Za-z0-9.\-]{1,64}\Z")
 
 
 def _operation_outcome(body: str) -> dict[str, Any] | None:

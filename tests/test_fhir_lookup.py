@@ -237,6 +237,37 @@ def test_resolve_read_url_rejects_bad_path(query: str) -> None:
         _resolve_read_url(BASE, query)
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Patient\n/123",  # LF ends the resourceType segment
+        "Patient\n/123\n",  # LF ends both segments
+    ],
+)
+def test_resolve_read_url_rejects_lf_terminated_segment(query: str) -> None:  # #1240
+    r"""Python's `$` matches BEFORE a final newline, so `^...$` accepted a segment ending in LF.
+
+    The patterns use `\Z` for exactly this. THE SHAPE MATTERS AND THE OBVIOUS TEST DOES NOT
+    DISCRIMINATE: a trailing LF on the whole query (`Patient/123\n`) is normalised away upstream and
+    builds a URL byte-identical to the clean input, measured before and after the fix -- so a test
+    written that way passes either way and proves nothing. Only an LF ending a segment that is
+    followed by more path reaches a gate as a newline-bearing token, and that is what flips from
+    BUILT to refused here.
+    """
+    with pytest.raises(ValueError):
+        _resolve_read_url(BASE, query)
+
+
+def test_lf_terminated_query_is_normalised_not_gated() -> None:  # #1240
+    r"""Pins WHY the sibling test uses the shape it does, so nobody 'simplifies' it back.
+
+    `Patient/123\n` builds the same URL as `Patient/123`. That is upstream normalisation, NOT the
+    grammar gate doing its job -- if this ever starts raising, the sibling test above is no longer
+    the discriminating case and needs re-deriving rather than deleting.
+    """
+    assert _resolve_read_url(BASE, "Patient/123\n") == _resolve_read_url(BASE, "Patient/123")
+
+
 async def test_read_rejects_bad_query_phi_safe() -> None:
     ex, opener = _executor(body=PATIENT.encode())
     with pytest.raises(FhirLookupError) as ei:
