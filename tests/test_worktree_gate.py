@@ -2,9 +2,9 @@
 
 The gate keeps concurrent Claude Code sessions from BUILDING in the shared primary checkout. It is keyed
 on the write's TARGET PATH, never on the session's cwd -- the distinction these tests exist to pin down,
-because ~29% of this repo's real Edit/Write calls come from a session sitting in the primary but write
-into a sibling worktree by absolute path, and those are already correct. A cwd-keyed gate would deny them
-all.
+because ~29% of the real Edit/Write calls made by sessions sitting in the primary write into a sibling
+worktree by absolute path, and those are already correct. A cwd-keyed gate would deny them all. That
+share is of those sessions' own calls, not of every call in the repo.
 
 Each test drives the real hook script as a subprocess with a real PreToolUse payload on stdin and asserts
 on the deny/allow decision, so the contract under test is the one Claude Code actually invokes.
