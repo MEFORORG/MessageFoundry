@@ -8493,6 +8493,36 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Authentication / account lifecycle. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- zero instances; on first deployment an administrator following the documented reset **would** render the `admin` account permanently unusable without either party being told.
 
+## 1244. an engine change that breaks a vault ASVS anchor produces no state change and no attribution: the signal is real, late, and lands in a gate that is already red
+
+> 🔢 **Filed 2026-08-13. NOT "nothing detects this" -- that framing was wrong and is recorded below so nobody re-derives it.** Value **6/10** -- Difficulty **4/10**. The detection already exists and works; what is missing is that it cannot **block**, cannot **attribute**, and currently cannot **change colour**.
+
+> **THE COUPLING.** The scorecard lives in the vault (private); the code it cites lives in the engine (public). Every one of the **1,998** evidence anchors names an engine path, and **192** of them cite engine *prose* under `docs/` -- the kind of line an ordinary documentation edit rewrites without anyone thinking about security evidence. Nothing in the engine repo references the scorecard, and nothing can: **the engine tree contains the verifier (`scripts/asvs/scorecard.py`) but zero scorecard data files**, by deliberate design, because the data is what must stay private.
+
+> **WHAT ALREADY WORKS, and it must not be rebuilt.** The vault gate's own trigger block documents this exact hazard and already fixed the worst of it: *"the anchors point into the ENGINE, but the triggers above all fire on VAULT events... Verified live: #119 landed in the engine and moved eleven anchors; this gate stayed green because nothing here had changed."* A daily `schedule:` run was added precisely to close that, and it does. **Any fix here starts from a working daily detector.**
+
+> **THE THREE GAPS THAT REMAIN, in ascending order of how badly they bite:**
+> ```
+> 1. NOT PRE-MERGE   an engine PR merges; the break is found on the next daily run.
+>                    The engine PR is where the change was still reviewable.
+> 2. NOT ATTRIBUTED  the run reports a broken anchor, not which engine change broke
+>                    it. Whoever reads it bisects a day of engine history by hand.
+> 3. NO STATE CHANGE the gate is ALREADY RED -- 11 FAIL rows on the current run --
+>                    and `verify` is NOT a required context. So a 12th failure moves
+>                    nothing anyone watches: not the check's colour, not
+>                    mergeability, not a notification.
+> ```
+> **Gap 3 is the real defect.** A detector whose output is a count inside an already-failing, non-blocking job is indistinguishable from the same job yesterday. That is why the instance below was caught by **a person reading a diff**, not by the instrument that exists to catch it.
+
+> **THE INSTANCE THAT PROMPTED THIS.** Engine PR #361 deletes a sentence from `docs/SECURITY.md` that an anchor pins verbatim. The break was found by a session reading the PR's diff and reasoning about the vault; the retirement was prepared by hand as a separate vault change. Had nobody looked, #361 would have merged and the count would have gone 11 to 12 on a schedule, hours later, attributed to nothing.
+
+> **A CONSTRAINT ON THE FIX THAT IS EASY TO MISS, and it is why the obvious build is wrong.** An engine-side check runs in a **public** repository with public logs. It must report **the engine file and line that stopped matching** and must **not** name the cell, the requirement id, or the count of affected cells -- those are the vaulted content, and a failing public CI log enumerating them hands out coverage by subtraction (CLAUDE.md section 12). "Report the line, never the cell" is a hard requirement of any design here, not a preference. This is what makes the item non-trivial: the natural implementation leaks.
+
+> **How to prove a fix:** in an engine PR, delete a line that an anchor pins verbatim, and assert the PR goes red **before merge**, naming the engine file and line and **naming no cell id**. Then assert the negative control: a PR touching an unanchored line stays green, so the check is discriminating rather than always-red. A fix that only shortens the schedule addresses gap 1 and neither of the others; a fix that makes `verify` required **without first closing the standing 11 failures** converts a silent problem into a permanently blocked repository.
+
+> ⚠️ **Recording the framing error, because it was mine and it was nearly filed.** This was first proposed as one item covering a whole class -- *"two artifacts that must agree with nothing noticing when they stop"* -- generalised from three sightings in one evening. That was wrong twice over. **A class has no prove-a-fix**, so it could never be closed, and bundling limbs with different fixes is exactly what splitting #1236 out of #1131 existed to prevent. And the premise did not survive contact: the detector exists, a daily run already covers the case, and only the blocking, attribution and visibility limbs are real. Two of the three original sightings did not survive at all -- one had resolved itself correctly, and the third was carried second-hand and never verified. On re-reading it was a **different mechanism** anyway (one instrument answering a narrower question than its declared scope, rather than two artifacts drifting apart); they share a smell, not a cause.
+
+**Cluster:** Security tooling / CI. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- this is evidence-integrity plumbing across two repositories, not shipped engine behaviour. The exposure is that the ASVS record can quietly describe code that no longer exists, which is a **stale anchor** (the evidence went stale), never an engine weakness.
 ## 1246. the scorecard's residual prose carries 1,965 ungated file-line citations, and an enumeration in prose can understate a cell's own gap
 
 > 🔢 **Filed 2026-08-13 -- a defect in the RECORD-KEEPING METHOD, not in the engine. Measured against the published scorecard, found by a builder hitting its consequence.** Value **6/10** -- Difficulty **4/10**. The ASVS gate validates `evidence[].expect` as a unique substring and reports line drift as advisory. **It does not read `residual` at all.** Residual prose carries **1,965 `file:line` citations across 248 of the 345 cells** -- roughly as many citations as there are validated anchors (1,998) -- and **nothing checks a single one**.
