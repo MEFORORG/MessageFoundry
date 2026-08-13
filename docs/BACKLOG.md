@@ -6323,9 +6323,21 @@ filing.
 ## 1131. research an honest pass for ASVS 6.1.1 -- what the anti-automation documentation must say about malicious account lockout
 
 > 🔢 **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** Value **7/10** · Difficulty **5/10**. ASVS **6.1.1** (L1) currently scores **partial**. The pinned verb asks that application documentation make clear how the anti-automation controls are configured and prevent malicious account lockout. One parenthetical at `docs/SECURITY.md:1474` answers the lockout clause, and its claim does not survive the shipped serial re-lock at `messagefoundry/auth/service.py:665-668`.
+>
+> ⚠️ **AMENDED 2026-08-13 -- THE ITEM STAYS OPEN AND ITS QUESTION IS RE-SCOPED. Three corrections, and the third is the one worth reading.**
+>
+> **1. THE REMEDY IS STRONGER THAN THIS ITEM CREDITS, AND THE DIFFERENCE IS LOAD-BEARING.** `api/auth_routes.py:753` routes `POST /users/{user_id}/reset-password`, and `:757` takes `Depends(require_step_up(Permission.USERS_MANAGE))` -- **the admin RE-AUTHENTICATES; it is not a plain permission check.** This item's own research question says *"anything that clears a lock is itself a control an attacker wants, so an unlock route is a candidate with its own abuse surface, not an answer"* -- and the step-up is a **partial answer to exactly that abuse surface**, which nothing in the record credits. Coverage is uniform, so this is not a partial-surface finding: all three backends clear the lock in `set_password` (`store.py`, `postgres.py`, `sqlserver.py` -- `failed_attempts=0`, `locked_until=NULL`, two sites each).
+>
+> **2. THE `docs/SECURITY.md:1474` CITATION IS STALE and will cost the next reader time.** At engine `9d98f339` that line is an unrelated **AD** row in the comparative-properties table. The disputed parenthetical is now at **`:1544`**, in the three-limiter anti-automation table. **Cite the greppable phrase, not the line number.**
+>
+> **3. WHY THIS ITEM GOT IT WRONG -- RECORDED AS METHOD, NOT MERELY AS A CORRECTION.** The filed absence claim searched `def admin_unlock|unlock_account|clear_lockout`. Measured on `main`: that regex returns **0 hits** in `auth/service.py`, a file containing exactly **1** `def admin_reset_password`. **The regex CANNOT STRUCTURALLY MATCH THE THING THAT SHIPS.** So the zero was a **true answer to a question nobody asked**, and this item's conclusion -- *"no dedicated administrative unlock exists"* -- is **literally true and materially misleading**: an unlock ships, as a side effect of a forced password rotation.
+>
+> > **THE PRESCRIPTION: an absence claim over a CAPABILITY must be written from the STATE, not from plausible function names.** *"Find every write to `locked_until`"* would have found it; *"find every function called something-unlock"* never could.
+>
+> **RE-SCOPE:** the live question is the **adequacy and disclosure of a step-up-gated forced-rotation reset as a remedy for a MALICIOUS lockout** -- not whether an unlock affordance exists. That is a harder question than the one filed, and it is why this stays open rather than closing on the route's existence.
 
 **Cluster:** Security / ASVS remediation research. **Priority:** P1. **Verdict:** research.
-**Severity:** no product effect on the control itself; on a first deployment an operator reading the documented protection set would not learn that a known local username can be held refused by repetition at roughly five requests per fifteen minutes, nor that no dedicated administrative unlock exists.
+**Severity:** no product effect on the control itself; on a first deployment an operator reading the documented protection set would not learn that a known local username can be held refused by repetition at roughly five requests per fifteen minutes, ~~nor that no dedicated administrative unlock exists.~~ **[STRUCK -- an unlock DOES ship, step-up-gated, via forced password rotation; see the 2026-08-13 amendment above.]**
 
 **The pinned verb.** "The documentation must make clear how these controls are configured and prevent malicious account lockout."
 
