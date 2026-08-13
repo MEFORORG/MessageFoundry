@@ -8687,3 +8687,65 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > records a decision I acted against rather than a conclusion I verified.
 
 **Cluster:** Security record / repository topology. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- nothing shipped changes; the exposure is that a ranked map of unmet security requirements **is** public today and cannot be made unpublic, only stopped from growing.
+
+## 1251. an allowlist of two determiners is the whole modifier grammar of the write-share gate, so any adjective defeats it silently
+
+> 🔢 **Filed 2026-08-13 -- handed over by the write-collision reconciliation lane at the owner's direction. The MessageFoundry fix EXISTS and needs landing; the sibling repo needs a re-derived port, not a copy.** Value **6/10** -- Difficulty **3/10**. A gate that holds a corrected measurement in place across 13 sites is defeated by inserting one adjective, and it fails **silently**: the pattern does not match, so the site is never considered and the gate reports green.
+
+> **THE DEFECT.** In the sibling repo `claude-multisession`, `tests/test_docs_do_not_drift.py:290-293`:
+> ```python
+> WRITE_SHARE = re.compile(
+>     r"\*{0,2}\d+\s*%\*{0,2}\s+of\s+(?:the\s+|all\s+)*"
+>     r"(?:file\s+writes|Edit/Write\s+calls|write\s+calls|writes)\b"
+> )
+> ```
+> The modifier run `(?:the\s+|all\s+)*` is an **allowlist of exactly two determiners**. Anything else --
+> an adjective, an unlisted possessive -- and the pattern does not match **at all**. Measured misses:
+> *"~29% of this repo's real Edit/Write calls"*, *"29% of all recorded writes"*, *"44% of the repo's
+> total file writes"*.
+
+> **WHY THIS IS WORTH A NUMBER RATHER THAN A TIDY-UP, and the reason generalises past this gate:** an
+> allowlist omits **exactly the unusual phrasing that made a sentence wrong in the first place**. A
+> sentence someone got wrong is more likely to be oddly worded than the sentences around it, so the
+> blind spot is **correlated with the defect**, not random. **The identical allowlist missed the single
+> wrongest sentence in this repo** -- the worktree gate's own docstring. Same shape, twice, in one day.
+> ⇒ **This is the failure family where a green result means "no instance in the phrasings I enumerated",
+> not "no instance".** It sits beside #1204, whose regex misses `"248 cells of 345"` because it requires
+> the number and the total to be adjacent.
+
+> **THE MESSAGEFOUNDRY HALF IS DONE AND NEEDS A ROUTE, NOT A BUILD.** `tests/test_write_share_denominator.py`
+> at **`71bb19d2`**, branch **`mefor-denominator`**. It replaces the allowlist with an **open modifier
+> run capped at three tokens**, plus explicit bars, a lookbehind, and four false-positive controls.
+> ⚠️ **CORRECTION TO THE HANDOVER AS RECEIVED: it was reported UNPUSHED. It is not.** `71bb19d2` is
+> contained in **`origin/mefor-denominator`**, verified with `git branch -r --contains`. So the route is
+> **a PR, not a push** -- and the fixed test is **not on `main`**, so the fix is real but unlanded.
+
+> **DO NOT PORT IT BLIND TO THE SIBLING REPO.** The bars in the MessageFoundry version -- `durable`,
+> `body`, `bytes` -- were **derived from this corpus**: ADR 0084 and the cost-model tests say *"63% of
+> the hub's durable writes"* about SQLite transactions, and one test says *"77% of the body bytes this
+> message writes"* where `writes` is a **verb**. `claude-multisession` has a different corpus and may
+> need different bars, or none. **Re-derive them there and give that repo its own false-positive
+> controls** -- a blind port either misses or cries wolf, and **a gate that cries wolf gets deleted by
+> the first person it annoys.**
+
+> **ACCEPTANCE, and the first two are the ones that matter:**
+> 1. A **negative control** planting the adjective form, asserting the pattern rejects it.
+> 2. **Mutate EVERY site the gate sees, one at a time, with BOTH context windows blanked**, and require
+>    each to be caught. ⚠️ **Blanking only the forward window produces false misses** -- that error
+>    produced a wrong *"5 blind spots"* reading before the instrument was fixed.
+> 3. False-positive controls for whatever bars are chosen.
+> 4. Suite green from **inside** `tests/`: `cd tests && python -m unittest discover -s . -q`. ⚠️ **A run
+>    from the repo root with `-s .` collects nothing and reads as a pass.**
+
+> **TWO ROUTING FACTS, and neither is the builder's to assume.** `claude-multisession` has **no numbered
+> backlog ledger of its own**, which is why this is filed here -- the MessageFoundry half is genuinely
+> ours and the sibling half has nowhere else to go. **And `claude-multisession` is OUTSIDE the Lander's
+> grant**, confirmed by that seat in writing; the last PR there was authorised by the owner **naming a
+> session personally, per-task, not standing**. **Whoever builds the port must ask the owner which route
+> before pushing.** Do not default to the Lander and do not inherit anyone else's authorisation.
+
+> **PROVENANCE.** The gate exists because one 30-day measurement was stated over two different
+> denominators; both figures are shares of the Edit/Write calls made by 166 primary-seated sessions,
+> not of all writes. Sibling half merged as `claude-multisession` PR #46.
+
+**Cluster:** Developer tooling / measurement gates. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- this governs a documentation-drift gate, not shipped engine code; the cost is that a corrected measurement **would** silently drift back across 13 published sites.
