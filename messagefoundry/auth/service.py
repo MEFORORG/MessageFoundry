@@ -726,12 +726,22 @@ class AuthService:
         # ASVS 6.4.1: an admin-issued initial/reset credential that was never claimed EXPIRES — the
         # password verified, but a `must_change_password` temp that is older than
         # `initial_password_expiry_hours` is refused like any other invalid login (a generic error, so
-        # it is indistinguishable from a wrong password) and audited. The bootstrap admin has its own
-        # expiry path (handled above) and is carved out; a user who set their own password has
-        # `must_change_password=False` and is never gated here.
+        # it is indistinguishable from a wrong password) and audited. A user who set their own
+        # password has `must_change_password=False` and is never gated here.
+        #
+        # THE BOOTSTRAP CARVE-OUT IS NARROW, AND BACKLOG #1245 IS WHY. It rests on the bootstrap
+        # having its own expiry path, which is true only while that account is UNCLAIMED — WP-3
+        # retires an unclaimed bootstrap on its own timer, so a second deadline here would be
+        # redundant. Once the holder claims it, WP-3 deliberately stops covering the account, and
+        # before #1245 the gap was masked only by the defect itself: the admin reset re-armed
+        # retirement and the account got disabled, so nobody noticed the temp had no deadline.
+        # Removing that accidental bound without putting one back would leave an admin-issued
+        # credential on the highest-privilege account name in the system valid forever — and the one
+        # action such a session permits is setting the password, i.e. account takeover. So a CLAIMED
+        # bootstrap is gated here exactly like any other account.
         expiry_hours = self._settings.initial_password_expiry_hours
         if (
-            username != BOOTSTRAP_USERNAME
+            (username != BOOTSTRAP_USERNAME or user.password_claimed_at is not None)
             and user.must_change_password
             and expiry_hours > 0
             and user.password_changed_at is not None

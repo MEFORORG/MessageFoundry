@@ -600,6 +600,75 @@ async def _make_reset_temp(store, service, *, username: str = "alice") -> str:
     return await service.admin_reset_password(user.id, actor="admin")
 
 
+async def test_a_reset_temp_on_a_CLAIMED_bootstrap_still_expires() -> None:
+    # BACKLOG #1245: the 6.4.1 carve-out for the bootstrap rests on WP-3 giving that account its own
+    # deadline, and that is true only while it is UNCLAIMED. Once claimed, WP-3 deliberately stops
+    # covering it -- so before this narrowing, an admin-issued temp on the highest-privilege account
+    # name in the system never expired at all.
+    #
+    # The gap was MASKED BY THE DEFECT ITSELF: pre-#1245 the reset re-armed retirement and the
+    # account got disabled, so nobody noticed the temp had no deadline. Fixing #1245 removed that
+    # accidental bound, which is why the bound has to be put back deliberately here.
+    store = await _store()
+    try:
+        # bootstrap_expiry_hours=0 turns the WP-3 time arm OFF, so this test isolates the 6.4.1 gate
+        # and cannot pass by the account being retired for an unrelated reason.
+        service = AuthService(
+            store, AuthSettings(initial_password_expiry_hours=72, bootstrap_expiry_hours=0)
+        )
+        boot = await service.initialize()
+        assert boot is not None
+        await _claim_bootstrap(service, boot.password)
+
+        admin = await store.get_user_by_username("admin")
+        assert admin is not None and admin.password_claimed_at is not None  # genuinely claimed
+        temp = await service.admin_reset_password(admin.id, actor="admin")
+
+        # POSITIVE CONTROL: inside the window the temp WORKS. Without this, the refusal below is
+        # equally consistent with the reset having produced an unusable credential.
+        assert (await service.login("admin", temp)).ok
+
+        await store._db.execute(
+            "UPDATE users SET password_changed_at=? WHERE id=?",
+            (time.time() - 73 * 3600, admin.id),
+        )
+        await store._db.commit()
+
+        out = await service.login("admin", temp)
+        assert not out.ok  # aged past 6.4.1 -> refused even with the CORRECT temp
+        assert out.error == "invalid credentials"  # generic, as for any other account
+        # And it is refused by EXPIRY, not by retirement -- the claimed account is still enabled.
+        still = await store.get_user_by_username("admin")
+        assert still is not None and not still.disabled
+    finally:
+        await store.close()
+
+
+async def test_an_unclaimed_bootstrap_temp_keeps_its_carve_out() -> None:
+    # The other side of the narrowing, and the reason it is a narrowing rather than a deletion: an
+    # UNCLAIMED bootstrap still has its own WP-3 deadline, so the 6.4.1 gate must stay carved out for
+    # it. This reds if anyone "simplifies" the condition by removing the carve-out entirely.
+    store = await _store()
+    try:
+        service = AuthService(
+            store, AuthSettings(initial_password_expiry_hours=72, bootstrap_expiry_hours=0)
+        )
+        boot = await service.initialize()
+        assert boot is not None
+        admin = await store.get_user_by_username("admin")
+        assert admin is not None and admin.password_claimed_at is None  # never claimed
+        await store._db.execute(
+            "UPDATE users SET password_changed_at=? WHERE id=?",
+            (time.time() - 73 * 3600, admin.id),
+        )
+        await store._db.commit()
+        # Aged well past 6.4.1, but never claimed: WP-3 owns this account's lifecycle, so the
+        # original bootstrap credential is still accepted here.
+        assert (await service.login("admin", boot.password)).ok
+    finally:
+        await store.close()
+
+
 async def test_reset_temp_password_expires_when_unclaimed() -> None:
     store = await _store()
     try:
