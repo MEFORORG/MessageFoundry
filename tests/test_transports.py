@@ -1413,7 +1413,7 @@ async def test_file_destination_gzip_compress(tmp_path: Path) -> None:
     written = tmp_path / "out.hl7.gz"
     assert written.exists()  # `.gz` appended
     assert not (tmp_path / "out.hl7").exists()
-    assert gzip_decompress(written.read_bytes()) == ADT.encode("utf-8")
+    assert gzip_decompress(written.read_bytes(), max_output_bytes=None) == ADT.encode("utf-8")
 
 
 async def test_file_source_gunzips_before_sniff(tmp_path: Path) -> None:
