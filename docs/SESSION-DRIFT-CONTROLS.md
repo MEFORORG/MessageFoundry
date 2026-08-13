@@ -62,8 +62,8 @@ there is no defence in depth between them.
 | 4 | `EnterWorktree` (relocating a live session) | tool name only |
 
 The single most important design decision is that **rules 1/3/3b key on the target, never on the cwd**.
-The gate's own docstring records that 29% of Edit/Write calls came from a session *sitting* in the primary
-that wrote *correctly* into a worktree by absolute path; a cwd-keyed gate would have denied all of them.
+The gate's own docstring records that 29% of the Edit/Write calls made by sessions *sitting* in the primary
+wrote *correctly* into a worktree by absolute path; a cwd-keyed gate would have denied all of them.
 Rule 2 is the sole exception, and that exception is the source of the ultracode friction in §4.
 
 **[`scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1)** refuses
@@ -637,9 +637,24 @@ worktrees, which the gate explicitly permits writing into.
 
 **Cited, not re-measured — treat with care:**
 
-- **"29% of Edit/Write calls landed in a worktree; 44% in the primary; 166 sessions over 30 days."** From
-  the gate's own docstring. This is the *sole* quantitative justification for the target-keyed design.
-  Nothing in the repo lets it be recomputed, and nobody has asked whether it still holds.
+- **"Over 30 days, 166 sessions ran with their cwd in the shared primary; 6,075 of *their* Edit/Write
+  calls (44%) landed in the primary's tree and 4,010 (29%) landed in a worktree by absolute path."**
+  From the table in [`WORKTREE-GATE.md`](WORKTREE-GATE.md). This is the *sole* quantitative
+  justification for the target-keyed design. Nothing in the repo lets it be recomputed, and nobody has
+  asked whether it still holds.
+
+  > **CORRECTION 2026-08-13 — this entry stated the denominator wrongly and named the wrong source.**
+  > It originally read *"29% of Edit/Write calls landed in a worktree; 44% in the primary; 166 sessions
+  > over 30 days."* **From the gate's own docstring.** Both halves were wrong. The percentages are
+  > shares of the Edit/Write calls made by those 166 primary-seated sessions — roughly 13,800 — not of
+  > every call in the repo; stated bare, a reader supplies the wider denominator and is not corrected.
+  > And the docstring is not the source: `git log -S '44%'` and `git log -S '166'` over
+  > [`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1) each return **zero commits
+  > across all history**, so it has never carried either figure and only ever carried the 29%. The
+  > table is the only artifact holding both numerators, which is the only context in which their shared
+  > denominator had to be made explicit. Corrected rather than rewritten silently, because the false
+  > attribution is what made the loose reading look authoritative and a later reader will otherwise
+  > re-derive it.
 ~~**"A subagent's denied edits came back with an empty `permission_denials` list."**~~ **Superseded** —
   re-measured above. The denial surfaces clearly to the subagent, the write never lands, and the receipt
   now records it against the subagent's pid.

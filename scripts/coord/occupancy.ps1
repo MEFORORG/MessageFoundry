@@ -42,8 +42,9 @@
 
     WHAT IT CANNOT SEE -- state this wherever it is consumed:
       * A session that writes into a worktree BY ABSOLUTE PATH from somewhere else. Records carry the
-        cwd a session was launched in, and measurement on this repo says 29% of writes come from a
-        session sitting in the primary and land in a sibling worktree. Those are invisible here, so a
+        cwd a session was launched in, and measurement on this repo says 29% of the writes made by
+        sessions sitting in the primary land in a sibling worktree -- a share of THOSE sessions'
+        writes, not of every write in the repo. Those are invisible here, so a
         cwd-keyed fence alone is not sufficient protection for a destructive action. Measured
         2026-07-30 on this repo: 5 live sessions, 9 worktrees, and ZERO of the four `<primary>-<slug>`
         siblings drew a veto -- including the one a session was demonstrably building in. A caller that

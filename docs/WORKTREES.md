@@ -169,8 +169,9 @@ segment, is now excluded outright and listed as a non-candidate; `-Name` cannot 
 
 ### Why signal 2 is not a nicety
 
-Signal 1 only sees where a session was **launched**. Measured on this repo: 29% of writes come from a
-session sitting in the primary and landing in a sibling by absolute path — and on 2026-07-30, with 5
+Signal 1 only sees where a session was **launched**. Measured on this repo: 29% of the writes made by
+sessions sitting in the primary land in a sibling by absolute path — a share of those sessions' own
+writes, not of every write here — and on 2026-07-30, with 5
 live sessions across 9 worktrees, signal 1 vetoed **none** of the four `<primary>-<slug>` siblings,
 including one a session was demonstrably building in. Signal 2 was the only thing standing between
 that session and this script. The run therefore prints how many candidates signal 1 actually vetoed,
@@ -418,9 +419,10 @@ own them).
 **WHERE A COMMAND RUNS IS NOT WHERE THE CALLER IS, and tooling here keeps assuming it is.** Much of
 this repo's coordination machinery resolves "which worktree is this about?" from the **current
 directory** — `git rev-parse --show-toplevel`, `getcwd`, an unqualified relative path — even when it
-was handed an explicit path. That assumption is false about **one write in three**: `occupancy.ps1`
-measures a session acting on a worktree by absolute path from elsewhere at **29% of writes on this
-repo**. So `pwsh -File <abs>/scripts/coord/alloc.ps1` run from worktree A while you intend to commit
+was handed an explicit path. That assumption is false about **one primary-seated write in three**:
+`occupancy.ps1` measures a session acting on a worktree by absolute path from elsewhere at **29% of the
+writes made by sessions sitting in the primary**. So `pwsh -File <abs>/scripts/coord/alloc.ps1` run
+from worktree A while you intend to commit
 from worktree B records A, and `cd "$D" && git ...` is resolved against your session's cwd rather
 than `$D`, because a hook cannot expand a shell variable.
 
@@ -754,7 +756,7 @@ it never moves anything — and `-Rehome` refuses on a session that still looks 
 `-MinIdleMinutes`, default 10; override with `-Force`) and honours `-WhatIf` for a no-op preview.
 
 **It keys on the write's target path, never on the session's cwd.** In that same 30-day window, **29% of
-writes came from a session sitting in the primary but landed inside a sibling worktree by absolute
+the writes made by those same 166 primary-seated sessions landed inside a sibling worktree by absolute
 path** — already correct. A cwd-keyed gate would have denied every one of them. So a session may stay
 where it is and simply write into its worktree; there is no need to `cd`, relocate, or restart.
 

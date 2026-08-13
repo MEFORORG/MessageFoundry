@@ -37,9 +37,11 @@ session — accumulated 12 stale worktrees. Advisory text has no measurable effe
 human or on the model.
 
 **Second — and this is the part that is easy to get wrong — the gate must key on the write's TARGET PATH,
-never on the session's cwd.** 29% of writes already come from a session sitting in the primary that
-correctly writes *into a worktree* by absolute path. A cwd-keyed gate would have denied all 4,010 of them.
-Where a session *sits* is irrelevant; only where it *writes* matters.
+never on the session's cwd.** The worktree row of the table above is the 29%: those sessions already
+write *correctly* into a worktree by absolute path, and a cwd-keyed gate would have denied all 4,010 of
+them. Both percentages are shares of the same 166 sessions' Edit/Write calls, so the 29% and the 44%
+are two numerators over one denominator rather than two measurements. Where a session *sits* is
+irrelevant; only where it *writes* matters.
 
 ## What it blocks
 
