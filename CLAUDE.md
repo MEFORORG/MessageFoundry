@@ -175,10 +175,10 @@ retry-timers as asyncio tasks supervised by the `RegistryRunner` so a crash in o
 
 ## 3. Repository Layout
 
+Package **roles**, not a file listing — `ls` gives you the names, this gives you what each is for.
+
 ```
 messagefoundry/
-  __main__.py      # CLI entrypoint: `messagefoundry serve ...`
-  logging_setup.py # stdlib logging config (NSSM captures stdout to files)
   config/          # connector models (models.py) + code-first wiring (wiring.py) + service settings (settings.py)
   pipeline/        # engine.py (Engine), wiring_runner.py (RegistryRunner), dryrun.py
   transports/      # base.py (connector registry), mllp.py, file.py, dicom.py (C-STORE SCP + SCU/C-ECHO), dicomweb.py (STOW-RS, ADR 0025), smart.py (SMART Backend Services token provider, ADR 0024)   ← "connectors"
@@ -198,10 +198,10 @@ ide/               # VS Code extension (TypeScript): setup, promote, test bench,
 environments/      # per-environment <env>.toml value files for env() lookups (dev/staging/prod)
 samples/           # config/ (example Connection/Router/Handler modules) + send_mllp.py sender
 harness/           # standalone PySide6 send/receive test harness (+ config/ disposition-coverage graph; reuses console-rehomed Qt widgets in _console_widgets.py/_login.py)
-scripts/service/   # NSSM install/uninstall PowerShell scripts
-docs/              # ARCHITECTURE.md, SERVICE.md, CONNECTIONS.md, CONFIGURATION.md (service settings)
-tests/             # pytest suite
 ```
+
+`scripts/`, `docs/` and `tests/` are omitted on purpose — their names say what they hold, and the
+files inside churn. Each document worth reading is linked from the section that relies on it.
 
 Add focused `CLAUDE.md` files in subpackages (e.g. `auth/`) only when local conventions
 diverge enough to warrant it; keep this root file general.
