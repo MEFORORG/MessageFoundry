@@ -1831,8 +1831,12 @@ runs bulk AES-256-GCM. #198 closes the **application-code-feasible** half and ac
 - **Person/entity authentication** (required) — local argon2id and/or AD bind; lockout on brute force.
 - **Audit controls** (required) — durable, user-attributed audit trail (append-only via the store API).
 - **Automatic logoff** (addressable) — idle + absolute session timeouts.
-- **Emergency access** (required) — the bootstrap admin provides break-glass; treat its credential as
-  a sealed secret.
+- **Emergency access** (required) — **not applicable to this component.** Break-glass exists so a
+  clinician can reach a *patient's record* when normal authorisation would refuse it. This engine
+  holds no point-of-care record: it routes and transforms messages in transit, and the record of
+  authority lives in the systems on either side, which is where an emergency-access path belongs.
+  The bootstrap admin is **not** a break-glass mechanism and is not a compliance control — it seeds
+  the first real administrator and then self-retires (see *Auto-retirement (WP-3)* above).
 
 ---
 
