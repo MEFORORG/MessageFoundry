@@ -8651,3 +8651,39 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > **RELATIONSHIP TO ASVS 2.4.1 (#1114): this makes the cell WORSE, not better.** Rule 4 holds that *"it can be configured"* is never a pass; here it cannot be configured at all, so the control is effectively **absent** on the ingest plane while being documented as present-but-disabled. #1114 stays **partial** and its own hardened question -- whether a control that ships off can be an honest pass -- is settled by the method rather than by research.
 
 **Cluster:** Transports / MLLP, and security documentation. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- zero instances; on first deployment an operator **would** be told a rate limit is available and **would** be unable to enable it.
+
+## 1250. move the backlog to the vault: the public ledger is an aggregate weakness map over a closed public standard
+
+> 🔢 **Filed 2026-08-13 -- OWNER-RULED that the backlog belongs in the vault, and ruled in the same breath that moving it NOW is not safe. This item exists to hold the decision until the preconditions land.** Value **8/10** -- Difficulty **7/10**. Not a doc move: `docs/BACKLOG.md` is load-bearing for a pre-commit hook, a CI workflow, an allocator and **13 test files**.
+
+> **THE ARGUMENT, and it is about AGGREGATION rather than any single entry.** ASVS is a **closed, public** standard -- all 345 requirements are known to everyone -- so a map of our code against it discloses the gaps **by subtraction**, which is why the scorecard is vaulted ([[the presence-map rule]]). One public item describing one defect is ordinary open-source practice; every project's tracker carries known defects. **But the aggregate already exists and nobody had to assemble it:** **103 open items carry "ASVS" in the heading**, in one file, retrievable with a single search. We produced a ranked weakness map as a side effect of filing consistently. *The "individual items are fine" reading may be true of an item and false of the practice that yields a hundred of them.*
+
+> ⛔ **THE COST IS ASYMMETRIC AND THAT IS THE WHOLE URGENCY.** Over-restricting is recoverable -- move files, lose nothing. **Over-publishing is not: a public repository's history cannot be unpublished.** What is there is already cloned, indexed, and has shipped in PyPI sdists. So this only ever gets more expensive: **at 103 items it is a review; at 200 it is a migration.**
+
+> ⛔ **WHY IT MUST NOT BE DONE TODAY -- the destination is currently WORSE than the source.** The vault's ledger gate is **inert**: no installed hooks, no high-water floor, one claim. Two sessions can pick the same number and **merge clean, in the security record**. Moving a ledger whose entire purpose is collision-free allocation into the one repository that cannot enforce it would trade a disclosure problem for a corruption problem. **PRECONDITION: the vault must have atomic allocation, a high-water ratchet and INSTALLED hooks first** (the Q5 ruling, 2026-08-13). Engine-band filing is unaffected meanwhile and continues.
+
+> **BLAST RADIUS, measured at `c2241cfe`, not estimated. 66 tracked files reference `BACKLOG.md`:**
+> ```
+> 13 tests/     13 docs/adr/     12 docs/     8 docs/testing/master-test-plan/
+>  5 scripts/docs/    2 messagefoundry/pipeline/    2 .github/workflows/    2 .github/
+> ```
+> **Machinery that reads it and would break on a move:** `scripts/hooks/ledger_check.py` (the pre-commit
+> allocation gate), `scripts/docs/backlog_status_check.py` (`parse_items`, the single definition of item
+> status), `.github/workflows/backlog-hygiene.yml`, and `scripts/coord/alloc.ps1`.
+> ⚠️ **Thirteen test files read the ledger from disk**, which is why a "docs-only" change to this file has
+> never been test-neutral. Any move must re-point them all, and a partial move leaves the pre-commit gate
+> reading one file while CI reads another -- **allocation collisions returning silently**, which is the
+> defect the gate exists to prevent.
+
+> **DECIDE AT MOVE TIME, not now, and record which was chosen:** whether the **whole** ledger moves or
+> only ASVS-derived items (a split ledger doubles the allocation surface and is probably worse);
+> whether the public repo keeps a **stub** pointing at the vault or nothing at all; and what happens to
+> the **already-published history**, which cannot be recalled and may make a partial move cosmetic.
+
+> **BOUND ON THE ARGUMENT ITSELF.** The aggregation reading is **not settled** -- it was raised by the
+> tracking session as a question for the owner, explicitly not as a finding, and the owner has ruled on
+> the DESTINATION without anyone certifying the underlying reading. **I am not a neutral party to it:**
+> I filed twelve ASVS items into the public backlog tonight on the permissive reading, so this item
+> records a decision I acted against rather than a conclusion I verified.
+
+**Cluster:** Security record / repository topology. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- nothing shipped changes; the exposure is that a ranked map of unmet security requirements **is** public today and cannot be made unpublic, only stopped from growing.
