@@ -184,6 +184,21 @@ def _reject_control_chars(value: str, field: str) -> str:
     return value
 
 
+def _reject_config_control_chars(value: str, setting: str) -> str:
+    """Reject an OPERATOR-CONFIGURED value carrying a C0/DEL control char, at CONSTRUCTION time.
+
+    Deliberately distinct from ``_reject_control_chars``, which screens MESSAGE-derived values on the
+    send path and raises a permanent ``NegativeAckError``. The distinction is the disposition: a bad
+    *message* dead-letters one message, whereas a bad *setting* is wrong for every message the
+    connection will ever send -- so it must fail the connection at load rather than dead-letter an
+    unbounded stream of messages that were never at fault. Raises ``ValueError`` to match the other
+    construction-time setting checks. PHI-safe: names the setting, never the value.
+    """
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise ValueError(f"FHIR destination {setting!r} contains an illegal control character")
+    return value
+
+
 def _validate_path_token(value: str, pattern: re.Pattern[str], field: str) -> str:
     """Reject a message-derived path segment that doesn't match its FHIR grammar before it flows into
     the request URL. ``_reject_control_chars`` blocks CRLF/NUL but NOT path metacharacters ('/', '..',
@@ -210,6 +225,7 @@ class FhirDestination(DestinationConnector):
             raise ValueError(
                 "FHIR destination requires a 'url' setting (the FHIR service base URL)"
             )
+        _reject_config_control_chars(url, "url")
         scheme = urllib.parse.urlsplit(url).scheme.lower()
         if scheme not in ("http", "https"):
             raise ValueError(f"FHIR destination 'url' must be http or https, got scheme {scheme!r}")
@@ -233,7 +249,14 @@ class FhirDestination(DestinationConnector):
                 f"FHIR destination conditional must be one of {_CONDITIONALS} or unset, "
                 f"got {self.conditional!r}"
             )
-        self.conditional_query: str | None = s.get("conditional_query") or None
+        # Screened HERE rather than on the send path: it reaches an unencoded URL interpolation AND
+        # the If-None-Exist HEADER value, and the header sink has none of the URL limb's incidental
+        # neutralisations (urllib.parse.unwrap strips a trailing CRLF; Request.full_url splits at '#'
+        # client-side -- neither touches a header value).
+        _q = s.get("conditional_query") or None
+        self.conditional_query: str | None = (
+            _reject_config_control_chars(str(_q), "conditional_query") if _q else None
+        )
         if (
             self.conditional in ("if-none-exist", "conditional-update")
             and not self.conditional_query

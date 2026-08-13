@@ -241,6 +241,49 @@ def test_resolve_if_match_versionid_with_control_char_is_permanent() -> None:
     assert ei.value.permanent is True
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "identifier=x\r\nX-Evil: 1",  # CRLF -- header injection via the If-None-Exist sink
+        "identifier=x\nX-Evil: 1",  # bare LF
+        "identifier=x\x00",  # NUL
+        "identifier=x\x7f",  # DEL
+    ],
+)
+def test_conditional_query_control_char_is_refused_at_construction(value: str) -> None:  # #1241
+    """An operator-configured `conditional_query` reaches TWO sinks with no screen between config and
+    wire: an unencoded URL interpolation, and the `If-None-Exist` HEADER value.
+
+    Screened at CONSTRUCTION, not per message, and the distinction is the point. A bad *message* is a
+    permanent dead-letter -- one message fails. A bad *setting* is wrong for every message the
+    connection will ever send, so it must fail the connection at load rather than dead-letter an
+    unbounded stream of messages that were never at fault.
+
+    The header sink is why this cannot be left to the send path: unlike the URL limb it has NO
+    incidental neutralisation -- `urllib.parse.unwrap` strips a trailing CRLF and `Request.full_url`
+    splits at '#' client-side, and neither touches a header value.
+    """
+    with pytest.raises(ValueError, match="control character"):
+        _dest(conditional="if-none-exist", conditional_query=value)
+
+
+def test_clean_conditional_query_still_constructs() -> None:  # #1241
+    """Positive control for the screen: it must admit what it is not screening for."""
+    d = _dest(conditional="if-none-exist", conditional_query="identifier=http://h|123")
+    assert d.conditional_query == "identifier=http://h|123"
+
+
+def test_base_url_control_char_is_refused_at_construction() -> None:  # #1241
+    # Built directly rather than through _dest, which already supplies url=.
+    bad = Destination(
+        name="OB_FHIR",
+        type=ConnectorType.FHIR,
+        settings={"url": "https://fhir.example.org/fhir\r\nX-Evil: 1"},
+    )
+    with pytest.raises(ValueError, match="control character"):
+        build_destination(bad)
+
+
 def test_invalid_url_from_urllib_is_a_permanent_dead_letter() -> None:  # #1241
     """`http.client.InvalidURL` must not escape `_post` as an unhandled exception.
 
