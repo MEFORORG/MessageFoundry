@@ -573,16 +573,42 @@ class AuthService:
                 return True
         return False
 
+    async def _unclaimed_bootstrap(self) -> UserRecord | None:
+        """The first-run bootstrap admin while it is still present, enabled and **never claimed** —
+        otherwise ``None``. This is the ONE claimed-ness test of the WP-3 lifecycle: both the
+        retirement (:meth:`_retire_superseded_bootstrap`) and its advisory warning
+        (:meth:`bootstrap_expiry_warning`) go through it, because two open-coded copies of one
+        lifecycle test is exactly how the warn path silently inherited BACKLOG #1245.
+
+        Claimed-ness is the RECORDED ``users.password_claimed_at`` — stamped write-once when the
+        holder sets their own credential through authenticated self-service rotation — never the
+        INFERRED ``must_change_password``. That distinction is the fix: "never claimed" is
+        monotonic (once claimed, always claimed) while ``must_change_password`` is not, since an
+        admin password reset legitimately re-raises it (ASVS 6.4.6 wants an admin-issued credential
+        to be a one-time temp, so that write must stay). Reading the flag as claimed-ness therefore
+        made a reset of the account named ``admin`` look never-claimed again, and the next trigger
+        would disable an account claimed long ago — on a single-admin deployment, with no second
+        administrator left able to re-enable it. A recorded fact cannot be un-recorded by a writer
+        that means something else.
+
+        Note ``password_claimed_at`` records that the holder once set their own credential, NOT
+        that they are still in control — recovering a compromised account is what the admin reset
+        is for, and it deliberately does not restore retirement eligibility."""
+        boot = await self._store.get_user_by_username(BOOTSTRAP_USERNAME)
+        if boot is None or boot.disabled or boot.password_claimed_at is not None:
+            return None  # gone, already disabled, or claimed (a real account now)
+        return boot
+
     async def _retire_superseded_bootstrap(self, now: float | None = None) -> None:
         """Disable the first-run bootstrap admin once it's no longer needed (WP-3): when a **second**
-        administrator exists, or — while still **unclaimed** (never password-changed) — once its expiry
-        window lapses. Only ever touches an unclaimed bootstrap (``must_change_password`` still set): if
-        the operator changed its password it is a normal admin account and is left alone, so this can't
-        lock out a legitimate single-admin deployment."""
+        administrator exists, or — while still **unclaimed** — once its expiry window lapses. It only
+        ever touches an account that has never been claimed per :meth:`_unclaimed_bootstrap`; an
+        account whose holder set their own credential is a normal admin account and is left alone,
+        so retirement cannot lock a single-admin deployment out of its only administrator."""
         now = time.time() if now is None else now
-        boot = await self._store.get_user_by_username(BOOTSTRAP_USERNAME)
-        if boot is None or boot.disabled or not boot.must_change_password:
-            return  # gone, already disabled, or claimed (a real account now)
+        boot = await self._unclaimed_bootstrap()
+        if boot is None:
+            return
         expiry_hours = self._settings.bootstrap_expiry_hours
         expired = expiry_hours > 0 and now >= boot.created_at + expiry_hours * 3600
         superseded = await self._other_enabled_admin_exists(boot.id)
@@ -597,8 +623,9 @@ class AuthService:
         )
 
     async def bootstrap_expiry_warning(self, now: float | None = None) -> tuple[float, int] | None:
-        """ASVS 6.4.5 arm 2: if the first-run bootstrap admin is STILL UNCLAIMED and ``now`` sits inside
-        its warn window ``[expires_at - bootstrap_warn_hours, expires_at)``, return the retirement instant
+        """ASVS 6.4.5 arm 2: if the first-run bootstrap admin is STILL UNCLAIMED (the shared test,
+        :meth:`_unclaimed_bootstrap`) and ``now`` sits inside its warn window
+        ``[expires_at - bootstrap_warn_hours, expires_at)``, return the retirement instant
         + whole hours remaining ONCE — an in-memory latch means a periodic caller emits exactly one
         reminder per process. Returns ``None`` when time-expiry is off, the bootstrap is
         gone/disabled/claimed, ``now`` is before the window (or already at/past it — retirement itself has
@@ -614,9 +641,9 @@ class AuthService:
         expiry_hours = self._settings.bootstrap_expiry_hours
         if expiry_hours <= 0:
             return None  # no time-expiry configured → nothing to warn about
-        boot = await self._store.get_user_by_username(BOOTSTRAP_USERNAME)
-        if boot is None or boot.disabled or not boot.must_change_password:
-            return None  # gone, already disabled, or claimed (a real account now)
+        boot = await self._unclaimed_bootstrap()
+        if boot is None:
+            return None
         now = time.time() if now is None else now
         expires_at = boot.created_at + expiry_hours * 3600
         warn_start = expires_at - max(0, self._settings.bootstrap_warn_hours) * 3600
