@@ -94,6 +94,37 @@ _PROTOCOLS = ("sftp", "ftp", "ftps")
 _T = TypeVar("_T")
 
 
+def _is_contained_name(name: object) -> bool:
+    """True if ``name`` is a single, safe path component — a listing entry we may join onto the
+    configured remote directory (BACKLOG #1238, ASVS 5.3.2).
+
+    The name comes from a **remote server's own directory listing**, so it is chosen by a party we do
+    not control: a malicious or compromised partner could return ``../../etc/passwd.hl7``, and the
+    default ``pattern`` of ``*.hl7`` matches it (``fnmatch``'s ``*`` spans ``/``, unlike ``glob``).
+
+    **Reject, never rewrite.** ``posixpath.basename`` is the obvious fix and is actively harmful:
+    it MUTATES rather than refuses, so ``../../etc/adt_20260812.hl7`` becomes ``adt_20260812.hl7``,
+    which rejoins to a *real* file in the poll directory — handing a hostile server a retrieve /
+    move / delete primitive against the partner's own drop directory. It is also a no-op on the
+    Windows-separator form (``posixpath`` tokenizes only ``/``), and because its output can never
+    contain ``/`` any containment check placed after it is unreachable and always passes. For a
+    healthcare feed, refusing one file is strictly better than silently reading the wrong one, and
+    mutation cannot give that property.
+
+    Refused: a non-``str``; empty; ``.`` and ``..``; any ``/`` or ``\\``; a control character; and the
+    drive-relative form (``C:x.hl7``), which carries no separator at all and so slips a
+    separator-only check."""
+    if not isinstance(name, str) or not name or name in (".", ".."):
+        return False
+    if "/" in name or "\\" in name:
+        return False
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
+        return False
+    # A drive-relative path ("C:x.hl7") resolves against the drive's CWD on Windows and contains no
+    # separator, so the checks above cannot see it. Two chars, ASCII letter, then a colon.
+    return not (len(name) >= 2 and name[0].isascii() and name[0].isalpha() and name[1] == ":")
+
+
 def _redact(host: str, path: str) -> str:
     """``host:path`` only — never credentials, for a log line."""
     return f"{host}:{path}"
@@ -920,6 +951,22 @@ class RemoteFileSource(SourceConnector):
         for name, size in sorted(entries):
             if self._stop.is_set():
                 break  # shutting down — leave the rest for the next start (at-least-once)
+            if not _is_contained_name(name):
+                # #1238 (ASVS 5.3.2): the server chose this name. Refuse it HERE — at the source,
+                # before the pattern filter — because the raw name reaches at least four consumers
+                # (the retrieve path, the error/oversize move, the after_read disposition, and the
+                # leave-mode dedup key), and a per-consumer check would keep missing one: the
+                # consumer set grew at every measurement pass and never shrank.
+                # NOT quarantined: moving it would join the hostile name onto a directory, which is
+                # the very operation being refused. Left in place and logged, so an operator sees it
+                # every poll rather than once. PHI-safe: names are not logged at INFO+ elsewhere in
+                # this source, so this stays WARNING-with-no-name — the count is the signal.
+                logger.warning(
+                    "REMOTEFILE %s: a listing entry was refused as an unsafe path component "
+                    "(not a single safe name); left in place, not retrieved",
+                    _redact(self._host, self._remote_dir),
+                )
+                continue
             if not fnmatch.fnmatch(name, self._pattern):
                 continue
             path = posixpath.join(self._remote_dir, name)
