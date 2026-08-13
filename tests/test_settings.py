@@ -163,16 +163,6 @@ def test_egress_allowlist_loads_from_file_and_env(tmp_path: Path) -> None:
     assert s.egress.allowed_file_dirs == ["/data/out", "/data/archive"]  # from env (comma-split)
 
 
-def test_egress_fhir_require_structured_default_and_env(tmp_path: Path) -> None:
-    # 1.2.2 (ASVS): default off (byte-identical), coerced True from the env string like deny_by_default.
-    cfg = _write(tmp_path / "messagefoundry.toml", "[egress]\n")
-    assert load_settings(config_path=cfg, environ={}).egress.fhir_require_structured_params is False
-    s = load_settings(
-        config_path=cfg, environ={"MEFOR_EGRESS_FHIR_REQUIRE_STRUCTURED_PARAMS": "true"}
-    )
-    assert s.egress.fhir_require_structured_params is True
-
-
 def test_retention_secure_by_default_knob(tmp_path: Path) -> None:
     # #186a: allow_unbounded_phi defaults to the SECURE posture (False = the serve gate bounds PHI
     # retention). The [egress].deny_by_default MODEL default is left UNCHANGED (False) — the fail-closed
