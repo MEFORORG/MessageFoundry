@@ -90,13 +90,16 @@ CASES: list[tuple[str, str, bool, str]] = [
         """,
     ),
     (
-        "fhir_pos_flat_query_fstring",
+        "fhir_pos_path_fstring",
         "unsafe-db-lookup",
         True,
+        # #1243 removed the flat '?'-query this used to interpolate into, so the fixture now
+        # interpolates the PATH -- a live injection vector (it is what #1240's path-segment grammar
+        # gates defend), not a retired one. The rule reads args[1] either way.
         """
         @handler("h")
         def h(msg):
-            res = fhir_lookup("epic", f"Patient?identifier=MRN|{msg['PID-3.1']}")
+            res = fhir_lookup("epic", f"Patient/{msg['PID-3.1']}")
             return Send("OB", msg)
         """,
     ),
@@ -275,10 +278,12 @@ CASES: list[tuple[str, str, bool, str]] = [
         "fhir_pos_keyword_query",
         "unsafe-db-lookup",
         True,
+        # #1243: keyword form, interpolated PATH (see fhir_pos_path_fstring). The rule honours the
+        # query= keyword as well as the 2nd positional, which is the property this case pins.
         """
         @handler("h")
         def h(msg):
-            fhir_lookup("epic", query=f"Patient?x={msg['PID-3.1']}")
+            fhir_lookup("epic", query=f"Patient/{msg['PID-3.1']}")
             return Send("OB", msg)
         """,
     ),
