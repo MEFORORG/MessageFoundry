@@ -8402,6 +8402,33 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > 🔢 **Filed 2026-08-13 - not started.** Value **5/10** · Difficulty **3/10**. Several operator-configured values are interpolated into URL paths, query strings and an HTTP header with weaker treatment than the message-derived values beside them -- in one case with no screen at all. Found during #1107 (ASVS 1.2.2). **The subject is the asymmetry**, so fixing one site without the others misses the point.
 
+> ⚠️ **Amendment 2026-08-13 -- the item's JUSTIFICATION was the weaker of the two available, and the stronger one is a measured fact. Severity is UNCHANGED and deliberately not upgraded.**
+>
+> **FILED AS:** "the treatment is inconsistent within one file." That is a tidiness argument.
+> **THE REAL ARGUMENT:** on the header sink there is **no other control at all** for four distinct byte classes, so this screen is **not defence-in-depth -- it is the only control**. The inconsistency is merely *how that survived review*.
+>
+> **PYTHON'S STDLIB HEADER GUARD DOES NOT BLOCK obs-fold INJECTION.** Measured twice independently, reading the pattern out of `http.client` rather than trusting a report. The guard is:
+> ```
+> b'\n(?![ \t])|\r(?![ \t\n])'
+>
+>   b'a\r\nX-Injected: 1'      ILLEGAL   <- bare CRLF is caught
+>   b'a\r\n X-Injected: 1'     PASSES    <- CRLF + SPACE  (obs-fold)
+>   b'a\r\n\tX-Injected: 1'    PASSES    <- CRLF + TAB    (obs-fold)
+>   b'a\n X: 1'                PASSES    <- bare LF + SPACE
+>   b'a\x00b'                  PASSES    <- NUL
+>   b'a\x7fb'                  PASSES    <- DEL
+>   b'identifier=sys|val'      PASSES    <- legitimate value; the check discriminates
+> ```
+> The negative lookahead is doing exactly what **RFC 7230 obs-fold** describes -- a CRLF followed by whitespace is a **line continuation**, so the stdlib treats it as legal and a value carrying one ships as an **additional CRLF-terminated line in the request**. NUL and DEL are not in the pattern at all.
+>
+> **SEVERITY IS NOT UPGRADED, and that is a deliberate call.** `conditional_query` is **operator configuration**, not message-derived, so an operator would have to configure the hostile value themselves. This stays below the message-derived sites where it was filed. What changes is *why* it matters, not *how much*.
+>
+> **TWO CORRECTIONS TO THIS ITEM'S OWN TEXT:**
+> - It cites `tests/test_fhir_transport.py:220` for the pinned URL assertion. **`:220` is `assert method == "PUT"`; the assertion is at `:221`.** Off by one.
+> - It says the flat-search path "at least screens". **STALE** as of `513855b3` -- #1243 limb A now **refuses** a `?`-query outright. That **strengthens** this item: reject-not-encode is now the file's habit at **two** sites, so this screen follows an established local pattern rather than introducing one.
+>
+> **A DESIGN EXISTS AND IS RESCUED** (not implemented; `fhir.py` was held pending #1243 limb A). Its shape, for whoever builds it: one module-level grammar beside the existing `_FHIR_*` regexes, admitting RFC 3986's query set **plus `|`** (which FHIR needs for `system|code` and RFC 3986 does not admit) and nothing else -- so control characters, space, non-ASCII, `#` and a second `?` are excluded **by construction** rather than by enumerating bad shapes, which is the right polarity for a screen. Anchored `\A...\Z`, **never `^...$`** -- `$` also matches before a trailing newline, which is precisely **#1240's** defect; the two items agree without having been coordinated. A plain `ValueError` at construction rather than the `NegativeAckError` the `versionId` precedent uses, **because the provenance differs**: `versionId` is message-derived and dead-lettering is right, while this is static config and a dead-letter would kill every message forever over a startup-detectable defect. A **constant** error message -- the siblings at `:229`/`:237` echo their value, which is safe only because `conditional` is a closed enum of four literals, and copying that shape onto a free-text setting would be the mistake.
+
 **Cluster:** Security / input validation. **Priority:** P2. **Verdict:** build.
 **Severity:** Conditional and lower than the message-derived sites, because these values come from operator config rather than from an inbound message -- an operator can already choose the endpoint. It is filed because the treatment is *inconsistent within the same file*, which is how the weaker one survives review.
 
