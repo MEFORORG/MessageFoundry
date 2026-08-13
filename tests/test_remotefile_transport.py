@@ -39,6 +39,7 @@ from messagefoundry.transports.remotefile import (
     RemoteFileSource,
     _FtpClient,
     _ftps_ssl_context,
+    _is_contained_name,
     _RemoteClient,
     _RemoteError,
     _SftpClient,
@@ -1144,3 +1145,82 @@ async def test_remote_destination_validate_directory_test_probe_never_creates(
     with pytest.raises(DeliveryError):
         await dest.test_connection()
     assert client.dirs == []
+
+
+# --- #1238 (ASVS 5.3.2): a server-chosen listing name is REJECTED, never rewritten ---------------
+
+
+class _HostileListingClient(_FakeClient):
+    """A client whose listing returns names the SERVER chose, verbatim.
+
+    ``_FakeClient.list_dir`` derives names with ``posixpath.basename`` off its ``files`` keys, so it
+    structurally cannot produce a traversal name -- it would sanitize the very input under test. This
+    subclass returns the raw listing instead, which is what a hostile partner server does.
+    """
+
+    def __init__(self, names: list[str], **kw: Any) -> None:
+        super().__init__(**kw)
+        self._names = names
+
+    def list_dir(self, remote_dir: str) -> list[tuple[str, int]]:
+        return [(n, 10) for n in self._names]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../../etc/passwd.hl7",  # traversal, and the default *.hl7 pattern MATCHES it
+        "/etc/passwd.hl7",  # absolute
+        "..\..\etc\passwd.hl7",  # Windows separators -- posixpath.basename is a NO-OP on this
+        "sub/dir.hl7",  # a subdirectory component
+        ".",
+        "..",
+        "",
+        "a\x00b.hl7",  # NUL
+        "a\nb.hl7",  # newline
+        "C:evil.hl7",  # drive-relative: NO separator at all, so a separator-only check misses it
+    ],
+)
+def test_unsafe_listing_names_are_refused(name: str) -> None:  # #1238
+    assert _is_contained_name(name) is False
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["a.hl7", "adt_20260812.hl7", "A-1.2_3.hl7", "file with spaces.hl7", "unicode-\u00e9.hl7"],
+)
+def test_legitimate_listing_names_are_accepted(name: str) -> None:  # #1238
+    # The refusal must not be so broad that it rejects ordinary partner filenames -- a check that
+    # refuses everything is not a control either.
+    assert _is_contained_name(name) is True
+
+
+async def test_traversal_entry_is_never_retrieved(monkeypatch: pytest.MonkeyPatch) -> None:  # #1238
+    """The whole point: a hostile listing entry reaches NO consumer.
+
+    Asserted on the client's recorded ops, not on the handler alone, because the raw name reaches at
+    least four consumers (retrieve, the error/oversize move, the after_read disposition, and the
+    leave-mode dedup key). Checking only "the handler was not called" would pass even if the engine
+    had already moved or deleted at the hostile path.
+    """
+    client = _HostileListingClient(["../../etc/passwd.hl7"])
+    src = _src(monkeypatch, client)
+    h = _RecordingHandler()
+    src._handler = h
+    await src._poll_once()
+    assert h.bodies == []  # nothing ingested
+    assert client.ops == []  # and NOTHING was retrieved, moved, renamed or removed
+
+
+async def test_a_safe_entry_beside_a_hostile_one_still_flows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1238
+    # Refusing one entry must not abort the poll -- the legitimate file beside it is still delivered.
+    # Without this, a hostile server could suppress a real feed by planting one bad name.
+    client = _HostileListingClient(["../../etc/passwd.hl7", "good.hl7"])
+    client.files["/in/good.hl7"] = b"MSH|^~\&|A"
+    src = _src(monkeypatch, client)
+    h = _RecordingHandler()
+    src._handler = h
+    await src._poll_once()
+    assert h.bodies == [b"MSH|^~\&|A"]
