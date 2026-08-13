@@ -6569,6 +6569,22 @@ filing.
 
 **The research question.** What would identification keyed on the IdP-namespaced subject actually require here, across all three store backends, and what is the correct ceremony for the first federated login of an account that predates federation -- that account has no (iss, sub) yet, so every candidate binding is a trust-on-first-use decision wearing a different hat, and the research must say which of them is defensible rather than assuming one. Named unknowns: whether splitting `AuthProvider` is a real improvement or merely relocates the collision; whether the allow-list can constrain the local part without rejecting legitimate UPNs; whether a single pinned issuer fronting upstream guest principals changes the answer.
 
+> ⚠️ **AMENDED 2026-08-13 (dispatcher) -- ONE LIMB OF THE RESEARCH QUESTION IS NOW MEASURED, so nobody re-derives it: keying identity on the IdP-namespaced subject REQUIRES A SCHEMA CHANGE ON ALL THREE BACKENDS, and on SQL Server it requires a COLUMN RE-TYPE, not just an index.** Measured at `origin/main`, with a discriminating control:
+> ```
+> UNIQUE index / index naming oidc_issuer or oidc_subject:
+>   store.py 0     postgres.py 0     sqlserver.py 0        <- none, on any backend
+>   POSITIVE CONTROL: 'UNIQUE' appears 13 times in store.py, so the probe discriminates
+>
+> column types today:
+>   postgres.py:531-532    oidc_issuer TEXT,  oidc_subject TEXT
+>   sqlserver.py:1357      oidc_issuer NVARCHAR(MAX) NULL,  oidc_subject NVARCHAR(MAX) NULL
+> ```
+> **The columns exist and carry no uniqueness constraint of any kind.** So an `(issuer, subject)` identity key is not a code-only change: it needs a unique index on all three, **and on SQL Server `NVARCHAR(MAX)` cannot be an index KEY column at all** (max key size 900/1700 bytes), so those two columns must be re-typed to a bounded `NVARCHAR(n)` first. **That is a second migration on that backend**, and it is the kind of cost that decides between the candidate designs rather than following from one.
+>
+> **CITATION FIX in the same pass:** the banner cites `messagefoundry/store/store.py:1590` for `users.username`. **`:1590` is a BLANK LINE**; the declaration `username TEXT NOT NULL UNIQUE` is at **`:1593`**. Found independently by two seats, which is why it is recorded rather than quietly patched.
+>
+> **What this does NOT settle:** the ceremony for the first federated login of a pre-federation account, which remains the item's hard question and is untouched by any of the above. **A migration cost is an input to that decision, not an answer to it.**
+
 **What would NOT be an honest pass.** Grounding the cell on the (issuer, sub) continuity pair. The scorecard forbids exactly this and explains why: that is 10.5.2's verb ("for the scope of an identity provider" -- within one IdP), and the pair cannot discriminate here at all, because `auth/oidc/claims.py:227` rejects any token whose `iss` differs from the single pinned issuer before the guard runs. Equally not a pass: rescoring `na` because `oidc_enabled` ships off -- the method's 3.7.3 worked example holds that a disabled feature removes the trigger, not the control.
 
 **Source:** filed 2026-08-08 from the ASVS ledger-coverage sweep, which found 80 of the 108 partial and fail cells carried no item naming them in `docs/BACKLOG.md`. The scorecard is the record of record for the verdict; this item tracks the research toward changing it.
