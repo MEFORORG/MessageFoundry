@@ -6289,6 +6289,18 @@ filing.
 ## 1129. research an honest pass for ASVS 5.2.3 -- a literal before-uncompressing check when the declared size is attacker-controlled
 
 > 🔢 **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** Value **5/10** · Difficulty **5/10**. ASVS **5.2.3** (L2) currently scores **partial**. The pinned verb asks that compressed files be checked against a maximum uncompressed size *and* a maximum file count *before* uncompressing. The engine's readers enforce their ceilings incrementally instead, deliberately, and the Handler-facing archive reader ships its size ceiling off.
+>
+> ⚠️ **AMENDED 2026-08-13 -- THE CENTRAL PREMISE IS FALSE. A literal before-uncompressing check DOES ship, DEFAULT-ON, and it cites this very cell in its own source.** The item stays OPEN, but on a much narrower question than it was filed with.
+>
+> **What ships:** `parsing/dicom/_inflate.py` provides `bounded_inflate_or_error(compressed, *, max_bytes)`, which inflates in `_INFLATE_CHUNK`-bounded chunks, **discards the output**, and raises `DicomBombError` the instant the cumulative uncompressed size would cross the cap -- so a small compressed bomb with a huge inflated size **never materialises in memory**. `guard_part10_deflate(data, *, max_bytes=DEFAULT_MAX_INFLATED_BYTES)` runs it **before any `dcmread`**, and the default argument is what makes it **default-on** rather than opt-in.
+>
+> **And the code names this cell.** `parsing/dicom/peek.py:81` reads: *"ASVS 5.2.3: a Deflated Explicit VR LE object inflates unbounded inside dcmread ... Pre-check the inflate in bounded memory and reject an over-cap object ... BEFORE dcmread ever touches it."* **The module knew about this cell while this item did not know about the module** -- the same shape recorded on #1114.
+>
+> **THE STRUCK CLAUSE, and why it is not a small correction.** The item's ground is that the engine enforces ceilings *incrementally instead* of checking before uncompressing. That is the pinned verb's exact distinction, and it is **false for the DICOM path**: this is a literal before-uncompressing check, which is the thing the verb asks for. The `zip_decompress` half stands unchanged.
+>
+> **RE-SCOPE:** the live question is whether the Handler-facing `zip_decompress` default (`max_output_bytes=None`) is an honest gap **given** that the transport-facing DICOM path already does the literal check -- and whether "maximum number of files" is answered anywhere. That is narrower and harder than "does a before-uncompressing check exist", which is answered.
+>
+> **SECOND ITEM FROM THE 2026-08-08 SWEEP WITH A FALSE CENTRAL PREMISE**, after #1131. Both failed the same way: **the absence was asserted from plausible shapes rather than from the state.** #1131's regex could not match `admin_reset_password`; this one looked at the archive reader and did not look for a bounded inflate elsewhere. **If a third turns up, the sweep's METHOD is the defect and wants its own item, not another amendment.**
 
 **Cluster:** Security / ASVS remediation research. **Priority:** P2. **Verdict:** research.
 **Severity:** On a first deployment a Handler author calling `zip_decompress` without passing `max_output_bytes` would get no total-size ceiling. Bounded in practice by the transports' own ceilings on the bytes that reach a Handler, but the helper is re-exported and its default is permissive.
