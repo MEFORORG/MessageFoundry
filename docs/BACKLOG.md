@@ -8450,3 +8450,32 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > ⚠️ **Amendment, same day, recording what the adversarial pass corrected.** The item was first written as "latent, and a clean scalar/sub-table asymmetry." Both halves were wrong. It is **active**, because the measurement was taken one commit before the backfill landed and the parent revision genuinely has zero `sym` keys -- a stale checkout reproduces the wrong answer perfectly and reads as confirmation. And the asymmetry is four-way, not two-way; the clean framing concealed the table-mangling and the payload-only drop entirely. A fifth limb about line-ending rewriting was **investigated and rejected**: the tool does rewrite the working tree to LF, but `core.autocrlf=true` normalizes it back in the index, so the blob is unchanged and the claimed review-diff consequence does not occur.
 
 **Cluster:** Security tooling / evidence integrity. **Priority:** P1. **Verdict:** build. **Severity:** no deployment axis -- vault tooling, ships to nobody. P1 rather than P2 because the loss is **pending on the next routine operation**, is **silent in both directions** (the writer reports success, the verifier reports green having checked less), and destroys evidence that cost a dedicated backfill to produce.
+
+## 1245. an administrator password reset re-arms bootstrap retirement, permanently disabling the account it was meant to recover
+
+> 🔢 **Filed 2026-08-13 -- an AVAILABILITY defect whose own docstring asserts it cannot happen, found while adjudicating the ASVS 6.1.1 re-score.** Value **7/10** -- Difficulty **3/10**. `admin_reset_password` sets `must_change_password=True`, which is the exact flag `_retire_superseded_bootstrap` treats as "still unclaimed". So resetting the password of a local account named `admin`, on a system that has any other enabled administrator, **would disable that account on its next login attempt and make the freshly issued temporary credential unusable**. The reset is the documented remedy; applying it destroys the account.
+
+> **THE DOCSTRING STATES THE SAFETY PROPERTY THIS DEFEATS, WHICH IS WHY IT SURVIVED REVIEW.** `auth/service.py:580-581` reads: *"the operator changed its password it is a normal admin account and is left alone, so this can't lock out a legitimate single-admin deployment."* That is true of a **self-service** change -- which clears `must_change_password` -- and false of an **administrator reset**, which sets it back. The retirement gate is not testing "has this account been claimed"; it is testing a flag that a second, unrelated shipped code path re-raises. A reader checking whether retirement is safe finds a sentence saying it is.
+
+> **THE CHAIN, every link read at `origin/main` rather than inferred:**
+> ```
+> auth/service.py:2730-2733  admin_reset_password -> set_password(..., must_change_password=True)
+>              :2735         -> revoke_user_sessions(user_id)      the self-service escape closes here
+>              :650-651      _login_local: if username == BOOTSTRAP_USERNAME -> _retire_superseded_bootstrap()
+>                            -- BEFORE the credential check at :669
+>              :584          gate: return early if `not boot.must_change_password`   <- the reset re-opened it
+>              :588          superseded = _other_enabled_admin_exists(boot.id)       <- true, no expiry wait
+>              :591          set_user_disabled(boot.id, disabled=True)
+>              :653-663      the same attempt then returns "invalid credentials"
+> ```
+> **The loop is closed.** Re-enabling through `PATCH /users/{user_id}` does not help: `must_change_password` is still set and another administrator still exists, so the next login retires it again. **No route clears the flag** -- it is not a `PATCH`-able field, and the only writes that set it `False` are on the self-service password-change path, which needs a live session that `:2735` has just revoked.
+
+> **THE FAILURE IS SILENT AT BOTH ENDS, which is the part that makes it worth a P2.** The administrator sees a successful reset and hands over a temporary password. The account holder sees `invalid credentials` -- the generic refusal at `:653-663`, deliberately indistinguishable from a wrong password so that it does not leak account state. Neither party is told the account was retired. The audit log records `auth.bootstrap_admin_retired` at `:593`, so the evidence exists, but nothing surfaces it at the moment of failure and no operator would think to look there for what presents as a mistyped password.
+
+> **SCOPE, stated precisely so severity is not inflated.** This is **not** a whole-system lockout: the trigger *requires* another enabled administrator, and that administrator still works. What is destroyed is the account named `admin` specifically, and per BACKLOG #1236's neighbourhood it cannot be renamed (`update_user` does not rename) or deleted, so it persists as a permanently disabled row. The exposure is availability, not credential disclosure. **No deployment axis -- zero instances**; this is written in the conditional because nothing is running it.
+
+> **INTERACTION WITH #1136 / ADR 0163, so this is not fixed twice or fixed away by accident.** ADR 0163 proposes removing the bootstrap admin entirely, which would delete this defect along with its subject. That is a much larger change gated on four owner decisions and is not scheduled. **This item should be fixed on its own terms in the meantime**, and the fix is small: `admin_reset_password` should not re-raise the "unclaimed" signal for an account that has already been claimed, or the retirement gate should test claimed-ness by something a reset cannot forge. Whoever fixes it must also correct the docstring at `:580-581`, because that sentence is the reason nobody looked.
+
+> **BOUND ON WHAT WAS VERIFIED.** The control flow above was read statically at `origin/main` and each cited line confirmed individually; it has **not** been reproduced by executing a login sequence. A test that resets the password of a claimed `admin` account on a two-administrator system and then asserts the temporary credential works is the confirming experiment, and it does not exist today.
+
+**Cluster:** Authentication / account lifecycle. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- zero instances; on first deployment an administrator following the documented reset **would** render the `admin` account permanently unusable without either party being told.
