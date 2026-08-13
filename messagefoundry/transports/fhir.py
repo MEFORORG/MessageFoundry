@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import http.client
 import json
 import logging
 import re
@@ -635,10 +636,16 @@ class FhirDestination(DestinationConnector):
             raise DeliveryError(
                 f"FHIR {_redact_url(self.base_url)} unreachable: {exc.reason}"
             ) from exc
-        except ValueError as exc:
+        except (ValueError, http.client.InvalidURL) as exc:
             # Backstop for an illegal request value urllib rejects (a CRLF in a header/URL that slipped
             # past the control-char guard, or a bad conditional_query) — a permanent failure (a retry
             # re-sends the same body), never an escaping internal error. PHI-safe: redacted url only.
+            #
+            # InvalidURL is named EXPLICITLY because it is not a ValueError: its MRO is
+            # InvalidURL -> HTTPException -> Exception, so it is neither a ValueError nor an OSError
+            # and matched none of the arms here — including this one, which was written for exactly
+            # the CRLF-in-a-URL case it raises. Without it the URL limb escapes send() as an
+            # unhandled internal error instead of the classified permanent dead-letter above.
             raise NegativeAckError(
                 f"FHIR {_redact_url(self.base_url)} rejected an invalid request value",
                 code="bad-request-value",

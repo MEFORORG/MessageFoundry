@@ -11,6 +11,7 @@ dest.send(...)`` against a synchronous fake opener and hold no loop-bound state 
 from __future__ import annotations
 
 import email.message
+import http.client
 import io
 import json
 import urllib.error
@@ -238,6 +239,37 @@ def test_resolve_if_match_versionid_with_control_char_is_permanent() -> None:
     with pytest.raises(NegativeAckError) as ei:
         _dest(conditional="if-match")._resolve_request(crlf)
     assert ei.value.permanent is True
+
+
+def test_invalid_url_from_urllib_is_a_permanent_dead_letter() -> None:  # #1241
+    """`http.client.InvalidURL` must not escape `_post` as an unhandled exception.
+
+    THE GAP IT CLOSES: InvalidURL derives from HTTPException, NOT ValueError and NOT OSError
+    (`InvalidURL -> HTTPException -> Exception`), so it matched none of `_post`'s arms -- including
+    the ValueError backstop whose own comment says it exists for "a CRLF in a header/URL that
+    slipped past the control-char guard". That is precisely this exception, and it escaped the arm
+    written for it. On first deployment the URL limb would surface as an internal error out of
+    `send()` rather than the classified permanent dead-letter the file intends.
+
+    The sibling arms are asserted below so this cannot pass by the whole method being widened.
+    """
+    dest = _dest()
+    dest._opener = _FakeOpener(  # type: ignore[assignment]
+        exc=http.client.InvalidURL("URL can't contain control characters")
+    )
+    with pytest.raises(NegativeAckError) as ei:
+        dest._post(PATIENT, "POST", f"{BASE}/Patient", {})
+    assert ei.value.permanent is True
+
+
+def test_invalid_url_fix_did_not_widen_the_other_arms() -> None:  # #1241
+    """Negative control for the test above: a connection failure must STILL be a retryable
+    DeliveryError, not swept into the permanent dead-letter class."""
+    dest = _dest()
+    dest._opener = _FakeOpener(exc=urllib.error.URLError("connection refused"))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        dest._post(PATIENT, "POST", f"{BASE}/Patient", {})
+    assert not isinstance(ei.value, NegativeAckError)
 
 
 def test_resolve_id_with_control_char_is_permanent() -> None:
