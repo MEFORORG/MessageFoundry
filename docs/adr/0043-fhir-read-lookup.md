@@ -194,9 +194,11 @@ check` / the console **without** issuing a PHI-bearing read — the natural FHIR
 - **AC-1** — WHEN a Handler calls `fhir_lookup(connection, "Patient/123")` against a declared `FhirLookup`, THE SYSTEM
   SHALL issue a read-only `GET {base}/Patient/123` over the hardened opener and return the parsed resource dict.
   → `tests/test_fhir_lookup.py::test_read_by_id_returns_resource`
-- **AC-2** — WHEN a Handler calls `fhir_lookup(connection, "Patient?identifier=MRN|123")`, THE SYSTEM SHALL issue a
-  read-only `GET {base}/Patient?identifier=MRN|123` and return the searchset `Bundle` dict.
-  → `tests/test_fhir_lookup.py::test_search_returns_bundle`
+- **AC-2** — ~~WHEN a Handler calls `fhir_lookup(connection, "Patient?identifier=MRN|123")`, THE SYSTEM SHALL issue a
+  read-only `GET {base}/Patient?identifier=MRN|123` and return the searchset `Bundle` dict.~~
+  **SUPERSEDED by the 2026-08-13 amendment below (BACKLOG #1243).** The flat `?`-query is refused; a search is
+  `fhir_lookup(connection, "Patient", {"identifier": "MRN|123"})`.
+  → `tests/test_fhir_lookup.py::test_structured_params_are_the_only_search_form`
 - **AC-3** — WHEN `fhir_lookup` is called on a **Router** or in the **dry-run / Test Bench** path, THE SYSTEM SHALL
   raise `FhirLookupError` (no active runner), never return live data.
   → `tests/test_fhir_lookup.py::test_unavailable_on_router_and_dryrun`
@@ -317,3 +319,37 @@ endpoint. **SMART App Launch** / human-user flows stay out (ADR 0024) — read a
 - [ ] **Confirm the thread-pool posture** — `fhir_lookup` shares the default executor with `db_lookup`; decide whether
   the deferred dedicated-lookup-pool follow-up (ADR 0010) should be revisited now that two live-lookup kinds can
   contend.
+
+---
+
+## Amendment (2026-08-13) — the flat `?`-query search form is REMOVED (BACKLOG #1243, ASVS 1.2.2)
+
+**AC-2 above is superseded.** `fhir_lookup` no longer accepts a `?`-query inside `query`; a search is
+expressed as the path in `query` plus the fields in `params`, and `_resolve_read_url` raises on a `?`.
+
+**Why, and it is not "we removed a legacy form".** The flat form appended the caller's search string to
+the URL **with no encoding at all** (`transports/fhir.py`, `url = f"{url}?{search_part}"`). ASVS 1.2.2
+asks that untrusted data be *encoded according to its context* when a URL is built dynamically. The
+three-shape screen that stood in front of that append — rejecting `#`, a second `?`, and a
+percent-decoded control character — was **the statement of the shortfall, not a control**: its own
+comment recorded that it declined to touch the `&`/`=`/`|` separators, and those are precisely what
+carries a parameter injection. An engine cannot encode a string whose separators are the author's
+syntax, so the form could not be made safe without ceasing to be that form.
+
+**Why removal rather than the setting that already existed.** `[egress].fhir_require_structured_params`
+shipped `False` and, set `True`, refused the flat form. That was rejected as the fix: it leaves the
+unencoded sink reachable behind one config edit, which closes the requirement on a **default** rather
+than on the **absence of the sink** — a compensating control that a single setting removes. The setting
+is deleted along with the path. With zero deployments there is no migration cost to weigh against the
+simpler end state (CLAUDE.md §0).
+
+**What is unaffected.** A read-by-id (`"Patient/123"`) carries no `?` and is unchanged. The structured
+`params` form is unchanged: each value is percent-encoded via `urlencode(quote_via=quote, safe="")`, so
+a value cannot inject an additional search parameter, and a `list[str]` expands to repeated params.
+
+**What this amendment does NOT close.** Percent-encoding neutralises `&` and `=`, which are URL
+delimiters. It does **not** neutralise `,`, `|` and `$`, which are **FHIR search-value** separators:
+they survive percent-decoding and reach the server with their separator meaning intact, so a value
+carrying one still alters the query's semantics one layer above the URL. That gap is open, is tracked
+on **BACKLOG #1243 limb B**, and is **not** resolved here — the two questions were filed together
+precisely because closing this one alone does not close ASVS 1.2.2.

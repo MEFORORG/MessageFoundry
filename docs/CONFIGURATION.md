@@ -916,13 +916,6 @@ transport's list is set, an outbound of that transport not on it is **refused at
 | `proxy_url` | str | _unset_ | site-wide **default forward/egress web proxy** for the HTTP family — REST/SOAP/FHIR/`fhir_lookup`/DICOMweb plus the OAuth2/SMART token endpoints ([ADR 0126](adr/0126-outbound-forward-egress-web-proxy-for-the-stdlib-http-family.md)). A connection that sets no per-connection `proxy` inherits this; a per-connection value overrides it. Unset (default) = no site-wide proxy (byte-identical — only per-connection proxies apply). `"default"` selects the OS default web proxy (`getproxies()`); an `http(s)://` address names an explicit one. **Proxy credentials stay per-connection** (secrets via `env()`), never a global TOML value. Via env: `MEFOR_EGRESS_PROXY_URL` |
 | `proxy_no_proxy` | list | `[]` | the site-wide `NO_PROXY`-style **bypass list** inherited by a connection that sets no per-connection `proxy_no_proxy`. Each entry is a host, `.suffix`, `*.suffix` or `*`. Via env: comma-separated `MEFOR_EGRESS_PROXY_NO_PROXY` |
 | `deny_by_default` | | | **→ moved to `[security].block_unlisted_outbound`** (ADR 0118) — set it there; no longer accepted in `[egress]`. |
-| `fhir_require_structured_params` | bool | `false` | when `true`, a `fhir_lookup` search must use the structured `params=` form (each value percent-encoded); the flat author-encoded `?`-query is refused before it dials out (ASVS 1.2.2, [ADR 0043](adr/0043-fhir-read-lookup.md)). A read-by-id and the `params=` form are unaffected. Default `false` keeps the flat form (byte-identical). Via env: `MEFOR_EGRESS_FHIR_REQUIRE_STRUCTURED_PARAMS` |
-
-> **FHIR-read query hardening (ASVS 1.2.2).** For a Pass posture set `[egress].fhir_require_structured_params = true`
-> so every `fhir_lookup` search is forced through the per-value-encoded `params=` form and the flat `?`-query
-> escape hatch (which relies on the Handler author to encode each value) can no longer smuggle an extra FHIR
-> search parameter. Default-off keeps the flat form for back-compat, which leaves the query-encoding an author
-> responsibility — the structured form is the safe path either way.
 
 > **Fully-open egress on a PHI instance is a startup REFUSAL, not a warning** (see the table above).
 > With none of the six **counted** allowlists set (`allowed_smtp`/`allowed_direct` do not count —
