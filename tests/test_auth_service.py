@@ -267,6 +267,57 @@ async def test_claimed_bootstrap_survives_user_creation_after_an_admin_reset() -
         await store.close()
 
 
+async def test_a_directory_provisioned_admin_is_not_retired_by_wp3() -> None:
+    # BACKLOG #1245, the regression the claimed-ness fix would otherwise INTRODUCE. WP-3 governs the
+    # LOCAL first-run account. The retired ``must_change_password`` test excluded a directory row BY
+    # ACCIDENT -- such a row has no password, so it carries the flag False and the old predicate
+    # returned early on it. ``password_claimed_at`` has no such side effect: a federated row has no
+    # stamp either, which reads as "never claimed". Without the auth_provider guard this test reds
+    # with the AD administrator DISABLED and its sessions revoked, audited as a bootstrap retirement
+    # -- the same lockout class #1245 exists to prevent, on a different row shape.
+    store = await _store()
+    try:
+        # Reachable because the bootstrap is minted only when the store is EMPTY: a directory-first
+        # install or a DR restore leaves the username free for the directory to claim.
+        await store.create_user(
+            user_id="ad-admin-row",
+            username="admin",
+            auth_provider=AuthProvider.AD.value,
+            display_name="Directory Administrator",
+            email=None,
+        )
+        service = AuthService(store, AuthSettings(bootstrap_expiry_hours=72))
+        # Starting the engine against a non-empty store seeds the built-in roles and runs the
+        # retirement pass, but mints NO bootstrap -- that is what leaves the username to the
+        # directory, and it is trigger :518 firing on this row before any login happens.
+        assert await service.initialize() is None
+        seeded = await store.get_user_by_username("admin")
+        assert seeded is not None
+        # POSITIVE CONTROL: the row really is in the shape that used to be protected by accident --
+        # no password, flag clear, no stamp. Without this, a green below could mean the fixture never
+        # built the interesting row rather than that the guard held.
+        assert seeded.auth_provider == AuthProvider.AD.value
+        assert seeded.password_hash is None
+        assert seeded.must_change_password is False
+        assert seeded.password_claimed_at is None
+
+        # Supersession: a second enabled administrator is the arm that fires without a time window.
+        await service.create_local_user(
+            username="alice",
+            password="another-long-passphrase",
+            display_name=None,
+            email=None,
+            roles=[Role.ADMINISTRATOR.value],
+            actor="system",
+        )
+        survivor = await store.get_user_by_username("admin")
+        assert survivor is not None and not survivor.disabled
+        # And the advisory warner must be silent about it too -- it asks the same question.
+        assert await service.bootstrap_expiry_warning(now=time.time() + 71 * 3600) is None
+    finally:
+        await store.close()
+
+
 async def test_unclaimed_bootstrap_is_still_retired_after_an_admin_reset() -> None:
     # The other half of #1245, and the reason the fix could not simply be a carve-out on the reset
     # path: an admin reset does not claim the account, so a bootstrap NOBODY ever claimed stays

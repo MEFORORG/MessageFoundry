@@ -597,6 +597,17 @@ class AuthService:
         boot = await self._store.get_user_by_username(BOOTSTRAP_USERNAME)
         if boot is None or boot.disabled or boot.password_claimed_at is not None:
             return None  # gone, already disabled, or claimed (a real account now)
+        # WP-3 governs the LOCAL first-run account and nothing else. This guard is not incidental to
+        # the claimed-ness fix, it is REQUIRED BY it: the retired ``must_change_password`` test
+        # excluded a directory-provisioned account BY ACCIDENT, because such a row has no password
+        # and so carries the flag False, and the old predicate returned early on exactly that. The
+        # recorded stamp does not reproduce that side effect -- a federated row has no stamp either,
+        # which reads as "never claimed" -- so replacing the flag without this line would newly
+        # auto-disable a real directory administrator who happens to be named ``admin``, revoking
+        # their sessions and auditing it as a bootstrap retirement. That is the same lockout class
+        # WP-3's own fix exists to prevent, re-opened on a different row shape.
+        if boot.auth_provider != AuthProvider.LOCAL.value:
+            return None
         return boot
 
     async def _retire_superseded_bootstrap(self, now: float | None = None) -> None:
