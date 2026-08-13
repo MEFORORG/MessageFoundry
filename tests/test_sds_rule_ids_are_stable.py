@@ -39,6 +39,7 @@ before it reaches this public repository.
 from __future__ import annotations
 
 import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -369,14 +370,35 @@ def _citation_sources() -> list[Path]:
     ``tests/`` is deliberately excluded: the self-bite fixtures below define synthetic identifiers
     (``SDS-9.1`` and friends) that name no real rule by design, and scanning them would make this guard
     fail on its own evidence.
+
+    NESTED ``CLAUDE.md`` FILES ARE INCLUDED, and the enumeration above is why they have to be named
+    explicitly. Root ``CLAUDE.md`` is a literal path and the globs are rooted at ``docs/``,
+    ``messagefoundry/`` and ``scripts/`` -- so a subpackage ``CLAUDE.md`` (which
+    ``CLAUDE.md`` section 3 invites) would be scanned only if it happened to land under one of those
+    three, and a relocated ``SDS-N.N`` citation would otherwise leave this guard's coverage SILENTLY.
+    There are none today; this is the prerequisite, not a response to one.
+
+    They are resolved through ``git ls-files`` rather than ``_REPO.rglob("CLAUDE.md")`` because this
+    repository nests worktrees under ``.claude/worktrees/`` -- an rglob would walk into sibling
+    checkouts and scan a different tree's file.
     """
+    tracked = subprocess.run(  # nosec B603 B607 - fixed argv, no shell, no caller-supplied executable
+        ["git", "-C", str(_REPO), "ls-files", "-z", "CLAUDE.md", "*/CLAUDE.md"],
+        encoding="utf-8",
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    nested = sorted(_REPO / rel for rel in tracked.split("\0") if rel)
     paths = [
         _REPO / "CLAUDE.md",
+        *nested,
         *sorted((_REPO / "docs").rglob("*.md")),
         *sorted((_REPO / "messagefoundry").rglob("*.py")),
         *sorted((_REPO / "scripts").rglob("*.py")),
     ]
-    return [p for p in paths if p.is_file()]
+    seen: set[Path] = set()
+    return [p for p in paths if p.is_file() and not (p in seen or seen.add(p))]
 
 
 def test_every_cited_id_resolves(rules: list[Rule], retired: list[Retired]) -> None:

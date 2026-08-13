@@ -214,7 +214,8 @@ jobs:
             tests/test_docs_runbooks.py tests/test_docs_security_pathways.py tests/test_security_doc_drift.py
             tests/test_security_doc_rate_limits.py tests/test_threat_model_doc_drift.py
             tests/test_backlog_status_check.py tests/test_sds_rule_ids_are_stable.py
-            tests/test_link_resolution.py tests/test_dast_claims.py"
+            tests/test_link_resolution.py tests/test_dast_claims.py
+            tests/test_claude_section_citations.py"
           # Every named module must EXIST. A path typo would otherwise make pytest error on an unknown
           # file, or — worse under a future -k/--ignore form — silently scan nothing and read as a pass.
           for m in $DOC_GUARDS; do
