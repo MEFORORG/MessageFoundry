@@ -99,9 +99,8 @@ def _executor(
     body: bytes = b"",
     status: int = 200,
     conn: dict | None = None,
-    require_structured: bool = False,
 ) -> tuple[FhirLookupExecutor, _FakeOpener]:
-    ex = FhirLookupExecutor(conn or _CONN, require_structured=require_structured)
+    ex = FhirLookupExecutor(conn or _CONN)
     opener = _FakeOpener(exc=exc, body=body, status=status)
     for name in ex.connections:  # swap the per-connection opener for the fake
         ex._opener[name] = opener  # type: ignore[attr-defined]
@@ -153,13 +152,15 @@ async def test_read_by_id_returns_resource() -> None:  # AC-1
     assert req.data is None  # GET-only: no body, structurally read-only
 
 
-async def test_search_returns_bundle() -> None:  # AC-2
+async def test_search_returns_bundle() -> None:  # AC-2 as amended 2026-08-13 (#1243)
+    # ADR 0043's AC-2 originally specified the flat "Patient?identifier=MRN|123" form and named this
+    # test as its evidence. #1243 removed that form; the ADR amendment supersedes AC-2 accordingly.
     ex, opener = _executor(body=SEARCHSET.encode())
-    res = await ex.read("epic", "Patient?identifier=MRN|123")
+    res = await ex.read("epic", "Patient", {"identifier": "MRN|123"})
     assert res["resourceType"] == "Bundle" and res["type"] == "searchset"
     req = opener.requests[0]
     assert req.get_method() == "GET"
-    assert req.full_url == f"{BASE}/Patient?identifier=MRN|123"
+    assert req.full_url == f"{BASE}/Patient?identifier=MRN%7C123"
 
 
 async def test_read_unknown_connection() -> None:  # AC-6 (unknown connection)
@@ -182,11 +183,39 @@ def test_resolve_read_url_by_id() -> None:
     assert _resolve_read_url(BASE, "Patient/123") == f"{BASE}/Patient/123"
 
 
-def test_resolve_read_url_search() -> None:
-    assert (
+def test_resolve_read_url_refuses_flat_query() -> None:  # #1243 limb A
+    # The flat '?'-query is GONE. It appended the caller's string with no encoding at all, so there is
+    # now exactly one search form and it is encoded by construction.
+    with pytest.raises(ValueError, match="not supported") as ei:
         _resolve_read_url(BASE, "Patient?identifier=MRN|123")
-        == f"{BASE}/Patient?identifier=MRN|123"
-    )
+    assert "MRN" not in str(ei.value)  # PHI-safe: names the shape, never the query's values
+
+
+def test_resolve_read_url_refuses_flat_query_even_when_clean() -> None:  # #1243 limb A
+    # A query carrying none of the three shapes the old screen rejected ('#', a second '?', a control
+    # char) is STILL refused -- the removal is unconditional, not a widened denylist.
+    with pytest.raises(ValueError, match="not supported"):
+        _resolve_read_url(BASE, "Patient?given=Ann&family=Lee")
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "../Patient?x=1",  # traversal + a query
+        "Patient/1/2?x=1",  # too many segments + a query
+        "Pat ient?x=1",  # bad type grammar + a query
+    ],
+)
+def test_path_gate_outranks_the_query_refusal(query: str) -> None:  # #1243 limb A
+    """A malformed PATH carrying a '?' must report the PATH defect, not the '?'-query refusal.
+
+    The `?` check sits after the grammar gates deliberately. Moving it earlier would be an easy and
+    invisible refactor: every one of these still raises ValueError, so a bare `pytest.raises(ValueError)`
+    would pass either way -- and a traversal attempt would then be reported as "pass params= instead",
+    masking the more dangerous condition behind the more cosmetic one. The `match=` clause below is
+    what makes this test discriminate, so it is mandatory rather than decorative."""
+    with pytest.raises(ValueError, match="resourceType is not a valid|path must be"):
+        _resolve_read_url(BASE, query)
 
 
 @pytest.mark.parametrize(
@@ -236,9 +265,10 @@ def test_resolve_read_url_empty_params_is_bare_search() -> None:  # #204 (a)
     assert _resolve_read_url(BASE, "Patient", {}) == f"{BASE}/Patient"
 
 
-def test_resolve_read_url_rejects_params_with_query_string() -> None:  # #204
-    # Mixing the structured params= form with a flat '?'-query is ambiguous → refused.
-    with pytest.raises(ValueError, match="not both"):
+def test_resolve_read_url_rejects_params_with_query_string() -> None:  # #204, #1243
+    # Was "ambiguous, pick one form"; since #1243 removed the flat form a '?' is refused outright,
+    # so this case is subsumed rather than special.
+    with pytest.raises(ValueError, match="not supported"):
         _resolve_read_url(BASE, "Patient?active=true", {"identifier": "MRN|123"})
 
 
@@ -274,63 +304,34 @@ async def test_read_flat_search_screen_rejects_injection_shapes(query: str) -> N
     assert len(opener.requests) == 0  # screened BEFORE any dial-out
 
 
-def test_flat_search_multi_param_still_verbatim() -> None:  # #204 (c) — no over-blocking
-    # A legitimate multi-param search (&/=/|) is NOT rejected — those are author-supplied FHIR
-    # separators; the flat form rides verbatim (per-value encoding is the author's duty).
-    url = _resolve_read_url(BASE, "Patient?given=Ann&family=Lee&identifier=MRN|9")
-    assert url == f"{BASE}/Patient?given=Ann&family=Lee&identifier=MRN|9"
+# --- 1.2.2 / #1243 limb A: there is exactly ONE search form, encoded by construction -----------
 
 
-# --- 1.2.2: [egress].fhir_require_structured_params refuses the flat '?'-query -----------------
+def test_read_by_id_unaffected_by_the_removal() -> None:  # #1243 limb A
+    # A read-by-id carries no '?' at all, so it never touched the flat path and is unchanged.
+    assert _resolve_read_url(BASE, "Patient/123") == f"{BASE}/Patient/123"
 
 
-def test_require_structured_rejects_flat_query() -> None:
-    # A CLEAN flat query (no control char / '#' / second '?') proves the raise fires BEFORE the
-    # defense-in-depth screen — the flat form is closed outright when the operator requires params=.
-    with pytest.raises(ValueError, match="fhir_require_structured_params") as ei:
-        _resolve_read_url(BASE, "Patient?identifier=MRN|123", require_structured=True)
-    assert "MRN" not in str(
-        ei.value
-    )  # PHI-safe: the message names the setting/shape, not the value
+def test_structured_params_are_the_only_search_form() -> None:  # #1243 limb A
+    # The safe form is untouched by the removal: values stay percent-encoded, structure preserved.
+    assert (
+        _resolve_read_url(BASE, "Patient", {"identifier": "MRN|123"})
+        == f"{BASE}/Patient?identifier=MRN%7C123"
+    )
 
 
-def test_require_structured_allows_params() -> None:
-    # The safe structured form still works when the flag is on.
-    url = _resolve_read_url(BASE, "Patient", {"identifier": "MRN|123"}, require_structured=True)
-    assert url == f"{BASE}/Patient?identifier=MRN%7C123"
-
-
-def test_require_structured_allows_read_by_id() -> None:
-    # A read-by-id has no '?' → never enters the flat-query block → unaffected by the flag.
-    assert _resolve_read_url(BASE, "Patient/123", require_structured=True) == f"{BASE}/Patient/123"
-
-
-def test_default_flat_query_still_rides() -> None:
-    # Byte-identical guard: require_structured defaulted off leaves the flat form verbatim.
-    url = _resolve_read_url(BASE, "Patient?given=Ann&identifier=MRN|9")
-    assert url == f"{BASE}/Patient?given=Ann&identifier=MRN|9"
-
-
-async def test_executor_require_structured_rejects_flat_read() -> None:
-    ex, opener = _executor(body=PATIENT.encode(), require_structured=True)
+async def test_executor_refuses_flat_read_before_dialling_out() -> None:  # #1243 limb A
+    ex, opener = _executor(body=PATIENT.encode())
     with pytest.raises(FhirLookupError):
         await ex.read("epic", "Patient?identifier=MRN|123")
     assert len(opener.requests) == 0  # refused before any dial-out
 
 
-async def test_executor_require_structured_allows_params_read() -> None:
-    ex, opener = _executor(body=SEARCHSET.encode(), require_structured=True)
+async def test_executor_params_read_still_works() -> None:  # #1243 limb A
+    ex, opener = _executor(body=SEARCHSET.encode())
     await ex.read("epic", "Patient", {"identifier": "MRN|123"})
     assert len(opener.requests) == 1
     assert opener.requests[0].full_url == f"{BASE}/Patient?identifier=MRN%7C123"
-
-
-async def test_executor_default_flat_read_unchanged() -> None:
-    # Byte-identical guard at the executor level: default False preserves the flat escape hatch.
-    ex, opener = _executor(body=PATIENT.encode())
-    await ex.read("epic", "Patient?identifier=MRN|123")
-    assert len(opener.requests) == 1
-    assert opener.requests[0].full_url == f"{BASE}/Patient?identifier=MRN|123"
 
 
 # --- error path is PHI- and secret-safe (AC-6) -------------------------------
@@ -340,7 +341,7 @@ async def test_error_is_phi_and_secret_safe_on_http_error() -> None:  # AC-6
     # A 404/500 names only the connection + redacted host + status — never the query values or a body.
     ex, _ = _executor(exc=_http_error(404, body=b'{"resourceType":"OperationOutcome"}'))
     with pytest.raises(FhirLookupError) as ei:
-        await ex.read("epic", "Patient?identifier=SSN|000-00-0000")
+        await ex.read("epic", "Patient", {"identifier": "SSN|000-00-0000"})
     msg = str(ei.value)
     assert "epic" in msg and "404" in msg
     assert "000-00-0000" not in msg  # the query value never reaches the error
@@ -532,7 +533,7 @@ def _reg_with_fhir_handler(fn: Any) -> Registry:
 
 def test_dry_run_raises_when_handler_calls_fhir_lookup() -> None:  # AC-3 (dry-run)
     def handler(msg: Any) -> None:
-        fhir_lookup("epic", f"Patient?identifier=MRN|{msg['PID-3.1']}")
+        fhir_lookup("epic", "Patient", {"identifier": f"MRN|{msg['PID-3.1']}"})
         return None
 
     reg = _reg_with_fhir_handler(handler)
@@ -580,7 +581,7 @@ async def test_fhir_lookup_over_length_read_url_is_refused() -> None:
     `pytest.raises(FhirLookupError)` would pass either way and prove nothing."""
     ex, opener = _executor()
     with pytest.raises(FhirLookupError, match="over the 8192-char limit"):
-        await ex.read("epic", "Patient?name=" + "a" * 9000)
+        await ex.read("epic", "Patient", {"name": "a" * 9000})
     assert opener.requests == [], "the over-length request must never reach the opener"
 
 

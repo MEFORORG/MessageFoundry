@@ -2546,14 +2546,6 @@ class EgressSettings(_Section):
     # startup advisory. Default false = the per-list opt-in behavior above (empty = unrestricted).
     deny_by_default: bool = False
 
-    # 1.2.2 (ASPIRATIONAL, ASVS 1.2.2): require the per-value-encoded structured params= form for every
-    # fhir_lookup search. When true, the author-encoded flat '?'-query escape hatch is REFUSED (raised in
-    # FhirLookupExecutor._resolve_read_url before the defense-in-depth screen) so a search value can never
-    # smuggle an extra FHIR search parameter. Default false keeps the flat form (byte-identical to today);
-    # a read-by-id and the structured params= form are unaffected either way.
-    # Env: MEFOR_EGRESS_FHIR_REQUIRE_STRUCTURED_PARAMS.
-    fhir_require_structured_params: bool = False
-
     @field_validator(
         "allowed_mllp",
         "allowed_tcp",
