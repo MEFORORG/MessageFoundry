@@ -189,6 +189,10 @@ messagefoundry/
   api/             # FastAPI app.py + models.py + security.py (auth deps) + auth_routes.py (the engine's only external surface)
   apiclient/       # Qt-free / FastAPI-free engine-client library (ADR 0088) — the shared HTTP client (httpx)
   generators/      # conformant synthetic HL7 generators (adt.py, …) — `messagefoundry generate`; corpus git-ignored
+  security/        # security assets shipped in the wheel (ADR 0144)
+  support/         # support-bundle assembly + redaction (bundle.py, redact.py)
+  verify/          # deployment verifier — `messagefoundry verify` (checks.py, smoke.py, federation.py)
+  tray/            # Windows tray service-manager (ADR 0113) — stdlib ctypes, no PySide6; wraps service/service_status only
   checks.py        # `messagefoundry check` commit/CI gate (validate + dryrun + advisory lint)
 ide/               # VS Code extension (TypeScript): setup, promote, test bench, AI commands
 environments/      # per-environment <env>.toml value files for env() lookups (dev/staging/prod)
