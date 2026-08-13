@@ -9,7 +9,8 @@ occupancy of zero for a tree in active use. None of them raised.
 checkout passes with the bug still in: cwd and script root are the same directory, so the two candidate
 answers are indistinguishable. The case that can tell them apart is an absolute ``-File`` invocation whose
 cwd is a DIFFERENT checkout that also carries the file the script writes -- which is the ordinary shape on
-a clone carrying dozens of worktrees, and is measured at 29% of writes on this repo. Per BACKLOG #1000 a
+a clone carrying dozens of worktrees, and is measured at 29% of the writes made by sessions sitting in
+the primary. Per BACKLOG #1000 a
 control needs the case that can distinguish; a test run from inside the target proves nothing.
 
 The static spelling guards below are deliberately paired with a behavioural test each. On their own they

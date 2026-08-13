@@ -55,7 +55,8 @@
     WHAT THE FENCE CANNOT SEE (printed on every run, because a fence believed to be wider than it is
     is worse than no fence):
       * a session that writes into this worktree BY ABSOLUTE PATH from somewhere else -- measured on
-        this repo, 29% of writes come from a session sitting in the primary and land in a sibling.
+        this repo, 29% of the writes made by sessions sitting in the primary land in a sibling. That
+        is a share of those sessions' own writes, not of every write in the repo.
         Measured again 2026-07-30: 5 live sessions, 9 worktrees, and signal 1 vetoed NONE of the four
         `<primary>-<slug>` siblings, including one a session was demonstrably building in. Signal 2 is
         what stood between that session and this script;
@@ -676,7 +677,7 @@ $liveInRepo = @($occ.Sessions | Where-Object { Test-OccupancyVeto $_.State }).Co
 $fenceVetoedAtDecision = @($decisions | Where-Object { $_.Occupants.Count -gt 0 }).Count
 $fenceVetoed = $fenceVetoedAtDecision
 $blindSpots = @(
-    'a session writing into a worktree by absolute path from elsewhere (29% of writes on this repo)',
+    'a session writing into a worktree by absolute path from elsewhere (29% of the writes by primary-seated sessions, measured on this repo)',
     'a cwd recorded as a UNC or 8.3 short path',
     'a session that never registered',
     'a session that only edits files and runs no git command (invisible to signal 2 as well)'
