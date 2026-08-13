@@ -147,6 +147,7 @@ from messagefoundry.store.store import (
     delivery_key,
     not_deployed_detail,
     owned_lane_scope,
+    password_claim_set,
     should_record_event,
 )
 
@@ -529,7 +530,8 @@ _SCHEMA: list[str] = [
         totp_recovery_codes  TEXT,
         last_totp_step       INTEGER,
         oidc_issuer          TEXT,
-        oidc_subject         TEXT
+        oidc_subject         TEXT,
+        password_claimed_at  DOUBLE PRECISION
     )""",
     """CREATE TABLE IF NOT EXISTS roles (
         id           TEXT PRIMARY KEY,
@@ -653,7 +655,10 @@ _SCHEMA: list[str] = [
 # Bump when _migrate_lease_columns (the open-path migration code OUTSIDE _SCHEMA) changes behavior:
 # unlike _SCHEMA edits — which change _schema_hash automatically — the migration function's Python
 # body is invisible to the content hash, so this constant is its stand-in in the hash input.
-_MIGRATION_REV = 1
+# 2 (BACKLOG #1245): the users.password_claimed_at ADD + its one-time backfill live in
+# _migrate_lease_columns, so without this bump an already-open DB takes the schema_meta fast path and
+# never gains the column — every user read would then raise on the hard-subscript decode.
+_MIGRATION_REV = 2
 
 
 def _schema_hash() -> str:
@@ -1095,6 +1100,19 @@ class PostgresStore:
         ):
             if column not in users_cols:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
+        # Claimed-ness of the bootstrap admin (BACKLOG #1245): NULL on an existing row would read as
+        # "never claimed", which is what would retire an account whose holder claimed it long ago —
+        # this defect, re-introduced by its own fix. So the ADD is paired with a one-time backfill:
+        # a local account not flagged must_change_password already rotated its own credential, and
+        # password_changed_at is when. The backfill MUST stay inside this creation guard. Hoisted out
+        # it becomes a permanent SECOND WRITER of the column, and single-writer monotonicity is the
+        # entire point — a second writer is exactly the defect #1245 documents.
+        if "password_claimed_at" not in users_cols:
+            await conn.execute("ALTER TABLE users ADD COLUMN password_claimed_at DOUBLE PRECISION")
+            await conn.execute(
+                "UPDATE users SET password_claimed_at = password_changed_at"
+                " WHERE must_change_password = FALSE AND password_hash IS NOT NULL"
+            )
         sessions_has_mfa = await conn.fetch(
             "SELECT 1 FROM information_schema.columns"
             " WHERE table_name='sessions' AND column_name='mfa_verified_at'"
@@ -6184,8 +6202,11 @@ class PostgresStore:
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
+        # $2 is already `now`, so the claim term reuses it and the argument list is unchanged.
+        claim_set = password_claim_set(must_change_password, "$2")
         await self._execute(
             "UPDATE users SET password_hash=$1, password_changed_at=$2, must_change_password=$3,"
+            f"{claim_set}"
             " failed_attempts=0, locked_until=NULL, updated_at=$2 WHERE id=$4",
             password_hash,
             now,
