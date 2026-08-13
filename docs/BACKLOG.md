@@ -8290,3 +8290,26 @@ every worker session's handoff, which is the sentence the next session bases its
 **Relationship to the ASVS cell.** ASVS 5.3.2 holds at `partial`. This is a **build item, not a rescore** -- the verdict is the assessor's and the vault scorecard is the record of record. Do not cite this item as evidence of a verdict move.
 
 **Source:** split from #1130's research pass, 2026-08-12/13; owner ruling recorded 2026-08-13. Open and **not** settled by this item: whether a syntactic check meets the verb's "strict validation and sanitization" language. The 6.1.1 adjudication did not settle it (the control-property reading was refuted 4 of 4), so it inherits no general ruling and stays open on #1130.
+
+## 1239. `fhir.py` carries two identical control-char predicates behind different wrappers -- a latent drift, not a current divergence
+
+> 🔢 **Filed 2026-08-13 - not started. READ THE FRAMING BEFORE ACTING: the two predicates are byte-identical TODAY. This item records a LATENT hazard, not a live defect, and it must not be cited as evidence of a current gap.** Value **3/10** · Difficulty **2/10**. Noticed during #1107's ASVS 1.2.2 surface enumeration.
+
+**Cluster:** Code quality / drift hazard. **Priority:** P3. **Verdict:** build (small).
+**Severity:** none today. There is no behavioural difference to exploit and nothing is mis-screened. The cost is future-tense and conditional: a later hardening applied to one predicate would silently not apply to the other.
+
+**What is there.** `messagefoundry/transports/fhir.py` defines two control-character predicates whose test expressions are **identical**:
+- `:166` `def _reject_control_chars(value: str, field: str) -> str:` -- raises a permanent, PHI-safe `NegativeAckError` naming only the field. Used on the **path** context (`:424`, `:463`).
+- `:658` `def _has_control_char(text: str) -> bool:` -- returns a bool. Used on the **flat query** context (`:739` on the raw string, `:748` on the percent-decoded string).
+
+Both compute `any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in ...)`.
+
+**Why this is NOT filed as a duplication defect.** The differing wrappers are appropriate: a raise suits the path context (the delivery is classified permanent), a bool suits the query context (the caller raises `ValueError` with its own message). Applying them to different inputs is also deliberate and good -- the query path deliberately screens **both** the raw string and the percent-decoded one, which a single call could not do. **Do not "fix" this by collapsing the two wrappers.**
+
+**The actual hazard, stated conditionally.** The shared thing is the *predicate*, and it is written out twice. A future widening -- C1 controls (U+0080-U+009F), Unicode line separators (U+2028/U+2029), or a bidi-override class -- applied to one site would leave the other screening the older, narrower set, with nothing in the tree comparing them. The fix is to extract the predicate once and have both wrappers call it, keeping the wrappers exactly as they are.
+
+**What would NOT be an honest fix.** Collapsing the two call sites into one helper with a flag, or changing where either is applied. The wrappers and their application points are correct; only the duplicated expression is at issue.
+
+**Test.** Assert the two predicates agree across a shared character corpus, so a future widening of one without the other fails. That test is the durable control here and is worth more than the extraction itself.
+
+**Source:** observed during #1107's dynamic-URL surface enumeration, 2026-08-13, while establishing that `fhir.py` context-encodes the path and structured-query contexts but not the flat-query one. Recorded because "two hand-rolled treatments of one threat class in one file" is a drift shape worth tracking -- **and recorded with its current-identity measured**, so a later reader does not mistake it for a live divergence.
