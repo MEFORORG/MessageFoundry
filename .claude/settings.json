@@ -1,0 +1,93 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(*ruff.exe *)",
+      "PowerShell(*mypy.exe *)",
+      "PowerShell(Select-Object *)",
+      "PowerShell(git checkout main 2>&1)",
+      "PowerShell(git pull --ff-only 2>&1)"
+    ],
+    "deny": [
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(secrets/**)",
+      "Read(*.key)",
+      "Read(*.pem)",
+      "Read(*.pfx)",
+      "Read(*.db)",
+      "Read(*.db-wal)",
+      "Read(*.db-shm)",
+      "Read(bootstrap-admin.txt)",
+      "Edit(.env)",
+      "Edit(.env.*)",
+      "Edit(secrets/**)",
+      "Edit(*.db)",
+      "Write(.env)",
+      "Write(secrets/**)",
+      "PowerShell(Get-Content *.env*)",
+      "PowerShell(Get-Content *secrets*)",
+      "PowerShell(Get-Content *.db*)",
+      "Bash(rm -rf:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git reset --hard:*)",
+      "PowerShell(Remove-Item -Recurse -Force:*)",
+      "PowerShell(git push --force:*)",
+      "PowerShell(git push -f:*)",
+      "PowerShell(git reset --hard:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(git *)",
+            "command": "pwsh",
+            "args": [
+              "-NoProfile",
+              "-File",
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/block-blanket-git-stage.ps1"
+            ],
+            "timeout": 20,
+            "statusMessage": "Checking git staging"
+          }
+        ]
+      },
+      {
+        "matcher": "PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "PowerShell(git *)",
+            "command": "pwsh",
+            "args": [
+              "-NoProfile",
+              "-File",
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/block-blanket-git-stage.ps1"
+            ],
+            "timeout": 20,
+            "statusMessage": "Checking git staging"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh",
+            "args": [
+              "-NoProfile",
+              "-File",
+              "${CLAUDE_PROJECT_DIR}/scripts/worktree/session-context.ps1"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

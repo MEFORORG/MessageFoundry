@@ -35,13 +35,27 @@ _ROOT = Path(__file__).resolve().parents[1]
 # The private-path rules, verbatim from .gitignore's publishing-boundary block, each with a probe
 # path that must fall under it. Pinned deliberately — see the module docstring.
 _PRIVATE_PATHS: list[tuple[str, str]] = [
-    ("/.claude/", ".claude/probe-327.md"),
+    ("/.claude/*", ".claude/probe-327.md"),
     ("/TRANSCRIPTS.md", "TRANSCRIPTS.md"),
     ("/docs/security/", "docs/security/probe-327.md"),
     ("/docs/reviews/", "docs/reviews/probe-327.md"),
     ("/docs/marketing/", "docs/marketing/probe-327.md"),
     ("/docs/CI-TOPOLOGY.md", "docs/CI-TOPOLOGY.md"),
 ]
+
+# The ONE negated path in the block, and the only tracked file any private rule may cover.
+#
+# `/.claude/` became `/.claude/*` plus `!/.claude/settings.json` so the enforced controls -- the
+# deny-list and the `block-blanket-git-stage` PreToolUse guard -- reach a fresh clone and every
+# `git worktree add`, which deliver tracked files only. Before that, this repo's own #327 note
+# recorded the guard as one that "does not actually travel" and said not to count it as coverage.
+#
+# This is an exact SET, not a floor. Adding a second negation to the block -- `.claude/rules/`,
+# `.claude/skills/`, an agent definition, anything -- fails here until someone writes it down, and
+# `.claude/worktrees/` reaching this set would publish full nested checkouts.
+_TRACKED_EXCEPTIONS: dict[str, frozenset[str]] = {
+    "/.claude/*": frozenset({".claude/settings.json"}),
+}
 
 
 def _git(*args: str) -> subprocess.CompletedProcess[str]:
@@ -73,14 +87,22 @@ def test_nothing_under_a_private_path_is_tracked(rule: str, probe: str) -> None:
     Git does not ignore a file it is already tracking, so a path committed before its rule landed
     stays tracked forever and `check-ignore` will still cheerfully report it as ignored. Ignoring and
     not-publishing are different properties; this asserts the second one.
+
+    Asserted as an exact SET against `_TRACKED_EXCEPTIONS`, which is empty for every rule but the
+    `.claude/` one. A floor ("at least these are absent") would pass while a new negation quietly
+    published a second file; the set makes each addition a deliberate, reviewed edit.
     """
-    pathspec = rule.lstrip("/")
+    pathspec = rule.rstrip("*").lstrip("/")
     res = _git("ls-files", "--", pathspec)
-    tracked = [ln for ln in res.stdout.splitlines() if ln.strip()]
-    assert not tracked, (
-        f"{len(tracked)} file(s) under the private rule {rule!r} are TRACKED and would publish:\n  "
-        + "\n  ".join(tracked[:10])
-        + "\nThey are ignored in name only — git does not ignore what it already tracks."
+    tracked = {ln for ln in res.stdout.splitlines() if ln.strip()}
+    expected = _TRACKED_EXCEPTIONS.get(rule, frozenset())
+    assert tracked == expected, (
+        f"the tracked set under the private rule {rule!r} is not what _TRACKED_EXCEPTIONS pins.\n"
+        f"  expected: {sorted(expected) or '(nothing)'}\n"
+        f"  actual:   {sorted(tracked) or '(nothing)'}\n"
+        "A file that appears here publishes. A file that disappears means a control stopped "
+        "travelling to fresh clones and worktrees. Either way, update this pin in the SAME commit "
+        "or revert the change -- git does not ignore what it already tracks."
     )
 
 
@@ -96,3 +118,37 @@ def test_the_pinned_list_has_not_silently_shrunk() -> None:
         "fine — raise this number in the same commit. Removing one means the publishing boundary "
         "narrowed, which is a decision, not a cleanup."
     )
+
+
+def test_the_negation_re_includes_exactly_one_file() -> None:
+    """The `!` line is load-bearing on a public repo, and it is one character from being a no-op.
+
+    Written as `/.claude/` the directory itself would be excluded, and git cannot re-include a file
+    whose parent directory is excluded — the negation would parse fine, apply to nothing, and leave
+    `settings.json` untracked with no error anywhere. The contents form `/.claude/*` is what makes it
+    work, so the asymmetry is asserted rather than assumed: one path un-ignored, its siblings not.
+
+    The siblings matter beyond hygiene. `rules/`, `skills/` and `agents/` are the directories a
+    future session is most likely to reach for, and each would reach exactly one checkout while
+    looking repo-wide — the same delivery failure this whole block exists to close.
+    """
+    negated = _git("check-ignore", "-q", "--no-index", ".claude/settings.json")
+    assert negated.returncode != 0, (
+        "`.claude/settings.json` is IGNORED — the `!/.claude/settings.json` negation is not taking "
+        "effect. Check that the rule above it is `/.claude/*` and not `/.claude/`: a negation cannot "
+        "re-include a file whose parent directory is excluded, and it fails silently when it can't."
+    )
+
+    for sibling in (
+        ".claude/settings.local.json",
+        ".claude/worktrees/probe-327/CLAUDE.md",
+        ".claude/rules/probe-327.md",
+        ".claude/skills/probe-327/SKILL.md",
+        ".claude/agents/probe-327.md",
+    ):
+        res = _git("check-ignore", "-q", "--no-index", sibling)
+        assert res.returncode == 0, (
+            f"{sibling!r} is NOT ignored. The negation is meant to cover `settings.json` alone; a "
+            "second `!` line publishes session state or machine-local config. If this path is now "
+            "meant to travel, pin it in _TRACKED_EXCEPTIONS and say why in .gitignore."
+        )
