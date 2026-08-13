@@ -7802,6 +7802,19 @@ only to dismiss it as a control for time dilation - correct about dilation, sile
 CPU does"; an independent verification pass sharpened it to the above and corrected the remedy - the
 gate is the wrong shape, validation of the walk is the right one.
 ## 1211. `empty_claims_per_msg` is not contention-immune: the ratio form excursions past its own SLO band on a hosted runner
+>
+> ⚠️ **SECOND AND THIRD OCCURRENCES RECORDED 2026-08-13 -- the item said a recurrence gets evidence rather than another re-run, so here it is.** Both on `windows-2025`, both the same test and the same SLO, hours apart on unrelated changes:
+>
+> ```
+> PR #343  fixed_per_conn@N=24: 36   < prior 48.4 * 0.75 (= 36.30)   short by 0.30
+> PR #355  fixed_per_conn@N=24: 34.9 < prior 48.2 * 0.75 (= 36.15)   short by 1.25
+> ```
+>
+> **Neither change could reach this subsystem.** #343 touched `scripts/hooks/worktree_gate.ps1` and three gate test files; #355 touched a docs guard, its tests, `ci.yml` and four lines of `CLAUDE.md`. **Zero overlap with connscale, the store, or the pipeline in either case.**
+>
+> **THE MARGIN IS SHRINKING, AND THAT IS THE NEW INFORMATION.** The first excursion missed the band by **0.30**; the second by **1.25**, against a `prior` that barely moved (48.4 -> 48.2). A ratio drifting further outside its band across independent runs is a different signal from a single excursion, and it is what this item was left open to catch.
+>
+> **Also measured, and it argues against "the runner got slower":** the suite grew from **11,961** to **12,025** passing tests between the two runs, and the second failure took **40:46** against a 55:00 cap -- so the leg had headroom and was not being killed. The failure is the SLO, not the clock.
 
 > 🔢 **Filed 2026-08-10 -- measured, with the confirming re-run recorded before it ran.** Value **5/10** · Difficulty **3/10** · _fill-in_. `_empty_claims_per_msg` (`harness/load/connscale/runner.py`) is `Δempty_claims / Δread` over the same first-to-last window, and its docstring states the design claim in terms: *"both inputs are Δ/span over the SAME first->last in-hold samples, so span cancels ... that is why it survives runner contention: slowing the run scales numerator and denominator identically."* **That claim is measured FALSE on a GitHub hosted runner.** On PR #311 the `empty_claims_monotonic` SLO failed on windows-2025 at `fixed_per_conn@N=24: 33.7 < prior 46.8 * 0.75` -- an excursion of roughly 28% against a +/-25% band -- and a re-run of the IDENTICAL commit went green.
 
