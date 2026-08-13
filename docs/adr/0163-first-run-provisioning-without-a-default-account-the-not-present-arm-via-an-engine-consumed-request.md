@@ -114,10 +114,27 @@ engineering details. They are recorded here as open questions, not as solved pro
    review: lockout is modelled as `locked_until`, **not** `disabled` (`auth/service.py:761-769`), so
    a locked-out sole administrator still satisfies "an enabled administrator exists" and any intake
    gated on that predicate never runs — the recovery case it was chosen to serve.
-3. **What does ASVS 6.4.5 become?** This change deletes its entire implementation — both arms and
-   seven tests — because no engine-issued credential remains to carry an expiry. 6.4.5 must be
-   re-scored **with** 6.3.2, never after: re-scoring one and not the other records an improvement
-   bought by deleting the evidence.
+3. **What does ASVS 6.4.5 become?** It must be re-scored **with** 6.3.2, never after — but the
+   coupling is *narrower* than the first draft of this ADR claimed, and the correction matters
+   because overstating it inflates the apparent cost of a sound change.
+
+   **What dies:** the bootstrap-side half. `bootstrap_expiry_hours` and `bootstrap_warn_hours`, the
+   pre-retirement reminder, and the seven tests in `tests/test_auth_service.py` that exercise them
+   (headers at `:151` and `:177`). Three of the cell's six evidence anchors go with them.
+
+   **What survives, by explicit construction:** the admin-issued initial/reset credential expiry at
+   `auth/service.py:694-701`, keyed on `initial_password_expiry_hours`. The conjunct
+   `username != BOOTSTRAP_USERNAME` at `:696` is a **carve-out excluding the bootstrap, not a
+   dependency on it** — the comment at `:691-693` says so in terms. Deleting the bootstrap removes
+   the *reason for the carve-out*, so that condition gets **simpler**, not absent, and every
+   non-bootstrap `must_change_password` user still expires exactly as before. No behaviour change.
+   The remaining three anchors survive with it.
+
+   So the re-score is not a re-derivation from nothing: 6.4.5 is re-derived **on its surviving arm**
+   and may well hold at its current verdict for a reason it already carries. What forces the
+   coupling is that half its evidence dies and its residual's claim that the bootstrap arm is
+   covered becomes false the moment this lands. Re-scoring 6.3.2 alone would bank an improvement
+   while silently voiding three anchors on a neighbouring cell.
 4. **What replaces the HIPAA emergency-access mapping** that currently rests on the bootstrap
    credential?
 
@@ -141,6 +158,15 @@ an operator a launch creates a bootstrap admin **at the moment it asks for conse
 pinning one of those sentences, and [ADR 0110](0110-vs-code-extension-engine-lifecycle.md) §5; and
 roughly a dozen documentation files, several read from disk by doc-drift tests so they must land in
 the same change or CI reds.
+
+**Evidence anchors on `config/settings.py` are close to their tolerance, and this change touches that
+file.** The three anchors covering these two cells have each drifted **+31 lines** —
+`bootstrap_expiry_hours` 1772 to 1803, `initial_password_expiry_hours` 1784 to 1815,
+`bootstrap_warn_hours` 1777 to 1808. All three still resolve, because each expect string is unique
+and the recorded line is advisory within a plus-or-minus-40 window — but 31 of that window is already
+spent. A change moving `settings.py` by another ten lines pushes them past it. **Do not repair them
+piecemeal:** two of the three are deleted by this work anyway, so they belong in the coupled
+re-score, not in a separate anchor-refresh pass.
 
 **Engine sharding interacts.** Under [ADR 0063](0063-no-split-store-unified-store-for-sharding.md) a
 multi-shard fleet shares **one** store, and every shard is a full `serve` subprocess running the
