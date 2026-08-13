@@ -8566,3 +8566,25 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > **BOUND.** The absence of all four mechanisms is verified by reading `install-gate.ps1` and the hooks directory at `c2241cfe`. **What is NOT established is that `install-gate.ps1` performed this particular write at all** -- no `.bak` appeared beside the gate, which is consistent with the installer (it writes none for the script) but also consistent with some other process copying the file. **The writer remains unknown and this item does not claim otherwise**; it says only that had the sanctioned installer been used, it would have left nothing either.
 
 **Cluster:** Developer tooling / process safety. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- this governs a developer-machine hook, not shipped engine code; the cost is that a change to a shared safety control **would** be undetectable and unattributable, as it was here.
+
+## 1248. the federated identity binding is written with no audit row and no security notification, twenty lines above a role resync that emits both
+
+> 🔢 **Filed 2026-08-13 -- a real defect TODAY, split out of #1143's research so it does not wait on an unresolved design question.** Value **7/10** -- Difficulty **2/10**. Binding a local account to an external identity is the single most takeover-relevant fact that can be written to that account: after it, whoever controls the IdP subject controls the account. `_upsert_ad_user` writes it **silently** -- no audit row, no `_notify_security` -- and the **role resync twenty lines below emits both**.
+
+> **MEASURED at `2d11dacc`, from the state end rather than by name.** In `messagefoundry/auth/service.py`:
+> ```
+> :1109 :1114 :1119 :1120   the federated-binding writes
+> :1130                     the nearest _audit(...)          -- BELOW them, belongs to the role resync
+> :1139                     _notify_security(...)            -- BELOW them, same
+> ```
+> The audit and the notification that follow are the **resync's**, not the binding's. The binding itself emits neither.
+
+> **THE ADJACENCY IS THE ARGUMENT, and it is why this is a defect rather than a design choice.** This is not a codebase that forgot accounts can be notified: the author wrote both an audit row and a security notification **into the same function, twenty lines further down, for a strictly less sensitive event**. A role resync changes what an account may do; a federated binding changes *who the account is*. The lower-stakes event is instrumented and the higher-stakes one is not, in one continuous block of code. Whatever the reason, it is not that the mechanism was unavailable or unknown to the author.
+
+> **WHY IT IS FILED ALONE and must not be folded into #1143.** #1143's research pass concluded **hold at partial** and left its central ceremony question **explicitly unsettled** -- the proposed design was refuted, and a whole option family had been eliminated on a false premise. This finding is **independent of every one of those open questions**: it is true regardless of how the binding is eventually keyed, whether a TOFU ceremony is adopted, and whether a uniqueness constraint is added. Leaving it inside #1143 would make a defect that is real *today* hostage to a design decision that may take several passes.
+
+> **WHAT A FIX LOOKS LIKE, and the shape is already in the file.** Emit an audit row and a `_notify_security` on the binding write, using the resync's own calls twenty lines below as the pattern -- same function, same helpers, same call shape. **The account holder is the party who can recognise an unexpected binding**, and today they are the only party told nothing. Difficulty is 2/10 because the mechanism, the helpers and the precedent are all already present at the call site.
+
+> **BOUND.** The line numbers and the absence are verified at `2d11dacc` by locating every `_audit` and `_notify_security` call in the enclosing region and comparing their positions to the binding writes -- not by reading the function narratively, which is how an absence twenty lines from a presence gets missed. **NOT established here:** whether any *other* surface (a store-layer trigger, a middleware, an alert sink) records the binding independently. A reviewer should confirm that before sizing the fix, because a second recorder would change this from "unrecorded" to "not recorded *here*".
+
+**Cluster:** Authentication / federation / audit. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- zero instances; on first deployment a federated binding **would** be written to an account with nothing recorded and nobody told, so an unexpected binding **would** be invisible to the one party able to recognise it.
