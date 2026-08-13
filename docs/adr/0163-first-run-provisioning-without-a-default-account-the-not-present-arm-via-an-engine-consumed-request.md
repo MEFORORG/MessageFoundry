@@ -159,14 +159,19 @@ pinning one of those sentences, and [ADR 0110](0110-vs-code-extension-engine-lif
 roughly a dozen documentation files, several read from disk by doc-drift tests so they must land in
 the same change or CI reds.
 
-**Evidence anchors on `config/settings.py` are close to their tolerance, and this change touches that
-file.** The three anchors covering these two cells have each drifted **+31 lines** —
+**Evidence anchors on `config/settings.py` carry stale line numbers, and there is no deadline on
+fixing them.** The three anchors covering these two cells have each drifted **+31 lines** —
 `bootstrap_expiry_hours` 1772 to 1803, `initial_password_expiry_hours` 1784 to 1815,
-`bootstrap_warn_hours` 1777 to 1808. All three still resolve, because each expect string is unique
-and the recorded line is advisory within a plus-or-minus-40 window — but 31 of that window is already
-spent. A change moving `settings.py` by another ten lines pushes them past it. **Do not repair them
-piecemeal:** two of the three are deleted by this work anyway, so they belong in the coupled
-re-score, not in a separate anchor-refresh pass.
+`bootstrap_warn_hours` 1777 to 1808. All three still resolve, and will continue to however far the
+file moves: `ANCHOR_WINDOW` was **retired 2026-08-09** (`scripts/asvs/scorecard.py:107-125`). There is
+no tolerance to spend. Uniqueness locates the evidence and the recorded line is reported output that
+an advisory corrects — a wrong line is not a failure. **Do not repair them piecemeal:** two of the
+three are deleted by this work anyway, so they belong in the coupled re-score.
+
+*(An earlier revision of this ADR asserted a plus-or-minus-40 window with "31 of it spent" and a
+cliff ten lines away. That was false — the window does not exist — and it is recorded here rather
+than silently removed, because the failure mode is worth more than the fact: a specific figure
+attached to an unverified mechanism reads as verified, and it converts a tidy-up into a deadline.)*
 
 **Engine sharding interacts.** Under [ADR 0063](0063-no-split-store-unified-store-for-sharding.md) a
 multi-shard fleet shares **one** store, and every shard is a full `serve` subprocess running the
