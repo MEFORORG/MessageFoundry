@@ -8538,3 +8538,31 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > **SCOPE AND BOUND.** The 1,965/248 figures are a regex count of `path.ext:NNN` shapes in the `residual` field of the published scorecard (`e0677451`), so they are an **upper bound on citations** and say nothing about how many have drifted -- that is unmeasured and deliberately not claimed here. The 7.2.4 evidence is verified at `2d11dacc`: the seven stamp sites and their enclosing functions were read, and `_rotate_session_token` (`auth/service.py:1501`) has **no caller outside its own definition and `tests/test_session_rotation_primitive.py`**, so the rotation machinery is genuinely unwired. **NOT yet established:** whether `:2047`, `:2330` and `:2463` are each a *genuine* elevation the verb covers, or in part re-stamps on an already-elevated session. That determination is in flight in the #1146 lane and **7.2.4 must not be re-scoped on the count alone**.
 
 **Cluster:** Security record / ASVS method. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- this is a defect in the assessment record, not in shipped code; its cost is that a reader **would** treat an enumerated gap as the whole surface and ship a partial fix believing it complete.
+
+## 1247. installing the machine-global worktree gate leaves no record: no backup, no receipt, no log line, and Copy-Item preserves the source mtime
+
+> 🔢 **Filed 2026-08-13 -- found the hard way. The installed gate's CONTENT changed on this box while three sessions were running against it, and after all three looked, NOBODY CAN SAY WHO WROTE IT.** Value **6/10** -- Difficulty **3/10**. The change itself was benign and correct -- it moved the gate FORWARD, from `590b68f6` to `dd90232e` -- so this is a governance defect, not an incident. An unattributable write to a shared safety control is the same class of event whether it upgrades or downgrades; only the outcome differed.
+
+> **FOUR MECHANISMS COULD HAVE RECORDED IT. NONE IS PRESENT.** `scripts/worktree/install-gate.ps1:420` is a bare copy:
+> ```powershell
+> Copy-Item -LiteralPath (Join-Path $RepoRoot "scripts\hooks\worktree_gate.ps1") -Destination $GateDst -Force
+> ```
+> - **No backup.** Nothing preserves the bytes being overwritten. (`:162` *does* write a `.bak`, but that is inside the settings-JSON writer and never touches the gate script -- a near-miss that makes the absence easy to misread as present.)
+> - **No receipt.** `install-gate.ps1` contains **zero** occurrences of the string `receipt`.
+> - **No log line.** `~/.claude/hooks/worktree-gate.log` records gate DECISIONS, not installs: zero lines matching `install|copy|wrote|updated`.
+> - **No usable timestamp.** `Copy-Item` carries the SOURCE file's `LastWriteTime`, so the installed copy inherits an mtime from whichever checkout it came from. **The installed file read `2026-08-12 13:55:22` while its content had demonstrably changed after that instant.**
+
+> **THE MTIME IS WORSE THAN MISSING -- IT IS ACTIVELY MISLEADING, and it cost a true finding.** A stale-gate report was filed correctly, then **RETRACTED** on the strength of that timestamp ("nothing wrote it today"), and the retraction propagated to three sessions and the owner before a builder's *baseline hash* reproved the original claim. An absent record makes people say "unknown"; a **wrong** record makes them say something false with confidence. Anything that fixes this must not simply add a field -- it must stop the timestamp from reading as evidence.
+
+> **HOW THE WRITE WAS EVENTUALLY BOUNDED, since the technique is the only thing that worked.** Not from the file, which carries no history, but from a **record of the past taken before the change**: one session's pre-change test output printed the installed hash in two forms, and both resolve to the same commit --
+> ```
+> 590b68f6   LF = 13a6af15705e     CRLF = 24c511ff75a0      <- both printed at that session's baseline
+> dd90232e   LF = 937eaa397e41     CRLF = 4bd81a4df095      <- installed afterwards, and now
+> ```
+> A **re-measurement can never distinguish "my instrument was wrong" from "the artifact changed"** -- it sees only the present. The baseline could, because it was a record of the past. That asymmetry is the entire argument for this item: without one session happening to have captured a hash, the change would have been undetectable, not merely unattributed.
+
+> **PROPOSED FIX, deliberately small.** At the install site: write a **receipt** next to the gate recording the installing repo path, the source blob sha, the content hash written, the hash of what was replaced, and a real UTC timestamp taken at write time -- **not** inherited. Optionally keep the replaced bytes as a `.bak` so a bad install is reversible. Then have `install-gate.ps1` refuse to overwrite a gate whose content does not match its own receipt without an explicit flag, which turns a silent replacement into a question. **Do not fix this by touching mtime** -- a corrected timestamp is still a single mutable field asserting a fact nothing else corroborates.
+
+> **BOUND.** The absence of all four mechanisms is verified by reading `install-gate.ps1` and the hooks directory at `c2241cfe`. **What is NOT established is that `install-gate.ps1` performed this particular write at all** -- no `.bak` appeared beside the gate, which is consistent with the installer (it writes none for the script) but also consistent with some other process copying the file. **The writer remains unknown and this item does not claim otherwise**; it says only that had the sanctioned installer been used, it would have left nothing either.
+
+**Cluster:** Developer tooling / process safety. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- this governs a developer-machine hook, not shipped engine code; the cost is that a change to a shared safety control **would** be undetectable and unattributable, as it was here.
