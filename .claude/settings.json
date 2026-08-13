@@ -36,58 +36,5 @@
       "PowerShell(git push -f:*)",
       "PowerShell(git reset --hard:*)"
     ]
-  },
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "if": "Bash(git *)",
-            "command": "pwsh",
-            "args": [
-              "-NoProfile",
-              "-File",
-              "${CLAUDE_PROJECT_DIR}/scripts/hooks/block-blanket-git-stage.ps1"
-            ],
-            "timeout": 20,
-            "statusMessage": "Checking git staging"
-          }
-        ]
-      },
-      {
-        "matcher": "PowerShell",
-        "hooks": [
-          {
-            "type": "command",
-            "if": "PowerShell(git *)",
-            "command": "pwsh",
-            "args": [
-              "-NoProfile",
-              "-File",
-              "${CLAUDE_PROJECT_DIR}/scripts/hooks/block-blanket-git-stage.ps1"
-            ],
-            "timeout": 20,
-            "statusMessage": "Checking git staging"
-          }
-        ]
-      }
-    ],
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "pwsh",
-            "args": [
-              "-NoProfile",
-              "-File",
-              "${CLAUDE_PROJECT_DIR}/scripts/worktree/session-context.ps1"
-            ]
-          }
-        ]
-      }
-    ]
   }
 }
