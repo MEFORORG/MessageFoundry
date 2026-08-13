@@ -31,7 +31,7 @@ _BODY = b"MSH|^~\\&|SEND|FAC|RECV|FAC|20260717||ADT^A01|1|P|2.5\rPID|1||123^^^MR
 
 
 def test_gzip_roundtrip() -> None:
-    assert gzip_decompress(gzip_compress(_BODY)) == _BODY
+    assert gzip_decompress(gzip_compress(_BODY), max_output_bytes=None) == _BODY
 
 
 def test_gzip_compress_is_deterministic() -> None:
@@ -65,25 +65,25 @@ def test_gzip_decompress_at_ceiling_ok() -> None:
 def test_gzip_multi_member() -> None:
     # Concatenated gzip members decode to the concatenation (GzipFile handles multi-member).
     concat = gzip_compress(b"AAA") + gzip_compress(b"BBB")
-    assert gzip_decompress(concat) == b"AAABBB"
+    assert gzip_decompress(concat, max_output_bytes=None) == b"AAABBB"
 
 
 def test_gzip_decompress_rejects_corrupt() -> None:
     with pytest.raises(CompressionError):
-        gzip_decompress(b"this is not a gzip stream")
+        gzip_decompress(b"this is not a gzip stream", max_output_bytes=None)
 
 
 def test_gzip_decompress_rejects_truncated() -> None:
     blob = gzip_compress(_BODY)
     with pytest.raises(CompressionError):
-        gzip_decompress(blob[: len(blob) // 2])
+        gzip_decompress(blob[: len(blob) // 2], max_output_bytes=None)
 
 
 # --- deflate -----------------------------------------------------------------
 
 
 def test_deflate_roundtrip() -> None:
-    assert deflate_decompress(deflate_compress(_BODY)) == _BODY
+    assert deflate_decompress(deflate_compress(_BODY), max_output_bytes=None) == _BODY
 
 
 def test_deflate_is_deterministic() -> None:
@@ -98,13 +98,13 @@ def test_deflate_decompress_bomb_ceiling() -> None:
 
 def test_deflate_decompress_rejects_corrupt() -> None:
     with pytest.raises(CompressionError):
-        deflate_decompress(b"\xff\xff\xff\xff not deflate")
+        deflate_decompress(b"\xff\xff\xff\xff not deflate", max_output_bytes=None)
 
 
 def test_deflate_decompress_rejects_truncated() -> None:
     blob = deflate_compress(_BODY)
     with pytest.raises(CompressionError):
-        deflate_decompress(blob[:10])
+        deflate_decompress(blob[:10], max_output_bytes=None)
 
 
 # --- zip ---------------------------------------------------------------------
@@ -112,7 +112,7 @@ def test_deflate_decompress_rejects_truncated() -> None:
 
 def test_zip_roundtrip_multi_entry() -> None:
     entries = {"a.hl7": _BODY, "sub/b.txt": b"hello"}
-    out = zip_decompress(zip_compress(entries))
+    out = zip_decompress(zip_compress(entries), max_output_bytes=None)
     assert out == entries
 
 
@@ -130,12 +130,12 @@ def test_zip_decompress_total_ceiling() -> None:
 def test_zip_decompress_entry_cap() -> None:
     entries = {f"f{i}": b"x" for i in range(10)}
     with pytest.raises(CompressionError, match="member"):
-        zip_decompress(zip_compress(entries), max_entries=3)
+        zip_decompress(zip_compress(entries), max_output_bytes=None, max_entries=3)
 
 
 def test_zip_decompress_rejects_corrupt() -> None:
     with pytest.raises(CompressionError):
-        zip_decompress(b"PK not really a zip")
+        zip_decompress(b"PK not really a zip", max_output_bytes=None)
 
 
 # --- argument validation -----------------------------------------------------
@@ -178,4 +178,50 @@ def test_top_level_reexports() -> None:
 def test_gzip_interops_with_stdlib() -> None:
     # gzip_compress output is a standard gzip stream stdlib gzip.decompress reads (and vice-versa).
     assert gzip.decompress(gzip_compress(_BODY)) == _BODY
-    assert gzip_decompress(gzip.compress(_BODY)) == _BODY
+    assert gzip_decompress(gzip.compress(_BODY), max_output_bytes=None) == _BODY
+
+
+# --- #1237: the ceiling is REQUIRED, not merely defaulted ---------------------
+
+
+@pytest.mark.parametrize(
+    "fn, arg",
+    [
+        (gzip_decompress, b""),
+        (deflate_decompress, b""),
+        (zip_decompress, b""),
+    ],
+)
+def test_ceiling_has_no_default(fn: object, arg: bytes) -> None:  # #1237
+    """Calling a decompressor without ``max_output_bytes`` is a TypeError, not an unbounded read.
+
+    Asserted on the SIGNATURE as well as the call, because the call alone is a weak pin: these
+    functions raise ``CompressionError`` on malformed input, so a bare ``pytest.raises`` could pass
+    for the wrong reason if the parameter were ever given a default back. Checking that the parameter
+    has *no default* is what actually discriminates.
+    """
+    import inspect
+
+    param = inspect.signature(fn).parameters["max_output_bytes"]  # type: ignore[arg-type]
+    assert param.default is inspect.Parameter.empty, "max_output_bytes must have NO default (#1237)"
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY
+    with pytest.raises(TypeError):
+        fn(arg)  # type: ignore[operator]
+
+
+def test_explicit_none_still_means_unbounded() -> None:  # #1237
+    # The opt-out survives: a caller who has bounded the input upstream passes None deliberately.
+    # This is the half that makes the change safe to land -- behaviour is unchanged, only the
+    # silence is removed.
+    big = b"\x00" * (2 * 1024 * 1024)
+    assert gzip_decompress(gzip_compress(big), max_output_bytes=None) == big
+    assert deflate_decompress(deflate_compress(big), max_output_bytes=None) == big
+    assert zip_decompress(zip_compress({"a": big}), max_output_bytes=None) == {"a": big}
+
+
+def test_max_entries_keeps_its_default() -> None:  # #1237
+    # Deliberately NOT made required: max_entries already ships ON (1024) and is enforced against the
+    # central directory before any member is extracted, so it is not the silent-default defect.
+    import inspect
+
+    assert inspect.signature(zip_decompress).parameters["max_entries"].default == 1024
