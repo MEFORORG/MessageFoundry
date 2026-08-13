@@ -43,6 +43,22 @@ async def _store() -> MessageStore:
     return await MessageStore.open(":memory:")
 
 
+async def _claim_bootstrap(service: AuthService, boot_password: str) -> str:
+    """Claim the bootstrap admin the way an operator actually would: log in with the printed one-time
+    credential, then rotate it through :meth:`AuthService.change_password`. Returns the claimed
+    password.
+
+    Deliberately NOT a direct ``store.set_password``. Self-service rotation is the ONE path that
+    records the claim (``users.password_claimed_at``), so a store-level shortcut produces a row that
+    merely LOOKS claimed and leaves the suite blind to any later writer that moves the state it does
+    set. That shortcut is why BACKLOG #1245 was invisible to a green suite.
+    """
+    out = await service.login("admin", boot_password)
+    assert out.ok and out.identity is not None
+    assert await service.change_password(out.identity, NEW_PASSWORD) == []
+    return NEW_PASSWORD
+
+
 async def test_bootstrap_admin_created_once_and_can_log_in() -> None:
     store = await _store()
     try:
@@ -116,19 +132,21 @@ async def test_bootstrap_expires_when_left_unclaimed() -> None:
 
 
 async def test_claimed_bootstrap_is_not_retired() -> None:
-    # Once the operator changes the bootstrap password (must_change → False) it's a normal admin
-    # account; neither supersession nor expiry may disable it (no single-admin lockout).
+    # Once the operator claims the bootstrap account it is a normal admin account; neither
+    # supersession nor expiry may disable it (no single-admin lockout).
+    #
+    # REWRITTEN for BACKLOG #1245: the previous form claimed the account with a direct
+    # store.set_password, which pinned the PROXY (must_change_password) instead of the PROPERTY
+    # (the holder set their own credential). Claiming through the real service path is the point of
+    # the test, not collateral damage from the fix.
     store = await _store()
     try:
         service = AuthService(store, AuthSettings(bootstrap_expiry_hours=72))
-        await service.initialize()
+        boot = await service.initialize()
+        assert boot is not None
+        claimed = await _claim_bootstrap(service, boot.password)
         admin = await store.get_user_by_username("admin")
         assert admin is not None
-        await store.set_password(
-            admin.id,
-            password_hash=hash_password("a-claimed-real-passphrase"),
-            must_change_password=False,
-        )
         # age it past expiry AND add a second admin — still must not be disabled
         await store._db.execute(
             "UPDATE users SET created_at=? WHERE id=?", (time.time() - 99 * 3600, admin.id)
@@ -144,6 +162,135 @@ async def test_claimed_bootstrap_is_not_retired() -> None:
         )
         still = await store.get_user_by_username("admin")
         assert still is not None and not still.disabled
+        assert (await service.login("admin", claimed)).ok
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #1245: an ADMIN RESET of a claimed bootstrap must not re-arm its retirement ----------
+#
+# The retirement gate asks "was this account ever claimed?", which is monotonic. It used to answer
+# with must_change_password, which is not: admin_reset_password legitimately re-raises that flag
+# (ASVS 6.4.6 wants an admin-issued credential to be a one-time temp), so a reset made a long-claimed
+# account read as never-claimed and the next trigger would disable it. Each test below drives one
+# trigger. All of them claim through the service, never through the store.
+
+
+async def test_admin_reset_does_not_re_arm_retirement_of_a_claimed_bootstrap() -> None:
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(bootstrap_expiry_hours=72))
+        boot = await service.initialize()
+        assert boot is not None
+        claimed = await _claim_bootstrap(service, boot.password)
+        await service.create_local_user(
+            username="alice",
+            password="another-long-passphrase",
+            display_name=None,
+            email=None,
+            roles=[Role.ADMINISTRATOR.value],
+            actor="admin",
+        )
+        # NEGATIVE CONTROL: the claim held across supersession. Without it, a red below could just as
+        # well mean the fixture was never claimed in the first place.
+        assert (await service.login("admin", claimed)).ok
+        admin = await store.get_user_by_username("admin")
+        assert admin is not None
+        temp = await service.admin_reset_password(admin.id, actor="alice")
+        # The reset re-raises must_change_password — that write is correct and must stay; what must
+        # not follow from it is a retirement.
+        after_reset = await store.get_user_by_username("admin")
+        assert after_reset is not None and after_reset.must_change_password
+        out = await service.login("admin", temp)  # this login is itself a retirement trigger
+        assert out.ok and out.must_change_password
+        still = await store.get_user_by_username("admin")
+        assert still is not None and not still.disabled
+    finally:
+        await store.close()
+
+
+async def test_claimed_bootstrap_survives_restart_after_an_admin_reset() -> None:
+    # The restart trigger: initialize() retires on the way up, so a site that reset the password and
+    # restarted the service before anyone logged in would find the account disabled at boot, with no
+    # login attempt to correlate the audit line against.
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(bootstrap_expiry_hours=72))
+        boot = await service.initialize()
+        assert boot is not None
+        await _claim_bootstrap(service, boot.password)
+        admin = await store.get_user_by_username("admin")
+        assert admin is not None
+        await store._db.execute(  # arm the expiry arm: older than the window
+            "UPDATE users SET created_at=? WHERE id=?", (time.time() - 99 * 3600, admin.id)
+        )
+        await store._db.commit()
+        temp = await service.admin_reset_password(admin.id, actor="admin")
+        restarted = AuthService(store, AuthSettings(bootstrap_expiry_hours=72))
+        assert await restarted.initialize() is None  # non-empty store: no re-bootstrap
+        still = await store.get_user_by_username("admin")
+        assert still is not None and not still.disabled
+        assert (await restarted.login("admin", temp)).ok
+    finally:
+        await store.close()
+
+
+async def test_claimed_bootstrap_survives_user_creation_after_an_admin_reset() -> None:
+    # The create_local_user trigger, and note it fires for ANY new account — the retirement check
+    # there is unconditional, and an aged store satisfies the expiry arm on its own, so creating a
+    # read-only user is enough.
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(bootstrap_expiry_hours=72))
+        boot = await service.initialize()
+        assert boot is not None
+        await _claim_bootstrap(service, boot.password)
+        admin = await store.get_user_by_username("admin")
+        assert admin is not None
+        await store._db.execute(
+            "UPDATE users SET created_at=? WHERE id=?", (time.time() - 99 * 3600, admin.id)
+        )
+        await store._db.commit()
+        temp = await service.admin_reset_password(admin.id, actor="admin")
+        await service.create_local_user(
+            username="bob",
+            password="a-third-long-enough-passphrase",
+            display_name=None,
+            email=None,
+            roles=[Role.VIEWER.value],
+            actor="admin",
+        )
+        still = await store.get_user_by_username("admin")
+        assert still is not None and not still.disabled
+        assert (await service.login("admin", temp)).ok
+    finally:
+        await store.close()
+
+
+async def test_unclaimed_bootstrap_is_still_retired_after_an_admin_reset() -> None:
+    # The other half of #1245, and the reason the fix could not simply be a carve-out on the reset
+    # path: an admin reset does not claim the account, so a bootstrap NOBODY ever claimed stays
+    # retirable. This test reds if anyone makes admin_reset_password special-case the bootstrap or
+    # record a claim, which would delete the WP-3 auto-retirement entirely.
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(bootstrap_expiry_hours=72))
+        boot = await service.initialize()
+        assert boot is not None
+        admin = await store.get_user_by_username("admin")
+        assert admin is not None
+        temp = await service.admin_reset_password(admin.id, actor="admin")
+        await service.create_local_user(
+            username="alice",
+            password="another-long-passphrase",
+            display_name=None,
+            email=None,
+            roles=[Role.ADMINISTRATOR.value],
+            actor="admin",
+        )
+        retired = await store.get_user_by_username("admin")
+        assert retired is not None and retired.disabled
+        assert not (await service.login("admin", temp)).ok  # the fresh temp is refused too
     finally:
         await store.close()
 
@@ -225,23 +372,56 @@ async def test_bootstrap_expiry_warning_silent_before_the_window() -> None:
 
 
 async def test_bootstrap_expiry_warning_silent_when_claimed() -> None:
-    # "claimed fires nothing": once the operator changes the password (must_change → False) it is a
-    # normal admin account and draws no retirement reminder, even inside what would be the window.
+    # "claimed fires nothing": once the operator claims the account it is a normal admin account and
+    # draws no retirement reminder, even inside what would be the window.
+    #
+    # REWRITTEN for BACKLOG #1245, for the same reason as test_claimed_bootstrap_is_not_retired: the
+    # previous form claimed with a direct store.set_password, so it pinned must_change_password
+    # rather than the recorded claim the warner actually has to read.
     store = await _store()
     try:
         service = AuthService(
             store, AuthSettings(bootstrap_expiry_hours=72, bootstrap_warn_hours=24)
         )
-        await service.initialize()
+        boot = await service.initialize()
+        assert boot is not None
+        await _claim_bootstrap(service, boot.password)
         admin = await store.get_user_by_username("admin")
         assert admin is not None
-        await store.set_password(
-            admin.id,
-            password_hash=hash_password("a-claimed-real-passphrase"),
-            must_change_password=False,
-        )
         expires_at = admin.created_at + 72 * 3600
         assert await service.bootstrap_expiry_warning(now=expires_at - 1 * 3600) is None
+    finally:
+        await store.close()
+
+
+async def test_bootstrap_expiry_warning_silent_after_an_admin_reset_of_a_claimed_bootstrap() -> (
+    None
+):
+    # BACKLOG #1245, second reader: the warner asks the same claimed-ness question as the retirement
+    # and used to answer it the same wrong way. A fix scoped to the retirement gate alone greens the
+    # tests above while this path still tells an operator that a claimed, in-use admin account
+    # expires in N hours — advice that is both false and actively misleading.
+    store = await _store()
+    try:
+        service = AuthService(
+            store, AuthSettings(bootstrap_expiry_hours=72, bootstrap_warn_hours=24)
+        )
+        boot = await service.initialize()
+        assert boot is not None
+        admin = await store.get_user_by_username("admin")
+        assert admin is not None
+        inside_window = admin.created_at + 50 * 3600  # within [expires_at - 24h, expires_at)
+        # POSITIVE CONTROL: this instant DOES warn while the account is unclaimed, so the None below
+        # is the claim being read, not a window/latch/config mistake silently returning None.
+        assert await service.bootstrap_expiry_warning(now=inside_window) is not None
+        await _claim_bootstrap(service, boot.password)
+        await service.admin_reset_password(admin.id, actor="admin")
+        # A fresh service: the warn latch is per-process, and this also models the restart that would
+        # re-arm the reminder.
+        restarted = AuthService(
+            store, AuthSettings(bootstrap_expiry_hours=72, bootstrap_warn_hours=24)
+        )
+        assert await restarted.bootstrap_expiry_warning(now=inside_window) is None
     finally:
         await store.close()
 
