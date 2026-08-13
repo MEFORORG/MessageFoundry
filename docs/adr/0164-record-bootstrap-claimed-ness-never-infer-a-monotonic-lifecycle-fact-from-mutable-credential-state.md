@@ -85,12 +85,31 @@ administrative access is never lost.
    exactly one thing: *the holder set their own credential via authenticated self-service rotation.*
    It does **not** record "the holder is still in control", and that narrowness is deliberate.
 
-2. **One structurally-constrained writer.** The only path that records a claim is a `set_password`
-   call whose `must_change_password` argument is `False`, which today is reachable only from
-   self-service rotation. The bootstrap mint, `create_local_user` and `admin_reset_password` all pass
-   `True` and therefore can never claim. **You cannot record a claim without being the authenticated
-   holder** — the constraint is structural, not conventional, which matters because a conventional
-   single-writer rule is precisely what #1245 documents failing.
+2. **One writer, and the honest account of what enforces it.** A claim is recorded only by a
+   `set_password` call whose `must_change_password` argument is `False`. The bootstrap mint,
+   `create_local_user` and `admin_reset_password` all pass `True` and therefore cannot claim.
+
+   **A draft of this section claimed the constraint was "structural, not conventional" and that "you
+   cannot record a claim without being the authenticated holder". Both were false, and the review
+   that caught it measured them.** The store surface declared the **claiming** value as its default
+   (`must_change_password: bool = False`), so a caller that merely *omitted* the keyword recorded a
+   claim — demonstrated against a live store — and `scripts/security/dast_target.py` is an existing
+   caller passing `False` outside self-service rotation. Asserting a structural guarantee in the same
+   paragraph that says a conventional one is not good enough is the compensating-control-on-a-false-
+   premise defect (SDS-3.7) appearing inside the document written to prevent it. **The retraction is
+   kept rather than deleted, because the deleted version is what a later reader would re-derive.**
+
+   What is true now, in two parts:
+   - **The accidental path is closed structurally.** `set_password`'s default is flipped to `True`
+     across the protocol and all three backends, so **omission is the SAFE branch** and a forgotten
+     keyword can no longer stamp a claim. Every existing caller passes the argument explicitly, so
+     this changes no current behaviour — it bounds the next caller. (`create_user`'s default stays
+     `False`: it never writes this column, and AD provisioning depends on it.)
+   - **The deliberate path remains conventional, and is stated as such.** A caller can still pass
+     `False`. **The invariant is not "one caller" but "every caller passing `False` has just
+     authenticated the holder"**, and what enforces that is review, not the type system. A store
+     method taking no `must_change_password` at all — one that claims by construction — would make
+     it fully structural, and is the obvious next step if this ever needs strengthening.
 
 3. **Monotonicity enforced in SQL**, not in Python: `password_claimed_at = COALESCE(password_claimed_at, ?)`
    when a claim occurs, and the column is absent from the `SET` list otherwise. No statement anywhere

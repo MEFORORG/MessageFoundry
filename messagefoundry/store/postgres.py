@@ -6198,7 +6198,7 @@ class PostgresStore:
         user_id: str,
         *,
         password_hash: str,
-        must_change_password: bool = False,
+        must_change_password: bool = True,
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now

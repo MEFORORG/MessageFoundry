@@ -1231,11 +1231,22 @@ def password_claim_set(must_change_password: bool, placeholder: str) -> str:
     """The ``users.password_claimed_at`` term of a ``set_password`` UPDATE — shared by all three
     backends so the single-writer rule is stated once (BACKLOG #1245).
 
-    A caller passing ``must_change_password`` False is issuing a credential the holder chose, which
-    today means authenticated self-service rotation and nothing else — so that call, and only that
-    call, records the claim. A caller passing True is issuing a provisional credential (the bootstrap
+    A caller passing ``must_change_password`` False is issuing a credential the holder chose, so that
+    call records the claim. A caller passing True is issuing a provisional credential (the bootstrap
     mint, an admin-created account, an admin reset): it gets an EMPTY term, so the column is absent
     from the SET list and the statement can neither stamp nor clear it.
+
+    **AT LEAST TWO callers pass False, not one** -- stated as a floor rather than an enumeration
+    because a closed list here is a liability (SDS-3.6), and an earlier draft of this docstring said
+    "and only that call" and was wrong. Self-service rotation is the intended one. The argon2
+    rehash-on-login path passes the record's EXISTING flag straight through, which is False for any
+    already-rotated account, so it reaches this branch too. That is safe for a reason worth writing
+    down rather than rediscovering: reaching it requires a verified password, and on any row where
+    the flag is False with a password set the stamp is already present (a fresh database because
+    only rotation clears the flag, and it stamps; a migrated one because the upgrade backfill covers
+    exactly ``must_change_password = 0 AND password_hash IS NOT NULL``), so the COALESCE no-ops.
+    **The invariant to preserve is therefore not "one caller" but "every caller passing False has
+    just authenticated the holder".**
 
     ``COALESCE`` makes the claim WRITE-ONCE: a later rotation re-runs this term against a non-NULL
     column and changes nothing, so the stamp is monotonic once set. That monotonicity is the whole
@@ -7764,7 +7775,7 @@ class MessageStore:
         user_id: str,
         *,
         password_hash: str,
-        must_change_password: bool = False,
+        must_change_password: bool = True,
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
