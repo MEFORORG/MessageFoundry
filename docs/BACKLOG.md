@@ -8749,3 +8749,57 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > not of all writes. Sibling half merged as `claude-multisession` PR #46.
 
 **Cluster:** Developer tooling / measurement gates. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- this governs a documentation-drift gate, not shipped engine code; the cost is that a corrected measurement **would** silently drift back across 13 published sites.
+
+## 1252. the tally lint returns one exit code for three different outcomes, so a crash is indistinguishable from a verdict
+
+> 🔢 **Filed 2026-08-13 -- raised by a builder who explicitly argued BOTH sides and declined to decide. Filed on a narrower ground than the case they made, stated below.** Value **5/10** -- Difficulty **2/10**. `scripts/docs/asvs_tally_lint.py` exits **1** for *"I found a hard-coded tally"*, for *"I could not scan"*, and for *"the baseline over-counts"*. A consumer cannot tell a **verdict** from a **failure to reach one**.
+
+> **THE THREE OUTCOMES THAT LOOK IDENTICAL, measured in the order a prober hits them:**
+> 1. **A scan root outside the repo CRASHES it** -- `iter_markdown` calls `p.relative_to(repo)`
+>    (`:244`, `:247`) and raises `ValueError`. Uncaught, so the interpreter exits **1**.
+> 2. **Pointing `--repo` at the probe root fixes the crash**, and then the **baseline-may-only-shrink**
+>    check fires -- scanning a tree lacking the baselined files makes all 18 entries "over-count".
+>    Exits **1**, for a reason with nothing to do with tally detection.
+> 3. **Only an empty baseline plus `--repo` at the probe root isolates detection.**
+>
+> The script has exactly one exit path -- `:391 raise SystemExit(main())` -- and `main()` returns
+> `int`. Nothing distinguishes the three.
+
+> **THE NARROW GROUND THIS IS FILED ON: A GATE THAT RETURNS THE SAME CODE FOR "I FOUND A VIOLATION" AND
+> "I COULD NOT RUN" IS DEFECTIVE INDEPENDENT OF ERGONOMICS.** That is not a probing inconvenience, it is
+> the property that makes a red actionable. **This gate reddened `main` four hours before this filing**,
+> and whoever triaged it had to establish *by reading the source* whether the red meant a tally existed
+> -- because the exit code could not say. They got it right; the tool did not help.
+> ⇒ **The same conflation would mislead in CI, not just in a probe:** a refactor that moves files, or a
+> baseline that drifts, produces `1` and reads as *"a tally was found"*, sending someone to hunt a tally
+> that is not there.
+
+> **THE SELF-REINFORCING PART, which is why it is worth a number rather than a docstring.** Anyone
+> validating this gate the obvious way -- point it at a scratch file containing a suspect phrase --
+> gets **REFUSED** and concludes it works. That is a **false positive about the instrument, produced by
+> the instrument**, and it gets *more* convincing the more carefully you test: the innocent-prose
+> control refuses too, which looks like thoroughness confirming the tool. The builder hit this **three
+> times in a row** and caught it only with a negative control.
+
+> **IT IS ALSO A PRECONDITION FOR #1204.** That item widens this lint's pattern to close two confirmed
+> rephrasing bypasses. **Whoever does it must exercise the new pattern** -- and will either burn the
+> same three iterations, or fail to notice and ship a pattern they never actually exercised. Fixing
+> this first makes #1204 testable; leaving it makes #1204's verification untrustworthy.
+
+> **PROPOSED FIX -- small, and deliberately not a redesign.** Give the tool a **discriminating exit**:
+> distinguish *found a tally* from *could not scan* from *baseline over-counts*, via distinct exit codes
+> or a machine-readable first line, and catch the `relative_to` `ValueError` into the "could not scan"
+> class rather than letting it escape as a bare `1`. **Nothing about the detection logic changes.**
+
+> **THE COUNTER-CASE, recorded because the builder made it fairly and it is not weak:** nothing here is
+> *broken*. Refusing a scan root outside the repo is sane; the shrink-only baseline rule is a real
+> invariant worth keeping; the CI invocation is correct and the gate does its job in production. A
+> `--self-test` flag or a docstring might have sufficed. **The reason it is filed anyway is the exit-code
+> conflation specifically -- not the ergonomics, which are the recoverable part.**
+
+> **BOUND, and it is the builder's own and worth preserving: NOBODY IS KNOWN TO HAVE BEEN MISLED BY THIS
+> IN A REAL DECISION.** They were, three times, while probing -- and they explicitly declined to assert a
+> production consequence to strengthen the case. The CI-misleading path above is a **reachable
+> mechanism, not an observed event.**
+
+**Cluster:** Developer tooling / measurement gates. **Priority:** P3. **Verdict:** build. **Severity:** no deployment axis -- this governs a documentation lint, not shipped engine code; the cost is that a red **would** be read as a verdict when it is a crash.
