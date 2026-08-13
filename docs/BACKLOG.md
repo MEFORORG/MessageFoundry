@@ -8297,6 +8297,149 @@ every worker session's handoff, which is the sentence the next session bases its
 
 **Cluster:** Security / availability. **Priority:** P2. **Verdict:** build. **Severity:** conditional per CLAUDE.md section 0 -- on a first deployment with one administrator, a lockout would be unrecoverable without direct database access; **zero deployments, so nobody is locked out today.**
 
+## 1237. require an explicit decompression ceiling on the Handler-facing primitives
+
+> 🔢 **Filed 2026-08-12 - not started.** Value **6/10** · Difficulty **2/10**. Split out of **#1129** (ASVS 5.2.3, which stays `partial`) as the BUILD half, so the research item can close on its research. All three `*_decompress` primitives in `messagefoundry/parsing/compression.py` default `max_output_bytes=None`, so a Handler author who does not think about a ceiling silently gets none.
+
+**Cluster:** Security / hardening. **Priority:** P2. **Verdict:** build.
+**Severity:** Conditional -- there are zero deployments (§0). On a first deployment, a Handler calling `zip_decompress(body)` or `deflate_decompress(body)` without a ceiling would get no total-size bound. This is **not** bounded by the transports, contrary to #1129's severity sentence: the File connector decompresses single-stream gzip only (`transports/file.py:90`), so no transport ceiling ever sees a zip expansion, and `transports/file.py:73` bounds the **compressed** input at 16 MiB. Measured on `9d98f339` by loading the module directly with default arguments: 65,982 bytes in, 67,108,864 out across 8 members (1017:1), nothing raised, tracemalloc peak 76,081,609 bytes. At that ratio an admitted 16 MiB of compressed input would admit roughly 16 GiB of expansion in the transform worker.
+
+**What ships today.** `gzip_decompress` (`compression.py:91`) -- both in-engine callers already pass a ceiling (`pipeline/retention.py:110`, `transports/file.py:572`). `deflate_decompress` (`compression.py:125`) -- zero in-engine callers. `zip_decompress` (`compression.py:179-181`) -- zero in-engine callers, though its sibling `max_entries: int = 1024` **does** ship on and is enforced at `:196` against the central directory before the extraction loop at `:200`.
+
+**The change.** Make `max_output_bytes` keyword-only with **no default** on all three (`*, max_output_bytes: int | None`). Passing `None` explicitly still means "no ceiling" and stays available to a caller who has bounded the input upstream -- but it becomes a deliberate, greppable act instead of a silent default. In-tree precedent, same concern, same repo: `parsing/dicom/_inflate.py:74`, `def bounded_inflate_or_error(compressed: bytes, *, max_bytes: int) -> None:`.
+
+**Why this is not #1129's forbidden move.** #1129 rules out "changing the `None` default alone and scoring the cell", because swapping one unconsidered value for another leaves the clause where it was. A parameter with **no default** is a different construct: a gate that refuses when the precondition is absent.
+
+**Breakage.** None in tree, verified by word-boundary search -- note `zip_decompress` is a **substring** of `gzip_decompress`, so a naive grep conflates them. It **is** a breaking change to a re-exported public surface (`messagefoundry/__init__.py:92`, `:96`, `:200`, `:202`; `parsing/__init__.py:27`, `:31`); per §0 that cost is currently zero, so prefer the simple correct end state over a compatibility shim.
+
+**Tests.** Pin the signature (no default) on all three; assert a ceiling-less call raises `TypeError`; update the existing default-argument call sites at `tests/test_compression.py:34`, `:68`, `:73`, `:79`, `:86`, `:101`, `:107`, `:115`, `:133`, `:138`, passing `None` where the test means "unbounded" so each test's intent is preserved. Do **not** add any test that reads the archive's declared uncompressed size as the control.
+
+**Deliberately out of scope.** #1129's research also identified a bounded, output-**discarding** pre-pass for `zip_decompress` -- the shape shipped at `parsing/dicom/_inflate.py:74-107` -- which would satisfy the 5.2.3 verb's "before uncompressing" clause literally. Excluded here because it costs roughly one extra decompression pass on every accepted archive, while the existing incremental check is already the stronger control (it cannot be lied to by a false declared size). Buying literal verb-shape with real runtime cost is an owner call; file separately if wanted.
+
+**Relationship to the ASVS cell.** This closes the "ships off" limb for the size clause. It does **not** by itself move ASVS 5.2.3 to `pass` -- the verdict is the assessor's, the vault scorecard is the record of record, and the "before uncompressing" reading question is unresolved without the excluded pre-pass. Do not cite this item as evidence of a verdict move.
+
+**Source:** split from #1129 during its 2026-08-12 research pass. That pass also found #1129's own central premise false -- `parsing/dicom/peek.py:81-85` calls a default-on, output-discarding guard that reads no declared field and cites ASVS 5.2.3 in its own comment -- which is a separate ledger amendment to #1129.
+
+## 1238. contain the server-supplied remote listing name by rejecting it, never by rewriting it
+
+> 🔢 **Filed 2026-08-13 - not started. OWNER RULING RECORDED 2026-08-13: reject, never mutate.** Value **7/10** · Difficulty **3/10**. The BUILD half of **#1130** (ASVS 5.3.2, which holds at `partial`). `RemoteFileSource` uses a filename chosen by a remote SFTP/FTP server with no containment check. **The obvious fix -- `posixpath.basename()` -- is actively harmful and must not be used;** the reasons are recorded below because a later reader will otherwise re-propose it.
+
+**Cluster:** Security / hardening. **Priority:** P1. **Verdict:** build.
+**Severity:** Conditional -- there are zero deployments (§0). On a first deployment, a malicious or compromised partner file server could return a listing entry that escapes the configured directory. It needs a hostile server rather than mere drop-directory write access, which bounds it without removing it.
+
+**What ships today.** `transports/remotefile.py:918` takes the listing, `:920` iterates it, and the **only** filter before use is `fnmatch` at `:923` -- a glob on the *name*, never a containment check on the resulting *path*. Measured on Python 3.14.6: `fnmatch` treats `*` as matching `/` (unlike `glob`), so `'../../etc/passwd.hl7'`, `'/etc/passwd.hl7'`, `'.error/quarantined.hl7'` and `'..\..\etc\passwd.hl7'` **all match the default `*.hl7`**. The suffix is attacker-chosen, so the glob bounds nothing that matters. The local `File` source has the guard the remote one lacks (`_within_root`, `transports/file.py:358`, `:792`, `:803`).
+
+**The ruling.** A single-path-component **reject** at the loop head -- after the pattern filter, before the join at `:925`, so it dominates every consumer. Refuse: non-`str`, `""`, `"."`, `".."`, any `/` or `\`, control characters, and the drive-relative form (`C:x.hl7`, which carries no separator at all). **The ratio the ruling turns on:** for a healthcare feed, refusing one file is strictly better than silently reading the wrong one, and mutation cannot give that property.
+
+**Why `basename()` is rejected -- measured, not preferred.** It **mutates rather than refuses**, which makes it an *aliasing* primitive: `posixpath.basename('../../etc/adt_20260812.hl7')` is `'adt_20260812.hl7'`, which rejoins to a **real file** in the poll directory. One hostile entry would then drive the retrieve and the `after_read` action against a file it does not name -- a move under the default, or a **remote delete** under `after_read="delete"`. That hands a hostile server a move-or-delete primitive against the partner's own drop directory. It is also a **complete no-op on the Windows-separator form** (`basename('..\..\etc\passwd.hl7')` returns the string unchanged, because `posixpath` tokenizes only `/`), and its output can never contain `/`, so **any containment check placed after it is unreachable by construction and always passes** -- a test asserting "traversal is rejected" would go green for the wrong reason.
+
+**The count-and-log consequence, which is the strongest single argument and is not a security argument.** Under `after_read="leave"` the dedup key hashes the joined name (`:1028`, `:1029`). The alias and the real file produce the **identical** key -- both computed as `1c2195def3461a12` -- so one of the two would be silently skipped as already-ingested. That is a **§2 count-and-log invariant violation (never accept-and-drop), reached by way of the security fix.**
+
+**The NLST arm stays, and must never be cited as containment.** `transports/remotefile.py:284` already applies `basename` in the FTP NLST fallback. That is **load-bearing for protocol reasons** -- some servers return full pathnames from NLST -- so do not remove it. But it is *incidentally aliasing*, not incidentally contained, and a containment test landing on that arm would certify a control that does not exist. Checked 2026-08-13: **no scorecard cell anchors it and 5.3.2's residual does not mention `basename`**, so the record is clean today. Recorded here so a future pass does not helpfully add it as evidence.
+
+**The honest limit.** Name containment is fully in our power; **resolved-path containment is not.** No client-side check constrains a server that resolves a symlink its own way, lies about size or type, or simply serves different bytes for a benign-looking name. SFTP `normalize()` exists but is SFTP-only and asks the hostile party for the truth. Any residual must say this or it overclaims.
+
+**Why one chokepoint rather than per-site fixes.** The consumer set **grew at every pass and never shrank**: `posixpath.join` sites, then consumers of an already-joined path, then caller gating (three of `_move`'s four callers are error paths not gated on `after_read`), then `:944`'s retrieve and `:972`'s operator-supplied scan hook. Four passes, four expansions, no contractions -- each because the measuring instrument had drawn its boundary too tightly. **No closed count is given here deliberately**; that growth pattern is itself the argument for containing the name where it *enters* rather than at each place it is used.
+
+**Tests.** Write against the **MLSD** or **SFTP** arm, never NLST -- `:279` and `:434` pass the server's string through unchanged, while NLST is already incidentally aliasing and would prove nothing. Cover at least: `../` traversal, an absolute path, the backslash form, the drive-relative form, `.` / `..` / empty, a control character, and a name that still matches the configured pattern.
+
+**Relationship to the ASVS cell.** ASVS 5.3.2 holds at `partial`. This is a **build item, not a rescore** -- the verdict is the assessor's and the vault scorecard is the record of record. Do not cite this item as evidence of a verdict move.
+
+**Source:** split from #1130's research pass, 2026-08-12/13; owner ruling recorded 2026-08-13. Open and **not** settled by this item: whether a syntactic check meets the verb's "strict validation and sanitization" language. The 6.1.1 adjudication did not settle it (the control-property reading was refuted 4 of 4), so it inherits no general ruling and stays open on #1130.
+
+## 1239. `fhir.py` carries two identical control-char predicates behind different wrappers -- a latent drift, not a current divergence
+
+> 🔢 **Filed 2026-08-13 - not started. READ THE FRAMING BEFORE ACTING: the two predicates are byte-identical TODAY. This item records a LATENT hazard, not a live defect, and it must not be cited as evidence of a current gap.** Value **3/10** · Difficulty **2/10**. Noticed during #1107's ASVS 1.2.2 surface enumeration.
+
+**Cluster:** Code quality / drift hazard. **Priority:** P3. **Verdict:** build (small).
+**Severity:** none today. There is no behavioural difference to exploit and nothing is mis-screened. The cost is future-tense and conditional: a later hardening applied to one predicate would silently not apply to the other.
+
+**What is there.** `messagefoundry/transports/fhir.py` defines two control-character predicates whose test expressions are **identical**:
+- `:166` `def _reject_control_chars(value: str, field: str) -> str:` -- raises a permanent, PHI-safe `NegativeAckError` naming only the field. Used on the **path** context (`:424`, `:463`).
+- `:658` `def _has_control_char(text: str) -> bool:` -- returns a bool. Used on the **flat query** context (`:739` on the raw string, `:748` on the percent-decoded string).
+
+Both compute `any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in ...)`.
+
+**Why this is NOT filed as a duplication defect.** The differing wrappers are appropriate: a raise suits the path context (the delivery is classified permanent), a bool suits the query context (the caller raises `ValueError` with its own message). Applying them to different inputs is also deliberate and good -- the query path deliberately screens **both** the raw string and the percent-decoded one, which a single call could not do. **Do not "fix" this by collapsing the two wrappers.**
+
+**The actual hazard, stated conditionally.** The shared thing is the *predicate*, and it is written out twice. A future widening -- C1 controls (U+0080-U+009F), Unicode line separators (U+2028/U+2029), or a bidi-override class -- applied to one site would leave the other screening the older, narrower set, with nothing in the tree comparing them. The fix is to extract the predicate once and have both wrappers call it, keeping the wrappers exactly as they are.
+
+**What would NOT be an honest fix.** Collapsing the two call sites into one helper with a flag, or changing where either is applied. The wrappers and their application points are correct; only the duplicated expression is at issue.
+
+**Test.** Assert the two predicates agree across a shared character corpus, so a future widening of one without the other fails. That test is the durable control here and is worth more than the extraction itself.
+
+**Source:** observed during #1107's dynamic-URL surface enumeration, 2026-08-13, while establishing that `fhir.py` context-encodes the path and structured-query contexts but not the flat-query one. Recorded because "two hand-rolled treatments of one threat class in one file" is a drift shape worth tracking -- **and recorded with its current-identity measured**, so a later reader does not mistake it for a live divergence.
+
+> **AMENDED 2026-08-13 -- RESOLVED AS A SIDE EFFECT OF #1243, AND STAYS OPEN UNTIL THAT LANDS.** #1243 limb A deletes the flat `?`-query path, whose two screens (`_has_control_char(search_part)` and the same call over the percent-decoded string) were the **only** callers of `_has_control_char`. With them gone the function has no callers and is removed, leaving `_reject_control_chars` as the single control-char predicate in the file -- so the duplication this item records ceases to exist and there is nothing left to drift.
+>
+> **This item is NOT closed here on purpose.** The fix is unmerged at the time of writing, and a closed banner over an unmerged fix asserts a state that does not exist. It closes in the commit that lands #1243. Recorded now rather than at merge so a reader arriving in between does not go hunting for a duplication that the same branch already removes.
+
+## 1240. the FHIR grammar gates use `match` with a `$` anchor, so a trailing newline passes
+
+> 🔢 **Filed 2026-08-13 - not started. NOT EXPLOITABLE TODAY -- the reachability analysis is in the item and it is honest about that.** Value **5/10** · Difficulty **1/10**. Both FHIR grammar gates accept a value with a trailing newline, so on the `fhir_lookup` read path the gate does not enforce the grammar it advertises. Found during #1107 (ASVS 1.2.2).
+
+**Cluster:** Security / input validation. **Priority:** P2. **Verdict:** build (small).
+**Severity:** Conditional and currently **none** -- see reachability below. The defect is that a control does not do what it claims, which matters independently of whether another control happens to cover for it.
+
+**The defect.** `messagefoundry/transports/fhir.py:104-105`:
+```
+_FHIR_TYPE_RE = re.compile(r"^[A-Za-z]+$")
+_FHIR_ID_RE   = re.compile(r"^[A-Za-z0-9.\-]{1,64}$")
+```
+Python's `$` matches **before a trailing newline**. Measured on 3.14.6:
+```
+_FHIR_ID_RE.match("abc\n")        -> True     ACCEPTED
+_FHIR_TYPE_RE.match("Patient\n")  -> True     ACCEPTED
+_FHIR_ID_RE.match("ab\nc")        -> False    (embedded newline correctly refused)
+_FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
+```
+
+**Reachability, stated plainly because an item that overstates it gets discounted.** Not exploitable on this tree. On the **write** path `_reject_control_chars` runs *before* the gate (`:424`, `:463`), so a newline never reaches it. On **both** paths `urllib.parse.quote(value, safe="")` encodes it to `%0A` (`:428`, `:450`, `:454`, `:712`, `:718`), so no request splitting or header injection follows. **But** the `fhir_lookup` **read** path (`_resolve_read_url`, `:705-718`) has the gate and `quote` and **no** control-char screen, so there the gate is the sole grammar control and it admits a value its own grammar excludes.
+
+**The fix.** `match` to `fullmatch` on both regexes, and add `_reject_control_chars` to the read path so it matches the write path's two-control posture. Both are one-line changes.
+
+**Test.** Assert each regex refuses a trailing-newline value directly, not through the URL builder -- routing the assertion through `quote` would pass for the wrong reason and certify nothing, which is the same trap #1238 records for `basename`.
+
+**Source:** #1107's ASVS 1.2.2 dynamic-URL surface enumeration, 2026-08-13.
+
+## 1241. operator-config values reach URL and header sinks with no construction-time screen
+
+> 🔢 **Filed 2026-08-13 - not started.** Value **5/10** · Difficulty **3/10**. Several operator-configured values are interpolated into URL paths, query strings and an HTTP header with weaker treatment than the message-derived values beside them -- in one case with no screen at all. Found during #1107 (ASVS 1.2.2). **The subject is the asymmetry**, so fixing one site without the others misses the point.
+
+**Cluster:** Security / input validation. **Priority:** P2. **Verdict:** build.
+**Severity:** Conditional and lower than the message-derived sites, because these values come from operator config rather than from an inbound message -- an operator can already choose the endpoint. It is filed because the treatment is *inconsistent within the same file*, which is how the weaker one survives review.
+
+**The sites.**
+- `transports/fhir.py:431` -- `f"{base}/{type_seg}?{self.conditional_query}"`. `conditional_query` is read at `:231` and reaches the URL query with **no screen and no encoding at all** -- weaker than the flat-search path 300 lines below, which at least screens.
+- `transports/fhir.py:436` -- the same value into the `If-None-Exist` **HTTP header**, also unscreened. **The asymmetry is in the same file:** the `meta.versionId` limb at `:446`/`:449` deliberately *rejects rather than encodes* for exactly this threat, with the reason in-comment ("quoting is wrong for a header value, so reject rather than encode").
+- `transports/dicomweb.py:241` -- `f"{base}/studies/{self.study_uid}"`. `study_uid` gets a control-char screen at `:153` but **no grammar gate and no percent-encode**, asymmetric with `fhir.py:428` which does both.
+
+**Encoding is the WRONG fix for `conditional_query`, and this is the trap.** The value is *meant* to carry FHIR search syntax: `docs/CONNECTIONS.md:1479` documents `identifier=sys|val` as the intended shape and `tests/test_fhir_transport.py:220` pins `assert url == f"{BASE}/Patient?identifier=sys|val"`. Percent-encoding it would break the documented feature and fail that test. **The right control is a construction-time screen** (at `:231`, where the value is read) covering both sinks -- rejecting control characters and header-splitting sequences while leaving FHIR search syntax intact. For `study_uid`, a DICOM UID grammar gate plus `quote(safe="")` matches the `fhir.py:428` treatment.
+
+**What would NOT be an honest fix.** Screening only `:431` and leaving `:436`. The header sink is the one with the sharper failure mode and it is the one the existing `versionId` precedent already tells us how to handle.
+
+**Test.** One test per sink per site, asserting refusal at construction time rather than at the URL layer.
+
+**Source:** #1107's ASVS 1.2.2 dynamic-URL surface enumeration, 2026-08-13. Related: #1240 (the grammar gates on the message-derived path), #1239 (duplicated control-char predicate in the same file).
+
+## 1243. close ASVS 1.2.2 on the merits: remove the verbatim flat FHIR query path and escape FHIR value separators
+
+> 🔢 **Filed 2026-08-13 -- OWNER-RULED, both limbs, and the two limbs are one item on purpose.** Value **7/10** -- Difficulty **5/10**. ASVS 1.2.2 asks that untrusted data be *"encoded according to its context"* when dynamically building URLs. `transports/fhir.py` gets the URL layer right and the **FHIR value layer** wrong, and separately ships an **unencoded path as the default**. Either one alone holds the cell at partial, so **closing one limb without the other does not close 1.2.2** -- that is why this is not two items.
+
+> **LIMB A -- REMOVE THE VERBATIM FLAT QUERY PATH.** `[egress].fhir_require_structured_params` ships **`False`** (`config/settings.py:2555`), so the default path is `transports/fhir.py:750`, `url = f"{url}?{search_part}"` -- the caller's search string appended **with no encoding at all**. The four screens above it at `:744-748` reject `#`, a second `?`, and a percent-decoded control character, and the comment at `:741` labels them *"Defense-in-depth (ASVS 1.2.2)"*.
+> **Do not read that comment as a control. The screen is the gap.** It is a denylist of three shapes standing where contextual encoding belongs, and its own comment says why it stops there: it declines to break *"legitimate multi-param (&/=/|) searches"*. Anchoring `:744-748` as evidence for 1.2.2 would cite the statement of the shortfall as proof of the control.
+> **The ruling is deletion, not a flipped default.** Setting `fhir_require_structured_params = True` would leave the unencoded sink reachable behind one config edit, which closes the cell on a default rather than on the absence of the sink -- a compensating control that a single setting removes. With **zero deployments** there is no migration cost to protect, so the simple correct end state wins outright: one code path, encoded by construction.
+
+> **LIMB B -- ESCAPE THE FHIR VALUE SEPARATORS `,` `|` `$` IN STRUCTURED VALUES.** `_encode_search_params` (`transports/fhir.py:671`) percent-encodes via `urlencode(..., quote_via=quote, safe="")`, which neutralises `&` and `=` at the URL layer. It does **not** neutralise `,`, `|` or `$`, which are **FHIR search-value separators**: they survive percent-decoding and arrive at the server with their separator meaning intact. Verified by execution -- `code=a,b` and `code=sys|val` reach the server as a two-value OR and a system-qualified token respectively, not as literals. A data value that happens to contain one therefore **changes the query's semantics**, which is parameter injection one layer above the URL. FHIR defines backslash escaping for exactly these characters; there is currently **no escaping of any kind** in the file.
+
+> **LIMB B DOES NOT TOUCH `conditional_query`, AND THAT IS THE WHOLE REASON IT IS SAFE.** The distinction is provenance, and it is easy to get backwards. A **structured value** is a single datum, so a separator inside it is always accidental and escaping it is always right. `conditional_query` is an **operator-authored whole query string** in which separators are the author's own syntax -- `CONNECTIONS.md:1479` documents `identifier=sys|val` as the intended shape and `tests/test_fhir_transport.py:210-221` pins it on both sinks (`If-None-Exist` at `:214`, the conditional-update URL at `:221`). **Escaping `conditional_query` would break a documented feature and fail a shipped test.** Its containment is a construction-time screen, which is **#1241**, already filed. Fixing this item must leave both assertions green.
+
+> **WHAT IS NOT IN SCOPE HERE, so nobody folds it in.** The `match`-versus-`fullmatch` grammar-gate defect and the missing READ-path control-char screen are **#1240**. The construction-time screen for operator config reaching URL and header sinks is **#1241**. The two identical control-char predicates are **#1239**. This item is the 1.2.2 encoding question only.
+
+> **RE-SCORE NOTE.** 1.2.2's residual of record currently reads, in full: *"fhir_require_structured_params ships False; on the default the flat search string is appended verbatim."* Limb A retires that sentence. The cell cannot reach an honest pass on Limb A alone, because the structured path it would then mandate still leaks the value-layer separators -- which is the finding that produced Limb B, and which had been filed as safe by everyone who looked at it, including the dispatcher who raised it.
+
+**Cluster:** Transports / FHIR egress. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- zero instances; on first deployment a Handler passing an unsanitised value into a FHIR search **would** be able to alter the query's meaning.
+
 ## 1242. `asvs-apply-cells.py` is a lossy writer in four distinct ways, and its own preservation guard is blind to three of them
 
 > 🔢 **Filed 2026-08-13 -- PENDING ACTIVE DATA LOSS, not a latent hazard. The next routine `--apply` destroys a whole commit's worth of structural evidence and prints a clean bill of health.** Value **8/10** -- Difficulty **4/10**. Vault-only security tooling, so there is no deployment axis; what it destroys is the **evidence record** the ASVS cells rest on. Findings below were adversarially verified (4 of 4 lenses), which corrected two errors in the original framing -- see the amendment note.
@@ -8330,20 +8473,118 @@ every worker session's handoff, which is the sentence the next session bases its
 
 **Cluster:** Security tooling / evidence integrity. **Priority:** P1. **Verdict:** build. **Severity:** no deployment axis -- vault tooling, ships to nobody. P1 rather than P2 because the loss is **pending on the next routine operation**, is **silent in both directions** (the writer reports success, the verifier reports green having checked less), and destroys evidence that cost a dedicated backfill to produce.
 
-## 1243. close ASVS 1.2.2 on the merits: remove the verbatim flat FHIR query path and escape FHIR value separators
+## 1245. an administrator password reset re-arms bootstrap retirement, permanently disabling the account it was meant to recover
 
-> 🔢 **Filed 2026-08-13 -- OWNER-RULED, both limbs, and the two limbs are one item on purpose.** Value **7/10** -- Difficulty **5/10**. ASVS 1.2.2 asks that untrusted data be *"encoded according to its context"* when dynamically building URLs. `transports/fhir.py` gets the URL layer right and the **FHIR value layer** wrong, and separately ships an **unencoded path as the default**. Either one alone holds the cell at partial, so **closing one limb without the other does not close 1.2.2** -- that is why this is not two items.
+> 🔢 **Filed 2026-08-13 -- an AVAILABILITY defect whose own docstring asserts it cannot happen, found while adjudicating the ASVS 6.1.1 re-score.** Value **7/10** -- Difficulty **3/10**. `admin_reset_password` sets `must_change_password=True`, which is the exact flag `_retire_superseded_bootstrap` treats as "still unclaimed". So resetting the password of a local account named `admin`, on a system that has any other enabled administrator, **would disable that account on its next login attempt and make the freshly issued temporary credential unusable**. The reset is the documented remedy; applying it destroys the account.
 
-> **LIMB A -- REMOVE THE VERBATIM FLAT QUERY PATH.** `[egress].fhir_require_structured_params` ships **`False`** (`config/settings.py:2555`), so the default path is `transports/fhir.py:750`, `url = f"{url}?{search_part}"` -- the caller's search string appended **with no encoding at all**. The four screens above it at `:744-748` reject `#`, a second `?`, and a percent-decoded control character, and the comment at `:741` labels them *"Defense-in-depth (ASVS 1.2.2)"*.
-> **Do not read that comment as a control. The screen is the gap.** It is a denylist of three shapes standing where contextual encoding belongs, and its own comment says why it stops there: it declines to break *"legitimate multi-param (&/=/|) searches"*. Anchoring `:744-748` as evidence for 1.2.2 would cite the statement of the shortfall as proof of the control.
-> **The ruling is deletion, not a flipped default.** Setting `fhir_require_structured_params = True` would leave the unencoded sink reachable behind one config edit, which closes the cell on a default rather than on the absence of the sink -- a compensating control that a single setting removes. With **zero deployments** there is no migration cost to protect, so the simple correct end state wins outright: one code path, encoded by construction.
+> **THE DOCSTRING STATES THE SAFETY PROPERTY THIS DEFEATS, WHICH IS WHY IT SURVIVED REVIEW.** `auth/service.py:580-581` reads: *"the operator changed its password it is a normal admin account and is left alone, so this can't lock out a legitimate single-admin deployment."* That is true of a **self-service** change -- which clears `must_change_password` -- and false of an **administrator reset**, which sets it back. The retirement gate is not testing "has this account been claimed"; it is testing a flag that a second, unrelated shipped code path re-raises. A reader checking whether retirement is safe finds a sentence saying it is.
 
-> **LIMB B -- ESCAPE THE FHIR VALUE SEPARATORS `,` `|` `$` IN STRUCTURED VALUES.** `_encode_search_params` (`transports/fhir.py:671`) percent-encodes via `urlencode(..., quote_via=quote, safe="")`, which neutralises `&` and `=` at the URL layer. It does **not** neutralise `,`, `|` or `$`, which are **FHIR search-value separators**: they survive percent-decoding and arrive at the server with their separator meaning intact. Verified by execution -- `code=a,b` and `code=sys|val` reach the server as a two-value OR and a system-qualified token respectively, not as literals. A data value that happens to contain one therefore **changes the query's semantics**, which is parameter injection one layer above the URL. FHIR defines backslash escaping for exactly these characters; there is currently **no escaping of any kind** in the file.
+> **THE CHAIN, every link read at `origin/main` rather than inferred:**
+> ```
+> auth/service.py:2730-2733  admin_reset_password -> set_password(..., must_change_password=True)
+>              :2735         -> revoke_user_sessions(user_id)      the self-service escape closes here
+>              :650-651      _login_local: if username == BOOTSTRAP_USERNAME -> _retire_superseded_bootstrap()
+>                            -- BEFORE the credential check at :669
+>              :584          gate: return early if `not boot.must_change_password`   <- the reset re-opened it
+>              :588          superseded = _other_enabled_admin_exists(boot.id)       <- true, no expiry wait
+>              :591          set_user_disabled(boot.id, disabled=True)
+>              :653-663      the same attempt then returns "invalid credentials"
+> ```
+> **The loop is closed.** Re-enabling through `PATCH /users/{user_id}` does not help: `must_change_password` is still set and another administrator still exists, so the next login retires it again. **No route clears the flag** -- it is not a `PATCH`-able field, and the only writes that set it `False` are on the self-service password-change path, which needs a live session that `:2735` has just revoked.
 
-> **LIMB B DOES NOT TOUCH `conditional_query`, AND THAT IS THE WHOLE REASON IT IS SAFE.** The distinction is provenance, and it is easy to get backwards. A **structured value** is a single datum, so a separator inside it is always accidental and escaping it is always right. `conditional_query` is an **operator-authored whole query string** in which separators are the author's own syntax -- `CONNECTIONS.md:1479` documents `identifier=sys|val` as the intended shape and `tests/test_fhir_transport.py:210-221` pins it on both sinks (`If-None-Exist` at `:214`, the conditional-update URL at `:221`). **Escaping `conditional_query` would break a documented feature and fail a shipped test.** Its containment is a construction-time screen, which is **#1241**, already filed. Fixing this item must leave both assertions green.
+> **THE FAILURE IS SILENT AT BOTH ENDS, which is the part that makes it worth a P2.** The administrator sees a successful reset and hands over a temporary password. The account holder sees `invalid credentials` -- the generic refusal at `:653-663`, deliberately indistinguishable from a wrong password so that it does not leak account state. Neither party is told the account was retired. The audit log records `auth.bootstrap_admin_retired` at `:593`, so the evidence exists, but nothing surfaces it at the moment of failure and no operator would think to look there for what presents as a mistyped password.
 
-> **WHAT IS NOT IN SCOPE HERE, so nobody folds it in.** The `match`-versus-`fullmatch` grammar-gate defect and the missing READ-path control-char screen are **#1240**. The construction-time screen for operator config reaching URL and header sinks is **#1241**. The two identical control-char predicates are **#1239**. This item is the 1.2.2 encoding question only.
+> **SCOPE, stated precisely so severity is not inflated.** This is **not** a whole-system lockout: the trigger *requires* another enabled administrator, and that administrator still works. What is destroyed is the account named `admin` specifically, and per BACKLOG #1236's neighbourhood it cannot be renamed (`update_user` does not rename) or deleted, so it persists as a permanently disabled row. The exposure is availability, not credential disclosure. **No deployment axis -- zero instances**; this is written in the conditional because nothing is running it.
 
-> **RE-SCORE NOTE.** 1.2.2's residual of record currently reads, in full: *"fhir_require_structured_params ships False; on the default the flat search string is appended verbatim."* Limb A retires that sentence. The cell cannot reach an honest pass on Limb A alone, because the structured path it would then mandate still leaks the value-layer separators -- which is the finding that produced Limb B, and which had been filed as safe by everyone who looked at it, including the dispatcher who raised it.
+> **INTERACTION WITH #1136 / ADR 0163, so this is not fixed twice or fixed away by accident.** ADR 0163 proposes removing the bootstrap admin entirely, which would delete this defect along with its subject. That is a much larger change gated on four owner decisions and is not scheduled. **This item should be fixed on its own terms in the meantime**, and the fix is small: `admin_reset_password` should not re-raise the "unclaimed" signal for an account that has already been claimed, or the retirement gate should test claimed-ness by something a reset cannot forge. Whoever fixes it must also correct the docstring at `:580-581`, because that sentence is the reason nobody looked.
 
-**Cluster:** Transports / FHIR egress. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- zero instances; on first deployment a Handler passing an unsanitised value into a FHIR search **would** be able to alter the query's meaning.
+> **BOUND ON WHAT WAS VERIFIED.** The control flow above was read statically at `origin/main` and each cited line confirmed individually; it has **not** been reproduced by executing a login sequence. A test that resets the password of a claimed `admin` account on a two-administrator system and then asserts the temporary credential works is the confirming experiment, and it does not exist today.
+
+> ⚠️ **Amendment, same day, strengthening the item on a peer review before it was pushed. Two of the original bound's open connections are now CLOSED, and the mechanism is stated more precisely.**
+>
+> **THE DEFECT IS A PROXY, and naming it that way makes the fix obvious.** The docstring at `auth/service.py:579` says the routine *"Only ever touches an unclaimed bootstrap (`must_change_password` still set)"* -- it **equates** unclaimed-ness with that flag. `must_change_password` is being used as a **proxy for "this account has never been claimed"**, and the equivalence holds only while the flag has exactly one writer. `admin_reset_password:2733` is a second writer, so it sets the proxy on an account that *was* claimed. The gate is not wrong about its own test; it is wrong that the test means what it is taken to mean. **The durable fix is to stop inferring claimed-ness from a mutable flag any path may raise** -- record it, or test something a reset cannot forge -- rather than to special-case the reset.
+>
+> **TWO UNOPENED CONNECTIONS FROM THE ORIGINAL BOUND ARE NOW READ, and both hold.** The original filing verified each link individually and said so; a peer correctly pointed out that individually-verified links are not a verified chain, because the gaps *between* them are invisible precisely when every link checked holds.
+> - `store/store.py:7714-7729` -- `set_password` issues `UPDATE users SET ... must_change_password=?`, so the flag **is** persisted, not merely passed.
+> - `auth/service.py:567-574` -- `_other_enabled_admin_exists` iterates users, skips disabled and the excluded id, and returns true for any holder of the ADMINISTRATOR role. A second enabled administrator **does** make `superseded` true, with no expiry wait.
+>
+> **WHAT REMAINS UNVERIFIED IS NOW SMALLER AND NAMED:** the chain has still not been executed end to end. What is unread is `get_user_by_username` returning the persisted flag on the read side. That is near-certain and it is still not the same as having run it.
+>
+> **THE CONFIRMING TEST MUST ASSERT THE CORRECT BEHAVIOUR, NOT REPRODUCE THE DEFECT.** A test written to assert what the code does today **turns the bug into expected behaviour**: whoever fixes this then sees a red test and concludes they broke something, so the green actively defends the defect. Write it as *reset a claimed `admin` on a two-administrator system, then **assert the temporary credential works***, and land it with **`@pytest.mark.xfail(strict=True)`**. `strict` is the load-bearing half -- it reds when the test starts **passing**, so the fix cannot land silently and the marker cannot rot into a permanently ignored line. A non-strict xfail is the same defect one level up.
+> The `reason=` string is the **artifact**, and it must name the **mechanism, not the symptom**: the gate at `:584` tests `must_change_password`, `admin_reset_password:2733` re-raises it, and no route clears it. That sentence is what makes the test re-derivable once these line numbers drift, which they will.
+
+**Cluster:** Authentication / account lifecycle. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- zero instances; on first deployment an administrator following the documented reset **would** render the `admin` account permanently unusable without either party being told.
+
+## 1244. an engine change that breaks a vault ASVS anchor produces no state change and no attribution: the signal is real, late, and lands in a gate that is already red
+
+> 🔢 **Filed 2026-08-13. NOT "nothing detects this" -- that framing was wrong and is recorded below so nobody re-derives it.** Value **6/10** -- Difficulty **4/10**. The detection already exists and works; what is missing is that it cannot **block**, cannot **attribute**, and currently cannot **change colour**.
+
+> **THE COUPLING.** The scorecard lives in the vault (private); the code it cites lives in the engine (public). Every one of the **1,998** evidence anchors names an engine path, and **192** of them cite engine *prose* under `docs/` -- the kind of line an ordinary documentation edit rewrites without anyone thinking about security evidence. Nothing in the engine repo references the scorecard, and nothing can: **the engine tree contains the verifier (`scripts/asvs/scorecard.py`) but zero scorecard data files**, by deliberate design, because the data is what must stay private.
+
+> **WHAT ALREADY WORKS, and it must not be rebuilt.** The vault gate's own trigger block documents this exact hazard and already fixed the worst of it: *"the anchors point into the ENGINE, but the triggers above all fire on VAULT events... Verified live: #119 landed in the engine and moved eleven anchors; this gate stayed green because nothing here had changed."* A daily `schedule:` run was added precisely to close that, and it does. **Any fix here starts from a working daily detector.**
+
+> **THE THREE GAPS THAT REMAIN, in ascending order of how badly they bite:**
+> ```
+> 1. NOT PRE-MERGE   an engine PR merges; the break is found on the next daily run.
+>                    The engine PR is where the change was still reviewable.
+> 2. NOT ATTRIBUTED  the run reports a broken anchor, not which engine change broke
+>                    it. Whoever reads it bisects a day of engine history by hand.
+> 3. NO STATE CHANGE the gate is ALREADY RED -- 11 FAIL rows on the current run --
+>                    and `verify` is NOT a required context. So a 12th failure moves
+>                    nothing anyone watches: not the check's colour, not
+>                    mergeability, not a notification.
+> ```
+> **Gap 3 is the real defect.** A detector whose output is a count inside an already-failing, non-blocking job is indistinguishable from the same job yesterday. That is why the instance below was caught by **a person reading a diff**, not by the instrument that exists to catch it.
+
+> **THE INSTANCE THAT PROMPTED THIS.** Engine PR #361 deletes a sentence from `docs/SECURITY.md` that an anchor pins verbatim. The break was found by a session reading the PR's diff and reasoning about the vault; the retirement was prepared by hand as a separate vault change. Had nobody looked, #361 would have merged and the count would have gone 11 to 12 on a schedule, hours later, attributed to nothing.
+
+> **A CONSTRAINT ON THE FIX THAT IS EASY TO MISS, and it is why the obvious build is wrong.** An engine-side check runs in a **public** repository with public logs. It must report **the engine file and line that stopped matching** and must **not** name the cell, the requirement id, or the count of affected cells -- those are the vaulted content, and a failing public CI log enumerating them hands out coverage by subtraction (CLAUDE.md section 12). "Report the line, never the cell" is a hard requirement of any design here, not a preference. This is what makes the item non-trivial: the natural implementation leaks.
+
+> **How to prove a fix:** in an engine PR, delete a line that an anchor pins verbatim, and assert the PR goes red **before merge**, naming the engine file and line and **naming no cell id**. Then assert the negative control: a PR touching an unanchored line stays green, so the check is discriminating rather than always-red. A fix that only shortens the schedule addresses gap 1 and neither of the others; a fix that makes `verify` required **without first closing the standing 11 failures** converts a silent problem into a permanently blocked repository.
+
+> ⚠️ **Recording the framing error, because it was mine and it was nearly filed.** This was first proposed as one item covering a whole class -- *"two artifacts that must agree with nothing noticing when they stop"* -- generalised from three sightings in one evening. That was wrong twice over. **A class has no prove-a-fix**, so it could never be closed, and bundling limbs with different fixes is exactly what splitting #1236 out of #1131 existed to prevent. And the premise did not survive contact: the detector exists, a daily run already covers the case, and only the blocking, attribution and visibility limbs are real. Two of the three original sightings did not survive at all -- one had resolved itself correctly, and the third was carried second-hand and never verified. On re-reading it was a **different mechanism** anyway (one instrument answering a narrower question than its declared scope, rather than two artifacts drifting apart); they share a smell, not a cause.
+
+**Cluster:** Security tooling / CI. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- this is evidence-integrity plumbing across two repositories, not shipped engine behaviour. The exposure is that the ASVS record can quietly describe code that no longer exists, which is a **stale anchor** (the evidence went stale), never an engine weakness.
+## 1246. the scorecard's residual prose carries 1,965 ungated file-line citations, and an enumeration in prose can understate a cell's own gap
+
+> 🔢 **Filed 2026-08-13 -- a defect in the RECORD-KEEPING METHOD, not in the engine. Measured against the published scorecard, found by a builder hitting its consequence.** Value **6/10** -- Difficulty **4/10**. The ASVS gate validates `evidence[].expect` as a unique substring and reports line drift as advisory. **It does not read `residual` at all.** Residual prose carries **1,965 `file:line` citations, spread across most of the scorecard** -- roughly as many citations as there are validated anchors (1,998) -- and **nothing checks a single one**.
+
+> **THE HALF-ROT SHAPE, and it is why this is invisible rather than merely untidy.** A cell can be **green on every anchor while the prose beside it has moved**, because the two live in the same TOML table and only one of them is machine-checked. Cell **7.2.4** is the demonstrating case at `2d11dacc`: its `_issue_session` evidence anchor still resolves **exactly**, so nothing about the cell looks stale -- while the residual's own citations for the two sites it names have drifted (`service.py:1638` and `:1997`, against stamp sites now at `:1709` and `:2082`). This is **not general rot**; it is selective rot in exactly the half no gate reads.
+
+> **THE DRIFTED NUMBERS ARE THE MINOR HALF. THE ENUMERATION IS THE DEFECT.** 7.2.4's residual states the gap as *"`AuthService.reauth` ... and `verify_mfa` ..."* -- two sites, presented as the surface. Asking from the STATE end instead (every stamp that raises a session's authority, rather than every plausible function name) finds **seven** `mark_session_*` sites in `auth/service.py`: `:1469` `_issue_session` (initial mint, correctly out of scope), `:1709` `reauth`, `:2047` `confirm_mfa_enrollment`, `:2082`/`:2086` `verify_mfa`, `:2330` `finish_webauthn_registration`, `:2463` `finish_webauthn_assertion`. **Three are named by neither the cell nor its backlog item**, and `finish_webauthn_assertion` is a passkey step-up -- re-authentication by any reading of the verb.
+
+> **AN UNDERSTATED GAP IS MORE DANGEROUS THAN AN OVERSTATED ONE, which is the whole reason to file this.** An overstated gap wastes effort and gets corrected on contact. An understated gap makes an INCOMPLETE FIX LOOK COMPLETE: wiring rotation into the two named sites would produce visible, demonstrable work -- *"re-authentication now rotates"* -- inviting a pass while a passkey or recovery-code elevation still carried the pre-elevation token forward. That is the same polarity as citing a remediation as evidence of the control it removed. **SDS-3.6 already names this class** (*a completeness claim is a liability -- prefer "at least" to an enumeration*); what is new is that the liability sits in the **one field nothing validates**.
+
+> **THE REMEDY IS A FILING RULE, NOT A NEW GATE, and the distinction is deliberate.** Validating 1,965 prose citations would need a tool that reds constantly on drift the project has already decided is **advisory** -- the `+/-40` anchor window was retired 2026-08-09 for precisely that reason (`scripts/asvs/scorecard.py:107-125`), and re-introducing line-exactness through the back door would re-make a mistake already unmade. Propose instead: **a residual that enumerates a surface must state HOW the enumeration was derived** -- the query, the corpus, the direction -- so a reader can re-run it rather than trust it. *"A grep for `def reauth|def verify_mfa` over `auth/`"* and *"every call to `mark_session_*` in `auth/`"* return different sets, and the second is the one that answers the question. Same shape as the existing rule that a sweep deriving an item from a cell must carry the cell's counter-evidence or say it dropped it.
+
+> **SCOPE AND BOUND.** The 1,965/248 figures are a regex count of `path.ext:NNN` shapes in the `residual` field of the published scorecard (`e0677451`), so they are an **upper bound on citations** and say nothing about how many have drifted -- that is unmeasured and deliberately not claimed here. The 7.2.4 evidence is verified at `2d11dacc`: the seven stamp sites and their enclosing functions were read, and `_rotate_session_token` (`auth/service.py:1501`) has **no caller outside its own definition and `tests/test_session_rotation_primitive.py`**, so the rotation machinery is genuinely unwired. **NOT yet established:** whether `:2047`, `:2330` and `:2463` are each a *genuine* elevation the verb covers, or in part re-stamps on an already-elevated session. That determination is in flight in the #1146 lane and **7.2.4 must not be re-scoped on the count alone**.
+
+**Cluster:** Security record / ASVS method. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- this is a defect in the assessment record, not in shipped code; its cost is that a reader **would** treat an enumerated gap as the whole surface and ship a partial fix believing it complete.
+
+## 1247. installing the machine-global worktree gate leaves no record: no backup, no receipt, no log line, and Copy-Item preserves the source mtime
+
+> 🔢 **Filed 2026-08-13 -- found the hard way. The installed gate's CONTENT changed on this box while three sessions were running against it, and after all three looked, NOBODY CAN SAY WHO WROTE IT.** Value **6/10** -- Difficulty **3/10**. The change itself was benign and correct -- it moved the gate FORWARD, from `590b68f6` to `dd90232e` -- so this is a governance defect, not an incident. An unattributable write to a shared safety control is the same class of event whether it upgrades or downgrades; only the outcome differed.
+
+> **FOUR MECHANISMS COULD HAVE RECORDED IT. NONE IS PRESENT.** `scripts/worktree/install-gate.ps1:420` is a bare copy:
+> ```powershell
+> Copy-Item -LiteralPath (Join-Path $RepoRoot "scripts\hooks\worktree_gate.ps1") -Destination $GateDst -Force
+> ```
+> - **No backup.** Nothing preserves the bytes being overwritten. (`:162` *does* write a `.bak`, but that is inside the settings-JSON writer and never touches the gate script -- a near-miss that makes the absence easy to misread as present.)
+> - **No receipt.** `install-gate.ps1` contains **zero** occurrences of the string `receipt`.
+> - **No log line.** `~/.claude/hooks/worktree-gate.log` records gate DECISIONS, not installs: zero lines matching `install|copy|wrote|updated`.
+> - **No usable timestamp.** `Copy-Item` carries the SOURCE file's `LastWriteTime`, so the installed copy inherits an mtime from whichever checkout it came from. **The installed file read `2026-08-12 13:55:22` while its content had demonstrably changed after that instant.**
+
+> **THE MTIME IS WORSE THAN MISSING -- IT IS ACTIVELY MISLEADING, and it cost a true finding.** A stale-gate report was filed correctly, then **RETRACTED** on the strength of that timestamp ("nothing wrote it today"), and the retraction propagated to three sessions and the owner before a builder's *baseline hash* reproved the original claim. An absent record makes people say "unknown"; a **wrong** record makes them say something false with confidence. Anything that fixes this must not simply add a field -- it must stop the timestamp from reading as evidence.
+
+> **HOW THE WRITE WAS EVENTUALLY BOUNDED, since the technique is the only thing that worked.** Not from the file, which carries no history, but from a **record of the past taken before the change**: one session's pre-change test output printed the installed hash in two forms, and both resolve to the same commit --
+> ```
+> 590b68f6   LF = 13a6af15705e     CRLF = 24c511ff75a0      <- both printed at that session's baseline
+> dd90232e   LF = 937eaa397e41     CRLF = 4bd81a4df095      <- installed afterwards, and now
+> ```
+> A **re-measurement can never distinguish "my instrument was wrong" from "the artifact changed"** -- it sees only the present. The baseline could, because it was a record of the past. That asymmetry is the entire argument for this item: without one session happening to have captured a hash, the change would have been undetectable, not merely unattributed.
+
+> **PROPOSED FIX, deliberately small.** At the install site: write a **receipt** next to the gate recording the installing repo path, the source blob sha, the content hash written, the hash of what was replaced, and a real UTC timestamp taken at write time -- **not** inherited. Optionally keep the replaced bytes as a `.bak` so a bad install is reversible. Then have `install-gate.ps1` refuse to overwrite a gate whose content does not match its own receipt without an explicit flag, which turns a silent replacement into a question. **Do not fix this by touching mtime** -- a corrected timestamp is still a single mutable field asserting a fact nothing else corroborates.
+
+> **BOUND.** The absence of all four mechanisms is verified by reading `install-gate.ps1` and the hooks directory at `c2241cfe`. **What is NOT established is that `install-gate.ps1` performed this particular write at all** -- no `.bak` appeared beside the gate, which is consistent with the installer (it writes none for the script) but also consistent with some other process copying the file. **The writer remains unknown and this item does not claim otherwise**; it says only that had the sanctioned installer been used, it would have left nothing either.
+
+**Cluster:** Developer tooling / process safety. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- this governs a developer-machine hook, not shipped engine code; the cost is that a change to a shared safety control **would** be undetectable and unattributable, as it was here.
