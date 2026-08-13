@@ -8615,3 +8615,39 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > **BOUND.** The line numbers and the absence are verified at `2d11dacc` by locating every `_audit` and `_notify_security` call in the enclosing region and comparing their positions to the binding writes -- not by reading the function narratively, which is how an absence twenty lines from a presence gets missed. **NOT established here:** whether any *other* surface (a store-layer trigger, a middleware, an alert sink) records the binding independently. A reviewer should confirm that before sizing the fix, because a second recorder would change this from "unrecorded" to "not recorded *here*".
 
 **Cluster:** Authentication / federation / audit. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- zero instances; on first deployment a federated binding **would** be written to an account with nothing recorded and nobody told, so an unexpected binding **would** be invisible to the one party able to recognise it.
+
+## 1249. SECURITY.md documents an ingest-plane rate limit that no code-first or TOML configuration can reach
+
+> 🔢 **Filed 2026-08-13 -- found while premise-checking #1114, and it is a better finding than the item it came from.** Value **7/10** -- Difficulty **2/10**. The MLLP message pacer is real, reads its settings, and ships off. **It also cannot be turned on by any documented means** -- and `docs/SECURITY.md:1633` lists its two keys in the operator control table with state **"off"**, which every reader takes to mean "set it to on".
+
+> **THE CHAIN, verified by execution twice independently, with a positive control:**
+> ```
+> mllp.py:1308   class _MessagePacer:                                   the control is real
+> mllp.py:1378   mps = s.get("max_messages_per_second", DEFAULT_...)    and reads its settings
+> mllp.py:116    DEFAULT_MAX_MESSAGES_PER_SECOND = None                 ships off
+>
+> MLLP() has 26 keyword-only parameters and NO **kwargs:
+>    max_messages_per_second   NOT A PARAMETER
+>    message_burst             NOT A PARAMETER
+>    max_connections           ACCEPTED        <- positive control; the check discriminates
+>
+> connections_file.py:286   return factory(**settings)     TOML routes through the SAME factory,
+>                                                          and the comment below says "the factory IS
+>                                                          the schema"
+> ```
+> So neither authoring surface can express the keys. The settings dict the pacer reads can never contain them.
+
+> **THE DEFECT IS NOT "THE CONTROL SHIPS OFF" -- IT IS THAT THE DOCUMENTATION ASSERTS AN AFFORDANCE THAT DOES NOT EXIST.** That is **SDS-3.7**, a compensating control resting on a false premise, sitting in the one document where the rule bites hardest. An operator doing diligence reads row 1633, concludes the ingest plane can be rate-limited, sets out to enable it, and cannot.
+> ⭐ **"off" is worse than absent.** An absent control prompts a question; a control documented as *present but disabled* prompts a configuration edit that cannot succeed, and the operator's most likely conclusion is that they have mis-typed the key.
+
+> **TWO OPPOSITE FIXES, AND THE CHOICE IS AN OWNER CALL -- deliberately not pre-decided here.**
+> **(a) Expose the two keys** on the `MLLP()` factory, making the documentation true and the control reachable. **(b) Delete the `SECURITY.md` row**, making the documentation true and the control honestly absent. They are opposite in every respect except that both end the false premise, and picking between them is a product decision about whether ingest-plane rate limiting is wanted at all.
+> **Whichever is chosen, the other must not be done by halves** -- exposing the keys without correcting the row's "off" wording, or deleting the row while leaving `_MessagePacer` reading settings nothing can supply, reproduces the defect in a new place.
+
+> **SCOPE, and it is wider than MLLP.** A pacing-vocabulary sweep over all **25** modules in `transports/` found **14 hits in `mllp.py`** (live positive control) and **ZERO in the other 24**. Eleven modules call `register_source`; **ten have no rate or volume control in any configuration**, including raw TCP, X12 and the DICOM C-STORE SCP. So a rate bound is not merely unreachable on MLLP -- it does not exist anywhere else on the ingest plane.
+
+> ⛔ **DO NOT SAY "UNBOUNDED INTAKE" -- that is false and #1114 says it.** At least four bounds ship **on**: `max_frame_bytes` 16 MiB, `max_connections` 256, `receive_timeout` 60s, and `file.py`'s `max_file_bytes` 16 MiB. They bound **SIZE and CONCURRENCY, not RATE**. The correct phrasing is **"no message-rate bound"**. This correction runs in the direction that makes the engine look *better*, which is why it is stated explicitly rather than left to a reader.
+
+> **RELATIONSHIP TO ASVS 2.4.1 (#1114): this makes the cell WORSE, not better.** Rule 4 holds that *"it can be configured"* is never a pass; here it cannot be configured at all, so the control is effectively **absent** on the ingest plane while being documented as present-but-disabled. #1114 stays **partial** and its own hardened question -- whether a control that ships off can be an honest pass -- is settled by the method rather than by research.
+
+**Cluster:** Transports / MLLP, and security documentation. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- zero instances; on first deployment an operator **would** be told a rate limit is available and **would** be unable to enable it.
