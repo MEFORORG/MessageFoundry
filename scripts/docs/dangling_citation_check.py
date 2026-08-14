@@ -204,7 +204,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("paths", nargs="*", type=Path, help="files to scan (default: docs/**/*.md)")
     parser.add_argument(
-        "--fail", action="store_true", help="exit non-zero when any citation is unresolved"
+        "--advisory",
+        action="store_true",
+        help="report and exit 0 even when a live-shape citation is found (default: exit 1)",
     )
     args = parser.parse_args(argv)
 
@@ -263,7 +265,24 @@ def main(argv: list[str] | None = None) -> int:
     print(
         "Not scanned: the private companion repository, where a citation is invisible to this repo."
     )
-    return 1 if args.fail else 0
+    # FAIL CLOSED, ON THE LIVE SHAPE ONLY (BACKLOG #1235). The first version of this took `--fail`
+    # as opt-in and nothing passed it, so a planted dangling citation was reported correctly AND the
+    # process still exited 0 -- a checker that cannot fail is not a check, which is the defect this
+    # tool exists to catch in other people's gates. Flipping the default cost nothing: repo-wide the
+    # script was referenced by two lines, both inside its own unit test.
+    #
+    # The exit code keys on the LIVE shape, not on the hit count. A number at or below the floor can
+    # never be issued, and a PR/issue/foreign-repo reference is not a backlog citation at all; both
+    # are reported for a human to read and neither is a defect. Failing on them would red the tree
+    # today for hits that are correct, and a gate that cries wolf gets switched off.
+    live = [h for h in hits if h.number > floor and not h.pr_shaped]
+    if live:
+        print()
+        print(f"LIVE SHAPE: {len(live)} citation(s) name a number that can still be issued.")
+        for h in live:
+            print(f"  {h.path}:{h.lineno}: #{h.number}")
+        print("Allocate the number before citing it, or write the reference so it CANNOT resolve.")
+    return 1 if (live and not args.advisory) else 0
 
 
 if __name__ == "__main__":
