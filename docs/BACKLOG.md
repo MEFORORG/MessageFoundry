@@ -8953,6 +8953,14 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **THIS IS A LATENT HAZARD, NOT A LIVE DEFECT, and it must not be cited as evidence of a current gap.** All six rejecting copies are consistent today; nothing is mis-screened and there is no behavioural difference to exploit. The cost is future-tense and conditional, and it is the same one #1239 named: a later hardening applied to one copy silently does not apply to the other six, and nothing reports the omission.
 
+> **STATUS 2026-08-14 (dispatcher) -- THE WORK HAS LANDED AND THIS IS CLOSABLE. The banner is NOT flipped here, deliberately; see the last paragraph.** The filed banner still reads "not started", which is now false. Measured at `origin/main` `ae76b9f9`, reading the ref:
+>
+> **THE CONSOLIDATION SHIPPED.** `messagefoundry/controlchars.py` exists and exports `has_control_char` and `strip_control_chars`. The expression `ord(ch) < 0x20 or ord(ch) == 0x7F` now occurs in **that module only** -- twice as implementation, once in a docstring that names what it replaced. The count this item was filed over, seven across six files, is retired.
+>
+> **AND IT IS ADOPTED, WHICH IS THE HALF WORTH CHECKING.** A new shared helper that nobody imports would satisfy the grep above while leaving all six copies in place, so the importers were enumerated rather than assumed: `config/codeset_edit.py`, `config/impact.py`, `transports/dicomweb.py`, `transports/fhir.py`, `transports/remotefile.py` (all `has_control_char`) and `transports/rest.py` (`strip_control_chars`) -- **six files, matching the six this item named.** `tests/test_controlchars.py` covers the module directly.
+>
+> **WHY THE STATUS BANNER IS LEFT OPEN RATHER THAN CLOSED.** `scripts/docs/backlog_status_check.py` treats an item carrying **both** a closed and an open banner as a hard error, and separately rejects a shipped item that still carries a `**Priority:**`. So closing this is three coupled edits -- replace the open banner, drop the `P3` line, move the item verbatim into `docs/archive/backlog/BACKLOG-CLOSED.md` -- not a banner addition, and a half-performed closure reds the hygiene gate. **This paragraph records the evidence so whoever performs that closure does not have to re-measure it.**
+
 **Cluster:** Code quality / drift hazard. **Priority:** P3. **Verdict:** build (small).
 **Severity:** none today, and no deployment axis (§0).
 
