@@ -7980,6 +7980,21 @@ gate is the wrong shape, validation of the walk is the right one.
 
 > Both are conditional on a first deployment: an operator who wrote `retry_max_attempts = 0` intending "unlimited" would get single-attempt dead-lettering, silently. Nothing is misconfigured today; there are zero deployments. Note the interaction with **#1051**, which set the finite default to 100 -- a floor should be decided alongside whether retry-forever needs a config spelling at all.
 
+> ⚠️ **AMENDED 2026-08-13 (dispatcher) -- HALF 1 BUILT on PR #383, HALF 2 OUTSTANDING, ITEM STAYS OPEN. Do not close this on #383.** Banner authored by the dispatcher rather than the builder, per the owner's 2026-08-13 ruling that a builder may not author ledger content.
+>
+> **HALF 1, THE `>=1` FLOOR: BUILT.** Verified on the branch against `origin/main`:
+> ```
+> origin/main   retry_max_attempts: int | None = 100
+> PR #383       retry_max_attempts: int | None = Field(default=100, ge=1)
+> ```
+> A configured `0` or negative is now **refused at load** rather than loading clean and dead-lettering on the **FIRST** failure -- the delivery check is `item.attempts >= max_attempts` against a **post-increment** count (`pipeline/wiring_runner.py:5040`), so `0` meant *give up now* while reading like *no limit*.
+>
+> ⚠️ **THE FLOOR IS ON THE OPERATOR-FACING SETTING ONLY, AND THAT IS DELIBERATE.** `RetryPolicy(max_attempts=0)` remains a **live internal idiom** for a permanent no-retry failure -- measured, it is used across **5 files** including `store.mark_failed` call sites and asserted by tests (`tests/test_batch_completion.py:206-208`, `tests/test_postgres_store.py:3109`). **Constraining the dataclass instead would have deleted a used mechanism while claiming to add a guard** -- the reads-as-hardening-but-removes-a-control shape.
+>
+> **THE ITEM'S STATED REASON FOR DEFERRING THE FLOOR IS ANSWERED, not ignored.** It said the floor was documented rather than fixed *"because a floor changes the accepted-configuration set"*. **Under section 0 there are ZERO deployments, so there is no accepted configuration to break and no migration cost to protect** -- the simple correct end state wins outright.
+>
+> **STILL OPEN, AND IT IS WHY THIS ITEM DOES NOT CLOSE: whether the retry-forever posture needs a TOML or env spelling.** `""`, `none` and `null` all raise `ValidationError`, so that posture is reachable in **code-first configuration only**. **That is a product question, it was handed back rather than decided, and the item itself says it should be decided alongside the floor.** A closure on #383 would silently answer it by omission.
+
 **Cluster:** Connections and Transports. **Priority:** P3. **Verdict:** build. **Severity:** minor.
 
 
