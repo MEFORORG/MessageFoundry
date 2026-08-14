@@ -64,6 +64,7 @@ from messagefoundry.config.tls_policy import (
     relax_verify_expiry,
     resolve_trust_anchor,
 )
+from messagefoundry.controlchars import has_control_char
 from messagefoundry.transports.base import (
     DeliveryError,
     DestinationConnector,
@@ -118,7 +119,7 @@ def _is_contained_name(name: object) -> bool:
         return False
     if "/" in name or "\\" in name:
         return False
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
+    if has_control_char(name):
         return False
     # A drive-relative path ("C:x.hl7") resolves against the drive's CWD on Windows and contains no
     # separator, so the checks above cannot see it. Two chars, ASCII letter, then a colon.
