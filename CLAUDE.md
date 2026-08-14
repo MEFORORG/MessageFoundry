@@ -284,6 +284,14 @@ diverge enough to warrant it; keep this root file general.
   three times). Allocate it atomically — `pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -Title
   "<title>"` — and add the ADR's index row in the *same* commit. A `pre-commit` hook rejects a number you
   did not allocate; see [`docs/LEDGER-GATE.md`](docs/LEDGER-GATE.md).
+- **Never CITE a `#N` you have not allocated — allocate first, or write a reference that cannot resolve.**
+  The counterpart of the rule above, and the more insidious half. While the number is unissued the citation
+  resolves to **nothing**, which is honest. The day someone legitimately allocates it, that citation
+  begins resolving — **to unrelated work, and with nothing anywhere reporting a problem**. A dangling
+  reference advertises its own brokenness; a wrongly-resolving one reads as a working cross-reference
+  forever. If you need to gesture at unfiled work, **name the subject, not a number** (*"the retention
+  runbook step, unallocated"*) — that costs nothing and cannot arm. See
+  [`docs/LEDGER-GATE.md`](docs/LEDGER-GATE.md) §"Citing a number you have not allocated".
 - **Building in two sessions at once?** Don't share the working tree — give each its own **git
   worktree** (`scripts/worktree/new.ps1 -Name <x>`, cleanup with `remove.ps1`). Each gets an isolated
   checkout + branch + `.venv`; same remote, same PR flow. See [`docs/WORKTREES.md`](docs/WORKTREES.md).

@@ -1056,7 +1056,13 @@ class DeliverySettings(_Section):
     # 100 default (#1051) — a test guards the sync, and the two MUST move together: leaving this at
     # None would restore retry-forever for every outbound that declares no retry= of its own, which
     # is the overwhelmingly common shape.
-    retry_max_attempts: int | None = 100
+    # `ge=1` because a configured 0 loaded clean and dead-lettered on the FIRST failure: the delivery
+    # check is `item.attempts >= max_attempts` against a POST-increment count, so 0 means give up
+    # immediately while READING like "no limit". `None` is the documented retry-forever posture and
+    # stays legal. The floor is on the OPERATOR-FACING setting only -- `RetryPolicy(max_attempts=0)`
+    # remains a deliberate internal idiom for a permanent, no-retry failure (store `mark_failed`), and
+    # constraining that instead would delete a used mechanism while claiming to add a guard.
+    retry_max_attempts: int | None = Field(default=100, ge=1)
     retry_backoff_seconds: float = 5.0
     retry_backoff_multiplier: float = 2.0
     retry_max_backoff_seconds: float = 300.0

@@ -45,6 +45,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.controlchars import has_control_char
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -93,7 +94,7 @@ def _reject_url_control_chars(value: str, field: str) -> None:
     CR/LF in ``study_uid`` would let it split the request line; urllib would reject it with a bare
     ``ValueError`` at send. Surface it as a clear construction-time ``ValueError`` (caught at
     ``check``/dry-run as a ``WiringError``) — PHI-safe (names the field, never the value)."""
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+    if has_control_char(value):
         raise ValueError(f"DICOMweb {field} contains an illegal control character")
 
 
