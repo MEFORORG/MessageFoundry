@@ -445,15 +445,28 @@ def test_required_section_exists_and_carries_a_table(heading: str) -> None:
     )
 
 
+def _delimiters_only(line: str) -> str:
+    r"""Drop ``\|`` so a LITERAL pipe inside a cell is not counted as a column delimiter.
+
+    GFM escapes a literal pipe in a table cell as ``\|``; it renders as ``|`` and does NOT split
+    the cell. A raw ``line.count("|")`` cannot tell the two apart, so a CORRECT row that quotes a
+    pipe reads as malformed -- which is not hypothetical: the 15.1.5 ``fhir_lookup`` row has to
+    name ``,`` ``|`` and ``$`` as FHIR *value* separators (BACKLOG #1243 limb B), and this
+    function's own docstring has always said "unescaped" while the code counted raw.
+    """
+    return line.replace(r"\|", "")
+
+
 def test_every_markdown_table_row_has_a_consistent_column_count() -> None:
     """A stray unescaped ``|`` inside a cell silently splits the row and hides half a control.
 
     These tables are the ASVS artifact, so a row that renders wrong is a defect, not cosmetics.
+    An ESCAPED ``\\|`` is a literal pipe, not a delimiter -- see ``_delimiters_only``.
     """
     broken: list[str] = []
     header_pipes: int | None = None
     for number, raw in enumerate(_doc_text().splitlines(), start=1):
-        line = raw.strip()
+        line = _delimiters_only(raw.strip())
         if not line.startswith("|"):
             header_pipes = None
             continue
@@ -563,13 +576,52 @@ def test_planted_omission_in_boundary_four_is_detected() -> None:
 # --- 4. setting-name resolution ------------------------------------------------------------------
 
 
+#: Settings the document names to record that they were **REMOVED**, rather than citing as live
+#: configuration. A threat model that cannot name a removed control cannot explain why the control
+#: is gone, and deleting the mention to satisfy the resolution check below would erase exactly the
+#: sentence a reader needs -- reintroducing the "asserts a broader control than ships" defect the
+#: removal was written to fix.
+#:
+#: Each entry names the change that removed it. ``test_removed_setting_allowlist_is_not_stale``
+#: refuses an entry whose setting resolves again, so this cannot quietly become a place to park a
+#: typo, nor outlive its reason if the setting ever comes back.
+_REMOVED_SETTINGS: dict[tuple[str, str], str] = {
+    ("egress", "fhir_require_structured_params"): (
+        "BACKLOG #1243 limb A removed it together with the verbatim flat '?'-query FHIR search "
+        "path it gated; the 15.1.5 fhir_lookup row names it to record that removal"
+    ),
+}
+
+
 def test_doc_toml_tokens_resolve_to_settings_fields() -> None:
-    """Every ``[section].key`` the threat model cites maps to a real ServiceSettings field."""
+    """Every ``[section].key`` the threat model cites maps to a real ServiceSettings field.
+
+    Except those it names to record a REMOVAL -- see ``_REMOVED_SETTINGS``.
+    """
     tokens = sorted(set(_TOML_TOKEN_RE.findall(_doc_text())))
     assert tokens, "no [section].key tokens found — regex or doc changed unexpectedly"
-    unresolved = sorted(f"[{sec}].{key}" for sec, key in tokens if not _key_resolves(sec, key))
+    unresolved = sorted(
+        f"[{sec}].{key}"
+        for sec, key in tokens
+        if not _key_resolves(sec, key) and (sec, key) not in _REMOVED_SETTINGS
+    )
     assert not unresolved, (
         f"THREAT-MODEL.md cites [section].key setting(s) with no matching field: {unresolved}"
+    )
+
+
+def test_removed_setting_allowlist_is_not_stale() -> None:
+    """Anti-rot: an entry in ``_REMOVED_SETTINGS`` whose setting RESOLVES again is a hole.
+
+    An exemption that outlives its reason silently excuses a live setting from the resolution
+    check above, which is the same shape of defect as a gate that has stopped asserting.
+    """
+    resurrected = sorted(
+        f"[{sec}].{key}" for (sec, key) in _REMOVED_SETTINGS if _key_resolves(sec, key)
+    )
+    assert not resurrected, (
+        f"_REMOVED_SETTINGS exempts setting(s) that resolve again: {resurrected} — the setting is "
+        "live, so drop the exemption and let the resolution check cover it"
     )
 
 
