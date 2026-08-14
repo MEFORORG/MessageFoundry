@@ -164,7 +164,7 @@ def test_omitted_keys_are_carried_through_rather_than_dropped(tmp_path: Path) ->
 
 
 def test_a_payload_only_unknown_key_survives_too() -> None:  # #1242
-    """The MIRROR of the 7818991d incident, and the direction the carry-through never covered.
+    """The MIRROR IMAGE of the 7818991d incident, and the direction the carry-through never covered.
 
     The preservation loop's SOURCE was the LIVE cell, so a key the writer has never heard of survived
     only if it was ALREADY in the vault. A key arriving on the PAYLOAD and absent from live was never
