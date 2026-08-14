@@ -8389,7 +8389,9 @@ every worker session's handoff, which is the sentence the next session bases its
 
 ## 1238. contain the server-supplied remote listing name by rejecting it, never by rewriting it
 
-> 🔢 **Filed 2026-08-13 - not started. OWNER RULING RECORDED 2026-08-13: reject, never mutate.** Value **7/10** · Difficulty **3/10**. The BUILD half of **#1130** (ASVS 5.3.2, which holds at `partial`). `RemoteFileSource` uses a filename chosen by a remote SFTP/FTP server with no containment check. **The obvious fix -- `posixpath.basename()` -- is actively harmful and must not be used;** the reasons are recorded below because a later reader will otherwise re-propose it.
+> ✅ **CLOSED 2026-08-14 - BUILT. OWNER RULING HELD: reject, never mutate.** Value **7/10** · Difficulty **3/10**. The BUILD half of **#1130** (ASVS 5.3.2, which holds at `partial`). `RemoteFileSource` used a filename chosen by a remote SFTP/FTP server with no containment check. **The obvious fix -- `posixpath.basename()` -- is actively harmful and was not used;** the reasons are retained below because a later reader will otherwise re-propose it.
+>
+> **Verified against `origin/main` rather than against the build report,** because a banner that closes on a report inherits the report's errors: `_is_contained_name` is defined at `transports/remotefile.py:97`, **wired** at `:954` (`if not _is_contained_name(name)`), and asserted in **both** polarities at `tests/test_remotefile_transport.py:1185` (rejects) and `:1195` (accepts). A one-polarity test would pass against a function that refuses everything.
 
 **Cluster:** Security / hardening. **Priority:** P1. **Verdict:** build.
 **Severity:** Conditional -- there are zero deployments (§0). On a first deployment, a malicious or compromised partner file server could return a listing entry that escapes the configured directory. It needs a hostile server rather than mere drop-directory write access, which bounds it without removing it.
@@ -8416,7 +8418,9 @@ every worker session's handoff, which is the sentence the next session bases its
 
 ## 1239. `fhir.py` carries two identical control-char predicates behind different wrappers -- a latent drift, not a current divergence
 
-> 🔢 **Filed 2026-08-13 - not started. READ THE FRAMING BEFORE ACTING: the two predicates are byte-identical TODAY. This item records a LATENT hazard, not a live defect, and it must not be cited as evidence of a current gap.** Value **3/10** · Difficulty **2/10**. Noticed during #1107's ASVS 1.2.2 surface enumeration.
+> ✅ **CLOSED 2026-08-14 - the item's stated resolution condition is met.** `_has_control_char` returns **0** occurrences across `messagefoundry/` at `origin/main`, so the `fhir.py` pair this item named is now a single. Value **3/10** · Difficulty **2/10**. Noticed during #1107's ASVS 1.2.2 surface enumeration. The framing it was filed under still holds and still applies: the predicates were byte-identical, this recorded a LATENT hazard, and it must not be cited as evidence of a current gap.
+>
+> **THIS CLOSURE DOES NOT RETIRE THE DRIFT HAZARD, and reading it that way would invert the item.** Closing on *"the pair is now a single"* is true of the item **as written** and false of the hazard it **describes**: the same predicate is copied more widely today than when this was filed, partly by the work that resolved it. The remaining sites are measured and carried forward as **#1253**. Closing here without that item would have retired a finding whose subject had grown -- which is why the successor is named in the banner rather than left to a reader to notice.
 
 **Cluster:** Code quality / drift hazard. **Priority:** P3. **Verdict:** build (small).
 **Severity:** none today. There is no behavioural difference to exploit and nothing is mis-screened. The cost is future-tense and conditional: a later hardening applied to one predicate would silently not apply to the other.
@@ -8817,3 +8821,32 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > records a decision I acted against rather than a conclusion I verified.
 
 **Cluster:** Security record / repository topology. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- nothing shipped changes; the exposure is that a ranked map of unmet security requirements **is** public today and cannot be made unpublic, only stopped from growing.
+
+## 1253. one control-char predicate written out seven times across six files
+
+> 🔢 **Filed 2026-08-14 - not started. SUCCESSOR to #1239, which closed on its own narrower condition.** Value **4/10** · Difficulty **3/10**. `#1239` recorded two byte-identical control-char predicates in `fhir.py` and was resolved by removing one of that pair. The predicate is written out **seven times across six files**, so resolving the pair addressed two of seven sites and the drift surface is **wider today than when #1239 was filed** -- partly because the work that resolved it added sites.
+
+> **THIS IS A LATENT HAZARD, NOT A LIVE DEFECT, and it must not be cited as evidence of a current gap.** All six rejecting copies are consistent today; nothing is mis-screened and there is no behavioural difference to exploit. The cost is future-tense and conditional, and it is the same one #1239 named: a later hardening applied to one copy silently does not apply to the other six, and nothing reports the omission.
+
+**Cluster:** Code quality / drift hazard. **Priority:** P3. **Verdict:** build (small).
+**Severity:** none today, and no deployment axis (§0).
+
+**What is there.** Measured at `origin/main` across `messagefoundry/`, the expression `ord(ch) < 0x20 or ord(ch) == 0x7F`:
+
+| site | action |
+| --- | --- |
+| `config/codeset_edit.py:305` | reject |
+| `config/impact.py:631` | reject |
+| `transports/dicomweb.py:96` | reject |
+| `transports/fhir.py:178` | reject |
+| `transports/fhir.py:201` | reject |
+| `transports/remotefile.py:121` | reject (#1238) |
+| `transports/rest.py:111` | strip |
+
+**Two exclusions, recorded so a later scan does not re-add them as sites.** `transports/rest.py:109` matches a naive grep but is **prose inside a docstring**, not a site. `parsing/sniff.py:179` tests the same code points but is a **genuinely different predicate** -- it is byte-wise rather than character-wise and subtracts an allowlist (`_TEXT_ALLOWED_CONTROLS`, `:151`) because a text sniffer must tolerate tab, CR and LF. Folding it into a shared helper would change its behaviour, so it is deliberately out of scope.
+
+**`rest.py:111` STRIPS rather than rejects, and that is defensible rather than a second instance of the pattern the owner ruled against in #1238.** It is recorded here because the difference looks like a defect at a glance and would otherwise be re-reported. #1238's argument against mutation is that `basename()` turns a path into a valid-but-**different** target, handing an attacker a real file. A header **value** has no such property: stripping CR/LF cannot redirect a request anywhere. `rest.py` already **rejects** a header *name* failing its RFC 7230 token check, so the split is name-rejected / value-stripped, which is principled. A fix that unifies the seven sites must therefore preserve two distinct actions and must not "simplify" the strip into a reject.
+
+**Why the count is stated as measured rather than as an enumeration.** The seven-site figure is a `git grep` result at a named ref, not a claim that no eighth spelling exists; a differently-spelled equivalent (a regex, a `str.translate`, a range test) would not match and is not counted. The item's subject is the *copying practice*, so a fix should make the shared helper the obvious thing to reach for, not merely rewrite the seven known lines.
+
+**Provenance.** The `transports/` half was measured and reported by the lane that had just widened it, as an amendment **against its own** closure recommendation for #1239. The `config/` sites and the two exclusions were added by a repo-wide re-measure during that closure.
