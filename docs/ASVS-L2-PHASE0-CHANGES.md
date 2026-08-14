@@ -140,13 +140,31 @@ Update it whenever a crypto dependency, algorithm, or key source changes.
 ### Rotation schedule (ASVS 13.1.4 / 13.3.4)
 
 A rotation cadence per critical secret, justified against the threat model + HIPAA. These are
-**operator-policy defaults** — the engine does **not** force-rotate or hard-expire a secret (rotation
-*execution* stays operator- / secret-manager-driven, by design). It **does** now **monitor** the cadence
+**operator-policy defaults** — the engine does **not** force-rotate a secret (rotation *execution*
+stays operator- / secret-manager-driven, by design), and for every secret class **except the store
+DEK** it does not hard-expire one either. It **does** **monitor** the cadence
 (ASVS 13.3.4, BACKLOG #282): the store DEK is tracked live-by-default and every configured secret class
 the engine holds is fingerprinted with a **DEK-derived keyed MAC** in store meta, so a **rotation is
 auto-detected** (the fingerprint changes → the clock resets) and a `secret_rotation_due` alert fires
 against the cadence below — never operator-attested, and carrying only dates + a one-way MAC, never a
-value. Under `[security].enforcement=ENFORCE` a DEK past its max-age + grace **escalates** at restart.
+value.
+
+**The store DEK is the exception and it HARD-EXPIRES on both of its axes (BACKLOG #1004).** Under
+`[security].enforcement=ENFORCE` a DEK past its max-age + grace **escalates its alert and REFUSES to
+start**; an **undetermined** age — no persisted stamp and no `store_key_last_rotated` override —
+refuses as well, because under ENFORCE an undetermined age is not a young one. Set
+`[secret_rotation].enforce_store_key_expiry = false` to keep the alert and drop the refusal; that is a
+deliberate relaxation and `security_loosenings()` names it on every boot. This mirrors the DEK's
+**usage** axis, which has always hard-expired at the 2^32 AES-GCM ceiling with no opt-out at all.
+
+> **Why this paragraph changed, stated because the distinction is load-bearing.** This document is
+> the standard ASVS 13.3.4 measures the engine against, so editing it as a *lever* — moving the
+> wording to close a gap the code still has — is forbidden, and would be indistinguishable in the
+> record from a real remediation. This is the opposite case: **the code changed first and these
+> sentences became false.** Leaving a superseded claim standing is the *"compensating control must
+> not rest on a false premise"* defect
+> ([Secure_Development_Standards.md](Secure_Development_Standards.md) SDS-3.7). A **record
+> correction following a shipped change**, never a substitute for one.
 
 | Secret (env var / connector setting) | Suggested cadence | Trigger / notes |
 |---|---|---|
