@@ -13,7 +13,7 @@
         fleet.ps1 -Text            # roster, receipt first
         fleet.ps1 -Text -All       # do not fold stale rows
         fleet.ps1 -Json            # machine-readable
-        fleet.ps1 -Chip <boxKey> <sessionKey>   # the standalone briefing for one spawn_task call
+        fleet.ps1 -Detail -BoxKey <box> -SessionKey <key>   # one seat's EVIDENCE, for a human
 
     WHY THE RECEIPT COMES BEFORE THE ROSTER, AND WHY IT CAN REFUSE.
 
@@ -39,6 +39,16 @@
     only as "as of HH:MMZ". A ruling or a briefing citing a bare SHA becomes unresolvable the moment
     its branch rebases, and this project has watched exactly that happen.
 
+    SCOPE, RULED 2026-08-14 AND NOT TO BE MISREAD. The project''s anti-registry thesis STANDS: a
+    hand-maintained seat registry remains rejected. What was granted is a NARROW exception for records
+    NOBODY WRITES BY HAND, on the ground that the status board''s unit of record is a work key whose
+    output has no sessions array and therefore structurally cannot answer "which sessions were running
+    and what was each doing". The VOLUNTARY half is demoted for the second ruled reason -- declaration
+    decays, measured at 8.8 to 31 percent adoption -- so nothing here may DEPEND on a seat having
+    declared anything. The chip GENERATOR is also out of scope: the owner composes chips by hand,
+    because a paste-ready briefing authored at queue time and executed at click time goes stale
+    silently, which happened live on this project the day this was written.
+
     ANCESTRY IS NOT CONTENT. "Is my commit an ancestor of main" and "is my content in main" are
     different questions, and squash-merge makes them disagree as a matter of course -- 51 of the last
     100 main commits carry a (#N) squash suffix. The landed probe therefore compares CONTENT over a
@@ -50,7 +60,7 @@ param(
     [switch]$Text,
     [switch]$Json,
     [switch]$All,
-    [switch]$Chip,
+    [switch]$Detail,
     [string]$BoxKey,
     [string]$SessionKey,
     [int]$FoldDays = 7,
@@ -293,89 +303,100 @@ $receipt = [ordered]@{
 # Render.
 # ---------------------------------------------------------------------------------------------
 
-if ($Chip) {
+# -Detail: the EVIDENCE for one seat, for a human who is composing a spawn_task chip BY HAND.
+#
+# OWNER RULING 2026-08-14: the chip GENERATOR is out of scope. This is not that, and the difference
+# is not cosmetic. A generated briefing is a paste-ready artifact authored at queue time and executed
+# at click time -- true when written, false when run, and it carries no marker saying which. That
+# hazard fired live on this project the same day. A hand-composed chip cannot go stale silently,
+# because a human wrote each line knowing when they wrote it.
+#
+# So this prints FACTS WITH THEIR AGE and the COMMANDS TO RE-CHECK THEM. It is deliberately not
+# phrased as a prompt, and it does not address a future session.
+if ($Detail) {
     $row = $rows | Where-Object { $_.Box -eq $BoxKey -and $_.SessionKey -eq $SessionKey } | Select-Object -First 1
     if (-not $row) { Write-Error "fleet.ps1: no record for $BoxKey/$SessionKey"; exit 2 }
     $rec = $row.Rec
-    $lines = @()
-    $lines += "You are a REPLACEMENT SEAT. The session that held this work is gone. You inherit NOTHING"
-    $lines += "from it except what is written below. Everything here was measured at $($rec.asOf) and the"
-    $lines += "world has moved since -- RE-VERIFY BEFORE YOU ACT, do not trust a line because it is specific."
-    $lines += ""
-    $lines += "PREDECESSOR CHECKOUT: $($rec.worktree)"
-    $lines += "BRANCH: $($row.Branch)   (identified by NAME, never by a commit id -- a rebase reissues the id)"
-    if ($rec.tip) { $lines += "ITS TIP WAS: $($rec.tip)  AS OF $($rec.asOf). Resolve the branch yourself; do not use this id as an identifier." }
-    $lines += ""
-    if ($rec.seat) { $lines += "SEAT: $($rec.seat)" } else { $lines += "SEAT: NOT DECLARED. The predecessor never declared one; do not invent a role." }
-    if ($rec.goal) { $lines += "GOAL AS DECLARED: $($rec.goal)" } else { $lines += "GOAL: NOT DECLARED." }
-    if ($rec.done) { $lines += "DONE MEANS: $($rec.done)" }
-    if ($rec.outOfScope) { $lines += "OUT OF SCOPE: $($rec.outOfScope)" }
-    $lines += ""
-    $lines += "FIRST ACTIONS, IN THIS ORDER, BEFORE ANY BUILDING:"
-    $lines += "  1. Look at the predecessor checkout. Uncommitted work there is the ONLY thing that truly dies:"
-    $lines += "     git -C `"$($rec.worktree)`" status --porcelain"
-    $lines += "     git -C `"$($rec.worktree)`" log --oneline origin/main..HEAD"
-    if ($rec.stashSha) {
-        $lines += "     A stash commit was captured at record time, covering TRACKED edits only: $($rec.stashSha)"
-        $lines += "     Recover with: git -C `"$($rec.worktree)`" checkout $($rec.stashSha) -- ."
+    $ageTxt = if ($null -ne $row.AgeHours) { "$($row.AgeHours)h old" } else { "age unknown" }
+
+    "SEAT EVIDENCE -- $($row.Box)/$($row.SessionKey)"
+    "This is EVIDENCE for you to read, not a briefing to paste. Compose the chip yourself."
+    "Every line below was recorded $ageTxt and may have expired since. Re-check commands are given."
+    ""
+    "STATE (computed now): $($row.State)   fence=$($row.Fence)"
+    "CHECKOUT: $($rec.worktree)"
+    "BRANCH:   $($row.Branch)"
+    "  Work is named by BRANCH. A commit id is not an identifier here -- a rebase reissues it."
+    if ($rec.tip) { "  tip was $($rec.tip) as of the record; resolve the branch yourself." }
+    ""
+    "WHAT THIS SEAT ACTUALLY DID -- involuntary evidence, written as a side effect of working:"
+    $commits = @()
+    if (($rec.PSObject.Properties.Name -contains 'commits') -and $rec.commits) { $commits = @($rec.commits) }
+    if ($commits.Count -gt 0) {
+        foreach ($c in $commits) { "  $c" }
+    } else {
+        "  no commits since the merge-base were recorded"
     }
-    # The loudest thing in the whole briefing, because it is the only category that is GONE if the
-    # checkout is removed. `git stash create` has no -u, so an untracked file is held by no git
-    # object anywhere -- not in a stash, not in a commit, not on a remote.
+    $touched = @()
+    if (($rec.PSObject.Properties.Name -contains 'touchedPaths') -and $rec.touchedPaths) { $touched = @($rec.touchedPaths) }
+    if ($touched.Count -gt 0) {
+        "  touched $($touched.Count) path(s): " + (($touched | Select-Object -First 15) -join ', ')
+    }
+    ""
+    "WORK AT RISK -- check this FIRST, it is the only category that cannot be recovered elsewhere:"
     $untracked = @()
     if (($rec.PSObject.Properties.Name -contains 'dirty') -and $rec.dirty -and
-        ($rec.dirty.PSObject.Properties.Name -contains 'untracked')) {
-        $untracked = @($rec.dirty.untracked)
-    }
+        ($rec.dirty.PSObject.Properties.Name -contains 'untracked')) { $untracked = @($rec.dirty.untracked) }
     if ($untracked.Count -gt 0) {
-        $lines += ""
-        $lines += "     *** $($untracked.Count) UNTRACKED FILE(S) EXIST ONLY IN THAT WORKING DIRECTORY. ***"
-        $lines += "     NO GIT OBJECT HOLDS THEM -- not the stash above, not a commit, not a remote."
-        $lines += "     COPY THEM BEFORE ANYTHING ELSE. If that checkout is removed they are gone:"
-        foreach ($u in ($untracked | Select-Object -First 40)) { $lines += "       $u" }
-        if ($untracked.Count -gt 40) { $lines += "       ... and $($untracked.Count - 40) more" }
-    }
-    $lines += "  2. git fetch origin FIRST, then decide whether the work already landed. Compare CONTENT, not"
-    $lines += "     ancestry -- squash-merge makes 'commits ahead' and 'content ahead' disagree routinely:"
-    if ($rec.touchedPaths -and @($rec.touchedPaths).Count -gt 0) {
-        $lines += "       git diff --name-only origin/main $($row.Branch) -- " + (@($rec.touchedPaths) -join ' ')
-        $lines += "     Empty output means the content is already on main. DO NOT REBUILD IT."
+        "  $($untracked.Count) UNTRACKED file(s) -- HELD BY NO GIT OBJECT. Not in the stash, not in a"
+        "  commit, not on a remote. If that checkout is removed they are gone:"
+        foreach ($u in ($untracked | Select-Object -First 40)) { "    $u" }
+    } else { "  no untracked files were recorded" }
+    if ($rec.stashSha) { "  stash commit (TRACKED edits only): $($rec.stashSha)" }
+    if (($rec.PSObject.Properties.Name -contains 'stashCovers')) { "  stash covers: $($rec.stashCovers)" }
+    if ($rec.unpushed) { "  unpushed commits vs $($rec.unpushed.base): $($rec.unpushed.count)" }
+    else { "  unpushed: NO-UPSTREAM (nobody has looked; this is not the same as zero)" }
+    ""
+    "RE-CHECK BEFORE YOU ACT ON ANY OF THE ABOVE:"
+    "  git fetch origin"
+    "  git -C `"$($rec.worktree)`" status --porcelain"
+    "  git -C `"$($rec.worktree)`" log --oneline origin/main..HEAD"
+    if ($touched.Count -gt 0) {
+        "  git diff --name-only origin/main $($row.Branch) -- " + (($touched | Select-Object -First 15) -join ' ')
+        "    Empty output means the CONTENT is already on main. Ancestry answers a different question:"
+        "    squash-merge routinely makes commits-ahead and content-ahead disagree."
     } else {
-        $lines += "       (no touched paths were recorded, so this check is UNCHECKABLE here -- derive the"
-        $lines += "        pathspec yourself from the branch's merge-base before concluding anything)"
+        "  landed check is UNCHECKABLE -- no touched paths recorded, so derive the pathspec from the"
+        "  branch's own merge-base rather than diffing the whole tree."
     }
-    $lines += "  3. Re-check claims and allocations BEFORE taking any. This briefing was written at generate"
-    $lines += "     time and you are reading it at click time; a hold may have been declared in between."
-    $ownClaims = @($rec.claims | Where-Object { $_.attribution -eq 'this-episode' })
-    $inhClaims = @($rec.claims | Where-Object { $_.attribution -ne 'this-episode' })
-    if ($ownClaims.Count -gt 0) { $lines += "     CLAIMS HELD BY THE PREDECESSOR EPISODE: " + (($ownClaims | ForEach-Object { $_.key }) -join ', ') }
-    else { $lines += "     CLAIMS HELD BY THE PREDECESSOR EPISODE: none" }
-    if ($inhClaims.Count -gt 0) {
-        $lines += "     ALSO PRESENT IN THAT WORKTREE BUT FROM EARLIER OCCUPANTS -- NOT YOURS, DO NOT REHOME:"
-        $lines += "       " + (($inhClaims | ForEach-Object { $_.key }) -join ', ')
-    }
-    $ownAlloc = @($rec.allocations | Where-Object { $_.attribution -eq 'this-episode' })
-    $inhAlloc = @($rec.allocations | Where-Object { $_.attribution -ne 'this-episode' })
-    if ($ownAlloc.Count -gt 0) { $lines += "     LEDGER NUMBERS ALLOCATED BY THIS EPISODE: " + (($ownAlloc | ForEach-Object { "$($_.kind) #$($_.number)" }) -join ', ') }
-    else { $lines += "     LEDGER NUMBERS ALLOCATED BY THIS EPISODE: none" }
-    if ($inhAlloc.Count -gt 0) {
-        $lines += "     $($inhAlloc.Count) MORE are allocated to that worktree PATH by earlier occupants."
-        $lines += "     THEY ARE NOT YOURS. Do not rehome them and do not cite them."
-    }
+    ""
+    "LEDGER AND CLAIMS -- attribution matters, the path outlives its occupant:"
+    $ownC = @($rec.claims | Where-Object { $_.attribution -eq 'this-episode' })
+    $inhC = @($rec.claims | Where-Object { $_.attribution -ne 'this-episode' })
+    "  claims by THIS episode:      " + $(if ($ownC.Count) { (($ownC | ForEach-Object { $_.key }) -join ', ') } else { 'none' })
+    if ($inhC.Count) { "  present but from EARLIER occupants of that path (NOT this seat's): " + (($inhC | ForEach-Object { $_.key }) -join ', ') }
+    $ownA = @($rec.allocations | Where-Object { $_.attribution -eq 'this-episode' })
+    $inhA = @($rec.allocations | Where-Object { $_.attribution -ne 'this-episode' })
+    "  ledger numbers by THIS episode: " + $(if ($ownA.Count) { (($ownA | ForEach-Object { "$($_.kind) #$($_.number)" }) -join ', ') } else { 'none' })
+    if ($inhA.Count) { "  $($inhA.Count) more allocated to that PATH by earlier occupants -- not this seat's, do not rehome or cite" }
+    ""
+    "DECLARED INTENT -- VOLUNTARY, UNVERIFIED, AND OFTEN ABSENT BY DESIGN."
+    "  Measured adoption of voluntary declaration on this project: 8.8 to 31 percent. Treat anything"
+    "  here as a hint that was true when someone typed it, never as the record. The evidence above is"
+    "  the record."
+    if ($rec.seat) { "  seat:        $($rec.seat)" } else { "  seat:        not declared" }
+    if ($rec.goal) { "  goal:        $($rec.goal)" }
+    if ($rec.done) { "  done means:  $($rec.done)" }
+    if ($rec.outOfScope) { "  out of scope: $($rec.outOfScope)" }
     if ($rec.handoff -and $rec.handoff.path) {
-        $lines += ""
-        $lines += "  4. READ THE HANDOFF: $($rec.handoff.path)"
-        if ($rec.handoff.PSObject.Properties.Name -contains 'unresolved' -and $rec.handoff.unresolved) {
-            $lines += "     WARNING: that path DID NOT RESOLVE when it was recorded. Treat it as a lead, not a document."
+        "  handoff:     $($rec.handoff.path)"
+        if (($rec.handoff.PSObject.Properties.Name -contains 'unresolved') -and $rec.handoff.unresolved) {
+            "               WARNING: that path DID NOT RESOLVE when recorded. A lead, not a document."
         }
     }
-    $lines += ""
-    $lines += "  5. Declare yourself so the NEXT switch reads fresh state rather than backfilling:"
-    $lines += "     pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare -Seat <seat> -Predecessor $($row.Box)/$($row.SessionKey) -Goal `"...`""
-    $lines += ""
-    $lines += "ACCOUNT BOUNDARY -- these do NOT cross and must not be inherited: usage figures, project"
-    $lines += "memory, artifact capabilities, workflow caches, and the realtime send channel. Read your own."
-    $lines -join "`n"
+    ""
+    "ACCOUNT BOUNDARY -- do NOT carry these across: usage figures, project memory, artifact"
+    "capabilities, workflow caches, the realtime send channel. Read your own."
     exit 0
 }
 
@@ -425,8 +446,9 @@ if ($folded -gt 0) { ""; "$folded row(s) folded as ORPHANED-STALE (older than $F
 ""
 "RESPAWN POPULATION (INTERRUPTED, HANDED): " + @($rows | Where-Object { $_.State -in @('INTERRUPTED', 'HANDED') }).Count
 "  Never respawned: RUNNING, POSSIBLY RUNNING, SUPERSEDED, CLOSED."
-"  Briefing for one row:  fleet.ps1 -Chip -BoxKey <box> -SessionKey <key>"
+"  Briefing for one row:  fleet.ps1 -Detail -BoxKey <box> -SessionKey <key>"
 
 $code = if ($fenceAvailable) { 0 } else { 2 }
 exit $code
+
 

@@ -264,12 +264,30 @@ function Get-GitFacts {
     }
     $dirtyPaths = @($trackedPaths) + @($untrackedPaths)
 
+    # THE INVOLUNTARY ANSWER TO "WHAT WAS THIS SEAT DOING".
+    #
+    # Owner ruling, 2026-08-14: the exception permitting a stored per-seat record is granted for the
+    # INVOLUNTARY half only; the voluntary half is dropped or demoted, because voluntary declaration
+    # decays -- measured at 8.8 to 31 percent adoption. Rendering an empty declared field with its age
+    # was explicitly ruled INSUFFICIENT: the ground was upheld, not merely the symptom.
+    #
+    # So the briefing must be complete WITHOUT anyone having declared anything, and this is what makes
+    # that possible. A commit subject is written by the seat as a side effect of working, it is
+    # durable, it is dated, and it describes what was actually DONE rather than what someone intended
+    # at the start. It is strictly better evidence than a stale declared goal.
+    $commits = @()
+    if ($mergeBase) {
+        $c = Invoke-Git -Dir $Wt -GitArgs @('log', '--format=%h %ad %s', '--date=short', "$mergeBase..HEAD", '--max-count=25')
+        if ($c) { $commits = @($c -split "`n" | Where-Object { $_ }) }
+    }
+
     return [ordered]@{
         branch    = $branch
         upstream  = $upstream
         tip       = $tip
         mergeBase = $mergeBase
         touched   = $touched
+        commits   = $commits
         unpushed  = $unpushed
         dirty     = [ordered]@{
             count          = $dirtyPaths.Count
@@ -514,6 +532,11 @@ try {
         tip              = $g.tip
         mergeBase        = $g.mergeBase
         touchedPaths     = $g.touched
+        # The involuntary answer to "what was this seat doing". Owner ruling 2026-08-14 demoted the
+        # voluntary declared half, so the briefing has to stand up without it, and this is what it
+        # stands on: subjects written as a side effect of working, dated, and describing what was
+        # actually DONE rather than what was intended at the start.
+        commits          = $g.commits
         unpushed         = $g.unpushed
         dirty            = $g.dirty
         stashSha         = $g.stashSha
