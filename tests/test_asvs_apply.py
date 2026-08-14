@@ -470,3 +470,142 @@ def test_the_preservation_backstop_fires_when_a_SUBTABLE_field_is_dropped(
     # mutation proof that passes by tripping an unrelated check proves nothing about its invariant.
     out = capsys.readouterr().out
     assert "evidence[0] would LOSE" in out and "expect" in out, out
+
+
+# --- #1242: the value half. Carrying a KEY while corrupting its VALUE is not carrying it. ---------
+
+
+def test_a_table_or_array_value_ROUND_TRIPS_rather_than_becoming_a_repr(tmp_path: Path) -> None:
+    """The writer used to emit any non-bool, non-int value as ``toml_str(str(value))``, so a table
+    became a quoted PYTHON REPR: ``sym_table = "{'a': 1}"``. That parses, so nothing went red, and
+    re-reading returned the STRING -- the value was unrecoverable from the file.
+
+    THE ASSERTION IS THE ROUND TRIP, NOT THE RENDERING. Checking the emitted text looks right passes
+    against a serializer that emits JSON (``{"a": 1}``), which is not TOML and will not parse. Only
+    reading it back with the same parser the record is read with proves the value survived.
+    """
+    rec = _record(tmp_path)
+    payload = _cell_111(
+        sym_table={"a": 1, "b": "two"},
+        sym_list=[1, "x", True],
+        deep={"outer": {"inner": "v"}},
+        rows=[{"a": 1}, {"b": 2}],
+        ratio=1.5,
+        flag=True,
+    )
+    rc = main([str(_payload(tmp_path, [payload])), "--scorecard", str(rec), "--apply"])
+    assert rc == 0
+
+    cell = next(
+        c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"] if c["id"] == "1.1.1"
+    )
+    for key in ("sym_table", "sym_list", "deep", "rows", "ratio", "flag"):
+        assert cell[key] == payload[key], f"{key} did not survive the write: {cell[key]!r}"
+
+
+def test_a_DOTTED_key_is_QUOTED_rather_than_silently_re_nested(tmp_path: Path) -> None:
+    """THE ONLY BAD KEY THAT FAILS QUIETLY, and the reason the quoting rule is unconditional.
+
+    A dotted key is not a syntax error in TOML -- it is a NESTING OPERATOR. Emitted bare,
+    ``{1.2.2 = "x"}`` is VALID and reads back as ``{'1': {'2': {'2': 'x'}}}``: the file loads, the
+    gate stays green, the structure differs. Spaces and quotes fail LOUDLY and are therefore safe.
+
+    It is not hypothetical here -- ASVS requirement ids ARE that shape. A test using only plain keys
+    passes either way, which is why this one uses a dotted key specifically, with a plain key beside
+    it as the negative control.
+    """
+    rec = _record(tmp_path)
+    payload = _cell_111(dotted={"1.2.2": "pass", "12.1.1": "fail"}, plain={"ok": 1})
+    rc = main([str(_payload(tmp_path, [payload])), "--scorecard", str(rec), "--apply"])
+    assert rc == 0
+
+    cell = next(
+        c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"] if c["id"] == "1.1.1"
+    )
+    assert cell["dotted"] == {"1.2.2": "pass", "12.1.1": "fail"}, cell["dotted"]
+    assert cell["plain"] == {"ok": 1}  # the control: plain keys were never the problem
+
+
+def test_the_TYPE_guard_refuses_a_value_the_writer_would_have_mangled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """MUTATION PROOF for the value half, and the reason the key-set check is not enough.
+
+    ``lost = set(was) - set(now)`` is a pure KEY-SET difference: a type-mangled field KEEPS ITS KEY,
+    so it passes. That is not a flaw in that check -- it was written to catch DROPPED keys and it
+    does -- but it means a rewrite could corrupt every value while preserving every key and report
+    green. Without the type comparison this mutation is invisible.
+    """
+    import scripts.asvs.apply as mod
+
+    rec = _record(tmp_path)
+    # First write the table for real, so the LIVE record holds a table to be corrupted.
+    assert (
+        main(
+            [
+                str(_payload(tmp_path, [_cell_111(sym_table={"a": 1})])),
+                "--scorecard",
+                str(rec),
+                "--apply",
+            ]
+        )
+        == 0
+    )
+
+    real_render = mod.render
+
+    def mangling_render(cell: dict, live: dict | None = None) -> str:
+        text = real_render(cell, live)
+        return text.replace("sym_table = { a = 1 }", "sym_table = \"{'a': 1}\"")
+
+    monkeypatch.setattr(mod, "render", mangling_render)
+    before = rec.read_bytes()
+    # The payload deliberately does NOT mention sym_table: this is the WRITER changing a type nobody
+    # asked it to change, which is exactly the case the guard is scoped to.
+    rc = main([str(_payload(tmp_path, [_cell_111()])), "--scorecard", str(rec), "--apply"])
+
+    assert rc == 1
+    assert rec.read_bytes() == before, "refused, but wrote anyway"
+    # It must refuse for THIS reason -- several other guards here also return 1, and a mutation proof
+    # that passes by tripping an unrelated check proves nothing about the invariant it claims.
+    out = capsys.readouterr().out
+    assert "would CHANGE the TYPE" in out and "sym_table" in out, out
+
+
+def test_the_TYPE_guard_does_NOT_refuse_a_payload_that_intentionally_retypes(
+    tmp_path: Path,
+) -> None:
+    """THE SCOPING, and without it the guard gets disabled the first time it cries wolf.
+
+    The check compares the VAULT against the REWRITTEN FILE, so an unscoped version would also refuse
+    a payload that legitimately changes a field's type -- schema evolution, a scalar becoming a
+    table. That is an EDIT, not damage. The corruption case is the WRITER retyping a key the payload
+    never mentioned, so the check skips keys the payload carries.
+    """
+    rec = _record(tmp_path)
+    assert (
+        main(
+            [
+                str(_payload(tmp_path, [_cell_111(note="a plain string")])),
+                "--scorecard",
+                str(rec),
+                "--apply",
+            ]
+        )
+        == 0
+    )
+    # Same key, deliberately a different type, stated by the payload.
+    rc = main(
+        [
+            str(_payload(tmp_path, [_cell_111(note={"now": "a table"})])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+        ]
+    )
+    assert rc == 0, "an intentional retype by the payload must be allowed"
+
+    cell = next(
+        c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"] if c["id"] == "1.1.1"
+    )
+    assert cell["note"] == {"now": "a table"}
