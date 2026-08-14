@@ -9183,6 +9183,27 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **How to prove a fix.** Insert a line at the top of a file the ledger cites and assert the check **reports that citation**; insert a line **below** every citation into that file and assert it does **not** (an over-reporting gate is ignored within a week, which is the same death as no gate). Then the mutation that matters: **delete the check's file-filter so it reports every citation in the ledger, and confirm the test that says "does not report" now FAILS.** A detector that only ever fires is not distinguishable from one that fires correctly, on a corpus this size.
 
+> **PRICED 2026-08-14 (measured by a builder, endorsed by the dispatcher seat, filed here by the dispatcher per the 2026-08-13 authoring ruling). IT HAD BEEN LIVING IN A HANDOFF FOR SIX HOURS -- filing it so it stops depending on a seat staying alive.**
+>
+> ```
+> 1,184 citations measured
+>    906  resolve under exactly ONE root
+>     28  resolve under MULTIPLE roots (ambiguous)
+>    250  resolve under NO root
+>    ---
+>    278  (23%) cannot be checked by a path-keyed checker AT ALL
+>     11  ARE ALREADY PAST EOF -- live breakage in the repo today, not hypothetical
+> ```
+>
+> **THE FINDING THAT DRIVES THE RECOMMENDATION.** Because 23 percent of the corpus does not name one resolvable file, **a checker keyed on exact repo-relative paths would silently skip them and report green.** That is a gate-shaped hole rather than a gate -- the same defect this ledger keeps filing against other people's gates.
+>
+> **BUILD THE CHEAP FORM, AND THE SILENCE MUST BE PRINTED.** The run has to emit *"278 not checked because they do not resolve"* as part of its own output. A detector that reports only what it checked is indistinguishable from one that checked everything. **Re-price the strong form only AFTER the detector runs once, because the detector's output IS the cleaning list the strong form needs first.**
+>
+> **THREE ARITHMETIC CAVEATS, RECORDED RATHER THAN SMOOTHED -- do not treat these figures as settled.**
+> - **`923 land on a real line` was reported "of the resolved", and 923 is GREATER than the 906 resolved.** It cannot be a subset as stated. The measuring builder flagged this themselves rather than being caught at it.
+> - **This pass counts 1,184; this item's own heading and banner say 1,193.** A nine-citation gap between two passes over one corpus, unreconciled. Note that 906 + 28 + 250 sums to **exactly 1,184**, so this pass is at least internally coherent as a partition; that is evidence about consistency, **not** about which pass is right.
+> - **The load-bearing figure is the 11 past EOF.** It is the only one asserting present-tense breakage, it is small enough to check by hand, and it does not depend on the partition. **Re-derive the rest when the detector runs** -- which is the point of building it.
+
 **Cluster:** Ledger tooling / evidence integrity. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) -- documentation accuracy. The cost is that the ledger's own evidence decays invisibly, and the decay is fastest after exactly the kind of broad, correct, well-reviewed change nobody would think to re-check it against.
 
