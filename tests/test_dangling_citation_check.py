@@ -174,3 +174,53 @@ def test_the_floor_is_conservative_never_optimistic(tmp_path: pathlib.Path) -> N
     ledger = tmp_path / "L.md"
     ledger.write_text("## 1500. an item\n\n> open\n", encoding="utf-8")
     assert cc.allocation_floor([ledger]) == 1500
+
+
+# --- THE GATE ITSELF, run over the real tree (BACKLOG #1235) ---------------------------------------
+#
+# The detector shipped in PR #385 wired into NOTHING: repo-wide it was referenced by two lines, both
+# inside this file, and its CLI exited 0 even when it reported a hit. A detector nobody invokes and
+# that cannot fail is not a gate. These give it the failing arm and make the suite the caller.
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _live_shape_citations() -> list[tuple[str, int, int]]:
+    """Citations naming a number ABOVE the floor that are not PR/foreign-repo shaped.
+
+    Below the floor is unreachable forever, and a foreign reference is not a backlog citation at
+    all; both are reported by the tool for a human to read and neither is a defect.
+    """
+    root = _repo_root()
+    floor = cc.allocation_floor()
+    filed = cc.allocated_numbers()
+    out: list[tuple[str, int, int]] = []
+    for path in sorted((root / "docs").rglob("*.md")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for lineno, number, _line, pr_shaped in cc.citations_in(text):
+            if number in filed or number <= floor or pr_shaped:
+                continue
+            out.append((str(path.relative_to(root)), lineno, number))
+    return out
+
+
+def test_the_docs_scan_actually_covers_something() -> None:
+    """PRINT AND PIN THE POPULATION. A walk that collapses to nothing reports clean forever, which
+    is the exact failure this whole item is about."""
+    found = sorted((_repo_root() / "docs").rglob("*.md"))
+    print(f"scanned {len(found)} markdown files under docs/")
+    assert len(found) > 200, f"only {len(found)} docs found -- the walk is not finding them"
+
+
+def test_no_docs_citation_names_a_number_that_can_still_be_issued() -> None:
+    """THE GATE. A citation to an unissued number is harmless until someone files that number, at
+    which point it silently starts naming unrelated work. Catch it while it is still honest."""
+    live = _live_shape_citations()
+    assert not live, "citations naming a still-issuable number:\n  " + "\n  ".join(
+        f"{p}:{n} #{num}" for p, n, num in live
+    )

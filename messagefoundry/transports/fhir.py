@@ -47,6 +47,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.controlchars import has_control_char
 from messagefoundry.parsing.fhir import FhirPeek, FhirPeekError
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -175,7 +176,7 @@ def _reject_control_chars(value: str, field: str) -> str:
     ``ValueError`` that would otherwise escape ``send()`` as an 'internal error'. Surface it as a
     permanent ``NegativeAckError`` (a retry re-sends the same body) with a PHI-safe message (the field
     name only, never the value)."""
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+    if has_control_char(value):
         raise NegativeAckError(
             f"FHIR {field} contains an illegal control character",
             code="bad-request-value",
@@ -198,7 +199,7 @@ def _reject_config_control_chars(value: str, setting: str, where: str = "destina
     and the read executor -- and #1241's subject is precisely the asymmetry of screening one and not
     its sibling.
     """
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+    if has_control_char(value):
         raise ValueError(f"FHIR {where} {setting!r} contains an illegal control character")
     return value
 
