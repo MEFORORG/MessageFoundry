@@ -8376,7 +8376,17 @@ Both compute `any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in ...)`.
 
 ## 1240. the FHIR grammar gates use `match` with a `$` anchor, so a trailing newline passes
 
-> 🔢 **Filed 2026-08-13 - not started. NOT EXPLOITABLE TODAY -- the reachability analysis is in the item and it is honest about that.** Value **5/10** · Difficulty **1/10**. Both FHIR grammar gates accept a value with a trailing newline, so on the `fhir_lookup` read path the gate does not enforce the grammar it advertises. Found during #1107 (ASVS 1.2.2).
+> ✅ **SHIPPED -- fixed on PR #379, banner authored by the dispatcher because a builder may not author ledger content (owner ruling 2026-08-13).** Filed 2026-08-13. **NOT EXPLOITABLE TODAY -- the reachability analysis is in the item and it is honest about that.** Value **5/10** · Difficulty **1/10**. The defect as filed: both FHIR grammar gates accepted a value with a trailing newline, so on the `fhir_lookup` read path the gate did not enforce the grammar it advertises. Found during #1107 (ASVS 1.2.2).
+>
+> **VERIFIED BY THE DISPATCHER BEFORE SIGNING THE CLOSURE, by printing the operands on both refs rather than counting them:**
+> ```
+> origin/main   _FHIR_TYPE_RE = re.compile(r"^[A-Za-z]+$")            _FHIR_ID_RE = ...{1,64}$")
+> PR #379 head  _FHIR_TYPE_RE = re.compile(r"^[A-Za-z]+\Z")           _FHIR_ID_RE = ...{1,64}\Z")
+> call sites    _FHIR_TYPE_RE.match(...) / _FHIR_ID_RE.match(...)     UNCHANGED, correctly
+> ```
+> **`$` -> `\Z` on the two pattern definitions, which is the durable form:** it covers **all three** call sites at once and cannot be re-broken by a future caller, where converting the calls to `.fullmatch` would fix three sites and leave the fourth caller free to reintroduce it. The read-path `_reject_control_chars` limb was deliberately **not** added -- redundant once the gates are strict, and it would reintroduce the duplication #1239 records as retired.
+>
+> ⚠️ **The obvious regression test CANNOT DISCRIMINATE and must not be written.** `_resolve_read_url:689` does `raw = query.strip()`, so `"Patient/123\n"` returns an **identical URL before and after the fix**. Only `"Patient\n/123"` flips admitted-to-refused. A test using the stripped form would ship green and prove nothing -- measured by executing the shipped and patched sources, not argued.
 
 **Cluster:** Security / input validation. **Priority:** P2. **Verdict:** build (small).
 **Severity:** Conditional and currently **none** -- see reachability below. The defect is that a control does not do what it claims, which matters independently of whether another control happens to cover for it.
@@ -8404,7 +8414,15 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 ## 1241. operator-config values reach URL and header sinks with no construction-time screen
 
-> 🔢 **Filed 2026-08-13 - not started.** Value **5/10** · Difficulty **3/10**. Several operator-configured values are interpolated into URL paths, query strings and an HTTP header with weaker treatment than the message-derived values beside them -- in one case with no screen at all. Found during #1107 (ASVS 1.2.2). **The subject is the asymmetry**, so fixing one site without the others misses the point.
+> 🔢 **Filed 2026-08-13. PARTIALLY FIXED on PR #379 and DELIBERATELY STILL OPEN -- see the amendment below. DO NOT CLOSE THIS ON #379.** Value **5/10** · Difficulty **3/10**. Several operator-configured values are interpolated into URL paths, query strings and an HTTP header with weaker treatment than the message-derived values beside them -- in one case with no screen at all. Found during #1107 (ASVS 1.2.2). **The subject is the asymmetry**, so fixing one site without the others misses the point.
+>
+> ⚠️ **AMENDED 2026-08-13 (dispatcher) -- PARTIAL PROGRESS RECORDED, ITEM STAYS OPEN.** Banner authored by the dispatcher rather than the builder, per the owner's 2026-08-13 ruling that a builder may resolve conflicts but may not author ledger content. **The builder flagged the partiality in its own commit body; this records it in the ledger so a reader of `main` cannot mistake #379 for a closure.**
+>
+> **WHAT #379 FIXED:** construction-time screening of `url` and `conditional_query`, plus a wrong-exception-class defect that was worse than the filed finding -- `http.client.InvalidURL` derives from `HTTPException`, **not** `ValueError` and **not** `OSError`, so it escaped **every** except arm in `_post` including the backstop written for exactly that case. The result was an unhandled exception out of `send()` rather than the classified dead-letter the file intends.
+>
+> **WHAT REMAINS, and it is why this stays open:** **`transports/dicomweb.py`**, which this item names and #379 does not touch; and a **SECOND unscreened url-construction site in `FhirLookupExecutor`** in the same file, discovered only because an edit matched two locations. **The item's own framing is the reason a partial close would be wrong -- the subject is the ASYMMETRY, and one sink screened while a sibling is not reproduces exactly the defect being reported.**
+>
+> **TWO CORRECTIONS TO THE FILED TEXT, neither reducing severity.** The comparison clause does not merely go stale, it **INVERTS**: the neighbouring flat-search path it called "weaker but at least screening" was removed outright by `039757ff`, so `:431` became the **only** unencoded interpolation left in the file -- which **strengthens** this item rather than weakening it. And the enum rationale is **right advice for the wrong reason**: containment comes from the `!r` conversion escaping control characters, not from the enum's closedness. **Replace the reason or the next reader copies the enum argument to a site with no `!r`.**
 
 > ⚠️ **Amendment 2026-08-13 -- the item's JUSTIFICATION was the weaker of the two available, and the stronger one is a measured fact. Severity is UNCHANGED and deliberately not upgraded.**
 >

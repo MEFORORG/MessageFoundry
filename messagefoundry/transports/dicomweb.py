@@ -141,6 +141,7 @@ class DicomWebDestination(DestinationConnector):
             raise ValueError(
                 "DICOMweb destination requires a 'url' setting (the DICOMweb service base URL)"
             )
+        _reject_url_control_chars(url, "url")
         scheme = urllib.parse.urlsplit(url).scheme.lower()
         if scheme not in ("http", "https"):
             raise ValueError(
@@ -248,9 +249,17 @@ class DicomWebDestination(DestinationConnector):
         headers: dict[str, str] = {"Accept": _DICOM_JSON}
         extra = s.get("headers") or {}
         if isinstance(extra, dict):
+            # Screened for the same reason study_uid is, and NAMES as well as values: both halves land
+            # on the wire, so a CRLF in either splits the request. Unlike a URL a header value has no
+            # incidental neutralisation downstream -- nothing strips or re-encodes it.
+            for k, v in extra.items():
+                _reject_url_control_chars(str(k), "header name")
+                _reject_url_control_chars(str(v), f"header {str(k)!r} value")
             headers.update({str(k): str(v) for k, v in extra.items()})
         token = s.get("bearer_token")
         if token:
+            # PHI/secret-safe: the helper names the field, never the value.
+            _reject_url_control_chars(str(token), "bearer_token")
             headers["Authorization"] = f"Bearer {token}"
         user, password = s.get("basic_user"), s.get("basic_password")
         if user and password:
