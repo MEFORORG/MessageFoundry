@@ -8769,6 +8769,33 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **THE DOCSTRING STATES THE SAFETY PROPERTY THIS DEFEATS, WHICH IS WHY IT SURVIVED REVIEW.** `auth/service.py:580-581` reads: *"the operator changed its password it is a normal admin account and is left alone, so this can't lock out a legitimate single-admin deployment."* That is true of a **self-service** change -- which clears `must_change_password` -- and false of an **administrator reset**, which sets it back. The retirement gate is not testing "has this account been claimed"; it is testing a flag that a second, unrelated shipped code path re-raises. A reader checking whether retirement is safe finds a sentence saying it is.
 
+> **INTERMITTENT-FAILURE DIAGNOSTIC ADDED 2026-08-14 (dispatcher, from a builder's read-only pass; no claim taken and the claim is untouched). READ THIS BEFORE INVESTIGATING THE INTERMITTENT.**
+>
+> **FIRST, THE CORRECTION THAT SAVES A WHOLE PASS: the recorded failure is `must_change_password` FALSE after `admin_reset_password` -- NOT the retirement assertion.** One pass was already spent investigating the wrong assertion. **Do not repeat it.**
+>
+> **SIX CANDIDATE MECHANISMS, EACH REFUTED BY READING** -- recorded so nobody re-derives them:
+> ```
+> set_password placeholder misalignment on an empty claim fragment
+>     REFUTED -- claim_args is conditioned on the same flag; the binding stays aligned
+> argon2 rehash-on-login writing back a stale flag
+>     REFUTED -- awaited inline at service.py:799, not backgrounded
+> admin_reset_password overwriting its own write
+>     REFUTED -- sequential; nothing touches the column after set_password
+> change_password suppressing the flag
+>     REFUTED -- must_change defaults False and is unused on that path
+> _opt_float falsy-coercing to None
+>     REFUTED -- `None if value is None else float(value)`
+> _commit() moving a transaction boundary
+>     REFUTED -- bare wrapper; commit then count
+> ```
+> **THE MECHANISM WAS NOT FOUND, and no seventh is offered as a story.** That is deliberate: a plausible unverified mechanism is what this ledger keeps having to retract.
+>
+> **ONE STRUCTURAL NOTE WORTH CHECKING FIRST ON A SERVER BACKEND:** there IS a second writer path -- a group-committer owning its own `BEGIN`/`COMMIT`. It **cannot** be active in this test (`:memory:` store, no engine), but it is the only transaction-boundary hazard in the file.
+>
+> **THE DIAGNOSTIC, and it is the actionable half. THE FAILURE CANNOT DISTINGUISH THREE CAUSES: (a) the write never landed, (b) it landed and something reset it, (c) the read path is wrong. All three produce an identical red.** A **PAIRED READ AT THE SAME INSTANT -- the store record AND the raw row --** splits them on the next occurrence. **Two lines, and it does not require reproducing the failure first**, which is what makes it worth adding before anyone tries to.
+>
+> **DO NOT CLOSE THIS ON A GREEN RE-RUN. A green re-run is consistent with an intermittent, not evidence against one.**
+
 > **THE CHAIN, every link read at `origin/main` rather than inferred:**
 > ```
 > auth/service.py:2730-2733  admin_reset_password -> set_password(..., must_change_password=True)
