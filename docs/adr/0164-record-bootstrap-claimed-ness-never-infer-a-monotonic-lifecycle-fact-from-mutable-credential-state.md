@@ -131,6 +131,26 @@ administrative access is never lost.
    hoisted out, the backfill becomes a permanent **second writer** of the field whose single-writer
    property is the entire point.
 
+   **The backfill is incomplete, inherently, and the boundary is named rather than left implied.**
+   (The three anchors in this paragraph are the **shipped fix**, not the `96c9a860` baseline the
+   Context section is measured against.) Its predicate is
+   `must_change_password = FALSE AND password_hash IS NOT NULL`
+   (`postgres.py:1118-1119`; `= 0` at `store.py:3131-3132` and `sqlserver.py:1393-1394`) — that is,
+   it reconstructs a claim from the very flag this ADR exists to stop trusting, because on a
+   pre-upgrade database it is the only evidence there is. So a bootstrap that was **claimed and
+   then administratively reset** before the upgrade has `must_change_password` back to `TRUE`, is
+   excluded by the predicate, and reads **unclaimed** after the upgrade. On that one pre-existing
+   row the pre-fix behaviour survives the fix: the next trigger would retire it.
+
+   **This is not a gap that a better migration closes.** The claim left no durable trace before the
+   column existed, and the reset overwrote the single bit that carried it — the information was
+   destroyed prior to the upgrade, so no query over the pre-upgrade columns can recover it.
+   `password_changed_at` is not a fallback: every `set_password` refreshes it, the reset included,
+   which is the same measurement that killed the second rejected alternative below. The affected
+   population is developer databases only (CLAUDE.md §0 — zero deployments), and the remedy on such
+   a row is one self-service rotation, which stamps the column through its single writer. A first
+   deployment creates the column at mint and is unaffected.
+
 ---
 
 ## Rejected alternatives
