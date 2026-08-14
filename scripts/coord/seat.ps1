@@ -565,6 +565,12 @@ function Write-RecordAtomic {
 
 $exit = 0
 try {
+    # STILL GATED ON -Record, and the reason is not the one it looks like. Reading stdin is what
+    # supplies the session id, and -Declare/-Close were writing to the anonymous slot for want of it
+    # (rule 4) -- but they get theirs from -SessionId or the environment (Get-SessionKey), because
+    # [Console]::In.ReadToEnd() BLOCKS on an inherited pipe that nobody closes. A hook never invokes
+    # -Declare; a human at a terminal never pipes it a payload. So the identity gap is closed without
+    # putting a blocking read on a path that has no payload to read.
     $payload = if ($Record) { Read-HookPayload } else { $null }
 
     $wtHint = $Worktree
@@ -608,6 +614,19 @@ try {
     }
 
     $sk = Get-SessionKey -Payload $payload -Override $SessionId
+    $identified = [bool]$sk.Id
+
+    # RULE 4, THE REFUSAL. A declaration or a close that cannot name its session has nowhere
+    # legitimate to go: the anonymous slot belongs to whoever was here last, so writing there both
+    # invents a seat the roster counts and marks a record the closing seat is not the subject of.
+    # This is a NO-WRITE path, like rule 1, and it says how to fix it rather than failing quietly.
+    if (($Declare -or $Close) -and -not $identified) {
+        $how = "pass -SessionId <id>, or set CLAUDE_CODE_SESSION_ID"
+        Write-Error "seat.ps1: -Declare/-Close needs a session identity and found none ($how); nothing written." -EA Continue
+        Write-WriterError -Stage 'no-session-identity' -Message "declare/close refused: no session id ($how)"
+        exit 0
+    }
+
     $recPath = Join-Path (Join-Path $script:SeatsDir $boxKey) ("$($sk.Key).json")
 
     # Read the prior record so -Declare and -Close amend rather than truncate, and so `writes` and
@@ -623,18 +642,64 @@ try {
         return $Default
     }
 
+    # PriorOwn IS Prior FOR AN IDENTIFIED RECORD AND NOTHING AT ALL FOR AN ANONYMOUS ONE. The `nosid`
+    # file is one slot per CHECKOUT, so its prior contents may be a different session's; carrying them
+    # forward is how a fresh seat came back holding someone else's goal and lifecycle. `writes` still
+    # uses Prior: it counts writes to that FILE, which is true of the slot regardless of who wrote.
+    function PriorOwn([string]$Name, $Default) {
+        if (-not $identified) { return $Default }
+        return (Prior $Name $Default)
+    }
+
     $now = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
-    $g = Get-GitFacts -Wt $wt
+    # One ref per (box, session), overwritten each turn exactly as the record is, so anchoring adds no
+    # cardinality the layer did not already have. The name is self-documenting to whoever finds it in
+    # `git for-each-ref` months later.
+    $stashRef = "refs/mefor-seat/$(ConvertTo-RefComponent $boxKey)/$(ConvertTo-RefComponent $sk.Key)"
+    $g = Get-GitFacts -Wt $wt -StashRef $stashRef
     $cr = Get-ConfigRootLabel
 
-    $lifecycle = Prior 'lifecycle' 'open'
-    $lifecycleAt = Prior 'lifecycleAt' $now
+    $lifecycle = PriorOwn 'lifecycle' 'open'
+    $lifecycleAt = ConvertTo-Utc8601 (PriorOwn 'lifecycleAt' $now)
+    if (-not $lifecycleAt) { $lifecycleAt = $now }
     if ($Close) {
         $lifecycle = if ($Handback) { 'handed' } else { 'closed' }
         $lifecycleAt = $now
     }
 
-    $handoffObj = Prior 'handoff' $null
+    # THE EPISODE BASELINE, minted once and never moved. It is a separate field from lifecycleAt for
+    # the reason given at Get-Attribution: a -Close must not be able to disown the episode's own work.
+    $episodeStart = ConvertTo-Utc8601 (PriorOwn 'episodeStart' $null)
+    $episodeStartSource = PriorOwn 'episodeStartSource' $null
+    if (-not $identified) {
+        # No identity, no baseline. Attribution then answers 'unknown' for every claim and allocation,
+        # which is the truth: this record cannot say whose episode it is. Inventing a baseline here
+        # would hand a confident answer either way, and both directions are wrong (claiming another
+        # occupant's ledger numbers, or disowning your own).
+        $episodeStart = $null
+        $episodeStartSource = 'unknown-session'
+    } elseif (-not $episodeStart) {
+        # The first Stop hook fires at the END of turn 1, so minting the baseline here would put every
+        # turn-1 allocation before its own episode -- and allocating a ledger number early is the
+        # normal shape of a turn 1. The transcript the payload names was created when the SESSION was,
+        # which is the question actually being asked.
+        $tp = $null
+        if ($payload -and ($payload.PSObject.Properties.Name -contains 'transcript_path')) { $tp = [string]$payload.transcript_path }
+        if ($tp -and (Test-Path -LiteralPath $tp)) {
+            try {
+                $episodeStart = ConvertTo-Utc8601 ((Get-Item -LiteralPath $tp -EA Stop).CreationTimeUtc)
+                $episodeStartSource = 'payload-transcript'
+            } catch { $episodeStart = $null }
+        }
+        if (-not $episodeStart) {
+            # Honest about what it is: an UPPER bound on the true start, so turn-1 work can still read
+            # as inherited. The source is stored so a reader can tell which kind of baseline this is.
+            $episodeStart = $now
+            $episodeStartSource = 'first-write'
+        }
+    }
+
+    $handoffObj = PriorOwn 'handoff' $null
     if ($Declare -and $Handoff) {
         if (Test-Path -LiteralPath $Handoff) {
             $hi = Get-Item -LiteralPath $Handoff
@@ -653,10 +718,23 @@ try {
         }
     }
 
-    $pred = Prior 'predecessor' $null
+    $pred = PriorOwn 'predecessor' $null
     if ($Declare -and $Predecessor) {
         $parts = $Predecessor -split '[/\\]', 2
         if ($parts.Count -eq 2) { $pred = [ordered]@{ boxKey = $parts[0]; sessionKey = $parts[1] } }
+    }
+
+    # THE OPTIONAL FIELDS ARE BUILT BEFORE THE RECORD LITERAL, EACH DEGRADING ON ITS OWN. A throw
+    # inside the literal costs the ENTIRE write -- the involuntary git facts along with it -- and rule
+    # 2's exit 0 then reports that as success. Measured: one note holding a double space did exactly
+    # that, and the seat's whole episode went unrecorded behind a clean exit code.
+    $notesValue = PriorOwn 'notes' ''
+    if ($Declare -and $Notes) {
+        try { $notesValue = Limit-Text -Text $Notes }
+        catch {
+            $notesValue = "[note dropped by the writer: $($_.Exception.Message)]"
+            Write-WriterError -Stage 'notes' -Message $_.Exception.Message
+        }
     }
 
     $rec = [ordered]@{
@@ -666,7 +744,11 @@ try {
         asOfSource       = if ($Record) { 'hook:Stop' } elseif ($Declare) { 'cli:Declare' } elseif ($Close) { 'cli:Close' } else { 'cli:other' }
         writes           = [int](Prior 'writes' 0) + 1
         lifecycle        = $lifecycle
+        # WHEN THE LIFECYCLE LAST CHANGED. It is NOT the episode baseline -- that is episodeStart,
+        # below -- and it must never be read as one again.
         lifecycleAt      = $lifecycleAt
+        episodeStart     = $episodeStart
+        episodeStartSource = $episodeStartSource
         boxKey           = $boxKey
         worktree         = $wt
         worktreeSource   = 'git rev-parse --show-toplevel'
@@ -679,12 +761,14 @@ try {
         configRootLabel  = $cr.Label
         configRootSource = $cr.Source
         poolEpoch        = Get-PoolEpoch -SeatsDir $script:SeatsDir
-        seat             = if ($Declare -and $Seat) { $Seat } else { Prior 'seat' $null }
-        seatSource       = if ($Declare -and $Seat) { 'declared' } else { Prior 'seatSource' $null }
-        declaredAt       = if ($Declare -and $Seat) { $now } else { Prior 'declaredAt' $null }
-        goal             = if ($Declare -and $Goal) { $Goal } else { Prior 'goal' $null }
-        done             = if ($Declare -and $Done) { $Done } else { Prior 'done' $null }
-        outOfScope       = if ($Declare -and $OutOfScope) { $OutOfScope } else { Prior 'outOfScope' $null }
+        # PriorOwn, not Prior: the declared half of an anonymous record would be the previous
+        # occupant's (rule 4).
+        seat             = if ($Declare -and $Seat) { $Seat } else { PriorOwn 'seat' $null }
+        seatSource       = if ($Declare -and $Seat) { 'declared' } else { PriorOwn 'seatSource' $null }
+        declaredAt       = if ($Declare -and $Seat) { $now } else { ConvertTo-Utc8601 (PriorOwn 'declaredAt' $null) }
+        goal             = if ($Declare -and $Goal) { $Goal } else { PriorOwn 'goal' $null }
+        done             = if ($Declare -and $Done) { $Done } else { PriorOwn 'done' $null }
+        outOfScope       = if ($Declare -and $OutOfScope) { $OutOfScope } else { PriorOwn 'outOfScope' $null }
         branch           = $g.branch
         upstream         = $g.upstream
         tip              = $g.tip
@@ -698,12 +782,13 @@ try {
         unpushed         = $g.unpushed
         dirty            = $g.dirty
         stashSha         = $g.stashSha
+        stashRef         = $g.stashRef
         stashCovers      = $g.stashCovers
-        claims           = @(Get-ClaimsFor -CoordDir $coord -Wt $wt -EpisodeStart $lifecycleAt)
-        allocations      = @(Get-AllocationsFor -CoordDir $coord -Wt $wt -EpisodeStart $lifecycleAt)
+        claims           = @(Get-ClaimsFor -CoordDir $coord -Wt $wt -EpisodeStart $episodeStart)
+        allocations      = @(Get-AllocationsFor -CoordDir $coord -Wt $wt -EpisodeStart $episodeStart)
         handoff          = $handoffObj
         predecessor      = $pred
-        notes            = if ($Declare -and $Notes) { ($Notes -replace '\s+', ' ').Substring(0, [Math]::Min(2000, $Notes.Length)) } else { Prior 'notes' '' }
+        notes            = $notesValue
     }
 
     Write-RecordAtomic -Path $recPath -Object $rec

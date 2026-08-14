@@ -231,7 +231,7 @@ if (Test-Path -LiteralPath $errFile) {
 $originMainSha = Invoke-Git -Dir $repo -GitArgs @('rev-parse', 'origin/main')
 $originMainAgeMinutes = $null
 # NOT $null, and not blank. A blank age beside a populated sha reads as a pass; this has to say which.
-$originMainAgeSource = 'UNCHECKABLE -- no FETCH_HEAD anywhere in this clone (nobody has fetched since it was created)'
+$originMainAgeSource = 'UNCHECKABLE -- no FETCH_HEAD anywhere in this clone; nobody has fetched here since it was created'
 $fetchHeads = @()
 foreach ($p in @((Join-Path $common 'FETCH_HEAD')) + @(Get-ChildItem -LiteralPath (Join-Path $common 'worktrees') -Directory -EA SilentlyContinue |
                  ForEach-Object { Join-Path $_.FullName 'FETCH_HEAD' })) {
@@ -419,7 +419,7 @@ if ($records.Count -eq 0 -and $heartbeats.Count -eq 0) { $stops += 'recordsExami
 if ($recordsUnfenceable -gt 0) { $stops += "recordsUnfenceable=$recordsUnfenceable -- that many records carry no session id or threw in the fence, so their liveness is UNMEASURED, not quiet" }
 # UNCHECKABLE is its own stop. Silence beside a populated originMainSha reads as a pass, and that is
 # precisely the blind direction: landed verdicts computed against a cached main of unknown age.
-if ($null -eq $originMainAgeMinutes) { $stops += "originMainAgeMinutes=UNCHECKABLE -- $originMainAgeSource; landed verdicts below would be computed against a cached origin/main of UNKNOWN age" }
+if ($null -eq $originMainAgeMinutes) { $stops += "originMainAgeMinutes is $originMainAgeSource -- landed verdicts below would be computed against a cached origin/main of UNKNOWN age" }
 elseif ($originMainAgeMinutes -gt 60) { $stops += "originMainAgeMinutes=$originMainAgeMinutes (source: $originMainAgeSource) -- nobody has fetched in this clone recently; landed verdicts would be computed against a stale ref" }
 
 $receipt = [ordered]@{
