@@ -9212,7 +9212,22 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 >     DECOY          %LOCALAPPDATA%\Temp\claude\<worktree>\<session>\scratchpad\fake\run\seat-tick.last
 >                    a THIRD hit, under a directory literally named `fake`
 >
-> **This is not hypothetical.** The stale decoy's entire content is a **`FATAL seats-unreadable`** record -- `seats.json` carried **case-differing duplicate keys** (`c:\users\<user>\...` against `C:\Users\<User>\...`, identical but for casing) and the tick script **died on the JSON parse**. **So a glob-based alarm would report a permanent hard failure from ten hours ago**, and a reader would spend the outage chasing a crash that was already over. *(That historical crash is worth recording in its own right: a Windows path-casing collision killed the clock once already.)*
+> **This is not hypothetical, and THE TWO DECOYS FAIL IN OPPOSITE DIRECTIONS -- which is why "pin the path" is a HARD REQUIREMENT and not a caution.**
+>
+> **Decoy A makes the alarm SCREAM on a healthy clock.** Its entire content is a **`FATAL seats-unreadable`** record -- `seats.json` carried **case-differing duplicate keys** (`c:\users\<user>\...` against `C:\Users\<User>\...`, identical but for casing) and the tick script **died on the JSON parse**. A glob-based alarm reports a permanent hard failure from ten hours ago. **Loud, wrong, and someone investigates within minutes.** *(That historical crash is worth recording in its own right: a Windows path-casing collision killed the clock once already.)*
+>
+> **Decoy B makes the alarm GO SILENT -- and silence is indistinguishable from health.** Its entire content is one line, measured:
+>
+>     2026-08-14T12:09:01.2079773Z<TAB>steward=THROTTLED(last-send--35997s-ago,floor-360s)
+>                                      dispatcher=THROTTLED(last-send--17999s-ago,floor-360s)
+>
+> **It reads `THROTTLED` for every seat, so it routes straight into THIS ITEM'S OWN EXCLUSION RULE** -- the rule two paragraphs up that says to skip `COLD`/`BACKLOG`/`THROTTLED` intervals. An implementation that globs the filename and lands here does not merely read stale data: **it concludes there is nothing to analyse, and reports nothing wrong, because from its point of view nothing IS wrong.** The alarm is quiet **by design**, on a file ten hours old. **AN ALARM THAT CANNOT FIRE IS WORSE THAN NO ALARM**, because the absence of an alert is read as evidence of health -- the same family as every other fault in this item: an instrument answering truthfully about a question nobody asked.
+>
+> **SO: PIN THE ABSOLUTE PATH. Do not search for the filename, and do NOT "search, then take the newest"** -- newest-wins happens to give the right answer today and breaks silently the moment any scratchpad copy is written after the real one.
+
+> **BUILD THE CHEAP INTERNAL-CONSISTENCY CHECK ANYWAY, because path discipline decays and this one also catches real corruption.** **When a record says `THROTTLED`, assert its age is within the same order of magnitude as its own stated floor before honouring the exclusion.** Decoy B claims `THROTTLED` with `floor-360s` while its age is ~36,000s -- **a hundred-fold contradiction of the state it declares**, since throttling means *suppressed because a send was too RECENT*. (Read literally, `last-send--35997s-ago` is **negative**, i.e. a send ten hours in the **future**; both readings are self-contradictory, and either one trips the check.) **One comparison. It catches this decoy, and it catches genuine corruption in the authoritative file, which is the better reason to build it.**
+
+> **ONE NON-DISCREPANCY, recorded so nobody re-derives it as evidence of tampering.** Decoy B's filesystem **mtime reads 07:09 local** while its **in-content stamp reads 12:09:01Z**. **Five hours apart, same event** -- mtime is local, the content stamp is UTC. It is neither a stale write nor a forged record. Flagged because a five-hour gap between a file's contents and its mtime is exactly the shape that gets escalated as one or the other; the same offset explains two seats reporting the FATAL file's time as `12:11` and `07:11`.
 
 > **How to prove it works, and the negative control that makes the proof mean anything.** Assert the alarm **FIRES** when the watched worktree is absent from a **fresh** `seat-tick.last` -- that is the case the freshness-only version gets wrong, so it is the only test that discriminates the two implementations. Then assert it **STAYS SILENT** across a `THROTTLED`/`BACKLOG` interval and across millisecond-adjacent duplicate records. **A test that only proves it fires on a stale file proves nothing: the broken implementation passes that too.**
 
