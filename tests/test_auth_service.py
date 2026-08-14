@@ -644,27 +644,50 @@ async def test_a_reset_temp_on_a_CLAIMED_bootstrap_still_expires() -> None:
         await store.close()
 
 
-async def test_an_unclaimed_bootstrap_temp_keeps_its_carve_out() -> None:
-    # The other side of the narrowing, and the reason it is a narrowing rather than a deletion: an
-    # UNCLAIMED bootstrap still has its own WP-3 deadline, so the 6.4.1 gate must stay carved out for
-    # it. This reds if anyone "simplifies" the condition by removing the carve-out entirely.
+@pytest.mark.parametrize("bootstrap_expiry_hours", [0, 8760])
+async def test_an_unclaimed_bootstrap_temp_expires_even_when_wp3_has_no_timer(
+    bootstrap_expiry_hours: int,
+) -> None:
+    # BACKLOG #1245. An EARLIER version of this test asserted the OPPOSITE -- that an unclaimed
+    # bootstrap keeps a blanket 6.4.1 carve-out -- and it set bootstrap_expiry_hours=0 in its own
+    # fixture, which turns OFF the very WP-3 deadline the carve-out's justification invoked. That is
+    # a test locking a hole in as intended behaviour, which is the worst shape available, and it was
+    # written into the commit whose stated purpose was closing a carve-out.
+    #
+    # The carve-out conflated TWO DIFFERENT CONTROLS. WP-3 retires an ACCOUNT; ASVS 6.4.1 expires a
+    # CREDENTIAL. Different triggers, different outcomes, and one is not a substitute for the other.
+    #
+    # Both parameters are documented, supported configurations that leave WP-3 unable to bound the
+    # credential: 0 disables the time arm outright (settings.py "0 = no time expiry"), and 8760 sets
+    # it 100x longer than the 6.4.1 policy. Measured before the fix: the printed first-run
+    # administrator credential still logged in at 73 hours, 8760 hours, and 87600 hours -- ten years.
     store = await _store()
     try:
         service = AuthService(
-            store, AuthSettings(initial_password_expiry_hours=72, bootstrap_expiry_hours=0)
+            store,
+            AuthSettings(
+                initial_password_expiry_hours=72,
+                bootstrap_expiry_hours=bootstrap_expiry_hours,
+            ),
         )
         boot = await service.initialize()
         assert boot is not None
         admin = await store.get_user_by_username("admin")
         assert admin is not None and admin.password_claimed_at is None  # never claimed
+
+        # POSITIVE CONTROL: inside the 6.4.1 window the credential WORKS, so the refusal below cannot
+        # be an unusable credential or a retired account.
+        assert (await service.login("admin", boot.password)).ok
+
         await store._db.execute(
             "UPDATE users SET password_changed_at=? WHERE id=?",
             (time.time() - 73 * 3600, admin.id),
         )
         await store._db.commit()
-        # Aged well past 6.4.1, but never claimed: WP-3 owns this account's lifecycle, so the
-        # original bootstrap credential is still accepted here.
-        assert (await service.login("admin", boot.password)).ok
+
+        out = await service.login("admin", boot.password)
+        assert not out.ok  # 6.4.1 bounds it even though WP-3 cannot
+        assert out.error == "invalid credentials"  # generic, as for any other account
     finally:
         await store.close()
 
@@ -734,10 +757,19 @@ async def test_initial_password_expiry_zero_disables_the_gate() -> None:
         await store.close()
 
 
-async def test_bootstrap_admin_is_not_gated_by_initial_password_expiry() -> None:
-    # The bootstrap admin is must_change + carries password_changed_at, but is CARVED OUT of the
-    # 6.4.1 gate (it has its own bootstrap_expiry_hours path). With bootstrap expiry off, an aged,
-    # unclaimed bootstrap still logs in — the initial-password gate must not catch it.
+async def test_bootstrap_admin_IS_gated_by_initial_password_expiry() -> None:
+    # RETRACTED AND INVERTED (BACKLOG #1245). This test previously asserted the OPPOSITE -- that an
+    # aged, unclaimed bootstrap credential still logs in -- under the comment "it has its own
+    # bootstrap_expiry_hours path". The retraction is recorded rather than the old version quietly
+    # deleted, because the old assertion is what a later reader would otherwise re-derive.
+    #
+    # The premise was false in this test's OWN fixture: it sets bootstrap_expiry_hours=0, which
+    # disables the WP-3 time arm outright, so the "own path" it invoked did not exist here. What it
+    # actually pinned was a printed first-run administrator credential surviving 500 hours against a
+    # 1-hour policy -- 500x -- and asserted that as correct.
+    #
+    # WP-3 retires an ACCOUNT; ASVS 6.4.1 expires a CREDENTIAL. One is not a substitute for the
+    # other, and the carve-out that conflated them is gone.
     store = await _store()
     try:
         service = AuthService(
@@ -746,12 +778,21 @@ async def test_bootstrap_admin_is_not_gated_by_initial_password_expiry() -> None
         boot = await service.initialize()
         assert boot is not None
         admin = await store.get_user_by_username("admin")
+        assert admin is not None
+        # POSITIVE CONTROL: fresh, the credential works -- so the refusal below is the expiry gate
+        # and not an unusable credential or a disabled account.
+        assert (await service.login("admin", boot.password)).ok
         await store._db.execute(
             "UPDATE users SET password_changed_at=? WHERE id=?",
             (time.time() - 500 * 3600, admin.id),
         )
         await store._db.commit()
-        assert (await service.login("admin", boot.password)).ok  # not gated by the 6.4.1 expiry
+        out = await service.login("admin", boot.password)
+        assert not out.ok  # 500 hours against a 1-hour policy: refused
+        assert out.error == "invalid credentials"
+        # Refused by EXPIRY, not by retirement -- WP-3's timer is off in this fixture.
+        still = await store.get_user_by_username("admin")
+        assert still is not None and not still.disabled
     finally:
         await store.close()
 

@@ -729,20 +729,26 @@ class AuthService:
         # it is indistinguishable from a wrong password) and audited. A user who set their own
         # password has `must_change_password=False` and is never gated here.
         #
-        # THE BOOTSTRAP CARVE-OUT IS NARROW, AND BACKLOG #1245 IS WHY. It rests on the bootstrap
-        # having its own expiry path, which is true only while that account is UNCLAIMED — WP-3
-        # retires an unclaimed bootstrap on its own timer, so a second deadline here would be
-        # redundant. Once the holder claims it, WP-3 deliberately stops covering the account, and
-        # before #1245 the gap was masked only by the defect itself: the admin reset re-armed
-        # retirement and the account got disabled, so nobody noticed the temp had no deadline.
-        # Removing that accidental bound without putting one back would leave an admin-issued
-        # credential on the highest-privilege account name in the system valid forever — and the one
-        # action such a session permits is setting the password, i.e. account takeover. So a CLAIMED
-        # bootstrap is gated here exactly like any other account.
+        # THERE IS NO BOOTSTRAP CARVE-OUT HERE, AND BACKLOG #1245 IS WHY IT WENT. It used to exempt
+        # the bootstrap entirely, on the premise that WP-3 gives that account its own deadline. That
+        # premise CONFLATES TWO DIFFERENT CONTROLS: WP-3 retires an ACCOUNT, 6.4.1 expires a
+        # CREDENTIAL. Different triggers, different outcomes, and one is not a substitute for the
+        # other — which becomes visible the moment WP-3 cannot bound the credential at all:
+        #
+        #   - `bootstrap_expiry_hours = 0` is a documented, supported value that disables the time
+        #     arm outright (settings.py, "0 = no time expiry"), and the supersession arm needs a
+        #     second administrator who may never be created. MEASURED before this fix: the printed
+        #     first-run credential still logged in at 73 hours, 8760 hours and 87600 hours.
+        #   - `bootstrap_expiry_hours` set LONGER than this policy (say 8760) bounded the credential
+        #     at 100x the 6.4.1 window.
+        #
+        # Neither is reported by security_loosenings(), so both were silent. Dropping the carve-out
+        # is near-behaviour-neutral at the stock 72/72 defaults — a freshly minted bootstrap has
+        # created_at and password_changed_at within milliseconds of each other, so 6.4.1 comes due at
+        # the same instant WP-3 retirement already does — while closing both misconfigurations.
         expiry_hours = self._settings.initial_password_expiry_hours
         if (
-            (username != BOOTSTRAP_USERNAME or user.password_claimed_at is not None)
-            and user.must_change_password
+            user.must_change_password
             and expiry_hours > 0
             and user.password_changed_at is not None
             and now - user.password_changed_at > expiry_hours * 3600.0

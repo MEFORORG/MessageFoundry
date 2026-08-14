@@ -1810,8 +1810,11 @@ class AuthSettings(_Section):
     # is never claimed EXPIRES this many hours after it was set. Without it, an unused reset password
     # grants an authenticated session indefinitely — and the one action it permits is to SET the
     # password, i.e. account takeover. Keyed on `password_changed_at`; a user who set their own password
-    # has `must_change_password=False` and is unaffected. The bootstrap admin has its own
-    # `bootstrap_expiry_hours` path and is exempt. 0 = no expiry (not recommended on a PHI instance).
+    # has `must_change_password=False` and is unaffected. THE BOOTSTRAP ADMIN IS NOT EXEMPT (BACKLOG
+    # #1245): it used to be, on the premise that `bootstrap_expiry_hours` covered it, but WP-3 retires
+    # an ACCOUNT while this expires a CREDENTIAL, and WP-3 cannot bound the credential at all when
+    # `bootstrap_expiry_hours = 0` or is set longer than this value. 0 = no expiry (not recommended on
+    # a PHI instance) — and note that setting THIS to 0 now also unbounds the first-run credential.
     initial_password_expiry_hours: int = 72
 
     # Active Directory / LDAP. The bind password is a secret: MEFOR_AUTH_AD_BIND_PASSWORD.
