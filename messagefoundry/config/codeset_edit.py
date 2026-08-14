@@ -40,6 +40,7 @@ from messagefoundry.config.code_sets import (
     load_code_sets,
 )
 from messagefoundry.config.wiring import WiringError
+from messagefoundry.controlchars import has_control_char
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
 
 #: Extensions the loader recognises (the writer only ever *writes* ``.csv``; both are read).
@@ -302,7 +303,7 @@ def _validate_name(codesets_dir: Path, name: str) -> None:
     # Reject control characters (NUL, tab, newline, DEL, …) before they reach a filesystem call: an
     # embedded NUL makes Path.resolve() raise a bare ValueError the CLI's except clause can't catch
     # (crashing with no JSON on stdout), and none belong in a bare file stem regardless.
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
+    if has_control_char(name):
         raise WiringError(f"code set name {name!r} must not contain control characters")
     if "/" in name or "\\" in name:
         raise WiringError(f"code set name {name!r} must not contain a path separator")

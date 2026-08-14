@@ -44,6 +44,7 @@ from messagefoundry.config.reachability import (
     build_reference_index,
 )
 from messagefoundry.config.wiring import Registry, WiringError
+from messagefoundry.controlchars import has_control_char
 
 __all__ = [
     "LiteralEdit",
@@ -628,7 +629,7 @@ def _validate_new_name(config_dir: Path, target_kind: str, new: str) -> None:
     # A name is embedded verbatim into a Python/TOML string literal; a quote, backslash, or control
     # char would break out of the literal (or the value). Names are simple identifiers-in-practice —
     # refuse anything that could corrupt the rewrite.
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in new):
+    if has_control_char(new):
         raise WiringError(f"the new name {new!r} must not contain control characters")
     if any(ch in new for ch in ("'", '"', "\\")):
         raise WiringError(f"the new name {new!r} must not contain a quote or backslash")
