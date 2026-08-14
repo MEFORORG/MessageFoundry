@@ -9277,6 +9277,18 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Also update CLAUDE.md §11** to record the measured population, so the next reader cannot re-derive the false zero. §11 currently quantifies only the five holdouts.
 
+> **SCOPE BOUNDARY, ADDED 2026-08-14 -- THIS ITEM DOES NOT AUTHORISE REMOVING THE GLYPH FROM MAINTAINER-INTERNAL SECURITY RECORDS, AND THERE IS A MEASURED ORDERING HAZARD IF ANYONE READS IT THAT WAY.**
+>
+> **THE POPULATION THIS ITEM MEASURED IS THE ENGINE REPOSITORY ONLY** -- 496 occurrences across 80 files at `ae76b9f9`, of which `scripts/` and the web console contain **zero**. The maintainer-internal security record is a **separate repository that this census never touched**, so nothing in the table above says anything about it.
+>
+> **WHY THE DISTINCTION IS LOAD-BEARING RATHER THAN TIDY.** `scripts/asvs/apply.py` refuses to write a record entry whose prose carries a banned glyph, and **U+26A0 is the FIRST character in that class** (`_BANNED`, `:26`). That refusal runs in the **validation** phase at `:217`; the **field-preservation invariant** runs later at `:275`. **Measured independently from the code side: for at least one entry carrying a top-level non-scalar value, the glyph refusal is currently the ONLY thing preventing a write that would type-mangle that value into a quoted Python repr -- which parses, so nothing goes red.**
+>
+> **THE REFUSAL WAS NEVER DESIGNED AS THAT CONTROL AND NOTHING RECORDS IT AS ONE. It holds the line by accident of ordering.** That is exactly the shape SDS-3.7 forbids -- a compensating control resting on a premise nobody wrote down -- except here the premise is *"a glyph happens to be present"*, which **this item's own subject is a proposal to remove**.
+>
+> **THE ORDERING CONSTRAINT, and it applies to the OTHER population, not to this one:** the type-mangling repair (**#1242**) must land **BEFORE** any glyph removal from those records. Removing the glyph first deletes the only barrier and the write proceeds into the defect **silently and with a green exit**.
+>
+> **SO THE SEQUENCING IN THIS ITEM IS UNCHANGED AND SAFE** -- shipped operator docs first, the two ledger files last, all inside the engine repo, none of it gated on #1242. **What is added is a fence:** if a later reader treats this item as the mandate for glyph removal *everywhere*, they inherit an ordering precondition this item never priced. **Anyone extending the sweep beyond the engine repo owns that precondition and must land #1242 first.**
+
 **Source:** raised via the Liaison 2026-08-14 as a ledger-scope question (214 in the two ledger files); the repo-wide census that changed its scope, and the corrected distribution above, were measured while answering it.
 
 ## 1266. the seat clock's broadcast fanout drops seats per-firing, and no seat can detect it from its own inbox
