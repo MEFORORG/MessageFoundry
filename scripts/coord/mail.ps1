@@ -342,10 +342,27 @@ if ($Send) {
         try { $roster = @($rosterJson | ConvertFrom-Json) } catch { $roster = @(); $rosterUnavailable = $true }
         $me = (Get-Location).Path.TrimEnd('\', '/').ToLowerInvariant()
         foreach ($r in $roster) {
-            if (-not $r.Worktree) { continue }
+            # Cwd, NOT Worktree. `Worktree` is the roster's DISPLAY LABEL -- a bare leaf name like
+            # `builder-1-session-d229ce` -- while `Cwd` carries the addressable absolute path. The two
+            # fields answer neighbouring questions and only one of them is an address.
+            #
+            # MEASURED 2026-08-13, AND IT HAD EATEN EVERY BROADCAST THIS REPO EVER SENT.
+            # ConvertTo-BoxKey slugs the LEAF but hashes the FULL PATH, so hashing a bare label yields
+            # `<leaf>-<hash-of-label>` sitting beside the real `<leaf>-<hash-of-path>`: same visible
+            # name, different key, and no reader ever drains it. Found 40 messages stranded across 10
+            # such boxes -- including an OWNER-AFK "keep working" broadcast to all 8 seats that nobody
+            # received. An `ls` of box/ looks entirely CORRECT, which is exactly why it survived.
+            #
+            # The single-recipient branch below never carried this bug because it runs Resolve-Path.
+            # That asymmetry is also why the receipts looked healthy: direct sends worked, broadcasts
+            # vanished, and the channel appeared to be up.
+            if (-not $r.Cwd) { continue }
             if ($r.IsSelf) { continue }
-            if ($r.Worktree.TrimEnd('\', '/').ToLowerInvariant() -eq $me) { continue }
-            $targets += $r.Worktree
+            # This comparison used to be made against $r.Worktree -- a bare name tested against an
+            # absolute path, so it could never match and NEVER excluded anyone. Self-exclusion rested
+            # entirely on IsSelf. Against Cwd it finally does the job it was written to do.
+            if ($r.Cwd.TrimEnd('\', '/').ToLowerInvariant() -eq $me) { continue }
+            $targets += $r.Cwd
         }
         if ($targets.Count -eq 0) {
             # THE TWO CASES ARE NOW SEPARATED BY EVIDENCE RATHER THAN BY ASSERTION, and they exit
@@ -370,6 +387,29 @@ if ($Send) {
             throw "Recipient worktree does not exist: $To"
         }
         $targets = @((Resolve-Path -LiteralPath $To).Path)
+    }
+
+    # NO TARGET BECOMES A BOX KEY UNTIL IT IS AN ABSOLUTE, EXISTING DIRECTORY.
+    #
+    # ConvertTo-BoxKey accepts ANY string and returns a plausible-looking key for it, so a wrong
+    # target does not fail -- it silently mints a NEW box that no reader will ever drain, and then
+    # reports "Queued 1 message(s)". A write into a black hole with a success message on top.
+    #
+    # This gate is DELIBERATELY REDUNDANT with both branches above: the broadcast branch now reads
+    # Cwd and the single branch runs Resolve-Path, so neither should reach here with a bad target.
+    # It exists because the failure is silent and permanent, and because the next caller to build
+    # $targets some third way will not remember any of this. The cost is two Test-Path calls per
+    # send; the thing it prevents cost 40 undelivered messages that nobody noticed for nine hours.
+    foreach ($t in $targets) {
+        if (-not [System.IO.Path]::IsPathRooted($t)) {
+            throw ("Refusing to send: target '$t' is not an absolute path. A box key is derived from " +
+                "the FULL path, so a bare name does not fail -- it mints an unread shadow box. " +
+                "Pass a worktree path, not a worktree name.")
+        }
+        if (-not (Test-Path -LiteralPath $t -PathType Container)) {
+            throw ("Refusing to send: target directory does not exist: $t " +
+                "(a key would still be minted for it, and nothing would ever read that box).")
+        }
     }
 
     # PER-TARGET, NOT ALL-OR-NOTHING. Now that a publish can genuinely fail -- the verify is real, so a
