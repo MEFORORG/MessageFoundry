@@ -9244,3 +9244,51 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **Also update CLAUDE.md §11** to record the measured population, so the next reader cannot re-derive the false zero. §11 currently quantifies only the five holdouts.
 
 **Source:** raised via the Liaison 2026-08-14 as a ledger-scope question (214 in the two ledger files); the repo-wide census that changed its scope, and the corrected distribution above, were measured while answering it.
+
+## 1266. the seat clock's broadcast fanout drops seats per-firing, and no seat can detect it from its own inbox
+
+> 🔢 **Filed 2026-08-14 -- routed to this seat as an UNCLAIMED CODE item. It sat as three seats' corroboration for a full day with nobody owning it, because it is invisible from every vantage point that noticed it.** Value **5/10** · Difficulty **4/10**. **THE CLOCK IS HEALTHY AND THE FANOUT IS NOT** -- conflating those is the whole reason this went unfiled.
+
+> **THE MEASUREMENT.** 112 firings on 2026-08-14 at a **10.0 min cadence** (9.9 / 10.0 / 10.1) -- the timer is fine. But recipients per firing swing **1 to 11, median 2**, and **53 of 112 firings reached exactly ONE seat**. The seat that measured it received **33 of 112**. **The dropout is PER-SEAT-PER-FIRING, not an outage window:** two seats missed 19:01 and 19:11 which 7 and 6 other seats received, and one missed 18:51 which the other received.
+
+> **TWO INNOCENT EXPLANATIONS ARE ALREADY REFUTED -- do not re-run them.** *Roster growth* (few seats live early, more later) fails because the count **collapses and recovers**: 10,10,10,10,9,11,11 then 2,5,3,3,6,2,2,2 then back to 10,10,10,10,11. Eleven seats do not all die at 15:01 and all return at 16:21. *"The seat was dark"* fails **first-hand** -- one skip is bracketed by the skipped seat's own demonstrated sends 5 minutes before and **93 seconds after**, and seats come back (`Y Y Y . . Y`), so it is not progressive death either.
+
+> **THE UNEXPLAINED PART IS THE BEST LEAD.** **Three seats received all six firings in a window where others flickered.** Whatever varies does not vary for them. Recorded as the strongest open lead, **not** as a conclusion.
+
+> **CANDIDATE MECHANISMS -- ENUMERATED, NOT DIAGNOSED. None is measured.** (1) The roster enumerated at fire time misses live seats -- broadcast enumerates via `scripts/coord/presence.ps1`, and a seat invisible at fire time is skipped; consistent with the data, and **no seat has read the roster source**. (2) A deliberate withhold to seats carrying undrained mail, on the reasoning that the pending tick already IS the wake -- **offered and then RETRACTED by its own author as never measured**. **It must be excluded by READING THE CODE, not by asking a seat whether it felt skipped, because from the receiving end a correctly-withheld send and a failed one are THE SAME OBSERVATION.** That it is also the reassuring answer is exactly why it needs the stricter treatment: *"working as designed"* ends an investigation. (3) **Instrument floor** -- recipient counts come from delivered mail files, so a message written but never enqueued is invisible to the instrument and **the counts are a floor, not a census.**
+
+> **THE DISCRIMINATOR, and it is the reusable half.** **A QUANTISED gap means the clock fired and you were skipped; a RAGGED gap is a real gap.** A drifted period does not land on a multiple of the cadence; a suppression lands on exactly one. Measured both ways: gaps of **30.0 / 29.9 / 20.0 / 20.0** min against a 10.0 cadence, and independently **40.03 min = 4.003x cadence** from a second seat's transcript rather than the mail store. **This is why it ran all day unreported -- from inside one seat, "the clock is slow" and "the broadcast skipped me" present identically.**
+
+> **FIRST-HAND DATA FROM THE FILING SEAT, AND IT MUST NOT BE READ AS REASSURANCE.** This seat received ticks at 21:41:16, 21:51:11, 22:01:15 and 22:11:11 -- three closed gaps of 9m55s, 10m04s and 9m56s, every endpoint on the `:x1` grid. That is a clean receipt, and **a clean receipt at one seat is exactly what a fanout defect looks like from inside a seat that got the messages.** It corroborates the cadence half and says **nothing whatever** about fanout. Recorded so a later reader does not cite it as evidence against this item.
+
+**Cluster:** Fleet coordination / seat clock. **Priority:** P2. **Verdict:** build.
+**Severity:** none, and no deployment axis (§0) -- this is internal coordination tooling, not engine code. The cost is that coordination work silently does not happen and nothing reports it.
+
+**The cheap fix.** **Compare RECIPIENT SETS ACROSS FIRINGS.** The fault is visible only there. No seat is asked to do it and **no seat can do it from its own inbox alone**, which is the structural reason a day of corroboration produced no owner.
+
+**How to prove a fix.** Recipient-set comparison must be shown able to FAIL: suppress a known seat from one firing deliberately and assert the check names that seat and that firing. A comparison that has only ever run against live data, and only ever agreed, is indistinguishable from one that cannot disagree. Then exclude candidate (2) by reading the broadcast code and recording in this item **which** it was, because a green check under a deliberate-withhold design would be correct behaviour misreported as a fix.
+
+**Related:** the tick rubric that structurally cannot express this fault is **#1267** -- deliberately a separate item, different owner and different fix.
+**Source:** routed 2026-08-14 by the role-playbooks seat as a code item it could not claim (that seat edits `roles/` only); measurements are that seat's and two corroborating seats', reproduced here rather than re-derived.
+
+## 1267. the tick rubric asks only about cadence, so it cannot express a fanout fault and its change-test conceals a stoppage
+
+> 🔢 **Filed 2026-08-14. The text lives in the RUNNING CLOCK'S OWN SEND, not in `roles/` and not in the roster code -- different owner and different fix from #1266, which is why these are two items and must not be merged.** Value **5/10** · Difficulty **2/10**. Both halves below are about one block of prose that every seat receives on every tick.
+
+> **A. THE RUBRIC ASKS ABOUT CADENCE, SO IT STRUCTURALLY CANNOT EXPRESS A FANOUT FAULT.** It instructs a seat to classify a long gap as a slow or broken clock and to conclude *"the chain is broken and you are awake only by luck."* A seat that hits a **quantised** gap -- the signature of *"the clock fired and you were skipped"* -- is therefore instructed to file the **wrong diagnosis**. One nearly did. **CONFIRMED FIRST-HAND BY THE FILING SEAT:** four ticks were received this session, each eliciting a cadence report, and **a cadence report is the only shape this rubric can produce.** It cannot express a recipient-set fault because no seat can observe one from its own inbox (#1266).
+
+> **B. THE SHARPER HALF, and it is a defect in the QUESTION rather than in any answer.** A seat took **six perfect ticks, answered "nothing changed" correctly every time, and stayed stopped for FORTY MINUTES.** Every individual answer was right; **the sequence concealed the stoppage.** The concealing sentence is live in the running clock:
+> ```
+> "Act only if something actually changed. Waking is not a reason to do work."
+> ```
+> **The right question is not "did anything change?" but "is there anything I can advance WITHOUT approval?"** -- which was **YES for all forty minutes**. Verified live: that sentence is present verbatim in the ticks this seat received while filing this item.
+
+> **WHY NO MONITOR WOULD HAVE CAUGHT IT.** A watchdog auditing for silence, for a broken chain, or for a missed firing finds **nothing wrong**, because nothing was ever silent or broken. The clock fired, the sends landed, the seat woke, and the seat answered correctly. **The failure is that the rubric elicited a truthful answer to a question whose truthful answer is compatible with total stoppage.**
+
+**Cluster:** Fleet coordination / seat clock. **Priority:** P3. **Verdict:** build (a prose change plus a check that the prose cannot silently revert).
+**Severity:** none, and no deployment axis (§0). The cost is seats correctly reporting themselves idle while work sits available.
+
+**How to prove a fix.** Changing the sentence is the easy half and is not sufficient. **Assert that a seat which CAN advance something without approval, and whose state is otherwise unchanged, is told to act** -- i.e. construct the case where the old text says "sleep" and the new text says "work", and pin the difference. A rewrite that produces the same instruction on that case has changed the wording and not the rubric. Also pin the quantised-versus-ragged distinction (#1266) as text the rubric actually contains, so limb A cannot regress silently.
+
+**Related:** **#1266** is the roster/fanout defect this rubric cannot describe. Fixing either alone leaves the other; they are separate because the owners and the artefacts differ, not because the subject does.
+**Source:** routed 2026-08-14 by the role-playbooks seat alongside #1266, with an explicit request that the two be kept apart.
