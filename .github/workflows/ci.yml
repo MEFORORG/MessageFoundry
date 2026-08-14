@@ -209,13 +209,38 @@ jobs:
           # drift, and then the step prints a module it does not run, or runs one it does not print.
           # A defence implemented by duplication defeats itself. The variable is the fix, and the
           # cross-check below turns a drift into a hard failure rather than a quiet one.
+          # MEMBERSHIP RULE (#1262). A module belongs here if it CAN FAIL on a change touching only
+          # allowlisted paths -- because those are exactly the changes that skip the suite, so those
+          # are exactly the gates that would be silently absent at the only moment they are needed.
+          #
+          # DERIVE IT BY TRACING WHAT A MODULE OPENS, NOT BY READING ITS NAME OR ITS SOURCE. Measured
+          # 2026-08-14, both static shortcuts fail, in opposite directions:
+          #   "source mentions a docs-ish token"      -> 135 candidates; the signal drowns
+          #   "source quotes a real allowlisted path" -> MISSES 8 OF THE 16 then listed here, because
+          #                                              gates build paths (REPO / "docs" / name)
+          #                                              rather than writing one literal
+          # A criterion that cannot re-derive the KNOWN members cannot be trusted to find unknown
+          # ones. The check that works is to patch open/Path.read_text and record which allowlisted
+          # paths a module actually reads while running.
+          #
+          # THIS LIST IS A FLOOR, NOT A CENSUS. The trace that produced the two additions below ran in
+          # an environment missing five CI extras, where 89 tests SKIPPED -- and a skipped test reads
+          # nothing. More members may be missing. Re-derive with the full extras before believing the
+          # set is complete.
+          #
+          # test_doc_ref_handle.py READS NO DOCUMENTATION -- it tests mfdoc:v1:ref: document handles
+          # in the message store, and is here because its NAME reads like "documentation reference".
+          # KEPT DELIBERATELY (dispatcher ruling, #1262): removing a guard is a different act from
+          # adding one, and dropping it on a reading of its name is the same move that put it here.
+          # The cost is a few wasted seconds; the cost of the other error is a gate that stops running.
           DOC_GUARDS="tests/test_asvs_file_surface_doc_drift.py tests/test_cloud_phi_hipaa_doc_drift.py
             tests/test_crit2_inline_doc_drift.py tests/test_doc_ref_handle.py tests/test_docs_db_grants.py
             tests/test_docs_runbooks.py tests/test_docs_security_pathways.py tests/test_security_doc_drift.py
             tests/test_security_doc_rate_limits.py tests/test_threat_model_doc_drift.py
             tests/test_backlog_status_check.py tests/test_sds_rule_ids_are_stable.py
             tests/test_link_resolution.py tests/test_dast_claims.py
-            tests/test_claude_section_citations.py tests/test_write_share_denominator.py"
+            tests/test_claude_section_citations.py tests/test_write_share_denominator.py
+            tests/test_cutover_slug_rot.py tests/test_backlog_citation_check.py"
           # Every named module must EXIST. A path typo would otherwise make pytest error on an unknown
           # file, or — worse under a future -k/--ignore form — silently scan nothing and read as a pass.
           for m in $DOC_GUARDS; do
