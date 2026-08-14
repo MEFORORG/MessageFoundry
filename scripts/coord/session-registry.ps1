@@ -134,6 +134,20 @@ function Test-RecordLiveness {
     # A record with NO pid cannot be fenced, so it is UNREADABLE, not DEAD. It used to report DEAD --
     # which is not a veto anywhere -- and a registry file caught mid-write has exactly this shape, so a
     # session that had just launched read as "nobody is there" to a caller about to delete its worktree.
+    #
+    # ASK WHETHER THE PROPERTY IS THERE; DO NOT READ IT AND TEST FOR $null. Under
+    # `Set-StrictMode -Version Latest` reading an absent property THROWS rather than yielding $null, and
+    # strict mode is DYNAMICALLY SCOPED -- it is the CALLER's setting that governs, so this guard's
+    # reachability is decided outside this file. fleet.ps1 sets it before dot-sourcing, which made both
+    # guards below dead code from that caller and turned the mid-write record they exist to catch into
+    # an unhandled throw: measured, fleet.ps1 exited 1 with a bare PropertyNotFoundException and printed
+    # no receipt, no roster and no stop conditions at all. This is the same presence idiom fleet.ps1
+    # already uses on `cwd`. A record shape whose fields are not PSObject properties answers "absent"
+    # here and lands on UNREADABLE, which is the safe direction: UNREADABLE ranks with the possibly-live
+    # states, so an unrecognised record vetoes rather than green-lighting a destructive caller.
+    if ($Record.PSObject.Properties.Name -notcontains 'pid') {
+        return @{ State = "UNREADABLE"; Detail = "no pid in record; it cannot be fenced" }
+    }
     $procId = [int]$Record.pid
     if (-not $procId) { return @{ State = "UNREADABLE"; Detail = "no pid in record; it cannot be fenced" } }
 
@@ -147,7 +161,9 @@ function Test-RecordLiveness {
         # upgrading it to LIVE: an unverifiable fence is not a passed fence.
         return @{ State = "UNVERIFIED"; Detail = "pid $procId alive; start time unreadable" }
     }
-    if ($null -eq $Record.startedAt) {
+    # Presence first, for the strict-mode reason given at the pid guard above; then the present-but-null
+    # case, which a record carrying `"startedAt": null` still produces.
+    if (($Record.PSObject.Properties.Name -notcontains 'startedAt') -or ($null -eq $Record.startedAt)) {
         return @{ State = "UNVERIFIED"; Detail = "pid $procId alive; record has no startedAt" }
     }
 
