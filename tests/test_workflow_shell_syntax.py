@@ -28,12 +28,13 @@ to prevent was purely syntactic.
 from __future__ import annotations
 
 import re
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+from tests._bash_support import CANNOT_RUN_CODES, require_bash
 
 yaml = pytest.importorskip("yaml")
 
@@ -107,24 +108,39 @@ def test_there_are_shell_blocks_to_check() -> None:
     )
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available to syntax-check with")
 def test_every_shell_run_block_parses(tmp_path: Path) -> None:
-    """``bash -n`` every block. Reports ALL offenders, not just the first, so one run fixes them all."""
-    bash = shutil.which("bash")
-    assert bash is not None  # narrowed by the skipif; keeps mypy honest
+    """``bash -n`` every block. Reports ALL offenders, not just the first, so one run fixes them all.
+
+    **The guard used to be ``skipif(shutil.which("bash") is None)``, which asked the wrong question
+    (BACKLOG #1272).** It asks *is bash PRESENT*; what matters is *is the bash I found USABLE for what
+    I am about to do*. On Windows the WSL launcher is present, passes that guard, and then cannot
+    resolve any path this process wrote -- so **every block failed identically regardless of its
+    content**. Measured 2026-08-14: 160 of 160, with the backslashes eaten in the error text.
+
+    ``require_bash`` replaces it with a live namespace probe, and the two outcome classes below are
+    kept apart so a harness failure can never impersonate a defect again.
+    """
+    bash = require_bash(tmp_path)
     blocks = _shell_blocks()
     failures: list[str] = []
+    unrunnable: list[str] = []
     for i, (wf, job, step, script) in enumerate(blocks):
         # Write to a FILE rather than piping via stdin. A script containing a heredoc (`<<'PYVER'`) makes
         # `bash -n` read the heredoc body from the same stream it is reading the script from, and it
         # blocks waiting for a terminator that never arrives — measured as a 30 s timeout, not a syntax
         # error. With a file argument, stdin is free and heredoc bodies are skipped unparsed, which is
         # exactly the behaviour wanted: an embedded Python block should be opaque to a shell check.
-        probe = tmp_path / f"block{i}.sh"
-        probe.write_text(_GHA_EXPR.sub("GHA_EXPR", script), encoding="utf-8")
+        name = f"block{i}.sh"
+        (tmp_path / name).write_text(_GHA_EXPR.sub("GHA_EXPR", script), encoding="utf-8")
         try:
-            proc = subprocess.run(
-                [bash, "-n", str(probe)], capture_output=True, text=True, timeout=30
+            # RELATIVE path, run from tmp_path: no namespace conversion is involved at all, which is
+            # the same belt-and-braces `test_merge_gate_controls` adopted for this in August.
+            proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local
+                [bash, "-n", name],
+                cwd=str(tmp_path),
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
         except (
             subprocess.TimeoutExpired
@@ -133,7 +149,20 @@ def test_every_shell_run_block_parses(tmp_path: Path) -> None:
                 f"{wf} :: job {job} :: {step}\n    bash -n TIMED OUT (unterminated heredoc?)"
             )
             continue
-        if proc.returncode != 0:
+        # 126/127 mean bash could not RUN the file; 2 means it read it and the SYNTAX is bad. Folding
+        # them together is what let one unresolvable path present as 160 nonexistent syntax errors.
+        if proc.returncode in CANNOT_RUN_CODES:
+            unrunnable.append(f"{wf} :: job {job} :: {step}\n    {proc.stderr.strip()}")
+        elif proc.returncode != 0:
             failures.append(f"{wf} :: job {job} :: {step}\n    {proc.stderr.strip()}")
-    print(f"syntax-checked {len(blocks)} shell blocks; {len(failures)} failed")
+    print(
+        f"syntax-checked {len(blocks)} shell blocks with {bash}; "
+        f"{len(failures)} failed, {len(unrunnable)} unrunnable"
+    )
+    # Reported FIRST and separately: if the checker could not run, the other list is uninformative.
+    assert not unrunnable, (
+        f"`{bash}` could not RUN these blocks (exit 126/127) -- this is a HARNESS failure, not a "
+        "syntax defect, and the blocks below were never actually checked:\n\n"
+        + "\n\n".join(unrunnable)
+    )
     assert not failures, "shell `run:` blocks that do not parse:\n\n" + "\n\n".join(failures)
