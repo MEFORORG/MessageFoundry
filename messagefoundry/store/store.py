@@ -8034,6 +8034,12 @@ class MessageStore:
                 await self._db.execute(
                     "DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,)
                 )
+                # BACKLOG #1233: presets are owner-scoped by Identity.user_id (#1225) and there is no
+                # FK cascade on this table, so without this DELETE the rows outlive the account —
+                # PHI-shaped `criteria` (ADR 0136) persisting with no owner able to reach or purge it,
+                # and counted by nothing. `owner` holds the user_id, not the username, which is what
+                # makes this a single keyed DELETE rather than a name lookup.
+                await self._db.execute("DELETE FROM search_presets WHERE owner=?", (user_id,))
                 await self._db.execute("DELETE FROM users WHERE id=?", (user_id,))
                 await self._commit()
             except Exception:

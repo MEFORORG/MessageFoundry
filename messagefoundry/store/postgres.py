@@ -656,8 +656,13 @@ _SCHEMA: list[str] = [
 # unlike _SCHEMA edits — which change _schema_hash automatically — the migration function's Python
 # body is invisible to the content hash, so this constant is its stand-in in the hash input.
 # 2 (BACKLOG #1245): the users.password_claimed_at ADD + its one-time backfill live in
-# _migrate_lease_columns, so without this bump an already-open DB takes the schema_meta fast path and
-# never gains the column — every user read would then raise on the hard-subscript decode.
+# _migrate_lease_columns, so that body changed behavior and the contract above requires the bump —
+# the bump is the ONLY thing tying the changed migration body to the hash input. It is NOT what
+# moves the hash for THIS change: the same change also adds the column to the users CREATE TABLE in
+# _SCHEMA above, and _schema_hash() hashes "\n".join(_SCHEMA), so the hash moves either way here.
+# Leaning on that coincidence is the trap the contract exists to close — a later edit confined to
+# _migrate_lease_columns would move nothing, and an already-open DB would take the schema_meta fast
+# path straight past it.
 _MIGRATION_REV = 2
 
 
@@ -6430,6 +6435,11 @@ class PostgresStore:
             await conn.execute("DELETE FROM user_roles WHERE user_id=$1", user_id)
             await conn.execute("DELETE FROM sessions WHERE user_id=$1", user_id)
             await conn.execute("DELETE FROM webauthn_credentials WHERE user_id=$1", user_id)
+            # BACKLOG #1233, verbatim with the SQLite and SQL Server bodies: presets are owner-scoped
+            # by Identity.user_id (#1225) with no FK cascade, so without this the rows outlive the
+            # account carrying PHI-shaped `criteria` (ADR 0136) that no owner can reach or purge.
+            # This leg is CI-only, so a divergence between the three backends surfaces first in CI.
+            await conn.execute("DELETE FROM search_presets WHERE owner=$1", user_id)
             await conn.execute("DELETE FROM users WHERE id=$1", user_id)
 
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:

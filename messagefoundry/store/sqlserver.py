@@ -9381,6 +9381,12 @@ class SqlServerStore:
                 await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
                 await cur.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
                 await cur.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
+                # BACKLOG #1233, verbatim with the SQLite and Postgres bodies: presets are
+                # owner-scoped by Identity.user_id (#1225) with no FK cascade, so without this the
+                # rows outlive the account carrying PHI-shaped `criteria` (ADR 0136) that no owner can
+                # reach or purge. This leg is CI-only, so an asymmetry between the three backends
+                # surfaces first in CI rather than here.
+                await cur.execute("DELETE FROM search_presets WHERE owner=?", (user_id,))
                 await cur.execute("DELETE FROM users WHERE id=?", (user_id,))
                 await self._commit(conn)
             except Exception:
