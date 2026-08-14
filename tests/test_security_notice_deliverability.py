@@ -84,6 +84,39 @@ async def _call(
     )
 
 
+# ---------------------------------------------------------------------------------------------
+# THE WIRING TEST THAT BELONGS HERE IS ABSENT ON PURPOSE, AND THIS IS WHAT IT FOUND.
+#
+# Every test below drives the PREDICATE directly, so none of them fails if the lifespan call site
+# in `create_managed_app` is deleted. That gap is real and is NOT closed here.
+#
+# The obvious closure -- build a PHI/enforce managed app and assert `app.router.lifespan_context`
+# raises -- was written, run, and REMOVED because IT HANGS. Measured, with a control:
+#
+#   sibling lifespan test that does NOT raise
+#     (test_security_posture_defaults.py::test_managed_app_stashes_auth_settings_for_the_registry)
+#                                                     -> 1 passed in 1.13s
+#   raising from the lifespan BODY, after `yield`      -> exits cleanly (probe: A/B/C/D/E all printed)
+#   raising during lifespan STARTUP, before `yield`    -> HANGS; pytest emits zero output
+#
+# The gate sits at api/app.py after `engine.start()`, the upload-retention runner and the security
+# notifier are all running, and before the three `asyncio.create_task` handles the teardown expects.
+# The `finally` guards each handle with `is not None`, so this is not an unbound name -- it is
+# teardown of a PARTIALLY-STARTED lifespan not completing.
+#
+# TWO THINGS THIS DOES AND DOES NOT ESTABLISH, kept apart deliberately:
+#   IT DOES     -- an exception raised during lifespan startup, driven through
+#                  `app.router.lifespan_context`, does not unwind. That is a pre-existing property
+#                  of this lifespan; the gate is merely the first thing to raise in that window.
+#   IT DOES NOT -- say what uvicorn does. Production startup failure goes through uvicorn's own
+#                  path, which is UNMEASURED here. The refusal may well exit cleanly in `serve`.
+#
+# So the gate's REFUSAL PATH IS UNVERIFIED under the runner that actually ships, and a hang there
+# would be worse than the defect #1020 fixes -- a silent notice at least leaves the server running
+# and legible. Verify under uvicorn before relying on it, and file the teardown behaviour separately.
+# ---------------------------------------------------------------------------------------------
+
+
 async def test_phi_enforce_refuses_when_no_admin_has_an_address() -> None:
     # The #1020 scenario exactly: first run, bootstrap administrator created with no email, SMTP
     # transport perfectly configured. The transport gate passes; nothing is deliverable.
