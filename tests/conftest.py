@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.settings import INSECURE_CONFIG_SOURCE_ESCAPE_ENV
+from tests._extras_probe import report_header_lines, write_incomplete_run_summary
 
 # ---------------------------------------------------------------------------------------------------
 # Per-PROCESS test slot.
@@ -327,3 +328,44 @@ def _tolerate_logging_on_closed_capture_streams() -> Iterator[None]:
         yield
     finally:
         logging.raiseExceptions = prior_raise
+
+
+# ---------------------------------------------------------------------------------------------------
+# LOUD OMISSION: an incomplete run must SAY SO (BACKLOG #1230 — the loud-omission half only, per the
+# owner's 2026-08-12 scope ruling; the venv is deliberately NOT changed here).
+#
+# scripts/worktree/new.ps1:232 creates a worktree venv with `.[dev,harness]`. CI installs
+# `.[dev,harness,fhir,dicom,x12,xml,webauthn]` (.github/workflows/ci.yml:273). Every module gated on
+# that five-extra gap removes ITSELF at collection time via a module-level `pytest.importorskip`, so
+# those tests never become test items at all: a large block of coverage collapses into a short skip
+# tally and the run still prints as green.
+#
+# THE DEFECT IS THE SILENCE, NOT THE ABSENCE. Skipping an uninstalled optional extra is correct and
+# intended. Rendering an incomplete run as a complete one is not — "the full suite is green" is the
+# sentence the next session bases its own scope on, and a local run cannot currently earn it.
+#
+# Deliberately NOT a pinned test count. A hard-coded figure would be right the day it was written and
+# silently wrong after, and a stale number in a measurement surface is worse than none: re-running
+# reproduces it, so it reads as verified. What prints is what is re-derived every run — which extras
+# are absent, and the command that installs them.
+#
+# This never fails a run and never skips anything itself. It only makes an already-incomplete run
+# legible, so the omission has to be read rather than inferred from a skip count.
+#
+# SCOPE, STATED RATHER THAN IMPLIED. These hooks live in tests/conftest.py, so they load for any run
+# that collects tests/ — which includes every full-suite run, the only kind that can earn the phrase
+# above. A run scoped ENTIRELY to the other testpath (packaging/messagefoundry-webconsole/tests)
+# does not load this file and prints no banner. Measured both ways, with a control to rule out the
+# hooks simply being inert: webconsole-only collected 365 tests silently; the same flags over a
+# tests/ path printed the banner. That gap is left rather than fixed with a repo-root conftest.py,
+# which would change collection globally and is outside this item's ruled scope — a deliberately
+# scoped run already reads as partial; a full-suite run is the one that must not.
+# ---------------------------------------------------------------------------------------------------
+
+
+def pytest_report_header() -> list[str]:
+    return report_header_lines()
+
+
+def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
+    write_incomplete_run_summary(terminalreporter)
