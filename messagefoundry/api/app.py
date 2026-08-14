@@ -181,7 +181,7 @@ from messagefoundry.api.security import (
 # mount_ui), so the engine imports + boots + serves the JSON API with the console ABSENT. serve_ui-on
 # behavior is preserved via three seams the console installs: app.state.ui_csp,
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
-from messagefoundry.auth import Identity, Permission
+from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.service import AuthService, BootstrapAdmin
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
@@ -5290,6 +5290,68 @@ def create_app(
     return app
 
 
+async def _assert_security_notice_is_deliverable(
+    store: Store,
+    *,
+    auth_settings: AuthSettings | None,
+    alerts_settings: AlertsSettings | None,
+    ai_settings: AiSettings | None,
+    security_settings: SecuritySettings | None,
+) -> None:
+    """BACKLOG #1020: refuse to serve a PHI instance whose security notices reach NOBODY.
+
+    The serve gate in ``messagefoundry/__main__.py`` already refuses without a notification channel,
+    but it computes readiness from ``notify_security_events`` + ``email_smtp_host`` + ``email_from``
+    -- **SMTP wiring alone**. That asks *"is a transport configured"* and never *"can the account
+    that matters actually receive"*: the instrument answering the adjacent question (SDS-3.8). On a
+    first run the only account that exists is the bootstrap administrator, created with no address,
+    so the gate passes green while every one of the ten notice types about the account holding
+    ``frozenset(Permission)`` silently no-ops -- including ``LOGIN_AFTER_FAILURES``, the classic
+    someone-guessed-it signal.
+
+    **This check must live here and not beside the transport gate.** ``_serve`` is synchronous and
+    opens no store, so at that point there is no user table to ask. The ASGI lifespan is the only
+    place the store and the freshly minted bootstrap admin are both in hand -- which is why the
+    owner's ruling (option (b), 2026-08-13) corrected the item's own stated fix location.
+
+    **Why deliverability rather than "require an email at creation".** ``update_user_profile`` issues
+    ``UPDATE users SET display_name=?, email=?`` unconditionally on every directory login, so any
+    address a human sets on an AD or OIDC account is overwritten at that holder's next sign-in. A fix
+    resting on an OPERATOR ACTION cannot cover that population; a startup assertion about the state
+    of the table can.
+
+    Deliberately narrow: it asks only whether SOME enabled administrator carries an address, not
+    whether mail to it would arrive. Proving actual delivery needs an SMTP round trip at startup,
+    which is a different and much larger change.
+    """
+    auth_settings = auth_settings or AuthSettings()
+    if not auth_settings.enabled or not auth_settings.notify_security_events:
+        return  # no notices to deliver; the transport gate already governs whether that is allowed
+    alerts = alerts_settings or AlertsSettings()
+    if not alerts.security_notifications_required:
+        return  # the audited, in-writing opt-out -- the pull-only feed is accepted
+    data_class, _production = (ai_settings or AiSettings()).derived_posture()
+    if data_class is not DataClass.PHI:
+        return
+    for user in await store.list_users():
+        if user.disabled or not user.email:
+            continue
+        if Role.ADMINISTRATOR.value in await store.get_user_role_ids(user.id):
+            return
+    detail = (
+        "no enabled Administrator has an email address, so every out-of-band security notice about "
+        "the most privileged accounts would be silently dropped (SecurityEventNotifier returns "
+        "early when the recipient has no address). The [alerts] SMTP transport being configured "
+        "does not make a notice deliverable -- on a first run the bootstrap administrator is created "
+        "without one. Set an address on at least one enabled Administrator, or accept the pull-only "
+        "/me/security-events feed in writing via [alerts].security_notifications_required=false."
+    )
+    enforcement = (security_settings or SecuritySettings()).enforcement
+    if enforcement is SecurityEnforcement.ENFORCE:
+        raise RuntimeError(f"refusing to start a PHI instance: {detail}")
+    _log.warning("PHI instance with no deliverable security-notice recipient: %s", detail)
+
+
 def _emit_bootstrap_admin(bootstrap: BootstrapAdmin, store_settings: StoreSettings) -> None:
     """Persist the one-time bootstrap password to a restricted file — never the rotating log.
 
@@ -5853,6 +5915,13 @@ def create_managed_app(
             app.state.auth = auth
             if bootstrap is not None:
                 _emit_bootstrap_admin(bootstrap, resolved)
+            await _assert_security_notice_is_deliverable(
+                store,
+                auth_settings=auth_settings,
+                alerts_settings=alerts_settings,
+                ai_settings=ai_settings,
+                security_settings=security_settings,
+            )
             if not auth.webauthn_available() and await store.any_webauthn_credentials():
                 # L5b (ADR 0068 decision 5): enrolled passkeys exist but the [webauthn] extra is
                 # not installed (engine moved/reinstalled, same DB) — affected users stay
