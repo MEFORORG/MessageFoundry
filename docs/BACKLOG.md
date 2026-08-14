@@ -9235,3 +9235,53 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Fleet coordination / observability. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) -- this is fleet tooling, not engine code. The cost is that the mechanism which keeps every seat alive has no independent observer, so its death is silent by construction, and the first implementation anyone reaches for is green at precisely the moment it should be red.
+
+## 1270. a claim that returns empty parks the lane at TERMINAL IDLE with work pending, and both routes there are silent
+
+> 🔢 **Filed 2026-08-14 - not started. THE OBSERVABILITY GAP IS WORSE THAN THE DEFECT, so it leads.** A batch claim can return **empty** for a reason that is not "there is no work", and the dispatcher is told only "empty". **Two routes, both reaching it silently:** a swallowed native **1222** lock-timeout under `SET LOCK_TIMEOUT 0`, **logged only at DEBUG**; and a **READPAST head skip**, where the batch claim drops the *whole lane* when its `rn=1` head is locked -- with **no log line at all**. On the empty result, **T12 drops the lane to TERMINAL IDLE with no timer armed.** A lane that has silently stopped claiming, recovered only by a periodic sweep, **reads healthy from outside** -- there is no counter, no warning, and nothing that distinguishes it from an idle system with nothing to do.
+
+> **NOT SQL-SERVER-ONLY. `Postgres` is NOT structurally immune** -- its claim uses `FOR UPDATE SKIP LOCKED`, **the same head-of-line skip**. Do not scope a fix to one backend.
+
+> **MEASURED, from a real CI failure with its own state dump** (`tests/test_stage_dispatcher.py::test_slot_budget_exactness[sqlserver-2]`, job `94882084246`; raw log preserved off-repo because that job is path-gated and the run has since been superseded):
+>
+>     empty_claims(total,wake_fanout,idle_poll)=(4, 1, 3)  busy_violations=0
+>     processing_lanes=1  slots_free=1
+>     IB_SLOT3/0/1: phase=IDLE  timer_armed=None  lane_task=none
+>     IB_SLOT3/0/1  rows=[('pending', 0, 100.0)]      <-- WORK PENDING, NOTHING SCHEDULED TO TOUCH IT
+>     clock[0].now=1000.0  armed=[]
+>
+> **Work pending, lanes idle, no timer armed, nothing scheduled to re-ready them: a LOST WAKEUP, not a slow start.**
+
+> **THE TIMEOUT HYPOTHESIS IS REFUTED, NOT MERELY UNSUPPORTED -- and this is the part that matters for whoever fixes it.** The obvious reading was that an 8-second `_wait_until` budget is generous against SQLite and marginal against a containerised SQL Server on a loaded runner. **Two facts kill it.** `busy_violations=0` **and** `slots_free + processing_lanes == 2`, so **the invariant the test polices held exactly** -- the budget logic is not what broke. And **`clock.now=1000.0` is a MOCK clock**, so the dispatcher's own time was not advancing on wall clock at all. **Waiting longer would not have helped, therefore RAISING THE TIMEOUT WOULD HAVE HIDDEN IT** -- the obvious fix is indistinguishable from a real one from the outside, which is precisely why it must not be taken.
+
+> **THE MITIGATION IS REAL AND BELONGS HERE, not omitted to make the finding look worse.** The dump's own clause: *"these tests disable the sweep that would re-ready it."* **In production the sweep runs, so the lane recovers.** §0 applies twice over -- **zero deployments, and the compensating control exists.** So this is written in the conditional: a deploying site **would** see lanes stall until a sweep, with **no log line** explaining why, on either supported server backend. **It is not a stalled pipeline today and must not be written as one.**
+
+> **HOW THIS WAS NEARLY NOT CLASSIFIED AT ALL -- the gated-leg problem, folded in here rather than given its own number.** The `sqlserver-store` job is **path-gated** and skips on every `main` run, so the reasoning went: no baseline on `main`, therefore a single failure is unclassifiable. **The middle step does not carry the conclusion.** That job had run **six times on the PR's own branch that evening -- four passes, one failure, one cancelled.** The baseline existed; it was simply not where it was looked for, which is *an absence measured over the wrong population*. **And the search almost failed for a second, independent reason:** `gh run list` reports **no failed run** on that branch, because **the failing job sits inside a run later CANCELLED as superseded**. *"Did any run fail"* answers **no** while *"did any job fail"* answers **yes** -- CLAUDE.md §11 / **SDS-3.8**'s job-versus-step example, with a new instance. **Query jobs, not runs.** The general form -- *a failure on a gated leg carries less information than the same failure on an ungated one* -- is true and kept here as a paragraph; **it does not get its own number, because its motivating instance turned out to be classifiable and the baseline was found by luck rather than by design.** File it separately only if it recurs with a genuinely unclassifiable failure, and then with two instances.
+
+> **How to prove a fix, and why the dump is the model.** A fix must make the *silent* case *loud*: assert that an empty claim caused by a lock-timeout or a head-of-line skip **emits a distinguishable signal at INFO or above, or increments a counter an operator can see** -- not that the lane eventually recovers, which it already does. **The negative control is the sweep: disable it and assert the lane is still diagnosable from its own output.** *(That is what made this classifiable at all -- the failure carried a full dispatcher/store dump, so one occurrence, after the fact, out of a superseded run's log, was enough. The predecessor's note that "a bare `assert False` is what made instance 2 cost a day of re-diagnosis" is the counterfactual.)*
+
+> **ON THE "instance 2" LABEL, because it will be read as a regression and should not be.** The dump self-labels this **"BACKLOG #344 instance 2"** and the test docstring credits *"#344 proposal 6"* for the dump mechanism. **#344 is CLOSED**, and its subject is *fixed wall-clock bounds drifting out of proportion to the work they bound* -- whereas this is a **lost wakeup**. **Different failures. "Instance 2" is the DIAGNOSTIC's lineage, not the defect's.** Whether that closure needs revisiting belongs to whoever owns it; **this item does not assert a regression against it.**
+
+**Cluster:** Store / dispatcher observability. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure -- zero deployments (§0), and the production sweep recovers the lane. Would cost a deploying site stalled lanes recovered only on a sweep interval, with **no log line at all** on one route and **DEBUG-only** on the other, on **both** server backends.
+
+## 1271. invalid escape sequences in test_remotefile_transport.py become a SyntaxError and take the whole module at collection
+
+> 🔢 **Filed 2026-08-14 - not started. THE BLAST RADIUS IS THE MODULE, NOT THE LINE.** Python has announced that invalid escape sequences become a **`SyntaxError`**; this project targets **3.14+** and will meet that upgrade. A `SyntaxError` fails at **COLLECTION**, so the whole of `tests/test_remotefile_transport.py` disappears in one step rather than one test failing. **A test file that vanishes at collection does not report as a failure -- it reports as fewer tests**, which is the quietest possible way to lose coverage.
+
+> **THREE SITES, ONE FILE, reproduced here by compiling the module with `SyntaxWarning` captured:**
+>
+>     tests/test_remotefile_transport.py:1174   "..\..\etc\passwd.hl7"      -> str literal, needs r""
+>     tests/test_remotefile_transport.py:1221   b"MSH|^~\&|A"               -> BYTES literal, needs rb""
+>     tests/test_remotefile_transport.py:1226   b"MSH|^~\&|A"               -> BYTES literal, needs rb""
+
+> **TWO CORRECTIONS TO THE OBVIOUS FIX, both measured, both of which a careless patch gets wrong.**
+> - **Line 1174 carries THREE invalid escapes, not one: `\.`, `\e` and `\p`.** Python emits **one `SyntaxWarning` per line**, so **the warning count is not the defect count**. Escaping only the escape named in the warning leaves two behind, and the module still dies on the upgrade.
+> - **BOTH 1221 and 1226 are bytes literals**, not just one of them. **`rb""` for both**; treating either as a `str` is a different fix that does not compile the same.
+>
+> The `r`/`rb` form is **value-preserving today**: an invalid escape is currently retained literally, so `"..\..\etc\passwd.hl7"` and `r"..\..\etc\passwd.hl7"` already denote the same string. **The fix changes no test semantics** -- which is exactly why it is safe and why nothing currently fails.
+
+> **THE METHOD IS THE TRANSFERABLE PART, and a grep is the wrong instrument here by a factor of a hundred.** These were found by **compiling all 1,046 `.py` files with `SyntaxWarning` captured**, not by searching for backslashes. **A grep for the pattern returns 325 files, because `|^~\&` is the HL7 encoding-characters field** -- so it counts the **domain** rather than the **defect**. In a repo whose subject matter is a format built out of escape-like punctuation, **the compiler is the only instrument that answers the question being asked.** Any sweep for this class must compile, not match.
+
+**Cluster:** Test-suite durability / Python version readiness. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (§0) -- test-only. The cost is deferred and sharp: on a future Python the module stops being collected, and the loss shows up as a **smaller test count** rather than as a failure, which is the shape least likely to be noticed.
