@@ -196,6 +196,19 @@ def scan(
 
 
 def main(argv: list[str] | None = None) -> int:
+    # THIS MODULE MUST CARRY NON-cp1252 CHARACTERS, so it hardens the stream instead of losing them
+    # (BACKLOG #1030). The docstring below is argparse's description and quotes the machine-parsed
+    # banner alphabet CLAUDE.md section 11 protects; remediation text that cannot show an author the
+    # character it wants added is not actionable. On a stock Windows cp1252 console `--help` therefore
+    # raised UnicodeEncodeError on U+2705 before this line -- measured, not theorised.
+    #
+    # `errors="replace"` is deliberate and is NOT a way of tolerating mangled text: the codec is what
+    # was wrong, and it is fixed here to UTF-8. Replacement is the backstop for a stream that cannot
+    # be reconfigured at all, so one exotic codepoint can never again truncate a gate's output
+    # mid-sentence. Scoped to the CLI entry point: importers get their own stdout untouched.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     root = Path(__file__).resolve().parents[2]
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
