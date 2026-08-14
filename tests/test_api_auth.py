@@ -1436,3 +1436,47 @@ async def test_engine_internal_write_does_not_inherit_a_request_address(engine: 
     await engine.store.record_audit("retention.purge", actor="system")
     row = dict((await engine.store.list_audit(limit=1))[0])
     assert row["action"] == "retention.purge" and row["client"] is None
+
+
+async def test_disabling_the_LAST_second_factor_is_a_400_not_a_500(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1022: the guard's refusal has to reach the caller as a CLIENT error.
+
+    The refusal itself lives in AuthService and has its own unit tests. What this pins is the ROUTE:
+    an uncaught ValueError out of ``disable_mfa`` surfaces as a 500, which reports a user-correctable
+    condition as a server fault AND swallows the remedy the message carries. The neighbouring
+    ``/me/mfa/confirm`` route already mapped ValueError to 400; this one did not, so adding the guard
+    without touching the route would have turned a refusal into an internal error.
+    """
+    service = await _service(engine, AuthSettings(login_rate_limit_enabled=False))
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "adm")).json()["token"]
+        await _reauth(c, tok, purpose="mfa_enroll")
+        secret = (await c.post("/me/mfa/enroll", headers=_auth(tok))).json()["secret"]
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        await _reauth(c, tok, purpose="mfa_confirm")
+        confirmed = await c.post(
+            "/me/mfa/confirm", json={"code": totp.totp(secret, now=t0)}, headers=_auth(tok)
+        )
+        assert confirmed.status_code == 200, confirmed.text
+
+        # A LATER step deliberately: the activating code is single-use and cannot be replayed on
+        # /auth/mfa-verify inside its own window (BACKLOG #1021), so reusing it here would 401 and
+        # this test would fail for a reason that has nothing to do with what it is testing.
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        verified = await c.post(
+            "/auth/mfa-verify", json={"code": totp.totp(secret, now=t1)}, headers=_auth(tok)
+        )
+        assert verified.status_code == 200, verified.text
+
+        # TOTP is now the ONLY second factor and require_mfa defaults on, so the disable must refuse.
+        await _reauth(c, tok, purpose="mfa_disable")
+        r = await c.delete("/me/mfa", headers=_auth(tok))
+        assert r.status_code == 400, r.text
+        assert "enroll another factor first" in r.text
+        # AND MFA MUST STILL BE ON. A 400 whose side effect already happened is worse than a 500.
+        assert (await c.get("/me/mfa", headers=_auth(tok))).json()["enabled"] is True

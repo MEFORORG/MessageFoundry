@@ -434,8 +434,16 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> SimpleMessage:
         """Self-service: turn off the caller's TOTP MFA. Step-up gated — you prove your current factor
         (a TOTP or recovery code via ``/auth/mfa-verify``) and a fresh password BOUND to this disable
-        action (ADR 0077): a hijacked session inside the login window can't silently strip MFA."""
-        await service.disable_mfa(identity, client=_client(request))
+        action (ADR 0077): a hijacked session inside the login window can't silently strip MFA.
+
+        A 400 when TOTP is the caller's last second factor and MFA is still required (#1022) — the
+        caller must enroll another factor first. That is a CLIENT-correctable condition, so it must
+        not surface as a 500: an uncaught ValueError here would report a user error as a server
+        fault AND swallow the remedy the message carries."""
+        try:
+            await service.disable_mfa(identity, client=_client(request))
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return SimpleMessage(detail="MFA disabled")
 
     # --- self-service session inventory (WP-10, ASVS 7.5.2/7.4.5) -------------

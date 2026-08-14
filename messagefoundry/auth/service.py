@@ -2252,8 +2252,29 @@ class AuthService:
 
     async def disable_mfa(self, identity: Identity, *, client: str | None = None) -> None:
         """Self-service: turn off the caller's TOTP MFA (the API gates this behind step-up). Audited +
-        the user is notified out-of-band (ASVS 6.3.7)."""
+        the user is notified out-of-band (ASVS 6.3.7).
+
+        Raises :class:`ValueError` when TOTP is the caller's LAST second factor and MFA is still
+        required — the same refusal, on the same condition, as
+        :meth:`delete_webauthn_credential` (ADR 0068 decision 5). BACKLOG #1022: these are two
+        self-service routes to zero factors behind one step-up gate, and only one of them asked.
+
+        This is NOT the admin escape hatch — that is :meth:`admin_reset_mfa`, which clears TOTP and
+        every passkey and is deliberately unguarded. Nothing here narrows it.
+        """
         user = await self._store.get_user(identity.user_id)
+        if user is not None and user.totp_enabled:
+            creds = await self._store.list_webauthn_credentials(identity.user_id)
+            # Dropping to zero factors while MFA is required is not a lockout — it lands the user in
+            # the enroll-required flow. So NEITHER self-service path is a recovery path, which is
+            # precisely why both must refuse identically rather than one being an escape hatch.
+            if not creds and self._mfa_required_for(
+                user, identity.roles, second_factor_enrolled=False
+            ):
+                raise ValueError(
+                    "this is your last second factor and MFA is required for your account — "
+                    "enroll another factor first"
+                )
         await self._store.disable_totp(identity.user_id)
         await self._audit(
             "auth.mfa_disabled",
