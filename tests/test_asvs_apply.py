@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.asvs.apply import _BANNED, main
+from scripts.asvs.apply import _BANNED, main, render
 
 #: A two-cell record. `5.4.3` is owner-CLOSED, mirroring the real one, because the closed-cell guards
 #: are the ones with the worst failure mode: an un-closing is invisible to every downstream check.
@@ -161,6 +161,49 @@ def test_omitted_keys_are_carried_through_rather_than_dropped(tmp_path: Path) ->
     got = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}["5.4.3"]
     assert got["decision_closed"] is True
     assert got["decision_closed_by"] == "owner"
+
+
+def test_a_payload_only_unknown_key_survives_too() -> None:  # #1242
+    """The MIRROR of the 7818991d incident, and the direction the carry-through never covered.
+
+    The preservation loop's SOURCE was the LIVE cell, so a key the writer has never heard of survived
+    only if it was ALREADY in the vault. A key arriving on the PAYLOAD and absent from live was never
+    iterated at all -- the `key in cell` skip the design relies on never even evaluated for it, because
+    the key was not in the source being walked.
+
+    That is the same silent-drop shape as the incident, one direction over: a NEW schema field applied
+    to a cell that predates it would vanish on write, and an absent field reads as a valid default, so
+    no gate downstream can tell PRESERVED from DROPPED.
+
+    The module comment already states the governing rule -- the writer enumerates only what it ORDERS,
+    and everything else survives by default. This asserts that rule holds for BOTH sources.
+    """
+    cell = {
+        "id": "1.2.3",
+        "level": 1,
+        "verdict": "Pass",
+        "last_verified": "2026-08-13",
+        "verified_at": "0" * 40,
+        "a_future_scalar": "must survive",
+        "a_future_flag": True,
+        "a_future_count": 7,
+    }
+    # live has NONE of the future keys -- so a live-sourced loop can never reach them.
+    out = render(cell, {"id": "1.2.3", "level": 1, "verdict": "Pass"})
+    assert 'a_future_scalar = "must survive"' in out
+    assert "a_future_flag = true" in out
+    assert "a_future_count = 7" in out
+
+
+def test_live_only_keys_still_survive_after_the_payload_fix() -> None:  # #1242
+    """Negative control for the test above: widening the source must not LOSE the direction that
+    already worked. A key present only on the live cell is still carried."""
+    out = render(
+        {"id": "1.2.3", "level": 1, "verdict": "Pass", "last_verified": "x", "verified_at": "y"},
+        {"id": "1.2.3", "decision_closed": True, "decision_closed_by": "owner"},
+    )
+    assert "decision_closed = true" in out
+    assert 'decision_closed_by = "owner"' in out
 
 
 def test_the_preservation_backstop_fires_when_carry_through_is_broken(
