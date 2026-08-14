@@ -4096,6 +4096,21 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 ## 1017. worktree_gate rule 3d has no ownership signal, so it denies a session removing a worktree it created itself
 
+> **ALREADY-DONE, MEASURED 2026-08-14 (dispatcher, from a builder's read-only pass). THE "not started" BELOW IS FALSE -- IT WAS FIXED UNDER `#1041`. The status banner is NOT flipped here; see the closure note at the end of this block.** A builder claimed this, found it built, released the claim, and reported it rather than quietly moving on -- which is the only reason it is not about to be claimed a third time.
+>
+> **ALL THREE OF THIS ITEM'S MEASUREMENTS HAVE INVERTED**, verified against `origin/main` `5e86bdfb` (the ref, not a working tree):
+> ```
+> "grepping the 3d block for cwd returns zero hits"   -> the block at :1040-1052 DOES mention cwd
+> "the deny text asserts the target belongs to
+>  ANOTHER SESSION"                                    -> now only a historical COMMENT; no live deny string
+> "never reads session_id or transcript_path"          -> STILL TRUE, and the new comment DECLARES that gap
+> ```
+> **THE FIX IS BETTER THAN THIS ITEM ASKED FOR, and its own comment records the reasoning:** rule 3d once justified having no cwd check by arguing *"git refuses to remove the worktree you are STANDING in"*; that inference was found unreachable (`#1041`), so **the cwd check is now MADE rather than argued for**. It establishes *"this IS the tree you are standing in"* and **explicitly does not claim the converse**, so the deny text asserts only what is checked. That subtlety is exactly what this item asked for.
+>
+> **CLOSURE IS A SEPARATE ACT AND IS NOT PERFORMED HERE** -- `backlog_status_check.py` hard-errors on an item carrying both a closed and an open banner, and separately on a shipped item that still carries a `**Priority:**`, so closing is three coupled edits including a verbatim archive move. **This banner records the evidence so whoever performs that closure does not re-measure it.**
+>
+> **AND A RELEASE-CONDITION RULING THAT GENERALISES, recorded because `BUILDER.md` section 6 leaves it open:** the builder released the claim rather than holding it, on the grounds that COMMON's condition is **fix-TEXT-on-main** and for an ALREADY-DONE item the text is on main **by definition**. That is right, and it answers the open question in one direction only: **ALREADY-DONE is releasable; CONCLUDED-AS-RESEARCH is not, because there is no text.**
+
 > 🔢 **Filed 2026-08-04 — not started.** Value **6/10** · Difficulty **5/10** · _quick win_. Rule 3d denies on three conditions — a git token, a `worktree remove|move` match, and a target resolving under a governed root — and consults nothing about who owns the target. Ownership is instead **inferred** from a premise in the rule's own header: git refuses to remove the tree you are standing in, "so a `worktree remove` that reaches git is, by construction, aimed at somebody else's". That inference is invalid: not-the-tree-I-stand-in does not imply not-mine.
 
 **Cluster:** Developer tooling / session-drift controls. **Priority:** P3. **Verdict:** build. **Severity:** developer-tooling correctness with no product surface — the rule is in a PreToolUse hook, not the engine, so nothing reaches a shipped artifact and there is no PHI or security dimension. Unlike most items here it is **not conditional**: the gate is armed and its own receipt log records the false positive.
