@@ -9173,6 +9173,12 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **THE DOC HALF IS ALREADY DEMONSTRATED TO WORK, ON THAT SAME SEAT.** Their 20.0 minute gap **exceeds the rubric's ~15 minute threshold**, so by the rubric they should have reported a broken chain. They did not - only because the quantised-versus-ragged discriminator had reached them minutes earlier. **The rubric would have produced one more false clock report; the discriminator prevented it.**
 
+> **A RAGGED CONTROL CASE, 2026-08-14 ~20:58Z, AND IT IS WHAT KEEPS THIS ITEM HONEST.** Every gap above is **quantised**. Two seats then recorded **ragged** ones in the same window - **46.8 min (residual 0.32)** and **36.8 min (residual 0.68)** - and by the discriminator those are **real gaps in the chain, NOT fanout skips**. Both seats were demonstrably sending mail across their own gaps, so idleness explains neither.
+
+> **THE TWO GAPS HAVE DIFFERENT LENGTHS AND THE SAME END, WHICH IS THE DIAGNOSTIC PART.** 46.8 and 36.8 minutes both terminate at ~20:58, and the tick **phase moved** with them - every firing that day landed 9-16 seconds past the minute, that one landed at 02. **Different durations converging on one resume instant is the signature of the SCHEDULE RESTARTING**, not of a selection skipping people: a skip leaves each seat's gap an exact multiple of the cadence, a restart does not.
+
+> **SO THIS ITEM COVERS THE QUANTISED CASE ONLY, AND THE RAGGED ONE IS A DIFFERENT MECHANISM.** Recorded here so that a later reader with one ragged gap does not attach it to this item and conclude the fanout defect is broader than measured - and so that a fix for the fanout is not credited with curing a restart. **Nobody has confirmed what restarted; a hook was edited around 20:15 and that coincidence is named, not claimed.**
+
 > **UNEXPLAINED, AND THE BEST LEAD: three seats received ALL SIX firings across 18:41-19:21 while others flickered.** Whatever varies does not vary for them. **Nobody has read the roster source** - this item is filed on behaviour alone.
 
 **TWO FIXES WITH DIFFERENT OWNERS. State both, because one absorbs the other if you do not.**
