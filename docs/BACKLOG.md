@@ -9181,3 +9181,42 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Auth / store portability. **Priority:** P1. **Verdict:** build.
 **Severity:** would, on first deployment against a **SQL Server** store, allow the bootstrap-admin expiry and supersession enforcement to be bypassed by varying the case of the username; and would make account identity store-dependent across all three backends. No live exposure -- zero deployments (§0).
+
+## 1269. the seat clock has no external alarm, and the obvious implementation reads healthy at the moment it should fire
+
+> 🔢 **Filed 2026-08-14 - not started. A WATCHDOG CANNOT WATCH ITS OWN DEATH.** The seat clock (Windows task `MEFOR-Seat-Clock`, `PT10M`, 600s ticks against a ~900s mail doorbell, so a 300s margin) is what makes a session's "keep going" duty physically possible -- a turn ends and the session goes idle regardless of intent, and nothing else fires on a timer. **The chain is SERIAL: each tick re-arms the next watcher, so it has ONE LIFE, not many.** One missed re-arm and it is gone, silently, and every seat whose only wake source is the clock goes quiet with it. **Nothing outside the chain currently notices.**
+
+> **THE ALARM MUST ASSERT BOTH CONDITIONS, AND A FRESHNESS-ONLY CHECK IS THE TRAP THAT MAKES IT WORSE THAN NOTHING:**
+>
+>     1. seat-tick.last age is under ~10 min,  AND
+>     2. the NEWEST line names THE WATCHED WORKTREE as SENT:<id> or THROTTLED(...)
+>
+> `seat-tick.last` is **ONE FLEET-WIDE LINE, rewritten whenever ANY seat is ticked**, carrying per-seat status within it. So **the file can be thirty seconds old while a specific seat is absent or suppressed.** Measured by the Steward: **ticks 59m58s apart while the file stayed under two minutes old for the entire hour**, because other seats were being ticked normally. That seat stayed awake only because peers happened to message it. **A freshness-only alarm is green at exactly the moment it is supposed to fire** -- which is the [#1263](BACKLOG.md)/§6 *green-and-blind* shape, not a lesser version of it.
+
+> **TWO CONSTRUCTION RULES, both measured on a naive first attempt, and note the direction they fail in: BOTH REPORT A HEALTHY CLOCK AS BROKEN.**
+> - **DEDUPE BY TICK IDENTITY, NOT TIMESTAMP EQUALITY.** A raw scan produced **ten 0.0-minute intervals** and flagged over-firing ten times; **22 records were about 12 ticks**, differing in **milliseconds**.
+> - **EXCLUDE INTERVALS WHERE THE SEAT SHOWS `COLD` / `BACKLOG` / `THROTTLED`.** An **88-minute** gap read as *"chain broken"* was **deliberate suppression** on a seat that was taking continuous turns.
+>
+> **An alarm that fires on healthy cases gets discounted, and is therefore absent on the day it matters.** A false-positive watchdog is not a safe failure mode; it is a slow-acting off switch.
+
+> **DO NOT SIMPLIFY IT TO CONSUMING THE CLOCK'S OWN `COLD` LABEL.** Two seats measured that token and reached **opposite conclusions, both correctly**: `COLD` marks **UNDRAINED MAIL PAST THE DOORBELL, not a dead session** -- four seats carried it while all four were writing transcripts within thirty seconds. If an implementation consumes the label at all, it must **cross-check against the seat actually writing transcripts** before alerting.
+
+> **WATCH BOTH BOUNDS. Under ~6 minutes means OVER-firing, and that is the EXPENSIVE fault** -- every tick wakes a seat and spends a turn, so a runaway clock burns the very budget the alarm exists to protect. A too-slow clock costs latency; a too-fast one costs money continuously.
+
+> **PIN THE ABSOLUTE PATH. DO NOT SEARCH FOR THE FILENAME -- THERE ARE AT LEAST THREE FILES WITH IT.**
+>
+>     AUTHORITATIVE  %USERPROFILE%\.claude\mefor-usage\seat-tick.last
+>                    (735 bytes, mtime 22:31; seat-tick.ps1, seat-tick.state.json, seats.json alongside)
+>     DECOY          %LOCALAPPDATA%\Temp\claude\<worktree>\<session>\scratchpad\seat-tick.last
+>                    same filename, 410 bytes, TEN HOURS STALE, verified DIFFERENT by cmp
+>     DECOY          %LOCALAPPDATA%\Temp\claude\<worktree>\<session>\scratchpad\fake\run\seat-tick.last
+>                    a THIRD hit, under a directory literally named `fake`
+>
+> **This is not hypothetical.** The stale decoy's entire content is a **`FATAL seats-unreadable`** record -- `seats.json` carried **case-differing duplicate keys** (`c:\users\<user>\...` against `C:\Users\<User>\...`, identical but for casing) and the tick script **died on the JSON parse**. **So a glob-based alarm would report a permanent hard failure from ten hours ago**, and a reader would spend the outage chasing a crash that was already over. *(That historical crash is worth recording in its own right: a Windows path-casing collision killed the clock once already.)*
+
+> **How to prove it works, and the negative control that makes the proof mean anything.** Assert the alarm **FIRES** when the watched worktree is absent from a **fresh** `seat-tick.last` -- that is the case the freshness-only version gets wrong, so it is the only test that discriminates the two implementations. Then assert it **STAYS SILENT** across a `THROTTLED`/`BACKLOG` interval and across millisecond-adjacent duplicate records. **A test that only proves it fires on a stale file proves nothing: the broken implementation passes that too.**
+
+> **PROVENANCE, kept separate because these were measured by different seats.** The mechanism, the 59m58s measurement, the 88-minute suppression case and the dedupe finding are the **Steward's**, relayed via the Dispatcher and **not re-verified here**. The paths, the `cmp`, the `FATAL` content and the live baseline are the **Dispatcher's**, measured 2026-08-14 ~22:31Z. **The third glob hit (`scratchpad/fake/run/`) is this seat's**, found while confirming the decoy. Whoever builds this should re-measure rather than inherit -- *a provenance line carried through a handoff is a claim, not a fact*, which is itself a lesson from the same evening.
+
+**Cluster:** Fleet coordination / observability. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (§0) -- this is fleet tooling, not engine code. The cost is that the mechanism which keeps every seat alive has no independent observer, so its death is silent by construction, and the first implementation anyone reaches for is green at precisely the moment it should be red.
