@@ -7,11 +7,19 @@ THE DEFECT THIS EXISTS FOR. ``docs/Secure_AI_Development_Standards.md`` prescrib
 §11's *retained, auditable evidence* set, and cited it as evidence for two claims in the A.4 register —
 a register whose stated audience is "adopters and auditors".
 
-Measured 2026-07-29: **zero**. ``git log -n 300`` contains 0 ``Co-Authored-By`` trailers and 0
-``Tier:`` lines, while **81 tracked files** under ``docs/`` instruct omitting the trailer because the
-CLA bot fails on it. And the blocker is structural rather than cultural: ``cla.yml`` allowlists exactly
-three identities, the CLA bot reads a trailer co-author as a contributor who must sign, and ``cla`` is
-a **required** status check — so adding the trailer reds the merge gate.
+Measured 2026-07-29: **zero** ``Co-Authored-By`` trailers and zero ``Tier:`` lines across
+``git log -n 300``, while **81 tracked files** under ``docs/`` instruct omitting the trailer.
+
+That count was right when taken. The *explanation* attached to it was not, and this module used to
+encode the wrong one. The standard said the trailer was **structurally blocked** — ``cla.yml``
+allowlists three identities, ``cla`` is a required check, so adding the trailer supposedly reds the
+merge gate — and the assertion below pinned that sentence, which made this test a guard REQUIRING the
+document to keep asserting it. Re-measured 2026-08-13: 15 commits carrying the trailer are on
+``origin/main``, dated 2026-07-30 to 2026-08-09, merged through ordinary PRs. Nothing blocked them.
+
+So the assertions here pin the *discipline* rather than any one causal story: the section must state
+the status, must carry a DATED measurement, and must not restate the withdrawn "blocked" claim. A
+drift guard that pins a specific cause becomes the thing keeping a refuted cause alive.
 
 Citing a control with a measured adoption of zero as audit evidence is the same integrity failure the
 doc-drift test family already guards elsewhere (``test_security_doc_drift.py``,
@@ -121,8 +129,8 @@ def test_the_trailer_is_not_listed_as_a_built_guardrail() -> None:
         f"the {_TRAILER} trailer is listed as a BUILT guardrail:\n  "
         + "\n  ".join(offending)
         + "\n"
-        "Measured adoption is zero and the required `cla` check blocks it (§6.7). Move it to the "
-        "designed-but-deferred list, or actually adopt and enforce it."
+        "It is neither prescribed nor enforced, and its appearances are unexplained (§6.7). Move it "
+        "to the designed-but-deferred list, or actually adopt and enforce it."
     )
 
 
@@ -163,34 +171,56 @@ def test_the_claims_register_does_not_rest_a_live_claim_on_the_trailer() -> None
     )
 
 
-def test_section_6_7_says_the_trailer_is_not_in_use_and_why() -> None:
-    """A gap named without its cause gets 'fixed' by reinstating the thing that cannot work.
+def test_section_6_7_states_the_status_and_dates_its_measurement() -> None:
+    """A gap named without a dated measurement gets 'fixed' from memory by the next session.
 
-    §6.7 is where a reader goes to learn the commit convention. If it still presents the trailer as
-    the convention, the next session re-adds it, watches the required `cla` context go red, and reaches
-    for the branch-protection settings. Both halves are asserted — the STATUS (not in use) and the
-    CAUSE (the required CLA check) — because the status alone reads as an oversight to correct.
+    §6.7 is where a reader goes to learn the commit convention. If it presents the trailer as the
+    convention, the next session re-adds it repo-wide. If it presents a *reason* the trailer cannot
+    work, the next session designs around a constraint that may no longer hold — which is exactly
+    what happened here, so the reason is no longer pinned. What is pinned is that the claim carries a
+    date, so a reader can tell a current measurement from a remembered one.
     """
     section = _section("### 6.7 Commit / PR with provenance", until="### 6.8")
     low = section.lower()
 
-    assert any(marker in low for marker in ("not in use", "not currently used", "⛔")), (
-        "§6.7 does not state that the Co-Authored-By trailer is NOT in use. Measured adoption is zero, "
-        "so presenting the trailer block as the commit convention makes this section fiction — and it "
-        "is the section a contributor actually follows."
+    assert any(
+        marker in low for marker in ("not in use", "not currently used", "not prescribed")
+    ), (
+        "§6.7 does not state that the Co-Authored-By trailer is NOT in use. It is neither prescribed "
+        "nor enforced, so presenting the trailer block as the commit convention makes this section "
+        "fiction — and it is the section a contributor actually follows."
     )
-    assert "cla" in low and re.search(r"block|reds\b|red the", low), (
-        "§6.7 does not record WHY the trailer is unusable — that `cla` is a required status check and "
-        "the CLA bot treats a trailer co-author as a contributor who must sign. Without the cause, the "
-        "recorded gap invites exactly the change that wedges the merge gate for every PR."
+    assert re.search(r"re-?measured\s+20\d\d-\d\d-\d\d", low), (
+        "§6.7 carries no DATED re-measurement. Trailer adoption here has already changed once without "
+        "anyone deciding it should, so an undated claim about the current rate is a claim about "
+        "whenever someone last looked. Re-measure, then write the date next to the number."
+    )
+    # Strip inline code before hunting the withdrawn phrase. A withdrawal has to NAME what it
+    # withdraws or no reader can follow it, so the section must be able to say the words without
+    # tripping this. Backticks are the repo's existing marker for "quoting a token, not adopting it"
+    # (CLAUDE.md section 11 makes exactly this distinction for the glyph rule), and
+    # scripts/docs/link_check.py already strips code spans for the same reason.
+    prose = re.sub(r"`[^`]*`", "", low)
+    assert not re.search(r"structurally blocked|cannot be, as things stand", prose), (
+        "§6.7 has reinstated the withdrawn claim that the trailer is structurally blocked by the "
+        "required `cla` check. It is not: 15 trailer-bearing commits merged to origin/main between "
+        "2026-07-30 and 2026-08-09. Whatever the CLA action reads to decide who must sign, it is not "
+        "this trailer. Restating a refuted cause in a published standard is the SDS-3.7 defect."
     )
 
 
-def test_the_cla_allowlist_is_still_what_makes_the_trailer_unusable() -> None:
-    """Pins the CAUSE in the workflow, so the doc claim and the mechanism cannot drift apart.
+def test_the_cla_allowlist_still_exists_and_names_the_maintainer() -> None:
+    """The allowlist is the CLA gate's shape. It is NOT what keeps the trailer out.
 
-    If the allowlist mechanism changes, the standard's explanation needs revisiting — and this is the
-    test that says so, rather than the explanation quietly becoming fiction.
+    This test used to be named for the claim that the allowlist made the trailer unusable, and it
+    passed throughout the eleven days when trailer-bearing commits were merging — because what it
+    actually checks is that `cla.yml` declares an allowlist naming the maintainer, which was true the
+    whole time and says nothing about trailers. Keeping the old name meant a green test appeared to
+    corroborate a refuted claim.
+
+    The assertions are worth keeping on their own terms: if the allowlist disappears or stops naming
+    the maintainer, fork PRs and the CLA gate behave differently and §6.7's adoption discussion needs
+    re-checking. That is the real invariant, and it is all this proves.
     """
     yaml = pytest.importorskip("yaml")
     wf = yaml.safe_load(_CLA.read_text(encoding="utf-8"))
@@ -202,11 +232,11 @@ def test_the_cla_allowlist_is_still_what_makes_the_trailer_unusable() -> None:
         if (step.get("with") or {}).get("allowlist")
     ]
     assert allowlists, (
-        "cla.yml no longer declares an `allowlist`. That was the mechanism making a trailer co-author "
-        "read as an unsigned contributor — re-check whether the trailer is now usable and update "
-        "docs/Secure_AI_Development_Standards.md §6.7 either way."
+        "cla.yml no longer declares an `allowlist`. That list is what currently makes the CLA gate a "
+        "formality for the maintainer and a real check for a fork contributor — re-read "
+        "docs/Secure_AI_Development_Standards.md §6.7 and A.6 for anything that depended on it."
     )
     assert "wshallwshall" in allowlists[0], (
-        f"the CLA allowlist no longer names the maintainer: {allowlists[0]!r}. The trailer-blocking "
-        "explanation in §6.7 is derived from this list; re-verify it."
+        f"the CLA allowlist no longer names the maintainer: {allowlists[0]!r}. Every PR would now go "
+        "through signature collection; re-check §6.7 and A.6 before assuming either still holds."
     )
