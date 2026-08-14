@@ -9275,7 +9275,30 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > 🔢 **Filed 2026-08-14. The text lives in the RUNNING CLOCK'S OWN SEND, not in `roles/` and not in the roster code -- different owner and different fix from #1266, which is why these are two items and must not be merged.** Value **5/10** · Difficulty **2/10**. Both halves below are about one block of prose that every seat receives on every tick.
 
-> **A. THE RUBRIC ASKS ABOUT CADENCE, SO IT STRUCTURALLY CANNOT EXPRESS A FANOUT FAULT.** It instructs a seat to classify a long gap as a slow or broken clock and to conclude *"the chain is broken and you are awake only by luck."* A seat that hits a **quantised** gap -- the signature of *"the clock fired and you were skipped"* -- is therefore instructed to file the **wrong diagnosis**. One nearly did. **CONFIRMED FIRST-HAND BY THE FILING SEAT:** four ticks were received this session, each eliciting a cadence report, and **a cadence report is the only shape this rubric can produce.** It cannot express a recipient-set fault because no seat can observe one from its own inbox (#1266).
+> **RETRACTED IN PART, SAME DAY, BEFORE THIS ITEM WAS EVER READ BY ANYONE ELSE -- LIMB A WAS ALREADY FIXED WHEN I FILED IT. Limb A is struck; LIMB B IS CONFIRMED LIVE. The retraction is kept in place rather than deleted, because how it happened is worth more than the item.**
+>
+> **MEASURED AGAINST THE PRIMARY ARTEFACT** -- an untruncated live tick delivered to this seat's own mail box at 22:21:11Z, read from disk rather than from the note I filed from:
+> ```
+> LIMB A -- does the live rubric name a delivery/fanout fault?
+>   "QUANTISED"        PRESENT      "DELIVERY fault"   PRESENT
+>   "FANOUT skip"      PRESENT      "failed SEND"      present (a line wrap splits the two words)
+> LIMB A -- the text I attributed to the rubric
+>   "chain is broken"        ABSENT
+>   "awake only by luck"     ABSENT
+> LIMB B -- the concealing sentence
+>   "Act only if something actually changed"   PRESENT
+>   "Waking is not a reason to do work"        PRESENT
+> LIMB B -- the replacement this item proposes
+>   "advance WITHOUT approval"                 ABSENT   (so limb B's fix has NOT been applied)
+> ```
+>
+> **LIMB A IS WRONG TWICE OVER, and the second way is the worse one.** The defect it describes was fixed before filing -- the live rubric already carries the divide-by-ten discriminator, quantised-versus-ragged, the 53-of-112 measurement, and two refinements no measuring seat had (only a CLOSED gap can be divided; an off-grid fire makes the gaps on both sides unclassifiable). **And separately, the rubric text I quoted against it does not exist:** *"the chain is broken and you are awake only by luck"* returns ABSENT. I filed a quotation from a note instead of from the artefact, so the item would have been unfalsifiable by anyone checking the phrase.
+>
+> **HOW IT HAPPENED, recorded because two seats hit it within one hour.** Both this seat and the routing seat wrote up limb A from notes predating the rewrite; the routing seat caught itself the same way, by a live tick landing in its own box, and retracted. **The primary artefact was one message away in both inboxes the whole time.** Same family as the landed amendment at this ledger's own `#1242` and as a builder's commit message that answered a question four seats then argued about: **the note outlived the code.**
+>
+> **LIMB B SURVIVES AND IS NOW BETTER EVIDENCED THAN WHEN FILED** -- confirmed verbatim in a tick received *while filing the retraction of limb A*, which is as close to a live demonstration as this item is going to get.
+
+> **A. RETRACTED -- SEE THE RETRACTION ABOVE. Struck, not deleted.** The claim was that the rubric asks about cadence and so structurally cannot express a fanout fault. It instructs a seat to classify a long gap as a slow or broken clock and to conclude *"the chain is broken and you are awake only by luck."* A seat that hits a **quantised** gap -- the signature of *"the clock fired and you were skipped"* -- is therefore instructed to file the **wrong diagnosis**. One nearly did. **CONFIRMED FIRST-HAND BY THE FILING SEAT:** four ticks were received this session, each eliciting a cadence report, and **a cadence report is the only shape this rubric can produce.** It cannot express a recipient-set fault because no seat can observe one from its own inbox (#1266).
 
 > **B. THE SHARPER HALF, and it is a defect in the QUESTION rather than in any answer.** A seat took **six perfect ticks, answered "nothing changed" correctly every time, and stayed stopped for FORTY MINUTES.** Every individual answer was right; **the sequence concealed the stoppage.** The concealing sentence is live in the running clock:
 > ```
