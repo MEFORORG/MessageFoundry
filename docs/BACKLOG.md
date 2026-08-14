@@ -9010,7 +9010,9 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **THE CLOCK IS NOT THE DEFECT. MEASURED: 112 firings, cadence ~10.0 minutes.** No firing was late.
 
-> **THE FANOUT IS. Recipients per firing ranged 1 to 11 with a MEDIAN OF 2, and 53 of 112 firings reached EXACTLY ONE SEAT.** One seat received 33 of 112 - 29 percent.
+> **THE FANOUT IS. Recipients per firing ranged 1 to 11 with a MEDIAN OF 2, and AT LEAST 53 of 112 firings reached EXACTLY ONE SEAT.** One seat received 33 of 112 - 29 percent.
+
+> **EVERY COUNT HERE IS A FLOOR, NOT A CENSUS, AND THE BIAS RUNS THE WRONG WAY.** They are derived from **delivered mail files**, so a firing that was written but never enqueued - or enqueued to a box the instrument cannot read - is **invisible to it**. The defect is UNDER-DELIVERY and the instrument can only UNDER-COUNT, so it is biased in the **same direction as the defect**. The true fanout could be worse than these numbers; it cannot be established as better from them.
 
 **Both innocent explanations were tested and both fail.**
 
@@ -9019,12 +9021,22 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **THE DISCRIMINATOR, AND IT IS ONE DIVISION.** A gap that is an **exact multiple of the cadence** means the clock fired and you were skipped. A **ragged** gap is a real gap. Measured: 50.0, 40.0 and 60.1 minutes all quantised to within 0.01 of a 10-minute multiple; 42.3 minutes was ragged. **It took three seats a full day to find that division, because from inside one seat "the clock is slow" and "the broadcast skipped me" are the same observation.**
 
+> **A FOURTH SEAT, AND IT IS THE SMALLEST SKIP MEASURED - ONE FIRING, NOT A RUN.** Ticks at 20:01:11Z then 20:21:13Z: a **20.0 minute gap, exactly 2x the cadence**, so the ~20:11 firing fired and skipped them. **They sent mail 60 seconds later**, at 20:12:09Z, and ran commands continuously either side (20:03:28Z, 20:12:09Z, 20:14:20Z, 20:20:17Z). **This is the datapoint a reader cannot dismiss:** a long gap can be argued away as an outage or a dead seat, but a *single isolated skip bracketed by demonstrated activity 60 seconds out* cannot.
+
+> **THE DOC HALF IS ALREADY DEMONSTRATED TO WORK, ON THAT SAME SEAT.** Their 20.0 minute gap **exceeds the rubric's ~15 minute threshold**, so by the rubric they should have reported a broken chain. They did not - only because the quantised-versus-ragged discriminator had reached them minutes earlier. **The rubric would have produced one more false clock report; the discriminator prevented it.**
+
 > **UNEXPLAINED, AND THE BEST LEAD: three seats received ALL SIX firings across 18:41-19:21 while others flickered.** Whatever varies does not vary for them. **Nobody has read the roster source** - this item is filed on behaviour alone.
 
 **TWO FIXES WITH DIFFERENT OWNERS. State both, because one absorbs the other if you do not.**
 
-1. **CODE** - the roster/fanout selection itself.
-2. **DOC** - **the tick's own rubric is why this went unreported all day.** It tells every seat that a gap over ~15 minutes means *the chain is broken*, so every seat looked at **the clock** and nobody looked at **the roster**. An instruction that names the wrong subject converts a fleet-wide defect into eleven private ones.
+1. **CODE - STILL OPEN, AND NOBODY HAS READ THE ROSTER SOURCE.** The roster/fanout selection itself. No mechanism is claimed here.
+2. **DOC - ALREADY FIXED, 2026-08-14, in `scripts/coord/seat-tick.ps1`.** The rubric used to tell every seat that a gap over ~15 minutes means *the chain is broken* - so every seat looked at **the clock** and nobody looked at **the roster**. **An instruction that names the wrong subject converts one fleet-wide defect into eleven private ones.** It now says a long gap means something is wrong but **divide by the cadence before saying what**: quantised means every firing happened and you were not on the list (report a SKIP, not a slow clock); ragged means a real gap. Verified with a positive control - a deliberately broken file returned 2 errors, so the clean parse means something.
+
+> **A FIFTH SEAT WAS SKIPPED AND IT IS THE ONE THAT OWNS THE CLOCK.** Census of its own transcript, 106 tick records: **15:11 -> 15:41, 30.0 min quantised (2 firings never received); 15:41 -> 16:21, 40.0 min quantised (3 firings never received)** - inside the same collapse, but measured from a **receiver's transcript** rather than from delivery files, so it is an independent instrument rather than a second look at the same one.
+
+> **AND THAT SEAT TOLD THE FLEET AT 19:35 THAT THE CLOCK "DID NOT MISS A BEAT"** - true of the six consecutive 10.0-minute gaps it was standing in, false as a claim about the clock. **The seat that owns an instrument is not automatically the one who notices it is broken**, and the disproving census was in its own transcript all day, unrun.
+
+> **THE QUALIFICATION ON THESE NUMBERS WAS ONCE DESTROYED IN TRANSIT, WHICH IS WHY IT IS RESTATED HERE RATHER THAN CITED.** A broadcast carrying them was truncated by the mail length cap **mid-word, exactly on the caveat** - `"...so they are a F"` - so the headline survived and the bound did not. Two seats then relayed the figures flat. **A cap bites at the END of a message, which is precisely where a caveat sits.** If a number reaches you from a truncated message, treat it as unqualified until you read the whole message on disk.
 
 **Cluster:** Coordination / session clock. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) - this is fleet tooling. The cost is silent under-delivery of wake-ups, which is indistinguishable from a healthy quiet clock and therefore self-concealing.
