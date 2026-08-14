@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from messagefoundry.config.settings import (
     ApiSettings,
     AuthSettings,
+    DeliverySettings,
     DrSettings,
     ServiceSettings,
     SqlAuth,
@@ -1273,3 +1274,32 @@ def test_an_ip_literal_origin_is_still_fine_with_no_tls_posture_declared() -> No
     developer running on 127.0.0.1 is locked out."""
     s = ApiSettings(public_origin="http://127.0.0.1:8765", serve_ui=True)
     assert s.public_origin == "http://127.0.0.1:8765"
+
+
+@pytest.mark.parametrize("bad", [0, -1, -100])
+def test_retry_max_attempts_below_one_is_refused_at_load(bad: int) -> None:  # #1217
+    """`0` loaded clean and dead-lettered on the FIRST failure, while READING like "no limit".
+
+    The delivery check is ``item.attempts >= max_attempts`` against a POST-increment count, so a
+    configured `0` means give up immediately -- the opposite of what an operator writing `0` in a
+    retry field almost certainly intends, and the opposite of what `None` means two lines above it.
+    A negative value was equally accepted and equally silent.
+
+    Refused at LOAD rather than clamped, because a silently-corrected setting is a setting the
+    operator never learns was wrong.
+    """
+    with pytest.raises(ValidationError):
+        DeliverySettings(retry_max_attempts=bad)
+
+
+def test_retry_forever_and_the_finite_default_both_survive_the_floor() -> None:  # #1217
+    """The negative control, and it guards the two values the floor must NOT touch.
+
+    `None` is retry-forever and is a legitimate, documented posture -- a floor that refused it would
+    remove a capability while claiming to add a guard. `100` is the finite default #1051 set, and the
+    settings model mirrors `RetryPolicy`'s; a test already guards that sync and the two must move
+    together.
+    """
+    assert DeliverySettings(retry_max_attempts=None).retry_max_attempts is None
+    assert DeliverySettings().retry_max_attempts == 100
+    assert DeliverySettings(retry_max_attempts=1).retry_max_attempts == 1
