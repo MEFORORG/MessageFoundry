@@ -279,19 +279,23 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
 
 #### Known gap carried to Phase 3 — retention/purge does NOT yet decref an attachment — **CLOSED by Phase 3a (2026-07-13)**
 
-`purge_message_bodies` (and `strip_embedded_documents`) null a message's `raw` body — which holds the
-skeleton + its `mfdoc:v1:ref:` handle — but do **not** decref the referenced attachment, and the
-`messages` table does **not** persist a message's `attachment_refs` (the ingress incref happens in
-`enqueue_ingress` but no column records which refs a message holds for a later release). **Consequence:**
-when a detached message's body is purged, its attachment's refcount is never decremented, so the
-attachment + its chunks are **retained past their last referrer** (a PHI-at-rest over-retention, not a
-loss — the ADR "refcount over-count keeps PHI past its last referrer" hazard). This is **not** a
-Phase-1b delivery concern (delivery must never decref — see above); it belongs to **Phase 3** (the
-read-surface + retention migration), which must persist per-message attachment refs and decref them in the
-same transaction as the body purge (mirroring `_release_outbound_body_refs` for `shared_body`). Flagged
-here rather than left as a silent leak. Until Phase 3 lands, an operator reclaiming a streaming feed's
-storage relies on the startup `sweep_orphan_attachments` (refcount-0 only) — a purged-but-still-referenced
-attachment is **not** yet reclaimed.
+**This section describes the gap as it stood BEFORE Phase 3a, and is kept for the record. Every
+sentence below is past tense deliberately: the heading above and the line below both state that
+Phase 3a closed it, and a present-tense body under a closed heading reads as a live defect.**
+
+`purge_message_bodies` (and `strip_embedded_documents`) nulled a message's `raw` body — which holds the
+skeleton + its `mfdoc:v1:ref:` handle — but did **not** decref the referenced attachment, and the
+`messages` table did **not** persist a message's `attachment_refs` (the ingress incref happened in
+`enqueue_ingress` but no column recorded which refs a message held for a later release). **Consequence
+at the time:** when a detached message's body was purged, its attachment's refcount was never
+decremented, so the attachment + its chunks were **retained past their last referrer** (a PHI-at-rest
+over-retention, not a loss — the ADR "refcount over-count keeps PHI past its last referrer" hazard).
+That was **not** a Phase-1b delivery concern (delivery must never decref — see above); it belonged to
+**Phase 3** (the read-surface + retention migration), which had to persist per-message attachment refs
+and decref them in the same transaction as the body purge (mirroring `_release_outbound_body_refs` for
+`shared_body`). Flagged at the time rather than left as a silent leak. Until Phase 3a landed, an
+operator reclaiming a streaming feed's storage relied on the startup `sweep_orphan_attachments`
+(refcount-0 only) — a purged-but-still-referenced attachment was **not** reclaimed.
 
 **→ This gap is CLOSED by Phase 3a (below):** retention now persists the linkage and decrefs on purge.
 

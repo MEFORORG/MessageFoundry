@@ -4873,7 +4873,7 @@ and `enforce_admins` governs **protected branches**. Re-enabling it would refuse
 
 **A signal exists, but NOT the one this item first claimed — read this before designing anything.** `scripts/coord/occupancy.ps1` provides `Get-WorktreeOccupancy`, `Get-WorktreeOccupants` (with `-IncludeNested`), `Get-NestedWorktrees` and `Get-ContainingWorktrees`, and `scripts/worktree/prune-merged.ps1` uses them as a *fence* before removing worktrees, re-reading immediately before acting. The first version of this item concluded from that: *"the project already accepts this signal as sufficient to gate a deletion"*. **That is true of the COMBINATION and false of the occupancy lookup alone, and the difference is the whole design.**
 
-Measured on a live `-Apply` run, 2026-08-05: of 24 candidates, **signal 1 (occupancy) vetoed 0**. All 16 skips came from signal 2, the git-metadata age rule — 14 *"recently active"*, 2 *"not merged"*. Measured independently from the session that filed this item, at the same time: the fence reported `Available = True`, reported 5 of 42 worktrees occupied, and placed **0** occupants in `MessageFoundry-gate-deferrals` — the worktree that session was demonstrably live in, having committed to it a minute earlier. That is the script's own disclosed blind spot: *a session writing into a worktree by absolute path from elsewhere*, which it puts at 29% of writes on this repo.
+Measured on a live `-Apply` run, 2026-08-05: of 24 candidates, **signal 1 (occupancy) vetoed 0**. All 16 skips came from signal 2, the git-metadata age rule — 14 *"recently active"*, 2 *"not merged"*. Measured independently from the session that filed this item, at the same time: the fence reported `Available = True`, reported 5 of 42 worktrees occupied, and placed **0** occupants in `MessageFoundry-gate-deferrals` — the worktree that session was demonstrably live in, having committed to it a minute earlier. That is the script's own disclosed blind spot: *a session writing into a worktree by absolute path from elsewhere*, which it puts at 29% of the writes made by sessions sitting in the primary.
 
 **So the load-bearing half is the 36-hour age rule, not the occupancy lookup.** A design that vendors only `Get-WorktreeOccupancy` inherits the half that measured 0 of 24, and under the fail-closed constraint below that is the worse half to choose: it returns a confident *"unoccupied"* for a tree that was being written to a minute ago. Whatever is built must carry the age rule too, or the fail-closed requirement is carried by nothing. Rule 3d remains the one place making this decision with neither.
 
@@ -8376,7 +8376,17 @@ Both compute `any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in ...)`.
 
 ## 1240. the FHIR grammar gates use `match` with a `$` anchor, so a trailing newline passes
 
-> 🔢 **Filed 2026-08-13 - not started. NOT EXPLOITABLE TODAY -- the reachability analysis is in the item and it is honest about that.** Value **5/10** · Difficulty **1/10**. Both FHIR grammar gates accept a value with a trailing newline, so on the `fhir_lookup` read path the gate does not enforce the grammar it advertises. Found during #1107 (ASVS 1.2.2).
+> ✅ **SHIPPED -- fixed on PR #379, banner authored by the dispatcher because a builder may not author ledger content (owner ruling 2026-08-13).** Filed 2026-08-13. **NOT EXPLOITABLE TODAY -- the reachability analysis is in the item and it is honest about that.** Value **5/10** · Difficulty **1/10**. The defect as filed: both FHIR grammar gates accepted a value with a trailing newline, so on the `fhir_lookup` read path the gate did not enforce the grammar it advertises. Found during #1107 (ASVS 1.2.2).
+>
+> **VERIFIED BY THE DISPATCHER BEFORE SIGNING THE CLOSURE, by printing the operands on both refs rather than counting them:**
+> ```
+> origin/main   _FHIR_TYPE_RE = re.compile(r"^[A-Za-z]+$")            _FHIR_ID_RE = ...{1,64}$")
+> PR #379 head  _FHIR_TYPE_RE = re.compile(r"^[A-Za-z]+\Z")           _FHIR_ID_RE = ...{1,64}\Z")
+> call sites    _FHIR_TYPE_RE.match(...) / _FHIR_ID_RE.match(...)     UNCHANGED, correctly
+> ```
+> **`$` -> `\Z` on the two pattern definitions, which is the durable form:** it covers **all three** call sites at once and cannot be re-broken by a future caller, where converting the calls to `.fullmatch` would fix three sites and leave the fourth caller free to reintroduce it. The read-path `_reject_control_chars` limb was deliberately **not** added -- redundant once the gates are strict, and it would reintroduce the duplication #1239 records as retired.
+>
+> ⚠️ **The obvious regression test CANNOT DISCRIMINATE and must not be written.** `_resolve_read_url:689` does `raw = query.strip()`, so `"Patient/123\n"` returns an **identical URL before and after the fix**. Only `"Patient\n/123"` flips admitted-to-refused. A test using the stripped form would ship green and prove nothing -- measured by executing the shipped and patched sources, not argued.
 
 **Cluster:** Security / input validation. **Priority:** P2. **Verdict:** build (small).
 **Severity:** Conditional and currently **none** -- see reachability below. The defect is that a control does not do what it claims, which matters independently of whether another control happens to cover for it.
@@ -8404,7 +8414,42 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 ## 1241. operator-config values reach URL and header sinks with no construction-time screen
 
-> 🔢 **Filed 2026-08-13 - not started.** Value **5/10** · Difficulty **3/10**. Several operator-configured values are interpolated into URL paths, query strings and an HTTP header with weaker treatment than the message-derived values beside them -- in one case with no screen at all. Found during #1107 (ASVS 1.2.2). **The subject is the asymmetry**, so fixing one site without the others misses the point.
+> 🔢 **Filed 2026-08-13. PARTIALLY FIXED on PR #379 and DELIBERATELY STILL OPEN -- see the amendment below. DO NOT CLOSE THIS ON #379.** Value **5/10** · Difficulty **3/10**. Several operator-configured values are interpolated into URL paths, query strings and an HTTP header with weaker treatment than the message-derived values beside them -- in one case with no screen at all. Found during #1107 (ASVS 1.2.2). **The subject is the asymmetry**, so fixing one site without the others misses the point.
+>
+> ⚠️ **AMENDED 2026-08-13 (dispatcher) -- PARTIAL PROGRESS RECORDED, ITEM STAYS OPEN.** Banner authored by the dispatcher rather than the builder, per the owner's 2026-08-13 ruling that a builder may resolve conflicts but may not author ledger content. **The builder flagged the partiality in its own commit body; this records it in the ledger so a reader of `main` cannot mistake #379 for a closure.**
+>
+> **WHAT #379 FIXED:** construction-time screening of `url` and `conditional_query`, plus a wrong-exception-class defect that was worse than the filed finding -- `http.client.InvalidURL` derives from `HTTPException`, **not** `ValueError` and **not** `OSError`, so it escaped **every** except arm in `_post` including the backstop written for exactly that case. The result was an unhandled exception out of `send()` rather than the classified dead-letter the file intends.
+>
+> **WHAT REMAINS, and it is why this stays open:** **`transports/dicomweb.py`**, which this item names and #379 does not touch; and a **SECOND unscreened url-construction site in `FhirLookupExecutor`** in the same file, discovered only because an edit matched two locations. **The item's own framing is the reason a partial close would be wrong -- the subject is the ASYMMETRY, and one sink screened while a sibling is not reproduces exactly the defect being reported.**
+>
+> **TWO CORRECTIONS TO THE FILED TEXT, neither reducing severity.** The comparison clause does not merely go stale, it **INVERTS**: the neighbouring flat-search path it called "weaker but at least screening" was removed outright by `039757ff`, so `:431` became the **only** unencoded interpolation left in the file -- which **strengthens** this item rather than weakening it. And the enum rationale is **right advice for the wrong reason**: containment comes from the `!r` conversion escaping control characters, not from the enum's closedness. **Replace the reason or the next reader copies the enum argument to a site with no `!r`.**
+
+> ⚠️ **Amendment 2026-08-13 -- the item's JUSTIFICATION was the weaker of the two available, and the stronger one is a measured fact. Severity is UNCHANGED and deliberately not upgraded.**
+>
+> **FILED AS:** "the treatment is inconsistent within one file." That is a tidiness argument.
+> **THE REAL ARGUMENT:** on the header sink there is **no other control at all** for four distinct byte classes, so this screen is **not defence-in-depth -- it is the only control**. The inconsistency is merely *how that survived review*.
+>
+> **PYTHON'S STDLIB HEADER GUARD DOES NOT BLOCK obs-fold INJECTION.** Measured twice independently, reading the pattern out of `http.client` rather than trusting a report. The guard is:
+> ```
+> b'\n(?![ \t])|\r(?![ \t\n])'
+>
+>   b'a\r\nX-Injected: 1'      ILLEGAL   <- bare CRLF is caught
+>   b'a\r\n X-Injected: 1'     PASSES    <- CRLF + SPACE  (obs-fold)
+>   b'a\r\n\tX-Injected: 1'    PASSES    <- CRLF + TAB    (obs-fold)
+>   b'a\n X: 1'                PASSES    <- bare LF + SPACE
+>   b'a\x00b'                  PASSES    <- NUL
+>   b'a\x7fb'                  PASSES    <- DEL
+>   b'identifier=sys|val'      PASSES    <- legitimate value; the check discriminates
+> ```
+> The negative lookahead is doing exactly what **RFC 7230 obs-fold** describes -- a CRLF followed by whitespace is a **line continuation**, so the stdlib treats it as legal and a value carrying one ships as an **additional CRLF-terminated line in the request**. NUL and DEL are not in the pattern at all.
+>
+> **SEVERITY IS NOT UPGRADED, and that is a deliberate call.** `conditional_query` is **operator configuration**, not message-derived, so an operator would have to configure the hostile value themselves. This stays below the message-derived sites where it was filed. What changes is *why* it matters, not *how much*.
+>
+> **TWO CORRECTIONS TO THIS ITEM'S OWN TEXT:**
+> - It cites `tests/test_fhir_transport.py:220` for the pinned URL assertion. **`:220` is `assert method == "PUT"`; the assertion is at `:221`.** Off by one.
+> - It says the flat-search path "at least screens". **STALE** as of `513855b3` -- #1243 limb A now **refuses** a `?`-query outright. That **strengthens** this item: reject-not-encode is now the file's habit at **two** sites, so this screen follows an established local pattern rather than introducing one.
+>
+> **A DESIGN EXISTS AND IS RESCUED** (not implemented; `fhir.py` was held pending #1243 limb A). Its shape, for whoever builds it: one module-level grammar beside the existing `_FHIR_*` regexes, admitting RFC 3986's query set **plus `|`** (which FHIR needs for `system|code` and RFC 3986 does not admit) and nothing else -- so control characters, space, non-ASCII, `#` and a second `?` are excluded **by construction** rather than by enumerating bad shapes, which is the right polarity for a screen. Anchored `\A...\Z`, **never `^...$`** -- `$` also matches before a trailing newline, which is precisely **#1240's** defect; the two items agree without having been coordinated. A plain `ValueError` at construction rather than the `NegativeAckError` the `versionId` precedent uses, **because the provenance differs**: `versionId` is message-derived and dead-lettering is right, while this is static config and a dead-letter would kill every message forever over a startup-detectable defect. A **constant** error message -- the siblings at `:229`/`:237` echo their value, which is safe only because `conditional` is a closed enum of four literals, and copying that shape onto a free-text setting would be the mistake.
 
 **Cluster:** Security / input validation. **Priority:** P2. **Verdict:** build.
 **Severity:** Conditional and lower than the message-derived sites, because these values come from operator config rather than from an inbound message -- an operator can already choose the endpoint. It is filed because the treatment is *inconsistent within the same file*, which is how the weaker one survives review.
@@ -8421,6 +8466,24 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **Test.** One test per sink per site, asserting refusal at construction time rather than at the URL layer.
 
 **Source:** #1107's ASVS 1.2.2 dynamic-URL surface enumeration, 2026-08-13. Related: #1240 (the grammar gates on the message-derived path), #1239 (duplicated control-char predicate in the same file).
+
+## 1243. close ASVS 1.2.2 on the merits: remove the verbatim flat FHIR query path and escape FHIR value separators
+
+> 🔢 **Filed 2026-08-13 -- OWNER-RULED, both limbs, and the two limbs are one item on purpose.** Value **7/10** -- Difficulty **5/10**. ASVS 1.2.2 asks that untrusted data be *"encoded according to its context"* when dynamically building URLs. `transports/fhir.py` gets the URL layer right and the **FHIR value layer** wrong, and separately ships an **unencoded path as the default**. Either one alone holds the cell at partial, so **closing one limb without the other does not close 1.2.2** -- that is why this is not two items.
+
+> **LIMB A -- REMOVE THE VERBATIM FLAT QUERY PATH.** `[egress].fhir_require_structured_params` ships **`False`** (`config/settings.py:2555`), so the default path is `transports/fhir.py:750`, `url = f"{url}?{search_part}"` -- the caller's search string appended **with no encoding at all**. The four screens above it at `:744-748` reject `#`, a second `?`, and a percent-decoded control character, and the comment at `:741` labels them *"Defense-in-depth (ASVS 1.2.2)"*.
+> **Do not read that comment as a control. The screen is the gap.** It is a denylist of three shapes standing where contextual encoding belongs, and its own comment says why it stops there: it declines to break *"legitimate multi-param (&/=/|) searches"*. Anchoring `:744-748` as evidence for 1.2.2 would cite the statement of the shortfall as proof of the control.
+> **The ruling is deletion, not a flipped default.** Setting `fhir_require_structured_params = True` would leave the unencoded sink reachable behind one config edit, which closes the cell on a default rather than on the absence of the sink -- a compensating control that a single setting removes. With **zero deployments** there is no migration cost to protect, so the simple correct end state wins outright: one code path, encoded by construction.
+
+> **LIMB B -- ESCAPE THE FHIR VALUE SEPARATORS `,` `|` `$` IN STRUCTURED VALUES.** `_encode_search_params` (`transports/fhir.py:671`) percent-encodes via `urlencode(..., quote_via=quote, safe="")`, which neutralises `&` and `=` at the URL layer. It does **not** neutralise `,`, `|` or `$`, which are **FHIR search-value separators**: they survive percent-decoding and arrive at the server with their separator meaning intact. Verified by execution -- `code=a,b` and `code=sys|val` reach the server as a two-value OR and a system-qualified token respectively, not as literals. A data value that happens to contain one therefore **changes the query's semantics**, which is parameter injection one layer above the URL. FHIR defines backslash escaping for exactly these characters; there is currently **no escaping of any kind** in the file.
+
+> **LIMB B DOES NOT TOUCH `conditional_query`, AND THAT IS THE WHOLE REASON IT IS SAFE.** The distinction is provenance, and it is easy to get backwards. A **structured value** is a single datum, so a separator inside it is always accidental and escaping it is always right. `conditional_query` is an **operator-authored whole query string** in which separators are the author's own syntax -- `CONNECTIONS.md:1479` documents `identifier=sys|val` as the intended shape and `tests/test_fhir_transport.py:210-221` pins it on both sinks (`If-None-Exist` at `:214`, the conditional-update URL at `:221`). **Escaping `conditional_query` would break a documented feature and fail a shipped test.** Its containment is a construction-time screen, which is **#1241**, already filed. Fixing this item must leave both assertions green.
+
+> **WHAT IS NOT IN SCOPE HERE, so nobody folds it in.** The `match`-versus-`fullmatch` grammar-gate defect and the missing READ-path control-char screen are **#1240**. The construction-time screen for operator config reaching URL and header sinks is **#1241**. The two identical control-char predicates are **#1239**. This item is the 1.2.2 encoding question only.
+
+> **RE-SCORE NOTE.** 1.2.2's residual of record currently reads, in full: *"fhir_require_structured_params ships False; on the default the flat search string is appended verbatim."* Limb A retires that sentence. The cell cannot reach an honest pass on Limb A alone, because the structured path it would then mandate still leaks the value-layer separators -- which is the finding that produced Limb B, and which had been filed as safe by everyone who looked at it, including the dispatcher who raised it.
+
+**Cluster:** Transports / FHIR egress. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- zero instances; on first deployment a Handler passing an unsanitised value into a FHIR search **would** be able to alter the query's meaning.
 
 ## 1242. `asvs-apply-cells.py` is a lossy writer in four distinct ways, and its own preservation guard is blind to three of them
 
@@ -8570,3 +8633,97 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > **BOUND.** The absence of all four mechanisms is verified by reading `install-gate.ps1` and the hooks directory at `c2241cfe`. **What is NOT established is that `install-gate.ps1` performed this particular write at all** -- no `.bak` appeared beside the gate, which is consistent with the installer (it writes none for the script) but also consistent with some other process copying the file. **The writer remains unknown and this item does not claim otherwise**; it says only that had the sanctioned installer been used, it would have left nothing either.
 
 **Cluster:** Developer tooling / process safety. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- this governs a developer-machine hook, not shipped engine code; the cost is that a change to a shared safety control **would** be undetectable and unattributable, as it was here.
+
+## 1248. the federated identity binding is written with no audit row and no security notification, twenty lines above a role resync that emits both
+
+> 🔢 **Filed 2026-08-13 -- a real defect TODAY, split out of #1143's research so it does not wait on an unresolved design question.** Value **7/10** -- Difficulty **2/10**. Binding a local account to an external identity is the single most takeover-relevant fact that can be written to that account: after it, whoever controls the IdP subject controls the account. `_upsert_ad_user` writes it **silently** -- no audit row, no `_notify_security` -- and the **role resync twenty lines below emits both**.
+
+> **MEASURED at `2d11dacc`, from the state end rather than by name.** In `messagefoundry/auth/service.py`:
+> ```
+> :1109 :1114 :1119 :1120   the federated-binding writes
+> :1130                     the nearest _audit(...)          -- BELOW them, belongs to the role resync
+> :1139                     _notify_security(...)            -- BELOW them, same
+> ```
+> The audit and the notification that follow are the **resync's**, not the binding's. The binding itself emits neither.
+
+> **THE ADJACENCY IS THE ARGUMENT, and it is why this is a defect rather than a design choice.** This is not a codebase that forgot accounts can be notified: the author wrote both an audit row and a security notification **into the same function, twenty lines further down, for a strictly less sensitive event**. A role resync changes what an account may do; a federated binding changes *who the account is*. The lower-stakes event is instrumented and the higher-stakes one is not, in one continuous block of code. Whatever the reason, it is not that the mechanism was unavailable or unknown to the author.
+
+> **WHY IT IS FILED ALONE and must not be folded into #1143.** #1143's research pass concluded **hold at partial** and left its central ceremony question **explicitly unsettled** -- the proposed design was refuted, and a whole option family had been eliminated on a false premise. This finding is **independent of every one of those open questions**: it is true regardless of how the binding is eventually keyed, whether a TOFU ceremony is adopted, and whether a uniqueness constraint is added. Leaving it inside #1143 would make a defect that is real *today* hostage to a design decision that may take several passes.
+
+> **WHAT A FIX LOOKS LIKE, and the shape is already in the file.** Emit an audit row and a `_notify_security` on the binding write, using the resync's own calls twenty lines below as the pattern -- same function, same helpers, same call shape. **The account holder is the party who can recognise an unexpected binding**, and today they are the only party told nothing. Difficulty is 2/10 because the mechanism, the helpers and the precedent are all already present at the call site.
+
+> **BOUND.** The line numbers and the absence are verified at `2d11dacc` by locating every `_audit` and `_notify_security` call in the enclosing region and comparing their positions to the binding writes -- not by reading the function narratively, which is how an absence twenty lines from a presence gets missed. **NOT established here:** whether any *other* surface (a store-layer trigger, a middleware, an alert sink) records the binding independently. A reviewer should confirm that before sizing the fix, because a second recorder would change this from "unrecorded" to "not recorded *here*".
+
+**Cluster:** Authentication / federation / audit. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- zero instances; on first deployment a federated binding **would** be written to an account with nothing recorded and nobody told, so an unexpected binding **would** be invisible to the one party able to recognise it.
+
+## 1249. SECURITY.md documents an ingest-plane rate limit that no code-first or TOML configuration can reach
+
+> 🔢 **Filed 2026-08-13 -- found while premise-checking #1114, and it is a better finding than the item it came from.** Value **7/10** -- Difficulty **2/10**. The MLLP message pacer is real, reads its settings, and ships off. **It also cannot be turned on by any documented means** -- and `docs/SECURITY.md:1633` lists its two keys in the operator control table with state **"off"**, which every reader takes to mean "set it to on".
+
+> **THE CHAIN, verified by execution twice independently, with a positive control:**
+> ```
+> mllp.py:1308   class _MessagePacer:                                   the control is real
+> mllp.py:1378   mps = s.get("max_messages_per_second", DEFAULT_...)    and reads its settings
+> mllp.py:116    DEFAULT_MAX_MESSAGES_PER_SECOND = None                 ships off
+>
+> MLLP() has 26 keyword-only parameters and NO **kwargs:
+>    max_messages_per_second   NOT A PARAMETER
+>    message_burst             NOT A PARAMETER
+>    max_connections           ACCEPTED        <- positive control; the check discriminates
+>
+> connections_file.py:286   return factory(**settings)     TOML routes through the SAME factory,
+>                                                          and the comment below says "the factory IS
+>                                                          the schema"
+> ```
+> So neither authoring surface can express the keys. The settings dict the pacer reads can never contain them.
+
+> **THE DEFECT IS NOT "THE CONTROL SHIPS OFF" -- IT IS THAT THE DOCUMENTATION ASSERTS AN AFFORDANCE THAT DOES NOT EXIST.** That is **SDS-3.7**, a compensating control resting on a false premise, sitting in the one document where the rule bites hardest. An operator doing diligence reads row 1633, concludes the ingest plane can be rate-limited, sets out to enable it, and cannot.
+> ⭐ **"off" is worse than absent.** An absent control prompts a question; a control documented as *present but disabled* prompts a configuration edit that cannot succeed, and the operator's most likely conclusion is that they have mis-typed the key.
+
+> **TWO OPPOSITE FIXES, AND THE CHOICE IS AN OWNER CALL -- deliberately not pre-decided here.**
+> **(a) Expose the two keys** on the `MLLP()` factory, making the documentation true and the control reachable. **(b) Delete the `SECURITY.md` row**, making the documentation true and the control honestly absent. They are opposite in every respect except that both end the false premise, and picking between them is a product decision about whether ingest-plane rate limiting is wanted at all.
+> **Whichever is chosen, the other must not be done by halves** -- exposing the keys without correcting the row's "off" wording, or deleting the row while leaving `_MessagePacer` reading settings nothing can supply, reproduces the defect in a new place.
+
+> **SCOPE, and it is wider than MLLP.** A pacing-vocabulary sweep over all **25** modules in `transports/` found **14 hits in `mllp.py`** (live positive control) and **ZERO in the other 24**. Eleven modules call `register_source`; **ten have no rate or volume control in any configuration**, including raw TCP, X12 and the DICOM C-STORE SCP. So a rate bound is not merely unreachable on MLLP -- it does not exist anywhere else on the ingest plane.
+
+> **DO NOT SAY "UNBOUNDED INTAKE" -- that is false and #1114 says it.** At least four bounds ship **on**: `max_frame_bytes` 16 MiB, `max_connections` 256, `receive_timeout` 60s, and `file.py`'s `max_file_bytes` 16 MiB. They bound **SIZE and CONCURRENCY, not RATE**. The correct phrasing is **"no message-rate bound"**. This correction runs in the direction that makes the engine look *better*, which is why it is stated explicitly rather than left to a reader.
+
+> **RELATIONSHIP TO ASVS 2.4.1 (#1114): this makes the cell WORSE, not better.** Rule 4 holds that *"it can be configured"* is never a pass; here it cannot be configured at all, so the control is effectively **absent** on the ingest plane while being documented as present-but-disabled. #1114 stays **partial** and its own hardened question -- whether a control that ships off can be an honest pass -- is settled by the method rather than by research.
+
+**Cluster:** Transports / MLLP, and security documentation. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- zero instances; on first deployment an operator **would** be told a rate limit is available and **would** be unable to enable it.
+
+## 1250. move the backlog to the vault: the public ledger is an aggregate weakness map over a closed public standard
+
+> 🔢 **Filed 2026-08-13 -- OWNER-RULED that the backlog belongs in the vault, and ruled in the same breath that moving it NOW is not safe. This item exists to hold the decision until the preconditions land.** Value **8/10** -- Difficulty **7/10**. Not a doc move: `docs/BACKLOG.md` is load-bearing for a pre-commit hook, a CI workflow, an allocator and **13 test files**.
+
+> **THE ARGUMENT, and it is about AGGREGATION rather than any single entry.** ASVS is a **closed, public** standard -- all 345 requirements are known to everyone -- so a map of our code against it discloses the gaps **by subtraction**, which is why the scorecard is vaulted ([[the presence-map rule]]). One public item describing one defect is ordinary open-source practice; every project's tracker carries known defects. **But the aggregate already exists and nobody had to assemble it:** **103 open items carry "ASVS" in the heading**, in one file, retrievable with a single search. We produced a ranked weakness map as a side effect of filing consistently. *The "individual items are fine" reading may be true of an item and false of the practice that yields a hundred of them.*
+
+> **THE COST IS ASYMMETRIC AND THAT IS THE WHOLE URGENCY.** Over-restricting is recoverable -- move files, lose nothing. **Over-publishing is not: a public repository's history cannot be unpublished.** What is there is already cloned, indexed, and has shipped in PyPI sdists. So this only ever gets more expensive: **at 103 items it is a review; at 200 it is a migration.**
+
+> **WHY IT MUST NOT BE DONE TODAY -- the destination is currently WORSE than the source.** The vault's ledger gate is **inert**: no installed hooks, no high-water floor, one claim. Two sessions can pick the same number and **merge clean, in the security record**. Moving a ledger whose entire purpose is collision-free allocation into the one repository that cannot enforce it would trade a disclosure problem for a corruption problem. **PRECONDITION: the vault must have atomic allocation, a high-water ratchet and INSTALLED hooks first** (the Q5 ruling, 2026-08-13). Engine-band filing is unaffected meanwhile and continues.
+
+> **BLAST RADIUS, measured at `c2241cfe`, not estimated. 66 tracked files reference `BACKLOG.md`:**
+> ```
+> 13 tests/     13 docs/adr/     12 docs/     8 docs/testing/master-test-plan/
+>  5 scripts/docs/    2 messagefoundry/pipeline/    2 .github/workflows/    2 .github/
+> ```
+> **Machinery that reads it and would break on a move:** `scripts/hooks/ledger_check.py` (the pre-commit
+> allocation gate), `scripts/docs/backlog_status_check.py` (`parse_items`, the single definition of item
+> status), `.github/workflows/backlog-hygiene.yml`, and `scripts/coord/alloc.ps1`.
+> ⚠️ **Thirteen test files read the ledger from disk**, which is why a "docs-only" change to this file has
+> never been test-neutral. Any move must re-point them all, and a partial move leaves the pre-commit gate
+> reading one file while CI reads another -- **allocation collisions returning silently**, which is the
+> defect the gate exists to prevent.
+
+> **DECIDE AT MOVE TIME, not now, and record which was chosen:** whether the **whole** ledger moves or
+> only ASVS-derived items (a split ledger doubles the allocation surface and is probably worse);
+> whether the public repo keeps a **stub** pointing at the vault or nothing at all; and what happens to
+> the **already-published history**, which cannot be recalled and may make a partial move cosmetic.
+
+> **BOUND ON THE ARGUMENT ITSELF.** The aggregation reading is **not settled** -- it was raised by the
+> tracking session as a question for the owner, explicitly not as a finding, and the owner has ruled on
+> the DESTINATION without anyone certifying the underlying reading. **I am not a neutral party to it:**
+> I filed twelve ASVS items into the public backlog tonight on the permissive reading, so this item
+> records a decision I acted against rather than a conclusion I verified.
+
+**Cluster:** Security record / repository topology. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- nothing shipped changes; the exposure is that a ranked map of unmet security requirements **is** public today and cannot be made unpublic, only stopped from growing.
