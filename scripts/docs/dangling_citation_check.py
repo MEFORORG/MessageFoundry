@@ -131,9 +131,22 @@ def allocation_floor(sources: list[Path] | None = None) -> int:
     that does not actually depend on it. Reasoning from the registry makes a sound property look
     fragile and invites a guard nothing needs.
 
-    Deliberately conservative: the true floor is the max over origin/main, every ref AND every
-    allocation, so this ledger-only figure can only ever be LOWER. A number between the two is
-    reported as reachable when it is not -- an over-warning, never a missed trap.
+    Deliberately conservative: the allocator's observed set is a SUPERSET of the ledger headings --
+    it also reads refs, the working tree, claim files and a persisted high-water mark (``:97``) -- so
+    this ledger-only figure can only ever sit at or BELOW the true floor. A number between the two is
+    reported as reachable when it is not: an over-warning, never a missed trap.
+
+    THAT GAP IS THE POINT, NOT A ROUNDING ERROR, AND THE FLAGS IT PRODUCES ARE NOT FALSE POSITIVES.
+    A number that has been ALLOCATED but whose heading is not yet committed sits above this floor and
+    is reported live -- correctly, because the allocator's ratchet persists the max of the observed
+    set rather than the number just issued, so until that heading lands the only durable record of it
+    is an untracked, never-pushed registry file. Lose that file and the number is re-issued.
+
+    The flag then clears ITSELF: once the heading is committed the floor rises past it and it stops
+    being reported, which is exactly when it becomes permanently reserved. Do not "fix" a live report
+    on a freshly-allocated number, and do not add a near-the-floor rule to catch this case -- this
+    floor already covers it, and a second rule aimed at an edge the first one covers is how a tool
+    acquires a guard nothing needs.
     """
     numbers = allocated_numbers(sources)
     return max(numbers) if numbers else 0
