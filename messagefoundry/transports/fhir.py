@@ -184,7 +184,7 @@ def _reject_control_chars(value: str, field: str) -> str:
     return value
 
 
-def _reject_config_control_chars(value: str, setting: str) -> str:
+def _reject_config_control_chars(value: str, setting: str, where: str = "destination") -> str:
     """Reject an OPERATOR-CONFIGURED value carrying a C0/DEL control char, at CONSTRUCTION time.
 
     Deliberately distinct from ``_reject_control_chars``, which screens MESSAGE-derived values on the
@@ -193,9 +193,13 @@ def _reject_config_control_chars(value: str, setting: str) -> str:
     connection will ever send -- so it must fail the connection at load rather than dead-letter an
     unbounded stream of messages that were never at fault. Raises ``ValueError`` to match the other
     construction-time setting checks. PHI-safe: names the setting, never the value.
+
+    ``where`` carries the construction site because there are TWO in this module -- the destination
+    and the read executor -- and #1241's subject is precisely the asymmetry of screening one and not
+    its sibling.
     """
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
-        raise ValueError(f"FHIR destination {setting!r} contains an illegal control character")
+        raise ValueError(f"FHIR {where} {setting!r} contains an illegal control character")
     return value
 
 
@@ -787,6 +791,9 @@ class FhirLookupExecutor:
                 raise ValueError(
                     f"FhirLookup {cname!r} requires a 'url' setting (the FHIR base URL)"
                 )
+            # #1241: the SECOND url construction site in this module. The destination screens its
+            # own; screening one and not its sibling reproduces the asymmetry the item reports.
+            _reject_config_control_chars(url, "url", f"lookup {cname!r}")
             scheme = urllib.parse.urlsplit(url).scheme.lower()
             if scheme not in ("http", "https"):
                 raise ValueError(

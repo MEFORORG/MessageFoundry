@@ -512,6 +512,35 @@ def test_executor_rejects_non_http_scheme() -> None:
         FhirLookupExecutor({"bad": {"url": "ftp://h/fhir"}})
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://h/fhir\r\nX-Evil: 1",  # CRLF -- request splitting / header injection
+        "https://h/fhir\n",  # bare LF
+        "https://h/\x00fhir",  # NUL
+    ],
+)
+def test_executor_rejects_control_char_in_url(url: str) -> None:  # #1241
+    """The READ executor screens its operator-configured base URL, exactly as the destination does.
+
+    #1241's subject is the ASYMMETRY: one sink screened while a sibling is not reproduces the very
+    defect the item reports. This is that sibling -- a second url construction site in the same
+    module, reached from operator config, previously checked for type and scheme only.
+
+    Screened at CONSTRUCTION rather than per call: a bad setting is wrong for every lookup this
+    connection will ever serve, so it fails the connection at load rather than failing an unbounded
+    stream of reads that were never at fault.
+    """
+    with pytest.raises(ValueError, match="control character"):
+        FhirLookupExecutor({"bad": {"url": url}})
+
+
+def test_executor_clean_url_still_constructs() -> None:  # #1241
+    """Positive control: the screen must admit what it is not screening for."""
+    ex = FhirLookupExecutor({"ok": {"url": "https://h/fhir"}})
+    assert "ok" in ex.connections
+
+
 # --- fail-closed egress gate (AC-4) ------------------------------------------
 
 
