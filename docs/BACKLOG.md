@@ -3164,6 +3164,14 @@ So the registered control for a context should record **what it does not break**
 >
 > **DISPATCH RULING, so nobody discovers this at merge time:** the engine half may be **built** freely, and **must not be landed until the vault half is lined up to land with it**. A red drift gate on `main` is the predictable outcome otherwise, and it would be blamed on the engine change, which is correct behaviour meeting a stale record.
 
+> **RULING CORRECTED SAME DAY -- I HAD THE HAZARD INVERTED, AND THE INVERSION IS THE MORE IMPORTANT FINDING.** The paragraph above treats a **red** drift gate as the thing to avoid. Measured since: **the absence claim is keyed on the EXCEPTION NAME, not on behaviour.** It trips on a raise whose exception name contains a rotation-or-overdue token, and **does not trip** on names outside that set -- and the most natural name for this refusal sits **outside** it. So the likely outcome of building this is not a red gate at all: **the change lands clean, the gate stays green, and the recorded absence becomes false with nothing anywhere reporting it.**
+>
+> **THE REAL HAZARD IS NOT THE LOCKSTEP. IT IS THAT THE LOCKSTEP MIGHT NEVER FIRE.** A red gate here is the **safe** outcome -- it is the record noticing. A green one is the failure, and it is indistinguishable from correctness. **The lockstep ruling stands, but its reason is now the opposite of the one first written:** hold the halves together not because landing alone breaks the gate, but because landing alone may **quietly satisfy** it while the claim underneath goes stale.
+>
+> **CONSEQUENCE FOR WHOEVER BUILDS IT: THE EXCEPTION NAME IS A COORDINATION-VISIBLE DECISION, NOT A STYLE CHOICE**, until the claim is re-keyed. Whichever name is chosen must be reported, because a name outside the token set means the record went stale **silently** and someone has to know that happened.
+>
+> **AND THE DURABLE FIX IS TO RE-KEY THE CLAIM ON BEHAVIOUR RATHER THAN ON NAMES**, so that any refusal on this axis falsifies it whatever the exception is called. A name-keyed absence claim is the same defect as a name-keyed lossy-writer fix or a name-keyed lexical gate: **it holds only until someone chooses a word nobody anticipated.** Re-deriving the affected verdict is owner-gated and is not this seat's to take.
+
 **Cluster:** Security & Compliance. **Priority:** P1. **Verdict:** build — owner-decided
 2026-08-04. **Severity:** medium — the shipped code documents an annual DEK cadence
 (`docs/ASVS-L2-PHASE0-CHANGES.md:151`) and enforces only the usage half of it, so a first
