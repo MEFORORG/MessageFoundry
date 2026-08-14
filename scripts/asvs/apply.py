@@ -74,12 +74,51 @@ _EVIDENCE_ORDERED = ("path", "line", "expect")
 _ABSENCE_ORDERED = ("pattern", "positive_control", "mutation")
 
 
-def _scalar(key: str, value: object) -> str:
-    if isinstance(value, bool):
-        return f"{key} = {str(value).lower()}"
+#: A TOML bare key. Anything else must be QUOTED, and the reason is not cosmetic: a DOTTED key is not
+#: a syntax error in TOML, it is a NESTING OPERATOR. `{1.2.2 = "x"}` is VALID and parses to
+#: `{'1': {'2': {'2': 'x'}}}` -- the file loads, the gate stays green, the structure silently differs.
+#: Every other bad key (spaces, quotes, empty) fails LOUDLY and is therefore safe. The dot is the only
+#: one that corrupts quietly, and dotted identifiers are this record's native shape: requirement ids
+#: like 1.2.2, version strings, file paths. So the rule is unconditional -- quote unless it matches
+#: this exactly. "Quote the odd-looking ones" fails here, because 1.2.2 does not look odd.
+_BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _toml_value(value: object) -> str:
+    """Render any value as TOML. Recurses, so the quoting rule above applies at EVERY depth and
+    inside arrays of tables -- measured, not assumed: a dot at depth 3 re-nests exactly as one at
+    depth 1, and so does one inside a list.
+
+    NOT ``json.dumps``. `{"a": 1}` is JSON, not TOML; an inline table is `{a = 1}`, key EQUALS value.
+    Arrays happen to coincide between the two and tables do not, so a serializer that looks right on
+    arrays emits a file that will not parse the moment a table appears.
+    """
+    if isinstance(value, bool):  # before int -- bool IS an int in Python
+        return str(value).lower()
     if isinstance(value, int):
-        return f"{key} = {value}"
-    return f"{key} = {toml_str(str(value))}"
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, dict):
+        inner = ", ".join(
+            f"{k if _BARE_KEY.match(str(k)) else toml_str(str(k))} = {_toml_value(v)}"
+            for k, v in value.items()
+        )
+        return "{ " + inner + " }" if inner else "{}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
+    return toml_str(str(value))
+
+
+def _scalar(key: str, value: object) -> str:
+    """#1242: the name is now a misnomer kept for its call sites -- it renders ANY value, not just a
+    scalar. It used to fall through to ``toml_str(str(value))`` for anything that was not a bool or
+    an int, so a TABLE or ARRAY became a quoted PYTHON REPR: `sym_table = "{'a': 1}"`. That parses,
+    so nothing went red, and re-reading returned the STRING -- the value was not recoverable from the
+    file. Every carry path routes through here (the top-level union walk, the rewrite, and
+    ``_carried``), which is why one branch closes all three.
+    """
+    return f"{key} = {_toml_value(value)}"
 
 
 def _carried(entry: dict[str, Any], ordered: tuple[str, ...]) -> list[str]:
@@ -306,6 +345,27 @@ def main(argv: list[str] | None = None) -> int:
         lost = set(was) - set(now)
         if lost:
             print(f"REFUSING: cell {c['id']} would LOSE field(s) {sorted(lost)}")
+            return 1
+        # ...and the same question about the VALUE rather than the key (#1242). The check above is a
+        # pure KEY-SET difference, so a field whose value was type-mangled -- a table rewritten as a
+        # quoted Python repr -- KEEPS ITS KEY and passes it. That is not an oversight in the check
+        # above; it was written to catch DROPPED KEYS and it does. It is simply blind to this, and a
+        # rewrite that corrupts every value while preserving every key would report green.
+        #
+        # SCOPED TO KEYS THE PAYLOAD DID NOT TOUCH, deliberately: the corruption is the WRITER
+        # changing a type nobody asked it to change. A payload that INTENTIONALLY retypes a field --
+        # schema evolution, a scalar becoming a table -- is an edit, not damage, and an unscoped
+        # check would refuse it. A guard that refuses legitimate edits is a guard someone disables.
+        retyped = sorted(
+            k
+            for k in was
+            if k in now and k not in c and type(was[k]) is not type(now[k])  # noqa: E721
+        )
+        if retyped:
+            print(
+                f"REFUSING: cell {c['id']} would CHANGE the TYPE of field(s) {retyped} "
+                f"(key kept, value corrupted -- the key-set check above cannot see this)"
+            )
             return 1
         for sub in ("evidence", "absence"):
             if len(now.get(sub, [])) < len(was.get(sub, [])):
