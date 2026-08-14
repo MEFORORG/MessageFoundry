@@ -318,7 +318,7 @@ are safe.
 
 ## Citing a number you have not allocated
 
-**The allocation rule has a mirror, and the mirror is the more insidious half.** `alloc.ps1` stops two
+**The allocation rule has a counterpart, and the counterpart is the more insidious half.** `alloc.ps1` stops two
 sessions from *issuing* the same number. Nothing stops a document from *citing* a number that was never
 issued at all.
 
