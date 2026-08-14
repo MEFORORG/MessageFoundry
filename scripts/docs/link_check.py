@@ -20,12 +20,11 @@ links accumulated across 19 files before anyone counted them.
   repository invariant.
 * **Fragments.** ``#some-anchor`` is not validated here; only the path is. Heading slugs churn on
   every retitle and would make this noisy.
-* **Withheld directories.** ``docs/security/``, ``docs/reviews/``, ``docs/marketing/``,
-  ``docs/releases/`` and ``.claude/`` are gitignored. The master test plan states a missing path
-  there is a deliberate publishing boundary, not a defect, so flagging them would train readers to
-  ignore the gate. ``.claude/`` is the instructive one: it is *present* in a long-lived local
-  checkout and absent from CI's clean clone, so omitting it makes this checker pass locally and fail
-  on the runner.
+* **Withheld directories.** ``docs/security/``, ``docs/reviews/``, ``docs/marketing/`` and
+  ``docs/releases/`` are gitignored. The master test plan states a missing path there is a
+  deliberate publishing boundary, not a defect, so flagging them would train readers to ignore the
+  gate. ``.claude/`` was a fifth entry until ``.claude/settings.json`` became tracked; every link
+  the exemption covered pointed at that one file, so they are now checked like any other.
 * **Fenced code.** A path inside ``` is sample output being shown, not a link to follow.
 * **Inline code.** A link inside backticks is being *displayed*, not offered -- the same argument as
   fenced code, at smaller scale. Four real sites turn on it: a regex whose character class contains
@@ -59,24 +58,22 @@ from pathlib import Path, PurePosixPath
 # docs/releases/ joined when ADR 0160 Phase 1 untracked it (.gitignore carries "/docs/releases/") --
 # an archived throughput doc still cites the v0.1 plan that moved out with it.
 #
-# .claude/ (.gitignore:142) is exempt on the SAME publishing-boundary grounds -- 7 docs link to
-# .claude/settings.json, which no clone has.
+# .claude/ WAS a fifth entry, exempt because 7 links pointed at .claude/settings.json and no clone
+# had it. It is gone because the premise is: settings.json is tracked now, so those 7 resolve
+# through tracked_paths() like every other link and are counted rather than skipped.
 #
-# It is listed here as POLICY, not as protection. It was originally added as protection, because a
-# filesystem fallback made those 7 links pass in a long-lived local checkout and fail on CI's clean
-# clone -- the first repo-wide measurement was taken in such a checkout and undercounted by exactly
-# 7. That hazard is now closed STRUCTURALLY in tracked_paths(): resolution never consults the
-# filesystem, so no gitignored-but-present path can pass locally and fail on the runner, listed here
-# or not. Removing this entry would make those 7 links fail honestly and identically everywhere.
-# Keeping an enumerated exemption as the reason a control holds is the compensating-control-on-a-
-# false-premise shape (CLAUDE.md section 11, SDS-3.7); the enumeration expresses intent, the
-# resolver provides the guarantee.
+# Measured before removing it: all 7 markdown links whose href names a .claude/ path name
+# settings.json and nothing else, so nothing else loses its exemption. That mattered, because the
+# exemption `continue`s BEFORE `checked += 1` -- a withheld href is not merely resolved, it is never
+# counted, which #327 demonstrated by planting a missing path under .claude/ and watching the total
+# stay at 5359 and the run stay green. An exemption that hides its own coverage gap is the
+# compensating-control-on-a-false-premise shape (CLAUDE.md section 11, SDS-3.7). Keep this tuple to
+# genuinely unpublished trees; a path that ships belongs in the gate.
 WITHHELD = (
     "docs/security/",
     "docs/reviews/",
     "docs/marketing/",
     "docs/releases/",
-    ".claude/",
 )
 
 _LINK = re.compile(r"\]\((?P<href>[^)\s]+?)(?P<frag>#[^)\s]*)?\)")

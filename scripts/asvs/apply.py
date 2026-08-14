@@ -82,10 +82,20 @@ def render(cell: dict[str, Any], live: dict[str, Any] | None = None) -> str:
     out.append(f'verified_at = "{cell["verified_at"]}"')
     if cell.get("reviewed_by"):
         out.append(f"reviewed_by = {toml_str(cell['reviewed_by'])}")
-    # Carry through every other scalar the live cell had -- decision_closed and friends, and anything
-    # a future schema adds that this writer has never heard of.
-    for key, value in (live or {}).items():
-        if key in _ORDERED or key in _SUBTABLES or key in cell:
+    # Carry through every other scalar from BOTH SOURCES -- decision_closed and friends off the live
+    # cell, and anything a future schema adds that this writer has never heard of, from either side.
+    #
+    # The source is the UNION deliberately. Walking `live` alone meant a key arriving on the PAYLOAD
+    # and absent from the vault was never iterated, so the `key in cell` skip never even evaluated for
+    # it and the value was dropped -- the same silent loss as the allowlist incident above, one
+    # direction over, and equally invisible downstream because an absent field reads as a valid
+    # default. `cell` wins on a collision: the payload is the update.
+    #
+    # Skipping ONLY _ORDERED and _SUBTABLES keeps the rule the header states -- enumerate what you
+    # ORDER, never what you KEEP. The old `key in cell` clause was an enumeration of the second kind
+    # wearing a de-duplication's clothes: every key it legitimately suppressed is already in _ORDERED.
+    for key, value in {**(live or {}), **cell}.items():
+        if key in _ORDERED or key in _SUBTABLES:
             continue
         out.append(_scalar(key, value))
     for a in cell.get("evidence") or []:
