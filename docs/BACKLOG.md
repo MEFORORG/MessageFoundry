@@ -4141,7 +4141,16 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 >
 > **THE OPEN QUESTION, stated so it is not re-derived. Call this placement EARLY-LIFESPAN** (a third name, deliberately not "(c)" -- see the naming rule below): whether a point exists **inside the lifespan but BEFORE `engine.start()`** where the store is already open and a raise still exits cleanly. `#1257`'s hang is specifically *"an exception AFTER `engine.start()`"*. If such a point exists it needs neither an extra store open nor `#1257`. **This is UNVERIFIED -- the rider's evidence (raising from the lifespan BODY exits, during STARTUP hangs) is suggestive and does not settle the ordering.** Verify that precondition BEFORE building against it.
 >
-> **AND HERE IS EXACTLY WHERE TO MEASURE IT, so nobody re-locates it.** `engine.start()` **does not appear in `__main__.py` at all**; the ordering lives in the API's lifespan: `lifespan` is defined at `api/app.py:5512` and `await engine.start()` is at `api/app.py:5731`. **So EARLY-LIFESPAN's precondition is a question about the ~219 lines between them** -- is the store open there, and does raising there exit rather than hang.
+> **HALF OF THAT PRECONDITION IS NOW MEASURED AND IT HOLDS. THE WINDOW EXISTS AND IT IS NOT A NARROW SEAM.** `engine.start()` does not appear in `__main__.py` at all; the ordering lives in the API's lifespan. Measured at `origin/main`, `messagefoundry/api/app.py`, and independently confirmed:
+> ```
+> :5512   async def lifespan(...)
+> :5540   store = await open_store(...)      <-- store is OPEN from here
+> :5731   await engine.start()               <-- the hanging window starts here
+> :5923   yield
+> ```
+> **Between `:5540` and `:5731` -- 191 lines -- the store is open and `engine.start()` has NOT been called.** The only `engine.start` text inside that span is a **comment at `:5640`**; there is no call. **So EARLY-LIFESPAN is a real placement, not a hypothesis, and a deliverable-address check placed there gets the open store as a plain `await` -- no extra open, no sync/async bridge.**
+>
+> **WHAT REMAINS OPEN IS THE OTHER HALF, AND IT IS THE ONE THAT DECIDES THE PLACEMENT: does RAISING between `:5540` and `:5731` terminate rather than hang, under `uvicorn`?** `#1257`'s mechanism is *"an exception AFTER `engine.start()` unwinds nothing"*, so raising before that call **should** stay outside the hanging window -- **but that is an INFERENCE FROM THE MECHANISM, NOT A DEMONSTRATION, and this item's rider exists precisely because someone inferred.** One runnable test settles it: **if raising there exits, EARLY-LIFESPAN is clean and this item carries no `#1257` dependency; if it hangs, the whole window is contaminated, LIFESPAN placement returns and so does the dependency.**
 >
 > **SO THE `#1257` CROSS-LINK STAYS LIVE:** it binds under lifespan-after-start placement and is retired only by a placement demonstrated to sit outside that window.
 >
