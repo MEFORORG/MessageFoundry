@@ -8981,3 +8981,22 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **Do NOT enumerate candidates in this item, now or later.** Naming them here would place in the public ledger exactly the index this work exists to remove from it -- the item would perform the defect it was filed to find. The count is not recorded either, for the same reason.
 
 **Provenance.** Raised, and deliberately **not acted on**, by the seat that noticed it while applying the rule to a new item -- on the grounds that reclassifying existing public items is not a dispatcher's unilateral call. Escalated, authorised by the owner, and filed with the destination question settled up front rather than discovered when the result lands.
+
+## 1259. `parse_items` censuses a conflicted ledger without error, so a gate reports a clean count off a broken file
+
+> 🔢 **Filed 2026-08-14 - not started. The census AGREED WITH INTENT while the merge was broken, which is why this is worth an item rather than a note.** Value **6/10** · Difficulty **2/10** · _quick win_. `parse_items` walks a `docs/BACKLOG.md` containing `<<<<<<<`, `=======` and `>>>>>>>` and returns a **plausible, correct-looking census**, because a conflict marker is not a heading and nothing in that function is looking for one.
+
+> **REPRODUCED WITH A CONTROL.** The live ledger and a copy poisoned with conflict markers both parse to **287 items / 207 open**, and no exception is raised. The two counts are identical, so the census cannot be used to detect the condition -- **it is not that the number is wrong, it is that the number is right and the file is unusable.**
+
+**Cluster:** Ledger tooling / silent-pass gate. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (§0) -- nothing shipped changes. The cost is a gate that certifies a file no one can parse.
+
+**Why nothing else catches it.** Measured across the ledger gates: `scripts/docs/backlog_status_check.py` and `scripts/docs/backlog_citation_check.py` contain no marker detection at all. `scripts/hooks/ledger_check.py` matches a grep for *"conflict"* **only in prose** -- a comment about clean merges and an error string reading *"not as a conflict"* -- and detects no markers either. `.pre-commit-config.yaml` runs `ledger-gate`, `ruff-format`, `ruff-check`, `forbidden-content`, `gitleaks`, `actionlint` and `bandit`; **none inspects Markdown for conflict markers.** So a conflicted `docs/BACKLOG.md` can be committed and every ledger gate passes over it.
+
+**How it was found, and the finding underneath it.** A landing seat ran `parse_items` on a `merge-tree` output **before** checking the merge's exit code, and got a census matching the incoming batch's prediction exactly -- right item count, right open count, both new numbers present, no duplicates. The exit code was `rc=1` with six conflict markers in the blob. **The content check was a check on garbage that happened to look like data.** The general rule the seat drew is the more valuable half and belongs with the fix: **read the exit code BEFORE the content, because a content check on a conflicted tree certifies nothing.**
+
+**Scope.** Make the condition impossible to miss rather than relying on ordering discipline. Options to price: have `parse_items` (or its CLI) **refuse** a source containing conflict markers rather than parse it; and/or add the standard `check-merge-conflict` pre-commit hook, which is the cheap general fix and covers every file rather than this one. **The first is the one that protects programmatic callers**, which is where this bit -- a hook does not help a gate that is handed a tree in memory.
+
+**How to prove a fix.** Poison a copy of the real ledger with markers and assert the reader **fails**. Asserting it parses a clean file proves nothing: it already does that, and did so throughout the incident.
+
+**Provenance.** Reported by the seat whose own gate nearly certified the broken tree, against its own process, with the near-miss stated plainly rather than after quietly reordering its checks.
