@@ -37,7 +37,6 @@ import asyncio
 import base64
 import json
 import logging
-import re
 import secrets
 import urllib.error
 import urllib.parse
@@ -90,12 +89,21 @@ _DICOM_JSON = "application/dicom+json"
 _FAILED_SOP_SEQUENCE = "00081198"
 
 
-# DICOM PS3.5 section 9.1: a UID is dot-separated numeric components, at most 64 characters. Anchored
-# \A...\Z and never ^...$ — '$' also matches immediately before a trailing newline, which would readmit
-# the very byte the control-char screen exists to reject (the same defect BACKLOG #1240 gates against on
-# the message-derived path). Each component requires at least one digit, so '..', a leading dot and a
-# trailing dot are excluded STRUCTURALLY rather than by enumerating them.
-_DICOM_UID_RE = re.compile(r"\A[0-9]+(?:\.[0-9]+)*\Z")
+# DICOM PS3.5 section 9.1: a UID is dot-separated numeric components, at most 64 characters.
+#
+# Checked WITHOUT a regex, deliberately. The natural pattern for this grammar is
+# `\A[0-9]+(?:\.[0-9]+)*\Z`, which nests '+' inside '*' and so trips this repo's ReDoS gate
+# (`test_security_static.py::test_no_catastrophic_regex_in_source`). Measured against a known-
+# catastrophic control, that pattern is LINEAR -- 200x the input costs 183x the time, while the
+# control goes exponential -- so the gate is matching the SHAPE, not real backtracking. That is NOT
+# a reason to take an exception: a split-and-check is simpler, obviously linear, and leaves the
+# gate's conservatism (which is the design -- BACKLOG #1235) untouched. A false positive is a reason
+# to change the code, not to weaken the check.
+#
+# `str.isdigit()` is unusable here: it is Unicode-aware and returns True for superscript and
+# Arabic-Indic digits, so it would admit non-ASCII into the URL path and reopen the very hole this
+# screen closes. The explicit ASCII set is the control, not an optimisation.
+_UID_DIGITS = frozenset("0123456789")
 _DICOM_UID_MAX_LEN = 64
 
 
@@ -117,7 +125,11 @@ def _reject_non_uid(value: str, field: str) -> None:
         raise ValueError(
             f"DICOMweb {field} is longer than the {_DICOM_UID_MAX_LEN}-character DICOM UID limit"
         )
-    if not _DICOM_UID_RE.match(value):
+    # Every component must be non-empty and entirely ASCII digits. Requiring non-empty is what makes
+    # '..', a leading dot and a trailing dot illegal -- they are excluded STRUCTURALLY, not by
+    # enumeration. A trailing newline is excluded for free (it lands inside the final component and is
+    # not a digit), which is the hole a `$`-anchored regex would have left open -- #1240's defect.
+    if not all(part and _UID_DIGITS.issuperset(part) for part in value.split(".")):
         raise ValueError(
             f"DICOMweb {field} is not a valid DICOM UID (dot-separated digits, no other characters)"
         )

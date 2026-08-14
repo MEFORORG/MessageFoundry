@@ -225,6 +225,22 @@ def test_dicomweb_valid_study_uid_still_constructs(uid: str) -> None:  # #1241
     assert _dest(study_uid=uid)._target_url == f"{BASE}/studies/{uid}"
 
 
+def test_dicomweb_uid_screen_rejects_a_trailing_newline_on_its_own() -> None:  # #1241
+    """Tests the screen DIRECTLY, because via `_dest` the control-char screen would catch this first
+    and the two failures are indistinguishable from outside.
+
+    A `$`-anchored regex would have ADMITTED this -- `$` matches immediately before a trailing
+    newline, which is #1240's defect exactly. The split-and-check excludes it structurally: the
+    newline lands inside the final component and is not an ASCII digit. Pinned so a later rewrite back
+    to a regex cannot quietly reopen it.
+    """
+    from messagefoundry.transports.dicomweb import _reject_non_uid
+
+    with pytest.raises(ValueError, match="DICOM UID"):
+        _reject_non_uid("1.2.3\n", "study_uid")
+    _reject_non_uid("1.2.3", "study_uid")  # positive control: the clean value still passes
+
+
 def test_dicomweb_study_uid_percent_encode_is_a_noop_today() -> None:  # #1241
     """The percent-encode at the sink matches the `fhir.py` path-segment treatment this file was
     asymmetric with. It is a NO-OP while the grammar holds -- digits and dots are both RFC 3986
