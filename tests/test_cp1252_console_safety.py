@@ -21,6 +21,32 @@ its argparse description quotes the machine-parsed banner alphabet CLAUDE.md sec
 remediation text that cannot show an author the character it wants added is not actionable. A gate
 that could not express that would fire on correct code and be switched off.
 
+WHAT A SCRUBBING GATE WOULD DESTROY IN THIS REPOSITORY, MEASURED RATHER THAN IMAGINED. Besides the
+banner alphabet, ``backlog_status_check.py`` carries one further non-cp1252 character: a lone U+FE0F
+inside the banner regex, as ``[<class>]\\uFE0F?\\s``. That is an OPTIONAL VS-16, letting a banner be
+written with or without the selector -- exactly the handling CLAUDE.md section 11 mandates for any
+regex touching that alphabet. It is invisible at the point of use and looks like lint.
+
+Delete it and the ``?`` binds to the CHARACTER CLASS instead. The pattern STILL COMPILES, so nothing
+at author time objects. It then matches an indented continuation line (``^>\\s\\s``, which the ledger
+is full of), ``b.group("emoji")`` returns ``None``, and the dispatch below it evaluates
+``None in _CLOSED`` where ``_CLOSED`` is a ``str`` -- ``TypeError``, on any run that touches the real
+ledger. Two failure modes, and the second is the dangerous one:
+
+  * LOUDLY, TODAY -- every gate that calls ``parse_items`` dies, which is most of them.
+  * SILENTLY, LATER -- the first banner authored WITH a selector stops matching. No banner carries
+    one today, so nothing would catch that regression on the day it arrives.
+
+That is the case for hardening the stream rather than scrubbing the file, and it is why the exemption
+had to be expressible: one invisible character, removed by a well-meaning gate, takes out the reader
+every ledger gate depends on.
+
+NO COUNT IS PINNED IN THAT ARGUMENT, DELIBERATELY. The number of qualifying lines is ref-relative and
+grows with every filed item, so a figure would be stale the moment it was written -- and re-reading
+it would reproduce it, which reads as verification. That is the same hazard the banner in
+``conftest.py`` refuses for the same reason. The mechanism above needs no number and is re-derivable
+in one command on any ref.
+
 THREE PROPERTIES THIS KEEPS, each of which the item names:
 
   * IT PRINTS WHAT IT SCANNED. A filtered scan that skips a file type reads as clean when it never
