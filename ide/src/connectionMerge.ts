@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Pure (vscode-free) save-merge model behind BOTH connections.toml writers (#234 Phase 3). The
 // webview form (connectionEditor.ts / configEditors.ts) posts ONLY the fields it renders, but the
 // CLI's `connection upsert` is a FULL REPLACE of the named table (ADR 0007 — merge-on-absent was

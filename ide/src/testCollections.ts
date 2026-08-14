@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Pure, dependency-free model + compare for Test Bench saved regression collections (BACKLOG #168,
 // ADR 0121). No `vscode` import (persistence via workspaceState lives in testBench.ts), so this is
 // unit-testable in isolation — the same discipline as hl7diff.ts / hexdump.ts. The compare REUSES

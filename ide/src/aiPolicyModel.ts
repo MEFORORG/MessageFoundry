@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // The pure, vscode-free half of the IDE's AI-policy handling: the resolved policy shape, and the
 // authoritative-merge rule that decides what a FRESH engine answer may and may not overwrite.
 //

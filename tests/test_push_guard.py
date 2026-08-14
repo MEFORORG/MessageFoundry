@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Tests for the push guard (scripts/hooks/push_guard.py).
 
 Since the MEFORORG cutover this repository IS the published artifact -- a push to ``main`` is

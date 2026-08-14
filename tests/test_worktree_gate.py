@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Tests for the worktree gate PreToolUse hook (scripts/hooks/worktree_gate.ps1).
 
 The gate keeps concurrent Claude Code sessions from BUILDING in the shared primary checkout. It is keyed

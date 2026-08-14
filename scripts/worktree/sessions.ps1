@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 <#
 .SYNOPSIS
     Find (and rescue) Claude Code sessions for this repo across every login -- including the ones that

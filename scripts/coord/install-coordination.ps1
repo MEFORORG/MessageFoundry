@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 <#
 .SYNOPSIS
     Install the cross-session coordination hooks so they load in EVERY worktree, not just some.

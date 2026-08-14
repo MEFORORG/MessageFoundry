@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Claim gate -- stop two sessions building the same backlog item in parallel (BACKLOG #309).
 
 `ledger_check.py` stops two sessions taking the same ADR/BACKLOG *number*. This stops them doing the same

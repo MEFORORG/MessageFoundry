@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Keyboard-first new-connection wizard (#221e): a native multi-step QuickInput (the official
 // multiStepInput pattern — chained QuickPick/InputBox with Back navigation) that is an alternative to
 // the connectionEditor webview form. It collects the same fields and writes through the SAME

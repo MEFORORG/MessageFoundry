@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // [security] posture editor (ADR 0118) — a webview form that manages the plain-language, secure-by-
 // default switches in the service-settings TOML's `[security]` section by shelling the
 // `messagefoundry security show|set` CLI (which validates + writes comment-preservingly, and REJECTS the

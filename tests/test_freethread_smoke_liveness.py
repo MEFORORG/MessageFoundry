@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The free-threaded canary must be capable of reporting a problem.
 
 `freethread-smoke.yml` was structurally incapable of it: every step was `continue-on-error`, every

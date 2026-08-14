@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Report the cyclomatic-complexity (ruff C901) findings a pull request actually CAUSED.
 
 Raw C901 cannot be surfaced on a diff, and measuring it is what proves that: every C901 finding

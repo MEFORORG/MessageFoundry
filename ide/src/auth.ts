@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Authentication to the MessageFoundry engine API. The engine requires auth (opaque bearer
 // sessions), and promote drives the *running* engine, so it must sign in. Tokens are cached in
 // VS Code SecretStorage (never written to disk by us), keyed by engine URL, and re-acquired on

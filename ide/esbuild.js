@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Bundle the extension to dist/extension.js (CommonJS for the VS Code Node host).
 const esbuild = require("esbuild");
 

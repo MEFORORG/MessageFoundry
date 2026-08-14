@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The not-a-console boundary, frozen (ADR 0113 §2).
 
 The tray must render only status + link affordances — never workload data (message bodies, queue

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 <#
 .SYNOPSIS
     The mail claim primitive. ONE definition of "move a message and know whether you got it",

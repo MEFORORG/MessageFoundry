@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 import * as assert from "assert";
 import type { Hl7Structures } from "../../hl7schema";
 import { buildSegmentScope, resolveStructureIds, sampleSegments } from "../../hl7scope";
