@@ -10,10 +10,13 @@
     Dot-sourcing does nothing useful; run it.
 
         seat.ps1 -Record                      # the hook path: derive everything, write, exit 0
-        seat.ps1 -Declare -Seat builder3 -Goal "..." -Done "..." -OutOfScope "..."
-        seat.ps1 -Declare -Handoff <path>     # point at the document a replacement should read
-        seat.ps1 -Close [-Handback]
+        seat.ps1 -Declare -SessionId <id> -Seat builder3 -Goal "..." -Done "..." -OutOfScope "..."
+        seat.ps1 -Declare -SessionId <id> -Handoff <path>   # the doc a replacement should read
+        seat.ps1 -Close -SessionId <id> [-Handback]
         seat.ps1 -BumpEpoch                   # mark an account switch; see POOL EPOCH below
+
+    -Declare AND -Close NAME A SESSION OR WRITE NOTHING -- see rule 4. They take -SessionId, or read
+    it from CLAUDE_CODE_SESSION_ID / CLAUDE_SESSION_ID; with neither, they refuse loudly.
 
     WHY A RECORD AND NOT A ROW IN A SHARED FILE. This layer lives inside .git, which is NOT under
     version control -- measured: `git ls-files | grep -c '^\.git/'` returns 0 while the same
@@ -34,7 +37,7 @@
     missing. fleet.ps1 renders "declared: NONE" with its age as first-class output rather than
     showing a blank field as though it were a fact.
 
-    THREE HARD RULES, each paying for a measured failure on this box.
+    FOUR HARD RULES, each paying for a measured failure on this box.
 
     1. NEVER MINT A BOX KEY FROM A PATH THAT IS NOT A ROOTED, EXISTING DIRECTORY. mail.ps1:392-401
        records that the unguarded version "silently mints a NEW box that no reader will ever drain",
@@ -51,6 +54,18 @@
        separate them reads a disabled writer as an idle fleet. Hooks are disabled silently by
        disableAllHooks, by org policy and by workspace trust, and all three produce exactly the
        observable of a quiet, healthy fleet.
+
+    4. A RECORD IS PER (worktree, SESSION), SO A WRITE THAT CANNOT NAME ITS SESSION MAY NOT CARRY
+       ANOTHER SESSION'S WORK. `nosid` is ONE slot per checkout, shared by every unidentified session
+       that ever ran there. Measured: `-Declare` and `-Close` never read the session id, so they both
+       landed in that slot while the seat's own hook record sat beside it -- the roster showed a
+       phantom declared seat next to the real one, a `-Close` marked a record nobody was reading (so
+       the seat that closed itself was never closed), and the next occupant to declare came back
+       holding the previous occupant's goal, done and lifecycle=closed, which the roster renders as
+       finished work. So: -Declare/-Close REFUSE to write without a session identity, and the
+       involuntary -Record half still writes to `nosid` (losing the git facts would be worse) but
+       INHERITS NOTHING there and claims no episode baseline. The refusal is on the demoted voluntary
+       half only; the hook path does not depend on it.
 
     POOL EPOCH. `configRootLabel` names a CREDENTIAL DIRECTORY, not a Claude account -- two launcher
     scripts on this box point at the same .claude-account-2, and the Desktop runs against ~/.claude
@@ -104,7 +119,12 @@ function Write-WriterError {
     try {
         if (-not $script:SeatsDir) { return }
         $f = Join-Path $script:SeatsDir '.writer-errors.txt'
-        $line = '{0}`t{1}`t{2}`t{3}' -f ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')), $env:COMPUTERNAME, $Stage, ($Message -replace '\s+', ' ')
+        # DOUBLE-quoted, and that is the whole point: PowerShell processes the backtick escape only
+        # inside double quotes, so the single-quoted form wrote the two literal characters backtick-t
+        # between the fields. Measured: the log then split into ONE field on a tab, so the column
+        # naming WHICH stage failed could not be extracted, while the file itself looked healthy and
+        # fleet.ps1's line count stayed correct.
+        $line = "{0}`t{1}`t{2}`t{3}" -f ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')), $env:COMPUTERNAME, $Stage, ($Message -replace '\s+', ' ')
         Add-Content -Path $f -Value $line -Encoding utf8 -EA SilentlyContinue
     } catch { }
 }
@@ -112,13 +132,82 @@ function Write-WriterError {
 function Invoke-Git {
     # Returns trimmed stdout, or $null when git failed. NEVER throws: a repo in a state git dislikes
     # must degrade one field, not lose the whole record.
-    param([string]$Dir, [string[]]$GitArgs)
+    #
+    # -Raw SUPPRESSES THE TRIM, AND ANY COLUMN-SIGNIFICANT FORMAT MUST ASK FOR IT. Trim() is applied
+    # to the JOINED output, so it eats the head of the FIRST line. Measured: `git status --porcelain`
+    # writes the status in columns 1-2 and an unstaged modification is " M path", so the leading
+    # space of line 1 was stripped and the fixed Substring(3) below it then stored the first dirty
+    # path one character short -- 'alpha.py' recorded as 'lpha.py', with every later line intact and
+    # every count still agreeing, so nothing in the record disagreed with anything else.
+    param([string]$Dir, [string[]]$GitArgs, [switch]$Raw)
     try {
         $out = & git -C $Dir @GitArgs 2>$null
         if ($LASTEXITCODE -ne 0) { return $null }
         if ($null -eq $out) { return '' }
-        return ($out -join "`n").Trim()
+        $joined = ($out -join "`n")
+        if ($Raw) { return $joined }
+        return $joined.Trim()
     } catch { return $null }
+}
+
+function ConvertTo-UtcInstant {
+    # ONE conversion for every timestamp this file compares or stores, because the type here is not
+    # what the code reading it assumes.
+    #
+    # MEASURED: ConvertFrom-Json parses "2026-08-14T13:48:25Z" into a [DateTime], and [string] on
+    # THAT yields the culture form "08/14/2026 13:48:25" -- the Z is gone. Re-parsing that reads it
+    # as LOCAL and shifts it by the box's offset (five hours here). Both sides of the attribution
+    # comparison were being mangled the same way, so the skews cancelled and the fault was invisible;
+    # normalising one side alone would have UNCANCELLED it and been worse than leaving it. So both
+    # sides come through here, and the record stores what this returns.
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    try {
+        if ($Value -is [DateTime]) {
+            if ($Value.Kind -eq [DateTimeKind]::Utc) { return $Value }
+            if ($Value.Kind -eq [DateTimeKind]::Local) { return $Value.ToUniversalTime() }
+            # Unspecified: everything this layer writes is UTC, so read it as UTC rather than
+            # letting ToUniversalTime() add the local offset to a value that never carried one.
+            return [DateTime]::SpecifyKind($Value, [DateTimeKind]::Utc)
+        }
+        if ($Value -is [DateTimeOffset]) { return $Value.UtcDateTime }
+        $s = [string]$Value
+        if (-not $s.Trim()) { return $null }
+        return [DateTimeOffset]::Parse($s, [cultureinfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::AssumeUniversal -bor
+            [System.Globalization.DateTimeStyles]::AdjustToUniversal).UtcDateTime
+    } catch { return $null }
+}
+
+function ConvertTo-Utc8601 {
+    # The one stored shape. Round-tripping a record re-reads its timestamps as [DateTime], so every
+    # value carried forward is re-canonicalised on the way back out.
+    param($Value)
+    $u = ConvertTo-UtcInstant $Value
+    if ($null -eq $u) { return $null }
+    return $u.ToString('yyyy-MM-ddTHH:mm:ssZ')
+}
+
+function ConvertTo-RefComponent {
+    # git rejects a ref component with a leading dot, a '..' or a '.lock' suffix, so dots are removed
+    # outright rather than each rule being special-cased. Measured with `git check-ref-format`.
+    param([string]$Value)
+    $c = ($Value -replace '[^A-Za-z0-9_-]', '-')
+    if ($c.Length -gt 80) { $c = $c.Substring(0, 80) }
+    if (-not $c) { $c = 'unknown' }
+    return $c
+}
+
+function Limit-Text {
+    # COLLAPSE FIRST, THEN MEASURE THE COLLAPSED STRING. Measured: taking the length from the
+    # ORIGINAL and slicing the COLLAPSED copy throws on any note holding a double space, a tab or a
+    # newline, because collapsing is length-reducing. That throw landed while the record literal was
+    # being built, so it discarded the WHOLE write -- the involuntary git facts included -- while
+    # rule 2's unconditional exit 0 reported success.
+    param([string]$Text, [int]$Max = 2000)
+    $t = ($Text -replace '\s+', ' ')
+    if ($t.Length -le $Max) { return $t }
+    return $t.Substring(0, $Max)
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -165,8 +254,18 @@ function Read-HookPayload {
 function Get-SessionKey {
     param($Payload, [string]$Override)
     $sid = $null
-    if ($Override) { $sid = $Override }
-    elseif ($Payload -and ($Payload.PSObject.Properties.Name -contains 'session_id')) { $sid = [string]$Payload.session_id }
+    $src = $null
+    if ($Override) { $sid = $Override; $src = 'param' }
+    elseif ($Payload -and ($Payload.PSObject.Properties.Name -contains 'session_id') -and $Payload.session_id) {
+        $sid = [string]$Payload.session_id; $src = 'payload'
+    }
+    # THE ENV FALLBACK IS FOR THE CLI PATHS, which get no hook payload. Both names are tried and the
+    # order is measured, not guessed: on this box CLAUDE_CODE_SESSION_ID holds a 36-char uuid of the
+    # same shape the hook payload carries, while CLAUDE_SESSION_ID -- the name mail.ps1:230 reads --
+    # is EMPTY. A fallback that resolves to nothing is the failure this whole file exists to make
+    # visible, so it must not be the only one tried.
+    elseif ($env:CLAUDE_CODE_SESSION_ID) { $sid = $env:CLAUDE_CODE_SESSION_ID; $src = 'env:CLAUDE_CODE_SESSION_ID' }
+    elseif ($env:CLAUDE_SESSION_ID) { $sid = $env:CLAUDE_SESSION_ID; $src = 'env:CLAUDE_SESSION_ID' }
 
     if (-not $sid) {
         # THE LITERAL STRING, NOT nosid-<pid>. A hook runs as a pwsh CHILD whose pid changes every
@@ -177,7 +276,7 @@ function Get-SessionKey {
     }
     $clean = $sid -replace '[^A-Za-z0-9._-]', '-'
     if ($clean.Length -gt 80) { $clean = $clean.Substring(0, 80) }
-    return @{ Key = $clean; Id = $sid; Source = if ($Override) { 'param' } else { 'payload' } }
+    return @{ Key = $clean; Id = $sid; Source = $src }
 }
 
 function Get-ConfigRootLabel {
@@ -207,7 +306,7 @@ function Get-PoolEpoch {
 # ---------------------------------------------------------------------------------------------
 
 function Get-GitFacts {
-    param([string]$Wt)
+    param([string]$Wt, [string]$StashRef)
 
     $branch = Invoke-Git -Dir $Wt -GitArgs @('rev-parse', '--abbrev-ref', 'HEAD')
     $tip = Invoke-Git -Dir $Wt -GitArgs @('rev-parse', 'HEAD')
@@ -244,23 +343,58 @@ function Get-GitFacts {
     #
     # So: the stash covers tracked edits, untracked paths are listed by name, and the reader states
     # plainly that no git object holds them. Promising a recovery that cannot be delivered is worse
-    # than reporting the gap.
+    # than reporting the gap. The tracked half is anchored to a ref below for the same reason -- an
+    # unreferenced sha is a promise of recovery that gc can revoke without a word.
+    # -z, AND -Raw, AND NEITHER IS OPTIONAL.
+    #   -Raw: the status lives in columns 1-2, so a Trim() over the joined output eats the first
+    #     entry's status column and the fixed offset below then truncates that path (see Invoke-Git).
+    #   -z: without it git QUOTES any path holding a space or a non-ASCII byte (core.quotepath is on
+    #     by default) and the quotes are stored as part of the name -- measured: a new file
+    #     `has space.txt` was recorded as `"has space.txt"`, which is not a path anyone can act on.
+    #     -z emits NUL-terminated entries with the path verbatim.
+    # A rename/copy entry is followed by a SECOND field carrying the ORIGINAL path; it is consumed
+    # here rather than being read as a status line of its own.
     $trackedPaths = @()
     $untrackedPaths = @()
-    $st = Invoke-Git -Dir $Wt -GitArgs @('status', '--porcelain')
+    $st = Invoke-Git -Dir $Wt -GitArgs @('status', '--porcelain', '-z') -Raw
     if ($st) {
-        foreach ($line in ($st -split "`n" | Where-Object { $_ })) {
-            $p = $line.Substring(3)
-            if ($line.StartsWith('??')) { $untrackedPaths += $p } else { $trackedPaths += $p }
+        $entries = @($st -split "`0" | Where-Object { $_ })
+        for ($i = 0; $i -lt $entries.Count; $i++) {
+            $e = $entries[$i]
+            if ($e.Length -lt 4) { continue }
+            $xy = $e.Substring(0, 2)
+            $p = $e.Substring(3)
+            if ($xy[0] -eq 'R' -or $xy[0] -eq 'C') { $i++ }
+            if ($xy -eq '??') { $untrackedPaths += $p } else { $trackedPaths += $p }
         }
     }
 
     # `git stash create` builds a commit object WITHOUT touching the working tree or the stash ref,
     # so it cannot disturb a seat that may still be using the checkout.
+    #
+    # IT ALSO WRITES NO REF AND NO REFLOG ENTRY, so the object is unreachable from the moment it
+    # exists. Measured: `git gc --prune=now` deleted the recorded stash and the record went on
+    # carrying the same sha, with no way to tell a live handle from a dead one. So the sha is
+    # ANCHORED to a ref of its own here -- one plumbing call, the object becomes gc-proof, and the
+    # ref name says what it is to whoever finds it later.
     $stash = $null
+    $stashRefName = $null
     if ($trackedPaths.Count -gt 0) {
         $s = Invoke-Git -Dir $Wt -GitArgs @('stash', 'create')
-        if ($s) { $stash = $s }
+        if ($s) {
+            $stash = $s
+            if ($StashRef) {
+                # Invoke-Git returns '' on a silent success and $null only on failure.
+                $anchored = Invoke-Git -Dir $Wt -GitArgs @('update-ref', $StashRef, $s)
+                if ($null -ne $anchored) { $stashRefName = $StashRef }
+                else { Write-WriterError -Stage 'stash-anchor' -Message "update-ref $StashRef failed; the stash sha is unreferenced and gc can delete it" }
+            }
+        }
+    } elseif ($StashRef) {
+        # Nothing to cover this pass. An anchor from an earlier turn would keep holding edits that
+        # have since been committed or discarded, so it is dropped rather than left to outlive what
+        # it described. Deleting a ref that is not there is a no-op that exits 0.
+        Invoke-Git -Dir $Wt -GitArgs @('update-ref', '-d', $StashRef) | Out-Null
     }
     $dirtyPaths = @($trackedPaths) + @($untrackedPaths)
 
@@ -298,8 +432,15 @@ function Get-GitFacts {
             untracked      = @($untrackedPaths | Select-Object -First 200)
         }
         stashSha  = $stash
-        # What the stash actually covers, so the reader never over-promises recovery.
-        stashCovers = if ($stash) { 'tracked-only' } elseif ($untrackedPaths.Count -gt 0) { 'nothing-untracked-only' } else { 'nothing-clean' }
+        # The ref holding that sha, so a reader can test the OBJECT (`git rev-parse --verify`) rather
+        # than the string. A null here with a non-null stashSha means the anchor did not take.
+        stashRef  = $stashRefName
+        # What the stash actually covers, so the reader never over-promises recovery. An unanchored
+        # sha is named as such: it is a handle that can go dead between the write and the read.
+        stashCovers = if ($stash -and $stashRefName) { 'tracked-only' }
+                      elseif ($stash) { 'tracked-only-unanchored' }
+                      elseif ($untrackedPaths.Count -gt 0) { 'nothing-untracked-only' }
+                      else { 'nothing-clean' }
     }
 }
 
@@ -312,19 +453,31 @@ function Get-GitFacts {
 # So every claim and allocation carries an ATTRIBUTION rather than being silently included or
 # silently dropped. Dropping would be worse: an inherited allocation still sits in this worktree and
 # a human may still need to deal with it. The reader renders the two groups separately.
+#
+# THE BASELINE IS `episodeStart`, NOT `lifecycleAt`. They are different sentences and one variable
+# was serving both: lifecycleAt says WHEN THE LIFECYCLE LAST CHANGED, and -Close sets it to now. So
+# the deliberate handback -- the one path where a replacement is meant to inherit the work -- moved
+# the baseline to the close time, put every number the episode had just allocated BEFORE its own
+# "start", and handed the replacement "allocated to that PATH by earlier occupants -- not this
+# seat's, do not rehome or cite". Measured end to end: this-episode before the -Close -Handback,
+# worktree-inherited after it, with nothing else changed.
+#
+# NOT [string] PARAMETERS. Binding a [DateTime] (which is what ConvertFrom-Json hands back) to a
+# [string] parameter is a lossy culture-formatted cast; both operands go through ConvertTo-UtcInstant
+# instead. See the note there for why fixing only one side would have been worse than fixing neither.
 function Get-Attribution {
-    param([string]$At, [string]$EpisodeStart)
-    if (-not $At -or -not $EpisodeStart) { return 'unknown' }
-    try {
-        if ([DateTimeOffset]::Parse($At).ToUniversalTime() -ge [DateTimeOffset]::Parse($EpisodeStart).ToUniversalTime()) {
-            return 'this-episode'
-        }
-        return 'worktree-inherited'
-    } catch { return 'unknown' }
+    param($At, $EpisodeStart)
+    $a = ConvertTo-UtcInstant $At
+    $e = ConvertTo-UtcInstant $EpisodeStart
+    if ($null -eq $a -or $null -eq $e) { return 'unknown' }
+    if ($a -ge $e) { return 'this-episode' }
+    return 'worktree-inherited'
 }
 
 function Get-ClaimsFor {
-    param([string]$CoordDir, [string]$Wt, [string]$EpisodeStart)
+    # $EpisodeStart is deliberately untyped: a [string] parameter would culture-cast a [DateTime] on
+    # the way in, which is the exact loss ConvertTo-UtcInstant exists to stop.
+    param([string]$CoordDir, [string]$Wt, $EpisodeStart)
     # Claims are claim.ps1's to write. This reads them and attributes by holder worktree only.
     $out = @()
     $dir = Join-Path $CoordDir 'claims'
@@ -343,11 +496,15 @@ function Get-ClaimsFor {
         if ($hnorm -ne $norm) { continue }
         $at = $null
         foreach ($n in @('claimedAt', 'at', 'created')) {
-            if ($j.PSObject.Properties.Name -contains $n) { $at = [string]$j.$n; break }
+            if ($j.PSObject.Properties.Name -contains $n) { $at = $j.$n; break }
         }
+        # Stored in the canonical shape, not as the culture-formatted cast of whatever
+        # ConvertFrom-Json produced. A value that will not parse is kept VERBATIM rather than dropped:
+        # an unparsable timestamp is still evidence, and its attribution is already 'unknown'.
+        $atIso = ConvertTo-Utc8601 $at
         $out += [ordered]@{
             key         = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
-            claimedAt   = $at
+            claimedAt   = if ($atIso) { $atIso } elseif ($null -ne $at) { [string]$at } else { $null }
             attribution = (Get-Attribution -At $at -EpisodeStart $EpisodeStart)
         }
     }
@@ -355,7 +512,7 @@ function Get-ClaimsFor {
 }
 
 function Get-AllocationsFor {
-    param([string]$CoordDir, [string]$Wt, [string]$EpisodeStart)
+    param([string]$CoordDir, [string]$Wt, $EpisodeStart)
     $out = @()
     $dir = Join-Path $CoordDir 'alloc'
     if (-not (Test-Path -LiteralPath $dir)) { return $out }
@@ -371,13 +528,14 @@ function Get-AllocationsFor {
             if ((($aw.TrimEnd('\', '/').ToLowerInvariant()) -replace '/', '\') -ne $norm) { continue }
             $at = $null
             foreach ($n in @('claimed', 'allocatedAt', 'at')) {
-                if ($j.PSObject.Properties.Name -contains $n) { $at = [string]$j.$n; break }
+                if ($j.PSObject.Properties.Name -contains $n) { $at = $j.$n; break }
             }
+            $atIso = ConvertTo-Utc8601 $at
             $out += [ordered]@{
                 kind          = $kindDir.Name
                 number        = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
                 allocWorktree = $aw
-                allocatedAt   = $at
+                allocatedAt   = if ($atIso) { $atIso } elseif ($null -ne $at) { [string]$at } else { $null }
                 allocBranch   = if ($j.PSObject.Properties.Name -contains 'branch') { [string]$j.branch } else { $null }
                 attribution   = (Get-Attribution -At $at -EpisodeStart $EpisodeStart)
             }
