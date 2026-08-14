@@ -2867,6 +2867,28 @@ Honestly bounded: **this is build-time only.** No PHI path, no running-engine su
 
 > 🔢 **Filed 2026-08-01 — not started.** Value **6/10** · Difficulty **4/10** · _quick win_. Build state confirmed: zero of the 21 files under `.github/workflows/` carries a `merge_group:` trigger, so difficulty 4 and the step-2-is-a-precondition reasoning are right. Value 8 is not. The rubric's `8` is "an ASVS L3 Partial on defaults, or a production blind spot with no workaround" — this is neither. It is a repo-workflow blind spot, and a workaround demonstrably exists and is exercised: `gh pr update-branch` (#74 landed via three merges from main, #119 landed via re-sync), plus a detector the project already BUILT for exactly this condition and which the item itself cites — `scripts/ci/check_stalled_prs.py` + `.github/workflows/stalled-prs.yml`. So the readiness signal is not in fact unfalsifiable from outside: a scheduled job reports the stalled set. That makes it "real gap, awkward workaround" = 6, one rung above the rubric's `4` for DX (the item's own cluster is Developer Experience & CI), and 6 is generous for a cluster the ladder caps at 4. At value 6, difficulty 4: quadrant stays quick win, but tier is P2 (P1 needs value >= 8, or value >= 6 at difficulty <= 2 — and this one is 4). _(was 8/10 · 3/10.)_
 
+> **AMENDED 2026-08-14 (dispatcher, from a builder's pre-build read). THIS ITEM IS NOT BUILDABLE AS WRITTEN, AND THE OBSTACLE IS STRUCTURAL RATHER THAN AN OVERSIGHT. HELD PENDING AN OWNER DECISION -- see the fork at the end.**
+>
+> **IT IS TWO THINGS WEARING ONE NUMBER, WITH DIFFERENT OWNERS.** **HALF A** -- enabling the queue -- is a **repo-settings change on GitHub**: outward-facing, observable by every other party, **therefore the owner's act and not a builder's**. **HALF B** -- adding `merge_group:` triggers -- is ordinary repo files and would be builder work. **A claim on this number means half B unless it says otherwise; do not read one as "the queue is being turned on".**
+>
+> **THE BLOCKER: TWO OF THE FOUR WORKFLOWS CARRYING REQUIRED CONTEXTS CANNOT REPORT IN A MERGE QUEUE AT ALL, because their SUBJECT is the pull request.** Measured at `origin/main` (`.github/required-contexts.txt` is the authoritative set -- **13** required contexts, living in exactly four workflows):
+> ```
+> cla.yml              on: issue_comment [created] + pull_request_target [opened, synchronize]
+>                      NEITHER fires on merge_group, and the action needs a PR to act on.
+>                      A merge group has no PR.
+> backlog-hygiene.yml  no merge_group trigger; SEVEN references to github.event.pull_request.*
+>                      -- all null in a merge_group event. Its question ("does THIS PR update
+>                      BACKLOG.md") has no meaning for a merge group.
+> ```
+> **SO ADDING `merge_group:` TO FOUR FILES PRODUCES A QUEUE THAT HANGS ON `cla` FOREVER** -- the **required-but-absent trap that `required-contexts.txt` documents in its own header**, and which this repo has already been bitten by. **Half B done naively creates the exact failure its own source of record warns about.**
+>
+> **THE FORK, and it is an owner decision because every branch touches half A.**
+> - **(i) SHIM** -- give both workflows a `merge_group` trigger that short-circuits to success. **Delivers the queue, and manufactures a permanent green-that-means-not-applicable ON THE MERGE PATH.** Even written honestly -- the job stating in its own output that it is not-applicable and why -- **the honesty is not durable**: the next person to touch `cla.yml` inherits a job that reports success on `merge_group` and must re-derive why. That decay is the silent-control defect **ADR 0158** exists to name.
+> - **(ii) NARROW THE REQUIRED SET** -- **rejected.** Branch protection's required set is not per-event, so this means removing `cla` from protection entirely, **trading a merge race for an unsigned-CLA merge.** Strictly worse.
+> - **(iii) DO NOT ENABLE THE QUEUE** -- **the dispatcher's recommendation.** This item was re-scored from value **8 to 6 precisely because a working workaround exists and is exercised** (`gh pr update-branch`; `scripts/ci/check_stalled_prs.py` + `stalled-prs.yml` reporting the stalled set). **The shim cost above was NOT in that score.** With it priced, the item does not clear its own bar.
+>
+> **HALF B MUST NOT BE BUILT SPECULATIVELY, and that part is ruled rather than recommended.** A precondition is inert only while nothing consumes it: **once the workflows carry `merge_group`, enabling the queue looks like a one-click finish, and the structural exception gets built under time pressure instead of deliberately.**
+
 **Cluster:** Developer Experience & CI. **Priority:** P2. **Verdict:** build. **Severity:** medium.
 
 **What:** branch protection on `main` sets `required_status_checks.strict = true` — a PR must be up to date with the base to merge — and the repo has **no merge queue** (`repository.mergeQueue` is null; `allow_auto_merge` is true). The slowest required leg runs ~20–25 minutes. Those three facts compose into a race: a PR is mergeable only in the window between its checks going green and the next thing landing on `main`.
