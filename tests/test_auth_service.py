@@ -269,6 +269,57 @@ async def test_claimed_bootstrap_survives_user_creation_after_an_admin_reset() -
         await store.close()
 
 
+async def test_the_claim_stamp_is_write_once_across_a_second_rotation() -> None:
+    # BACKLOG #1245: ``set_password`` writes ``password_claimed_at=COALESCE(password_claimed_at, ?)``,
+    # so the FIRST claim stands for the life of the account and a later rotation cannot move it.
+    # store.py calls that monotonicity "the whole point" and ADR 0164 states it as a design
+    # commitment -- yet nothing pinned it. Replacing the COALESCE with a bare assignment left every
+    # other #1245 test green, because they all read the column through the NULL / not-NULL gate and
+    # never look at its VALUE.
+    #
+    # The stamp is evidence about WHEN the holder took the account. A later rotation that overwrote
+    # it would satisfy every not-None assertion in this file while destroying that fact.
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        boot = await service.initialize()
+        assert boot is not None
+        await _claim_bootstrap(service, boot.password)
+
+        first = await store.get_user_by_username("admin")
+        assert first is not None
+        assert first.password_claimed_at is not None and first.password_changed_at is not None
+        # The claiming write stamped its OWN instant (one ``now`` per UPDATE feeds both columns).
+        # Pinning that here is what makes the comparison below a statement about the claim INSTANT
+        # rather than about "some non-NULL value survived".
+        assert first.password_claimed_at == first.password_changed_at
+        original_stamp = first.password_claimed_at
+
+        # Rotate a SECOND time, through the real service path, as the holder.
+        out = await service.login("admin", NEW_PASSWORD)
+        assert out.ok and out.identity is not None
+        third_password = "A-third-Str0ng-Passphrase!!"
+        assert await service.change_password(out.identity, third_password) == []
+
+        again = await store.get_user_by_username("admin")
+        assert again is not None and again.password_claimed_at is not None
+
+        # POSITIVE CONTROLS: the second rotation really happened and really wrote THIS row. Without
+        # them an unmoved stamp is equally consistent with the rotation never occurring, which is the
+        # failure mode most likely to make this test lie. The credential check is clock-independent;
+        # the timestamp check proves the UPDATE carrying the claim term ran with a fresh ``now``, so
+        # a stamp that stayed put did so because of the COALESCE and not because nothing was written.
+        assert (await service.login("admin", third_password)).ok
+        assert not (await service.login("admin", NEW_PASSWORD)).ok
+        assert again.password_changed_at is not None
+        assert again.password_changed_at > first.password_changed_at
+
+        # THE PROPERTY: the claim instant did not move.
+        assert again.password_claimed_at == original_stamp
+    finally:
+        await store.close()
+
+
 async def test_the_upgrade_backfill_restores_a_claim_a_pre_column_database_cannot_carry(
     tmp_path: Path,
 ) -> None:
@@ -435,12 +486,30 @@ async def test_bootstrap_admin_carries_its_expiry_deadline() -> None:
         await store.close()
 
 
-async def test_bootstrap_admin_deadline_is_none_when_expiry_off() -> None:
+async def test_bootstrap_admin_deadline_is_none_only_when_BOTH_bounds_are_off() -> None:
+    # RETRACTED AND NARROWED (BACKLOG #1245). This asserted `expires_at is None` with ONLY
+    # `bootstrap_expiry_hours=0`, leaving `initial_password_expiry_hours` at its default 72 -- so it
+    # pinned bootstrap-admin.txt stating NO deadline while the credential it ships actually stopped
+    # working 72 hours later. The old assertion is kept in the record because a reader who sees only
+    # the corrected one cannot tell it was ever wrong.
+    #
+    # None is correct only when NEITHER bound is configured. With either one on, the file must name
+    # the earlier of them -- pinned across all four combinations by
+    # test_the_issued_deadline_is_the_earlier_bound_not_the_wp3_one.
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(bootstrap_expiry_hours=0))
-        boot = await service.initialize()
+        both_off = AuthSettings(bootstrap_expiry_hours=0, initial_password_expiry_hours=0)
+        boot = await AuthService(store, both_off).initialize()
         assert boot is not None and boot.expires_at is None
+    finally:
+        await store.close()
+
+    store = await _store()
+    try:
+        # WP-3 off but the credential bound live: a deadline EXISTS and must be surfaced.
+        wp3_off = AuthSettings(bootstrap_expiry_hours=0, initial_password_expiry_hours=72)
+        boot = await AuthService(store, wp3_off).initialize()
+        assert boot is not None and boot.expires_at is not None
     finally:
         await store.close()
 
@@ -600,11 +669,64 @@ async def _make_reset_temp(store, service, *, username: str = "alice") -> str:
     return await service.admin_reset_password(user.id, actor="admin")
 
 
+@pytest.mark.parametrize(
+    ("boot_hours", "cred_hours", "expect"),
+    [
+        (0, 72, "cred"),  # WP-3 off: the credential bound is the ONLY one, and must be surfaced
+        (8760, 72, "cred"),  # WP-3 far later: surfacing it would overstate the window by 121x
+        (72, 0, "boot"),  # 6.4.1 off: WP-3 is the only bound
+        (0, 0, None),  # both off: genuinely no deadline
+    ],
+)
+async def test_the_issued_deadline_is_the_earlier_bound_not_the_wp3_one(
+    boot_hours: int, cred_hours: int, expect: str | None
+) -> None:
+    # BACKLOG #1245: bootstrap-admin.txt prints this instant verbatim as "expires: <ISO> - sign in and
+    # change this password before then". Computing it from bootstrap_expiry_hours ALONE was the same
+    # account-versus-credential conflation #1245 removed from the login gate, surviving in the one
+    # field whose entire job is telling the operator when the credential dies.
+    #
+    # Measured before this fix: at boot=0 the file stated NO deadline while the credential expired at
+    # 72h, and at boot=8760 it stated a window 121x the real one. A file that overstates a deadline is
+    # worse than one that omits it -- the operator plans around a date that is not real.
+    store = await _store()
+    try:
+        service = AuthService(
+            store,
+            AuthSettings(
+                bootstrap_expiry_hours=boot_hours, initial_password_expiry_hours=cred_hours
+            ),
+        )
+        boot = await service.initialize()
+        assert boot is not None
+        admin = await store.get_user_by_username("admin")
+        assert admin is not None and admin.password_changed_at is not None
+
+        if expect is None:
+            assert boot.expires_at is None  # both bounds off
+            return
+
+        wp3 = admin.created_at + boot_hours * 3600
+        cred = admin.password_changed_at + cred_hours * 3600
+        assert boot.expires_at is not None
+        # The surfaced instant is the EARLIER bound, whichever kind it is.
+        assert boot.expires_at == (cred if expect == "cred" else wp3)
+        # And it never NAMES a moment later than the credential actually survives.
+        if cred_hours > 0:
+            assert boot.expires_at <= cred
+    finally:
+        await store.close()
+
+
 async def test_a_reset_temp_on_a_CLAIMED_bootstrap_still_expires() -> None:
-    # BACKLOG #1245: the 6.4.1 carve-out for the bootstrap rests on WP-3 giving that account its own
-    # deadline, and that is true only while it is UNCLAIMED. Once claimed, WP-3 deliberately stops
-    # covering it -- so before this narrowing, an admin-issued temp on the highest-privilege account
-    # name in the system never expired at all.
+    # BACKLOG #1245. THERE IS NO 6.4.1 CARVE-OUT ANY MORE -- an earlier version of this comment said
+    # the carve-out "rests on WP-3 giving that account its own deadline, and that is true only while
+    # it is UNCLAIMED", which framed the premise as merely NARROW. It is false outright: WP-3 retires
+    # an ACCOUNT and 6.4.1 expires a CREDENTIAL, and WP-3 cannot bound the credential at all when
+    # bootstrap_expiry_hours is 0 or is set longer than the 6.4.1 window. The retraction is recorded
+    # rather than the old wording quietly replaced, because a reader who finds only the corrected
+    # sentence cannot tell it was ever wrong. Before the fix, an admin-issued temp on the
+    # highest-privilege account name in the system never expired at all.
     #
     # The gap was MASKED BY THE DEFECT ITSELF: pre-#1245 the reset re-armed retirement and the
     # account got disabled, so nobody noticed the temp had no deadline. Fixing #1245 removed that

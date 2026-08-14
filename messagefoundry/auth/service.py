@@ -175,9 +175,11 @@ class BootstrapAdmin:
 
     username: str
     password: str
-    # ASVS 6.4.5: the instant an unclaimed bootstrap credential is auto-disabled
-    # (created_at + [auth].bootstrap_expiry_hours), or None when expiry is off (hours=0). Surfaced at
-    # issuance so the renewal instruction ("claim it before <ISO>") ships WITH the credential.
+    # ASVS 6.4.5: the instant this credential stops working — the EARLIER of the two bounds, since
+    # BACKLOG #1245 (WP-3 retiring the ACCOUNT at created_at + [auth].bootstrap_expiry_hours, and
+    # ASVS 6.4.1 expiring the CREDENTIAL at password_changed_at + [auth].initial_password_expiry_hours).
+    # None only when BOTH are off. Surfaced at issuance so the renewal instruction ("claim it before
+    # <ISO>") ships WITH the credential — which is exactly why it must not name the later of the two.
     expires_at: float | None = None
 
 
@@ -544,12 +546,32 @@ class AuthService:
         await self._audit("auth.bootstrap_admin_created", actor="bootstrap")
         # ASVS 6.4.5: derive the expiry from the STORED created_at (the same base
         # _retire_superseded_bootstrap uses), so the surfaced deadline is exactly the retirement instant.
-        expiry_hours = self._settings.bootstrap_expiry_hours
-        expires_at: float | None = None
-        if expiry_hours > 0:
-            created = await self._store.get_user(user_id)
-            if created is not None:
-                expires_at = created.created_at + expiry_hours * 3600
+        # BACKLOG #1245: the surfaced deadline is the EARLIER of the two bounds that can end this
+        # credential, not the WP-3 one alone. Computing it from `bootstrap_expiry_hours` by itself was
+        # the same account-versus-credential conflation #1245 removed from the login gate, surviving
+        # in the one field whose entire job is telling the operator when the credential dies — and it
+        # made `bootstrap-admin.txt` LIE in both directions once 6.4.1 stopped carving the bootstrap
+        # out: at `bootstrap_expiry_hours = 0` the file stated NO deadline while the credential
+        # expired at `initial_password_expiry_hours`, and at 8760 it stated a window 121x the real
+        # one. Each arm contributes nothing when its own setting is 0, so with both off there is
+        # genuinely no deadline and None is still correct.
+        created = await self._store.get_user(user_id)
+        deadlines: list[float] = []
+        if created is not None:
+            if self._settings.bootstrap_expiry_hours > 0:
+                # WP-3 retires the ACCOUNT, keyed on created_at.
+                deadlines.append(created.created_at + self._settings.bootstrap_expiry_hours * 3600)
+            if self._settings.initial_password_expiry_hours > 0 and (
+                created.password_changed_at is not None
+            ):
+                # ASVS 6.4.1 expires the CREDENTIAL, keyed on password_changed_at. For a freshly
+                # minted bootstrap these two stamps are the same clock read, so at equal windows the
+                # minimum is that shared instant and the surfaced value is unchanged.
+                deadlines.append(
+                    created.password_changed_at
+                    + self._settings.initial_password_expiry_hours * 3600
+                )
+        expires_at: float | None = min(deadlines) if deadlines else None
         return BootstrapAdmin(username=BOOTSTRAP_USERNAME, password=password, expires_at=expires_at)
 
     def _generate_policy_password(self) -> str:
@@ -649,14 +671,28 @@ class AuthService:
         the PHI-free ``bootstrap_admin_expiring`` AlertSink event; the password is never surfaced."""
         if self._bootstrap_expiry_warned:
             return None
-        expiry_hours = self._settings.bootstrap_expiry_hours
-        if expiry_hours <= 0:
-            return None  # no time-expiry configured → nothing to warn about
+        # BACKLOG #1245: warn about whichever bound comes FIRST. Gating on bootstrap_expiry_hours
+        # alone meant that at 0 this returned None and the operator got no warning at all for the
+        # deadline that now actually ends the credential (ASVS 6.4.1), and at a long WP-3 window it
+        # would have warned about the later bound. Keyed off the same minimum the issuance deadline
+        # uses, so the two can never disagree.
         boot = await self._unclaimed_bootstrap()
         if boot is None:
             return None
+        candidates: list[float] = []
+        if self._settings.bootstrap_expiry_hours > 0:
+            candidates.append(boot.created_at + self._settings.bootstrap_expiry_hours * 3600)
+        if (
+            self._settings.initial_password_expiry_hours > 0
+            and boot.password_changed_at is not None
+        ):
+            candidates.append(
+                boot.password_changed_at + self._settings.initial_password_expiry_hours * 3600
+            )
+        if not candidates:
+            return None  # no bound of either kind configured → nothing to warn about
         now = time.time() if now is None else now
-        expires_at = boot.created_at + expiry_hours * 3600
+        expires_at = min(candidates)
         warn_start = expires_at - max(0, self._settings.bootstrap_warn_hours) * 3600
         if not (warn_start <= now < expires_at):
             return None  # not yet in the window, or already at/past the retirement instant
