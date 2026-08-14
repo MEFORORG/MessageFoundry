@@ -136,8 +136,12 @@ function Get-NormPath([string]$p) {
 }
 
 # Worktrees of THIS clone, so the denominator is scoped to this repo rather than to the whole box.
+# Its AVAILABILITY is a fact in the receipt for the same reason the fence's is: an empty list and a
+# git that would not answer produce the same denominator, and one of them means the denominator is
+# not being computed at all.
 $repoWorktrees = @()
 $wtOut = Invoke-Git -Dir $repo -GitArgs @('worktree', 'list', '--porcelain')
+$worktreeListAvailable = [bool]$wtOut
 if ($wtOut) {
     foreach ($line in ($wtOut -split "`n")) {
         if ($line -match '^worktree\s+(.+)$') { $repoWorktrees += (Get-NormPath $Matches[1]) }
@@ -147,12 +151,21 @@ if ($wtOut) {
 # LIVE sessions sitting in this repo's worktrees. This is the denominator: a session here that has
 # produced no record is EVIDENCE THE WRITER IS DEAD, not evidence the fleet is idle.
 $liveInRepo = @()
+$registryUnfenceable = 0
 foreach ($row in $sessionRows) {
     if (-not $row.Record) { continue }
     $cwd = $null
     if ($row.Record.PSObject.Properties.Name -contains 'cwd') { $cwd = Get-NormPath ([string]$row.Record.cwd) }
     if (-not $cwd -or $repoWorktrees -notcontains $cwd) { continue }
-    $l = Test-RecordLiveness -Record $row.Record
+    # ONE malformed registry file must degrade ONE row, never the whole receipt. MEASURED on this
+    # file: a registry record carrying a non-numeric startedAt threw out of Test-RecordLiveness here
+    # -- this call sat outside any try -- and fleet.ps1 exited 1 having printed no receipt, no
+    # denominator, no stop conditions and no roster, only a stack trace. A registry file caught
+    # mid-write is exactly that shape, so the failure arrives at the moment a session is launching.
+    # That is this module's own worst outcome delivered as a crash: the reader is by construction the
+    # person least able to tell a broken instrument from an idle fleet. Counted, never swallowed.
+    $l = $null
+    try { $l = Test-RecordLiveness -Record $row.Record } catch { $registryUnfenceable++; continue }
     if ($l.State -eq 'LIVE') {
         $liveInRepo += [pscustomobject]@{
             SessionId = [string]$row.Record.sessionId
@@ -179,15 +192,42 @@ if (Test-Path -LiteralPath $errFile) {
     $writerErrors = @(Get-Content -LiteralPath $errFile -EA SilentlyContinue).Count
 }
 
-# origin/main's own age. Every landed verdict is computed against this ref, and the ref moves ONLY on
-# fetch. A landed verdict against a stale ref is the dangerous direction: this repo carries reverts,
-# and against a stale cached main a reverted change reads as "already landed" -- i.e. deliberately
-# reverted work would be recorded as done.
+# origin/main's own age. Every landed verdict is computed against this ref, and the local copy of it
+# only refreshes on FETCH. A landed verdict against a stale ref is the dangerous direction: this repo
+# carries reverts, and against a stale cached main a reverted change reads as "already landed" --
+# i.e. deliberately reverted work would be recorded as done.
+#
+# ASK THE QUESTION YOU MEAN (SDS-3.8). The question is "how long since anyone refreshed this clone's
+# copy of origin/main", and the instrument has to answer THAT sentence rather than a neighbouring one.
+# Stat'ing refs/remotes/origin/main answers "when did the ref last MOVE", and that is wrong in BOTH
+# directions -- both MEASURED on a throwaway clone:
+#   BLIND    the loose file does not exist while the ref is PACKED, which is the state of every fresh
+#            clone and of any repo after `git gc` / `git pack-refs`. The age came back null, and a
+#            null age skipped the stop condition silently, so an ordinary `git pack-refs --all`
+#            disarmed the check while `originMainSha` kept printing a healthy-looking value beside it.
+#   CRYING   when the file does exist, a fetch that confirms origin/main is UNCHANGED completes
+#   WOLF     without touching it. The check fired "has not been fetched recently" SECONDS after a
+#            verified-current fetch, which on a quiet solo repo is the normal state -- and a channel
+#            that fires when nothing is wrong trains its reader to skip it.
+#
+# FETCH_HEAD is the file git rewrites on EVERY fetch whether or not any ref moved, so it answers the
+# question asked. It is PER-WORKTREE (measured: a fetch from a linked worktree left <common>/FETCH_HEAD
+# untouched and wrote <common>/worktrees/<name>/FETCH_HEAD), while refs/remotes is shared by the whole
+# clone -- so the answer is the NEWEST FETCH_HEAD anywhere in the clone, not this worktree's. The SHA
+# still comes from `git rev-parse`, which is packed-ref aware and was never the broken half.
 $originMainSha = Invoke-Git -Dir $repo -GitArgs @('rev-parse', 'origin/main')
 $originMainAgeMinutes = $null
-$fetchHead = Join-Path $common 'refs\remotes\origin\main'
-if (Test-Path -LiteralPath $fetchHead) {
-    $originMainAgeMinutes = [int]((Get-Date).ToUniversalTime() - (Get-Item -LiteralPath $fetchHead).LastWriteTimeUtc).TotalMinutes
+# NOT $null, and not blank. A blank age beside a populated sha reads as a pass; this has to say which.
+$originMainAgeSource = 'UNCHECKABLE -- no FETCH_HEAD anywhere in this clone (nobody has fetched since it was created)'
+$fetchHeads = @()
+foreach ($p in @((Join-Path $common 'FETCH_HEAD')) + @(Get-ChildItem -LiteralPath (Join-Path $common 'worktrees') -Directory -EA SilentlyContinue |
+                 ForEach-Object { Join-Path $_.FullName 'FETCH_HEAD' })) {
+    if (Test-Path -LiteralPath $p) { $fetchHeads += (Get-Item -LiteralPath $p) }
+}
+if ($fetchHeads.Count -gt 0) {
+    $newest = ($fetchHeads | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1)
+    $originMainAgeMinutes = [int]((Get-Date).ToUniversalTime() - $newest.LastWriteTimeUtc).TotalMinutes
+    $originMainAgeSource = "FETCH_HEAD mtime (newest of $($fetchHeads.Count) in this clone)"
 }
 
 # ---------------------------------------------------------------------------------------------
