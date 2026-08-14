@@ -15,8 +15,12 @@ between the assertion and the assert.
 
 from __future__ import annotations
 
-import pytest
+from pathlib import Path
 
+import pytest
+from fastapi import FastAPI
+
+from messagefoundry.api import create_managed_app
 from messagefoundry.api.app import _assert_security_notice_is_deliverable
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
@@ -85,50 +89,24 @@ async def _call(
 
 
 # ---------------------------------------------------------------------------------------------
-# THE WIRING TEST THAT BELONGS HERE IS ABSENT ON PURPOSE, AND THIS IS WHAT IT FOUND.
+# THE WIRING TEST WAS ONCE IMPOSSIBLE HERE. IT IS THE LAST TEST IN THIS FILE.
 #
-# Every test below drives the PREDICATE directly, so none of them fails if the lifespan call site
-# in `create_managed_app` is deleted. That gap is real and is NOT closed here.
+# Every other test drives the PREDICATE directly, so none of them fails if the lifespan call site
+# in `create_managed_app` is deleted. Closing that gap means asserting the LIFESPAN refuses, and
+# that test was written, run, and removed once, because driving a startup failure through
+# `app.router.lifespan_context` hung with zero output.
 #
-# The obvious closure -- build a PHI/enforce managed app and assert `app.router.lifespan_context`
-# raises -- was written, run, and REMOVED because IT HANGS. Measured, with a control:
+# The cause was never this gate. The lifespan's teardown opened its `try:` at the `yield`, so it
+# guarded the running phase and never the startup phase: everything started between
+# `engine.start()` and the yield was abandoned in place, `engine.stop()` never ran, and since it
+# is what closes the store -- and aiosqlite's connection worker is a non-daemon thread -- the
+# interpreter could not shut down. Under uvicorn that read as a HUNG REFUSAL: the correct error
+# printed, `Application startup failed. Exiting.`, SystemExit(3), and then a process that stayed
+# alive. Legible to an operator watching a console; invisible to a supervisor, which sees a
+# service that started and never exited.
 #
-#   sibling lifespan test that does NOT raise
-#     (test_security_posture_defaults.py::test_managed_app_stashes_auth_settings_for_the_registry)
-#                                                     -> 1 passed in 1.13s
-#   raising from the lifespan BODY, after `yield`      -> exits cleanly (probe: A/B/C/D/E all printed)
-#   raising during lifespan STARTUP, before `yield`    -> HANGS; pytest emits zero output
-#
-# The gate sits at api/app.py after `engine.start()`, the upload-retention runner and the security
-# notifier are all running, and before the three `asyncio.create_task` handles the teardown expects.
-# The `finally` guards each handle with `is not None`, so this is not an unbound name -- it is
-# teardown of a PARTIALLY-STARTED lifespan not completing.
-#
-# TWO THINGS THIS DOES AND DOES NOT ESTABLISH, kept apart deliberately:
-#   IT DOES     -- an exception raised during lifespan startup, driven through
-#                  `app.router.lifespan_context`, does not unwind. That is a pre-existing property
-#                  of this lifespan; the gate is merely the first thing to raise in that window.
-#   IT DOES NOT -- say what uvicorn does. That was UNMEASURED when this note was first written.
-#
-# IT HAS SINCE BEEN MEASURED, UNDER UVICORN, AND THE ANSWER IS BOTH HALVES:
-#
-#   uvicorn REFUSES CORRECTLY AND LEGIBLY. It prints the full RuntimeError -- including the
-#   operator-facing remedy -- then `ERROR: Application startup failed. Exiting.` and raises
-#   SystemExit(3). No socket is served. The gate does what #1020 asks.
-#
-#   THE PROCESS THEN DOES NOT EXIT. Measured directly rather than through a wrapper: the python
-#   process was still alive 90 seconds after printing "Exiting.", and had to be killed. Consistent
-#   with the partial-startup teardown above -- `engine.start()`, the upload-retention runner and the
-#   security notifier are all running when the gate raises, and something among them keeps a
-#   non-daemon thread alive.
-#
-# SO THE FAILURE MODE IS A HUNG REFUSAL, NOT A SILENT ONE, and that distinction decides severity.
-# An operator reading a console sees the correct error. A SUPERVISOR does not: NSSM, systemd or a
-# container runtime sees a process that started and never exited -- a service that is running and
-# dead, which is the state a restart policy cannot detect and will not recover.
-#
-# THIS BLOCKS #1020 FROM LANDING AS WRITTEN. The refusal must terminate the process, not merely
-# refuse to serve. The teardown behaviour is a separate, pre-existing defect and is filed as such.
+# That was filed and fixed as BACKLOG #1257, and `tests/test_lifespan_startup_unwinds.py` is its
+# regression test. This file gets to keep the consequence: the wiring assertion below.
 # ---------------------------------------------------------------------------------------------
 
 
@@ -224,3 +202,45 @@ async def test_the_gate_is_silent_outside_its_three_preconditions(
         await _call(store, **kwargs)  # type: ignore[arg-type]
     finally:
         await store.close()
+
+
+def _phi_app(tmp_path: Path, *, security: SecuritySettings) -> FastAPI:
+    """A real PHI/enforce managed app whose only account will be the addressless bootstrap admin.
+
+    SMTP is fully wired on purpose: the transport gate in ``__main__`` would call this channel
+    healthy, which is the whole of #1020 -- a green transport over an undeliverable notice.
+    """
+    return create_managed_app(
+        db_path=tmp_path / "phi.db",
+        poll_interval=0.05,
+        auth_settings=AuthSettings(enabled=True, notify_security_events=True),
+        alerts_settings=AlertsSettings(
+            security_notifications_required=True,
+            email_smtp_host="smtp.example.test",
+            email_from="alerts@example.test",
+        ),
+        ai_settings=_PHI,
+        security_settings=security,
+    )
+
+
+async def test_the_LIFESPAN_refuses_and_not_merely_the_predicate(tmp_path: Path) -> None:
+    # THE WIRING TEST. Every other test in this file calls the predicate directly and would go on
+    # passing if the lifespan's call to it were deleted. This one fails in that case, which is the
+    # only reason it is worth its runtime.
+    app = _phi_app(tmp_path, security=_ENFORCE)
+    with pytest.raises(RuntimeError) as exc:
+        async with app.router.lifespan_context(app):
+            pass  # pragma: no cover -- startup must not reach here
+    assert "refusing to start" in str(exc.value)
+    assert "no enabled Administrator has an email address" in str(exc.value)
+
+
+async def test_the_same_app_starts_cleanly_under_warn(tmp_path: Path) -> None:
+    # POSITIVE CONTROL on the test above. Identical app, enforcement dialled to warn. Without this,
+    # the refusal is equally consistent with an app that cannot start for some unrelated reason --
+    # a passing test that proves nothing about the gate. That it starts AND unwinds here also
+    # exercises the ordinary path, so a teardown regression surfaces as a hang in this file too.
+    app = _phi_app(tmp_path, security=_WARN)
+    async with app.router.lifespan_context(app):
+        pass
