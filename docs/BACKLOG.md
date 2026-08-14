@@ -4135,7 +4135,13 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 >
 > **THE HAZARD IS STILL REAL AND THIS IS WHY THE RIDER READS AS IT DOES.** The check must know whether an **enabled Administrator has a deliverable address** -- that is a **STORE READ**, and the store is **not open in the preflight** (`_serve` has settings only: no `open_store`, no `AuthService`). **So the natural implementation is the lifespan, which IS the hanging path.** The lane that wrote the rider evidently assumed that placement and was right on that assumption.
 >
-> **IT IS A DESIGN FORK, NOT A BLOCKED ITEM.** Preflight placement costs one extra short-lived read-only store open and buys independence from `#1257`; lifespan placement costs nothing extra and inherits the dependency. **The building lane recommends PREFLIGHT and is writing an ADR.** If preflight proves unworkable, the fallback is lifespan **and the `#1257` dependency returns** -- so the cross-link above stays live either way.
+> **IT IS A DESIGN FORK, NOT A BLOCKED ITEM -- AND THE FORK IS NOT SETTLED. THE DESIGN BELONGS IN AN ADR, NOT IN FURTHER AMENDMENTS HERE.** This item records that a placement decision exists and what it turns on; it deliberately does not track the decision while it moves.
+>
+> **WHAT IS MEASURED AND STABLE.** Lifespan placement inherits the `#1257` dependency. **Preflight placement is more expensive than it first appears:** `list_users()` is **async** (`store/base.py:1548`, all three backends) and **`_serve` never opens a store at all** -- zero `open_store` calls across `1042-2833`, the only hit being a comment at `:1240`. So preflight is not "one extra store open"; it is the **first** store open in a preflight that has never had one, driven from sync code, ahead of whatever `open_store` does on first touch.
+>
+> **THE OPEN QUESTION, stated so it is not re-derived:** whether a point exists **inside the lifespan but BEFORE `engine.start()`** where the store is already open and a raise still exits cleanly. `#1257`'s hang is specifically *"an exception AFTER `engine.start()`"*. If such a point exists it needs neither an extra store open nor `#1257`. **This is UNVERIFIED -- the rider's evidence (raising from the lifespan BODY exits, during STARTUP hangs) is suggestive and does not settle the ordering.** Verify that precondition BEFORE building against it.
+>
+> **SO THE `#1257` CROSS-LINK STAYS LIVE:** it binds under lifespan-after-start placement and is retired only by a placement demonstrated to sit outside that window.
 >
 > **DO NOT WRITE THIS FORK AS "(a) VERSUS (b)".** The owner's settled ruling on this item is already called **option (b)** (*gate startup on a deliverable channel*), and a second (a)/(b) pair over the same item is precisely the label collision `#1242` exists to record. **Name them by placement: PREFLIGHT or LIFESPAN.**
 >
