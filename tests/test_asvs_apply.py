@@ -405,3 +405,68 @@ def test_scorecard_path_is_required_and_has_no_default(tmp_path: Path) -> None:
     with pytest.raises(SystemExit) as e:
         main([str(_payload(tmp_path, [_cell_111()]))])
     assert e.value.code == 2  # argparse usage error, not a silent fallback
+
+
+def test_an_unknown_key_INSIDE_a_subtable_entry_survives() -> None:  # #1242 limb 4
+    """The carry-through was delivered for TOP-LEVEL scalars and silently not for sub-table entries.
+
+    Evidence and absence entries were re-emitted as exactly path/line/expect and
+    pattern/positive_control/mutation, so any other field in an entry vanished on every rewrite --
+    the same silent loss as the allowlist incident, one level down, and equally invisible because an
+    absent field reads as a valid default.
+
+    The key used here is deliberately one the writer has never heard of. A test naming a field that
+    exists today would pass against a fix that simply lengthened the list, which is the defect again.
+    """
+    cell = {
+        "id": "1.2.3",
+        "level": 1,
+        "verdict": "Pass",
+        "last_verified": "2026-08-14",
+        "verified_at": "0" * 40,
+        "evidence": [
+            {"path": "a.py", "line": 3, "expect": "x", "a_future_note": "must survive"},
+        ],
+        "absence": [
+            {"pattern": "p", "positive_control": "c", "mutation": "m", "a_future_flag": True},
+        ],
+    }
+    out = render(cell)
+    assert 'a_future_note = "must survive"' in out
+    assert "a_future_flag = true" in out
+    # The ordered keys must be untouched, TYPES included -- `line` stays a bare int. Carrying unknown
+    # fields through is worthless if it re-types the known ones on the way past.
+    assert "  line = 3" in out
+    assert '  path = "a.py"' in out
+    assert '  pattern = "p"' in out
+
+
+def test_the_preservation_backstop_fires_when_a_SUBTABLE_field_is_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """MUTATION PROOF for the sub-table half of the invariant.
+
+    The test above proves the carry-through works today; this proves the record is still DEFENDED if
+    someone breaks it. Counting entries cannot see a field vanish from inside one, so before this the
+    writer and the guard were blind in the same place -- a rewrite could drop a field from every
+    evidence entry, keep the count, and report green.
+    """
+    import scripts.asvs.apply as mod
+
+    real_render = mod.render
+
+    def dropping_render(cell: dict, live: dict | None = None) -> str:
+        text = real_render(cell, live)
+        kept = [ln for ln in text.splitlines() if not ln.strip().startswith("expect = ")]
+        return "\n".join(kept) + "\n"
+
+    monkeypatch.setattr(mod, "render", dropping_render)
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    rc = main([str(_payload(tmp_path, [_cell_111()])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1, "a field was dropped from every evidence entry and the invariant did not fire"
+    assert rec.read_bytes() == before, "refused, but wrote anyway"
+    # It must refuse for THIS reason. Several other guards in this writer also return 1, and a
+    # mutation proof that passes by tripping an unrelated check proves nothing about its invariant.
+    out = capsys.readouterr().out
+    assert "evidence[0] would LOSE" in out and "expect" in out, out
