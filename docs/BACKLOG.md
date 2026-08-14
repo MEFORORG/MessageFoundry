@@ -8958,3 +8958,24 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **Blocks #1020**, whose gate is simply the first thing that has ever raised in this window. **This is a pre-existing defect in a lifespan every deployment runs, and it is deliberately NOT folded into an auth item** -- a lifespan-teardown change has its own blast radius and deserves its own review.
 
 **Provenance.** Found by the lane building #1020 when it closed that item's own open question -- *does the refusal terminate under `uvicorn` rather than under the harness?* -- and reported **against its own work**. The structural half was re-verified here at `HEAD` before filing. Its method note is recorded because it nearly cost the finding: a first probe reported "HUNG" from the lane's **own** `Wait-Job` timeout branch while the captured output beneath showed `uvicorn` exiting via `SystemExit(3)` -- a wrapper's exit path manufacturing a verdict about the thing it wraps.
+
+## 1258. classify existing ledger items against the publish-decisions-not-deficits ruling
+
+> 🔢 **Filed 2026-08-14 - not started. BLOCKED behind #1250, deliberately, and the reason is the item's own subject: its OUTPUT is the same shape as the thing it looks for.** Value **6/10** · Difficulty **3/10**. Owner-authorised. **This is a CLASSIFICATION task, not a defect report.** It names a **rule** and a **scope**; it does not name a weakness, and it must not acquire one.
+
+> **THE RULE.** *Publish decisions, not deficits* (owner ruling 2026-08-13, whose durable home is **ADR 0160**), extended explicitly to this ledger: a backlog item whose substance is *"this tooling can be misinstalled"* is a **deficit**, not a decision. **Engine defects file publicly as normal** -- that half is unchanged and is most of the ledger. Confirmed again 2026-08-14 when the owner declined to file a new item of this class publicly.
+
+> **THE SCOPE.** Existing items in `docs/BACKLOG.md`, assessed against that rule. **Not the archive, not ADRs, not the engine.**
+
+**Cluster:** Security record / repository topology. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis -- nothing shipped changes.
+
+**WHY IT IS BLOCKED RATHER THAN MERELY UNSTARTED, and this must be settled before anyone runs it.** The sweep's product is *a list of public items that disclose tooling weaknesses*. **That list is an index to precisely what the rule protects** -- the same aggregation argument that kept the 2026-08-14 item out of this file. So the output cannot be written here, and with no private ledger existing it has **nowhere to go**. Running the sweep first would manufacture a finding that must then be parked in a handoff file, adding to the very cost #1250 exists to end. **Land #1250, then run this into it.**
+
+**WHAT THE SWEEP MAY AND MAY NOT PRODUCE.** It may **identify**. It may **not** presume a remedy: **unfiling from a public repository does not unpublish anything**, so what to do about anything found is a *separate question with a different cost structure*, and this item must not answer it by implication. A reclassification that moves text without reducing exposure is churn wearing the shape of a fix.
+
+**HOW IT MUST READ, and this is a wording constraint rather than a preference.** The ruling is dated **2026-08-13**; the items most likely to match were filed around the same time. **A boundary never applied retroactively is not a boundary ignored.** The sweep is **hygiene, not an audit of anyone's judgement**, and if its output reads as an accusation it has been written wrongly. Nothing here is a finding against any lane.
+
+**Do NOT enumerate candidates in this item, now or later.** Naming them here would place in the public ledger exactly the index this work exists to remove from it -- the item would perform the defect it was filed to find. The count is not recorded either, for the same reason.
+
+**Provenance.** Raised, and deliberately **not acted on**, by the seat that noticed it while applying the rule to a new item -- on the grounds that reclassifying existing public items is not a dispatcher's unilateral call. Escalated, authorised by the owner, and filed with the destination question settled up front rather than discovered when the result lands.
