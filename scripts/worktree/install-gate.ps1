@@ -48,6 +48,11 @@ param(
     [string[]]$Repo,
     [switch]$Uninstall,
     [switch]$Status,
+    # Proceed even when the installed gate's content does not match its own install receipt (BACKLOG
+    # #1247). A mismatch means something wrote this machine-global file outside this installer, so the
+    # default is to STOP and ask rather than overwrite the evidence. Required only for that one case:
+    # a gate with no receipt at all is the normal pre-#1247 state and installs without this.
+    [switch]$OverwriteUnverifiedGate,
     # Do not gate Task/Agent/Workflow dispatch from the primary (writes are still gated).
     [switch]$NoDispatchGate,
     # Gate the EnterWorktree tool (rule 4), which relocates a LIVE session into a worktree.
@@ -79,6 +84,10 @@ $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $HomeDir   = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
 $HooksDir  = Join-Path $HomeDir ".claude/hooks"
 $GateDst   = Join-Path $HooksDir "worktree_gate.ps1"
+
+# Install-receipt helpers (BACKLOG #1247). A separate file because it must be dot-sourceable by a
+# test; this script cannot be, since loading it performs a machine-global install.
+. (Join-Path $PSScriptRoot "_gate_receipt.ps1")
 $ReposFile = Join-Path $HooksDir "worktree-gate.repos.txt"
 
 # Marker so we can find (and remove) exactly the entries we added, without disturbing other hooks.
@@ -417,7 +426,41 @@ $resolved = foreach ($r in $Repo) {
 }
 
 New-Item -ItemType Directory -Force -Path $HooksDir | Out-Null
-Copy-Item -LiteralPath (Join-Path $RepoRoot "scripts\hooks\worktree_gate.ps1") -Destination $GateDst -Force
+
+# BACKLOG #1247 -- this write used to be a bare Copy-Item over a MACHINE-GLOBAL safety control, with
+# no backup, no receipt and no log line. When the installed gate's content changed on this box while
+# three sessions ran against it, nothing could say who wrote it. The four steps below exist so that
+# question is answerable next time, and so an unexpected change STOPS the install instead of being
+# silently overwritten -- an overwrite destroys the only evidence that anything happened.
+$srcGateFile = Join-Path $RepoRoot "scripts\hooks\worktree_gate.ps1"
+$provenance  = Get-GateProvenance $GateDst ${function:Get-GateHash}
+$replacedSha = if (Test-Path -LiteralPath $GateDst) { Get-GateHash $GateDst } else { $null }
+
+if ($provenance -eq "MODIFIED" -and -not $OverwriteUnverifiedGate) {
+    $r = Read-GateReceipt $GateDst
+    throw @"
+REFUSING TO OVERWRITE: the installed gate does not match its own install receipt.
+
+  gate            : $GateDst
+  installed now   : $replacedSha
+  receipt records : $($r.installed_content_sha256)
+  receipt written : $($r.written_at_utc) by $($r.installed_by_repo)
+
+Something wrote this file outside this installer. Overwriting would destroy the only evidence of
+what it was. Inspect it first; then re-run with -OverwriteUnverifiedGate to proceed deliberately.
+
+DO NOT trust the file's timestamp to decide -- Copy-Item carries the SOURCE's LastWriteTime, so the
+installed gate's mtime reflects whichever checkout installed it and not when it was written here.
+"@
+}
+if ($provenance -eq "UNRECORDED") {
+    Write-Warning "installed gate has no install receipt (installed before BACKLOG #1247, or written by something else). Recording its hash as replaced: $replacedSha"
+}
+
+$backup = Backup-GateBeforeWrite $GateDst
+Copy-Item -LiteralPath $srcGateFile -Destination $GateDst -Force
+$receiptPath = Write-GateReceipt -GatePath $GateDst -SourcePath $srcGateFile -RepoRoot $RepoRoot `
+    -HashFn ${function:Get-GateHash} -ReplacedSha $replacedSha -ReplacedProvenance $provenance -BackupPath $backup
 
 @(
     "# Primary checkouts governed by the worktree gate (scripts\hooks\worktree_gate.ps1)."
