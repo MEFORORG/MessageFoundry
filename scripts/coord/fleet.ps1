@@ -813,6 +813,13 @@ if ($Detail) {
     "SEAT EVIDENCE -- $($row.Box)/$($row.SessionKey)"
     "This is EVIDENCE for you to read, not a briefing to paste. Compose the chip yourself."
     "Every line below was recorded $ageTxt and may have expired since. Re-check commands are given."
+    # THE STOP SIGNAL REACHES THIS SURFACE TOO. -Detail exits before the receipt is rendered, so a
+    # reader who was handed a -Detail command and ran only that never learns the roster it came from
+    # refused. This row's own evidence is unaffected -- what is unknown is what ELSE was running.
+    if ($stops.Count -gt 0) {
+        "WARNING: $($stops.Count) STOP CONDITION(S) fired on the roster this row came from, so the FLEET"
+        "around it is not fully enumerated. This row's evidence still stands. Run 'fleet.ps1 -Text' to read them."
+    }
     ""
     "STATE (computed now): $($row.State)   fence=$($row.Fence)"
     if ($row.CheckoutGone) {
