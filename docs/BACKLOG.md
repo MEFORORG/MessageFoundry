@@ -9289,3 +9289,29 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Test-suite durability / Python version readiness. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) -- test-only. The cost is deferred and sharp: on a future Python the module stops being collected, and the loss shows up as a **smaller test count** rather than as a failure, which is the shape least likely to be noticed.
+
+## 1272. the shell-syntax harness resolves whichever bash PATH orders first, and reports a harness failure as 160 content failures
+
+> 🔢 **Filed 2026-08-14 - not started. TWO SEATS RAN THE SAME TEST ON THE SAME BOX ON THE SAME DAY AND GOT OPPOSITE RESULTS.** `tests/test_workflow_shell_syntax.py` writes each workflow shell block to a temp file and checks it with `subprocess.run([bash, "-n", str(probe)])`, where `bash` comes from **`shutil.which("bash")`** and `str(probe)` is a **Windows** path. **Both a Git Bash and a WSL `bash` are installed on this box**, and `shutil.which` returns **whichever the invoking process's `PATH` happens to order first**. Nothing pins it.
+
+> **MEASURED, BOTH RESOLUTIONS, SAME WINDOWS PATH, WITH A REAL-SYNTAX-ERROR NEGATIVE CONTROL:**
+>
+>     C:\Program Files\Git\usr\bin\bash.EXE   valid script -> exit 0     broken script -> exit 2   DISCRIMINATES
+>     C:\windows\system32\bash.exe (WSL stub) valid script -> exit 127   broken script -> exit 127  CANNOT
+>
+> The WSL stub **eats the backslashes** -- `/bin/bash: C:UsersScott...: No such file or directory` -- because it cannot resolve a Windows path. **That is path mangling, not a quoting bug in the test.**
+
+> **THE DURABLE DEFECT IS THE CONFLATION, AND IT SURVIVES WHICHEVER BASH IS FOUND.** `bash -n` exits **2** for a real syntax error and **127** for *cannot find the file*, and **the harness treats any non-zero return as a syntax failure.** So when resolution lands on the WSL stub, **every block fails identically regardless of content** and the run reports **160 syntax errors that do not exist**. A harness failure **impersonates** a content failure. Worse than noise: on that resolution the test **cannot detect a real syntax error at all**, because a genuine defect is indistinguishable from the 160 -- *a control that cannot discriminate is not a weak control, it is not a control*. The general rule is already stated in the fleet role playbooks (`COMMON` 4.3.5): **a crashed instrument must not exit the same code as a real failure.**
+
+> **CORRECTION TO THE DIAGNOSIS AS IT WAS HANDED TO THIS SEAT, and it changes the title.** The report said the test *"cannot check anything on a Windows dev box"* and that `shutil.which("bash")` resolves to the WSL stub. **Re-measured here: it resolves to `C:\Program Files\Git\usr\bin\bash.EXE`, and the test then works correctly, including exit 2 on a planted syntax error.** So the failure is **NOT** universal on Windows -- it is **`PATH`-order-dependent**, which is *worse for diagnosis*: two seats disagree about whether a test is broken, both measure honestly, and **neither reading generalises.** The original diagnosis of the mechanism was exactly right; only its *scope* was overstated.
+
+> **THIS IS NOT ONE MODULE.** The same WSL-stub-cannot-read-a-Windows-path root cause independently produced the two residual failures in `tests/test_installed_coord_hooks.py::test_the_shim_actually_exits_nonzero_with_no_python_on_path[claimHook]`/`[pushHook]`, reported separately by another seat as *"the reinstall will not fix these"*. **Any fix should be made where `bash` is resolved, not per-test.**
+
+> **FIX DIRECTION (not chosen here).** Pin the interpreter rather than discovering it -- prefer an MSYS/Git Bash explicitly, or convert the path when the resolved `bash` is the WSL stub -- **and at minimum separate return code 127 from 2 so a harness failure names itself instead of impersonating content failures.** The last of those is worth doing **even if the resolution is fixed**, because it is what makes the next environment surprise legible.
+
+> **THREE HYPOTHESES ALREADY REFUTED -- do not spend on them.** *`bash` missing*: refuted, it resolves and `bash -c "echo BASH_OK"` exits 0. *A bare CR breaks `bash -n`*: refuted, a CR-terminated line exits 0. *CRLF breaks `bash -n` on multi-line input*: refuted, multi-line CRLF exits 0 with a broken-script control firing at exit 2. **The line-ending theory is dead.**
+
+> **ATTRIBUTION AND ITS STATED LIMIT, which must survive into any later summary.** The 19 failures in the sweep that surfaced this are **PRE-EXISTING**, established by **CONTROLLED REVERT** -- reverting two files to the base commit and re-running the same three modules in the same tree and venv reproduced the identical 19/28/7 triple, then restored byte-identical -- with a second instrument showing zero references to `asvs`/`apply.py` in any failing module. **THE LIMIT: that compared the COUNT TRIPLE and the TAIL of the FAILED list, NOT the full node-id set.** `COMMON` 4.5.6 -- *identity beats count* -- so the attribution is **strong but not a full node-id match**. **The other 18 failures (16 in `test_dependabot_automerge_guardrails.py`, 2 in `test_installed_coord_hooks.py`) are UNDIAGNOSED and no shared cause is asserted.**
+
+**Cluster:** Test-harness portability / instrument discrimination. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (§0) -- dev-box test tooling; **CI (Linux) is unaffected and reports nothing**. The cost is that every seat running a full suite on this box may or may not hit a 160-failure wall depending on its own `PATH`, and while it is hit the module cannot detect the defect it exists to catch.
