@@ -115,12 +115,23 @@ def test_a_startup_failure_after_engine_start_lets_the_process_exit(tmp_path: Pa
         f"exit path:\n{out}"
     )
 
-    # THE TEARDOWN MUST NOT MASK THE STARTUP ERROR. This is the regression test for hoisting the
-    # five teardown handles above the try. Measured by deleting one of them: the finally reaches
-    # those names BEFORE it reaches engine.stop(), so an unbound one raises UnboundLocalError
-    # inside the teardown, aborts it there, and the store never closes -- the hang comes straight
-    # back, with the real error replaced. So the hoist is part of the fix, not a tidiness pass.
+    # The refusal was reported at all. WEAK ON PURPOSE, and labelled so: it does NOT establish that
+    # the startup error survived teardown, because CPython chains. An exception raised inside the
+    # `finally` carries the original as ``__context__``, and Starlette's lifespan handler formats the
+    # WHOLE chain, so this string is present even when the original was replaced.
     assert "deliberate failure in the post-engine startup span" in out, (
-        f"the original startup error did not survive teardown -- something in the finally replaced "
-        f"it:\n{out}"
+        f"the startup failure was not reported at all:\n{out}"
+    )
+
+    # THE TEARDOWN MUST NOT MASK THE STARTUP ERROR -- and this is the assertion that tests it.
+    # Measured with a paired control (Engine.stop patched to raise AFTER a real stop, so the store
+    # still closes and the process still exits promptly):
+    #     clean run  -> "deliberate failure..." present, chaining banner ABSENT
+    #     masked run -> "deliberate failure..." present, chaining banner PRESENT
+    # So the presence check above is true in both and discriminates nothing; the banner is what
+    # separates them. An earlier version of this test asserted only presence and was captioned as
+    # the masking guard -- it would have passed against the very defect it named.
+    assert "During handling of the above exception" not in out, (
+        f"something raised while handling the startup failure, so the operator is shown the "
+        f"teardown's error instead of the real cause:\n{out}"
     )
