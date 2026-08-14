@@ -9214,6 +9214,30 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > - **This pass counts 1,184; this item's own heading and banner say 1,193.** A nine-citation gap between two passes over one corpus, unreconciled. Note that 906 + 28 + 250 sums to **exactly 1,184**, so this pass is at least internally coherent as a partition; that is evidence about consistency, **not** about which pass is right.
 > - **The load-bearing figure is the 11 past EOF.** It is the only one asserting present-tense breakage, it is small enough to check by hand, and it does not depend on the partition. **Re-derive the rest when the detector runs** -- which is the point of building it.
 
+> **AMENDED SAME DAY -- THE 1,193-versus-1,184 GAP IS NOT A DISAGREEMENT AND CANNOT BE ADJUDICATED. THAT IS THE FINDING, AND IT IS SHARPER THAN EITHER NUMBER.** Two corrections and one measurement, all landing after the pricing above was filed.
+>
+> **CORRECTION 1 -- THE ATTRIBUTION ABOVE IS WRONG, and the measuring seat caught it themselves.** The paragraph above says "this pass counts 1,184". **There was no such pass by that seat.** The figures were **RELAYED VERBATIM from an earlier handoff** written by a previous incarnation of it, under a heading that read as first-hand measurement. **A relayed number wearing a measured number's clothes** -- which is the same defect the 923/906 note above was preserved to prevent, one line earlier.
+>
+> **CORRECTION 2 -- A BARE TOTAL OVER THE LIVE LEDGER IS NOT A FACT. It is a fact only when paired with a REF.** Re-measured under a stated rule (a `path:line` citation whose path ends `.py`/`.ts`/`.ps1`/`.sh`/`.js`, across `docs/BACKLOG.md` + `docs/archive/backlog/BACKLOG-CLOSED.md`), and **independently reproduced by a second seat with a separately written matcher -- all four refs agreed to the unit**:
+> ```
+> ref          label                    live   arch   total
+> origin/main  current main              809    381    1190
+> fb72075d     main at queue time        809    381    1190
+> 7883cb41     a stale checkout's main   807    381    1188
+> 0b6ccc47     PR #394 branch            809    381    1190
+> ```
+> **1,193 and 1,184 were both recorded WITHOUT a ref, so there is no shared denominator to compare them against. They are unadjudicable as posed** -- not one right and one wrong.
+>
+> **THE RULE IS VALIDATED ON THE STABLE HALF, which is why the drift on the live half is trustworthy.** The **archived** file returns **381 at every ref** -- exactly the figure this item already carries. Archived items barely move, so reproducing the item's own number there to the unit is good evidence the re-measurement's rule matches this item's rule. **The live half provably drifts across refs** (807 against 809), and that is the whole point.
+>
+> **THREE INDEPENDENT DEMONSTRATIONS OF THIS ITEM'S OWN THESIS, all measured the day after it was filed.** (1) The live count moved **809 to 819 within a single session** -- the four items filed by one seat added **ten** citations. (2) A sibling item's citations **moved by 74 lines** on a PR head before that item was a day old. (3) The `807`/`809` split above **is** the drift, caught between two refs of the same branch. **This item does not need a hypothetical to justify itself.**
+>
+> **ONE THING UNEXPLAINED, STATED RATHER THAN SMOOTHED.** This item's text says **812** live; the re-measurement returns **809** at every ref tried, including one near its own filing. **Delta 3, live-file only.** The archived agreement argues against a whole-rule difference but does not exclude a live-only one. **1,190 is NOT proposed as a replacement for either earlier figure** -- publishing a third bare total would repeat the exact error this amendment records.
+>
+> **AND IT SHARPENS THE BUILD RECOMMENDATION, in the same direction as the printed-silence rule: THE DETECTOR MUST PRINT ITS REF AND ITS DENOMINATOR, not only its findings.** A detector reporting *"N citations need re-checking"* with neither is this same defect one level up -- a number nobody can reproduce or compare, **which is how this gap opened in the first place.**
+>
+> **Nothing here touches the 11-past-EOF figure.** It is independent of the partition, verifiable by hand, and remains the one present-tense breakage claim.
+
 **Cluster:** Ledger tooling / evidence integrity. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) -- documentation accuracy. The cost is that the ledger's own evidence decays invisibly, and the decay is fastest after exactly the kind of broad, correct, well-reviewed change nobody would think to re-check it against.
 
