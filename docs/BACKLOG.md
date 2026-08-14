@@ -4127,7 +4127,19 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 > **THE PRE-EXISTING CONDITION ABOVE NOW HAS A NUMBER: `#1257` (value 8, difficulty 5, not started) -- "an exception after `engine.start()` unwinds nothing, so a startup refusal hangs the process instead of exiting". Cross-linked 2026-08-14 (dispatcher) so the rider above stops being a warning nobody can act on.** The rider states the mechanism; it is not restated here.
 >
-> **ORDERING RULING: BUILD #1020 NOW, BUT IT MUST NOT CLOSE BEFORE `#1257` LANDS.** The reasoning is the rider's own, sharpened by one measured fact: **option (b) adds a SECOND refusal to a code path whose refusals are already known to hang.** The existing security-channel refusal sits at `__main__.py:2314-2322` and is exactly that path. So building this correctly, and landing it alone, **would make the product worse than leaving the defect in** -- an operator can see a wrong readiness answer, and cannot see a process that never finishes starting.
+> **ORDERING RULING: BUILD #1020 NOW; WHETHER IT MUST WAIT FOR `#1257` DEPENDS ON WHERE THE CHECK IS PLACED. NARROWED SAME HOUR -- the first version of this ruling asserted the dependency unconditionally and was too strong.**
+>
+> **THE TWO PLACEMENTS ARE DIFFERENT CODE PATHS, MEASURED.** `_serve` spans `__main__.py:1042-2833` and is a **PREFLIGHT that runs BEFORE the ASGI lifespan** -- its own comment at `:1541` says *"the Engine loads it inside the ASGI lifespan, well"* after. It holds **32 `return 2` sites**, and the existing security-channel refusal at `:2314-2322` reaches one at `:2329`: **a clean pre-engine process exit.** `#1257`'s hang is *"an exception after `engine.start()`"*, **inside the lifespan** -- and `engine.start()` does not appear in `__main__.py` at all. **So the hanging path and the existing refusal are not the same path.**
+>
+> **THEREFORE:** a **LIFESPAN-PLACED** check lands on the hanging path and genuinely gates on `#1257`. A **PREFLIGHT-PLACED** check refuses with the same clean `return 2` as the SMTP gate beside it and **has no `#1257` dependency at all.**
+>
+> **THE HAZARD IS STILL REAL AND THIS IS WHY THE RIDER READS AS IT DOES.** The check must know whether an **enabled Administrator has a deliverable address** -- that is a **STORE READ**, and the store is **not open in the preflight** (`_serve` has settings only: no `open_store`, no `AuthService`). **So the natural implementation is the lifespan, which IS the hanging path.** The lane that wrote the rider evidently assumed that placement and was right on that assumption.
+>
+> **IT IS A DESIGN FORK, NOT A BLOCKED ITEM.** Preflight placement costs one extra short-lived read-only store open and buys independence from `#1257`; lifespan placement costs nothing extra and inherits the dependency. **The building lane recommends PREFLIGHT and is writing an ADR.** If preflight proves unworkable, the fallback is lifespan **and the `#1257` dependency returns** -- so the cross-link above stays live either way.
+>
+> **DO NOT WRITE THIS FORK AS "(a) VERSUS (b)".** The owner's settled ruling on this item is already called **option (b)** (*gate startup on a deliverable channel*), and a second (a)/(b) pair over the same item is precisely the label collision `#1242` exists to record. **Name them by placement: PREFLIGHT or LIFESPAN.**
+>
+> **UNCHANGED:** build now, and do not close on the gate landing until the refusal is demonstrated to terminate under `uvicorn` -- which the rider required before either placement was on the table, and which preflight placement makes easy rather than moot.
 >
 > **WHY BUILD IT ANYWAY RATHER THAN PARK IT.** The gate is needed on any ordering, the owner's option (b) ruling is settled, and the work does not conflict with `#1257`'s fix -- one adds a refusal, the other makes refusals terminate. **Parking it would idle a lane against an item nobody has claimed.** The constraint is on CLOSURE and LANDING ORDER, not on the build.
 >
