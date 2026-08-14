@@ -74,7 +74,7 @@ authorization/resource server, enforcing scopes) is the system-of-record's job a
 requires the **unbuilt inbound facade (the deferred, not-yet-written ADR 0023)**. This ADR builds **only** the machine-to-machine client
 slice — `client_credentials` + signed-JWT assertion — which is exactly the no-human path.
 
-## Decision (proposed)
+## Decision (accepted and built -- see Status)
 
 A pluggable **SMART Backend Services token provider**, wired through existing seams. The FHIR/REST destination
 gains an optional token provider that, when present, supplies a fresh bearer on every request; everything else
@@ -169,14 +169,16 @@ The mint + token `POST` happen inside `send()`'s `asyncio.to_thread` worker
 ([fhir.py:322](../../messagefoundry/transports/fhir.py), [rest.py:208](../../messagefoundry/transports/rest.py))
 — **past the staged-queue boundary**, exactly where ADR 0015/0018 mint the WS-Security nonce and the JWS
 signature. A re-run/retry re-mints the token; routers and transforms stay pure and the **at-least-once
-invariant holds** (ADR 0001). **Re-mint on 401 (a *new* `_post` branch):** today `_post` has **no** 401-specific
-handling — it dead-letters a 401 as a *permanent* `NegativeAckError` (rest.py via the "other 4xx" arm,
-[rest.py:264-274](../../messagefoundry/transports/rest.py); fhir.py via `_classify_fhir`,
-[fhir.py:378-387](../../messagefoundry/transports/fhir.py)); only `_probe` labels a 401/403 "check credentials"
-([fhir.py:346-348](../../messagefoundry/transports/fhir.py), [rest.py:232-234](../../messagefoundry/transports/rest.py)).
-The backstop therefore **adds** a 401 branch to `_post`: when a token provider is present, invalidate the cached
+invariant holds** (ADR 0001). **Re-mint on 401 (a *new* `_post` branch). THIS SHIPPED; the present tense below described the
+pre-build state.** When this was written `_post` had **no** 401-specific handling and dead-lettered a 401 as a
+*permanent* `NegativeAckError` on both transports, with only `_probe` labelling a 401/403 "check credentials".
+The backstop **added** a 401 branch to `_post`: when a token provider is present, invalidate the cached
 token and raise a *transient* `DeliveryError` so the next retry fetches a fresh one (covering a token that
-expired between mint and use). `_probe` ([fhir.py:334](../../messagefoundry/transports/fhir.py)) likewise fetches
+expired between mint and use). **Both branches are built** -- one in `rest.py` and one in `fhir.py`.
+
+**Do not grep for a single spelling to confirm it.** The two branches do not share one: the REST arm tests a
+`status` variable while the FHIR arm tests the exception's `code`. A search for either alone returns zero on
+the other file and reads as not-shipped -- which is how this paragraph's staleness survived one check. `_probe` ([fhir.py:334](../../messagefoundry/transports/fhir.py)) likewise fetches
 a token before its metadata GET so reachability reflects real credentials.
 
 ### 5. The token endpoint is a second egress host — gate it (security parity)
@@ -279,7 +281,11 @@ so this is a **secret**-handling rule (the token is a bearer credential), parall
 - **Symmetric client authentication** (`client_secret_basic`/`client_secret_post`) — Backend Services mandates
   asymmetric; a symmetric fallback for non-SMART OAuth2 servers is a possible later add, not in scope.
 
-## To resolve on acceptance
+## To resolve on acceptance -- RESOLVED; kept as the record of what acceptance turned on
+
+**This list was answered when the ADR was accepted and built (see Status). It is retained because the
+questions record what the decision hinged on, not because any of them is outstanding.** Read it as
+history; derive current behaviour from the code, not from these items.
 
 - **Confirm the ADR number is 0024** and the **client-only** scope boundary (App Launch + server facade stay
   out; the server facade is the separate, deferred ADR 0023); add the `Proposed` row to
