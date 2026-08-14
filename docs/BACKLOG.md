@@ -9305,13 +9305,40 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **CORRECTION TO THE DIAGNOSIS AS IT WAS HANDED TO THIS SEAT, and it changes the title.** The report said the test *"cannot check anything on a Windows dev box"* and that `shutil.which("bash")` resolves to the WSL stub. **Re-measured here: it resolves to `C:\Program Files\Git\usr\bin\bash.EXE`, and the test then works correctly, including exit 2 on a planted syntax error.** So the failure is **NOT** universal on Windows -- it is **`PATH`-order-dependent**, which is *worse for diagnosis*: two seats disagree about whether a test is broken, both measure honestly, and **neither reading generalises.** The original diagnosis of the mechanism was exactly right; only its *scope* was overstated.
 
-> **THIS IS NOT ONE MODULE.** The same WSL-stub-cannot-read-a-Windows-path root cause independently produced the two residual failures in `tests/test_installed_coord_hooks.py::test_the_shim_actually_exits_nonzero_with_no_python_on_path[claimHook]`/`[pushHook]`, reported separately by another seat as *"the reinstall will not fix these"*. **Any fix should be made where `bash` is resolved, not per-test.**
+> **THIS IS NOT ONE MODULE, AND A SINGLE-VARIABLE CONTROL SHOWS ONE CAUSE ACCOUNTS FOR EVERY FAILURE IN THE SWEEP.** Same tree, same commit, same interpreter, same three modules -- **only the `PATH` order changed:**
+>
+>     bash resolved to                                  result
+>     C:\windows\system32\bash.EXE       (WSL stub)     19 failed, 28 passed, 7 skipped
+>     C:\Program Files\Git\usr\bin\bash.EXE (Git Bash)  47 passed,  7 skipped,  ZERO failures
+>
+> **19 + 28 = 47 -- a perfect complement.** The nineteen that failed are exactly the nineteen that then pass; runtime also fell from ~44s to 6.3s, because the WSL failures were the slow ones. **So all nineteen share ONE root cause, and it is shell RESOLUTION rather than content.** *(This supersedes an earlier "1 diagnosed, 18 undiagnosed, no shared cause asserted", retracted by its own author once the control was run and replaced here rather than left standing, because it understated the item.)*
+>
+> **It also explains a 100% failure rate that a separate line of investigation had emptied without refilling.** CRLF was the standing hypothesis for the 160-of-160; it was tested and **refuted** (multi-line CRLF passes `bash -n`, with a control firing at exit 2 on a genuinely broken script) -- which killed the theory **but supplied no replacement**. The control supplies it: **the 160-of-160 was never about the blocks at all.** *A 100% failure rate is an instrument signature*, and the instrument was the resolved shell.
+
+> **TWO DOWNSTREAM SIGNATURES, ONE CAUSE -- stated so nobody splits them back apart:**
+>
+>     127, "No such file or directory"   test_workflow_shell_syntax, test_installed_coord_hooks
+>                                        WSL cannot resolve the Windows path it is handed
+>     rc=1, "aborted under bash -e"      test_dependabot_automerge_guardrails
+>                                        the body DOES execute under WSL, then aborts
+>
+> Different symptoms, **same resolution point.** The cross-module link was reached **independently by two seats within minutes, from opposite directions** -- one from the shell-syntax module, one from the coord-hooks shim showing the identical backslash-eaten path -- which is stronger evidence than either seat asserting it alone.
+
+> **THE FIX BELONGS WHERE THE INTERPRETER IS RESOLVED, NOT PER-TEST -- AND PINNING `bash` ALONE IS THE TRAP:**
+>
+>     tests/test_workflow_shell_syntax.py:110           skipif(shutil.which("bash") is None, ...)
+>     tests/test_dependabot_automerge_guardrails.py:145 bash = shutil.which("bash")
+>     tests/test_installed_coord_hooks.py:666           sh   = shutil.which("sh") or shutil.which("bash")
+>
+> **The third tries `sh` FIRST.** A fix that pins only `bash` repairs two of the three and leaves the coord-hooks module resolving `sh` through the same unpinned discovery -- **and it would PRESENT AS A SUCCESSFUL FIX, because two-thirds of the failures disappear.** That is the shape worth guarding against here: a partial fix that looks total because the residue is small. **PIN THE SHELL, NOT THE NAME.**
 
 > **FIX DIRECTION (not chosen here).** Pin the interpreter rather than discovering it -- prefer an MSYS/Git Bash explicitly, or convert the path when the resolved `bash` is the WSL stub -- **and at minimum separate return code 127 from 2 so a harness failure names itself instead of impersonating content failures.** The last of those is worth doing **even if the resolution is fixed**, because it is what makes the next environment surprise legible.
 
 > **THREE HYPOTHESES ALREADY REFUTED -- do not spend on them.** *`bash` missing*: refuted, it resolves and `bash -c "echo BASH_OK"` exits 0. *A bare CR breaks `bash -n`*: refuted, a CR-terminated line exits 0. *CRLF breaks `bash -n` on multi-line input*: refuted, multi-line CRLF exits 0 with a broken-script control firing at exit 2. **The line-ending theory is dead.**
 
-> **ATTRIBUTION AND ITS STATED LIMIT, which must survive into any later summary.** The 19 failures in the sweep that surfaced this are **PRE-EXISTING**, established by **CONTROLLED REVERT** -- reverting two files to the base commit and re-running the same three modules in the same tree and venv reproduced the identical 19/28/7 triple, then restored byte-identical -- with a second instrument showing zero references to `asvs`/`apply.py` in any failing module. **THE LIMIT: that compared the COUNT TRIPLE and the TAIL of the FAILED list, NOT the full node-id set.** `COMMON` 4.5.6 -- *identity beats count* -- so the attribution is **strong but not a full node-id match**. **The other 18 failures (16 in `test_dependabot_automerge_guardrails.py`, 2 in `test_installed_coord_hooks.py`) are UNDIAGNOSED and no shared cause is asserted.**
+> **ATTRIBUTION AND ITS STATED LIMIT, which must survive into any later summary.** The 19 failures in the sweep that surfaced this are **PRE-EXISTING**, established by **CONTROLLED REVERT** -- reverting two files to the base commit and re-running the same three modules in the same tree and venv reproduced the identical 19/28/7 triple, then restored byte-identical -- with a second instrument showing zero references to `asvs`/`apply.py` in any failing module. **THE LIMIT: that compared the COUNT TRIPLE and the TAIL of the FAILED list, NOT the full node-id set.** `COMMON` 4.5.6 -- *identity beats count* -- so the attribution is **strong but not a full node-id match**. *(An earlier form of this paragraph recorded the other 18 failures -- 16 in `test_dependabot_automerge_guardrails.py`, 2 in `test_installed_coord_hooks.py` -- as **UNDIAGNOSED with no shared cause asserted**. **That is superseded by the single-variable control above**, which accounts for all 19. It is noted rather than deleted because the honest sequence matters: the shared cause was **established by an experiment**, not assumed from adjacency, and the author of the original caveat retracted it themselves once the control ran.)*
+
+> **WHAT IS STILL *NOT* CLAIMED, and these limits are the authors' own:** that **Git Bash is the correct resolution to pin** -- that is a design call nobody here has made; that **CI is affected** -- it is Linux and resolves one shell, so it reports nothing either way; and that this extends **beyond these three modules and their 19 failures** -- the full 12,516-test suite has **not** been re-run under a pinned shell.
 
 **Cluster:** Test-harness portability / instrument discrimination. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) -- dev-box test tooling; **CI (Linux) is unaffected and reports nothing**. The cost is that every seat running a full suite on this box may or may not hit a 160-failure wall depending on its own `PATH`, and while it is hit the module cannot detect the defect it exists to catch.
