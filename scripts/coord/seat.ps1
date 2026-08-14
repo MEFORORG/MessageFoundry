@@ -709,6 +709,11 @@ function Add-Attribution {
     # The cheap half of the two steps above: one comparison per entry, so it can run inside the
     # critical section where `episodeStart` is finally known. Key ORDER is fixed here rather than in
     # the scan, because it is what the record stores.
+    # $EpisodeStart AND $Entries ARE DELIBERATELY UNTYPED, and rawAt is passed through untouched: a
+    # [string] parameter culture-casts the [DateTime] ConvertFrom-Json hands back, which is the exact
+    # loss ConvertTo-UtcInstant exists to stop (see the note above Get-Attribution). Carrying the raw
+    # value from the scan to here rather than the formatted one is what keeps that true across the
+    # split.
     param($Entries, $EpisodeStart, [string[]]$Keys)
     $out = @()
     foreach ($e in @($Entries)) {

@@ -880,8 +880,10 @@ if ($Detail) {
     # most needs to know whether the object survived it.
     $stashSha = [string](Get-RecField $rec 'stashSha' '')
     $stashRef = [string](Get-RecField $rec 'stashRef' '')
+    $stashObjectGone = $false
     if ($stashSha) {
         $objSha = Invoke-Git -Dir $repo -GitArgs @('rev-parse', '--verify', '--quiet', "$stashSha^{commit}")
+        $stashObjectGone = (-not $objSha)
         $refSha = if ($stashRef) { Invoke-Git -Dir $repo -GitArgs @('rev-parse', '--verify', '--quiet', $stashRef) } else { $null }
         if (-not $objSha) {
             "  stash commit (TRACKED edits only): $stashSha"
@@ -902,8 +904,14 @@ if ($Detail) {
             "    git -C `"$($row.Worktree)`" stash apply $stashSha"
         }
     }
+    # `stashCovers` is the WRITER's word for what the stash held when it was made. Printed bare under a
+    # "no longer resolves" verdict it reads as a live promise of recovery, which is the exact
+    # over-promise this block exists to stop, so the reader's own measurement qualifies it.
     $stashCovers = Get-RecField $rec 'stashCovers'
-    if ($null -ne $stashCovers) { "  stash covers: $stashCovers" }
+    if ($null -ne $stashCovers) {
+        if ($stashObjectGone) { "  stash covers: $stashCovers -- AS RECORDED; the object backing it is gone (above)" }
+        else { "  stash covers: $stashCovers" }
+    }
     $unpushed = Get-RecField $rec 'unpushed'
     if ($unpushed) { "  unpushed commits vs $(Get-RecField $unpushed 'base' '?'): $(Get-RecField $unpushed 'count' '?')" }
     else { "  unpushed: NO-UPSTREAM (nobody has looked; this is not the same as zero)" }
@@ -1021,7 +1029,18 @@ if ($Json) {
     if (-not $Raw) {
         $outReceipt = [ordered]@{}
         foreach ($k in $receipt.Keys) {
-            $outReceipt[$k] = if ($k -eq 'seatsDir') { Protect-HomePath ([string]$receipt[$k]) } else { $receipt[$k] }
+            # ASSIGN THE VALUE, DO NOT ASSIGN THE OUTPUT OF AN `if`. A statement's output stream
+            # UNROLLS an array, so an EMPTY one contributes zero objects and the assignment lands
+            # $null. MEASURED here, on the one field where it matters most: `-Json -Raw` emitted
+            # "stopConditions": [] while `-Json` -- the DEFAULT, and the form most likely to be piped
+            # somewhere -- emitted "stopConditions": null for the same run, purely because it went
+            # through this loop. A machine reader then cannot tell "no stop conditions" from "this
+            # instrument does not report stop conditions", which is this module's own defect class
+            # (and PowerShell's `@($null).Count -eq 1` makes the miscount agree with a plausible
+            # wrong answer, as it did once already in this layer).
+            $v = $receipt[$k]
+            if ($k -eq 'seatsDir') { $v = Protect-HomePath ([string]$v) }
+            $outReceipt[$k] = $v
         }
         foreach ($r in $outRows) { $r.Worktree = Protect-HomePath ([string]$r.Worktree) }
         foreach ($r in $outLive) { $r.Worktree = Protect-HomePath ([string]$r.Worktree) }
