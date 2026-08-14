@@ -108,12 +108,27 @@ async def _call(
 #   IT DOES     -- an exception raised during lifespan startup, driven through
 #                  `app.router.lifespan_context`, does not unwind. That is a pre-existing property
 #                  of this lifespan; the gate is merely the first thing to raise in that window.
-#   IT DOES NOT -- say what uvicorn does. Production startup failure goes through uvicorn's own
-#                  path, which is UNMEASURED here. The refusal may well exit cleanly in `serve`.
+#   IT DOES NOT -- say what uvicorn does. That was UNMEASURED when this note was first written.
 #
-# So the gate's REFUSAL PATH IS UNVERIFIED under the runner that actually ships, and a hang there
-# would be worse than the defect #1020 fixes -- a silent notice at least leaves the server running
-# and legible. Verify under uvicorn before relying on it, and file the teardown behaviour separately.
+# IT HAS SINCE BEEN MEASURED, UNDER UVICORN, AND THE ANSWER IS BOTH HALVES:
+#
+#   uvicorn REFUSES CORRECTLY AND LEGIBLY. It prints the full RuntimeError -- including the
+#   operator-facing remedy -- then `ERROR: Application startup failed. Exiting.` and raises
+#   SystemExit(3). No socket is served. The gate does what #1020 asks.
+#
+#   THE PROCESS THEN DOES NOT EXIT. Measured directly rather than through a wrapper: the python
+#   process was still alive 90 seconds after printing "Exiting.", and had to be killed. Consistent
+#   with the partial-startup teardown above -- `engine.start()`, the upload-retention runner and the
+#   security notifier are all running when the gate raises, and something among them keeps a
+#   non-daemon thread alive.
+#
+# SO THE FAILURE MODE IS A HUNG REFUSAL, NOT A SILENT ONE, and that distinction decides severity.
+# An operator reading a console sees the correct error. A SUPERVISOR does not: NSSM, systemd or a
+# container runtime sees a process that started and never exited -- a service that is running and
+# dead, which is the state a restart policy cannot detect and will not recover.
+#
+# THIS BLOCKS #1020 FROM LANDING AS WRITTEN. The refusal must terminate the process, not merely
+# refuse to serve. The teardown behaviour is a separate, pre-existing defect and is filed as such.
 # ---------------------------------------------------------------------------------------------
 
 
