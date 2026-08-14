@@ -1847,7 +1847,8 @@ def PassThrough() -> ConnectionSpec:
     its transformed message into this inbound (naming it like an outbound), and the engine re-ingresses
     that body as a **new, independent inbound message** on this channel, routed by this inbound's own
     Router. This is the Corepoint ``PT_*`` pattern: one logical feed fans out across internal connectors
-    and re-routes deeper (e.g. ``PT_000000_ADT_2``) without an external hop.
+    and re-routes deeper (e.g. ``PT_<site>_ADT_2``, where ``<site>`` is the estate's site code) without
+    an external hop.
 
     It is an ordinary ``inbound(...)`` otherwise: declare its ``router`` (which re-routes the message)
     and ``content_type`` (``hl7v2`` → :class:`~messagefoundry.parsing.message.Message`; ``x12``/``text``/

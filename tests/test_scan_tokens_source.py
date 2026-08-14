@@ -41,6 +41,11 @@ _SETUP_SCRIPT = _ROOT / "scripts" / "dev" / "setup-leak-gate.ps1"
 #: collision the convention exists to avoid.
 _STANDIN = "SITEA"
 
+#: A synthetic site code (the shipped example's non-real ``99`` prefix plus four digits), assembled
+#: from parts for the same reason the routable IP below is: a whole literal in an identifier-shaped
+#: probe is itself a match for the prefix-free _ESTATE_ID_SHAPE detector, and this file is scanned.
+_SYNTH_CODE = "99" + "0123"
+
 # A routable probe IP, built from parts so no literal dotted-quad appears in this tracked file --
 # including in this comment, which is scanned like any other line.
 _ROUTABLE_IP = ".".join(["8", "8", "8", "8"])
@@ -109,11 +114,16 @@ def test_structural_only_scan_file_flags_routable_ip(
     assert any(_ROUTABLE_IP in h for h in ctx)
 
 
-def test_committed_files_contain_no_routable_ip(
+def test_committed_files_carry_no_structural_forbidden_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Scan the committed scanner + its .example with the structural detector: any routable IP baked
-    # into them would surface here. (Their only IPs are RFC5737/RFC1918 allow-listed prefixes.)
+    # Scan the committed scanner + its .example with EVERY structural detector -- the assertion is an
+    # empty hit list, not an IP-specific one, and the previous name (...contain_no_routable_ip) named
+    # one detector for a check that covers all of them. That mismatch matters in the direction it
+    # fails: this is what catches the gate self-tripping on its own illustration of a shape, and a
+    # reader scanning for such a guard would not have recognised it under the old name.
+    # (The committed IPs are RFC5737/RFC1918 allow-listed prefixes; the site-code and estate-shape
+    # examples both use the house ``<site>`` placeholder.)
     mod = _load(None, monkeypatch)
     for path in (_SCANNER, _EXAMPLE):
         assert mod.scan_file(path) == [], f"{path.name} carries structural forbidden content"  # type: ignore[attr-defined]
@@ -140,7 +150,9 @@ def test_example_tokens_match_as_specified(monkeypatch: pytest.MonkeyPatch) -> N
     # Estate substring inside a field-like body.
     assert any("estate token" in r for r in mod.scan_text("PID|exampleco|x", include_estate=True))  # type: ignore[attr-defined]
     # Boundary-aware site-code file detector.
-    assert mod._SITE_CODE_FILE.search("PT_990123_ADT") is not None  # type: ignore[attr-defined]
+    # Assembled, not written whole: ``PT_<digits>_ADT`` is a live match for the scanner's own
+    # prefix-free _ESTATE_ID_SHAPE detector, and this file is scanned by the gate it tests.
+    assert mod._SITE_CODE_FILE.search(f"PT_{_SYNTH_CODE}_ADT") is not None  # type: ignore[attr-defined]
     assert mod._SITE_CODE_FILE.search("ab990123cd") is None  # type: ignore[attr-defined]
 
 
@@ -973,3 +985,225 @@ def test_estate_only_token_still_caught_by_the_file_scan(
     hits = mod.scan_file(f, "tests/lanes.py")  # type: ignore[attr-defined]
     assert any("estate token" in h for h in hits)
     assert not any("zorpnet" in h.lower() for h in hits), "reason-only"
+
+
+# --------------------------------------------------------------------------------------------------
+# Prefix-free estate-identifier SHAPE backstop (BACKLOG #321). The site-code detectors are keyed on a
+# numeric prefix loaded from the private token source, so they are OFF for any estate whose prefix
+# nobody has added -- and that is the estate that leaks. This one is keyed on structure, so it is live
+# with no token source at all, which is what these tests establish: every one asserts TOKENS_PRESENT
+# is False first, so a pass can never be borrowed from a loaded prefix.
+#
+# Fixtures are ASSEMBLED, never written whole: this file is scanned by the gate it tests, so a literal
+# probe would make the suite trip its own detector.
+# --------------------------------------------------------------------------------------------------
+
+_SHAPE_REASON = "six-digit run inside an underscore-joined identifier"
+
+
+def _shape_hits(mod: ModuleType, tmp_path: Path, content: str, rel: str) -> list[str]:
+    """``scan_file`` hits for one line of content, at an explicit repo-relative path.
+
+    The path is always given: the default is the ABSOLUTE tmp path, which would put the machine's
+    directory layout into the very argument the path arm judges.
+    """
+    f = tmp_path / "probe.txt"
+    f.write_text(content, encoding="utf-8")
+    hits: list[str] = mod.scan_file(f, rel)  # type: ignore[attr-defined]
+    return hits
+
+
+def test_estate_identifier_shape_is_flagged_without_any_token_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The #321 defect, stated as a test: a required merge context exited 0 on a tracked file carrying
+    a real site code, because the prefix that would have caught it was not in the loaded list.
+
+    Both identifier forms the audit recorded are covered -- a ported feed module name and a transform
+    function name.
+    """
+    mod = _load(None, monkeypatch)
+    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"  # type: ignore[attr-defined]
+    assert mod._SITE_CODE_FILE.search(_SYNTH_CODE) is None, (  # type: ignore[attr-defined]
+        "precondition: the PREFIX-keyed detector is off, so only the shape can be doing the work"
+    )
+    for content in (
+        f"see IB_FILE_HR_Materials_{_SYNTH_CODE}_MFN.py for the mapping\n",
+        f"def xform_{_SYNTH_CODE}_to_erp_mfn(msg):\n",
+    ):
+        hits = _shape_hits(mod, tmp_path, content, "docs/notes.md")
+        assert any(_SHAPE_REASON in h for h in hits), content
+        # Reason-only: the identifier IS the disclosure, and this gate fails into a world-readable
+        # Actions log on the public repo.
+        assert not any(_SYNTH_CODE in h for h in hits), content
+
+
+def test_estate_identifier_shape_catches_the_leading_and_embedded_forms(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Both regex arms must be reachable. The code-leading arm is not decoration: it is the only one
+    that can see a code whose preceding identifier segment starts with a DIGIT."""
+    mod = _load(None, monkeypatch)
+    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"  # type: ignore[attr-defined]
+    for content in (
+        f"module {_SYNTH_CODE}_mfn_router.py\n",  # code-leading, dotted suffix
+        f"conn = 'IB_2ND_{_SYNTH_CODE}_MFN'\n",  # digit-led neighbour, reachable only by that arm
+        f"a feed named IB_FEED_{_SYNTH_CODE}.py in prose\n",  # code-trailing before a dot
+    ):
+        hits = _shape_hits(mod, tmp_path, content, "docs/notes.md")
+        assert any(_SHAPE_REASON in h for h in hits), content
+
+
+def test_ordinary_digit_runs_do_not_trip_the_estate_identifier_shape(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NEGATIVE CONTROL, and the one that decides whether this detector survives contact with a
+    required merge context.
+
+    Without it, a rule that flagged every digit run would pass every assertion above and look
+    identical to a working one -- and it would be worse than the hole it closes, because a gate that
+    cries wolf gets bypassed. Every class below was measured on the tracked tree: a BARE delimited
+    six-digit run alone matches 1,414 lines across 152 files, and the underscore anchor is what
+    removes all of them.
+    """
+    mod = _load(None, monkeypatch)
+    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"  # type: ignore[attr-defined]
+    for content, expected in (
+        (f"standalone {_SYNTH_CODE} here\n", False),  # bare delimited run: the 637-line class
+        (f"hash aff07c{_SYNTH_CODE}ff\n", False),  # embedded in a hex digest
+        (f"dob 20{_SYNTH_CODE}\n", False),  # digit-prefixed
+        (f"ratio 75.{_SYNTH_CODE}\n", False),  # decimal fraction
+        (f"ver 1.{_SYNTH_CODE}.2\n", False),  # dotted version
+        ("ADR_0093 and BACKLOG_1234 and HANDBACK_2026\n", False),  # width 4: the repo's real mass
+        ("error_2812 = module_1230\n", False),  # width 4 again, arbitrary test ids
+        ("IB_CS_00000 OB_00007_02\n", False),  # width 5, harness zero-padded names
+        ("x_1234567 and 1234567_x\n", False),  # width 7
+        ("chunk_size = 1_000_000\n", False),  # Python numeric separators, no letter segment
+        ("mask = 0x_123456\n", False),  # hex literal
+        ("oasis-200401-wss-wssecurity-secext-1.0.xsd\n", False),  # hyphen-joined: 11 measured hits
+        ("45 CFR 164-312 sandbox depth-100000\n", False),  # hyphen-joined citations/constants
+        ("MSH|^~&|A|B|C|D|20260814120000||ADT^A01|ID|P|2.5\n", False),  # HL7 timestamp
+        ("PID|1||123456^^^MRN||DOE^JANE\n", False),  # HL7 caret-delimited field
+        ("WRITELOG   1234 ms   993496 tasks\n", False),  # the DMV soak row the allowlist excuses
+        ("schema_version_20260814 = 1\n", False),  # eight-digit dated identifier
+        (
+            "PT_<site>_ADT_2 is the placeholder form\n",
+            False,
+        ),  # the house stand-in must stay writable
+        (f"conn = 'PT_{_SYNTH_CODE}_ADT_2'\n", True),  # the control: the real shape still fires
+    ):
+        hits = _shape_hits(mod, tmp_path, content, "docs/notes.md")
+        assert any(_SHAPE_REASON in h for h in hits) is expected, content
+
+
+def test_estate_identifier_shape_is_not_gated_by_the_site_skip_suffixes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The skip sets exist because BARE digit runs storm in lock/SVG/password files. The underscore
+    anchor already removes that storm (measured: zero matches across those files), so applying the
+    skip here would buy nothing and open a hole -- a flame-graph SVG's frame labels are FUNCTION
+    NAMES, and a transform function name is one of the two forms this detector exists for."""
+    mod = _load(None, monkeypatch)
+    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"  # type: ignore[attr-defined]
+    for name in ("requirements.lock", "art.svg", "common_passwords.txt"):
+        f = tmp_path / name
+        f.write_text(f"def xform_{_SYNTH_CODE}_to_erp_mfn\n", encoding="utf-8")
+        hits = mod.scan_file(f, f"docs/{name}")  # type: ignore[attr-defined]
+        assert any(_SHAPE_REASON in h for h in hits), name
+        # ...while the site-code detectors' own skip is unchanged: a BARE run in these files is still
+        # waved through, which is the asymmetry this test pins.
+        f.write_text(f"standalone {_SYNTH_CODE} here\n", encoding="utf-8")
+        assert mod.scan_file(f, f"docs/{name}") == [], name  # type: ignore[attr-defined]
+
+
+def test_an_estate_shaped_file_NAME_is_flagged_by_the_path_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Half of what #321 found was a FILENAME, and a module need not repeat its own name in its text.
+
+    The binary case is the sharp one, and it is why the check sits before the read: a DICOM or PDF
+    sample named with a site code is exactly as much of a leak as the .py beside it, and the content
+    scanner drops binaries unread.
+    """
+    mod = _load(None, monkeypatch)
+    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"  # type: ignore[attr-defined]
+    text = tmp_path / "innocuous.py"
+    text.write_text("HANDLERS = ()\n", encoding="utf-8")
+    hits = mod.scan_file(text, f"samples/config/IB_FILE_HR_{_SYNTH_CODE}_MFN.py")  # type: ignore[attr-defined]
+    assert len(hits) == 1, hits
+    assert ":0:" in hits[0], "a path-level finding has no line to point at and must say so"
+
+    blob = tmp_path / "scan.dcm"
+    blob.write_bytes(b"\x00\x01\x02 not text at all")
+    assert mod.scan_file(blob, "samples/dicom/scan.dcm") == []  # type: ignore[attr-defined]
+    assert len(mod.scan_file(blob, f"samples/dicom/{_SYNTH_CODE}_scan.dcm")) == 1  # type: ignore[attr-defined]
+
+
+def test_ordinary_paths_do_not_trip_the_estate_identifier_shape(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NEGATIVE CONTROL for the path arm. It is the arm with the smallest escape hatch -- the
+    ALLOWLIST is a per-line CONTENT veto and cannot reach a path finding, so the only remedy for a
+    false positive here is renaming a file. Measured zero over all tracked paths.
+
+    Half the entries below carry a SIX-DIGIT RUN on purpose. No tracked path does today (measured: 0
+    of 1955), so a table drawn only from real paths would hold under a detector with its anchor
+    deleted -- it would be a control that cannot fail, testing the corpus rather than the rule. These
+    are the near-miss shapes the repo's own conventions would produce first: a compressed benchmark
+    date, an eight-digit dated identifier, a hex-digest fixture name.
+    """
+    mod = _load(None, monkeypatch)
+    f = tmp_path / "x.py"
+    f.write_text("clean\n", encoding="utf-8")
+    for rel, expected in (
+        ("docs/adr/0166-sandbox-child-stderr-capture.md", False),
+        ("messagefoundry/store/sqlserver.py", False),
+        ("docs/benchmarks/results/2026-08-04/storedmv_soak.txt", False),
+        ("tests/test_scan_tokens_source.py", False),
+        ("harness/config/estate/_shape.py", False),
+        ("samples/config/IB_ACME_ADT_router.py", False),
+        ("docs/benchmarks/results/20260703-pooled/pooled_ab.json", False),
+        ("docs/benchmarks/results/2026-07-03/walk_console_20260703.txt", False),
+        ("tests/fixtures/hashes/aff07c990123ff.json", False),
+        # The control. Without it a detector that matched NOTHING would pass this test unchanged.
+        (f"samples/config/IB_FILE_{_SYNTH_CODE}_MFN.py", True),
+    ):
+        assert bool(mod.scan_file(f, rel)) is expected, rel  # type: ignore[attr-defined]
+
+
+def test_the_estate_identifier_shape_detector_is_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Guard the detector itself. NO floor mechanism counts a structural detector -- ``_FLOOR_SECTIONS``
+    counts token-source sections -- so if a future edit degrades this one to the module's own
+    never-matching sentinel, nothing else notices and every test above passes vacuously for the wrong
+    reason (the same shape of defect as a gate reporting clean because it read nothing)."""
+    mod = _load(None, monkeypatch)
+    assert mod._ESTATE_ID_SHAPE is not mod._NEVER  # type: ignore[attr-defined]
+    assert mod._ESTATE_ID_SHAPE.search(f"PT_{_SYNTH_CODE}_ADT") is not None  # type: ignore[attr-defined]
+
+
+def test_allowlist_rejects_an_entry_broad_enough_to_disable_the_estate_shape(
+    tmp_path: Path,
+) -> None:
+    """An allowlist entry is a per-line veto applied BEFORE every detector, so one over-broad line
+    switches the whole gate off while the loaded-counts diagnostic still reads healthy.
+
+    The pre-existing canaries rejected a bare six-digit quantifier but ACCEPTED the underscore-joined
+    form, which is exactly the shape someone would reach for to excuse one estate-shape false positive
+    -- and it would veto every line joining a digit run to an identifier. The narrow entry is the
+    control: a validator that rejected everything would look identical to a working one.
+    """
+    import importlib.util
+    import shutil
+
+    dst = tmp_path / "security"
+    shutil.copytree(_ROOT / "scripts" / "security", dst)
+    _D6 = chr(92) + "d{6}"  # built from parts so no line here is itself an allowlist-shaped literal
+    for entry, keep in ((_D6 + "_", False), ("_" + _D6, False), ("^HANDBACK_" + _D6 + "$", True)):
+        (dst / "scan-allowlist.txt").write_text(entry + "\n", encoding="utf-8")
+        spec = importlib.util.spec_from_file_location(
+            f"al_{next(_counter)}", dst / "scan_forbidden.py"
+        )
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        assert bool(mod.ALLOWLIST) is keep, entry  # type: ignore[attr-defined]

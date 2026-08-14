@@ -8,7 +8,7 @@
 # print "<WAIT_TYPE>  <wait_time_ms> ms  <waiting_tasks_count> tasks". A task count that lands in the
 # site-code range (e.g. WRITELOG ... 993496 tasks) collides with the site-code guard (99\d{4}) despite
 # being a pure engine perf counter with no customer-data path. This row shape is unambiguous DMV output,
-# so a real site code embedded in a path/HL7 field/prose (PT_990700_ADT, ^993496^) does NOT match it.
+# so a real site code embedded in a path/HL7 field/prose (PT_<site>_ADT, ^<site>^) does NOT match it.
 ^\s*[A-Z0-9_]+\s+\d+ ms\s+\d+ tasks\s*$
 
 # OIDC Core spec-section citations in the federated-SSO claim ladder (ADR 0142) read as dotted
