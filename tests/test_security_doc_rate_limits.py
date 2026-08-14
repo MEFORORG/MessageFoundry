@@ -532,23 +532,50 @@ def test_scope_guard_detects_a_planted_rescoping() -> None:
     )
 
 
-def test_ingest_plane_rate_limit_is_documented_as_existing_but_off() -> None:
-    """A silent omission reads as coverage, and so does an overstatement in the other direction.
+def test_ingest_plane_rate_limit_row_matches_the_code() -> None:
+    """The ingest row must describe the pacer's REACHABILITY as the code actually has it.
 
-    Until 2026-08-11 this guard asserted the doc said "no message-rate or volume limit exists", which
-    was true and load-bearing. The MLLP pacing build (ASVS 2.4.1 / 15.2.2) falsified it, so the guard
-    had to move with the code and the doc rather than be deleted -- the row must now state BOTH that
-    a control exists and that it ships OFF, because either half alone misleads: "exists" implies the
-    shipped default is bounded, and "none" is now simply false.
+    This guard has moved twice. Until 2026-08-11 it asserted the doc said "no message-rate or volume
+    limit exists"; the MLLP pacing build (ASVS 2.4.1 / 15.2.2) falsified that, so it moved to
+    requiring both that a control exists and that it "ships OFF". BACKLOG #1249 falsified that
+    wording in turn: the pacer is built, but neither key is a parameter of the ``MLLP()`` factory and
+    ``connections.toml`` desugars through that SAME factory, so no documented surface can set either.
+    "Off" is the more dangerous half-truth, because a reader takes it to mean "then set it to on".
+
+    WHAT THIS ASSERTS IS CONSISTENCY, NOT A PREFERENCE, AND THE DISTINCTION IS THE WHOLE POINT.
+    **#1249 is OPEN.** The owner has not chosen between exposing the two keys and rewording the row,
+    and a guard that pinned "NOT REACHABLE" as the correct state would settle that product question
+    BY BUILD -- the same shape as settling one by omission. So reachability is READ FROM THE
+    SIGNATURE and the doc is required to agree with whatever it says. Expose the keys and this test
+    demands the row stop saying unreachable; leave them out and it demands the row say so. Either
+    ruling stays cheap, and neither is pre-empted by a green run here.
     """
+    import inspect
+
+    from messagefoundry.config import wiring
+
+    pacing_keys = {"max_messages_per_second", "message_burst"}
+    accepted = pacing_keys & set(inspect.signature(wiring.MLLP).parameters)
+
     block = _section(_H_LIMITS)
     assert "Ingest plane" in block
     assert "max_messages_per_second" in block, (
         "the ingest row must name the control that now exists"
     )
-    assert "ships OFF" in block, "and must say it is not on by default, or 'exists' overstates it"
-    # The honest gaps stay named: an off default bounds nothing, and the raw-TCP intake never got it.
-    assert "still no volume bound" in block
+    if accepted:
+        assert "NOT REACHABLE" not in block, (
+            f"MLLP() now accepts {sorted(accepted)}, so the row may no longer call the pacer "
+            "unreachable -- it must state the shipped default instead"
+        )
+    else:
+        assert "NOT REACHABLE" in block, (
+            "MLLP() accepts neither pacing key, so the row must say the pacer cannot be turned on "
+            "rather than that it is merely off by default"
+        )
+        assert "NO message-RATE bound anywhere on the ingest plane" in block, (
+            "and must name the resulting gap outright, not leave it inferred"
+        )
+    # True under either ruling: the raw-TCP intake never got the pacer at all.
     assert "raw-TCP inbound" in block
     for cap in ("max_connections", "receive_timeout", "max_frame_bytes", "max_message_bytes"):
         assert cap in block, f"the ingest row must name the {cap} resource cap it DOES have"
