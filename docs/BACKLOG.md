@@ -9185,3 +9185,41 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Ledger tooling / evidence integrity. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) -- documentation accuracy. The cost is that the ledger's own evidence decays invisibly, and the decay is fastest after exactly the kind of broad, correct, well-reviewed change nobody would think to re-check it against.
+
+## 1265. the warning sign is unsanctioned decoration in 496 places across 80 files
+
+> 🔢 **Filed 2026-08-14 -- OWNER-RULED. The ruling is "not sanctioned; file a sweep", and "file it" is NOT "do it" -- nobody is authorised to start editing the 496 lines on the strength of this item.** Value **4/10** · Difficulty **4/10**. U+26A0 is **not** a sixth holdout glyph and never was; it is decoration, which CLAUDE.md §11 forbids outright. This item exists because §11 already rules that changing a glyph population is *"a migration with its own item, not a doc edit"*, and the owner applied that same shape here.
+
+> **IT HAS NO MACHINE-PARSED DEFENCE, WHICH IS THE WHOLE ARGUMENT.** The five holdouts are tolerated for one reason: `scripts/docs/backlog_status_check.py` parses them as item status (`_CLOSED` three glyphs, `_OPEN` two). **U+26A0 is in neither list.** `parse_items` ignores it entirely, so it carries no status semantics anywhere in the repo and nothing would parse differently if every instance vanished. **Demonstrated rather than argued:** the #1241 and #1253 amendments filed 2026-08-14 carry no glyph at all, and the hygiene gate passed clean at 528 items each declaring exactly one status. It is provably optional in the file where it is densest.
+
+> **THE MEASURED POPULATION, positive-controlled at `origin/main` `ae76b9f9`.** The ledger counts are the control: an instrument that cannot find the 121 everyone agrees are in `docs/BACKLOG.md` proves nothing by returning zero elsewhere. **This is not pedantry -- the first attempt at this census returned a FALSE ZERO for engine source off a broken shell escape, and only the control caught it.** A false zero on this exact question has blocked it once before.
+> ```
+> docs/ (all)                          447 occurrences /  57 files
+>   of which docs/BACKLOG.md           121            /   1
+>   of which BACKLOG-CLOSED.md          93            /   1
+>   of which docs/adr/                  35
+> tests/                                10            /   7
+> ide/                                   4            /   3
+> messagefoundry/ (engine source)        3            /   3
+> packaging/ (web console)               0            /   0
+> scripts/                               0            /   0
+> CLAUDE.md itself                       0
+> ----------------------------------------------------------------
+> REPO-WIDE                            496            /  80
+> ```
+> The three engine-source sites are `config/settings.py`, `auth/totp.py` and `api/_ui_seam.py`, one occurrence each.
+
+> **THE DISTRIBUTION MATTERS MORE THAN THE TOTAL, AND THE FIRST TELLING OF IT WAS WRONG.** This was initially described as concentrated in engine source, the web console's `oidc.py`, `ide/*.ts`, tests and shipped docs. **Measured, it is overwhelmingly PROSE: 233 instances outside the two ledger files are still under `docs/`, against about 17 in anything executable, and the web console has NONE.** So the two ledger files are 43 percent of the population and the honest framing of the rest is *documentation consistency*, not code hygiene.
+
+> **DO NOT FILE THIS AS A cp1252 HAZARD -- that hypothesis was tested and is dead.** `tests/test_cp1252_console_safety.py` states its scope as `scripts/**/*.py` only, and **`scripts/` contains zero of these**, so the gate is not silently missing them -- there is nothing there to miss. The engine hardens both streams, and Markdown is never printed to a console. **The cost here is the one §11 actually names: a bare glyph does not carry its scope, so presence-equals-meaning reading is invited and the ambiguity is hidden from review.** Filing it as an operational risk would be a compensating-control argument resting on a false premise (SDS-3.7).
+
+**Cluster:** Documentation / vocabulary consistency. **Priority:** P3. **Verdict:** build (mechanical, wide).
+**Severity:** none, and no deployment axis (§0). Nothing is mis-parsed today and no behaviour depends on it.
+
+**Sequencing, because the slices differ in risk.** The **shipped operator docs** (`SECURITY.md`, `PHI.md`, `INSTALL-GUIDE.md`, `DEPLOYMENT.md`, `CONNECTIONS.md`) are the defensible first slice: they have external readers and no machine-parsed neighbours. The **two ledger files** are the *last* slice, not the first -- they sit beside the five holdouts that `backlog_status_check.py` genuinely parses, so an edit there risks the status alphabet while every other slice cannot. The ~40 ADRs are historical records; decide explicitly whether a retired ADR is rewritten at all rather than sweeping it by default.
+
+**How to prove the sweep.** Re-run the census with the ledger counts as the positive control and assert the target slice reaches zero **while the control still reports non-zero** -- a census that returns zero everywhere is indistinguishable from a broken pattern, which is exactly how this was mis-measured the first time. Then assert `backlog_status_check.py` still passes at its full item count, since the one thing a careless sweep can actually break is the status alphabet it sits next to.
+
+**Also update CLAUDE.md §11** to record the measured population, so the next reader cannot re-derive the false zero. §11 currently quantifies only the five holdouts.
+
+**Source:** raised via the Liaison 2026-08-14 as a ledger-scope question (214 in the two ledger files); the repo-wide census that changed its scope, and the corrected distribution above, were measured while answering it.
