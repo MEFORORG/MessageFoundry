@@ -219,15 +219,25 @@ original→surrogate pair is ever emitted together with `dataset_key`.
 
 **`dataset_key` is a per-run secret salt.** It is drawn from `secrets.token_bytes`/`os.urandom` with **≥128
 bits** of entropy, held **only in process memory**, classified **PHI-equivalent** (it is itself a
-re-identification key for the seeded PRNG), **never written / logged / committed**, and **discarded at run
-end**. Keying is **one-way** (seeded PRNG, no inverse), so no surrogate can be inverted to its original.
+re-identification key for the keying construction), **never written / logged / committed**, and
+**discarded at run end**. Keying is **one-way** (a keyed hash, no inverse), so no surrogate can be
+inverted to its original. *(This ADR was written against a seeded-PRNG construction; the shipped one is
+a keyed BLAKE2b -- see the correction below and `messagefoundry/anon/keying.py`.)*
 
-**Irreversibility is salt-dependent, not cryptographic.** `random.Random` seeded from a string is **not** a
-keyed hash; the brute-force resistance here rests entirely on the salt never being persisted/logged and on
-**no `(original, surrogate)` pair ever leaking alongside `dataset_key`** — within a run, with a small
-surrogate pool, reversal is feasible if the salt or a plaintext pair leaks. If true cryptographic
-brute-force resistance is later required, switch the seed derivation to an HMAC/BLAKE2 keyed hash; that is a
-*To resolve on acceptance* question, called out below.
+**Irreversibility was salt-dependent rather than cryptographic WHEN THIS ADR WAS WRITTEN. THAT IS NO
+LONGER THE IMPLEMENTATION.** The paragraph below described a `random.Random` seed derived from a
+string, which is not a keyed hash, so brute-force resistance rested entirely on the salt never being
+persisted or logged and on **no `(original, surrogate)` pair ever leaking alongside `dataset_key`** --
+within a run, with a small surrogate pool, reversal was feasible if the salt or a plaintext pair
+leaked. It closed by saying that if true cryptographic brute-force resistance were later required, the
+seed derivation should switch to an HMAC or BLAKE2 keyed hash.
+
+**That switch was made.** The shipped keying is a **keyed BLAKE2b** under the per-dataset salt
+(`messagefoundry/anon/keying.py`), so the "not a keyed hash" premise no longer holds and the *To
+resolve on acceptance* question it raised is answered. **Read the construction from `anon/keying.py`
+rather than from this paragraph.** The operational rules it states are unchanged and still binding:
+the salt is never persisted or logged, and an `(original, surrogate)` pair must never leak alongside
+`dataset_key`.
 
 **Reproducibility model.** The per-run random salt means the **same real message anonymized twice yields a
 *different* fixture** — good for one-shot exports, but it makes a regenerated "committable anonymized
