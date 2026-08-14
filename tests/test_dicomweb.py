@@ -126,6 +126,49 @@ def test_dicomweb_study_uid_control_char_rejected() -> None:
         _dest(study_uid="1.2.3\r\nHost: evil")
 
 
+@pytest.mark.parametrize(
+    ("setting", "value"),
+    [
+        ("headers", {"X-Site": "a\r\nX-Evil: 1"}),  # CRLF in an operator header VALUE
+        ("headers", {"X-Site\r\nX-Evil": "1"}),  # CRLF in an operator header NAME
+        ("headers", {"X-Site": "a\x00b"}),  # NUL in a value
+        ("bearer_token", "tok\r\nX-Evil: 1"),  # CRLF in the credential -> Authorization header
+    ],
+)
+def test_dicomweb_operator_header_control_char_rejected(
+    setting: str, value: object
+) -> None:  # #1241
+    """`study_uid` was screened at construction; the other operator-configured settings that reach the
+    same wire were not. `headers` merged straight into the request headers and `bearer_token` went
+    into `Authorization` verbatim, so a CRLF in either is a header injection with nothing in front of
+    it -- and unlike a URL there is no incidental neutralisation on a header value.
+
+    Screened at CONSTRUCTION for the same reason as the sibling settings: a bad SETTING is wrong for
+    every message the connection will ever send, so it must fail the connection at load rather than
+    dead-letter an unbounded stream of messages that were never at fault.
+    """
+    with pytest.raises(ValueError, match="illegal control character"):
+        _dest(**{setting: value})  # type: ignore[arg-type]
+
+
+def test_dicomweb_base_url_control_char_rejected() -> None:  # #1241
+    with pytest.raises(ValueError, match="illegal control character"):
+        build_destination(
+            Destination(
+                name="OB",
+                type=ConnectorType.DICOMWEB,
+                settings=DICOMweb(url="https://pacs.example.org/dicom-web\r\nX-Evil: 1").settings,
+            )
+        )
+
+
+def test_dicomweb_clean_operator_headers_still_construct() -> None:  # #1241
+    """Positive control: the screen must admit what it is not screening for."""
+    d = _dest(headers={"X-Site": "site-a", "X-Trace": "abc-123"})
+    assert d._headers["X-Site"] == "site-a"
+    assert d._headers["X-Trace"] == "abc-123"
+
+
 def test_dicomweb_cleartext_credentials_refused() -> None:
     # Basic/bearer over plain http puts the credential on the wire — refused (mirrors REST/FHIR).
     with pytest.raises(ValueError, match="cleartext"):

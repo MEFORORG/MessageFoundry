@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import http.client
 import json
 import logging
 import re
@@ -101,8 +102,12 @@ _TRANSIENT_ISSUE_CODES = frozenset(
 # the message-derived path segments so a crafted resource can't smuggle '/', '..', '?', '#', or '@'
 # into the request path and redirect a PHI-bearing write to a different resource/operation on the same
 # allow-listed host (the [egress].allowed_http gate pins the host, not the path).
-_FHIR_TYPE_RE = re.compile(r"^[A-Za-z]+$")
-_FHIR_ID_RE = re.compile(r"^[A-Za-z0-9.\-]{1,64}$")
+# `\Z`, never `$`: Python's `$` also matches immediately BEFORE a final newline, so `^[A-Za-z]+$`
+# accepted "Patient\n" and the gate did not enforce the grammar it advertises. Anchoring the pattern
+# fixes every caller at once -- `match` vs `fullmatch` is a property of the CALL, and there are three
+# call sites (:189, :698, :704), so a per-call fix leaves the next one to re-introduce it.
+_FHIR_TYPE_RE = re.compile(r"^[A-Za-z]+\Z")
+_FHIR_ID_RE = re.compile(r"^[A-Za-z0-9.\-]{1,64}\Z")
 
 
 def _operation_outcome(body: str) -> dict[str, Any] | None:
@@ -179,6 +184,25 @@ def _reject_control_chars(value: str, field: str) -> str:
     return value
 
 
+def _reject_config_control_chars(value: str, setting: str, where: str = "destination") -> str:
+    """Reject an OPERATOR-CONFIGURED value carrying a C0/DEL control char, at CONSTRUCTION time.
+
+    Deliberately distinct from ``_reject_control_chars``, which screens MESSAGE-derived values on the
+    send path and raises a permanent ``NegativeAckError``. The distinction is the disposition: a bad
+    *message* dead-letters one message, whereas a bad *setting* is wrong for every message the
+    connection will ever send -- so it must fail the connection at load rather than dead-letter an
+    unbounded stream of messages that were never at fault. Raises ``ValueError`` to match the other
+    construction-time setting checks. PHI-safe: names the setting, never the value.
+
+    ``where`` carries the construction site because there are TWO in this module -- the destination
+    and the read executor -- and #1241's subject is precisely the asymmetry of screening one and not
+    its sibling.
+    """
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise ValueError(f"FHIR {where} {setting!r} contains an illegal control character")
+    return value
+
+
 def _validate_path_token(value: str, pattern: re.Pattern[str], field: str) -> str:
     """Reject a message-derived path segment that doesn't match its FHIR grammar before it flows into
     the request URL. ``_reject_control_chars`` blocks CRLF/NUL but NOT path metacharacters ('/', '..',
@@ -205,6 +229,7 @@ class FhirDestination(DestinationConnector):
             raise ValueError(
                 "FHIR destination requires a 'url' setting (the FHIR service base URL)"
             )
+        _reject_config_control_chars(url, "url")
         scheme = urllib.parse.urlsplit(url).scheme.lower()
         if scheme not in ("http", "https"):
             raise ValueError(f"FHIR destination 'url' must be http or https, got scheme {scheme!r}")
@@ -228,7 +253,14 @@ class FhirDestination(DestinationConnector):
                 f"FHIR destination conditional must be one of {_CONDITIONALS} or unset, "
                 f"got {self.conditional!r}"
             )
-        self.conditional_query: str | None = s.get("conditional_query") or None
+        # Screened HERE rather than on the send path: it reaches an unencoded URL interpolation AND
+        # the If-None-Exist HEADER value, and the header sink has none of the URL limb's incidental
+        # neutralisations (urllib.parse.unwrap strips a trailing CRLF; Request.full_url splits at '#'
+        # client-side -- neither touches a header value).
+        _q = s.get("conditional_query") or None
+        self.conditional_query: str | None = (
+            _reject_config_control_chars(str(_q), "conditional_query") if _q else None
+        )
         if (
             self.conditional in ("if-none-exist", "conditional-update")
             and not self.conditional_query
@@ -631,10 +663,16 @@ class FhirDestination(DestinationConnector):
             raise DeliveryError(
                 f"FHIR {_redact_url(self.base_url)} unreachable: {exc.reason}"
             ) from exc
-        except ValueError as exc:
+        except (ValueError, http.client.InvalidURL) as exc:
             # Backstop for an illegal request value urllib rejects (a CRLF in a header/URL that slipped
             # past the control-char guard, or a bad conditional_query) — a permanent failure (a retry
             # re-sends the same body), never an escaping internal error. PHI-safe: redacted url only.
+            #
+            # InvalidURL is named EXPLICITLY because it is not a ValueError: its MRO is
+            # InvalidURL -> HTTPException -> Exception, so it is neither a ValueError nor an OSError
+            # and matched none of the arms here — including this one, which was written for exactly
+            # the CRLF-in-a-URL case it raises. Without it the URL limb escapes send() as an
+            # unhandled internal error instead of the classified permanent dead-letter above.
             raise NegativeAckError(
                 f"FHIR {_redact_url(self.base_url)} rejected an invalid request value",
                 code="bad-request-value",
@@ -753,6 +791,9 @@ class FhirLookupExecutor:
                 raise ValueError(
                     f"FhirLookup {cname!r} requires a 'url' setting (the FHIR base URL)"
                 )
+            # #1241: the SECOND url construction site in this module. The destination screens its
+            # own; screening one and not its sibling reproduces the asymmetry the item reports.
+            _reject_config_control_chars(url, "url", f"lookup {cname!r}")
             scheme = urllib.parse.urlsplit(url).scheme.lower()
             if scheme not in ("http", "https"):
                 raise ValueError(

@@ -56,7 +56,12 @@ user exists, no further bootstrap occurs.
 self-retires while still **unclaimed** (never password-changed): it is **disabled once a second
 administrator exists**, and — if left unclaimed — **disabled `[auth].bootstrap_expiry_hours` after
 creation** (default 72 h; `0` disables the timer). Once you change its password it becomes a normal
-admin account and is never auto-disabled, so a single-admin deployment can't be locked out. A retired
+admin account and auto-retirement stops touching it: both the expiry timer and the supersession check
+fire only while the bootstrap is still **unclaimed**, which is carried by the `must_change_password`
+flag — so an administrative password reset, which re-sets that flag, **re-arms them**. And
+auto-retirement is not the only way to lose an administrator: the failed-attempt lockout is a
+**separate mechanism** and it does reach a claimed sole administrator (see
+[Brute-force & abuse protection](#brute-force--abuse-protection)). A retired
 bootstrap login is refused like any other invalid credential and the retirement is audited
 (`auth.bootstrap_admin_retired`).
 
@@ -1541,7 +1546,7 @@ threshold, the switch that disables it, and — the part that matters for "not d
 
 | # | Control | Protects | Threshold / window | Disable switch | What remains when off |
 |---|---|---|---|---|---|
-| 1 | **Per-account lockout** | one account's credential-guessing, on the password **and** TOTP/recovery legs | 5 consecutive failures → 15 min; a lapsed window restarts the counter (auto-expiring, so an attacker cannot maliciously lock an account indefinitely) | **no dedicated off switch.** `lockout_minutes = 0` makes the lock expire instantly, which is the effective opt-out; `lockout_threshold = 0` is **not** an off switch — it locks on the *first* failure | limiters 2 + 3 only |
+| 1 | **Per-account lockout** | one account's credential-guessing, on the password **and** TOTP/recovery legs | 5 consecutive failures → 15 min; a lapsed window restarts the counter, so each lock expires on its own — but **repetition is unbounded**: an attacker who keeps failing re-locks the account as each window lapses. Signal, recovery and what to arrange in advance: below the table | **no dedicated off switch.** `lockout_minutes = 0` makes the lock expire instantly, which is the effective opt-out; `lockout_threshold = 0` is **not** an off switch — it locks on the *first* failure | limiters 2 + 3 only |
 | 2 | **Sign-in sliding window** (`allow_login_attempt`) | password-spraying across many usernames, which never trips a single account's lockout | > 10 attempts per client IP **or** > 60 across all clients, per 60 s (either dimension alone refuses — `global_full or key_full`) | `[auth].login_rate_limit_enabled = false` | lockout only — **and limiter 3 disappears with it** (see below) |
 | 3 | **Per-actor credential-ceremony budget** (`allow_reauth_attempt`) | a session holder guessing a password at the re-proof surface, where lockout does **not** apply | > 10 ceremonies per acting **user**, per 60 s. **No global dimension** (`glob=0`) | *the same* `[auth].login_rate_limit_enabled` | **nothing** — `POST /me/reauth` and `POST /me/password` then have no anti-automation control at all |
 | 4 | **argon2 concurrency cap** | executor exhaustion under a login flood | an instance semaphore sized `max(2, min(8, cpu_count))`; every hash/verify runs off the event loop | none | n/a |
@@ -1550,6 +1555,45 @@ threshold, the switch that disables it, and — the part that matters for "not d
 | 7 | **Federated pending-flow bound** (`FlowCache.put`, **reject-when-full**) | flooding the OIDC start leg (`POST /ui/oidc/start` — the GET renders the 3.7.3 interstitial and stages nothing, so it is not a lever) to exhaust engine memory or deny federated sign-in | 16 pending flows per client IP, 512 engine-wide, 300 s TTL. It **rejects** rather than evicts — evict-oldest would turn a start-leg flood into a login DoS for legitimate users | **none** — and `oidc_flow_cache_max = 0` is not an opt-out either: `put` refuses at `len(entries) >= global_cap`, so `0` rejects **every** federated sign-in (`FlowCacheFullError` on the first flow, an OIDC denial of service). No validator floors it; treat it as a security-relevant value | limiter 2 (the same routes charge `allow_login_attempt` first) |
 | 8 | **WebAuthn pending-ceremony bound** (`ChallengeCache.put`) | flooding passkey registration/assertion ceremonies | 16 pending ceremonies per **user** (evicts that *same* user's oldest, so one principal can never deny another's), 4096 engine-wide (**refuses** with a cause-naming `ChallengeCacheFullError`), 120 s TTL | none | limiter 3 on the assertion **finish** leg only — `POST /ui/reauth/webauthn` (`routes/core.py:689`) and the error re-render inside `POST /ui/reauth` (`:612`) charge `allow_reauth_attempt`. The routes that *stage* a ceremony — the thing `ChallengeCache.put` actually bounds — charge **no** limiter: `POST /ui/account/webauthn/enroll`, `POST /ui/account/webauthn/verify`, and `GET /ui/reauth`, which re-stages fresh assertion options on **every** render. There this bound plus cookie-holder-only reachability is all there is |
 | 9 | **JWKS min-refetch floor** (`JwksCache.get_key`) | unauthenticated `kid`-driven refetch amplification against the IdP on the OIDC callback leg — the sibling of control 7 on the *other* federated leg | one upstream fetch per **300 s**, globally (`[auth].oidc_jwks_min_refetch_seconds`), plus a `_MAX_JWKS_BYTES` **512 KiB** response-body cap and a 3600 s key TTL. Within the floor an unknown `kid` raises `JwksError` and that login fails (a still-cached key is served even past the soft TTL rather than fail while throttled) | `oidc_jwks_min_refetch_seconds = 0` — no validator floor, so this **is** a genuine opt-out, and it restores the amplification | limiter 2 and control 7 (the same legs charge `allow_login_attempt` and stage a bounded flow first) |
+
+**Control 1 bounds the lock, not the campaign.** Each lockout releases itself after
+`lockout_minutes`, but `_register_failure` restarts the counter on a lapsed window and re-locks on the
+next run to the threshold, and the account row persists a failure count and an expiry — never a count
+of locks — so nothing accumulates across cycles and the number of cycles has no ceiling. The account
+is reachable in the gap between one lock expiring and the next being set, and no longer. Sustaining
+the re-lock costs far fewer attempts than control 2's sign-in window admits from a single client
+address, so control 2 does not bound it either. The exposure is availability, not credential
+disclosure, and its scope is narrow: only **local** accounts can be locked at all (the
+lockout-asymmetry note above says why), and control 6 refuses an off-network client before any
+failure is counted — but only where client addresses are meaningful. Behind an undeclared proxy or
+NAT control 6 is **inert**, by its own honest-limit note above, so it narrows who can reach the
+account rather than closing the case.
+
+**Signal.** The account holder gets an `ACCOUNT_LOCKED` security event — mailed only under the
+conditions the security-event notification section above states (an alert sink configured, the
+notification setting on, and an address on the account), and recorded on `GET /me/security-events`,
+which is a self-scoped feed the holder can read only while they still hold a live, fully-authenticated
+session. Each refusal is also audited, so a campaign is visible in the audit log while it runs. What
+is **not** available anywhere is **current lock state**: no API or console surface reports whether an
+account is locked right now, and a locked account still lists as enabled. Diagnose a suspected lockout
+from the audit log, not the user list.
+
+**Recovery.** Absent a sustained attacker nothing is needed — the lock expires on its own. Against a
+sustained one: across all three store backends the writes that clear `locked_until` are
+`set_password`, the successful-login write and the failed-attempt write, and only `set_password` can
+run while a lock is live — control 1 refuses before any credential is verified, so neither the
+successful-login write nor the login-time rehash beside it is ever reached, and the failed-attempt
+write only clears an **already lapsed** lock. Two routes reach `set_password` while an account is
+locked, both local-account-only, and **both issue a new password rather than merely lifting the
+lock**: the holder's own `POST /me/password`, reachable only while they still have a live session
+(session validation never consults `locked_until`, and that route is exempt from both the must-change
+and the MFA-pending gates), and the
+[administrator's reset](#admin-password-reset-wp-l3-12-asvs-646). No shipped command clears a lock
+without going through one of those two — the CLI manages no users.
+
+**Arrange in advance.** Keep a **second administrator who can sign in**: the administrator reset
+refuses a self-reset, so a sole administrator holding no live session has no in-band route back for as
+long as an attacker sustains the lock.
 
 > **Binding conditionality — controls 2 and 3 are one switch, not two.**
 > `[auth].login_rate_limit_enabled = false` constructs **neither** limiter: `_login_limiter` and
