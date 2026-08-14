@@ -735,12 +735,26 @@ def test_serve_insecure_bind_clamp_keys_on_enforcement_not_tier(
 # out explicitly (require_mfa = false). _expose_toml writes that opt-out by default.
 
 
+class _PassingProbe:
+    """Stand-in for TlsFloorProbe: the startup ladder reads only `.ok` and `.describe()`.
+
+    Stubbed to PASS for the same reason `uvicorn.run` is -- these cases test CONFIG gates, and
+    the probe's own network behaviour is covered by tests/test_tls_floor_probe.py. Stubbing it
+    to FAIL would assert the probe rather than the ladder."""
+
+    ok = True
+
+    def describe(self) -> str:
+        return "stubbed probe (test)"
+
+
 def _expose_toml(
     tmp_path: Path,
     *,
     require_mfa: bool = False,
     enforcement: str | None = None,
     synthetic: bool = False,
+    public_origin: str | None = None,
 ) -> None:
     """A non-loopback bind (exposed via a declared TLS-terminating proxy) with egress locked down.
 
@@ -774,7 +788,18 @@ def _expose_toml(
         # Declared here with the rest of the non-MFA plumbing so no case in this file is reading
         # the LAST rung's output while asserting on the one under test.
         "security.memory_encryption_operator_declared = true\n"
-        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+        # BACKLOG #1026: a PHI instance behind a declared terminator under `enforce` now REFUSES
+        # without a public address, because the ASVS 12.1.1 probe dials it and an unset value
+        # silently disabled that check. Opt-in (default None) so only the cases that reach the
+        # refusal declare it and the rest of this file is untouched. The AUTHORED key is
+        # `[security].web_console_public_address` -- ADR 0118 retired `[api].public_origin`, which
+        # is the internal settings name and is refused outright.
+        + (
+            f'security.web_console_public_address = "{public_origin}"\n'
+            if public_origin is not None
+            else ""
+        )
+        + '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
         "[retention]\ndead_letter_days = 30\n" + _SECURE_ALERTS,
         encoding="utf-8",
@@ -885,9 +910,12 @@ def test_serve_exposed_with_mfa_on_starts_in_prod(
     # so the ONLY posture under test is require_mfa.
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
-    _expose_toml(tmp_path, require_mfa=True)
+    _expose_toml(tmp_path, require_mfa=True, public_origin="https://mefor.example.org")
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "messagefoundry.config.tls_probe.probe_tls_floor", lambda origin: _PassingProbe()
+    )
     assert (
         main(["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind", "--env", "prod"])
         == 0
@@ -913,6 +941,9 @@ def test_serve_exposed_prod_phi_single_factor_ack_starts_with_warning(
         # ADR 0152 rung 2 declaration (see _expose_toml): the single-factor ACK is what is on
         # trial here, not the last rung in the ladder.
         "security.memory_encryption_operator_declared = true\n"
+        # BACKLOG #1026, same reason: a declared-terminator PHI instance under `enforce` refuses
+        # without a public address, and the single-factor ACK is what is on trial here.
+        'security.web_console_public_address = "https://mefor.example.org"\n'
         '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
         "[retention]\ndead_letter_days = 30\n" + _SECURE_ALERTS,
@@ -920,6 +951,9 @@ def test_serve_exposed_prod_phi_single_factor_ack_starts_with_warning(
     )
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "messagefoundry.config.tls_probe.probe_tls_floor", lambda origin: _PassingProbe()
+    )
     assert (
         main(["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind", "--env", "prod"])
         == 0
