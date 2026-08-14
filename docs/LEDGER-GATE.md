@@ -315,3 +315,52 @@ are safe.
 - **Numbers leak.** An abandoned branch's number is never reclaimed. Accepted, deliberately.
 - **It governs ADR and BACKLOG numbers only.** Any other shared sequence (a migration version, say) would
   need its own `-Kind`.
+
+## Citing a number you have not allocated
+
+**The allocation rule has a mirror, and the mirror is the more insidious half.** `alloc.ps1` stops two
+sessions from *issuing* the same number. Nothing stops a document from *citing* a number that was never
+issued at all.
+
+**While the number is unissued, the citation resolves to nothing.** That is honest and harmless: a
+dangling reference advertises its own brokenness, and anyone who follows it immediately sees there is
+nothing there.
+
+**The day someone legitimately allocates that number, the citation begins resolving — to unrelated
+work.** Nothing anywhere reports a problem, because nothing is broken in any mechanical sense. A
+wrongly-resolving reference reads as a working cross-reference forever, which is strictly worse than a
+broken one. This file's own header already states the general form of that trade: renumbering *"would
+only make stale citations resolve uniquely and WRONGLY, which is worse than resolving ambiguously."*
+
+### The rule
+
+**Either allocate the number before citing it, or write the reference so it CANNOT resolve.**
+
+Naming the subject instead of a number is enough, and costs nothing:
+
+    #1203                                  arms the day 1203 is issued
+    "the retention runbook step"           cannot arm
+    "unallocated - see the runbook step"   cannot arm, and says so
+
+### What is and is not dangerous
+
+**Only a citation ABOVE the current allocation floor can arm.** A number at or below the floor is
+already spoken for and can never be re-issued: `alloc.ps1` issues `$observed + 1` and never fills a
+hole, and the floor is computed from **committed ledger headings**, which survive a fresh clone. So a
+citation to a reserved-but-never-filed number resolves to nothing **permanently** — it is inert, not
+merely quiet.
+
+**Foreign `#N` references are not citations of this ledger at all** — an upstream driver issue, a
+vendor forum thread, another project's tracker. They match a naive scan and are not this rule's
+subject.
+
+### Enforcement
+
+`scripts/docs/dangling_citation_check.py` reports unresolved citations and keys its exit code on the
+**live shape** — above the floor, and not foreign — rather than on a raw hit count, so the inert cases
+are reported without failing anything. **It is fail-closed by default**, with `--advisory` as the
+explicit escape. Note its stated coverage bound: it sees this repository only, and **not** the private
+companion repository.
+
+**Enforcement does not replace the rule.** A checker can only find what has already been written; the
+rule is what stops it being written.
