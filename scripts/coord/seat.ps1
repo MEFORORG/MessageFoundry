@@ -185,6 +185,42 @@ function Invoke-Git {
     } catch { return $null }
 }
 
+function Invoke-GitProbe {
+    # Invoke-Git answers WHAT GIT SAID. This answers WHETHER GIT ANSWERED AT ALL, which is a
+    # different question and the only one that can be asked by a caller whose empty result would
+    # otherwise be stored as the fact "there is nothing here" (rule 6).
+    #
+    # Returns @{ ok; exitCode; out; err } and NEVER throws. `ok` is a fact about the PROBE, not about
+    # the tree: ok=$true with an empty `out` is git saying "none", ok=$false is git saying nothing at
+    # all. Collapsing those two is the defect.
+    #
+    # STDERR GOES TO A FILE, not through 2>&1. Merging a native command's stderr into the success
+    # stream under $ErrorActionPreference='Stop' turns a diagnostic line into a terminating error in
+    # this shell, and a probe whose whole job is to survive a failure must not be the thing that
+    # throws.
+    param([string]$Dir, [string[]]$GitArgs, [switch]$Raw)
+    $errFile = $null
+    try {
+        $errFile = [System.IO.Path]::GetTempFileName()
+        $out = & git -C $Dir @GitArgs 2>$errFile
+        $code = $LASTEXITCODE
+        $errText = ''
+        try { $errText = [string](Get-Content -LiteralPath $errFile -Raw -EA Stop) } catch { }
+        $joined = if ($null -eq $out) { '' } else { ($out -join "`n") }
+        if (-not $Raw) { $joined = $joined.Trim() }
+        return @{
+            ok       = ($code -eq 0)
+            exitCode = $code
+            out      = $joined
+            err      = (Limit-Text -Text $errText -Max 400)
+        }
+    } catch {
+        return @{ ok = $false; exitCode = $null; out = ''; err = (Limit-Text -Text $_.Exception.Message -Max 400) }
+    } finally {
+        if ($errFile) { Remove-Item -LiteralPath $errFile -Force -EA SilentlyContinue }
+    }
+}
+
 function ConvertTo-UtcInstant {
     # ONE conversion for every timestamp this file compares or stores, because the type here is not
     # what the code reading it assumes.
@@ -395,18 +431,32 @@ function Get-GitFacts {
     #     -z emits NUL-terminated entries with the path verbatim.
     # A rename/copy entry is followed by a SECOND field carrying the ORIGINAL path; it is consumed
     # here rather than being read as a status line of its own.
+    #
+    # RULE 6 APPLIES TO THIS PROBE FIRST. Every count below is downstream of ONE git call, and if that
+    # call cannot run, "0 dirty paths" is not a measurement -- it is the absence of one, wearing the
+    # same clothes as a clean tree. So the outcome is recorded beside the counts, and a status that
+    # did not answer leaves them NULL rather than zero.
     $trackedPaths = @()
     $untrackedPaths = @()
-    $st = Invoke-Git -Dir $Wt -GitArgs @('status', '--porcelain', '-z') -Raw
-    if ($st) {
-        $entries = @($st -split "`0" | Where-Object { $_ })
-        for ($i = 0; $i -lt $entries.Count; $i++) {
-            $e = $entries[$i]
-            if ($e.Length -lt 4) { continue }
-            $xy = $e.Substring(0, 2)
-            $p = $e.Substring(3)
-            if ($xy[0] -eq 'R' -or $xy[0] -eq 'C') { $i++ }
-            if ($xy -eq '??') { $untrackedPaths += $p } else { $trackedPaths += $p }
+    $statusOk = $true
+    $statusError = $null
+    $stProbe = Invoke-GitProbe -Dir $Wt -GitArgs @('status', '--porcelain', '-z') -Raw
+    if (-not $stProbe.ok) {
+        $statusOk = $false
+        $statusError = "git status --porcelain exit=$($stProbe.exitCode): $($stProbe.err)"
+        Write-WriterError -Stage 'status-probe' -Message $statusError
+    } else {
+        $st = $stProbe.out
+        if ($st) {
+            $entries = @($st -split "`0" | Where-Object { $_ })
+            for ($i = 0; $i -lt $entries.Count; $i++) {
+                $e = $entries[$i]
+                if ($e.Length -lt 4) { continue }
+                $xy = $e.Substring(0, 2)
+                $p = $e.Substring(3)
+                if ($xy[0] -eq 'R' -or $xy[0] -eq 'C') { $i++ }
+                if ($xy -eq '??') { $untrackedPaths += $p } else { $trackedPaths += $p }
+            }
         }
     }
 
@@ -418,23 +468,71 @@ function Get-GitFacts {
     # carrying the same sha, with no way to tell a live handle from a dead one. So the sha is
     # ANCHORED to a ref of its own here -- one plumbing call, the object becomes gc-proof, and the
     # ref name says what it is to whoever finds it later.
+    #
+    # AND IT IS THE PROBE RULE 6 WAS WRITTEN FOR. `git stash create` TAKES THE INDEX LOCK; the status
+    # call above does not. A sibling agent committing in the same checkout at the instant the Stop
+    # hook fires therefore fails this call and nothing else -- measured: status exit 0 with
+    # ' M tracked.txt', stash create exit 1 'Unable to create ... index.lock: File exists', record
+    # written with trackedCount=1 and stashCovers=nothing-untracked-only, .writer-errors.txt absent.
+    # A replacement seat reading that record is told the only thing to rescue is an untracked file,
+    # about a tracked edit held by no commit, no stash and no remote.
+    #
+    # So the outcome is a stored FACT with its provenance -- outcome, attempts, git's own exit code
+    # and stderr -- and stashCovers is derived from trackedCount as well as the sha, so it can say
+    # NOT-CAPTURED instead of "nothing". ONE retry, because an index lock is typically another
+    # process's short critical section rather than a persistent state; a second failure is reported,
+    # not fought.
     $stash = $null
     $stashRefName = $null
-    if ($trackedPaths.Count -gt 0) {
-        $s = Invoke-Git -Dir $Wt -GitArgs @('stash', 'create')
-        if ($s) {
-            $stash = $s
-            if ($StashRef) {
-                # Invoke-Git returns '' on a silent success and $null only on failure.
-                $anchored = Invoke-Git -Dir $Wt -GitArgs @('update-ref', $StashRef, $s)
-                if ($null -ne $anchored) { $stashRefName = $StashRef }
-                else { Write-WriterError -Stage 'stash-anchor' -Message "update-ref $StashRef failed; the stash sha is unreferenced and gc can delete it" }
+    $stashProbe = [ordered]@{
+        attempted = $false
+        # created | none | failed | not-attempted | not-attempted-status-failed
+        outcome   = if ($statusOk) { 'not-attempted' } else { 'not-attempted-status-failed' }
+        reason    = if ($statusOk) { 'no tracked modifications to cover' } else { 'git status did not answer, so tracked modifications are unknown' }
+        attempts  = 0
+        exitCode  = $null
+        error     = $null
+        at        = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    }
+    if ($statusOk -and $trackedPaths.Count -gt 0) {
+        $stashProbe.attempted = $true
+        $stashProbe.reason = $null
+        for ($attempt = 1; $attempt -le 2; $attempt++) {
+            $p = Invoke-GitProbe -Dir $Wt -GitArgs @('stash', 'create')
+            $stashProbe.attempts = $attempt
+            $stashProbe.exitCode = $p.exitCode
+            if ($p.ok) {
+                if ($p.out) { $stash = $p.out; $stashProbe.outcome = 'created' }
+                else {
+                    # git ANSWERED, and the answer was none. Distinct from the branch below, and the
+                    # distinction is the whole finding.
+                    $stashProbe.outcome = 'none'
+                    $stashProbe.reason = 'git stash create succeeded and produced no object'
+                }
+                $stashProbe.error = $null
+                break
             }
+            $stashProbe.outcome = 'failed'
+            $stashProbe.error = $p.err
+            if ($attempt -lt 2) { Start-Sleep -Milliseconds 300 }
         }
-    } elseif ($StashRef) {
+        if ($stashProbe.outcome -eq 'failed') {
+            Write-WriterError -Stage 'stash-probe' -Message "git stash create failed after $($stashProbe.attempts) attempts (exit=$($stashProbe.exitCode)): $($stashProbe.error); $($trackedPaths.Count) tracked path(s) are NOT captured"
+        }
+        if ($stash -and $StashRef) {
+            # Invoke-Git returns '' on a silent success and $null only on failure.
+            $anchored = Invoke-Git -Dir $Wt -GitArgs @('update-ref', $StashRef, $stash)
+            if ($null -ne $anchored) { $stashRefName = $StashRef }
+            else { Write-WriterError -Stage 'stash-anchor' -Message "update-ref $StashRef failed; the stash sha is unreferenced and gc can delete it" }
+        }
+    } elseif ($statusOk -and $StashRef) {
         # Nothing to cover this pass. An anchor from an earlier turn would keep holding edits that
         # have since been committed or discarded, so it is dropped rather than left to outlive what
         # it described. Deleting a ref that is not there is a no-op that exits 0.
+        #
+        # GATED ON $statusOk, and that gate is load-bearing: if status could not answer, "nothing to
+        # cover" is not known to be true, and deleting the anchor would destroy the last handle on
+        # the previous turn's tracked edits on the strength of a measurement that never happened.
         Invoke-Git -Dir $Wt -GitArgs @('update-ref', '-d', $StashRef) | Out-Null
     }
     $dirtyPaths = @($trackedPaths) + @($untrackedPaths)
@@ -465,21 +563,38 @@ function Get-GitFacts {
         commits   = $commits
         unpushed  = $unpushed
         dirty     = [ordered]@{
-            count          = $dirtyPaths.Count
+            # NULL, NOT 0, WHEN THE PROBE DID NOT ANSWER (rule 6). Zero is a measurement; null is the
+            # absence of one, and only one of those two is true when git could not be asked.
+            count          = if ($statusOk) { $dirtyPaths.Count } else { $null }
             paths          = @($dirtyPaths | Select-Object -First 200)
-            trackedCount   = $trackedPaths.Count
-            untrackedCount = $untrackedPaths.Count
+            trackedCount   = if ($statusOk) { $trackedPaths.Count } else { $null }
+            untrackedCount = if ($statusOk) { $untrackedPaths.Count } else { $null }
             # Named, not counted: a replacement seat has to copy these by hand.
             untracked      = @($untrackedPaths | Select-Object -First 200)
+            # The provenance of every number above. 'ok' means git answered; 'failed' means the counts
+            # are unknown rather than zero, and `probeError` says why.
+            probe          = if ($statusOk) { 'ok' } else { 'failed' }
+            probeError     = $statusError
         }
         stashSha  = $stash
         # The ref holding that sha, so a reader can test the OBJECT (`git rev-parse --verify`) rather
         # than the string. A null here with a non-null stashSha means the anchor did not take.
         stashRef  = $stashRefName
+        # The probe's own outcome, kept beside its result so "could not ask" is never read as "asked,
+        # and the answer was none" (rule 6).
+        stashProbe = $stashProbe
         # What the stash actually covers, so the reader never over-promises recovery. An unanchored
         # sha is named as such: it is a handle that can go dead between the write and the read.
-        stashCovers = if ($stash -and $stashRefName) { 'tracked-only' }
+        #
+        # DERIVED FROM trackedCount AS WELL AS THE SHA. Before that, a failed probe over a dirty tree
+        # emitted 'nothing-untracked-only' -- a stored claim that nothing tracked needs rescuing,
+        # contradicting trackedCount in the same record. The 'NOT-captured' arms are the ones that
+        # say a rescue is owed and this writer could not provide it.
+        stashCovers = if (-not $statusOk) { 'unknown-status-probe-failed' }
+                      elseif ($stash -and $stashRefName) { 'tracked-only' }
                       elseif ($stash) { 'tracked-only-unanchored' }
+                      elseif ($trackedPaths.Count -gt 0 -and $untrackedPaths.Count -gt 0) { 'tracked-edits-NOT-captured-and-untracked-only' }
+                      elseif ($trackedPaths.Count -gt 0) { 'tracked-edits-NOT-captured' }
                       elseif ($untrackedPaths.Count -gt 0) { 'nothing-untracked-only' }
                       else { 'nothing-clean' }
     }
@@ -515,10 +630,13 @@ function Get-Attribution {
     return 'worktree-inherited'
 }
 
+# THE SCAN AND THE ATTRIBUTION ARE SEPARATE STEPS, and the separation is what lets rule 5 keep its
+# critical section short. Scanning several hundred claim/alloc files is the slow half and depends on
+# nothing but the worktree; attributing them needs `episodeStart`, which comes from the PRIOR RECORD
+# and must therefore be read under the lock. Fused, the whole scan would have to run inside the
+# critical section and every Stop hook would serialise behind every other one for half a second.
 function Get-ClaimsFor {
-    # $EpisodeStart is deliberately untyped: a [string] parameter would culture-cast a [DateTime] on
-    # the way in, which is the exact loss ConvertTo-UtcInstant exists to stop.
-    param([string]$CoordDir, [string]$Wt, $EpisodeStart)
+    param([string]$CoordDir, [string]$Wt)
     # Claims are claim.ps1's to write. This reads them and attributes by holder worktree only.
     $out = @()
     $dir = Join-Path $CoordDir 'claims'
@@ -543,17 +661,19 @@ function Get-ClaimsFor {
         # ConvertFrom-Json produced. A value that will not parse is kept VERBATIM rather than dropped:
         # an unparsable timestamp is still evidence, and its attribution is already 'unknown'.
         $atIso = ConvertTo-Utc8601 $at
-        $out += [ordered]@{
-            key         = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
-            claimedAt   = if ($atIso) { $atIso } elseif ($null -ne $at) { [string]$at } else { $null }
-            attribution = (Get-Attribution -At $at -EpisodeStart $EpisodeStart)
+        # rawAt is carried so the attribution step gets the ORIGINAL value rather than a string it
+        # would have to re-parse. It is dropped by Add-Attribution and never reaches the record.
+        $out += @{
+            key       = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
+            claimedAt = if ($atIso) { $atIso } elseif ($null -ne $at) { [string]$at } else { $null }
+            rawAt     = $at
         }
     }
     return $out
 }
 
 function Get-AllocationsFor {
-    param([string]$CoordDir, [string]$Wt, $EpisodeStart)
+    param([string]$CoordDir, [string]$Wt)
     $out = @()
     $dir = Join-Path $CoordDir 'alloc'
     if (-not (Test-Path -LiteralPath $dir)) { return $out }
@@ -572,32 +692,133 @@ function Get-AllocationsFor {
                 if ($j.PSObject.Properties.Name -contains $n) { $at = $j.$n; break }
             }
             $atIso = ConvertTo-Utc8601 $at
-            $out += [ordered]@{
+            $out += @{
                 kind          = $kindDir.Name
                 number        = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
                 allocWorktree = $aw
                 allocatedAt   = if ($atIso) { $atIso } elseif ($null -ne $at) { [string]$at } else { $null }
                 allocBranch   = if ($j.PSObject.Properties.Name -contains 'branch') { [string]$j.branch } else { $null }
-                attribution   = (Get-Attribution -At $at -EpisodeStart $EpisodeStart)
+                rawAt         = $at
             }
         }
     }
     return $out
 }
 
+function Add-Attribution {
+    # The cheap half of the two steps above: one comparison per entry, so it can run inside the
+    # critical section where `episodeStart` is finally known. Key ORDER is fixed here rather than in
+    # the scan, because it is what the record stores.
+    param($Entries, $EpisodeStart, [string[]]$Keys)
+    $out = @()
+    foreach ($e in @($Entries)) {
+        $row = [ordered]@{}
+        foreach ($k in $Keys) { $row[$k] = $e[$k] }
+        $row['attribution'] = (Get-Attribution -At $e['rawAt'] -EpisodeStart $EpisodeStart)
+        $out += $row
+    }
+    return $out
+}
+
 # ---------------------------------------------------------------------------------------------
-# Atomic write.
+# Atomic write, and the serialisation that makes an UPDATE atomic (rule 5).
 # ---------------------------------------------------------------------------------------------
 
-function Write-RecordAtomic {
-    param([string]$Path, $Object)
+function Write-TextAtomic {
+    # Write-then-rename, so a reader never sees a half-written file and a crash never leaves a
+    # truncated one. Used for the record AND for the heartbeat, which is one file per BOX and
+    # therefore written by every session in that checkout at once.
+    #
+    # THE TEMP NAME CARRIES THE PID AND A TICK COUNT, and that is a fix, not decoration. A temp path
+    # derived from the destination alone means two concurrent writers collide ON THE TEMP FILE: the
+    # loser threw 'the process cannot access the file ... because it is being used by another
+    # process', logged a line and wrote NOTHING, having already done all the work. Measured on both
+    # files. The suffix stays '.tmp' so no reader's *.json or *.txt glob can ever pick one up.
+    param([string]$Path, [string]$Text, [int]$Attempts = 4)
     $dir = Split-Path $Path -Parent
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     # Temp file in the SAME directory: a rename across volumes is a copy, and a copy is not atomic.
-    $tmp = Join-Path $dir ('.' + [System.IO.Path]::GetFileName($Path) + '.tmp')
-    $json = $Object | ConvertTo-Json -Depth 8
-    Set-Content -LiteralPath $tmp -Value $json -Encoding utf8 -EA Stop
-    Move-Item -LiteralPath $tmp -Destination $Path -Force -EA Stop
+    $tmp = Join-Path $dir ('.' + [System.IO.Path]::GetFileName($Path) + ".$PID." + [string]([DateTime]::UtcNow.Ticks) + '.tmp')
+    try {
+        Set-Content -LiteralPath $tmp -Value $Text -Encoding utf8 -EA Stop
+        # The RENAME can still lose a race with a reader holding the destination open. It is a
+        # sub-millisecond window and retrying is cheap; failing is not.
+        for ($i = 1; $i -le $Attempts; $i++) {
+            try { Move-Item -LiteralPath $tmp -Destination $Path -Force -EA Stop; return }
+            catch { if ($i -eq $Attempts) { throw }; Start-Sleep -Milliseconds (20 * $i) }
+        }
+    } finally {
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -EA SilentlyContinue }
+    }
+}
+
+function Write-RecordAtomic {
+    param([string]$Path, $Object)
+    Write-TextAtomic -Path $Path -Text ($Object | ConvertTo-Json -Depth 8)
+}
+
+function Invoke-WithRecordLock {
+    # RULE 5. Runs $Body with the record's update lock held, and RETURNS WHETHER IT HELD IT --
+    # the body runs either way. The caller records the difference; it never skips the write.
+    #
+    # WHY THE BODY STILL RUNS ON FAILURE. This is a Stop hook. A writer that refuses to record
+    # because it could not take a lock converts a rare lost field into a guaranteed lost episode, and
+    # a writer that waits indefinitely hangs the seat it is supposed to be documenting. Both are
+    # worse than the race. So the wait is bounded, the answer is reported, and progress is
+    # unconditional -- which is rule 2 applied to contention.
+    #
+    # THE ORPHAN BREAK IS NOT OPTIONAL. The lock is a file; a process killed mid-hold (an exhausted
+    # account, a closed terminal, a rebooted box) leaves it behind forever, and nothing else on this
+    # box would ever clear it. StaleMs is set far above any legitimate hold: the critical section is
+    # a read, a compare and a rename -- single-digit milliseconds -- so a lock file that has not been
+    # touched for seconds is not held by anyone still running.
+    param(
+        [string]$LockPath,
+        [scriptblock]$Body,
+        [int]$TimeoutMs = 5000,
+        [int]$StaleMs = 3000
+    )
+    $dir = Split-Path $LockPath -Parent
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $handle = $null
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt $TimeoutMs) {
+        try {
+            # CreateNew is the atomic test-and-set: it fails if the file exists, and the check and the
+            # creation are one filesystem operation. Test-Path-then-create is two, and two is a race.
+            $handle = [System.IO.File]::Open($LockPath, [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+            break
+        } catch [System.IO.IOException] {
+            try {
+                $fi = Get-Item -LiteralPath $LockPath -EA Stop
+                if (([DateTime]::UtcNow - $fi.LastWriteTimeUtc).TotalMilliseconds -gt $StaleMs) {
+                    Remove-Item -LiteralPath $LockPath -Force -EA SilentlyContinue
+                    continue
+                }
+            } catch { }
+            Start-Sleep -Milliseconds 15
+        } catch {
+            # Not contention -- a permission or path fault. Spinning on it would burn the whole
+            # budget for nothing.
+            break
+        }
+    }
+    if ($handle) {
+        try {
+            # Who holds it, since the file is the only evidence a later orphan-break has to go on.
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes("$PID $([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))")
+            $handle.Write($bytes, 0, $bytes.Length)
+            $handle.Flush()
+            & $Body
+        } finally {
+            try { $handle.Dispose() } catch { }
+            Remove-Item -LiteralPath $LockPath -Force -EA SilentlyContinue
+        }
+        return $true
+    }
+    & $Body
+    return $false
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -639,11 +860,18 @@ try {
     $boxKey = ConvertTo-BoxKey -Path $wt
 
     # Rule 3. BEFORE any early return, so a no-op invocation still proves the writer ran.
+    #
+    # WRITTEN ATOMICALLY, because this file is keyed per BOX and every session in that checkout
+    # touches it. Set-Content truncates in place and takes an exclusive handle: measured, six
+    # simultaneous writers produced 'the process cannot access the file ... .writer-alive\<box>.txt
+    # because it is being used by another process', so the losers left the file holding an OLDER
+    # timestamp -- and a reader that ages this file would then read a running fleet as a dead one.
+    # It also means a reader can never catch the file mid-truncate and parse an empty string as an
+    # unreadable heartbeat. Path and contents are unchanged: one ISO-8601 Z instant, per box.
     try {
         $aliveDir = Join-Path $script:SeatsDir '.writer-alive'
-        if (-not (Test-Path -LiteralPath $aliveDir)) { New-Item -ItemType Directory -Path $aliveDir -Force | Out-Null }
-        Set-Content -LiteralPath (Join-Path $aliveDir "$boxKey.txt") `
-            -Value ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) -Encoding utf8 -EA Stop
+        Write-TextAtomic -Path (Join-Path $aliveDir "$boxKey.txt") `
+            -Text ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))
     } catch { Write-WriterError -Stage 'writer-alive' -Message $_.Exception.Message }
 
     if ($BumpEpoch) {
@@ -669,6 +897,33 @@ try {
     }
 
     $recPath = Join-Path (Join-Path $script:SeatsDir $boxKey) ("$($sk.Key).json")
+    # Beside the record, not inside the seats root: the lock's granularity IS the record, so two
+    # sessions in one checkout never wait on each other. '.lock' cannot be picked up by the reader's
+    # *.json glob.
+    $lockPath = "$recPath.lock"
+
+    # ------------------------------------------------------------------------------------------
+    # GATHER (unlocked). Everything here is slow -- ~8 git subprocesses and a scan of every claim
+    # and alloc file -- and none of it depends on the record's current contents, so holding the lock
+    # across it would serialise every seat's Stop hook behind every other one for half a second to
+    # buy nothing. Rule 5.
+    # ------------------------------------------------------------------------------------------
+    $now = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    # One ref per (box, session), overwritten each turn exactly as the record is, so anchoring adds no
+    # cardinality the layer did not already have. The name is self-documenting to whoever finds it in
+    # `git for-each-ref` months later.
+    $stashRef = "refs/mefor-seat/$(ConvertTo-RefComponent $boxKey)/$(ConvertTo-RefComponent $sk.Key)"
+    $g = Get-GitFacts -Wt $wt -StashRef $stashRef
+    $cr = Get-ConfigRootLabel
+    $rawClaims = @(Get-ClaimsFor -CoordDir $coord -Wt $wt)
+    $rawAllocs = @(Get-AllocationsFor -CoordDir $coord -Wt $wt)
+
+    # ------------------------------------------------------------------------------------------
+    # COMMIT (locked). Read prior -> derive the carried-forward fields from THAT read -> write.
+    # The prior read has to be inside the lock: it is the read half of the read-modify-write, and
+    # reading it in the gather phase is exactly the ~500 ms of blindness that lost a -Close.
+    # ------------------------------------------------------------------------------------------
+    $applyUpdate = {
 
     # Read the prior record so -Declare and -Close amend rather than truncate, and so `writes` and
     # the declared half survive a -Record that knows nothing about them.
@@ -691,14 +946,6 @@ try {
         if (-not $identified) { return $Default }
         return (Prior $Name $Default)
     }
-
-    $now = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
-    # One ref per (box, session), overwritten each turn exactly as the record is, so anchoring adds no
-    # cardinality the layer did not already have. The name is self-documenting to whoever finds it in
-    # `git for-each-ref` months later.
-    $stashRef = "refs/mefor-seat/$(ConvertTo-RefComponent $boxKey)/$(ConvertTo-RefComponent $sk.Key)"
-    $g = Get-GitFacts -Wt $wt -StashRef $stashRef
-    $cr = Get-ConfigRootLabel
 
     $lifecycle = PriorOwn 'lifecycle' 'open'
     $lifecycleAt = ConvertTo-Utc8601 (PriorOwn 'lifecycleAt' $now)
@@ -824,15 +1071,33 @@ try {
         dirty            = $g.dirty
         stashSha         = $g.stashSha
         stashRef         = $g.stashRef
+        # THE PROBE'S OWN OUTCOME (rule 6), and it is listed here for the reason
+        # test_missing_field_is_absent_not_empty exists: a field added to Get-GitFacts and not wired
+        # into this literal is absent from the record while every count still agrees. It happened to
+        # `commits` once and to this field once, caught by a rig that printed the field rather than
+        # counting it.
+        stashProbe       = $g.stashProbe
         stashCovers      = $g.stashCovers
-        claims           = @(Get-ClaimsFor -CoordDir $coord -Wt $wt -EpisodeStart $episodeStart)
-        allocations      = @(Get-AllocationsFor -CoordDir $coord -Wt $wt -EpisodeStart $episodeStart)
+        # Scanned in the gather phase, attributed here: attribution needs episodeStart, which is only
+        # known once the prior record has been read under the lock.
+        claims           = @(Add-Attribution -Entries $rawClaims -EpisodeStart $episodeStart -Keys @('key', 'claimedAt'))
+        allocations      = @(Add-Attribution -Entries $rawAllocs -EpisodeStart $episodeStart -Keys @('kind', 'number', 'allocWorktree', 'allocatedAt', 'allocBranch'))
         handoff          = $handoffObj
         predecessor      = $pred
         notes            = $notesValue
     }
 
     Write-RecordAtomic -Path $recPath -Object $rec
+
+    }   # end $applyUpdate
+
+    # THE RETURN VALUE IS A FACT ABOUT THIS WRITE, and it is recorded rather than acted on: the body
+    # ran either way (rule 5's deadline clause), so an unserialised update is a caveat in the writer
+    # error log, not a lost episode and never a hang.
+    $held = Invoke-WithRecordLock -LockPath $lockPath -Body $applyUpdate
+    if (-not $held) {
+        Write-WriterError -Stage 'record-lock' -Message "could not take $lockPath within the deadline; the update was applied WITHOUT serialisation and a concurrent write may have been overwritten"
+    }
 
     if (-not $Record) { Write-Host "wrote $recPath" }
 } catch {

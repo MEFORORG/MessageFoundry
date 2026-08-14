@@ -294,6 +294,33 @@ function Get-NormPath([string]$p) {
     return ($p.Trim().TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\')
 }
 
+# EXACT MATCH OR DESCENDANT, AND THE SEPARATOR IS NOT OPTIONAL.
+#
+# The denominator asks "is this live session sitting in one of this clone's worktrees", and a session
+# whose cwd is a SUBDIRECTORY of a worktree is still that worktree's session. Exact path equality
+# dropped every one of them, which shrinks the denominator exactly where it is supposed to
+# discriminate. MEASURED THE SAME NIGHT ON THIS BOX: presence.ps1 counted 13 live sessions where a
+# second instrument reached 10, and the checkout that had just been worked in was among the three the
+# second could not see.
+#
+# The appended separator is the whole defence: a bare StartsWith makes "...\MessageFoundry-ledger" a
+# child of "...\MessageFoundry", and this project has TWO files carrying that scar (occupancy.ps1:227
+# appends it; install-git-hooks.ps1:186 documents the sibling-worktree miss it caused).
+#
+# LONGEST MATCH WINS, or a worktree nested inside another -- which is this project's own layout,
+# .claude\worktrees\<name> under the primary -- folds into its parent and gets attributed to a
+# checkout it is nowhere near.
+function Resolve-WorktreeFor([string]$NormCwd, [string[]]$Worktrees) {
+    $best = $null
+    foreach ($w in $Worktrees) {
+        if (-not $w) { continue }
+        if ($NormCwd -eq $w -or $NormCwd.StartsWith("$w\", [StringComparison]::Ordinal)) {
+            if (-not $best -or $w.Length -gt $best.Length) { $best = $w }
+        }
+    }
+    return $best
+}
+
 # Worktrees of THIS clone, so the denominator is scoped to this repo rather than to the whole box.
 # Its AVAILABILITY is a fact in the receipt for the same reason the fence's is: an empty list and a
 # git that would not answer produce the same denominator, and one of them means the denominator is
@@ -307,15 +334,94 @@ if ($wtOut) {
     }
 }
 
+# NEWEST RECORD PER SESSION, AS AN AGE. "A record exists" and "the writer is still recording this
+# seat" are different sentences, and the denominator below needs the second one: one record ever
+# written satisfied the first forever, so a writer that recorded turn 1 and then died was
+# byte-identical to one recording every turn. A session can hold a record in more than one box (it
+# only has to cd), so the NEWEST wins.
+#
+# A record whose asOf will not parse keeps a $null age, which is treated below as NOT fresh. That is
+# the safe direction: it fires a stop that says the roster may be short, rather than certifying a
+# record whose age nothing could establish.
+$recordAgeBySession = @{}
+foreach ($r in $records) {
+    $sid = [string](Get-RecField $r.Rec 'sessionId' '')
+    if (-not $sid) { continue }
+    $m = Get-AgeMinutes (Get-RecField $r.Rec 'asOf')
+    if (-not $recordAgeBySession.ContainsKey($sid)) { $recordAgeBySession[$sid] = $m }
+    elseif ($null -ne $m -and ($null -eq $recordAgeBySession[$sid] -or $m -lt $recordAgeBySession[$sid])) {
+        $recordAgeBySession[$sid] = $m
+    }
+}
+
+# Writer heartbeat. "Installed", "resolvable" and "actually ran" are three different sentences and
+# the first alone answers the neighbouring question.
+#
+# THE TIMESTAMP INSIDE THE FILE IS THE MEASUREMENT; COUNTING THE FILES IS NOT. seat.ps1 rule 3 writes
+# a UTC instant into seats/.writer-alive/<boxKey>.txt on EVERY invocation including no-op ones, and
+# this used to count the files and never open them -- so proof-of-life could only ever go UP, and a
+# writer disabled months ago (disableAllHooks, org policy, workspace trust: all silent) read exactly
+# like one that ran a second ago. The file's own mtime is a FALLBACK, never the primary: it answers
+# "when was this file last written", which is the same sentence only while nothing else touches it.
+$heartbeats = @()
+$heartbeatAgeByBox = @{}
+$aliveDir = Join-Path $seatsDir '.writer-alive'
+if (Test-Path -LiteralPath $aliveDir) {
+    $heartbeats = @(Get-ChildItem -LiteralPath $aliveDir -Filter *.txt -EA SilentlyContinue)
+}
+foreach ($h in $heartbeats) {
+    $stamp = $null
+    try { $stamp = (Get-Content -LiteralPath $h.FullName -Raw -EA Stop) } catch { }
+    $age = Get-AgeMinutes ([string]$stamp).Trim()
+    if ($null -eq $age) { $age = ($now - $h.LastWriteTimeUtc).TotalMinutes }
+    # A PowerShell hashtable is case-insensitive on string keys by default, which is what this lookup
+    # needs: ConvertTo-BoxKey's slug half preserves the case of the directory leaf, so a key minted
+    # here from a normalised (lower-cased) path would otherwise miss the writer's own file.
+    $heartbeatAgeByBox[[System.IO.Path]::GetFileNameWithoutExtension($h.Name)] = $age
+}
+$heartbeatNewestAge = $null
+if ($heartbeatAgeByBox.Count -gt 0) {
+    $heartbeatNewestAge = [int][Math]::Round((($heartbeatAgeByBox.Values | Measure-Object -Minimum).Minimum))
+}
+
+# The writer's own failure log. seat.ps1 rule 2 appends one line per failure and still exits 0, so
+# this file is the ONLY trace of a seat that is provably not being recorded.
+#
+# THE OPERAND IS THE RECENT COUNT, NOT THE TOTAL, and that is a correctness choice rather than a
+# softening. The log is APPEND-ONLY and nothing truncates it, so a stop keyed on the total would fire
+# for ever after the first failure this repo ever had -- and a channel that fires when nothing is
+# wrong trains its reader to skip it, which is the CRYING WOLF failure this file already paid for
+# once on origin/main staleness. The total is still printed, so the history is not hidden.
+# An UNPARSABLE line counts as recent: failing toward firing the stop suppresses a completeness claim,
+# and the other direction hides a writer that is failing right now.
+$writerErrors = 0
+$writerErrorsRecent = 0
+$writerErrorNewestAge = $null
+$errFile = Join-Path $seatsDir '.writer-errors.txt'
+if (Test-Path -LiteralPath $errFile) {
+    $errLines = @(Get-Content -LiteralPath $errFile -EA SilentlyContinue | Where-Object { $_ -and $_.Trim() })
+    $writerErrors = $errLines.Count
+    foreach ($ln in $errLines) {
+        # seat.ps1 writes "<iso utc>`t<host>`t<stage>`t<message>".
+        $age = Get-AgeMinutes (($ln -split "`t")[0])
+        if ($null -eq $age -or $age -le $FreshMinutes) { $writerErrorsRecent++ }
+        if ($null -ne $age -and ($null -eq $writerErrorNewestAge -or $age -lt $writerErrorNewestAge)) {
+            $writerErrorNewestAge = $age
+        }
+    }
+}
+
 # LIVE sessions sitting in this repo's worktrees. This is the denominator: a session here that has
-# produced no record is EVIDENCE THE WRITER IS DEAD, not evidence the fleet is idle.
+# produced no record -- or no RECENT record -- is EVIDENCE THE WRITER IS DEAD, not evidence the fleet
+# is idle.
 $liveInRepo = @()
 $registryUnfenceable = 0
 foreach ($row in $sessionRows) {
     if (-not $row.Record) { continue }
-    $cwd = $null
-    if ($row.Record.PSObject.Properties.Name -contains 'cwd') { $cwd = Get-NormPath ([string]$row.Record.cwd) }
-    if (-not $cwd -or $repoWorktrees -notcontains $cwd) { continue }
+    $cwd = Get-NormPath ([string](Get-RecField $row.Record 'cwd' ''))
+    if (-not $cwd) { continue }
+    $wtMatch = Resolve-WorktreeFor -NormCwd $cwd -Worktrees $repoWorktrees
+    if (-not $wtMatch) { continue }
     # ONE malformed registry file must degrade ONE row, never the whole receipt. MEASURED on this
     # file: a registry record carrying a non-numeric startedAt threw out of Test-RecordLiveness here
     # -- this call sat outside any try -- and fleet.ps1 exited 1 having printed no receipt, no
@@ -325,31 +431,35 @@ foreach ($row in $sessionRows) {
     # person least able to tell a broken instrument from an idle fleet. Counted, never swallowed.
     $l = $null
     try { $l = Test-RecordLiveness -Record $row.Record } catch { $registryUnfenceable++; continue }
-    if ($l.State -eq 'LIVE') {
-        $liveInRepo += [pscustomobject]@{
-            SessionId = [string]$row.Record.sessionId
-            Cwd       = $cwd
-            Box       = (ConvertTo-BoxKey -Path ([string]$row.Record.cwd))
-            Root      = $row.Root
-        }
+    if ($l.State -ne 'LIVE') { continue }
+
+    $sid = [string](Get-RecField $row.Record 'sessionId' '')
+    $hasRecord = ($sid -and $recordAgeBySession.ContainsKey($sid))
+    $recAge = if ($hasRecord) { $recordAgeBySession[$sid] } else { $null }
+    # The box is minted from the MATCHED WORKTREE ROOT, not from the session's cwd: seat.ps1 keys the
+    # record on `git rev-parse --show-toplevel`, so a cwd one directory down would mint a box key that
+    # matches nothing this layer ever wrote.
+    $boxKey = ConvertTo-BoxKey -Path $wtMatch
+    $hbAge = if ($heartbeatAgeByBox.ContainsKey($boxKey)) { $heartbeatAgeByBox[$boxKey] } else { $null }
+    $liveInRepo += [pscustomobject]@{
+        SessionId           = $sid
+        Cwd                 = $cwd
+        Worktree            = $wtMatch
+        Box                 = $boxKey
+        Root                = $row.Root
+        HasRecord           = [bool]$hasRecord
+        RecordAgeMinutes    = $recAge
+        RecordFresh         = ($hasRecord -and $null -ne $recAge -and $recAge -le $FreshMinutes)
+        HeartbeatAgeMinutes = $hbAge
+        HeartbeatFresh      = ($null -ne $hbAge -and $hbAge -le $FreshMinutes)
     }
 }
 
-$recordedSessionIds = @($records | ForEach-Object { [string]$_.Rec.sessionId } | Where-Object { $_ })
-$liveWithoutRecord = @($liveInRepo | Where-Object { $recordedSessionIds -notcontains $_.SessionId })
-
-# Writer heartbeat. "Installed", "resolvable" and "actually ran" are three different sentences and
-# the first alone answers the neighbouring question.
-$heartbeats = @()
-$aliveDir = Join-Path $seatsDir '.writer-alive'
-if (Test-Path -LiteralPath $aliveDir) {
-    $heartbeats = @(Get-ChildItem -LiteralPath $aliveDir -Filter *.txt -EA SilentlyContinue)
-}
-$writerErrors = 0
-$errFile = Join-Path $seatsDir '.writer-errors.txt'
-if (Test-Path -LiteralPath $errFile) {
-    $writerErrors = @(Get-Content -LiteralPath $errFile -EA SilentlyContinue).Count
-}
+$liveWithoutRecord = @($liveInRepo | Where-Object { -not $_.HasRecord })
+$liveWithStaleRecord = @($liveInRepo | Where-Object { $_.HasRecord -and -not $_.RecordFresh })
+# The heartbeat separates "the writer is not running here" from "the writer runs and its write
+# failed": a fresh heartbeat beside a stale record is the second, and .writer-errors.txt says why.
+$liveWithoutFreshHeartbeat = @($liveInRepo | Where-Object { -not $_.HeartbeatFresh })
 
 # origin/main's own age. Every landed verdict is computed against this ref, and the local copy of it
 # only refreshes on FETCH. A landed verdict against a stale ref is the dangerous direction: this repo
@@ -393,30 +503,21 @@ if ($fetchHeads.Count -gt 0) {
 # Classify. Every state is derived here and none is read from a record.
 # ---------------------------------------------------------------------------------------------
 
-$now = [DateTime]::UtcNow
-
-# NOT [string]$iso. MEASURED: ConvertFrom-Json parses "2026-08-14T20:24:29Z" into a [DateTime] with
-# Kind=Utc, and casting THAT to string yields "08/14/2026 20:24:29" -- the Z is GONE. Parsing the
-# result treats it as LOCAL, silently adding the UTC offset, and this box reported ages five hours in
-# the FUTURE. The pattern was correct throughout; the TYPE was not what the code assumed, which is
-# why re-reading the parse call finds nothing and dumping the type finds it immediately.
-function Get-AgeHours($iso) {
-    if (-not $iso) { return $null }
-    try {
-        $utc = if ($iso -is [DateTime]) {
-            if ($iso.Kind -eq [DateTimeKind]::Utc) { $iso } else { $iso.ToUniversalTime() }
-        } else {
-            [DateTimeOffset]::Parse([string]$iso, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal).UtcDateTime
-        }
-        return [Math]::Round(($now - $utc).TotalHours, 1)
-    } catch { return $null }
-}
-
 $rows = @()
+$unclassifiableRecords = 0
 foreach ($r in $records) {
+  # ONE RECORD, ONE ROW, AND A THROW COSTS THE ROW RATHER THAN THE RECEIPT. Every field below is read
+  # through Get-RecField, so this catch should be unreachable -- it is here because "should be
+  # unreachable" is exactly what the shipped file assumed about the record shape, and an unhandled
+  # exception is the INVERSE of a stop: it suppresses the evidence and renders nothing. Two live
+  # throws remain reachable even so and neither is a field read: Test-Path on a junk worktree string,
+  # and casting a non-numeric poolEpoch. The row is still emitted, visibly unusable and out of the
+  # respawn population, and the count is a stop operand.
+  try {
     $rec = $r.Rec
-    $wt = if ($rec.PSObject.Properties.Name -contains 'worktree') { [string]$rec.worktree } else { '' }
-    $sid = if ($rec.PSObject.Properties.Name -contains 'sessionId') { [string]$rec.sessionId } else { $null }
+    $wt = [string](Get-RecField $rec 'worktree' '')
+    $sid = [string](Get-RecField $rec 'sessionId' '')
+    if (-not $sid) { $sid = $null }
 
     # Fence state, positive answers only. There is no heartbeat on this host and registry writes are
     # event-driven, so nothing here can PROVE a session is gone -- only that it is present.
@@ -448,8 +549,8 @@ foreach ($r in $records) {
             } catch { 'FENCE-ERROR' }
         }
 
-    $lifecycle = if ($rec.PSObject.Properties.Name -contains 'lifecycle') { [string]$rec.lifecycle } else { 'open' }
-    $ageH = Get-AgeHours $rec.asOf
+    $lifecycle = [string](Get-RecField $rec 'lifecycle' 'open')
+    $ageH = Get-AgeHours (Get-RecField $rec 'asOf')
 
     # DOES THE CHECKOUT STILL EXIST? One Test-Path, and the reader already re-derives everything else.
     # The project's own cleanup (scripts/worktree/remove.ps1, prune-merged.ps1) calls
@@ -458,7 +559,12 @@ foreach ($r in $records) {
     # one and stays in the respawn population, while -Detail prints "WORK AT RISK ... if that checkout
     # is removed they are gone" over files that went with the directory -- a warning written in the
     # conditional for a condition that already holds.
-    $checkoutGone = ($wt -and -not (Test-Path -LiteralPath $wt -PathType Container))
+    # Test-Path itself throws on a path holding characters the filesystem API rejects, and a record's
+    # worktree is a string read off disk. A path that cannot even be tested is not a checkout anyone
+    # can respawn into, so the throw resolves to GONE rather than to a dead reader.
+    $checkoutExists = $false
+    if ($wt) { try { $checkoutExists = Test-Path -LiteralPath $wt -PathType Container } catch { $checkoutExists = $false } }
+    $checkoutGone = ($wt -and -not $checkoutExists)
     # Git no longer LISTS the path, but a directory is still sitting there: a different fact, so it
     # gets a different name. Untracked files there are still recoverable, so this must not become a
     # state. Gated on the list being available at all, or a git that would not answer would flag
@@ -479,14 +585,15 @@ foreach ($r in $records) {
     # by the seat itself. It is voluntary, so nothing DEPENDS on it: absent a link nothing is
     # superseded, every row stays visible, and the failure direction is showing more rather than less.
     $superseded = $false
+    $myKey = [string](Get-RecField $rec 'sessionKey' '')
     foreach ($o in $records) {
         if ($o.File -eq $r.File) { continue }
-        if ($o.Rec.PSObject.Properties.Name -notcontains 'predecessor') { continue }
-        $p = $o.Rec.predecessor
+        $p = Get-RecField $o.Rec 'predecessor'
         if (-not $p) { continue }
-        if (($p.PSObject.Properties.Name -notcontains 'boxKey') -or ($p.PSObject.Properties.Name -notcontains 'sessionKey')) { continue }
-        $myKey = if ($rec.PSObject.Properties.Name -contains 'sessionKey') { [string]$rec.sessionKey } else { '' }
-        if (([string]$p.boxKey -eq $r.Box) -and ($myKey -and [string]$p.sessionKey -eq $myKey)) { $superseded = $true }
+        $pBox = [string](Get-RecField $p 'boxKey' '')
+        $pKey = [string](Get-RecField $p 'sessionKey' '')
+        if (-not $pBox -or -not $pKey) { continue }
+        if (($pBox -eq $r.Box) -and $myKey -and ($pKey -eq $myKey)) { $superseded = $true }
     }
 
     # ORDER IS THE FIX, NOT JUST THE ARMS. The POSITIVE fence answer goes FIRST, because it is the one
@@ -519,12 +626,18 @@ foreach ($r in $records) {
     # age stops tracking activity the moment the writer stops, and the two must not be conflated.
     $writerStale = ($null -ne $ageH -and $ageH -gt 1 -and $state -in @('RUNNING', 'POSSIBLY RUNNING'))
 
-    $declared = $null
-    if (($rec.PSObject.Properties.Name -contains 'seat') -and $rec.seat) { $declared = [string]$rec.seat }
+    $declared = [string](Get-RecField $rec 'seat' '')
+    if (-not $declared) { $declared = $null }
+
+    # `[int]` on a value read off disk throws for anything non-numeric, so the cast is gated rather
+    # than trusted. An epoch that will not parse renders as absent, which is what it is.
+    $epoch = $null
+    $epochRaw = Get-RecField $rec 'poolEpoch'
+    if ($null -ne $epochRaw -and "$epochRaw" -match '\A[0-9]+\z') { $epoch = [int]$epochRaw }
 
     $rows += [pscustomobject]@{
         Box              = $r.Box
-        SessionKey       = if ($rec.PSObject.Properties.Name -contains 'sessionKey') { [string]$rec.sessionKey } else { '' }
+        SessionKey       = $myKey
         Seat             = $declared
         State            = $state
         Fence            = $fence
@@ -532,12 +645,35 @@ foreach ($r in $records) {
         WriterStale      = $writerStale
         CheckoutGone     = [bool]$checkoutGone
         CheckoutUnlisted = [bool]$checkoutUnlisted
-        Branch           = if ($rec.PSObject.Properties.Name -contains 'branch') { [string]$rec.branch } else { $null }
+        Branch           = [string](Get-RecField $rec 'branch' '')
         Worktree         = $wt
-        Epoch            = if ($rec.PSObject.Properties.Name -contains 'poolEpoch') { [int]$rec.poolEpoch } else { $null }
+        Epoch            = $epoch
         Rec              = $rec
         File             = $r.File
     }
+  } catch {
+    # THE ROW SURVIVES ITS OWN RECORD. Rendering nothing here would delete a seat from the answer;
+    # rendering a row that says so keeps the checkout visible, keeps it OUT of the respawn population
+    # (nothing about it was established), and the stop condition keyed on this count tells the reader
+    # the roster is short by exactly this much and which file to open.
+    $unclassifiableRecords++
+    $rows += [pscustomobject]@{
+        Box              = $r.Box
+        SessionKey       = ''
+        Seat             = $null
+        State            = 'RECORD-UNUSABLE'
+        Fence            = 'RECORD-UNUSABLE'
+        AgeHours         = $null
+        WriterStale      = $false
+        CheckoutGone     = $false
+        CheckoutUnlisted = $false
+        Branch           = $null
+        Worktree         = ''
+        Epoch            = $null
+        Rec              = $r.Rec
+        File             = $r.File
+    }
+  }
 }
 
 # Records sharing ONE checkout. This is what the per-box SUPERSEDED rule was really reacting to, and
@@ -553,16 +689,42 @@ $boxesWithSeveral = @($rows | Group-Object Box | Where-Object { $_.Count -gt 1 }
 $recordsUnfenceable = @($rows | Where-Object { $_.Fence -in @('NOT-FENCEABLE', 'FENCE-ERROR') }).Count
 $recordsCheckoutGone = @($rows | Where-Object { $_.CheckoutGone }).Count
 
+# THE STOP SET IS THE RECEIPT, READ BACK. Every operand below is a field printed above it, and every
+# field printed above is read by something here -- see the header: a printed field that no stop reads
+# is a decoration, and this file shipped with two of them.
 $stops = @()
 if (-not $fenceAvailable) { $stops += 'fenceAvailable=false -- no config root with a sessions/ directory was found; every state below would be a guess' }
+# PRESENT IS NOT THE SAME AS ABLE TO SEE. With a sessions/ directory that holds nothing readable, the
+# fence answers NOT-REGISTERED for every record and INTERRUPTED is MANUFACTURED rather than measured --
+# including for seats that are running right now. This suppresses the completeness claim rather than
+# reclassifying the rows, because reclassifying them would empty the respawn population instead.
+elseif (-not $fenceCanSee) { $stops += "fenceSessionRecordsRead=0 over rootsExamined=$rootsExamined -- the fence is PRESENT but read no session records at all, so every NOT-REGISTERED verdict below (and every INTERRUPTED derived from one) was measured against an EMPTY registry" }
+if ($fenceRecordsUnreadable -gt 0) { $stops += "fenceSessionRecordsUnreadable=$fenceRecordsUnreadable -- that many registry files would not parse, so the live denominator is short by up to that many; a session that launched a moment ago has exactly that shape" }
 if (-not $worktreeListAvailable) { $stops += 'worktreeListAvailable=false -- git would not list this clone''s worktrees, so liveSessionsWithoutRecord below is computed against an EMPTY denominator and cannot fire' }
 if ($liveWithoutRecord.Count -gt 0) { $stops += "liveSessionsWithoutRecord=$($liveWithoutRecord.Count) -- the writer is not running in every live seat, so this roster is INCOMPLETE by that many" }
+# THE RECENCY HALF OF THE SAME DENOMINATOR. Existence alone was satisfied for ever by one record
+# written once, so a writer that recorded turn 1 and then died reported as healthy.
+if ($liveWithStaleRecord.Count -gt 0) { $stops += "liveSessionsWithStaleRecord=$($liveWithStaleRecord.Count) -- that many live seats have a record OLDER than $FreshMinutes minutes (or one whose age will not parse); the writer recorded them once and has not since, so what the roster says about them is out of date by an unknown amount" }
+if ($liveWithoutFreshHeartbeat.Count -gt 0) { $stops += "liveSessionsWithStaleWriterHeartbeat=$($liveWithoutFreshHeartbeat.Count) -- that many live seats have no writer heartbeat inside $FreshMinutes minutes, so the Stop hook is not firing there at all (disableAllHooks, org policy and workspace trust all disable it SILENTLY)" }
 if ($registryUnfenceable -gt 0) { $stops += "registryRecordsUnfenceable=$registryUnfenceable -- that many session records in this repo's worktrees could not be fenced at all, so the live denominator is short by up to that many" }
 if ($records.Count -eq 0 -and $heartbeats.Count -eq 0) { $stops += 'recordsExamined=0 AND writerHeartbeatIn=0 -- indistinguishable from a writer that was never installed' }
+# A RECORD THAT WOULD NOT PARSE IS A SEAT THIS ROSTER CANNOT DESCRIBE. It was already counted and
+# already printed; it just entered no stop, so a seats layer where EVERY record was unreadable
+# rendered as a confident empty roster. One of these may simply be mid-write -- that is a re-run, not
+# a reason to leave the claim of completeness standing.
+if ($unreadableRecords -gt 0) { $stops += "recordsUnreadable=$unreadableRecords -- that many files in the seats layer are not readable records (malformed, empty, or being written this instant), so the roster is short by up to that many" }
+if ($unclassifiableRecords -gt 0) { $stops += "recordsUnclassifiable=$unclassifiableRecords -- that many records parsed but could not be classified; they are rendered as RECORD-UNUSABLE and nothing about them was established" }
 # A record with no sessionId is STRUCTURALLY unfenceable rather than merely quiet, and it is reachable
 # by design (the plain hook path with no session_id on stdin writes exactly one). Its liveness column
 # is not a measurement, so the roster is incomplete by that many whatever state is rendered.
 if ($recordsUnfenceable -gt 0) { $stops += "recordsUnfenceable=$recordsUnfenceable -- that many records carry no session id or threw in the fence, so their liveness is UNMEASURED, not quiet" }
+# THE WRITER SAYING IT FAILED. seat.ps1 exits 0 on every failure by design (rule 2), so this log is the
+# only place a seat that is provably not being recorded shows up at all. Keyed on the RECENT count for
+# the reason given where it is computed: the log never shrinks.
+if ($writerErrorsRecent -gt 0) {
+    $newestTxt = if ($null -ne $writerErrorNewestAge) { "newest $([int]$writerErrorNewestAge)m ago" } else { 'newest of unknown age' }
+    $stops += "writerErrorLinesRecent=$writerErrorsRecent of writerErrorLines=$writerErrors ($newestTxt) -- the writer FAILED that many times inside $FreshMinutes minutes and still exited 0; read $errFile. Any seat it failed on is missing or stale below"
+}
 # UNCHECKABLE is its own stop. Silence beside a populated originMainSha reads as a pass, and that is
 # precisely the blind direction: landed verdicts computed against a cached main of unknown age.
 if ($null -eq $originMainAgeMinutes) { $stops += "originMainAgeMinutes is $originMainAgeSource -- landed verdicts below would be computed against a cached origin/main of UNKNOWN age" }
@@ -571,17 +733,30 @@ elseif ($originMainAgeMinutes -gt 60) { $stops += "originMainAgeMinutes=$originM
 $receipt = [ordered]@{
     renderedAtUtc              = $now.ToString('yyyy-MM-ddTHH:mm:ssZ')
     seatsDir                   = $seatsDir
+    # SDS-3.8 again: every staleness verdict below is a comparison against THIS number, so a reader
+    # cannot check any of them without seeing it.
+    freshWithinMinutes         = $FreshMinutes
     rootsExamined              = $rootsExamined
     fenceAvailable             = $fenceAvailable
+    fenceSessionRecordsRead    = $fenceRecordsRead
+    fenceSessionRecordsUnreadable = $fenceRecordsUnreadable
+    fenceCanSee                = $fenceCanSee
     recordsExamined            = $records.Count
     recordsUnreadable          = $unreadableRecords
+    recordsUnclassifiable      = $unclassifiableRecords
     recordsUnfenceable         = $recordsUnfenceable
     recordsCheckoutGone        = $recordsCheckoutGone
     liveSessionsInRepo         = $liveInRepo.Count
     liveSessionsWithoutRecord  = $liveWithoutRecord.Count
+    liveSessionsWithStaleRecord = $liveWithStaleRecord.Count
+    liveSessionsWithStaleWriterHeartbeat = $liveWithoutFreshHeartbeat.Count
     registryRecordsUnfenceable = $registryUnfenceable
     writerHeartbeatIn          = $heartbeats.Count
+    # The AGE of the newest heartbeat, not just how many files there are. Null means no heartbeat file
+    # exists at all, which is a different sentence from "one exists and is old".
+    writerHeartbeatNewestAgeMinutes = $heartbeatNewestAge
     writerErrorLines           = $writerErrors
+    writerErrorLinesRecent     = $writerErrorsRecent
     worktreeListAvailable      = $worktreeListAvailable
     repoWorktrees              = $repoWorktrees.Count
     checkoutsWithSeveralRecords = $boxesWithSeveral.Count
@@ -656,18 +831,17 @@ if ($Detail) {
     }
     "BRANCH:   $($row.Branch)"
     "  Work is named by BRANCH. A commit id is not an identifier here -- a rebase reissues it."
-    if ($rec.tip) { "  tip was $($rec.tip) as of the record; resolve the branch yourself." }
+    $tip = Get-RecField $rec 'tip'
+    if ($tip) { "  tip was $tip as of the record; resolve the branch yourself." }
     ""
     "WHAT THIS SEAT ACTUALLY DID -- involuntary evidence, written as a side effect of working:"
-    $commits = @()
-    if (($rec.PSObject.Properties.Name -contains 'commits') -and $rec.commits) { $commits = @($rec.commits) }
+    $commits = @(Get-RecField $rec 'commits' @())
     if ($commits.Count -gt 0) {
         foreach ($c in $commits) { "  $c" }
     } else {
         "  no commits since the merge-base were recorded"
     }
-    $touched = @()
-    if (($rec.PSObject.Properties.Name -contains 'touchedPaths') -and $rec.touchedPaths) { $touched = @($rec.touchedPaths) }
+    $touched = @(Get-RecField $rec 'touchedPaths' @())
     if ($touched.Count -gt 0) {
         # A LIST THAT IS SHORTER THAN ITS OWN COUNT MUST SAY SO. This used to print "touched 19
         # path(s):" and then list 15 with no ellipsis and no "showing first N".
@@ -681,9 +855,7 @@ if ($Detail) {
     } else {
         "WORK AT RISK -- check this FIRST, it is the only category that cannot be recovered elsewhere:"
     }
-    $untracked = @()
-    if (($rec.PSObject.Properties.Name -contains 'dirty') -and $rec.dirty -and
-        ($rec.dirty.PSObject.Properties.Name -contains 'untracked')) { $untracked = @($rec.dirty.untracked) }
+    $untracked = @(Get-RecField (Get-RecField $rec 'dirty') 'untracked' @())
     if ($untracked.Count -gt 0) {
         if ($row.CheckoutGone) {
             "  $($untracked.Count) UNTRACKED file(s) were held by NO GIT OBJECT, and the directory that"
@@ -696,9 +868,44 @@ if ($Detail) {
         foreach ($u in ($untracked | Select-Object -First 40)) { "    $u" }
         if ($untracked.Count -gt 40) { "    ... and $($untracked.Count - 40) more (SHOWING 40 OF $($untracked.Count))" }
     } else { "  no untracked files were recorded" }
-    if ($rec.stashSha) { "  stash commit (TRACKED edits only): $($rec.stashSha)" }
-    if (($rec.PSObject.Properties.Name -contains 'stashCovers')) { "  stash covers: $($rec.stashCovers)" }
-    if ($rec.unpushed) { "  unpushed commits vs $($rec.unpushed.base): $($rec.unpushed.count)" }
+    # THE STASH HANDLE IS TESTED, NOT PRINTED. `git stash create` writes no ref and no reflog entry, so
+    # the object it names is unreachable from the moment it exists; seat.ps1 now ANCHORS it under
+    # refs/mefor-seat/<box>/<session> and records that ref, and this is the reader half of that fix.
+    # MEASURED before it: `git gc --prune=now` deleted the recorded stash and the next -Detail printed
+    # the same sha in the same words -- a pruned handle and a live one were byte-identical, under a
+    # heading that tells the reader the tracked half is the recoverable one.
+    #
+    # THE PROBE RUNS IN THIS CLONE, NOT IN THE RECORD'S CHECKOUT. Every worktree of a clone shares one
+    # object store, and the recorded checkout may be CHECKOUT-GONE -- which is exactly when a reader
+    # most needs to know whether the object survived it.
+    $stashSha = [string](Get-RecField $rec 'stashSha' '')
+    $stashRef = [string](Get-RecField $rec 'stashRef' '')
+    if ($stashSha) {
+        $objSha = Invoke-Git -Dir $repo -GitArgs @('rev-parse', '--verify', '--quiet', "$stashSha^{commit}")
+        $refSha = if ($stashRef) { Invoke-Git -Dir $repo -GitArgs @('rev-parse', '--verify', '--quiet', $stashRef) } else { $null }
+        if (-not $objSha) {
+            "  stash commit (TRACKED edits only): $stashSha"
+            "    THAT OBJECT NO LONGER RESOLVES -- checked just now with 'git rev-parse --verify' in this"
+            "    clone. gc has pruned it. Those tracked edits are NOT recoverable from this handle; what"
+            "    is left is whatever was committed or pushed. This is a post-mortem line, not a rescue one."
+        } elseif ($refSha -and $refSha -eq $stashSha) {
+            "  stash commit (TRACKED edits only): $stashSha"
+            "    Verified just now: the object resolves AND $stashRef still holds it, so gc cannot take it."
+            "    Recover with:  git -C `"$($row.Worktree)`" stash apply $stashSha"
+        } else {
+            "  stash commit (TRACKED edits only): $stashSha"
+            $where = if (-not $stashRef) { 'the record names no anchoring ref (written by an older writer)' }
+                     elseif (-not $refSha) { "its anchor $stashRef is GONE" }
+                     else { "its anchor $stashRef now points at $refSha instead" }
+            "    The object still resolves, but $where -- so nothing holds it and the next gc in this"
+            "    clone can delete it without a word. Recover or re-anchor it NOW:"
+            "    git -C `"$($row.Worktree)`" stash apply $stashSha"
+        }
+    }
+    $stashCovers = Get-RecField $rec 'stashCovers'
+    if ($null -ne $stashCovers) { "  stash covers: $stashCovers" }
+    $unpushed = Get-RecField $rec 'unpushed'
+    if ($unpushed) { "  unpushed commits vs $(Get-RecField $unpushed 'base' '?'): $(Get-RecField $unpushed 'count' '?')" }
     else { "  unpushed: NO-UPSTREAM (nobody has looked; this is not the same as zero)" }
     ""
     "RE-CHECK BEFORE YOU ACT ON ANY OF THE ABOVE:"
@@ -735,26 +942,36 @@ if ($Detail) {
     }
     ""
     "LEDGER AND CLAIMS -- attribution matters, the path outlives its occupant:"
-    $ownC = @($rec.claims | Where-Object { $_.attribution -eq 'this-episode' })
-    $inhC = @($rec.claims | Where-Object { $_.attribution -ne 'this-episode' })
-    "  claims by THIS episode:      " + $(if ($ownC.Count) { (($ownC | ForEach-Object { $_.key }) -join ', ') } else { 'none' })
-    if ($inhC.Count) { "  present but from EARLIER occupants of that path (NOT this seat's): " + (($inhC | ForEach-Object { $_.key }) -join ', ') }
-    $ownA = @($rec.allocations | Where-Object { $_.attribution -eq 'this-episode' })
-    $inhA = @($rec.allocations | Where-Object { $_.attribution -ne 'this-episode' })
-    "  ledger numbers by THIS episode: " + $(if ($ownA.Count) { (($ownA | ForEach-Object { "$($_.kind) #$($_.number)" }) -join ', ') } else { 'none' })
+    # Get-RecField INSIDE the filters as well: these elements come from a JSON array on disk, so a
+    # claim written by an older writer, or one caught mid-write, need not carry `attribution` -- and
+    # under strict mode reading the absent property throws out of the whole -Detail render.
+    $claims = @(Get-RecField $rec 'claims' @())
+    $ownC = @($claims | Where-Object { (Get-RecField $_ 'attribution') -eq 'this-episode' })
+    $inhC = @($claims | Where-Object { (Get-RecField $_ 'attribution') -ne 'this-episode' })
+    "  claims by THIS episode:      " + $(if ($ownC.Count) { (($ownC | ForEach-Object { Get-RecField $_ 'key' '?' }) -join ', ') } else { 'none' })
+    if ($inhC.Count) { "  present but from EARLIER occupants of that path (NOT this seat's): " + (($inhC | ForEach-Object { Get-RecField $_ 'key' '?' }) -join ', ') }
+    $allocs = @(Get-RecField $rec 'allocations' @())
+    $ownA = @($allocs | Where-Object { (Get-RecField $_ 'attribution') -eq 'this-episode' })
+    $inhA = @($allocs | Where-Object { (Get-RecField $_ 'attribution') -ne 'this-episode' })
+    "  ledger numbers by THIS episode: " + $(if ($ownA.Count) { (($ownA | ForEach-Object { "$(Get-RecField $_ 'kind' '?') #$(Get-RecField $_ 'number' '?')" }) -join ', ') } else { 'none' })
     if ($inhA.Count) { "  $($inhA.Count) more allocated to that PATH by earlier occupants -- not this seat's, do not rehome or cite" }
     ""
     "DECLARED INTENT -- VOLUNTARY, UNVERIFIED, AND OFTEN ABSENT BY DESIGN."
     "  Measured adoption of voluntary declaration on this project: 8.8 to 31 percent. Treat anything"
     "  here as a hint that was true when someone typed it, never as the record. The evidence above is"
     "  the record."
-    if ($rec.seat) { "  seat:        $($rec.seat)" } else { "  seat:        not declared" }
-    if ($rec.goal) { "  goal:        $($rec.goal)" }
-    if ($rec.done) { "  done means:  $($rec.done)" }
-    if ($rec.outOfScope) { "  out of scope: $($rec.outOfScope)" }
-    if ($rec.handoff -and $rec.handoff.path) {
-        "  handoff:     $($rec.handoff.path)"
-        if (($rec.handoff.PSObject.Properties.Name -contains 'unresolved') -and $rec.handoff.unresolved) {
+    $decSeat = Get-RecField $rec 'seat'
+    $decGoal = Get-RecField $rec 'goal'
+    $decDone = Get-RecField $rec 'done'
+    $decScope = Get-RecField $rec 'outOfScope'
+    $decHandoff = Get-RecField $rec 'handoff'
+    if ($decSeat) { "  seat:        $decSeat" } else { "  seat:        not declared" }
+    if ($decGoal) { "  goal:        $decGoal" }
+    if ($decDone) { "  done means:  $decDone" }
+    if ($decScope) { "  out of scope: $decScope" }
+    if ($decHandoff -and (Get-RecField $decHandoff 'path')) {
+        "  handoff:     $(Get-RecField $decHandoff 'path')"
+        if (Get-RecField $decHandoff 'unresolved') {
             "               WARNING: that path DID NOT RESOLVE when recorded. A lead, not a document."
         }
     }
@@ -786,6 +1003,20 @@ function Protect-HomePath([string]$p) {
 
 if ($Json) {
     $outRows = @($rows | Select-Object Box, SessionKey, Seat, State, Fence, AgeHours, WriterStale, CheckoutGone, CheckoutUnlisted, Branch, Worktree, Epoch)
+    # THE DENOMINATOR'S OWN ROWS, not just its count. A machine reader that sees
+    # liveSessionsWithoutRecord=3 and cannot name the three has been told the roster is incomplete
+    # without being told where. These are the seats the roster CANNOT describe, so they are rendered
+    # beside the ones it can.
+    $outLive = @($liveInRepo | Where-Object { -not $_.RecordFresh } | ForEach-Object {
+        [pscustomobject]@{
+            SessionId           = $_.SessionId
+            Box                 = $_.Box
+            Worktree            = $_.Worktree
+            HasRecord           = $_.HasRecord
+            RecordAgeMinutes    = $(if ($null -ne $_.RecordAgeMinutes) { [int]$_.RecordAgeMinutes } else { $null })
+            HeartbeatAgeMinutes = $(if ($null -ne $_.HeartbeatAgeMinutes) { [int]$_.HeartbeatAgeMinutes } else { $null })
+        }
+    })
     $outReceipt = $receipt
     if (-not $Raw) {
         $outReceipt = [ordered]@{}
@@ -793,11 +1024,13 @@ if ($Json) {
             $outReceipt[$k] = if ($k -eq 'seatsDir') { Protect-HomePath ([string]$receipt[$k]) } else { $receipt[$k] }
         }
         foreach ($r in $outRows) { $r.Worktree = Protect-HomePath ([string]$r.Worktree) }
+        foreach ($r in $outLive) { $r.Worktree = Protect-HomePath ([string]$r.Worktree) }
     }
     [ordered]@{
         redacted = (-not $Raw)
         receipt  = $outReceipt
         rows     = $outRows
+        liveSessionsNotDescribed = $outLive
     } | ConvertTo-Json -Depth 8
     $code = if ($fenceAvailable) { 0 } else { 2 }
 exit $code
@@ -810,7 +1043,7 @@ exit $code
 "RECEIPT -- what was EXAMINED, not merely what was found:"
 foreach ($k in $receipt.Keys) {
     if ($k -eq 'stopConditions') { continue }
-    "  {0,-28} {1}" -f $k, $receipt[$k]
+    "  {0,-38} {1}" -f $k, $receipt[$k]
 }
 ""
 if ($stops.Count -gt 0) {
@@ -819,6 +1052,26 @@ if ($stops.Count -gt 0) {
     ""
 } else {
     "NO STOP CONDITIONS. The roster below is as complete as this instrument can establish."
+    ""
+}
+
+# THE DENOMINATOR, NAMED. A count in the receipt says the roster is short; this says by WHICH seats,
+# which is what a reader can actually act on. These are live sessions the FENCE can see sitting in
+# this clone's worktrees whose record is missing or stale -- so they are absent from, or out of date
+# in, the roster below, and nothing in that roster hints at them.
+$liveNotDescribed = @($liveInRepo | Where-Object { -not $_.RecordFresh })
+if ($liveNotDescribed.Count -gt 0) {
+    "LIVE SESSIONS THIS ROSTER CANNOT DESCRIBE -- $($liveNotDescribed.Count). The fence sees them; the writer did not:"
+    foreach ($s in $liveNotDescribed) {
+        $sid = if ($s.SessionId) { $s.SessionId } else { '(no session id)' }
+        if ($sid.Length -gt 12) { $sid = $sid.Substring(0, 12) }
+        $why = if (-not $s.HasRecord) { 'NO RECORD AT ALL' }
+               elseif ($null -eq $s.RecordAgeMinutes) { 'record present, its age WILL NOT PARSE' }
+               else { "newest record is $([int]$s.RecordAgeMinutes)m old (bound $FreshMinutes m)" }
+        $hb = if ($null -eq $s.HeartbeatAgeMinutes) { 'no writer heartbeat for that checkout' } else { "writer heartbeat $([int]$s.HeartbeatAgeMinutes)m old" }
+        "  {0,-13} {1}" -f $sid, $s.Worktree
+        "                {0}; {1}" -f $why, $hb
+    }
     ""
 }
 
@@ -857,9 +1110,12 @@ if ($boxesWithSeveral.Count -gt 0) {
 
 ""
 "RESPAWN POPULATION (INTERRUPTED, HANDED): " + @($rows | Where-Object { $_.State -in @('INTERRUPTED', 'HANDED') }).Count
-"  Never respawned: RUNNING, POSSIBLY RUNNING, SUPERSEDED, CLOSED, CHECKOUT-GONE, UNKNOWN-NO-FENCE."
+"  Never respawned: RUNNING, POSSIBLY RUNNING, SUPERSEDED, CLOSED, CHECKOUT-GONE, UNKNOWN-NO-FENCE,"
+"  RECORD-UNUSABLE."
 "  POSSIBLY RUNNING now also covers a record that could not be fenced at all (no session id, or the"
 "  fence threw). An unevaluated fence is not a passed fence, and the receipt counts them."
+"  RECORD-UNUSABLE is a file this reader could not turn into a row: nothing about that seat was"
+"  established, so it is neither respawned nor written off -- open the record and decide by hand."
 "  Briefing for one row:  fleet.ps1 -Detail -BoxKey <box> -SessionKey <session>"
 "  (both columns are printed above; the SESSION prefix shown is enough, and an ambiguous one is"
 "  refused by name rather than resolved to the first match.)"

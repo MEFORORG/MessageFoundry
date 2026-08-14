@@ -423,6 +423,29 @@ if ($Status) {
     exit 0
 }
 
+# --- Name the rows BEFORE removing them ----------------------------------------------------------
+# A REMOVAL THAT TAKES MORE THAN THE OPERATOR NAMED HAS TO SAY SO, BEFORE IT WRITES. -Only selects an
+# EVENT, and Stop carries three independent hooks -- the mail drain, the seat recorder and the urgent-
+# mail watcher -- so `-Only Stop -Uninstall` disarms two controls nobody mentioned. Measured
+# 2026-08-14 on a fixture settings.json: all three markers went, and the entire receipt was
+# "REMOVED <path>" plus a root count, naming none of them. The operator's natural check afterwards,
+# `-Status -Only Stop`, then shows three rows MISSING, which reads as success to someone who asked for
+# a removal.
+#
+# This is the CLASS fix rather than the instance: it also keeps the two -Only recipes elsewhere in this
+# file honest. They are true today only because their event happens to carry one row, and nothing
+# enforces that -- the day either event gains a sibling, this block starts naming what would go.
+if ($Uninstall) {
+    $markers = @($WIRING | ForEach-Object { $_.Marker } | Sort-Object -Unique)
+    if ($markers.Count -gt 1) {
+        Write-Host ""
+        Write-Host ("REMOVING {0} ROW(S) ACROSS {1} INDEPENDENT HOOKS -- named here BEFORE anything is written:" -f $WIRING.Count, $markers.Count) -ForegroundColor Yellow
+        foreach ($w in $WIRING) { Write-Host ("    {0,-16} {1,-38} {2}" -f $w.Event, $w.Script, $w.Marker) }
+        Write-Host "  If you meant ONE of these, -Script <part of the script path> selects a single row; -Only cannot."
+        Write-Host ""
+    }
+}
+
 # --- Install / uninstall, once per root ----------------------------------------------------------
 # One root failing must not stop the others. A throw part-way through used to leave the machine in a
 # state nobody wrote down: some roots wired, some not, and no record of which.
@@ -494,9 +517,17 @@ foreach ($path in $SettingsPath) {
 Write-Host ""
 Write-Host ("Roots examined: {0}   succeeded: {1}   failed: {2}   as of {3}" -f `
         $SettingsPath.Count, ($SettingsPath.Count - $failed.Count), $failed.Count, [DateTime]::UtcNow.ToString('o'))
-if (-not $Uninstall) {
-    foreach ($w in $WIRING) { Write-Host ("  {0,-16} -> {1}" -f $w.Event, $w.Script) }
-    Write-Host ""
+# THE ROW INVENTORY IS PRINTED ON BOTH PATHS. It used to be gated on `-not $Uninstall`, so a removal
+# reported only that something had been removed and from how many roots -- never WHICH rows. That is a
+# receipt stating what it found rather than what it acted on, and it is how one row's removal could
+# take three hooks with nothing in the output able to show it.
+foreach ($w in $WIRING) { Write-Host ("  {0,-16} -> {1,-38} [{2}]" -f $w.Event, $w.Script, $w.Marker) }
+Write-Host ""
+if ($Uninstall) {
+    Write-Host "  Those are the rows this run REMOVED wherever it succeeded; any hook not listed was left alone."
+    Write-Host "  Takes effect in NEWLY STARTED sessions; existing ones keep the config they booted with."
+}
+else {
     Write-Host "  Takes effect in NEWLY STARTED sessions; existing ones keep the config they booted with."
     Write-Host "  A root listed above is a root whose settings FILE now carries the entry. That is not the"
     Write-Host "  same as a hook that FIRED -- confirm with a session started under that login."
