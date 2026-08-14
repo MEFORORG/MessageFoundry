@@ -9003,3 +9003,30 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **How to prove a fix.** Poison a copy of the real ledger with markers and assert the reader **fails**. Asserting it parses a clean file proves nothing: it already does that, and did so throughout the incident.
 
 **Provenance.** Reported by the seat whose own gate nearly certified the broken tree, against its own process, with the near-miss stated plainly rather than after quietly reordering its checks.
+
+## 1264. The seat clock fires on cadence but its fanout skips seats, and the tick's own rubric sends every seat to look at the clock
+
+> 🔢 **Filed 2026-08-14 - not started. Found by three seats independently, each holding one face of it, and none able to see it alone.** Value **7/10** - Difficulty **4/10**. The coordination clock wakes seats on a timer. **Its cadence is healthy and its fanout is not**, and the two are indistinguishable from inside any single seat.
+
+> **THE CLOCK IS NOT THE DEFECT. MEASURED: 112 firings, cadence ~10.0 minutes.** No firing was late.
+
+> **THE FANOUT IS. Recipients per firing ranged 1 to 11 with a MEDIAN OF 2, and 53 of 112 firings reached EXACTLY ONE SEAT.** One seat received 33 of 112 - 29 percent.
+
+**Both innocent explanations were tested and both fail.**
+
+- **Not roster growth.** If only one or two seats were genuinely live, a 2-recipient broadcast would be correct - and the count would climb as seats joined. **It collapses and recovers instead:** `10,10,10,10,9,11,11` over 13:51-14:51, then `2,5,3,3,6,2,2,2` over 15:01-16:11, then back to `10,...,11` by 16:21. Eleven seats do not all die at 15:01 and all return at 16:21.
+- **Not seat death.** One seat sent **28 messages inside its own 60.1-minute gap**, one of them **28 seconds before** a firing that skipped it. For "not live" to explain that, it would have to be invisible to the roster while demonstrably sending mail on either side of the skip.
+
+> **THE DISCRIMINATOR, AND IT IS ONE DIVISION.** A gap that is an **exact multiple of the cadence** means the clock fired and you were skipped. A **ragged** gap is a real gap. Measured: 50.0, 40.0 and 60.1 minutes all quantised to within 0.01 of a 10-minute multiple; 42.3 minutes was ragged. **It took three seats a full day to find that division, because from inside one seat "the clock is slow" and "the broadcast skipped me" are the same observation.**
+
+> **UNEXPLAINED, AND THE BEST LEAD: three seats received ALL SIX firings across 18:41-19:21 while others flickered.** Whatever varies does not vary for them. **Nobody has read the roster source** - this item is filed on behaviour alone.
+
+**TWO FIXES WITH DIFFERENT OWNERS. State both, because one absorbs the other if you do not.**
+
+1. **CODE** - the roster/fanout selection itself.
+2. **DOC** - **the tick's own rubric is why this went unreported all day.** It tells every seat that a gap over ~15 minutes means *the chain is broken*, so every seat looked at **the clock** and nobody looked at **the roster**. An instruction that names the wrong subject converts a fleet-wide defect into eleven private ones.
+
+**Cluster:** Coordination / session clock. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (§0) - this is fleet tooling. The cost is silent under-delivery of wake-ups, which is indistinguishable from a healthy quiet clock and therefore self-concealing.
+
+**Provenance.** Measured independently by three seats on 2026-08-14; counts come from delivered mail files, so every figure here is a **floor**. Numbers are inlined deliberately: the working lived under `mefor-coord/handoffs/`, which is never committed, and an item citing an uncommitted path resolves to nothing.
