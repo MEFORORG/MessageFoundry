@@ -8584,6 +8584,31 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 >
 > **A DESIGN EXISTS AND IS RESCUED** (not implemented; `fhir.py` was held pending #1243 limb A). Its shape, for whoever builds it: one module-level grammar beside the existing `_FHIR_*` regexes, admitting RFC 3986's query set **plus `|`** (which FHIR needs for `system|code` and RFC 3986 does not admit) and nothing else -- so control characters, space, non-ASCII, `#` and a second `?` are excluded **by construction** rather than by enumerating bad shapes, which is the right polarity for a screen. Anchored `\A...\Z`, **never `^...$`** -- `$` also matches before a trailing newline, which is precisely **#1240's** defect; the two items agree without having been coordinated. A plain `ValueError` at construction rather than the `NegativeAckError` the `versionId` precedent uses, **because the provenance differs**: `versionId` is message-derived and dead-lettering is right, while this is static config and a dead-letter would kill every message forever over a startup-detectable defect. A **constant** error message -- the siblings at `:229`/`:237` echo their value, which is safe only because `conditional` is a closed enum of four literals, and copying that shape onto a free-text setting would be the mistake.
 
+> **AMENDED 2026-08-14 (dispatcher) -- "WHAT REMAINS" OVERSTATES WHAT IS LEFT, AND THE ANCHORS BELOW HAVE DRIFTED. THE ITEM STAYS OPEN; ONE OF ITS TWO REMAINING LIMBS IS BUILT.** Measured against `origin/main` at `ae76b9f9`, reading the ref rather than a working tree.
+>
+> **THE `FhirLookupExecutor` LIMB IS BUILT.** `transports/fhir.py:797` screens the lookup's `url` through `_reject_config_control_chars(url, "url", f"lookup {cname!r}")`, and the comment two lines above it cites this item by number and restates its asymmetry argument as the reason for the call. **So "WHAT REMAINS" names a site that no longer remains.** What is still outstanding is `transports/dicomweb.py` **alone**: `study_uid` takes a control-char screen at `:155` and then reaches the URL path at `:243` with **no grammar gate and no percent-encode** -- which is still exactly the asymmetry this item was filed over, so the item does not close.
+>
+> **AT LEAST SEVEN ANCHORS IN THE PROSE BELOW NO LONGER POINT AT WHAT THEY CLAIM.** Recorded so the next reader re-derives none of them. Not asserted to be exhaustive -- these are the ones measured.
+> ```
+> cited                       now              what is actually there
+> fhir.py:428                 --               base64 Authorization header build.
+>                                              NOT a screened-and-encoded exemplar.
+>                             :461/:483/:487   quote(..., safe="")      -- the percent-encode half
+>                             :482             _validate_path_token()   -- the grammar-gate half
+> fhir.py:431                 :464             the conditional-update URL
+> fhir.py:436                 :469             the If-None-Exist header
+> fhir.py:446 / :449          :479 / :482      the versionId reject-rather-than-encode precedent
+> fhir.py:231                 :261-263         and it is SCREENED there now, not unscreened
+> dicomweb.py:241             :243             the URL build; its screen is at :155, not :153
+> test_fhir_transport.py:220  :222             the pinned URL assertion
+> ```
+>
+> **`:428` IS THE ONE THAT MATTERS, because it fails in the direction that does not announce itself.** The others point at nothing recognisable, so a reader notices and re-locates them. `:428` points at a **real and plausibly adjacent line** -- an outbound HTTP header being built, in this same file -- so a reader can accept it as the cited exemplar and never notice the citation has come loose from its subject. A dangling anchor advertises its own brokenness; a wrongly-resolving one reads as a working citation forever.
+>
+> **`fhir.py:231` INVERTS rather than drifts, and this item already contains its own refutation.** The prose below says `conditional_query` reaches the URL with "no screen and no encoding at all". The `WHAT #379 FIXED` paragraph above says #379 added construction-time screening of exactly that value, and `:261-263` confirms it shipped. Both sentences are in this one item, and the stale one sits in the section a builder reads last.
+>
+> **The `tests/test_fhir_transport.py` anchor has now drifted twice.** This item already corrected `:220` to `:221`; it is `:222` today. **Do not correct it a third time -- pin it by content.** Three sequential off-by-ones on one assertion is the measurement that a line number is the wrong instrument for this reference, not a run of bad luck.
+
 **Cluster:** Security / input validation. **Priority:** P2. **Verdict:** build.
 **Severity:** Conditional and lower than the message-derived sites, because these values come from operator config rather than from an inbound message -- an operator can already choose the endpoint. It is filed because the treatment is *inconsistent within the same file*, which is how the weaker one survives review.
 
