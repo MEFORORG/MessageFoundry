@@ -622,22 +622,23 @@ def test_close_handback_survives_a_concurrent_record(repo: Path, tmp_path: Path)
     """
     sid = "sess-race"
     _write_record(repo, sid)
-    trigger = tmp_path / "go-race.txt"
-    rival = _prewarmed(f"& '{SEAT}' -Record -SessionId {sid}", repo, trigger)
+    # BOTH SIDES ARE PRE-WARMED, and that is the whole rig. Launching either at the moment of the
+    # race hands it a ~350 ms interpreter start, which is comparable to the window under attack:
+    # measured, a cold-started -Close finished its gather AFTER a warm rival and won by accident,
+    # so the test passed against a writer with the lock removed entirely.
+    go_close = tmp_path / "go-close.txt"
+    go_rival = tmp_path / "go-rival.txt"
+    closer = _prewarmed(f"& '{SEAT}' -Close -Handback -SessionId {sid}", repo, go_close)
+    rival = _prewarmed(f"& '{SEAT}' -Record -SessionId {sid}", repo, go_rival)
     try:
-        time.sleep(1.5)  # let the rival's interpreter reach its wait loop
-        close = subprocess.Popen(
-            ["pwsh", "-NoProfile", "-File", str(SEAT), "-Close", "-Handback", "-SessionId", sid],
-            cwd=str(repo),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        time.sleep(1.8)  # let both interpreters reach their wait loops
+        go_close.write_text("go", encoding="utf-8")
         time.sleep(0.12)  # the rival starts INSIDE the close's window, as measured
-        trigger.write_text("go", encoding="utf-8")
-        assert close.wait(timeout=120) == 0
+        go_rival.write_text("go", encoding="utf-8")
+        assert closer.wait(timeout=120) == 0
         assert rival.wait(timeout=120) == 0
     finally:
+        closer.kill()
         rival.kill()
 
     rec = _read_record(repo, sid)
