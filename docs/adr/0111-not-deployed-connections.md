@@ -260,12 +260,18 @@ SQLite/Postgres/SQL Server with no `CHECK` constraint anywhere. No migration rev
   Steps-palette work in the same tree. The flag is fully functional without them: hand-edited
   `connections.toml` and code-first `deployed=False` both work, and the engine, CLI, API and web console all
   honor it. The GUI simply will not *offer* the checkbox yet.
-- **BACKLOG #234 — `connections.toml` GUI save silently strips per-connection fields.** Uncovered while
-  adding `deployed` to the TOML **write** schema: `config/connections_edit.py:31-44` `_SCALAR_FIELDS` is a
-  **12-key whitelist with no passthrough**, so any GUI/CLI `connection upsert` silently drops `priority`,
-  `schedule`, `shard`, `metadata`, `batch`, `stall` and `dead_letter_days` from an existing connection's
-  table. That is a **pre-existing data-loss bug**, filed as **#234** and deliberately **not** fixed here —
-  this change only adds `deployed` (and `auto_start`) to the whitelist. Fixing the whitelist properly is a
-  passthrough-preservation change with its own blast radius.
+- **BACKLOG #234 — `connections.toml` GUI save silently stripped per-connection fields. CLOSED; the
+  description below is kept as the record of what was true when this ADR was written.** Uncovered while
+  adding `deployed` to the TOML **write** schema, `_SCALAR_FIELDS` in `config/connections_edit.py` was
+  then a short whitelist with no passthrough, so a GUI/CLI `connection upsert` dropped fields it did not
+  name from an existing connection's table. That was a **pre-existing data-loss bug**, filed as **#234**
+  and deliberately **not** fixed by this ADR, which only added `deployed` and `auto_start` to the
+  whitelist.
+
+  **#234 has since landed, and both halves of the old description are now wrong** — the count and the
+  mechanism. The whitelist is no longer short, and an unrecognised key is no longer dropped: it is
+  **rejected fail-loud with a `WiringError`**, mirroring the loader's `_reject_unknown` message shape.
+  Derive the current field set from `_SCALAR_FIELDS` in `config/connections_edit.py` rather than trusting
+  any count written here — a number in this ADR is a number that goes stale.
 - `ack_after=delivered`, per-connection scheduling of a *go-live date*, and any notion of a "planned"
   deployment window. `deployed` is a boolean; a date is a different feature.

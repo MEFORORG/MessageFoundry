@@ -81,7 +81,11 @@ base-tree/
 dast-auth-receipt.json
 canary-*.json
 
-# Claude Code: settings.json is shared/tracked; settings.local.json is machine-local (never commit)
+# Claude Code: settings.json is shared/tracked; settings.local.json is machine-local (never commit).
+# That first clause was FALSE from the day `/.claude/` landed until the publishing-boundary block
+# below was reshaped to `/.claude/*` plus a negation -- BACKLOG #327's DONE note carried the
+# contradiction to the owner rather than editing it in that lane. It is true again now. The rule
+# below is redundant with `/.claude/*` and is kept as the statement of intent for this one file.
 .claude/settings.local.json
 
 # Local reference notes pointing at machine-specific Claude Code transcript paths — never commit
@@ -139,7 +143,29 @@ scripts/security/scan-tokens.local.txt
 # two-line redaction). CLAUDE.md in particular MUST be tracked: it is gitignored-by-default's worst
 # case here, because `git worktree add` cannot deliver an untracked file, so every worktree silently
 # came up with ZERO project conventions loaded.
-/.claude/
+#
+# `.claude/` is ignored by CONTENTS (`/.claude/*`), NOT as a directory, so `settings.json` can be
+# re-included on the next line. Ignoring the directory itself would make that negation a silent
+# no-op: git cannot re-include a file whose parent directory is excluded. Everything else under
+# `.claude/` stays ignored by the same star rule -- `settings.local.json` (machine-local, also
+# named at line 85), `worktrees/` (session state, not configuration), and anything Claude Code
+# adds there later, which is ignored by DEFAULT rather than by enumeration.
+#
+# WHY settings.json IS TRACKED. It carries ENFORCED controls -- the deny-list covering `.env`,
+# `secrets/**`, keys and the local `*.db` store, plus the `block-blanket-git-stage` PreToolUse
+# guard -- and settings are enforced by the client where CLAUDE.md is only context, so section 5's
+# prose is not a substitute for it. Untracked, it hit the exact CLAUDE.md failure described above:
+# measured 2026-08-13, of 62 local checkouts carrying CLAUDE.md only 12 had `.claude/settings.json`,
+# so 50 ran with no deny-list and no staging guard. `git worktree add` delivers tracked files only.
+/.claude/*
+!/.claude/settings.json
+# Named explicitly rather than left to `/.claude/*` above. Until this line, the only travelling
+# protection for the session tree was that wildcard -- `.git/info/exclude` carries it too, but that
+# file is per-clone and reaches nobody else. A later edit that narrows the wildcard or adds a second
+# negation would expose full nested checkouts carrying `.venv`, `messagefoundry.db` and the caches.
+# NOTHING under `.claude/` may be negated except `settings.json`; tests/test_private_paths_stay_ignored.py
+# pins the tracked set so widening it fails a required check instead of shipping.
+/.claude/worktrees/
 /TRANSCRIPTS.md
 /docs/security/
 /docs/reviews/
