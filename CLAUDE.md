@@ -285,7 +285,7 @@ diverge enough to warrant it; keep this root file general.
   "<title>"` — and add the ADR's index row in the *same* commit. A `pre-commit` hook rejects a number you
   did not allocate; see [`docs/LEDGER-GATE.md`](docs/LEDGER-GATE.md).
 - **Never CITE a `#N` you have not allocated — allocate first, or write a reference that cannot resolve.**
-  The mirror of the rule above, and the more insidious half. While the number is unissued the citation
+  The counterpart of the rule above, and the more insidious half. While the number is unissued the citation
   resolves to **nothing**, which is honest. The day someone legitimately allocates it, that citation
   begins resolving — **to unrelated work, and with nothing anywhere reporting a problem**. A dangling
   reference advertises its own brokenness; a wrongly-resolving one reads as a working cross-reference
