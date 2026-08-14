@@ -1799,7 +1799,12 @@ class AuthSettings(_Section):
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
     lockout_minutes: int = 15
     # First-run bootstrap admin: auto-disabled once a second administrator exists, and (if still
-    # unclaimed — never password-changed) disabled this many hours after creation. 0 = no time expiry.
+    # unclaimed — never password-changed) disabled this many hours after creation. 0 = no time expiry
+    # OF THE ACCOUNT, which is not the same as no expiry of its CREDENTIAL (BACKLOG #1245): the
+    # printed first-run password is separately bounded by `initial_password_expiry_hours`, so at 0 the
+    # account survives indefinitely while the credential still dies on that other clock. Setting this
+    # LONGER than that value has the same shape. The deadline surfaced in `bootstrap-admin.txt` is the
+    # EARLIER of the two for exactly this reason.
     bootstrap_expiry_hours: int = 72
     # ASVS 6.4.5 arm 2: how many hours BEFORE that auto-disable to start reminding an operator (via the
     # `bootstrap_admin_expiring` AlertSink event) that the unclaimed first-run credential is about to be
@@ -4147,6 +4152,17 @@ def security_loosenings(
     ``password_check_breached``) that are gated elsewhere and are not reported here. That list is
     enumerated in the floor test's exemption set so the gap is a written decision that a new switch
     cannot silently join.
+
+    **``[auth].initial_password_expiry_hours`` is also unreported, and BACKLOG #1245 made it
+    load-bearing — recorded here as the written decision this paragraph demands, not left implied.**
+    It is not a ``[security]`` field, so the completeness floor (which iterates
+    ``SecuritySettings.model_fields``) never covered it and its absence is not a floor-test gap. What
+    changed is the consequence: since #1245 removed the bootstrap's carve-out from the ASVS 6.4.1
+    gate, this value is the ONLY bound on the printed first-run administrator credential whenever
+    ``bootstrap_expiry_hours`` is 0 or longer than it. So setting it to 0 unbounds that credential,
+    and nothing in this registry says so. Reporting it needs a new REQUIRED parameter (every one here
+    is required by design, so an optional detector cannot be added quietly), which is a larger change
+    than the item that exposed it — filed as content rather than folded in.
 
     Every parameter is REQUIRED, not optional, and deliberately so. There is exactly ONE shipped posture
     and an operator may only loosen from it, so a deviation that this registry cannot see is a second
