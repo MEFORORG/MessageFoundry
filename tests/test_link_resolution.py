@@ -105,18 +105,18 @@ def test_withheld_prefixes_are_the_gitignored_ones(checker) -> None:
         "docs/reviews/",
         "docs/marketing/",
         "docs/releases/",
-        ".claude/",
     }
 
 
 @pytest.mark.parametrize(
     "prefix",
-    ["docs/security/", "docs/reviews/", "docs/marketing/", "docs/releases/", ".claude/"],
+    ["docs/security/", "docs/reviews/", "docs/marketing/", "docs/releases/"],
 )
 def test_withheld_directories_are_not_flagged(tmp_path, checker, prefix: str) -> None:
     """A gitignored target is a publishing boundary, not a defect; flagging it trains people to
-    ignore the gate. ``docs/releases/`` joined when ADR 0160 Phase 1 untracked it; ``.claude/``
-    joined because 7 docs link to ``.claude/settings.json``, which no clone has.
+    ignore the gate. ``docs/releases/`` joined when ADR 0160 Phase 1 untracked it. ``.claude/``
+    LEFT once ``.claude/settings.json`` became tracked: all 7 links it covered named that one file,
+    so they now resolve through ``tracked_paths()`` and are counted instead of skipped.
 
     This list expresses INTENT. It is not what makes the gate environment-independent -- that is
     ``tracked_paths()`` never consulting the filesystem, pinned by
