@@ -15,8 +15,10 @@
         seat.ps1 -Close -SessionId <id> [-Handback]
         seat.ps1 -BumpEpoch                   # mark an account switch; see POOL EPOCH below
 
-    -Declare AND -Close NAME A SESSION OR WRITE NOTHING -- see rule 4. They take -SessionId, or read
-    it from CLAUDE_CODE_SESSION_ID / CLAUDE_SESSION_ID; with neither, they refuse loudly.
+    -Declare AND -Close NAME A SESSION OR WRITE NOTHING -- see rule 4. They take -SessionId, or fall
+    back to CLAUDE_CODE_SESSION_ID / CLAUDE_SESSION_ID; with neither, they refuse loudly. -SessionId
+    is the authoritative one: the environment names whoever is RUNNING the command, which in a
+    subagent is not the session the seat's hook records under. -Record never takes that fallback.
 
     WHY A RECORD AND NOT A ROW IN A SHARED FILE. This layer lives inside .git, which is NOT under
     version control -- measured: `git ls-files | grep -c '^\.git/'` returns 0 while the same
@@ -252,20 +254,26 @@ function Read-HookPayload {
 }
 
 function Get-SessionKey {
-    param($Payload, [string]$Override)
+    # THE ENV FALLBACK IS FOR THE CLI PATHS ONLY, and -AllowEnvFallback is how they ask. -Record has
+    # an AUTHORITATIVE payload and must not fall back: the environment names the session of whoever
+    # is running the command, which is not always the session whose Stop hook is firing -- measured,
+    # a subagent carries its own 36-char CLAUDE_CODE_SESSION_ID distinct from
+    # CLAUDE_CODE_HOST_SESSION_ID -- and a -Record keyed on that would split one seat's episode
+    # across two records, which is the "60 seats where there is one" failure `nosid` exists to stop.
+    #
+    # Both names are tried, and the order is measured rather than guessed: CLAUDE_CODE_SESSION_ID
+    # holds a uuid of the same shape the payload carries, while CLAUDE_SESSION_ID -- the name
+    # mail.ps1:230 reads -- is EMPTY on this box. A fallback that resolves to nothing is exactly the
+    # failure this file exists to make visible, so it must not be the only one tried.
+    param($Payload, [string]$Override, [switch]$AllowEnvFallback)
     $sid = $null
     $src = $null
     if ($Override) { $sid = $Override; $src = 'param' }
     elseif ($Payload -and ($Payload.PSObject.Properties.Name -contains 'session_id') -and $Payload.session_id) {
         $sid = [string]$Payload.session_id; $src = 'payload'
     }
-    # THE ENV FALLBACK IS FOR THE CLI PATHS, which get no hook payload. Both names are tried and the
-    # order is measured, not guessed: on this box CLAUDE_CODE_SESSION_ID holds a 36-char uuid of the
-    # same shape the hook payload carries, while CLAUDE_SESSION_ID -- the name mail.ps1:230 reads --
-    # is EMPTY. A fallback that resolves to nothing is the failure this whole file exists to make
-    # visible, so it must not be the only one tried.
-    elseif ($env:CLAUDE_CODE_SESSION_ID) { $sid = $env:CLAUDE_CODE_SESSION_ID; $src = 'env:CLAUDE_CODE_SESSION_ID' }
-    elseif ($env:CLAUDE_SESSION_ID) { $sid = $env:CLAUDE_SESSION_ID; $src = 'env:CLAUDE_SESSION_ID' }
+    elseif ($AllowEnvFallback -and $env:CLAUDE_CODE_SESSION_ID) { $sid = $env:CLAUDE_CODE_SESSION_ID; $src = 'env:CLAUDE_CODE_SESSION_ID' }
+    elseif ($AllowEnvFallback -and $env:CLAUDE_SESSION_ID) { $sid = $env:CLAUDE_SESSION_ID; $src = 'env:CLAUDE_SESSION_ID' }
 
     if (-not $sid) {
         # THE LITERAL STRING, NOT nosid-<pid>. A hook runs as a pwsh CHILD whose pid changes every
@@ -613,7 +621,7 @@ try {
         exit 0
     }
 
-    $sk = Get-SessionKey -Payload $payload -Override $SessionId
+    $sk = Get-SessionKey -Payload $payload -Override $SessionId -AllowEnvFallback:(-not $Record)
     $identified = [bool]$sk.Id
 
     # RULE 4, THE REFUSAL. A declaration or a close that cannot name its session has nowhere

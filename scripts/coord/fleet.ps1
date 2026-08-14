@@ -495,14 +495,14 @@ if ($Detail) {
     ""
     "STATE (computed now): $($row.State)   fence=$($row.Fence)"
     if ($row.CheckoutGone) {
-        "CHECKOUT: $($rec.worktree)"
+        "CHECKOUT: $($row.Worktree)"
         "  THAT DIRECTORY NO LONGER EXISTS -- checked just now. The record outlives the checkout by"
         "  construction: the project's own cleanup runs 'git worktree remove --force' and does not"
         "  touch this layer. Everything below that lived only in the working directory is ALREADY GONE,"
         "  not at risk. What survives is what git holds: pushed commits, and the stash object if it"
         "  still resolves. Every re-check command rooted at that path will fail, and that is expected."
     } else {
-        "CHECKOUT: $($rec.worktree)"
+        "CHECKOUT: $($row.Worktree)"
         if ($row.CheckoutUnlisted) {
             "  The directory is there, but 'git worktree list' does not name it -- it is a leftover"
             "  directory rather than a registered worktree of this clone. Files in it are still readable."
@@ -557,8 +557,8 @@ if ($Detail) {
     ""
     "RE-CHECK BEFORE YOU ACT ON ANY OF THE ABOVE:"
     "  git fetch origin"
-    "  git -C `"$($rec.worktree)`" status --porcelain"
-    "  git -C `"$($rec.worktree)`" log --oneline origin/main..HEAD"
+    "  git -C `"$($row.Worktree)`" status --porcelain"
+    "  git -C `"$($row.Worktree)`" log --oneline origin/main..HEAD"
     if ($touched.Count -gt 0) {
         # THE PATHSPEC IS READ FROM THE RECORD, NOT PASTED INTO THE COMMAND. The pasted form was
         # wrong twice over and both mechanisms yield the SAME observable -- git exits 0 with empty
@@ -574,7 +574,7 @@ if ($Detail) {
         # spaces are handled by the shell rather than by string concatenation here, and the command's
         # LENGTH no longer scales with the path count -- which is what made truncation tempting.
         "  `$p = (Get-Content -Raw `"$($row.File)`" | ConvertFrom-Json).touchedPaths"
-        "  git -C `"$($rec.worktree)`" diff --name-only origin/main $($row.Branch) -- @p"
+        "  git -C `"$($row.Worktree)`" diff --name-only origin/main $($row.Branch) -- @p"
         "    That reads all $($touched.Count) recorded path(s) from the record itself, so the pathspec"
         "    cannot be short and cannot be split on a space. ONLY THEN does empty output mean the"
         "    CONTENT is already on main. Ancestry answers a different question: squash-merge routinely"
