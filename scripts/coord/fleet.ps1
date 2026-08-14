@@ -59,6 +59,8 @@
 param(
     [switch]$Text,
     [switch]$Json,
+    # Opt OUT of redaction on -Json. Named, so the unsafe form is deliberate rather than the default.
+    [switch]$Raw,
     [switch]$All,
     [switch]$Detail,
     [string]$BoxKey,
@@ -400,10 +402,40 @@ if ($Detail) {
     exit 0
 }
 
+# REDACTION IS THE DEFAULT ON -Json, and -Raw is the opt-out.
+#
+# Owner decision D1 governs coordination state that leaves the terminal: absolute home paths and
+# free-text notes are stripped. -Json is the mode most likely to be piped somewhere -- a file, a
+# ticket, an artifact -- and a default that has to be remembered is not a control. So the safe form
+# is what you get for free and the unsafe form has to be asked for by name.
+#
+# It replaces the USER PROFILE PREFIX rather than pattern-matching a username: a regex for a name is
+# a needle that goes stale the moment the box changes hands, and this has to fail toward redacting.
+# The worktree LEAF survives, because a reader needs to tell two checkouts apart, and the leaf is a
+# branch-ish label rather than a home path.
+function Protect-HomePath([string]$p) {
+    if (-not $p) { return $p }
+    $home_ = $env:USERPROFILE
+    if ($home_ -and $p.StartsWith($home_, [StringComparison]::OrdinalIgnoreCase)) {
+        return '~' + $p.Substring($home_.Length)
+    }
+    return $p
+}
+
 if ($Json) {
+    $outRows = @($rows | Select-Object Box, SessionKey, Seat, State, Fence, AgeHours, WriterStale, Branch, Worktree, Epoch)
+    $outReceipt = $receipt
+    if (-not $Raw) {
+        $outReceipt = [ordered]@{}
+        foreach ($k in $receipt.Keys) {
+            $outReceipt[$k] = if ($k -eq 'seatsDir') { Protect-HomePath ([string]$receipt[$k]) } else { $receipt[$k] }
+        }
+        foreach ($r in $outRows) { $r.Worktree = Protect-HomePath ([string]$r.Worktree) }
+    }
     [ordered]@{
-        receipt = $receipt
-        rows    = @($rows | Select-Object Box, SessionKey, Seat, State, Fence, AgeHours, WriterStale, Branch, Worktree, Epoch)
+        redacted = (-not $Raw)
+        receipt  = $outReceipt
+        rows     = $outRows
     } | ConvertTo-Json -Depth 8
     $code = if ($fenceAvailable) { 0 } else { 2 }
 exit $code
