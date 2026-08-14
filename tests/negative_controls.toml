@@ -300,23 +300,31 @@ observed = "Each planted shape is reported and the real tree is clean, in this s
 context = "forbidden-content (customer/PHI leak guard)"
 plants = """
 A customer name, a case-sensitive site code, a routable host IP, and a file under docs/security/ caught
-by its PATH alone; plus a run that examines zero files, which must refuse rather than report clean.
+by its PATH alone; plus a run that examines zero files, which must refuse rather than report clean. And
+the #321 class specifically: an estate-shaped identifier caught with NO token source loaded, which is
+the only state in which the prefix-keyed site-code detectors are off.
 """
 red = [
   "tests/test_scan_forbidden.py::test_scan_file_flags_customer_name",
   "tests/test_scan_forbidden.py::test_scan_file_flags_site_code",
   "tests/test_scan_forbidden.py::test_a_file_under_docs_security_is_flagged_by_its_path_alone",
   "tests/test_scan_forbidden.py::test_zero_examined_still_refuses_rather_than_reporting_clean",
+  "tests/test_scan_tokens_source.py::test_estate_identifier_shape_is_flagged_without_any_token_source",
+  "tests/test_scan_tokens_source.py::test_an_estate_shaped_file_NAME_is_flagged_by_the_path_alone",
 ]
 holds = """
-Private and documentation IP ranges, ordinary docs paths, and clean text must all pass. This is the
-asymmetry with the most history behind it: BACKLOG #321 and #325 are both this gate failing to fire,
-and a control that reddened on 10.0.0.1 or on docs/CI.md would have been relaxed rather than trusted.
+Private and documentation IP ranges, ordinary docs paths, ordinary digit runs, and clean text must all
+pass. This is the asymmetry with the most history behind it: BACKLOG #321 and #325 are both this gate
+failing to fire, and a control that reddened on 10.0.0.1 or on docs/CI.md would have been relaxed
+rather than trusted. The estate-shape backstop is the sharpest case -- it is prefix-free by design, so
+nothing but its own negative controls stands between it and matching every six-digit run in the tree.
 """
 green = [
   "tests/test_scan_forbidden.py::test_scan_file_allows_private_and_doc_ips",
   "tests/test_scan_forbidden.py::test_the_path_detector_does_not_flag_ordinary_paths",
   "tests/test_scan_forbidden.py::test_scan_file_clean_text_has_no_hits",
+  "tests/test_scan_tokens_source.py::test_ordinary_digit_runs_do_not_trip_the_estate_identifier_shape",
+  "tests/test_scan_tokens_source.py::test_ordinary_paths_do_not_trip_the_estate_identifier_shape",
 ]
 observed = """
 Every planted shape is flagged and every benign one passes, in this suite. The gate additionally fails

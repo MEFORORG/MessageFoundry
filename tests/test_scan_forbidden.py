@@ -50,6 +50,11 @@ _SYNTH_ESTATE = ("acmecorp", "widgetco", "examplevendor")
 # detector and the in-memory SITE_CODE_RE so no real site code appears in this now-scanned file.
 _SYNTH_SITE_CODE_RE = re.compile(r"99\d{4}")
 _SYNTH_SITE_CODE_FILE = re.compile(r"(?<![A-Za-z0-9.])99\d{4}(?![A-Za-z0-9.])")
+#: A synthetic code, assembled rather than written whole. A probe of the form ``PT_<digits>_ADT`` is a
+#: live match for the scanner's own prefix-free ``_ESTATE_ID_SHAPE`` detector, and this file is scanned
+#: by the gate it tests -- so a literal here would make the suite trip its own detector. Same defusal
+#: as ``_routable_ip`` below.
+_SYNTH_CODE = "99" + "0210"
 
 
 @pytest.fixture
@@ -128,9 +133,9 @@ def test_scan_file_flags_site_code(sf, tmp_path: Path) -> None:
     # connection name reach the mirror. The ``_``-delimited code is caught even though a bare ``\b``
     # boundary would miss it.
     p = tmp_path / "wiring.py"
-    p.write_text("re-routes deeper (e.g. ``PT_990210_ADT_2``)\n", encoding="utf-8")
+    p.write_text(f"re-routes deeper (e.g. ``PT_{_SYNTH_CODE}_ADT_2``)\n", encoding="utf-8")
     hits = sf.scan_file(p, show_context=True)  # reason-only by default; see the IP test above
-    assert any("site code (990210)" in h for h in hits)
+    assert any(f"site code ({_SYNTH_CODE})" in h for h in hits)
 
 
 def test_scan_file_site_code_ignores_embedded_digit_runs(sf, tmp_path: Path) -> None:
