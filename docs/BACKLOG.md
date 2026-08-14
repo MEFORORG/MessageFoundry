@@ -9160,6 +9160,20 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **THE FANOUT IS. Recipients per firing ranged 1 to 11 with a MEDIAN OF 2, and AT LEAST 53 of 112 firings reached EXACTLY ONE SEAT.** One seat received 33 of 112 - 29 percent.
 
+> **THE COUNTS ARE ROBUST TO THE COUNTING RULE, WHICH IS THE FIRST THING A READER SHOULD TRY TO BREAK.** A fan-out stamps its recipients seconds apart, so grouping firings **by minute** could split one broadcast straddling a boundary into two with divided recipients - manufacturing exactly this defect's signature. Re-measured by **clustering** instead (consecutive sends within 30s = one firing, which is what a fan-out is):
+
+> ```
+> rule            firings   reached exactly ONE seat   median recipients
+> minute-key        112              53                      2
+> 30s cluster       113              53                      2
+> ```
+
+> **Two independent grouping rules, the same answer.** The artifact is worth at most one boundary firing, and the floor wording already covers it. Prefer **"at least 53 of ~113 firings reached exactly one seat"** - 113 is the better-grounded denominator.
+
+> **AND THE CENSUS IS KEYED ON SEND TIME, NOT DELIVERY TIME.** Every figure comes from the message's sender-stamped `createdUtc`. That closes the other obvious attack - *"was this measured at the receiver, where a queue can manufacture raggedness?"* - and it matters because the same clock read **broken on delivery time and 10.0 minutes on send time**. Corroborating seats measured their own gaps on the same axis.
+
+> **WHAT WOULD OVERTURN THE MIXED-MODE READING, stated so it is falsifiable:** it assumes firings **did** occur at ~20:11 and ~20:21. That is taken from the clock-owner's own "last good tick 20:21" and **has not been verified against the clock's heartbeat by anyone who read the source.** If those two firings never fired, that seat's gap is a pure outage and its two skips come off this count.
+
 > **EVERY COUNT HERE IS A FLOOR, NOT A CENSUS, AND THE BIAS RUNS THE WRONG WAY.** They are derived from **delivered mail files**, so a firing that was written but never enqueued - or enqueued to a box the instrument cannot read - is **invisible to it**. The defect is UNDER-DELIVERY and the instrument can only UNDER-COUNT, so it is biased in the **same direction as the defect**. The true fanout could be worse than these numbers; it cannot be established as better from them.
 
 **Both innocent explanations were tested and both fail.**
