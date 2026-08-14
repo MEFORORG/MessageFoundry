@@ -37,6 +37,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import secrets
 import urllib.error
 import urllib.parse
@@ -87,6 +88,39 @@ _DICOM_PART_TYPE = "application/dicom"
 _DICOM_JSON = "application/dicom+json"
 # DICOM Tag (group,element) for the STOW-RS FailedSOPSequence in the dicom+json response (DICOM PS3.18).
 _FAILED_SOP_SEQUENCE = "00081198"
+
+
+# DICOM PS3.5 section 9.1: a UID is dot-separated numeric components, at most 64 characters. Anchored
+# \A...\Z and never ^...$ — '$' also matches immediately before a trailing newline, which would readmit
+# the very byte the control-char screen exists to reject (the same defect BACKLOG #1240 gates against on
+# the message-derived path). Each component requires at least one digit, so '..', a leading dot and a
+# trailing dot are excluded STRUCTURALLY rather than by enumerating them.
+_DICOM_UID_RE = re.compile(r"\A[0-9]+(?:\.[0-9]+)*\Z")
+_DICOM_UID_MAX_LEN = 64
+
+
+def _reject_non_uid(value: str, field: str) -> None:
+    """Gate a configured DICOM UID to its PS3.5 grammar before it flows into the URL path.
+
+    ``_reject_url_control_chars`` rejects CR/LF/NUL but **not** the path metacharacters ('/', '..', '?',
+    '#', '@') that would redirect a PHI-bearing STOW-RS POST to a different study, or to another service
+    entirely, on the same allow-listed host (CWE-918). Digits-and-dots admits none of them **by
+    construction**, which is the right polarity for a screen: an allow-list cannot be outflanked by a bad
+    shape nobody thought to enumerate. PHI-safe — names the field, never the value.
+
+    Leading zeros within a component are **deliberately admitted** although PS3.5 forbids them. That is a
+    conformance rule, not a security one: it constrains no character this gate is here to exclude, and
+    refusing a real-world non-conformant UID at startup would block a legitimate deployment for no gain
+    in containment.
+    """
+    if len(value) > _DICOM_UID_MAX_LEN:
+        raise ValueError(
+            f"DICOMweb {field} is longer than the {_DICOM_UID_MAX_LEN}-character DICOM UID limit"
+        )
+    if not _DICOM_UID_RE.match(value):
+        raise ValueError(
+            f"DICOMweb {field} is not a valid DICOM UID (dot-separated digits, no other characters)"
+        )
 
 
 def _reject_url_control_chars(value: str, field: str) -> None:
@@ -153,6 +187,9 @@ class DicomWebDestination(DestinationConnector):
         self.study_uid: str | None = str(study_uid) if study_uid else None
         if self.study_uid is not None:
             _reject_url_control_chars(self.study_uid, "study_uid")  # it flows into the URL path
+            # BACKLOG #1241: and the control-char screen alone is not enough for a value that becomes a
+            # path SEGMENT — refuse at construction, where the operator sees it, not at the URL layer.
+            _reject_non_uid(self.study_uid, "study_uid")
         self.timeout: float = float(s.get("timeout_seconds", 30.0))
         self.encoding: str = s.get("encoding", "utf-8")
         # ADR 0013: capture the STOW-RS dicom+json response. Default False → returns None, byte-identical.
@@ -240,7 +277,11 @@ class DicomWebDestination(DestinationConnector):
         """``{base}/studies`` (server assigns the study) or ``{base}/studies/{study_uid}`` when set."""
         base = self.base_url.rstrip("/")
         if self.study_uid:
-            return f"{base}/studies/{self.study_uid}"
+            # Defense-in-depth percent-encode, matching the fhir.py path-segment treatment this file was
+            # asymmetric with (BACKLOG #1241). It is a NO-OP today by construction — the UID grammar
+            # admits only digits and dots, both RFC 3986 unreserved — and that is the point: it is here
+            # so a later loosening of the grammar cannot silently put a raw metacharacter in the path.
+            return f"{base}/studies/{urllib.parse.quote(self.study_uid, safe='')}"
         return f"{base}/studies"
 
     def _build_headers(self, s: dict[str, Any]) -> dict[str, str]:

@@ -169,6 +169,76 @@ def test_dicomweb_clean_operator_headers_still_construct() -> None:  # #1241
     assert d._headers["X-Trace"] == "abc-123"
 
 
+@pytest.mark.parametrize(
+    "uid",
+    [
+        "../../metadata",  # path traversal out of /studies/ entirely
+        "1.2.3/../../metadata",  # traversal that starts out looking like a UID
+        "1.2.3/series",  # a second path segment -- a different STOW-RS endpoint
+        "1.2.3?bulk=1",  # a query the service would act on
+        "1.2.3#frag",  # a fragment
+        "user@evil.example.org",  # userinfo shape
+        "1.2.3 4",  # space
+        "1.2.é3",  # non-ASCII: outside the grammar, and NOT a control char
+        "1..2",  # empty component -- admitted by a lazy [0-9.] class, refused by this one
+        ".1.2",  # leading dot
+        "1.2.",  # trailing dot
+        "1.2.3" + ".9" * 40,  # 85 chars: over the PS3.5 64-character limit
+    ],
+)
+def test_dicomweb_study_uid_grammar_rejected(uid: str) -> None:  # #1241
+    """The remaining half of this item: `study_uid` had the control-char screen but NO grammar gate, so
+    every value here reached `{base}/studies/{study_uid}` unaltered. `has_control_char` is a C0/DEL
+    predicate -- it does not know what a path metacharacter is, and none of these carries a control
+    character, so all twelve passed the only screen in front of them.
+
+    The sharp ones are the traversals: `../../metadata` redirects a PHI-bearing STOW-RS POST off the
+    study endpoint entirely, to another service on the same allow-listed host (CWE-918), which no
+    egress allow-list catches because the HOST never changes.
+
+    Refused at CONSTRUCTION, not at the URL layer -- a bad SETTING is wrong for every message the
+    connection will ever send, so it must fail the connection at load rather than dead-letter an
+    unbounded stream of messages that were never at fault (the same reasoning as the sibling screens).
+    """
+    with pytest.raises(ValueError, match="DICOM UID"):
+        _dest(study_uid=uid)
+
+
+@pytest.mark.parametrize(
+    "uid",
+    [
+        "1.2.840.10008.5.1.4.1.1.2",  # a real DICOM SOP-class-shaped UID
+        "1",  # single component
+        "1.2.3",
+        "0.0.0",  # the component "0" is legal on its own
+        "1.02.3",  # leading zero: PS3.5 forbids it, this gate DELIBERATELY admits it
+        "9" * 64,  # exactly at the 64-character limit, not over it
+    ],
+)
+def test_dicomweb_valid_study_uid_still_constructs(uid: str) -> None:  # #1241
+    """Positive control -- without it a gate that refused EVERYTHING would pass the test above.
+
+    `1.02.3` is the deliberate admission: a leading zero is a PS3.5 conformance violation, not a
+    security one, and refusing a real-world non-conformant UID at startup would block a legitimate
+    deployment without excluding a single character the gate exists to exclude.
+    """
+    assert _dest(study_uid=uid)._target_url == f"{BASE}/studies/{uid}"
+
+
+def test_dicomweb_study_uid_percent_encode_is_a_noop_today() -> None:  # #1241
+    """The percent-encode at the sink matches the `fhir.py` path-segment treatment this file was
+    asymmetric with. It is a NO-OP while the grammar holds -- digits and dots are both RFC 3986
+    unreserved -- and this test pins that, so the encode can never be blamed for a changed URL.
+
+    It is defence-in-depth against a LATER loosening of the grammar, not a control that does work
+    today; the grammar gate above is what actually contains the value.
+    """
+    uid = "1.2.840.10008.1.1"
+    assert (
+        _dest(study_uid=uid)._target_url == f"{BASE}/studies/{uid}"
+    )  # byte-identical, nothing encoded
+
+
 def test_dicomweb_cleartext_credentials_refused() -> None:
     # Basic/bearer over plain http puts the credential on the wire — refused (mirrors REST/FHIR).
     with pytest.raises(ValueError, match="cleartext"):
