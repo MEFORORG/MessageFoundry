@@ -3145,8 +3145,9 @@ So the registered control for a context should record **what it does not break**
 
 ## 1004. ASVS 13.3.4 — the store DEK's calendar expiry alerts and never refuses; build the enforced stop with a loud opt-out
 
-> 🔢 **Filed 2026-08-04 — not started. Scored 2026-08-04 → P1.** Value **8/10** · Difficulty
-> **4/10** · _quick win_. The store DEK has two expiry axes and only one of them stops. The
+> 🔢 **Filed 2026-08-04 — IN PROGRESS 2026-08-14. Scored 2026-08-04 → P1.** Value **8/10** · Difficulty
+> **4/10 — RE-SIZED, SEE THE NOTE DIRECTLY BELOW; the _quick win_ tag is WRONG and a sweep must not
+> size from it.** The store DEK has two expiry axes and only one of them stops. The
 > **usage** axis refuses unconditionally — `AesGcmCipher._count_invocation` raises `CipherError`
 > at `_GCM_MAX_INVOCATIONS = 2**32` (`messagefoundry/store/crypto.py:135`, the raise at
 > `:683-688`), reads no setting, and is `encrypt()`'s first statement (`:698`). The **calendar**
@@ -3156,6 +3157,12 @@ So the registered control for a context should record **what it does not break**
 > — no raise, no exit, no invalidation. **Owner-decided 2026-08-04: build the refusal, with a
 > setting that lets an operator turn the enforced expiration off.** It is also the ASVS 13.3.4
 > cell's own named up-trigger.
+
+> **RE-SIZED 2026-08-14 (dispatcher) -- THIS IS NOT A QUICK WIN, AND THE TAG IS THE FIELD A SWEEP READS.** Reported by the builder who claimed it against the tag and then measured the actual shape: the refusal must be sited **outside** the engine's blanket `except` or it is **not a control at all**; an **undetermined** age must be ruled to REFUSE rather than alert, which is a decision and not a code change; and the opt-out setting has to be wired into the security-loosening surface, which carries its own signalling obligations. **That is a day of careful work, not a quick win.** The value and priority are unchanged and the item is unusually well specified -- **only the difficulty tag was wrong**, and it is precisely the field the next quick-win sweep sizes from, which is how a P1 ends up in a batch that cannot finish it.
+
+> **AND IT CANNOT LAND ALONE: BUILDING IT MAKES AN ASVS ABSENCE CLAIM FALSE BY CONSTRUCTION.** The scorecard's absence check greps the engine, the web console, the harness and `scripts/`, so **the commit that adds the refusal turns a recorded absence into a present control and reds the vault drift gate.** The vault side is **larger than a re-anchor**: the absence claim must be removed or rewritten, the verdict re-derived, anchors re-pointed, and the residual down-triggers re-read -- several of which name the very function and settings this item changes. **The engine half belongs to a builder; the vault half belongs to the ASVS Tracker, and neither can land without the other.**
+>
+> **DISPATCH RULING, so nobody discovers this at merge time:** the engine half may be **built** freely, and **must not be landed until the vault half is lined up to land with it**. A red drift gate on `main` is the predictable outcome otherwise, and it would be blamed on the engine change, which is correct behaviour meeting a stale record.
 
 **Cluster:** Security & Compliance. **Priority:** P1. **Verdict:** build — owner-decided
 2026-08-04. **Severity:** medium — the shipped code documents an annual DEK cadence
