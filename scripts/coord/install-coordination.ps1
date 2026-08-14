@@ -28,10 +28,11 @@
     and exited silently -- that session got no banner and no gate, and nothing reported the absence.
     The primary tracks main, so every session runs the same current code whatever branch it is on.
 
-    WHAT GETS WIRED
-      SessionStart                          -> scripts/worktree/session-context.ps1  (who is live, what they build)
-      PreToolUse Edit|Write|MultiEdit|Notebook -> scripts/hooks/collision_gate.ps1   (refuse a file a live session is changing)
-      UserPromptSubmit                      -> scripts/hooks/announce-session.ps1    (tell the peers you exist, and what you intend)
+    WHAT GETS WIRED: the $WIRING table below is the source of record, and -Status prints it per config
+    root. It is deliberately NOT restated here. This header used to list three rows while the table
+    carried seven, so an operator reading the header could not learn that ONE event, Stop, carries
+    three independent hooks -- and that gap is exactly what made the seat marker's removal recipe wrong
+    (see $SEAT_MARKER).
 
     Idempotent: re-running replaces our own entries and leaves every other hook untouched.
 
@@ -40,6 +41,8 @@
     pwsh -NoProfile -File scripts\coord\install-coordination.ps1
     pwsh -NoProfile -File scripts\coord\install-coordination.ps1 -Uninstall
     pwsh -NoProfile -File scripts\coord\install-coordination.ps1 -Only UserPromptSubmit -Uninstall
+    # ONE row of a multi-row event -- -Only cannot express this, because it selects the EVENT:
+    pwsh -NoProfile -File scripts\coord\install-coordination.ps1 -Script seat-record -Uninstall
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
@@ -143,8 +146,15 @@ $WAKE_MARKER = "mefor-wake"
 #   mefor-coord / mefor-announce / mefor-mail / mefor-wake / mefor-seat
 # No one of the five contains another in either direction, so no installer can strip a sibling's row.
 # Its own blast radius is small by design -- a Stop hook that fails records nothing that turn and
-# costs the session nothing -- but it is separate so the recorder can be removed
-# (-Only Stop -Uninstall) without disarming the mail drain, which shares the Stop event.
+# costs the session nothing -- and a separate marker is what makes this row independently removable.
+#
+# THE REMOVAL RECIPE IS `-Script seat-record -Uninstall`. It is NOT `-Only Stop -Uninstall`, which is
+# what this comment used to say -- wrong in the one place a 2am operator looks for the remedy. -Only
+# selects an EVENT (the -Script parameter above states that rule in full), and Stop carries THREE
+# unrelated rows. Measured 2026-08-14 against a fixture settings.json: `-Only Stop -Uninstall` removed
+# mefor-mail, mefor-seat AND mefor-wake -- the async mail drain and the whole urgent-mail push tier
+# went with the recorder -- while `-Script seat-record -Uninstall` on the same fixture removed
+# mefor-seat alone and left the other two standing.
 $SEAT_MARKER = "mefor-seat"
 
 # The shim. No installed copy: it locates the script in a checkout and runs it, so a `git pull` updates
@@ -243,6 +253,25 @@ function New-AnnounceShimCommand {
 # $mf gates the notice on "this is a MessageFoundry checkout": this file is user-global and runs in
 # every unrelated project on the machine, and a notice about a missing MEFOR script in someone's
 # unrelated repo is noise, not a signal.
+#
+# IT ENDS WITH A TRAILING `exit 0`, WHICH New-WakeShimCommand ALREADY CARRIED AND THIS BUILDER DID NOT.
+# Outside a repo the `if ($LASTEXITCODE -eq 0 -and $c)` guard is false, nothing in the body runs, and
+# the last thing the shim executed is a FAILED `git rev-parse` -- so pwsh -Command exits 1. This entry
+# is user-global and fires at every turn end in every unrelated project on the machine, so without the
+# suffix it reports a failed Stop hook, with an EMPTY stderr (git's message is eaten by `2>$null`), in
+# every folder on this box that is not a git checkout. Measured 2026-08-14 in one run, same lab, cwd
+# not a git repo: seat rc=1, wake rc=0. The cost is not the exit code itself -- it is that a hook which
+# cries wolf at every turn end trains the reader to skip the whole Stop channel, including the turn it
+# finally emits the notice above.
+#
+# BLANKET `exit 0` HERE, NOT THE WAKE SHIM'S `exit $LASTEXITCODE`, AND THAT ASYMMETRY IS DELIBERATE.
+# For the wake row the exit code IS the payload: a rewake fires on 2 and only on 2, so that builder has
+# to forward it. This row's target disclaims the exit code entirely -- scripts/hooks/seat-record.ps1
+# states "THIS HOOK MUST NEVER FAIL THE TURN. It exits 0 unconditionally" and reports trouble through
+# seats/.writer-errors.txt and a stdout notice instead. Measured against a target rigged to exit 3:
+# this shim answered 0 BEFORE the change and answers 0 AFTER it, so the suffix moves the never-ran path
+# alone and forwards nothing new. The wake builder answered 3 on that same target in the same run,
+# which is what establishes that the measurement could see a non-zero exit at all.
 function New-SeatShimCommand {
     $notice = "[seat] scripts/hooks/seat-record.ps1 is missing from this checkout -- the seat recorder is wired but resolving nothing, so this session is NOT being recorded and a cold start would not see it."
     return (
@@ -255,7 +284,8 @@ function New-SeatShimCommand {
         'if (Test-Path -LiteralPath (Join-Path $b ''scripts/coord/presence.ps1'')) { $mf = $true } ' +
         '$s = Join-Path $b ''scripts/hooks/seat-record.ps1''; ' +
         'if (Test-Path -LiteralPath $s) { & $s; $hit = $true; break } } ' +
-        'if (-not $hit -and $mf) { Write-Output ' + "'$notice'" + ' } }'
+        'if (-not $hit -and $mf) { Write-Output ' + "'$notice'" + ' } }' + "`n" +
+        'exit 0'
     )
 }
 

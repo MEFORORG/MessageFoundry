@@ -37,10 +37,64 @@
     was EXAMINED, not merely what was found, and any of the STOP conditions below suppresses the
     manifest rather than rendering a confident empty answer.
 
+    EVERY RECEIPT FIELD IS EITHER A STOP OPERAND OR THE INSTRUMENT FOR ONE, AND A PRINTED FIELD THAT
+    IS NEITHER IS A DECORATION. Measured on the shipped file against a throwaway repo: `recordsUnreadable`
+    and `writerErrorLines` were both PRINTED and both entered NO stop condition, so a seats layer with an
+    unreadable record, and a seat whose writer had just failed and said so in
+    seats/.writer-errors.txt, each rendered under "NO STOP CONDITIONS. The roster below is as complete
+    as this instrument can establish." That is this module's one job failing in the one place it exists
+    to hold. The rule now runs both ways: nothing is printed that no stop reads, and nothing is a stop
+    operand that the receipt does not print.
+
+    A COUNT OF FILES IS NOT A MEASUREMENT OF FRESHNESS. Three fields were counting existence where the
+    question was recency, and all three could therefore only ever go UP:
+      * `writerHeartbeatIn` counted files in seats/.writer-alive/ and never read the UTC timestamp
+        seat.ps1 writes INSIDE each one, so proof-of-life could never go stale or fall.
+      * `liveSessionsWithoutRecord` asked only whether a record EXISTS for a live session, so one
+        record ever written satisfied the denominator forever -- a writer that recorded turn 1 and
+        then died was byte-identical to one recording every turn.
+      * `writerErrorLines` counts an APPEND-ONLY log, so it can never fall by construction, and a stop
+        keyed on the total would fire forever after the first ever failure. The operand is therefore
+        the RECENT count. A channel that fires when nothing is wrong trains its reader to skip it, and
+        this file already paid for that lesson once (see CRYING WOLF below).
+    So every staleness verdict here is measured against -FreshMinutes, and that bound is itself a
+    receipt field, because a number is not checkable without the instrument that produced it (SDS-3.8).
+
+    A FENCE THAT IS PRESENT IS NOT A FENCE THAT CAN SEE. `rootsExamined` and `fenceAvailable` test that
+    a config root holds a sessions/ DIRECTORY -- an existence test on a folder. An EMPTY sessions/
+    directory passes it, and then every record with a session id gets the fence's ordinary
+    NOT-REGISTERED answer and lands on INTERRUPTED, which is the most destructive verdict available and
+    the one that puts a row in the respawn population. MEASURED: with a genuinely LIVE session in the
+    repo and its registry record removed, the seat rendered INTERRUPTED under "NO STOP CONDITIONS",
+    and rendered RUNNING in the same run with the record restored. So the number of session records
+    actually READ is now a receipt field and a stop operand of its own.
+
+    AND THE FIX IS A STOP, NOT A RECLASSIFICATION. Mapping the blind fence's answers to POSSIBLY
+    RUNNING would drive the RESPAWN POPULATION TO ZERO -- NOT-REGISTERED is also the fence's ordinary
+    answer for the entire dead population -- and manufacture the confidently-empty roster this module
+    exists to prevent. That exact fix was proposed once for the UNKNOWN token and rejected for that
+    reason. A stop suppresses the CLAIM OF COMPLETENESS while still rendering every row; a
+    reclassification would delete the rows from the answer.
+
     THE DENOMINATOR IS THE POINT. Joining records to the fence tells you nothing about a session
     that produced NO record -- it is not missing, it does not exist. `liveSessionsWithoutRecord`
     supplies the missing denominator by starting from the FENCE and subtracting, so a dead writer
-    shows up as a positive count instead of as silence.
+    shows up as a positive count instead of as silence. It is scoped to this clone's worktrees, and
+    the scoping test is EXACT-MATCH-OR-DESCENDANT: a session whose cwd is a subdirectory of a
+    worktree is still that worktree's session, and dropping it silently shrinks the denominator to
+    the point where it stops discriminating. MEASURED THE SAME NIGHT: presence.ps1 counted 13 live
+    sessions where a second instrument reached 10, and the checkout that had just been worked in was
+    among those the second could not see. The separator is not optional in that test -- a bare
+    StartsWith makes "MessageFoundry-ledger" a child of "MessageFoundry".
+
+    A CRASH IS THE INVERSE OF A STOP, NOT A STRONGER ONE. A stop suppresses the claim of completeness
+    and still renders the evidence; an unhandled exception suppresses the evidence and renders
+    nothing. Under `Set-StrictMode -Version Latest` a MISSING PROPERTY THROWS, so every record field
+    is read through Get-RecField and the classification of one record is wrapped: one malformed file
+    must cost ONE ROW, never the receipt. MEASURED on the shipped file: a one-line `{"a":1}`, a
+    whitespace-only file and a ZERO-BYTE file dropped into any box directory each produced exit 1, a
+    bare PropertyNotFoundException, and no receipt, no denominator, no stop conditions and no roster
+    at all.
 
     EVERY VERDICT IS COMPUTED AT READ TIME AND NONE IS STORED. A stored verdict is read after the
     world moved. Measured on this repo the same day: one unchanged commit carried three SHAs across
@@ -79,6 +133,10 @@ param(
     [string]$BoxKey,
     [string]$SessionKey,
     [int]$FoldDays = 7,
+    # THE ONE STALENESS BOUND, shared by every "is this still being written" verdict below and printed
+    # in the receipt beside them. One knob rather than three, because a reader who widens it has to be
+    # able to see, in one place, everything they just widened.
+    [int]$FreshMinutes = 120,
     [string]$RepoHint
 )
 
@@ -89,6 +147,8 @@ $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\mail-key.ps1"
 
 function Invoke-Git {
+    # $null means git REFUSED (non-zero exit); '' means it succeeded and said nothing. Callers that
+    # test object existence depend on that distinction, so do not collapse the two.
     param([string]$Dir, [string[]]$GitArgs)
     try {
         $out = & git -C $Dir @GitArgs 2>$null
@@ -96,6 +156,28 @@ function Invoke-Git {
         if ($null -eq $out) { return '' }
         return ($out -join "`n").Trim()
     } catch { return $null }
+}
+
+# EVERY RECORD FIELD IS READ THROUGH THIS, and the reason is in the header: under
+# `Set-StrictMode -Version Latest` a missing property THROWS instead of yielding $null. Measured on the
+# shipped file, `$rec.sessionId` over a box directory containing one `{"a":1}` took the whole reader
+# down with a PropertyNotFoundException before the receipt was built -- the failure mode that most
+# needs a receipt produced none. The registry half of this class was closed in an earlier pass (the
+# fence call is wrapped and `cwd` is presence-checked); the SEATS half -- the files this layer writes
+# itself -- was still open, and it is the half a half-finished write lands in.
+#
+# ABSENT AND NULL COLLAPSE TO THE DEFAULT ON PURPOSE. A record carrying `"sessionId": null` (the
+# documented `nosid` path) and one missing the key entirely are the same fact to every reader here.
+function Get-RecField {
+    param($Object, [string]$Name, $Default = $null)
+    if ($null -eq $Object) { return $Default }
+    try {
+        if ($Object.PSObject.Properties.Name -contains $Name) {
+            $v = $Object.$Name
+            if ($null -ne $v) { return $v }
+        }
+    } catch { }
+    return $Default
 }
 
 $repo = if ($RepoHint) { $RepoHint } else { (Get-Location).Path }
@@ -109,6 +191,39 @@ $seatsDir = Join-Path $coord 'seats'
 $primary = Split-Path $common -Parent
 
 # ---------------------------------------------------------------------------------------------
+# Time. Defined before the gather because the gather now MEASURES ages rather than counting files.
+# ---------------------------------------------------------------------------------------------
+
+$now = [DateTime]::UtcNow
+
+# NOT [string]$iso. MEASURED: ConvertFrom-Json parses "2026-08-14T20:24:29Z" into a [DateTime] with
+# Kind=Utc, and casting THAT to string yields "08/14/2026 20:24:29" -- the Z is GONE. Parsing the
+# result treats it as LOCAL, silently adding the UTC offset, and this box reported ages five hours in
+# the FUTURE. The pattern was correct throughout; the TYPE was not what the code assumed, which is
+# why re-reading the parse call finds nothing and dumping the type finds it immediately.
+#
+# MINUTES IS THE PRIMITIVE AND HOURS IS DERIVED FROM IT. Get-AgeHours rounds to 0.1h, i.e. six
+# minutes, which is coarser than every freshness bound in this file; a staleness verdict computed off
+# the rounded value would be answering a neighbouring question (SDS-3.8).
+function Get-AgeMinutes($iso) {
+    if (-not $iso) { return $null }
+    try {
+        $utc = if ($iso -is [DateTime]) {
+            if ($iso.Kind -eq [DateTimeKind]::Utc) { $iso } else { $iso.ToUniversalTime() }
+        } else {
+            [DateTimeOffset]::Parse([string]$iso, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal).UtcDateTime
+        }
+        return ($now - $utc).TotalMinutes
+    } catch { return $null }
+}
+
+function Get-AgeHours($iso) {
+    $m = Get-AgeMinutes $iso
+    if ($null -eq $m) { return $null }
+    return [Math]::Round($m / 60, 1)
+}
+
+# ---------------------------------------------------------------------------------------------
 # Gather. Records first, then the fence, then the denominator.
 # ---------------------------------------------------------------------------------------------
 
@@ -118,19 +233,44 @@ if (Test-Path -LiteralPath $seatsDir) {
     foreach ($d in @(Get-ChildItem -LiteralPath $seatsDir -Directory -EA SilentlyContinue |
                      Where-Object { $_.Name -notlike '.*' })) {
         foreach ($f in @(Get-ChildItem -LiteralPath $d.FullName -Filter *.json -EA SilentlyContinue)) {
-            try {
-                $j = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop
-                $records += [pscustomobject]@{ Rec = $j; File = $f.FullName; Box = $d.Name }
-            } catch {
+            $j = $null
+            try { $j = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop }
+            catch {
                 # A record being written RIGHT NOW has exactly this shape. Counted, never dropped:
                 # dropping turns an occupied seat into an absent one in the receipt's own numbers.
-                $unreadableRecords++
+                $j = $null
             }
+            # A PARSE THAT DID NOT THROW IS NOT A RECORD. MEASURED: a ZERO-BYTE file and a
+            # whitespace-only file both come back from `Get-Content -Raw` as '' rather than $null, and
+            # ConvertFrom-Json accepts '' and returns $null WITHOUT raising -- so the catch above never
+            # saw them, a $null went into $records, and the reader died on it two sections later with
+            # no receipt. The test is on the BASE object because [pscustomobject] matches any value
+            # wrapped in a PSObject: measured, `5 -is [pscustomobject]` and `"hi" -is [pscustomobject]`
+            # are both TRUE, so the obvious test would have admitted a bare JSON scalar as a seat.
+            if ($null -eq $j -or -not ($j.PSObject.BaseObject -is [System.Management.Automation.PSCustomObject])) {
+                $unreadableRecords++
+                continue
+            }
+            $records += [pscustomobject]@{ Rec = $j; File = $f.FullName; Box = $d.Name }
         }
     }
 }
 
-# The fence. Its availability is a FACT IN THE RECEIPT, not an assumption.
+# The fence. Its availability is a FACT IN THE RECEIPT, not an assumption -- and PRESENT and ABLE TO
+# SEE are two facts, so they are two fields.
+#
+# `rootsExamined`/`fenceAvailable` are STRUCTURE: Get-ClaudeConfigRoots keeps a root only if it holds a
+# sessions/ DIRECTORY, which is an existence test on a folder. An EMPTY sessions/ passes it, and then
+# every fenced record gets the fence's ordinary Found=$false and lands on INTERRUPTED -- the most
+# destructive verdict available and the one that fills the respawn population. MEASURED against a
+# throwaway repo with a controlled config root: one genuinely LIVE session rendered RUNNING with its
+# registry record present and INTERRUPTED with the sessions/ directory emptied, both runs reporting
+# rootsExamined=1, fenceAvailable=true and "NO STOP CONDITIONS".
+#
+# So `fenceSessionRecordsRead` is the MEASUREMENT -- how many registry records the fence actually
+# parsed -- and it is what `fenceCanSee` and the stop below are keyed on. It does NOT feed the
+# classifier: see the header for why turning a blind fence into POSSIBLY RUNNING would zero the
+# respawn population and manufacture the very roster this module exists to prevent.
 $fenceAvailable = $true
 $sessionRows = @()
 $rootsExamined = 0
@@ -142,6 +282,12 @@ try {
 } catch {
     $fenceAvailable = $false
 }
+# -IncludeUnreadable returns a row with Record=$null for a registry file that would not parse -- a
+# session that launched a moment ago is exactly that shape. Those are a hole in the denominator, not
+# an absence, so they are counted rather than dropped.
+$fenceRecordsUnreadable = @($sessionRows | Where-Object { -not $_.Record }).Count
+$fenceRecordsRead = @($sessionRows).Count - $fenceRecordsUnreadable
+$fenceCanSee = ($fenceAvailable -and $fenceRecordsRead -gt 0)
 
 function Get-NormPath([string]$p) {
     if (-not $p) { return '' }

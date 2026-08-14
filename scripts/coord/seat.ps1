@@ -24,7 +24,15 @@
     version control -- measured: `git ls-files | grep -c '^\.git/'` returns 0 while the same
     instrument returns 1952 tracked files. So there is no history, no merge, and no conflict
     detection. Two writers on one file is last-write-wins SILENTLY. One file per (worktree, session)
-    is what removes the shared-write hazard rather than mitigating it.
+    removes the CROSS-SEAT half of that hazard: seat A can no longer overwrite seat B.
+
+    IT DOES NOT REMOVE THE OTHER HALF, AND THIS FILE USED TO CLAIM IT DID. One record still has
+    several writers OF ITS OWN -- the seat's Stop hook and the same seat's `-Close`, and every
+    subagent turn -- and each of them is a read-modify-write, not a write. Measured on this box: the
+    gap between the prior read and the write is ~500 ms, and firing `-Close -Handback` with a rival
+    `-Record` starting 120 ms later lost the close in 3 of 3 trials -- close exit 0, the words
+    "wrote <path>" on stdout, `lifecycle=open` on disk, `.writer-errors.txt` absent, and the roster
+    then calling that seat INTERRUPTED. Rule 5 is what actually removes it.
 
     THE READER COMPUTES; THIS ONLY STORES. Roster state, respawn eligibility and the spawn briefing
     are all derived at read time by fleet.ps1. Nothing here stores a verdict, because a verdict
@@ -39,7 +47,7 @@
     missing. fleet.ps1 renders "declared: NONE" with its age as first-class output rather than
     showing a blank field as though it were a fact.
 
-    FOUR HARD RULES, each paying for a measured failure on this box.
+    SIX HARD RULES, each paying for a measured failure on this box.
 
     1. NEVER MINT A BOX KEY FROM A PATH THAT IS NOT A ROOTED, EXISTING DIRECTORY. mail.ps1:392-401
        records that the unguarded version "silently mints a NEW box that no reader will ever drain",
@@ -68,6 +76,31 @@
        involuntary -Record half still writes to `nosid` (losing the git facts would be worse) but
        INHERITS NOTHING there and claims no episode baseline. The refusal is on the demoted voluntary
        half only; the hook path does not depend on it.
+
+    5. EVERY UPDATE TO A RECORD IS SERIALISED, AND THE SERIALISATION HAS A DEADLINE. Read-prior ->
+       ~8 git subprocesses + a claims/alloc scan -> write is a ~500 ms window in which another
+       writer's committed update is invisible; whoever renames last wins and the loser's fields are
+       gone with no trace anywhere. Measured before the fix: 3 of 3 `-Close -Handback` runs lost the
+       close to a rival `-Record` started 120 ms later, and 6 concurrent `-Record` runs moved the
+       `writes` counter 1 -> 3 where 7 was owed. So the SLOW half (git facts, the claims scan) runs
+       unlocked, and only read-prior -> assemble -> rename is held under
+       seats/<box>/.<sessionKey>.json.lock -- a hold of milliseconds, not half a second.
+
+       THE DEADLINE IS THE OTHER HALF OF THE RULE, and it outranks the serialisation. This runs as a
+       Stop hook; a lock that blocks forever is a worse defect than the race it prevents, so the wait
+       is bounded, a lock older than any legitimate hold is broken as an orphan, and a wait that
+       still times out PROCEEDS UNLOCKED and records that it did (rule 2). Blocking is never the
+       failure mode.
+
+    6. A PROBE THAT COULD NOT ASK MUST NOT BE STORED AS AN ANSWER OF NONE. `git stash create` needs
+       the index lock; `git status --porcelain` does not. Measured with a sibling process holding
+       .git/index.lock: status returned ' M tracked.txt' (exit 0) while stash create exited 1, and
+       the record stored trackedCount=1 beside stashCovers=nothing-untracked-only with
+       .writer-errors.txt absent -- "there is nothing to rescue" asserted over a tracked edit held by
+       no commit, no stash and no remote, in the one file a replacement seat reads to decide whether
+       the checkout is safe to reuse. Index-lock contention is not hypothetical here: sibling agents
+       commit in the same checkout while the hook fires. So each probe stores its OUTCOME and its
+       PROVENANCE next to its result, and a result that was never obtained is null, never zero.
 
     POOL EPOCH. `configRootLabel` names a CREDENTIAL DIRECTORY, not a Claude account -- two launcher
     scripts on this box point at the same .claude-account-2, and the Desktop runs against ~/.claude
