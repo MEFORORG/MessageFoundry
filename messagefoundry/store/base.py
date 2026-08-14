@@ -1708,6 +1708,21 @@ class AuthStore(Protocol):
         carries a different subject is refused, not handed the account."""
         ...
 
+    async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
+        """The account bound to this verified ``(issuer, sub)``, or ``None`` (BACKLOG #1256).
+
+        **The inverse of the #1015 guard, and the direction that guard cannot look.** That check
+        resolves a user by USERNAME and asks whether *this account* carries a different subject --
+        so it constrains WHICH subject may bind to a given account, and is structurally incapable of
+        seeing a SECOND ACCOUNT already holding the same subject. Nothing else could see it either:
+        measured, there is no UNIQUE constraint naming the federated columns on any of the three
+        backends (0/0/0, against 13/8/10 total UNIQUE declarations as the positive control).
+
+        Deliberately a lookup rather than a scan: it sits on the federated login path, and
+        ``list_users()`` would make every sign-in O(number of accounts).
+        """
+        ...
+
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]: ...
 
     async def list_ad_group_role_map(self) -> Sequence[Row]: ...

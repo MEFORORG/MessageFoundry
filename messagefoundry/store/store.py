@@ -7755,6 +7755,17 @@ class MessageStore:
             row = await cur.fetchone()
         return UserRecord.from_mapping(dict(row)) if row else None
 
+    async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
+        # BACKLOG #1256. Both columns are compared, never `subject` alone: a subject is unique only
+        # WITHIN its issuer, so matching on it across issuers would refuse two unrelated people who
+        # happen to share an opaque identifier at different IdPs.
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT * FROM users WHERE oidc_issuer=? AND oidc_subject=?", (issuer, subject)
+            )
+            row = await cur.fetchone()
+        return UserRecord.from_mapping(dict(row)) if row else None
+
     async def get_user_by_username(self, username: str) -> UserRecord | None:
         async with self._read() as db:
             cur = await db.execute("SELECT * FROM users WHERE username=?", (username,))

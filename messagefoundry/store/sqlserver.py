@@ -9098,6 +9098,18 @@ class SqlServerStore:
         d = await self._fetchone("SELECT * FROM users WHERE username=?", (username,))
         return UserRecord.from_mapping(d) if d else None
 
+    async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
+        # BACKLOG #1256. Both columns, never `subject` alone -- a subject is unique only within its
+        # issuer. NOTE the comparison is the DATABASE's, and these columns carry no explicit COLLATE:
+        # under a case-insensitive server default two subjects differing only in case would match
+        # here, which is SAFE for this predicate (it can only refuse MORE) but is the opposite of the
+        # byte-exact comparison SQLite and Postgres perform. The BIN2 remedy this file applies to
+        # `reference_sets.[key]` is the fix if that divergence ever needs closing.
+        d = await self._fetchone(
+            "SELECT * FROM users WHERE oidc_issuer=? AND oidc_subject=?", (issuer, subject)
+        )
+        return UserRecord.from_mapping(d) if d else None
+
     async def list_users(self) -> list[UserRecord]:
         rows = await self._fetchall("SELECT * FROM users ORDER BY username")
         return [UserRecord.from_mapping(d) for d in rows]

@@ -1203,6 +1203,29 @@ class AuthService:
             )
             != federated_subject
         ):
+            # BACKLOG #1256: SUBJECT-EXCLUSIVITY, the direction #1015's guard cannot look. That guard
+            # resolves by username and asks whether THIS ACCOUNT holds a different subject; it is
+            # structurally incapable of seeing a SECOND ACCOUNT already bound to the subject now
+            # presenting. Nothing else sees it either -- measured, no UNIQUE constraint names these
+            # columns on any backend (0/0/0, positive control 13/8/10 total UNIQUE declarations).
+            #
+            # Without this, one verified identity could come to own two accounts: bind as `alice`,
+            # have the directory resolve you to `bob` later, and both rows carry your subject with
+            # #1015 refusing neither, because each account's own binding is self-consistent.
+            #
+            # Refused rather than re-pointed: silently moving a binding would hand the subject the
+            # newer account and strand the older one, which is the account-takeover-without-
+            # credential-compromise shape #1015 exists to prevent, arriving from the other side.
+            holder = await self._store.get_user_by_federated_subject(*federated_subject)
+            if holder is not None and holder.id != user.id:
+                await self._directory_reject_audit(
+                    principal.username, "oidc", "federated_subject_already_bound"
+                )
+                return LoginOutcome(
+                    ok=False,
+                    error="federated sign-in failed",
+                    reason="federated_subject_already_bound",
+                )
             # First federated login for this account (or an unbound AD account's first): record the
             # (issuer, sub) binding so a later reassigned-username login carrying a different subject is
             # refused by the guard above. A matching binding is left untouched (no updated_at churn).

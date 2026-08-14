@@ -6191,6 +6191,15 @@ class PostgresStore:
         d = await self._fetchone("SELECT * FROM users WHERE username=$1", username)
         return UserRecord.from_mapping(dict(d)) if d else None
 
+    async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
+        # BACKLOG #1256. Both columns, never `subject` alone -- a subject is unique only within its
+        # issuer, so a subject-only match would refuse two unrelated people sharing an opaque
+        # identifier at different IdPs.
+        d = await self._fetchone(
+            "SELECT * FROM users WHERE oidc_issuer=$1 AND oidc_subject=$2", issuer, subject
+        )
+        return UserRecord.from_mapping(dict(d)) if d else None
+
     async def list_users(self) -> list[UserRecord]:
         rows = await self._fetchall("SELECT * FROM users ORDER BY username")
         return [UserRecord.from_mapping(dict(r)) for r in rows]
