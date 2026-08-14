@@ -10,6 +10,7 @@ Handler graph.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -68,6 +69,9 @@ from messagefoundry.pipeline.secret_rotation import (
     MonitoredSecret,
     SecretRotationRunner,
     SecretStamp,
+    StoreKeyExpiredError,
+    alert_dek_expiry_refusal,
+    dek_expiry_refusal,
     reconcile_rotation_meta,
     secrets_from_settings_and_stamps,
 )
@@ -1065,6 +1069,35 @@ class Engine:
                     log.exception(
                         "secret-rotation stamp reconcile failed; continuing with config dates"
                     )
+                # ASVS 13.3.4 (#1004): REFUSE to start on a calendar-overdue DEK, so the calendar axis
+                # stops the way the usage axis (the 2**32 AES-GCM ceiling) already does. THE PLACEMENT
+                # IS THE CONTROL — this sits OUTSIDE the `except Exception` directly above, whose entire
+                # body is a log call. Sited one level in, the raise would be caught there, logged and
+                # stepped over: a traceback and a NORMAL ENGINE START, which is a refusal that refuses
+                # nothing. Do not move it inside the try, and do not widen that handler — its stated
+                # purpose (a reconcile failure must never take the engine down) is correct, and
+                # narrowing it is a separate decision with its own risk.
+                #
+                # That swallow is also why an UNDETERMINED age refuses rather than passing:
+                # `_secret_rotation_stamps` is assigned only on the successful path, so a swallowed
+                # reconcile leaves it empty, and a gate reading "no stamp" as "not overdue" would be
+                # silently disabled by the very failure it most needs to survive. `dek_expiry_refusal`
+                # returns rather than raises for the same reason — an ignored refusal is a dropped
+                # return value, which reads as a bug, where a swallowed exception reads as nothing.
+                dek_key_id = self.store.cipher_info().active_key_id
+                if dek_key_id is not None:  # a keyless store has no DEK age to be overdue
+                    refusal = dek_expiry_refusal(
+                        self._secret_rotation_settings,
+                        self._secret_rotation_stamps,
+                        datetime.date.today(),
+                        enforcement=self._security_enforcement,
+                    )
+                    if refusal is not None:
+                        # Alert IN ADDITION, never INSTEAD — a no-op when the ENFORCE escalation inside
+                        # the reconcile already spoke for the overdue branch.
+                        alert_dek_expiry_refusal(self._alert_sink, refusal)
+                        log.error("refusing to start: %s", refusal.reason)
+                        raise StoreKeyExpiredError(refusal.reason)
             self._secret_rotation_runner = SecretRotationRunner(
                 self._tracked_secrets,
                 self._secret_rotation_settings,

@@ -1547,6 +1547,7 @@ def create_app(
                 cleartext_hops,
                 expired_hops,
                 db_hops,
+                getattr(request.app.state, "secret_rotation_settings", None),
             )
         ]
         synthetic_relaxation = (
@@ -5815,6 +5816,13 @@ def create_managed_app(
         # fall back to AuthSettings() defaults and report a subset. Mirrors store_settings above.
         if auth_settings is not None:
             app.state.auth_settings = auth_settings
+        # Same reason, for [secret_rotation]: security_loosenings() names enforce_store_key_expiry when
+        # it is off (ASVS 13.3.4, #1004), and the posture route cannot see it without this. Stashed
+        # OUTSIDE any enabled guard for the reason given directly above — a resolved-but-disabled
+        # settings object is still the resolved settings, and falling back to defaults would report the
+        # loosening as ABSENT, which is exactly the silent opt-out the entry exists to prevent.
+        if secret_rotation_settings is not None:
+            app.state.secret_rotation_settings = secret_rotation_settings
         if auth_settings is not None and auth_settings.enabled:
             # Out-of-band security-event push (#188, ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP
             # transport, sent to each affected user's own address. The notifier is wired only when the

@@ -3149,6 +3149,15 @@ class SecretRotationSettings(_Section):
     # ENFORCE escalation grace (ASVS 13.3.4): under [security].enforcement=ENFORCE, a DEK older than
     # store_key_max_age_days + this grace escalates its rotation alert (higher severity) at restart.
     enforce_grace_days: int = 30
+    # ASVS 13.3.4 (BACKLOG #1004): under ENFORCE, a calendar-overdue DEK REFUSES to start rather than
+    # only alerting. Defaults ON, and deliberately so: the DEK's other expiry axis -- the 2**32 usage
+    # ceiling in AesGcmCipher -- refuses UNCONDITIONALLY with no opt-out at all, so a calendar axis
+    # shipping OFF would be strictly weaker than its own sibling on the same key, with no principled
+    # basis for the asymmetry. Set false to keep the alert and drop the refusal; that is a deliberate
+    # relaxation and security_loosenings() names it on every boot, because a silent opt-out is
+    # indistinguishable from a defect. No second max-age and no second grace: the refusal fires on the
+    # SAME expression the ENFORCE alert already computes, so the two can never disagree.
+    enforce_store_key_expiry: bool = True
 
     @field_validator("warn_days")
     @classmethod
@@ -4133,6 +4142,7 @@ def security_loosenings(
     cleartext_hops: Sequence[str],
     expiry_relaxed_hops: Sequence[str],
     unverified_db_hops: Sequence[str],
+    secret_rotation: SecretRotationSettings | None = None,
 ) -> list[tuple[str, str]]:
     """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
     section, as ``(switch, plain-language risk)``.
@@ -4398,6 +4408,20 @@ def security_loosenings(
                 f"driver with no verifying keyword set ({named}) — MessageFoundry cannot introspect an "
                 "arbitrary driver's TLS posture, so the weakened-TLS refusal does not apply and the "
                 "rows, and the DSN credential, may cross in plaintext",
+            )
+        )
+    # ASVS 13.3.4 (#1004): the store DEK's calendar expiry refuses at start by default. Turning that
+    # off leaves the alert and drops the stop, so a calendar-overdue key runs indefinitely with a log
+    # line as the only signal — which is the posture this item was filed to remove. Named here because
+    # a silent opt-out is indistinguishable from a defect, and because the DEK's OTHER expiry axis (the
+    # 2**32 usage ceiling) cannot be switched off at all: relaxing one and not the other is a real
+    # asymmetry an operator should have to see on every boot.
+    if secret_rotation is not None and not secret_rotation.enforce_store_key_expiry:
+        out.append(
+            (
+                "enforce_store_key_expiry",
+                "the store data-encryption key may run past its configured max age indefinitely — a "
+                "calendar-overdue DEK now only alerts instead of refusing to start",
             )
         )
     return out

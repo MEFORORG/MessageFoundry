@@ -52,10 +52,13 @@ if TYPE_CHECKING:
     from messagefoundry.store.store import SecretRotationMetaStore
 
 __all__ = [
+    "DekExpiryRefusal",
     "MonitoredSecret",
     "SecretCheck",
     "SecretRotationRunner",
     "SecretStamp",
+    "StoreKeyExpiredError",
+    "dek_expiry_refusal",
     "reconcile_rotation_meta",
     "secrets_from_settings",
     "secrets_from_settings_and_stamps",
@@ -349,6 +352,135 @@ def _maybe_escalate_dek(
             )
         except Exception:
             log.warning("secret_rotation ENFORCE escalation sink failed", exc_info=True)
+
+
+class StoreKeyExpiredError(RuntimeError):
+    """The store DEK is past its calendar expiry and the engine refused to start (ASVS 13.3.4).
+
+    Raised by the CALLER of :func:`dek_expiry_refusal`, never from inside this module's reconcile
+    path -- see that function's docstring for why the siting is the whole control.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class DekExpiryRefusal:
+    """Why the DEK must stop the engine, and whether the alert arm has already spoken.
+
+    ``alerted`` distinguishes the two causes and the caller needs it. The OVERDUE case has already
+    emitted ``secret_rotation_due(enforced=True)`` from :func:`_maybe_escalate_dek`; the UNDETERMINED
+    case emits nothing today. A refusal with no accompanying alert tells an operator the engine
+    stopped without telling them why, so the caller raises the alert itself when this is False.
+    **Alert IN ADDITION, never INSTEAD.**
+    """
+
+    reason: str
+    alerted: bool
+
+
+def dek_expiry_refusal(
+    settings: SecretRotationSettings,
+    stamps: Mapping[str, SecretStamp],
+    today: datetime.date,
+    *,
+    enforcement: SecurityEnforcement,
+) -> DekExpiryRefusal | None:
+    """Decide whether a calendar-overdue store DEK must refuse the start. ``None`` means allow.
+
+    The DEK has two expiry axes and only one of them used to stop. The USAGE axis refuses
+    unconditionally -- ``AesGcmCipher`` raises at ``_GCM_MAX_INVOCATIONS`` (2**32), reads no setting
+    and has no opt-out. The CALENDAR axis computed the same overdue condition and emitted a single
+    alert, so a deployment could run a calendar-overdue key indefinitely with a log line as the only
+    signal (BACKLOG #1004, owner-decided 2026-08-04).
+
+    Pure and side-effect-free on purpose: the decision is testable without an engine, a store or a
+    clock, and the one thing that makes it a control -- its call site -- stays visible at that call
+    site instead of being buried here.
+
+    **THE SITING IS THE CONTROL, AND IT IS WHY THIS RETURNS RATHER THAN RAISES.**
+    ``reconcile_rotation_meta`` is awaited inside a blanket ``except Exception:`` in ``Engine.start``
+    whose entire body is a log call. A raise sited anywhere beneath that await is logged and stepped
+    over, giving a traceback and a normal engine start -- a refusal that refuses nothing. The caller
+    must invoke this OUTSIDE that handler and raise :class:`StoreKeyExpiredError` itself. Returning a
+    value makes the mistake hard to make by accident: an ignored refusal is a dropped return value,
+    which reads as a bug, whereas a swallowed exception reads as nothing at all.
+
+    **AN UNDETERMINED AGE REFUSES; IT IS NOT A YOUNG ONE.** ``Engine._secret_rotation_stamps`` starts
+    empty and is assigned only on the reconcile's SUCCESSFUL path, so a swallowed reconcile failure
+    leaves it empty. With no operator override -- the shipped live-by-default posture -- a gate
+    treating "no stamp and no override" as "not overdue" would be silently disabled by that very
+    swallow, one level removed, through code that reads correct.
+
+    Scope belongs to the caller: invoke only under a keyed cipher with a store implementing
+    ``SecretRotationMetaStore``. A keyless or non-tracking store has no DEK age to be overdue.
+    """
+    if enforcement is not SecurityEnforcement.ENFORCE:
+        return None
+    if not settings.enforce_store_key_expiry:
+        # Deliberate operator relaxation: this drops the REFUSAL and never the reminder. The alert arm
+        # above is untouched, and security_loosenings() names the choice on every boot.
+        return None
+
+    # The same effective last-rotated resolution the alert arm uses -- operator override wins over the
+    # persisted stamp -- so the refusal and the alert cannot disagree about which date they mean.
+    if settings.store_key_last_rotated:
+        eff_last = datetime.date.fromisoformat(settings.store_key_last_rotated)
+    else:
+        dek_stamp = stamps.get(_DEK_SECRET_ID)
+        if dek_stamp is None:
+            return DekExpiryRefusal(
+                reason=(
+                    "store DEK age is UNDETERMINED: no persisted rotation stamp and no "
+                    "[secret_rotation].store_key_last_rotated override. Under "
+                    "[security].enforcement=ENFORCE an undetermined age is not a young one. Set the "
+                    "override, or resolve the stamp reconcile failure logged above"
+                ),
+                alerted=False,
+            )
+        eff_last = dek_stamp.last_rotated
+
+    # The SAME expression the ENFORCE alert computes; deliberately not a second arithmetic.
+    days_overdue = (today - eff_last).days - settings.store_key_max_age_days
+    if days_overdue > settings.enforce_grace_days:
+        return DekExpiryRefusal(
+            reason=(
+                f"store DEK is {days_overdue} day(s) past its "
+                f"{settings.store_key_max_age_days}-day max age, beyond the "
+                f"{settings.enforce_grace_days}-day ENFORCE grace (last rotated "
+                f"{eff_last.isoformat()}). Rotate the key, or set "
+                f"[secret_rotation].enforce_store_key_expiry = false to run on alerts alone"
+            ),
+            alerted=True,
+        )
+    return None
+
+
+def alert_dek_expiry_refusal(alert_sink: AlertSink | None, refusal: DekExpiryRefusal) -> None:
+    """Emit the alert that must accompany a refusal the alert arm has not already covered.
+
+    A no-op when ``refusal.alerted`` -- the OVERDUE branch was alerted by :func:`_maybe_escalate_dek`
+    inside the reconcile, and a second identical alert would be noise. The UNDETERMINED branch emits
+    nothing today, and a refusal with no alert stops the engine without telling the operator why.
+
+    Lives here rather than at the call site so the DEK's secret id and label stay private to this
+    module, and so a sink failure cannot convert an alerting problem into a start failure: the refusal
+    is raised by the caller regardless of whether this succeeds. For the same reason a missing sink is
+    a no-op rather than an error -- losing the alert must never cost the refusal, which is the louder
+    of the two signals and the one that actually stops the engine.
+    """
+    if refusal.alerted or alert_sink is None:
+        return
+    try:
+        alert_sink.secret_rotation_due(
+            # The numeric field cannot carry this condition -- the age is precisely what is unknown --
+            # so the label states it and ``last_rotated`` says so in words.
+            f"{_DEK_LABEL} (age UNDETERMINED)",
+            secret=_DEK_SECRET_ID,
+            last_rotated="unknown",
+            days_overdue=0,
+            enforced=True,
+        )
+    except Exception:
+        log.warning("store-DEK expiry refusal alert sink failed", exc_info=True)
 
 
 class SecretRotationRunner:
