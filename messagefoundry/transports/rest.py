@@ -54,6 +54,7 @@ from messagefoundry.config.tls_policy import (
     is_loopback_hop_host,
     relax_verify_expiry,
 )
+from messagefoundry.controlchars import strip_control_chars
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -108,7 +109,7 @@ def _strip_header_control_chars(value: str) -> str:
     """Neutralize a message-derived header VALUE (header-injection safety, #68): strip every C0 control
     (< 0x20 — incl. CR/LF) and DEL (0x7F) so the value can never split the request line or inject an
     extra header. Returns the value with those bytes removed (a single, safe header value)."""
-    return "".join(ch for ch in value if not (ord(ch) < 0x20 or ord(ch) == 0x7F))
+    return strip_control_chars(value)
 
 
 # --- captured HTTP response headers (BACKLOG #154, ADR 0013 amendment) -----------------------------
