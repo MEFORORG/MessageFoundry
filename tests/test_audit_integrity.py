@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import re
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -898,3 +899,113 @@ async def test_migration_adds_client_to_a_preexisting_store(tmp_path: Path) -> N
         assert "4" in (message or "")
     finally:
         await store.close()
+
+
+# --------------------------------------------------------------------------- BACKLOG #328
+# The monotonic-prefix comparator, which sits BESIDE the exact seal above rather than replacing it.
+# The test directly above this block pins the exact seal's staleness as DESIGNED; nothing here may
+# loosen it, and the first test asserts BOTH comparators on one chain so the pair cannot drift apart.
+
+
+def test_a_prefix_anchor_survives_an_append_where_the_exact_anchor_must_not(tmp_path: Path) -> None:
+    """The whole reason #328 exists, asserted as a CONTRAST rather than in isolation.
+
+    A running instance writes audit rows, so an exact anchor consumed by the startup auto-verify would
+    alarm on essentially every restart -- that is why the anchor could never be wired there. The prefix
+    comparator asks the weaker question (*was the recorded state ever true, and has the chain only
+    grown?*) and therefore survives the restart it has to survive.
+
+    Both verdicts are taken on ONE chain in ONE pass so this test fails if either half changes: if the
+    exact seal ever stops rejecting, the pinning test above is being weakened somewhere else.
+    """
+    db = tmp_path / "prefix_append.db"
+    _seed_audit_rows(db, 4)
+
+    async def _run() -> tuple[bool, bool]:
+        s = await MessageStore.open(db)
+        anchor = await s.audit_anchor()
+        await s.record_audit("legitimate", actor="x")
+        exact_ok, _ = await s.verify_audit_chain(expected_anchor=anchor)
+        prefix_ok, _ = await s.verify_audit_chain(expected_prefix=anchor)
+        await s.close()
+        return exact_ok, prefix_ok
+
+    exact_ok, prefix_ok = asyncio.run(_run())
+    assert exact_ok is False, (
+        "the exact seal stopped rejecting an append -- its designed property is gone"
+    )
+    assert prefix_ok is True, "the prefix comparator alarmed on a chain that merely GREW"
+
+
+def test_a_prefix_anchor_detects_a_truncated_tail(tmp_path: Path) -> None:
+    """#328's actual subject. Truncation is the case the bare startup walk cannot see at all."""
+    db = tmp_path / "prefix_trunc.db"
+    _seed_audit_rows(db, 6)
+
+    async def _anchor() -> tuple[int, str]:
+        s = await MessageStore.open(db)
+        a = await s.audit_anchor()
+        await s.close()
+        return a
+
+    anchor = asyncio.run(_anchor())
+
+    with sqlite3.connect(db) as conn:  # cut the tail off behind the engine's back
+        conn.execute("DELETE FROM audit_log WHERE id > (SELECT MIN(id) + 2 FROM audit_log)")
+        conn.commit()
+
+    async def _verify() -> tuple[bool, str | None]:
+        s = await MessageStore.open(db)
+        v = await s.verify_audit_chain(expected_prefix=anchor)
+        await s.close()
+        return v
+
+    ok, msg = asyncio.run(_verify())
+    assert ok is False
+    assert msg is not None and "truncated or rewritten" in msg
+    # The walk never reached the recorded position, so there is no captured head to compare. That must
+    # FAIL rather than pass vacuously -- a missing capture is the strongest evidence, not its absence.
+    assert "never reached" in msg
+
+
+def test_a_prefix_anchor_is_not_satisfied_by_row_count_alone(tmp_path: Path) -> None:
+    """The negative control for the comparator's own weakening, and it had to be built twice.
+
+    Dropping the head compare and keeping only ``count >= exp_count`` must be caught by something
+    here, or the head compare is untested. THE OBVIOUS CONSTRUCTION DOES NOT DO IT: rewriting a row
+    in place breaks the hash chain, so the WALK reports ``chain broken`` and returns before the
+    prefix comparator is consulted at all -- the test then passes for a reason that has nothing to do
+    with what it claims to check. Measured: with the head compare deleted, that version still passed.
+
+    This is the shape that actually discriminates -- a SAME-COUNT TAIL REPLACEMENT. Truncate behind
+    the engine's back, then let the engine append replacements through its own API so the chain is
+    INTERNALLY VALID and the row count is restored. Only the head recorded at the anchored position
+    distinguishes it, which is exactly the check under test.
+    """
+    db = tmp_path / "prefix_replace.db"
+    _seed_audit_rows(db, 5)
+
+    async def _anchor() -> tuple[int, str]:
+        s = await MessageStore.open(db)
+        a = await s.audit_anchor()
+        await s.close()
+        return a
+
+    anchor = asyncio.run(_anchor())
+    assert anchor[0] == 5
+
+    with sqlite3.connect(db) as conn:  # drop the last two rows
+        conn.execute("DELETE FROM audit_log WHERE id > (SELECT MIN(id) + 2 FROM audit_log)")
+        conn.commit()
+
+    async def _replace_and_verify() -> tuple[bool, str | None]:
+        s = await MessageStore.open(db)
+        await s.record_audit("substitute_a", actor="x")  # restores the count via the real chain
+        await s.record_audit("substitute_b", actor="x")
+        v = await s.verify_audit_chain(expected_prefix=anchor)
+        await s.close()
+        return v
+
+    ok, msg = asyncio.run(_replace_and_verify())
+    assert ok is False, "a same-count tail replacement passed the prefix comparator"
+    assert msg is not None and "truncated or rewritten" in msg
