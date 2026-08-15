@@ -500,13 +500,21 @@ $recordNewestAgeByBox = @{}
 $recordsFutureDated = 0
 foreach ($r in $records) {
     $m = Get-AgeMinutes (Get-RecField $r.Rec 'asOf')
-    if (Test-AgeNonsense $m) { $recordsFutureDated++ }
-    if ($null -ne $m) {
-        if ($null -eq $recordNewestAge -or $m -lt $recordNewestAge) { $recordNewestAge = $m }
-        if (-not $recordNewestAgeByBox.ContainsKey($r.Box) -or $m -lt $recordNewestAgeByBox[$r.Box]) {
-            $recordNewestAgeByBox[$r.Box] = $m
+    # A FUTURE-DATED RECORD IS NOT THE WRITER'S NEWEST SUCCESS, IT IS A BROKEN CLOCK, and admitting it
+    # here would corrupt both comparisons built on this number in the UNSAFE direction: it would mark
+    # every writer failure ANSWERED (a record "after" all of them) and would make the heartbeat look
+    # rolled back in every box holding one. It gets its own count and its own stop instead.
+    $mTrusted = $m
+    if (Test-AgeNonsense $m) { $recordsFutureDated++; $mTrusted = $null }
+    if ($null -ne $mTrusted) {
+        if ($null -eq $recordNewestAge -or $mTrusted -lt $recordNewestAge) { $recordNewestAge = $mTrusted }
+        if (-not $recordNewestAgeByBox.ContainsKey($r.Box) -or $mTrusted -lt $recordNewestAgeByBox[$r.Box]) {
+            $recordNewestAgeByBox[$r.Box] = $mTrusted
         }
     }
+    # $m, NOT $mTrusted, from here down: the per-session age is what the roster RENDERS, and a reader
+    # is owed the nonsense value itself ("dated 240m in the FUTURE") rather than a blank that reads as
+    # unparsable. Test-AgeFresh already refuses it, so it cannot certify anything.
     $sid = [string](Get-RecField $r.Rec 'sessionId' '')
     if (-not $sid) { continue }
     if (-not $recordAgeBySession.ContainsKey($sid)) { $recordAgeBySession[$sid] = $m }

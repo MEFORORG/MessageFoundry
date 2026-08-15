@@ -152,10 +152,10 @@
        store, so it survives the removal of the checkout it describes -- measured with
        `git worktree remove --force`, which this project's own scripts/worktree/remove.ps1 and
        prune-merged.ps1 both call. The record was pointing away from the only surviving copy of the
-       tracked work at the moment that mattered most. When the
-       probe cannot ask, the REF STORE is re-read instead -- a measurement taken now, not a value
-       copied out of the prior record -- and the object's own committer date is stored as
-       `stashAsOf` so the reader sees the anchor's age rather than inheriting a claim about now.
+       tracked work at the moment that mattered most. So when the probe cannot ask, the REF STORE is
+       re-read instead -- a measurement taken now, not a value copied out of the prior record, so an
+       anchor that has since been pruned still reads as gone -- and the object's own committer date
+       is stored as `stashAsOf`, giving the reader the anchor's age instead of a claim about now.
 
     POOL EPOCH. `configRootLabel` names a CREDENTIAL DIRECTORY, not a Claude account -- two launcher
     scripts on this box point at the same .claude-account-2, and the Desktop runs against ~/.claude
