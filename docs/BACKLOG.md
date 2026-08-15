@@ -8844,7 +8844,45 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 ## 1242. `asvs-apply-cells.py` is a lossy writer in four distinct ways, and its own preservation guard is blind to three of them
 
-> 🔢 **Filed 2026-08-13 -- PENDING ACTIVE DATA LOSS, not a latent hazard. The next routine `--apply` destroys a whole commit's worth of structural evidence and prints a clean bill of health.** Value **8/10** -- Difficulty **4/10**. Vault-only security tooling, so there is no deployment axis; what it destroys is the **evidence record** the ASVS cells rest on. Findings below were adversarially verified (4 of 4 lenses), which corrected two errors in the original framing -- see the amendment note.
+> 🔢 **Filed 2026-08-13 -- ~~PENDING ACTIVE DATA LOSS, not a latent hazard. The next routine `--apply` destroys a whole commit's worth of structural evidence and prints a clean bill of health.~~ SEVERITY CORRECTED 2026-08-15 -- THAT SENTENCE WAS WRONG IN BOTH DIRECTIONS AT ONCE, see below. NO LIMB DESTROYS ON A ROUTINE `--apply` TODAY; WHAT REMAINS IS PRECISELY A LATENT HAZARD.** Value **8/10** -- Difficulty **4/10**. Vault-only security tooling, so there is no deployment axis; what it destroys is the **evidence record** the ASVS cells rest on. Findings below were adversarially verified (4 of 4 lenses), which corrected two errors in the original framing -- see the amendment note.
+>
+> **THE SEVERITY SENTENCE WAS FALSE IN BOTH DIRECTIONS AT ONCE, WHICH IS WHY IT IS STRUCK RATHER THAN
+> QUIETLY REWORDED.** It **denied latency for a defect that is now purely latent**, and **asserted
+> active loss that no longer occurs**. A reader acting on it would **hold work that is safe and
+> mis-rank a risk that is real** -- the two errors do not cancel, they compound.
+>
+> **MEASURED: the item's OWN five stated proof properties, run on a synthetic cell (copies only), with
+> the pre-`#403` writer as a negative control.** Table attached rather than summarised, and the control
+> reported alongside -- a severity correction arriving without one invites the doubt it exists to remove.
+> ```
+> property                                  main 360a8173   pre-#403 (5e86bdfb)
+> unknown key in an EVIDENCE entry              PASS              FAIL
+> unknown key in an ABSENCE entry               PASS              FAIL
+> top-level TABLE stays a dict                  PASS              FAIL   <- the "fourth limb"
+> top-level LIST stays a list                   PASS              FAIL
+> dotted key stays ONE key                      PASS              FAIL
+> ```
+> **THE CONTROL FIRES ON ALL FIVE**, so the properties discriminate rather than blanket-passing.
+>
+> **CONFIRMED INDEPENDENTLY BY CODE READING, from the opposite end and by a different seat.** On
+> `origin/main`: `scripts/asvs/apply.py:87 _toml_value` emits a real TOML inline table for a `dict`
+> (`:102`) and a real array for a `list`/`tuple` (`:108`), so `_scalar` (`:113`) no longer stringifies
+> a top-level table into a quoted Python `repr`. **Re-verified here at `f2478010`, and the control is
+> that `_toml_value` DOES NOT EXIST at `4d3a72eb` -- only `_scalar` at `:68`.** The repairing function
+> is absent before `#403`, which is the same fact the table's property 3 reports behaviourally.
+>
+> **WHY THE "FOURTH LIMB UNTOUCHED" CLAIM PERSISTED, and it is the transferable half:** the author's
+> commit message said *"a fourth limb class ... is untouched HERE"* -- **true, and scoped to the commit
+> it sat in.** That disclaimer was then applied to a **two-commit PR**, and the fourth limb was fixed by
+> the OTHER commit of the pair. **Quoting it verbatim preserved the words and silently widened the
+> scope**; a paraphrase would have forced the scope to be stated and the error would have surfaced.
+> **Verbatim quotation is not automatically safer than paraphrase -- it protects the words, not the
+> boundary they were true inside.**
+>
+> **STATUS IS UNCHANGED AND DELIBERATELY SO: `#1242` STAYS OPEN.** The guard's `k`-not-in-`c` **scoping
+> gap** is a different defect from the four writer limbs -- the guard's blind spot rather than the
+> writer's corruption -- and it is unfixed, living only on an unmerged ref. **Two separate sentences,
+> both true: no limb destroys on a routine apply, AND the guard would fail to catch a regression.**
 
 > **THE TAXONOMY IS FOUR-WAY, not the clean scalar-versus-anchor split it first appears to be.** `render()` handles four kinds of key and gets exactly one right:
 > ```
