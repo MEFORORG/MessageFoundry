@@ -666,8 +666,12 @@ def test_the_two_writer_log_channels_are_split_in_both_directions(
     FIELDS. Without the second arm below, the first is satisfied by a writer that reports nothing at
     all -- which is the failure rule 2 exists to forbid.
     """
-    errfile = lambda: _seats_dir(repo) / ".writer-errors.txt"  # noqa: E731
-    degfile = lambda: _seats_dir(repo) / ".writer-degraded.txt"  # noqa: E731
+
+    def errfile() -> Path:
+        return _seats_dir(repo) / ".writer-errors.txt"
+
+    def degfile() -> Path:
+        return _seats_dir(repo) / ".writer-degraded.txt"
 
     # ARM 1 -- a contended `git stash create`. DEGRADED, and named in the record itself.
     (repo / "tracked.txt").write_text("modified\n", encoding="utf-8")
