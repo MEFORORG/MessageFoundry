@@ -576,24 +576,47 @@ foreach ($b in $recordNewestAgeByBox.Keys) {
 # The writer's own failure log. seat.ps1 rule 2 appends one line per failure and still exits 0, so
 # this file is the ONLY trace of a seat that is provably not being recorded.
 #
-# THE OPERAND IS THE RECENT COUNT, NOT THE TOTAL, and that is a correctness choice rather than a
-# softening. The log is APPEND-ONLY and nothing truncates it, so a stop keyed on the total would fire
-# for ever after the first failure this repo ever had -- and a channel that fires when nothing is
-# wrong trains its reader to skip it, which is the CRYING WOLF failure this file already paid for
-# once on origin/main staleness. The total is still printed, so the history is not hidden.
-# An UNPARSABLE line counts as recent: failing toward firing the stop suppresses a completeness claim,
-# and the other direction hides a writer that is failing right now.
+# THE OPERAND IS NOT THE TOTAL, and that is a correctness choice rather than a softening. The log is
+# APPEND-ONLY and nothing truncates it, so a stop keyed on the total would fire for ever after the
+# first failure this repo ever had -- the CRYING WOLF failure this file already paid for once on
+# origin/main staleness. The total is still printed, so the history is not hidden.
+#
+# BUT "RECENT" ALONE IS THE OTHER HORN, AND IT IS THE ONE THAT MATTERS HERE. A count bounded by
+# -FreshMinutes of THIS READ is disarmed by exactly the delay this reader is built for: a new account
+# opened after a cutoff arrives hours late by construction. MEASURED: six failures stamped three hours
+# ago, nothing recorded since, rendered "NO STOP CONDITIONS" -- and the same six read with
+# `-FreshMinutes 240` fired the stop, so the reader's arrival time was the only variable.
+#
+# SO THERE ARE TWO OPERANDS AND THEY ANSWER DIFFERENT SENTENCES. RECENT is now-relative and says "the
+# writer is failing right now"; it decays as the reader arrives later, which is correct for that
+# sentence. UNANSWERED compares two timestamps that are BOTH on disk -- a failure with no successful
+# record write AFTER it -- and says "the writer's last recorded act was a failure". That one does not
+# move when the reader does: it stays lit six hours or six days late, and it goes quiet on RECOVERY,
+# the moment any record lands after the failure. An ancient failure followed by successful writes is
+# therefore silent, which is what stops the append-only log from crying wolf.
+#
+# TIES COUNT AS UNANSWERED (`-le`): a failure and a record stamped in the same second cannot be
+# ordered from here, and failing toward firing suppresses a completeness claim rather than certifying
+# one. An UNPARSABLE line counts as BOTH, for the same reason.
+#
+# THE ATTRIBUTION IS COARSE AND SAYING SO IS PART OF THE FIX (SDS-3.6). seat.ps1 writes
+# "<iso utc>`t<host>`t<stage>`t<message>" -- there is no BOX in that line -- so "a successful record
+# write after it" is necessarily global. One box's writer failing while another box records normally
+# is therefore ANSWERED by the other box's success. Narrowing that needs a box key in the log line,
+# which is seat.ps1's to add, not this reader's to guess.
 $writerErrors = 0
 $writerErrorsRecent = 0
+$writerErrorsUnanswered = 0
 $writerErrorNewestAge = $null
 $errFile = Join-Path $seatsDir '.writer-errors.txt'
 if (Test-Path -LiteralPath $errFile) {
     $errLines = @(Get-Content -LiteralPath $errFile -EA SilentlyContinue | Where-Object { $_ -and $_.Trim() })
     $writerErrors = $errLines.Count
     foreach ($ln in $errLines) {
-        # seat.ps1 writes "<iso utc>`t<host>`t<stage>`t<message>".
         $age = Get-AgeMinutes (($ln -split "`t")[0])
         if ($null -eq $age -or $age -le $FreshMinutes) { $writerErrorsRecent++ }
+        # No record at all means nothing has succeeded since ANY of these, so every line is unanswered.
+        if ($null -eq $age -or $null -eq $recordNewestAge -or $age -le $recordNewestAge) { $writerErrorsUnanswered++ }
         if ($null -ne $age -and ($null -eq $writerErrorNewestAge -or $age -lt $writerErrorNewestAge)) {
             $writerErrorNewestAge = $age
         }
@@ -638,9 +661,13 @@ foreach ($row in $sessionRows) {
         Root                = $row.Root
         HasRecord           = [bool]$hasRecord
         RecordAgeMinutes    = $recAge
-        RecordFresh         = ($hasRecord -and $null -ne $recAge -and $recAge -le $FreshMinutes)
+        # BOTH bounds go through the same two-sided test. A fix applied to one of a pair of sibling
+        # operands and not the other is how the hole moves rather than closes: these two are read by
+        # two different stops and a future-dated heartbeat passes a one-sided bound exactly as a
+        # future-dated record does.
+        RecordFresh         = ($hasRecord -and (Test-AgeFresh $recAge $FreshMinutes))
         HeartbeatAgeMinutes = $hbAge
-        HeartbeatFresh      = ($null -ne $hbAge -and $hbAge -le $FreshMinutes)
+        HeartbeatFresh      = (Test-AgeFresh $hbAge $FreshMinutes)
     }
 }
 
@@ -703,6 +730,14 @@ foreach ($r in $records) {
   # and casting a non-numeric poolEpoch. The row is still emitted, visibly unusable and out of the
   # respawn population, and the count is a stop operand.
   try {
+    # A FILE THAT CARRIES NO FIELD THIS READER READS IS NOT A SEAT, AND SAYING SO IS THE POINT. The
+    # gather admits an object shape; this is where a shape that is not a RECORD stops being described.
+    # Rendering it as POSSIBLY RUNNING -- which is what `{"a":1}` produced, measured -- asserts a
+    # POSITIVE liveness verdict about a file nobody wrote as a seat, and quietly keeps it out of the
+    # respawn population on those grounds. RECORD-UNUSABLE says the true thing instead: nothing about
+    # this was established. Same row, same visibility, same stop; only the claim changes.
+    if (-not $r.IsSeatRecord) { throw "not a seat record: no sessionId, sessionKey, worktree or asOf" }
+
     $rec = $r.Rec
     $wt = [string](Get-RecField $rec 'worktree' '')
     $sid = [string](Get-RecField $rec 'sessionId' '')
@@ -916,8 +951,13 @@ if ($writerErrorsRecent -gt 0) {
 }
 # UNCHECKABLE is its own stop. Silence beside a populated originMainSha reads as a pass, and that is
 # precisely the blind direction: landed verdicts computed against a cached main of unknown age.
-if ($null -eq $originMainAgeMinutes) { $stops += "originMainAgeMinutes is $originMainAgeSource -- landed verdicts below would be computed against a cached origin/main of UNKNOWN age" }
-elseif ($originMainAgeMinutes -gt 60) { $stops += "originMainAgeMinutes=$originMainAgeMinutes (source: $originMainAgeSource) -- nobody has fetched in this clone recently; landed verdicts would be computed against a stale ref" }
+#
+# AND THE BOUND IS THE PRINTED ONE. This compared against a literal 60 that appeared in no receipt
+# field and in no stop text, two lines under a header sentence claiming every staleness verdict here
+# is measured against -FreshMinutes. MEASURED: FETCH_HEAD aged to 90 minutes and `-FreshMinutes 600`
+# printed `freshWithinMinutes 600` and fired anyway. One knob, and the knob is on the receipt.
+if ($null -eq $originMainAgeMinutes) { $stops += "originMainAgeMinutes is $originMainAgeSource (originMainSha=$originMainSha) -- landed verdicts below would be computed against a cached origin/main of UNKNOWN age" }
+elseif (-not (Test-AgeFresh $originMainAgeMinutes $FreshMinutes)) { $stops += "originMainAgeMinutes=$originMainAgeMinutes against freshWithinMinutes=$FreshMinutes (source: $originMainAgeSource; originMainSha=$originMainSha) -- nobody has fetched in this clone recently, or FETCH_HEAD is dated in the future; landed verdicts would be computed against a ref of unestablished age" }
 
 $receipt = [ordered]@{
     renderedAtUtc              = $now.ToString('yyyy-MM-ddTHH:mm:ssZ')

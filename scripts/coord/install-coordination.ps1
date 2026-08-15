@@ -473,6 +473,11 @@ function Test-IsOurs([hashtable]$Entry, [string]$Marker = $MARKER) {
 # The comparison re-derives the expectation from the working tree at the moment you ask, so it is still
 # correct for a reader who runs it days after the install -- there is no recorded verdict to age out.
 #
+# SCOPE, STATED SO THE VERDICT IS NOT OVER-READ: each row is judged against entries carrying THAT row's
+# marker on THAT row's event. A row of ours wired under some other event is not searched for and reads
+# here as MISSING, and a foreign hook is never judged at all. This says whether the rows in the table
+# are current; it is not a survey of everything in the file.
+#
 # scripts/coord/install-git-hooks.ps1 already had this parity check for the payloads it copies, and
 # tests/test_installed_coord_hooks.py records the same "reported INSTALLED over a payload that was in
 # fact stale" measurement against it. This is that check, on this side.
