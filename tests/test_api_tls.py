@@ -401,6 +401,7 @@ def _posture_b_toml(
     enforcement: str | None = None,
     synthetic: bool = False,
     loopback: bool = False,
+    public_origin: str | None = "https://mefor.example.org",
 ) -> None:
     """A non-loopback Posture-B bind (declared proxy) with every NON-Posture-B exposure gate satisfied
     (egress deny-by-default + secure retention + SMTP alerts), so only the intra-service-auth + KEX-floor
@@ -411,6 +412,11 @@ def _posture_b_toml(
         'trusted_proxies = ["10.0.0.9"]',
         f'proxy_intra_service_auth = "{intra}"',
     ]
+    # PRE-SATISFIED, exactly like intra/floor above and for the same reason. Since BACKLOG #1026 a
+    # PHI instance behind a declared terminator under `enforce` REFUSES without `public_origin` --
+    # the ASVS 12.1.1 probe dials it, so leaving it unset silently disabled that check. Declaring it
+    # here keeps these cases testing the two Posture-B attestations rather than the new precondition.
+    # `_posture_probe_toml` passes None to put the precondition itself under test.
     if floor is not None:
         lines.append(f'proxy_tls_min_version = "{floor}"')
     # [security] posture switches lead (document root); non-security [api] plumbing follows.
@@ -427,7 +433,20 @@ def _posture_b_toml(
             else 'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         )
         + "security.block_unlisted_outbound = true\n"
-        "security.delete_message_bodies_after_days = 30\n"
+        # PRE-SATISFIED, exactly like intra/floor and for the same reason. Since BACKLOG #1026 a PHI
+        # instance behind a declared terminator under `enforce` REFUSES without a public address --
+        # the ASVS 12.1.1 probe dials it, so leaving it unset silently disabled that check. Declared
+        # here so these cases keep testing the Posture-B attestations rather than the new
+        # precondition; `_posture_probe_toml` passes None to put the precondition itself under test.
+        # NOTE THE KEY: ADR 0118 moved the authored form to `[security].web_console_public_address`.
+        # `[api].public_origin` is the INTERNAL settings name and is refused outright -- that rename
+        # caught this fixture twice, once for the console and once for the address.
+        + (
+            f'security.web_console_public_address = "{public_origin}"\n'
+            if public_origin is not None
+            else ""
+        )
+        + "security.delete_message_bodies_after_days = 30\n"
         # ADR 0152 rung 2: a declared TLS terminator counts as EXPOSED, so a PHI instance here also
         # warns without an in-use data-protection declaration. Declared with the rest of the
         # non-Posture-B plumbing so these cases keep testing the two Posture-B attestations and not
@@ -440,6 +459,15 @@ def _posture_b_toml(
     (tmp_path / "messagefoundry.toml").write_text(body, encoding="utf-8")
 
 
+class _PassingProbe:
+    """Minimal stand-in for TlsFloorProbe: the ladder reads only `.ok` and `.describe()`."""
+
+    ok = True
+
+    def describe(self) -> str:
+        return "stubbed probe (test)"
+
+
 def _run_posture_b(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, env: str, key: bool = True
 ) -> int:
@@ -450,6 +478,17 @@ def _run_posture_b(
         monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    # The ASVS 12.1.1 TLS-floor probe makes real handshakes against `public_origin`. Since BACKLOG
+    # #1026 this posture REQUIRES `public_origin`, so the probe now runs in every Posture-B case --
+    # and with nothing listening it returns 2, which would make every test here fail for a reason
+    # none of them is about. Stubbed to PASS for the same reason `uvicorn.run` is stubbed: these
+    # cases test CONFIG gates, and the probe's own network behaviour is covered by
+    # tests/test_tls_floor_probe.py. A test that stubbed it to FAIL would be asserting the probe,
+    # not the ladder.
+    monkeypatch.setattr(
+        "messagefoundry.config.tls_probe.probe_tls_floor",
+        lambda origin: _PassingProbe(),
+    )
     return main(["serve", "--config", str(SAMPLES_CONFIG), "--env", env])
 
 
@@ -1350,3 +1389,80 @@ def test_real_mutual_tls_handshake_on_built_context(tmp_path: Path) -> None:
 # (build_api_ssl_context wired into a live uvicorn bind) is a CI/infra-bound integration left to the
 # windows-service-smoke / TLS CI legs — the handshake logic above exercises the SAME server context the
 # serve path builds, so the drift it would catch is the uvicorn wiring, not the TLS policy itself.
+
+
+# --- #1026: `public_origin` is REQUIRED in the declared-terminator PHI posture -------------------
+#
+# The ASVS 12.1.1 TLS-floor probe's gate has FOUR conditions; the comment above it named THREE and
+# asserted every other posture "never reaches here". The undocumented fourth was `public_origin`,
+# and the only thing that required `public_origin` was itself gated on `serve_ui`. So with the
+# console OFF, a PHI instance behind a declared terminator under `enforce` started with the probe
+# silently inert and nothing reported the skip.
+#
+# The same block already refuses twice for exactly this shape: it returns 2 when the probe's
+# MECHANISM is missing ("a check that degrades to a no-op ... reports success forever afterwards")
+# and on unreachable ("a gate that is trivially defeated is not a gate"). Owner ruling 2026-08-14:
+# require it regardless of `serve_ui`.
+
+
+def _posture_probe_toml(
+    tmp_path: Path, *, public_origin: str | None, serve_ui: bool, synthetic: bool = False
+) -> None:
+    """The declared-terminator PHI posture under `enforce`, with the console and `public_origin`
+    varied independently -- which is the pair the defect coupled."""
+    _posture_b_toml(
+        tmp_path,
+        intra="mtls",
+        floor="1.2",
+        enforcement="enforce",
+        synthetic=synthetic,
+        public_origin=public_origin,
+    )
+    path = tmp_path / "messagefoundry.toml"
+    body = path.read_text(encoding="utf-8")
+    # The console is `[security].serve_web_console` on the AUTHORED surface; `[api].serve_ui` is the
+    # internal settings name and ADR 0118 retired the authored form outright. Writing the wrong one
+    # here refused with a clear message rather than silently ignoring it, which is the config surface
+    # behaving well -- and a reminder that the internal name and the authored key are not the same.
+    body = body.replace(
+        "security.block_unlisted_outbound = true\n",
+        f"security.serve_web_console = {'true' if serve_ui else 'false'}\n"
+        "security.block_unlisted_outbound = true\n",
+        1,
+    )
+    if public_origin is not None:
+        body = body.replace("[api]\n", f'[api]\npublic_origin = "{public_origin}"\n', 1)
+    path.write_text(body, encoding="utf-8")
+
+
+def test_phi_behind_a_declared_terminator_refuses_without_public_origin_console_OFF(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """THE DEFECT. With `serve_ui` false nothing required `public_origin`, so this posture started
+    and the 12.1.1 probe never ran -- silently."""
+    _posture_probe_toml(tmp_path, public_origin=None, serve_ui=False)
+    assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 2
+    err = capsys.readouterr().err
+    assert "public_origin" in err
+    assert "12.1.1" in err, "the refusal must name the control it protects, not just the setting"
+
+
+def test_the_refusal_does_not_depend_on_the_console(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The console-ON arm refused before #1026 too. Pinning both arms is what makes the fix a
+    property of the POSTURE rather than of an unrelated console setting."""
+    _posture_probe_toml(tmp_path, public_origin=None, serve_ui=True)
+    assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 2
+    assert "public_origin" in capsys.readouterr().err
+
+
+def test_a_non_phi_instance_is_not_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """POSITIVE CONTROL, and the one that stops this becoming a blanket refusal: the scope is the
+    posture the requirement is about. A synthetic-data instance must still start with no
+    `public_origin`, or the refusal is measuring something other than its own posture."""
+    _posture_probe_toml(tmp_path, public_origin=None, serve_ui=False, synthetic=True)
+    rc = _run_posture_b(tmp_path, monkeypatch, env="prod")
+    assert rc != 2 or "public_origin" not in capsys.readouterr().err

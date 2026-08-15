@@ -4317,6 +4317,8 @@ a file, which is the fact the whole finding rests on.
 
 > 🔢 **Filed 2026-08-05 — not started.** Value **6/10** · Difficulty **3/10** · _quick win_. The probe's gate requires **four** conditions; the comment directly above it names **three** and asserts that "every other posture never reaches here". The undocumented fourth is `public_origin` — and `public_origin` is only *mandatory* when `serve_ui` is also on. So with the console **off**, a PHI instance behind a declared terminator under `enforce` can start with it unset and the probe never runs.
 
+
+> **AMENDED 2026-08-14 (lander) -- THE IMPLEMENTATION LANDED IN THIS PR; THE STATUS BANNER IS DELIBERATELY UNCHANGED.** `public_origin` is now required in the declared-terminator PHI enforce posture, which makes the comment at `:2113-2114` true **by construction** rather than by convention. A negative control was run and still discriminates: reverted, the console-OFF case fails while console-ON and non-PHI pass. **Closing this item is a judgement about completeness, not a mechanical consequence of the code landing, so it is left to the ledger seats rather than taken by the seat that merely supplied the paired commit.**
 **Cluster:** Security / startup gates, ASVS 12.1.1. **Priority:** P2. **Verdict:** build (small). **Severity:** would leave an ASVS 12.1.1 control silently inert in a legitimate deployment posture on first deployment — the TLS floor of the terminator in front of a PHI API would go unmeasured, with nothing reporting the skip.
 
 **The gate, measured at `e0482aea`.** `messagefoundry/__main__.py` runs the probe under:
@@ -8908,6 +8910,8 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **RELATIONSHIP TO ASVS 2.4.1 (#1114): this makes the cell WORSE, not better.** Rule 4 holds that *"it can be configured"* is never a pass; here it cannot be configured at all, so the control is effectively **absent** on the ingest plane while being documented as present-but-disabled. #1114 stays **partial** and its own hardened question -- whether a control that ships off can be an honest pass -- is settled by the method rather than by research.
 
+
+> **AMENDED 2026-08-14 (lander) -- THE IMPLEMENTATION LANDED IN THIS PR; THE STATUS BANNER IS DELIBERATELY UNCHANGED.** `max_messages_per_second` and `message_burst` are now exposed on the `MLLP()` factory, so the settings the connector has read since the pacer was built are reachable from code-first wiring and, via `connections_file.py`'s `factory(**settings)`, from `connections.toml` as well. Off by default, and that default is tested. **Closing this item is a judgement about completeness, not a mechanical consequence of the code landing, so it is left to the ledger seats rather than taken by the seat that merely supplied the paired commit.**
 **Cluster:** Transports / MLLP, and security documentation. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- zero instances; on first deployment an operator **would** be told a rate limit is available and **would** be unable to enable it.
 
 ## 1250. move the backlog to the vault: the public ledger is an aggregate weakness map over a closed public standard
