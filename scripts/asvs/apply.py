@@ -356,6 +356,21 @@ def main(argv: list[str] | None = None) -> int:
         # changing a type nobody asked it to change. A payload that INTENTIONALLY retypes a field --
         # schema evolution, a scalar becoming a table -- is an edit, not damage, and an unscoped
         # check would refuse it. A guard that refuses legitimate edits is a guard someone disables.
+        #
+        # THE INTENT ABOVE IS RIGHT AND THIS IMPLEMENTATION OF IT IS KNOWN-INCOMPLETE -- see the open
+        # BACKLOG #1242. `k not in c` scopes by "the payload did not MENTION this key", which is not
+        # the same question as "the payload asked for this type". A payload that CARRIES the key is
+        # skipped entirely, so a corruption arriving through a mentioned key passes at exit 0, while
+        # the same corruption through an omitted key is refused. That asymmetry is the defect: of the
+        # whole record exactly one cell holds a top-level non-scalar, and the natural payload for
+        # rewriting that cell ECHOES the key -- so the guard covers every cell that cannot be hurt
+        # and stops looking at the one that can.
+        #
+        # This note exists because the paragraph above ARGUES for the boundary and argues well. An
+        # unguarded gap invites the question; a well-reasoned wrong boundary suppresses it, and an
+        # auditor reading this function would otherwise find a guard, find a persuasive rationale,
+        # and stop. Do not read the presence of this check as "the writer's type corruption is
+        # guarded". Read #1242's open row first.
         retyped = sorted(
             k
             for k in was
