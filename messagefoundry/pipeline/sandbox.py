@@ -756,12 +756,26 @@ class SandboxSession:
         left over **after** its answer was written by something other than the call we made — a
         Handler writing straight to fd 1, or a grandchild that inherited it while the worker was
         alive. Letting such a frame sit in the queue is the whole exploit: the next dispatch would
-        take it as its own answer. It is not an authoring accident either — the child rebinds
-        ``sys.stdout`` to stderr at bootstrap (ADR 0166), so the text layer cannot reach fd 1 at all
-        and a frame arriving here was written by something that went looking for the raw descriptor.
-        There is no benign case to preserve. Drop the
+        take it as its own answer. Drop the
         worker and dead-letter the message in hand; :meth:`_kill` then reaps that grandchild along
         with the rest of the worker's tree, so it cannot keep writing to the pipe.
+
+        **The justification is the protocol violation, NOT a claim that fd 1 is unreachable.** An
+        earlier version of this docstring said the ADR 0166 stdout rebind meant "the text layer cannot
+        reach fd 1 at all", so "there is no benign case to preserve". **Both were false, and this
+        docstring is where a DESTRUCTIVE action is reasoned from, which is what made it worth
+        correcting rather than softening.** Rebinding the *name* ``sys.stdout`` leaves the descriptor
+        wide open: ``sys.__stdout__`` is still a text layer on fd 1 — its ``.buffer`` is the very
+        ``BufferedWriter`` :func:`_sandbox_worker.main` captured as the frame writer — and
+        ``os.write(1, ...)`` and ``open(1, "wb")`` reach it too. What the rebind actually removes is
+        the *accidental* case (a bare ``print()`` in a Handler), which is worth having and is all it
+        claims in ADR 0166 and in the worker's own bootstrap comment; asserting more here contradicted
+        both, in the same change that wrote them.
+
+        The action is unchanged and does not need the stronger claim: a frame no outstanding request
+        asked for violates the one-request-one-frame protocol whether it was written deliberately or
+        by accident, and the queue cannot tell the difference. Benign-but-unsolicited is still a frame
+        the next dispatch would misread as its answer.
 
         :data:`_EOF` is the opposite case and must NOT be treated the same way. It is a parent-private
         singleton with no wire form (see :class:`_Eof`), so a worker cannot manufacture one — it
