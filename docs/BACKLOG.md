@@ -9484,6 +9484,39 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > 🔢 **Filed 2026-08-14 - not started. A CITATION THAT DRIFTS DOES NOT BREAK; IT RESOLVES TO THE WRONG LINE, WHICH IS THE FAILURE THIS PROJECT ALREADY TREATS AS WORSE.** Value **7/10** · Difficulty **4/10**. The two ledger files carry **1,193** `path:line` citations into code (`.py`/`.ts`/`.ps1`/`.sh`/`.js`) -- 812 live, 381 archived. **Nothing anywhere checks that the cited line still contains what the citation says it does.**
 
 > **TWO CHECKERS EXIST AND NEITHER ASKS THIS QUESTION -- by their own account.** `link_check.py` answers *"does this path resolve"*, and it does. `backlog_citation_check.py` resolves a **backlog number** against the **ledger namespace** -- *"does the cited FILE contain the item"* -- and its docstring already draws exactly this distinction for its own case: *"The two checkers ask different questions and neither subsumes the other."* **A `path:line` citation into source is a third question, and it has no gate.** Verified by reading both modules on `origin/main`, not inferred from their names.
+>
+> **MEASURED 2026-08-15 -- FIVE FOR FIVE. Every item worked in one session had drifted `file:line`
+> citations, and this is the evidence this item was filed without.** Supplied by the builder who hit
+> them, not by a sweep, so it is a **run of consecutive cases rather than a sampled rate** -- which is
+> the stronger shape for "always" and the weaker one for "how many".
+> ```
+> #328     engine.py:827/:834             never right -- subject at :919 and :857/:871
+> #1017    worktree_gate.ps1 :508-549     file grew 805 -> 1866 lines; rule 3d now at :1035
+> #1215    mail-drain.ps1 :37-42          marker assertion at :57; contradicting code at :802
+> #1100    adr/README.md:134              the ADR 0105 row is at :139
+> 08:116   wiring_runner.py :3068-3069    actual text at :3571 and :3692 -- about 500 lines off
+> ```
+> **THE ITEM TEXT WAS RELIABLE EVERY TIME; ONLY THE COORDINATES WERE WRONG.** That asymmetry is the
+> whole finding: **prose survives a refactor and a line number does not**, so the citation decays while
+> the sentence around it stays true and keeps vouching for it.
+>
+> **AND THE FAILURE IS NOT BENIGN, WHICH IS THE HALF A "STALE ANCHOR" FRAMING LOSES.** A reader who
+> follows a drifted anchor lands on **unrelated code that is often plausibly adjacent** -- reference-runner
+> code under `#328`, loopback-worker code under the `08:116` probe -- and can reasonably conclude **THE
+> ITEM WAS ALREADY FIXED**. That is a **false already-done manufactured by the citation itself**, and it
+> is the same class as the landed-but-open trap on `#1010`, reached by a different road: both make a
+> reader believe work is done that is not, or not done that is.
+>
+> **THE CHEAP DISCRIMINATOR, and it separates the two failures this item has to tell apart:** grep the
+> **cited FILE** for a token from the item's **SUBJECT**. If it lands nowhere near the cited line, the
+> **coordinates** drifted; if it lands nowhere at all, the **claim** is stale. Different fixes, and
+> guessing between them is what produces the false already-done.
+>
+> **COROLLARY FOR ANY VERIFICATION SWEEP: FOLLOWING THE CITATION IS THE FAILURE MODE, NOT THE SHORTCUT.**
+> Find the code by **content**. A sister defect exists in `roles/` -- doc-to-doc references with symbolic
+> ids -- and that one **is** machine-resolvable and is being filed separately; **this one is not, because
+> a line number has no identity to check.** That is why a resolver closes that corpus and cannot close
+> this one.
 
 > **THE TRIGGER THAT MADE THIS CONCRETE.** A licence-header sweep prepends **two lines to 212 tracked source files**. Every citation into any of those files that names a line **below the header is now off by exactly two**. Nothing fails, nothing warns, and no reviewer of that diff would ever see the ledger. **The sweep is correct and should land** -- this item is not an argument against it. It is the observation that a correct bulk edit is indistinguishable, to every gate we own, from one that quietly invalidated a thousand references.
 
