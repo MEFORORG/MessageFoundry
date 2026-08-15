@@ -952,6 +952,54 @@ def audit_row_hash(
     return hmac.new(key, data, hashlib.sha256).hexdigest()
 
 
+def audit_prefix_verdict(
+    expected_prefix: tuple[int, str], prefix_head: str | None, count: int
+) -> tuple[bool, str | None]:
+    """Is the recorded anchor a PREFIX of the chain as it stands now? (BACKLOG #328)
+
+    THE SECOND COMPARATOR, BESIDE THE EXACT ONE -- NOT A REPLACEMENT. ``expected_anchor`` is an exact
+    point-in-time seal: it requires the chain's CURRENT head to equal the recorded one, so any appended
+    row makes it diverge. That is a DESIGNED property, pinned by
+    ``test_an_anchor_goes_stale_on_the_next_appended_row``, and it is why the startup auto-verify could
+    never consume a stored anchor -- a running instance writes audit rows, so it would alarm on
+    essentially every restart.
+
+    This asks the weaker and more useful question: *was the recorded state ever true, and has the chain
+    only GROWN since?* It holds the head captured AT row ``expected_prefix[0]`` against the recorded
+    one. Rows appended afterwards are irrelevant to it, so it survives restarts -- while still catching
+    the two things #328 is about: a TRUNCATED tail (fewer rows than recorded) and a MID-CHAIN REWRITE
+    (the head at that position no longer matches).
+
+    **Chosen over seal-on-stop/check-on-start because that alternative is blind exactly where the
+    threat lives.** Sealing during a clean shutdown detects truncation across a clean stop -- and a
+    tamperer does not shut down cleanly. A control that needs the adversary's cooperation to arm itself
+    is a ceremony, not a control.
+
+    ``prefix_head`` is ``None`` when the walk never reached that position, which IS the truncation case
+    and must fail rather than pass vacuously -- a missing capture is the strongest evidence the
+    comparator can see, not an absence of evidence.
+
+    Written ONCE and imported by the other backends deliberately: this predicate stated per-backend is
+    the copy-versus-single-source defect BACKLOG #1253 catalogues, where a later hardening reaches one
+    copy and silently misses the rest.
+    """
+    exp_count, exp_head = expected_prefix
+    # Bind the compare FIRST so it is always evaluated, matching the exact comparator's idiom: the
+    # anchor head is a MAC, so it gets constant-time treatment and the work does not vary with where
+    # the mismatch is (ASVS 11.2.4 -- the walk above is written the same way, and for the same reason).
+    head_ok = prefix_head is not None and hmac.compare_digest(
+        audit_mac_bytes(prefix_head), audit_mac_bytes(exp_head)
+    )
+    if count < exp_count or not head_ok:
+        have = "(never reached)" if prefix_head is None else f"{prefix_head[:12]!r}"
+        return (
+            False,
+            f"audit log is not an extension of the recorded prefix (have {count} row(s), head at "
+            f"row {exp_count} {have}, expected {exp_head[:12]!r}) — truncated or rewritten",
+        )
+    return True, None
+
+
 def audit_mac_bytes(value: str | None) -> bytes:
     """Normalise a stored/recomputed ``audit_log.row_hash`` to comparison bytes for
     :func:`hmac.compare_digest` (ASVS 11.2.4). Shared verbatim by all three store backends so the
@@ -7560,7 +7608,10 @@ class MessageStore:
         return int(row["n"]), (row["head"] or "")
 
     async def verify_audit_chain(
-        self, *, expected_anchor: tuple[int, str] | None = None
+        self,
+        *,
+        expected_anchor: tuple[int, str] | None = None,
+        expected_prefix: tuple[int, str] | None = None,
     ) -> tuple[bool, str | None]:
         """Recompute the audit hash-chain in order; returns ``(ok, message)``.
 
@@ -7597,6 +7648,9 @@ class MessageStore:
         prev = ""
         count = 0
         first_break: int | None = None
+        #: Head as it stood AT ``expected_prefix[0]`` rows. Stays None when the walk never gets there,
+        #: which is the truncation case and must FAIL rather than pass vacuously (BACKLOG #328).
+        prefix_head: str | None = None
         for r in rows:
             # Per-row secret: keyless below the #190 watermark, keyed at/above it (in-heap HMAC key OR
             # isolated-module Transit MAC) — so a keyless prefix and a keyed suffix both verify across an
@@ -7628,6 +7682,11 @@ class MessageStore:
             # row, instead of cascading a false break onto every successor.
             prev = r["row_hash"] or ""
             count += 1
+            # BACKLOG #328: remember the head AT the recorded prefix position, in this same pass. A
+            # POSITION test, not a data-dependent branch, so it does not reintroduce the early-return
+            # the walk deliberately avoids (ASVS 11.2.4) and costs one comparison per row.
+            if expected_prefix is not None and count == expected_prefix[0]:
+                prefix_head = prev
         if first_break is not None:
             return False, f"audit chain broken at row id={first_break}"
         if expected_anchor is not None:
@@ -7642,6 +7701,10 @@ class MessageStore:
                     f"audit log diverges from recorded anchor (have {count} row(s) head {prev[:12]!r}, "
                     f"expected {exp_count} head {exp_head[:12]!r}) — truncated or rewritten",
                 )
+        if expected_prefix is not None:
+            ok, msg = audit_prefix_verdict(expected_prefix, prefix_head, count)
+            if not ok:
+                return False, msg
         return True, f"verified {count} audit row(s)"
 
     async def has_prior_backup_history(self) -> bool:
