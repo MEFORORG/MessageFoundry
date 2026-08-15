@@ -9187,3 +9187,36 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Auth / store portability. **Priority:** P1. **Verdict:** build.
 **Severity:** would, on first deployment against a **SQL Server** store, allow the bootstrap-admin expiry and supersession enforcement to be bypassed by varying the case of the username; and would make account identity store-dependent across all three backends. No live exposure -- zero deployments (§0).
+
+## 1273. the module that exists to write the C0/DEL test once writes it twice, and logging_setup re-derives it a third time
+
+> 🔢 **Filed 2026-08-15 - not started. THE CONSOLIDATION DOES NOT CONSOLIDATE ITS OWN TWO FUNCTIONS.** [`controlchars.py`](../messagefoundry/controlchars.py) was created by [#1253](BACKLOG.md) to write the C0/DEL test **once**; its docstring is titled *"The C0/DEL control-character test, written once"* and ends *"THE POINT IS THE COPYING PRACTICE, not the seven known lines. If you need this test, import it."* **It then spells the predicate out twice inside itself**, and a third statement of the same set lives in `logging_setup`.
+
+> **MEASURED, three independent spellings of one set:**
+>
+>     messagefoundry/controlchars.py:47   ord(ch) < 0x20 or ord(ch) == 0x7F        (has_control_char)
+>     messagefoundry/controlchars.py:56   ord(ch) < 0x20 or ord(ch) == 0x7F        (strip_control_chars)
+>     messagefoundry/logging_setup.py:66  for _i in range(0x20): ... [0x7F]        (_CTRL_TRANSLATION)
+>
+> There is **no shared constant or predicate** either function reads -- the whole module is 57 lines and both spell it out longhand.
+
+> **THE ITEM IS THE BROKEN PROMISE, NOT THE DUPLICATION -- and the module states the promise itself.** `controlchars.py:43-44`: *"Widening it is a behaviour change at seven call sites at once, **which is exactly the leverage this module exists to provide**; make it deliberately."* **That leverage does not exist.** Add U+0085, or a bidi override, to `has_control_char` and it reaches **neither `strip_control_chars` one function below it nor `_CTRL_TRANSLATION` in another module** -- and nothing reports the omission. **The import-me instruction is sound and is followed by the six call sites; the module's own interior is where it fails.**
+
+> **THE OPERATIONS ARE GENUINELY DIFFERENT AND ALL THREE BELONG -- this is not a duplicate-function report.**
+>
+>     strip_control_chars   REMOVES   -- discards the information
+>     has_control_char      TESTS     -- reports presence
+>     scrub_control_chars   ESCAPES   -- preserves it visibly as \n, \x01
+>
+> **A log relay must ESCAPE rather than STRIP:** discarding a control character from a log record destroys evidence of what the child process actually wrote. #1253 already ruled out collapsing the sites behind one flagged helper, because *"a flag parameter would have re-created the coupling the item exists to remove, one indirection further away"* -- **and that ruling stands.** What is asked for here is **one definition of the SET**, with three operations over it, not one function with three modes.
+
+> **WHY IT IS WORTH A NUMBER: THE PREDECESSOR PREDICTED ITS OWN SUCCESSOR AND WAS RIGHT ONE ITEM LATER.** #1253 is the successor to #1239, and **#1253's banner records that the drift surface was wider than at #1239's filing *"partly because the work that resolved it added sites"*.** This is a **third instance created by the work that closed the second** -- and the sharpest part is that **two of the three copies are inside the artefact built to end the copying.**
+
+> **How to prove a fix, with the control that makes it mean something.** Widen the shared definition by **one code point** (U+0085 is the natural probe -- it is C1, currently and deliberately excluded) and assert that **all three behaviours change together**: `has_control_char` reports it, `strip_control_chars` removes it, and `scrub_control_chars` escapes it. **Today that test fails on two of the three.** The negative control is the same edit applied to only `has_control_char`: the other two must still fail, or the test is not reading what it claims to.
+>
+> *Scope note: do not widen the set as part of the fix.* The exclusion of C1 and Unicode separators is **deliberate and documented** -- every call site screens values bound for byte-oriented sinks where C0 and DEL are the injection alphabet. **Single-source it first; widening it is a separate, deliberate decision** that the fix is designed to make possible.
+
+> **PROVENANCE.** The drift was found and reported by the building lane **against their own commit** (`3854d159`, #343), **unprompted**, while closing #1253 -- and they **declined to fix it unasked**, on the ground that reopening a landed item's subject to fold in one's own follow-up is not a builder's call. **That restraint is why it is a filed item rather than an unreviewed amendment.** The routing to this seat is the Dispatcher's; **the third spelling (`controlchars.py:56`) and the broken-leverage framing were measured here** -- what was handed over was *"stated twice"*, and the file says three.
+
+**Cluster:** Security tooling / single-source hardening. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (§0) -- no value is mis-screened today, every copy agrees. The cost is **future-tense and is exactly the one #1239 named**: a later hardening applied to one copy silently does not apply to the rest, and **nothing reports the omission**. It is filed now because the copies are two files apart and agree, which is the state in which drift is cheapest to prevent and hardest to notice.
