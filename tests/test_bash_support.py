@@ -14,7 +14,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from tests._bash_support import CANNOT_RUN_CODES, bash_sees, require_bash
+import pytest
+from _pytest.outcomes import Failed
+
+from tests._bash_support import CANNOT_RUN_CODES, require_bash, require_shell, shell_sees
 
 
 def test_the_bash_namespace_probe_rejects_an_interpreter_that_cannot_see_the_fixture(
@@ -41,11 +44,36 @@ def test_the_bash_namespace_probe_rejects_an_interpreter_that_cannot_see_the_fix
     launcher first on PATH, three modules still using ``shutil.which`` produced 19 failures; with Git
     Bash first, the same tree at the same commit produced 47 passed. Nothing changed but PATH order.
     """
-    assert not bash_sees(Path(sys.executable), tmp_path), (
+    assert not shell_sees(Path(sys.executable), tmp_path), (
         "the namespace probe accepted a non-shell interpreter, so it cannot reject a bash that is "
         "looking at the wrong filesystem either"
     )
-    assert bash_sees(Path(require_bash(tmp_path)), tmp_path)
+    assert shell_sees(Path(require_bash(tmp_path)), tmp_path)
+
+
+def test_require_shell_probes_EVERY_name_rather_than_stopping_at_the_first(tmp_path: Path) -> None:
+    """THE MULTI-NAME CONTRACT, and it is the correction that made this helper general (#1216).
+
+    ``test_installed_coord_hooks`` resolves ``shutil.which("sh") or shutil.which("bash")`` -- ``sh``
+    FIRST. A helper that only ever proved *bash* usable would repair that file **by accident** on a box
+    where ``sh`` happens to be absent, and leave it broken wherever an UNUSABLE ``sh`` sits on PATH,
+    because ``sh`` would win the ``or`` and never be probed at all. Builder 3 measured exactly that
+    shape on this box: ``which("sh")`` finds nothing, so it falls through to a ``bash`` that resolves
+    to the WSL launcher.
+
+    So the property is *every name is probed*, not *the first name decides*. A first name that yields
+    no usable candidate must not abort the search -- asserted here with a name no machine can satisfy,
+    which is the only way to exercise the fall-through deterministically on any platform.
+    """
+    resolved = require_shell(tmp_path, "mf-not-a-real-shell", "bash")
+    assert shell_sees(Path(resolved), tmp_path), (
+        "require_shell returned an interpreter that cannot read this process's files"
+    )
+    # POSITIVE CONTROL for the assertion above: the same call with only the impossible name MUST fail.
+    # Without it, a require_shell that silently returned something unprobed would pass the line above
+    # whenever the fallback happened to work anyway.
+    with pytest.raises(Failed):
+        require_shell(tmp_path, "mf-not-a-real-shell")
 
 
 def test_the_cannot_run_codes_do_not_swallow_a_real_syntax_error() -> None:

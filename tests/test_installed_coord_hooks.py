@@ -51,11 +51,12 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+
+from tests._bash_support import require_shell
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "coord" / "install-coordination.ps1"
@@ -663,10 +664,14 @@ def test_the_shim_actually_exits_nonzero_with_no_python_on_path(var: str, tmp_pa
     Run against a COPY in tmp_path, never against the installed hook -- that file fires on every push
     in every worktree on this box.
     """
-    sh = shutil.which("sh") or shutil.which("bash")
-    print(f"POSIX shell: {sh or 'NONE FOUND'}")
-    if sh is None:
-        pytest.skip("SKIP (nothing executed): no sh/bash on PATH to run the shim body with")
+    # `shutil.which("sh") or shutil.which("bash")` asked whether A shell EXISTS, and tried `sh` FIRST
+    # (BACKLOG #1216). On this box `which("sh")` finds nothing, so it fell through to a `bash` that
+    # PATH resolves to C:\Windows\System32\bash.exe -- the WSL launcher -- which cannot read a path
+    # this process just wrote. Both shim tests then failed with exit 127 and the backslashes eaten,
+    # while the guard above never fired because a shell WAS found. `require_shell` probes each name in
+    # turn, so an unusable `sh` can no longer win the `or` and go untested.
+    sh = require_shell(tmp_path, "sh", "bash")
+    print(f"POSIX shell: {sh}")
 
     script = tmp_path / "shim"
     script.write_text(HERE_STRINGS[var].replace("\r\n", "\n"), encoding="utf-8", newline="")
@@ -680,8 +685,16 @@ def test_the_shim_actually_exits_nonzero_with_no_python_on_path(var: str, tmp_pa
     if sysroot := os.environ.get("SYSTEMROOT"):
         env["SYSTEMROOT"] = sysroot
 
+    # RELATIVE script name with cwd=tmp_path: not converting a namespace at all is stronger than
+    # converting one correctly, and an absolute Windows path is what the WSL launcher mangled.
     r = subprocess.run(
-        [sh, str(script)], input="", capture_output=True, text=True, env=env, check=False
+        [sh, script.name],
+        cwd=str(tmp_path),
+        input="",
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
     )
     print(f"exit={r.returncode}\nstderr:\n{r.stderr}")
     assert r.returncode != 0, (
