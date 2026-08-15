@@ -44,6 +44,7 @@ __all__ = [
     "set_runtime_level",
     "current_log_level",
     "silence_phi_prone_dependency_loggers",
+    "scrub_control_chars",
     "ControlCharScrubFilter",
     "RedactionFilter",
     "JsonFormatter",
@@ -104,6 +105,18 @@ for _i in range(0x100):
 _CONTINUATION_PREFIX = "    | "
 
 
+def scrub_control_chars(text: str) -> str:
+    """Escape C0 control characters and DEL (tab kept as benign whitespace) so no part of ``text`` can
+    begin a new physical line or drive a terminal.
+
+    The single definition of that translation. :class:`ControlCharScrubFilter` applies it to every
+    record on a configured handler; a caller that assembles a record's content from an untrusted BYTE
+    stream needs it at the point of assembly, because "one peer write is one log record" is that
+    caller's own framing contract and cannot depend on how the host process configured logging — today
+    the ADR 0166 sandbox stderr relay. Idempotent: the escaped forms contain no control characters."""
+    return text.translate(_CTRL_TRANSLATION)
+
+
 def _scrub_block(text: str) -> str:
     """Escape control characters in a multi-line block (``exc_text``/``stack_info``) while KEEPING its
     line breaks, indenting every line with :data:`_CONTINUATION_PREFIX`.
@@ -116,7 +129,7 @@ def _scrub_block(text: str) -> str:
     filter chain, so a record dispatched to stdout *and* the off-box forwarder is scrubbed twice and the
     two sinks must not disagree."""
     return "\n".join(
-        _CONTINUATION_PREFIX + line.removeprefix(_CONTINUATION_PREFIX).translate(_CTRL_TRANSLATION)
+        _CONTINUATION_PREFIX + scrub_control_chars(line.removeprefix(_CONTINUATION_PREFIX))
         for line in text.split("\n")
     )
 
@@ -138,7 +151,7 @@ class ControlCharScrubFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()
-        scrubbed = message.translate(_CTRL_TRANSLATION)
+        scrubbed = scrub_control_chars(message)
         if scrubbed != message:
             record.msg = scrubbed
             record.args = ()
@@ -506,9 +519,9 @@ def configure_stderr_logging(level: int = logging.WARNING) -> logging.Handler:
     stream right and the *filters* wrong. It installs a handler with **no filters at all**, and
     redaction here is a property of the **handler**, not of the logger or the call site (see
     :func:`_install_phi_filters`), so a child that builds its own handler builds an unfiltered one
-    unless it asks for the chain: its records would reach the inherited stderr with neither PHI
-    redaction nor CR/LF neutralization (BACKLOG #1054). Every process that logs installs the chain, or
-    it does not have it.
+    unless it asks for the chain: its records would reach the stderr the parent captures and relays
+    (ADR 0166) with neither PHI redaction nor CR/LF neutralization (BACKLOG #1054). Every process that
+    logs installs the chain, or it does not have it.
 
     The text formatter is the shared one, so a child line is byte-compatible with the parent's and
     :class:`ControlCharScrubFilter`'s "no line may impersonate the record prefix" guarantee is stated

@@ -598,6 +598,7 @@ def test_accepts_runs_inside_the_sandbox_child(sandbox_graph: tuple[Registry, st
 
     session = SandboxSession(
         SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0),
+        inbound="IB_T",
         config_dir=config_dir,
         env=None,
     )
@@ -618,6 +619,7 @@ def test_pure_accepts_is_byte_identical_through_the_sandbox(
 
     session = SandboxSession(
         SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0),
+        inbound="IB_T",
         config_dir=config_dir,
         env=None,
     )

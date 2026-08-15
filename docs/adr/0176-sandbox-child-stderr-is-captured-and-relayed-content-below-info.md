@@ -10,9 +10,9 @@
 
 ## Context
 
-**fd 1 is strictly framed. fd 2 has no discipline at all.** The sandbox worker is spawned at
-[`pipeline/sandbox.py:442-450`](../../messagefoundry/pipeline/sandbox.py) with `stdout=PIPE` and
-`stderr=None`. The `None` is load-bearing and was deliberate — its comment reads *"let the child's
+**fd 1 is strictly framed. fd 2 has no discipline at all.** The sandbox worker was spawned in
+[`pipeline/sandbox.py`](../../messagefoundry/pipeline/sandbox.py) (`SandboxSession._spawn`) with
+`stdout=PIPE` and `stderr=None`. The `None` was load-bearing and deliberate — its comment reads *"let the child's
 stderr (logging) pass through to the engine's stderr"* — but the consequence is that the child's
 stderr **is** the engine's own stderr, inherited raw. Admin-authored Handler code therefore writes
 directly into the engine's log stream, unframed and unattributed.
@@ -46,9 +46,23 @@ nothing pins. Leaving it is leaving a latent frame corruption behind a coinciden
 
 **D1 — Capture the child's stderr and relay it through the engine's stdlib logger.** Spawn with
 `stderr=subprocess.PIPE` and drain it on a dedicated reader thread, mirroring the existing stdout
-frame reader at [`sandbox.py:495`](../../messagefoundry/pipeline/sandbox.py). Every relayed line is
-attributed to the inbound and worker that produced it, sanitised of ANSI and other control bytes, and
-rate-limited, with the suppression count reported rather than silently dropped.
+frame reader at [`sandbox.py`](../../messagefoundry/pipeline/sandbox.py) (`_reader_loop`). Every
+relayed line is attributed to the inbound, the child pid and a per-session **worker generation**
+counter — a pid alone is not a unique identity, because an OS recycles pids and a stale generation's
+relay can still be draining a killed child while the live one runs. Control bytes are neutralised by
+`logging_setup.scrub_control_chars`, the **one** definition `ControlCharScrubFilter` already applies to
+every record, called here at the point a byte stream is assembled into a record rather than
+reimplemented beside it. Lines are rate-limited, with the suppression count reported rather than
+silently dropped.
+
+**One bound in D1 must not be confused with the byte cap rejected below.** A child can write megabytes
+with no newline, and an unbounded carry would let it size the parent's heap, so the drain splits a run
+that reaches a fixed length into several records. That is a **memory** bound on the parent and it
+**discards nothing** — every byte is still relayed, across more records. The rejected cap discards, and
+discards the wrong end.
+
+PHI redaction is deliberately **not** a second call site here: it is a property of the engine's log
+handlers, which this parent-side relay rides like any other record.
 
 **D2 — Content is relayed at DEBUG only. At INFO and above, the engine emits an attributed,
 rate-limited NOTICE carrying the identity and a count, and no content.** This is the load-bearing
@@ -58,11 +72,30 @@ record at INFO or above, because no such call site exists. An operator running a
 *that* a given inbound's Handler is writing to stderr, and how much, which is the operationally
 actionable part.
 
-**D3 — The worker rebinds `sys.stdout` to fd 2 at bootstrap, leaving raw fd 1 exclusively for
-frames.** Sequenced after the frame writer captures its raw handle and before `load_config()` runs
-any admin-authored code — which the comment at
-[`sandbox.py:452-455`](../../messagefoundry/pipeline/sandbox.py) already identifies as the earliest
-untrusted code and the first opportunity to spawn a grandchild.
+**Built with two independent mechanisms, and the redundancy was measured rather than assumed.** The
+sole content call site is `log.debug`, and it additionally sits behind an `isEnabledFor(DEBUG)` guard so
+the bytes are never even decoded below that level. Breaking *either* alone still keeps a printed message
+body off an INFO log; only breaking both puts one there. That is why the guard is worth its line despite
+looking redundant next to a `log.debug`: it is what makes the property survive a later edit that raises
+the call site, which is the realistic way this regresses.
+
+**The notice level is `WARNING`, not `INFO`.** An operator running `[logging].level = WARNING` would
+never see an INFO notice, and a printing Handler would be entirely invisible — the accept-and-drop shape
+the count-and-log invariant forbids, reintroduced by the fix for it. Cry-wolf is answered by the
+throttle rather than by the level.
+
+**D3 — The worker rebinds `sys.stdout` to stderr at bootstrap, so the text layer cannot reach fd 1.**
+Sequenced after the frame writer captures its raw handle and before `load_config()` runs any
+admin-authored code — which the job-assignment comment in
+[`sandbox.py`](../../messagefoundry/pipeline/sandbox.py) already identifies as the earliest untrusted
+code and the first opportunity to spawn a grandchild.
+
+**This is design intent, not an enforced invariant, and the difference matters (SDS-3.7).** Rebinding
+the *name* `sys.stdout` does not make fd 1 frames-only: `sys.__stdout__.buffer`, `os.write(1, ...)` and
+`open(1, "wb")` all still reach the raw descriptor. What keeps a raw writer harmless is unchanged — the
+closed-tag codec and the parent's unsolicited-frame check. Claiming the rebind seals fd 1 would be a
+compensating control resting on a false premise; what it actually buys is that the *accidental* case
+(`print()` in a Handler) can no longer sit one buffering change away from corrupting a frame.
 
 ## Alternatives rejected
 
@@ -95,18 +128,47 @@ stderr reader must therefore start in the same window the stdout reader does —
 write — and no spawn or error path may leave a `PIPE` undrained. **This hazard did not exist before
 this decision.**
 
-**Attribution requires plumbing the engine does not have today.** `SandboxRunner` holds its policy,
-config directory and environment, but no inbound name. Attributing a relayed line to an inbound
-therefore widens the change beyond `sandbox.py` into the construction site in `engine.py`. That cost
-is accepted: an unattributed relay closes (b) and leaves (a) open, and (a) is the forgery half.
+*Measured while building it* (1 MiB written from config module scope, `startup_seconds = 10`): the
+spawn wedges for the full startup budget when the drain starts after the boot **reply** is read, and
+does **not** wedge when it starts immediately after the boot frame **write**, because the parent then
+blocks on the reply while the drain is already running. The rule above is stated at the stricter of the
+two on purpose — the safe boundary is cheap, the failure is a startup timeout that names the wrong
+cause, and the margin is whatever a future edit inserts between the two points.
 
-**A second reader thread is a second teardown obligation.** It must be daemonised, cooperatively
-stopped, and torn down on respawn and on close alongside the existing reader, or a killed worker
-generation leaks a thread holding a dead pipe.
+**Attribution requires plumbing the engine does not have today.** `SandboxSession` holds its policy,
+config directory and environment, but no inbound name. Attributing a relayed line to an inbound
+therefore widens the change beyond `sandbox.py` into the sole production construction site,
+`RegistryRunner._sandbox_for` in `pipeline/wiring_runner.py` — **not** `engine.py`, which builds only
+the policy and the config source. That cost is accepted: an unattributed relay closes (b) and leaves
+(a) open, and (a) is the forgery half. The parameter is **required and keyword-only**, so a future
+caller that forgets it fails at type-check time rather than silently reinstating an unattributed relay.
+
+**A second drain thread is a second teardown obligation, and it is EOF-driven rather than
+cooperatively stopped.** There is no stop flag to set: the drain is blocked in `read()` on the child's
+pipe, and what ends it is the pipe reaching EOF when `_kill` reaps the whole process tree — the same
+reap that already EOFs fd 1. Neither pipe is closed to force it, because closing a file object under a
+mid-read thread raises `ValueError`, which neither drain's `except OSError` catches, so it would escape
+into `threading.excepthook`. The respawn path therefore does **not** join: a surviving grandchild holds
+both pipes, and waiting on it under the session lock would wedge the feed. `close()` is the one
+exception and takes a **bounded** join, because this drain — unlike the frame reader, which only
+enqueues — calls into `logging`, and a daemon thread inside a handler's `emit` when `logging.shutdown`
+runs at exit either writes to a closed stream or holds a lock the atexit hook then blocks on.
+
+**The relay is the sole drainer, so a slow log handler becomes back-pressure on the child.** A stalled
+`[logging].forward_*` TCP/TLS collector makes each relayed record block for the forward timeout; a
+blocked relay stops draining; a full pipe blocks the child mid-dispatch until `wall_seconds` fires and
+the message dead-letters. This is back-pressure and not loss, and it only arises at `DEBUG`, where
+content is being relayed at all — but it is a coupling that `stderr=None` did not have, and it belongs
+here rather than in an incident.
 
 **Operators running at INFO lose Handler stdout and stderr content.** This is the deliberate cost of
-D2 and should be stated in the operator documentation rather than discovered. The notice tells them
-the content exists and at which level to find it.
+D2 and is stated in [docs/CONFIGURATION.md](../CONFIGURATION.md) rather than left to be discovered.
+The notice tells them the content exists and at which level to find it. One caveat travels with that
+instruction: `configure_stderr_logging` pins the **child's** root logger at `WARNING` for the worker's
+whole life, and raising the parent's level does not reach it, so `DEBUG` yields every `print` and raw
+write plus the child's `WARNING`+ records, and never the child's own `DEBUG`/`INFO` records — which the
+child never emitted. Plumbing a level into the boot frame would add a wire field and is left as an
+unfiled follow-up, named by subject because no number is allocated for it.
 
 ## References
 

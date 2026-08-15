@@ -673,11 +673,14 @@ def test_the_tray_file_sink_is_scoped_out_by_name() -> None:
 def test_the_sandbox_worker_stderr_writer_is_filtered_not_disclosed() -> None:
     """§7's filter-coverage claim must match how the ADR 0087 child actually configures logging.
 
-    The child inherits the engine's stderr (``stderr=None``) either way, so what decides the doc is
-    whether it builds its own **unfiltered** handler. It used to: a bare ``basicConfig``, whose handler
-    carries no filters, put WARNING+ records from admin-authored Handler code onto stream 1's own sink
-    outside the chain, and §7 disclosed that. It now calls ``configure_stderr_logging``, which installs
-    the same three filters (BACKLOG #1054), so the disclosure must be gone instead.
+    Two independent mechanisms cover the child's stderr, and §7 states both. In the CHILD: what decides
+    the doc is whether it builds its own **unfiltered** handler. It used to: a bare ``basicConfig``,
+    whose handler carries no filters, put WARNING+ records from admin-authored Handler code onto
+    stream 1's own sink outside the chain, and §7 disclosed that. It now calls
+    ``configure_stderr_logging``, which installs the same three filters (BACKLOG #1054), so the
+    disclosure must be gone instead. In the PARENT: the child's stderr is no longer *inherited* at all
+    (ADR 0166) — it is captured and relayed, with content gated below INFO — so §7's claim now rests on
+    that gate too, and the gate is pinned here rather than only described in prose.
 
     Pinned BOTH ways, because the interesting direction is the regression: a future edit that put
     ``basicConfig`` back would silently reopen the gap, and this reddens and demands §7 say so again.
@@ -688,14 +691,23 @@ def test_the_sandbox_worker_stderr_writer_is_filtered_not_disclosed() -> None:
         encoding="utf-8"
     )
     sandbox = (_ROOT / "messagefoundry" / "pipeline" / "sandbox.py").read_text(encoding="utf-8")
-    assert "stderr=None" in sandbox, "the child no longer inherits the engine's stderr; revisit §7"
+    assert "stderr=subprocess.PIPE" in sandbox, (
+        "the child's stderr is no longer captured by the parent — it is inherited raw again, so §7's "
+        "'content only at DEBUG' gate does not exist. Revisit §7 and ADR 0166."
+    )
+    assert "isEnabledFor(logging.DEBUG)" in sandbox, (
+        "the stderr relay no longer gates content on DEBUG. §7 claims the never-log-bodies rule holds "
+        "BY CONSTRUCTION here; without this guard that claim rests on operator discipline instead."
+    )
     unfiltered = "logging.basicConfig" in worker
     text = _doc_text()
     disclosed = "outside the filter chain" in text
     if unfiltered:
         assert disclosed, (
-            "the sandbox worker child writes to the engine's INHERITED stderr through a bare "
-            "basicConfig, so §7's 'three filters on every record' claim is not true of it. Say so."
+            "the sandbox worker child emits through a bare basicConfig, whose handler carries no "
+            "filters, so §7's 'three filters on every record' claim is not true at the source. The "
+            "parent's ADR 0166 relay does not cover this: relayed records ride the engine's handlers, "
+            "but a record the CHILD writes unredacted is already unredacted on the wire. Say so."
         )
         assert "in the engine process" in text, (
             "the filter-coverage sentence must be scoped to the engine process"
@@ -708,6 +720,11 @@ def test_the_sandbox_worker_stderr_writer_is_filtered_not_disclosed() -> None:
         assert "configure_stderr_logging" in worker, (
             "the child neither uses basicConfig nor configure_stderr_logging — it may have no filter "
             "chain at all. Establish which, and say so in §7."
+        )
+        assert "DEBUG" in _section_7(), (
+            "§7 must name the level at which relayed child stderr content appears. Without it the "
+            "reader cannot act on the disclosure: they learn content is withheld and not where to "
+            "find it, nor that finding it puts full Handler output on a PHI-class log."
         )
     assert ServiceSettings().sandbox.mode == "off", (
         "[sandbox].mode no longer defaults off; §7 describes an OPT-IN posture — revisit it here."
