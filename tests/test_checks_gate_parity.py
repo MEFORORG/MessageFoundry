@@ -34,6 +34,22 @@ _ALERTS = '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@exa
 #: _PROXY: it is a [security] key, and TOML would file it under [api] if it followed a table header.
 #: The rung's own warn/refuse matrix lives in tests/test_memory_encryption_readout.py.
 _MEMORY_ENCRYPTION = "security.memory_encryption_operator_declared = true\n"
+#: BACKLOG #1026: a PHI instance behind a declared terminator under `enforce` REFUSES without a
+#: public address -- the ASVS 12.1.1 probe dials it, and an unset value silently disabled that check.
+#: Declared in the exposed rows exactly like _MEMORY_ENCRYPTION above, and subject to the SAME
+#: placement rule for the same reason: it is a [security] key, so it must precede _PROXY or TOML
+#: files it under [api]. The AUTHORED key is `web_console_public_address`; `[api].public_origin` is
+#: the INTERNAL settings name and ADR 0118 retired the authored form, which is refused outright.
+_PUBLIC_ADDRESS = 'security.web_console_public_address = "https://mefor.example.org"\n'
+
+
+class _PassingProbe:
+    """Stand-in for TlsFloorProbe: the startup ladder reads only ``.ok`` and ``.describe()``."""
+
+    ok = True
+
+    def describe(self) -> str:
+        return "stubbed probe (test)"
 
 
 def _serve(
@@ -53,6 +69,12 @@ def _serve(
     (tmp_path / "messagefoundry.toml").write_text(toml, encoding="utf-8")
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    # The 12.1.1 probe makes real TLS handshakes against the declared address, which #1026 now
+    # requires in this posture. Stubbed to PASS for the same reason uvicorn.run is: these rows test
+    # CONFIG-GATE PARITY, and the probe's own network behaviour is tests/test_tls_floor_probe.py.
+    monkeypatch.setattr(
+        "messagefoundry.config.tls_probe.probe_tls_floor", lambda origin: _PassingProbe()
+    )
     argv = ["serve", "--config", str(SAMPLES_CONFIG), "--env", env]
     if insecure:
         argv.append("--allow-insecure-bind")
@@ -120,6 +142,7 @@ _MATRIX: list[tuple[str, str, str, bool, int]] = [
         "security.block_unlisted_outbound = true\n"
         "security.delete_message_bodies_after_days = 30\n"
         + _MEMORY_ENCRYPTION
+        + _PUBLIC_ADDRESS
         + _PROXY
         + _RETENTION_DL
         + _ALERTS,
