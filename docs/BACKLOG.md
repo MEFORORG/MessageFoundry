@@ -8075,6 +8075,20 @@ gate is the wrong shape, validation of the walk is the right one.
 
 > **Scope:** probe whether the discovered `bash` can actually open a temp file, rather than whether one exists, and skip honestly when it cannot -- naming which interpreter was found. **Consequence beyond this one test:** every baseline measured on this box is only a baseline FOR THE SHELL IT WAS MEASURED IN, which is why two lanes measuring one commit on one day reported 1 failure and 19.
 
+> **AMENDED 2026-08-15 (dispatcher) -- THIS ITEM'S SCOPE PRESCRIBES THE WRONG REMEDY, AND THE RIGHT ONE ALREADY SHIPPED THE DAY BEFORE THIS WAS FILED. THE SHIPPING CODE WINS; THE SCOPE LINE IS SUPERSEDED.**
+>
+> **THE DIVERGENCE:** Scope says *"skip honestly when it cannot -- naming which interpreter was found"*. **The build does LOUD FAILURE, not a skip**, and that is correct.
+>
+> **WHY LOUD FAILURE, and the reasoning is decisive rather than stylistic.** `.github/workflows/ci.yml` sets `defaults.run.shell: bash` **on every OS**, so a leg without a usable bash **cannot run the gate at all**. A skip there is a **green that proves nothing** -- the silent-control shape **ADR 0158** names -- and it is **worse than a red, because a red gets investigated**. The resolver tries **git-derived candidates first**, so a loud failure fires only when **no bash on the machine can read a file the process just wrote** -- at which point the box cannot run the suite meaningfully anyway.
+>
+> **AND THE REMEDY WAS ALREADY IN THE TREE WHEN THIS WAS FILED.** `tests/test_merge_gate_controls.py` solved this on **2026-08-10** -- **one day before this item was filed on 2026-08-11** -- shipping `_bash_candidates()` (git-derived first), `_bash_sees()` (**a live positive control: write a token, require the candidate to READ IT BACK**, deliberately not a pattern match on a path spelling), and `_require_bash()`, whose own text reads *"a bash that can see this process's files, or a loud failure -- **NEVER A SKIP**"*. **So this item's Scope contradicts a module in its own test directory that had already refused that exact remedy, with the reason written down.**
+>
+> **THE REAL DEFECT IS THEREFORE NARROWER AND CHEAPER THAN FILED: it is not a missing design, it is THREE MODULES THAT NEVER ADOPTED AN EXISTING ONE.** Copy-versus-single-source, not absent-solution. **The fix is promotion and adoption, keeping a 127-versus-2 discrimination as a second layer so a harness failure can never impersonate a syntax error.**
+>
+> **COUNT DRIFT, recorded so it is not read as a discrepancy:** this item says *"154 shell blocks; 154 failed"*; the same instrument reported **160 of 160** on 2026-08-14. **The corpus grew; the 100-percent signature -- which is the actual finding -- held at both sizes.**
+>
+> **`#1272` IS THIS ITEM'S DUPLICATE and closes with a pointer here.** It was filed onto an unpushed branch and named the 160 where this one names the 154 -- **two symptoms of one PATH-order defect, filed twice because neither author could see the other's tree.** This number survives on a mechanical asymmetry, not on merit: **a landed item is amendable from any worktree; an unpushed one is editable only by the branch holder.**
+
 **Cluster:** Testing and instruments. **Priority:** P2. **Verdict:** build. **Severity:** conditional -- no product effect; it manufactures failures that mask real ones.
 
 ---
