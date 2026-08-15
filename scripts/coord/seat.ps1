@@ -55,9 +55,35 @@
        path, never an empty-string path -- writing to seats/-<hash>/ would be the same defect with a
        new name.
 
-    2. A WRITER THAT DIES MUST NOT DIE SILENTLY. Every failure appends one line to
-       seats/.writer-errors.txt and the script still exits 0. Exiting non-zero from a Stop hook is
-       its own hazard; leaving no trace is worse than either.
+    2. A WRITER THAT DIES MUST NOT DIE SILENTLY, AND A WRITER THAT MERELY DEGRADED MUST NOT BE
+       REPORTED AS ONE THAT DIED. Every failure appends one line and the script still exits 0.
+       Exiting non-zero from a Stop hook is its own hazard; leaving no trace is worse than either.
+
+       TWO FILES, BECAUSE THEY ARE TWO SENTENCES AND A READER ACTS DIFFERENTLY ON EACH. Same four
+       tab-separated columns (utc, host, stage, message), so one splitter reads both:
+         * seats/.writer-errors.txt   THE RECORD DID NOT LAND, OR LANDED SHORT. Stages: writer-alive
+           (rule 3's proof-of-life was not written, so a reader will age a running writer as dead),
+           read-prior (the carried-forward fields were lost), record-lock (applied unserialised, so a
+           concurrent update may have been overwritten), no-session-identity (rule 4 refused the
+           write), main (the write may not have happened at all). "Missing or stale" is TRUE of a
+           seat named here.
+         * seats/.writer-degraded.txt A PROBE COULD NOT ANSWER AND THE RECORD SAYS SO IN ITS OWN
+           FIELDS. Stages: status-probe (dirty.probe=failed, dirty.probeError, and the counts and
+           lists all null), stash-probe / stash-anchor (stashProbe.outcome + exitCode + error,
+           stashCovers, stashSha/stashRef), handoff-pointer (handoff.unresolved), notes (the note
+           field holds the drop marker). The record for a seat named here is present and complete.
+       Every line in the degraded log is ALSO carried in that turn's own record, as `writerDegraded`,
+       so the per-seat evidence stands without the fleet-wide file.
+
+       WHY THE SPLIT IS NOT COSMETIC. Measured on a throwaway repo: one sibling holding
+       .git/index.lock across exactly one -Record produced a record that was fresh, complete and
+       correct in every field, and a roster banner reading "STOP CONDITIONS FIRED -- ... the writer
+       FAILED that many times inside 120 minutes ... Any seat it failed on is missing or stale
+       below". Both halves of that sentence were false of that seat, and rule 6's own text says this
+       contention "is not hypothetical -- sibling agents commit in the same checkout while the hook
+       fires". A stop channel that fires when nothing is wrong is a stop channel a cold-start reader
+       learns to skip, and the turn it finally carries a real "this turn was NOT recorded" is the
+       turn that gets skipped with it.
 
     3. TOUCH seats/.writer-alive/<boxKey>.txt ON EVERY INVOCATION, including no-op ones. "The writer
        ran" and "the seat had something to say" are different sentences, and a reader that cannot
@@ -101,6 +127,26 @@
        the checkout is safe to reuse. Index-lock contention is not hypothetical here: sibling agents
        commit in the same checkout while the hook fires. So each probe stores its OUTCOME and its
        PROVENANCE next to its result, and a result that was never obtained is null, never zero.
+
+       THE RULE COVERS THE LISTS, NOT ONLY THE COUNTS, and it was applied to the counts alone for
+       one pass. Measured with a peer process holding .git/index open exclusively, so
+       `git status --porcelain -z` exited 128: dirty.count/trackedCount/untrackedCount were all
+       null -- correct -- beside dirty.paths=[] and dirty.untracked=[], while the checkout held
+       ' M tracked.txt' and an untracked ONLY-COPY.md. The lists are the half a reader triages on,
+       so the empty ones rendered as "no untracked files were recorded" under the heading "WORK AT
+       RISK -- ... the only category that cannot be recovered elsewhere". An answer of none is a
+       measurement; both lists are null when there was no measurement to list.
+
+       AND A LATER PROBE THAT COULD NOT ASK MUST NOT DELETE AN EARLIER PROBE'S ANSWER. `stashSha`
+       and `stashRef` were re-derived every turn from this turn's probe alone, so turn 2 under
+       contention rewrote a live anchor to null: measured, turn 1 stored a sha and a ref that
+       `git rev-parse --verify` still resolved AFTER turn 2 declared stashCovers=
+       tracked-edits-NOT-captured. The anchor lives in the common git dir and outlives
+       `git worktree remove --force`, which this project's own remove.ps1 and prune-merged.ps1 both
+       call, so the record was pointing away from the only surviving copy of the work. When the
+       probe cannot ask, the REF STORE is re-read instead -- a measurement taken now, not a value
+       copied out of the prior record -- and the object's own committer date is stored as
+       `stashAsOf` so the reader sees the anchor's age rather than inheriting a claim about now.
 
     POOL EPOCH. `configRootLabel` names a CREDENTIAL DIRECTORY, not a Claude account -- two launcher
     scripts on this box point at the same .claude-account-2, and the Desktop runs against ~/.claude
@@ -146,14 +192,17 @@ $WRITER = 'seat.ps1/1.0.0'
 # ---------------------------------------------------------------------------------------------
 
 $script:SeatsDir = $null
+# Every degradation recorded during THIS run, in order. Carried into the record so a reader has a
+# PER-SEAT operand and does not have to infer one from a fleet-wide log (rule 2's second channel).
+$script:Degraded = @()
 
-function Write-WriterError {
-    param([string]$Stage, [string]$Message)
+function Write-SeatLog {
+    param([string]$File, [string]$Stage, [string]$Message)
     # Best-effort by construction: if we cannot even record the failure we must still exit 0, or a
     # broken writer takes the seat's Stop hook down with it.
     try {
         if (-not $script:SeatsDir) { return }
-        $f = Join-Path $script:SeatsDir '.writer-errors.txt'
+        $f = Join-Path $script:SeatsDir $File
         # DOUBLE-quoted, and that is the whole point: PowerShell processes the backtick escape only
         # inside double quotes, so the single-quoted form wrote the two literal characters backtick-t
         # between the fields. Measured: the log then split into ONE field on a tab, so the column
@@ -162,6 +211,29 @@ function Write-WriterError {
         $line = "{0}`t{1}`t{2}`t{3}" -f ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')), $env:COMPUTERNAME, $Stage, ($Message -replace '\s+', ' ')
         Add-Content -Path $f -Value $line -Encoding utf8 -EA SilentlyContinue
     } catch { }
+}
+
+function Write-WriterError {
+    # THE RECORD DID NOT LAND, OR LANDED SHORT. See rule 2 for the split and why it is not cosmetic.
+    param([string]$Stage, [string]$Message)
+    Write-SeatLog -File '.writer-errors.txt' -Stage $Stage -Message $Message
+}
+
+function Write-WriterDegraded {
+    # THE RECORD LANDED AND SAYS SO ITSELF. A probe that could not answer is not a writer that died,
+    # and routing it into the same file made a reader's completeness stop fire on this project's
+    # ordinary multi-agent workflow -- measured: one sibling holding .git/index.lock across one Stop
+    # hook produced a fresh, complete, correct record and a roster banner reading "the writer FAILED
+    # ... Any seat it failed on is missing or stale below", which was false of that seat in both
+    # halves. Same four tab-separated columns as the error log, so any reader's splitter works
+    # verbatim on either file.
+    param([string]$Stage, [string]$Message)
+    $script:Degraded += [ordered]@{
+        stage  = $Stage
+        at     = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        detail = ($Message -replace '\s+', ' ')
+    }
+    Write-SeatLog -File '.writer-degraded.txt' -Stage $Stage -Message $Message
 }
 
 function Invoke-Git {
@@ -432,10 +504,11 @@ function Get-GitFacts {
     # A rename/copy entry is followed by a SECOND field carrying the ORIGINAL path; it is consumed
     # here rather than being read as a status line of its own.
     #
-    # RULE 6 APPLIES TO THIS PROBE FIRST. Every count below is downstream of ONE git call, and if that
-    # call cannot run, "0 dirty paths" is not a measurement -- it is the absence of one, wearing the
-    # same clothes as a clean tree. So the outcome is recorded beside the counts, and a status that
-    # did not answer leaves them NULL rather than zero.
+    # RULE 6 APPLIES TO THIS PROBE FIRST, AND TO THE LISTS AS WELL AS THE COUNTS. Every count AND
+    # every path below is downstream of ONE git call, and if that call cannot run, "0 dirty paths"
+    # and "[]" are not measurements -- they are the absence of one, wearing the same clothes as a
+    # clean tree. So the outcome is recorded beside the results, and a status that did not answer
+    # leaves counts and lists alike NULL rather than zero and empty.
     $trackedPaths = @()
     $untrackedPaths = @()
     $statusOk = $true
@@ -444,7 +517,9 @@ function Get-GitFacts {
     if (-not $stProbe.ok) {
         $statusOk = $false
         $statusError = "git status --porcelain exit=$($stProbe.exitCode): $($stProbe.err)"
-        Write-WriterError -Stage 'status-probe' -Message $statusError
+        # DEGRADED, not an error: the record below carries probe=failed, probeError, and null counts
+        # and lists, so it describes this failure itself (rule 2).
+        Write-WriterDegraded -Stage 'status-probe' -Message $statusError
     } else {
         $st = $stProbe.out
         if ($st) {
@@ -484,6 +559,7 @@ function Get-GitFacts {
     # not fought.
     $stash = $null
     $stashRefName = $null
+    $stashAt = $null
     $stashProbe = [ordered]@{
         attempted = $false
         # created | none | failed | not-attempted | not-attempted-status-failed
@@ -492,6 +568,10 @@ function Get-GitFacts {
         attempts  = 0
         exitCode  = $null
         error     = $null
+        # TRUE when this turn could not ask and the sha/ref below therefore name an EARLIER turn's
+        # anchor, re-read from the ref store just now. The pair (carried, stashAsOf) is what stops a
+        # reader mistaking a surviving anchor for one taken this turn.
+        carried   = $false
         at        = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
     }
     if ($statusOk -and $trackedPaths.Count -gt 0) {
@@ -502,7 +582,14 @@ function Get-GitFacts {
             $stashProbe.attempts = $attempt
             $stashProbe.exitCode = $p.exitCode
             if ($p.ok) {
-                if ($p.out) { $stash = $p.out; $stashProbe.outcome = 'created' }
+                if ($p.out) {
+                    $stash = $p.out
+                    $stashProbe.outcome = 'created'
+                    # Dated where it is MADE, not where it is anchored: an unanchored sha is still a
+                    # thing that was true at a time, and the failed-anchor path must not leave it
+                    # undated.
+                    $stashAt = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+                }
                 else {
                     # git ANSWERED, and the answer was none. Distinct from the branch below, and the
                     # distinction is the whole finding.
@@ -517,13 +604,15 @@ function Get-GitFacts {
             if ($attempt -lt 2) { Start-Sleep -Milliseconds 300 }
         }
         if ($stashProbe.outcome -eq 'failed') {
-            Write-WriterError -Stage 'stash-probe' -Message "git stash create failed after $($stashProbe.attempts) attempts (exit=$($stashProbe.exitCode)): $($stashProbe.error); $($trackedPaths.Count) tracked path(s) are NOT captured"
+            # DEGRADED, not an error: this record carries stashProbe.outcome/exitCode/error and a
+            # stashCovers that says a rescue is owed, so it describes the failure itself (rule 2).
+            Write-WriterDegraded -Stage 'stash-probe' -Message "git stash create failed after $($stashProbe.attempts) attempts (exit=$($stashProbe.exitCode)): $($stashProbe.error); $($trackedPaths.Count) tracked path(s) are NOT captured this turn"
         }
         if ($stash -and $StashRef) {
             # Invoke-Git returns '' on a silent success and $null only on failure.
             $anchored = Invoke-Git -Dir $Wt -GitArgs @('update-ref', $StashRef, $stash)
             if ($null -ne $anchored) { $stashRefName = $StashRef }
-            else { Write-WriterError -Stage 'stash-anchor' -Message "update-ref $StashRef failed; the stash sha is unreferenced and gc can delete it" }
+            else { Write-WriterDegraded -Stage 'stash-anchor' -Message "update-ref $StashRef failed; the stash sha is unreferenced and gc can delete it" }
         }
     } elseif ($statusOk -and $StashRef) {
         # Nothing to cover this pass. An anchor from an earlier turn would keep holding edits that
@@ -535,7 +624,51 @@ function Get-GitFacts {
         # the previous turn's tracked edits on the strength of a measurement that never happened.
         Invoke-Git -Dir $Wt -GitArgs @('update-ref', '-d', $StashRef) | Out-Null
     }
+
+    # A PROBE THAT COULD NOT ASK MUST NOT ERASE THE ANSWER AN EARLIER ONE OBTAINED (rule 6, and the
+    # record's first principle: facts keep their time and a verdict is computed at read time).
+    #
+    # Before this, stashSha and stashRef came from THIS turn's probe alone, so a single contended
+    # turn rewrote a live anchor to null -- measured, with the turn-1 ref still resolving to the
+    # turn-1 sha at the instant the record said there was nothing capturing the tracked edits.
+    #
+    # THE RECOVERY IS A MEASUREMENT, NOT A COPY. The prior record's field would be a label written
+    # in the past; the REF STORE is the authority and is re-read here, so the record names an object
+    # only while that object is genuinely reachable. `for-each-ref` gives the sha and the commit's
+    # own committer date in one call, and a ref that is not there exits 0 with no output -- so an
+    # anchor that has since been pruned or deleted correctly yields nothing to carry.
+    #
+    # ONLY THE TWO could-not-ask OUTCOMES CARRY. 'none' means git answered and the answer was
+    # nothing; 'not-attempted' means the tree was measured clean and the branch above has already
+    # DELETED the ref. Carrying on either would resurrect a claim the writer just measured away.
+    $stashCarried = $false
+    if (-not $stash -and $StashRef -and ($stashProbe.outcome -in @('failed', 'not-attempted-status-failed'))) {
+        $anchor = Invoke-Git -Dir $Wt -GitArgs @('for-each-ref', '--format=%(objectname)%09%(committerdate:iso-strict)', $StashRef)
+        if ($anchor) {
+            $parts = $anchor -split "`t"
+            if ($parts[0] -match '\A[0-9a-f]{7,64}\z') {
+                $stash = $parts[0]
+                $stashRefName = $StashRef
+                $stashCarried = $true
+                $stashProbe.carried = $true
+                # The object's OWN date, so the age is the anchor's and not this write's.
+                $stashAt = if ($parts.Count -gt 1) { ConvertTo-Utc8601 $parts[1] } else { $null }
+            }
+        }
+    }
+
     $dirtyPaths = @($trackedPaths) + @($untrackedPaths)
+
+    # RULE 6 FOR THE LISTS, NOT ONLY THE COUNTS. Built here rather than inline in the literal
+    # because an `if` whose true branch yields an EMPTY array collapses to $null on assignment --
+    # which would silently turn "measured clean" into "could not ask", the inverse of this defect
+    # and just as wrong. A variable holds the empty array; the literal only references it.
+    $dirtyPathsOut = $null
+    $untrackedOut = $null
+    if ($statusOk) {
+        $dirtyPathsOut = @($dirtyPaths | Select-Object -First 200)
+        $untrackedOut = @($untrackedPaths | Select-Object -First 200)
+    }
 
     # THE INVOLUNTARY ANSWER TO "WHAT WAS THIS SEAT DOING".
     #
@@ -566,11 +699,14 @@ function Get-GitFacts {
             # NULL, NOT 0, WHEN THE PROBE DID NOT ANSWER (rule 6). Zero is a measurement; null is the
             # absence of one, and only one of those two is true when git could not be asked.
             count          = if ($statusOk) { $dirtyPaths.Count } else { $null }
-            paths          = @($dirtyPaths | Select-Object -First 200)
+            # NULL, NOT [], FOR THE SAME REASON AND ON THE SAME GATE. These two lists are the half a
+            # reader triages on -- an empty one rendered as "no untracked files were recorded" under
+            # "WORK AT RISK" while an only-copy file sat in the checkout.
+            paths          = $dirtyPathsOut
             trackedCount   = if ($statusOk) { $trackedPaths.Count } else { $null }
             untrackedCount = if ($statusOk) { $untrackedPaths.Count } else { $null }
             # Named, not counted: a replacement seat has to copy these by hand.
-            untracked      = @($untrackedPaths | Select-Object -First 200)
+            untracked      = $untrackedOut
             # The provenance of every number above. 'ok' means git answered; 'failed' means the counts
             # are unknown rather than zero, and `probeError` says why.
             probe          = if ($statusOk) { 'ok' } else { 'failed' }
@@ -580,6 +716,11 @@ function Get-GitFacts {
         # The ref holding that sha, so a reader can test the OBJECT (`git rev-parse --verify`) rather
         # than the string. A null here with a non-null stashSha means the anchor did not take.
         stashRef  = $stashRefName
+        # WHEN THE OBJECT ABOVE WAS MADE -- not when this record was written. They are the same
+        # instant only on a turn that actually created one; on a carried anchor this is the earlier
+        # turn's commit date, read off the object itself, and it is what stops "there is a stash"
+        # being read as "there is a stash of what the tree holds right now".
+        stashAsOf = $stashAt
         # The probe's own outcome, kept beside its result so "could not ask" is never read as "asked,
         # and the answer was none" (rule 6).
         stashProbe = $stashProbe
@@ -590,7 +731,14 @@ function Get-GitFacts {
         # emitted 'nothing-untracked-only' -- a stored claim that nothing tracked needs rescuing,
         # contradicting trackedCount in the same record. The 'NOT-captured' arms are the ones that
         # say a rescue is owed and this writer could not provide it.
-        stashCovers = if (-not $statusOk) { 'unknown-status-probe-failed' }
+        #
+        # THE CARRIED ARMS COME FIRST AND SAY BOTH HALVES. A surviving anchor is a real rescue
+        # object, so the record must name it; it was made on an EARLIER turn, so it must not be
+        # reported as covering what the tree holds now. 'tracked-only' would say the second thing.
+        stashCovers = if ($stashCarried -and -not $statusOk) { 'earlier-anchor-held-status-probe-failed' }
+                      elseif ($stashCarried -and $untrackedPaths.Count -gt 0) { 'earlier-anchor-held-this-turn-NOT-captured-and-untracked-only' }
+                      elseif ($stashCarried) { 'earlier-anchor-held-this-turn-NOT-captured' }
+                      elseif (-not $statusOk) { 'unknown-status-probe-failed' }
                       elseif ($stash -and $stashRefName) { 'tracked-only' }
                       elseif ($stash) { 'tracked-only-unanchored' }
                       elseif ($trackedPaths.Count -gt 0 -and $untrackedPaths.Count -gt 0) { 'tracked-edits-NOT-captured-and-untracked-only' }

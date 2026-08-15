@@ -17,10 +17,21 @@
     THE FIX: wire the hooks at USER level (~/.claude/settings.json), which is per-machine and loads in
     every worktree regardless of how it was created -- the same place the worktree gate already lives.
 
-    NO INSTALLED COPY. Each hook is a one-line shim that locates the script in a checkout and runs it,
-    so there is nothing to go stale: after a `git pull` the hook is current everywhere, immediately.
-    This is deliberate -- the worktree gate's installer copies its script, and running it from a stale
-    checkout has already silently downgraded the live gate once.
+    NO INSTALLED COPY OF THE SCRIPT. Each hook is a one-line shim that locates the script in a checkout
+    and runs it, so the SCRIPT is current everywhere the moment a `git pull` lands -- there is no second
+    copy of it to fall behind. This is deliberate: the worktree gate's installer copies its script, and
+    running it from a stale checkout has already silently downgraded the live gate once.
+
+    THE SHIM BODY IS A COPY, THOUGH, AND IT DOES GO STALE. This header used to say "there is nothing to
+    go stale", which is false about the one thing this file writes: the shim TEXT lands in settings.json,
+    so a root wired by an older checkout keeps the older shim until this installer is re-run -- and a
+    marker-only check calls that INSTALLED. Measured 2026-08-15 against a fixture: a seat row hand-
+    reverted to its pre-fix body (no trailing `exit 0`) reported INSTALLED while that same wired command
+    answered rc=1 outside a repo, and a row whose whole body was `# mefor-mail` + `Write-Output 42`
+    reported INSTALLED too. -Status therefore COMPARES each wired command against the command THIS
+    checkout generates and reports STALE when they differ -- a verdict measured at the moment you ask,
+    not a label recorded at some earlier install, so it is still right for a reader who arrives days
+    later. A stale row also sets exit code 3, so the divergence reaches a script and not only a reader.
 
     THE SHIM RESOLVES THE PRIMARY CHECKOUT, not the calling worktree. Coordination is infrastructure
     and must be uniform across sessions. Measured 2026-07-29: a worktree sitting on a branch that
@@ -157,9 +168,52 @@ $WAKE_MARKER = "mefor-wake"
 # mefor-seat alone and left the other two standing.
 $SEAT_MARKER = "mefor-seat"
 
-# The shim. No installed copy: it locates the script in a checkout and runs it, so a `git pull` updates
-# the hook everywhere with nothing to fall stale. Silent and exit-0 outside a repo, because this file is
-# user-global and runs in every unrelated project on the machine.
+# ==================================================================================================
+# THE EXIT RULE, SHARED BY EVERY BUILDER BELOW. Stated once here; the other builders point at it
+# rather than restating it, and the ONE deliberate exception (the wake row) states only its own half.
+#
+# EVERY SHIM ENDS WITH A TRAILING `exit 0`, AND SO MUST ANY BUILDER ADDED LATER. Outside a git repo the
+# `if ($LASTEXITCODE -eq 0 -and $c)` guard is false, nothing in the body runs, and the last thing the
+# shim executed is a FAILED `git rev-parse` -- so `pwsh -Command <shim>` exits 1 with an EMPTY stderr,
+# git's message having been eaten by `2>$null`. These entries are user-global and fire in every
+# unrelated project on the machine, and one of them is on Stop, at every turn end. The cost is not the
+# exit code itself -- it is that a channel crying wolf in every non-checkout folder on the box trains
+# the reader to skip it, including the turn it finally carries a missing-script notice.
+#
+# MEASURED 2026-08-15, one run, one non-git cwd, each installed command run as `pwsh -NoProfile
+# -Command <command>`; control in the same run: `git rev-parse --git-common-dir` there exits 128.
+#   BEFORE: coord@SessionStart 1, coord@PreToolUse 1, mail@SessionStart 1, mail@Stop 1,
+#           announce@UserPromptSubmit 1, seat@Stop 0, wake@Stop 0.    AFTER: all seven 0.
+# The suffix had been applied to the SEAT builder alone, so five of the seven rows still cried wolf --
+# including the mail drain, which shares Stop with the row that got the fix.
+#
+# WHAT THE SUFFIX GUARANTEES IS NARROWER THAN "THIS SHIM ALWAYS EXITS 0", AND THE NARROW FORM IS THE
+# ONE TO QUOTE. `exit 0` is the last STATEMENT, so it is reached only if control gets there. A
+# TERMINATING error inside the body unwinds straight past it: measured in the same lab, a shim whose
+# resolved target runs `$ErrorActionPreference='Stop'; throw` answers rc=1 WITH the suffix in place,
+# under pwsh 7 and under Windows PowerShell 5.1 alike. So the guarantee is exactly this -- THE SHIM
+# DOES NOT REPORT A FAILURE OF ITS OWN PLUMBING, meaning the `git rev-parse` that fails outside a repo,
+# which is the one that fires constantly. A real fault inside a target still surfaces.
+#
+# THE RUNNER IS PART OF THAT MEASUREMENT, so never quote the exit codes without it. Under `powershell`
+# (Windows PowerShell 5.1 -- the literal string in each row's `shell` key) the non-git case answered 0
+# even BEFORE the suffix, because 5.1 does not map a failed native command onto the process exit code
+# the way pwsh 7 does. The suffix costs nothing there and fixes pwsh 7, which is what a hand-run or a
+# pwsh-configured harness uses.
+#
+# BLANKET `exit 0` HERE AND ON THE ANNOUNCE BUILDER; ONLY New-WakeShimCommand FORWARDS. For the wake
+# row the exit code IS the payload -- a rewake fires on 2 and only on 2. Every other wired target
+# disclaims it: grepped 2026-08-15, collision_gate.ps1, session-context.ps1, mail-drain.ps1,
+# announce-session.ps1 and seat-record.ps1 contain no `exit` other than `exit 0` on any path.
+# collision_gate.ps1 fails OPEN by design and denies through JSON on stdout rather than an exit code,
+# and a UserPromptSubmit failure can block the user's prompt outright. Nothing is lost by swallowing
+# either: measured, the un-suffixed shared shim answered rc=1 for a target that exited 3, so it never
+# forwarded a code faithfully to begin with -- it only ever turned "something happened" into "failed".
+# ==================================================================================================
+
+# The shim. No installed copy of the SCRIPT: it locates the script in a checkout and runs it, so a
+# `git pull` updates the hook everywhere with nothing to fall stale. The shim TEXT is a copy and CAN
+# fall stale -- see the header, and -Status, which measures exactly that.
 #
 # IT RESOLVES THE PRIMARY CHECKOUT, NOT THE CURRENT WORKTREE, and that order matters. Coordination is
 # INFRASTRUCTURE and has to be uniform: two sessions running different versions of the collision
@@ -177,7 +231,8 @@ function New-ShimCommand([string]$RelativeScript, [string]$Marker = $MARKER) {
         'foreach ($b in $bases) { ' +
         'if (-not $b) { continue } ' +
         "`$s = Join-Path `$b.Trim() '$RelativeScript'; " +
-        'if (Test-Path -LiteralPath $s) { & $s; break } } }'
+        'if (Test-Path -LiteralPath $s) { & $s; break } } }' + "`n" +
+        'exit 0'
     )
 }
 
@@ -235,7 +290,8 @@ function New-AnnounceShimCommand {
         'if (Test-Path -LiteralPath (Join-Path $b ''scripts/coord/presence.ps1'')) { $mf = $true } ' +
         '$s = Join-Path $b ''scripts/hooks/announce-session.ps1''; ' +
         'if (Test-Path -LiteralPath $s) { & $s -CommonDir $c; $hit = $true; break } } ' +
-        'if (-not $hit -and $mf) { Write-Output ' + "'$notice'" + ' } }'
+        'if (-not $hit -and $mf) { Write-Output ' + "'$notice'" + ' } }' + "`n" +
+        'exit 0'
     )
 }
 
@@ -254,24 +310,13 @@ function New-AnnounceShimCommand {
 # every unrelated project on the machine, and a notice about a missing MEFOR script in someone's
 # unrelated repo is noise, not a signal.
 #
-# IT ENDS WITH A TRAILING `exit 0`, WHICH New-WakeShimCommand ALREADY CARRIED AND THIS BUILDER DID NOT.
-# Outside a repo the `if ($LASTEXITCODE -eq 0 -and $c)` guard is false, nothing in the body runs, and
-# the last thing the shim executed is a FAILED `git rev-parse` -- so pwsh -Command exits 1. This entry
-# is user-global and fires at every turn end in every unrelated project on the machine, so without the
-# suffix it reports a failed Stop hook, with an EMPTY stderr (git's message is eaten by `2>$null`), in
-# every folder on this box that is not a git checkout. Measured 2026-08-14 in one run, same lab, cwd
-# not a git repo: seat rc=1, wake rc=0. The cost is not the exit code itself -- it is that a hook which
-# cries wolf at every turn end trains the reader to skip the whole Stop channel, including the turn it
-# finally emits the notice above.
-#
-# BLANKET `exit 0` HERE, NOT THE WAKE SHIM'S `exit $LASTEXITCODE`, AND THAT ASYMMETRY IS DELIBERATE.
-# For the wake row the exit code IS the payload: a rewake fires on 2 and only on 2, so that builder has
-# to forward it. This row's target disclaims the exit code entirely -- scripts/hooks/seat-record.ps1
-# states "THIS HOOK MUST NEVER FAIL THE TURN. It exits 0 unconditionally" and reports trouble through
-# seats/.writer-errors.txt and a stdout notice instead. Measured against a target rigged to exit 3:
-# this shim answered 0 BEFORE the change and answers 0 AFTER it, so the suffix moves the never-ran path
-# alone and forwards nothing new. The wake builder answered 3 on that same target in the same run,
-# which is what establishes that the measurement could see a non-zero exit at all.
+# IT ENDS WITH A BLANKET `exit 0` -- the shared exit rule above, which every builder now follows. What
+# is specific to THIS row is why the blanket form rather than the wake row's `exit $LASTEXITCODE`:
+# scripts/hooks/seat-record.ps1 states "THIS HOOK MUST NEVER FAIL THE TURN. It exits 0 unconditionally"
+# and reports trouble through seats/.writer-errors.txt and a stdout notice instead, so there is no exit
+# code here worth forwarding. Measured against a target rigged to exit 3: this shim answered 0 before
+# the suffix and answers 0 after it, while the wake builder answered 3 on the same target in the same
+# run -- which is what establishes that the measurement could see a non-zero exit at all.
 function New-SeatShimCommand {
     $notice = "[seat] scripts/hooks/seat-record.ps1 is missing from this checkout -- the seat recorder is wired but resolving nothing, so this session is NOT being recorded and a cold start would not see it."
     return (
@@ -287,6 +332,22 @@ function New-SeatShimCommand {
         'if (-not $hit -and $mf) { Write-Output ' + "'$notice'" + ' } }' + "`n" +
         'exit 0'
     )
+}
+
+# ONE resolution of "which builder does this row use", called by BOTH the install path and -Status.
+#
+# IT IS A FUNCTION AND NOT A SWITCH IN TWO PLACES FOR A REASON THAT IS THE WHOLE POINT OF THE -Status
+# PARITY CHECK. If -Status carried its own copy of the switch, the two could drift -- and a drift here
+# is invisible in the worst way: -Status would compare each wired row against a command that nothing
+# installs, so every root would read STALE while every root was in fact current, or the reverse. The
+# comparison is only worth anything if the expectation comes from the same code that does the writing.
+function Get-ShimCommand([hashtable]$Row) {
+    switch ($Row.Shim) {
+        "announce" { return (New-AnnounceShimCommand) }
+        "seat" { return (New-SeatShimCommand) }
+        "wake" { return (New-WakeShimCommand $Row.Script $Row.Marker) }
+        default { return (New-ShimCommand $Row.Script $Row.Marker) }
+    }
 }
 
 # Timeout 15 on the announce row is the hook's ONLY time bound -- the peer lookup runs in-process by
@@ -398,10 +459,28 @@ function Test-IsOurs([hashtable]$Entry, [string]$Marker = $MARKER) {
 # --- Status: report EVERY root, and report the ones with nothing as loudly as the ones with something.
 # A per-root breakdown is the point. A single aggregated "INSTALLED" is what let a four-root hole sit
 # unnoticed: the root you happen to be running under says yes, and nothing asks about the others.
+#
+# INSTALLED IS A MEASUREMENT, NOT A LABEL. It used to be "a row carrying our marker exists", which is a
+# claim about something somebody wrote at some earlier install -- and the marker is the one part of the
+# shim that never changes. So a row wired by an older checkout, or hand-edited, or reduced to the marker
+# plus a `Write-Output`, all read INSTALLED. That is how a fleet ends up half-wired with nothing saying
+# so, and it is worst for the payload this file actually delivers, which is shim TEXT copied into
+# settings.json. Each row is now compared against what THIS checkout generates for it (Get-ShimCommand,
+# the same call the install path makes) and reported as one of:
+#   MISSING   -- no row carries the marker on that event.
+#   INSTALLED -- every row carrying the marker is byte-identical to what this checkout would write.
+#   STALE     -- the marker is there and the command is not ours-as-of-now. Re-run the installer.
+# The comparison re-derives the expectation from the working tree at the moment you ask, so it is still
+# correct for a reader who runs it days after the install -- there is no recorded verdict to age out.
+#
+# scripts/coord/install-git-hooks.ps1 already had this parity check for the payloads it copies, and
+# tests/test_installed_coord_hooks.py records the same "reported INSTALLED over a payload that was in
+# fact stale" measurement against it. This is that check, on this side.
 if ($Status) {
     Write-Host ""
     Write-Host "Coordination hooks, as of $([DateTime]::UtcNow.ToString('o'))"
     Write-Host "Roots examined: $($SettingsPath.Count)"
+    $staleRows = @()
     foreach ($p in $SettingsPath) {
         $s = $null
         try { $s = Read-Settings $p } catch {
@@ -414,12 +493,39 @@ if ($Status) {
         Write-Host ""
         Write-Host "  $p"
         foreach ($w in $WIRING) {
-            $ours = @(@($s.hooks[$w.Event]) | Where-Object { $_ -and (Test-IsOurs $_ $w.Marker) })
-            $state = if ($ours.Count -gt 0) { "INSTALLED" } else { "MISSING" }
+            $expected = Get-ShimCommand $w
+            $wired = @()
+            foreach ($entry in @($s.hooks[$w.Event])) {
+                if (-not $entry) { continue }
+                foreach ($h in @($entry.hooks)) {
+                    $cmd = [string]$h.command
+                    if ($cmd -match [regex]::Escape($w.Marker)) { $wired += $cmd }
+                }
+            }
+            $current = @($wired | Where-Object { $_ -eq $expected }).Count
+            $state =
+            if ($wired.Count -eq 0) { "MISSING" }
+            elseif ($current -eq $wired.Count) { if ($wired.Count -eq 1) { "INSTALLED" } else { "INSTALLED ($($wired.Count) COPIES)" } }
+            elseif ($current -eq 0) { "STALE" }
+            else { "STALE ($current of $($wired.Count) current)" }
             Write-Host ("    {0,-16} {1,-38} {2}" -f $w.Event, $w.Script, $state)
+            if ($state.StartsWith("STALE")) {
+                $staleRows += ("{0}  {1}  {2}" -f $p, $w.Event, $w.Script)
+                Write-Host "      wired, but the command is NOT what this checkout generates" -ForegroundColor Yellow
+            }
         }
     }
     Write-Host ""
+    if ($staleRows.Count -gt 0) {
+        Write-Host ("STALE: {0} wired row(s) carry a command this checkout no longer generates." -f $staleRows.Count) -ForegroundColor Yellow
+        foreach ($r in $staleRows) { Write-Host "      $r" }
+        Write-Host "  A marker-only check calls these INSTALLED, and they run the OLD shim until refreshed."
+        Write-Host "  Re-run this installer with no arguments to rewrite them from this checkout."
+        Write-Host ""
+        # Exit 3, distinct from 2 (a filter that matched nothing) and 1 (a root that failed to write),
+        # so a caller can tell "wired but stale" from the other two without parsing this text.
+        exit 3
+    }
     exit 0
 }
 
@@ -442,6 +548,8 @@ if ($Uninstall) {
         Write-Host ("REMOVING {0} ROW(S) ACROSS {1} INDEPENDENT HOOKS -- named here BEFORE anything is written:" -f $WIRING.Count, $markers.Count) -ForegroundColor Yellow
         foreach ($w in $WIRING) { Write-Host ("    {0,-16} {1,-38} {2}" -f $w.Event, $w.Script, $w.Marker) }
         Write-Host "  If you meant ONE of these, -Script <part of the script path> selects a single row; -Only cannot."
+        Write-Host "  That list is what this run SELECTED, read off the wiring table before looking at any root."
+        Write-Host "  What it actually took is counted per root below, and the two differ whenever a row is absent."
         Write-Host ""
     }
 }
@@ -449,16 +557,39 @@ if ($Uninstall) {
 # --- Install / uninstall, once per root ----------------------------------------------------------
 # One root failing must not stop the others. A throw part-way through used to leave the machine in a
 # state nobody wrote down: some roots wired, some not, and no record of which.
+#
+# EVERY ROOT GETS EXACTLY ONE OUTCOME LINE, AND THE WORD ON IT IS EARNED. Before this, a root the
+# operator PREVIEWED (-WhatIf) or DECLINED (-Confirm answered No) printed nothing at all, so the sole
+# difference between a preview and a real removal was the ABSENCE of a line -- while the trailing prose
+# still said rows had been removed. An absence is not a receipt; it is the reader being asked to notice
+# something that was not printed.
 $failed = @()
+$wroteRoots = @()
+$previewRoots = @()
+# MEASURED, per selected row: how many entries the strip loop actually dropped. Kept in TWO
+# accumulators because a preview measures the same thing and changes nothing on disk, and a receipt
+# that adds the two together is back to claiming a removal that did not happen.
+$removedWritten = [int[]]::new($WIRING.Count)
+$removedPreview = [int[]]::new($WIRING.Count)
 foreach ($path in $SettingsPath) {
     try {
         $settings = Read-Settings $path
         if (-not $settings.hooks) { $settings.hooks = [ordered]@{} }
 
         # Strip our entries first -- this is both the uninstall path and the idempotency of re-install.
-        foreach ($w in $WIRING) {
+        #
+        # COUNT WHAT COMES OUT. The loop used to keep only $kept and discard the removed set, so there
+        # was no number anywhere for "how many rows did this actually take" -- and the receipt filled
+        # the gap from the static $WIRING table instead. Measured 2026-08-15 on a fixture whose only
+        # hook was a foreign row: `-Only Stop -Uninstall` removed nothing and still printed the full
+        # three-row inventory under "REMOVED", byte-comparable to the run where three rows really went.
+        $rootRemoved = [int[]]::new($WIRING.Count)
+        for ($i = 0; $i -lt $WIRING.Count; $i++) {
+            $w = $WIRING[$i]
             if ($settings.hooks[$w.Event]) {
-                $kept = @(@($settings.hooks[$w.Event]) | Where-Object { $_ -and -not (Test-IsOurs $_ $w.Marker) })
+                $present = @(@($settings.hooks[$w.Event]) | Where-Object { $_ })
+                $kept = @($present | Where-Object { -not (Test-IsOurs $_ $w.Marker) })
+                $rootRemoved[$i] = $present.Count - $kept.Count
                 if ($kept.Count -gt 0) { $settings.hooks[$w.Event] = $kept } else { $settings.hooks.Remove($w.Event) }
             }
         }
@@ -470,14 +601,7 @@ foreach ($path in $SettingsPath) {
                 $entry.hooks = @(
                     [ordered]@{
                         type          = "command"
-                        command       = $(
-                            switch ($w.Shim) {
-                                "announce" { New-AnnounceShimCommand }
-                                "seat" { New-SeatShimCommand }
-                                "wake" { New-WakeShimCommand $w.Script $w.Marker }
-                                default { New-ShimCommand $w.Script $w.Marker }
-                            }
-                        )
+                        command       = (Get-ShimCommand $w)
                         shell         = "powershell"
                         timeout       = $w.Timeout
                         statusMessage = $w.Msg
