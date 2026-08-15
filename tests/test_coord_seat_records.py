@@ -541,6 +541,333 @@ def test_stash_anchor_survives_a_failed_probe_and_is_dropped_on_a_clean_one(repo
     )
 
 
+def test_rule_six_governs_the_dirty_lists_in_both_directions(repo: Path) -> None:
+    """ "AN ANSWER OF NONE" AND "NO ANSWER" MUST NOT SHARE A SPELLING -- AND THE LISTS ARE THE HALF
+    A READER TRIAGES ON.
+
+    Rule 6 was applied to the three counts and not to the two path lists for a whole pass. MEASURED
+    with a peer process holding .git/index open exclusively, so ``git status --porcelain -z`` exited
+    128: count/trackedCount/untrackedCount were all null -- correct -- beside ``paths: []`` and
+    ``untracked: []`` while the checkout held a tracked edit and an untracked ONLY-COPY.md. fleet.ps1
+    reads exactly those two lists and nothing else in the block, so it printed "no untracked files
+    were recorded" under the heading "WORK AT RISK ... the only category that cannot be recovered
+    elsewhere".
+
+    THE CLEAN ARM IS NOT DECORATION. Nulling the lists unconditionally is the INVERSE defect and is
+    just as wrong -- a tree measured clean has an answer, and it is the empty list. Pinning only the
+    null arm is satisfied by a writer that never lists anything.
+    """
+    # MEASURED CLEAN: an answer of none, spelled as one.
+    clean = _write_record(repo, "sess-lists-clean")["dirty"]
+    assert clean["probe"] == "ok"
+    assert clean["count"] == 0
+    assert clean["paths"] == [], clean
+    assert clean["untracked"] == [], clean
+
+    # COULD NOT ASK: no answer, spelled as none of one.
+    (repo / "tracked.txt").write_text("modified\n", encoding="utf-8")
+    (repo / "ONLY-COPY.md").write_text("held by no git object\n", encoding="utf-8")
+    (repo / ".git" / "index").write_bytes(b"NOT AN INDEX" * 8)
+    assert _git_rc(repo, "status", "--porcelain") != 0, "the probe still answers; test is vacuous"
+
+    blind = _write_record(repo, "sess-lists-blind")["dirty"]
+    assert blind["probe"] == "failed"
+    assert blind["count"] is None
+    assert blind["trackedCount"] is None
+    assert blind["untrackedCount"] is None
+    assert blind["paths"] is None, (
+        "an empty list is an assertion that nothing is dirty, made by a probe that could not look"
+    )
+    assert blind["untracked"] is None, (
+        "this is the list fleet.ps1 renders under WORK AT RISK; [] there reads as 'nothing to "
+        "rescue' over a file that exists nowhere else"
+    )
+
+
+def _hold_lock(tmp_path: Path, lock: Path, seconds: int) -> subprocess.Popen[bytes]:
+    """A rival that HOLDS the record lock and keeps re-stamping it.
+
+    The writer breaks a lock whose mtime is older than StaleMs (3 s), so a holder that stops
+    touching it is an ORPHAN and gets broken -- a different arm entirely. Re-stamping every 250 ms
+    is what makes this a hold the writer must wait out and then proceed past.
+    """
+    holder_script = tmp_path / f"holder-{lock.name}.ps1"
+    holder_script.write_text(
+        "param([string]$LockPath,[int]$Seconds)\n"
+        "$fs = [System.IO.File]::Open($LockPath, 'CreateNew', 'Write', 'Read')\n"
+        "$sw = [System.Diagnostics.Stopwatch]::StartNew()\n"
+        "while ($sw.Elapsed.TotalSeconds -lt $Seconds) {\n"
+        "  $b = [System.Text.Encoding]::UTF8.GetBytes('held ' + [DateTime]::UtcNow.Ticks)\n"
+        "  $fs.Write($b, 0, $b.Length); $fs.Flush($true)\n"
+        "  (Get-Item -LiteralPath $LockPath).LastWriteTimeUtc = [DateTime]::UtcNow\n"
+        "  Start-Sleep -Milliseconds 250\n"
+        "}\n"
+        "$fs.Dispose()\n"
+        "Remove-Item -LiteralPath $LockPath -Force -EA SilentlyContinue\n",
+        encoding="utf-8",
+    )
+    return subprocess.Popen(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(holder_script),
+            "-LockPath",
+            str(lock),
+            "-Seconds",
+            str(seconds),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _stages(f: Path) -> list[str]:
+    if not f.exists():
+        return []
+    return [
+        ln.split("\t")[2]
+        for ln in f.read_text(encoding="utf-8").splitlines()
+        if len(ln.split("\t")) > 2
+    ]
+
+
+def test_the_two_writer_log_channels_are_split_in_both_directions(
+    repo: Path, tmp_path: Path
+) -> None:
+    """TWO SENTENCES, TWO FILES, AND THE SECOND ARM IS WHAT STOPS THE FIRST BEING VACUOUS.
+
+    ``.writer-errors.txt`` means THE RECORD DID NOT LAND, OR LANDED SHORT, and fleet.ps1 makes it a
+    STOP operand whose text says "the writer FAILED ... Any seat it failed on is missing or stale
+    below". MEASURED before the split: one sibling holding .git/index.lock across exactly one
+    -Record produced a record that was fresh, complete and correct in every field, and that banner
+    over it -- both halves false of that seat, fired by this project's ordinary multi-agent
+    workflow. A stop channel that fires when nothing is wrong is one a cold-start reader skips, and
+    the turn it finally carries a real "this turn was NOT recorded" is the turn skipped with it.
+
+    ``.writer-degraded.txt`` means A PROBE COULD NOT ANSWER AND THE RECORD SAYS SO IN ITS OWN
+    FIELDS. Without the second arm below, the first is satisfied by a writer that reports nothing at
+    all -- which is the failure rule 2 exists to forbid.
+    """
+    errfile = lambda: _seats_dir(repo) / ".writer-errors.txt"  # noqa: E731
+    degfile = lambda: _seats_dir(repo) / ".writer-degraded.txt"  # noqa: E731
+
+    # ARM 1 -- a contended `git stash create`. DEGRADED, and named in the record itself.
+    (repo / "tracked.txt").write_text("modified\n", encoding="utf-8")
+    lock = repo / ".git" / "index.lock"
+    lock.write_text("", encoding="utf-8")
+    try:
+        rec = _write_record(repo, "sess-channel-degraded")
+    finally:
+        lock.unlink()
+
+    assert not errfile().exists(), (
+        f"a degraded probe was routed into the STOP channel: {errfile().read_text(encoding='utf-8')}"
+    )
+    assert "stash-probe" in _stages(degfile())
+    assert [d["stage"] for d in rec["writerDegraded"]] == ["stash-probe"], rec["writerDegraded"]
+
+    # ARM 2 -- the record was applied UNSERIALISED. That is the error channel, and only that one.
+    sid = "sess-channel-error"
+    _write_record(repo, sid)
+    lk = Path(str(_record_path(repo, sid)) + ".lock")
+    holder = _hold_lock(tmp_path, lk, 9)
+    try:
+        time.sleep(1.0)
+        assert lk.exists(), "the holder never took the lock; this arm would be vacuous"
+        assert _pwsh(SEAT, "-Record", "-SessionId", sid, cwd=repo).returncode == 0
+    finally:
+        holder.kill()
+        holder.wait(timeout=30)
+
+    assert "record-lock" in _stages(errfile()), _stages(errfile())
+    assert "record-lock" not in _stages(degfile()), (
+        "a write that may have been overwritten is not a probe that could not ask -- naming it in "
+        "the record is impossible, so the reader needs the log open and the stop is owed"
+    )
+
+
+def test_writer_degraded_is_per_turn_and_not_cumulative(repo: Path) -> None:
+    """The array is this TURN's evidence, so a recovered turn must carry an empty one.
+
+    A cumulative array would make the per-seat operand behave exactly like the append-only
+    fleet-wide log -- it could only ever grow, so every record after the first degradation would
+    report a degraded writer for ever. That is the crying-wolf shape one layer in.
+    """
+    (repo / "tracked.txt").write_text("modified\n", encoding="utf-8")
+    lock = repo / ".git" / "index.lock"
+    lock.write_text("", encoding="utf-8")
+    try:
+        degraded = _write_record(repo, "sess-perturn")
+    finally:
+        lock.unlink()
+    assert [d["stage"] for d in degraded["writerDegraded"]] == ["stash-probe"]
+    assert degraded["stashCovers"].startswith("tracked-edits-NOT-captured")
+
+    healthy = _write_record(repo, "sess-perturn")
+    assert healthy["writerDegraded"] == [], healthy["writerDegraded"]
+    assert healthy["stashCovers"] == "tracked-only", (
+        "the positive control: the same tree, the same seat, the probe now answering"
+    )
+
+
+def test_a_carried_stash_anchor_is_re_measured_from_the_ref_store(repo: Path) -> None:
+    """A LATER PROBE THAT COULD NOT ASK MUST NOT DELETE AN EARLIER PROBE'S ANSWER.
+
+    ``stashSha``/``stashRef`` were re-derived every turn from that turn's probe alone, so one
+    contended turn rewrote a live anchor to null: MEASURED, turn 1 stored a sha under
+    refs/mefor-seat/<box>/<session>, ``git rev-parse --verify`` on that ref still returned it, and
+    the record by then said stashSha=null with stashCovers=tracked-edits-NOT-captured. The anchor
+    lives in the COMMON ref store, so it survives ``git worktree remove --force`` -- which this
+    project's own cleanup scripts call -- and the record was pointing away from the only surviving
+    copy of the tracked work at the moment that mattered most.
+
+    ALL THREE ARMS, BECAUSE ONLY THE SET SHOWS THE GATE IS DOING WORK. Recovery is a MEASUREMENT of
+    the ref store taken now, not a value copied out of the prior record, so arm C -- the anchor has
+    since been deleted -- must yield null rather than a dangling sha.
+    """
+    index = repo / ".git" / "index"
+    good = index.read_bytes()
+    (repo / "tracked.txt").write_text("modified\n", encoding="utf-8")
+    first = _write_record(repo, "sess-carry")
+    ref, sha = first["stashRef"], first["stashSha"]
+    assert ref and sha and first["stashProbe"]["carried"] is False
+
+    # ARM A -- the probe could not ask, and the anchor is still there.
+    index.write_bytes(b"NOT AN INDEX" * 8)
+    a = _write_record(repo, "sess-carry")
+    assert a["stashSha"] == sha, "a live rescue object was forgotten by the record naming it"
+    assert a["stashRef"] == ref
+    assert a["stashProbe"]["carried"] is True
+    assert a["stashCovers"] == "earlier-anchor-held-status-probe-failed", a["stashCovers"]
+    assert _git(repo, "rev-parse", "--verify", ref) == sha, "the ref store is the authority"
+
+    # ARM B -- the tree is MEASURED clean, so the anchor describes nothing and is dropped.
+    index.write_bytes(good)
+    _git(repo, "checkout", "--", "tracked.txt")
+    b = _write_record(repo, "sess-carry")
+    assert b["stashSha"] is None and b["stashRef"] is None
+    assert b["stashProbe"]["carried"] is False
+    assert b["stashCovers"] == "nothing-clean"
+    assert _git_rc(repo, "rev-parse", "--verify", "--quiet", ref) != 0
+
+    # ARM C -- the probe could not ask AND the ref has been deleted since.
+    (repo / "tracked.txt").write_text("modified again\n", encoding="utf-8")
+    again = _write_record(repo, "sess-carry")
+    assert again["stashRef"] == ref
+    _git(repo, "update-ref", "-d", ref)
+    index.write_bytes(b"NOT AN INDEX" * 8)
+    c = _write_record(repo, "sess-carry")
+    assert c["stashSha"] is None, "a sha nothing holds is a recovery promise gc already revoked"
+    assert c["stashRef"] is None
+    assert c["stashProbe"]["carried"] is False
+    assert c["stashCovers"] == "unknown-status-probe-failed"
+    index.write_bytes(good)
+
+
+def test_stash_as_of_dates_the_object_and_not_the_write(repo: Path) -> None:
+    """A CARRIED ANCHOR IS A FACT FROM AN EARLIER TURN AND THE RECORD MUST DATE IT AS ONE.
+
+    "There is a stash" read beside a fresh ``asOf`` says "there is a stash of what the tree holds
+    right now", which is false of every carried anchor. So the object's OWN committer date is stored
+    and the pair (carried, stashAsOf) is what stops the misreading.
+    """
+    stamp = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
+
+    def at(s: str) -> datetime:
+        assert stamp.match(s), s
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+
+    (repo / "tracked.txt").write_text("modified\n", encoding="utf-8")
+    made = _write_record(repo, "sess-stashage")
+    assert made["stashProbe"]["carried"] is False
+    # THE SAME INSTANT, to the resolution these are stored at: `$now` is stamped immediately before
+    # the git calls that build the object, so the only gap is the gather itself.
+    gap = (at(made["stashAsOf"]) - at(made["asOf"])).total_seconds()
+    assert 0 <= gap <= 2, (made["asOf"], made["stashAsOf"])
+
+    time.sleep(2.2)
+    (repo / ".git" / "index").write_bytes(b"NOT AN INDEX" * 8)
+    carried = _write_record(repo, "sess-stashage")
+    assert carried["stashProbe"]["carried"] is True
+    assert carried["stashSha"] == made["stashSha"]
+    assert at(carried["stashAsOf"]) < at(carried["asOf"]), (
+        "a carried anchor dated at the write would report an earlier turn's rescue object as a "
+        "capture of the tree as it stands now"
+    )
+    assert abs((at(carried["stashAsOf"]) - at(made["stashAsOf"])).total_seconds()) <= 2, (
+        "the carried date must be the OBJECT's, so it must match the turn that made it"
+    )
+
+
+def test_rule_two_holds_the_exit_code_at_zero_across_every_new_failure_path(
+    repo: Path, tmp_path: Path
+) -> None:
+    """A STOP HOOK THAT EXITS NON-ZERO IS ITS OWN HAZARD, so every new probe path is measured.
+
+    Rule 2 is unconditional and the paths added since it was written are the ones nothing pinned:
+    a status probe that could not run, a stash probe another process blocked, a record lock held
+    past the deadline, and an orphaned lock broken on the way in.
+    """
+    index = repo / ".git" / "index"
+    good = index.read_bytes()
+    errfile = _seats_dir(repo) / ".writer-errors.txt"
+
+    # (1) THE STATUS PROBE COULD NOT RUN.
+    index.write_bytes(b"NOT AN INDEX" * 8)
+    r = _pwsh(SEAT, "-Record", "-SessionId", "sess-rc-status", cwd=repo)
+    assert r.returncode == 0, r.stderr
+    index.write_bytes(good)
+
+    # (2) A SIBLING HELD THE INDEX LOCK ACROSS THE STASH PROBE.
+    (repo / "tracked.txt").write_text("modified\n", encoding="utf-8")
+    ilock = repo / ".git" / "index.lock"
+    ilock.write_text("", encoding="utf-8")
+    try:
+        r = _pwsh(SEAT, "-Record", "-SessionId", "sess-rc-stash", cwd=repo)
+    finally:
+        ilock.unlink()
+    assert r.returncode == 0, r.stderr
+
+    # (3) THE RECORD LOCK WAS HELD PAST THE DEADLINE, so the writer proceeded unlocked.
+    sid = "sess-rc-lock"
+    _write_record(repo, sid)
+    lk = Path(str(_record_path(repo, sid)) + ".lock")
+    holder = _hold_lock(tmp_path, lk, 9)
+    try:
+        time.sleep(1.0)
+        assert lk.exists(), "the holder never took the lock; this arm would be vacuous"
+        t0 = time.monotonic()
+        r = _pwsh(SEAT, "-Record", "-SessionId", sid, cwd=repo)
+        waited = time.monotonic() - t0
+        assert r.returncode == 0, r.stderr
+        assert waited >= 4.0, f"the deadline was never reached ({waited:.1f}s); arm is vacuous"
+    finally:
+        holder.kill()
+        holder.wait(timeout=30)
+    before = _stages(errfile).count("record-lock")
+    assert before >= 1, "a hold outlasting the deadline must be reported exactly once"
+
+    # (4) AN ORPHANED LOCK IS BROKEN, and that is the NORMAL path -- fast, and not a reported
+    # failure. Nothing else on this box would ever clear it.
+    sid = "sess-rc-orphan"
+    _write_record(repo, sid)
+    orphan = Path(str(_record_path(repo, sid)) + ".lock")
+    orphan.write_text("99999 orphan", encoding="utf-8")
+    old = time.time() - 30
+    os.utime(orphan, (old, old))
+    t0 = time.monotonic()
+    r = _pwsh(SEAT, "-Record", "-SessionId", sid, cwd=repo)
+    elapsed = time.monotonic() - t0
+    assert r.returncode == 0, r.stderr
+    assert elapsed < 4.0, f"the orphan was waited out rather than broken ({elapsed:.1f}s)"
+    assert not orphan.exists()
+    assert _stages(errfile).count("record-lock") == before, (
+        "breaking an orphan is the normal path and must not enter the STOP channel"
+    )
+
+
 def test_commits_are_recorded_as_the_involuntary_answer(repo: Path) -> None:
     """Owner ruling 2026-08-14 demoted the voluntary declared half.
 
@@ -1029,37 +1356,274 @@ def test_unreadable_record_fires_a_stop(repo: Path, fence: Fence) -> None:
     ]
 
 
-def test_writer_errors_fire_a_stop_now_and_not_thirty_days_ago(repo: Path, fence: Fence) -> None:
-    """The operand is the RECENT count, and that is correctness rather than softening.
+def test_the_writer_error_stop_decays_on_recovery_not_on_the_clock(
+    repo: Path, fence: Fence
+) -> None:
+    """THE READER IS LATE BY CONSTRUCTION, SO A BOUND AGAINST "NOW" IS THE WRONG BOUND.
 
     ``.writer-errors.txt`` is append-only and nothing truncates it, so a stop keyed on the TOTAL
-    would fire for ever after the first failure this repo ever had -- and a channel that fires when
-    nothing is wrong trains its reader to skip it. This file already paid for that lesson once on
-    origin/main staleness. The second half is the anti-crying-wolf property and the one that will
-    regress.
+    fires for ever after the first failure this repo ever had -- crying wolf, a lesson this layer
+    already paid for on origin/main staleness. But the obvious repair, "count only failures inside
+    -FreshMinutes of THIS READ", is disarmed by exactly the delay this module exists for: a new
+    account opened after a cutoff arrives hours late, so the operand is ZERO by construction at the
+    one moment anybody reads it. MEASURED before the fix: six failures stamped three hours ago,
+    nothing recorded since, rendered "NO STOP CONDITIONS", and the SAME six lines read with
+    ``-FreshMinutes 240`` fired -- the reader's arrival time was the only variable.
+
+    THE FIX IS TO COMPARE TWO TIMESTAMPS THAT ARE BOTH ON DISK. A failure with no successful record
+    write AFTER it stays lit however late it is read, and goes quiet the moment the writer recovers.
+    ARMS (a) AND (c) ARE THE PAIR THAT MATTERS: (a) is an ancient failure the writer recovered from,
+    which an UNBOUNDED count would fire on; (c) is a failure whose newest record is OLDER than it,
+    which a NOW-bounded count is silent about. Only an operand keyed on recovery answers both.
     """
-    _make_clean_roster(repo, fence)
+    sid = "sess-writer-errors"
+    _make_clean_roster(repo, fence, sid)
     errfile = _seats_dir(repo) / ".writer-errors.txt"
     now = datetime.now(UTC)
-    line = "{0}\tBOX\tstash-probe\tgit stash create failed\n"
+    line = "{0}\tBOX\trecord-lock\tthe record was written unserialised\n"
 
-    errfile.write_text(line.format(_iso(now)), encoding="utf-8")
-    _, payload = _fleet_json(repo, fence)
-    receipt = payload["receipt"]
+    def run(err_age: timedelta, record_age: timedelta) -> tuple[dict, list[str]]:
+        errfile.write_text(line.format(_iso(now - err_age)), encoding="utf-8")
+        _patch_record(repo, sid, asOf=_iso(now - record_age))
+        _, payload = _fleet_json(repo, fence)
+        receipt = payload["receipt"]
+        return receipt, [s for s in receipt["stopConditions"] if "writerErrorLines" in s]
+
+    # POSITIVE CONTROL for the now-relative half, which is kept and is still the right operand for
+    # the sentence "the writer is failing right now".
+    receipt, stops = run(timedelta(minutes=5), timedelta(minutes=1))
     assert receipt["writerErrorLines"] == 1
     assert receipt["writerErrorLinesRecent"] == 1
-    assert any(s.startswith("writerErrorLinesRecent=") for s in receipt["stopConditions"]), receipt[
+    assert stops, receipt["stopConditions"]
+
+    # (a) A FAILURE THIRTY DAYS OLD THAT THE WRITER RECOVERED FROM ONE MINUTE AGO.
+    receipt, stops = run(timedelta(days=30), timedelta(minutes=1))
+    assert receipt["writerErrorLines"] == 1, "the history must not be hidden"
+    assert receipt["writerErrorLinesRecent"] == 0
+    assert receipt["writerErrorLinesUnanswered"] == 0
+    assert not stops, f"an answered failure fired; that is the crying wolf: {stops}"
+
+    # (b) RECOVERED, THEN THE FLEET STOPPED. The record is old too, but it still lands AFTER the
+    # failure, so nothing here is unresolved.
+    receipt, stops = run(timedelta(days=30), timedelta(hours=9))
+    assert receipt["writerErrorLinesUnanswered"] == 0
+    assert not stops, stops
+
+    # (c) THE COLD-START READ. A failure nine hours old whose newest record is OLDER than it: the
+    # last thing this writer is recorded as doing is failing. A now-bounded operand is silent here.
+    receipt, stops = run(timedelta(hours=9), timedelta(days=30))
+    assert receipt["writerErrorLinesRecent"] == 0, (
+        "the now-relative operand must be zero at this arrival -- that is what makes (c) the arm "
+        "the arrival-independent one exists for"
+    )
+    assert receipt["writerErrorLinesUnanswered"] == 1
+    assert stops, "a failure with nothing successful after it went silent for the late reader"
+
+    # (d) THE SAME ORDERING, READ THREE DAYS LATER. A clock-bounded operand decays; this one does
+    # not, and that is the whole property.
+    receipt, stops = run(timedelta(days=3), timedelta(days=30))
+    assert receipt["writerErrorLinesUnanswered"] == 1
+    assert stops, stops
+
+
+def test_a_writer_error_with_no_record_anywhere_counts_as_unanswered(
+    repo: Path, fence: Fence
+) -> None:
+    """NOTHING HAS EVER SUCCEEDED, SO EVERY LINE IS UNANSWERED.
+
+    The arrival-independent operand asks "did a record write land after this failure". With no
+    record at all there is no "after" to find, and the safe reading is that none of them was
+    answered -- a seats layer holding failures and no records is the exact shape of a writer that
+    never managed to record anything.
+    """
+    sid = "sess-no-record"
+    _make_clean_roster(repo, fence, sid)
+    box = _box_of(repo, sid)
+    errfile = _seats_dir(repo) / ".writer-errors.txt"
+    now = datetime.now(UTC)
+    errfile.write_text(
+        f"{_iso(now - timedelta(hours=9))}\tBOX\tmain\tthe record may not have been written\n"
+        f"{_iso(now - timedelta(days=30))}\tBOX\twriter-alive\tproof-of-life not written\n",
+        encoding="utf-8",
+    )
+
+    # CONTROL IN THE SAME RUN: with the record present and fresh, both lines are answered.
+    _patch_record(repo, sid, asOf=_iso(now))
+    _, payload = _fleet_json(repo, fence)
+    assert payload["receipt"]["writerErrorLinesUnanswered"] == 0, payload["receipt"]
+
+    shutil.rmtree(_seats_dir(repo) / box)
+    _, payload = _fleet_json(repo, fence)
+    receipt = payload["receipt"]
+    assert receipt["recordsExamined"] == 0
+    assert receipt["writerRecordNewestAgeMinutes"] is None
+    assert receipt["writerErrorLinesUnanswered"] == 2, (
+        "with no record on disk nothing has succeeded since ANY failure, so every line is owed"
+    )
+    hit = [s for s in receipt["stopConditions"] if "writerErrorLinesUnanswered=2" in s]
+    assert hit, receipt["stopConditions"]
+    assert "NO record exists at all" in hit[0], hit[0]
+
+
+def test_the_heartbeat_is_compared_to_the_newest_record_not_to_the_clock(
+    repo: Path, fence: Fence
+) -> None:
+    """AN ABSOLUTE AGE BOUND ON THE HEARTBEAT FIRES EVERY MORNING ON AN IDLE FLEET.
+
+    The newest heartbeat on a genuinely quiet repo is old by definition, and this reader arrives
+    late by construction, so "the newest heartbeat is older than N" is the crying-wolf shape. The
+    inconsistency that never cries wolf is a COMPARISON: seat.ps1 rule 3 touches the heartbeat on
+    every invocation and does it BEFORE writing any record, so a heartbeat OLDER than the newest
+    record in the SAME box cannot happen to a functioning writer.
+
+    THE TWO CONTROLS LIVE IN THIS TEST FOR A REASON. Someone "strengthening" this into an age bound
+    turns arm 1 red, and someone deleting the rule turns arms 3 and 4 red. Either alone is passable
+    by the wrong instrument.
+    """
+    sid = "sess-heartbeat-order"
+    _make_clean_roster(repo, fence, sid)
+    box = _box_of(repo, sid)
+    hb = _seats_dir(repo) / ".writer-alive" / f"{box}.txt"
+    now = datetime.now(UTC)
+
+    def run(hb_age: timedelta, record_age: timedelta) -> tuple[dict, list[str]]:
+        hb.write_text(_iso(now - hb_age), encoding="utf-8")
+        _patch_record(repo, sid, asOf=_iso(now - record_age))
+        _, payload = _fleet_json(repo, fence)
+        receipt = payload["receipt"]
+        return receipt, [
+            s for s in receipt["stopConditions"] if s.startswith("writerHeartbeatNewestAgeMinutes=")
+        ]
+
+    # CRYING-WOLF CONTROL 1 -- A GENUINELY IDLE FLEET. Both a month old, consistent with each other.
+    receipt, stops = run(timedelta(days=30), timedelta(days=30))
+    assert receipt["writerHeartbeatNewestAgeMinutes"] > 43000, receipt
+    assert not stops, f"an absolute age bound fired on an idle fleet: {stops}"
+
+    # CRYING-WOLF CONTROL 2 -- a live writer whose seat simply had a quiet week.
+    receipt, stops = run(timedelta(minutes=1), timedelta(days=7))
+    assert not stops, stops
+
+    # THE INCONSISTENCY. A record newer than the heartbeat that is supposed to precede it.
+    receipt, stops = run(timedelta(days=3, hours=1), timedelta(hours=1))
+    assert stops, "proof-of-life rolled back and nothing said so"
+    assert box in stops[0], stops[0]
+
+    # THE SAME ORDERING READ A WEEK LATER. Both operands are on disk, so arrival changes nothing.
+    receipt, stops = run(timedelta(days=10, hours=1), timedelta(days=7, hours=1))
+    assert stops, "the comparison decayed with the reader's arrival time"
+    assert box in stops[0], stops[0]
+
+
+def test_a_future_dated_record_and_a_future_dated_heartbeat_are_both_refused(
+    repo: Path, fence: Fence
+) -> None:
+    """A BOUND IS TWO-SIDED OR IT IS NOT A BOUND, AND IT HAS TO BE TWO-SIDED ON BOTH SIBLINGS.
+
+    ``age -le $bound`` passes every NEGATIVE age, so a record stamped in the future read as
+    maximally fresh for ever -- MEASURED against a real live process, ``AGE_H -240`` printed beside
+    "NO STOP CONDITIONS". The heartbeat is the sibling operand read by a different stop, and fixing
+    one of a pair is how a hole MOVES rather than closes, so both are pinned here.
+    """
+    sid = "aaaaaaaa-0000-0000-0000-0000000000d1"
+    fence.live(sid, repo)
+    _write_record(repo, sid)
+    box = _box_of(repo, sid)
+    hb = _seats_dir(repo) / ".writer-alive" / f"{box}.txt"
+    now = datetime.now(UTC)
+
+    _patch_record(repo, sid, asOf=_iso(now + timedelta(days=10)))
+    _, payload = _fleet_json(repo, fence)
+    receipt = payload["receipt"]
+    assert receipt["recordsFutureDated"] == 1
+    assert receipt["liveSessionsWithStaleRecord"] == 1, (
+        "ten days in the future is not freshness; it is a clock nothing here can believe"
+    )
+    assert any(s.startswith("recordsFutureDated=") for s in receipt["stopConditions"]), receipt[
+        "stopConditions"
+    ]
+    text = _pwsh(FLEET, "-Text", cwd=repo, env=fence.env)
+    assert "[WRITER-STALE]" in text.stdout, text.stdout
+
+    # THE SIBLING. Same defect, different operand, different stop.
+    _patch_record(repo, sid, asOf=_iso(now))
+    hb.write_text(_iso(now + timedelta(days=10)), encoding="utf-8")
+    _, payload = _fleet_json(repo, fence)
+    receipt = payload["receipt"]
+    assert receipt["writerHeartbeatNewestAgeMinutes"] < 0, receipt
+    assert receipt["liveSessionsWithStaleWriterHeartbeat"] == 1, (
+        "a heartbeat dated in the future read as proof of life"
+    )
+    assert any(
+        s.startswith("liveSessionsWithStaleWriterHeartbeat=") for s in receipt["stopConditions"]
+    ), receipt["stopConditions"]
+
+    # CONTROL: with both stamped NOW, neither operand fires -- so the two arms above are not
+    # satisfied by an instrument that simply refuses everything.
+    hb.write_text(_iso(now), encoding="utf-8")
+    _, payload = _fleet_json(repo, fence)
+    receipt = payload["receipt"]
+    assert receipt["recordsFutureDated"] == 0
+    assert receipt["liveSessionsWithStaleWriterHeartbeat"] == 0
+    assert receipt["liveSessionsWithStaleRecord"] == 0
+
+
+def test_a_future_dated_fetch_head_fires_the_origin_main_stop(repo: Path, fence: Fence) -> None:
+    """The same one-sided bound, on the third operand that shares it.
+
+    A FETCH_HEAD dated ahead of now yields a negative age, which ``-le`` reads as the freshest
+    possible fetch -- so every landed verdict below would be computed against a cached ref while the
+    receipt certified it was just refreshed.
+    """
+    _make_clean_roster(repo, fence)
+    fh = repo / ".git" / "FETCH_HEAD"
+
+    # CONTROL: freshly written by _make_clean_roster, so the stop is silent for the right reason.
+    _, payload = _fleet_json(repo, fence)
+    assert not [
+        s for s in payload["receipt"]["stopConditions"] if s.startswith("originMainAgeMinutes")
+    ], payload["receipt"]["stopConditions"]
+
+    future = time.time() + 86400
+    os.utime(fh, (future, future))
+    _, payload = _fleet_json(repo, fence)
+    receipt = payload["receipt"]
+    assert receipt["originMainAgeMinutes"] < 0, receipt
+    assert any(s.startswith("originMainAgeMinutes=") for s in receipt["stopConditions"]), receipt[
         "stopConditions"
     ]
 
-    errfile.write_text(line.format(_iso(now - timedelta(days=30))), encoding="utf-8")
+
+def test_origin_main_is_measured_against_the_printed_bound(repo: Path, fence: Fence) -> None:
+    """SDS-3.8: a number is not checkable without the instrument that produced it.
+
+    This verdict used to compare against a literal 60 that appeared in no receipt field and in no
+    stop text, two lines under a header sentence claiming every staleness verdict here is measured
+    against ``-FreshMinutes``. MEASURED on that version: FETCH_HEAD aged to 90 minutes with
+    ``-FreshMinutes 600`` printed ``freshWithinMinutes 600`` and fired anyway.
+
+    BOTH DIRECTIONS, ONE FIXTURE. Firing alone is satisfied by a stop that always fires; silence
+    alone is satisfied by deleting the stop.
+    """
+    _make_clean_roster(repo, fence)
+    fh = repo / ".git" / "FETCH_HEAD"
+    old = time.time() - 200 * 60
+    os.utime(fh, (old, old))
+
     _, payload = _fleet_json(repo, fence)
     receipt = payload["receipt"]
-    assert receipt["writerErrorLines"] == 1, "the history must not be hidden"
-    assert receipt["writerErrorLinesRecent"] == 0
-    assert not any("writerErrorLines" in s for s in receipt["stopConditions"]), (
-        f"a month-old failure fired a stop; that is the crying-wolf regression: "
-        f"{receipt['stopConditions']}"
+    assert receipt["freshWithinMinutes"] == 120
+    assert 195 <= receipt["originMainAgeMinutes"] <= 205, receipt["originMainAgeMinutes"]
+    fired = [s for s in receipt["stopConditions"] if s.startswith("originMainAgeMinutes=")]
+    assert fired, receipt["stopConditions"]
+    assert "freshWithinMinutes=120" in fired[0], fired[0]
+
+    _, payload = _fleet_json(repo, fence, "-FreshMinutes", "600")
+    receipt = payload["receipt"]
+    assert receipt["freshWithinMinutes"] == 600
+    assert 195 <= receipt["originMainAgeMinutes"] <= 205, "the SAME fixture, only the knob moved"
+    assert not [s for s in receipt["stopConditions"] if s.startswith("originMainAgeMinutes=")], (
+        "the verdict ignored the bound the receipt printed beside it"
     )
 
 
@@ -1163,6 +1727,132 @@ def test_fence_can_see_is_measured_not_assumed(repo: Path, fence: Fence) -> None
     assert not any("fenceSessionRecordsRead=0" in s for s in receipt["stopConditions"]), receipt[
         "stopConditions"
     ]
+
+
+def test_a_blind_config_root_is_named_beside_the_total_that_hides_it(
+    repo: Path, fence: Fence
+) -> None:
+    """ "CAN SEE" IS A PER-ROOT FACT AND AN AGGREGATE CANNOT CARRY IT.
+
+    A seat's registry record lives under exactly ONE config root and the target box runs five.
+    ``fenceSessionRecordsRead`` is a TOTAL, so a root that read NOTHING is invisible the instant any
+    other root reads something -- the previous pass moved the measurement from "a directory exists"
+    to "records were read", which was right, and then collapsed it across roots, which put the hole
+    back one level down. MEASURED with a REAL live process: delete the live session's registry file
+    from the root that owned it, leave one unrelated readable record in the other root, and the
+    total stays at 1, ``fenceCanSee`` stays TRUE, no stop fires, and the still-running seat renders
+    INTERRUPTED into the respawn population under "NO STOP CONDITIONS".
+
+    THE AGGREGATE IS ASSERTED UNCHANGED ON PURPOSE. If a future fix "fixes" this by making
+    ``fenceCanSee`` false whenever any root is blind, three of five roots on the target box are
+    permanently empty and the instrument is lit for ever -- the crying wolf this file already paid
+    for. The last assertion is the other guard: the row must STILL be INTERRUPTED. Reclassifying it
+    to POSSIBLY RUNNING would empty the respawn population, which is the rejected fix.
+    """
+    blind = fence.add_root(".claude-account-2")
+    sid = "aaaaaaaa-0000-0000-0000-0000000000c9"
+    fence.live(sid, repo, sessions=blind)
+    fence.record("11111111-1111-1111-1111-111111111111", repo.parent / "elsewhere", 4, 1)
+    _write_record(repo, sid)
+
+    # CONTROL: while root B holds the live session's record, nothing is manufactured.
+    _, payload = _fleet_json(repo, fence)
+    receipt = payload["receipt"]
+    assert receipt["rootsExamined"] == 2
+    assert receipt["fenceSessionRecordsRead"] == 2
+    assert receipt["fenceRootsReadingNothing"] == 0
+    assert payload["rows"][0]["State"] == "RUNNING"
+
+    # ATTACK: root B goes blind. Only that one file moves.
+    for f in blind.glob("*.json"):
+        f.unlink()
+    _, payload = _fleet_json(repo, fence)
+    receipt = payload["receipt"]
+    assert receipt["fenceSessionRecordsRead"] == 1
+    assert receipt["fenceCanSee"] is True, (
+        "the OR across roots still answers true, and it should -- SOME root did read something. "
+        "That is exactly why it cannot be the instrument for this"
+    )
+    assert receipt["fenceRootsReadingNothing"] == 1
+    assert ".claude-account-2=0" in receipt["fenceSessionRecordsReadPerRoot"], receipt[
+        "fenceSessionRecordsReadPerRoot"
+    ]
+    assert any(s.startswith("fenceRootsReadingNothing=") for s in receipt["stopConditions"]), (
+        receipt["stopConditions"]
+    )
+    assert payload["rows"][0]["State"] == "INTERRUPTED", (
+        "THE ANTI-RECLASSIFICATION GUARD: a stop suppresses the CLAIM OF COMPLETENESS; it must not "
+        "delete the row from the answer, which is what emptying the respawn population does"
+    )
+    text = _pwsh(FLEET, "-Text", cwd=repo, env=fence.env)
+    assert "RESPAWN POPULATION (INTERRUPTED, HANDED): 1" in text.stdout, text.stdout
+
+
+def test_the_per_root_fence_stop_is_gated_on_a_manufactured_interrupted_row(
+    repo: Path, fence: Fence
+) -> None:
+    """THE GATE IS THE WHOLE DESIGN, AND ANY ONE ARM ALONE IS SATISFIED BY DELETING THE RULE.
+
+    A sessions/ directory that is simply EMPTY is the ordinary state of an idle login, and nothing
+    on this host separates it from a root whose records went missing -- registry writes are
+    event-driven and there is no heartbeat. MEASURED on the target box: THREE of five roots read
+    zero records right now, so an ungated "some root read nothing" is lit on every run for ever.
+
+    So the stop also requires the destructive verdict to EXIST in this run: at least one row
+    rendered INTERRUPTED on the strength of a NOT-REGISTERED fence answer. A PERMANENTLY BLIND ROOT
+    IS PRESENT IN ALL FOUR ARMS, so the only thing that changes between them is whether anything was
+    manufactured. Arm 2 doubles as the only assertion anywhere on the ORPHANED-STALE state -- the
+    one state that removes a row from the respawn population on elapsed time alone.
+    """
+    fence.add_root(".claude-account-3")  # never populated, so blind in every arm below
+    fence.record("11111111-1111-1111-1111-111111111111", repo.parent / "elsewhere", 4, 1)
+    sid = "aaaaaaaa-0000-0000-0000-0000000000ca"
+    _write_record(repo, sid)
+
+    def run() -> tuple[dict, dict, list[str]]:
+        _, payload = _fleet_json(repo, fence)
+        receipt = payload["receipt"]
+        assert receipt["fenceRootsReadingNothing"] == 1, (
+            f"the blind root left the fixture, so this arm proves nothing: {receipt}"
+        )
+        return (
+            payload,
+            receipt,
+            [s for s in receipt["stopConditions"] if s.startswith("fenceRootsReadingNothing=")],
+        )
+
+    # ARM 1 -- a fresh row that IS in the respawn population on a NOT-REGISTERED answer. FIRES.
+    payload, receipt, fired = run()
+    assert payload["rows"][0]["State"] == "INTERRUPTED"
+    assert receipt["recordsInterruptedByFence"] == 1
+    assert fired, receipt["stopConditions"]
+
+    # ARM 2 -- the SAME row aged past -FoldDays. It folds out of the roster and out of the
+    # population on elapsed time alone, so there is nothing left for the stop to warn about. QUIET.
+    _patch_record(repo, sid, asOf=_iso(datetime.now(UTC) - timedelta(days=8)))
+    payload, receipt, fired = run()
+    assert payload["rows"][0]["State"] == "ORPHANED-STALE"
+    assert receipt["recordsInterruptedByFence"] == 0
+    assert not fired, fired
+    text = _pwsh(FLEET, "-Text", cwd=repo, env=fence.env)
+    assert "1 row(s) folded as ORPHANED-STALE (older than 7 days)" in text.stdout, text.stdout
+    assert "RESPAWN POPULATION (INTERRUPTED, HANDED): 0" in text.stdout, text.stdout
+    assert "ORPHANED-STALE" in _pwsh(FLEET, "-Text", "-All", cwd=repo, env=fence.env).stdout, (
+        "folded is not deleted -- -All must still render the row"
+    )
+
+    # ARM 3 -- a seat that closed itself. Nothing was manufactured; the label is the seat's own.
+    assert _pwsh(SEAT, "-Close", "-SessionId", sid, cwd=repo).returncode == 0
+    payload, receipt, fired = run()
+    assert payload["rows"][0]["State"] == "CLOSED"
+    assert receipt["recordsInterruptedByFence"] == 0
+    assert not fired, fired
+
+    # ARM 4 -- no seat record at all. A blind root with nothing to be blind ABOUT.
+    shutil.rmtree(_seats_dir(repo))
+    payload, receipt, fired = run()
+    assert receipt["recordsExamined"] == 0
+    assert not fired, fired
 
 
 def test_live_session_in_a_subdirectory_counts_and_a_sibling_checkout_does_not(
@@ -1377,23 +2067,217 @@ def test_checkout_gone_is_visible_and_out_of_the_respawn_population(
     counted for respawn -- while -Detail put "WORK AT RISK ... if that checkout is removed they are
     gone" over files that went with the directory. A warning written in the conditional for a
     condition that already holds.
+
+    BOTH HALVES, BECAUSE THE EMPTYING IS THE DANGEROUS HALF. This verdict is ONE ``Test-Path`` over
+    a string read off disk, and a Test-Path that THROWS resolves to GONE as well -- so the field
+    that removes rows from the respawn population is exactly the field that must not be a printed
+    decoration. Pinning the emptying while asserting nothing about the receipt is how a confidently
+    empty population gets rendered under "NO STOP CONDITIONS", which is this module's one job
+    failing. The decay arm is the anti-crying-wolf half: a checkout removed months ago is history.
     """
     sid = "aaaaaaaa-0000-0000-0000-0000000000b1"
     fence.record("11111111-1111-1111-1111-111111111111", repo.parent / "elsewhere", 4, 1)
     _write_record(repo, sid)
+    (repo / ".git" / "FETCH_HEAD").write_text("", encoding="utf-8")
 
     _, payload = _fleet_json(repo, fence)
     assert payload["rows"][0]["State"] == "INTERRUPTED", "control: the checkout is there"
+    assert payload["receipt"]["recordsCheckoutGone"] == 0
 
     _patch_record(repo, sid, worktree=str(repo.parent / "vanished-worktree"))
     _, payload = _fleet_json(repo, fence)
     row = payload["rows"][0]
+    receipt = payload["receipt"]
     assert row["State"] == "CHECKOUT-GONE"
     assert row["CheckoutGone"] is True
-    assert payload["receipt"]["recordsCheckoutGone"] == 1
+    assert receipt["recordsCheckoutGone"] == 1
     text = _pwsh(FLEET, "-Text", cwd=repo, env=fence.env)
     assert "RESPAWN POPULATION (INTERRUPTED, HANDED): 0" in text.stdout, text.stdout
     assert "CHECKOUT-GONE" in text.stdout, "out of the population, but still VISIBLE"
+
+    # THE RECEIPT HALF. An emptied population may not stand under a claim of completeness.
+    assert any(s.startswith("recordsCheckoutGone=") for s in receipt["stopConditions"]), receipt[
+        "stopConditions"
+    ]
+    assert "NO STOP CONDITIONS" not in text.stdout, text.stdout
+
+    # THE DECAY. Bounded by the roster's OWN visibility bound rather than a new one: a record older
+    # than -FoldDays is history, and re-arming on it for ever is the crying wolf.
+    _patch_record(repo, sid, asOf=_iso(datetime.now(UTC) - timedelta(days=8)))
+    _, payload = _fleet_json(repo, fence)
+    receipt = payload["receipt"]
+    assert payload["rows"][0]["State"] == "CHECKOUT-GONE", "still visible, still out of the pool"
+    assert receipt["recordsCheckoutGone"] == 1, "the count is history and must not be hidden"
+    assert not any(s.startswith("recordsCheckoutGone=") for s in receipt["stopConditions"]), (
+        receipt["stopConditions"]
+    )
+
+
+def test_a_record_is_admitted_on_evidence_with_both_negative_controls(
+    repo: Path, fence: Fence
+) -> None:
+    """NOT CRASHING IS NOT THE SAME AS DESCRIBING, AND THE HALF LEFT UNDONE ASSERTED MORE.
+
+    Get-RecField hands back a default for every absent field, so a JSON object carrying nothing this
+    reader reads never faulted: MEASURED, ``{"a":1}`` alone in a box directory rendered
+    ``(no-key) NOT-DECLARED POSSIBLY RUNNING`` with recordsUnreadable=0 and recordsUnclassifiable=0,
+    and -Detail printed a full SEAT EVIDENCE briefing over it including two re-check commands rooted
+    at an empty path. POSSIBLY RUNNING is a POSITIVE liveness verdict about a file nobody wrote as a
+    seat.
+
+    THE TWO NEGATIVE CONTROLS ARE THE POINT OF PUTTING ALL THREE IN ONE TEST. Admission is on
+    EVIDENCE -- one of sessionId / sessionKey / worktree / asOf -- and without something pinning the
+    thin-but-real records the guard can be tightened until it deletes reachable classes of live
+    seats: a record carrying only a session id, and the documented ``nosid`` record the plain hook
+    path writes by design.
+    """
+    fence.record("11111111-1111-1111-1111-111111111111", repo.parent / "elsewhere", 4, 1)
+
+    # NEGATIVE CONTROL 1 -- the documented nosid record: sessionKey, worktree and asOf, no id.
+    assert _pwsh(SEAT, "-Record", cwd=repo).returncode == 0
+    nosid_box = _record_path(repo, "nosid").parent.name
+
+    # NEGATIVE CONTROL 2 -- a record whose ONLY field is a session id.
+    sidonly_box = _seats_dir(repo) / "box-sidonly"
+    sidonly_box.mkdir()
+    (sidonly_box / "thin.json").write_text(
+        json.dumps({"sessionId": "aaaaaaaa-0000-0000-0000-0000000000e1"}), encoding="utf-8"
+    )
+
+    # THE FILE THAT IS NOT A SEAT.
+    junk_box = _seats_dir(repo) / "box-junk"
+    junk_box.mkdir()
+    (junk_box / "junk.json").write_text('{"a":1}', encoding="utf-8")
+
+    _, payload = _fleet_json(repo, fence)
+    receipt = payload["receipt"]
+    states = {r["Box"]: r["State"] for r in payload["rows"]}
+    assert receipt["recordsExamined"] == 3
+    assert receipt["recordsUnreadable"] == 0, "it parsed; unreadable is a different sentence"
+    assert receipt["recordsUnclassifiable"] == 1
+    assert states["box-junk"] == "RECORD-UNUSABLE"
+    assert states["box-sidonly"] == "INTERRUPTED", (
+        "a record carrying only a session id is thin, not junk -- the fence can answer about it"
+    )
+    assert states[nosid_box] == "POSSIBLY RUNNING", "the nosid path is reachable BY DESIGN"
+    assert receipt["recordsUnfenceable"] == 1, "nosid is structurally unfenceable and says so"
+    text = _pwsh(FLEET, "-Text", cwd=repo, env=fence.env)
+    assert "RESPAWN POPULATION (INTERRUPTED, HANDED): 1" in text.stdout, text.stdout
+
+    # -Detail OVER THE UNUSABLE ROW. The file path is the only true thing, so it is the only thing.
+    d = _pwsh(FLEET, "-Detail", "-BoxKey", "box-junk", cwd=repo, env=fence.env)
+    assert d.returncode == 0, d.stderr
+    assert str(junk_box / "junk.json") in d.stdout, d.stdout
+    for invented in ("CHECKOUT:", "fence=", "unpushed", "WORK AT RISK"):
+        assert invented not in d.stdout, (invented, d.stdout)
+
+
+def test_several_respawnable_rows_in_one_checkout_fire_a_stop_and_a_closed_one_does_not(
+    repo: Path, fence: Fence
+) -> None:
+    """SEVERAL RECORDS IN ONE CHECKOUT IS ORDINARY; SEVERAL RESPAWNABLE ONES IS A COLLISION.
+
+    Sessions come and go in a worktree, so a stop keyed on the crowd is permanently lit on any repo
+    with history. What a reader can be harmed by is several rows in ONE checkout that are all in the
+    respawn population, because the footer's own rule is "respawn at most one per checkout" and
+    nothing else in the render enforces it. ``checkoutsWithSeveralRecords`` is asserted UNCHANGED
+    across both arms: it is the instrument the stop's own text quotes, not the operand.
+    """
+    fence.record("11111111-1111-1111-1111-111111111111", repo.parent / "elsewhere", 4, 1)
+    older = "aaaaaaaa-0000-0000-0000-0000000000f1"
+    newer = "aaaaaaaa-0000-0000-0000-0000000000f2"
+    _write_record(repo, older)
+    _write_record(repo, newer)
+
+    _, payload = _fleet_json(repo, fence)
+    receipt = payload["receipt"]
+    assert receipt["checkoutsWithSeveralRecords"] == 1
+    assert receipt["checkoutsWithSeveralRespawnable"] == 1
+    assert any(
+        s.startswith("checkoutsWithSeveralRespawnable=") for s in receipt["stopConditions"]
+    ), receipt["stopConditions"]
+
+    assert _pwsh(SEAT, "-Close", "-SessionId", newer, cwd=repo).returncode == 0
+    _, payload = _fleet_json(repo, fence)
+    receipt = payload["receipt"]
+    assert receipt["checkoutsWithSeveralRecords"] == 1, (
+        "the crowd did not change -- only one of the two left the respawn population"
+    )
+    assert receipt["checkoutsWithSeveralRespawnable"] == 0
+    assert not any(
+        s.startswith("checkoutsWithSeveralRespawnable=") for s in receipt["stopConditions"]
+    ), receipt["stopConditions"]
+
+
+def test_a_record_unusable_row_is_not_counted_as_a_second_session(repo: Path, fence: Fence) -> None:
+    """The advisory that field drives asserts the rows are DIFFERENT SESSIONS.
+
+    Its text is "these are DIFFERENT sessions that occupied the same directory ... each row is its
+    own work". A file this reader could not turn into a row is not a session, and counting it there
+    puts that sentence over a file nobody wrote as a seat.
+    """
+    fence.record("11111111-1111-1111-1111-111111111111", repo.parent / "elsewhere", 4, 1)
+    sid = "aaaaaaaa-0000-0000-0000-0000000000f5"
+    _write_record(repo, sid)
+    box = _box_of(repo, sid)
+    (_seats_dir(repo) / box / "junk.json").write_text('{"a":1}', encoding="utf-8")
+
+    _, payload = _fleet_json(repo, fence)
+    receipt = payload["receipt"]
+    assert receipt["recordsExamined"] == 2
+    assert receipt["recordsUnclassifiable"] == 1
+    assert receipt["checkoutsWithSeveralRecords"] == 0, receipt
+
+    # POSITIVE CONTROL, same box, same run: a SECOND REAL record does raise it.
+    _write_record(repo, "aaaaaaaa-0000-0000-0000-0000000000f6")
+    _, payload = _fleet_json(repo, fence)
+    assert payload["receipt"]["checkoutsWithSeveralRecords"] == 1, payload["receipt"]
+
+
+def test_every_receipt_field_is_read_by_a_stop(tmp_path: Path) -> None:
+    """THE TWO-WAY RULE AS AN EXECUTABLE CHECK RATHER THAN A HEADER SENTENCE.
+
+    fleet.ps1's header states it both ways -- nothing is printed that no stop reads, and nothing is
+    a stop operand the receipt does not print. The pass that first wrote that sentence shipped THREE
+    fresh decorations (``recordsCheckoutGone``, ``checkoutsWithSeveralRecords``,
+    ``writerHeartbeatNewestAgeMinutes``), and a hand scan then found three more the reader who filed
+    those had missed. A sentence in a header cannot go red; this can, at the moment a field is
+    printed with nothing reading it.
+
+    A FIELD IS "READ" IF ITS NAME APPEARS IN THE STOP-CONSTRUCTION BLOCK -- as the operand
+    (``$fenceCanSee``) or by name inside a stop's own text, where it is the instrument a reader
+    needs in order to check that operand. THE ALLOW-LIST IS DECLARED, NOT GLOSSED: ``renderedAtUtc``
+    and ``seatsDir`` name WHEN and WHERE every other field was measured, and ``stopConditions`` IS
+    the stop set, so requiring it to read itself is vacuous.
+    """
+    text = FLEET.read_text(encoding="utf-8")
+    start = text.index("\n$stops = @()")
+    end = text.index("\n$receipt = [ordered]@{")
+    stop_block = text[start:end]
+    body_start = text.index("\n", end + 1)
+    receipt_body = text[body_start : text.index("\n}\n", body_start)]
+    keys = re.findall(r"^\s{4}([A-Za-z][A-Za-z0-9]*)\s+=", receipt_body, re.M)
+
+    # THE VACUITY GUARD. A parse that silently matched nothing would pass every assertion below.
+    assert len(keys) > 30, keys
+    assert "recordsCheckoutGone" in keys and "stopConditions" in keys, keys
+    assert "$stops +=" in stop_block
+
+    allowed = {"renderedAtUtc", "seatsDir", "stopConditions"}
+    orphans = [k for k in keys if k not in allowed and k not in stop_block]
+    assert not orphans, (
+        f"{len(orphans)} receipt field(s) are printed and no stop reads them: {orphans}. "
+        f"Either give each a stop or move it to the declared allow-list in fleet.ps1's header."
+    )
+
+    # POSITIVE CONTROL: the scan can SEE a decoration. Without it a regex that matched nothing
+    # useful, or an `in` test that always answered true, would report a clean file for ever.
+    seeded = receipt_body + "\n    decorationNobodyReads      = 1\n"
+    seeded_keys = re.findall(r"^\s{4}([A-Za-z][A-Za-z0-9]*)\s+=", seeded, re.M)
+    assert "decorationNobodyReads" in seeded_keys
+    assert [k for k in seeded_keys if k not in allowed and k not in stop_block] == [
+        "decorationNobodyReads"
+    ]
 
 
 # =================================================================================================
