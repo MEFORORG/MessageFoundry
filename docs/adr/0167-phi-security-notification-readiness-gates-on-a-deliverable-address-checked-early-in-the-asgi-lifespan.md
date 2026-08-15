@@ -62,14 +62,28 @@ and no engine tasks exist.
 
 | name | placement | store access | terminates? | exit code |
 |---|---|---|---|---|
-| **LIFESPAN** | after `engine.start()` | open | **NO — hangs** (BACKLOG #1257) | n/a |
+| **LIFESPAN** | after `engine.start()` | open | **hangs on `origin/main`; FIXED on PR #394** | n/a |
 | **PREFLIGHT** | `_serve`, before the ASGI app | **none available** | yes | **2** |
 | **EARLY-LIFESPAN** | after the store opens, before `engine.start()` | **open, plain `await`** | **yes, measured** | **3** |
 
-**LIFESPAN is out on a measurement, not a preference.** #1257 records that an exception after
-`engine.start()` unwinds nothing, so the refusal hangs the process instead of exiting — **strictly
-worse than the defect this ADR fixes**, because an operator can see a wrong readiness answer but
-cannot see a process that never finishes starting.
+**LIFESPAN is out on a measurement, not a preference — AND THE MEASUREMENT IS SCOPED TO A REF.**
+#1257 records that an exception after `engine.start()` unwinds nothing, so the refusal hangs the
+process instead of exiting — **strictly worse than the defect this ADR fixes**, because an operator
+can see a wrong readiness answer but cannot see a process that never finishes starting.
+
+> ⚠️ **THAT DISQUALIFICATION IS TRUE OF `origin/main`, NOT OF THE CODEBASE.** **#1257's fix is
+> already built on PR #394** — verified by reading the artifact rather than the claim:
+> `tests/test_lifespan_startup_unwinds.py` exists at `refs/pull/394/head`, docstring *"BACKLOG
+> #1257: a startup failure after `engine.start()` must let the PROCESS exit."* **Once #394 lands,
+> LIFESPAN stops being disqualified.**
+>
+> **This ADR still chooses EARLY-LIFESPAN, and the choice does not depend on the hang:** it avoids
+> the post-`engine.start()` window entirely, so it is right whether or not #1257 has landed. What
+> changes is only *why the alternative was rejected*.
+>
+> **Recorded this way deliberately.** A structural-sounding argument about a defect that no longer
+> exists is worse than no argument: the next reader finds no hang, concludes the ADR is wrong, and
+> distrusts the parts that are still right. **This one was only ever right about a ref.**
 
 **PREFLIGHT was recommended and withdrawn by its author on measurement.** `_serve` (lines 1042-2833)
 runs entirely before the lifespan and never opens a store — zero `open_store` calls across the whole
@@ -159,3 +173,10 @@ and everything `api/app.py` has constructed by `:5540`.
 **BACKLOG #1020's rider asks for the refusal to be demonstrated to terminate under `uvicorn`, and a
 rider that exists because someone inferred is not satisfied by an inference.** **This ADR must not be
 cited as discharging it.** The real gate carries that obligation when it lands.
+
+**AND ONE OPEN CHECK AGAINST THE POST-#394 TREE.** The exit-code results above were taken on a
+minimal repro, which #394 does not touch — so they stand as measurements of *uvicorn's* behaviour.
+**But the REAL gate's behaviour inside a lifespan that now unwinds properly has not been measured by
+anyone.** It is plausible that a correctly-unwinding lifespan changes nothing about the exit code,
+and plausible is not measured. **Re-run the arms against the post-#394 tree before treating exit 3 as
+settled for the shipped gate.**
