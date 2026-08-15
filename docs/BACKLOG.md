@@ -9431,6 +9431,31 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **CANDIDATE MECHANISMS -- ENUMERATED, NOT DIAGNOSED. None is measured.** (1) The roster enumerated at fire time misses live seats -- broadcast enumerates via `scripts/coord/presence.ps1`, and a seat invisible at fire time is skipped; consistent with the data, and **no seat has read the roster source**. (2) A deliberate withhold to seats carrying undrained mail, on the reasoning that the pending tick already IS the wake -- **offered and then RETRACTED by its own author as never measured**. **It must be excluded by READING THE CODE, not by asking a seat whether it felt skipped, because from the receiving end a correctly-withheld send and a failed one are THE SAME OBSERVATION.** That it is also the reassuring answer is exactly why it needs the stricter treatment: *"working as designed"* ends an investigation. (3) **Instrument floor** -- recipient counts come from delivered mail files, so a message written but never enqueued is invisible to the instrument and **the counts are a floor, not a census.**
 
+> **A BETTER INSTRUMENT EXISTS AND NOBODY WAS USING IT -- but it is still two-way, and the truth is FOUR-way. Added 2026-08-15; the instrument is another seat's, the limitation is measured here.**
+>
+> **THE INSTRUMENT: the mail store does not DELETE undelivered messages, it moves them to `expired/` beside `inbox/` and `seen/`.** That converts an absence into evidence, and it defeats this item's own *"no seat can tell from its own inbox"* premise -- **true of the INBOX, false of the BOX**, because a discarded message was written down on its way out.
+>
+> **VERIFIED INDEPENDENTLY ON THIS SEAT'S OWN 132-MINUTE OUTAGE:**
+> ```
+> 00:41:10Z  last tick consumed                      -> in seen/
+> 00:51:10Z  tick DELIVERED, never consumed          -> in expired/  *** proof the send was MADE ***
+> 00:51 -> 02:53   NO FILE OF ANY KIND
+> 02:51:10Z  seat-tick.last reads  dispatcher=STALE(no-live-session)
+> ```
+> **SO THIS SEAT'S OWN LONG GAP CONTAINS ZERO FAULTS**, and anyone counting it toward this item would be counting a correct suppression.
+>
+> **THE FOUR CASES, of which only the last is this item's subject:**
+> ```
+> file in expired/                              send reached, not consumed   NOT a fault
+> no file + seat marked BACKLOG(...suppressed)  correctly withheld           NOT a fault
+> no file + seat marked STALE(no-live-session)  correctly withheld           NOT a fault
+> no file + seat LIVE and unsuppressed          fanout skip or failed send   *** FAULT ***
+> ```
+> **AND ONE UNCONSUMED MESSAGE CAUSES THE SILENCE THAT FOLLOWS IT** -- a pending message marks the box backlogged, which suppresses subsequent sends -- **so a single `expired/` file explains an arbitrarily long following gap.** Counting those intervals as skips overcounts without bound.
+>
+> **THE LIMITATION THAT MATTERS FOR THIS ITEM'S FIX, measured: THE SUPPRESSION REASON IS RETAINED NOWHERE.** `seat-tick.last` is a **single line, overwritten every tick**; `seat-tick.state.json` holds **one timestamp per worktree** and no state. **So `expired/` answers "did it reach me" retrospectively, and NOTHING answers "why not" retrospectively.**
+> **CONSEQUENCE, and it upgrades the cheap fix below rather than replacing it: comparing RECIPIENT SETS across firings reports WHO was absent, never WHY.** A seat absent because it was correctly withheld is indistinguishable from one that was skipped. **THE CLOCK MUST LOG ITS PER-SEAT DECISION PER FIRING -- sent / suppressed-backlog / suppressed-stale / skipped -- or the comparison counts correct behaviour as a fault.** That is a durable one-line-per-firing record, not a redesign.
+
 > **CORRECTED 2026-08-15 -- THE DISCRIMINATOR BELOW IS TWO-WAY AND THE TRUTH IS THREE-WAY. ONE OF THE THREE IS NOT A FAULT.** Relayed by the seat that supplied the original write-up, against its own evidence.
 > ```
 > fanout skip -- the roster omitted you                          FAULT, and it is THIS item
