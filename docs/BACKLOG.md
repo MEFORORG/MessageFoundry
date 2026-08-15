@@ -9882,6 +9882,166 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **Cluster:** Auth / store portability. **Priority:** P1. **Verdict:** build.
 **Severity:** would, on first deployment against a **SQL Server** store, allow the bootstrap-admin expiry and supersession enforcement to be bypassed by varying the case of the username; and would make account identity store-dependent across all three backends. No live exposure -- zero deployments (§0).
 
+## 1269. the seat clock has no external alarm, and the obvious implementation reads healthy at the moment it should fire
+
+> 🔢 **Filed 2026-08-14 - not started. A WATCHDOG CANNOT WATCH ITS OWN DEATH.** The seat clock (Windows task `MEFOR-Seat-Clock`, `PT10M`, 600s ticks against a ~900s mail doorbell, so a 300s margin) is what makes a session's "keep going" duty physically possible -- a turn ends and the session goes idle regardless of intent, and nothing else fires on a timer. **The chain is SERIAL: each tick re-arms the next watcher, so it has ONE LIFE, not many.** One missed re-arm and it is gone, silently, and every seat whose only wake source is the clock goes quiet with it. **Nothing outside the chain currently notices.**
+
+> **THE ALARM MUST ASSERT BOTH CONDITIONS, AND A FRESHNESS-ONLY CHECK IS THE TRAP THAT MAKES IT WORSE THAN NOTHING:**
+>
+>     1. seat-tick.last age is under ~10 min,  AND
+>     2. the NEWEST line names THE WATCHED WORKTREE as SENT:<id> or THROTTLED(...)
+>
+> `seat-tick.last` is **ONE FLEET-WIDE LINE, rewritten whenever ANY seat is ticked**, carrying per-seat status within it. So **the file can be thirty seconds old while a specific seat is absent or suppressed.** Measured by the Steward: **ticks 59m58s apart while the file stayed under two minutes old for the entire hour**, because other seats were being ticked normally. That seat stayed awake only because peers happened to message it. **A freshness-only alarm is green at exactly the moment it is supposed to fire** -- which is the [#1263](BACKLOG.md)/§6 *green-and-blind* shape, not a lesser version of it.
+
+> **TWO CONSTRUCTION RULES, both measured on a naive first attempt, and note the direction they fail in: BOTH REPORT A HEALTHY CLOCK AS BROKEN.**
+> - **DEDUPE BY TICK IDENTITY, NOT TIMESTAMP EQUALITY.** A raw scan produced **ten 0.0-minute intervals** and flagged over-firing ten times; **22 records were about 12 ticks**, differing in **milliseconds**.
+> - **EXCLUDE INTERVALS WHERE THE SEAT SHOWS `COLD` / `BACKLOG` / `THROTTLED`.** An **88-minute** gap read as *"chain broken"* was **deliberate suppression** on a seat that was taking continuous turns.
+>
+> **An alarm that fires on healthy cases gets discounted, and is therefore absent on the day it matters.** A false-positive watchdog is not a safe failure mode; it is a slow-acting off switch.
+
+> **DO NOT SIMPLIFY IT TO CONSUMING THE CLOCK'S OWN `COLD` LABEL.** Two seats measured that token and reached **opposite conclusions, both correctly**: `COLD` marks **UNDRAINED MAIL PAST THE DOORBELL, not a dead session** -- four seats carried it while all four were writing transcripts within thirty seconds. If an implementation consumes the label at all, it must **cross-check against the seat actually writing transcripts** before alerting.
+
+> **WATCH BOTH BOUNDS. Under ~6 minutes means OVER-firing, and that is the EXPENSIVE fault** -- every tick wakes a seat and spends a turn, so a runaway clock burns the very budget the alarm exists to protect. A too-slow clock costs latency; a too-fast one costs money continuously.
+
+> **PIN THE ABSOLUTE PATH. DO NOT SEARCH FOR THE FILENAME -- THERE ARE AT LEAST THREE FILES WITH IT.**
+>
+>     AUTHORITATIVE  %USERPROFILE%\.claude\mefor-usage\seat-tick.last
+>                    (735 bytes, mtime 22:31; seat-tick.ps1, seat-tick.state.json, seats.json alongside)
+>     DECOY          %LOCALAPPDATA%\Temp\claude\<worktree>\<session>\scratchpad\seat-tick.last
+>                    same filename, 410 bytes, TEN HOURS STALE, verified DIFFERENT by cmp
+>     DECOY          %LOCALAPPDATA%\Temp\claude\<worktree>\<session>\scratchpad\fake\run\seat-tick.last
+>                    a THIRD hit, under a directory literally named `fake`
+>
+> **This is not hypothetical, and THE TWO DECOYS FAIL IN OPPOSITE DIRECTIONS -- which is why "pin the path" is a HARD REQUIREMENT and not a caution.**
+>
+> **Decoy A makes the alarm SCREAM on a healthy clock.** Its entire content is a **`FATAL seats-unreadable`** record -- `seats.json` carried **case-differing duplicate keys** (`c:\users\<user>\...` against `C:\Users\<User>\...`, identical but for casing) and the tick script **died on the JSON parse**. A glob-based alarm reports a permanent hard failure from ten hours ago. **Loud, wrong, and someone investigates within minutes.** *(That historical crash is worth recording in its own right: a Windows path-casing collision killed the clock once already.)*
+>
+> **Decoy B makes the alarm GO SILENT -- and silence is indistinguishable from health.** Its entire content is one line, measured:
+>
+>     2026-08-14T12:09:01.2079773Z<TAB>steward=THROTTLED(last-send--35997s-ago,floor-360s)
+>                                      dispatcher=THROTTLED(last-send--17999s-ago,floor-360s)
+>
+> **It reads `THROTTLED` for every seat, so it routes straight into THIS ITEM'S OWN EXCLUSION RULE** -- the rule two paragraphs up that says to skip `COLD`/`BACKLOG`/`THROTTLED` intervals. An implementation that globs the filename and lands here does not merely read stale data: **it concludes there is nothing to analyse, and reports nothing wrong, because from its point of view nothing IS wrong.** The alarm is quiet **by design**, on a file ten hours old. **AN ALARM THAT CANNOT FIRE IS WORSE THAN NO ALARM**, because the absence of an alert is read as evidence of health -- the same family as every other fault in this item: an instrument answering truthfully about a question nobody asked.
+>
+> **SO: PIN THE ABSOLUTE PATH. Do not search for the filename, and do NOT "search, then take the newest"** -- newest-wins happens to give the right answer today and breaks silently the moment any scratchpad copy is written after the real one.
+
+> **BUILD THE CHEAP INTERNAL-CONSISTENCY CHECK ANYWAY, because path discipline decays and this one also catches real corruption.** **When a record says `THROTTLED`, assert its age is within the same order of magnitude as its own stated floor before honouring the exclusion.** Decoy B claims `THROTTLED` with `floor-360s` while its age is ~36,000s -- **a hundred-fold contradiction of the state it declares**, since throttling means *suppressed because a send was too RECENT*. (Read literally, `last-send--35997s-ago` is **negative**, i.e. a send ten hours in the **future**; both readings are self-contradictory, and either one trips the check.) **One comparison. It catches this decoy, and it catches genuine corruption in the authoritative file, which is the better reason to build it.**
+
+> **ONE NON-DISCREPANCY, recorded so nobody re-derives it as evidence of tampering.** Decoy B's filesystem **mtime reads 07:09 local** while its **in-content stamp reads 12:09:01Z**. **Five hours apart, same event** -- mtime is local, the content stamp is UTC. It is neither a stale write nor a forged record. Flagged because a five-hour gap between a file's contents and its mtime is exactly the shape that gets escalated as one or the other; the same offset explains two seats reporting the FATAL file's time as `12:11` and `07:11`.
+
+> **How to prove it works, and the negative control that makes the proof mean anything.** Assert the alarm **FIRES** when the watched worktree is absent from a **fresh** `seat-tick.last` -- that is the case the freshness-only version gets wrong, so it is the only test that discriminates the two implementations. Then assert it **STAYS SILENT** across a `THROTTLED`/`BACKLOG` interval and across millisecond-adjacent duplicate records. **A test that only proves it fires on a stale file proves nothing: the broken implementation passes that too.**
+
+> **PROVENANCE, kept separate because these were measured by different seats.** The mechanism, the 59m58s measurement, the 88-minute suppression case and the dedupe finding are the **Steward's**, relayed via the Dispatcher and **not re-verified here**. The paths, the `cmp`, the `FATAL` content and the live baseline are the **Dispatcher's**, measured 2026-08-14 ~22:31Z. **The third glob hit (`scratchpad/fake/run/`) is this seat's**, found while confirming the decoy. Whoever builds this should re-measure rather than inherit -- *a provenance line carried through a handoff is a claim, not a fact*, which is itself a lesson from the same evening.
+
+**Cluster:** Fleet coordination / observability. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (§0) -- this is fleet tooling, not engine code. The cost is that the mechanism which keeps every seat alive has no independent observer, so its death is silent by construction, and the first implementation anyone reaches for is green at precisely the moment it should be red.
+
+## 1270. a claim that returns empty parks the lane at TERMINAL IDLE with work pending, and both routes there are silent
+
+> 🔢 **Filed 2026-08-14 - not started. THE OBSERVABILITY GAP IS WORSE THAN THE DEFECT, so it leads.** A batch claim can return **empty** for a reason that is not "there is no work", and the dispatcher is told only "empty". **Two routes, both reaching it silently:** a swallowed native **1222** lock-timeout under `SET LOCK_TIMEOUT 0`, **logged only at DEBUG**; and a **READPAST head skip**, where the batch claim drops the *whole lane* when its `rn=1` head is locked -- with **no log line at all**. On the empty result, **T12 drops the lane to TERMINAL IDLE with no timer armed.** A lane that has silently stopped claiming, recovered only by a periodic sweep, **reads healthy from outside** -- there is no counter, no warning, and nothing that distinguishes it from an idle system with nothing to do.
+
+> **NOT SQL-SERVER-ONLY. `Postgres` is NOT structurally immune** -- its claim uses `FOR UPDATE SKIP LOCKED`, **the same head-of-line skip**. Do not scope a fix to one backend.
+
+> **MEASURED, from a real CI failure with its own state dump** (`tests/test_stage_dispatcher.py::test_slot_budget_exactness[sqlserver-2]`, job `94882084246`; raw log preserved off-repo because that job is path-gated and the run has since been superseded):
+>
+>     empty_claims(total,wake_fanout,idle_poll)=(4, 1, 3)  busy_violations=0
+>     processing_lanes=1  slots_free=1
+>     IB_SLOT3/0/1: phase=IDLE  timer_armed=None  lane_task=none
+>     IB_SLOT3/0/1  rows=[('pending', 0, 100.0)]      <-- WORK PENDING, NOTHING SCHEDULED TO TOUCH IT
+>     clock[0].now=1000.0  armed=[]
+>
+> **Work pending, lanes idle, no timer armed, nothing scheduled to re-ready them: a LOST WAKEUP, not a slow start.**
+
+> **THE TIMEOUT HYPOTHESIS IS REFUTED, NOT MERELY UNSUPPORTED -- and this is the part that matters for whoever fixes it.** The obvious reading was that an 8-second `_wait_until` budget is generous against SQLite and marginal against a containerised SQL Server on a loaded runner. **Two facts kill it.** `busy_violations=0` **and** `slots_free + processing_lanes == 2`, so **the invariant the test polices held exactly** -- the budget logic is not what broke. And **`clock.now=1000.0` is a MOCK clock**, so the dispatcher's own time was not advancing on wall clock at all. **Waiting longer would not have helped, therefore RAISING THE TIMEOUT WOULD HAVE HIDDEN IT** -- the obvious fix is indistinguishable from a real one from the outside, which is precisely why it must not be taken.
+
+> **THE MITIGATION IS REAL AND BELONGS HERE, not omitted to make the finding look worse.** The dump's own clause: *"these tests disable the sweep that would re-ready it."* **In production the sweep runs, so the lane recovers.** §0 applies twice over -- **zero deployments, and the compensating control exists.** So this is written in the conditional: a deploying site **would** see lanes stall until a sweep, with **no log line** explaining why, on either supported server backend. **It is not a stalled pipeline today and must not be written as one.**
+
+> **HOW THIS WAS NEARLY NOT CLASSIFIED AT ALL -- the gated-leg problem, folded in here rather than given its own number.** The `sqlserver-store` job is **path-gated** and skips on every `main` run, so the reasoning went: no baseline on `main`, therefore a single failure is unclassifiable. **The middle step does not carry the conclusion.** That job had run **six times on the PR's own branch that evening -- four passes, one failure, one cancelled.** The baseline existed; it was simply not where it was looked for, which is *an absence measured over the wrong population*. **And the search almost failed for a second, independent reason:** `gh run list` reports **no failed run** on that branch, because **the failing job sits inside a run later CANCELLED as superseded**. *"Did any run fail"* answers **no** while *"did any job fail"* answers **yes** -- CLAUDE.md §11 / **SDS-3.8**'s job-versus-step example, with a new instance. **Query jobs, not runs.** The general form -- *a failure on a gated leg carries less information than the same failure on an ungated one* -- is true and kept here as a paragraph; **it does not get its own number, because its motivating instance turned out to be classifiable and the baseline was found by luck rather than by design.** File it separately only if it recurs with a genuinely unclassifiable failure, and then with two instances.
+
+> **How to prove a fix, and why the dump is the model.** A fix must make the *silent* case *loud*: assert that an empty claim caused by a lock-timeout or a head-of-line skip **emits a distinguishable signal at INFO or above, or increments a counter an operator can see** -- not that the lane eventually recovers, which it already does. **The negative control is the sweep: disable it and assert the lane is still diagnosable from its own output.** *(That is what made this classifiable at all -- the failure carried a full dispatcher/store dump, so one occurrence, after the fact, out of a superseded run's log, was enough. The predecessor's note that "a bare `assert False` is what made instance 2 cost a day of re-diagnosis" is the counterfactual.)*
+
+> **ON THE "instance 2" LABEL, because it will be read as a regression and should not be.** The dump self-labels this **"BACKLOG #344 instance 2"** and the test docstring credits *"#344 proposal 6"* for the dump mechanism. **#344 is CLOSED**, and its subject is *fixed wall-clock bounds drifting out of proportion to the work they bound* -- whereas this is a **lost wakeup**. **Different failures. "Instance 2" is the DIAGNOSTIC's lineage, not the defect's.** Whether that closure needs revisiting belongs to whoever owns it; **this item does not assert a regression against it.**
+
+**Cluster:** Store / dispatcher observability. **Priority:** P2. **Verdict:** build.
+**Severity:** no live exposure -- zero deployments (§0), and the production sweep recovers the lane. Would cost a deploying site stalled lanes recovered only on a sweep interval, with **no log line at all** on one route and **DEBUG-only** on the other, on **both** server backends.
+
+## 1271. invalid escape sequences in test_remotefile_transport.py become a SyntaxError and take the whole module at collection
+
+> 🔢 **Filed 2026-08-14 - not started. THE BLAST RADIUS IS THE MODULE, NOT THE LINE.** Python has announced that invalid escape sequences become a **`SyntaxError`**; this project targets **3.14+** and will meet that upgrade. A `SyntaxError` fails at **COLLECTION**, so the whole of `tests/test_remotefile_transport.py` disappears in one step rather than one test failing. **A test file that vanishes at collection does not report as a failure -- it reports as fewer tests**, which is the quietest possible way to lose coverage.
+
+> **THREE SITES, ONE FILE, reproduced here by compiling the module with `SyntaxWarning` captured:**
+>
+>     tests/test_remotefile_transport.py:1174   "..\..\etc\passwd.hl7"      -> str literal, needs r""
+>     tests/test_remotefile_transport.py:1221   b"MSH|^~\&|A"               -> BYTES literal, needs rb""
+>     tests/test_remotefile_transport.py:1226   b"MSH|^~\&|A"               -> BYTES literal, needs rb""
+
+> **TWO CORRECTIONS TO THE OBVIOUS FIX, both measured, both of which a careless patch gets wrong.**
+> - **Line 1174 carries THREE invalid escapes, not one: `\.`, `\e` and `\p`.** Python emits **one `SyntaxWarning` per line**, so **the warning count is not the defect count**. Escaping only the escape named in the warning leaves two behind, and the module still dies on the upgrade.
+> - **BOTH 1221 and 1226 are bytes literals**, not just one of them. **`rb""` for both**; treating either as a `str` is a different fix that does not compile the same.
+>
+> The `r`/`rb` form is **value-preserving today**: an invalid escape is currently retained literally, so `"..\..\etc\passwd.hl7"` and `r"..\..\etc\passwd.hl7"` already denote the same string. **The fix changes no test semantics** -- which is exactly why it is safe and why nothing currently fails.
+
+> **SO THE INSTRUCTION IS: FIX PER *LINE*, BY MAKING THE WHOLE LITERAL RAW -- NOT PER *WARNING*.** Independently reproduced by two seats: **3 warnings, 3 lines, FIVE invalid escapes** (`\.` `\e` `\p` on 1174; `\&` on each of 1221 and 1226). And the three lines need **two different fix forms** -- `r"..."` for the `str` on 1174, `rb"..."` for the **bytes** on 1221 and 1226 -- **so a uniform patch is wrong in one direction and a per-warning patch is wrong in the other.**
+
+> **THE VARIANT THIS EXPOSED IS WORTH MORE THAN THE DEFECT, AND IT IS NOT AN INSTRUMENT FAULT.** The compiler is **right about LOCATION and silent about MAGNITUDE** -- one warning per line, by design -- and it **stays honest on re-run**: fix one escape on 1174 and it warns again. **The lossy step was the SUMMARY.** *"3 sites, 1 file"* was passed between seats and **"sites" silently became "defects" in transit**, because the two words coincide whenever a line carries exactly one escape -- which is true of two of the three lines here. **The exposed party is a patch author who acts on a relayed count and does not re-run the compiler.** Every other instrument failure recorded around this item was a tool answering an adjacent question; **here the tool answered exactly the right question and the sentence carrying its answer lost the distinction.** *A count relayed without its unit is a different claim from the one measured.*
+
+> **THE METHOD IS THE TRANSFERABLE PART, and a grep is the wrong instrument here by a factor of a hundred.** These were found by **compiling all 1,046 `.py` files with `SyntaxWarning` captured**, not by searching for backslashes. **A grep for the pattern returns 325 files, because `|^~\&` is the HL7 encoding-characters field** -- so it counts the **domain** rather than the **defect**. In a repo whose subject matter is a format built out of escape-like punctuation, **the compiler is the only instrument that answers the question being asked.** Any sweep for this class must compile, not match.
+
+**Cluster:** Test-suite durability / Python version readiness. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (§0) -- test-only. The cost is deferred and sharp: on a future Python the module stops being collected, and the loss shows up as a **smaller test count** rather than as a failure, which is the shape least likely to be noticed.
+
+## 1272. the shell-syntax harness resolves whichever bash PATH orders first, and reports a harness failure as 160 content failures
+
+> 🔢 **Filed 2026-08-14 - not started. TWO SEATS RAN THE SAME TEST ON THE SAME BOX ON THE SAME DAY AND GOT OPPOSITE RESULTS.** `tests/test_workflow_shell_syntax.py` writes each workflow shell block to a temp file and checks it with `subprocess.run([bash, "-n", str(probe)])`, where `bash` comes from **`shutil.which("bash")`** and `str(probe)` is a **Windows** path. **Both a Git Bash and a WSL `bash` are installed on this box**, and `shutil.which` returns **whichever the invoking process's `PATH` happens to order first**. Nothing pins it.
+
+> **MEASURED, BOTH RESOLUTIONS, SAME WINDOWS PATH, WITH A REAL-SYNTAX-ERROR NEGATIVE CONTROL:**
+>
+>     C:\Program Files\Git\usr\bin\bash.EXE   valid script -> exit 0     broken script -> exit 2   DISCRIMINATES
+>     C:\windows\system32\bash.exe (WSL stub) valid script -> exit 127   broken script -> exit 127  CANNOT
+>
+> The WSL stub **eats the backslashes** -- `/bin/bash: C:UsersScott...: No such file or directory` -- because it cannot resolve a Windows path. **That is path mangling, not a quoting bug in the test.**
+
+> **THE DURABLE DEFECT IS THE CONFLATION, AND IT SURVIVES WHICHEVER BASH IS FOUND.** `bash -n` exits **2** for a real syntax error and **127** for *cannot find the file*, and **the harness treats any non-zero return as a syntax failure.** So when resolution lands on the WSL stub, **every block fails identically regardless of content** and the run reports **160 syntax errors that do not exist**. A harness failure **impersonates** a content failure. Worse than noise: on that resolution the test **cannot detect a real syntax error at all**, because a genuine defect is indistinguishable from the 160 -- *a control that cannot discriminate is not a weak control, it is not a control*. The general rule is already stated in the fleet role playbooks (`COMMON` 4.3.5): **a crashed instrument must not exit the same code as a real failure.**
+
+> **CORRECTION TO THE DIAGNOSIS AS IT WAS HANDED TO THIS SEAT, and it changes the title.** The report said the test *"cannot check anything on a Windows dev box"* and that `shutil.which("bash")` resolves to the WSL stub. **Re-measured here: it resolves to `C:\Program Files\Git\usr\bin\bash.EXE`, and the test then works correctly, including exit 2 on a planted syntax error.** So the failure is **NOT** universal on Windows -- it is **`PATH`-order-dependent**, which is *worse for diagnosis*: two seats disagree about whether a test is broken, both measure honestly, and **neither reading generalises.** The original diagnosis of the mechanism was exactly right; only its *scope* was overstated.
+
+> **THIS IS NOT ONE MODULE, AND A SINGLE-VARIABLE CONTROL SHOWS ONE CAUSE ACCOUNTS FOR EVERY FAILURE IN THE SWEEP.** Same tree, same commit, same interpreter, same three modules -- **only the `PATH` order changed:**
+>
+>     bash resolved to                                  result
+>     C:\windows\system32\bash.EXE       (WSL stub)     19 failed, 28 passed, 7 skipped
+>     C:\Program Files\Git\usr\bin\bash.EXE (Git Bash)  47 passed,  7 skipped,  ZERO failures
+>
+> **19 + 28 = 47 -- a perfect complement.** The nineteen that failed are exactly the nineteen that then pass; runtime also fell from ~44s to 6.3s, because the WSL failures were the slow ones. **So all nineteen share ONE root cause, and it is shell RESOLUTION rather than content.** *(This supersedes an earlier "1 diagnosed, 18 undiagnosed, no shared cause asserted", retracted by its own author once the control was run and replaced here rather than left standing, because it understated the item.)*
+>
+> **It also explains a 100% failure rate that a separate line of investigation had emptied without refilling.** CRLF was the standing hypothesis for the 160-of-160; it was tested and **refuted** (multi-line CRLF passes `bash -n`, with a control firing at exit 2 on a genuinely broken script) -- which killed the theory **but supplied no replacement**. The control supplies it: **the 160-of-160 was never about the blocks at all.** *A 100% failure rate is an instrument signature*, and the instrument was the resolved shell.
+
+> **TWO DOWNSTREAM SIGNATURES, ONE CAUSE -- stated so nobody splits them back apart:**
+>
+>     127, "No such file or directory"   test_workflow_shell_syntax, test_installed_coord_hooks
+>                                        WSL cannot resolve the Windows path it is handed
+>     rc=1, "aborted under bash -e"      test_dependabot_automerge_guardrails
+>                                        the body DOES execute under WSL, then aborts
+>
+> Different symptoms, **same resolution point.** The cross-module link was reached **independently by two seats within minutes, from opposite directions** -- one from the shell-syntax module, one from the coord-hooks shim showing the identical backslash-eaten path -- which is stronger evidence than either seat asserting it alone.
+
+> **THE FIX BELONGS WHERE THE INTERPRETER IS RESOLVED, NOT PER-TEST -- AND PINNING `bash` ALONE IS THE TRAP:**
+>
+>     tests/test_workflow_shell_syntax.py:110           skipif(shutil.which("bash") is None, ...)
+>     tests/test_dependabot_automerge_guardrails.py:145 bash = shutil.which("bash")
+>     tests/test_installed_coord_hooks.py:666           sh   = shutil.which("sh") or shutil.which("bash")
+>
+> **The third tries `sh` FIRST.** A fix that pins only `bash` repairs two of the three and leaves the coord-hooks module resolving `sh` through the same unpinned discovery -- **and it would PRESENT AS A SUCCESSFUL FIX, because two-thirds of the failures disappear.** That is the shape worth guarding against here: a partial fix that looks total because the residue is small. **PIN THE SHELL, NOT THE NAME.**
+
+> **FIX DIRECTION (not chosen here).** Pin the interpreter rather than discovering it -- prefer an MSYS/Git Bash explicitly, or convert the path when the resolved `bash` is the WSL stub -- **and at minimum separate return code 127 from 2 so a harness failure names itself instead of impersonating content failures.** The last of those is worth doing **even if the resolution is fixed**, because it is what makes the next environment surprise legible.
+
+> **THREE HYPOTHESES ALREADY REFUTED -- do not spend on them.** *`bash` missing*: refuted, it resolves and `bash -c "echo BASH_OK"` exits 0. *A bare CR breaks `bash -n`*: refuted, a CR-terminated line exits 0. *CRLF breaks `bash -n` on multi-line input*: refuted, multi-line CRLF exits 0 with a broken-script control firing at exit 2. **The line-ending theory is dead.**
+
+> **ATTRIBUTION AND ITS STATED LIMIT, which must survive into any later summary.** The 19 failures in the sweep that surfaced this are **PRE-EXISTING**, established by **CONTROLLED REVERT** -- reverting two files to the base commit and re-running the same three modules in the same tree and venv reproduced the identical 19/28/7 triple, then restored byte-identical -- with a second instrument showing zero references to `asvs`/`apply.py` in any failing module. **THE LIMIT: that compared the COUNT TRIPLE and the TAIL of the FAILED list, NOT the full node-id set.** `COMMON` 4.5.6 -- *identity beats count* -- so the attribution is **strong but not a full node-id match**. *(An earlier form of this paragraph recorded the other 18 failures -- 16 in `test_dependabot_automerge_guardrails.py`, 2 in `test_installed_coord_hooks.py` -- as **UNDIAGNOSED with no shared cause asserted**. **That is superseded by the single-variable control above**, which accounts for all 19. It is noted rather than deleted because the honest sequence matters: the shared cause was **established by an experiment**, not assumed from adjacency, and the author of the original caveat retracted it themselves once the control ran.)*
+
+> **WHAT IS STILL *NOT* CLAIMED, and these limits are the authors' own:** that **Git Bash is the correct resolution to pin** -- that is a design call nobody here has made; that **CI is affected** -- it is Linux and resolves one shell, so it reports nothing either way; and that this extends **beyond these three modules and their 19 failures** -- the full 12,516-test suite has **not** been re-run under a pinned shell.
+
+**Cluster:** Test-harness portability / instrument discrimination. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (§0) -- dev-box test tooling; **CI (Linux) is unaffected and reports nothing**. The cost is that every seat running a full suite on this box may or may not hit a 160-failure wall depending on its own `PATH`, and while it is hit the module cannot detect the defect it exists to catch.
 ## 1273. the module that exists to write the C0/DEL test once writes it twice, and logging_setup re-derives it a third time
 
 > 🔢 **Filed 2026-08-15 - not started. THE CONSOLIDATION DOES NOT CONSOLIDATE ITS OWN TWO FUNCTIONS.** [`controlchars.py`](../messagefoundry/controlchars.py) was created by [#1253](BACKLOG.md) to write the C0/DEL test **once**; its docstring is titled *"The C0/DEL control-character test, written once"* and ends *"THE POINT IS THE COPYING PRACTICE, not the seven known lines. If you need this test, import it."* **It then spells the predicate out twice inside itself**, and a third statement of the same set lives in `logging_setup`.
