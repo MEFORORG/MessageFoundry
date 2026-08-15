@@ -1214,8 +1214,14 @@ def test_a_bootstrap_stderr_flood_does_not_wedge_the_spawn(tmp_path: Path) -> No
     the boot reply. ``startup_seconds`` is deliberately short so a regression fails fast instead of
     eating the 60s pytest-timeout budget.
 
-    FALSIFICATION: move the drain-thread start below the boot-frame write in ``_spawn`` and this hangs
-    to ``startup_seconds`` and raises ``SandboxError``."""
+    FALSIFICATION: move the drain-thread start below the point where the boot **reply** is read in
+    ``_spawn`` and this hangs to ``startup_seconds`` and raises ``SandboxError``.
+
+    NOT below the boot-frame WRITE, which is what this said first and is measurably wrong: starting
+    the drain immediately after the write does NOT wedge, because the parent then blocks on the reply
+    while the drain is already running (ADR 0166 records the measurement). A falsification that does
+    not falsify is worse than none -- it reads as a checked escape hatch, and the one person who
+    follows it concludes the guard is untestable rather than that the instruction was wrong."""
     (tmp_path / "graph.py").write_text(_FLOOD_GRAPH, encoding="utf-8")
     session = SandboxSession(
         SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0, startup_seconds=10.0),
