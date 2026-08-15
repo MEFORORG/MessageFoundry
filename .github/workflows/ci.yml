@@ -670,7 +670,32 @@ jobs:
         # third entry in `testpaths`, which is the exact drift #1027 exists to prevent. Subtracting FROM
         # `testpaths` keeps it the single source of truth for what the suite is.
         # `tests/test_ci_engine_step_excludes_webconsole.py` pins all three of those decisions.
-        run: pytest -q --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
+        run: |
+          # BACKLOG #1260 -- NAME A NATIVE CRASH AS ONE. GitHub reports `steps.tests.outcome` as
+          # "failure" for ANY non-zero exit, so a segfault and a failing assertion are
+          # indistinguishable to everything downstream. Observed on a real PR: the check is named
+          # `test (windows-2025, py3.14)`, the step `Tests (pytest)`, the process exited 139
+          # (128 + SIGSEGV) printing "Segmentation fault" -- and ZERO tests failed. There is no
+          # pytest summary line and no FAILED id anywhere in the log, because the process died
+          # before it could write one. A reader at any of those three layers reaches for a test
+          # regression that does not exist.
+          #
+          # THIS CHANGES NOTHING ABOUT PASS/FAIL: the exit code is re-raised unchanged, so a crash
+          # still reds the leg. It only makes the log and the annotation TRUE.
+          #
+          # IT DELIBERATELY DOES NOT RETRY. scripts/ci/retry-native-crash.sh exists and is correct,
+          # but its documented scope is the pyodbc/py3.14 SQL Server binding crash (upstream #1459),
+          # down to a "REMOVE THIS WRAPPER once #1459 ships a fix" instruction. The engine suite does
+          # not use pyodbc, so this leg's crash has a DIFFERENT and currently unknown cause --
+          # wrapping it here would couple an unrelated leg's crash handling to that removal note, and
+          # retrying an unknown-cause crash is closer to laundering than the pyodbc case, where the
+          # cause is documented upstream. Whether to retry this leg is the item's other half.
+          rc=0
+          pytest -q --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT" || rc=$?
+          if [ "$rc" -eq 139 ] || [ "$rc" -eq 134 ]; then
+            echo "::error title=Native crash in the engine suite::pytest died from signal $((rc - 128)) (exit $rc). This is a NATIVE CRASH, not a test failure -- the process died before pytest could write a summary line, so no test result was produced at all. Do NOT read it as a test regression (BACKLOG #1260)."
+          fi
+          exit $rc
 
       - name: Step margin -- boundary between the two gated steps
         if: always()
