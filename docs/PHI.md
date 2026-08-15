@@ -1029,12 +1029,33 @@ of the filters above. It is **out of scope for this section** — but treat a
 [§2](#2-where-phi-lives--data-at-rest-inventory).
 
 The **opt-in ADR 0087 sandbox worker** (`[sandbox].mode = "subprocess"`, default `"off"`) is **not** an
-exclusion. The child is spawned with `stderr=None`, so it **inherits the engine's stderr** — stream 1's
-own sink — and it installs the three filters above on that stream itself, via `configure_stderr_logging`
-(BACKLOG #1054). A `WARNING`+ record emitted in the child by admin-authored Router/Handler code, or by a
-library it pulls, is therefore redacted and CR/LF-scrubbed on the same terms as an engine record.
-Redaction is a property of the **handler**, so this is a second installation of the chain rather than
-something the child inherits along with the file descriptor.
+exclusion, and this paragraph is the single statement of how its output reaches stream 1 — the code
+docstrings link here rather than restate it. Two independent mechanisms cover it:
+
+- **Inside the child.** It calls `configure_stderr_logging`, which installs the same three filters on
+  its own stderr handler (BACKLOG #1054), so a `WARNING`+ record emitted there by admin-authored
+  Router/Handler code, or by a library it pulls, is redacted and CR/LF-scrubbed at the source.
+  Redaction is a property of the **handler**, so this is a second installation of the chain rather
+  than something the child inherits along with a file descriptor.
+- **In the engine parent (ADR 0166, BACKLOG #343).** The child is spawned with
+  `stderr=subprocess.PIPE` — it no longer *inherits* stream 1's sink — and a per-worker drain thread
+  turns those bytes into engine log records attributed to the inbound, the child pid and the worker
+  generation. **Content is relayed at `DEBUG` and only at `DEBUG`.** At `INFO` and above the engine
+  emits an attributed, rate-limited `WARNING` notice carrying the identity and a line **count** and no
+  content, so the never-log-bodies rule holds **by construction**: a Handler that `print()`s a message
+  body cannot put that body on a default-level log, because no call site above `DEBUG` carries child
+  stderr content at all. Suppressed lines are counted and reported by the next notice, never dropped
+  silently. Relayed records ride stream 1's own handlers, so they are redacted and scrubbed on
+  stream 1's terms; the relay additionally scrubs control characters itself, because "one child write
+  is one log record" is the drain's own framing contract and cannot depend on the host process's
+  logging configuration. **Residuals, stated rather than implied — at least these:** raising the service to `DEBUG`
+  to read that content puts full Handler output on stream 1, at stream 1's PHI class — the same
+  posture as any `DEBUG` run; and the child's own root logger is pinned at `WARNING` when the worker
+  starts, so `DEBUG` shows every `print`/raw write plus the child's `WARNING`+ records, and never the
+  child's own `DEBUG`/`INFO` records, which the child never emitted. **A byte-cap truncation was
+  rejected, not overlooked:** truncating an HL7 v2 message to its first N bytes keeps MSH and PID and
+  discards the clinically bulky remainder, so it preserves precisely the most identifying part of the
+  record (ADR 0166).
 
 ---
 

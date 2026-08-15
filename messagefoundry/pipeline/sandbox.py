@@ -82,13 +82,15 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final
+from typing import IO, Any, Final
 
 from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.config.run_context import RunContext
+from messagefoundry.logging_setup import scrub_control_chars
 from messagefoundry.pipeline import _sandbox_codec as codec
 from messagefoundry.pipeline._sandbox_codec import SandboxCodecError, SandboxError
 
@@ -177,6 +179,163 @@ class _Eof:
 
 
 _EOF: Final = _Eof()
+
+
+# --- child stderr relay (BACKLOG #343, ADR 0166) ------------------------------
+
+#: One ``read(2)``. The child is spawned with ``bufsize=0``, so ``proc.stderr`` is RAW: this is the
+#: syscall size, not a buffer fill, and a short read is normal. Sized well above the line cap so a
+#: flooding child costs syscalls proportional to volume, not to line count.
+_STDERR_READ: Final = 65536
+
+#: Longest run held while waiting for a newline. A MEMORY bound on the parent, never a redaction: a
+#: Handler can write megabytes with no terminator, and an unbounded carry lets the child size the
+#: parent's heap. Reaching it splits one write across several DEBUG records and DISCARDS NOTHING --
+#: which is exactly what distinguishes it from the per-line byte cap ADR 0166 rejected. That cap was
+#: rejected for a reason specific to this payload: truncating an HL7 v2 message to its first N bytes
+#: keeps MSH and PID -- the header and the patient identifiers -- and discards the clinically bulky
+#: remainder, so it preserves precisely the most identifying part of the record. It is the worst
+#: available redaction for this format, not merely a weak one.
+_STDERR_LINE_CAP: Final = 8192
+
+#: Floor between two stderr notice records for one worker generation. The notice is what an operator
+#: at INFO gets INSTEAD of content, so it must not become the flood it reports. Lines inside a window
+#: are COUNTED and carried by the next notice, so nothing is dropped silently.
+_STDERR_NOTICE_SECONDS: Final = 60.0
+
+#: How long :meth:`SandboxSession.close` waits for each drain thread. Bounded on purpose: a surviving
+#: grandchild can hold the pipes open indefinitely, and this runs under the session lock.
+_STDERR_JOIN_SECONDS: Final = 1.0
+
+
+class _StderrRelay:
+    """One worker GENERATION's stderr, turned into log records (BACKLOG #343, ADR 0166).
+
+    Content at DEBUG and only DEBUG; at INFO and above an attributed, rate-limited notice carrying
+    identity and a COUNT and no content. CLAUDE.md section 9 holds here **by construction** rather than
+    by operator discipline: there is no call site at which child stderr content becomes a record above
+    DEBUG, so no configuration, verbosity setting or error path can put a printed message body on a
+    default-level log. The rejected per-line byte cap is recorded on :data:`_STDERR_LINE_CAP`.
+
+    One instance per spawn, reachable only through its own daemon thread. A relay whose child was killed
+    can still be draining that child's buffered output while the next generation runs, so every counter
+    lives here rather than on the session: a respawn replaces the session's thread list and the stale
+    relay goes with it, unable to write into the live generation's state -- the same stale-generation
+    isolation the fresh :class:`queue.Queue` gives the frame reader. The notice budget therefore resets
+    on respawn; accepted, because a respawn costs a full ``load_config()``.
+
+    PHI redaction is deliberately NOT re-implemented here. It is a property of the engine's log
+    HANDLERS (:func:`~messagefoundry.logging_setup._install_phi_filters`), which this parent-side call
+    site rides exactly like any other engine log record; a second call site would be the drift SDS-3.5
+    warns about. Control-character scrubbing IS applied here, because "one child write is one log
+    record" is this class's own framing contract and must not depend on how the host process configured
+    logging (an embedded runner may carry plain handlers). The honest residual: in a host that never
+    called ``configure_logging``, relayed DEBUG content reaches that host's handlers unredacted --
+    exactly as any engine log line does, not a new exclusion. Identity is ``(inbound, pid,
+    generation)``: pid alone is not unique, because an OS recycles pids and the whole design turns on a
+    stale generation's relay coexisting with the live one."""
+
+    __slots__ = ("_inbound", "_pid", "_gen", "_buf", "_pending", "_total", "_last_notice")
+
+    def __init__(self, inbound: str, pid: int, generation: int) -> None:
+        self._inbound = inbound
+        self._pid = pid
+        self._gen = generation
+        self._buf = bytearray()
+        self._pending = 0
+        self._total = 0
+        self._last_notice: float | None = None
+
+    def run(self, stream: IO[bytes]) -> None:
+        """Drain ``stream`` to EOF on a daemon thread. Never raises: an escaping exception would end
+        the drain, and a pipe nobody drains blocks the child once the OS buffer fills."""
+        try:
+            while True:
+                chunk = stream.read(_STDERR_READ)
+                if not chunk:
+                    break
+                self.feed(chunk)
+        except OSError:
+            pass  # the pipe died with the worker; the kill path reports that, this thread does not
+        finally:
+            self.close()
+
+    def feed(self, chunk: bytes) -> None:
+        """Accumulate ``chunk`` and emit every complete line (or cap-length run) it completes."""
+        self._buf.extend(chunk)
+        while True:
+            newline = self._buf.find(b"\n")
+            # ``<=``, not ``<``: a terminator landing exactly ON the bound is a complete line of cap
+            # length, not an over-length run. Splitting there instead would consume the bytes and leave
+            # the newline to open the next pass, emitting a spurious empty record.
+            if 0 <= newline <= _STDERR_LINE_CAP:
+                line = bytes(self._buf[:newline])
+                del self._buf[: newline + 1]
+            elif len(self._buf) >= _STDERR_LINE_CAP:
+                # No terminator within the bound: split rather than hold. Splitting mid-character is
+                # why the decode below is `errors="replace"` and not strict.
+                line = bytes(self._buf[:_STDERR_LINE_CAP])
+                del self._buf[:_STDERR_LINE_CAP]
+            else:
+                return
+            self._line(line)
+
+    def close(self) -> None:
+        """Flush a trailing unterminated write and force a final notice, so a child that exits
+        mid-line is still both relayed and counted."""
+        if self._buf:
+            line = bytes(self._buf)
+            self._buf.clear()
+            self._line(line)
+        self._notice(force=True)
+
+    def _line(self, line: bytes) -> None:
+        self._pending += 1
+        self._total += 1
+        self._notice(force=False)
+        if not log.isEnabledFor(logging.DEBUG):
+            # Section 9 rests on TWO independent facts, and this guard is only the second of them.
+            # First: the sole call site carrying content is the ``log.debug`` below, so raising the
+            # service level is the only way content becomes a record at all. Second: this guard, which
+            # means the bytes never even become a `str` below DEBUG -- so the property survives an edit
+            # that raises that call site, and no decode/scrub cost is paid on a flooding child. Both
+            # were measured: breaking either alone still keeps a printed body off an INFO log.
+            return
+        # `errors="replace"`, never strict: a decode raise here would kill the drain and re-create the
+        # deadlock this thread exists to prevent. Never latin-1 either -- it corrupts on NUL (CLAUDE.md
+        # section 8).
+        text = scrub_control_chars(line.removesuffix(b"\r").decode("utf-8", "replace"))
+        log.debug(
+            "sandbox stderr [%s pid %d gen %d]: %s", self._inbound, self._pid, self._gen, text
+        )
+
+    def _notice(self, *, force: bool) -> None:
+        """Report THAT the child wrote to stderr -- identity and counts, never content.
+
+        WARNING, not INFO: an operator running ``[logging].level = WARNING`` would never see an INFO
+        notice, and a printing Handler would be completely invisible -- the accept-and-drop shape the
+        count-and-log invariant forbids, reintroduced by the fix for it. Cry-wolf is answered by the
+        throttle instead: one record per generation at first output, then at most one per window, and
+        worker spawns are per-inbound-per-reload rather than per-message."""
+        if self._pending == 0:
+            return
+        now = time.monotonic()
+        throttled = (
+            self._last_notice is not None and now - self._last_notice < _STDERR_NOTICE_SECONDS
+        )
+        if not force and throttled:
+            return
+        lines, self._pending = self._pending, 0
+        self._last_notice = now
+        log.warning(
+            "sandbox worker wrote to stderr [%s pid %d gen %d]: %d line(s) since the last notice, "
+            "%d total for this worker; content is relayed at DEBUG only (ADR 0166)",
+            self._inbound,
+            self._pid,
+            self._gen,
+            lines,
+            self._total,
+        )
 
 
 def _write_frame(stream: Any, body: bytes) -> None:
@@ -396,13 +555,19 @@ class SandboxSession:
         self,
         policy: SandboxPolicy,
         *,
+        inbound: str,
         config_dir: str | Path,
         env: str | None,
         code_sets: Mapping[str, CodeSet] | None = None,
     ) -> None:
         self.policy = policy
+        # Required, with no default, deliberately: this is what attributes a relayed stderr line to a
+        # feed (ADR 0166), and a default would silently reinstate the unattributable relay for every
+        # future caller. Parent-side only -- it is not marshalled, on the same rule as ``_env`` below.
+        self._inbound = inbound
         self._config_dir = str(Path(config_dir))
-        # Kept for the caller's signature (engine.py resolves and passes it), but NOT marshalled: the
+        # Kept for the caller's signature (``engine.py`` resolves it into the config source and
+        # ``wiring_runner._sandbox_for`` passes it here), but NOT marshalled: the
         # worker never read it — `load_config()` takes only a directory — and a dead field on the wire
         # is a field nobody validates.
         self._env = env
@@ -416,6 +581,14 @@ class SandboxSession:
         # after spawn, cleared by every ``_kill``. POSIX reaps via the worker's process group instead.
         self._job: int | None = None
         self._responses: queue.Queue[Any] = queue.Queue()
+        # The current generation's drain threads (frames on fd 1, stderr on fd 2), joined ONLY on the
+        # shutdown path -- see :meth:`close`.
+        self._threads: list[threading.Thread] = []
+        # Monotonic per-session worker counter. Part of a relayed line's identity because a pid is NOT
+        # a unique generation id: an OS recycles pids (aggressively on Windows), and a stale relay can
+        # still be draining a killed child while the next one runs -- two generations' records would
+        # then be byte-indistinguishable, which is the attribution defect this change exists to fix.
+        self._generation = 0
         self._lock = threading.Lock()
         self._closed = False
 
@@ -435,6 +608,7 @@ class SandboxSession:
         # A fresh response queue per spawn so a prior (killed) worker's trailing EOF can't leak into
         # this generation's reads.
         self._responses = queue.Queue()
+        self._generation += 1
         # Fixed argv (this interpreter + our own worker module), no shell, no
         # untrusted input in the command line — so B603 does not apply. ``start_new_session`` puts the
         # worker in its own POSIX process group so ``_kill`` can ``killpg`` its whole tree; it is a
@@ -443,21 +617,49 @@ class SandboxSession:
             [sys.executable, "-m", WORKER_MODULE],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=None,  # let the child's stderr (logging) pass through to the engine's stderr
+            # CAPTURED, not inherited (BACKLOG #343, ADR 0166): with ``stderr=None`` the child's stderr
+            # WAS the engine's, so admin-authored Handler code wrote unframed, unattributed bytes --
+            # including whole message bodies -- straight into the operator's log of record.
+            stderr=subprocess.PIPE,
             bufsize=0,
             close_fds=True,
             start_new_session=sys.platform != "win32",
         )
-        assert proc.stdin is not None and proc.stdout is not None
+        assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+        # BOTH drains start before anything that can raise between here and the boot frame write. For
+        # fd 1 that ordering is pre-existing; for fd 2 it is a REQUIREMENT this change creates. A PIPE
+        # nobody drains blocks its writer once the fixed OS buffer fills (tens of KiB), and the boot frame
+        # below triggers ``load_config()`` -- top-level admin config, the earliest untrusted code and
+        # the first thing that can print. Undrained, every spawn would hang to ``startup_seconds`` and
+        # report a startup timeout naming the wrong cause. Starting them before the job assignment also
+        # closes the window in which that assignment raising would leave a live child with an undrained
+        # pipe and no reaper. Per-generation state travels as THREAD ARGUMENTS, never off ``self``, so
+        # a stale generation's drain cannot write into the live one's counters.
+        gen = self._generation
+        relay = _StderrRelay(self._inbound, proc.pid, gen)
+        self._threads = [
+            threading.Thread(
+                target=self._reader_loop,
+                args=(proc.stdout, self._responses),
+                name=f"mf-sandbox-frames-{self._inbound}-{gen}",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=relay.run,
+                args=(proc.stderr,),
+                name=f"mf-sandbox-stderr-{self._inbound}-{gen}",
+                daemon=True,
+            ),
+        ]
+        for thread in self._threads:
+            thread.start()
         # Assign the Windows kill-on-close job BEFORE the boot frame. The boot frame triggers
         # ``load_config()``, which runs top-level admin config — the earliest untrusted code and the
         # first chance to spawn a grandchild. Until then the worker parks on its first stdin read, so
-        # assigning here is race-free: any process the worker later spawns is already in the job.
+        # assigning here is race-free: any process the worker later spawns is already in the job. The
+        # drains above do not disturb that argument, which turns on the CHILD's first stdin read and
+        # not on what the parent's threads are doing.
         self._job = _assign_kill_on_close_job(proc)
-        reader = threading.Thread(
-            target=self._reader_loop, args=(proc.stdout, self._responses), daemon=True
-        )
-        reader.start()
         try:
             _write_frame(
                 proc.stdin,
@@ -513,6 +715,13 @@ class SandboxSession:
         # response pipe) and would outlive a bare ``proc.kill()`` as an orphan still holding the pipe.
         # ``self._job`` is the current worker's kill-on-close job on Windows (``None`` on POSIX, where
         # the worker's process group is reaped instead). Clear it after — the handle is now closed.
+        #
+        # The same reap EOFs fd 2, so the stderr relay thread ends on its own here exactly as the frame
+        # reader does. Neither thread is joined on THIS path (a respawn must not wait on a grandchild
+        # that holds a pipe open, and this runs under the session lock), and neither pipe is closed:
+        # closing a file object under a mid-read thread raises ``ValueError``, which is not what either
+        # drain's ``except OSError`` catches, so it would escape into ``threading.excepthook``. The
+        # shutdown-only bounded join lives in :meth:`close`.
         _reap_process_tree(proc, self._job)
         self._job = None
         try:  # noqa: SIM105
@@ -527,6 +736,18 @@ class SandboxSession:
         with self._lock:
             self._closed = True
             self._kill(self._proc)
+            for thread in self._threads:
+                # A bounded join, and ONLY on the shutdown path. The stderr relay LOGS, and a daemon
+                # thread that logs can still be inside a handler's ``emit`` when ``logging.shutdown``
+                # runs at exit -- writing to a closed stream, or holding a handler lock the atexit hook
+                # then blocks on. An UNBOUNDED join would be wrong (a surviving grandchild holds the
+                # pipes, and this runs under ``self._lock`` from ``asyncio.to_thread``), but a short one
+                # lets the final flush land before the handlers close. The reap above EOFs both pipes,
+                # so the usual cost is microseconds; the budget is spent only when a grandchild survived
+                # it, and the runner closes sessions SEQUENTIALLY, so that ceiling is per inbound.
+                # The respawn path in :meth:`_spawn` deliberately does not join at all.
+                thread.join(timeout=_STDERR_JOIN_SECONDS)
+            self._threads = []
 
     def _reject_unsolicited(self, proc: subprocess.Popen[bytes] | None, when: str) -> None:
         """Drop the worker if anything is pending that no outstanding request asked for.
@@ -535,8 +756,10 @@ class SandboxSession:
         left over **after** its answer was written by something other than the call we made — a
         Handler writing straight to fd 1, or a grandchild that inherited it while the worker was
         alive. Letting such a frame sit in the queue is the whole exploit: the next dispatch would
-        take it as its own answer. It is not an authoring accident either — ``print()`` goes through
-        the text wrapper, not the frame writer — so there is no benign case to preserve. Drop the
+        take it as its own answer. It is not an authoring accident either — the child rebinds
+        ``sys.stdout`` to stderr at bootstrap (ADR 0166), so the text layer cannot reach fd 1 at all
+        and a frame arriving here was written by something that went looking for the raw descriptor.
+        There is no benign case to preserve. Drop the
         worker and dead-letter the message in hand; :meth:`_kill` then reaps that grandchild along
         with the rest of the worker's tree, so it cannot keep writing to the pipe.
 

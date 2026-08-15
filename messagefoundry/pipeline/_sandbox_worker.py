@@ -24,12 +24,14 @@ direction, in either process.
    The reply echoes the request's ``id``, ``phase`` and ``name`` so the parent can prove the frame
    answers the call it made.
 
-stdout is the binary IPC channel — **nothing else may write to it**. Logging and any diagnostics go to
-stderr (inherited by the engine) through the **same PHI-redaction + control-char-scrub filter chain the
-engine installs on its own handlers** (:func:`~messagefoundry.logging_setup.configure_stderr_logging`),
-so a child log line carrying message-derived content is redacted and CR/LF-neutralized here rather than
-arriving raw on the inherited stream. The engine parent enforces the wall-clock cap and kills a runaway
-child, so this process never needs its own watchdog.
+stdout is the binary IPC channel — **nothing else may write to it**, and :func:`_redirect_stdout_to_stderr`
+states that intent by pointing ``sys.stdout`` at stderr for the rest of the process (ADR 0166). Logging
+and any diagnostics go to stderr — which the parent CAPTURES and relays, attributed, with content
+confined below INFO — through the **same PHI-redaction + control-char-scrub filter chain the engine
+installs on its own handlers** (:func:`~messagefoundry.logging_setup.configure_stderr_logging`), so a
+child log line carrying message-derived content is redacted and CR/LF-neutralized here as well as on
+the parent's own handlers. The engine parent enforces the wall-clock cap and kills a runaway child, so
+this process never needs its own watchdog.
 """
 
 from __future__ import annotations
@@ -48,6 +50,36 @@ from messagefoundry.logging_setup import configure_stderr_logging
 # reach the engine's stderr with neither PHI redaction nor CR/LF scrubbing (BACKLOG #1054).
 configure_stderr_logging()
 log = logging.getLogger("messagefoundry.sandbox.worker")
+
+#: Keeps the startup ``sys.stdout`` wrapper alive for the process lifetime. Load-bearing, not
+#: belt-and-braces: :func:`main` captures ``sys.stdout.buffer`` (the ``BufferedWriter``), which does
+#: **not** keep its ``TextIOWrapper`` alive; after the rebind ``sys.__stdout__`` is the only other
+#: reference, ``TextIOWrapper.__del__`` closes its buffer, and admin config -- which runs after the
+#: rebind -- may assign ``sys.__stdout__``. A one-line ``sys.__stdout__ = None`` in a config module
+#: would otherwise close fd 1 and make the next frame write raise ``ValueError``, which none of
+#: :func:`main`'s ``except (OSError, SandboxError)`` clauses catch.
+_ORIGINAL_STDOUT: Any = None
+
+
+def _redirect_stdout_to_stderr() -> None:
+    """Point ``sys.stdout`` at ``sys.stderr`` so ordinary text output cannot reach fd 1 (BACKLOG #343).
+
+    fd 1 is the MFW2 frame channel. A Handler's ``print()`` lands in the startup ``TextIOWrapper``'s
+    buffer while frames go through the underlying ``BufferedWriter``, so today it happens not to
+    corrupt a frame -- an artifact of two buffers over one descriptor that nobody chose and nothing
+    pins. Aliasing the NAME states the intent: text goes to stderr, where the parent's relay attributes
+    it and confines its content below INFO.
+
+    Design intent, **not** an enforced invariant: ``sys.__stdout__.buffer``, ``os.write(1, ...)`` and
+    ``open(1, "wb")`` still reach fd 1. The closed-tag codec plus the parent's unsolicited-frame check
+    remain the control for a raw writer -- claiming fd 1 is enforced frames-only would be a
+    compensating control resting on a false premise (SDS-3.7).
+
+    Not ``os.dup2(2, 1)``, which moves the DESCRIPTOR and would take the frame writer's own
+    ``BufferedWriter`` with it; not ``detach()``, which leaves ``sys.__stdout__`` unusable."""
+    global _ORIGINAL_STDOUT
+    _ORIGINAL_STDOUT = sys.stdout
+    sys.stdout = sys.stderr
 
 
 class _ForbiddenImportFinder:
@@ -215,6 +247,10 @@ def main() -> int:
 
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
+    # Sequenced deliberately: AFTER the frame writer captures its raw handle (at module scope the
+    # capture above would resolve to fd 2 and send every frame to the wrong pipe) and BEFORE the boot
+    # frame read below, whose reply path runs ``load_config()`` -- the earliest untrusted code.
+    _redirect_stdout_to_stderr()
 
     frame = _read_frame_bytes(stdin)
     if frame is None:
