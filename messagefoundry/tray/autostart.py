@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Opt-in autostart via the HKCU Run key (ADR 0113 §9).
 
 Autostart is **off by default** and toggled from the menu. The launch command pins the **absolute**

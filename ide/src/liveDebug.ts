@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Live-debug (#92): a deterministic, OFFLINE confidence loop. When toggled on, saving a config module
 // re-runs `messagefoundry dryrun --trace json` against a chosen SYNTHETIC sample and renders, over the
 // active module: (v1) CodeLens summaries above the `@router` / `@handler` / inbound() declarations, and

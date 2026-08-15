@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Tests for the ledger gate (scripts/hooks/ledger_check.py).
 
 The defect under test merges CLEAN, which is what makes it dangerous: two sessions each pick "the next

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Background status poller for the tray (ADR 0113 §3).
 
 A single daemon thread ticks every few seconds: read the local SCM state, probe the tokenless

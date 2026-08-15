@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The SessionStart backstop's allowlist, and the self-protection its installer was missing.
 
 Two findings from the drift audit, both about the *second* half of the estate — the part everyone forgets

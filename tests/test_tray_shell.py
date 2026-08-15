@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Shell-adjacent seams (ADR 0113 §2/§4/§9): menu id mapping, autostart, single-instance, imports.
 
 The ctypes message pump itself is Windows-only and covered by manual QA; here we pin the decidable

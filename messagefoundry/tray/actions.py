@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Tray actions: open the console, the repo in VS Code, and the service log (ADR 0113 §5/§7).
 
 Side-effecting shells (open a browser tab, spawn ``code``, open a file) kept thin; the resolution

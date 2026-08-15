@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // The Steps-view HL7 field picker (ADR 0104 §2.3): a native cascading segment -> field -> component
 // quick-pick that produces a path literal (e.g. "PID-3.1"). It NEVER blocks a path — free-text is
 // reachable at every stage, so Z-segments / site-custom / cross-version paths are always typeable

@@ -1,5 +1,5 @@
 # Copyright (c) MessageFoundry contributors.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """A4 — structural guards against the harness's ONE bug class.
 
 Nine defects (B1, B6, B7, B8, B9, B10 and the D-series) share a single shape: **a fixed constant

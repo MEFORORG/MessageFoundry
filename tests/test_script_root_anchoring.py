@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Scripts invoked by absolute ``-File`` path must act on the checkout they LIVE in, not the cwd.
 
 The regression home for the "cwd is not the caller" family (BACKLOG #1057, #1059, #1060, #1062, #1063).

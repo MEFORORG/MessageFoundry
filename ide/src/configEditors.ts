@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Custom editors (#221b): register the EXISTING connection form and code-set grid as
 // `CustomTextEditorProvider`s so opening connections.toml / a codesets/*.csv lands in the form by
 // default, with VS Code's automatic "Reopen With → Text Editor" always available (the AWS Workflow
