@@ -505,6 +505,18 @@ harness process only.)
   and until it lands those five glyphs stay. **No NEW glyph vocabulary may be introduced anywhere**,
   and nothing outside those two files may adopt one.
 
+  **THE WARNING SIGN (U+26A0) IS NOT A SIXTH HOLDOUT — owner-ruled 2026-08-14, "not sanctioned".** It
+  is in neither `_CLOSED` nor `_OPEN`, so `parse_items` ignores it and it carries no status semantics
+  anywhere; it is decoration, which the rule above forbids outright. **The measured population is
+  recorded here so nobody re-derives the false zero that stalled this question once already: 496
+  occurrences across 80 files** at `ae76b9f9` — 447 under `docs/` (121 in `BACKLOG.md`, 93 in
+  `BACKLOG-CLOSED.md`, 35 in `docs/adr/`), 10 in `tests/`, 4 in `ide/`, 3 in engine source, and **zero
+  in `scripts/`, in the web console, and in this file**. Retiring them is **BACKLOG #1265**, a filed
+  migration — *not* a licence to start editing those 496 lines, and not a cp1252 hazard (the cp1252
+  gate covers `scripts/**/*.py`, which contains none of them). **Census this population only with the
+  ledger counts as a positive control** — the first attempt returned a false zero off a broken shell
+  escape, and a pattern that finds nothing anywhere is indistinguishable from a clean repo.
+
   **When you must read that alphabet, import `parse_items` from `backlog_status_check.py`. Never
   re-derive it.** It *defines* item status — the banner block ends at the first line that is neither
   blank nor a blockquote — and a hand-rolled scan is a second, silently different definition. That is
