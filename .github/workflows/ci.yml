@@ -317,6 +317,21 @@ jobs:
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
         run: ruff format --check .
 
+      # Licence headers (BACKLOG #1010). Mirrors the `licence-header` pre-commit hook. Scope lives in
+      # the script's COMMENT_PREFIXES map rather than being restated here, so unlike ruff and bandit
+      # these two callers cannot drift apart in the first place.
+      #
+      # DELIBERATELY NOT PATHS-FILTERED, unlike the ruff steps above. `changes.code` keys on
+      # `alwayscode='\.(py|ps1|sh|ts|js|yml|yaml|toml|lock|cfg|ini)$'`, which omits `.go` -- so a
+      # Go-only PR sets code=false and this gate would skip on precisely the PR that introduced the
+      # headerless file. No `.go` source is tracked today, but BACKLOG #1011 rules on whether a Go tree
+      # stays, and a gate that silently stops covering a language the moment one is added is the exact
+      # failure this item exists to remove. The scan reads ~1,300 files in under a second, so filtering
+      # it would buy nothing and cost a blind spot.
+      - name: Licence headers (SPDX)
+        if: runner.os == 'Linux'
+        run: python scripts/quality/licence_header_check.py
+
       # Two mypy passes on Linux so BOTH platforms' typed branches are checked without paying for a
       # Windows mypy: the default linux-platform run, plus an explicit --platform win32 run that types
       # the sys.platform=='win32' branches (ctypes.windll / DPAPI / service_control) the linux run

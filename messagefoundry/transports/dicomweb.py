@@ -89,6 +89,52 @@ _DICOM_JSON = "application/dicom+json"
 _FAILED_SOP_SEQUENCE = "00081198"
 
 
+# DICOM PS3.5 section 9.1: a UID is dot-separated numeric components, at most 64 characters.
+#
+# Checked WITHOUT a regex, deliberately. The natural pattern for this grammar is
+# `\A[0-9]+(?:\.[0-9]+)*\Z`, which nests '+' inside '*' and so trips this repo's ReDoS gate
+# (`test_security_static.py::test_no_catastrophic_regex_in_source`). Measured against a known-
+# catastrophic control, that pattern is LINEAR -- 200x the input costs 183x the time, while the
+# control goes exponential -- so the gate is matching the SHAPE, not real backtracking. That is NOT
+# a reason to take an exception: a split-and-check is simpler, obviously linear, and leaves the
+# gate's conservatism (which is the design -- BACKLOG #1235) untouched. A false positive is a reason
+# to change the code, not to weaken the check.
+#
+# `str.isdigit()` is unusable here: it is Unicode-aware and returns True for superscript and
+# Arabic-Indic digits, so it would admit non-ASCII into the URL path and reopen the very hole this
+# screen closes. The explicit ASCII set is the control, not an optimisation.
+_UID_DIGITS = frozenset("0123456789")
+_DICOM_UID_MAX_LEN = 64
+
+
+def _reject_non_uid(value: str, field: str) -> None:
+    """Gate a configured DICOM UID to its PS3.5 grammar before it flows into the URL path.
+
+    ``_reject_url_control_chars`` rejects CR/LF/NUL but **not** the path metacharacters ('/', '..', '?',
+    '#', '@') that would redirect a PHI-bearing STOW-RS POST to a different study, or to another service
+    entirely, on the same allow-listed host (CWE-918). Digits-and-dots admits none of them **by
+    construction**, which is the right polarity for a screen: an allow-list cannot be outflanked by a bad
+    shape nobody thought to enumerate. PHI-safe — names the field, never the value.
+
+    Leading zeros within a component are **deliberately admitted** although PS3.5 forbids them. That is a
+    conformance rule, not a security one: it constrains no character this gate is here to exclude, and
+    refusing a real-world non-conformant UID at startup would block a legitimate deployment for no gain
+    in containment.
+    """
+    if len(value) > _DICOM_UID_MAX_LEN:
+        raise ValueError(
+            f"DICOMweb {field} is longer than the {_DICOM_UID_MAX_LEN}-character DICOM UID limit"
+        )
+    # Every component must be non-empty and entirely ASCII digits. Requiring non-empty is what makes
+    # '..', a leading dot and a trailing dot illegal -- they are excluded STRUCTURALLY, not by
+    # enumeration. A trailing newline is excluded for free (it lands inside the final component and is
+    # not a digit), which is the hole a `$`-anchored regex would have left open -- #1240's defect.
+    if not all(part and _UID_DIGITS.issuperset(part) for part in value.split(".")):
+        raise ValueError(
+            f"DICOMweb {field} is not a valid DICOM UID (dot-separated digits, no other characters)"
+        )
+
+
 def _reject_url_control_chars(value: str, field: str) -> None:
     """Reject a configured value that carries a C0/DEL control char before it flows into the URL path. A
     CR/LF in ``study_uid`` would let it split the request line; urllib would reject it with a bare
@@ -153,6 +199,9 @@ class DicomWebDestination(DestinationConnector):
         self.study_uid: str | None = str(study_uid) if study_uid else None
         if self.study_uid is not None:
             _reject_url_control_chars(self.study_uid, "study_uid")  # it flows into the URL path
+            # BACKLOG #1241: and the control-char screen alone is not enough for a value that becomes a
+            # path SEGMENT — refuse at construction, where the operator sees it, not at the URL layer.
+            _reject_non_uid(self.study_uid, "study_uid")
         self.timeout: float = float(s.get("timeout_seconds", 30.0))
         self.encoding: str = s.get("encoding", "utf-8")
         # ADR 0013: capture the STOW-RS dicom+json response. Default False → returns None, byte-identical.
@@ -240,7 +289,11 @@ class DicomWebDestination(DestinationConnector):
         """``{base}/studies`` (server assigns the study) or ``{base}/studies/{study_uid}`` when set."""
         base = self.base_url.rstrip("/")
         if self.study_uid:
-            return f"{base}/studies/{self.study_uid}"
+            # Defense-in-depth percent-encode, matching the fhir.py path-segment treatment this file was
+            # asymmetric with (BACKLOG #1241). It is a NO-OP today by construction — the UID grammar
+            # admits only digits and dots, both RFC 3986 unreserved — and that is the point: it is here
+            # so a later loosening of the grammar cannot silently put a raw metacharacter in the path.
+            return f"{base}/studies/{urllib.parse.quote(self.study_uid, safe='')}"
         return f"{base}/studies"
 
     def _build_headers(self, s: dict[str, Any]) -> dict[str, str]:

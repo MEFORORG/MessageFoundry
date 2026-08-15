@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // AI-assistance policy resolution for the IDE. The policy is centrally governed by the engine; the
 // IDE reads it (never sets it) and gates the @messagefoundry chat assistant accordingly. Resolution
 // is authoritative-engine-first, falling back to the local CLI (which reads messagefoundry.toml) when

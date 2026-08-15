@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Pure (vscode-free) helpers for the config-dir refresh lane (ADR 0091 follow-through): the
 // trailing-edge debounce that coalesces a burst of file events (a git pull touching 40 files, or a
 // save that fires BOTH onDidSaveTextDocument and the FileSystemWatcher) into ONE validate+refresh

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Pure, dependency-free HL7 v2 before/after diff for the Test Bench. No `vscode` import, so it is
 // unit-testable in isolation and cannot pull the extension host into a test. The engine's
 // `parsing/` package is intentionally NOT imported (§4 keeps the IDE off the engine internals);

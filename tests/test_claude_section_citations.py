@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Every cited ``CLAUDE.md`` section number must resolve to a section that exists.
 
 ``CLAUDE.md``'s numbered sections are a de facto API. Measured 2026-08-12: 281 tracked files name the

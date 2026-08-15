@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Push guard -- refuse a DIRECT push to a protected branch, a push to a ref outside
 ``refs/heads/``/``refs/tags/``, or a push whose tip tree carries private documents.
 

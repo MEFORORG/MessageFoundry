@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Code-set (translation table) grid editor — a webview that creates/edits a codesets/<name>.csv by
 // shelling the `messagefoundry codeset show|upsert|rename|remove` CLI (which validates + writes the
 // CSV, then re-loads it as the post-write authority). A code set is read-only reference data: the

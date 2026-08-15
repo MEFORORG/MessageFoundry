@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Branded launcher so Windows names the tray "MessageFoundry Tray", not "Python" (ADR 0113).
 
 Windows 11's "Other system tray icons" list (Settings → Personalization → Taskbar) names an icon

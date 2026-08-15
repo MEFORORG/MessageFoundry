@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Wiring Map (ADR 0091 D3): a READ-ONLY, focus-first graph panel over the one wiring graph — an
 // on-demand editor-area webview (the Nx Console pattern), never a sidebar surface and never the
 // whole estate by default. Strictly a projection of wiringMapModel's output: four labelled columns

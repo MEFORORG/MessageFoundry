@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Pure segment ranking for the HL7 field picker (ADR 0104 §2.3 P2). Given a handler's recognized message
 // type (from `accepts=message_type_of(...)` or an inferred guard) + the sample's segments, partition the
 // schema's segments into visibly distinct groups — in-scope first, then Z-segments and other sample

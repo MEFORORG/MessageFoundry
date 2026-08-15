@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Icon asset selection for the tray (ADR 0113 §8).
 
 Pure mapping from ``(TrayState, Theme)`` to a checked-in ``.ico`` file under ``tray/assets/``. The

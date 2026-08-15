@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 <#
 .SYNOPSIS
     Install the cross-session coordination hooks so they load in EVERY worktree, not just some.
@@ -139,6 +141,14 @@ $MAIL_MARKER = "mefor-mail"
 #   mefor-coord / mefor-announce / mefor-mail / mefor-wake   -- pairwise non-containing, checked.
 $WAKE_MARKER = "mefor-wake"
 
+# A FIFTH marker, for the seat recorder. Same pairwise rule, re-checked rather than assumed:
+#   mefor-coord / mefor-announce / mefor-mail / mefor-wake / mefor-seat
+# No one of the five contains another in either direction, so no installer can strip a sibling's row.
+# Its own blast radius is small by design -- a Stop hook that fails records nothing that turn and
+# costs the session nothing -- but it is separate so the recorder can be removed
+# (-Only Stop -Uninstall) without disarming the mail drain, which shares the Stop event.
+$SEAT_MARKER = "mefor-seat"
+
 # The shim. No installed copy: it locates the script in a checkout and runs it, so a `git pull` updates
 # the hook everywhere with nothing to fall stale. Silent and exit-0 outside a repo, because this file is
 # user-global and runs in every unrelated project on the machine.
@@ -221,6 +231,36 @@ function New-AnnounceShimCommand {
     )
 }
 
+# The SEAT shim. Deliberately NOT Shim='std', and the reason is the defect this whole layer is built
+# to expose. The std shim is Test-Path-then-run: when the script is absent it produces ZERO BYTES and
+# exits 0, which is byte-identical to a healthy hook that had nothing to do. install-coordination.ps1
+# already records that exact class -- "byte-identical to a healthy hook with no peers, which is how a
+# wired-but-resolving-nothing hook survived for weeks".
+#
+# THAT MATTERS MORE HERE THAN ANYWHERE ELSE. The shim resolves against the PRIMARY checkout's working
+# tree, which tracks main and is routinely behind it. Until this commit lands on main, every seat's
+# recorder resolves nothing -- and with the std shim the fleet would look quiet and healthy while
+# recording nothing at all, in every session, with every settings.json reporting green.
+#
+# $mf gates the notice on "this is a MessageFoundry checkout": this file is user-global and runs in
+# every unrelated project on the machine, and a notice about a missing MEFOR script in someone's
+# unrelated repo is noise, not a signal.
+function New-SeatShimCommand {
+    $notice = "[seat] scripts/hooks/seat-record.ps1 is missing from this checkout -- the seat recorder is wired but resolving nothing, so this session is NOT being recorded and a cold start would not see it."
+    return (
+        "# $SEAT_MARKER`n" +
+        '$c = (& git rev-parse --path-format=absolute --git-common-dir 2>$null); ' +
+        'if ($LASTEXITCODE -eq 0 -and $c) { $c = $c.Trim(); ' +
+        '$bases = @((Split-Path $c -Parent), (& git rev-parse --path-format=absolute --show-toplevel 2>$null)); ' +
+        '$hit = $false; $mf = $false; ' +
+        'foreach ($b in $bases) { if (-not $b) { continue } $b = $b.Trim(); ' +
+        'if (Test-Path -LiteralPath (Join-Path $b ''scripts/coord/presence.ps1'')) { $mf = $true } ' +
+        '$s = Join-Path $b ''scripts/hooks/seat-record.ps1''; ' +
+        'if (Test-Path -LiteralPath $s) { & $s; $hit = $true; break } } ' +
+        'if (-not $hit -and $mf) { Write-Output ' + "'$notice'" + ' } }'
+    )
+}
+
 # Timeout 15 on the announce row is the hook's ONLY time bound -- the peer lookup runs in-process by
 # design -- so it must comfortably exceed presence.ps1's MEASURED ~1.0 s while staying short enough that
 # a hang is not felt as a hang at prompt submit. UserPromptSubmit takes no matcher.
@@ -237,6 +277,10 @@ $WIRING = @(
     # exactly the standing tax that keeps steer-inject opt-in. Stop pays it once.
     @{ Event = "SessionStart"; Matcher = $null; Script = "scripts/hooks/mail-drain.ps1"; Timeout = 20; Msg = "Checking session mail"; Marker = $MAIL_MARKER; Shim = "std" }
     @{ Event = "Stop"; Matcher = $null; Script = "scripts/hooks/mail-drain.ps1"; Timeout = 20; Msg = "Checking session mail"; Marker = $MAIL_MARKER; Shim = "std" }
+    # Stop, not UserPromptSubmit: the recorder is exercised at ACCOUNT-SWITCH frequency (days), so a
+    # per-prompt spawn would be a standing tax for a rare path. Timeout 25 covers seat.ps1's git calls
+    # -- roughly ten cheap plumbing commands plus a `stash create` -- with room on a loaded box.
+    @{ Event = "Stop"; Matcher = $null; Script = "scripts/hooks/seat-record.ps1"; Timeout = 25; Msg = "Recording this seat's episode"; Marker = $SEAT_MARKER; Shim = "seat" }
 
     # The URGENT tier: mail-watch.ps1, armed at Stop, which is the moment the session goes IDLE.
     #
@@ -378,6 +422,7 @@ foreach ($path in $SettingsPath) {
                         command       = $(
                             switch ($w.Shim) {
                                 "announce" { New-AnnounceShimCommand }
+                                "seat" { New-SeatShimCommand }
                                 "wake" { New-WakeShimCommand $w.Script $w.Marker }
                                 default { New-ShimCommand $w.Script $w.Marker }
                             }

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Measure what the Steps view actually projects over a config estate (BACKLOG #239).
 
 WHY THIS EXISTS. [ADR 0089](../../docs/adr/0089-recognition-first-lens-native-idioms.md) §1

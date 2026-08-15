@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Meta-test: a server-DB suite that no workflow runs is dead coverage.
 
 A module gated at import time on ``MEFOR_TEST_SQLSERVER`` / ``MEFOR_TEST_POSTGRES`` contributes
