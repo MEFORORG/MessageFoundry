@@ -43,8 +43,24 @@
     unreadable record, and a seat whose writer had just failed and said so in
     seats/.writer-errors.txt, each rendered under "NO STOP CONDITIONS. The roster below is as complete
     as this instrument can establish." That is this module's one job failing in the one place it exists
-    to hold. The rule now runs both ways: nothing is printed that no stop reads, and nothing is a stop
-    operand that the receipt does not print.
+    to hold.
+
+    THE RULE RUNS BOTH WAYS, AND THE SECOND HALF IS THE ONE THAT REGRESSES. Nothing is a stop operand
+    that the receipt does not print, and a printed field is read by AT LEAST ONE stop -- as its
+    operand, or by name inside a stop's own text, where it is the instrument a reader needs in order to
+    check that operand. THE EXCEPTIONS ARE DECLARED RATHER THAN GLOSSED, because an enumeration that
+    claims to be exhaustive is a liability (SDS-3.6): `renderedAtUtc` and `seatsDir` are read by no
+    stop, and they are here because they name WHEN and WHERE every other field was measured.
+
+    The pass that first wrote that sentence shipped three fresh decorations, which is why the rule is
+    now stated with its exceptions instead of as a guarantee. MEASURED by reading this file's own
+    bytes -- the `$receipt` block against every `$stops +=` line -- `recordsCheckoutGone`,
+    `checkoutsWithSeveralRecords` and `writerHeartbeatNewestAgeMinutes` were printed and no stop read
+    any of them; the same scan also caught `liveSessionsInRepo`, `repoWorktrees` and `originMainSha`,
+    which the reader who filed the first three had not. The worst of them is `recordsCheckoutGone`,
+    because it is the field that REMOVES rows from the respawn population. Each is now read, and every
+    stop added for one is GATED so that it is not permanently lit -- see CRYING WOLF below for why
+    that gate is not optional, and why "give the orphan a stop" is only half a repair.
 
     A COUNT OF FILES IS NOT A MEASUREMENT OF FRESHNESS. Three fields were counting existence where the
     question was recency, and all three could therefore only ever go UP:
@@ -57,8 +73,26 @@
         keyed on the total would fire forever after the first ever failure. The operand is therefore
         the RECENT count. A channel that fires when nothing is wrong trains its reader to skip it, and
         this file already paid for that lesson once (see CRYING WOLF below).
-    So every staleness verdict here is measured against -FreshMinutes, and that bound is itself a
-    receipt field, because a number is not checkable without the instrument that produced it (SDS-3.8).
+    So every staleness verdict here is measured against a bound the receipt PRINTS, because a number
+    is not checkable without the instrument that produced it (SDS-3.8). There are two such bounds and
+    both are receipt fields: `-FreshMinutes` (`freshWithinMinutes`) for "is this still being written",
+    and `-FoldDays` (`foldOlderThanDays`) for "is this old enough to fold out of the roster".
+    ORIGIN/MAIN'S OWN AGE USED TO BE THE COUNTEREXAMPLE and it is worth naming, because the sentence
+    it falsified sat two lines above it: that verdict compared against a literal 60 which appeared in
+    no receipt field and in no stop text. MEASURED on the shipped file -- FETCH_HEAD aged to 90
+    minutes, `-FreshMinutes 600` -- the receipt printed `freshWithinMinutes 600` and the stop fired
+    anyway, handing the reader a verdict they could not check against anything they had been shown.
+    That is the exact SDS-3.8 failure the sentence claimed to have closed. It is now on the same knob
+    as everything else.
+
+    AND A BOUND IS TWO-SIDED OR IT IS NOT A BOUND. `age -le $FreshMinutes` on its own passes a
+    NEGATIVE age, so a record timestamped in the FUTURE read as maximally fresh for ever. MEASURED
+    against a REAL live process: an asOf ten days ahead rendered `AGE_H -240` beside "NO STOP
+    CONDITIONS", and so did a three-hour-old record written without its trailing Z on a box west of
+    UTC -- the ConvertFrom-Json retyping bug this project measured three times in one day, see
+    Get-AgeMinutes. A nonsense age now gets the treatment this file already documents for an
+    UNPARSABLE one -- NOT fresh, which is the safe direction -- and is counted into a stop of its own,
+    because a record whose clock is wrong is one no staleness verdict here can describe.
 
     A FENCE THAT IS PRESENT IS NOT A FENCE THAT CAN SEE. `rootsExamined` and `fenceAvailable` test that
     a config root holds a sessions/ DIRECTORY -- an existence test on a folder. An EMPTY sessions/
@@ -75,6 +109,50 @@
     exists to prevent. That exact fix was proposed once for the UNKNOWN token and rejected for that
     reason. A stop suppresses the CLAIM OF COMPLETENESS while still rendering every row; a
     reclassification would delete the rows from the answer.
+
+    AND "CAN SEE" IS A PER-ROOT FACT THAT AN AGGREGATE CANNOT CARRY. A seat's registry record lives
+    under exactly ONE config root, and this box runs five. `fenceSessionRecordsRead` is a TOTAL, so a
+    root that read NOTHING is invisible the instant any other root reads something -- the previous
+    pass moved the measurement from "a directory exists" to "records were read", which was right, and
+    then collapsed it across roots, which put the hole back one level down. MEASURED against a
+    controlled two-root USERPROFILE with a REAL live process: delete the live session's registry file
+    from the root that owned it, leave one unrelated readable record in the other root, and the total
+    stays at 1, `fenceCanSee` stays TRUE, no stop fires, and the still-running seat renders INTERRUPTED
+    and enters the respawn population under "NO STOP CONDITIONS". The denominator goes blind by the
+    same cause, so the second net is down too: `liveSessionsInRepo` fell 1 to 0 in the same run. The
+    receipt therefore reports the DISTRIBUTION, `fenceSessionRecordsReadPerRoot`, beside the total, and
+    the number of roots that read nothing is a stop operand.
+
+    THAT STOP IS GATED, AND THE GATE IS THE WHOLE DESIGN. A sessions/ directory that is simply EMPTY
+    is the ordinary state of an idle login, and nothing on this host separates it from a root whose
+    records went missing -- registry writes are event-driven and there is no heartbeat, which is
+    session-registry.ps1's own standing caveat. MEASURED on this box: THREE of five roots read zero
+    records right now, so an ungated "some root read nothing" would fire on every run for ever, which
+    is the CRYING WOLF failure below and one this file has already paid for once. So the stop also
+    requires the destructive verdict to EXIST in this run: at least one row rendered INTERRUPTED on
+    the strength of a NOT-REGISTERED fence answer. If nothing was manufactured there is nothing to
+    say, and the wording points at the rows rather than at the roots.
+
+    THE READER IS LATE BY CONSTRUCTION, SO A BOUND AGAINST "NOW" CAN DISARM A STOP FOR ITS ONLY
+    READER. This file is run by a FRESH ACCOUNT AFTER a cutoff, routinely hours after the events it is
+    being asked about. A stop whose operand is "did this happen within -FreshMinutes of THIS READ" is
+    therefore evaluated long after the window it was meant to cover. MEASURED: six writer failures
+    stamped three hours ago -- every seat the writer was asked to record, nothing recorded since --
+    rendered under "NO STOP CONDITIONS", and the same six lines read with `-FreshMinutes 240` fired the
+    stop, so the only thing separating silence from the alarm was when the reader happened to arrive.
+    Both horns are real and neither may be traded for the other: an UNBOUNDED count fires for ever
+    after this repo's first failure (crying wolf), a NOW-bounded one is silent for the late reader who
+    is the only reader.
+
+    THE WAY OUT IS TO CHANGE WHAT THE OPERAND IS COMPARED TO, NOT HOW WIDE THE WINDOW IS. Compare two
+    timestamps that are BOTH on disk and the answer stops depending on when it is asked. A writer error
+    with no successful record write AFTER it stays lit for a reader arriving six hours or six days
+    late, and goes quiet the moment the writer records anything -- which is the sentence a reader
+    actually needs, and it decays on RECOVERY rather than on the clock. Same shape for the heartbeat:
+    seat.ps1 touches it BEFORE writing any record, so a heartbeat OLDER than the newest record in the
+    same box is structurally impossible while the writer works, and an absolute age bound there would
+    instead fire every morning on a genuinely idle fleet. Where a now-relative count is still worth
+    printing it is kept and NAMED as now-relative, beside the arrival-independent one.
 
     THE DENOMINATOR IS THE POINT. Joining records to the fence tells you nothing about a session
     that produced NO record -- it is not missing, it does not exist. `liveSessionsWithoutRecord`
@@ -223,6 +301,28 @@ function Get-AgeHours($iso) {
     return [Math]::Round($m / 60, 1)
 }
 
+# THE ONE FRESHNESS TEST, AND IT IS TWO-SIDED. Every "is this still being written" verdict goes
+# through here so the bound cannot be one-sided in one place and two-sided in another -- that split is
+# how a fix lands on one operand and misses its sibling.
+#
+# A NEGATIVE AGE IS NOT FRESHNESS, IT IS A BROKEN CLOCK. `$age -le $bound` alone passes every future
+# timestamp, so a record stamped ten days ahead reads as maximally fresh for ever and one stamped
+# three hours ago by a writer that dropped its trailing Z reads as fresh on any box west of UTC.
+# MEASURED both ways against a real live process: AGE_H -240 and AGE_H -2, each beside "NO STOP
+# CONDITIONS". So a nonsense age is routed to exactly where this file already routes an UNPARSABLE
+# one -- NOT fresh -- and Test-AgeNonsense below feeds a stop of its own, because "not fresh" alone
+# would only say the record is old when what is true is that its clock cannot be believed.
+#
+# THE SLOP IS ON THE NONSENSE TEST, NOT ON FRESHNESS. asOf is written truncated to the second and the
+# reader's own $now is taken later, so an honest record is never negative by more than rounding; two
+# minutes absorbs an idle clock-sync nudge without absorbing a real skew.
+function Test-AgeFresh($AgeMinutes, [int]$BoundMinutes) {
+    return ($null -ne $AgeMinutes -and $AgeMinutes -ge 0 -and $AgeMinutes -le $BoundMinutes)
+}
+function Test-AgeNonsense($AgeMinutes) {
+    return ($null -ne $AgeMinutes -and $AgeMinutes -lt -2)
+}
+
 # ---------------------------------------------------------------------------------------------
 # Gather. Records first, then the fence, then the denominator.
 # ---------------------------------------------------------------------------------------------
@@ -251,7 +351,28 @@ if (Test-Path -LiteralPath $seatsDir) {
                 $unreadableRecords++
                 continue
             }
-            $records += [pscustomobject]@{ Rec = $j; File = $f.FullName; Box = $d.Name }
+            # A JSON OBJECT IS NOT A SEAT RECORD EITHER. The guard above only asks whether the parse
+            # produced an object, which ANY `{...}` satisfies, and Get-RecField hands back a default
+            # for every absent field -- so the classifier below never faults on a shape problem and the
+            # RECORD-UNUSABLE state built for exactly this file is unreachable from here. MEASURED on
+            # the shipped file: a single `{"a":1}` dropped into a box directory rendered a roster row
+            # reading `(no-key)  NOT-DECLARED  POSSIBLY RUNNING` with recordsUnreadable=0 and
+            # recordsUnclassifiable=0, and -Detail printed a full SEAT EVIDENCE briefing over it,
+            # including two re-check commands rooted at an empty path. POSSIBLY RUNNING is a POSITIVE
+            # liveness verdict, and it was being asserted about a file that is not a seat.
+            #
+            # SO ADMIT ON EVIDENCE THIS READER ACTUALLY READS, NOT ON SYNTAX. One of these four fields
+            # is enough, and each is enough on its own because each is separately reachable: sessionId
+            # or sessionKey identifies the seat, `worktree` is what a respawn needs, and `asOf` is what
+            # every age is computed from. The documented `nosid` record (no sessionId at all, written
+            # by the plain hook path) carries the last three and is admitted unchanged -- pinned as a
+            # negative control, because a guard that rejected it would delete a whole reachable class
+            # of real seats from the roster.
+            $isSeatRecord = $false
+            foreach ($k in @('sessionId', 'sessionKey', 'worktree', 'asOf')) {
+                if ($null -ne (Get-RecField $j $k)) { $isSeatRecord = $true; break }
+            }
+            $records += [pscustomobject]@{ Rec = $j; File = $f.FullName; Box = $d.Name; IsSeatRecord = $isSeatRecord }
         }
     }
 }
@@ -271,9 +392,15 @@ if (Test-Path -LiteralPath $seatsDir) {
 # parsed -- and it is what `fenceCanSee` and the stop below are keyed on. It does NOT feed the
 # classifier: see the header for why turning a blind fence into POSSIBLY RUNNING would zero the
 # respawn population and manufacture the very roster this module exists to prevent.
+#
+# AND THE TOTAL IS NOT THE MEASUREMENT EITHER -- see the header. A seat's registry record lives under
+# exactly ONE root, so `fenceSessionRecordsRead` summed across roots hides a blind one behind a
+# populated one. The DISTRIBUTION is what the receipt owes the reader, so it is built here and the
+# count of roots that read nothing is a stop operand below.
 $fenceAvailable = $true
 $sessionRows = @()
 $rootsExamined = 0
+$roots = @()
 try {
     $roots = @(Get-ClaudeConfigRoots)
     $rootsExamined = $roots.Count
@@ -287,7 +414,25 @@ try {
 # an absence, so they are counted rather than dropped.
 $fenceRecordsUnreadable = @($sessionRows | Where-Object { -not $_.Record }).Count
 $fenceRecordsRead = @($sessionRows).Count - $fenceRecordsUnreadable
+# NAMED FOR WHAT IT MEASURES. This is an OR across roots and always was: it says SOME root answered,
+# never that every root could. The per-root breakdown below is what carries the other half, and the
+# stop keyed on this one is still the right stop for the case it names -- a registry that is empty
+# EVERYWHERE.
 $fenceCanSee = ($fenceAvailable -and $fenceRecordsRead -gt 0)
+
+# THE LEAF, NOT THE PATH. Config roots live under USERPROFILE and this field is rendered on -Json,
+# where redaction only rewrites `seatsDir`; a leaf (".claude-account-2") is the part a reader needs
+# and carries no home path, so the safe form is also the readable one.
+$fenceReadByRoot = [ordered]@{}
+foreach ($rt in $roots) { $fenceReadByRoot[[string](Split-Path $rt -Leaf)] = 0 }
+foreach ($row in $sessionRows) {
+    if (-not $row.Record) { continue }
+    $leaf = [string](Split-Path ([string]$row.Root) -Leaf)
+    if (-not $fenceReadByRoot.Contains($leaf)) { $fenceReadByRoot[$leaf] = 0 }
+    $fenceReadByRoot[$leaf] = [int]$fenceReadByRoot[$leaf] + 1
+}
+$fenceRootsBlind = @($fenceReadByRoot.Keys | Where-Object { [int]$fenceReadByRoot[$_] -eq 0 })
+$fenceReadPerRootText = (@($fenceReadByRoot.Keys | ForEach-Object { "$_=$($fenceReadByRoot[$_])" }) -join '; ')
 
 function Get-NormPath([string]$p) {
     if (-not $p) { return '' }
@@ -343,11 +488,27 @@ if ($wtOut) {
 # A record whose asOf will not parse keeps a $null age, which is treated below as NOT fresh. That is
 # the safe direction: it fires a stop that says the roster may be short, rather than certifying a
 # record whose age nothing could establish.
+#
+# THE SAME PASS ALSO YIELDS THE WRITER'S NEWEST SUCCESS, GLOBALLY AND PER BOX. A record on disk IS a
+# successful record write, so its age is the one arrival-independent thing this layer can compare a
+# writer FAILURE or a stale HEARTBEAT against -- see the header on why comparing either to "now"
+# disarms it for the only reader this file has. It is accumulated over EVERY record, sid or not: the
+# documented `nosid` record is still a write that succeeded.
 $recordAgeBySession = @{}
+$recordNewestAge = $null
+$recordNewestAgeByBox = @{}
+$recordsFutureDated = 0
 foreach ($r in $records) {
+    $m = Get-AgeMinutes (Get-RecField $r.Rec 'asOf')
+    if (Test-AgeNonsense $m) { $recordsFutureDated++ }
+    if ($null -ne $m) {
+        if ($null -eq $recordNewestAge -or $m -lt $recordNewestAge) { $recordNewestAge = $m }
+        if (-not $recordNewestAgeByBox.ContainsKey($r.Box) -or $m -lt $recordNewestAgeByBox[$r.Box]) {
+            $recordNewestAgeByBox[$r.Box] = $m
+        }
+    }
     $sid = [string](Get-RecField $r.Rec 'sessionId' '')
     if (-not $sid) { continue }
-    $m = Get-AgeMinutes (Get-RecField $r.Rec 'asOf')
     if (-not $recordAgeBySession.ContainsKey($sid)) { $recordAgeBySession[$sid] = $m }
     elseif ($null -ne $m -and ($null -eq $recordAgeBySession[$sid] -or $m -lt $recordAgeBySession[$sid])) {
         $recordAgeBySession[$sid] = $m
@@ -382,6 +543,34 @@ foreach ($h in $heartbeats) {
 $heartbeatNewestAge = $null
 if ($heartbeatAgeByBox.Count -gt 0) {
     $heartbeatNewestAge = [int][Math]::Round((($heartbeatAgeByBox.Values | Measure-Object -Minimum).Minimum))
+}
+
+# AND THE AGE HAS TO BE READ BY SOMETHING, OR IT IS THE DECORATION IT REPLACED. The previous pass
+# swapped a file COUNT for an AGE and then left the age in the receipt with no stop reading it -- the
+# only heartbeat stop is `liveSessionsWithStaleWriterHeartbeat`, which is computed over the live
+# sessions in this clone and is therefore structurally ZERO in the cold-start case this module exists
+# for. MEASURED: the Stop hook disabled thirty days ago, every seat dead, `writerHeartbeatIn=2` and
+# `writerHeartbeatNewestAgeMinutes=43200` printed above "NO STOP CONDITIONS".
+#
+# AN ABSOLUTE AGE BOUND IS THE WRONG INSTRUMENT HERE and that is not a judgement call: the newest
+# heartbeat on a genuinely IDLE fleet is old by definition, and the reader arrives late by
+# construction, so an absolute bound fires every morning on a healthy quiet repo. The comparison is
+# what never cries wolf. seat.ps1 rule 3 touches the heartbeat on EVERY invocation and does it BEFORE
+# writing any record, so within a box `heartbeat newer-or-equal to the newest record` holds while the
+# writer works; a heartbeat OLDER than a record in the same box means that record was written by
+# something that did not touch the heartbeat, which cannot happen to a functioning writer. The one
+# minute of slop is the write ordering inside a single turn, which is sub-second.
+#
+# WHAT IT DOES NOT CATCH, SAID PLAINLY RATHER THAN GLOSSED (SDS-3.6): a fleet where the writer stopped
+# EVERYWHERE at once leaves the heartbeat and the record equally old, so the comparison is silent and
+# only the seats' own ages say the fleet is cold. This narrows the hole to that case; it does not
+# close it, and the honest alternative was a bound that fires on every idle morning.
+$heartbeatOlderThanRecordBoxes = @()
+foreach ($b in $recordNewestAgeByBox.Keys) {
+    if (-not $heartbeatAgeByBox.ContainsKey($b)) { continue }
+    $hb = $heartbeatAgeByBox[$b]
+    $rc = $recordNewestAgeByBox[$b]
+    if ($null -ne $hb -and $null -ne $rc -and $hb -gt ($rc + 1)) { $heartbeatOlderThanRecordBoxes += $b }
 }
 
 # The writer's own failure log. seat.ps1 rule 2 appends one line per failure and still exits 0, so

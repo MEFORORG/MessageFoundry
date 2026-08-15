@@ -629,7 +629,23 @@ foreach ($path in $SettingsPath) {
             # failure mode here, and it is worst of all in a root we cannot test by starting a session.
             try { $null = $json | ConvertFrom-Json } catch { throw "generated settings JSON is invalid: $_" }
             Set-Content -LiteralPath $path -Value $json -Encoding UTF8
-            Write-Host ("  {0}  {1}" -f $(if ($Uninstall) { "REMOVED " } else { "INSTALLED" }), $path)
+            $wroteRoots += $path
+            for ($i = 0; $i -lt $WIRING.Count; $i++) { $removedWritten[$i] += $rootRemoved[$i] }
+            if ($Uninstall) {
+                Write-Host ("  REMOVED   {0} row(s)  {1}" -f (($rootRemoved | Measure-Object -Sum).Sum), $path)
+            }
+            else { Write-Host ("  INSTALLED {0}" -f $path) }
+        }
+        else {
+            # ShouldProcess said no: -WhatIf, or a -Confirm the operator declined. NOTHING was written
+            # to this root, and saying so here is the whole fix -- PowerShell's own "What if:" line is
+            # about the intent, not about what the file now holds.
+            $previewRoots += $path
+            for ($i = 0; $i -lt $WIRING.Count; $i++) { $removedPreview[$i] += $rootRemoved[$i] }
+            if ($Uninstall) {
+                Write-Host ("  PREVIEW   {0} row(s) of ours are present and would go -- NOTHING WRITTEN  {1}" -f (($rootRemoved | Measure-Object -Sum).Sum), $path) -ForegroundColor Yellow
+            }
+            else { Write-Host ("  PREVIEW   NOTHING WRITTEN  {0}" -f $path) -ForegroundColor Yellow }
         }
     }
     catch {
@@ -639,22 +655,54 @@ foreach ($path in $SettingsPath) {
 }
 
 Write-Host ""
-Write-Host ("Roots examined: {0}   succeeded: {1}   failed: {2}   as of {3}" -f `
-        $SettingsPath.Count, ($SettingsPath.Count - $failed.Count), $failed.Count, [DateTime]::UtcNow.ToString('o'))
-# THE ROW INVENTORY IS PRINTED ON BOTH PATHS. It used to be gated on `-not $Uninstall`, so a removal
-# reported only that something had been removed and from how many roots -- never WHICH rows. That is a
-# receipt stating what it found rather than what it acted on, and it is how one row's removal could
-# take three hooks with nothing in the output able to show it.
-foreach ($w in $WIRING) { Write-Host ("  {0,-16} -> {1,-38} [{2}]" -f $w.Event, $w.Script, $w.Marker) }
+# "succeeded" USED TO COUNT A PREVIEW AS A SUCCESS, which is the same lie one level up: a -WhatIf run
+# over five roots reported five successes and wrote nothing. The three counters below are disjoint and
+# each names what happened to the file.
+Write-Host ("Roots examined: {0}   written: {1}   previewed (NOTHING WRITTEN): {2}   failed: {3}   as of {4}" -f `
+        $SettingsPath.Count, $wroteRoots.Count, $previewRoots.Count, $failed.Count, [DateTime]::UtcNow.ToString('o'))
+# THE ROW INVENTORY IS PRINTED ON BOTH PATHS, AND ON THE UNINSTALL PATH IT CARRIES A MEASURED COUNT.
+# It used to be gated on `-not $Uninstall`, so a removal reported only that something had been removed
+# and from how many roots -- never WHICH rows. Printing the rows closed that half and left the other
+# open: the rows came from the static $WIRING table, so the receipt was identical whether the run took
+# three rows, one, or none, and identical again under -WhatIf where it takes none by construction.
+# Every number below is counted by the strip loop above, against each file as this run read it.
+foreach ($i in 0..($WIRING.Count - 1)) {
+    $w = $WIRING[$i]
+    $tail = ""
+    if ($Uninstall) {
+        if ($wroteRoots.Count -gt 0) {
+            $tail = "  removed {0}" -f $removedWritten[$i]
+            if ($removedPreview[$i] -gt 0) { $tail += ("   (+{0} matched in a root nothing was written to)" -f $removedPreview[$i]) }
+        }
+        else { $tail = "  would remove {0}" -f $removedPreview[$i] }
+    }
+    Write-Host ("  {0,-16} -> {1,-38} [{2}]{3}" -f $w.Event, $w.Script, $w.Marker, $tail)
+}
 Write-Host ""
 if ($Uninstall) {
-    Write-Host "  Those are the rows this run REMOVED wherever it succeeded; any hook not listed was left alone."
-    Write-Host "  Takes effect in NEWLY STARTED sessions; existing ones keep the config they booted with."
+    if ($wroteRoots.Count -gt 0) {
+        Write-Host "  Those counts are MEASURED: each is the number of entries this run actually dropped from"
+        Write-Host "  the roots it wrote. A row showing 0 was examined and was not there -- which is the case"
+        Write-Host "  this receipt could not previously distinguish from a removal. Any hook not listed was"
+        Write-Host "  left alone."
+        Write-Host "  Takes effect in NEWLY STARTED sessions; existing ones keep the config they booted with."
+    }
+    if ($previewRoots.Count -gt 0) {
+        Write-Host ("  {0} of {1} root(s) were a PREVIEW (-WhatIf, or a -Confirm you declined). NOTHING was" -f $previewRoots.Count, $SettingsPath.Count) -ForegroundColor Yellow
+        Write-Host "  written there and every hook is still wired exactly as it was. Their counts above are"
+        Write-Host "  what a real run would have dropped, measured against the file as it stands now."
+    }
 }
 else {
-    Write-Host "  Takes effect in NEWLY STARTED sessions; existing ones keep the config they booted with."
-    Write-Host "  A root listed above is a root whose settings FILE now carries the entry. That is not the"
-    Write-Host "  same as a hook that FIRED -- confirm with a session started under that login."
+    if ($wroteRoots.Count -gt 0) {
+        Write-Host "  Takes effect in NEWLY STARTED sessions; existing ones keep the config they booted with."
+        Write-Host "  A root marked INSTALLED above is a root whose settings FILE now carries the entry. That is"
+        Write-Host "  not the same as a hook that FIRED -- confirm with a session started under that login."
+    }
+    if ($previewRoots.Count -gt 0) {
+        Write-Host ("  {0} of {1} root(s) were a PREVIEW (-WhatIf, or a -Confirm you declined). NOTHING was" -f $previewRoots.Count, $SettingsPath.Count) -ForegroundColor Yellow
+        Write-Host "  written there. The rows above are what a real run WOULD write, not what any file carries."
+    }
 }
 Write-Host ""
 if ($failed.Count -gt 0) { exit 1 }

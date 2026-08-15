@@ -943,14 +943,21 @@ function Invoke-WithRecordLock {
                 [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
             break
         } catch [System.IO.IOException] {
+            # THE SLEEP IS SKIPPED ONLY WHEN THE BREAK ACTUALLY SUCCEEDED. -EA Stop, not
+            # SilentlyContinue: a lock whose holder is ALIVE cannot be deleted (the handle above is
+            # opened FileShare::Read, which does not permit delete), and a hold that legitimately
+            # outlasts StaleMs would then have looked stale on every pass and spun this loop at full
+            # tilt for the whole timeout -- burning a core inside a Stop hook to reach the same
+            # answer. A failed break falls through and waits like ordinary contention.
+            $broke = $false
             try {
                 $fi = Get-Item -LiteralPath $LockPath -EA Stop
                 if (([DateTime]::UtcNow - $fi.LastWriteTimeUtc).TotalMilliseconds -gt $StaleMs) {
-                    Remove-Item -LiteralPath $LockPath -Force -EA SilentlyContinue
-                    continue
+                    Remove-Item -LiteralPath $LockPath -Force -EA Stop
+                    $broke = $true
                 }
             } catch { }
-            Start-Sleep -Milliseconds 15
+            if (-not $broke) { Start-Sleep -Milliseconds 15 }
         } catch {
             # Not contention -- a permission or path fault. Spinning on it would burn the whole
             # budget for nothing.
@@ -1155,7 +1162,8 @@ try {
             # note already points at a handoff filename that no longer exists, and nothing reported
             # it because nothing validates a pointer.
             $handoffObj = [ordered]@{ path = $Handoff; bytes = $null; sha256 = $null; pointedAt = $now; unresolved = $true }
-            Write-WriterError -Stage 'handoff-pointer' -Message "declared handoff does not exist: $Handoff"
+            # DEGRADED: the record carries handoff.unresolved=true, so it says this itself (rule 2).
+            Write-WriterDegraded -Stage 'handoff-pointer' -Message "declared handoff does not exist: $Handoff"
         }
     }
 
@@ -1174,7 +1182,9 @@ try {
         try { $notesValue = Limit-Text -Text $Notes }
         catch {
             $notesValue = "[note dropped by the writer: $($_.Exception.Message)]"
-            Write-WriterError -Stage 'notes' -Message $_.Exception.Message
+            # DEGRADED: the notes field itself holds the drop marker, so the record says this (rule
+            # 2). The rest of the write -- the whole involuntary half -- landed intact.
+            Write-WriterDegraded -Stage 'notes' -Message $_.Exception.Message
         }
     }
 
@@ -1224,6 +1234,9 @@ try {
         dirty            = $g.dirty
         stashSha         = $g.stashSha
         stashRef         = $g.stashRef
+        # The anchor's OWN age. A carried anchor is a fact from an earlier turn and this record must
+        # not date it to now (see Get-GitFacts).
+        stashAsOf        = $g.stashAsOf
         # THE PROBE'S OWN OUTCOME (rule 6), and it is listed here for the reason
         # test_missing_field_is_absent_not_empty exists: a field added to Get-GitFacts and not wired
         # into this literal is absent from the record while every count still agrees. It happened to
@@ -1238,6 +1251,11 @@ try {
         handoff          = $handoffObj
         predecessor      = $pred
         notes            = $notesValue
+        # EVERY DEGRADATION THIS TURN RECORDED, IN THE TURN'S OWN RECORD (rule 2's second channel).
+        # seats/.writer-degraded.txt is fleet-wide and append-only; this is per-seat and per-turn, so
+        # a reader can say WHICH seat degraded and WHEN without parsing a shared log, and an empty
+        # list here is a measurement -- this write reached this line, so the list is complete for it.
+        writerDegraded   = @($script:Degraded)
     }
 
     Write-RecordAtomic -Path $recPath -Object $rec
