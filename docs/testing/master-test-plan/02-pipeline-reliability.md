@@ -117,8 +117,13 @@ chapter or any downstream one:
    run `test_load_failover_{sqlserver,postgres}` with the harness setting **no** `claim_mode`, i.e.
    under the pooled default, and hard-gate zero acknowledged loss + `lane_inversions == 0`.
 4. **Postgres 2-engine crash-and-restart recovery.** `FCP:STORE-10`'s "not built" is stale —
-   `tests/test_shard_recovery_postgres.py` exists (4 tests). Its problem is that it **runs nowhere**
-   (PIPE-01), not that it is missing.
+   `tests/test_shard_recovery_postgres.py` exists (4 tests). **CORRECTED (BACKLOG #1100): it does not
+   "run nowhere".** It runs in `ci.yml`'s `postgres-store` job, step *"Run the failover +
+   engine-shard recovery suites on real Postgres"* — but that job is gated on
+   `schedule || workflow_dispatch || changes.outputs.serverdb == 'true'`, so it does **not** run on a
+   PR that touches no server-DB path. The accurate statement is *runs only on the server-DB
+   path-gated leg*, which is what PIPE-01 is actually for. "Runs nowhere" understated the coverage and
+   "runs in CI" would overstate it; only the gated form supports a decision about PIPE-01.
 5. **`accepts=` static fail-closed validation** — `FCP:PIPE-9` is closed by
    `test_accepts_seam.py` (the three static-validation negatives).
 6. **Purity replay-equality harness** — `FCP:PIPE-14`'s replay half is closed by
