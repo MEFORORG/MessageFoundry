@@ -9573,6 +9573,27 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **A. RETRACTED -- SEE THE RETRACTION ABOVE. Struck, not deleted.** The claim was that the rubric asks about cadence and so structurally cannot express a fanout fault. It instructs a seat to classify a long gap as a slow or broken clock and to conclude *"the chain is broken and you are awake only by luck."* A seat that hits a **quantised** gap -- the signature of *"the clock fired and you were skipped"* -- is therefore instructed to file the **wrong diagnosis**. One nearly did. **CONFIRMED FIRST-HAND BY THE FILING SEAT:** four ticks were received this session, each eliciting a cadence report, and **a cadence report is the only shape this rubric can produce.** It cannot express a recipient-set fault because no seat can observe one from its own inbox (#1266).
 
+> **THE FIX FOR THIS ITEM NEARLY KILLED THE FLEET, MEASURED 2026-08-15. READ THIS BEFORE APPLYING ANYTHING.** The building lane drafted the replacement text, was stopped on unrelated authority grounds, and **then measured the draft it had already written**:
+> ```
+> current tick body        1960 chars   (verified independently -- the live delivered tick)
+> hard cap                 2000         headroom FORTY
+> their FIRST draft        3536         OVER BY 1536
+> the 2026-08-14 outage    3395         -- their draft was WORSE than the edit that
+>                                          killed every seat's clock for 35 minutes
+> revised, measured        1981         under cap, NINETEEN to spare
+> ```
+> **AND THE VERIFICATION THEY WOULD NATURALLY HAVE RUN IS EXACTLY THE PAIR THAT CANNOT CATCH IT.** `seat-tick.ps1:201-204` records it from the last occurrence: *"the author checked that the file PARSED and carried no glyphs. Both passed. Neither could have caught this -- a clean parse says nothing about a runtime length check in a different script. MEASURE THE BODY LENGTH AFTER ANY EDIT, AND THEN RUN THE CLOCK AND READ THE HEARTBEAT. A live fire is the only check that covers this."*
+>
+> **THE NEAR MISS IS THE FINDING, NOT THE SAVE.** They had reached *"do not apply"* independently -- **on AUTHORITY grounds, because the file is unversioned, which is an UNRELATED reason.** So the fleet was protected **by luck**, while a fleet-killing text sat in a proposal document **reading as ready to paste.** **A correct outcome reached for the wrong reason is not a control.**
+>
+> **WHAT PAID FOR THE NEW TEXT IS THE FILE'S OWN STANDING RULE, `:206-207`:** *"forensic detail belongs in the BACKLOG ITEM, not in a message that fires every ten minutes to every seat."* **The revision drops the old forensics -- the 53-of-112 figure and the 36-minute outage -- and cites this item instead.** That is the rule applied to the very text that states it.
+>
+> **APPLY-TIME REQUIREMENT, non-negotiable and from the file itself: after applying, RUN THE CLOCK AND READ THE HEARTBEAT.** A live fire is the only check that covers the cap.
+>
+> **LIMB B'S PROVE-THE-FIX FIRED ON ITS OWN AUTHOR, TEN MINUTES AFTER THEY WROTE IT.** At the first tick after drafting they ran both questions against their own state: **the OLD question said STOP; the NEW question said WORK, and named a specific item.** That is the constructed case the item demanded, arriving unconstructed.
+>
+> **SECOND-ORDER FINDING, and it wants its own number: NINETEEN CHARACTERS IS NOT A MARGIN.** The body is **chronically at cap** -- 1960 before, 1981 after -- so **the next edit of any size fails identically, and nothing measures it.** The remedy is either a length assertion that **fails loudly at edit time**, or a deliberate reduction restoring real headroom. **Routed as content; not filed here.**
+
 > **C. A THIRD DEFECT, ADDED 2026-08-15, AND IT IS NOT LIMB A RESURRECTED.** Limb A was retracted because the rubric **does** name a fanout fault. **This is the opposite problem: it names it and MISCLASSIFIES it.** The live text asserts that QUANTISED *"means every firing HAPPENED and NONE REACHED YOU -- a DELIVERY fault, not a slow clock."* **That is wrong in one of three cases.** A quantised gap also arises when the seat was **DARK and the clock CORRECTLY SUPPRESSED** -- measured at 79m56s = 8.0 cadences exactly, on-grid both ends, **working as designed** (`#1266`). **So the rubric instructs every seat to report a correct suppression as a delivery fault**, which inflates the very count `#1266` rests on. **The fix is a third branch, not a reworded second one:** a seat must exclude intervals in which it was dark before classifying at all. **This is rubric text, so it belongs here and not in `#1266`.**
 
 > **THE REPLACEMENT PROCEDURE, supplied 2026-08-15 by the seat the clock wakes. THE RUBRIC'S REAL DEFECT IS THAT IT STOPS: it says a quantised gap cannot separate a FANOUT SKIP from a FAILED SEND, and then ends -- a dead end in the exact case it was written to diagnose. It is resolvable, just not from one seat alone.**
