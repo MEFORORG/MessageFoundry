@@ -52,19 +52,57 @@ optional in `UserCreateRequest` and is not required for the Administrator role, 
 privileged account has the identical hole. Keying on the bootstrap user would close the instance this
 was found on and leave the class open.
 
-**2. Run the check EARLY IN THE LIFESPAN — after the store opens, before `engine.start()`.**
+**2. Run the check AFTER the bootstrap admin is created — which is AFTER `engine.start()`.**
 
-Measured on `api/app.py`: `async def lifespan` at `:5512`, `store = await open_store(...)` at `:5540`,
-`await engine.start()` at `:5731`. **The window is 191 lines wide**, and inside it the store is open
-and no engine tasks exist.
+> ## ⚠️ OVERTURNED 2026-08-15 03:20Z, BY WRITING THE CODE. THE TITLE OF THIS ADR IS NOW WRONG.
+>
+> **This ADR chose EARLY-LIFESPAN — after `open_store` at `:5540`, before `engine.start()` at
+> `:5731` — and that placement is IMPOSSIBLE for this check.** Measured on `api/app.py`, one
+> lifespan, in order:
+>
+> ```
+> 5540  store = await open_store(...)          <- the window I chose starts
+> 5731  await engine.start()                   <- the window I chose ends
+> 5837  auth = AuthService(...)                <- the service does not EXIST until here
+> 5852  bootstrap = await auth.initialize()    <- CREATES the bootstrap admin
+> 5923  yield
+> ```
+>
+> **Two independent blockers, either one fatal.** In the chosen window there is **no `AuthService`**
+> to call `has_notifiable_admin()` on; and on a first run there is **no administrator at all**,
+> because `initialize()` is what creates it (`auth/service.py:517`, `_ensure_bootstrap_admin`). A
+> check there would **refuse every first run, before the account it is about exists** — turning a
+> gate that reports a wrong answer into a gate that prevents startup outright.
+>
+> **SO THE `#1257` DEPENDENCY IS REAL AND RETURNS.** The check must sit after `:5852`, which is
+> inside the post-`engine.start()` window that `#1257` records as hanging. **The Dispatcher's
+> original ruling — do not close `#1020` before `#1257` — was right on its own terms all along, and
+> my narrowing of it was wrong.**
+>
+> **THIS VINDICATES THE RIDER'S AUTHOR.** They assumed the lifespan placement and were right, for a
+> reason neither the Dispatcher nor I identified while arguing about it: not merely *"the store is
+> there"*, but **the data the check needs does not exist until after the engine has started.**
+>
+> **What does NOT change:** the decision to gate on a deliverable address; the predicate
+> (`has_notifiable_admin`, built at `29a026e2`); the scoping to the ROLE; and the exit-code findings,
+> which were always about the post-start path.
+>
+> **This was found by writing the code, not by reading it.** Three seats reasoned about this
+> placement across two hours and none of us asked where the bootstrap admin is created — the one
+> question the check's own subject makes load-bearing.
 
 ### Placements considered
 
-| name | placement | store access | terminates? | exit code |
+| name | placement | has the data? | terminates? | exit code |
 |---|---|---|---|---|
-| **LIFESPAN** | after `engine.start()` | open | **hangs on `origin/main`; FIXED on PR #394** | n/a |
-| **PREFLIGHT** | `_serve`, before the ASGI app | **none available** | yes | **2** |
-| **EARLY-LIFESPAN** | after the store opens, before `engine.start()` | **open, plain `await`** | **yes, measured** | **3** |
+| **LIFESPAN (post-bootstrap, after `:5852`)** | after `engine.start()` | **YES — the only placement that does** | hangs on `origin/main`; **fixed on PR #394** | n/a |
+| **PREFLIGHT** | `_serve`, before the ASGI app | **no** — no store, no `AuthService` | yes | **2** |
+| **EARLY-LIFESPAN** | `:5540`–`:5731` | **NO — no `AuthService`, and on a first run no admin exists yet** | yes, measured | 3 |
+
+**The "has the data?" column is the one that decides it, and it is the column this ADR originally
+did not have.** The first two versions compared placements on store access, termination and exit
+code — three real properties, none of which is the binding constraint. **The binding constraint is
+that the check's subject does not exist until `:5852`.**
 
 **LIFESPAN is out on a measurement, not a preference — AND THE MEASUREMENT IS SCOPED TO A REF.**
 #1257 records that an exception after `engine.start()` unwinds nothing, so the refusal hangs the
