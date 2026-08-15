@@ -29,22 +29,43 @@ import tomllib
 from pathlib import Path
 
 import pytest
+import yaml
 
 _ROOT = Path(__file__).resolve().parents[1]
 _CI = _ROOT / ".github" / "workflows" / "ci.yml"
 _PYPROJECT = _ROOT / "pyproject.toml"
 _CONSOLE = "packaging/messagefoundry-webconsole/tests"
+#: The engine suite's step, addressed by NAME so this guard survives changes to how it is invoked.
+_ENGINE_STEP = "Tests (pytest)"
 
 
 def _engine_step_run_line() -> str:
     """The `run:` line of the engine `Tests (pytest)` step."""
-    text = _CI.read_text(encoding="utf-8")
-    # The engine step is the bare `pytest -q ...` invocation; the console step names its path.
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("run: pytest -q"):
-            return stripped
-    pytest.fail(f"no engine `run: pytest -q` line found in {_CI}")
+    # LOCATED STRUCTURALLY, BY STEP NAME, NOT BY SPELLING (BACKLOG #1260).
+    #
+    # This used to scan for a line starting with `run: pytest -q`, which pinned the step to being a
+    # ONE-LINE `run:`. Wrapping the invocation in a block -- so a native crash can be named as a
+    # crash rather than reported as a test failure -- broke the LOOKUP rather than any assertion, and
+    # the failure then read "no engine step found" instead of "the step moved". A locator coupled to
+    # a step's spelling blocks every change to how that step is invoked, which is not what this guard
+    # is for: it exists to assert the console package is SUBTRACTED.
+    #
+    # THE OBVIOUS RELAXATION IS WORSE AND WAS MEASURED. Broadening the scan to any `pytest -q` line
+    # matches `.github/workflows/ci.yml`'s EARLIER doc-guards step (`pytest -q -rs $DOC_GUARDS`) and
+    # asserts against the wrong invocation entirely -- caught here because this test went red on it.
+    # Disambiguating by `--ignore-glob` would have been circular: that is the thing under assertion,
+    # so the locator would be satisfied by its own subject and could never fail.
+    workflow = yaml.safe_load(_CI.read_text(encoding="utf-8"))
+    for job in workflow["jobs"].values():
+        for step in job.get("steps") or []:
+            if step.get("name") == _ENGINE_STEP:
+                run = step.get("run", "")
+                for line in run.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("pytest "):
+                        return stripped
+                pytest.fail(f"the {_ENGINE_STEP!r} step runs no `pytest` command:\n{run}")
+    pytest.fail(f"no step named {_ENGINE_STEP!r} found in {_CI}")
 
 
 def test_console_is_in_testpaths() -> None:
