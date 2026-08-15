@@ -125,6 +125,7 @@ from messagefoundry.store.store import (
     _append_channel_scope,
     _qmark_cutoff_case,
     audit_mac_bytes,
+    audit_prefix_verdict,
     audit_row_hash,
     delivery_key,
     not_deployed_detail,
@@ -8863,7 +8864,10 @@ class SqlServerStore:
         return bool(rows)
 
     async def verify_audit_chain(
-        self, *, expected_anchor: tuple[int, str] | None = None
+        self,
+        *,
+        expected_anchor: tuple[int, str] | None = None,
+        expected_prefix: tuple[int, str] | None = None,
     ) -> tuple[bool, str | None]:
         """Recompute the audit hash-chain in order; returns (ok, message) — see the SQLite store.
 
@@ -8889,6 +8893,15 @@ class SqlServerStore:
         )
         prev = ""
         first_break: int | None = None
+        #: BACKLOG #328. This backend is the ODD ONE OUT and it is worth naming: the SQLite and Postgres
+        #: twins carry a running ``count`` through the walk, while this one reports ``len(rows)`` and
+        #: tracks no position at all. A prefix capture needs a POSITION, so the counter the other two
+        #: already have is introduced here. Generalising the fix from either twin would have produced a
+        #: change that works on two backends and silently does nothing on this one.
+        seen = 0
+        #: Head as it stood AT ``expected_prefix[0]`` rows; None when the walk never reached that
+        #: position, which IS the truncation case. See the SQLite twin.
+        prefix_head: str | None = None
         for r in rows:
             # Per-row secret: keyless below the #190 watermark, keyed at/above it — in-heap HMAC key OR
             # isolated-module Transit MAC (ADR 0138), mirroring the SQLite twin so a keyless prefix and a
@@ -8919,6 +8932,12 @@ class SqlServerStore:
             if not row_ok and first_break is None:
                 first_break = int(r["id"])
             prev = r["row_hash"] or ""
+            seen += 1
+            # BACKLOG #328: capture the head AT the recorded prefix position in this same pass. A
+            # POSITION test, not a data-dependent branch, so it does not reintroduce the early return
+            # this walk deliberately avoids.
+            if expected_prefix is not None and seen == expected_prefix[0]:
+                prefix_head = prev
         if first_break is not None:
             return False, f"audit chain broken at row id={first_break}"
         if expected_anchor is not None:
@@ -8930,6 +8949,10 @@ class SqlServerStore:
                     f"audit log diverges from recorded anchor (have {len(rows)} row(s) head "
                     f"{prev[:12]!r}, expected {exp_count} head {exp_head[:12]!r}) — truncated or rewritten",
                 )
+        if expected_prefix is not None:
+            ok, msg = audit_prefix_verdict(expected_prefix, prefix_head, seen)
+            if not ok:
+                return False, msg
         return True, f"verified {len(rows)} audit row(s)"
 
     # --- auth: users / roles / sessions --------------------------------------

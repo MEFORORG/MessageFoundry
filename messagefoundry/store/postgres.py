@@ -143,6 +143,7 @@ from messagefoundry.store.store import (
     WebAuthnCredential,
     _finite_cutoff,  # backlog #106: keep-forever cutoff clamp
     audit_mac_bytes,
+    audit_prefix_verdict,
     audit_row_hash,
     delivery_key,
     not_deployed_detail,
@@ -6062,7 +6063,10 @@ class PostgresStore:
         return row is not None
 
     async def verify_audit_chain(
-        self, *, expected_anchor: tuple[int, str] | None = None
+        self,
+        *,
+        expected_anchor: tuple[int, str] | None = None,
+        expected_prefix: tuple[int, str] | None = None,
     ) -> tuple[bool, str | None]:
         """Recompute the audit hash-chain in order; returns ``(ok, message)``. Pass ``expected_anchor``
         from :meth:`audit_anchor` (held out-of-band) to also detect tail-truncation.
@@ -6085,6 +6089,9 @@ class PostgresStore:
         prev = ""
         count = 0
         first_break: int | None = None
+        #: Head as it stood AT ``expected_prefix[0]`` rows; None when the walk never reached that
+        #: position, which IS the truncation case (BACKLOG #328). See the SQLite twin.
+        prefix_head: str | None = None
         for r in rows:
             # Per-row secret: keyless below the #190 watermark, keyed at/above it — in-heap HMAC key OR
             # isolated-module Transit MAC (ADR 0138), mirroring the SQLite twin so a keyless prefix and a
@@ -6116,6 +6123,11 @@ class PostgresStore:
                 first_break = int(r["id"])
             prev = r["row_hash"] or ""
             count += 1
+            # BACKLOG #328: capture the head AT the recorded prefix position in this same pass. A
+            # POSITION test, not a data-dependent branch, so it does not reintroduce the early return
+            # this walk deliberately avoids.
+            if expected_prefix is not None and count == expected_prefix[0]:
+                prefix_head = prev
         if first_break is not None:
             return False, f"audit chain broken at row id={first_break}"
         if expected_anchor is not None:
@@ -6127,6 +6139,10 @@ class PostgresStore:
                     f"audit log diverges from recorded anchor (have {count} row(s) head {prev[:12]!r}, "
                     f"expected {exp_count} head {exp_head[:12]!r}) — truncated or rewritten",
                 )
+        if expected_prefix is not None:
+            ok, msg = audit_prefix_verdict(expected_prefix, prefix_head, count)
+            if not ok:
+                return False, msg
         return True, f"verified {count} audit row(s)"
 
     # --- auth: users / roles / sessions --------------------------------------

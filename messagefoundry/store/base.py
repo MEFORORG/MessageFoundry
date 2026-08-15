@@ -1498,7 +1498,10 @@ class AuditStore(Protocol):
     async def audit_anchor(self) -> tuple[int, str]: ...
 
     async def verify_audit_chain(
-        self, *, expected_anchor: tuple[int, str] | None = None
+        self,
+        *,
+        expected_anchor: tuple[int, str] | None = None,
+        expected_prefix: tuple[int, str] | None = None,
     ) -> tuple[bool, str | None]: ...
 
     async def rekey_audit_chain(
