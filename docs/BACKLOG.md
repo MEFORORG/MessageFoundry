@@ -4248,6 +4248,8 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 ## 1022. disable_mfa has no last-factor guard where delete_webauthn_credential does, so the two removal paths can be ordered to reach zero factors
 
+> **DO NOT BUILD -- ALREADY BUILT AND UNLANDED ON PR #394. Flagged 2026-08-15.** This item reads OPEN and UNCLAIMED on `origin/main`, so the pool offers it as fresh work; **the next lane to pull it rebuilds what exists.** That PR carries `b680ee0d fix(auth): refuse to strip the LAST second factor via disable_mfa (#1022)` and `261ae1c9 fix(webconsole): render the last-factor refusal as a page, not raw JSON (#1022)`. Re-checked at `origin/main` `2b64170a`: **still unlanded.** **Clear this banner when #394 lands; until then treat the item as taken.**
+
 > 🔢 **Filed 2026-08-04 — not started.** Value **5/10** · Difficulty **4/10** · _fill-in_. `delete_webauthn_credential` computes `last_second_factor` and refuses when MFA is required; `disable_mfa` has no equivalent test at all. A user with TOTP plus one passkey can delete the passkey (permitted, because `totp_enabled` is still True) and then disable TOTP (permitted, no guard), arriving at zero enrolled factors — the state ADR 0068 AC-10 says the system shall refuse.
 > ⚠️ **AMENDED 2026-08-11 — the guard is SOUND but the item is PARTIAL, and ADR 0068 now contradicts itself. Stays OPEN.** `w3-l2-auth-policy` (`a46f7a83`, pushed, **unlanded**) adds the missing `disable_mfa` last-factor test. Adversarially re-resolved and it survived: `has_webauthn_credentials` exists on **all four** store backends, so it is not silently `AttributeError`-ing off SQLite, and the identity is rebuilt per request, so roles are not stale.
 
@@ -9168,6 +9170,10 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 ## 1257. an exception after `engine.start()` unwinds nothing, so a startup refusal hangs the process instead of exiting
 
+> **DO NOT BUILD -- ALREADY BUILT AND UNLANDED ON PR #394. Flagged 2026-08-15.** This item reads OPEN and UNCLAIMED on `origin/main`, so the pool offers it as fresh work. That PR carries `0e9c104b fix(api): unwind the lifespan when startup fails after engine.start() (#1257)`, `ccfdfd90 test(api): assert the teardown did not MASK the startup error (#1257)`, and a new `tests/test_lifespan_startup_unwinds.py`. Re-checked at `origin/main` `2b64170a`: **that test file is still ABSENT, so it is still unlanded.**
+>
+> **AND ITS UNLANDED STATE IS LOAD-BEARING FOR `#1020`.** That item's placement decision was made because a post-`engine.start()` raise HANGS -- **measured against `origin/main`, which lacks this fix.** So `#1020`'s constraint is **REF-SCOPED, not permanent**: when this lands, the placement it disqualified stops being disqualified. `#1020`'s chosen placement avoids the window entirely and is unaffected either way. **Clear this banner when #394 lands, and re-read `#1020` at the same time.**
+
 > 🔢 **Filed 2026-08-14 - not started. A HUNG refusal, not a silent one -- and that distinction is the whole item.** Value **8/10** · Difficulty **5/10**. Any exception raised in the ASGI lifespan **after** `await engine.start()` leaves the engine, the upload-retention runner and the alert notifier running, and **the process never exits.** `uvicorn` itself behaves correctly: it prints the full error, logs `Application startup failed. Exiting.`, raises `SystemExit(3)` and binds no socket. The **process** then stays alive indefinitely.
 
 > **WHY THIS IS WORSE THAN A WRONG ANSWER, and the reason it outranks the item that found it.** An operator watching a console sees exactly the right error. **A SUPERVISOR SEES NOTHING WRONG.** The engine ships under **NSSM** ([`docs/SERVICE.md`](SERVICE.md)); systemd and container runtimes behave the same way. All of them decide by process liveness, and **running-and-dead is the one state a restart policy cannot detect and will not recover.** A service that refuses loudly and then hangs is indistinguishable, to the thing responsible for restarting it, from a service that is working.
@@ -9207,6 +9213,8 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **Provenance.** Raised, and deliberately **not acted on**, by the seat that noticed it while applying the rule to a new item -- on the grounds that reclassifying existing public items is not a dispatcher's unilateral call. Escalated, authorised by the owner, and filed with the destination question settled up front rather than discovered when the result lands.
 
 ## 1259. `parse_items` censuses a conflicted ledger without error, so a gate reports a clean count off a broken file
+
+> **DO NOT BUILD -- ALREADY BUILT AND UNLANDED ON PR #394. Flagged 2026-08-15.** This item reads OPEN and UNCLAIMED on `origin/main`, so the pool offers it as fresh work; **the next lane to pull it rebuilds what exists.** Measured against `refs/pull/394/head` (`0b6ccc47`): `scripts/docs/backlog_status_check.py` is **300 lines with zero conflict-marker signals on `origin/main`** and **326 lines with eleven on the PR**. Re-checked at `origin/main` `2b64170a`: **still unlanded.** **Clear this banner when #394 lands; until then treat the item as taken.**
 
 > 🔢 **Filed 2026-08-14 - not started. The census AGREED WITH INTENT while the merge was broken, which is why this is worth an item rather than a note.** Value **6/10** · Difficulty **2/10** · _quick win_. `parse_items` walks a `docs/BACKLOG.md` containing `<<<<<<<`, `=======` and `>>>>>>>` and returns a **plausible, correct-looking census**, because a conflict marker is not a heading and nothing in that function is looking for one.
 
