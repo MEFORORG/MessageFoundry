@@ -3967,6 +3967,33 @@ open.
 > **AND THE GENERATOR IS A CORRECT PRACTICE, WHICH IS WHY IT WILL RECUR.** The landing seat **deliberately declined to take closure**, on the defensible ground that closure is a judgement and the seat supplying a paired commit is arguably the wrong one to make it. **A practice that is right and produces stale-open items will keep producing them** -- so the remedy is a standing check, not a one-off flip. **Do not "fix" this by asking landing seats to close items they land.**
 >
 > **CLOSURE IS NOT PERFORMED HERE:** `backlog_status_check.py` hard-errors on an item carrying both a closed and an open banner, and separately on a shipped item still carrying a `**Priority:**`, so closing is three coupled edits including a verbatim archive move. **This banner records the evidence so whoever performs that closure does not re-measure it.**
+>
+> **ESCALATED 2026-08-15 ~04:05Z: THE CLAIM HAS BEEN RELEASED, AND IT WAS RIGHT TO RELEASE IT.** The
+> holding seat verified the landing on the ref before releasing (with a control, so the probe could not
+> answer yes to everything) and released correctly. **The consequence is that the last remaining
+> protection on this item was machine-local, and it is now gone on this machine too.** `#1010` is now
+> **landed, unclaimed, and reading as an unstarted quick win** -- and a `_quick win_` label is an active
+> invitation. **This banner is the only thing standing between that and a rebuild of merged work.**
+>
+> **PROVENANCE, so nobody re-measures it:** the build landed as **PR #398, merged 2026-08-15 03:49:37Z**;
+> the adding commit is **`8e551f41`**. On main the gate ships with its **negative control** and the
+> backfill; `fleet.ps1`, `seat.ps1` and `seat-record.ps1` all carry the SPDX header there.
+>
+> **AND A BANNER PROTECTS NOBODY UNTIL IT IS ON `main`.** This text is written on a dispatcher branch,
+> and builders read `origin/main`. **The write and the protection are two separate events with a gap
+> between them**, and during that gap the item is exactly as dangerous as it was before anyone noticed.
+> That gap is not a flaw in this banner; it is the general property of every ledger correction, and it
+> is why the durable remedy for this class is a standing check rather than a diligent reader.
+>
+> **CARRY THIS SENTENCE INTO THE CLOSURE -- it is the transferable half and it outlives the item:**
+> **the window between a backfill and its gate landing is where violations enter, and it is NOT
+> language-specific.** Measured: **`#399` added three `.ps1` files with no header AFTER the backfill was
+> written and BEFORE the gate landed.** Each pull request was **green in isolation**; the incompatibility
+> existed only once both were on main, so no single-PR check could have caught it. The standing note that
+> a new `.py` needs a header because an earlier sweep covered only existing files describes **this same
+> hole** -- which makes it **structural, not anecdotal**, and it will recur in the next language the gate
+> learns.
+
 
 
 > 🔢 **Scored 2026-08-04 → P2.** Value **7/10** · Difficulty **3/10** · _quick win_. AGPL-3.0-or-later is asserted twice — in `LICENSE` and at `pyproject.toml:29` — and then per-file provenance is left to habit. 981 of 1,044 tracked `.py` carry `SPDX-License-Identifier`, which makes the convention real and near-universal; the 63 that do not include **all 17 files of `messagefoundry/tray/`**, a package `only-include` puts in the wheel and `[project.gui-scripts]` gives its own entry point. Widen past Python and it is **196 of 1,181 tracked sources across six languages**. Five more files declare **Apache-2.0** in an AGPL project. Nothing — no hook, no workflow, no test — checks a licence header in any language.
