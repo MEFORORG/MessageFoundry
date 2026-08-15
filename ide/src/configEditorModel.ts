@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Pure (vscode-free) helpers behind the customEditor providers (#221b): deriving a code-set's name
 // from its file path, deciding whether it opens read-only in the grid, and the small guard that stops
 // the webview↔document update loop. Separated from configEditors.ts so this mapping is unit-testable

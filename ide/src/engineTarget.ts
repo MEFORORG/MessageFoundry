@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Engine-target host policy, shared by promote.ts and auth.ts so the loopback host list and the
 // non-TLS refusal live in ONE place (a divergent list would be a SSRF/credential-exfil gap).
 // Complements the machine-scoping of messagefoundry.engineUrl/environments (SEC-005, CWE-918): scope

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Alert-rule editor (ADR 0014) — a webview that manages the operator alert rules in the service-
 // settings TOML's `[[alerts.rules]]` by shelling the `messagefoundry alert list|add|remove` CLI
 // (which validates + writes comment-preservingly). Rules are pure routing/threshold DATA — there is

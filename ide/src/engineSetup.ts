@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Engine setup — the guided page the status pill leads with in a STORE-LESS workspace (BACKLOG #238,
 // ADR 0112 amendment 2026-07-16). A webview, not a QuickPick, because the situation needs room to
 // explain: production engines run as a service (docs/SERVICE.md), so an authoring checkout normally

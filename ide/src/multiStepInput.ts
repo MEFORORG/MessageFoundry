@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // The official VS Code "multi-step input" helper (adapted from the vscode-extension-samples
 // `quickinput-sample/src/multiStepInput.ts`), typed for strict mode. It drives a chain of QuickPick /
 // InputBox steps with Back navigation: each step function returns the next step (or calls

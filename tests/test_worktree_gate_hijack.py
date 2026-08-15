@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Tests for rule 3b of the worktree gate: hijacking a LINKED WORKTREE onto an existing branch.
 
 Rule 3 protects only the shared PRIMARY. Rule 3b protects every OTHER governed worktree from the one

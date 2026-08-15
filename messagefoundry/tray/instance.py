@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Single-instance guard via a per-session named mutex (ADR 0113 §9).
 
 ``CreateMutexW`` in the ``Local\\`` (per-session) namespace: a second launch sees

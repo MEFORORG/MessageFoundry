@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Typed wrapper over `messagefoundry connection schema --json` — the transport catalogue the
 // connection editor renders its form from (ADR 0007). The engine introspects its own factories
 // (messagefoundry/config/connection_schema.py), so the editor shows whatever the INSTALLED engine

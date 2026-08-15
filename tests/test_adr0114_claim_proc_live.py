@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """ADR 0114 sub-lever A — live SQL Server legs (env-gated: MEFOR_TEST_SQLSERVER=1 + MEFOR_STORE_*).
 
 The offline suite (test_adr0114_claim_proc.py) freezes the DDL text, the gate logic, and the

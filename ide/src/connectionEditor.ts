@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Connection editor (ADR 0007) — a webview form that creates/edits a connection in the workspace's
 // connections.toml by shelling the `messagefoundry connection upsert|remove` CLI (which validates +
 // writes comment-preservingly). Logic (routers/handlers) stays in .py; this edits transport config.

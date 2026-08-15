@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Shared HL7 v2 schema access for the code-view completion (completion.ts) and the Steps-view field
 // picker (hl7Picker.ts). Single source for the bundled hl7schema.json shape + segment ordering + the
 // segment/field/component enumeration primitives, so the two surfaces cannot drift. No per-keystroke

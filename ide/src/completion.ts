@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Live, no-server completion: HL7 field paths inside msg["..."]/.field("...")/.set("...") from the
 // bundled hl7schema.json — segment suggestions ranked by the enclosing @handler's declared message
 // type (accepts=message_type_of / the inert message_type= kwarg) via the bundled hl7structures.json
