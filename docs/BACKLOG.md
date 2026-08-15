@@ -4168,7 +4168,25 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 > **THE PRE-EXISTING CONDITION ABOVE NOW HAS A NUMBER: `#1257` (value 8, difficulty 5, not started) -- "an exception after `engine.start()` unwinds nothing, so a startup refusal hangs the process instead of exiting". Cross-linked 2026-08-14 (dispatcher) so the rider above stops being a warning nobody can act on.** The rider states the mechanism; it is not restated here.
 >
-> **ORDERING RULING: BUILD #1020 NOW; WHETHER IT MUST WAIT FOR `#1257` DEPENDS ON WHERE THE CHECK IS PLACED. NARROWED SAME HOUR -- the first version of this ruling asserted the dependency unconditionally and was too strong.**
+> **FINAL 2026-08-15 -- THE NARROWING BELOW IS OVERTURNED AND THE ORIGINAL UNCONDITIONAL RULING WAS RIGHT. `#1257` IS A REAL, UNAVOIDABLE DEPENDENCY. THE GATE IS PARKED. This entry is the CONVERGENCE, not another intermediate state; the item stops tracking this design here.**
+>
+> **FOUND BY WRITING THE CODE RATHER THAN READING IT**, by the building lane, against their own recommendation. **The lifespan runs in this order** (verified independently at `origin/main`):
+> ```
+> api/app.py:5540   store = await open_store(
+> api/app.py:5731   await engine.start()          <- the #1257 window opens here
+> api/app.py:5837       auth = AuthService(
+> api/app.py:5852       bootstrap = await auth.initialize()
+> auth/service.py:517       created = await self._ensure_bootstrap_admin()
+> ```
+> **TWO INDEPENDENT BLOCKERS ON A PRE-START CHECK, EITHER ONE FATAL.** (1) **There is no `AuthService` before `:5837`** to ask. (2) **On a FIRST RUN there is no administrator AT ALL** -- `initialize()` is what creates it. **So a check in the `:5540`-`:5731` window would REFUSE EVERY FIRST RUN, before the account it is about exists** -- converting a gate that reports a WRONG ANSWER into one that PREVENTS STARTUP. **That is worse than the defect, which is the identical test used to rule the post-start placement out.**
+>
+> **THEREFORE THE CHECK MUST SIT AFTER `:5852`, INSIDE THE POST-`engine.start()` WINDOW, AND THE `#1257` DEPENDENCY RETURNS INTACT.** The placement that has the data is the placement that carries the hazard; there is no third option.
+>
+> **THIS VINDICATES THE ORIGINAL RIDER'S AUTHOR FOR A REASON NONE OF THE THREE PARTIES IDENTIFIED WHILE ARGUING.** They assumed the lifespan placement and were right -- **not because "the store is there", which is what all of us debated, but because THE DATA THE CHECK NEEDS DOES NOT EXIST UNTIL AFTER THE ENGINE HAS STARTED.**
+>
+> **DISPATCH RULING: DO NOT BUILD THE GATE YET.** `#394` **rewrites the exact window** the check must live in (`api/app.py` grows 5985 to 6065 lines there, and its fix IS that window's unwind behaviour), and that PR is **draft and disarmed**, so there is no landing to race. **Building against a structure about to change, in the one place the code must go, is waste.** Re-approach against the post-`#394` tree.
+>
+> **WHAT SURVIVES AND IS NOT PARKED:** the decision to gate on a deliverable address; the predicate itself (**built and tested**); the ROLE scoping; and the exit-code findings, **which were always about the post-start path and are unaffected.**
 >
 > **THE TWO PLACEMENTS ARE DIFFERENT CODE PATHS, MEASURED.** `_serve` spans `__main__.py:1042-2833` and is a **PREFLIGHT that runs BEFORE the ASGI lifespan** -- its own comment at `:1541` says *"the Engine loads it inside the ASGI lifespan, well"* after. It holds **32 `return 2` sites**, and the existing security-channel refusal at `:2314-2322` reaches one at `:2329`: **a clean pre-engine process exit.** `#1257`'s hang is *"an exception after `engine.start()`"*, **inside the lifespan** -- and `engine.start()` does not appear in `__main__.py` at all. **So the hanging path and the existing refusal are not the same path.**
 >
