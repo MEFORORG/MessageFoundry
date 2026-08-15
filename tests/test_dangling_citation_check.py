@@ -188,25 +188,26 @@ def _repo_root() -> Path:
 
 
 def _live_shape_citations() -> list[tuple[str, int, int]]:
-    """Citations naming a number ABOVE the floor that are not PR/foreign-repo shaped.
+    """Citations naming a number that can still be issued -- the shape that can arm.
 
-    Below the floor is unreachable forever, and a foreign reference is not a backlog citation at
-    all; both are reported by the tool for a human to read and neither is a defect.
+    CALLS THE SHIPPED PREDICATES RATHER THAN RE-DERIVING THEM (BACKLOG #1235 residual 2). This
+    helper previously re-implemented both halves inline -- `number in filed` duplicating
+    `unresolved_citations`, and `number <= floor or pr_shaped` duplicating what `main` filters on.
+    Two of the three agreed with the script by convention, with nothing binding them: a rule with
+    two definitions is the exact defect this tool exists to catch in other people's gates.
+
+    The consequence is checkable and is the point: a single mutation to `cc.is_live_shape` now reds
+    BOTH this real-tree gate and the exit-code arms below. Before, mutating one left the other
+    green, which is what "agreeing by convention" buys you.
     """
     root = _repo_root()
     floor = cc.allocation_floor()
-    filed = cc.allocated_numbers()
-    out: list[tuple[str, int, int]] = []
-    for path in sorted((root / "docs").rglob("*.md")):
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        for lineno, number, _line, pr_shaped in cc.citations_in(text):
-            if number in filed or number <= floor or pr_shaped:
-                continue
-            out.append((str(path.relative_to(root)), lineno, number))
-    return out
+    hits = cc.unresolved_citations(sorted((root / "docs").rglob("*.md")), cc.allocated_numbers())
+    return [
+        (str(hit.path.relative_to(root)), hit.lineno, hit.number)
+        for hit in hits
+        if cc.is_live_shape(hit, floor)
+    ]
 
 
 def test_the_docs_scan_actually_covers_something() -> None:
