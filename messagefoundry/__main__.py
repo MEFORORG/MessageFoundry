@@ -2110,8 +2110,49 @@ def _serve(args: argparse.Namespace) -> int:
     # beyond the declaration itself" — true of a declaration, false of a measurement. A reachable
     # front door that speaks TLS 1.0 is a fact, on loopback or not.
     #
-    # Scope is deliberately the posture the requirement is about: a declared terminator, PHI, and
-    # `enforce`. Every other posture never reaches here and is byte-identical.
+    # REQUIRE `public_origin` IN THIS POSTURE, REGARDLESS OF `serve_ui` (BACKLOG #1026, owner-ruled
+    # 2026-08-14). There IS a refusal for an unset `public_origin`, and it is gated on the console:
+    # `if settings.api.serve_ui and settings.api.tls_terminated_upstream`. With `serve_ui` false
+    # nothing required it, so a PHI instance behind a declared terminator under `enforce` could start
+    # with it unset and the probe below simply never ran -- with nothing reporting the skip.
+    #
+    # That is the failure this same block already refuses twice, one level down. It returns 2 when the
+    # probe's MECHANISM is missing, because "a check that degrades to a no-op when its mechanism
+    # disappears reports success forever afterwards", and it refuses on unreachable because "a gate
+    # that is trivially defeated is not a gate". Leaving `public_origin` unset WAS trivially defeating
+    # this gate, and the outcome WAS a check that reports success forever. The principle was stated
+    # twice here and violated one level up.
+    #
+    # This refuses a posture that starts today. Per CLAUDE.md section 0 there are zero deployments, so
+    # that costs nothing now and will never be cheaper to add -- and the owner was told the cost
+    # rather than it being hidden. It is NOT the reason the answer is (a): the reason is that this is
+    # the only end where the control measures its own posture instead of measuring whether someone
+    # happened to configure an unrelated console setting.
+    if (
+        settings.api.tls_terminated_upstream
+        and data_class is DataClass.PHI
+        and enforcing
+        and not settings.api.public_origin
+    ):
+        print(
+            f"error: refusing to serve on a PHI instance ({env_name!r}) behind a declared TLS "
+            "terminator under `enforce` without [api].public_origin — the ASVS 12.1.1 TLS-floor "
+            "probe dials that origin, so leaving it unset silently disables the check rather than "
+            'failing it. Set [api].public_origin to the origin the browser uses (e.g. "https://'
+            'mefor.example.org"). See docs/security/OFF-LOOPBACK-DEPLOYMENT.md.',
+            file=sys.stderr,
+        )
+        return 2
+
+    # Scope is the posture the requirement is about: a declared terminator, PHI, and `enforce`. Every
+    # other posture never reaches here and is byte-identical.
+    #
+    # `public_origin` appears as a fourth condition and is NOT a fourth scope narrowing: the refusal
+    # directly above guarantees it is set for exactly this posture, so the two agree by construction
+    # rather than by coincidence. It is kept as a belt-and-braces and as the type narrowing the probe
+    # call needs. Before #1026 this comment named three conditions while the gate had four, and the
+    # undocumented fourth was the whole defect -- a reader concluded the probe runs whenever a PHI
+    # instance sits behind a declared terminator under `enforce`, and it did not.
     if (
         settings.api.tls_terminated_upstream
         and data_class is DataClass.PHI
