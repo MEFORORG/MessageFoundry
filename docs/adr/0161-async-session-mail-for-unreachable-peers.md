@@ -3,7 +3,13 @@
 
 # ADR 0161 — Async session mail for unreachable peers
 
-- **Status:** Proposed (2026-08-05) — the code is a **prototype and is deliberately NOT WIRED**; see §"Status and what gates wiring"
+- **Status:** Proposed (2026-08-05); **the "not wired" half is FALSE at HEAD and is corrected below**
+  (BACKLOG #1215). This line and §"Status and what gates wiring" both described the code as an unwired
+  prototype with nothing live in any session. `scripts/coord/install-coordination.ps1:238-239` carries a
+  **SessionStart row and a Stop row**, both pointing at `scripts/hooks/mail-drain.ps1`, and the channel
+  has been delivering to live sessions. The ADR's *decision* is untouched; only its claim about the
+  code's deployment state was wrong, and it was wrong in the direction that invites a reader to treat a
+  running mechanism as hypothetical.
 - **Date:** 2026-08-05
 - **Related:** [BACKLOG #1028](../BACKLOG.md) · [SESSION-MAIL.md](../SESSION-MAIL.md) (the operator-facing document) · [ADR 0158](0158-silent-controls-green-signals-that-mean-nothing-and-shape-over-detection.md) (silent controls — a green signal that means nothing) · [ADR 0160](0160-public-repo-content-policy-operator-and-security-review-material-only.md) (what belongs in the public repo) · [CLAUDE.md](../../CLAUDE.md) §5 (worktrees, git discipline), §9 (PHI), §11 (state a load-bearing fact once; no glyphs) · [PHI.md](../PHI.md)
 
@@ -331,11 +337,25 @@ the realtime channel (D2).
 
 ## Status and what gates wiring
 
-This ADR is `Proposed`, and the code it describes is a **prototype that is deliberately not wired**.
-The rows for the drain hook exist in `scripts/coord/install-coordination.ps1` and stay exactly as
-they are; no config root has been installed from them, so nothing is live in any session. Wiring is a
-separate, owner-approved step, and it is gated on the work tracked as
-[BACKLOG #1028](../BACKLOG.md).
+**CORRECTED (BACKLOG #1215). THE CHANNEL IS WIRED AND LIVE.** This section previously read: *"the code
+it describes is a prototype that is deliberately not wired ... no config root has been installed from
+them, so nothing is live in any session."* Both halves are false at HEAD.
+
+`scripts/coord/install-coordination.ps1:238-239` carries a **SessionStart** row and a **Stop** row,
+both pointing at `scripts/hooks/mail-drain.ps1`, and both fire: sessions receive mail at their turn
+boundary and at start-up. The ADR's decision, its measurements and its recorded trade-offs are
+unaffected — what was wrong is only the deployment-state claim.
+
+**WHY THIS ERROR IS WORSE THAN A STALE STATUS LINE.** "Nothing is live in any session" is not merely
+out of date; it invites a reader to reason about a *running* mechanism as if it were hypothetical — to
+weigh a change to it as costless, or to treat a defect in it as latent. The same inversion is why
+`scripts/hooks/mail-drain.ps1`'s header said "THIS DOES NOT WIRE ANYTHING" in the very commit that
+added the rows. A document describing its own subject's deployment state has no external check, so it
+decays in exactly the direction nobody re-measures.
+
+Wiring was originally framed as a separate owner-approved step gated on
+[BACKLOG #1028](../BACKLOG.md); that step has happened, and this section is the record of it rather
+than a plan for it.
 
 **Measured against the target surface, 2026-08-05.** The channel was tested from a real VS Code
 extension session, against a throwaway repo carrying only project-level `.claude/settings.json` hooks.
