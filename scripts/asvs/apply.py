@@ -360,11 +360,20 @@ def main(argv: list[str] | None = None) -> int:
         # THE INTENT ABOVE IS RIGHT AND THIS IMPLEMENTATION OF IT IS KNOWN-INCOMPLETE -- see the open
         # BACKLOG #1242. `k not in c` scopes by "the payload did not MENTION this key", which is not
         # the same question as "the payload asked for this type". A payload that CARRIES the key is
-        # skipped entirely, so a corruption arriving through a mentioned key passes at exit 0, while
-        # the same corruption through an omitted key is refused. That asymmetry is the defect: of the
-        # whole record exactly one cell holds a top-level non-scalar, and the natural payload for
-        # rewriting that cell ECHOES the key -- so the guard covers every cell that cannot be hurt
-        # and stops looking at the one that can.
+        # skipped entirely, so this guard cannot see a corruption arriving through a mentioned key,
+        # while the same corruption through an omitted key is refused. That asymmetry is the defect:
+        # of the whole record exactly one cell holds a top-level non-scalar, and the natural payload
+        # for rewriting that cell ECHOES the key -- so the guard covers every cell that cannot be
+        # hurt and stops looking at the one that can.
+        #
+        # THE EXPOSURE IS LATENT, NOT LIVE, AND THE DISTINCTION IS LOAD-BEARING. Measured on this
+        # writer by a seat other than its author: the table is PRESERVED whether the payload carries
+        # the key or omits it. Corruption requires a BROKEN writer -- and then only when the payload
+        # carries the key, which is exactly the case this guard does not inspect. So the correct
+        # sentence is "WOULD fail to catch a regression here", not "corrupts today"; the second reads
+        # as 12.1.5 being at risk now, and it is not. Written conditionally on purpose: a false
+        # present-tense claim propagates into severity language and security records, which is the
+        # defect this comment exists to prevent, one level up.
         #
         # This note exists because the paragraph above ARGUES for the boundary and argues well. An
         # unguarded gap invites the question; a well-reasoned wrong boundary suppresses it, and an
