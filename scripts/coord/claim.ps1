@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 <#
 .SYNOPSIS
     Claim a piece of WORK, atomically, so two concurrent sessions cannot build the same thing twice.

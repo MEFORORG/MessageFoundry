@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Pure, dependency-free UTF-8 byte hex dump for the Test Bench (BACKLOG #84, ADR 0119). No `vscode`
 // import, so it is unit-testable in isolation and cannot pull the extension host into a test — the
 // same discipline as hl7diff.ts.

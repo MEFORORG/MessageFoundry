@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The installer must register a matcher for every tool the gate script actually branches on.
 
 This exists because it went wrong. Rule 3 (git verbs that swap the shared primary's working tree) was

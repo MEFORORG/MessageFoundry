@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 # PreToolUse guard: block blanket git staging so parallel Claude Code sessions sharing a working
 # tree can't sweep each other's files into one commit. Reads the tool-call JSON on stdin; if the
 # command does a broad stage (git add -A/--all/-u/. or git commit -a/-am/--all) it returns a

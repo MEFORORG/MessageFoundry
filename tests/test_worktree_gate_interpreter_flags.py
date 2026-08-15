@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Which flags count as an INTERPRETER flag, and why the answer has to be a rule rather than a list.
 
 ``Get-ScannableSegments`` does not blank the quoted argument of an interpreter flag, it RECURSES into

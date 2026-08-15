@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Engine status-bar item — the Extension-Host shell for the engine-link doctor (ADR — engine-link
 // doctor). It is DISTINCT from liveDebug.ts's left-side "MEFOR Live" / "Values" toggles (those are the
 // offline dry-run loop); this reflects the real, running engine the analyst promotes to.

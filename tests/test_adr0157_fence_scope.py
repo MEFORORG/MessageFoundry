@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Structural gate for ADR 0157's H1 epoch-fence scope on ``store/postgres.py``.
 
 **Deliberately NOT env-gated.** Every other Postgres test needs ``MEFOR_TEST_POSTGRES`` and a live

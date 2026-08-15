@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The gate's own enforcement surface, and the shared git config that arms the commit gates.
 
 Two holes with a shared shape: the thing doing the enforcing was not itself protected.

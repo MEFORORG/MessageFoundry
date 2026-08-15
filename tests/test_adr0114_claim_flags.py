@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """ADR 0114 flag architecture (§6): three Phase-4 claim-path sub-lever flags on ``[store]``.
 
 All three are DEFAULT OFF (reliability-core), read once at store open, and SQL-Server-only by

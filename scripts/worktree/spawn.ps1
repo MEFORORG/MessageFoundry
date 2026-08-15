@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 <#
 .SYNOPSIS
     Create a parallel-session worktree (via new.ps1) AND open a new editor window in it - one step.

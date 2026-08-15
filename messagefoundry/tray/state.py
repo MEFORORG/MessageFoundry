@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Pure engine-status state machine for the MessageFoundry tray (ADR 0113 §3).
 
 No I/O, no ctypes, no Qt — stdlib only, so the whole reducer is unit-testable on any OS. The

@@ -64,13 +64,71 @@ _PROSE_FIELDS = (
 )
 _SUBTABLES = ("evidence", "absence")
 
+#: The keys each sub-table entry is ORDERED by. Exactly the same distinction as `_ORDERED` one level
+#: down: these fix the emission order, they do NOT define the set that survives. #1242 limb 4 -- the
+#: entries were re-emitted as precisely these keys and nothing else, so a field inside an evidence or
+#: absence entry was dropped on every rewrite. The promotion of this writer was specified to carry the
+#: union through so the schema could grow without hand-editing the record; that was delivered for
+#: top-level scalars and silently not for sub-table entries.
+_EVIDENCE_ORDERED = ("path", "line", "expect")
+_ABSENCE_ORDERED = ("pattern", "positive_control", "mutation")
+
+
+#: A TOML bare key. Anything else must be QUOTED, and the reason is not cosmetic: a DOTTED key is not
+#: a syntax error in TOML, it is a NESTING OPERATOR. `{1.2.2 = "x"}` is VALID and parses to
+#: `{'1': {'2': {'2': 'x'}}}` -- the file loads, the gate stays green, the structure silently differs.
+#: Every other bad key (spaces, quotes, empty) fails LOUDLY and is therefore safe. The dot is the only
+#: one that corrupts quietly, and dotted identifiers are this record's native shape: requirement ids
+#: like 1.2.2, version strings, file paths. So the rule is unconditional -- quote unless it matches
+#: this exactly. "Quote the odd-looking ones" fails here, because 1.2.2 does not look odd.
+_BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _toml_value(value: object) -> str:
+    """Render any value as TOML. Recurses, so the quoting rule above applies at EVERY depth and
+    inside arrays of tables -- measured, not assumed: a dot at depth 3 re-nests exactly as one at
+    depth 1, and so does one inside a list.
+
+    NOT ``json.dumps``. `{"a": 1}` is JSON, not TOML; an inline table is `{a = 1}`, key EQUALS value.
+    Arrays happen to coincide between the two and tables do not, so a serializer that looks right on
+    arrays emits a file that will not parse the moment a table appears.
+    """
+    if isinstance(value, bool):  # before int -- bool IS an int in Python
+        return str(value).lower()
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, dict):
+        inner = ", ".join(
+            f"{k if _BARE_KEY.match(str(k)) else toml_str(str(k))} = {_toml_value(v)}"
+            for k, v in value.items()
+        )
+        return "{ " + inner + " }" if inner else "{}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
+    return toml_str(str(value))
+
 
 def _scalar(key: str, value: object) -> str:
-    if isinstance(value, bool):
-        return f"{key} = {str(value).lower()}"
-    if isinstance(value, int):
-        return f"{key} = {value}"
-    return f"{key} = {toml_str(str(value))}"
+    """#1242: the name is now a misnomer kept for its call sites -- it renders ANY value, not just a
+    scalar. It used to fall through to ``toml_str(str(value))`` for anything that was not a bool or
+    an int, so a TABLE or ARRAY became a quoted PYTHON REPR: `sym_table = "{'a': 1}"`. That parses,
+    so nothing went red, and re-reading returned the STRING -- the value was not recoverable from the
+    file. Every carry path routes through here (the top-level union walk, the rewrite, and
+    ``_carried``), which is why one branch closes all three.
+    """
+    return f"{key} = {_toml_value(value)}"
+
+
+def _carried(entry: dict[str, Any], ordered: tuple[str, ...]) -> list[str]:
+    """Every key of a sub-table entry the writer does not ORDER, emitted verbatim after the ordered
+    ones. The same rule the top-level loop follows -- enumerate what you ORDER, never what you KEEP.
+
+    Deliberately NOT keyed on the field names that happen to exist today: a name-keyed fix satisfies
+    the symptom and drops the next field anyone adds, which is the defect itself with a longer list.
+    """
+    return [f"  {_scalar(key, value)}" for key, value in entry.items() if key not in ordered]
 
 
 def render(cell: dict[str, Any], live: dict[str, Any] | None = None) -> str:
@@ -98,16 +156,22 @@ def render(cell: dict[str, Any], live: dict[str, Any] | None = None) -> str:
         if key in _ORDERED or key in _SUBTABLES:
             continue
         out.append(_scalar(key, value))
+    # The three explicit emissions in each loop below are an ORDERING, not a membership test, and the
+    # `_carried` tail is what makes that true (#1242 limb 4). They are left spelled out rather than
+    # generated so the ordered keys keep their exact typing -- `line` stays an int through int(), the
+    # rest stay TOML basic strings -- which keeps every byte of today's output identical.
     for a in cell.get("evidence") or []:
         out.append("  [[cell.evidence]]")
         out.append(f"  path = {toml_str(a['path'])}")
         out.append(f"  line = {int(a['line'])}")
         out.append(f"  expect = {toml_str(a['expect'])}")
+        out.extend(_carried(a, _EVIDENCE_ORDERED))
     for a in cell.get("absence") or []:
         out.append("  [[cell.absence]]")
         out.append(f"  pattern = {toml_str(a['pattern'])}")
         out.append(f"  positive_control = {toml_str(a['positive_control'])}")
         out.append(f"  mutation = {toml_str(a['mutation'])}")
+        out.extend(_carried(a, _ABSENCE_ORDERED))
     return "\n".join(out) + "\n"
 
 
@@ -282,6 +346,42 @@ def main(argv: list[str] | None = None) -> int:
         if lost:
             print(f"REFUSING: cell {c['id']} would LOSE field(s) {sorted(lost)}")
             return 1
+        # ...and the same question about the VALUE rather than the key (#1242). The check above is a
+        # pure KEY-SET difference, so a field whose value was type-mangled -- a table rewritten as a
+        # quoted Python repr -- KEEPS ITS KEY and passes it. That is not an oversight in the check
+        # above; it was written to catch DROPPED KEYS and it does. It is simply blind to this, and a
+        # rewrite that corrupts every value while preserving every key would report green.
+        #
+        # SCOPED TO KEYS THE PAYLOAD DID NOT TOUCH, deliberately: the corruption is the WRITER
+        # changing a type nobody asked it to change. A payload that INTENTIONALLY retypes a field --
+        # schema evolution, a scalar becoming a table -- is an edit, not damage, and an unscoped
+        # check would refuse it. A guard that refuses legitimate edits is a guard someone disables.
+        #
+        # THE INTENT ABOVE IS RIGHT AND THIS IMPLEMENTATION OF IT IS KNOWN-INCOMPLETE -- see the open
+        # BACKLOG #1242. `k not in c` scopes by "the payload did not MENTION this key", which is not
+        # the same question as "the payload asked for this type". A payload that CARRIES the key is
+        # skipped entirely, so a corruption arriving through a mentioned key passes at exit 0, while
+        # the same corruption through an omitted key is refused. That asymmetry is the defect: of the
+        # whole record exactly one cell holds a top-level non-scalar, and the natural payload for
+        # rewriting that cell ECHOES the key -- so the guard covers every cell that cannot be hurt
+        # and stops looking at the one that can.
+        #
+        # This note exists because the paragraph above ARGUES for the boundary and argues well. An
+        # unguarded gap invites the question; a well-reasoned wrong boundary suppresses it, and an
+        # auditor reading this function would otherwise find a guard, find a persuasive rationale,
+        # and stop. Do not read the presence of this check as "the writer's type corruption is
+        # guarded". Read #1242's open row first.
+        retyped = sorted(
+            k
+            for k in was
+            if k in now and k not in c and type(was[k]) is not type(now[k])  # noqa: E721
+        )
+        if retyped:
+            print(
+                f"REFUSING: cell {c['id']} would CHANGE the TYPE of field(s) {retyped} "
+                f"(key kept, value corrupted -- the key-set check above cannot see this)"
+            )
+            return 1
         for sub in ("evidence", "absence"):
             if len(now.get(sub, [])) < len(was.get(sub, [])):
                 print(
@@ -289,6 +389,17 @@ def main(argv: list[str] | None = None) -> int:
                     f"{len(was.get(sub, []))} -> {len(now.get(sub, []))}"
                 )
                 return 1
+            # ...and the same question one level down (#1242 limb 4). Counting ENTRIES cannot see a
+            # FIELD vanish from inside one, so a sub-table entry could be rewritten with fewer keys
+            # while the count matched and this invariant reported green -- exactly the state the
+            # top-level `set(was) - set(now)` above exists to prevent.
+            for i, (wsub, nsub) in enumerate(zip(was.get(sub, []), now.get(sub, []), strict=False)):
+                lost_sub = set(wsub) - set(nsub)
+                if lost_sub:
+                    print(
+                        f"REFUSING: cell {c['id']} {sub}[{i}] would LOSE field(s) {sorted(lost_sub)}"
+                    )
+                    return 1
 
     print(f"{len(edits)} cell blocks re-rendered; file parses; {len(parsed['cell'])} cells intact")
     for c in payload:

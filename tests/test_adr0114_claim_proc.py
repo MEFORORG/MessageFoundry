@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """ADR 0114 sub-lever A (``fifo_claim_proc``): the two lane-family versioned claim procedures.
 
 Offline (no SQL Server; pyodbc never imported): the DDL is lint-checked as text, the startup gate

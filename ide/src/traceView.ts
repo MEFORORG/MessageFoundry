@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Pure, dependency-free mapping of a `messagefoundry dryrun --trace json` trace into the Test Bench's
 // Coverage and Profiling panes. No `vscode` import, so it is unit-testable in isolation and never pulls
 // the extension host into a test (mirrors hl7diff.ts). The engine's `parsing/` package is intentionally

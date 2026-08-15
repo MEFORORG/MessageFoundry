@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Ledger gate — stop two concurrent sessions from silently colliding on an ADR / BACKLOG number.
 
 THE DEFECT THIS EXISTS FOR. Two sessions each grep for "the next free number", both pick N, and create
