@@ -61,17 +61,23 @@
 
        TWO FILES, BECAUSE THEY ARE TWO SENTENCES AND A READER ACTS DIFFERENTLY ON EACH. Same four
        tab-separated columns (utc, host, stage, message), so one splitter reads both:
-         * seats/.writer-errors.txt   THE RECORD DID NOT LAND, OR LANDED SHORT. Stages: writer-alive
-           (rule 3's proof-of-life was not written, so a reader will age a running writer as dead),
-           read-prior (the carried-forward fields were lost), record-lock (applied unserialised, so a
-           concurrent update may have been overwritten), no-session-identity (rule 4 refused the
-           write), main (the write may not have happened at all). "Missing or stale" is TRUE of a
-           seat named here.
+         * seats/.writer-errors.txt   THE RECORD DID NOT LAND, OR LANDED SHORT.
          * seats/.writer-degraded.txt A PROBE COULD NOT ANSWER AND THE RECORD SAYS SO IN ITS OWN
-           FIELDS. Stages: status-probe (dirty.probe=failed, dirty.probeError, and the counts and
-           lists all null), stash-probe / stash-anchor (stashProbe.outcome + exitCode + error,
-           stashCovers, stashSha/stashRef), handoff-pointer (handoff.unresolved), notes (the note
-           field holds the drop marker). The record for a seat named here is present and complete.
+           FIELDS.
+       THE TEST A NEW STAGE MUST PASS, which is the authority here rather than any list: name the
+       record field a reader would find this failure in. If there is one, the record describes
+       itself and the stage is DEGRADED. If naming it requires the reader to have the log open, the
+       record is short and the stage is an ERROR. As of this writing the degraded stages are
+       status-probe (dirty.probe/probeError, counts and lists null), stash-probe and stash-anchor
+       (stashProbe.outcome/exitCode/error, stashCovers, stashSha/stashRef/stashAsOf),
+       handoff-pointer (handoff.unresolved) and notes (the note field holds the drop marker); the
+       error stages are writer-alive (rule 3's proof-of-life is not IN the record, so a reader ages
+       a running writer as dead), read-prior (the carried-forward fields were lost), record-lock
+       (applied unserialised, so a concurrent update may have been overwritten), no-session-identity
+       (rule 4 refused the write) and main (the write may not have happened at all). seat.ps1 is not
+       the only writer of the error log: scripts/hooks/seat-record.ps1 appends hook-writer-failed
+       there when this script could not be run at all, which is the same sentence from further out.
+
        Every line in the degraded log is ALSO carried in that turn's own record, as `writerDegraded`,
        so the per-seat evidence stands without the fleet-wide file.
 
@@ -139,11 +145,14 @@
 
        AND A LATER PROBE THAT COULD NOT ASK MUST NOT DELETE AN EARLIER PROBE'S ANSWER. `stashSha`
        and `stashRef` were re-derived every turn from this turn's probe alone, so turn 2 under
-       contention rewrote a live anchor to null: measured, turn 1 stored a sha and a ref that
-       `git rev-parse --verify` still resolved AFTER turn 2 declared stashCovers=
-       tracked-edits-NOT-captured. The anchor lives in the common git dir and outlives
-       `git worktree remove --force`, which this project's own remove.ps1 and prune-merged.ps1 both
-       call, so the record was pointing away from the only surviving copy of the work. When the
+       contention rewrote a live anchor to null: measured, turn 1 stored sha 34b696a7 under
+       refs/mefor-seat/<box>/sess-anchor, and `git rev-parse --verify` on that ref still returned
+       34b696a7 AFTER turn 2 had written stashSha=null, stashRef=null and
+       stashCovers=tracked-edits-NOT-captured-and-untracked-only. The anchor lives in the COMMON ref
+       store, so it survives the removal of the checkout it describes -- measured with
+       `git worktree remove --force`, which this project's own scripts/worktree/remove.ps1 and
+       prune-merged.ps1 both call. The record was pointing away from the only surviving copy of the
+       tracked work at the moment that mattered most. When the
        probe cannot ask, the REF STORE is re-read instead -- a measurement taken now, not a value
        copied out of the prior record -- and the object's own committer date is stored as
        `stashAsOf` so the reader sees the anchor's age rather than inheriting a claim about now.
@@ -641,6 +650,15 @@ function Get-GitFacts {
     # ONLY THE TWO could-not-ask OUTCOMES CARRY. 'none' means git answered and the answer was
     # nothing; 'not-attempted' means the tree was measured clean and the branch above has already
     # DELETED the ref. Carrying on either would resurrect a claim the writer just measured away.
+    #
+    # THIS IS NOT THE INHERITANCE RULE 4 FORBIDS, and the distinction is worth stating because the
+    # anonymous slot does reach here. Rule 4 bars an unidentified record from inheriting IDENTITY
+    # and INTENT -- seat, goal, lifecycle, the episode baseline -- because those would name the
+    # wrong occupant. A stash anchor names an OBJECT IN THIS CHECKOUT'S OWN OBJECT STORE, dated by
+    # itself, under a ref this same slot wrote and this same slot already deletes when the tree
+    # comes back clean. Measured on the nosid slot: the anchor carries while episodeStart stays
+    # null and episodeStartSource stays 'unknown-session'. Withholding it would hide a real rescue
+    # object from the reader that most needs one, which is the unsafe direction.
     $stashCarried = $false
     if (-not $stash -and $StashRef -and ($stashProbe.outcome -in @('failed', 'not-attempted-status-failed'))) {
         $anchor = Invoke-Git -Dir $Wt -GitArgs @('for-each-ref', '--format=%(objectname)%09%(committerdate:iso-strict)', $StashRef)

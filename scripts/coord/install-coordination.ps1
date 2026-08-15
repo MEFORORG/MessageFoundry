@@ -679,7 +679,10 @@ foreach ($i in 0..($WIRING.Count - 1)) {
             $tail = "  removed {0}" -f $removedWritten[$i]
             if ($removedPreview[$i] -gt 0) { $tail += ("   (+{0} matched in a root nothing was written to)" -f $removedPreview[$i]) }
         }
-        else { $tail = "  would remove {0}" -f $removedPreview[$i] }
+        elseif ($previewRoots.Count -gt 0) { $tail = "  would remove {0}" -f $removedPreview[$i] }
+        # NO ROOT WAS READ, so there is no count -- and printing 0 here would be the same defect one
+        # layer down: a number that was never obtained rendered as a measurement of none.
+        else { $tail = "  NOT MEASURED (no root could be read)" }
     }
     Write-Host ("  {0,-16} -> {1,-38} [{2}]{3}" -f $w.Event, $w.Script, $w.Marker, $tail)
 }
@@ -708,6 +711,13 @@ else {
         Write-Host ("  {0} of {1} root(s) were a PREVIEW (-WhatIf, or a -Confirm you declined). NOTHING was" -f $previewRoots.Count, $SettingsPath.Count) -ForegroundColor Yellow
         Write-Host "  written there. The rows above are what a real run WOULD write, not what any file carries."
     }
+}
+# A FAILED ROOT IS IN NONE OF THE NUMBERS ABOVE, and the reader has to be told that rather than left to
+# derive it from a count. Its file was never read or never written, so it contributed nothing to any
+# per-row figure and its actual state is unknown to this run.
+if ($failed.Count -gt 0) {
+    Write-Host ("  {0} root(s) FAILED above and are counted in NONE of the figures here. What those files" -f $failed.Count) -ForegroundColor Red
+    Write-Host "  now hold is unknown to this run -- re-run, or check them with -Status." -ForegroundColor Red
 }
 Write-Host ""
 if ($failed.Count -gt 0) { exit 1 }
