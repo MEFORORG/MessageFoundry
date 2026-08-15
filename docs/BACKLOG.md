@@ -3953,6 +3953,22 @@ open.
 
 ## 1010. No licence-header gate exists in any language, and 196 first-party sources carry no SPDX tag
 
+> **THE BUILD HAS LANDED ON `origin/main` AND THIS BANNER STILL READS OPEN. DO NOT REBUILD. Measured 2026-08-15 at `origin/main` `4d3a72eb`.**
+> ```
+> scripts/quality/licence_header_check.py    EXISTS on main
+> tests/test_licence_header_gate.py          EXISTS on main
+> tests/test_ide_licence_packaging.py        EXISTS on main
+> parse_items(#1010) on origin/main          is_open = True
+> ```
+> **THIS IS THE INVERSE OF THE `#394` TRAP CLASS, and it is the more dangerous direction.** Those items were *built and UNLANDED*, so they were invisible to any query over `origin/main`. **This one is built, LANDED, and unflipped -- so it is invisible to the opposite query.** A pool audit that checks unlanded refs finds `#1022`/`#1257`/`#1259` and **cannot see this at all.**
+>
+> **THE CLAIM PROTECTING IT DOES NOT REPLICATE.** `#1010` is claimed on one machine, so it is absent from the unclaimed pool **there** -- and `mefor-coord/claims/` is **machine-local and unversioned**. **A seat on any other checkout sees an open, unclaimed, buildable item whose work already shipped. This banner is the protection that travels; the claim is not.**
+>
+> **AND THE GENERATOR IS A CORRECT PRACTICE, WHICH IS WHY IT WILL RECUR.** The landing seat **deliberately declined to take closure**, on the defensible ground that closure is a judgement and the seat supplying a paired commit is arguably the wrong one to make it. **A practice that is right and produces stale-open items will keep producing them** -- so the remedy is a standing check, not a one-off flip. **Do not "fix" this by asking landing seats to close items they land.**
+>
+> **CLOSURE IS NOT PERFORMED HERE:** `backlog_status_check.py` hard-errors on an item carrying both a closed and an open banner, and separately on a shipped item still carrying a `**Priority:**`, so closing is three coupled edits including a verbatim archive move. **This banner records the evidence so whoever performs that closure does not re-measure it.**
+
+
 > 🔢 **Scored 2026-08-04 → P2.** Value **7/10** · Difficulty **3/10** · _quick win_. AGPL-3.0-or-later is asserted twice — in `LICENSE` and at `pyproject.toml:29` — and then per-file provenance is left to habit. 981 of 1,044 tracked `.py` carry `SPDX-License-Identifier`, which makes the convention real and near-universal; the 63 that do not include **all 17 files of `messagefoundry/tray/`**, a package `only-include` puts in the wheel and `[project.gui-scripts]` gives its own entry point. Widen past Python and it is **196 of 1,181 tracked sources across six languages**. Five more files declare **Apache-2.0** in an AGPL project. Nothing — no hook, no workflow, no test — checks a licence header in any language.
 
 **Cluster:** Supply chain / licensing. **Priority:** P2. **Verdict:** build. **Severity:** medium.
