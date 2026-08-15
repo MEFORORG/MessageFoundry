@@ -54,7 +54,7 @@ import re
 import shutil
 import subprocess
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -159,11 +159,23 @@ class Fence:
         e["USERPROFILE"] = str(self.home)
         return e
 
+    def add_root(self, leaf: str = ".claude-account-2") -> Path:
+        """A SECOND config root, because "can the fence see" is a PER-ROOT fact.
+
+        ``Get-ClaudeConfigRoots`` keeps every ``$USERPROFILE/.claude*`` directory that holds a
+        sessions/ folder, and a seat's registry record lives under exactly ONE of them. A fixture
+        with a single root cannot express a BLIND root standing beside a populated one -- which is
+        the shape an aggregate count hides, and the shape the target box is in right now.
+        """
+        d = self.home / leaf / "sessions"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
     def clear(self) -> None:
         for f in self.sessions.glob("*.json"):
             f.unlink()
 
-    def live(self, session_id: str, cwd: Path) -> int:
+    def live(self, session_id: str, cwd: Path, sessions: Path | None = None) -> int:
         """Register a session whose pid is a process we started, so the fence answers LIVE.
 
         The fence requires the process to have started BEFORE the session registered (a pid that
@@ -177,11 +189,20 @@ class Fence:
         )
         self._procs.append(p)
         time.sleep(0.7)
-        self.record(session_id, cwd, pid=p.pid, started_ms=int(time.time() * 1000))
+        self.record(
+            session_id, cwd, pid=p.pid, started_ms=int(time.time() * 1000), sessions=sessions
+        )
         return p.pid
 
-    def record(self, session_id: str, cwd: Path, pid: int, started_ms: int) -> Path:
-        f = self.sessions / f"{pid}-{session_id[:8]}.json"
+    def record(
+        self,
+        session_id: str,
+        cwd: Path,
+        pid: int,
+        started_ms: int,
+        sessions: Path | None = None,
+    ) -> Path:
+        f = (sessions or self.sessions) / f"{pid}-{session_id[:8]}.json"
         f.write_text(
             json.dumps(
                 {
@@ -452,8 +473,14 @@ def test_index_lock_reports_tracked_edits_as_not_captured(repo: Path) -> None:
     ), rec["stashCovers"]
     assert rec["stashProbe"]["outcome"] == "failed"
     assert rec["stashProbe"]["exitCode"] is not None, "git's own exit code is the provenance"
-    errors = (_seats_dir(repo) / ".writer-errors.txt").read_text(encoding="utf-8")
-    assert "stash-probe" in errors, "rule 2: a writer that dies must not die silently"
+    # RULE 2'S *DEGRADED* CHANNEL, NOT ITS ERROR CHANNEL. The record above describes this failure in
+    # its own fields, so the seat is neither missing nor stale -- and the error log is a STOP operand
+    # whose text says it is. See test_the_two_writer_log_channels_are_split_in_both_directions.
+    degraded = (_seats_dir(repo) / ".writer-degraded.txt").read_text(encoding="utf-8")
+    assert "stash-probe" in degraded, "rule 2: a writer that degrades must not degrade silently"
+    assert not (_seats_dir(repo) / ".writer-errors.txt").exists(), (
+        "a probe that could not ask is not a record that did not land"
+    )
 
     # POSITIVE CONTROL, same repo, same tree, lock gone. Without it the assertions above could be
     # satisfied by a writer that never captures anything.
@@ -540,13 +567,28 @@ def test_inherited_allocations_are_not_attributed_to_this_episode(repo: Path) ->
     directory. Handing those to a replacement as "yours" would have it rehome ledger numbers
     belonging to work that finished last week.
 
-    THE FIXTURE SITS FIVE MINUTES FROM THE BOUNDARY, NOT SIX YEARS, AND THAT IS THE TEST.
-    The live defect is exactly ONE LOCAL UTC OFFSET wide -- ``ConvertFrom-Json`` hands back a
-    [DateTime], ``[string]`` on it yields the culture form with the Z gone, and re-parsing that
-    reads it as LOCAL and shifts it by the box's offset. A 2020 timestamp is insensitive to any
-    error smaller than six years, so it certified the exact bug the attribution machinery exists to
-    prevent. Both arms are asserted from the SAME record: the five-minutes-after allocation is the
-    positive control that this instrument can still say ``this-episode`` at all.
+    THE FIXTURE SITS FIVE MINUTES FROM THE BOUNDARY, NOT SIX YEARS. The live defect is exactly ONE
+    LOCAL UTC OFFSET wide -- ``ConvertFrom-Json`` hands back a [DateTime], ``[string]`` on it yields
+    the culture form with the Z gone, and re-parsing that reads it as LOCAL and shifts it by the
+    box's offset. A 2020 timestamp is insensitive to any error smaller than six years, so it
+    certified the exact bug the attribution machinery exists to prevent. Both arms are asserted from
+    the SAME record: the five-minutes-after allocation is the positive control that this instrument
+    can still say ``this-episode`` at all.
+
+    AND THE MARGIN THAT DISCRIMINATES MUST NOT BE THE HOST'S OWN UTC OFFSET, which is what those two
+    arms alone rest on. A shift equal to the local offset is ZERO on a box at offset 0, so those
+    arms are real on this machine and VACUOUS on a hosted CI runner, which runs UTC -- and the
+    required merge gates are hosted Windows runners. That is not a margin anyone can widen: a
+    local-versus-UTC confusion is by construction undetectable where local IS UTC, so no fixture and
+    no assertion can recover power there (stated rather than glossed, SDS-3.6).
+
+    SO THE OFFSET IS MOVED INTO THE FIXTURE, WHERE THE TEST CONTROLS IT. Allocations 9003/9004 carry
+    an EXPLICIT zone in the timestamp itself -- a non-ISO spelling ``2026-08-14 15:05:00 -0500``,
+    which ConvertFrom-Json leaves as a STRING (measured) so it reaches the writer's string branch
+    with its zone intact. Their wall clock sits FIVE HOURS from their true instant, and their true
+    instant sits five minutes either side of the baseline. A writer that reads the wall clock and
+    drops the zone therefore lands 4h55m on the wrong side of the boundary ON ANY HOST, offset 0
+    included. That is the arm that still has teeth on CI, and its margin is carried by the data.
     """
     # Turn 1 mints the episode baseline. Everything below is placed relative to what it recorded,
     # so the margin is exact rather than approximate.
@@ -558,32 +600,56 @@ def test_inherited_allocations_are_not_attributed_to_this_episode(repo: Path) ->
     alloc = repo / ".git" / "mefor-coord" / "alloc" / "backlog"
     alloc.mkdir(parents=True)
 
-    def put(number: str, at: datetime) -> None:
+    def put(number: str, claimed: str) -> None:
         (alloc / f"{number}.json").write_text(
             json.dumps(
                 {
                     "number": number,
                     "kind": "backlog",
                     "worktree": str(repo).replace("\\", "/"),
-                    "claimed": _iso(at),
+                    "claimed": claimed,
                 }
             ),
             encoding="utf-8",
         )
 
-    put("9001", episode_start - timedelta(minutes=5))
-    put("9002", episode_start + timedelta(minutes=5))
+    def zoned(at: datetime, offset_hours: int) -> str:
+        """The same INSTANT, spelled with an explicit zone and a wall clock five hours away.
+
+        Deliberately NOT the ISO ``T`` form: PowerShell's ConvertFrom-Json retypes an ISO string
+        into a [DateTime] and normalises it to the host's zone before any of the writer's code sees
+        it, which hands the offset straight back to the host. This spelling stays a [string]
+        (measured), so the zone reaches the conversion as data.
+        """
+        tz = timezone(timedelta(hours=offset_hours))
+        local = at.astimezone(tz)
+        return local.strftime("%Y-%m-%d %H:%M:%S ") + local.strftime("%z")
+
+    put("9001", _iso(episode_start - timedelta(minutes=5)))
+    put("9002", _iso(episode_start + timedelta(minutes=5)))
+    # HOST-INDEPENDENT ARMS. The wall clock of 9003 reads 4h55m BEFORE the baseline and its true
+    # instant is 5m after; 9004 is the mirror. Drop the zone and each lands on the other verdict.
+    put("9003", zoned(episode_start + timedelta(minutes=5), -5))
+    put("9004", zoned(episode_start - timedelta(minutes=5), +5))
 
     rec = _write_record(repo, "sess-alloc")
     got = {a["number"]: a for a in rec["allocations"]}
     assert "9001" in got, "the allocation must still be REPORTED -- it does sit in this worktree"
     assert got["9001"]["attribution"] == "worktree-inherited", (
         "an allocation claimed FIVE MINUTES before this episode began must never be attributed to "
-        "it; a one-UTC-offset parse error is what flips this arm"
+        "it; a one-UTC-offset parse error is what flips this arm on a non-UTC host"
     )
     assert got["9002"]["attribution"] == "this-episode", (
         "positive control: five minutes AFTER the baseline is this episode's, so the instrument is "
         "discriminating rather than answering worktree-inherited to everything"
+    )
+    assert got["9003"]["attribution"] == "this-episode", (
+        "a zone-carrying timestamp was attributed by its WALL CLOCK: its true instant is five "
+        "minutes after the baseline and only dropping the -0500 puts it before"
+    )
+    assert got["9004"]["attribution"] == "worktree-inherited", (
+        "the mirror arm -- only dropping the +0500 moves this instant from before the baseline to "
+        "4h55m after it. Both 9003 and 9004 discriminate at offset 0, which is what CI runs"
     )
 
 
@@ -1013,10 +1079,14 @@ def test_malformed_records_leave_the_reader_alive(repo: Path, fence: Fence, tmp_
     _make_clean_roster(repo, fence)
     box = _seats_dir(repo) / "probe-box"
     box.mkdir()
+    # `{"a":1}` PARSES, so it is not unreadable; it carries no field this reader reads, so it is
+    # RECORD-UNUSABLE and counted as unclassifiable. What it must never be is a described seat --
+    # see test_a_record_is_admitted_on_evidence_with_both_negative_controls, which pins the state,
+    # the population and the -Detail render, and pins the two records that MUST still be admitted.
     cases = {
         "zero.json": ("", "recordsUnreadable"),
         "blank.json": ("   \r\n  ", "recordsUnreadable"),
-        "scalar.json": ('{"a":1}', "recordsUnfenceable"),
+        "scalar.json": ('{"a":1}', "recordsUnclassifiable"),
     }
 
     blind = _mutant(
