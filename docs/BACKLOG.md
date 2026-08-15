@@ -9396,6 +9396,15 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 >
 > **THE POPULATION THIS ITEM MEASURED IS THE ENGINE REPOSITORY ONLY** -- 496 occurrences across 80 files at `ae76b9f9`, of which `scripts/` and the web console contain **zero**. The maintainer-internal security record is a **separate repository that this census never touched**, so nothing in the table above says anything about it.
 >
+> **CORRECTED 2026-08-15 -- READ THIS BEFORE THE PARAGRAPH BELOW IT. THE FENCE STANDS; ITS STATED REASON IS FALSE.** The next paragraph says the glyph refusal *"is currently the ONLY thing preventing"* the type-mangling write and *"holds the line by accident of ordering"*. **Measured false at `scripts/asvs/apply.py:216`:**
+> ```
+> blob = "" if anchor_repair else " ".join(str(v) for v in (c.get("residual", ""),))
+> ```
+> **On the anchor-repair path the glyph check searches an EMPTY STRING, so it cannot fire at all.** An anchor repair was measured writing a corrupted table **with exit 0**, while the ordinary write was refused on the same content.
+> **AND THE BYPASS IS THE ROUTINE OPERATION, NOT AN OBSCURE PATH: an anchor repair is the ONE write that role may perform unasked.**
+> **SO THE PARAGRAPH BELOW DESCRIBES A COMPENSATING CONTROL THAT DOES NOT COMPENSATE -- SDS-3.7, inside text written to document an SDS-3.7 defect.** Kept rather than deleted, because the wrong version is the one a later reader would otherwise re-derive from the ordering alone.
+> **WHAT DOES NOT CHANGE: the FENCE and the ORDERING.** Corruption-before-glyph still holds and the type-mangling repair still lands first. **WHAT CHANGES IS THE URGENCY, in the uncomfortable direction: the exposure does NOT wait for this item's sweep -- it exists now, through the sanctioned path.**
+
 > **WHY THE DISTINCTION IS LOAD-BEARING RATHER THAN TIDY.** `scripts/asvs/apply.py` refuses to write a record entry whose prose carries a banned glyph, and **U+26A0 is the FIRST character in that class** (`_BANNED`, `:26`). That refusal runs in the **validation** phase at `:217`; the **field-preservation invariant** runs later at `:275`. **Measured independently from the code side: for at least one entry carrying a top-level non-scalar value, the glyph refusal is currently the ONLY thing preventing a write that would type-mangle that value into a quoted Python repr -- which parses, so nothing goes red.**
 >
 > **THE REFUSAL WAS NEVER DESIGNED AS THAT CONTROL AND NOTHING RECORDS IT AS ONE. It holds the line by accident of ordering.** That is exactly the shape SDS-3.7 forbids -- a compensating control resting on a premise nobody wrote down -- except here the premise is *"a glyph happens to be present"*, which **this item's own subject is a proposal to remove**.
