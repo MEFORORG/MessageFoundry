@@ -9637,6 +9637,38 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 ## 1266. the seat clock's broadcast fanout drops seats per-firing, and no seat can detect it from its own inbox
 
+
+> **MEASURED 2026-08-15 -- A RECEIVING SEAT *CAN* DISCRIMINATE SUPPRESSION FROM A FAILED SEND, AND
+> THIS ITEM SAYS IT CANNOT. The single-instance claim is right; the COUNT over a long dark window is
+> what breaks the tie.** This seat went dark 04:21:10Z to 13:43:00Z -- **562 minutes, 56.2 cadences**:
+> ```
+> messages that reached this box during the dark window   1   (04:31:09Z, expired unread)
+> messages if every firing had been sent blindly         ~56
+> messages if suppression engaged the instant I went dark  0
+> first tick after I drained                             13:51:09Z -- IMMEDIATE
+> ```
+> **ONE, NOT FIFTY-SIX AND NOT ZERO.** The clock sent **exactly one more tick** after this seat's last
+> drain, that tick was never consumed, and **every subsequent firing for nine and a half hours was
+> withheld** -- then delivery resumed on the very next cadence once the box drained. That is a **latch
+> with a one-cadence delay**, and it is a behavioural signature, not an inference from absence.
+>
+> **WHAT THIS RULES OUT, AND IT IS THE FAULT LIMB:** the *"scheduler runs perfectly and every SEND
+> fails"* mechanism predicts **~56** arrivals or 56 failures, not one. **It is excluded for this
+> window.** The clock is not blind-sending into a dead box.
+>
+> **WHAT IT DOES NOT RULE OUT, stated so nobody over-reads it:** it does **not** separate
+> *"presence-based enumeration skips a seat that is not live"* from *"a deliberate withhold to a seat
+> carrying undrained mail"*. **Both predict this exact pattern.** That second candidate was offered
+> and then **retracted by its own author as "offered, never measured"** -- it now has a measurement
+> consistent with it, which is not the same as confirmation. **Still settle it by reading the code.**
+>
+> **AND THE CONSEQUENCE FOR THIS ITEM'S OWN SEVERITY, which points the uncomfortable way: THE
+> 53-OF-112 FIGURE MAY BE SUBSTANTIALLY CORRECT SUPPRESSION RATHER THAN FAULT.** This item's own
+> three-way discriminator already warns that a measurer must exclude intervals where they were dark or
+> they will count correct withholds as skips. **A naive reading of this seat's own 570-minute quantised
+> gap would have scored 57 fanout skips, and the true fault count for it is ZERO.** Before anyone
+> builds a fix, **re-derive 53-of-112 with dark intervals excluded** -- the fault may be much smaller
+> than filed, or absent.
 > 🔢 **Filed 2026-08-14 -- routed to this seat as an UNCLAIMED CODE item. It sat as three seats' corroboration for a full day with nobody owning it, because it is invisible from every vantage point that noticed it.** Value **5/10** · Difficulty **4/10**. **THE CLOCK IS HEALTHY AND THE FANOUT IS NOT** -- conflating those is the whole reason this went unfiled.
 
 > **THE MEASUREMENT.** 112 firings on 2026-08-14 at a **10.0 min cadence** (9.9 / 10.0 / 10.1) -- the timer is fine. But recipients per firing swing **1 to 11, median 2**, and **53 of 112 firings reached exactly ONE seat**. The seat that measured it received **33 of 112**. **The dropout is PER-SEAT-PER-FIRING, not an outage window:** two seats missed 19:01 and 19:11 which 7 and 6 other seats received, and one missed 18:51 which the other received.
