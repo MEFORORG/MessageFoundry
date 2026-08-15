@@ -9457,6 +9457,26 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **CANDIDATE MECHANISMS -- ENUMERATED, NOT DIAGNOSED. None is measured.** (1) The roster enumerated at fire time misses live seats -- broadcast enumerates via `scripts/coord/presence.ps1`, and a seat invisible at fire time is skipped; consistent with the data, and **no seat has read the roster source**. (2) A deliberate withhold to seats carrying undrained mail, on the reasoning that the pending tick already IS the wake -- **offered and then RETRACTED by its own author as never measured**. **It must be excluded by READING THE CODE, not by asking a seat whether it felt skipped, because from the receiving end a correctly-withheld send and a failed one are THE SAME OBSERVATION.** That it is also the reassuring answer is exactly why it needs the stricter treatment: *"working as designed"* ends an investigation. (3) **Instrument floor** -- recipient counts come from delivered mail files, so a message written but never enqueued is invisible to the instrument and **the counts are a floor, not a census.**
 
+> **BLOCKED ON AUTHORITY, NOT ON INFORMATION. DO NOT DISPATCH THIS TO A BUILDER UNTIL AN OWNER RULES. Added 2026-08-15 after this item was dispatched and handed back.** The analysis below is complete and correct; **the edit it implies cannot safely be made by any seat.**
+>
+> **THE SUBJECT FILE IS NOT UNDER VERSION CONTROL -- NOT IN THIS REPO, NOT ANYWHERE.** Measured:
+> ```
+> git ls-files | grep seat-tick     -> ZERO   (control: 1952 files tracked)
+> git grep "seat-tick" origin/main  -> ZERO references anywhere in the repo
+> ~/.claude/mefor-usage/.git        -> DOES NOT EXIST
+> ```
+> Corroborating signature in that directory: **`atrisk_ledger.py.deleted-20260805`** -- a file "deleted" by renaming it, which is what an unversioned directory looks like.
+>
+> **SO ANY FIX HERE IS AN UNATTRIBUTABLE WRITE TO A LIVE, SHARED, MACHINE-GLOBAL CONTROL** that every seat's clock depends on **while the edit is being made** -- no review, no rollback, no record of who changed it. **That is the same defect class as `#1247`, one level worse: the worktree gate at least had a committed source to compare an installed copy against. This has none.**
+>
+> **AND THE BLAST RADIUS IS DOCUMENTED IN THE FILE ITSELF, `:191-198`:** *"THE TICK BODY HAS A HARD 2000-CHARACTER CAP AND EXCEEDING IT KILLS THE CLOCK SILENTLY ... THE CLOCK WAS DEAD FOR ABOUT 35 MINUTES"*, and the first symptom was the author noticing they had stopped receiving their own ticks. **A bad edit here silences the entire fleet AND EXITS 0 WHILE DOING IT** -- which is this item's own subject, turned on the item's own fix.
+>
+> **THEREFORE THE FIRST DELIVERABLE IS VERSION CONTROL, NOT THE LOG.** Bring `seat-tick.ps1` and `seats.json` under version control -- this repo under `scripts/coord/`, or the vault -- **and the retention change becomes an ordinary reviewable commit.** Until then **every improvement anyone makes to this clock hits the same wall**, and `#1267` is blocked identically because its fix is a rewrite of the tick body: **the exact edit that caused the 35-minute outage.**
+>
+> **IF THE OWNER PREFERS IT STAY OUT-OF-REPO, the `#1247` pattern is the fallback and transfers directly:** back up the bytes, write a receipt naming who wrote it and from where, and **refuse to overwrite an unrecognised copy.**
+>
+> **THIS IS AN OWNER DECISION. An AFK delegation lets a seat exercise grants it already holds; it does not create a grant over a shared machine-global control.** The building lane reached that conclusion independently and handed the item back rather than proceeding -- **which is the correct outcome and the reason nothing was broken.**
+
 > **READ THIS FIRST -- THE CLOCK ALREADY DECIDES OUT LOUD; ONLY THE RETENTION IS MISSING. THE FIRST DELIVERABLE IS MUCH SMALLER THAN THIS ITEM IMPLIES.** Measured in `seat-tick.ps1` by a builder and verified line-by-line here.
 >
 > **`$results` ALREADY CARRIES ONE ENTRY PER SEAT PER FIRING, WITH THE DECISION AND ITS REASON.** Seven states, not the four this item's corrected table lists: `SENT`, `THROTTLED(last-send-Ns-ago,floor-Ms)`, `STALE(no-live-session)`, `GONE(no-such-worktree)`, `COLD(...)`, `BACKLOG(n-pending,oldest=Nm,suppressed)`, `FAILED(queued=N,exit=N,...)`, plus `NO-TARGETS` and `FATAL`.
