@@ -9154,6 +9154,24 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 ## 1255. two testpaths ship a top-level conftest each, so a bare import conftest binds to whichever loaded first
 
+> **THE FAILURE MODE IS WORSE THAN FILED, AND THE FIX IS A DECISION RATHER THAN A TASK. Measured 2026-08-15; verified independently here.** This item describes the signature as an `AttributeError` naming a module path from the wrong package -- i.e. failing loudly-ish. **It can fail SILENTLY instead.**
+>
+> **THE TWO CONFTESTS SHARE EIGHT TOP-LEVEL NAMES** -- `_Baseline`, `_QuiesceNullHandler`, `_allow_insecure_config_source_in_tests`, `_quiesce_background_loggers_at_teardown`, `_quiesce_baseline`, `_quiesce_targets`, `_restore_baseline`, `_tolerate_logging_on_closed_capture_streams` -- **the logging-quiesce machinery, duplicated in both trees.** So a mis-bound `import conftest` **does not necessarily raise: it can SUCCEED and return the WRONG IMPLEMENTATION.** That is the shape this project keeps meeting -- **a resolution that lands on something plausible from the wrong subject** -- and it is strictly worse than the documented signature.
+>
+> **PRECONDITIONS CONFIRMED at `origin/main`:** `pyproject.toml` sets **no `importmode`**, so pytest runs its default **`prepend`** -- exactly the mode where top-level module names collide. **Both directories ship `conftest.py`; NEITHER has `__init__.py`.** And the LATENT framing holds: **no bare `import conftest` exists in either tree today.**
+>
+> **THE FORK, WITH THE RISK THAT DECIDES IT MEASURED RATHER THAN ASSERTED:**
+> - **(A) `importmode = "importlib"`.** The modern, documented fix; removes the `sys.modules` collision outright. **RISK: importlib mode does NOT insert rootdir on `sys.path`, and 36 FILES do `from tests.X import ...` -- INCLUDING `tests/conftest.py` ITSELF.** So it **trades a LATENT collision for a LIVE import break.**
+> - **(B) Add `__init__.py` to both test directories**, making the conftests distinct dotted modules. **Preserves the 36 cross-tree imports; changes pytest's module naming for 660 + 14 test files.**
+>
+> **RECOMMENDED: (B)** -- the cross-tree imports are load-bearing and ship today, so the lower-risk direction is the one that keeps them working.
+>
+> **VERIFICATION MUST BE A FULL-SUITE RUN, and this is not conservatism.** The defect is about what happens when **BOTH trees are collected**, so **any check that runs one tree passes by construction.** That is this item's own *"invisible in isolation"* point applied to its own fix.
+>
+> **PARKED ON VERIFICATION COST, NOT ON DIRECTION.** A latent defect whose fix changes the import semantics of **674 test files** should not land on a fleet that cannot currently measure its own pool, and the honest check is the long one.
+>
+> **INSTRUMENT CAUTION FOR WHOEVER RE-MEASURES THE SHARED NAMES:** the first attempt used `grep -oP` and **died on this box's locale** (*"supports only unibyte and UTF-8 locales"*) -- **it printed NOTHING, which reads exactly like "no shared names".** Redone with an AST walk. **A failed instrument that prints nothing is indistinguishable from a clean result.**
+
 > 🔢 **Filed 2026-08-14 - not started. LATENT, not live: no caller trips it at `origin/main` today.** Value **6/10** · Difficulty **2/10** · _quick win_. `pyproject.toml` sets `testpaths = ["tests", "packaging/messagefoundry-webconsole/tests"]`. **Both directories contain a `conftest.py` and NEITHER contains an `__init__.py`**, so both claim the same top-level module name `conftest`. In a full run only one wins `sys.modules`, and a bare `import conftest` in either tree silently binds to it.
 
 > **THE FAILURE IS INVISIBLE IN ISOLATION, WHICH IS THE WHOLE DEFECT.** Run either tree alone and the import resolves to that tree's own `conftest` and passes. Run both -- which is what `pytest` does by default, and what CI does -- and one tree's import silently resolves to the OTHER tree's module. The observed signature is an `AttributeError` naming a module path from the *wrong* package, not an `ImportError`, so it reads as a missing attribute rather than a mis-bound import.
