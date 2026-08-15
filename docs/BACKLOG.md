@@ -9519,6 +9519,26 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **C. A THIRD DEFECT, ADDED 2026-08-15, AND IT IS NOT LIMB A RESURRECTED.** Limb A was retracted because the rubric **does** name a fanout fault. **This is the opposite problem: it names it and MISCLASSIFIES it.** The live text asserts that QUANTISED *"means every firing HAPPENED and NONE REACHED YOU -- a DELIVERY fault, not a slow clock."* **That is wrong in one of three cases.** A quantised gap also arises when the seat was **DARK and the clock CORRECTLY SUPPRESSED** -- measured at 79m56s = 8.0 cadences exactly, on-grid both ends, **working as designed** (`#1266`). **So the rubric instructs every seat to report a correct suppression as a delivery fault**, which inflates the very count `#1266` rests on. **The fix is a third branch, not a reworded second one:** a seat must exclude intervals in which it was dark before classifying at all. **This is rubric text, so it belongs here and not in `#1266`.**
 
+> **THE REPLACEMENT PROCEDURE, supplied 2026-08-15 by the seat the clock wakes. THE RUBRIC'S REAL DEFECT IS THAT IT STOPS: it says a quantised gap cannot separate a FANOUT SKIP from a FAILED SEND, and then ends -- a dead end in the exact case it was written to diagnose. It is resolvable, just not from one seat alone.**
+> ```
+> GIVEN A QUANTISED GAP:
+>  1. CHECK YOUR OWN PER-SEAT STATUS FOR THE MISSED CYCLES FIRST.
+>     COLD / BACKLOG / THROTTLED / suppressed against your worktree
+>       -> the clock deliberately did not tick you. NOT A FAULT. STOP.
+>  2. ONLY IF NOT SUPPRESSED, compare a SECOND SEAT'S log for the same cycle.
+>     another seat received it  -> FANOUT SKIP
+>     no seat received it       -> FAILED SEND or scheduler; check the task's own
+>                                  LastRunTime / LastTaskResult, which are INDEPENDENT OF MAIL
+> ```
+> **THE ORDER IS LOAD-BEARING: step 1 is cheapest, needs no second seat, and is the INNOCENT explanation.**
+>
+> **AND THE COUNTERWEIGHT MUST SHIP WITH IT OR STEP 1 BECOMES THE NEW DEFECT.** Confirm suppression from the clock's **RECORDED STATUS FOR THOSE CYCLES** -- **not from the plausibility of the story, and NOT from a CURRENT label**, which is transient and describes the mail queue rather than liveness. **No recorded suppression for the missed cycles means you were NOT suppressed; go to step 2.**
+> > **TEST THE REASSURING BRANCH WITH THE SAME EVIDENCE YOU WOULD DEMAND OF THE ALARMING ONE.**
+>
+> **THE TWO-BRANCH VERSION WAS PROPOSED AND WITHDRAWN BY ITS OWN AUTHOR, and the reason belongs here:** under two branches, *"another seat received that cycle"* resolves to FANOUT SKIP -- **and a correctly-suppressed seat produces exactly that evidence.** The fix would have **manufactured phantom fanout bugs out of the clock working correctly** -- the same overcount `#1266` records, **arriving through the REMEDY rather than through the original text.**
+>
+> **THIS PROCEDURE IS CURRENTLY UNRUNNABLE RETROSPECTIVELY, AND THAT IS THE COUPLING TO `#1266`.** Step 1 needs the per-cycle status, and **that status is retained nowhere** -- `seat-tick.last` is a single line overwritten every tick, `seat-tick.state.json` holds one timestamp per worktree and no state. **So a seat with no evidence for step 1 is pushed straight to step 2, which is exactly the branch that overcounts.** **The two items therefore share one prerequisite: the clock must log its per-seat decision AND ITS REASON, per firing, durably.** Neither item's fix works without it.
+
 > **B. THE SHARPER HALF, and it is a defect in the QUESTION rather than in any answer.** A seat took **six perfect ticks, answered "nothing changed" correctly every time, and stayed stopped for FORTY MINUTES.** Every individual answer was right; **the sequence concealed the stoppage.** The concealing sentence is live in the running clock:
 > ```
 > "Act only if something actually changed. Waking is not a reason to do work."
