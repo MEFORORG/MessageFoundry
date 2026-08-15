@@ -70,9 +70,12 @@
         record ever written satisfied the denominator forever -- a writer that recorded turn 1 and
         then died was byte-identical to one recording every turn.
       * `writerErrorLines` counts an APPEND-ONLY log, so it can never fall by construction, and a stop
-        keyed on the total would fire forever after the first ever failure. The operand is therefore
-        the RECENT count. A channel that fires when nothing is wrong trains its reader to skip it, and
-        this file already paid for that lesson once (see CRYING WOLF below).
+        keyed on the total would fire forever after the first ever failure. A channel that fires when
+        nothing is wrong trains its reader to skip it, and this file already paid for that lesson once
+        (see CRYING WOLF below). The total is therefore NOT the operand; two derived counts are, and
+        they answer different sentences -- see THE READER IS LATE BY CONSTRUCTION below, because the
+        obvious repair (bound it to the last -FreshMinutes) silences the channel for this file's only
+        reader.
     So every staleness verdict here is measured against a bound the receipt PRINTS, because a number
     is not checkable without the instrument that produced it (SDS-3.8). There are two such bounds and
     both are receipt fields: `-FreshMinutes` (`freshWithinMinutes`) for "is this still being written",
@@ -173,6 +176,18 @@
     whitespace-only file and a ZERO-BYTE file dropped into any box directory each produced exit 1, a
     bare PropertyNotFoundException, and no receipt, no denominator, no stop conditions and no roster
     at all.
+
+    BUT NOT CRASHING IS NOT THE SAME AS DESCRIBING. Trading the crash for a rendered ROW is only half
+    the repair, and the half left undone asserted MORE than the crash did. Get-RecField hands back a
+    default for every absent field, so a JSON object carrying nothing this reader reads never faulted:
+    MEASURED, `{"a":1}` alone in a box directory rendered `(no-key) NOT-DECLARED POSSIBLY RUNNING` with
+    recordsUnreadable=0 and recordsUnclassifiable=0, and -Detail printed a full SEAT EVIDENCE briefing
+    over it with two re-check commands rooted at an empty path. POSSIBLY RUNNING is a POSITIVE
+    liveness verdict about a file nobody wrote as a seat. So admission is now on EVIDENCE rather than
+    on syntax -- at least one of sessionId, sessionKey, worktree, asOf -- and anything else lands on
+    RECORD-UNUSABLE, the state that already existed to say "nothing about this was established" and
+    that already had a stop. The documented `nosid` record is admitted unchanged and is pinned as the
+    negative control, because a guard that rejected it would delete a reachable class of real seats.
 
     EVERY VERDICT IS COMPUTED AT READ TIME AND NONE IS STORED. A stored verdict is read after the
     world moved. Measured on this repo the same day: one unchanged commit carried three SHAs across
