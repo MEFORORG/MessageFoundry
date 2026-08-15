@@ -8119,6 +8119,27 @@ gate is the wrong shape, validation of the walk is the right one.
 
 ## 1217. `retry_max_attempts` has no `>=1` floor, and retry-forever has no TOML or env spelling
 
+> **SPLITS: HALF (1) IS ALREADY-DONE; HALF (2) IS A REAL OPEN DESIGN QUESTION. Measured 2026-08-15, verified independently here.**
+>
+> **HALF (1) -- DONE, DELIBERATELY, WITH ITS REASONING IN THE CODE.** `config/settings.py:1065` reads `retry_max_attempts: int | None = Field(default=100, ge=1)`, and the comment at `:1059-1064` resolves this item verbatim: a configured **0 loaded clean and dead-lettered on the FIRST failure**, because the delivery check is `item.attempts >= max_attempts` against a **POST-increment** count -- *"so 0 means give up immediately while READING like 'no limit'."*
+>
+> **A NEAR MISS WORTH MORE THAN THE ITEM: THE OBVIOUS "REMAINING HALF" WOULD HAVE DELETED A USED MECHANISM.** `config/models.py:279` -- `max_attempts: int | None = 100` -- is **UNFLOORED**, and adding `ge=1` to it looks exactly like finishing the job. **FOUR TEST FILES DEPEND ON `RetryPolicy(max_attempts=0)` DELIBERATELY**, as the permanent no-retry idiom: `test_batch_completion.py`, `test_resend.py`, `test_postgres_store.py`, `test_sqlserver_store.py` (control: 30 test files mention `RetryPolicy`, so the dependency probe discriminates).
+> **AND `settings.py:1062-1064` ANTICIPATES THE MISTAKE BY NAME:** the floor is on the **operator-facing setting only**, because `RetryPolicy(max_attempts=0)` *"remains a deliberate internal idiom for a permanent, no-retry failure (store `mark_failed`), and CONSTRAINING THAT INSTEAD WOULD DELETE A USED MECHANISM WHILE CLAIMING TO ADD A GUARD."*
+> **THE GENERAL FORM, and it is the reusable half: a guard added to the wrong layer is a CAPABILITY DELETION wearing a tightening's clothes -- and the four failing tests would have pointed at the new guard rather than at the removed idiom.** What caught it was **ORDER, not care: grep what DEPENDS on a value before constraining it.** The dependency and the comment agreed, which is the only reason either is trustworthy.
+>
+> **HALF (2) STANDS AND IS MEASURED, not quoted.** `DeliverySettings` loaded against every plausible TOML spelling:
+> ```
+> retry_max_attempts = 0          REJECTED       = -1        REJECTED
+>                    = ""         REJECTED       = "none"    REJECTED
+>                    = "forever"  REJECTED       key omitted LOADS -> 100
+> python None (code-first)        LOADS -> None
+> ```
+> **SO RETRY-FOREVER IS REACHABLE IN CODE-FIRST CONFIGURATION AND NOWHERE ELSE.** TOML has no null literal, so **the documented posture cannot be expressed from `connections.toml` or the environment at all.**
+>
+> **CHOOSING THE SPELLING *IS* THE ITEM, which is why this is not a fill-in.** `0` is out -- it is the exact reading-versus-meaning trap half (1) closed. `-1` is the same defect one step removed. A word means the field stops being `int | None` and needs a validator, **changing the operator-facing schema and `docs/CONFIGURATION.md`'s `[delivery]` catalog.**
+> **RECOMMENDED: a string spelling (`retry_max_attempts = "forever"`) coerced to `None` by a field validator -- the only candidate that cannot be misread as a count.** Per section 0 there are **zero deployments**, so the schema change costs nothing today and the simple correct end state is available.
+
+
 > 🔢 **Filed 2026-08-11 -- found by Session C while building #1051; measured and documented rather than fixed, because a floor changes the accepted-configuration set.** Value **4/10** -- Difficulty **2/10** -- _fill-in_. Two halves. (1) **`0` or a negative value loads clean and dead-letters on the FIRST failure** -- the check is `attempts >= max_attempts` against a post-increment count, so `0` means "give up immediately" while reading like "no limit". (2) **There is no TOML or env spelling for retry-forever**: `""`, `none` and `null` all raise `ValidationError`, so that posture is reachable **per-outbound in code-first configuration only**.
 
 > Both are conditional on a first deployment: an operator who wrote `retry_max_attempts = 0` intending "unlimited" would get single-attempt dead-lettering, silently. Nothing is misconfigured today; there are zero deployments. Note the interaction with **#1051**, which set the finite default to 100 -- a floor should be decided alongside whether retry-forever needs a config spelling at all.
