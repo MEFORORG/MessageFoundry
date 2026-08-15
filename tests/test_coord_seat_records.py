@@ -26,6 +26,22 @@ hypothetical:
 * ``test_receipt_answers_and_says_so`` / ``test_receipt_refuses_and_says_so`` -- the reader must
   state what it LOOKED AT, so that an empty roster over a dead writer is distinguishable from an
   empty roster over an idle one -- AND the two runs must be distinguishable from each other.
+* ``test_a_blind_config_root_is_named_beside_the_total_that_hides_it`` -- a fix that closes a hole
+  at one granularity and leaves it at another. The aggregate is asserted UNCHANGED, and the
+  INTERRUPTED row is asserted to survive, because both "fixes" that would break this are worse.
+* ``test_the_writer_error_stop_decays_on_recovery_not_on_the_clock`` -- THE READER IS LATE BY
+  CONSTRUCTION. A bound keyed to "within N minutes of NOW" is evaluated hours after the events it
+  is meant to catch, so it can be silent for the only reader this layer has.
+* ``test_every_receipt_field_is_read_by_a_stop`` -- the module's two-way rule as an EXECUTABLE
+  check over fleet.ps1's own bytes rather than a sentence in its header, which cannot go red.
+
+**A BOUND IS ANSWERED WITH "WHAT DOES IT DO TO A READER ARRIVING SIX HOURS LATE".** Three stops
+here are keyed on comparisons between two timestamps that are BOTH on disk -- writer errors against
+the newest record, the heartbeat against the newest record in its own box, a vanished checkout
+against -FoldDays -- precisely so their answers do not move when the reader does. Each of those
+tests carries the crying-wolf control beside the firing arm, because the opposite repair (an
+unbounded count, an absolute age) is lit for ever on a healthy quiet repo and trains its reader to
+skip the channel.
 
 **EVERY FENCED TEST CONTROLS ITS OWN CONFIG ROOT, AND THAT IS A CORRECTNESS PROPERTY.** The one
 reader test this file used to carry asserted only that some keys were present and that one record
@@ -1215,6 +1231,24 @@ def test_bad_worktree_writes_nothing_rather_than_a_junk_box(repo: Path, tmp_path
     resolves against the caller's cwd, so a run whose WORKTREE fails to resolve while the CWD is a
     real checkout sails past rule 1 straight into ``ConvertTo-BoxKey`` with an empty path and
     creates the seats layer under a repo it was never recording.
+
+    THE THIRD CASE IS THE ONE NOTHING COVERED: git ANSWERS, exit 0, with a rooted path that DOES
+    NOT EXIST. Measured -- an inherited ``GIT_WORK_TREE`` pointing at a directory that is not there
+    makes ``git rev-parse --show-toplevel`` print it and exit 0, and ``--git-common-dir`` still
+    resolves, so neither "git refused" nor "there is no common dir" is what stops this one. Only the
+    existence check does, and an inherited GIT_WORK_TREE in a hook's environment is not exotic.
+
+    WHAT IS *NOT* PINNED HERE, MEASURED RATHER THAN ASSUMED (SDS-3.6). The previous author filed
+    this test as unable to see the deletion of Rule 1's three guards inside ``Resolve-Worktree``
+    (Resolve-Path / IsPathRooted / Test-Path-Container), and that reproduces: a copy of seat.ps1
+    with those three lines replaced by ``return $top`` leaves every arm below GREEN. The reason is
+    structural rather than an oversight in the fixture -- those guards sit between two others that
+    bracket them, ``if (-not $top)`` upstream and the git-common-dir refusal downstream, and a path
+    ``git -C`` can still change to is by definition an existing directory. I could not construct an
+    input that separates them: a non-existent toplevel is reachable (the third case above) but then
+    ``git -C`` refuses it, and ``git rev-parse --show-toplevel`` normalises ``..`` and never returns
+    a relative path. So the third case is red only against the PAIR of deletions, and the inner
+    guards remain defence in depth that this suite cannot isolate.
     """
     outside = tmp_path / "not-a-repo"
     outside.mkdir()
@@ -1228,6 +1262,30 @@ def test_bad_worktree_writes_nothing_rather_than_a_junk_box(repo: Path, tmp_path
     assert "could not resolve a rooted existing worktree" in r.stderr, r.stderr
     assert not (repo / ".git" / "mefor-coord").exists(), (
         "rule 1 was bypassed: the writer built the seats layer for a worktree it could not name"
+    )
+
+    # THE THIRD CASE. git names a worktree that is not there, and says so with exit 0.
+    ghost = dict(os.environ)
+    ghost["GIT_DIR"] = str(repo / ".git")
+    ghost["GIT_WORK_TREE"] = str(repo / "NOT-THERE")
+    named = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=str(repo),
+        env=ghost,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    # THE IN-RUN CONTROL: without it this arm is indistinguishable from "git refused", which the
+    # first two arms already cover.
+    assert named.returncode == 0, named.stderr
+    assert not Path(named.stdout.strip()).exists(), named.stdout
+
+    r = _pwsh(SEAT, "-Record", "-SessionId", "sess-ghost", cwd=repo, env=ghost)
+    assert r.returncode == 0
+    assert "could not resolve a rooted existing worktree" in r.stderr, r.stderr
+    assert not (repo / ".git" / "mefor-coord").exists(), (
+        "a worktree git NAMED but that does not exist minted a box no reader will ever drain"
     )
 
     # POSITIVE CONTROL, same repo, same instrument: a legitimate run DOES create exactly one box.
@@ -2667,6 +2725,128 @@ def test_seat_shim_ends_with_exit_zero_and_exits_zero_outside_a_repo(tmp_path: P
     assert r.stdout.strip() == "", r.stdout
 
 
+def _our_rows(settings: Path) -> list[tuple[str, str, str]]:
+    """(event, marker, command) for EVERY row this installer wrote -- all seven, not one per marker.
+
+    Two markers carry two rows each, so a per-marker lookup silently covers five of seven. That is
+    how the non-git exit-1 class came to be measured on one shim builder of three and reported
+    fixed while four rows -- one of them on Stop, beside the row that got the fix -- still cried
+    wolf at every turn end in every non-checkout folder on the box.
+    """
+    out: list[tuple[str, str, str]] = []
+    for event, cmd in _commands(settings):
+        for m in MARKERS:
+            if f"# {m}" in cmd:
+                out.append((event, m, cmd))
+                break
+    return out
+
+
+def _run_shim(cmd: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", cmd],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=120,
+    )
+
+
+def _rig_repo(path: Path, scripts: dict[str, str]) -> Path:
+    """A checkout that is recognisably MessageFoundry, carrying only the scripts named."""
+    rig = _init_repo(path)
+    (rig / "scripts" / "coord").mkdir(parents=True)
+    (rig / "scripts" / "coord" / "presence.ps1").write_text("# marker\n", encoding="utf-8")
+    for rel, body in scripts.items():
+        p = rig / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body, encoding="utf-8")
+    return rig
+
+
+def test_every_installed_shim_exits_zero_outside_a_repo(tmp_path: Path) -> None:
+    """ALL SEVEN ROWS, BECAUSE THE HOLE MOVED RATHER THAN CLOSED WHEN ONE BUILDER WAS FIXED.
+
+    These entries are user-global and fire in every unrelated project on the machine, two of them
+    on Stop at every turn end. Outside a repo the guard is false, nothing in the body runs, and the
+    last thing executed is a FAILED ``git rev-parse`` -- so ``pwsh -Command`` exits 1 with an EMPTY
+    stderr, git's message having been eaten by ``2>$null``. MEASURED with the suffix on the seat
+    builder alone: seat 0, wake 0, and mail@SessionStart, mail@Stop, coord@SessionStart,
+    coord@PreToolUse and announce@UserPromptSubmit all 1.
+
+    THE RUNNER IS PART OF THE MEASUREMENT. Under Windows PowerShell 5.1 -- the literal string in
+    each row's ``shell`` key -- the non-git case answered 0 even before the fix, because 5.1 does
+    not map a failed native command onto the process exit code. This runs pwsh 7, which is what a
+    hand-run or a pwsh-configured harness uses and where the defect is real.
+    """
+    settings = _settings_fixture(tmp_path)
+    assert _install(settings).returncode == 0
+    nongit = tmp_path / "nongit"
+    nongit.mkdir()
+    # THE IN-RUN CONTROL. Without it a cwd that happened to be a checkout takes the other branch
+    # entirely and every row below passes for the wrong reason.
+    assert _git_rc(nongit, "rev-parse", "--git-common-dir") != 0, "cwd is a repo; test is vacuous"
+
+    rows = _our_rows(settings)
+    assert len(rows) == 7, rows
+    bad = []
+    for event, marker, cmd in rows:
+        p = _run_shim(cmd, nongit)
+        if p.returncode != 0 or p.stdout.strip():
+            bad.append((event, marker, p.returncode, p.stdout, p.stderr))
+    assert not bad, bad
+
+
+def test_the_trailing_exit_zero_does_not_swallow_a_terminating_error(tmp_path: Path) -> None:
+    """THE GUARANTEE IS NARROW AND THE NARROW FORM IS THE ONE TO ENFORCE.
+
+    ``exit 0`` is the last STATEMENT, so it is reached only if control gets there: a TERMINATING
+    error inside the body unwinds straight past it. What the suffix guarantees is exactly that THE
+    SHIM DOES NOT REPORT A FAILURE OF ITS OWN PLUMBING -- the ``git rev-parse`` that fails outside a
+    repo, which is the one that fires constantly. A real fault inside a target still surfaces.
+
+    Without this, "this shim always exits 0" is one careless edit away from being written into the
+    header, and the sentence would be false in the one direction that matters: a target that blows
+    up would be indistinguishable from a healthy turn.
+    """
+    settings = _settings_fixture(tmp_path)
+    assert _install(settings).returncode == 0
+    cmd = _marker_command(settings, "mefor-seat")
+
+    throwing = _rig_repo(
+        tmp_path / "rig-throw",
+        {"scripts/hooks/seat-record.ps1": "$ErrorActionPreference = 'Stop'\nthrow 'boom'\n"},
+    )
+    p = _run_shim(cmd, throwing)
+    assert p.returncode == 1, (p.returncode, p.stdout, p.stderr)
+
+    # THE CONTROL, SAME SHIM, SAME RIG SHAPE: a target that merely exits non-zero IS swallowed, so
+    # the assertion above is about terminating errors rather than about the suffix being absent.
+    exiting = _rig_repo(tmp_path / "rig-exit3", {"scripts/hooks/seat-record.ps1": "exit 3\n"})
+    assert _run_shim(cmd, exiting).returncode == 0
+
+
+def test_a_missing_script_notice_survives_the_trailing_exit_zero(tmp_path: Path) -> None:
+    """The notice is the ONE surface that still resolves when the script does not.
+
+    A wired-but-resolving-nothing hook is byte-identical to a healthy hook with no work, which is
+    how one survived for weeks. The suffix must not silence it: it is appended AFTER the body, so
+    the notice is written and then the shim exits 0 -- both, not one.
+    """
+    settings = _settings_fixture(tmp_path)
+    assert _install(settings).returncode == 0
+    rig = _rig_repo(tmp_path / "rig-noscripts", {})
+
+    for marker, needle in (
+        ("mefor-seat", "[seat] scripts/hooks/seat-record.ps1 is missing"),
+        ("mefor-announce", "[announce] scripts/hooks/announce-session.ps1 is missing"),
+    ):
+        p = _run_shim(_marker_command(settings, marker), rig)
+        assert p.returncode == 0, (marker, p.returncode, p.stderr)
+        assert needle in p.stdout, (marker, p.stdout)
+
+
 def test_seat_shim_swallows_a_failing_target_and_the_wake_shim_does_not(tmp_path: Path) -> None:
     """The asymmetry is deliberate and both halves must be pinned together.
 
@@ -2676,26 +2856,304 @@ def test_seat_shim_swallows_a_failing_target_and_the_wake_shim_does_not(tmp_path
     were ever silently converted to the wake shim's propagating form, a future seat-record failure
     would surface as a failed Stop hook. The wake case is the instrument control: a harness that
     cannot observe a non-zero exit at all would otherwise pass both halves.
+
+    THE STD AND ANNOUNCE ROWS ARE HERE TOO, because the blanket form is now the shared rule and
+    only the wake row is the exception. Pinning two of four builders is what left four rows
+    unfixed last time.
     """
     settings = _settings_fixture(tmp_path)
     assert _install(settings).returncode == 0
 
-    rig = _init_repo(tmp_path / "rigged")
-    (rig / "scripts" / "coord").mkdir(parents=True)
-    (rig / "scripts" / "coord" / "presence.ps1").write_text("# marker\n", encoding="utf-8")
-    (rig / "scripts" / "hooks").mkdir(parents=True)
-    (rig / "scripts" / "hooks" / "seat-record.ps1").write_text("exit 3\n", encoding="utf-8")
-    (rig / "scripts" / "hooks" / "mail-watch.ps1").write_text("exit 3\n", encoding="utf-8")
+    rig = _rig_repo(
+        tmp_path / "rigged",
+        {
+            "scripts/hooks/seat-record.ps1": "exit 3\n",
+            "scripts/hooks/mail-watch.ps1": "exit 3\n",
+            "scripts/hooks/mail-drain.ps1": "exit 3\n",
+            "scripts/hooks/collision_gate.ps1": "exit 3\n",
+            "scripts/hooks/announce-session.ps1": "param([string]$CommonDir)\nexit 3\n",
+            "scripts/worktree/session-context.ps1": "exit 3\n",
+        },
+    )
+    answers = {
+        (event, marker): _run_shim(cmd, rig).returncode
+        for event, marker, cmd in _our_rows(settings)
+    }
+    assert answers[("Stop", "mefor-wake")] == 3, (
+        "the control could not observe a non-zero exit at all"
+    )
+    assert answers[("Stop", "mefor-seat")] == 0, (
+        "the seat shim started propagating its target's code"
+    )
+    for key, rc in answers.items():
+        if key != ("Stop", "mefor-wake"):
+            assert rc == 0, (key, rc, answers)
 
-    def run(marker: str) -> int:
-        return subprocess.run(
-            ["pwsh", "-NoProfile", "-Command", _marker_command(settings, marker)],
-            cwd=str(rig),
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            timeout=120,
-        ).returncode
 
-    assert run("mefor-wake") == 3, "the control could not observe a non-zero exit at all"
-    assert run("mefor-seat") == 0, "the seat shim started propagating its target's exit code"
+# --- -Status: a MEASUREMENT of the wired command, not a label somebody wrote at an earlier install.
+
+
+def _status_rows(out: str) -> list[tuple[str, str, str]]:
+    rows = []
+    for ln in out.splitlines():
+        m = re.match(r"^ {4}(\S+)\s+(scripts/\S+)\s+(\S.*)$", ln)
+        if m:
+            rows.append((m.group(1), m.group(2), m.group(3).strip()))
+    return rows
+
+
+def test_status_measures_the_wired_command_and_a_one_byte_drift_reads_stale(
+    tmp_path: Path,
+) -> None:
+    """INSTALLED USED TO BE A LABEL: "a row carrying our marker exists".
+
+    The marker is the one part of the shim that never changes, so a row wired by an older checkout,
+    or hand-edited, or reduced to the marker plus a ``Write-Output``, all read INSTALLED. MEASURED:
+    a seat row hand-reverted to its pre-fix body reported INSTALLED while that same wired command,
+    run in a non-git directory, answered rc=1 -- the exact defect the edit claimed to have closed,
+    reported as fixed. This file's payload IS shim text copied into settings.json, so the divergence
+    is load-bearing here in a way it is not for a hook that lives in a checkout.
+
+    THE UNTOUCHED ROWS ARE ASSERTED IN THE SAME RUN. A check that blanket-fails is worthless in the
+    same way a check that blanket-passes is; only the discrimination is evidence.
+    """
+    settings = tmp_path / "s.json"
+    settings.write_text("{}", encoding="utf-8")
+
+    missing = _install(settings, "-Status")
+    assert missing.returncode == 0
+    assert all(state == "MISSING" for _, _, state in _status_rows(missing.stdout)), missing.stdout
+
+    assert _install(settings).returncode == 0
+    fresh = _install(settings, "-Status")
+    assert fresh.returncode == 0
+    assert [s for _, _, s in _status_rows(fresh.stdout)] == ["INSTALLED"] * 7, fresh.stdout
+
+    # ONE BYTE, on one row.
+    data = json.loads(settings.read_text(encoding="utf-8-sig"))
+    touched = 0
+    for entries in data["hooks"].values():
+        for entry in entries:
+            for h in entry["hooks"]:
+                if "# mefor-seat" in h.get("command", ""):
+                    h["command"] = h["command"] + " "
+                    touched += 1
+    assert touched == 1
+    settings.write_text(json.dumps(data), encoding="utf-8")
+
+    stale = _install(settings, "-Status")
+    assert stale.returncode == 3, (stale.returncode, stale.stdout)
+    rows = {(e, s): state for e, s, state in _status_rows(stale.stdout)}
+    assert rows[("Stop", "scripts/hooks/seat-record.ps1")] == "STALE", rows
+    assert [v for k, v in rows.items() if k != ("Stop", "scripts/hooks/seat-record.ps1")] == [
+        "INSTALLED"
+    ] * 6, rows
+
+    # THE REMEDY THE RECEIPT PRINTS. If re-running the installer did not clear it, the instruction
+    # in that receipt would be wrong at the moment an operator follows it.
+    assert "Re-run this installer with no arguments" in stale.stdout
+    assert _install(settings).returncode == 0
+    cleared = _install(settings, "-Status")
+    assert cleared.returncode == 0, cleared.stdout
+    assert [s for _, _, s in _status_rows(cleared.stdout)] == ["INSTALLED"] * 7, cleared.stdout
+
+
+def test_status_and_the_install_path_derive_the_expectation_from_one_builder(
+    tmp_path: Path,
+) -> None:
+    """IF -Status CARRIED ITS OWN COPY OF THE SWITCH, A DRIFT WOULD BE INVISIBLE IN THE WORST WAY.
+
+    It would compare each wired row against a command nothing installs, so every root would read
+    STALE while every root was in fact current -- or the reverse, which is worse. The comparison is
+    only worth anything if the expectation comes from the same code that does the writing.
+
+    So a MUTANT installer whose seat builder differs by one byte is used as the instrument: what it
+    WRITES and what it EXPECTS must move together. A copy of the switch in -Status shows up as the
+    mutant calling its own freshly written row STALE.
+    """
+    mutant = _mutant(
+        tmp_path,
+        "seatbuilder",
+        INSTALLER,
+        [
+            (
+                "'if (Test-Path -LiteralPath $s) { & $s; $hit = $true; break } } '",
+                "'if (Test-Path -LiteralPath $s) { & $s;  $hit = $true; break } } '",
+            )
+        ],
+    )
+    settings = tmp_path / "s2.json"
+    settings.write_text("{}", encoding="utf-8")
+
+    def status(script: Path) -> tuple[int, dict[tuple[str, str], str]]:
+        r = _pwsh(script, "-SettingsPath", str(settings), "-Status", cwd=tmp_path)
+        return r.returncode, {(e, s): st for e, s, st in _status_rows(r.stdout)}
+
+    assert _pwsh(mutant, "-SettingsPath", str(settings), cwd=tmp_path).returncode == 0
+    rc, rows = status(mutant)
+    assert rc == 0, rows
+    assert rows[("Stop", "scripts/hooks/seat-record.ps1")] == "INSTALLED", (
+        "the mutant's -Status disagreed with the mutant's own install -- the two are not reading "
+        "the same builder"
+    )
+    rc, rows = status(INSTALLER)
+    assert rc == 3
+    assert rows[("Stop", "scripts/hooks/seat-record.ps1")] == "STALE", rows
+
+    # AND THE DRIFT IS ONLY A DRIFT UNTIL A RE-INSTALL.
+    assert _install(settings).returncode == 0
+    rc, rows = status(INSTALLER)
+    assert rc == 0, rows
+
+
+# --- The removal receipt: what was MEASURED, not what the wiring table says was intended.
+
+
+def test_a_preview_uninstall_writes_nothing_and_never_claims_a_removal(tmp_path: Path) -> None:
+    """AN ABSENCE IS NOT A RECEIPT.
+
+    MEASURED on the pre-fix file: ``-Uninstall -WhatIf`` left the marker set byte-for-byte
+    identical while stdout stated "Roots examined: 1   succeeded: 1   failed: 0", the full
+    seven-row inventory, and "Those are the rows this run REMOVED wherever it succeeded". The only
+    honest signal was the ABSENCE of the per-root line -- the reader being asked to notice
+    something that was not printed. A declined ``-Confirm`` produced the same output.
+
+    THE REAL REMOVAL IS THE POSITIVE CONTROL AND IT IS IN THIS TEST. Without it every assertion
+    here is satisfied by an installer that never removes anything.
+    """
+    settings = _settings_fixture(tmp_path)
+    assert _install(settings).returncode == 0
+    before = settings.read_bytes()
+
+    for args, stdin in ((["-Uninstall", "-WhatIf"], None), (["-Uninstall", "-Confirm"], "N\n" * 8)):
+        r = _pwsh(
+            INSTALLER,
+            "-SettingsPath",
+            str(settings),
+            *args,
+            cwd=tmp_path,
+            stdin=stdin,
+        )
+        assert r.returncode == 0, (args, r.stdout, r.stderr)
+        assert settings.read_bytes() == before, args
+        assert "written: 0   previewed (NOTHING WRITTEN): 1" in r.stdout, r.stdout
+        claimed = [ln for ln in r.stdout.splitlines() if "removed" in ln.lower()]
+        assert not claimed, (args, claimed)
+        would = [ln for ln in r.stdout.splitlines() if re.search(r"would remove \d+$", ln)]
+        assert len(would) == 7, (args, would)
+
+    real = _install(settings, "-Uninstall")
+    assert real.returncode == 0, real.stdout
+    assert settings.read_bytes() != before
+    assert "REMOVED   7 row(s)" in real.stdout, real.stdout
+    assert len([ln for ln in real.stdout.splitlines() if re.search(r"removed 1$", ln)]) == 7
+
+
+def test_a_removal_that_matched_nothing_reports_zero_and_not_the_wiring_table(
+    tmp_path: Path,
+) -> None:
+    """ "REMOVED 3" AND "REMOVED 0" WERE INDISTINGUISHABLE, AND THAT IS THE SITUATION THE TOOL IS FOR.
+
+    MEASURED: a fixture whose only hook was a foreign row, then ``-Only Stop -Uninstall``. Nothing
+    was removed -- the AFTER inventory was byte-identical -- and the operator saw "REMOVING 3
+    ROW(S)", "REMOVED <path>", "Roots examined: 1 succeeded: 1 failed: 0", the three rows again,
+    and "Those are the rows this run REMOVED". Structurally identical to the run where three real
+    rows went. An operator disarming a misbehaving hook across five roots gets a clean REMOVED from
+    a root where the strip matched nothing, concludes it is gone, and the hook keeps firing.
+    """
+    foreign = tmp_path / "foreign.json"
+    foreign.write_text(
+        json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "# other"}]}]}}),
+        encoding="utf-8",
+    )
+    r = _pwsh(INSTALLER, "-SettingsPath", str(foreign), "-Only", "Stop", "-Uninstall", cwd=tmp_path)
+    assert r.returncode == 0, r.stdout
+    assert "REMOVED   0 row(s)" in r.stdout, r.stdout
+    zeros = [ln for ln in r.stdout.splitlines() if re.search(r"removed 0$", ln)]
+    assert len(zeros) == 3, zeros
+    kept = json.loads(foreign.read_text(encoding="utf-8-sig"))
+    assert kept["hooks"]["Stop"][0]["hooks"][0]["command"] == "# other", kept
+
+    # THE DISCRIMINATION: the same command, a fixture that really carries the rows.
+    settings = _settings_fixture(tmp_path)
+    assert _install(settings).returncode == 0
+    r2 = _pwsh(
+        INSTALLER, "-SettingsPath", str(settings), "-Only", "Stop", "-Uninstall", cwd=tmp_path
+    )
+    assert "REMOVED   3 row(s)" in r2.stdout, r2.stdout
+    assert len([ln for ln in r2.stdout.splitlines() if re.search(r"removed 1$", ln)]) == 3, (
+        r2.stdout
+    )
+
+
+def test_a_root_that_could_not_be_read_reports_not_measured_rather_than_zero(
+    tmp_path: Path,
+) -> None:
+    """A RESULT THAT WAS NEVER OBTAINED IS NOT A MEASUREMENT OF NONE.
+
+    The same rule seat.ps1's rule 6 states for its probes, one layer up: with no root readable
+    there is no count, and printing 0 asserts that every row was examined and was absent.
+    """
+    bad = tmp_path / "bad.json"
+    bad.write_text("{ this is not json", encoding="utf-8")
+    r = _pwsh(INSTALLER, "-SettingsPath", str(bad), "-Uninstall", cwd=tmp_path)
+    assert r.returncode == 1, r.stdout
+    assert "FAILED    " in r.stdout, r.stdout
+    tails = [ln for ln in r.stdout.splitlines() if "NOT MEASURED (no root could be read)" in ln]
+    assert len(tails) == 7, tails
+    assert not [ln for ln in r.stdout.splitlines() if re.search(r"removed \d+$", ln)], r.stdout
+    assert "counted in NONE of the figures here" in r.stdout, r.stdout
+
+
+def test_every_root_gets_one_outcome_line_and_a_failed_root_is_in_no_figure(
+    tmp_path: Path,
+) -> None:
+    """ONE ROOT FAILING MUST NOT STOP THE OTHERS, AND MUST NOT SILENTLY JOIN THEIR NUMBERS.
+
+    A throw part-way through used to leave the machine in a state nobody wrote down: some roots
+    wired, some not, and no record of which. A failed root's file was never read or never written,
+    so it contributed nothing to any per-row figure -- and the reader has to be TOLD that rather
+    than left to derive it from a count that looks complete.
+
+    ``-SettingsPath`` is invoked through ``-Command`` here rather than ``-File`` because the -File
+    argument parser has no array syntax: measured, ``-SettingsPath a b c`` binds b and c to the
+    positional -Only and -Except instead, and the comma form arrives as ONE path (deliberately --
+    a Windows path may legally contain a comma).
+    """
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps({"hooks": {}}), encoding="utf-8")
+    assert _install(good).returncode == 0
+    bad = tmp_path / "bad2.json"
+    bad.write_text("{ not json", encoding="utf-8")
+    fresh = tmp_path / "does-not-exist-yet.json"
+    assert not fresh.exists()
+
+    quoted = ",".join(f"'{p}'" for p in (good, bad, fresh))
+    r = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-Command",
+            f"& '{INSTALLER}' -SettingsPath @({quoted}) -Uninstall",
+        ],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=180,
+    )
+    assert r.returncode == 1, r.stdout
+    assert "Roots examined: 3   written: 2   previewed (NOTHING WRITTEN): 0   failed: 1" in r.stdout
+
+    outcomes = [
+        ln
+        for ln in r.stdout.splitlines()
+        if re.match(r"^ {2}(REMOVED|INSTALLED|PREVIEW|FAILED)\b", ln)
+    ]
+    assert len(outcomes) == 3, outcomes
+    for p in (good, bad, fresh):
+        assert len([ln for ln in outcomes if str(p) in ln]) == 1, (p, outcomes)
+
+    # The FAILED root is in NO per-row figure: the only root that held our rows is `good`.
+    assert len([ln for ln in r.stdout.splitlines() if re.search(r"removed 1$", ln)]) == 7, r.stdout
+    assert "1 root(s) FAILED above and are counted in NONE of the figures here" in r.stdout
