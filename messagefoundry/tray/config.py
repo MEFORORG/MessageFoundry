@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Tray configuration + engine-URL discovery (ADR 0113 §5).
 
 The pure core — :func:`compose_config`, :func:`parse_serve_args`, :func:`build_engine_url`,

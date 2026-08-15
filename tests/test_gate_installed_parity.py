@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Does the gate that is RUNNING match the gate that is in the repo?
 
 Nothing answered this, and that gap is the root cause of every other defect found in the drift machinery.

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Taskbar theme detection for the tray icon (ADR 0113 §8).
 
 The tray picks a dark-glyph or light-glyph icon by the **taskbar** appearance, read from

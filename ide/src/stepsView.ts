@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // The Steps view editor (ADR 0076 §2 phase 2b + phase 3 / BACKLOG #222). A `CustomTextEditorProvider`
 // over a Handler `.py` that renders it as a Corepoint-style ordered, nested typed Steps view:
 // action / lookup / control / send rows with parameter forms, and in-place read-only `code` rows for

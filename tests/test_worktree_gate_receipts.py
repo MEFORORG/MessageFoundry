@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The gate must leave a receipt when it denies, and its deny message must not misdirect.
 
 Until the receipt existed the gate was unfalsifiable. It wrote its decision to stdout and exited 0, so

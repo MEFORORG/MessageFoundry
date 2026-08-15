@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Pure (vscode-free) reduction of the engine's `GET /connections` payload into the RuntimeMap the
 // CONNECTIONS tree renders (ADR 0091 "live decorations"). The endpoint emits one "source" row per
 // inbound connection and one "destination" row per (inbound → outbound) EDGE that has carried

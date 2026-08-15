@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Schema-driven connection form model (ADR 0007) — PURE, like connectionMerge.ts: this module must
 // never import vscode (`npm run test:unit` is plain-node mocha). It turns the ENGINE's
 // `connection schema --json` plus one connection's `settings` table into the ordered, grouped field

@@ -1,5 +1,5 @@
 # Copyright (c) MessageFoundry contributors.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """A2 (part 1) — pin the BODY-COPY amplification factor per ingress message.
 
 The incumbent's qualified spec budgets **~10.9 KB of storage per message** (500 GB/day over 45M). Nothing

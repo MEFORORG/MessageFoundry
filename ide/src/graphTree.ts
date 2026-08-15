@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Sidebar tree of the wired graph, from `messagefoundry graph --json` (v2). Also the name source
 // for completion (Send(...) / router="..."), so it's refreshed on save. Rendering is the pure
 // view-model in graphModel.ts (ADR 0091 D2): an element-centric four-section perspective (default)

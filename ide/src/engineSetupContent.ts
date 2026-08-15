@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // The guided engine-setup page's CONTENT MODEL (BACKLOG #238, ADR 0112 amendment 2026-07-16) — the
 // copy and action buttons behind the pill's store-less "Set up an engine…" lead. Deliberately
 // `vscode`-free (like cookbookRecipes.ts) so the plain-node unit suite can pin the two properties

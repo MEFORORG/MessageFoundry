@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Tray config compose + engine-URL discovery (ADR 0113 §5) — pure, runs on any OS."""
 
 from __future__ import annotations

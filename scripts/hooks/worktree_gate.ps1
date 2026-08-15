@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 <#
 .SYNOPSIS
     PreToolUse gate: keep concurrent Claude Code sessions from BUILDING in a shared primary checkout.
