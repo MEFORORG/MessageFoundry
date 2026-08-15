@@ -55,6 +55,21 @@ repos:
         pass_filenames: true
         types: [text]
         exclude: ^scripts/security/scan-tokens\.local\.txt$
+      # LICENCE HEADER (BACKLOG #1010): every first-party source must declare the project's SPDX
+      # identifier. It asserts the VALUE, not the presence of the string -- five files declared
+      # Apache-2.0 in an AGPL project and a presence-only check passed every one of them.
+      #
+      # SCOPE IS SINGLE-SOURCED IN THE SCRIPT (its COMMENT_PREFIXES map), not restated here and again
+      # in ci.yml. That is deliberate: ruff and bandit each had their scope written twice, drifted, and
+      # needed tests/test_lint_scope_parity.py to hold them together. Here `files:` only narrows what
+      # pre-commit bothers to forward -- the script filters by extension itself and CI passes no paths
+      # at all -- so the hook and the CI step cannot disagree about what is in scope.
+      - id: licence-header
+        name: licence header (SPDX)
+        entry: python scripts/quality/licence_header_check.py
+        language: system
+        pass_filenames: true
+        files: \.(py|ps1|sh|ts|js|go)$
 
   # Secret scanning — blocks a commit that would introduce a credential/token/key.
   # (rev is verified by `pre-commit autoupdate` on first install; a wrong tag fails loudly there,

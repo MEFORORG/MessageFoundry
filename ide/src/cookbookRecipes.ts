@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // The Cookbook's static "solved problems" catalog (BACKLOG #104) — HL7 Router/Handler recipes as
 // real, editable Python. Deliberately `vscode`-free/pure: this is the data cookbook.ts (the webview
 // panel) renders and inserts via `editor.insertSnippet`, kept import-clean so the catalog itself is

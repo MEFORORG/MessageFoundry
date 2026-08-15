@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Pure completion-scope helpers for the code-view inline autocomplete (ADR 0104 §2.3 Step 1,
 // BACKLOG #230 P2/P3). Every unit-tested helper lives HERE — completion.ts imports vscode at its
 // line 4 and `npm run test:unit` is plain-node mocha — so: no vscode import, no I/O, no Python.

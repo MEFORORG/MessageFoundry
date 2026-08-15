@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Minimal HTTP client for the local MessageFoundry engine API. The IDE otherwise only shells out to
 // the Python CLI; Stage → Promote is the one action that drives the *running* engine over HTTP. Uses
 // the Node built-ins (no global `fetch` dependency, no npm deps) — same zero-dep style as cli.ts.

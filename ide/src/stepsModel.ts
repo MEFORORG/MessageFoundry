@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Pure (vscode-free) view-model behind the read-only Steps view (ADR 0076 §2 phase 2b / #222).
 //
 // It consumes the `messagefoundry lens parse --json` contract (ADR 0076 §3) — the engine owns the

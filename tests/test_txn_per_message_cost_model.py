@@ -1,5 +1,5 @@
 # Copyright (c) MessageFoundry contributors.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """A1 — pin the durable-write cost model: ``txn/msg = 3 + 2H + 2N``.
 
 `H` = handlers the router SELECTS. `N` = outbound destinations. ADR 0051 states this model and the whole

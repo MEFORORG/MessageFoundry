@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Generate the tray's status ``.ico`` assets — pure stdlib, no Pillow (ADR 0113 §8).
 
 Emits one multi-resolution ``.ico`` per (TrayState, taskbar Theme) into ``messagefoundry/tray/assets/``.

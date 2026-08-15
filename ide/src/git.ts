@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Thin bridge to the user's git binary — the git analog of cli.ts. Discovers the executable via the
 // built-in Git extension (which honors the user's `git.path` and the bundled Git for Windows), and
 // runs commands with a runner that never rejects (resolves with stdout/stderr/exit code).
