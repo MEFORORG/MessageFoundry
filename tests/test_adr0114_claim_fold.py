@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """ADR 0114 sub-lever C (``fifo_claim_fold_reset``): the INGRESS/ROUTED reset fold.
 
 Offline (no SQL Server): the store is built bare (``object.__new__``) or through the real

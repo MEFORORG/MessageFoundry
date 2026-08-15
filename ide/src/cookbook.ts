@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Cookbook — a searchable "solved problems" gallery webview (BACKLOG #104). Mirrors Corepoint's
 // cookbook of pre-built integration patterns: browse/search a recipe by name, then INSERT its real,
 // editable Python via `editor.insertSnippet` — the same insertion primitive as Insert Element

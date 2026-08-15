@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // MessageFoundry VS Code extension — Phase 2 skeleton:
 //   * live HL7-aware completion (no server)
 //   * validate-on-save -> Problems

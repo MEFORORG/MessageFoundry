@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 <#
 .SYNOPSIS
     Install the CLAIM gate (commit-msg) in the SHARED .git/hooks — one copy governs every worktree at

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The SIGIL that introduces an interpreter flag, and the two other spelling axes measured beside it.
 
 :mod:`tests.test_worktree_gate_interpreter_flags` replaced a hand-typed list of flag spellings with a

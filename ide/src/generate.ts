@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // "Generate Samples" — a guided flow over the `messagefoundry generate` CLI: pick a message type
 // (from `generate --list`), choose triggers + a per-trigger count, and write a synthetic-but-
 // conformant corpus into the Test Bench's message-sets folder. All data is synthetic — no PHI.

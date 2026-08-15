@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Resolve every citation of a root ``CLAUDE.md`` section number to a real section.
 
 WHY THIS EXISTS. ``CLAUDE.md``'s numbered sections are a de facto API: measured 2026-08-12, 281

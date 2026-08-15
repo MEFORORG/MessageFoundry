@@ -1,5 +1,5 @@
 # Copyright (c) MessageFoundry contributors.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """A1 — turn the STATIC cost-model gates into a LIVE runtime assertion.
 
 ``tests/test_txn_per_message_cost_model.py`` pins ``txn/msg = 3 + 2H + 2N`` and

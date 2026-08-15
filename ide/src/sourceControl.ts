@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // "Set Up Version Control & Checks" — a guided, offline, provider-agnostic flow that puts a
 // code-first MessageFoundry project under git and wires a local pre-commit hook running
 // `messagefoundry check`. Leans on the user's git (respecting an existing repo); never contacts a

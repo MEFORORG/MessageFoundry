@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Wires the tray together (ADR 0113): poller → icon/menu, menu actions → open/control.
 
 The pure modules decide *what* to render and *what* an action means; this class connects them to the

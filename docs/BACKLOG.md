@@ -3933,6 +3933,12 @@ open.
 
 > 🔢 **Scored 2026-08-04 → P2.** Value **7/10** · Difficulty **3/10** · _quick win_. AGPL-3.0-or-later is asserted twice — in `LICENSE` and at `pyproject.toml:29` — and then per-file provenance is left to habit. 981 of 1,044 tracked `.py` carry `SPDX-License-Identifier`, which makes the convention real and near-universal; the 63 that do not include **all 17 files of `messagefoundry/tray/`**, a package `only-include` puts in the wheel and `[project.gui-scripts]` gives its own entry point. Widen past Python and it is **196 of 1,181 tracked sources across six languages**. Five more files declare **Apache-2.0** in an AGPL project. Nothing — no hook, no workflow, no test — checks a licence header in any language.
 
+
+> **AMENDED 2026-08-14 (lander) -- THE GATE, ITS NEGATIVE CONTROL AND THE BACKFILL LANDED IN THIS PR; THE STATUS BANNER IS DELIBERATELY UNCHANGED.** 225 files, and the extension's licence metadata is now pinned. Author's full suite: **3 failed / 12439 passed**, and all three failures are the installed-hook drift below rather than the gate.
+
+> **THIS ITEM CREATES AN OWNER ACTION THAT NO CI CHECK CAN SEE.** The backfill changed three INSTALLED hook scripts (`claim_check.py`, `push_guard.py`, `worktree_gate.ps1`), so the machine-installed copies no longer match source and **three tests go red locally on EVERY worktree on this box** -- the hooks live in the common git dir, so one stale copy is stale for all of them. **Those are local-machine tests; CI has no user settings and SKIPS them, so a GREEN CI IS NOT EVIDENCE THE DRIFT IS ABSENT.** The reassuring signal is the one structurally blind to it. Remedy is a reinstall from a **current** checkout, owner-run: **land, pull, THEN install** -- installing from a stale checkout DOWNGRADES the gate.
+
+> **CLOSURE IS NOT TAKEN HERE.** Step 6's premise was separately found false and the item carries more than the gate itself. Whether it is complete is a judgement, and the seat supplying a paired commit to unblock a required check is the wrong one to make it.
 **Cluster:** Supply chain / licensing. **Priority:** P2. **Verdict:** build. **Severity:** medium.
 
 **What:** a language-agnostic licence-header gate — a checker asserting that every first-party source carries `SPDX-License-Identifier: AGPL-3.0-or-later`, wired as a `local` **pre-commit** hook beside `ledger-gate` and `forbidden-content` (which are the same shape) and mirrored in **CI**, plus the backfill it demands. It must assert the **value**, not the presence of the string: five files carry a header naming the wrong licence today, and a presence-only check passes all five.
@@ -4311,6 +4317,8 @@ a file, which is the fact the whole finding rests on.
 
 > 🔢 **Filed 2026-08-05 — not started.** Value **6/10** · Difficulty **3/10** · _quick win_. The probe's gate requires **four** conditions; the comment directly above it names **three** and asserts that "every other posture never reaches here". The undocumented fourth is `public_origin` — and `public_origin` is only *mandatory* when `serve_ui` is also on. So with the console **off**, a PHI instance behind a declared terminator under `enforce` can start with it unset and the probe never runs.
 
+
+> **AMENDED 2026-08-14 (lander) -- THE IMPLEMENTATION LANDED IN THIS PR; THE STATUS BANNER IS DELIBERATELY UNCHANGED.** `public_origin` is now required in the declared-terminator PHI enforce posture, which makes the comment at `:2113-2114` true **by construction** rather than by convention. A negative control was run and still discriminates: reverted, the console-OFF case fails while console-ON and non-PHI pass. **Closing this item is a judgement about completeness, not a mechanical consequence of the code landing, so it is left to the ledger seats rather than taken by the seat that merely supplied the paired commit.**
 **Cluster:** Security / startup gates, ASVS 12.1.1. **Priority:** P2. **Verdict:** build (small). **Severity:** would leave an ASVS 12.1.1 control silently inert in a legitimate deployment posture on first deployment — the TLS floor of the terminator in front of a PHI API would go unmeasured, with nothing reporting the skip.
 
 **The gate, measured at `e0482aea`.** `messagefoundry/__main__.py` runs the probe under:
@@ -8695,6 +8703,28 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 >
 > **THE COUNTS AND THE CELL'S IDENTITY STAY IN THE VAULT AND ARE DELIBERATELY ABSENT HERE.** `docs/BACKLOG.md` is public, and a map from requirement ids to their state, over a closed public requirement set, hands out the complement by subtraction. **The mechanism is fully stated without them:** a reader with vault access can locate the single victim in one query, and a reader without one still knows exactly what to fix and how to prove it.
 
+> **PROGRESS 2026-08-15 -- TWO LIMBS LANDED, AND THE ITEM DOES NOT CLOSE. THE BANNER IS DELIBERATELY UNCHANGED.** Split out of PR #394 under the owner's ruling and landed on their own: the **sub-table-entry** limb and the **non-scalar VALUES** limb, as the pair `17b7f022` + `48bbd7a8` (the latter is the on-PR identity of `d1b30bc9`; **cite the pair, never `17b7f022` alone**).
+>
+> **THE AUTHOR'S OWN COMMIT MESSAGE FORBIDS CLOSING THIS, and it is quoted rather than paraphrased:** *"THIS DOES NOT CLOSE #1242. A fourth limb class -- live-only top-level TABLE values type-mangled through `_scalar()` -- is untouched here."* **So no banner moves.** A separate behavioural round trip measured the **sub-table limb open on `main`** before this landed -- the writer exited 0, reported *"345 cells intact"*, and dropped ten evidence fields.
+>
+> **SCOPE CORRECTION 2026-08-15 -- THE ERROR WAS IN READING THAT QUOTE, NOT IN THE QUOTE.** *"Untouched **here**"* meant **that commit** -- `17b7f022`, the sub-table limb. **The fourth limb WAS fixed, by the OTHER commit of the pair (`48bbd7a8`), which its author wrote separately.** Measured on `main`: `_toml_value` (`:87`) handles `dict` (`:102`) and `list`/`tuple` (`:108`), and `_scalar` (`:113`) returns `f"{key} = {_toml_value(value)}"` -- **a real TOML inline table, not a `repr()`** -- **introduced by that commit, with zero occurrences on `main` beforehand.** Independently, the ASVS Tracker ran the item's five stated proof properties against the landed writer **with the pre-#403 writer as a negative control where all five fail**: **all five pass**, including *top-level TABLE stays a dict*, which **is** the fourth limb. **So no limb destroys on a routine apply.**
+>
+> **A COMMIT-SCOPED DISCLAIMER WAS APPLIED TO A TWO-COMMIT PR, AND QUOTING IT VERBATIM IS WHAT HID THAT.** Verbatim quotation preserved the **words** and silently widened the **scope**; a paraphrase would have forced the scope to be stated and the error would have surfaced. *The artefact was correct and the frame around it was not.*
+>
+> **WHAT DOES NOT CHANGE:** the `k not in c` **scoping** hole is a *different* defect from the four limbs -- the guard's blind spot rather than the writer's corruption -- and it remains **open and latent**. **Two separate sentences: no limb destroys on a routine apply, AND the guard would fail to catch a regression.**
+>
+> **What the landing is proved by, and what it is not.** The pair ships **22 tests** that pass on the fix; reverting `apply.py` alone to `main` while keeping those tests **fails 6 of 22**, so they discriminate the fix rather than merely accompanying it, and the revert restores byte-identical. **That proves the two limbs, not the item.**
+>
+> **THIS IS THE PRE-SCOPING-FIX VERSION OF THE GUARD, AND IT SHIPS WITH A KNOWN HOLE.** Verified as **live code, not a comment**, at `scripts/asvs/apply.py:362` as landed:
+> ```
+> if k in now and k not in c and type(was[k]) is not type(now[k])
+> ```
+> **`k not in c` is the scoping defect.** With the writer's dict branch disabled, a payload **omitting** the key is refused while a payload **carrying** it writes a Python `repr` into a TOML string and **returns exit 0**. It is not a corner case: of the whole record **exactly one cell holds a top-level non-scalar**, and the natural payload for rewriting that cell **echoes the key**. **The guard covers every cell that cannot be hurt and stops looking at the one that can.**
+>
+> **A correction exists and is deliberately NOT included here:** it replaces the clause with exclusions for `_ORDERED` (which `render()` coerces by design) and `_SUBTABLES`, and compares the type the **payload** stated. It is **built, mutation-proven, and unlanded on any remote ref**, and it is **not on PR #394** -- so folding it into a split of #394 would both exceed the ruling and land code reviewed by nobody but its author, which is the concern the split exists to honour. **The guard as landed is strictly better than no guard and is NOT what a reader of "the #1242 fix landed" would assume.** That gap is the reason this paragraph exists rather than a footnote.
+>
+> *Read the USE, not the string: a bare grep for `k not in c` also matches the correction, whose retraction comment quotes the clause it removed.*
+
 **Cluster:** Security tooling / evidence integrity. **Priority:** P1. **Verdict:** build. **Severity:** no deployment axis -- vault tooling, ships to nobody. P1 rather than P2 because the loss is **pending on the next routine operation**, is **silent in both directions** (the writer reports success, the verifier reports green having checked less), and destroys evidence that cost a dedicated backfill to produce.
 
 ## 1245. an administrator password reset re-arms bootstrap retirement, permanently disabling the account it was meant to recover
@@ -8886,6 +8916,8 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **RELATIONSHIP TO ASVS 2.4.1 (#1114): this makes the cell WORSE, not better.** Rule 4 holds that *"it can be configured"* is never a pass; here it cannot be configured at all, so the control is effectively **absent** on the ingest plane while being documented as present-but-disabled. #1114 stays **partial** and its own hardened question -- whether a control that ships off can be an honest pass -- is settled by the method rather than by research.
 
+
+> **AMENDED 2026-08-14 (lander) -- THE IMPLEMENTATION LANDED IN THIS PR; THE STATUS BANNER IS DELIBERATELY UNCHANGED.** `max_messages_per_second` and `message_burst` are now exposed on the `MLLP()` factory, so the settings the connector has read since the pacer was built are reachable from code-first wiring and, via `connections_file.py`'s `factory(**settings)`, from `connections.toml` as well. Off by default, and that default is tested. **Closing this item is a judgement about completeness, not a mechanical consequence of the code landing, so it is left to the ledger seats rather than taken by the seat that merely supplied the paired commit.**
 **Cluster:** Transports / MLLP, and security documentation. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- zero instances; on first deployment an operator **would** be told a rate limit is available and **would** be unable to enable it.
 
 ## 1250. move the backlog to the vault: the public ledger is an aggregate weakness map over a closed public standard

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // "Home" — a webview view at the top of the MessageFoundry sidebar: grouped action cards that run
 // extension commands. Every action is live; the `soon` flag renders a "soon" badge for any action
 // still queued in the backlog. Monitoring + engine run/stop deliberately live in the Console, not here.
