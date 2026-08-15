@@ -8695,6 +8695,12 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 >
 > **THE COUNTS AND THE CELL'S IDENTITY STAY IN THE VAULT AND ARE DELIBERATELY ABSENT HERE.** `docs/BACKLOG.md` is public, and a map from requirement ids to their state, over a closed public requirement set, hands out the complement by subtraction. **The mechanism is fully stated without them:** a reader with vault access can locate the single victim in one query, and a reader without one still knows exactly what to fix and how to prove it.
 
+> **PROGRESS 2026-08-15 -- TWO LIMBS LANDED, AND THE ITEM DOES NOT CLOSE. THE BANNER IS DELIBERATELY UNCHANGED.** Split out of PR #394 under the owner's ruling and landed on their own: the **sub-table-entry** limb and the **non-scalar VALUES** limb, as the pair `17b7f022` + `48bbd7a8` (the latter is the on-PR identity of `d1b30bc9`; **cite the pair, never `17b7f022` alone**).
+>
+> **THE AUTHOR'S OWN COMMIT MESSAGE FORBIDS CLOSING THIS, and it is quoted rather than paraphrased:** *"THIS DOES NOT CLOSE #1242. A fourth limb class -- live-only top-level TABLE values type-mangled through `_scalar()` -- is untouched here."* **So no banner moves.** A separate behavioural round trip measured the **sub-table limb open on `main`** before this landed -- the writer exited 0, reported *"345 cells intact"*, and dropped ten evidence fields -- and that instrument reaches **only** the sub-table sites, so it says nothing about the `_scalar` top-level limb either.
+>
+> **What the landing is proved by, and what it is not.** The pair ships **22 tests** that pass on the fix; reverting `apply.py` alone to `main` while keeping those tests **fails 6 of 22**, so they discriminate the fix rather than merely accompanying it, and the revert restores byte-identical. **That proves the two limbs, not the item.** A further scoping fix (`k not in c` admitting a payload-carried corruption at exit 0) is **built but unlanded** and is not part of this.
+
 **Cluster:** Security tooling / evidence integrity. **Priority:** P1. **Verdict:** build. **Severity:** no deployment axis -- vault tooling, ships to nobody. P1 rather than P2 because the loss is **pending on the next routine operation**, is **silent in both directions** (the writer reports success, the verifier reports green having checked less), and destroys evidence that cost a dedicated backfill to produce.
 
 ## 1245. an administrator password reset re-arms bootstrap retirement, permanently disabling the account it was meant to recover
