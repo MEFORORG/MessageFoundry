@@ -23,6 +23,7 @@ from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     ADMIN_NEW_IP,
     EMAIL_CHANGED,
+    FEDERATED_IDENTITY_BOUND,
     LOGIN_AFTER_FAILURES,
     MFA_DISABLED,
     MFA_ENABLED,
@@ -45,6 +46,7 @@ _SUBJECTS = {
     PASSWORD_RESET: "Your MessageFoundry password was reset",
     EMAIL_CHANGED: "Your MessageFoundry account email was changed",
     ROLES_CHANGED: "Your MessageFoundry account roles were changed",
+    FEDERATED_IDENTITY_BOUND: "A single sign-on identity was linked to your MessageFoundry account",
     ACCOUNT_DISABLED: "Your MessageFoundry account was disabled",
     MFA_ENABLED: "Two-factor authentication was enabled on your MessageFoundry account",
     MFA_DISABLED: "Two-factor authentication was disabled on your MessageFoundry account",
@@ -58,6 +60,11 @@ _DESCRIPTIONS = {
     PASSWORD_RESET: "Your account password was reset by an administrator.",
     EMAIL_CHANGED: "Your account's email address was changed.",
     ROLES_CHANGED: "Your account's roles were changed by an administrator.",
+    FEDERATED_IDENTITY_BOUND: (
+        "A single sign-on identity from your organisation's identity provider was linked to your "
+        "account. From now on that identity can sign in as you. If you did not expect this, contact "
+        "your administrator immediately."
+    ),
     ACCOUNT_DISABLED: "Your account was disabled by an administrator.",
     MFA_ENABLED: "A two-factor authenticator (TOTP) was enrolled on your account.",
     MFA_DISABLED: "Two-factor authentication was removed from your account.",

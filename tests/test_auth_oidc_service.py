@@ -705,6 +705,65 @@ async def test_success_audit_carries_mech_and_evidence(
         await store.close()
 
 
+async def test_binding_a_federated_identity_is_audited_and_notified_ONCE(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1248. Binding an external identity is the most takeover-relevant write there is --
+    after it, whoever controls the IdP subject controls the account -- and it was SILENT, while the
+    role resync a few lines below it emitted both an audit row and a notification for a strictly less
+    sensitive event. A role change alters what an account MAY DO; a binding alters WHO IT IS.
+
+    THE SECOND LOGIN IS THE CONTROL AND IT CARRIES THE TEST. A bare "an audit row exists after a
+    federated login" would pass against a writer that emits on EVERY login, which is a different and
+    much noisier behaviour -- and it would also pass if the row belonged to some neighbouring event.
+    Asserting the count is still ONE after a second successful login with the SAME subject pins the
+    row to the BINDING rather than to the sign-in, which is the property the item is about.
+
+    THE SUBJECT MUST NOT APPEAR. The issuer names which IdP was bound, which is the operator-actionable
+    half; the `sub` is a stable per-user directory identifier and does not belong in a row read far
+    more widely than the account it describes.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+
+        _stub_exchange(monkeypatch, _mint(rsa_key, _claims()))
+        assert (
+            await service.authenticate_oidc(
+                AUTH_CODE, _flow(), redirect_uri="https://ops.example/ui/oidc/callback"
+            )
+        ).ok
+
+        rows = await _audit_rows(store, "auth.federated_identity_bound")
+        # The message covers BOTH directions deliberately: 0 means the binding was silent, and >1
+        # means it is keyed on something firing more than once per binding. An earlier draft said
+        # only "was not audited", which is FALSE in the over-firing case -- and a mutation that
+        # duplicated the audit was caught by this line reporting exactly that wrong reason.
+        assert len(rows) == 1, f"expected exactly one binding audit row, got {len(rows)}"
+        detail = json.loads(rows[0]["detail"] or "{}")
+        assert detail["provider"] == "oidc"
+        assert detail["issuer"] == "https://idp.example"
+        assert "S-1-5-21-federated" not in (rows[0]["detail"] or ""), (
+            "the OIDC subject reached the audit row; the issuer is the actionable half"
+        )
+
+        # CONTROL: sign in again as the SAME subject. The binding already matches, so it is left
+        # untouched -- and therefore must not be re-audited or re-notified.
+        _stub_exchange(monkeypatch, _mint(rsa_key, _claims()))
+        assert (
+            await service.authenticate_oidc(
+                AUTH_CODE, _flow(), redirect_uri="https://ops.example/ui/oidc/callback"
+            )
+        ).ok
+        again = await _audit_rows(store, "auth.federated_identity_bound")
+        assert len(again) == 1, (
+            f"the binding audit fired {len(again)} times across two logins -- it is keyed on the "
+            f"sign-in rather than on the binding"
+        )
+    finally:
+        await store.close()
+
+
 async def test_no_secret_code_or_token_reaches_the_logs_or_the_audit(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

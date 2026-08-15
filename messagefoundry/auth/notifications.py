@@ -31,6 +31,11 @@ PASSWORD_CHANGED = "password_changed"  # nosec B105 — event-type label, not a 
 PASSWORD_RESET = "password_reset"  # nosec B105 — event label, not a credential; admin-initiated (6.3.7/6.4.6)
 EMAIL_CHANGED = "email_changed"  # 6.3.7 — the account's email address was changed
 ROLES_CHANGED = "roles_changed"  # 6.3.7 — an admin changed the account's roles
+# 6.3.7 — an external identity (issuer, sub) was bound to this account. BACKLOG #1248: the single most
+# takeover-relevant fact that can be written to an account, since afterwards whoever controls the IdP
+# subject controls the account. It sat UNNOTIFIED while the role resync a few lines below it in
+# `_complete_ad_login` notified for a strictly less sensitive change.
+FEDERATED_IDENTITY_BOUND = "federated_identity_bound"
 ACCOUNT_DISABLED = "account_disabled"  # 6.3.7 — an admin disabled the account
 MFA_ENABLED = "mfa_enabled"  # 6.3.7 — a second factor (TOTP) was enrolled on the account
 MFA_DISABLED = (

@@ -33,6 +33,7 @@ from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     ADMIN_NEW_IP,
     EMAIL_CHANGED,
+    FEDERATED_IDENTITY_BOUND,
     LOGIN_AFTER_FAILURES,
     MFA_DISABLED,
     MFA_ENABLED,
@@ -1118,6 +1119,37 @@ class AuthService:
             # refused by the guard above. A matching binding is left untouched (no updated_at churn).
             await self._store.set_user_federated_subject(
                 user.id, federated_subject[0], federated_subject[1]
+            )
+            # BACKLOG #1248: audit and notify the BINDING, not just the role resync below it.
+            #
+            # Binding an external identity is the single most takeover-relevant fact that can be
+            # written to an account: after it, whoever controls the IdP subject controls the account.
+            # It was written SILENTLY -- while the resync twenty lines down emits both an audit row and
+            # a notification for a strictly less sensitive event. A role change alters what an account
+            # MAY DO; a binding alters WHO IT IS. The adjacency is the argument: this is not a codebase
+            # that forgot accounts can be notified, so the lower-stakes event being instrumented and
+            # the higher-stakes one not is a defect rather than a decision.
+            #
+            # THE SUBJECT IS NOT LOGGED, DELIBERATELY. An OIDC `sub` is a stable per-user identifier
+            # from the directory -- a personal identifier, not a secret, but not something to spray
+            # into an audit row that is read far more widely than it. The ISSUER identifies which IdP
+            # was bound, which is the operator-actionable half; "which subject" is recoverable from the
+            # account row itself by anyone entitled to it.
+            await self._audit(
+                "auth.federated_identity_bound",
+                actor=user.username,
+                detail=_json({"provider": "oidc", "issuer": federated_subject[0]}),
+                client=client,
+            )
+            # Out-of-band to the affected user (ASVS 6.3.7), matching the resync below. Best-effort:
+            # the binding has already been recorded, and a notification that cannot be delivered must
+            # never be able to roll back a write the login has committed to.
+            await self._notify_security(
+                FEDERATED_IDENTITY_BOUND,
+                username=user.username,
+                email=user.email,
+                client=client,
+                detail={"issuer": federated_subject[0]},
             )
         role_ids = sorted(await self._store.roles_for_ad_groups(principal.groups))
         previous = set(await self._store.get_user_role_ids(user.id))
