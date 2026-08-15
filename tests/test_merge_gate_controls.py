@@ -30,10 +30,7 @@ the two read as one.
 
 from __future__ import annotations
 
-import os
 import re
-import shutil
-import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -41,61 +38,25 @@ from typing import Any
 
 import pytest
 
+from tests._bash_support import child_env as _child_env
+from tests._bash_support import require_bash as _require_bash
+from tests._bash_support import run as _run
+from tests._bash_support import text as _text
 from tests._workflow_contexts import ROOT, jobs_of, load_workflow
 
-_TIMEOUT = 300
-
-
 # ===================================================================================================
-# Child processes. PIN THE CHILD'S ENVIRONMENT -- do not inherit it.
+# Child processes and bash resolution now live in `tests/_bash_support.py` (BACKLOG #1272).
+#
+# THEY WERE WRITTEN HERE, AND THIS MODULE'S TESTS STILL GUARD THEM -- that is why the import is by
+# alias rather than a rewrite of every call site: the proven module keeps its behaviour, and the
+# negative control that makes `_bash_sees` more than a hopeful call travels with the helpers to
+# `tests/test_bash_support.py`. A promotion that moved them away from the tests proving them would
+# leave the helper looking identical and no longer proven, anywhere.
+#
+# They were promoted because three sibling modules resolved bash with `shutil.which` and were
+# measured producing 19 failures that were entirely an artifact of PATH ORDER. The fix existed here
+# since 2026-08-10 and simply did not propagate.
 # ===================================================================================================
-def _child_env(**extra: str) -> dict[str, str]:
-    """A minimal, EXPLICIT environment for a child process.
-
-    Measured in wave 2 of this backlog pass: a lane's new test passed in its author's shell and failed
-    at integration, because that shell happened to export ``PYTHONIOENCODING=utf-8`` while the test
-    pinned only the PARENT's decoding. It would have passed ubuntu and reddened the Windows legs. So
-    nothing is inherited here except what a child genuinely cannot run without, and the two variables
-    that incident turned on are set EXPLICITLY rather than passed through.
-
-    ``LC_ALL=C`` and the ``GIT_CONFIG_*`` overrides exist for the same reason one level over: a global
-    ``core.autocrlf``, a global hooks path, or a locale that reorders ``grep`` output would otherwise
-    make the result a fact about this machine.
-    """
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "LC_ALL": "C",
-        "LANG": "C",
-        "PYTHONIOENCODING": "utf-8",
-        "PYTHONUTF8": "1",
-        "GIT_AUTHOR_NAME": "negative control",
-        "GIT_AUTHOR_EMAIL": "control@example.invalid",
-        "GIT_COMMITTER_NAME": "negative control",
-        "GIT_COMMITTER_EMAIL": "control@example.invalid",
-        "GIT_TERMINAL_PROMPT": "0",
-    }
-    # Windows: a child python cannot start without these, and they carry no behaviour of their own.
-    for name in ("SYSTEMROOT", "SystemRoot", "COMSPEC", "TEMP", "TMP", "WINDIR", "PATHEXT"):
-        if name in os.environ:
-            env[name] = os.environ[name]
-    env.update(extra)
-    return env
-
-
-def _run(argv: list[str], cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
-    """Run a child and return RAW BYTES.
-
-    Decoding is done by the caller with ``errors="replace"``. A child whose output cannot be decoded
-    under the ambient code page must not be able to turn an assertion about an EXIT CODE into a
-    ``UnicodeDecodeError`` -- that failure mode is a property of the console, not of the gate.
-    """
-    return subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
-        argv, cwd=str(cwd), env=env, capture_output=True, timeout=_TIMEOUT, check=False
-    )
-
-
-def _text(proc: subprocess.CompletedProcess[bytes]) -> str:
-    return (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
 
 
 # ===================================================================================================
@@ -276,66 +237,6 @@ def _hygiene_script() -> str:
     return script
 
 
-def _bash_candidates() -> list[Path]:
-    """Every plausible bash, GIT-DERIVED FIRST.
-
-    ``shutil.which("bash")`` alone is a fact about PATH, and on Windows PATH order decides WHICH
-    OPERATING SYSTEM answers: ``C:\\Windows\\System32\\bash.exe`` is the WSL launcher, whose filesystem
-    namespace is not the one this process just wrote a fixture into. Git for Windows always ships bash
-    beside git, so git -- which every test here already requires -- is the deterministic anchor.
-    """
-    found: list[Path] = []
-    git = shutil.which("git")
-    if git:
-        # `<root>/cmd/git.exe`, `<root>/bin/git.exe` and `<root>/mingw64/bin/git.exe` are all shipped
-        # layouts, so walk up and try both bash homes from each level.
-        for parent in Path(git).resolve().parents:
-            for rel in ("bin/bash.exe", "usr/bin/bash.exe", "bin/bash"):
-                found.append(parent / rel)
-    on_path = shutil.which("bash")
-    if on_path:
-        found.append(Path(on_path))
-    return found
-
-
-def _bash_sees(bash: Path, tmp_path: Path) -> bool:
-    """LIVE POSITIVE CONTROL for the namespace, not a guess from the path string.
-
-    Rejecting ``system32`` by name would be a pattern match on a spelling. This writes a token into
-    the directory the fixture will live in and requires the candidate to read it back -- if it cannot,
-    it is looking at a different filesystem and every verdict it returns would be about nothing.
-    """
-    probe = tmp_path / "mf_bash_probe.txt"
-    probe.write_text("MFPROBE-OK\n", encoding="utf-8")
-    try:
-        out = _run([str(bash), "-c", "cat mf_bash_probe.txt"], tmp_path, _child_env())
-    except OSError:
-        return False
-    return out.returncode == 0 and b"MFPROBE-OK" in out.stdout
-
-
-def _require_bash(tmp_path: Path) -> str:
-    """A bash that can see this process's files, or a loud failure -- never a skip.
-
-    ci.yml sets ``defaults.run.shell: bash`` on every OS, so a leg without a usable bash could not run
-    the gate this control exercises, and a skip there would be a green that proves nothing.
-    """
-    tried: list[str] = []
-    for candidate in _bash_candidates():
-        if not candidate.is_file():
-            continue
-        tried.append(str(candidate))
-        if _bash_sees(candidate, tmp_path):
-            print(f"[#1000] bash resolved to {candidate} (namespace probe passed)")
-            return str(candidate)
-    pytest.fail(
-        "no bash on this machine can read a file this process just wrote. Tried: "
-        f"{tried or '(none found)'}. On Windows, `bash` on PATH is often "
-        "C:\\Windows\\System32\\bash.exe -- the WSL launcher, which runs in a different filesystem "
-        "namespace, and a control that ran there would be measuring nothing."
-    )
-
-
 def _fixture_repo(tmp_path: Path, env: dict[str, str]) -> tuple[Path, str, str, str]:
     """A repository shaped like the PR the gate exists to police.
 
@@ -423,33 +324,6 @@ def hygiene(tmp_path: Path) -> tuple[str, str, Path, dict[str, str], str, str]:
 def _ascii(text: str) -> str:
     """Child output, safe to print under any console code page."""
     return text.encode("ascii", "backslashreplace").decode("ascii")
-
-
-def test_the_bash_namespace_probe_rejects_an_interpreter_that_cannot_see_the_fixture(
-    tmp_path: Path,
-) -> None:
-    """NEGATIVE CONTROL OF THE RESOLVER, and it is here because this file already shipped the bug once.
-
-    MEASURED 2026-08-10. The first version resolved bash with ``shutil.which("bash")`` and passed it an
-    ABSOLUTE Windows path. Under a Git Bash parent it passed; run from PowerShell, where PATH resolves
-    ``bash`` to ``C:\\Windows\\System32\\bash.exe`` -- the WSL launcher, a different filesystem
-    namespace -- every hygiene control failed with exit 127 and the backslashes eaten. So the control's
-    verdict was a fact about PATH ORDER, which is precisely the ambient-environment green the wave-2
-    incident warned about, one variable over.
-
-    Two things fixed it and both are asserted here rather than described: the candidate is derived from
-    ``git`` (which ships bash beside it) and then made to READ A FILE this process wrote, and the
-    script is invoked by a RELATIVE path so no namespace conversion is involved at all.
-
-    A candidate that cannot read the token must be rejected. ``sys.executable`` stands in for one: it
-    is a real, runnable program that is not a shell, so the probe must refuse it while accepting the
-    resolved bash in the same call.
-    """
-    assert not _bash_sees(Path(sys.executable), tmp_path), (
-        "the namespace probe accepted a non-shell interpreter, so it cannot reject a bash that is "
-        "looking at the wrong filesystem either"
-    )
-    assert _bash_sees(Path(_require_bash(tmp_path)), tmp_path)
 
 
 def test_the_backlog_hygiene_gate_fails_a_code_pr_that_leaves_the_ledger_alone(
