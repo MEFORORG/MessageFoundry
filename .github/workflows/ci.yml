@@ -674,6 +674,7 @@ jobs:
           # every OS, so $VAR resolves the same on the Windows legs (Git Bash).
           FAULT_TIMEOUT: ${{ matrix.fault_timeout }}
           PYTEST_TIMEOUT: ${{ matrix.pytest_timeout }}
+          PYTEST_WORKERS: ${{ matrix.pytest_workers }}
         # `--ignore-glob` subtracts the web console package, which runs as its OWN step below. BACKLOG
         # #1027 added that package to the root `testpaths` so a bare local `pytest` stops silently
         # excluding it; without this subtraction the SAME 356 tests would then run TWICE on every leg.
@@ -685,7 +686,23 @@ jobs:
         # third entry in `testpaths`, which is the exact drift #1027 exists to prevent. Subtracting FROM
         # `testpaths` keeps it the single source of truth for what the suite is.
         # `tests/test_ci_engine_step_excludes_webconsole.py` pins all three of those decisions.
-        run: pytest -q --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
+        #
+        # `-n` RUNS THE SUITE ACROSS PROCESSES (pytest-xdist), and it is the whole reason this step
+        # stopped being 40 minutes. Measured 2026-08-16 on this branch: serial 2191s vs `-n 4
+        # --dist loadfile` 511s locally, with the failure set IDENTICAL in both runs (the same six
+        # pre-existing environment failures, zero parallelism-induced). That box has 20 cores and a
+        # hosted runner has 4, so the CI figure is expected to be lower than that 4.29x -- re-read
+        # the step duration from the first runs rather than quoting the local number.
+        #
+        # `--dist loadfile` IS LOAD-BEARING, NOT A PREFERENCE. xdist's default is `--dist load`, which
+        # scatters individual tests from one file across workers, and this suite has two things that
+        # breaks. (1) 44 module-scoped fixtures live outside conftest and would be rebuilt once PER
+        # WORKER instead of once -- `tests/test_worktree_prune_merged.py` alone pays ~3s of setup per
+        # test. (2) `tests/test_multishard_smoke.py` is the sole consumer of MEFOR_TEST_PORT_BASE and
+        # binds a real port window; keeping a file's tests together keeps that window inside one
+        # process. The cost of `loadfile` is that the run cannot finish faster than its single largest
+        # FILE, which is why the per-file hot spots are worth attacking next.
+        run: pytest -q -n "$PYTEST_WORKERS" --dist loadfile --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
 
       - name: Step margin -- boundary between the two gated steps
         if: always()
@@ -920,9 +937,19 @@ jobs:
           # used to take `step_timeout` -- a 2-to-4-minute suite holding a 25-to-55-minute budget --
           # which is why the nesting invariant could not hold for it on any leg. Derived in the note
           # above the `Web console tests (pytest)` step, which is also where to re-derive it.
-          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":43,"step_timeout":31,"webconsole_step_timeout":5,"pytest_timeout":60,"fault_timeout":90}'
-          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":6,"pytest_timeout":120,"fault_timeout":150}'
-          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":6,"pytest_timeout":120,"fault_timeout":150}'
+          # `pytest_workers` is the xdist worker count for the engine suite. It is a MATRIX knob rather
+          # than a literal in the run body for the same reason every other per-leg number here is one:
+          # the trial dispatches that size it are then a one-line edit, and a leg can differ from its
+          # siblings without touching the step. Sized at 4 because GitHub's hosted ubuntu and Windows
+          # runners are 4-vCPU; `-n auto` would resolve to the same 4 today but would silently
+          # over-subscribe if the runner size ever changes, and this suite spawns pwsh/git children
+          # that compete for those same cores (measured: ~1.12 cores of average child occupancy), so
+          # the count is stated rather than inferred. IF TIMING-SENSITIVE TESTS START FLAKING, 2 IS THE
+          # CONSERVATIVE RUNG -- it leaves 2 vCPU of headroom for the dispatcher and connscale
+          # assertions that measure elapsed time, at roughly two thirds of the saving.
+          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":43,"step_timeout":31,"webconsole_step_timeout":5,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
+          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":6,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
+          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":6,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
             echo "matrix={\"include\":[$U,$W22,$W25]}" >> "$GITHUB_OUTPUT"
           else

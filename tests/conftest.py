@@ -114,10 +114,33 @@ def _claim_test_slot() -> int:
     return 0  # saturated: fall back to the shared defaults rather than failing the run
 
 
+# PUBLISHING THE SLOT: `setdefault` IS WRONG INSIDE AN XDIST WORKER, and silently so.
+#
+# Under pytest-xdist the CONTROLLER parses config and loads the initial conftests BEFORE it spawns any
+# worker -- pyproject's `testpaths` makes `tests` an initial arg, so THIS module runs in the controller
+# first. It claims a slot and publishes it into its own environ. execnet then spawns the workers with
+# no env override, so every worker INHERITS those values and `setdefault` is a no-op in all of them:
+# N workers all reading one port base, which is precisely the collision the slot machinery above exists
+# to prevent. Nothing would report it -- the workers would simply race for the same ports.
+#
+# So a worker must claim its OWN slot and OVERWRITE. `PYTEST_XDIST_WORKER` is set by xdist in the
+# worker process only ("gw0", "gw1", ...) and is absent in the controller and in any serial run, which
+# makes it the exact discriminator. On a serial run this reduces to the original `setdefault`
+# behaviour, so an outer harness can still pin the slot by exporting these before invoking pytest.
+_IN_XDIST_WORKER = "PYTEST_XDIST_WORKER" in os.environ
+
+
+def _publish_slot_var(name: str, value: str) -> None:
+    if _IN_XDIST_WORKER:
+        os.environ[name] = value
+    else:
+        os.environ.setdefault(name, value)
+
+
 _SLOT = _claim_test_slot()
-os.environ.setdefault("MEFOR_TEST_SLOT", str(_SLOT))
-os.environ.setdefault("MEFOR_TEST_PORT_BASE", str(20000 + _PORTS_PER_SLOT * _SLOT))
-os.environ.setdefault("MEFOR_TEST_QSETTINGS_ORG", f"MEFOR-Test-{_SLOT}")
+_publish_slot_var("MEFOR_TEST_SLOT", str(_SLOT))
+_publish_slot_var("MEFOR_TEST_PORT_BASE", str(20000 + _PORTS_PER_SLOT * _SLOT))
+_publish_slot_var("MEFOR_TEST_QSETTINGS_ORG", f"MEFOR-Test-{_SLOT}")
 
 
 @pytest.fixture(scope="session", autouse=True)
