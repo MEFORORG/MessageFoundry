@@ -1120,8 +1120,10 @@ listener** and deliberately does **not** inherit the loopback carve-out — an a
 must not also admit anything running on the local box. ⚠️ That one is an **`inbound(...)` keyword** (or
 the top-level key in a `connections.toml` `[[inbound]]` table); there is **no**
 `[inbound].source_ip_allowlist` service setting. `[inbound]` carries only `bind_host`, `ack_after` and
-`stream_inflight_budget_bytes`, and every section model ignores unknown keys — so that spelling in
-`messagefoundry.toml` is accepted and **silently discarded**, leaving the listener ungated.
+`stream_inflight_budget_bytes`, and an unrecognized key in a known section is **refused at load** — so
+that spelling in `messagefoundry.toml` **fails the start** (`serve` exit 2), naming the section and the
+key. It used to be accepted and silently discarded, which left the listener ungated with nothing
+reporting a problem; that is the failure mode the refusal exists to remove.
 
 **Action vocabulary (closed set).** Every row below **opens its Action cell** with exactly one of:
 **ALLOW** (pass through), **DENY** (403 / 401 / 400 / 409 / refused connection / DIMSE status /
