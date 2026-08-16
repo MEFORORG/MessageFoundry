@@ -50,6 +50,20 @@
     check that cannot tell must not print the word that means it can. Use -SkipReachability to
     suppress the probe; the output then says reachability was not checked.
 
+    A RELATED PRACTICE, because this check is how the need surfaces. Prose that CITES a commit which
+    will deliberately never land -- a trial branch, a refuted experiment, a rejected approach -- makes
+    a merged file depend on a sha this check would otherwise be the only thing protecting. Measured
+    2026-08-16: `.github/workflows/ci.yml` line 994 on origin/main cites a worker-count trial "at
+    2bb733915", that branch was deliberately deleted from the public remote, and `git ls-remote
+    origin` returns zero matches for the sha. Three refs hold it -- one local branch and two rescue
+    refs. A single `git branch -D` would leave a merged citation resolving to nothing.
+
+    So when citing work that will not land, name a REF-INDEPENDENT identifier beside the sha -- a CI
+    run id, a PR number, an artefact url -- something whose retention does not depend on a git ref.
+    The citation then degrades gracefully: lose the sha and the evidence is still reachable. The sha
+    is precisely the half this tool exists to rescue, which is why it is the wrong half to rely on
+    alone.
+
     WHAT THIS DOES NOT MEASURE. Uncommitted and untracked work (use `git status`), and whether a
     remote-tracking ref is up to date with what the server has now (run `git fetch --prune` first if
     that matters). Reachability from ANY remote-tracking ref counts as backed, including a rescue
