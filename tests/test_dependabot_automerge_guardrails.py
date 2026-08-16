@@ -565,6 +565,15 @@ def _iso(hours_ago: float) -> str:
         ("no dateable artifact", '{"urls":[]}', "false"),
         ("PyPI error", None, "false"),
     ],
+    # `ids` IS REQUIRED HERE, and not for readability. `_iso()` calls `datetime.now()` at COLLECTION
+    # time, so without this the timestamp lands inside the generated test ID and the ID changes on
+    # every collection. Under pytest-xdist each worker collects in its OWN process, microseconds
+    # apart, so the workers disagree about what the test is called and xdist aborts the whole run
+    # with "Different tests were collected between gw0 and gw1" — measured, not theorised. Pinning
+    # the ids to the stable `label` keeps the dates relative to now (which is the behaviour under
+    # test) while making the NAME reproducible. Any future row whose parameters are derived from the
+    # clock, a uuid, or a random value needs the same treatment.
+    ids=["aged 30 days", "published 1 hour ago", "no dateable artifact", "PyPI error"],
 )
 def test_release_age_passes_an_aged_release_and_holds_a_fresh_one(
     label: str, payload: str | None, expected: str, tmp_path: Path
