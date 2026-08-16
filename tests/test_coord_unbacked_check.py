@@ -100,7 +100,10 @@ def test_a_pushed_branch_reads_clean_and_still_states_its_coverage(repo: Path) -
     # A bare "clean" is indistinguishable from a run that scanned nothing. This is the assertion that
     # makes the clean path trustworthy.
     assert "coverage :" in r.stdout
-    assert "1 refs across 1 repository" in r.stdout
+    # Refs AND worktrees, deliberately: a single count cannot say which of the two it meant, and the
+    # gap between them is where a detached HEAD hides.
+    assert "1 refs and" in r.stdout
+    assert "worktree checkouts across 1 repository" in r.stdout
 
 
 def test_a_branch_no_worktree_has_checked_out_is_still_counted(repo: Path) -> None:
@@ -120,7 +123,35 @@ def test_a_branch_no_worktree_has_checked_out_is_still_counted(repo: Path) -> No
     r = check(repo)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "side" in r.stdout
-    assert "1 commits on 1 branches exist on no remote" in r.stdout
+    assert "1 commits on 1 branch exist on no remote" in r.stdout
+
+
+def test_a_detached_worktree_head_is_counted(repo: Path, tmp_path: Path) -> None:
+    """THE THIRD REGRESSION, and the one a per-ref fix does not cover. A worktree with a detached
+    HEAD is on no branch, so scanning refs/heads cannot reach it however thorough that scan is.
+    Measured 2026-08-16: 23 of 44 registered worktrees were detached and 11 carried 30 commits on no
+    remote while this script reported zero."""
+    git(repo, "checkout", "-q", "-b", "tmpwork")
+    (repo / "d.txt").write_text("detached work", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "work that will be left detached")
+    sha = git(repo, "rev-parse", "HEAD").strip()
+    git(repo, "checkout", "-q", "main")
+    # Delete the branch so the commit is reachable ONLY from the worktree's detached HEAD -- the
+    # exact shape that made this invisible.
+    git(repo, "branch", "-qD", "tmpwork")
+    wt = tmp_path / "detached-wt"
+    git(repo, "worktree", "add", "--detach", str(wt), sha)
+
+    # Every branch is pushed, so a ref-only scan sees nothing.
+    for ref in git(repo, "for-each-ref", "--format=%(refname)", "refs/heads").splitlines():
+        assert git(repo, "rev-list", "--count", ref.strip(), "--not", "--remotes").strip() == "0"
+
+    res = check(repo)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "detached" in res.stdout
+    # Coverage must name refs AND worktrees; one number hides which of the two it meant.
+    assert "worktree checkouts" in res.stdout
 
 
 def test_a_repo_with_no_remote_at_all_is_reported_not_skipped(tmp_path: Path) -> None:

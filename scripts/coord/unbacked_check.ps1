@@ -37,6 +37,20 @@
     Such repos are reported as NO-REMOTE rather than folded into a count, because the remedy differs:
     the others need a push, this one needs a remote to push to.
 
+    A BRANCH SCAN CANNOT SEE A DETACHED HEAD, AND THAT IS THE THIRD FALSE NEGATIVE THIS SCRIPT HAS
+    SHIPPED. Scanning `refs/heads` answers "does any BRANCH carry unbacked commits". A worktree with a
+    detached HEAD is on no branch, so it is structurally invisible to that scan -- and detached is not
+    an edge case here: measured 2026-08-16, 23 of one repository's 44 registered worktrees were
+    detached, and 11 of them carried 30 commits that existed on no remote while this script reported
+    zero. So every worktree HEAD is checked as well, and a detached one is reported against its
+    PATH, because it has no branch name to report against.
+
+    The pattern across all three defects is the same and worth stating once: each earlier version
+    answered a question adjacent to the one a reader would ask. Per HEAD instead of per ref; per
+    local ref instead of per reachable remote; per branch instead of per checkout. The fix each time
+    was to widen what "everything" means, which is why the coverage line now counts refs AND
+    worktrees rather than a single number that hides which of the two it meant.
+
     CONFIGURED IS NOT REACHABLE, AND THE DIFFERENCE IS A FALSE NEGATIVE. `--not --remotes` excludes
     everything reachable from `refs/remotes/*`, and those are LOCAL COPIES of what a server once
     advertised. If the server is gone, they still exclude -- so the check reports a repository as
@@ -115,8 +129,10 @@ $Path = @($Path | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().
 
 $repos = @()
 $totalRefs = 0
+$totalWorktrees = 0
 $totalUnbacked = 0
 $totalCommits = 0
+$totalDetached = 0
 
 foreach ($p in $Path) {
     if (-not (Test-Path -LiteralPath $p)) {
@@ -145,6 +161,31 @@ foreach ($p in $Path) {
 
     $refs = @(& git -C $p for-each-ref --format='%(refname)' refs/heads 2>$null)
     $findings = @()
+
+    # DETACHED WORKTREE HEADS. A worktree checked out on a branch is already covered by the ref scan
+    # above; one with a detached HEAD is on no branch and no ref scan can reach it. Enumerate the
+    # checkouts themselves so "everything" means every place a commit can be sitting, not every
+    # branch. Reported against the worktree PATH because there is no branch name to report.
+    $wtHeads = @()
+    foreach ($line in @(& git -C $p worktree list --porcelain 2>$null)) {
+        if ($line -match '^worktree (.+)$') { $wtHeads += $Matches[1] }
+    }
+    $detached = @()
+    foreach ($wp in $wtHeads) {
+        $native = $wp -replace '/', '\'
+        if (-not (Test-Path -LiteralPath $native)) { continue }
+        # symbolic-ref fails on a detached HEAD; that failure IS the test.
+        & git -C $native symbolic-ref --quiet HEAD 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) { continue }
+        $dn = (& git -C $native rev-list --count HEAD --not --remotes 2>$null)
+        if ($dn -and [int]$dn -gt 0) {
+            $detached += [pscustomobject]@{
+                Worktree = $native
+                Head     = (& git -C $native rev-parse --short HEAD 2>$null)
+                Commits  = [int]$dn
+            }
+        }
+    }
 
     foreach ($ref in $refs) {
         # --not --remotes excludes everything reachable from any remote-tracking ref. With no remotes
@@ -175,13 +216,18 @@ foreach ($p in $Path) {
         # unknown amount and must not be read as clean.
         Unverifiable        = (($remotes.Count -gt 0) -and (-not $SkipReachability) -and ($reachable.Count -eq 0))
         RefsScanned         = $refs.Count
+        WorktreesScanned    = $wtHeads.Count
         Unbacked            = $findings.Count
         Commits             = $sum
         Findings            = $findings
+        DetachedUnbacked    = $detached
     }
     $totalRefs += $refs.Count
+    $totalWorktrees += $wtHeads.Count
     $totalUnbacked += $findings.Count
     $totalCommits += $sum
+    $totalDetached += $detached.Count
+    $totalCommits += (($detached | Measure-Object -Property Commits -Sum).Sum)
 }
 
 if ($Json) {
@@ -189,15 +235,18 @@ if ($Json) {
     [pscustomobject]@{
         RepositoriesScanned  = $repos.Count
         RefsScanned          = $totalRefs
+        WorktreesScanned     = $totalWorktrees
         BranchesUnbacked     = $totalUnbacked
+        DetachedWorktreesUnbacked = $totalDetached
         CommitsUnbacked      = $totalCommits
         RepositoriesUnverifiable = $unverifiableCount
         ReachabilityChecked  = (-not $SkipReachability)
         Repositories         = $repos
     } | ConvertTo-Json -Depth 6
-    # Unverifiable must fail too. A consumer that keys only on CommitsUnbacked would read a dead
-    # remote as a clean result, which is the defect this axis exists to expose.
-    exit ([int](($totalUnbacked -gt 0) -or ($unverifiableCount -gt 0)))
+    # Unverifiable and detached must both fail too. A consumer keying only on CommitsUnbacked would
+    # read a dead remote as clean; one keying only on BranchesUnbacked would miss every detached
+    # checkout, which is how 30 commits went unreported.
+    exit ([int](($totalUnbacked -gt 0) -or ($unverifiableCount -gt 0) -or ($totalDetached -gt 0)))
 }
 
 $unverifiableRepos = @($repos | Where-Object { $_.Unverifiable })
@@ -219,11 +268,16 @@ foreach ($r in $repos) {
         Write-Host "              remote, re-point it, or bundle the repository and treat it as unbacked." -ForegroundColor Red
         continue
     }
-    if ($r.Unbacked -eq 0) { continue }
+    if ($r.Unbacked -eq 0 -and $r.DetachedUnbacked.Count -eq 0) { continue }
     Write-Host "UNBACKED      $($r.Repo)" -ForegroundColor Yellow
     if (-not $Quiet) {
         foreach ($f in ($r.Findings | Sort-Object Commits -Descending)) {
             Write-Host ("              {0,-55} {1}" -f $f.Ref, $f.Commits)
+        }
+        # Reported against the path, and labelled, because a reader scanning for a branch name will
+        # not find one -- that absence is the whole reason a ref scan missed it.
+        foreach ($f in ($r.DetachedUnbacked | Sort-Object Commits -Descending)) {
+            Write-Host ("              {0,-55} {1}" -f "(detached) $($f.Worktree) @ $($f.Head)", $f.Commits) -ForegroundColor Yellow
         }
     }
 }
@@ -231,7 +285,9 @@ foreach ($r in $repos) {
 # COVERAGE FIRST, ALWAYS, INCLUDING ON A CLEAN RUN. See the DESCRIPTION: a bare "clean" cannot be
 # distinguished from a run that examined nothing.
 Write-Host ""
-Write-Host "coverage : $totalRefs refs across $($repos.Count) repositor$(if ($repos.Count -eq 1) { 'y' } else { 'ies' })"
+# Refs AND worktrees, never one number. A single count hides which of the two it meant, and the
+# gap between them is exactly where 30 commits hid on 2026-08-16.
+Write-Host "coverage : $totalRefs refs and $totalWorktrees worktree checkouts across $($repos.Count) repositor$(if ($repos.Count -eq 1) { 'y' } else { 'ies' })"
 if ($SkipReachability) {
     Write-Host "           reachability NOT checked (-SkipReachability) -- a dead remote reads as backed" -ForegroundColor Yellow
 } else {
@@ -243,11 +299,14 @@ if ($unverifiableRepos.Count -gt 0) {
     Write-Host "result   : UNVERIFIABLE in $($unverifiableRepos.Count) repositor$(if ($unverifiableRepos.Count -eq 1) { 'y' } else { 'ies' }) -- see above. Not reporting clean." -ForegroundColor Red
     exit 1
 }
-if ($totalUnbacked -eq 0) {
+if ($totalUnbacked -eq 0 -and $totalDetached -eq 0) {
     Write-Host "result   : 0 unbacked commits" -ForegroundColor Green
     exit 0
 }
-Write-Host "result   : $totalCommits commits on $totalUnbacked branches exist on no remote" -ForegroundColor Yellow
+$where = @()
+if ($totalUnbacked -gt 0) { $where += "$totalUnbacked branch$(if ($totalUnbacked -ne 1) { 'es' })" }
+if ($totalDetached -gt 0) { $where += "$totalDetached detached worktree$(if ($totalDetached -ne 1) { 's' })" }
+Write-Host "result   : $totalCommits commits on $($where -join ' and ') exist on no remote" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "Remedy, which buys durability without publication or review:"
 Write-Host "  git config mefor.durabilityRemote <private-remote>   # once, per repository"
