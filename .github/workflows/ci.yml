@@ -640,8 +640,10 @@ jobs:
       # twice now.
       #
       # The remaining margin is a SHARED budget across every PR that lands, and it is now ACCOUNTED
-      # FOR: `scripts/ci/step_margin.py` runs after both gated steps below and reds the leg when a
-      # step's own duration comes within 1.30x of its own cap (BACKLOG #344 proposal 1). Three PRs
+      # FOR: `scripts/ci/step_margin.py` runs after the gated step below and reds the leg when a
+      # step's own duration comes within 1.30x of its own cap (BACKLOG #344 proposal 1). It used to run
+      # after BOTH gated steps; the web console suite moved to its own `webconsole` job and took its
+      # half of the check with it, so each job now measures the one gated step it owns. Three PRs
       # each adding a minute of Windows time is still individually blameless -- the difference is that
       # the third one now says so instead of the fourth one dying at the cap with zero failing
       # assertions. It is NOT a request to raise a cap; the underlying slowness is #320.
@@ -704,87 +706,16 @@ jobs:
         # FILE, which is why the per-file hot spots are worth attacking next.
         run: pytest -q -n "$PYTEST_WORKERS" --dist loadfile --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
 
-      - name: Step margin -- boundary between the two gated steps
-        if: always()
-        run: python scripts/ci/step_margin.py --mark between
-
-      # The web console's OWN suite (Option B, ADR 0065): the moved /ui tests live in the package's
-      # tests/. They ARE in the root `testpaths` since BACKLOG #1027, so a bare local `pytest` collects
-      # them -- the engine step above subtracts them explicitly via `--ignore-glob` rather than relying
-      # on `testpaths` to exclude them, which it no longer does. They still run as a SECOND step on the
-      # SAME leg, under the package's OWN pytest configuration. The package was installed editable in the install
-      # step above (`-e packaging/messagefoundry-webconsole`), so both suites exercise the same
-      # engine build. Its pyproject sets asyncio_mode="auto" + session loop scopes; the timeout flags
-      # mirror the engine step (a hung ASGI test fails fast + named, not at the silent job cap).
-      # SEAM MATRIX — KNOWN GAP, deliberately recorded rather than silently carried. This runs the
-      # package against the ONE installed engine (whatever ENGINE_UI_SEAM is at HEAD). The original
-      # comment said "only ENGINE_UI_SEAM==1 exists today ... when a seam 2 lands, expand this into a
-      # matrix" — that trigger fired long ago and was never actioned: the console now supports a
-      # RANGE (SUPPORTED_ENGINE_SEAMS), so the back-compat claim that an older engine still renders
-      # is NOT exercised anywhere. Closing it means installing the MIN and MAX supported engine
-      # builds and running the package suite against each.
-      #
-      # THIS STEP HAS ITS OWN CAP AS OF BACKLOG #344 PROPOSAL 5, and that is a structural change, not a
-      # tidy-up. It used to carry `matrix.step_timeout` -- the same 25/55 the engine suite holds -- so a
-      # 2-to-4-minute suite sat behind a budget it could never reach: reaching this step has already
-      # spent setup plus `Tests`, so its cap could not fire first at any `job_timeout` worth setting
-      # (~55 min on ubuntu, ~114 on Windows). A hang HERE was therefore an unattributed JOB-level kill
-      # with no step conclusion at all, which is exactly the failure the nesting invariant exists to
-      # prevent, arriving by the one path that invariant did not cover.
-      #
-      # SIZING. Same rule as `step_timeout` -- ceil_minute(1.35 x the leg's measured max) -- then
-      # FLOORED at 5:00, because at these absolute durations 1.35x is under a minute of real headroom
-      # and hosted-runner provisioning noise alone has been observed at 4:30 (`Set up job`, ubuntu run
-      # 31109989006). Maxima are the 2026-08-08 pool recorded above and in
-      # `scripts/ci/step_margin_baseline.toml`:
-      #
-      #   leg      measured max   x1.35   floored   cap    margin over the measured max
-      #   ubuntu   2:22 (n=441)   3:12    5:00      5      2.113x
-      #   W22      2:51           3:51    5:00      6      2.105x  (takes the shared Windows value)
-      #   W25      3:59 (n=360)   5:23    6:00      6      1.506x
-      #
-      # THOSE MAXIMA ARE THEMSELVES RIGHT-CENSORED, and by the JOB cap rather than by a step cap: this
-      # step runs second, so a job-level kill lands inside it. Run 30724385719 is the exhibit -- `Tests`
-      # SUCCESS at 25:51, then this step CANCELLED at 30:14. So the numbers above are lower bounds, and
-      # the floor is doing real work rather than being generosity.
-      #
-      # NESTING INVARIANT, SECOND GATED STEP -- setup(max) + step_timeout + webconsole_step_timeout must
-      # stay under job_timeout. This is the line that could not be satisfied before, on ANY leg:
-      #   ubuntu  5:22 + 25:00 + 5:00 = 35:22 < 37:00  (gap 1:38)
-      #   W22     4:05 + 55:00 + 6:00 = 65:05 < 66:00  (gap 0:55)
-      #   W25     2:32 + 55:00 + 6:00 = 63:32 < 66:00  (gap 2:28)
-      # It now holds on all three, so a hang in the web console suite fails as a NAMED STEP.
-      #
-      # WORST CASE THE CAPS ADMIT, with both gated steps passing one second under their own caps --
-      # the quantity the job paragraph above could not previously bound at all, because the second
-      # gated step's cap was the first one's:
-      #   ubuntu  5:22 + 30:59 + 4:59 = 41:20 vs 43:00  (+1:40)   was 5:22 + 24:59 + 24:59 = 55:20  NEGATIVE
-      #   W22     4:05 + 54:59 + 5:59 = 65:03 vs 66:00  (+0:57)   was 4:05 + 54:59 + 54:59 = 114:03 NEGATIVE
-      #   W25     2:32 + 54:59 + 5:59 = 63:30 vs 66:00  (+2:30)   was 2:32 + 54:59 + 54:59 = 112:30 NEGATIVE
-      # The old table stated a worst case built from the MEASURED web-console maxima, which is a
-      # different quantity: it described what had been observed, not what the caps permitted.
-      #
-      # THE RE-DERIVE TRIGGER IS THE MARGIN CHECK ITSELF, not a second number written here to drift
-      # against it. The check below reds at 1.30x of the cap -- 3:51 on ubuntu, 4:37 on Windows -- and
-      # a run reaching that is 1.6x to 1.9x this leg's maximum over hundreds of observations, which is
-      # an event rather than a slow morning. It also prints the percent-of-cap on every run, so the
-      # approach is visible before the refusal. The old habit of writing a separate trigger into this
-      # file is exactly what produced a permanently-tripped 28:00 alarm nobody could act on.
-      - name: Web console tests (pytest)
-        id: webconsole
-        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        timeout-minutes: ${{ matrix.webconsole_step_timeout }}
-        env:
-          QT_QPA_PLATFORM: offscreen
-          PYTHONFAULTHANDLER: "1"
-          # env-passed (not a ${{ }} expansion into run:) — see the Tests step above for why.
-          FAULT_TIMEOUT: ${{ matrix.fault_timeout }}
-          PYTEST_TIMEOUT: ${{ matrix.pytest_timeout }}
-        run: pytest packaging/messagefoundry-webconsole/tests -q -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
-
       # THE MARGIN CHECK (BACKLOG #344 proposal 1). Last in the job so a LOW margin cannot skip a suite
       # that has not run yet -- a step `if:` with no status function carries an implicit `success()`,
-      # so a failing check placed between the two gated steps would silently skip the second one.
+      # so a failing check placed ahead of a gated step would silently skip it.
+      #
+      # IT NOW GUARDS ONE STEP, NOT TWO. The web console suite moved to its own `webconsole` job and
+      # took its half of this check with it, so the `between` mark is gone: this reads
+      # `before-tests .. now`, which is the whole of the only gated step left in this job. The
+      # invariant did not weaken -- it was RE-SCOPED. Each job now holds exactly one gated step, its
+      # own cap, and its own check, which is a stronger shape than one check straddling two steps
+      # whose budgets had to be summed under a single job cap.
       #
       # It keys on `steps.<id>.outcome` -- THE STEP'S OWN CONCLUSION, never the job's. That substitution
       # is not pedantry: a step that nearly exhausts its cap is the most likely to push its job into
@@ -794,25 +725,134 @@ jobs:
       # A skipped step (docs-only PR) reports NO OBSERVATION in words rather than a healthy-looking
       # ratio, and the script runs its own red/green control pair on every invocation and prints both
       # into the job summary -- a gate that has never been red is a claim, not a control.
-      - name: Step margin -- both gated steps
+      - name: Step margin -- engine suite
         if: always()
         env:
           TESTS_OUTCOME: ${{ steps.tests.outcome }}
-          WEBCONSOLE_OUTCOME: ${{ steps.webconsole.outcome }}
           STEP_CAP: ${{ matrix.step_timeout }}
-          WEBCONSOLE_CAP: ${{ matrix.webconsole_step_timeout }}
           LEG: ${{ matrix.os }}
         run: |
           rc=0
           # `|| rc=$?` OUTSIDE the command, so a non-zero exit is captured rather than swallowed by
-          # `set -e` or absorbed into a pipeline. Both checks always run: reporting only the first
-          # would hide the leg that is actually tight.
+          # `set -e` or absorbed into a pipeline.
           python scripts/ci/step_margin.py --step "Tests (pytest)" --leg "$LEG" \
             --cap-minutes "$STEP_CAP" --outcome "$TESTS_OUTCOME" \
-            --since before-tests --until between || rc=$?
+            --since before-tests --until now || rc=$?
+          exit $rc
+
+  # THE WEB CONSOLE SUITE, IN ITS OWN PARALLEL JOB (was a second step on every `test` leg).
+  #
+  # WHY IT MOVED. It was ~170s sitting SERIALLY behind a ~1090s engine suite on the critical-path leg,
+  # for no reason other than sharing a checkout. Run alongside instead of after, it costs zero
+  # wall-clock: its whole job (setup + suite) finishes far inside the engine job it now runs beside.
+  #
+  # THIS REVERSES THE PLACEMENT HALF OF BACKLOG #344 PROPOSAL 5, AND KEEPS ITS SUBSTANCE. That proposal
+  # gave this suite its own `webconsole_step_timeout` because two steps sharing one `timeout-minutes`
+  # meant the second one's cap could never fire first -- reaching it had already spent setup plus the
+  # engine suite. Moving it to its own job does not undo that; it completes it. The suite keeps its own
+  # STEP cap, gains its own JOB cap (`webconsole_job_timeout`), and keeps its own margin check. The
+  # nesting invariant is now setup(max) + webconsole_step_timeout < webconsole_job_timeout in ONE job,
+  # instead of a sum of two step budgets straddling a single job cap -- strictly easier to satisfy and
+  # to check, which is why the guard in tests/test_ci_step_margin.py is re-scoped per job rather than
+  # relaxed.
+  #
+  # IT IS NOT A REQUIRED CONTEXT AND DOES NOT NEED TO BE. `ci-gate` lists it in `needs:` and fails on
+  # any needed job's `failure` or `cancelled`, and `CI gate` IS required -- the same mechanism that
+  # already gates the six path-gated legs. Adding a new required context would instead have meant a
+  # branch-protection change and the required-but-absent trap on every docs-only PR.
+  #
+  # THE DOCS-ONLY GATE IS PER-STEP, NOT PER-JOB, exactly as in `test` and for the same reason: a
+  # job-level `if:` would skip the job outright, and `ci-gate` reads `needs.*.result`, where a skipped
+  # job reports `skipped` rather than `success`. Keeping the job running and no-oping its steps keeps
+  # that roll-up honest on a docs-only PR.
+  webconsole:
+    name: web console tests (${{ matrix.os }}, py${{ matrix.python-version }})
+    needs: changes
+    strategy:
+      fail-fast: false
+      # Same per-repo matrix as `test`: this suite is as platform-sensitive as the engine one (it runs
+      # under the package's OWN pytest config, against a real ASGI test client), so it gets the same
+      # legs rather than a cheaper ubuntu-only run.
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}
+    runs-on: ${{ matrix.hosted }}
+    timeout-minutes: ${{ matrix.webconsole_job_timeout }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Qt offscreen system libraries
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
+
+      - name: Set up uv
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          cache-dependency-glob: |
+            pyproject.toml
+            requirements.lock
+
+      # THE SAME INSTALL LINE AS `test`, deliberately. The console suite imports the engine, so it must
+      # be exercised against the same build; keeping the commands identical (rather than trimming to a
+      # console-only set) means the two jobs cannot drift into testing different resolutions of the same
+      # lock. It also shares the uv cache entry -- same key, already warm from the sibling job.
+      - name: Install project (dev + console + fhir + dicom + x12 + xml extras)
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
+
+      - name: Step margin -- start the clock
+        if: always()
+        run: python scripts/ci/step_margin.py --mark before-webconsole
+
+      # The web console's OWN suite (Option B, ADR 0065): the moved /ui tests live in the package's
+      # tests/. They ARE in the root `testpaths` since BACKLOG #1027, so a bare local `pytest` collects
+      # them -- the engine step in `test` subtracts them explicitly via `--ignore-glob` rather than
+      # relying on `testpaths` to exclude them, which it no longer does. The package is installed
+      # editable above, so both suites exercise the same engine source.
+      #
+      # NO `-n` HERE, deliberately. xdist buys the engine suite ~2x across ~13,000 tests; this is ~356
+      # tests in 2-to-4 minutes, where worker startup would eat most of the gain, and the job now runs
+      # concurrently with the engine one anyway -- its wall-clock is already off the critical path.
+      # Adding workers would spend the contention risk the -n 8 trial measured to buy nothing.
+      - name: Web console tests (pytest)
+        id: webconsole
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        timeout-minutes: ${{ matrix.webconsole_step_timeout }}
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONFAULTHANDLER: "1"
+          # env-passed (not a ${{ }} expansion into run:) -- see the engine Tests step for why.
+          FAULT_TIMEOUT: ${{ matrix.fault_timeout }}
+          PYTEST_TIMEOUT: ${{ matrix.pytest_timeout }}
+        run: pytest packaging/messagefoundry-webconsole/tests -q -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
+
+      # This job's half of the margin check (BACKLOG #344 proposal 1), moved here with the suite it
+      # measures. Same contract as the engine one: last in the job, `if: always()` so a step killed at
+      # its cap is still reported, and keyed on `steps.webconsole.outcome` -- the STEP's own conclusion,
+      # never the job's, because a step that nearly exhausts its cap is the most likely to push its job
+      # into `timeout-minutes` and filtering on the job would delete exactly those rows.
+      - name: Step margin -- web console suite
+        if: always()
+        env:
+          WEBCONSOLE_OUTCOME: ${{ steps.webconsole.outcome }}
+          WEBCONSOLE_CAP: ${{ matrix.webconsole_step_timeout }}
+          LEG: ${{ matrix.os }}
+        run: |
+          rc=0
           python scripts/ci/step_margin.py --step "Web console tests (pytest)" --leg "$LEG" \
             --cap-minutes "$WEBCONSOLE_CAP" --outcome "$WEBCONSOLE_OUTCOME" \
-            --since between --until now || rc=$?
+            --since before-webconsole --until now || rc=$?
           exit $rc
 
   # Build + type-check the VS Code extension, and run its integration tests. The Python jobs never
@@ -966,9 +1006,17 @@ jobs:
           # session_mail's claim-verdict test, which is the slowest single test in the suite. Contention
           # hits exactly the tests that measure time or bind real ports, which is why the failures
           # cluster there rather than scattering.
-          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":43,"step_timeout":31,"webconsole_step_timeout":5,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
-          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":6,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
-          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":6,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
+          # `webconsole_job_timeout` caps the SEPARATE web console job. It exists because that suite
+          # moved out of `test` into its own parallel job, so it now needs a job cap of its own -- and
+          # the nesting invariant has to hold there too: setup(max) + webconsole_step_timeout must fit
+          # under it. Recorded setup maxima are 5:22 ubuntu / 4:05 W22 / 2:32 W25, and ci.yml records
+          # provisioning noise alone at 4:30, so the worst case is about 5:22 + 4:30 + 5:00 = 14:52 on
+          # the widest leg. 20 clears that with room. It is a DEADLOCK BACKSTOP, not a tightness gate:
+          # the drift detector is the margin check against `webconsole_step_timeout`, so sizing this
+          # close to the observed run would buy no detection and cost false reds on green suites.
+          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":43,"step_timeout":31,"webconsole_step_timeout":5,"webconsole_job_timeout":20,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
+          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":6,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
+          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":6,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
             echo "matrix={\"include\":[$U,$W22,$W25]}" >> "$GITHUB_OUTPUT"
           else
@@ -2175,6 +2223,14 @@ jobs:
       - load-test
       - load-test-sqlserver
       - windows-service-smoke
+      # `webconsole` rides this roll-up rather than taking a required context of its own. It is NOT
+      # path-gated like the five above -- it runs on every PR -- so it COULD have been required
+      # directly; riding here is the cheaper correct choice, because adding a context means a
+      # branch-protection change and, until that lands, a PR that can never satisfy it. The coverage is
+      # identical either way: this job is `if: always()` and fails on any needed job's `failure` or
+      # `cancelled`, and `CI gate` is required. Before this, the console suite gated merges by being a
+      # step inside the required `test` legs; it must not silently stop gating them now that it is not.
+      - webconsole
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any gated leg failed or was cancelled
