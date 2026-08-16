@@ -947,6 +947,25 @@ jobs:
           # the count is stated rather than inferred. IF TIMING-SENSITIVE TESTS START FLAKING, 2 IS THE
           # CONSERVATIVE RUNG -- it leaves 2 vCPU of headroom for the dispatcher and connscale
           # assertions that measure elapsed time, at roughly two thirds of the saving.
+          #
+          # DO NOT RE-RUN THE "MORE WORKERS MIGHT BE FREE" EXPERIMENT: 8 WAS MEASURED AND IT IS WORSE ON
+          # EVERY LEG. The tempting argument is that a worker blocked waiting on a pwsh/git child is not
+          # holding a core, so 4 workers on 4 vCPU are under-subscribed. It is wrong. Dispatched
+          # 2026-08-16 on branch claude/ci-worker-count-trial at 2bb733915 (run 31968796353), all three
+          # legs raised to 8 together so each compares against its own baseline:
+          #
+          #   leg             -n 4 baseline (n=2)   -n 8 (n=1)   delta   -n 8 outcome
+          #   ubuntu-latest   630 / 633s            731s         +16%    RED, 2 timing assertions
+          #   windows-2022    967 / 1004s           1067s         +8%    green
+          #   windows-2025    1084 / 1092s          1366s        +25%    RED, 3 tests
+          #
+          # The -n 4 baselines are two runs agreeing within 4 percent (PR #411 and its post-merge push).
+          # What went red is the mechanism, not bad luck: ubuntu lost the two elapsed-time assertions
+          # (test_outbound_batch.py's pacing floor and a super-linear-scaling ratio), and windows-2025
+          # lost the three heaviest multi-process tests -- connscale_smoke, multishard_smoke and
+          # session_mail's claim-verdict test, which is the slowest single test in the suite. Contention
+          # hits exactly the tests that measure time or bind real ports, which is why the failures
+          # cluster there rather than scattering.
           U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":43,"step_timeout":31,"webconsole_step_timeout":5,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
           W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":6,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":6,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
