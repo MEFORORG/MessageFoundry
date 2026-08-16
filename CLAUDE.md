@@ -279,6 +279,16 @@ diverge enough to warrant it; keep this root file general.
   one-layer-per-commit changes and narrate each (respect the ledger gate — never `--no-verify` or a
   rename workaround). **Pushes, PRs, and merges need the owner's approval**: they are outward-facing
   and, with auto-merge on, a PR effectively merges to `main`.
+- **Whoever executes a push or merge announces it** — one `mail.ps1 -Send -To all` line, before
+  (heads-up: `"pushing #N now, touches X"`) and/or after (`"landed #N at <sha>, touches X, rebase if
+  BEHIND"`). Worded around the *action*, not a fixed identity — no gate enforces *who* may push a
+  branch or merge a PR, only *which* refs (`push_guard.py` blocks direct pushes to protected refs; it
+  cannot see `gh pr merge` at all), so hard-coding this to a role would leave the exact lapse case
+  silently uncovered. **Never a hold/freeze/wait request or a promise about future state** — a
+  2026-08-01 rehearsal of exactly that shape stayed "in force" for hours after the condition it named
+  had already resolved, while `main` moved four times underneath it (`docs/WORKTREES.md`, "Announcing
+  yourself"). This is an **unenforced courtesy norm, not a substitute** for `gh pr view <N> --json
+  mergeStateStatus`, which stays the only authoritative merge-state check.
 - **Never grep for the next free ADR / BACKLOG number.** Two sessions that both grep pick the *same*
   number, create differently-named files, **merge clean**, and silently corrupt the ledger (it has fired
   three times). Allocate it atomically — `pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -Title
