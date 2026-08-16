@@ -64,11 +64,12 @@ class FhirLookupError(RuntimeError):
 
 
 #: The runner the engine publishes for the duration of one off-loop transform: it takes
-#: ``(connection, query, params)`` (``query`` is ``"Patient/123"``, ``"Patient?identifier=..."``, or a
-#: path-only ``"Patient"`` paired with structured ``params``) and returns the parsed read result as a
-#: plain dict (a resource, or a searchset ``Bundle``). ``params`` (ADR 0043, BACKLOG #204) is the
-#: **safely-encoded** search form: each value is percent-encoded by the engine, so an attacker-influenced
-#: value can never inject an extra FHIR search parameter (CWE-88). ``None`` = the flat ``query`` form.
+#: ``(connection, query, params)`` (``query`` is a read-by-id ``"Patient/123"`` or a path-only
+#: ``"Patient"`` paired with structured ``params``) and returns the parsed read result as a plain dict
+#: (a resource, or a searchset ``Bundle``). ``params`` (ADR 0043, BACKLOG #204) is the **safely-encoded**
+#: search form and, since #1243, the only one: each value is percent-encoded by the engine, so an
+#: attacker-influenced value can never inject an extra FHIR search parameter (CWE-88). ``None`` means a
+#: read-by-id (no search); a ``?``-query inside ``query`` is refused.
 FhirLookupRunner = Callable[[str, str, Mapping[str, str | list[str]] | None], dict[str, Any]]
 
 # Active runner as a ContextVar (mirrors db_lookup._active): the runner is published around the off-loop
