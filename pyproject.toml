@@ -193,6 +193,12 @@ dev = [
     "pytest-asyncio>=0.26",  # >=0.26 adds asyncio_default_test_loop_scope (BACKLOG #17 shared-loop fix)
     "pytest-timeout>=2.3",  # per-test watchdog: a hung test dumps stacks + fails fast in 60s, never wedges the leg
     "pytest-rerunfailures>=16.0",  # in-run auto-retry for the known harness-monitor timing flake: a single flake occurrence self-heals instead of reding the whole matrix + blocking auto-merge
+    # The engine suite runs across processes in CI (`-n` in ci.yml's `Tests (pytest)` step). Serial,
+    # it was 91 percent of the whole CI critical path. Two things had to be fixed before it worked and
+    # both are pinned by tests, so this is not a flag that can be dropped back in casually:
+    # collection-time timestamps must not reach a test id (tests/test_dependabot_automerge_guardrails.py)
+    # and the per-process port slot must not be inherited by workers (tests/conftest.py).
+    "pytest-xdist>=3.6",
     # Pinned BELOW 0.16: ruff 0.16.0 turned on stricter defaults (RUF022/RUF100/BLE001) that flag
     # hundreds of findings in existing code — at least ~870 on PR #66's ubuntu leg (whole-repo scope,
     # 2026-08-01). An unbounded ">=" lets `uv lock` adopt that new baseline, and it flows out through
