@@ -1139,6 +1139,25 @@ jobs:
           #   windows-2025    1084 / 1092s          1366s        +25%    RED, 3 tests
           #
           # The -n 4 baselines are two runs agreeing within 4 percent (PR #411 and its post-merge push).
+          #
+          # -n 4 IS NOT CLEAR OF THE TIMING FLOOR, ONLY FURTHER FROM IT. Recorded because the paragraph
+          # below reads as "8 is unsafe, 4 is settled" and the second half is now known to be too
+          # strong. Observed 2026-08-17 on PR #420, run 32005389065, ubuntu-latest, at -n 4:
+          #     FAILED tests/test_send_pacing.py::test_single_message_seam_is_paced
+          #     assert 0.03876582899999903 >= (0.05 * 0.8)
+          # Missed by 1.2 ms -- 0.0388 against a required 0.0400 -- on a PR whose diff does not touch
+          # that file (two coordination files, one of them pwsh-gated and skipped on ubuntu). So a 20
+          # percent tolerance on a 50 ms interval does not reliably clear a shared runner even at the
+          # merged worker count. If this is to be fixed, the lever is the TOLERANCE or the pacing
+          # mechanism, not pytest_workers -- lowering workers to 2 would buy margin by accident and
+          # cost wall clock everywhere.
+          #
+          # ONE THING THAT SHOULD HELP, and is stated as a prediction rather than a result: the tooling
+          # partition takes ~1,880 subprocess-spawning tests off this leg, and those are precisely the
+          # contention this floor is sensitive to. All 7 pacing tests passed on a local -n 4 engine leg
+          # under the partition, the seam test at 0.194s. That is one green run on a 20-core box, which
+          # is not evidence about a 4-vCPU runner -- if the flake recurs on a partitioned leg, this
+          # prediction was wrong and the tolerance is the only remaining lever.
           # What went red is the mechanism, not bad luck: ubuntu lost the two elapsed-time assertions
           # (test_outbound_batch.py's pacing floor and a super-linear-scaling ratio), and windows-2025
           # lost the three heaviest multi-process tests -- connscale_smoke, multishard_smoke and
