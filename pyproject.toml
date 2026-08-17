@@ -317,8 +317,16 @@ asyncio_default_fixture_loop_scope = "session"
 testpaths = ["tests", "packaging/messagefoundry-webconsole/tests"]
 # Per-test watchdog: a single hung await/socket is killed at 60s with a full thread-stack dump naming
 # the culprit, instead of burning the CI job's wall-clock. `thread` method works cross-platform (no
-# SIGALRM) and fires even when the main thread is blocked in a C call. Individual tests run well under
-# 60s (the whole suite is ~2–5 min).
+# SIGALRM) and fires even when the main thread is blocked in a C call. The cap is per TEST, and every
+# leg passes under it, so no single test exceeds it. This value binds LOCAL runs only: ci.yml passes an
+# explicit --timeout= per leg from its matrix (60s ubuntu, 120s Windows), which overrides it.
+#
+# NO SUITE TOTAL HERE, DELIBERATELY. This line carried "~2-5 min" long after that stopped being true,
+# and the figure has since moved again -- #411 took the engine suite across processes, so the serial
+# number it implied is now two revisions stale rather than one. A duplicated measurement rots silently
+# because nothing points at it; the fix is to not keep a second copy. Suite timing, its provenance, the
+# serial-vs-parallel comparison and the worker sizing are recorded ONCE, in the comments above the
+# `Tests (pytest)` step and the matrix in .github/workflows/ci.yml. Read it there.
 addopts = "--timeout=60 --timeout-method=thread"
 markers = [
     "win2025_acceptance: Windows Server 2025 on-server acceptance probes (env-gated; skip off-server).",
