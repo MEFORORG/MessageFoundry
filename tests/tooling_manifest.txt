@@ -37,6 +37,7 @@ tests/test_ci_docs_only_detector.py
 tests/test_ci_engine_step_excludes_webconsole.py
 tests/test_ci_leg_data_class.py
 tests/test_ci_step_margin.py
+tests/test_ci_tooling_gate.py
 tests/test_ci_venv_pinning.py
 tests/test_claim_check.py
 tests/test_claude_section_citations.py
@@ -84,13 +85,13 @@ tests/test_security_posture.py
 tests/test_selfheal_installed_parity.py
 tests/test_serverdb_ci_coverage.py
 tests/test_session_context_presence.py
+tests/test_session_mail_held.py
 tests/test_session_mail.py
 tests/test_session_registry.py
 tests/test_setup_leak_gate_reports_source.py
 tests/test_stalled_prs.py
 tests/test_testpaths_webconsole_coverage.py
 tests/test_workflow_shell_syntax.py
-tests/test_worktree_gate.py
 tests/test_worktree_gate_command_parsing.py
 tests/test_worktree_gate_control_plane.py
 tests/test_worktree_gate_default_reposfile.py
@@ -102,6 +103,7 @@ tests/test_worktree_gate_interpreter_sigils.py
 tests/test_worktree_gate_receipts.py
 tests/test_worktree_gate_remedy_families.py
 tests/test_worktree_gate_shell_semantics.py
+tests/test_worktree_gate.py
 tests/test_worktree_new_cleanup_advice.py
 tests/test_worktree_new_no_track.py
 tests/test_worktree_prune_merged.py
@@ -110,4 +112,3 @@ tests/test_worktree_selfheal_wiring.py
 tests/test_worktree_venv_constraint.py
 tests/test_write_share_denominator.py
 tests/test_zizmor_config_hygiene.py
-tests/test_ci_tooling_gate.py
