@@ -971,6 +971,38 @@ def test_no_registry_record_stands_down_without_spending_the_budget(
     assert m.get("state") != "announced", f"a stand-down recorded an announcement: {m}"
 
 
+def test_a_duplicated_session_id_is_reported_as_ambiguous_not_missing(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Two roots claiming one id is a CONFIGURATION, not a race, and the receipt has to say so.
+
+    The lookup refuses to adjudicate between them, which is right -- it cannot know which login the
+    session is actually on. What it must not do is let the hook report "no registry record matched",
+    which is what happened while the lookup collapsed zero-matches and many-matches to the same empty
+    string. That note sends an operator looking for a missing file that is present twice, which is the
+    one place the cause is visible. Unlike a half-written record, this does not resolve on its own.
+    """
+    home = tmp_path / "home"
+    _registry(home, SELF_ID, ".claude")
+    _registry(home, SELF_ID, ".claude-account-1")
+    sd = tmp_path / "sd"
+    p = run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[PEER, ACCT],
+        env={"USERPROFILE": str(home)},
+    )
+    assert not p.stdout.strip(), f"announced without knowing its own login: {p.stdout!r}"
+    assert outcomes(sd) == ["NO_LOGIN"], outcomes(sd)
+    # Asserted against the RENDERED receipt, which Get-Clean caps at 80 chars. The first version of
+    # this note put its distinguishing word at the end of a sentence and the cap ate it, leaving a
+    # receipt that read the same for a missing record as for a duplicated one.
+    note = " ".join(receipts(sd))
+    assert "AMBIGUOUS" in note, f"the ambiguous case was not named within the cap: {note}"
+    assert "MISSING" not in note, f"reported missing when it was duplicated: {note}"
+
+
 def test_repeated_stand_downs_do_not_arm_the_kill_ladder(repo: Path, tmp_path: Path) -> None:
     """A STAND-DOWN MUST BE RECOVERABLE, and one invocation cannot show that.
 

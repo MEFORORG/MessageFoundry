@@ -486,7 +486,8 @@ try {
         # Registry records are enumerated across every config root, so the lookup answers for a session
         # the roster cannot see. Prefer the roster row when there is one -- it is already loaded and
         # costs nothing -- and fall back to the registry, never to a literal.
-        $myLogin = if ($me -and $me.Login) { [string]$me.Login } else { Get-LoginForSession -SessionId $selfId }
+        $lookup = if ($me -and $me.Login) { $null } else { Get-LoginForSession -SessionId $selfId }
+        $myLogin = if ($me -and $me.Login) { [string]$me.Login } else { [string]$lookup.Login }
 
         # NO LOGIN, NO ANNOUNCEMENT. Standing down is the only safe branch, and both alternatives were
         # measured to be worse:
@@ -530,11 +531,27 @@ try {
             # would send an operator looking for a missing file that may be present and corrupt --
             # which is the launch-moment case this registry library is built around. Count them
             # instead, on this rare path only, and let the number speak.
-            $unreadable = @(Get-SessionRecords -IncludeUnreadable | Where-Object { $_.Unreadable }).Count
-            $why = if ($unreadable -gt 0) {
-                "could not determine this session's login; $unreadable registry record(s) unreadable, possibly still being written"
+            #
+            # THE AMBIGUOUS CASE IS NAMED SEPARATELY BECAUSE IT DOES NOT SELF-RESOLVE. Two roots each
+            # claiming this id is a configuration, not a race: it will still be true next prompt, and
+            # every prompt after that. Reporting it as "no record matched" -- which this did until the
+            # lookup started returning its match count -- sent an operator hunting for a missing file
+            # that was in fact present TWICE, which is the one place the cause was visible.
+            $matched = if ($lookup) { [int]$lookup.Matched } else { 0 }
+            $unreadable = if ($matched -gt 1) { 0 } else {
+                @(Get-SessionRecords -IncludeUnreadable | Where-Object { $_.Unreadable }).Count
+            }
+            # LEAD WITH THE DISCRIMINATOR. Write-Receipt folds this through Get-Clean with an 80-char
+            # cap, so anything past that is gone from the only durable record of the decision. The
+            # first version buried the word that told the three cases apart at the end of a sentence
+            # and it was truncated away -- the receipt then read identically for a missing record and
+            # a duplicated one, which is the failure this note exists to prevent.
+            $why = if ($matched -gt 1) {
+                "AMBIGUOUS: $matched config roots hold a record for this id; will not self-resolve"
+            } elseif ($unreadable -gt 0) {
+                "UNREADABLE: $unreadable registry record(s) unparsed, maybe still being written"
             } else {
-                "could not determine this session's login; no registry record matched this session id"
+                "MISSING: no registry record matched this session id"
             }
             Write-Receipt 'NO_LOGIN' @{ peers = $peers.Count; checks = [int]$upd.checks; note = $why }
             exit 0

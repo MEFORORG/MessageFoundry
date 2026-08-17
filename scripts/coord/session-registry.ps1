@@ -111,8 +111,19 @@ function Get-LoginLabel([string]$RootPath) {
 # it. Registry records are enumerated across every root, so this answers for a session the roster
 # cannot see -- and returns '' honestly when there is no record rather than inventing one.
 #
-# RETURNS '' FOR "NOT KNOWN", never a default. Callers must treat empty as "cannot compute", because
-# the whole point is that a wrong login is worse than an absent one.
+# RETURNS AN OBJECT, NOT A BARE LABEL, and the second field is the whole reason. An empty Login means
+# "not known", never a default, because a wrong login is worse than an absent one -- but "not known"
+# has two causes that a caller must be able to tell apart:
+#
+#   Matched = 0   no record carries this id. Usually transient: a session announcing on its first
+#                 prompt while its record is still being written resolves itself next prompt.
+#   Matched > 1   two or more config roots each claim this id. NOT transient and NOT self-resolving:
+#                 duplicate roots do not converge, so a caller that treats it as "try again later"
+#                 waits forever.
+#
+# Collapsing both to '' cost a real defect: the announce hook reported "no registry record matched
+# this session id" while two matched, sending an operator to look for a missing file that was in fact
+# present twice -- the one place the cause was visible.
 function Get-LoginForSession {
     [CmdletBinding()]
     # NOT Mandatory, and that is a correctness decision rather than laxity. A mandatory [string] REJECTS
@@ -123,16 +134,16 @@ function Get-LoginForSession {
     # string stranded a message inside a bare catch. An absent id is a legitimate question here and its
     # answer is '' -- the caller decides what that means.
     param([string]$SessionId, [string[]]$ConfigRoot)
-    if (-not $SessionId) { return '' }
-    # EXACTLY ONE match is the only answer worth acting on. Zero means no record. More than one means
-    # the same id is registered under two roots, which this function cannot adjudicate and must not
-    # pick a winner for.
+    if (-not $SessionId) { return [pscustomobject]@{ Login = ''; Matched = 0 } }
+    # EXACTLY ONE match is the only answer worth acting on. More than one means the same id is
+    # registered under two roots, which this function cannot adjudicate and must not pick a winner
+    # for -- but it REPORTS the count, so the caller can say which of the two silences it is in.
     $hits = @(
         Get-SessionRecords -ConfigRoot $ConfigRoot |
             Where-Object { $_.Record -and $_.Record.sessionId -and ($_.Record.sessionId -ieq $SessionId) }
     )
-    if ($hits.Count -ne 1) { return '' }
-    return (Get-LoginLabel $hits[0].Root)
+    $login = if ($hits.Count -eq 1) { Get-LoginLabel $hits[0].Root } else { '' }
+    return [pscustomobject]@{ Login = $login; Matched = $hits.Count }
 }
 
 # Every registry record, with the root it came from attached.
