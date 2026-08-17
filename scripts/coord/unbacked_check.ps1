@@ -51,6 +51,19 @@
     was to widen what "everything" means, which is why the coverage line now counts refs AND
     worktrees rather than a single number that hides which of the two it meant.
 
+    THE WORKTREE COUNT INCLUDES THE PRIMARY CHECKOUT, because `git worktree list` registers it as
+    one. Stated because it is a silent off-by-one in exactly the reconciliation this script invites:
+    two people counting "how many worktrees" will differ by one and each will believe the other has
+    found something. Checking it is correct -- the primary can carry unbacked commits like any other
+    checkout -- so the fix is to say so, not to subtract it.
+
+    WHY THIS CHECK AND NOT A CLAIM SWEEP. This project also has a coordination registry that records
+    which checkout holds which work, and it is tempting to reconcile from there instead. It does not
+    cover this: measured 2026-08-16, a worktree created by `scripts/worktree/new.ps1` carried a
+    committed-but-unpushed commit and NO claim named it, because that script does not take one. A
+    claim-based sweep is therefore blind to precisely the worktree most worth finding -- one holding
+    work nobody has registered. This check reads git, not the registry, and is unaffected.
+
     CONFIGURED IS NOT REACHABLE, AND THE DIFFERENCE IS A FALSE NEGATIVE. `--not --remotes` excludes
     everything reachable from `refs/remotes/*`, and those are LOCAL COPIES of what a server once
     advertised. If the server is gone, they still exclude -- so the check reports a repository as
@@ -287,7 +300,7 @@ foreach ($r in $repos) {
 Write-Host ""
 # Refs AND worktrees, never one number. A single count hides which of the two it meant, and the
 # gap between them is exactly where 30 commits hid on 2026-08-16.
-Write-Host "coverage : $totalRefs refs and $totalWorktrees worktree checkouts across $($repos.Count) repositor$(if ($repos.Count -eq 1) { 'y' } else { 'ies' })"
+Write-Host "coverage : $totalRefs refs and $totalWorktrees worktree checkouts (incl. primary) across $($repos.Count) repositor$(if ($repos.Count -eq 1) { 'y' } else { 'ies' })"
 if ($SkipReachability) {
     Write-Host "           reachability NOT checked (-SkipReachability) -- a dead remote reads as backed" -ForegroundColor Yellow
 } else {

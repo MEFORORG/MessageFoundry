@@ -103,7 +103,10 @@ def test_a_pushed_branch_reads_clean_and_still_states_its_coverage(repo: Path) -
     # Refs AND worktrees, deliberately: a single count cannot say which of the two it meant, and the
     # gap between them is where a detached HEAD hides.
     assert "1 refs and" in r.stdout
-    assert "worktree checkouts across 1 repository" in r.stdout
+    # "incl. primary" is asserted deliberately: git worktree list registers the primary checkout, so
+    # two people counting worktrees differ by one and each thinks the other found something.
+    assert "worktree checkouts (incl. primary) across 1 repository" in r.stdout
+    assert "1 worktree checkouts" in r.stdout
 
 
 def test_a_branch_no_worktree_has_checked_out_is_still_counted(repo: Path) -> None:
