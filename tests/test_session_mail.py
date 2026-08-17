@@ -34,7 +34,6 @@ fixed and cannot be quietly closed.
 from __future__ import annotations
 
 import concurrent.futures
-import datetime
 import json
 import os
 import re
@@ -1368,80 +1367,6 @@ RETAIN_DAYS = _const("RETAIN_DAYS")
 # go red on a reflow that changed nothing.
 HELD_NOTICE = "consumed at this session's next turn boundary"
 CONSUMED_NOTICE = "delivered at"
-
-
-
-
-
-
-
-
-
-
-
-
-# --- 8a. The phantom. --------------------------------------------------------------------------
-
-
-
-
-
-
-# --- 8b. A real session, and the wired path. ----------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-# --- 8c. The session id is untrusted input, and a path is built from it. -------------------------
-
-
-
-
-
-
-
-
-# --- 8d. Marker lifecycle. ----------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-# --- 8e. Fail open, on the paths this change added. ---------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# --- 8f. What the operator is told. --------------------------------------------------------------
-
-
-
-
 
 
 # --------------------------------------------------------------------------------------------------
