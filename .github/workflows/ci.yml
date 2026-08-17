@@ -903,7 +903,23 @@ jobs:
     # construction, and push-to-main is where it surfaces. See the `tooling` output on `changes`.
     if: needs.changes.outputs.tooling == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    # SIZED FOR THE WINDOWS LEG, NOT THE UBUNTU ONE, and the first cut (25 job / 18 step) was too
+    # tight to survive it. Derivation, stated so it can be re-derived rather than trusted: the tier
+    # runs 431s at -n 4 on a 20-PHYSICAL-core box, with the pwsh/git children this tier spawns landing
+    # on spare cores. A hosted runner has 4 vCPU and no spare -- ci.yml already records ~1.12 cores of
+    # average child occupancy for exactly this work, and the -n 8 trial documented above shows what
+    # oversubscription does here. Windows adds its ~2.4x process-spawn tax on top, and the Windows leg
+    # is the ONLY leg that executes the 337 platform-gated tests at all. A 2.5-3x factor on 431s is
+    # 18-21 minutes, which the old 18-minute step cap sat directly on top of.
+    #
+    # These are DEADLOCK BACKSTOPS, not tightness gates -- the same reasoning the engine matrix records
+    # for its own 66/55. Sizing a cap close to the observed run buys no detection and costs red builds
+    # on green suites, and a gate that cries wolf gets deleted. The engine Windows legs carry 66/55 for
+    # a bigger suite; 40/30 here is proportionate and still well clear.
+    #
+    # RE-DERIVE IF the tier's -n 4 wall clock is ever observed above 25 minutes on the Windows leg, or
+    # if pytest_workers changes.
+    timeout-minutes: 40
     defaults:
       run:
         shell: bash
@@ -941,7 +957,7 @@ jobs:
       # `--dist loadfile` for the same reason as the engine step: these tests bind real port windows and
       # own module-scoped fixtures, so a file's tests must stay in one worker.
       - name: Harness tests (pytest)
-        timeout-minutes: 18
+        timeout-minutes: 30 # see the job cap above for the derivation; must stay under it with setup
         run: pytest -q -n 4 --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' --timeout=120 --junitxml=tooling-junit.xml
 
       # A marker typo, a manifest rename, or a conftest hook that silently stops firing all produce the
@@ -960,25 +976,14 @@ jobs:
       # Windows). It is a DEAD-MARKER backstop, not a coverage assertion: a tight floor would go red
       # every time the tier legitimately grows or a platform gate moves, and a gate that cries wolf gets
       # deleted. Coverage drift is tests/test_tooling_partition.py's job, on evidence, not this one's.
+      # A SCRIPT, NOT AN INLINE HEREDOC. The logic and its reasoning live in the script, where they can
+      # be read, linted, type-checked and run locally -- and where a shell that handles heredocs
+      # differently cannot change the answer. This job is the first in this workflow to run a `run:`
+      # body on BOTH ubuntu and Windows, so an inline heredoc here would have been the first of its
+      # kind on the Windows leg; that is not a thing to discover from a red build.
       - name: Prove the tier actually ran
-        if: always()
-        shell: bash
-        run: |
-          python - <<'PY'
-          import sys, xml.etree.ElementTree as ET
-          tree = ET.parse("tooling-junit.xml")
-          ran = skipped = 0
-          for tc in tree.iter("testcase"):
-              if tc.find("skipped") is not None:
-                  skipped += 1
-              else:
-                  ran += 1
-          print(f"tooling tests EXECUTED: {ran}   skipped: {skipped}")
-          if ran < 1000:
-              print(f"::error::the tooling marker EXECUTED only {ran} tests -- the partition is not "
-                    f"being applied; check tests/tooling_manifest.txt and the conftest hook reading it")
-              sys.exit(1)
-          PY
+        if: always() # a timeout or a crash is exactly when the receipt matters most
+        run: python scripts/ci/tooling_receipt.py --report tooling-junit.xml
 
   # Build + type-check the VS Code extension, and run its integration tests. The Python jobs never
   # touch ide/, so a dep bump or IDE code change that breaks the bundle or the types would otherwise
