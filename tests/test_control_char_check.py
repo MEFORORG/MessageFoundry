@@ -98,14 +98,54 @@ def test_list_reports_scope_and_exits_zero() -> None:
     assert "README.md" in proc.stdout
 
 
-def test_this_repository_has_no_control_bytes_outside_the_ide_extension() -> None:
-    """The live check. `ide/src/*.ts` carries DELIBERATE raw NUL key separators, which are their
-    owner's call to convert; everything else must stay clean, and did not before today."""
+def test_this_repository_passes_the_gate_outright() -> None:
+    """The live check, and now a PASS rather than a filtered one.
+
+    This test used to run the scan and then discard `ide/src/` hits from the OUTPUT, which meant the
+    gate exited 1 on `main` while this test went green -- so no CI step could be added, and the hook
+    blocked every commit touching those two files over content already there. The allowance belongs
+    in the script, where both callers read it; the test's job is to assert the repository is clean by
+    the gate's own verdict, not by a second opinion the gate does not share.
+    """
     proc = run()
-    offending = {
-        line.split(":")[1].strip()
-        for line in proc.stderr.splitlines()
-        if line.startswith("control-char: ") and ":" in line[14:]
-    }
-    unexpected = {p for p in offending if not p.startswith("ide/src/")}
-    assert not unexpected, f"control bytes outside ide/src/: {sorted(unexpected)}"
+    assert proc.returncode == 0, proc.stderr
+    # The exception is DECLARED in the output, not merely applied -- this is what would fail if
+    # someone widened NUL_IS_CONTENT_UNDER into a blanket directory skip.
+    assert "deliberate NUL(s) allowed under ide/src/" in proc.stdout
+
+
+def test_a_nul_under_the_allowed_prefix_is_permitted_and_counted(tmp_path: Path) -> None:
+    d = tmp_path / "ide" / "src"
+    d.mkdir(parents=True)
+    f = d / "keys.ts"
+    f.write_bytes(b'const k = "a\x00b";\n')
+    proc = run(str(f))
+    assert proc.returncode == 0, proc.stderr
+    assert "1 deliberate NUL(s) allowed" in proc.stdout
+
+
+def test_the_allowance_is_per_byte_not_per_directory(tmp_path: Path) -> None:
+    """A collapsed word-boundary escape under ide/src/ is STILL refused.
+
+    TypeScript is the likeliest place for this defect -- the escape and the byte are equally valid in
+    a string literal -- so a blanket directory skip would have blinded the gate exactly where it is
+    most needed. This is the test that keeps the allowance narrow.
+    """
+    d = tmp_path / "ide" / "src"
+    d.mkdir(parents=True)
+    f = d / "pattern.ts"
+    f.write_bytes(b'const p = "\x08[0-9]";\n')
+    proc = run(str(f))
+    assert proc.returncode == 1, proc.stdout
+    assert "BACKSPACE" in proc.stderr
+
+
+def test_the_prefix_match_is_boundary_aware(tmp_path: Path) -> None:
+    """`vendor/not-ide/src/` is not `ide/src/`, and a bare substring test would have said it was."""
+    d = tmp_path / "vendor" / "not-ide" / "src"
+    d.mkdir(parents=True)
+    f = d / "x.ts"
+    f.write_bytes(b'const q = "a\x00b";\n')
+    proc = run(str(f))
+    assert proc.returncode == 1, proc.stdout
+    assert "NUL" in proc.stderr

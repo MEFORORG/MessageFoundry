@@ -307,6 +307,24 @@ jobs:
         if: runner.os == 'Linux'
         run: python scripts/quality/licence_header_check.py
 
+      # Control bytes. Mirrors the `control-char` pre-commit hook, and exists for the reason zizmor.yml
+      # states for actionlint: the hook is the load-bearing half and this step is the backstop for
+      # `git commit --no-verify` and for a fresh clone whose hooks are not installed until
+      # scripts/coord/install-git-hooks.ps1 runs. The hook shipped without this step, so for one day the
+      # gate ran only where hooks happened to be installed -- a gate against bytes no human view shows,
+      # itself invisible when skipped.
+      #
+      # Scope AND the ide/src NUL allowance live in the script, not here, for the reason the licence
+      # step above gives: two callers that restate a scope drift apart, and the drift is silent.
+      #
+      # DELIBERATELY NOT PATHS-FILTERED, and the argument is sharper than for licence headers. This
+      # gate covers .md, .json and .txt, none of which appear in `changes.code`'s alwayscode pattern --
+      # so a docs-only PR sets code=false, and a filter would skip the gate on exactly the prose where
+      # a pasted escape most often lands. ~1,850 files, stdlib only, well under a second.
+      - name: Control bytes (invisible)
+        if: runner.os == 'Linux'
+        run: python scripts/quality/control_char_check.py
+
       # Two mypy passes on Linux so BOTH platforms' typed branches are checked without paying for a
       # Windows mypy: the default linux-platform run, plus an explicit --platform win32 run that types
       # the sys.platform=='win32' branches (ctypes.windll / DPAPI / service_control) the linux run
