@@ -40,6 +40,7 @@ import httpx
 import pytest
 
 import messagefoundry.api.app as engine_app
+import messagefoundry.api.header_floor as engine_header_floor
 import messagefoundry_webconsole
 import messagefoundry_webconsole._auth as webconsole_auth
 import messagefoundry_webconsole._security as security
@@ -537,10 +538,19 @@ def _detected_browser_security_features() -> set[str]:
 
 def _emitted_browser_security_headers() -> set[str]:
     """Every :data:`BROWSER_SECURITY_HEADERS` name present in the code that reaches a /ui response:
-    the whole console package, plus the ENGINE's ``api/app.py`` (its security-headers middleware
-    stamps /ui responses too, so those headers are relied on by /ui just the same)."""
+    the whole console package, plus the ENGINE modules that stamp headers onto /ui responses.
+
+    ``api/header_floor.py`` is named alongside ``api/app.py`` because the baseline header LITERALS
+    live there now, and a derivation that misses the emitter goes circular rather than red: the only
+    remaining occurrence of a name would be the ``_security.py`` degrade-contract docstring, which is
+    the very text this guard then asserts the name appears in. Deleting a bucket row would drop the
+    header from ``emitted`` too, and the loop below would simply stop checking it. Measured on this
+    branch: with ``header_floor.py`` absent from this list, removing ``X-Frame-Options: DENY`` from
+    the docstring left the module GREEN. **Any future module that writes one of these names has to be
+    added here** — the contract this guard enforces is only as wide as the code it reads."""
     sources = [p.read_text(encoding="utf-8") for p in _PACKAGE_DIR.rglob("*.py")]
     sources.append(Path(engine_app.__file__).read_text(encoding="utf-8"))
+    sources.append(Path(engine_header_floor.__file__).read_text(encoding="utf-8"))
     blob = "\n".join(sources)
     return {name for name in BROWSER_SECURITY_HEADERS if name in blob}
 
