@@ -434,10 +434,17 @@ judge.** Instances: BACKLOG #1057, #1059, #1060.
 
 ## Automatic coordination context (SessionStart hook)
 
+> **NOT WIRED as of 2026-08-17 -- this section describes what the hook DOES, not a control that is
+> running.** `install-coordination.ps1 -Status` reports `scripts/worktree/session-context.ps1` MISSING
+> in **all five** config roots, and an independent read of each `settings.json` agrees; the project
+> `.claude/settings.json` this paragraph used to name carries **no hook rows at all**. Nothing on this
+> box currently prints the banner below. Check before relying on it -- `pwsh -NoProfile -File
+> scripts\coord\install-coordination.ps1 -Status` -- and never take this paragraph as the answer.
+
 You don't have to brief each new chat by hand. A `SessionStart` hook
-([../scripts/worktree/session-context.ps1](../scripts/worktree/session-context.ps1), wired in
-[`../.claude/settings.json`](../.claude/settings.json)) injects context into every new Claude Code
-window. It always prints the project's Ultracode working-default reminder, and **when 2+ worktrees
+([../scripts/worktree/session-context.ps1](../scripts/worktree/session-context.ps1)) injects context
+into every new Claude Code window. It always prints the project's Ultracode working-default
+reminder, and **when 2+ worktrees
 share this `.git`** it appends the parallel-session block: which worktree/branch this chat owns, the
 full worktree list, and the shared-memory write rule above. With a single worktree it prints only the
 working-default line.
