@@ -62,6 +62,13 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_asvs_residual_lint.py",
         "test_c901_delta.py",
         "test_cp1252_console_safety.py",
+        # Arrived with #421 while this branch was in flight. Same shape as cp1252_console_safety and
+        # licence_header_gate above: a repo-wide scanner over TRACKED TEXT, which includes
+        # messagefoundry/**. A control byte landing in engine source is caught by this gate and no
+        # other, so gating it behind scripts/** would leave the engine change that introduced one
+        # facing nothing. It builds most cases in tmp_path, but test_list_reports_scope_and_exits_zero
+        # reads the real `git ls-files` scope -- which is the half that makes it engine-subject.
+        "test_control_char_check.py",
         "test_crypto_inventory_scanner.py",
         "test_dependency_boundaries.py",
         "test_ech_record_premise.py",
