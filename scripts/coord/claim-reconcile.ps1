@@ -134,14 +134,23 @@ function Test-LandedByPullRequest {
     param([string]$Branch, [string]$Tip)
     if (-not $ghAvailable) { return $null }
     try {
-        $raw = & $GhCommand pr list --head $Branch --state merged --json number,headRefOid,mergedAt --limit 5 2>$null
+        $raw = & $GhCommand pr list --head $Branch --state merged --json number,headRefOid,mergedAt,mergeCommit --limit 5 2>$null
         if ($LASTEXITCODE -ne 0 -or -not $raw) { return $null }
-        foreach ($pr in ($raw | ConvertFrom-Json)) {
+        $prs = @($raw | ConvertFrom-Json)
+        foreach ($pr in $prs) {
             if ($pr.headRefOid -and $Tip -and $pr.headRefOid -eq $Tip) {
-                return [pscustomobject]@{ Number = $pr.number; MergedAt = $pr.mergedAt }
+                return [pscustomobject]@{ Number = $pr.number; MergedAt = $pr.mergedAt; ExactTip = $true; Landing = "" }
             }
         }
-        return $false   # merged PRs exist for this head, but none at this tip
+        # No PR at this exact tip. Return the most recent merged one anyway, carrying its LANDING
+        # commit: the tip may have moved after the merge (a later merge from main is the common
+        # cause), and the landing commit is what the fourth arm compares against.
+        if ($prs.Count) {
+            $best = $prs[0]
+            return [pscustomobject]@{ Number = $best.number; MergedAt = $best.mergedAt
+                ExactTip = $false; Landing = [string]$best.mergeCommit.oid }
+        }
+        return $false
     }
     catch { return $null }   # could not ask; NOT the same as "no PR", and must not read like it
 }
@@ -211,9 +220,44 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
     else {
         $tip = (& git -C $repo rev-parse $ref 2>$null)
         $pr = Test-LandedByPullRequest -Branch $branch -Tip ($tip ? $tip.Trim() : "")
-        if ($pr -is [pscustomobject]) {
+        if ($pr -is [pscustomobject] -and $pr.ExactTip) {
             $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "RELEASABLE"
                 why = "holder gone and deregistered; PR #$($pr.Number) merged $($pr.MergedAt) with head at this exact tip -- squashed, so the $ahead commit(s) are the same work" }
+        }
+        elseif ($pr -is [pscustomobject] -and -not $pr.ExactTip -and $pr.Landing) {
+            # ARM FOUR: identical AT THE POINT IT LANDED, not identical to main today.
+            #
+            # Comparing a branch's files to current origin/main is wrong in the direction that HOLDS
+            # work that landed: main moves on, the files get edited again, and a branch merged four
+            # days ago stops matching. Measured 2026-08-16 on claude/adr-0158-land -- 0 of 2 files
+            # identical to main, while the same blobs are identical to the squash commit 10af48bb
+            # that landed them, 400-plus commits back. Both facts are true; only one answers the
+            # question. Found by the peer session that measured patch-id and blob identity side by
+            # side, and it is the trap underneath the squash trap.
+            $landing = $pr.Landing
+            $base = (& git -C $repo merge-base $ref $landing 2>$null)
+            $touched = @()
+            if ($base) { $touched = @(& git -C $repo diff --name-only ($base.Trim()) $ref 2>$null) }
+            $identical = $touched.Count -gt 0
+            foreach ($f in $touched) {
+                $a = (& git -C $repo rev-parse --quiet --verify "${ref}:$f" 2>$null)
+                $b = (& git -C $repo rev-parse --quiet --verify "${landing}:$f" 2>$null)
+                if (-not $a -or -not $b -or $a -ne $b) { $identical = $false; break }
+            }
+            if ($identical) {
+                $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "RELEASABLE"
+                    why = "holder gone and deregistered; PR #$($pr.Number) landed at $($landing.Substring(0,9)) and all $($touched.Count) file(s) this branch touched are byte-identical there" }
+            }
+            else {
+                $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "HOLD"
+                    why = "$ahead commit(s) not on $mainRef; PR #$($pr.Number) merged but this tip is not its head and the branch files differ from the landing commit" }
+            }
+        }
+        elseif ($pr -is [pscustomobject]) {
+            # A merged PR exists for this head, its tip does not match, and no landing commit could
+            # be resolved. That proves an earlier state landed and nothing about this one.
+            $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "HOLD"
+                why = "$ahead commit(s) on '$branch' not on $mainRef; PR #$($pr.Number) merged at a different tip and its landing commit could not be read" }
         }
         elseif ($null -eq $pr -and -not $NoPullRequests) {
             # HOLD, not UNKNOWN. The local evidence already proves work exists here; a probe that

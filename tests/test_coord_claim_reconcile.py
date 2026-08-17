@@ -300,3 +300,58 @@ def test_the_script_carries_no_control_characters() -> None:
     text = RECONCILE.read_text(encoding="utf-8")
     bad = {hex(ord(c)) for c in text if ord(c) < 32 and c not in "\r\n\t"}
     assert not bad, f"control characters in claim-reconcile.ps1: {sorted(bad)}"
+
+
+def test_a_branch_whose_files_match_the_LANDING_commit_is_releasable(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Arm four. Identical AT THE POINT IT LANDED, not identical to main today.
+
+    Comparing a branch to current main holds work that landed: main moves on, the files are edited
+    again, and a branch merged days ago stops matching. Measured on the live registry 2026-08-16 --
+    claude/adr-0158-land had 0 of 2 files identical to main while the same blobs were identical to
+    the squash commit that landed them, 400-plus commits back. Both true; only one answers the
+    question. Found by the peer session running patch-id and blob identity side by side.
+
+    The fixture is the real shape: a branch, a SEPARATE squash commit on main carrying the same
+    content, and then main moving on so a comparison against its HEAD would say "did not land".
+    """
+    git(repo, "branch", "feature", "main")
+    git(repo, "worktree", "add", "-q", str(repo.parent / "wt-feature"), "feature")
+    wt = repo.parent / "wt-feature"
+    (wt / "work.txt").write_text("the delivered work", encoding="utf-8")
+    git(wt, "add", "-A")
+    git(wt, "commit", "-qm", "the work, on the branch")
+    git(repo, "worktree", "remove", "--force", str(wt))
+
+    # the squash: a different commit on main with byte-identical content
+    (repo / "work.txt").write_text("the delivered work", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "squash of the branch (#346)")
+    landing = git(repo, "rev-parse", "HEAD").strip()
+
+    # main moves on, and edits the same file, so today's blobs no longer match the branch
+    (repo / "work.txt").write_text("the delivered work, since revised", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "main moves on and edits the same file")
+
+    write_claim(repo, "k-landing", tmp_path / "vanished", "feature")
+    stub = _gh_stub(
+        tmp_path,
+        '[{"number":346,"headRefOid":"0000000000000000000000000000000000000000",'
+        f'"mergedAt":"2026-08-12T17:45:36Z","mergeCommit":{{"oid":"{landing}"}}}}]',
+    )
+    out = verdicts(repo, "-GhCommand", str(stub))
+    assert out["k-landing"] == "RELEASABLE", out
+
+
+def test_a_merged_pr_with_no_readable_landing_commit_holds(repo: Path, tmp_path: Path) -> None:
+    """The negative control for arm four: a PR at another tip proves an earlier state landed."""
+    unmerged_branch(repo, "other-tip")
+    write_claim(repo, "k-other", tmp_path / "vanished", "other-tip")
+    stub = _gh_stub(
+        tmp_path,
+        '[{"number":1,"headRefOid":"0000000000000000000000000000000000000000",'
+        '"mergedAt":"2026-08-01T00:00:00Z","mergeCommit":{"oid":""}}]',
+    )
+    assert verdicts(repo, "-GhCommand", str(stub))["k-other"] == "HOLD"
