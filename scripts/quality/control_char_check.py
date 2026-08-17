@@ -27,6 +27,18 @@ adding a language is adding an entry and nothing else. Binary and data blobs are
 control byte there is content rather than a mistake. TAB, LF and CR are permitted: they are the
 control characters text legitimately contains.
 
+ONE PER-PATH ALLOWANCE, in ``NUL_IS_CONTENT_UNDER``: raw NUL under ``ide/src/``, where the extension
+uses it as a composite-key separator. It is per-BYTE and not a directory skip -- a collapsed ``\\b`` in
+those same files is still refused -- and the count allowed is PRINTED on every run, because a gate
+whose subject is an invisible byte must not have an invisible exception. This landed a day after the
+check itself, when the check was found failing on ``main``: shipped as a pre-commit hook only, it also
+blocked any commit touching those two files over content that was already there.
+
+BOTH CALLERS READ THIS FILE FOR THEIR SCOPE, and that is deliberate. The pre-commit hook is the
+load-bearing half; the CI step in ``ci.yml`` is the backstop for ``git commit --no-verify`` and for a
+fresh clone whose hooks are not installed yet -- the same division ``zizmor.yml`` states for actionlint
+and ``ci.yml`` states for licence headers. Neither caller restates the scope, so they cannot drift.
+
 Usage:
   control_char_check.py [FILE ...]   # check the given files (how pre-commit invokes it)
   control_char_check.py              # check every in-scope git-tracked file (how CI invokes it)
@@ -75,9 +87,31 @@ NAMES = {
 }
 
 
+#: Paths where a raw NUL is CONTENT rather than a collapsed escape. The IDE extension uses it as the
+#: separator inside composite keys, which is its owner's call to change and not this gate's to force.
+#:
+#: NARROWED TO NUL ON PURPOSE, and this is the whole point of the constant. A blanket skip of the
+#: directory would have suppressed a collapsed ``\\b`` or ``\\a`` in TypeScript -- the language most
+#: likely to carry one, since the escape and the byte are equally valid in a string literal -- which is
+#: the exact defect this file exists to catch. So the allowance is per-BYTE, not per-path: every other
+#: control byte is still refused under these prefixes, and a NUL anywhere else is still refused too.
+NUL_IS_CONTENT_UNDER = ("ide/src/",)
+
+
 def in_scope(path: str) -> bool:
     """True when *path* carries an in-scope text extension."""
     return Path(path).suffix.lower() in TEXT_SUFFIXES
+
+
+def nul_is_content(path: str) -> bool:
+    """True when *path* is one where a raw NUL is deliberate content.
+
+    Boundary-aware rather than a substring test: the callers disagree about the paths they pass --
+    pre-commit hands over repo-relative names, an ad-hoc run hands over absolute ones -- and a bare
+    ``in`` would also match a file merely NAMED like the prefix (``vendor/not-ide/src/x.ts``).
+    """
+    value = str(path).replace("\\", "/")
+    return any(value.startswith(p) or f"/{p}" in value for p in NUL_IS_CONTENT_UNDER)
 
 
 def tracked_files() -> list[str]:
@@ -94,17 +128,22 @@ def tracked_files() -> list[str]:
     return sorted(p for p in out.split("\0") if p and in_scope(p))
 
 
-def offences(path: str) -> list[tuple[int, int, int]]:
-    """Every disallowed byte in *path* as (line, column, byte).
+def offences(path: str) -> tuple[list[tuple[int, int, int]], int]:
+    """Every disallowed byte in *path* as (line, column, byte), plus the count deliberately allowed.
 
     Read as BYTES, deliberately. Decoding first would raise on a genuinely binary file that slipped
     the extension filter, and would report an encoding error instead of the thing being looked for.
+
+    The second element is returned rather than discarded so the caller can SAY how many bytes it chose
+    not to report. An allowance nobody prints is indistinguishable from a scan that found nothing.
     """
     try:
         raw = Path(path).read_bytes()
     except OSError:
-        return []
+        return [], 0
+    allow_nul = nul_is_content(path)
     hits: list[tuple[int, int, int]] = []
+    allowed = 0
     line = 1
     col = 1
     for b in raw:
@@ -113,9 +152,12 @@ def offences(path: str) -> list[tuple[int, int, int]]:
             col = 1
             continue
         if b < 0x20 and b not in ALLOWED or b == 0x7F:
-            hits.append((line, col, b))
+            if b == 0x00 and allow_nul:
+                allowed += 1
+            else:
+                hits.append((line, col, b))
         col += 1
-    return hits
+    return hits, allowed
 
 
 def main(argv: list[str]) -> int:
@@ -130,15 +172,26 @@ def main(argv: list[str]) -> int:
     paths = [p for p in argv if in_scope(p)] if argv else tracked_files()
 
     violations = 0
+    allowed = 0
     for p in paths:
-        for line, col, b in offences(p):
+        hits, allowed_here = offences(p)
+        allowed += allowed_here
+        for line, col, b in hits:
             name = NAMES.get(b, f"0x{b:02x}")
             sys.stderr.write(f"control-char: {p}:{line}:{col}: {name}\n")
             violations += 1
 
+    # Always stated, on both paths. This gate's whole subject is a byte that no ordinary view shows,
+    # so an allowance it declines to mention would reproduce the defect in the reporting.
+    note = (
+        f"; {allowed} deliberate NUL(s) allowed under {', '.join(NUL_IS_CONTENT_UNDER)}"
+        if allowed
+        else ""
+    )
+
     if violations:
         sys.stderr.write(
-            f"control-char: {violations} control byte(s) across {len(paths)} file(s) checked.\n"
+            f"control-char: {violations} control byte(s) across {len(paths)} file(s) checked{note}.\n"
             "  These are invisible in an editor, in git diff and in review -- `cat -A` or a hex dump\n"
             "  is the only ordinary view that shows them. If you meant an escape sequence, write it\n"
             "  as two characters (backslash + letter); if you meant the byte, this is the wrong file.\n"
@@ -147,7 +200,10 @@ def main(argv: list[str]) -> int:
 
     # Coverage on the clean path too. "No violations" over a scope nobody stated is the silence this
     # repository keeps finding: a guard that checked nothing reports identically to one that passed.
-    print(f"control-char: OK -- {len(paths)} file(s) checked, no control bytes outside TAB/LF/CR")
+    print(
+        f"control-char: OK -- {len(paths)} file(s) checked, "
+        f"no control bytes outside TAB/LF/CR{note}"
+    )
     return 0
 
 
