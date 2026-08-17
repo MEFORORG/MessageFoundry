@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Engine status-bar item — the Extension-Host shell for the engine-link doctor (ADR — engine-link
 // doctor). It is DISTINCT from liveDebug.ts's left-side "MEFOR Live" / "Values" toggles (those are the
 // offline dry-run loop); this reflects the real, running engine the analyst promotes to.
@@ -33,10 +35,10 @@ import {
 } from "./engineControlModel";
 import { HttpError, NetworkError, getJson } from "./engineClient";
 import { logAction, logProbe, logState, showEngineLog } from "./engineLog";
-import { assertTargetAllowed, isLocalEngine } from "./engineTarget";
+import { assertBrowsableUrl, assertTargetAllowed, isLocalEngine } from "./engineTarget";
 import {
   CMD,
-  POLICY_ROUTE,
+  ENVIRONMENT_PLAN,
   POLL_PLAN,
   VERIFY_PLAN,
   classifyDeep,
@@ -297,7 +299,15 @@ export class EngineStatusBar implements vscode.Disposable {
     }
   }
 
-  /** Best-effort, tokenless: name the engine's active environment in the hover. Never fails the probe. */
+  /**
+   * Best-effort, TOKENLESS: name the engine's active environment in the hover. Never fails the probe.
+   *
+   * It runs off the 15s poll, so it must never carry a bearer (CWE-613 — see the file header). That is
+   * driven by {@link ENVIRONMENT_PLAN}'s `authenticated: false` rather than a literal `undefined` token
+   * argument, so the tokenlessness is DATA that CI asserts. `aiPolicy.ts` reads the SAME route WITH a
+   * bearer under `ASSIST_GATE_PLAN`, because it wants the identity-dependent `assist_permitted` and is
+   * user-initiated; the difference between the two is deliberate (ADR 0110 amendment, BACKLOG #330).
+   */
   private async readEnvironment(): Promise<void> {
     if (
       this.link.environment ||
@@ -309,7 +319,7 @@ export class EngineStatusBar implements vscode.Disposable {
     }
     const gen = this.targetGen;
     const target = this.link.target;
-    const outcome = await this.fetch(target.url, POLICY_ROUTE, undefined, PROBE_TIMEOUT_MS);
+    const outcome = (await this.runProbe(ENVIRONMENT_PLAN[0], target.url, PROBE_TIMEOUT_MS)).outcome;
     if (outcome.kind !== "ok" || gen !== this.targetGen) {
       return;
     }
@@ -753,6 +763,15 @@ export function registerEngineStatusBar(context: vscode.ExtensionContext): Engin
     const suffix = typeof path === "string" && path.startsWith("/") ? path : "/ui";
     const url = bar.currentUrl().replace(/\/+$/, "") + suffix;
     logAction("open web console", url);
+    // openExternal hands the URL to the OS handler, which launches an APPLICATION for schemes like
+    // file: or ms-msdt: — so screen the scheme positively before opening. The value derives from the
+    // engineUrl setting, which is machine-scoped and therefore not workspace-injectable; that bounds
+    // who can set it, and is not a reason to hand an arbitrary scheme to the OS.
+    const check = assertBrowsableUrl(url);
+    if (!check.ok) {
+      await vscode.window.showErrorMessage(`MessageFoundry: ${check.reason}`);
+      return;
+    }
     await vscode.env.openExternal(vscode.Uri.parse(url));
   };
 

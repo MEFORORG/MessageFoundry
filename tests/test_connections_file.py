@@ -303,6 +303,26 @@ def test_duplicate_name_across_file_and_code_fails(tmp_path: Path) -> None:
         load_config(cfg)
 
 
+def test_outbound_validate_directory_loads_from_toml(tmp_path: Path) -> None:
+    # #114: the data-authored outbound reaches the connector through the same build_outbound_connection
+    # choke point as the code-first one, with no second check in the TOML reader — so the startup
+    # validation toggle is available on both authoring surfaces. (It was a WiringError while only the
+    # inbound half existed; both halves are built now.)
+    cfg = _config(
+        tmp_path,
+        """
+        [[outbound]]
+        name = "OB_FILE"
+        transport = "file"
+          [outbound.settings]
+          directory = "out"
+          validate_directory = true
+        """,
+    )
+    reg = load_config(cfg)
+    assert reg.outbound["OB_FILE"].spec.settings["validate_directory"] is True
+
+
 def test_unknown_transport_fails(tmp_path: Path) -> None:
     cfg = _config(
         tmp_path,

@@ -44,7 +44,15 @@ import shutil
 import stat
 import subprocess
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -82,6 +90,7 @@ from messagefoundry.store.document_strip import StripResult, cutoff_for
 from messagefoundry.store.gcm_bound import checkpoint_invocations
 from messagefoundry.store.metadata import (
     decode_response_headers,
+    encode_reference_value,
     encode_response_headers,
     merge_user_metadata,
 )
@@ -764,6 +773,14 @@ class UserRecord:
     # via the store's get_totp_secret / get_recovery_code_hashes accessors.
     totp_enabled: bool = False
     totp_enrolled_at: float | None = None
+    # Federated-account identity (BACKLOG #1015, ADR 0142): the verified OIDC ``(issuer, sub)`` this
+    # AD-backed account's federated identity is PINNED to. Non-reassignable, unlike the display username.
+    # The account is still resolved by its username; this binding only refuses a login whose username
+    # resolves here but carries a different subject. NULL on a local account and on an AD account that
+    # has never completed a federated login. Set on the first federated login and enforced on every
+    # subsequent one, so a reassigned username cannot hand the account to a new subject.
+    oidc_issuer: str | None = None
+    oidc_subject: str | None = None
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> UserRecord:
@@ -785,6 +802,8 @@ class UserRecord:
             channel_scope=d.get("channel_scope"),
             totp_enabled=bool(d.get("totp_enabled", 0)),
             totp_enrolled_at=_opt_float(d.get("totp_enrolled_at")),
+            oidc_issuer=d.get("oidc_issuer"),
+            oidc_subject=d.get("oidc_subject"),
         )
 
 
@@ -1560,7 +1579,9 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     params       TEXT NOT NULL,        -- JSON args captured at request time, replayed on approval
     requester    TEXT NOT NULL,        -- who initiated; can never self-approve (dual-control, 2.3.5)
     requested_at REAL NOT NULL,
-    status       TEXT NOT NULL DEFAULT 'pending',  -- pending | approved | rejected | expired
+    status       TEXT NOT NULL DEFAULT 'pending',  -- pending | approved | rejected | expired | failed
+                                       -- 'failed': the gate released it but the executor raised, so
+                                       -- the operation did NOT happen (ASVS 2.3.3 compensation)
     approver     TEXT,                 -- the distinct second user who released/declined it
     decided_at   REAL,
     expires_at   REAL                  -- NULL = never; past this a pending request can't be approved
@@ -1587,7 +1608,9 @@ CREATE TABLE IF NOT EXISTS users (
     totp_enabled         INTEGER NOT NULL DEFAULT 0,  -- TOTP enrolled + confirmed active
     totp_enrolled_at     REAL,
     totp_recovery_codes  TEXT,                 -- JSON list of argon2id hashes of single-use recovery codes
-    last_totp_step       INTEGER               -- highest TOTP time-step already consumed (single-use within window, ASVS 6.5.1); NULL = none yet
+    last_totp_step       INTEGER,              -- highest TOTP time-step already consumed (single-use within window, ASVS 6.5.1); NULL = none yet
+    oidc_issuer          TEXT,                 -- federated identity (BACKLOG #1015): verified OIDC issuer; NULL = not federated / never federated-logged-in
+    oidc_subject         TEXT                  -- federated identity (BACKLOG #1015): verified OIDC sub; the account's federated login is pinned to (issuer, sub), refusing a reassigned username
 );
 
 CREATE TABLE IF NOT EXISTS roles (
@@ -1658,7 +1681,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user
 
 CREATE TABLE IF NOT EXISTS search_presets (
     id         TEXT PRIMARY KEY,                 -- uuid4 hex; the cell-AAD pk for the encrypted criteria
-    owner      TEXT NOT NULL,                    -- the owning username (per-user; every read is owner-scoped)
+    owner      TEXT NOT NULL,                    -- the owning Identity.user_id (BACKLOG #1225: NOT the
+                                                 -- reassignable username); every read is owner-scoped
     name       TEXT NOT NULL,                    -- operator-chosen label, unique per owner
     criteria   TEXT,                             -- JSON of the typed search params; AES-256-GCM at rest
                                                  -- (content/field_value are PHI-shaped) — ADR 0136/0019
@@ -1802,6 +1826,10 @@ class MessageStore:
         # (before the committer below) so its note_commit hook can bump committed_txns from batch start.
         self.committed_txns = 0
         self.body_copies = 0
+        # ADR 0157 C3: protocol/`/stats` uniformity only. SQLite never fences a terminal resolve —
+        # set_leader_epoch is a hard no-op here and [cluster].enabled is rejected on SQLite at config
+        # load — so this is a permanent 0 and there is no increment site in this module.
+        self.fenced_writes = 0
         self._cipher: Cipher = cipher or IdentityCipher()
         # HKDF-derived HMAC key for the tamper-evident audit chain (#190). None → the chain stays the
         # keyless SHA-256 chain (byte-identical to a pre-#190 / unencrypted store). Held only in memory;
@@ -3030,12 +3058,17 @@ class MessageStore:
         # --- end custom RBAC roles (ADR 0045) --------------------------------
         # MFA (WP-14): a pre-existing DB's users predate the TOTP columns — ALTER them in (NULL/0 on
         # existing rows = "not enrolled", correct). Idempotent: skipped once present.
+        # Federated (issuer, sub) identity keying (BACKLOG #1015): a pre-existing DB's users predate the
+        # columns — ALTER them in (NULL on existing rows = "not yet federated", byte-identical to before,
+        # since the username stayed the sole key). Idempotent: skipped once present.
         for column, decl in (
             ("totp_secret", "TEXT"),
             ("totp_enabled", "INTEGER NOT NULL DEFAULT 0"),
             ("totp_enrolled_at", "REAL"),
             ("totp_recovery_codes", "TEXT"),
             ("last_totp_step", "INTEGER"),
+            ("oidc_issuer", "TEXT"),
+            ("oidc_subject", "TEXT"),
         ):
             if column not in user_cols:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -3976,7 +4009,8 @@ class MessageStore:
                 version,
                 k,
                 self._cipher.encrypt(
-                    json.dumps(v), aad=cell_aad("reference", "value", name, version, k)
+                    encode_reference_value(v),
+                    aad=cell_aad("reference", "value", name, version, k),
                 ),
             )
             for k, v in rows.items()
@@ -7424,15 +7458,26 @@ class MessageStore:
             return list(await cur.fetchall())
 
     async def decide_pending_approval(
-        self, approval_id: str, *, status: str, approver: str | None, decided_at: float
+        self,
+        approval_id: str,
+        *,
+        status: str,
+        approver: str | None,
+        decided_at: float,
+        from_status: str = "pending",
     ) -> bool:
-        """Atomically move a still-``pending`` request to ``status`` (approved/rejected/expired).
-        Returns ``True`` iff this call made the transition — guards against a double decision."""
+        """Atomically move a request in ``from_status`` to ``status``.
+        Returns ``True`` iff this call made the transition — guards against a double decision.
+
+        ``from_status`` defaults to ``pending`` (the request/decide path: approved/rejected/expired).
+        The approval gate also uses it for the ASVS 2.3.3 compensating transition ``approved`` ->
+        ``failed``, which must NOT be able to move a row some other caller already rejected or
+        expired — hence the guard is a parameter rather than a hardcoded literal."""
         async with self._lock:
             cur = await self._db.execute(
                 "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?"
-                " WHERE id = ? AND status = 'pending'",
-                (status, approver, decided_at, approval_id),
+                " WHERE id = ? AND status = ?",
+                (status, approver, decided_at, approval_id, from_status),
             )
             await self._commit()
             return cur.rowcount > 0
@@ -8152,6 +8197,20 @@ class MessageStore:
             )
             await self._commit()
 
+    async def set_user_federated_subject(
+        self, user_id: str, issuer: str, subject: str, *, now: float | None = None
+    ) -> None:
+        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015). Recorded on the first
+        federated login so a later login carrying a different ``sub`` for a reassigned username is
+        refused rather than handed the prior subject's account."""
+        now = time.time() if now is None else now
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?",
+                (issuer, subject, now, user_id),
+            )
+            await self._commit()
+
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
         normalized = sorted({g.strip().lower() for g in groups if g.strip()})
         if not normalized:
@@ -8696,6 +8755,66 @@ class MessageStore:
             )
             await self._commit()
             return int(cur.rowcount)
+
+    async def purge_reference_snapshots(
+        self, *, older_than: float, declared: Collection[str], now: float | None = None
+    ) -> int:
+        # ADR 0006 reference snapshots: `value` is PL-2 (PHI.md §2) and until ASVS 14.2.7 had NO purge
+        # path at all — a set dropped from config kept its decryptable rows forever, because the only
+        # thing that ever replaced them was the next sync's build-new-then-flip, which never comes.
+        #
+        # Orphan-scoped: a DECLARED set is never touched however old its synced_at. Scoping it any wider
+        # would delete live data the engine is serving.
+        if not declared:
+            # Positive-signal guard. An empty `declared` reads as "every set is abandoned", so a caller
+            # holding a registry that declares zero reference sets — a subset --config, a per-team
+            # split, a harness redirect aimed at the real DB — would wipe the store. That is never a
+            # legitimate instruction, so it is an error rather than a very destructive no-op.
+            raise ValueError(
+                "purge_reference_snapshots requires a non-empty `declared` set; an empty one would "
+                "purge every snapshot in the store. A registry declaring zero reference sets cannot "
+                "authorize purging any — the caller must skip the phase instead."
+            )
+        async with self._lock:
+            cur = await self._db.execute(
+                "SELECT name FROM reference_version WHERE synced_at < ?", (older_than,)
+            )
+            candidates = [r[0] for r in await cur.fetchall() if r[0] not in declared]
+            deleted = 0
+            for name in candidates:
+                # The eligibility predicate is RE-ASSERTED inside the delete, not read above and
+                # trusted. `declared` is computed by the caller outside this lock, so a config reload
+                # can commit a fresh patient-keyed snapshot between the SELECT and here; without the
+                # EXISTS the purge would delete live rows and the set would go present-but-empty,
+                # returning None from reference(name).get(k) with no error at all.
+                cur = await self._db.execute(
+                    "DELETE FROM reference WHERE name = ?"
+                    " AND EXISTS (SELECT 1 FROM reference_version v"
+                    "             WHERE v.name = ? AND v.synced_at < ?)",
+                    (name, name, older_than),
+                )
+                if not cur.rowcount:
+                    continue  # a concurrent re-sync won the race — leave it alone
+                deleted += int(cur.rowcount)
+                # KEEP the pointer row, but BUMP its version. Deleting the pointer is invisible to
+                # converge_reference_cache (it only adds/updates names present in a fresh read), so a
+                # cluster follower would serve the purged PHI from RAM until restart. Keeping it
+                # unchanged is just as bad: converge only reloads a set whose version DIFFERS, so an
+                # unchanged version means the follower's populated cache is never revisited. Bumping it
+                # makes the deletion propagate through the mechanism that already exists, rather than
+                # bolting a second removal path onto every backend.
+                await self._db.execute(
+                    "UPDATE reference_version SET row_count = 0, version = 'purged:' || version"
+                    " WHERE name = ? AND version NOT LIKE 'purged:%'",
+                    (name,),
+                )
+                # SQLite keeps no per-set version map (it is single-node and the sole writer, which is
+                # why converge_reference_cache is a no-op here) — evicting the read-through cache is
+                # the whole of the local convergence story. The server backends, which DO track
+                # versions, rely on the bumped pointer above.
+                self._reference_cache.pop(name, None)
+            await self._commit()
+            return deleted
 
     async def purge_dead_letters(
         self,

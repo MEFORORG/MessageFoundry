@@ -83,7 +83,17 @@ _UI_NO_GATE_ROUTES = frozenset(
 )
 
 #: Every route requiring MORE THAN ONE permission, across both planes. Each fails closed on either.
-_MULTI_PERMISSION_ROUTES = frozenset({("GET", "/messages/export"), ("GET", "/ui/alerts")})
+_MULTI_PERMISSION_ROUTES = frozenset(
+    {
+        ("GET", "/messages/export"),
+        ("GET", "/ui/alerts"),
+        # BACKLOG #324: the console editor DISPLAYS the body it edits (textarea + `data-original`),
+        # and the POST's reject arm re-ships the pristine stored copy — so both verbs require
+        # `messages:view_raw` alongside `messages:edit`.
+        ("GET", "/ui/messages/{message_id}/edit"),
+        ("POST", "/ui/messages/{message_id}/edit-resend"),
+    }
+)
 
 #: ``/ui`` routes on plain ``require_ui`` while a JSON route with the same method and the same
 #: permission set carries a stronger wrapper. Reviewed and disclosed, one reason each, in the doc's
@@ -237,7 +247,10 @@ _NO_PHI_RESPONSE_MODELS: dict[str, str] = {
     "UploadDeleteResult": "file_id/filename/deleted",
     "UploadResendResult": "file_id/index/message_id/status/to",
     "UploadedFileInfo": "file metadata: name/size/sha256/uploader/count — never content",
-    "UploadedFileList": "envelope: files + total",
+    "UploadedFileList": (
+        "envelope: files + total + scope, the fixed own/any_owner enum saying whose files the count "
+        "was taken over (never operator text)"
+    ),
     "UploadedMessageSummary": "index/message_type/control_id/size only — no body, no summary",
     "UploadedMessagesResult": "envelope: counters + UploadedMessageSummary rows",
 }
@@ -430,6 +443,16 @@ _CONTEXTUAL_REVIEWED_NON_INPUTS = frozenset(
         # ALERT — no login, session or authorization outcome turns on it (contrast its sibling
         # `bootstrap_expiry_hours`, which DISABLES the account and is therefore an inventoried input).
         "bootstrap_warn_hours",
+        # ASVS 3.7.3: destinations exempted from the "you are leaving this site" interstitial. It
+        # decides whether the operator is SHOWN A NOTIFICATION before an outbound navigation — not
+        # whether any request is authorized. No login, session, permission or authorization outcome
+        # turns on it, and it is never read on an inbound request path at all.
+        #
+        # ⚠️ It IS a security-relevant setting and it LOWERS security when non-empty, which is why the
+        # serve gate warns and names every entry. That makes it a settings-reference concern, not an
+        # 8.1.3/8.1.4 contextual-input one — the two are different questions and this list is the
+        # place the difference gets recorded rather than assumed.
+        "external_link_allowlist",
     }
 )
 
@@ -1630,6 +1653,47 @@ def test_contextual_prefixed_settings_force_a_documented_decision() -> None:
         f"_CONTEXTUAL_REVIEWED_NON_INPUTS names fields that no longer exist or no longer match a "
         f"contextual marker: {stale}"
     )
+
+
+def test_admin_exposed_is_not_derived_from_the_mutated_console_flag() -> None:
+    """The exposure predicate must not read a field an earlier arm has already rewritten.
+
+    ``settings.api.serve_ui`` is flipped to ``False`` IN PLACE by both ADR 0143 degrade arms before
+    the exposure gates run, so by the time ``admin_exposed`` is derived it answers "is /ui mounted?",
+    not "is the admin interface on the network?". Deriving the MFA-at-exposure and #189 dual-control
+    gates from it (BACKLOG #326) made both unreachable on the runbook's RECOMMENDED loopback-behind-
+    declared-proxy topology, while the ADR 0152 arm in the same function called that boot exposed.
+
+    The behavioural pins live in ``tests/test_cli.py`` and ``tests/test_checks_gate_parity.py``. This
+    is the SHAPE guard: it exists so the defect cannot quietly return through a refactor that keeps
+    every current test green (re-introducing the console term only changes behaviour for configs no
+    case happens to cover). Kept here beside the dual-control slice because it uses the same idiom on
+    the same file, including its liveness receipt.
+    """
+    source = (_ROOT / "messagefoundry" / "__main__.py").read_text(encoding="utf-8")
+    marker = "\n    admin_exposed = "
+    # Liveness receipt FIRST: a rename or a reflow that makes the slice empty must red this test, not
+    # make it unfailable. `in` is checked explicitly so the failure names the cause rather than
+    # surfacing a bare ValueError from `index`.
+    assert marker in source, (
+        "no top-level `admin_exposed = ` assignment found in messagefoundry/__main__.py. If it was "
+        "renamed, update this guard AND docs/SECURITY.md Table A AND the literal marker in "
+        "test_startup_dual_control_arm_is_documented_as_warn_only, which all name it."
+    )
+    start = source.index(marker) + 1
+    assignment = source[start : source.index("\n", start)]
+    assert assignment.strip().startswith("admin_exposed = ") and len(assignment.strip()) > len(
+        "admin_exposed = "
+    ), (
+        f"the assignment slice looks wrong — the assertions below would pass vacuously: {assignment!r}"
+    )
+    for banned in ("ui_exposed", "serve_ui"):
+        assert banned not in assignment, (
+            f"`admin_exposed` is derived from `{banned}`, which the ADR 0143 degrade arms rewrite in "
+            f"place further up this same function (BACKLOG #326). Derive it from `instance_exposed` "
+            f"— the console being mounted is a presentation fact, not an exposure fact. Slice was: "
+            f"{assignment!r}"
+        )
 
 
 def test_startup_dual_control_arm_is_documented_as_warn_only() -> None:

@@ -219,6 +219,60 @@ def test_malformed_record_does_not_break_the_roster(repo: Path, config_root: Pat
     assert [r["Short"] for r in rows] == ["12121212"]
 
 
+def test_the_human_table_names_its_columns_so_the_id_cannot_read_as_a_sha(
+    repo: Path, config_root: Path
+) -> None:
+    """BACKLOG #1098. The default (non-``-Json``) output is a fixed-width table with no header, whose
+    leading cell is an 8-hex REGISTRY SESSION ID -- the same shape ``git worktree list`` uses for an
+    abbreviated commit SHA, in a banner (``session-context.ps1``) that points readers straight here.
+
+    Asserts the EMITTED TEXT, which is the only place this defect can exist: every other test in this
+    file reads ``-Json``, where the field is named ``Short`` and no ambiguity is possible. That is
+    precisely how a reporting defect survives a green suite.
+    """
+    write_session(config_root, pid=os.getpid(), cwd=repo, session_id="abcdef01-1111")
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(PRESENCE),
+            "-Repo",
+            str(repo),
+            "-ConfigRoot",
+            str(config_root),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, f"presence.ps1 failed: {proc.stderr}"
+    print(proc.stdout)
+
+    lines = proc.stdout.splitlines()
+    header = next((ln for ln in lines if "sess-id" in ln), None)
+    assert header is not None, (
+        f"the table prints no column header, so its leading 8-hex cell has no stated meaning:\n"
+        f"{proc.stdout}"
+    )
+    assert "surface" in header and "worktree" in header and "branch" in header, (
+        f"a header naming only the ambiguous column leaves the rest unnamed: {header!r}"
+    )
+
+    # The header must sit above the row it governs, or it labels a different table.
+    row = next(ln for ln in lines if "abcdef01" in ln)
+    assert lines.index(header) < lines.index(row)
+    # And the id must land UNDER its own column rather than merely somewhere on the line. A header
+    # whose cells do not line up with the data is a label pointing at the wrong value, which is the
+    # same class of defect this test exists to close.
+    assert row.index("abcdef01") == header.index("sess-id"), (
+        f"header and row are not aligned, so the label points at the wrong cell:\n"
+        f"{header!r}\n{row!r}"
+    )
+
+
 def _find_free_pid() -> int:
     """A pid that is not currently running -- start a process, note its pid, wait for it to exit."""
     proc = subprocess.Popen(
@@ -227,3 +281,34 @@ def _find_free_pid() -> int:
     proc.wait(timeout=30)
     time.sleep(0.3)  # let the OS reap it before we claim the pid is gone
     return proc.pid
+
+
+def test_outside_a_repo_the_json_roster_carries_an_unavailable_receipt(tmp_path: Path) -> None:
+    """ "I could not look" must not render as "nobody is live" on the machine-readable channel.
+
+    presence.ps1 already emits an UNAVAILABLE receipt to STDERR for the RepoFound=true /
+    Available=false case, precisely so an empty stdout list stops being ambiguous -- its own comment
+    says so. The RepoFound=FALSE path returned the same ``[]`` with NO receipt at all, so one of the
+    two ways of being unable to look stayed silent on exactly the channel a consumer parses. The fix
+    had been applied to one of two paths.
+
+    stdout is deliberately unchanged and still ``[]``: every existing consumer keeps working, and the
+    receipt is what separates the cases. Asserting BOTH is the point -- a test that only checked
+    stderr would pass against a version that had broken the JSON contract.
+    """
+    outside = tmp_path / "not-a-repo"
+    outside.mkdir()
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(PRESENCE), "-Json"],
+        cwd=str(outside),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.stdout.strip() == "[]", f"the JSON contract changed: {proc.stdout!r}"
+    assert "UNAVAILABLE" in proc.stderr, (
+        "an unreadable roster emitted no receipt, so an empty list is indistinguishable from "
+        f"'nobody is live': stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "not inside a git repository" in proc.stderr.lower(), proc.stderr

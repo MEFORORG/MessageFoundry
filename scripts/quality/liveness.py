@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Gate liveness: prove each advisory quality job actually MEASURED something.
 
 Three defects across two of quality-advisory.yml's gates, all green the whole time. Two are the same
@@ -271,7 +273,7 @@ def render_summary(violations: list[dict[str, str]], accepted: list[dict[str, An
             lines.append(f"| `{v['signal']}` | {v['message']} |")
         lines.append("")
     else:
-        lines += ["Every gate that ran proved it measured something. ✅", ""]
+        lines += ["Every gate that ran proved it measured something. PASS", ""]
 
     if accepted:
         lines += ["| Signal | Status | Examined | Evidence |", "| --- | --- | --- | --- |"]

@@ -40,7 +40,7 @@ written when both cells passed **no** SSL context to `starttls()` — which mean
 authentication: an on-path attacker presenting any certificate read the Handler payload and the SMTP
 credential.
 
-[BACKLOG #323](../BACKLOG.md) closed that in two steps, and the sentence is true again — but for a
+[BACKLOG #323](../archive/backlog/BACKLOG-CLOSED.md#323-smtp-tls-is-unverified-on-all-three-send-paths) closed that in two steps, and the sentence is true again — but for a
 different reason than it was written for:
 
 - **Layers 1–2 (PR #132)** gave `EmailDestination` / `DirectDestination` an explicit verifying context

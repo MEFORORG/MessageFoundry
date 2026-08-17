@@ -25,6 +25,7 @@ So the assertions here are derived, not copied:
 from __future__ import annotations
 
 import ast
+import inspect
 import re
 from pathlib import Path
 
@@ -32,6 +33,7 @@ import pytest
 
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, ServiceSettings
+from messagefoundry.store.base import Store
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -530,11 +532,51 @@ def test_scope_guard_detects_a_planted_rescoping() -> None:
     )
 
 
-def test_ingest_plane_is_documented_as_having_no_rate_limit() -> None:
-    """A silent omission reads as coverage. The data plane has resource caps only."""
+def test_ingest_plane_rate_limit_row_matches_the_code() -> None:
+    """The ingest row must describe the pacer's REACHABILITY as the code actually has it.
+
+    This guard has moved twice. Until 2026-08-11 it asserted the doc said "no message-rate or volume
+    limit exists"; the MLLP pacing build (ASVS 2.4.1 / 15.2.2) falsified that, so it moved to
+    requiring both that a control exists and that it "ships OFF". BACKLOG #1249 falsified that
+    wording in turn: the pacer is built, but neither key is a parameter of the ``MLLP()`` factory and
+    ``connections.toml`` desugars through that SAME factory, so no documented surface can set either.
+    "Off" is the more dangerous half-truth, because a reader takes it to mean "then set it to on".
+
+    WHAT THIS ASSERTS IS CONSISTENCY, NOT A PREFERENCE, AND THE DISTINCTION IS THE WHOLE POINT.
+    **#1249 is OPEN.** The owner has not chosen between exposing the two keys and rewording the row,
+    and a guard that pinned "NOT REACHABLE" as the correct state would settle that product question
+    BY BUILD -- the same shape as settling one by omission. So reachability is READ FROM THE
+    SIGNATURE and the doc is required to agree with whatever it says. Expose the keys and this test
+    demands the row stop saying unreachable; leave them out and it demands the row say so. Either
+    ruling stays cheap, and neither is pre-empted by a green run here.
+    """
+    import inspect
+
+    from messagefoundry.config import wiring
+
+    pacing_keys = {"max_messages_per_second", "message_burst"}
+    accepted = pacing_keys & set(inspect.signature(wiring.MLLP).parameters)
+
     block = _section(_H_LIMITS)
     assert "Ingest plane" in block
-    assert "no message-rate or volume limit exists" in block
+    assert "max_messages_per_second" in block, (
+        "the ingest row must name the control that now exists"
+    )
+    if accepted:
+        assert "NOT REACHABLE" not in block, (
+            f"MLLP() now accepts {sorted(accepted)}, so the row may no longer call the pacer "
+            "unreachable -- it must state the shipped default instead"
+        )
+    else:
+        assert "NOT REACHABLE" in block, (
+            "MLLP() accepts neither pacing key, so the row must say the pacer cannot be turned on "
+            "rather than that it is merely off by default"
+        )
+        assert "NO message-RATE bound anywhere on the ingest plane" in block, (
+            "and must name the resulting gap outright, not leave it inferred"
+        )
+    # True under either ruling: the raw-TCP intake never got the pacer at all.
+    assert "raw-TCP inbound" in block
     for cap in ("max_connections", "receive_timeout", "max_frame_bytes", "max_message_bytes"):
         assert cap in block, f"the ingest row must name the {cap} resource cap it DOES have"
 
@@ -1041,13 +1083,99 @@ def test_protection_set_guard_detects_a_planted_omission() -> None:
     )
 
 
-def test_malicious_lockout_clause_is_discharged_in_the_doc() -> None:
-    """The lockout window auto-expires, so an attacker cannot lock an account out indefinitely."""
-    block = _section(_H_SET)
-    lowered = " ".join(block.lower().split())
-    assert "auto-expiring" in lowered or "lapsed window restarts" in lowered
+def test_lockout_auto_expires_but_re_locking_is_unbounded() -> None:
+    """One lock releases itself; REPETITION of the lock is not bounded. The doc must carry both.
+
+    The retired assertion (``test_malicious_lockout_clause_is_discharged_in_the_doc``) drew a
+    conclusion the code does not support and then passed on the token that carried it: the doc said
+    an attacker "cannot maliciously lock an account indefinitely", while ``_register_failure``
+    restarts the counter on a lapsed window, re-locks on the next run to the threshold, and consults
+    nothing that accumulates across cycles. So the ceiling it claimed does not exist. Here the
+    unboundedness is DERIVED from the two places lock state can live (the store write's parameters
+    and the function's reads) and then asserted POSITIVELY against the row's own
+    "Threshold / window" cell, so a replacement row that says something else cannot pass.
+    """
+    # --- derived: no lock COUNTER is persisted, so nothing can accumulate across cycles ------------
+    # Signature-based on purpose. ``record_login_failure`` writes ``locked_until=?`` and CLEARS the
+    # lock when passed None, so any grep for a literal like "locked_until=NULL" is a SPELLING and
+    # would miss it (and would miss a future unlock built on the same write).
+    params = inspect.signature(Store.record_login_failure).parameters
+    keywords = {name for name, p in params.items() if p.kind is inspect.Parameter.KEYWORD_ONLY}
+    assert keywords == {"failed_attempts", "locked_until", "now"}, (
+        f"Store.record_login_failure now takes {sorted(keywords)}. The persisted lockout state is "
+        "the whole basis for the 6.1.1 note that re-locking is unbounded; if a lock COUNT landed, "
+        "re-derive that note in the same change."
+    )
+
+    tree = ast.parse(_SERVICE.read_text(encoding="utf-8"))
+    register = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+        and node.name == "_register_failure"
+    )
+    user_reads = {
+        node.attr
+        for node in ast.walk(register)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "user"
+    }
+    assert user_reads == {"failed_attempts", "locked_until", "id"}, (
+        f"_register_failure now consults {sorted(user_reads)} on the user row. If a cross-cycle "
+        "ceiling landed, the 6.1.1 note that re-locking is unbounded is stale."
+    )
+
+    # --- derived: the counter has exactly the two LOCAL feeders the note scopes it to --------------
+    feeders = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+        and node.name != "_register_failure"
+        and _calls_to(node, {"_register_failure"})
+    }
+    assert feeders == {"_login_local", "verify_mfa"}, (
+        f"the per-account lockout is now fed from {sorted(feeders)}; the 6.1.1 note scopes it to "
+        "LOCAL accounts, and the recovery argument below the table rests on that scope."
+    )
+
+    # --- positive: the row's Threshold / window cell states BOTH halves ----------------------------
+    table = _protection_rows()
+    window = table[0].index("Threshold / window")
+    row = next(r for r in table[1:] if "lockout_minutes" in "  ".join(r))
+    cell = row[window].lower()
+    assert "lapsed window restarts" in cell, (
+        "the lockout row must still state that the lock EXPIRES on its own (the true half of the "
+        f"retired clause); its Threshold / window cell reads {row[window]!r}."
+    )
+    assert "unbounded" in cell and any(
+        verb in cell for verb in ("re-lock", "re-locks", "re-impose", "re-imposes")
+    ), (
+        "the lockout row must state that RE-LOCKING is unbounded, in the Threshold / window cell "
+        f"where the window property belongs; it reads {row[window]!r}."
+    )
+
+    # --- the shipped numbers the cell quotes ------------------------------------------------------
     settings = ServiceSettings().auth
     assert (settings.lockout_threshold, settings.lockout_minutes) == (5, 15)
+    # RENDERED forms with their units, not bare str(int): "15 min" contains both "5" and "15", so a
+    # bare-substring check on the integers passes on almost any cell and is close to a tautology.
+    assert f"{settings.lockout_threshold} consecutive failures" in cell, (
+        f"the lockout row must state the shipped threshold with its unit; it reads {row[window]!r}."
+    )
+    assert f"{settings.lockout_minutes} min" in cell, (
+        f"the lockout row must state the shipped window with its unit; it reads {row[window]!r}."
+    )
+
+    # --- the doc's LOCAL scope, and the exact retired conclusion ----------------------------------
+    block = _section(_H_SET)
+    assert "only **local** accounts can be locked" in block, (
+        "the 6.1.1 set must scope the lockout to LOCAL accounts; the recovery argument beneath the "
+        "table is only true of them."
+    )
+    assert "cannot maliciously lock an account indefinitely" not in _doc_text(), (
+        "the retired clause claimed a ceiling the code does not implement."
+    )
 
 
 def test_route_to_limiter_map_matches_the_call_sites() -> None:

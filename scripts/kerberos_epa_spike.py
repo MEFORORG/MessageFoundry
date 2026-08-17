@@ -15,9 +15,9 @@ built with** ``channel_bindings=None`` **but a client presents a channel-binding
 provider ENFORCE it (reject) or IGNORE it (accept)?** GSSAPI acceptors traditionally ignore a client
 CBT unless the acceptor itself supplies bindings; Windows SSPI may enforce under registry/EPA policy.
 
-- If the decisive cell **(server=None, client=present)** ACCEPTS → the acceptor ignores client CBT →
+- If the decisive cell **(server=None, client=present)** ACCEPTS -> the acceptor ignores client CBT ->
   the WP-15 reverse-proxy posture is safe untouched, **no knob needed** for #98(b).
-- If it REJECTS → SSPI is enforcing → an explicit CBT-off knob (or an opt-in
+- If it REJECTS -> SSPI is enforcing -> an explicit CBT-off knob (or an opt-in
   ``tls-server-end-point`` binding for the in-process-TLS mode only) is warranted — #98(b).
 
 **How it mirrors production.** The acceptor is constructed exactly as
@@ -284,14 +284,14 @@ def _interpret(server_has_cb: bool, client_kind: str, accepted: bool) -> str:
             return "baseline: neither side binds — must ACCEPT (sanity check)"
         # The decisive cells: acceptor bound to nothing, client presenting a CBT.
         if accepted:
-            return "DECISIVE → acceptor IGNORES client CBT (proxy posture SAFE, no knob needed)"
-        return "DECISIVE → acceptor ENFORCES client CBT (SSPI/EPA — #98(b) knob WARRANTED)"
+            return "DECISIVE -> acceptor IGNORES client CBT (proxy posture SAFE, no knob needed)"
+        return "DECISIVE -> acceptor ENFORCES client CBT (SSPI/EPA — #98(b) knob WARRANTED)"
     # Acceptor supplies bindings — the conventional EPA-on direction.
     if client_kind == "none":
-        return "acceptor bound, client unbound → reject expected if EPA is honoured"
+        return "acceptor bound, client unbound -> reject expected if EPA is honoured"
     if client_kind == "matching":
-        return "both bound + agree → ACCEPT expected (EPA satisfied)"
-    return "both bound + DISAGREE → reject expected (EPA mismatch caught)"
+        return "both bound + agree -> ACCEPT expected (EPA satisfied)"
+    return "both bound + DISAGREE -> reject expected (EPA mismatch caught)"
 
 
 def main() -> int:
@@ -377,7 +377,7 @@ def main() -> int:
         print("    Kerberos EPA conclusion can be drawn. Fix the SPN/DNS/TGT so Kerberos resolves,")
         print("    then re-run (see runbook §5).")
     elif not baseline_ok:
-        # The control leg failed its own "must ACCEPT" expectation → the rig itself is broken; any
+        # The control leg failed its own "must ACCEPT" expectation -> the rig itself is broken; any
         # rejection in the decisive cells is untrustworthy as an enforcement signal.
         print(
             "  INCONCLUSIVE — the baseline cell (server=None, client=none) did NOT accept, so the"
@@ -389,18 +389,18 @@ def main() -> int:
         print(
             f"  On {provider}, the acceptor built with channel_bindings=None IGNORES a client CBT."
         )
-        print("  → The WP-15 reverse-proxy posture is safe as shipped; no CBT-off knob is needed.")
-        print("  → #98(b) opt-in binding is OPTIONAL (in-process-TLS mode only), not required.")
+        print("  -> The WP-15 reverse-proxy posture is safe as shipped; no CBT-off knob is needed.")
+        print("  -> #98(b) opt-in binding is OPTIONAL (in-process-TLS mode only), not required.")
     elif decisive_cb_rejects:
         print(
             f"  On {provider}, the acceptor built with channel_bindings=None ENFORCES a client CBT."
         )
-        print("  → Confirmed via a channel-binding rejection (BadBindingsError) in every decisive")
+        print("  -> Confirmed via a channel-binding rejection (BadBindingsError) in every decisive")
         print("    cell, with the baseline accepting and Kerberos negotiated throughout.")
         print(
-            "  → A deployment behind a TLS-terminating proxy would break (EPA structurally wrong)."
+            "  -> A deployment behind a TLS-terminating proxy would break (EPA structurally wrong)."
         )
-        print("  → #98(b) is WARRANTED: an explicit CBT-off knob, and/or an opt-in")
+        print("  -> #98(b) is WARRANTED: an explicit CBT-off knob, and/or an opt-in")
         print("    tls-server-end-point binding for the in-process-TLS termination mode only.")
     else:
         print(

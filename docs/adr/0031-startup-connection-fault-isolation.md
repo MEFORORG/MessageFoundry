@@ -196,3 +196,79 @@ surfacing and the `connection_stopped` alert. Reload stays fail-fast for the res
 check only runs at bind, so a below-threshold / not-deployed / auto-start-off connection is unaffected.
 The equivalent outbound (FileDestination) is out of scope here — it already `mkdir`s on write and has
 the on-demand `POST /connections/{name}/test` probe.
+
+**Follow-on (2026-08-03, BACKLOG #114) — the outbound rejects the option rather than ignoring it.**
+**Superseded by the 2026-08-10 amendment below, which builds the hook and removes this `WiringError`;
+kept for the reasoning, which still holds.** Because `File()`/`Sftp()`/`Ftp()` are single factories
+serving both directions, the option above could be *written* onto an outbound, where nothing read it —
+accepted and silently ignored. That was made a **`WiringError` at bind** in
+`build_outbound_connection`, the one choke point both the code-first `outbound()` and the
+`connections.toml` loader (ADR 0007) pass through. The outbound *validation hook* itself
+(`DestinationConnector.validate_startup`) was out of scope here — note that the "on-demand test probe"
+workaround cited above is **inbound-only in effect**: `FileDestination.test_connection` →
+`_probe_dir_writable` and `RemoteFileDestination.test_connection` → `ensure_dir` both **create** the
+target directory, so on an outbound no shipped mechanism could distinguish "the directory exists" from
+"I just made it."
+
+## Amendment (2026-08-10, BACKLOG #114) — the outbound half: `DestinationConnector.validate_startup`
+
+**Status:** Accepted (owner go — build the remainder). Built in the same change.
+
+**Context.** The 2026-07-17 amendment deferred the outbound hook on two grounds: the destination
+"already `mkdir`s on write", and it "has the on-demand `POST /connections/{name}/test` probe". The
+2026-08-03 follow-on already withdrew the second (both destinations' `test_connection` **create** the
+directory — re-measured against the shipped code before this amendment was written, on a missing
+directory, for both FILE and REMOTEFILE). This withdraws the first: `mkdir`-on-write is not a weaker
+form of validation, it is the defect. A typo'd `directory`/`remote_dir` does not fail — it is
+**created**, and every message delivered into it is counted and logged as delivered, because it was.
+On a first deployment that is a feed landing in a path nobody is watching with no error anywhere.
+(Nothing is misdelivering today; there are zero deployments — see CLAUDE.md §0.)
+
+**Decision.** Three parts.
+
+1. **`DestinationConnector.validate_startup()`**, defaulting to a **no-op** — the exact shape of the
+   `SourceConnector` hook above, so the other eleven destination connectors are untouched and this is
+   not a protocol change that ripples. `FileDestination` and `RemoteFileDestination` override it. The
+   runner awaits it in `_start_outbound` immediately after the connector is built, **inside the
+   existing ADR-0031 isolation `try`**: a `DestinationStartupError` therefore takes the same path as a
+   build failure — the lane is recorded `failed` with **no live connector**, its delivery worker is
+   **still spawned**, and rows routed to it are retried + buildup-alerted, never dropped. On an
+   outbound, "invalid means not-started" *is* that degraded-lane state, so §1's reliability and
+   count-and-log invariants are preserved rather than re-argued. The same call is made on the operator
+   start path (`_ensure_destination_built`, which already isolates rather than raises). It is **not**
+   made on the reload path, whose stated invariant is that a connector build there cannot fail (intake
+   is quiesced at that point, so a raise would strand the swap).
+
+2. **`validate_directory` becomes a both-directions option** on `File`/`Sftp`/`Ftp`, and the
+   2026-08-03 outbound `WiringError` is **removed**. That guard existed for exactly one reason — no
+   destination read the setting — and that reason is now gone; keeping it would mean shipping the hook
+   behind a second, differently-named knob. Default stays `false`, so every outbound authored today
+   builds and runs byte-identically.
+
+3. **A created directory is loud.** Under the default (defer) arm the target is still created on
+   write and the delivery still succeeds — but a create that actually happened now logs a `WARNING`
+   naming the path. This is the half that applies to every existing outbound, because it is the
+   default arm: the failure mode being closed is silence, not the creation itself.
+
+Three deliberate details, each the mirror of a source-side one:
+
+- **No-create at every asking point.** `validate_startup` uses `_probe_dir_startup` (FILE) or a
+  `list_dir` (REMOTEFILE) — never `_probe_dir_writable`/`ensure_dir`, both of which create. Under
+  `validate_directory=true` `test_connection` switches to the same no-create probes, because
+  otherwise the operator's own `POST /connections/{name}/test` would silently repair the typo the
+  toggle exists to catch and the next restart would then validate clean.
+- **No-create at delivery time too, under the toggle.** "This directory must exist" has to keep
+  meaning that after start, so `_write`/`_upload` do not create it either: a share that vanished
+  mid-run fails the send **retryably** and the lane backs off and self-heals. The REMOTEFILE arm
+  pre-checks with a `list_dir` specifically to reclassify — an SFTP/FTP no-such-dir is a **permanent**
+  error, so letting the upload fail naturally would dead-letter live traffic over a merely-unmounted
+  share. It costs one extra round trip per delivery, on the opt-in path only.
+- **The default arm still serves the item's own trigger.** An intermittently-available directory must
+  **not** fail startup — which is why the toggle is opt-in and defaults to defer in both directions.
+
+**Consequences.** Additive; a graph that never sets `validate_directory` on an outbound behaves as
+before apart from the create-on-write WARNING. The FILE default path's syscall count is unchanged
+(`mkdir(parents=True, exist_ok=True)` already probed `is_dir()` on its `FileExistsError` branch, which
+is the common one). `_RemoteClient.ensure_dir` now reports whether it created — a module-private
+contract with two implementations. No new schema and no new dependency; a refusal rides the existing
+`_failed`/`failed` surfacing and the `connection_stopped` alert.

@@ -35,6 +35,7 @@ from messagefoundry.redaction import redact
 
 __all__ = [
     "configure_logging",
+    "configure_stderr_logging",
     "set_runtime_level",
     "current_log_level",
     "silence_phi_prone_dependency_loggers",
@@ -68,6 +69,30 @@ for _i in range(0x20):
         _CTRL_TRANSLATION[_i] = f"\\x{_i:02x}"
 _CTRL_TRANSLATION[0x7F] = "\\x7f"
 
+#: Stamped on every physical line of a record's ``exc_text``/``stack_info`` (BACKLOG #335). A traceback
+#: is multi-line by nature, so collapsing it the way the rendered message is collapsed would cost the
+#: operator the readability an incident depends on. Its line breaks are kept and every line is indented
+#: instead, so no traceback line starts at column 0 and none can impersonate the ``_LOG_FORMAT`` record
+#: prefix (ASVS 16.4.1 — the readability call ADR 0034 §1 deferred).
+_CONTINUATION_PREFIX = "    | "
+
+
+def _scrub_block(text: str) -> str:
+    """Escape control characters in a multi-line block (``exc_text``/``stack_info``) while KEEPING its
+    line breaks, indenting every line with :data:`_CONTINUATION_PREFIX`.
+
+    The **first** line is indented too, so the guarantee does not rest on it being the stdlib
+    ``Traceback (most recent call last):`` header: ``Formatter.formatException`` emits no header at all
+    when the exception carries no ``__traceback__``, and that first line is then peer-derived text.
+
+    Idempotent — the prefix is stripped before it is re-applied — because every handler carries its own
+    filter chain, so a record dispatched to stdout *and* the off-box forwarder is scrubbed twice and the
+    two sinks must not disagree."""
+    return "\n".join(
+        _CONTINUATION_PREFIX + line.removeprefix(_CONTINUATION_PREFIX).translate(_CTRL_TRANSLATION)
+        for line in text.split("\n")
+    )
+
 
 class ControlCharScrubFilter(logging.Filter):
     """Neutralize CR/LF and other control characters in the rendered log message to prevent log
@@ -76,7 +101,13 @@ class ControlCharScrubFilter(logging.Filter):
     Untrusted MLLP peer data and HL7-derived exception text reach the general log; without this a
     crafted value containing a newline could inject a forged log line into NSSM's captured stdout.
     We render the message (applying ``%`` args) once, escape any control characters, and only then
-    replace ``record.msg`` — clean messages keep their lazy ``msg``/``args`` untouched."""
+    replace ``record.msg`` — clean messages keep their lazy ``msg``/``args`` untouched.
+
+    ``record.exc_text`` and ``record.stack_info`` are covered too (BACKLOG #335, ADR 0034 §1), via
+    :func:`_scrub_block`. This filter is installed **last** (see :func:`_install_phi_filters`), so
+    :class:`RedactionFilter` has already rendered ``exc_info`` into ``exc_text`` and cleared it; a
+    handler carrying this filter *without* that one would leave an unrendered ``exc_info`` for the
+    formatter to expand unscrubbed."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()
@@ -84,6 +115,14 @@ class ControlCharScrubFilter(logging.Filter):
         if scrubbed != message:
             record.msg = scrubbed
             record.args = ()
+        # The rendered message is only half the record: ``Formatter.format`` appends ``exc_text`` and
+        # ``stack_info`` VERBATIM, so a CR/LF inside an exception message forged a whole line on the
+        # text sink (BACKLOG #335). ``RedactionFilter`` is installed first and renders ``exc_info``
+        # into ``exc_text``, so both fields are already populated when this filter runs.
+        if record.exc_text:
+            record.exc_text = _scrub_block(record.exc_text)
+        if record.stack_info:
+            record.stack_info = _scrub_block(record.stack_info)
         return True
 
 
@@ -235,6 +274,18 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
 
     def __init__(self, *args: Any, timeout: float | None = None, **kwargs: Any) -> None:
         self._sock_timeout = timeout
+        # Forward the timeout to the stdlib ctor as well (BACKLOG #350). SysLogHandler.createSocket
+        # applies `self.timeout` via settimeout() *before* sock.connect(), so this is the only thing
+        # that bounds the STARTUP connect; our own settimeout in createSocket runs after connect has
+        # already returned and can bound nothing but later sends/reconnects. Without this the startup
+        # connect fell back to the OS default — on a collector host that DROPS rather than refuses,
+        # that stalls engine start, contradicting this class's own "can't block the calling thread"
+        # contract and _build_syslog_handler's docstring.
+        # Routed through kwargs rather than passed explicitly: `timeout` is also SysLogHandler's 4th
+        # POSITIONAL parameter, so `super().__init__(*args, timeout=...)` is a possible double-bind
+        # that mypy rejects outright. Every construction site here is keyword-only, so this is
+        # equivalent at runtime and honest to the checker.
+        kwargs["timeout"] = timeout
         super().__init__(*args, **kwargs)  # SysLogHandler.__init__ calls createSocket() (3.11+)
 
     def createSocket(self) -> None:
@@ -412,6 +463,39 @@ def configure_logging(
 
     silence_phi_prone_dependency_loggers()
     return forwarder_installed
+
+
+def configure_stderr_logging(level: int = logging.WARNING) -> logging.Handler:
+    """Install a **stderr-only** root handler carrying the same PHI-redaction + control-char-scrub
+    filter chain :func:`configure_logging` puts on stdout, and return it.
+
+    For a MessageFoundry child process whose **stdout is a binary channel**: today the ADR 0087 sandbox
+    worker, whose stdout carries the MFW2 IPC frames, so a stray log byte written there would corrupt a
+    frame. The obvious way to express that — ``logging.basicConfig(stream=sys.stderr)`` — gets the
+    stream right and the *filters* wrong. It installs a handler with **no filters at all**, and
+    redaction here is a property of the **handler**, not of the logger or the call site (see
+    :func:`_install_phi_filters`), so a child that builds its own handler builds an unfiltered one
+    unless it asks for the chain: its records would reach the inherited stderr with neither PHI
+    redaction nor CR/LF neutralization (BACKLOG #1054). Every process that logs installs the chain, or
+    it does not have it.
+
+    The text formatter is the shared one, so a child line is byte-compatible with the parent's and
+    :class:`ControlCharScrubFilter`'s "no line may impersonate the record prefix" guarantee is stated
+    against the same prefix on both streams.
+
+    Replaces any handlers already on the root logger, exactly as :func:`configure_logging` does, so it
+    is idempotent and safe to call from a test.
+    """
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(_make_formatter("text"))
+    _install_phi_filters(handler)
+
+    root = logging.getLogger()
+    for existing in list(root.handlers):
+        root.removeHandler(existing)
+    root.addHandler(handler)
+    root.setLevel(level)
+    return handler
 
 
 def set_runtime_level(level: str) -> str:

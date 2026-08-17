@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import http.client
 import json
 import logging
 import re
@@ -46,6 +47,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.controlchars import has_control_char
 from messagefoundry.parsing.fhir import FhirPeek, FhirPeekError
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -101,8 +103,12 @@ _TRANSIENT_ISSUE_CODES = frozenset(
 # the message-derived path segments so a crafted resource can't smuggle '/', '..', '?', '#', or '@'
 # into the request path and redirect a PHI-bearing write to a different resource/operation on the same
 # allow-listed host (the [egress].allowed_http gate pins the host, not the path).
-_FHIR_TYPE_RE = re.compile(r"^[A-Za-z]+$")
-_FHIR_ID_RE = re.compile(r"^[A-Za-z0-9.\-]{1,64}$")
+# `\Z`, never `$`: Python's `$` also matches immediately BEFORE a final newline, so `^[A-Za-z]+$`
+# accepted "Patient\n" and the gate did not enforce the grammar it advertises. Anchoring the pattern
+# fixes every caller at once -- `match` vs `fullmatch` is a property of the CALL, and there are three
+# call sites (:189, :698, :704), so a per-call fix leaves the next one to re-introduce it.
+_FHIR_TYPE_RE = re.compile(r"^[A-Za-z]+\Z")
+_FHIR_ID_RE = re.compile(r"^[A-Za-z0-9.\-]{1,64}\Z")
 
 
 def _operation_outcome(body: str) -> dict[str, Any] | None:
@@ -170,12 +176,31 @@ def _reject_control_chars(value: str, field: str) -> str:
     ``ValueError`` that would otherwise escape ``send()`` as an 'internal error'. Surface it as a
     permanent ``NegativeAckError`` (a retry re-sends the same body) with a PHI-safe message (the field
     name only, never the value)."""
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+    if has_control_char(value):
         raise NegativeAckError(
             f"FHIR {field} contains an illegal control character",
             code="bad-request-value",
             permanent=True,
         )
+    return value
+
+
+def _reject_config_control_chars(value: str, setting: str, where: str = "destination") -> str:
+    """Reject an OPERATOR-CONFIGURED value carrying a C0/DEL control char, at CONSTRUCTION time.
+
+    Deliberately distinct from ``_reject_control_chars``, which screens MESSAGE-derived values on the
+    send path and raises a permanent ``NegativeAckError``. The distinction is the disposition: a bad
+    *message* dead-letters one message, whereas a bad *setting* is wrong for every message the
+    connection will ever send -- so it must fail the connection at load rather than dead-letter an
+    unbounded stream of messages that were never at fault. Raises ``ValueError`` to match the other
+    construction-time setting checks. PHI-safe: names the setting, never the value.
+
+    ``where`` carries the construction site because there are TWO in this module -- the destination
+    and the read executor -- and #1241's subject is precisely the asymmetry of screening one and not
+    its sibling.
+    """
+    if has_control_char(value):
+        raise ValueError(f"FHIR {where} {setting!r} contains an illegal control character")
     return value
 
 
@@ -205,6 +230,7 @@ class FhirDestination(DestinationConnector):
             raise ValueError(
                 "FHIR destination requires a 'url' setting (the FHIR service base URL)"
             )
+        _reject_config_control_chars(url, "url")
         scheme = urllib.parse.urlsplit(url).scheme.lower()
         if scheme not in ("http", "https"):
             raise ValueError(f"FHIR destination 'url' must be http or https, got scheme {scheme!r}")
@@ -228,7 +254,14 @@ class FhirDestination(DestinationConnector):
                 f"FHIR destination conditional must be one of {_CONDITIONALS} or unset, "
                 f"got {self.conditional!r}"
             )
-        self.conditional_query: str | None = s.get("conditional_query") or None
+        # Screened HERE rather than on the send path: it reaches an unencoded URL interpolation AND
+        # the If-None-Exist HEADER value, and the header sink has none of the URL limb's incidental
+        # neutralisations (urllib.parse.unwrap strips a trailing CRLF; Request.full_url splits at '#'
+        # client-side -- neither touches a header value).
+        _q = s.get("conditional_query") or None
+        self.conditional_query: str | None = (
+            _reject_config_control_chars(str(_q), "conditional_query") if _q else None
+        )
         if (
             self.conditional in ("if-none-exist", "conditional-update")
             and not self.conditional_query
@@ -631,10 +664,16 @@ class FhirDestination(DestinationConnector):
             raise DeliveryError(
                 f"FHIR {_redact_url(self.base_url)} unreachable: {exc.reason}"
             ) from exc
-        except ValueError as exc:
+        except (ValueError, http.client.InvalidURL) as exc:
             # Backstop for an illegal request value urllib rejects (a CRLF in a header/URL that slipped
             # past the control-char guard, or a bad conditional_query) — a permanent failure (a retry
             # re-sends the same body), never an escaping internal error. PHI-safe: redacted url only.
+            #
+            # InvalidURL is named EXPLICITLY because it is not a ValueError: its MRO is
+            # InvalidURL -> HTTPException -> Exception, so it is neither a ValueError nor an OSError
+            # and matched none of the arms here — including this one, which was written for exactly
+            # the CRLF-in-a-URL case it raises. Without it the URL limb escapes send() as an
+            # unhandled internal error instead of the classified permanent dead-letter above.
             raise NegativeAckError(
                 f"FHIR {_redact_url(self.base_url)} rejected an invalid request value",
                 code="bad-request-value",
@@ -655,12 +694,6 @@ register_destination(ConnectorType.FHIR, FhirDestination)
 # body), so a Handler cannot mutate the FHIR server through it (FHIR writes stay on FhirDestination).
 
 
-def _has_control_char(text: str) -> bool:
-    """True if ``text`` holds a C0 control (< 0x20) or DEL (0x7F) — a CRLF/NUL/etc. that must never ride a
-    URL (header/request smuggling)."""
-    return any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text)
-
-
 def _encode_search_params(params: Mapping[str, str | list[str]]) -> str:
     """Percent-encode a structured search into a URL query string, so a **value** can never inject an
     extra FHIR search parameter (CWE-88 argument injection, ASVS 1.2.2). ``urlencode(quote_via=quote,
@@ -675,26 +708,20 @@ def _resolve_read_url(
     base: str,
     query: str,
     params: Mapping[str, str | list[str]] | None = None,
-    require_structured: bool = False,
 ) -> str:
     """Build a read-only ``GET`` URL from a ``FhirLookup`` ``query``: a read-by-id (``"Patient/123"``) or a
-    search (``"Patient?identifier=MRN|123"``, or a path-only ``"Patient"`` plus structured ``params``).
+    path-only search (``"Patient"``) plus structured ``params``.
 
     Grammar-gates the resource-type and id **path segments** to the FHIR token/id grammars (the same gate
     ``FhirDestination`` applies to a write path, CWE-918): a crafted query can't smuggle ``/``, ``..``,
     ``#``, ``@`` (or a leading ``/`` / absolute URL) into the path and redirect the read to another
     resource/operation — or off the allow-listed host.
 
-    Search values are handled two ways (ASVS 1.2.2, BACKLOG #204):
-
-    * ``params`` given (**safe**): each value is percent-encoded via :func:`_encode_search_params`, so a
-      value can never inject an extra search parameter. Mixing ``params`` with a ``?`` in ``query`` is
-      ambiguous and refused.
-    * the flat ``?``-query (back-compat, **author-encoded**): it rides the URL as authored after a
-      defense-in-depth screen — it rejects a control char (raw **or** percent-decoded), a URL fragment
-      ``#``, or a second ``?`` (unambiguous injection shapes), but it deliberately does **not** re-encode a
-      legitimate author-supplied ``&``/``=``/``|`` separator (per-value encoding of the flat form is the
-      author's duty; ``params`` is the safe path).
+    **There is exactly one search form, and it is encoded by construction** (ASVS 1.2.2, BACKLOG #1243).
+    Every value goes through :func:`_encode_search_params`, so a value can never inject an extra search
+    parameter. A ``?``-query in ``query`` is **refused**: the flat author-encoded form was removed rather
+    than gated behind a setting, because a setting leaves the unencoded sink one config edit away and
+    closes the requirement on a default instead of on the absence of the sink.
 
     Raises a PHI-safe ``ValueError`` (it names only the offending shape/segment, never the query's
     parameter values)."""
@@ -717,37 +744,17 @@ def _resolve_read_url(
             raise ValueError("FHIR read id is not a valid FHIR id")
         path = f"{type_seg}/{urllib.parse.quote(resource_id, safe='')}"
     url = f"{base.rstrip('/')}/{path}"
+    if sep:
+        # The flat '?'-query is GONE (BACKLOG #1243). It appended the caller's string unencoded, and the
+        # three-shape screen that used to stand here ('#', a second '?', a decoded control char) was the
+        # statement of the shortfall, not a control -- its own comment said it declined to touch the
+        # '&'/'='/'|' separators that carry the injection. PHI-safe: names the shape only, never the query.
+        raise ValueError(
+            "FHIR read: a '?'-query is not supported; pass search parameters via params="
+        )
     if params is not None:
-        # Structured, safely-encoded search form: refuse the ambiguous "both forms at once" shape so the
-        # engine never has to reconcile a flat ?-query with per-value-encoded params.
-        if sep:
-            raise ValueError(
-                "FHIR read: pass search parameters via params= OR a '?'-query in the path, not both"
-            )
         encoded = _encode_search_params(params)
         return f"{url}?{encoded}" if encoded else url
-    if sep:  # flat search query string — control-char gate + defense-in-depth injection screen
-        if require_structured:
-            # 1.2.2: the operator required the structured params= form
-            # ([egress].fhir_require_structured_params); close the author-encoded flat '?'-query escape
-            # hatch. Refused BEFORE the screen so the only accepted search form is the safely
-            # percent-encoded params= path. PHI-safe: names the shape/setting only, never search_part.
-            raise ValueError(
-                "FHIR read: flat '?'-query is refused ([egress].fhir_require_structured_params); "
-                "pass search parameters via params="
-            )
-        if _has_control_char(search_part):
-            raise ValueError("FHIR read search query contains an illegal control character")
-        # Defense-in-depth (ASVS 1.2.2): reject the shapes the engine can flag unambiguously without
-        # breaking legitimate multi-param (&/=/|) searches. '#' would start a URL fragment; a second '?'
-        # is a malformed/injected query; a percent-decoded control char is a smuggled CRLF/NUL.
-        if "#" in search_part:
-            raise ValueError("FHIR read search query contains a URL fragment ('#')")
-        if "?" in search_part:
-            raise ValueError("FHIR read search query contains a second '?'")
-        if _has_control_char(urllib.parse.unquote(search_part)):
-            raise ValueError("FHIR read search query decodes to an illegal control character")
-        url = f"{url}?{search_part}"
     return url
 
 
@@ -766,16 +773,10 @@ class FhirLookupExecutor:
     ``OperationOutcome`` issue code, a redacted host) — never the returned body, the query's parameter
     values, or the SMART token."""
 
-    def __init__(
-        self, connections: Mapping[str, Mapping[str, Any]], *, require_structured: bool = False
-    ) -> None:
+    def __init__(self, connections: Mapping[str, Mapping[str, Any]]) -> None:
         # connections: name -> already-env-resolved settings (the runner substitutes env() first).
         from messagefoundry.transports.smart import token_provider_from_settings
 
-        # 1.2.2 ([egress].fhir_require_structured_params): when True every search must use the
-        # per-value-encoded params= form; the flat '?'-query escape hatch is refused. Default False
-        # keeps the flat form (byte-identical). Threaded in by wiring_runner from EgressSettings.
-        self._require_structured = require_structured
         self._base: dict[str, str] = {}
         self._headers: dict[str, dict[str, str]] = {}
         self._timeout: dict[str, float] = {}
@@ -791,6 +792,9 @@ class FhirLookupExecutor:
                 raise ValueError(
                     f"FhirLookup {cname!r} requires a 'url' setting (the FHIR base URL)"
                 )
+            # #1241: the SECOND url construction site in this module. The destination screens its
+            # own; screening one and not its sibling reproduces the asymmetry the item reports.
+            _reject_config_control_chars(url, "url", f"lookup {cname!r}")
             scheme = urllib.parse.urlsplit(url).scheme.lower()
             if scheme not in ("http", "https"):
                 raise ValueError(
@@ -913,9 +917,7 @@ class FhirLookupExecutor:
                 f"fhir_lookup: no FhirLookup connection named {connection!r} (declared: {known})"
             )
         try:
-            url = _resolve_read_url(
-                self._base[connection], query, params, require_structured=self._require_structured
-            )
+            url = _resolve_read_url(self._base[connection], query, params)
         except ValueError as exc:
             # PHI-safe: _resolve_read_url names only the offending shape/segment, never the query values.
             raise FhirLookupError(f"fhir_lookup on {connection!r}: {exc}") from exc

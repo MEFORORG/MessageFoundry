@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // The extension's engine log (ADR — engine-link doctor). Until now NOTHING on the engine path logged
 // anywhere: a refused socket, a 5s timeout, a 401 and a cleared token all vanished without a trace the
 // user could read. "Let me SEE the connection to the engine" is answered largely by this file.

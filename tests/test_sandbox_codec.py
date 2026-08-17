@@ -26,7 +26,13 @@ from messagefoundry.config.models import ContentType
 from messagefoundry.config.response import CapturedResponse
 from messagefoundry.config.run_context import RunContext, run_contexts
 from messagefoundry.config.state import state_get
-from messagefoundry.config.wiring import Send, SetMeta, SetState, WiringError
+from messagefoundry.config.wiring import (
+    Send,
+    SetMeta,
+    SetState,
+    WiringError,
+    handler_result_items,
+)
 from messagefoundry.parsing.message import Message, RawMessage
 from messagefoundry.pipeline import _sandbox_codec as codec
 from messagefoundry.pipeline import sandbox
@@ -481,13 +487,42 @@ def test_hostile_frames_fail_closed(case: str, body: bytes) -> None:
     assert EXECUTED == []
 
 
-def test_recursion_error_is_not_a_value_error() -> None:
+def test_recursion_error_is_not_a_value_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pins the reason ``decode_frame`` catches ``RecursionError`` explicitly: it is a ``RuntimeError``,
     so a ``except ValueError`` would have let a deep-nesting rejection escape the fail-closed contract
-    exactly as the old bare ``KeyError`` did."""
+    exactly as the old bare ``KeyError`` did.
+
+    THE TRIGGER IS A RAISED ``RecursionError``, NOT REAL RECURSION (BACKLOG #1222). Manufacturing one by
+    parsing ``"[" * 100000`` measured the RUNNER as much as the code: json's C accelerator consumes the
+    C stack, which no Python-level knob reaches -- ``sys.getrecursionlimit()`` is 1000 while
+    ``json.loads`` gets to ~16,900, so ``sys.setrecursionlimit`` cannot move it either. Measured: first
+    raise at depth 16,913 on one box and NO raise at 100,000 on a CI runner, a 6x spread on identical
+    bytes. That reddened ``main`` and two unrelated pull requests, on a file byte-identical to the one
+    that had passed hours earlier.
+
+    Do NOT "fix" a future recurrence by raising the depth: that buys a green on today's runner image,
+    re-fires on the next roll, and makes the test MORE environment-coupled rather than less. What the
+    contract needs is the type relationship and the handler, and neither needs a real stack overflow.
+    """
+    # (1) the type facts the handler's except-tuple depends on. Environment-independent.
     assert not issubclass(RecursionError, ValueError)
-    with pytest.raises(RecursionError):
-        json.loads(_deep_json(100000))
+    assert issubclass(RecursionError, RuntimeError)
+
+    # (2) drive the handler itself: a RecursionError out of the header parse must be converted into the
+    # fail-closed SandboxCodecError. Narrowing that tuple to ValueError lets it escape, which is exactly
+    # what this pins -- so this arm reds if the RecursionError is dropped from decode_frame.
+    frame = encode_frame({"v": 1, "t": "ready"}, ())
+
+    class _RecursingJson:
+        """Stands in for the codec's ``json`` only for ``loads``; ``dumps`` is untouched and unused here."""
+
+        @staticmethod
+        def loads(*_args: object, **_kwargs: object) -> object:
+            raise RecursionError("simulated deep nesting")
+
+    monkeypatch.setattr(codec, "json", _RecursingJson)
+    with pytest.raises(SandboxCodecError, match="RecursionError"):
+        decode_frame(frame)
 
 
 # --- (5) the value grammar round-trips exactly -------------------------------
@@ -575,6 +610,32 @@ def _generator_result() -> Any:
     return gen()
 
 
+#: What each return shape partitions to, as ``[sends, state, meta]``. The table is the acceptance
+#: criterion, asserted against BOTH modes — a shape may not partition differently across the pipe.
+_PARITY: dict[str, list[int]] = {
+    "none": [0, 0, 0],
+    "bare_send": [1, 0, 0],
+    "mixed_list": [1, 1, 1],  # the trailing `7` is unrecognised and drops
+    "send_subclass": [1, 0, 0],
+    "tuple_of_sends": [2, 0, 0],  # BACKLOG #341 — was [0, 0, 0]
+    # >1 element on purpose — a 1-element set has only one ordering, so it cannot see _UNORDERED.
+    "set_of_sends": [3, 0, 0],  # BACKLOG #341 — was [0, 0, 0]
+    "bare_int": [0, 0, 0],  # not a container, not a recognised item — still DROPS
+    "generator": [1, 0, 0],  # BACKLOG #341 — was [0, 0, 0]
+    # THE acceptance criterion of #341 — `return []` / `return ()` must keep FILTERING, not start
+    # delivering and not start raising — carried across the process boundary, not just in-process.
+    "empty_list": [0, 0, 0],
+    "empty_tuple": [0, 0, 0],
+}
+
+#: Cases whose container defines **no** iteration order, so parity is over the delivered MULTISET only.
+#: ``Send`` is a frozen dataclass hashed on its fields and ``str`` hashing is seeded per process, so a
+#: ``set``'s fan-out order differs between processes — i.e. between the sandbox child and the parent,
+#: and between a first pass and a crash re-run. Asserting an order here would pin a per-process
+#: accident as a contract; ADR 0087's AC-11 and `wiring.handler_result_items` say the same in prose.
+_UNORDERED = {"set_of_sends"}
+
+
 @pytest.mark.parametrize(
     ("case", "make"),
     [
@@ -583,23 +644,73 @@ def _generator_result() -> Any:
         ("mixed_list", lambda: [Send("OB_A", "x"), SetState("n", "k", 1), SetMeta("m", "v"), 7]),
         ("send_subclass", lambda: _SubSend("OB_A", "x")),
         ("tuple_of_sends", lambda: (Send("OB_A", "x"), Send("OB_B", "y"))),
-        ("set_of_sends", lambda: {Send("OB_A", "x")}),
+        ("set_of_sends", lambda: {Send("OB_A", "x"), Send("OB_B", "y"), Send("OB_C", "z")}),
         ("bare_int", lambda: 7),
         ("generator", _generator_result),
+        ("empty_list", list),
+        ("empty_tuple", tuple),
     ],
 )
 def test_partition_parity_table(case: str, make: Any) -> None:
-    """``_partition`` stays the SOLE filter: the codec reproduces its exact input container, so the
-    ``(sends, state, meta)`` shape is identical to ``mode=off`` for every return shape — including the
-    ones ``mode=off`` silently drops. Normalising an iterable into a list here would start delivering
-    ``Send``\\ s the current engine does not (shipping PHI it drops today)."""
+    """``[sandbox].mode`` never changes which ``Send``\\ s a Handler delivers.
+
+    The child materialises a transform return with ``_partition``'s OWN rule
+    (:func:`~messagefoundry.config.wiring.handler_result_items`), exactly as it already materialises a
+    router return with ``_handler_names``' logic — so a tuple/set/generator fan-out delivers under
+    ``mode=subprocess`` precisely as it does under ``mode=off`` (BACKLOG #341), an EMPTY container still
+    FILTERS, a ``Send`` **subclass** still delivers, and a value neither rule recognises still drops
+    (described as an ``Ignored`` slot rather than omitted, so ``_partition`` stays the SOLE filter).
+    Fixing the parent's ``_partition`` alone would make the disposition MODE-DEPENDENT — in-process
+    delivers while subprocess drops — which is worse than the original accept-and-drop this closes.
+
+    **Destinations are compared, not just counts** — equal lengths would pass even if the codec swapped
+    one outbound for another. For an ordered container the exact ORDER is pinned too; for a ``set``
+    (``_UNORDERED``) only the multiset is, because a set has no iteration order to preserve. Note the
+    scope honestly: this round-trip is **in-process**, so it cannot observe the cross-process reordering
+    a real child imposes on a ``set`` — which is precisely why the contract is stated over the multiset
+    rather than asserted over an order that only holds within one hash seed."""
     direct = _partition(make())
     through_codec = _partition(_rt_transform(make()))  # type: ignore[arg-type]
-    assert [len(x) for x in through_codec] == [len(x) for x in direct]
+    assert [len(x) for x in direct] == _PARITY[case]
+    assert [len(x) for x in through_codec] == _PARITY[case]
     if case == "send_subclass":
         assert len(direct[0]) == 1 and through_codec[0][0].to == "OB_A"  # still DELIVERS
-    if case in ("tuple_of_sends", "set_of_sends", "bare_int", "generator", "none"):
-        assert [len(x) for x in direct] == [0, 0, 0]  # still DROPS, in both modes
+    dests_direct = [s.to for s in direct[0]]
+    dests_codec = [s.to for s in through_codec[0]]
+    if case in _UNORDERED:
+        assert sorted(dests_codec) == sorted(dests_direct)
+    else:
+        assert dests_codec == dests_direct
+    if case in ("empty_list", "empty_tuple"):
+        # The filter idiom must cross the pipe AS A CONTAINER, and `[0, 0, 0]` alone cannot see that:
+        # an empty container mis-described as an *unrecognised single value* also partitions to
+        # `[0, 0, 0]` (the parent rebuilds an `Ignored`). Pinning the described shape is what makes
+        # this row falsifiable at all — a truthiness gate in `handler_result_items` (`and result`,
+        # the natural "simplification") flips `shape` to `"one"` while every count stays green.
+        assert enc_result("transform", make(), _Blobs()) == {"r": "items", "shape": "list", "i": []}
+
+
+def test_handler_result_items_treats_a_str_as_a_single_value() -> None:
+    """The shared materialization rule's two carve-outs, asserted directly on the rule itself.
+
+    A ``str``/``bytes`` IS iterable but is not a container of ``Send``\\ s — iterating one would
+    partition its characters. And the gate is an explicit ``__iter__`` (``isinstance(..., Iterable)``),
+    never a duck-typed ``list(result)``, so a non-iterable value is a single item rather than a raise.
+
+    An end-to-end "a ``str`` return still drops" test could NOT catch the first carve-out: characters
+    are not ``Send``\\ s, so the disposition is ``[0, 0, 0]`` with or without it. Asserting on the rule
+    is what makes the carve-out falsifiable at all."""
+    s1, s2 = Send("OB_A", "x"), Send("OB_B", "y")
+    assert handler_result_items("OB_A") is None
+    assert handler_result_items(b"x") is None
+    assert handler_result_items(bytearray(b"x")) is None
+    assert handler_result_items(7) is None
+    assert handler_result_items(None) is None
+    assert handler_result_items(s1) is None  # a frozen dataclass is not iterable
+    assert handler_result_items((s1, s2)) == [s1, s2]
+    assert handler_result_items([s1]) == [s1]
+    assert handler_result_items(()) == []
+    assert _partition("OB_A") == ([], [], [])  # and a str return still DROPS end to end
 
 
 # --- (8) parent-side constructor faults are wrapped --------------------------

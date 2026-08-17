@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Pure (vscode-free) view-model behind the read-only Steps view (ADR 0076 §2 phase 2b / #222).
 //
 // It consumes the `messagefoundry lens parse --json` contract (ADR 0076 §3) — the engine owns the
@@ -17,7 +19,19 @@ import type { TraceInvocation, TraceValue } from "./liveDebug";
 
 // ---- the `lens parse --json` contract (ADR 0076 §3; mirror of messagefoundry/lens.py output) --------
 
-export type RowKind = "action" | "lookup" | "control" | "send" | "code" | "diagnostic";
+export type RowKind =
+  | "action"
+  | "lookup"
+  | "control"
+  | "send"
+  | "code"
+  | "diagnostic"
+  // ADR 0076 Amendment A (#248): a run of standalone comment lines. Emitted only at contract 2 -- an
+  // engine asked for contract 1 never sends one, which is how an older IDE can never meet it (A.7).
+  | "note"
+  // ADR 0076 Amendment D (#232): a `@router`'s routing return. Carries HANDLER names, a different
+  // namespace from a send row's outbound-connection names at a different pipeline stage (D.5).
+  | "route";
 
 /** One row of a handler's Steps, exactly as `lens parse` emits it (§3). Fields are per-kind. */
 export interface LensRow {
@@ -61,6 +75,18 @@ export interface LensRow {
   // `return Send(...)`). It is NOT a return, so insert-after is allowed and it is a normal reorderable
   // step. Absent on every returned send + older contract (→ treated as a return, unchanged).
   appended?: boolean;
+  // note rows (Amendment A A.1) -- the comment body without its leading `#`, the physical line(s)
+  // verbatim, and whether it is a read-only pragma (fmt off / lint suppression / region). A run of
+  // lines joins with a newline; editing `text` re-renders each line from its OWN indent and `#` prefix.
+  text?: string;
+  raw?: string;
+  pragma?: boolean;
+  // route rows (Amendment D D.3) -- the selected handler names, and an additive `unrouted` flag for a
+  // routed-NOWHERE return (`return []` / `()` / `None` / bare `return`), which maps to the store
+  // disposition UNROUTED (logged, never dropped). A DYNAMIC return also has empty `handlers` but carries
+  // NO `unrouted`, so the two are distinguishable -- never key "routes nowhere" on emptiness.
+  handlers?: string[];
+  unrouted?: boolean;
   // ADR 0104 fan-out: the accumulator's managed scaffold — `"collector_init"` on `sends = []`,
   // `"return_collector"` on the bare `return sends` footer. A `code` row carrying this stays read-only
   // (the kind is unchanged); the webview renders it muted, and the footer counts as a return (insert-after
@@ -95,12 +121,53 @@ export interface LensHandler {
   // typeless handler / older contract omits them (→ generic, unscoped picker).
   accepts_types?: string[];
   inferred_type?: { code?: string; trigger?: string };
+  // ADR 0076 Amendment D -- which element this projection is. Absent on a contract-1 payload (which only
+  // ever carries handlers), so `role ?? "handler"` is the correct read everywhere.
+  role?: "handler" | "router";
+  // The contract version the engine actually emitted, echoed back so the view can tell a v2 engine from
+  // a v1 one without re-deriving it from the row kinds present.
+  contract_version?: number;
 }
 
 /** The whole-file `lens parse --json` payload: `{ module, handlers }` (see __main__._lens). */
 export interface LensParseResult {
   module: string;
   handlers: LensHandler[];
+}
+
+// ---- contract negotiation (ADR 0076 §A.7 / §D.7) ----------------------------------------------------
+//
+// `lens parse` emits no schema version of its own and the extension shells whatever `messagefoundry` is
+// on PATH, so BOTH skew directions are handled explicitly rather than discovered at render time:
+//
+//  * an OLDER extension meeting a NEWER engine passes no `--contract`, so the engine defaults to the
+//    shipped contract and never sends a kind that extension has no title for (it would render a blank,
+//    titleless row); and
+//  * a NEWER extension meeting an OLDER engine passes `--contract`, which that engine's argument parser
+//    rejects — so the CLI wrapper retries WITHOUT the flag and degrades to the v1 projection (no note
+//    rows, no router Steps) instead of surfacing an argument error.
+//
+// Both the constant and the predicate live here, in the vscode-free model module, so the negotiation is
+// unit-testable without the Extension Host.
+
+/** The row-contract version this extension can RENDER — the `note` + `route` kinds (Amendments A + D). */
+export const LENS_CONTRACT = 2;
+
+const UNKNOWN_ARG_RE = /unrecognized arguments?|no such option|unknown option|invalid choice/i;
+
+/**
+ * Whether CLI output is an argument parser rejecting a flag it does not know (argparse's wording, plus
+ * the common alternatives). Deliberately NARROW: a genuine refusal — a syntax error in the module, an
+ * unknown contract version, a stale row coordinate — must NOT match, or a real error would be silently
+ * retried away and reported as a downgrade.
+ */
+export function looksLikeUnknownArgument(text: string): boolean {
+  return UNKNOWN_ARG_RE.test(text);
+}
+
+/** {@link looksLikeUnknownArgument} over a thrown value (the `runJson*` failure path). */
+export function isUnknownArgumentError(err: unknown): boolean {
+  return looksLikeUnknownArgument(err instanceof Error ? err.message : String(err));
 }
 
 // ---- the row view-model the webview renders ---------------------------------------------------------
@@ -142,6 +209,9 @@ export interface RowViewModel {
   // A `return []` filter send — carried so the per-row "+ dest" button is hidden on it (fanning out a
   // "drop the message" step is not meaningful; use Add→Send). Absent on every other row.
   filtered?: boolean;
+  // A read-only PRAGMA note — carried so the webview greys its edit/delete controls rather than letting
+  // the user discover the engine's refusal as an error toast (F6). Absent on every other row.
+  pragma?: boolean;
   title: string;
   subtitle?: string;
   badge?: string; // e.g. "unrecognized" for a control whose test is outside the bounded grammar (§4)
@@ -178,6 +248,11 @@ export interface RowViewModel {
 export interface HandlerViewModel {
   handler: string;
   defLine: number;
+  // The element's role (ADR 0076 Amendment D). Every row of this element is stamped with it so the
+  // Add-palette can grey the items that role may not author, instead of letting the user pick one and
+  // meet the engine's refusal as an error toast (F6). Optional only so a hand-built test view-model may
+  // omit it; buildHandlerViewModel always populates it, defaulting to "handler".
+  role?: "handler" | "router";
   rows: RowViewModel[];
 }
 
@@ -284,8 +359,8 @@ function sliceSource(lines: string[], lineStart: number, lineEnd: number): strin
   return lines.slice(from - 1, to).join("\n");
 }
 
-/** The human title for a row (kind-specific). */
-function rowTitle(row: LensRow): string {
+/** The human title for a row (kind-specific). Exported so the kind coverage is directly testable. */
+export function rowTitle(row: LensRow): string {
   switch (row.kind) {
     case "action":
       return row.action ? (ACTION_LABELS[row.action] ?? humanizeIdentifier(row.action)) : "Action";
@@ -302,6 +377,14 @@ function rowTitle(row: LensRow): string {
       return row.filtered ? "Filter" : "Send";
     case "diagnostic":
       return row.call ? (DIAGNOSTIC_LABELS[row.call] ?? humanizeIdentifier(row.call)) : "Diagnostic";
+    case "note":
+      // Titled honestly as what it is. NOT "Note": no heuristic decides whether a comment is prose or
+      // commented-out code (A.5), so the row says "Comment" and shows the text verbatim.
+      return row.pragma ? "Pragma" : "Comment";
+    case "route":
+      // A routed-nowhere return reads as "Unrouted" (the store disposition), never "Filter" -- a router
+      // does not filter, and conflating the two would misdescribe what the engine records.
+      return row.unrouted ? "Unrouted" : "Route";
     case "code":
       // ADR 0104 fan-out scaffold — the managed accumulator boundary reads as a muted, non-actionable
       // step (still a read-only code row underneath).
@@ -356,7 +439,24 @@ function rowParams(row: LensRow): ParamField[] {
  * `_editable_slots` (operands render verbatim / read-only).
  */
 export function isRowEditable(kind: RowKind): boolean {
-  return kind === "action" || kind === "lookup" || kind === "send" || kind === "diagnostic";
+  return (
+    kind === "action" ||
+    kind === "lookup" ||
+    kind === "send" ||
+    kind === "diagnostic" ||
+    kind === "note" ||
+    kind === "route"
+  );
+}
+
+/**
+ * Whether a row is editable IN PRACTICE — {@link isRowEditable} on its kind, minus a PRAGMA note. A
+ * pragma (a formatter or lint suppression, a region marker) is functional code: the engine refuses
+ * set_params, delete_row and move_row on it (ADR 0076 A.4), so offering the controls would guarantee an
+ * error toast (F6). Everything that gates a control on editability keys on this, not on the kind alone.
+ */
+export function isRowMutable(row: { kind: RowKind; pragma?: boolean }): boolean {
+  return isRowEditable(row.kind) && row.pragma !== true;
 }
 
 /**
@@ -369,8 +469,14 @@ export function isRowEditable(kind: RowKind): boolean {
  * draggable + shows ↑/↓ on.
  */
 export function isRowMovable(row: LensRow): boolean {
+  // A `note` is NOT movable in v1: a comment is not a statement, so the engine has nothing to relocate,
+  // and ADR 0076 A.6 records that move/delete of a recognized row ALREADY re-attaches neighbouring
+  // comments to the wrong step — a movable note would render that misattribution as a confident caption.
+  if (row.kind === "note") {
+    return false;
+  }
   return (
-    isRowEditable(row.kind) ||
+    isRowMutable(row) ||
     (row.kind === "control" && (row.control === "if" || row.control === "for" || row.control === "raise"))
   );
 }
@@ -382,7 +488,7 @@ export function isRowMovable(row: LensRow): boolean {
  * (so the webview greys the trash to avoid an error toast, F6).
  */
 export function isRowDeletable(row: LensRow): boolean {
-  return isRowEditable(row.kind) || (row.kind === "control" && (row.control === "if" || row.control === "for"));
+  return isRowMutable(row) || (row.kind === "control" && (row.control === "if" || row.control === "for"));
 }
 
 /**
@@ -408,6 +514,15 @@ export function editableParamNames(row: LensRow): string[] {
   }
   if (row.kind === "send") {
     return (row.outbounds ?? []).length === 1 ? ["to"] : [];
+  }
+  // A note exposes its comment text; a pragma exposes nothing (the engine refuses the edit).
+  if (row.kind === "note") {
+    return row.pragma === true ? [] : ["text"];
+  }
+  // A route exposes its handler list — but only when the selection is STATIC. A dynamic return projects
+  // `handlers: []` with no `unrouted`, and editing that would flatten real code to a literal list.
+  if (row.kind === "route") {
+    return (row.handlers ?? []).length > 0 || row.unrouted === true ? ["handlers"] : [];
   }
   return [];
 }
@@ -459,6 +574,12 @@ export function buildRowViewModel(row: LensRow, index: number, lines: string[]):
   if (row.kind === "code") {
     vm.code = sliceSource(lines, row.line_start, row.line_end);
   }
+  // A note renders its own verbatim line(s) in the same read-only slot a code row uses, so an IDE that
+  // knows the kind shows the comment rather than a blank row.
+  if (row.kind === "note") {
+    vm.code = row.raw ?? sliceSource(lines, row.line_start, row.line_end);
+    vm.pragma = row.pragma === true;
+  }
   return vm;
 }
 
@@ -467,6 +588,8 @@ export function buildHandlerViewModel(handler: LensHandler, lines: string[]): Ha
   return {
     handler: handler.handler,
     defLine: handler.def_line,
+    // A contract-1 payload carries only handlers, so an absent `role` reads as "handler" everywhere.
+    role: handler.role ?? "handler",
     rows: handler.rows.map((row, i) => buildRowViewModel(row, i, lines)),
   };
 }
@@ -684,7 +807,10 @@ export interface EditMessage {
   lineStart: number;
   lineEnd: number;
   name: string; // the param name (e.g. "dst", "to")
-  value: string; // the new value, as typed in the field
+  // The new value, as typed in the field. A `number` for a number-kind widget (BACKLOG #235) so it
+  // round-trips to the engine as a JSON number and renders as an int/float literal — a string would
+  // render a re-typed string literal (`_render_literal` emits `6` for an int but `"6"` for a str).
+  value: string | number;
   // The row's PROJECTION-TIME source text (the row as the user saw it when the lens projected the inputs),
   // echoed back from the webview's `data-expect-src` and carried to `lens rewrite` as `expect_src` (F7).
   // Optional so a hand-built message (tests / an older payload) may omit it — then no stale check is sent.
@@ -697,7 +823,9 @@ export interface EditRequest {
   line_start: number;
   line_end: number;
   op: "set_params";
-  params: Record<string, string>;
+  // A number-kind field carries a JS number so `JSON.stringify` emits a bare `6` (an int/float literal),
+  // not `"6"` (a re-typed string literal) — BACKLOG #235. Every other param stays a string.
+  params: Record<string, string | number>;
   // The projected row's source text from the LIVE buffer (no EOL). `lens rewrite` verifies it still
   // matches the row before splicing, so a stale coordinate (a coincidental same-shape row) is refused
   // instead of edited in the wrong place (F7). Omitted → no stale check (older/no-buffer callers).
@@ -706,10 +834,12 @@ export interface EditRequest {
 
 /**
  * Map a webview edit message to the engine's `lens rewrite` edit spec (ADR 0076 §5) — pure, so the
- * mapping is unit-testable without the Extension Host. The value is passed as a JSON string, which the
- * engine renders as a Python **string literal** when the current argument is a literal (the common
- * analyst edit: a field path, a code, a destination name); the engine refuses — and the provider
- * surfaces — an edit of an argument that is currently an expression, so the lens never guesses.
+ * mapping is unit-testable without the Extension Host. A string value is rendered by the engine as a
+ * Python **string literal** when the current argument is a literal (the common analyst edit: a field
+ * path, a code, a destination name); a number value (a number-kind widget, BACKLOG #235) passes through
+ * as a JSON number so the engine renders an int/float literal, not a re-typed `"6"`. The engine refuses
+ * — and the provider surfaces — an edit of an argument that is currently an expression, so the lens
+ * never guesses.
  *
  * `expectSrc` is the row's PROJECTION-TIME source text (the row as the user saw it when the lens
  * projected the inputs). It is taken from the explicit argument when given (older 2-arg callers) and
@@ -879,6 +1009,11 @@ export interface AddMenuItem {
   seed?: Record<string, ParamValue>; // op === "insert_row": default params for a no-prompt inline-fill
   prompts: PromptSpec[];
   anchorConstraint?: "if_chain"; // Else / Else If: only valid on an if-chain anchor
+  // Which element ROLE the item may be inserted into (ADR 0076 D.6). Absent means HANDLER ONLY -- the
+  // safe default, since every pre-Amendment-D item authors a transform verb, a lookup, a diagnostic or an
+  // outbound send, none of which belongs in a router. A router stays pure destination-selection, and the
+  // engine refuses those ops inside one; scoping the palette means the user never meets that refusal.
+  roles?: readonly ("handler" | "router")[];
 }
 
 const IF_OPERATORS = ["exists", "equals", "not_equals", "contains"] as const;
@@ -949,16 +1084,20 @@ export const ADD_MENU_CATALOG: readonly AddMenuItem[] = [
   },
   {
     id: "fhir_lookup", label: "FHIR Lookup", group: "Translate & lookup", op: "insert_row", action: "fhir_lookup",
-    assignVar: true,
+    // #1243 removed the flat '?'-query, so structured params= is the ONLY way to express a search and the
+    // row must carry one -- without the seed the Add menu could emit a read-by-id only, and a placeholder
+    // teaching "Patient?identifier=X" generated a Handler the engine refuses on its first run.
+    assignVar: true, seed: { params: { expr: "{}" } },
     prompts: [
       { field: "var", label: "Assign result to", kind: "text", placeholder: "pat" },
       { field: "connection", label: "FHIR connection ([egress].allowed_http)", kind: "text", placeholder: "epic" },
-      { field: "query", label: "FHIR query", kind: "text", placeholder: "Patient?identifier=X" },
+      { field: "query", label: "FHIR path (search fields go in params)", kind: "text", placeholder: "Patient" },
     ],
   },
   // --- Structure & flow ---
   {
     id: "if", label: "If", group: "Structure & flow", op: "template", template: "if",
+    roles: ["handler", "router"],
     prompts: [
       { field: "field", label: "Field path", kind: "text", placeholder: "PID-3.1" },
       { field: "operator", label: "Condition", kind: "choice", choices: IF_OPERATORS },
@@ -967,20 +1106,31 @@ export const ADD_MENU_CATALOG: readonly AddMenuItem[] = [
   },
   {
     id: "elif", label: "Else If", group: "Structure & flow", op: "insert_clause", clause: "elif", anchorConstraint: "if_chain",
+    roles: ["handler", "router"],
     prompts: [
       { field: "field", label: "Field path", kind: "text", placeholder: "PID-3.1" },
       { field: "operator", label: "Condition", kind: "choice", choices: IF_OPERATORS },
       { field: "value", label: "Value", kind: "text", optional: true },
     ],
   },
-  { id: "else", label: "Else", group: "Structure & flow", op: "insert_clause", clause: "else", anchorConstraint: "if_chain", prompts: [] },
+  { id: "else", label: "Else", group: "Structure & flow", op: "insert_clause", clause: "else", anchorConstraint: "if_chain", roles: ["handler", "router"], prompts: [] },
   {
     id: "for_each", label: "For Each", group: "Structure & flow", op: "template", template: "for_each",
+    roles: ["handler", "router"],
     prompts: [{ field: "segment_id", label: "Segment id", kind: "text", placeholder: "OBX" }],
   },
   { id: "filter", label: "Filter", group: "Structure & flow", op: "template", template: "filter", prompts: [] },
   {
+    // ADR 0076 Amendment D: the router's routing return. It carries HANDLER names -- a different
+    // namespace from Send's outbound-connection names, at a different pipeline stage (D.5) -- so it is a
+    // separate item with its own prompt, never a re-labelled Send.
+    id: "route", label: "Route To", group: "Structure & flow", op: "template", template: "route",
+    roles: ["router"],
+    prompts: [{ field: "handlers", label: "Handler name(s), comma-separated", kind: "text", placeholder: "oru_relay" }],
+  },
+  {
     id: "raise", label: "Raise", group: "Structure & flow", op: "template", template: "raise",
+    roles: ["handler", "router"],
     prompts: [
       { field: "exc_type", label: "Exception", kind: "choice", choices: ["ValueError", "RuntimeError"] },
       { field: "message", label: "Message", kind: "text", placeholder: "bad MRN" },
@@ -995,6 +1145,7 @@ export const ADD_MENU_CATALOG: readonly AddMenuItem[] = [
   },
   {
     id: "comment", label: "Comment", group: "Structure & flow", op: "insert_comment",
+    roles: ["handler", "router"],
     prompts: [{ field: "text", label: "Comment", kind: "text" }],
   },
   // --- Diagnostics (editable after insert, ADR 0106 §5 K — filled inline) ---
@@ -1007,10 +1158,32 @@ export const ADD_MENU_BY_ID: Readonly<Record<string, AddMenuItem>> = Object.from
   ADD_MENU_CATALOG.map((item) => [item.id, item]),
 );
 
-/** The catalog grouped in stable order — for the grouped <optgroup> select + the right-click submenu. */
+/** Whether an Add-menu item may be inserted into an element of `role` (see {@link AddMenuItem.roles}). */
+export function itemAllowedInRole(item: AddMenuItem, role: "handler" | "router"): boolean {
+  return (item.roles ?? ["handler"]).includes(role);
+}
+
+/**
+ * The catalog grouped in stable order — for the grouped <optgroup> select + the right-click submenu.
+ *
+ * The palette is rendered once per DOCUMENT but a document may hold both handlers and routers, so every
+ * item is emitted and the ones outside the selected row's role are marked (`roleScope`) for the webview
+ * to disable — the same shape the `if_chain` anchor constraint already uses. Groups that end up entirely
+ * out of scope are still emitted, so the menu's shape does not jump as the selection moves.
+ */
 export function addMenuGroups(): { group: AddMenuGroup; items: AddMenuItem[] }[] {
   const order: AddMenuGroup[] = ["Transform", "Translate & lookup", "Structure & flow", "Diagnostics"];
   return order.map((group) => ({ group, items: ADD_MENU_CATALOG.filter((i) => i.group === group) }));
+}
+
+/** The catalog restricted to what `role` may author — the pure answer AC-R5 asserts against. */
+export function paletteFor(role: "handler" | "router"): AddMenuItem[] {
+  return ADD_MENU_CATALOG.filter((item) => itemAllowedInRole(item, role));
+}
+
+/** The `data-role-scope` attribute value for an item: the roles it is valid in, space-separated. */
+export function roleScopeAttr(item: AddMenuItem): string {
+  return (item.roles ?? ["handler"]).join(" ");
 }
 
 /**
@@ -1077,6 +1250,15 @@ export function buildAddMenuRequest(
       if (values.exc_type) req.exc_type = values.exc_type;
       if (values.message !== undefined && values.message !== "") req.message = values.message;
       if (values.destination) req.destination = values.destination;
+      // `route` gathers its handler names as one comma-separated field; split + trim here so the engine
+      // receives the list its template validates, and drop empties so a trailing comma is not a name.
+      if (values.handlers !== undefined) {
+        const names = values.handlers
+          .split(",")
+          .map((h) => h.trim())
+          .filter((h) => h.length > 0);
+        if (names.length > 0) req.handlers = names;
+      }
       return withExpect(req);
     }
     case "insert_clause": {
@@ -1176,7 +1358,13 @@ export interface ContextMenuEnablement {
  * {@link walkMove} returning a destination, so a suite edge / non-movable / sole-child row greys them).
  */
 export function contextMenuEnablement(
-  row: { kind: RowKind; appended?: boolean; scaffold?: string; filtered?: boolean },
+  row: {
+    kind: RowKind;
+    appended?: boolean;
+    scaffold?: string;
+    filtered?: boolean;
+    pragma?: boolean;
+  },
   ctx: { canMoveUp: boolean; canMoveDown: boolean },
 ): ContextMenuEnablement {
   return {
@@ -1184,8 +1372,9 @@ export function contextMenuEnablement(
     // Insert AFTER is suppressed on a terminal return (a returned send OR the `return sends` footer) — a
     // step after it is dead code — but ALLOWED on a mid-body `sends.append(...)` (ADR 0104), which is a
     // normal step, not a return.
-    insertAfter: !isReturnRow(row),
-    deleteRow: isRowEditable(row.kind),
+    // A `route` row is a return too: a step after a routing return is dead code.
+    insertAfter: !isReturnRow(row) && row.kind !== "route",
+    deleteRow: isRowMutable(row),
     moveUp: ctx.canMoveUp,
     moveDown: ctx.canMoveDown,
     // ADR 0104 fan-out: add another destination — on any real send (returned or appended), never the filter.
@@ -1279,6 +1468,7 @@ export interface TemplateRequest {
   exc_type?: string; // raise
   message?: string;
   destination?: string; // send
+  handlers?: string[]; // route (ADR 0076 Amendment D) — HANDLER names, never outbound connections
   expect_src?: string;
 }
 
@@ -1503,13 +1693,22 @@ export interface DropResolution {
 
 /**
  * Whether `target` can accept a drop of `drag` (pure). Widened from the same-suite rule to: same handler,
- * not itself, target draggable, and target is NOT inside the dragged block's own [start, end] span (so a
- * block can't be dropped into itself). NO same-suite requirement — the headline cross-suite move.
+ * not itself, target draggable, target is NOT a read-only `code` row, and target is NOT inside the
+ * dragged block's own [start, end] span (so a block can't be dropped into itself). NO same-suite
+ * requirement — the headline cross-suite move.
+ *
+ * The `code`-row rule is NOT redundant with `target.draggable`: {@link renderRowHtml} marks a `code` row
+ * draggable ON PURPOSE, purely so a drag ATTEMPT can be intercepted and answered with "edit it in the
+ * code editor" (see the comment at renderRowHtml, "never treats a code row as a drop target"). Without
+ * this line the model contradicted that stated contract while the webview mirror (`canDrop` in
+ * `media/stepsWebview.js`) honoured it — the one divergence `src/test/suite/steps-mirror.test.ts`
+ * found (BACKLOG #233).
  */
 export function canDropRow(drag: RowDropContext, target: RowDropContext): boolean {
   return (
     target !== drag &&
     target.draggable &&
+    target.kind !== "code" &&
     target.handler === drag.handler &&
     !(drag.lineStart <= target.lineStart && target.lineStart <= drag.lineEnd)
   );
@@ -1668,8 +1867,11 @@ export function insertionBarAnchor(res: DropResolution, rows: readonly RowDropCo
  * its elif/else continuation bodies, gets an "after the whole block" slot at the outer level; a
  * send/return contributes no "after" slot (a block never lands after the return). elif/else headers are
  * CONTINUATIONS (consumed with their `if`), never standalone slots.
+ *
+ * Exported (BACKLOG #233) so a parity suite can compare it against the CSP-isolated copy of
+ * `buildDropSlots` in `media/stepsWebview.js`; it has no production caller outside {@link walkMove}.
  */
-function buildDropSlots(rows: readonly RowDropContext[]): DropResolution[] {
+export function buildDropSlots(rows: readonly RowDropContext[]): DropResolution[] {
   const childrenBySuite = new Map<string, RowDropContext[]>();
   for (const r of rows) {
     const list = childrenBySuite.get(r.suite);
@@ -1973,9 +2175,19 @@ export function buildPasteRequest(
  * `shouldReactToDocumentChange()` is false, so the `WorkspaceEdit` we apply does NOT feed back into a
  * re-render that would fight the webview (the loop). `endEdit()` releases the slot. Pure + synchronous,
  * so the provider's flow is unit-testable without the Extension Host.
+ *
+ * A suppressed change is DEFERRED, not dropped (BACKLOG #234). `shouldReactToDocumentChange()` returning
+ * false is the right answer for OUR OWN `WorkspaceEdit`, but the provider cannot tell that apart from a
+ * USER save that happened to land while a `lens rewrite` held the slot — and returning false made the
+ * caller return early, discarding the save outright. The view would then keep showing a projection of
+ * the pre-save buffer until the next save. So a caller that declines to react calls
+ * {@link EditLoopGuard.noteSuppressedChange}, and the release path ({@link releaseEdit}) runs the owed
+ * refresh once the slot frees. The debt is recorded as a single boolean (a re-projection is idempotent —
+ * ten suppressed saves owe exactly one refresh), mirroring the queue/take shape of the pending edits.
  */
 export class EditLoopGuard {
   private inFlight = false;
+  private suppressedChange = false;
   private readonly pending = new Map<string, EditMessage>();
 
   beginEdit(): boolean {
@@ -2023,8 +2235,31 @@ export class EditLoopGuard {
     this.inFlight = false;
   }
 
+  /**
+   * Record that a document change arrived while the slot was held and was therefore NOT acted on, so the
+   * re-projection it owes can run when the slot frees (BACKLOG #234). Idempotent: a re-projection reads
+   * the whole buffer, so any number of suppressed changes owe exactly one refresh. Prefer
+   * {@link releaseEdit} over calling {@link EditLoopGuard.endEdit} directly so the debt is always paid.
+   */
+  noteSuppressedChange(): void {
+    this.suppressedChange = true;
+  }
+
+  /** Take (and CLEAR) the owed-refresh flag — the same clear-on-read contract {@link takePending} has,
+   * so a refresh can never be run twice for one suppressed change. */
+  takeSuppressedChange(): boolean {
+    const owed = this.suppressedChange;
+    this.suppressedChange = false;
+    return owed;
+  }
+
   get isEditing(): boolean {
     return this.inFlight;
+  }
+
+  /** Whether a document change was suppressed and still owes a re-projection (diagnostics/tests). */
+  get hasSuppressedChange(): boolean {
+    return this.suppressedChange;
   }
 
   /** How many distinct-field edits are waiting to be applied after the in-flight one (F5). */
@@ -2039,6 +2274,80 @@ export class EditLoopGuard {
 }
 
 /**
+ * Release the single edit slot, then run any re-projection a document change owed while the slot was
+ * held (BACKLOG #234). THE ONLY sanctioned way to release: calling {@link EditLoopGuard.endEdit}
+ * directly frees the slot without paying the debt, which is exactly the dropped-save defect — a save
+ * that landed mid-rewrite would leave the view showing a stale projection until the user saved again.
+ *
+ * `onRefreshOwed` is invoked at most once per suppressed run (the flag is clear-on-read) and NOT AT ALL
+ * when nothing was suppressed, so the ordinary path is unchanged. Synchronous and never throwing on its
+ * own; the callback is the caller's (the provider schedules its debounced `render()`).
+ */
+export function releaseEdit(guard: EditLoopGuard, onRefreshOwed?: () => void): void {
+  guard.endEdit();
+  if (guard.takeSuppressedChange()) {
+    onRefreshOwed?.();
+  }
+}
+
+/**
+ * The ONE debounced re-projection channel (ADR 0076 §5 "sync on save", Amendment C / BACKLOG #234).
+ *
+ * Two callers ask for a re-projection and they must not stack: the save subscription, and
+ * {@link releaseEdit} paying the refresh a suppressed save owed. Both go through {@link schedule}, so
+ * they coalesce into one run exactly like two rapid saves do.
+ *
+ * {@link cancel} is the half that stops a suppressed save from producing TWO re-projections. Three of
+ * the provider's release sites (`applyStructural`, `applyPickedEdit`, `applyUndoRedo`) release the slot
+ * and then FORCE a full re-projection a few lines later. Without cancellation the forced run and the
+ * armed debounced run both fire — a second `lens parse` child process and a second whole-webview HTML
+ * replacement ~250 ms later, which lands on the user as a flicker that eats focus and any half-typed
+ * input. A re-projection reads the whole current buffer, so the run starting NOW already satisfies
+ * whatever the armed one owed: cancelling is a discharge, not a drop.
+ *
+ * `cancel` covers the release-THEN-force order only. The provider's `render()` therefore ALSO calls
+ * {@link EditLoopGuard.takeSuppressedChange} for the force-THEN-release order (`drainEdits`' rejection
+ * handler renders INSIDE the drain, before the `finally` releases, so nothing is armed yet to cancel).
+ * Paths that return before ANY render — a `lens rewrite` refusal, a disposed panel — reach neither
+ * discharge, so the deferral stays load-bearing exactly where it is the only route.
+ *
+ * Timer functions are injected rather than closed over so the whole channel is unit-testable node-side
+ * with a fake clock, the same reason {@link drainEdits} lives here instead of in the provider.
+ */
+export class RerenderDebouncer<H = unknown> {
+  private handle: H | undefined;
+
+  constructor(
+    private readonly run: () => void,
+    private readonly delayMs: number,
+    private readonly setTimer: (fn: () => void, ms: number) => H,
+    private readonly clearTimer: (handle: H) => void,
+  ) {}
+
+  /** Arm (or RE-arm) the debounce. Repeated calls before it fires collapse to one run. */
+  schedule(): void {
+    this.cancel();
+    this.handle = this.setTimer(() => {
+      this.handle = undefined;
+      this.run();
+    }, this.delayMs);
+  }
+
+  /** Discharge any armed run. Called at the TOP of a re-projection, and on panel dispose. */
+  cancel(): void {
+    if (this.handle !== undefined) {
+      this.clearTimer(this.handle);
+      this.handle = undefined;
+    }
+  }
+
+  /** Whether a run is currently armed (tests + diagnostics). */
+  get armed(): boolean {
+    return this.handle !== undefined;
+  }
+}
+
+/**
  * Drain one edit + any queued follow-ups through `apply`, one at a time, under the loop guard (ADR 0076
  * §5). Extracted from the provider (which imports vscode) so the whole drain — including the guarantee
  * that an UNEXPECTED `apply` rejection never strands a queued edit — is unit-testable node-side.
@@ -2048,13 +2357,16 @@ export class EditLoopGuard {
  * yields. `apply` performs the actual `lens rewrite` + `WorkspaceEdit`; its OWN handled outcomes (a CLI
  * refusal) never throw, but an unexpected `WorkspaceEdit` rejection (or a spawn failure) would — that is
  * caught, routed to `onError`, and the loop KEEPS DRAINING so a pending second edit is not wedged until
- * the user types again. The slot is always released in `finally`. Never throws.
+ * the user types again. The slot is always released in `finally` — through {@link releaseEdit}, so a
+ * document change suppressed during the drain still gets its re-projection (BACKLOG #234), including on
+ * the rejected-apply path above. Never throws.
  */
 export async function drainEdits(
   guard: EditLoopGuard,
   first: EditMessage,
   apply: (msg: EditMessage) => Promise<void>,
   onError?: (err: unknown, msg: EditMessage) => void,
+  onRefreshOwed?: () => void,
 ): Promise<void> {
   if (!guard.beginEdit()) {
     guard.queue(first);
@@ -2071,7 +2383,7 @@ export async function drainEdits(
       current = guard.takePending();
     }
   } finally {
-    guard.endEdit();
+    releaseEdit(guard, onRefreshOwed);
   }
 }
 
@@ -2114,7 +2426,72 @@ export function pickMode(action: string | undefined, param: string): "path" | "s
   return action && HL7_PATH_PARAMS[action]?.includes(param) ? "path" : undefined;
 }
 
-function renderParamsHtml(params: ParamField[], editable: Set<string>, handlerName: string, row: RowViewModel): string {
+// ---- op parameter schema (BACKLOG #235) -------------------------------------------------------------
+//
+// The IDE drives each EDITABLE param's input WIDGET from the engine's own type hints instead of a
+// hand-maintained per-op input table (a second source of truth that drifts from the signatures). The
+// engine emits it as `messagefoundry lens schema --json` (messagefoundry/lens_schema.py); the IDE shells
+// it via cli.lensSchema() and threads it through the pure renderer below. This WIDENS what an
+// already-recognized, already-editable row exposes as a richer control — it does NOT widen the
+// recognition grammar or make any new param editable (the editable gating is unchanged, ADR 0076 §5).
+
+/** One parameter's schema entry, as `lens schema` emits it (see lens_schema.py's module docstring). */
+export interface OpParamSchema {
+  name: string;
+  // The minimal, stable kind vocabulary the engine emits. `unknown` (and any absent op) falls back to a
+  // plain text input, so an unrecognized hint never breaks the form.
+  kind: "str" | "int" | "float" | "bool" | "enum" | "list" | "codeset" | "unknown";
+  required: boolean;
+  keyword_only: boolean;
+  choices?: string[]; // enum kinds only
+  default?: string | number | boolean | null; // present only when the default is a JSON scalar
+  nullable?: boolean; // an `X | None` slot
+}
+
+/** The whole `lens schema` payload: op-name -> its editable params. */
+export type OpSchema = Record<string, OpParamSchema[]>;
+
+/** The input widget a param resolves to (a text input is the universal fallback). */
+export interface WidgetSpec {
+  kind: "text" | "number" | "enum";
+  choices?: string[]; // enum only
+}
+
+/**
+ * Resolve the input widget for one op's param from the schema (pure — the single place the kind ->
+ * widget mapping lives, so the renderer and its tests agree). An `enum` (with choices) -> a dropdown; an
+ * `int`/`float` -> a validated number field; everything else — `str`, `codeset` (an expression slot, not
+ * a per-row literal), `unknown`, an op ABSENT from the schema, or no schema at all -> a text input (the
+ * current behavior, so an unmapped/older contract degrades cleanly).
+ */
+export function resolveWidget(
+  op: string | undefined,
+  paramName: string,
+  schema: OpSchema | undefined,
+): WidgetSpec {
+  if (!op || !schema) {
+    return { kind: "text" };
+  }
+  const param = schema[op]?.find((p) => p.name === paramName);
+  if (!param) {
+    return { kind: "text" };
+  }
+  if (param.kind === "enum" && param.choices && param.choices.length > 0) {
+    return { kind: "enum", choices: param.choices };
+  }
+  if (param.kind === "int" || param.kind === "float") {
+    return { kind: "number" };
+  }
+  return { kind: "text" };
+}
+
+function renderParamsHtml(
+  params: ParamField[],
+  editable: Set<string>,
+  handlerName: string,
+  row: RowViewModel,
+  schema?: OpSchema,
+): string {
   if (params.length === 0) {
     return "";
   }
@@ -2126,11 +2503,51 @@ function renderParamsHtml(params: ParamField[], editable: Set<string>, handlerNa
         // stale coordinate is refused, not mis-spliced (F7). An empty value shows a `[blank]` placeholder (a
         // hint, NOT a value) so a freshly-inserted template reads as "fill me in"; `placeholder` is inert on
         // submit, so the F7 round-trip is unaffected.
-        const input =
-          `<input type="text" class="edit" data-handler="${escapeHtml(handlerName)}" ` +
+        //
+        // BACKLOG #235: the input WIDGET is resolved from the engine's param schema (enum -> <select>,
+        // int/float -> type=number, everything else -> text). Every widget carries the IDENTICAL edit
+        // coordinates (data-handler/data-line-start/data-line-end/data-expect-src/data-name) so the F7
+        // stale-guard round-trip is unchanged; with no schema (the read-only callers) every param resolves
+        // to `text`, so this markup is byte-identical to before.
+        const attrs =
+          `data-handler="${escapeHtml(handlerName)}" ` +
           `data-line-start="${row.lineStart}" data-line-end="${row.lineEnd}" ` +
           `data-expect-src="${escapeHtml(row.expectSrc ?? "")}" ` +
-          `data-name="${escapeHtml(p.name)}" value="${escapeHtml(p.value)}" placeholder="[blank]" />`;
+          `data-name="${escapeHtml(p.name)}"`;
+        const widget = resolveWidget(row.action, p.name, schema);
+        let input: string;
+        if (widget.kind === "enum" && widget.choices) {
+          // A closed-set param -> a dropdown; the current value is pre-selected. When the current literal
+          // is NOT one of the schema's choices (a hand-authored value the vocabulary no longer lists), it
+          // is prepended as the selected option so the dropdown DISPLAYS the actual argument — otherwise a
+          // <select> with no selected option shows its FIRST choice, misrepresenting an unchanged literal.
+          // The out-of-set option still round-trips through the same edit splice; an empty value takes no
+          // such option (the [blank] hint role is left to the choices).
+          const inSet = widget.choices.includes(p.value);
+          const current =
+            !inSet && p.value !== ""
+              ? `<option value="${escapeHtml(p.value)}" selected>${escapeHtml(p.value)}</option>`
+              : "";
+          const options = widget.choices
+            .map(
+              (c) =>
+                `<option value="${escapeHtml(c)}"${c === p.value ? " selected" : ""}>` +
+                `${escapeHtml(c)}</option>`,
+            )
+            .join("");
+          input = `<select class="edit" ${attrs}>${current}${options}</select>`;
+        } else if (widget.kind === "number") {
+          // A number field posts a JS number (see stepsWebview.js) so the engine renders an int/float
+          // literal, never a re-typed string literal (`_render_literal` renders `6` for an int but `"6"`
+          // for a str — posting the string would silently retype the arg).
+          input =
+            `<input type="number" class="edit" ${attrs} ` +
+            `value="${escapeHtml(p.value)}" placeholder="[blank]" />`;
+        } else {
+          input =
+            `<input type="text" class="edit" ${attrs} ` +
+            `value="${escapeHtml(p.value)}" placeholder="[blank]" />`;
+        }
         // ADR 0104 §2.3: a pickable HL7 path/segment slot gets a picker button BESIDE its input. The input is
         // NEVER removed (free-text always available); the pick writes through the SAME edit splice. Only a
         // slot with a pick button gets the horizontal `.edit-row` wrapper — every other editable field's
@@ -2198,7 +2615,12 @@ function renderRowActionsHtml(row: RowViewModel, handlerName: string): string {
 /** Render one row as a nested list item. Pure — every dynamic value is escaped. `handlerName` scopes an
  * editable field's edit coordinates + the structural affordances (phase 3); omit it (read-only callers)
  * to keep every field disabled and hide the structural buttons. */
-export function renderRowHtml(row: RowViewModel, handlerName = ""): string {
+export function renderRowHtml(
+  row: RowViewModel,
+  handlerName = "",
+  schema?: OpSchema,
+  role: "handler" | "router" = "handler",
+): string {
   const indent = `style="margin-left:${row.nesting * INDENT_PX}px"`;
   const badge = row.badge ? `<span class="badge">${escapeHtml(row.badge)}</span>` : "";
   const subtitle = row.subtitle ? `<span class="subtitle">${escapeHtml(row.subtitle)}</span>` : "";
@@ -2210,7 +2632,7 @@ export function renderRowHtml(row: RowViewModel, handlerName = ""): string {
   const body =
     row.kind === "code"
       ? `<pre class="code">${escapeHtml(row.code ?? "")}</pre>`
-      : renderParamsHtml(row.params, editable, handlerName, row);
+      : renderParamsHtml(row.params, editable, handlerName, row, schema);
   const lineLabel =
     row.lineStart === row.lineEnd ? `line ${row.lineStart}` : `lines ${row.lineStart}–${row.lineEnd}`;
   // A MOVABLE row (an action/lookup/send row, or a whole if/for block via its header row) is a drag SOURCE
@@ -2236,6 +2658,12 @@ export function renderRowHtml(row: RowViewModel, handlerName = ""): string {
     // `data-scaffold` (the muted init/footer), `data-is-return` (the terminal-return test).
     `data-appended="${row.appended ? "true" : ""}" data-scaffold="${escapeHtml(row.scaffold ?? "")}" ` +
     `data-is-return="${row.isReturn ? "true" : ""}" data-filtered="${row.filtered ? "true" : ""}" ` +
+    // ADR 0076 Amendment A: a PRAGMA note is read-only, so the webview mirror greys its edit/delete/move
+    // controls rather than letting the user discover the engine's refusal as an error toast (F6).
+    `data-pragma="${row.pragma ? "true" : ""}" ` +
+    // ADR 0076 Amendment D: the enclosing element's role, so the Add-palette can grey the items this
+    // role may not author rather than letting the user meet the engine's refusal as an error toast (F6).
+    `data-role="${escapeHtml(role)}" ` +
     // data-control (control rows only) lets the DnD layer include an elif/else CONTINUATION when it walks a
     // dropped-after block's body to find its visual bottom (the insertion-bar anchor, insertionBarAnchor).
     `data-control="${escapeHtml(row.control ?? "")}">` +
@@ -2254,8 +2682,11 @@ export function renderRowHtml(row: RowViewModel, handlerName = ""): string {
 }
 
 /** Render one handler's Steps (header + ordered nested rows). Pure. */
-export function renderHandlerHtml(handler: HandlerViewModel): string {
-  const rows = handler.rows.map((r) => renderRowHtml(r, handler.handler)).join("");
+export function renderHandlerHtml(handler: HandlerViewModel, schema?: OpSchema): string {
+  const role = handler.role ?? "handler";
+  const rows = handler.rows
+    .map((r) => renderRowHtml(r, handler.handler, schema, role))
+    .join("");
   return (
     `<section class="handler">` +
     `<h2>${escapeHtml(handler.handler)}` +
@@ -2266,12 +2697,13 @@ export function renderHandlerHtml(handler: HandlerViewModel): string {
   );
 }
 
-/** Render every handler's Steps body (the provider wraps this in the CSP/nonce page shell). Pure. */
-export function renderHandlersHtml(handlers: HandlerViewModel[]): string {
+/** Render every handler's Steps body (the provider wraps this in the CSP/nonce page shell). Pure.
+ * `schema` (BACKLOG #235) drives each editable param's widget; omitted -> every param is a text input. */
+export function renderHandlersHtml(handlers: HandlerViewModel[], schema?: OpSchema): string {
   if (handlers.length === 0) {
     return `<p class="empty">No handlers to show.</p>`;
   }
-  return handlers.map(renderHandlerHtml).join("");
+  return handlers.map((h) => renderHandlerHtml(h, schema)).join("");
 }
 
 /**
@@ -2299,6 +2731,7 @@ export function renderStepsContextMenuHtml(): string {
                 `<button type="button" class="ctx-item" role="menuitem" ` +
                 `data-cmd="insert" data-position="${position}" data-item-id="${escapeHtml(item.id)}"` +
                 (item.anchorConstraint ? ` data-anchor="${escapeHtml(item.anchorConstraint)}"` : "") +
+                ` data-role-scope="${escapeHtml(roleScopeAttr(item))}"` +
                 `>${escapeHtml(item.label)}</button>`,
             )
             .join(""),

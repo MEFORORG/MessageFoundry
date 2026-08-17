@@ -1,6 +1,6 @@
 # Copyright (c) MessageFoundry contributors.
-# SPDX-License-Identifier: Apache-2.0
-"""A3 — value-level coverage for the per-PID CPU collector.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""A3 — value-level coverage for the per-PID CPU collector, and for the SUBTREE the values cover.
 
 Before this module the CPU path had **no value-level test at all**: ``test_connscale_smoke`` asserted
 ``fd_count_peak`` only, and ``test_fd_sampler_reads_self`` exercised ``.sample()`` (handles), never
@@ -8,13 +8,20 @@ Before this module the CPU path had **no value-level test at all**: ``test_conns
 exactly what the SQL-Server rig observed, and exactly this harness's signature defect: a plausible number
 where there is no measurement.
 
-Two properties are asserted here:
+Properties asserted here:
 
 1. **A flat cumulative CPU counter over a non-trivial span degrades to a GAP (``None``), never ``0.00``.**
    The counter's unit is 100 ns; a process we could read handles for consumed *some* CPU. A flat counter
    means the sampler is bound to the wrong process (an idle launcher/supervisor, or a subtree cached
    before the shard workers spawned), so it must report "unknown", not "idle".
 2. **A process that genuinely burns CPU is measured as burning CPU.** The positive control.
+3. **The subtree the gauges are summed over is the engine's** (BACKLOG #1210). A gauge is only as good
+   as its covering PID set, and an unvalidated ppid walk adopts a stale-parent subtree wholesale. The
+   ``stale_ppid`` group below drives the real probe over a deliberately adopted subtree and asserts the
+   reported peak EXCLUDES it, with the adoption itself asserted first as a live positive control.
+
+Note the fixtures derive ``handles``/``working_set_bytes`` FROM each tick's PID set (see
+``_HANDLES_PER_PID``) rather than pinning them: pinning is what made property 3 untestable here.
 """
 
 from __future__ import annotations
@@ -26,7 +33,15 @@ import time
 
 import pytest
 
-from harness.load.connscale.probe import _PROBE_TIMEOUT_S, FdSampler, ProcSample
+from harness.load.connscale.probe import (
+    _CREATION_SKEW_TOLERANCE_S,
+    _PROBE_TIMEOUT_S,
+    FdSampler,
+    ProcRow,
+    ProcSample,
+    _posix_stat_ppid_starttime,
+    _validated_descendants,
+)
 from harness.load.connscale.runner import _PROC_BY_SAMPLE, _drain_proc
 from harness.load.enginepoll import EngineSample
 
@@ -61,6 +76,16 @@ def _sample(elapsed: float) -> EngineSample:
 # A stable single-PID subtree — the common case, where every interval is a clean same-set delta.
 _STABLE_PIDS = frozenset({1234})
 
+# Per-PID handle / RSS weights, so a fixture tick's handles and working set MOVE WITH the PID set it
+# was summed over — as the real probe's do. BACKLOG #1210: the fixture used to pin ``handles=61`` and
+# ``working_set_bytes=6_000_000`` on EVERY tick regardless of the ``cpu_pids`` it was varying. On
+# Windows both come from the SAME ``Get-Process`` rows, so a PID joining the sum necessarily moves
+# both; a tick where the set grows and the handle count does not is physically unrealizable. That made
+# it the one input shape in which an over-wide subtree is INVISIBLE, and the fixture then asserted the
+# FD/RSS pass-through as correct. Deriving from the set means no test can pin them apart again.
+_HANDLES_PER_PID = 61
+_WS_BYTES_PER_PID = 6_000_000
+
 
 def _derive(pairs: list[tuple[float, float | None]]) -> object:
     """Drive ``_drain_proc`` over (elapsed_s, cumulative_cpu_seconds) readings, holding the summed-over
@@ -72,12 +97,19 @@ def _derive_sets(
     triples: list[tuple[float, float | None, frozenset[int] | None]],
 ) -> object:
     """Drive ``_drain_proc`` over (elapsed_s, cumulative_cpu_seconds, cpu_pids) readings, so a test can
-    change the summed-over subtree between ticks (#220)."""
+    change the summed-over subtree between ticks (#220).
+
+    ``handles`` / ``working_set_bytes`` are DERIVED from that tick's PID set (see ``_HANDLES_PER_PID``),
+    never pinned: a tick with no observed set reports both as gaps, and a tick over a wider set reports
+    a proportionally wider footprint."""
     samples = []
     for elapsed, cpu, pids in triples:
         s = _sample(elapsed)
         _PROC_BY_SAMPLE[id(s)] = ProcSample(
-            handles=61, cpu_seconds=cpu, working_set_bytes=6_000_000, cpu_pids=pids
+            handles=None if pids is None else _HANDLES_PER_PID * len(pids),
+            cpu_seconds=cpu,
+            working_set_bytes=None if pids is None else _WS_BYTES_PER_PID * len(pids),
+            cpu_pids=pids,
         )
         samples.append(s)
     return _drain_proc(samples)
@@ -91,8 +123,9 @@ def test_flat_cpu_counter_over_a_long_span_is_a_gap_not_zero() -> None:
     assert d.cpu_util_cores_mean is None
     assert d.cpu_util_cores_peak is None
     # The non-CPU gauges still read — the process WAS there, which is precisely why flat CPU is a bug.
-    assert d.handles_peak == 61
-    assert d.working_set_peak_bytes == 6_000_000
+    # The subtree here is the single stable PID, so the footprint is one PID's worth.
+    assert d.handles_peak == _HANDLES_PER_PID * len(_STABLE_PIDS)
+    assert d.working_set_peak_bytes == _WS_BYTES_PER_PID * len(_STABLE_PIDS)
 
 
 def test_flat_cpu_counter_over_a_short_span_stays_zero() -> None:
@@ -149,9 +182,15 @@ def test_a_membership_changed_interval_is_degraded_to_a_gap() -> None:
     assert d.cpu_seconds_total is None
     assert d.cpu_util_cores_mean is None
     assert d.cpu_util_cores_peak is None
-    # The non-CPU gauges still read — the process set was observed, only its CPU delta is unsound.
-    assert d.handles_peak == 61
-    assert d.working_set_peak_bytes == 6_000_000
+    # The non-CPU gauges still read, and they read the WIDER middle tick — `max()` latches the two-PID
+    # sum. That is arithmetically fine for an instantaneous gauge over a genuinely larger subtree, and
+    # it is exactly why an over-wide subtree is not a #220-shaped problem: the number is not a
+    # difference, so no gate here can tell a real second process from an adopted one — provenance has
+    # to be established at the WALK, which is what the stale-ppid group below covers (BACKLOG #1210).
+    # The old form of this assertion read `== 61` on all three ticks, which pinned the join to zero
+    # effect and asserted that pass-through as correct.
+    assert d.handles_peak == _HANDLES_PER_PID * 2
+    assert d.working_set_peak_bytes == _WS_BYTES_PER_PID * 2
 
 
 def test_a_departing_pid_does_not_drive_cpu_negative() -> None:
@@ -324,3 +363,232 @@ def test_a_transient_resolve_error_does_not_blackout_the_rest_of_the_run(
     assert sampler._resolve_errored is True
     sampler._resolve_pids()  # call 5: served from the still-valid cache -> the run recovers
     assert sampler._resolve_errored is False
+
+
+# --- stale_ppid: the subtree the gauges cover is the ENGINE's (BACKLOG #1210) ----------------------
+
+#: Length of the synthetic post-comm tail: comfortably past field 22 (index 19).
+_STAT_TAIL_LEN = 30
+
+
+def _stat_line(*, ppid: int = 4242, starttime: int = 987654) -> str:
+    """A synthetic ``/proc/<pid>/stat`` body, addressed BY INDEX so the fixture cannot drift out of
+    alignment with the parser it checks. Fields after the comm are numbered from 3, so index i holds
+    field i+3: [0] = state, [1] = ppid (field 4), [19] = starttime (field 22).
+
+    Every other slot is filled with a NON-NUMERIC marker, so a parser that read a neighbouring index
+    would return ``None`` rather than a plausible wrong number. The comm deliberately contains a space
+    AND a ``)`` so the split-after-the-LAST-``)`` rule is exercised rather than assumed."""
+    fields = [f"field{i + 3}" for i in range(_STAT_TAIL_LEN)]
+    fields[0] = "S"
+    fields[1] = str(ppid)
+    fields[19] = str(starttime)
+    return "1234 (py thon) proc) " + " ".join(fields) + "\n"
+
+
+def test_posix_stat_parse_reads_ppid_and_field_22_starttime() -> None:
+    # The POSIX half of the provenance check hangs entirely off field 22. Locate it by CONSTRUCT: build
+    # a stat body whose field 22 is a distinctive value and require the parser to find exactly that.
+    parsed = _posix_stat_ppid_starttime(_stat_line(ppid=77, starttime=555_000))
+    assert parsed is not None
+    ppid, started = parsed
+    assert ppid == 77
+    assert started is not None
+    # starttime is in clock ticks since boot; the parser divides by SC_CLK_TCK so callers can state a
+    # tolerance in seconds. Assert the RATIO, not a hardcoded Hz, so this holds on any tick rate.
+    clk = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+    assert started == pytest.approx(555_000 / float(clk))
+
+
+def test_posix_stat_parse_degrades_rather_than_guessing_on_a_truncated_line() -> None:
+    # A line long enough for ppid but not for field 22 yields ppid + an UNKNOWN start time. Unknown must
+    # stay unknown: the walk rejects an unvalidatable candidate rather than admitting it.
+    short = "1234 (py) S 99 " + " ".join(f"field{i + 5}" for i in range(10)) + "\n"
+    assert _posix_stat_ppid_starttime(short) == (99, None)
+    assert _posix_stat_ppid_starttime("1234 (py)\n") is None
+
+
+def _rows(*triples: ProcRow) -> list[ProcRow]:
+    return list(triples)
+
+
+def test_a_candidate_that_predates_the_root_is_not_a_descendant() -> None:
+    # The #1210 mechanism in miniature: pid 900 is live, its recorded parent PID was RECYCLED onto the
+    # root, and 900 predates the root by an hour. It is not a descendant of THIS root.
+    root_started = 10_000.0
+    walked = _validated_descendants(
+        _rows(
+            (500, 1, root_started),  # the root
+            (900, 500, root_started - 3600.0),  # adopted via a stale ppid
+            (901, 500, root_started + 0.05),  # a genuine child, spawned just after the root
+        ),
+        500,
+    )
+    assert walked == [901]
+
+
+def test_the_subtree_of_a_rejected_candidate_is_pruned_not_re_entered() -> None:
+    # One wrong ppid link drags in the adoptee's WHOLE TREE, not the adoptee alone. A child of a
+    # rejected node is created after the rejected node — so it passes the creation test on its own —
+    # and must still be excluded, because its ancestry runs through a node that is not ours.
+    root_started = 10_000.0
+    walked = _validated_descendants(
+        _rows(
+            (500, 1, root_started),
+            (900, 500, root_started - 3600.0),  # rejected: predates the root
+            (901, 900, root_started + 5.0),  # its child: NEWER than the root, still not ours
+            (902, 901, root_started + 6.0),  # and its grandchild
+        ),
+        500,
+    )
+    assert walked == []
+
+
+def test_a_candidate_with_no_creation_instant_is_rejected_fail_closed() -> None:
+    # Unvalidatable is not validated. Admitting a row whose creation instant the OS did not record
+    # would leave the exact hole this check exists to close.
+    walked = _validated_descendants(_rows((500, 1, 10_000.0), (900, 500, None)), 500)
+    assert walked == []
+
+
+def test_a_snapshot_without_the_root_cannot_validate_anything() -> None:
+    # No root creation instant means no floor, so nothing is checkable. Report "cannot resolve" (None),
+    # which the Windows caller turns into a degraded gap plus a retry, rather than walking unchecked.
+    assert _validated_descendants(_rows((900, 500, 10_000.0)), 500) is None
+
+
+def test_a_genuine_child_within_the_clock_skew_tolerance_is_still_adopted() -> None:
+    # The POSITIVE CONTROL for the rejections above: the check must not start dropping real
+    # descendants. The creation stamp is a wall-clock read (~15.6 ms kernel granularity on Windows), so
+    # a child can legitimately timestamp a hair BEFORE its parent; the tolerance covers that, and
+    # nothing near the age of a genuine adoption.
+    root_started = 10_000.0
+    inside = _validated_descendants(
+        _rows((500, 1, root_started), (900, 500, root_started - _CREATION_SKEW_TOLERANCE_S / 2)),
+        500,
+    )
+    assert inside == [900]
+    outside = _validated_descendants(
+        _rows((500, 1, root_started), (900, 500, root_started - _CREATION_SKEW_TOLERANCE_S * 2)),
+        500,
+    )
+    assert outside == []
+
+
+def test_the_walk_still_terminates_on_a_ppid_cycle() -> None:
+    # The pre-#1210 walk's only guard was the cycle guard; keep it. A recycled PID can produce a loop.
+    root_started = 10_000.0
+    walked = _validated_descendants(
+        _rows(
+            (500, 1, root_started),
+            (600, 500, root_started + 1.0),
+            (601, 600, root_started + 2.0),
+            (600, 601, root_started + 1.0),  # 600 reappears as its own grandchild
+        ),
+        500,
+    )
+    assert sorted(walked) == [600, 601]
+
+
+# --- the acceptance test: the real probe, over a real deliberately-adopted subtree -----------------
+
+_IDLE = "import time; time.sleep(45)"
+#: The adoptee opens a large, countable block of sockets so its contribution to a handle/fd SUM is
+#: unmistakable — the point of the acceptance test is the MAGNITUDE, not just set membership.
+_ADOPTEE_HANDLES = 200
+_HANDLE_HOG = (
+    f"import socket, time; s=[socket.socket() for _ in range({_ADOPTEE_HANDLES})]; time.sleep(45)"
+)
+
+
+def _enumerate(sampler: FdSampler) -> list[ProcRow] | None:
+    return sampler._enumerate_windows() if sys.platform == "win32" else sampler._enumerate_posix()
+
+
+def _bfs_unvalidated(rows: list[ProcRow], root: int) -> list[int]:
+    """The PRE-#1210 walk, reproduced here so the test can show what it WOULD have reported: BFS the
+    ppid map with a cycle guard and no other check."""
+    children: dict[int, list[int]] = {}
+    for pid, ppid, _ in rows:
+        children.setdefault(ppid, []).append(pid)
+    out: list[int] = []
+    seen = {root}
+    queue = list(children.get(root, []))
+    while queue:
+        pid = queue.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        out.append(pid)
+        queue.extend(children.get(pid, []))
+    return out
+
+
+def _handles_peak_over(sampler: FdSampler, pids: list[int]) -> int | None:
+    """Sum a REAL per-PID OS read over ``pids`` and push it through ``_drain_proc``, so what the test
+    asserts is the reported ``handles_peak`` gauge rather than an intermediate."""
+    raw = sampler._sample_windows(pids) if sys.platform == "win32" else sampler._sample_posix(pids)
+    s = _sample(0.0)
+    _PROC_BY_SAMPLE[id(s)] = raw
+    return _drain_proc([s]).handles_peak
+
+
+@pytest.mark.skipif(sys.platform not in ("win32", "linux"), reason="OS process-table probe path")
+def test_the_reported_peak_excludes_a_stale_ppid_adopted_subtree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #1210 acceptance. Drive the real probe over a real adopted subtree and show the reported
+    ``handles_peak`` no longer carries it.
+
+    Everything here is the OS's own except ONE bit: the adoptee's recorded parent PID is re-pointed at
+    the root. That single rewrite is exactly what Windows reports once the adoptee's real parent exits
+    and the root is later issued that PID, and it is the one input that cannot be manufactured on
+    demand — forcing a real PID recycle means exhausting the PID space. The live PIDs, their creation
+    instants, the per-PID handle reads and the peak derivation are all real.
+    """
+    # Spawn the ADOPTEE first, so it genuinely predates the root by more than the skew tolerance.
+    adoptee = subprocess.Popen([sys.executable, "-c", _HANDLE_HOG])  # noqa: S603 - fixed argv
+    root: subprocess.Popen[bytes] | None = None
+    try:
+        time.sleep(2 * _CREATION_SKEW_TOLERANCE_S)
+        root = subprocess.Popen([sys.executable, "-c", _IDLE])  # noqa: S603 - fixed argv
+        time.sleep(1.0)  # let both settle (and any launcher shim re-exec its base interpreter)
+
+        sampler = FdSampler(root.pid, resolve_every=1)
+        real_rows = _enumerate(sampler)
+        if not real_rows:
+            pytest.skip("process-table enumeration unavailable on this runner")
+        if all(pid != root.pid for pid, _, _ in real_rows):
+            pytest.skip("the spawned root is not in the process-table snapshot")
+
+        adopted_rows: list[ProcRow] = [
+            (pid, root.pid, created) if pid == adoptee.pid else (pid, ppid, created)
+            for pid, ppid, created in real_rows
+        ]
+        monkeypatch.setattr(sampler, "_enumerate_windows", lambda: adopted_rows)
+        monkeypatch.setattr(sampler, "_enumerate_posix", lambda: adopted_rows)
+
+        # (1) POSITIVE CONTROL: the adoption is real. The pre-#1210 walk pulls the adoptee in, so this
+        #     fixture genuinely reproduces the class rather than asserting a vacuous absence.
+        would_have = _bfs_unvalidated(adopted_rows, root.pid)
+        assert adoptee.pid in would_have, (adoptee.pid, would_have)
+
+        # (2) The validated walk rejects it.
+        resolved = sampler._resolve_pids()
+        assert sampler._resolve_errored is False
+        assert resolved[0] == root.pid
+        assert adoptee.pid not in resolved, (adoptee.pid, resolved)
+
+        # (3) And the number an SLO would judge — handles_peak — excludes it. Measured, not asserted
+        #     structurally: the adopted sum must exceed the validated one by at least the block of
+        #     sockets the adoptee holds.
+        validated_peak = _handles_peak_over(sampler, resolved)
+        adopted_peak = _handles_peak_over(sampler, [root.pid, *would_have])
+        if validated_peak is None or adopted_peak is None:
+            pytest.skip("per-PID handle read unavailable on this runner")
+        assert adopted_peak - validated_peak >= _ADOPTEE_HANDLES, (adopted_peak, validated_peak)
+    finally:
+        for proc in (adoptee, root):
+            if proc is not None:
+                proc.kill()
+                proc.wait(timeout=10)

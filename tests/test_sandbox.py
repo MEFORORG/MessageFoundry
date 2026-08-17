@@ -13,7 +13,10 @@ answer a later dispatch, and the engine's code-set tables — not the child's ow
 from __future__ import annotations
 
 import math
+import os
 import queue
+import signal
+import sys
 import time
 from pathlib import Path
 from types import MappingProxyType
@@ -100,6 +103,22 @@ class _Gadget:
 @handler("h_gadget")
 def h_gadget(msg):
     return _Gadget()
+
+
+@handler("h_gen_fanout")
+def h_gen_fanout(msg):
+    # A GENERATOR handler (BACKLOG #341). Its yields are lazy, so this also pins WHERE the child
+    # materialises them, not just that it does.
+    yield Send("OB_T", "GEN_A")
+    yield Send("OB_T", "GEN_B")
+
+
+@handler("h_set_fanout")
+def h_set_fanout(msg):
+    # A SET handler (BACKLOG #341). Six elements, because the contract this probes is the delivered
+    # MULTISET: the child is a different PROCESS with its own hash seed, so the order it materialises
+    # a set in is not the parent's.
+    return {Send("OB_T", f"SET_{c}") for c in "ABCDEF"}
 
 
 @handler("h_state")
@@ -458,6 +477,48 @@ def test_a_handler_returning_a_reduce_gadget_does_not_execute_in_the_engine(
     assert not sentinel.exists(), "a Handler's __reduce__ executed in the engine parent"
 
 
+def test_a_generator_handler_delivers_under_mode_subprocess(graph: tuple[Registry, str]) -> None:
+    """BACKLOG #341 across the process boundary. Before the shared materialization rule the child
+    described a generator/tuple/set return as ``{"o": "other"}`` and the parent rebuilt an inert
+    ``Ignored()``, so a fan-out that delivers N in-process delivered 0 under ``mode=subprocess``.
+    Fixing only the parent's ``_partition`` would leave exactly that mode-dependent disposition."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        sandboxed = _deliveries(registry, "h_gen_fanout", sandbox=session, run_context=RunContext())
+    finally:
+        session.close()
+    assert sandboxed == [("OB_T", "GEN_A"), ("OB_T", "GEN_B")]
+    assert sandboxed == _deliveries(registry, "h_gen_fanout")  # identical to mode=off
+
+
+def test_a_set_handler_delivers_the_same_multiset_under_mode_subprocess(
+    graph: tuple[Registry, str],
+) -> None:
+    """A ``set`` return crosses the boundary with every ``Send`` intact — and with its ORDER unpinned,
+    deliberately (ADR 0087 AC-11).
+
+    The child is a separate ``Popen`` with **no** inherited ``PYTHONHASHSEED``, and ``Send`` is a frozen
+    dataclass hashed on its fields, so the child iterates a 6-element set in a different order than the
+    parent would. Asserting an order here would pin a per-process accident and flake; asserting the
+    multiset is the contract the engine actually offers. That the two modes do NOT necessarily agree on
+    order is why `docs/CONNECTIONS.md` steers authors to a list/tuple when order matters.
+
+    The counts are pinned at 6 so the comparison cannot pass by both sides being empty — which is the
+    exact way this test would have "passed" before the fix, when a set delivered nothing in either mode.
+    """
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        sandboxed = _deliveries(registry, "h_set_fanout", sandbox=session, run_context=RunContext())
+    finally:
+        session.close()
+    off = _deliveries(registry, "h_set_fanout")
+    assert len(sandboxed) == len(off) == 6
+    assert sorted(sandboxed) == sorted(off)
+    assert sorted(p for _, p in sandboxed) == [f"SET_{c}" for c in "ABCDEF"]
+
+
 def test_generator_router_routes_under_mode_subprocess(graph: tuple[Registry, str]) -> None:
     """A generator Router is documented-supported and unpicklable, so ``mode=subprocess`` used to
     dead-letter every message it routed. The child now materialises the router result with
@@ -698,7 +759,12 @@ def _codeset_graph(tmp_path: Path, mapped: str) -> Registry:
         '    return "h"\n'
         '@handler("h")\n'
         "def h(msg):\n"
-        '    return Send("OB_C", code_set("cs")["A"])\n',
+        '    return Send("OB_C", code_set("cs")["A"])\n'
+        '@handler("h_gen_cs")\n'
+        "def h_gen_cs(msg):\n"
+        "    # A GENERATOR whose BODY reads a run-scoped provider. The read happens when something\n"
+        "    # iterates the generator, so this probes WHERE that materialization runs in the child.\n"
+        '    yield Send("OB_C", code_set("cs")["A"])\n',
         encoding="utf-8",
     )
     return load_config(tmp_path)
@@ -720,6 +786,29 @@ def test_code_sets_are_loaded_by_the_child_and_resolve(tmp_path: Path) -> None:
     finally:
         session.close()
     assert [(d.to, d.payload) for d in ds] == [("OB_C", "MAPPED")]
+
+
+def test_a_generator_handlers_body_runs_inside_the_childs_run_context(tmp_path: Path) -> None:
+    """A generator Handler's body executes LAZILY — at the instant something materialises it. In the
+    child that instant must fall INSIDE ``with run_contexts(...)``.
+
+    The codec's ``enc_result`` is called from ``_respond``, *outside* that block, so materialising
+    there would run the Handler body with no active run context: a ``code_set(...)`` inside a
+    generator Handler would raise ``CodeSetError`` under ``mode=subprocess`` while working fine under
+    ``mode=off``. That is a mode-dependent disposition — the exact class of failure ADR 0087's parity
+    rule forbids, and the reason the worker materialises the result itself."""
+    registry = _codeset_graph(tmp_path, "MAPPED")
+    session = _session(str(tmp_path), code_sets=registry.code_sets)
+    rc = RunContext(code_sets=registry.code_sets)
+    try:
+        ds, _, _, _ = transform_one(registry, "h_gen_cs", RAW, sandbox=session, run_context=rc)
+    finally:
+        session.close()
+    assert [(d.to, d.payload) for d in ds] == [("OB_C", "MAPPED")]
+    # And byte-identical to mode=off, which activates the same providers around the same call.
+    with run_contexts(rc, phase="transform"):
+        off, _, _, _ = transform_one(registry, "h_gen_cs", RAW, run_context=rc)
+    assert [(d.to, d.payload) for d in ds] == [(d.to, d.payload) for d in off]
 
 
 def test_an_unreloaded_codeset_edit_does_not_brick_the_inbound(tmp_path: Path) -> None:
@@ -770,4 +859,144 @@ def test_the_engines_code_sets_win_over_the_childs_own_load(graph: tuple[Registr
             _deliveries(registry, "h_ok")
         )
     finally:
+        session.close()
+
+
+# --- (BACKLOG #342) killing the worker reaps its whole process tree ----------
+
+# A graph whose Handler spawns a GRANDCHILD that inherits fd 1 (the response pipe). `close_fds=False`
+# plus un-redirected stdout makes the grandchild inherit the worker's fd 1 on BOTH platforms; it then
+# sleeps well past the test, so absent a tree-reap it lingers as an orphan STILL HOLDING the pipe (the
+# #342 defect). `subprocess`/`sys` are not in DEFAULT_FORBIDDEN_MODULES, so the Handler may import them.
+_ORPHAN_GRAPH = """
+from messagefoundry import inbound, outbound, router, handler, MLLP, Send
+
+inbound("IB_O", MLLP(port=19351), router="r")
+outbound("OB_O", MLLP(host="127.0.0.1", port=19352))
+
+
+@router("r")
+def r(msg):
+    return "h_orphan"
+
+
+@handler("h_orphan")
+def h_orphan(msg):
+    import subprocess
+    import sys
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        close_fds=False,  # inherit the worker's open fds, fd 1 (the response pipe) among them
+    )
+    with open(__PIDFILE__, "w", encoding="utf-8") as fh:
+        fh.write(str(child.pid))
+    return Send("OB_O", "SPAWNED")
+"""
+
+
+def _orphan_graph(tmp_path: Path) -> tuple[Registry, str, Path]:
+    """Write the orphan-spawning graph and return ``(registry, config_dir, pidfile)`` — mirrors the
+    ``_codeset_graph`` pattern. ``pidfile`` is where the Handler records the grandchild's pid."""
+    pidfile = tmp_path / "grandchild.pid"
+    source = _ORPHAN_GRAPH.replace("__PIDFILE__", repr(str(pidfile)))
+    (tmp_path / "graph.py").write_text(source, encoding="utf-8")
+    return load_config(tmp_path), str(tmp_path), pidfile
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether ``pid`` names a live process — cross-platform, no third-party deps."""
+    if sys.platform == "win32":
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return False  # no such pid (or already fully reaped)
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by someone else — still "alive"
+    return True
+
+
+def _best_effort_kill_pid(pid: int) -> None:
+    """Kill ``pid`` if it is still around, swallowing every failure. Keeps a FALSIFY run (where the
+    reap is disabled and the grandchild survives) from leaking a 30s sleeper."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            process_terminate = 0x0001
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = kernel32.OpenProcess(process_terminate, False, pid)
+            if handle:
+                try:
+                    kernel32.TerminateProcess(handle, 1)
+                finally:
+                    kernel32.CloseHandle(handle)
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def test_worker_kill_reaps_the_whole_process_tree(tmp_path: Path) -> None:
+    """Killing the worker must reap the WHOLE tree, not just the immediate child (BACKLOG #342).
+
+    A Handler spawns a grandchild that inherits fd 1 (the response pipe). Before the fix a bare
+    ``proc.kill()`` terminated only the worker, leaving the grandchild alive — an orphan still holding
+    the pipe, so the pipe never reached EOF and the kill was incomplete. The fix reaps the tree: a
+    Windows ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` job object (exercised locally, this host is
+    Windows) or a POSIX new-session process group killed with ``killpg`` (exercised by the CI
+    ubuntu-latest leg).
+
+    The observable is platform-neutral: for THIS grandchild — which holds fd 1 until it exits —
+    pipe-EOF is equivalent to "grandchild reaped", so the primary assert covers BOTH halves of the
+    defect (pipe released AND no lingering process). ``_pid_alive`` re-checks the process half
+    directly. See the FALSIFICATION recorded in the lane report: forcing
+    ``_assign_kill_on_close_job`` to return ``None`` degrades the Windows path to a bare
+    ``proc.kill()``, the grandchild survives, the pipe never EOFs, and this test goes red."""
+    registry, config_dir, pidfile = _orphan_graph(tmp_path)
+    session = _session(config_dir)
+    grandchild_pid: int | None = None
+    try:
+        # Drive the Handler so the worker spawns the fd-1-holding grandchild.
+        assert _deliveries(registry, "h_orphan", sandbox=session, run_context=RunContext()) == [
+            ("OB_O", "SPAWNED")
+        ]
+        grandchild_pid = int(pidfile.read_text())
+        proc = session._proc
+        assert proc is not None
+        responses = session._responses  # capture THIS generation's queue before the kill
+
+        # The single funnel for a wall-cap kill / crash cleanup / shutdown.
+        session._kill(proc)
+
+        # PRIMARY: the response pipe reaches EOF only once EVERY holder of fd 1 is gone — the worker
+        # AND the grandchild. The reader thread enqueues `_EOF` at that point.
+        try:
+            frame = responses.get(timeout=8.0)
+        except queue.Empty:
+            frame = None
+        assert frame is _EOF, (
+            "response pipe never reached EOF -- a grandchild still holds it; the worker tree "
+            "was not reaped"
+        )
+        # SECONDARY: the process half, asserted directly.
+        assert not _pid_alive(grandchild_pid), "the grandchild survived the worker kill"
+    finally:
+        if grandchild_pid is not None:
+            _best_effort_kill_pid(grandchild_pid)
         session.close()

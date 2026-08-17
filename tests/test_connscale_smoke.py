@@ -18,25 +18,28 @@ A small N (12 → 24) keeps it inside the pytest-timeout budget; the shipped ``c
 
 from __future__ import annotations
 
-import socket
 import sys
 
 import pytest
 
 from harness.load.connscale.profile import load_connscale_profile_text
 from harness.load.connscale.runner import run_connscale
+from tests._connscale_ports import (
+    INBOUND_PORT_HI,
+    INBOUND_PORT_LO,
+    require_contiguous,
+    reserve_api_and_sink_bases,
+    reserve_contiguous_ports,
+)
 
 pytestmark = pytest.mark.timeout(120)  # the per-test 60s default is too tight for two engine spawns
 
+# The connection-count sweep; its max sets the contiguous inbound-port width (BACKLOG #1014).
+_SMOKE_COUNTS = (12, 24)
 
-def _free_port() -> int:
-    s = socket.socket()
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("127.0.0.1", 0))
-    try:
-        return int(s.getsockname()[1])
-    finally:
-        s.close()
+# The three port families this run consumes -- inbound, API and sink -- are all reserved as whole
+# contiguous ranges by tests/_connscale_ports.py, which is where the windows and the rationale for
+# them live (BACKLOG #1014 for the inbound family, #1103 for the other two).
 
 
 def _smoke_profile(base_port: int) -> object:
@@ -44,7 +47,7 @@ def _smoke_profile(base_port: int) -> object:
     return load_connscale_profile_text(f"""
 [connscale]
 name = "smoke-it"
-counts = [12, 24]
+counts = {list(_SMOKE_COUNTS)}
 sweep_mode = "both"
 aggregate_rate = 24.0
 per_conn_rate = 1.0
@@ -66,16 +69,25 @@ empty_claims_monotonic = true
 """)
 
 
-@pytest.mark.flaky(
-    reruns=2, reruns_delay=3
-)  # CI runners are noisy (mf-ci-test-flakes): re-run clears
 async def test_connscale_smoke_end_to_end() -> None:
-    # Reserve a base inbound-port block that won't collide with the sink/API ports. The 24-conn max
-    # sweep needs 24 contiguous inbound ports; pick a high base well clear of the ephemeral churn.
-    base_port = 41000
-    sink_port = _free_port()
-    api_port = _free_port()
+    # Reserve a contiguous inbound-port block (BACKLOG #1014). The sweep's max connection count
+    # needs that many contiguous inbound ports, and the engine binds base_port + i for each. A
+    # RANDOM anchor de-correlates concurrent worktrees so they no longer contend for one fixed
+    # block; contiguity is asserted at the acquisition site, and the allocator fails loudly if no
+    # free block can be found (never a silent fixed fallback).
+    inbound_ports = reserve_contiguous_ports(
+        max(_SMOKE_COUNTS), lo=INBOUND_PORT_LO, hi=INBOUND_PORT_HI
+    )
+    base_port = require_contiguous(inbound_ports, max(_SMOKE_COUNTS), "inbound")
     profile = _smoke_profile(base_port)
+
+    # ... and reserve the API and sink RANGES the same way (BACKLOG #1103). Both are derived by
+    # increment from their base -- the runner binds api_port + step for EVERY sweep step, the sink
+    # binds sink_port + i for every sink port -- so reserving only the base, as this test used to,
+    # left every port after the first merely assumed free. Two CI reds came of that assumption, on
+    # PRs that could not reach this code at all. All three families now come from disjoint windows
+    # below the OS ephemeral floors, so the kernel cannot hand one out after it is probed.
+    api_port, sink_port = reserve_api_and_sink_bases(profile, sink_ports=1)  # type: ignore[arg-type]
 
     report = await run_connscale(
         profile,  # type: ignore[arg-type]
@@ -148,3 +160,8 @@ def test_fd_sampler_reads_self() -> None:
     assert live is None or live > 0  # None only if the OS tool is unavailable on this runner
     dead = FdSampler(2**31 - 1).sample()  # an implausible PID
     assert dead is None
+
+
+# The port-allocator's own guards (contiguity, fail-loud exhaustion, the too-narrow window, and
+# #1103's "every port the sweep will use was reserved") live in tests/test_connscale_ports.py,
+# beside the allocator they cover.

@@ -81,7 +81,7 @@ CREATE USER [CORP\mefor-svc$] FOR LOGIN [CORP\mefor-svc$];
 -- Least privilege: schema bootstrap (§2) + row CRUD; NOT sysadmin/db_owner.
 ALTER ROLE db_datareader  ADD MEMBER [CORP\mefor-svc$];
 ALTER ROLE db_datawriter  ADD MEMBER [CORP\mefor-svc$];
-ALTER ROLE db_ddladmin    ADD MEMBER [CORP\mefor-svc$];    -- create tables/indexes on first open
+ALTER ROLE db_ddladmin    ADD MEMBER [CORP\mefor-svc$];    -- schema DDL: first open + upgrades
 ```
 
 **4. The engine `[store]` block** — integrated auth, encrypted, verifying the DB cert against the
@@ -89,8 +89,8 @@ Windows machine trust store (§5); **no secret in the file or env**:
 
 ```toml
 [store]
-type = "sqlserver"
-host = "sql01.corp.example.com"
+backend = "sqlserver"
+server = "sql01.corp.example.com"
 database = "MessageFoundry"
 auth = "integrated"                # Trusted_Connection=yes — the gMSA's identity authenticates
 encrypt = true                     # default; TLS to the DB
@@ -99,9 +99,36 @@ require_managed_identity = true    # refuse a static SQL login on production PHI
 ```
 
 > **Why the `$`:** a gMSA authenticates as a *computer-class* principal, so its SQL login name carries the
-> trailing `$` (`CORP\mefor-svc$`) — the same name NSSM's `ObjectName` uses. `db_ddladmin` is needed only
-> for the first-open schema bootstrap (§2); drop it to `db_datareader`/`db_datawriter` afterward, or
-> pre-create the schema and never grant it.
+> trailing `$` (`CORP\mefor-svc$`) — the same name NSSM's `ObjectName` uses.
+>
+> **Why exactly these three, and never `db_owner` / `sysadmin`:** the store issues `CREATE TABLE` /
+> `CREATE INDEX` / `ALTER TABLE ... ADD` / `DROP INDEX` / `DROP TABLE` (`db_ddladmin`), then only
+> `SELECT` (`db_datareader`) and `INSERT` / `UPDATE` / `DELETE` / `MERGE` (`db_datawriter`). It never
+> creates the database, never `TRUNCATE`s, calls no DMV and no extended procedure, and its two
+> `ALTER DATABASE ... SET` statements (`READ_COMMITTED_SNAPSHOT` and `ALLOW_SNAPSHOT_ISOLATION`) each
+> degrade to a warning — §2.
+>
+> **The one thing a higher role would unlock — and why §2's RCSI pre-enable is a prerequisite, never a
+> tuning knob.** `db_owner` holds `ALTER` on the database, so it would let the engine turn RCSI on
+> itself at open; this login cannot, and the shipped default (`[pipeline].claim_mode = "pooled"` with
+> `require_rcsi_for_pooled = true`) **refuses to start** while RCSI is off. Have a DBA run the RCSI and
+> `ALLOW_SNAPSHOT_ISOLATION` statements once, before first start. That is the price of the reduced
+> role, and it is the only one — it is never a reason to grant a higher role.
+>
+> **`EXECUTE` is not in the set.** The only **user** stored procedures the engine calls are the two
+> lane-family claim procs, and only when `[store].fifo_claim_proc = true` — SQL Server only, default
+> `false` ([`CONFIGURATION.md`](CONFIGURATION.md) `[store]`). (`sp_getapplock`, used on every finalize
+> and at schema init, is a **system** procedure `public` can already execute — no grant.) Their
+> *creation* rides the schema batch either way, but it is permission-guarded and self-no-ops when the
+> principal cannot take it, so a login without `CREATE PROCEDURE` still opens cleanly. If you do enable
+> the flag with a split bootstrap/runtime principal, the runtime one also needs `VIEW DEFINITION` on
+> both procs — without it the startup gate cannot read the bodies it verifies and degrades to the
+> shipped batch.
+>
+> **`db_ddladmin` is a schema-change grant, not a first-run-only one** (§2). Dropping it after the
+> first open is supported *only* if you re-grant it for the first start of any upgrade whose schema
+> moved: that start issues the DDL batch and **fails outright** without it. Pre-creating the schema
+> and never granting it is the other supported posture, and it takes the same upgrade discipline.
 
 ---
 
@@ -113,10 +140,25 @@ require_managed_identity = true    # refuse a static SQL login on production PHI
 - **Schema-evolution policy:** schema changes are **idempotent additive DDL applied on open** (new
   columns/indexes added if missing; nothing destructive). An engine upgrade that adds a column brings it
   in on the next start. Because v0.1 is greenfield-only, there is no cross-version data backfill to plan.
+- **Steady state issues no DDL at all.** Both server backends stamp a content hash of the shipped DDL
+  batch into a one-row `schema_meta` table; when it matches at open, the batch and its serializing lock
+  are skipped entirely ([ADR 0064](adr/0064-schema-init-fastpath.md)). So the batch runs only against a
+  virgin database and on the **first start of a build whose schema moved** — and on that start a login
+  without DDL rights **fails the open**; it does not degrade. Plan the DDL grant as an upgrade-window
+  privilege, not a one-time bootstrap one.
 - **SQL Server specifics:** RCSI (`READ_COMMITTED_SNAPSHOT`) is enabled at open (with a DBA-fallback
   warning if the login can't `ALTER DATABASE`); pre-enable it if your security policy forbids that grant.
+  With the §1.1 least-privilege login this is **not conditional** — that login cannot `ALTER DATABASE`,
+  and pooled claim mode (the shipped default) fails closed when RCSI is off.
+  The engine login's grants are §1.1 — `db_datareader` + `db_datawriter` + `db_ddladmin`, and never
+  `db_owner` or `sysadmin`.
 
-> _Filled by staging:_ the exact bootstrap login privileges + the pre-create DDL per backend.
+> _Filled by staging:_ the **PostgreSQL** bootstrap role grants + the pre-create DDL per backend. The
+> SQL Server set is settled in §1.1 and is **not** transferable: Postgres has no equivalent of SQL Server's fixed **database** roles
+> (`db_datareader`/`db_datawriter`/`db_ddladmin`),
+> the schema uses `BIGSERIAL` sequences rather than `IDENTITY`, and there is no stored-procedure path
+> (`fifo_claim_proc` is SQL Server only), so the Postgres grants are a role/schema-ownership question
+> this doc does not yet answer.
 
 ---
 
@@ -279,4 +321,4 @@ update the pin in lockstep — pin the **CA**, not the leaf, to keep rotations m
 
 *Companion: [`CONFIGURATION.md`](CONFIGURATION.md) (`[store]`/`[cluster]`), [`CLUSTERING.md`](CLUSTERING.md)
 (HA topology + failover), [`DEPLOYMENT.md`](DEPLOYMENT.md) (channel × TLS), and the v0.1 plan
-([`releases/v0.1-EXECUTION-PLAN.md`](releases/v0.1-EXECUTION-PLAN.md)).*
+(`releases/v0.1-EXECUTION-PLAN.md`).*

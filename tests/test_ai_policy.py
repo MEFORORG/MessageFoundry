@@ -17,6 +17,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
@@ -196,7 +197,8 @@ def test_ai_settings_defaults() -> None:
     assert ai.environment is None  # no default — serve requires it (no silent PROD)
     assert ai.data_class is None
     assert ai.production is None
-    # forward-compat fields are accepted-but-unused in the MVP.
+    # `provider` is READ (it addresses the broker and is recorded in the per-use audit) but never
+    # dispatched on; `model`/`baa_attested`/`endpoint` are forward-compat. See #95.
     assert ai.provider == "claude"
     assert ai.model == "claude-opus-4-8"
     assert ai.baa_attested is False
@@ -401,3 +403,75 @@ async def test_ai_policy_assist_permitted_reflects_role(engine: Engine) -> None:
         viewer = (await c.get("/ai/policy", headers={"Authorization": f"Bearer {vw_tok}"})).json()
     assert coder["assist_permitted"] is True  # coding role grants ai:assist
     assert viewer["assist_permitted"] is False  # viewer role does not
+
+
+# --- BACKLOG #95: [ai].provider is validated at config time ------------------------------------
+
+
+def test_an_unserviced_ai_provider_is_refused_at_config_time() -> None:
+    """The engine brokers exactly ONE wire shape, so a provider it cannot service is a config error.
+
+    Before #95 any string was accepted. That is worse than it looks: the value is recorded in the
+    per-use audit whether or not the broker is ever built, so a config naming an unserviceable
+    provider made the audit trail assert something untrue, and the mistake otherwise surfaced only
+    as an opaque provider-side failure at request time."""
+    from messagefoundry.config.settings import AiSettings
+
+    for unserviced in ("azure_openai", "bedrock", "ollama", "gpt-4o-gateway", ""):
+        with pytest.raises(ValidationError, match=r"\[ai\]\.provider must be one of"):
+            AiSettings(provider=unserviced, environment="dev")
+
+
+def test_the_provider_check_is_exact_not_case_or_prefix_folded() -> None:
+    """`Claude` and `claude-3` are not `claude`.
+
+    A case- or prefix-tolerant check would accept names the broker cannot service, which is the
+    inverse failure this validator exists to prevent -- it must describe what chat() can send."""
+    from messagefoundry.config.settings import AiSettings
+
+    for near_miss in ("Claude", "CLAUDE", "claude-3", " claude"):
+        with pytest.raises(ValidationError):
+            AiSettings(provider=near_miss, environment="dev")
+
+
+def test_the_serviceable_provider_default_still_loads() -> None:
+    from messagefoundry.config.settings import AiSettings
+
+    assert AiSettings(provider="claude", environment="dev").provider == "claude"
+    assert AiSettings(environment="dev").provider == "claude"
+
+
+def test_an_unserviced_provider_is_refused_through_the_real_config_path(tmp_path: Path) -> None:
+    """Constructor-only coverage would miss a load-time gap, so drive load_settings() itself."""
+    from messagefoundry.config.settings import load_settings
+
+    cfg = tmp_path / "service.toml"
+    cfg.write_text(
+        '[ai]\nenvironment = "dev"\nmode = "managed_endpoint"\nprovider = "azure_openai"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValidationError, match=r"\[ai\]\.provider must be one of"):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_the_allowlist_matches_what_the_broker_can_actually_send() -> None:
+    """The allowlist is hand-maintained because nothing can derive it -- there is no provider
+    registry, and AiBroker.provider has zero readers. This pins it to its stated source of truth so
+    that widening the list without teaching chat() a second wire shape fails here.
+
+    The inverse failure is the tempting one: listing aspirational names would ACCEPT configurations
+    the broker cannot service, restoring the opaque runtime failure #95 removed."""
+    import inspect
+
+    from messagefoundry.config.settings import _SERVICEABLE_AI_PROVIDERS
+    from messagefoundry.transports.ai_broker import AiBroker
+
+    body = inspect.getsource(AiBroker.chat)
+    # One wire shape, unconditional: the Anthropic Messages body. If chat() ever branches on the
+    # provider, this assertion is the reminder that the allowlist may widen with it.
+    assert "anthropic-version" in body
+    assert "self.provider" not in body, (
+        "chat() now reads self.provider -- if it dispatches on it, widen "
+        "_SERVICEABLE_AI_PROVIDERS to match, and only then"
+    )
+    assert frozenset({"claude"}) == _SERVICEABLE_AI_PROVIDERS

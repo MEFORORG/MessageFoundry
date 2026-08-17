@@ -10,6 +10,11 @@ unlocks it, plus the one helper that enforces it. Centralizing it means the poli
 auditable spot instead of being re-implemented inline per endpoint, where a new endpoint or field could
 silently leak PHI (the Broken Object Property Level Authorization risk, ASVS 8.2.3).
 
+**The default denies.** The models here are :class:`~messagefoundry.api.phi_gate.PhiGatedModel`\\ s,
+which withhold every gated property from JSON until an authorization decision is recorded on the
+instance; :func:`redact_unauthorized` is what records one. That module states the mechanism and its
+scope — this one owns the policy (which permission unlocks which property).
+
 **Read-side only.** The API exposes no client-writable PHI properties — mutations are coarse, separately
 permission-gated actions (replay / purge / reload / connection-control) — so there is no per-field
 *write* authorization surface today. See docs/SECURITY.md "Field-level authorization" for the model and
@@ -34,6 +39,7 @@ from messagefoundry.api.models import (
     MessageSummary,
     OutboxInfo,
 )
+from messagefoundry.api.phi_gate import PhiGatedModel
 from messagefoundry.auth import Identity, Permission
 
 #: Response model → {property → Permission that unlocks it}. The single source of truth for which
@@ -44,7 +50,8 @@ from messagefoundry.auth import Identity, Permission
 #: PHI-classified column (carrying re-ingress/correlation lineage today, operator/handler-attached
 #: values by design) — so it must be gated and audited like the other summary-tier PHI fields, not
 #: returned to a caller lacking view_summary. Add a row here when a new PHI-bearing response property
-#: is introduced.
+#: is introduced — and name it in the model's own ``phi_gated_properties`` in the same change, which
+#: ``tests/test_field_authz_fail_closed.py`` pins in both directions.
 PHI_FIELDS: dict[type[BaseModel], dict[str, Permission]] = {
     MessageSummary: {
         "summary": Permission.MESSAGES_VIEW_SUMMARY,
@@ -86,12 +93,25 @@ def gated_properties(model_cls: type[BaseModel]) -> dict[str, Permission]:
 
 
 def redact_unauthorized(model: M, identity: Identity) -> M:  # noqa: UP047
-    """Return ``model`` with each PHI property the caller may **not** see set to ``None`` — a no-op
-    when the caller holds every relevant permission. The single per-property read gate (ASVS 8.2.3)."""
-    withheld = {
-        prop: None for prop, perm in gated_properties(type(model)).items() if not identity.has(perm)
-    }
-    return model.model_copy(update=withheld) if withheld else model
+    """Return ``model`` with each PHI property the caller may **not** see set to ``None``, and the
+    rest **released** for serialization. The single per-property read gate (ASVS 8.2.3).
+
+    Release is the half that makes the gate fail-closed (#1045): a :class:`PhiGatedModel` withholds
+    every gated property from JSON until an authorization decision is recorded on the instance, so
+    this call is what turns a permitted property back on rather than what turns a forbidden one off.
+    A route that never calls it returns ``null`` for all of them.
+    """
+    gated = gated_properties(type(model))
+    if not gated:
+        return model
+    allowed = {prop for prop, perm in gated.items() if identity.has(perm)}
+    # Still null the values, so `count_exposed` and any server-side read of the returned model agree
+    # with what is actually serialized. The serializer alone would leave the attribute populated.
+    withheld: dict[str, None] = {prop: None for prop in gated if prop not in allowed}
+    out = model.model_copy(update=withheld)
+    if isinstance(out, PhiGatedModel):
+        out.release_phi(allowed)
+    return out
 
 
 def count_exposed(models: Sequence[BaseModel]) -> int:

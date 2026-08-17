@@ -174,6 +174,75 @@ def test_scan_file_clean_text_has_no_hits(sf, tmp_path: Path) -> None:
     assert sf.scan_file(p) == []  # bare competitor name is intentionally allowed
 
 
+# --- LOCATION detector: a file judged by where it sits, not by its bytes -----------------------------
+# The private security corpus is prose ABOUT this repo -- threat models, ASVS assessments, remediation
+# plans -- so it carries no customer name, no site code, no IP and no secret. Every content detector
+# above reports it clean by working correctly. These tests cover the only rule that can see it.
+
+
+def test_a_file_under_docs_security_is_flagged_by_its_path_alone(sf, tmp_path: Path) -> None:
+    """Content is deliberately innocuous: the PATH is the entire finding."""
+    p = tmp_path / "threat-model.md"
+    p.write_text("A generic engine doc about HL7 routing.\n", "utf-8")
+    assert sf.scan_file(p) == []  # same bytes, ordinary location -> clean
+
+    hits = sf.scan_file(p, "docs/security/threat-model.md")
+    assert len(hits) == 1, hits
+    assert "docs/security/" in hits[0]
+    assert ":0:" in hits[0], "a path-level finding has no line to point at and must say so"
+
+
+def test_the_path_detector_fires_on_a_binary_file_too(sf, tmp_path: Path) -> None:
+    """The interaction with ``test_scan_file_skips_binary``, which is why the check runs BEFORE the read.
+
+    A PDF or a diagram under docs/security/ is exactly as much of a leak as the markdown beside it, and
+    the content scanner drops binaries unread. Ordering the location rule after that read would have
+    made every non-text file in the corpus invisible -- the widest possible hole in a leak gate.
+    """
+    p = tmp_path / "diagram.pdf"
+    p.write_bytes(b"\x00\x01\x02 not text at all")
+    assert sf.scan_file(p) == []  # binary in an ordinary location is still skipped
+    assert len(sf.scan_file(p, "docs/security/diagram.pdf")) == 1
+
+
+def test_a_relocated_copy_under_docs_security_is_still_flagged(sf, tmp_path: Path) -> None:
+    """Unanchored by design: a vendored or moved copy is the same leak as the top-level one."""
+    p = tmp_path / "x.md"
+    p.write_text("clean\n", "utf-8")
+    assert len(sf.scan_file(p, "ide/docs/security/x.md")) == 1
+
+
+def test_the_path_detector_does_not_flag_ordinary_paths(sf, tmp_path: Path) -> None:
+    """NEGATIVE CONTROL. A rule that flagged everything would pass every test above and be useless.
+
+    ``scripts/security/`` is the sharp one: the scanner's own source and this test file both live
+    under a directory whose name contains "security", and a rule written as a bare substring would
+    flag the gate itself on every run -- the kind of self-trip that gets a detector deleted.
+    """
+    p = tmp_path / "x.md"
+    p.write_text("clean\n", "utf-8")
+    for rel in (
+        "scripts/security/scan_forbidden.py",
+        "tests/test_scan_forbidden.py",
+        "docs/SECURITY.md",
+        "docs/securityish/x.md",
+        "docs/reviews/x.md",
+        "messagefoundry/auth/security.py",
+    ):
+        assert sf.scan_file(p, rel) == [], f"{rel} must not be flagged by the location rule"
+        assert sf.forbidden_path_reason(rel) is None, rel
+
+
+def test_the_location_rule_list_is_not_empty(sf) -> None:
+    """Guard the rule source. An empty FORBIDDEN_PATHS makes every assertion above vacuous, and unlike
+    the token list this one is NOT externalized -- it ships in the file, so absence is a defect."""
+    print(f"location rules: {[p.pattern for p, _ in sf.FORBIDDEN_PATHS]}")
+    assert sf.FORBIDDEN_PATHS, "no location rules compiled -- the path detector is decoration"
+    assert sf.forbidden_path_reason("docs/security/x.md"), (
+        "the shipped rule set does not flag docs/security, which is the class it exists for"
+    )
+
+
 # --- reasons-only in-memory scan (the importable scan_text contract) ---------------------------------
 
 
@@ -253,3 +322,93 @@ def test_no_token_source_is_absent_rather_than_synthetic(monkeypatch: pytest.Mon
     mod = _scanner_with_tokens(monkeypatch, None)
     assert mod.TOKENS_PRESENT is False
     assert mod.is_synthetic_token_set() is False
+
+
+# --- --path coverage: every named path is scanned, and a file is scanned as itself -------------------
+# Regression tests for a gate that reported CLEAN over content it never opened. These drive `main()`
+# end-to-end rather than `_candidate_files` directly, because the defect was only observable through the
+# exit code: the ZERO-files refusal fires on the TOTAL, so one real directory masked every dropped path.
+
+
+@pytest.fixture
+def sf_main(sf, monkeypatch: pytest.MonkeyPatch):
+    """``sf`` patches the detection globals, but ``main()`` calls ``reload_tokens()`` as its first act and
+    would overwrite them with the externalized real set (or an empty one on a fork). Neutralise the
+    reload so ``main()`` is exercised against the SYNTHETIC tokens.
+
+    Without this the tests below would silently assert nothing: on a box with real tokens loaded the
+    synthetic "ACME" is not forbidden, so a dirty tree would exit 0 and the test would fail for a reason
+    unrelated to what it is checking. The require/floor env vars are cleared for the same reason -- an
+    inherited MEFOR_REQUIRE_TOKENS would make every call below return 2."""
+    monkeypatch.setattr(sf, "reload_tokens", lambda: None)
+    monkeypatch.delenv("MEFOR_REQUIRE_TOKENS", raising=False)
+    monkeypatch.delenv("MEFOR_MIN_DETECTORS", raising=False)
+    return sf
+
+
+def _clean_and_dirty(tmp_path: Path) -> tuple[Path, Path]:
+    """A clean directory, and a separate directory holding one file with a synthetic forbidden token."""
+    clean = tmp_path / "clean"
+    (clean / "sub").mkdir(parents=True)
+    (clean / "sub" / "ok.md").write_text("nothing to see here\n", encoding="utf-8")
+    dirty = tmp_path / "dirty"
+    dirty.mkdir()
+    (dirty / "leak.md").write_text("contact ACME about this\n", encoding="utf-8")
+    return clean, dirty
+
+
+def test_a_forbidden_token_in_the_SECOND_named_path_is_still_caught(
+    sf_main, tmp_path: Path
+) -> None:
+    """The defect, stated as a test. Only ``argv[1]`` was read, so every path after the first was dropped
+    with no message. Measured 2026-08-04: a four-path audit reported clean having examined ONE of the
+    four, and nothing in the output revealed it.
+
+    A leak gate whose green means "the first argument was clean" is worse than no gate: the caller reads
+    it as "all of these are clean" and stops looking."""
+    clean, dirty = _clean_and_dirty(tmp_path)
+    assert sf_main.main(["--path", str(clean), str(dirty)]) == 1
+
+
+def test_a_forbidden_token_in_a_named_FILE_is_caught(sf_main, tmp_path: Path) -> None:
+    """``rglob()`` on a non-directory yields nothing, so naming a file scanned exactly zero of it. Alone
+    that surfaced as the ZERO-files refusal (exit 2), which at least fails closed; mixed with a scannable
+    directory it disappeared into a clean exit 0."""
+    _clean, dirty = _clean_and_dirty(tmp_path)
+    assert sf_main.main(["--path", str(dirty / "leak.md")]) == 1
+
+
+def test_a_named_FILE_mixed_with_a_clean_DIRECTORY_is_not_swallowed(
+    sf_main, tmp_path: Path
+) -> None:
+    """The exact invocation shape that produced the false clean."""
+    clean, dirty = _clean_and_dirty(tmp_path)
+    assert sf_main.main(["--path", str(clean), str(dirty / "leak.md")]) == 1
+
+
+def test_all_clean_named_paths_still_pass(sf_main, tmp_path: Path) -> None:
+    """The control. Without it, a fix that returned 1 unconditionally would satisfy every test above."""
+    clean, _dirty = _clean_and_dirty(tmp_path)
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "fine.md").write_text("all good\n", encoding="utf-8")
+    assert sf_main.main(["--path", str(clean), str(other), str(other / "fine.md")]) == 0
+
+
+def test_the_run_reports_how_many_files_it_examined(
+    sf_main, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Coverage has to be visible without suspecting an under-scan. Exit 0 plus a token-count line could
+    not distinguish "scanned what you named" from "scanned one of the four you named"."""
+    clean, _dirty = _clean_and_dirty(tmp_path)
+    assert sf_main.main(["--path", str(clean)]) == 0
+    err = capsys.readouterr().err
+    assert "examined 1 file(s)" in err
+    assert "1 named path(s)" in err
+
+
+def test_zero_examined_still_refuses_rather_than_reporting_clean(sf_main, tmp_path: Path) -> None:
+    """The pre-existing fail-closed behaviour must survive the fix: an empty tree is not a pass."""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert sf_main.main(["--path", str(empty)]) == 2

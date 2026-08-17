@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Tests for rule 3 of the worktree gate: git commands that swap the SHARED PRIMARY's working tree.
 
 This rule exists because it actually happened. A sibling session ran `git checkout <its-branch>` inside
@@ -146,6 +148,88 @@ def test_a_nested_worktree_naming_its_own_path_is_allowed(tmp_path: Path, repos_
         run_gate(shell(f"cd {nested} && git switch -c feature/x", cwd=nested), repos_file) is None
     )
     assert run_gate(shell(f"git -C {nested} rebase origin/main", cwd=nested), repos_file) is None
+
+
+def test_naming_the_primary_in_an_unrelated_argument_is_allowed(
+    tmp_path: Path, repos_file: Path
+) -> None:
+    """The in-text fallback must match a DIRECTORY-CHANGE argument, not the path appearing anywhere.
+
+    Measured 2026-08-04, three times in one session: a safe `git restore <files>` in a worktree was
+    denied as *"would change the working tree of the SHARED PRIMARY"* because a later `cat` in the same
+    compound command happened to name ``<primary>/.git/mefor-coord/...``. Isolating the identical git
+    call was allowed instantly, so the verdict depended on what else the command said.
+
+    Worse than the noise: the refusal TEXT asserted the primary was at risk when it never was, and a gate
+    that misdescribes what it blocked teaches people to route around it. Same defect #308 fixed for the
+    nested-worktree subpath, arriving through a different spelling."""
+    primary = tmp_path / "Repo"
+    nested = primary / ".claude" / "worktrees" / "alerts"
+    # the exact shape that fired: a worktree-local git verb + an unrelated read under the primary
+    assert (
+        run_gate(
+            shell(
+                f'git restore a.py b.py && cat "{primary}/.git/mefor-coord/alloc/backlog/.mark"',
+                cwd=nested,
+            ),
+            repos_file,
+        )
+        is None
+    )
+    # a read of the primary's tree alongside a worktree verb is still not a write to it
+    assert (
+        run_gate(shell(f"git switch -c wip && ls {primary}/docs", cwd=nested), repos_file) is None
+    )
+
+
+def test_a_git_verb_inside_the_coordination_dir_still_swaps_the_primary(
+    tmp_path: Path, repos_file: Path
+) -> None:
+    """Why rule 1's coordination exemption lives in rule 1 and NOT in ``Test-Governed``.
+
+    ``<primary>/.git/mefor-coord/`` is exempt from rule 1, because a write there lands in the shared
+    git dir and not in the primary's working tree. The obvious refactor is to put that exemption in
+    ``Test-Governed`` beside the ``.claude/worktrees/`` one, whose shape is identical. That would open a
+    real bypass: rule 3 feeds the SESSION'S cwd through the same helper, and a git verb run from inside
+    the coordination directory resolves GIT_DIR to the primary and swaps the tree every other session is
+    standing in. Rule 1 judges a write TARGET; only rule 1 may exempt this path.
+
+    The ``-C`` spelling is the one that proves the deny is STRUCTURAL rather than a lucky hit from the
+    in-text fallback: an explicit ``-C`` is authoritative about which repository git acts on, so it sets
+    ``$anyInferredTarget`` false and disables that fallback entirely."""
+    primary = tmp_path / "Repo"
+    coord = f"{primary}/.git/mefor-coord"
+    nested = primary / ".claude" / "worktrees" / "alerts"
+
+    # resolved from a `cd` in the prefix ...
+    assert_denied(run_gate(shell(f"cd {coord} && git reset --hard", cwd=nested), repos_file))
+    # ... from the session's cwd ...
+    assert_denied(run_gate(shell("git reset --hard", cwd=coord), repos_file))
+    # ... and with the fallback switched off, which is the load-bearing case
+    assert_denied(run_gate(shell(f'git -C "{coord}" reset --hard', cwd=nested), repos_file))
+    # a read from there is still fine, as everywhere else
+    assert run_gate(shell("git status", cwd=coord), repos_file) is None
+
+
+def test_stepping_into_the_primary_still_denies_however_it_is_spelled(
+    tmp_path: Path, repos_file: Path
+) -> None:
+    """The narrowing must not cost the true positive the fallback exists for. Every directory-change
+    spelling that lands in the primary still denies, including the PowerShell aliases and `cd /d`."""
+    primary = tmp_path / "Repo"
+    for step in (
+        f"cd {primary} && git checkout main",
+        f"cd '{primary}' ; git reset --hard",
+        f'pushd "{primary}"; git checkout main',
+        f"Set-Location {primary}; git checkout main",
+        f"Set-Location -LiteralPath {primary}; git switch main",
+        f"sl {primary}; git checkout main",
+        f"chdir {primary} && git checkout main",
+        f"cd /d {primary} && git checkout main",
+        # already inside the primary, then wandering: still denied, deliberately conservative
+        f"cd {primary} && cd {tmp_path / 'Elsewhere'} && git checkout main",
+    ):
+        assert_denied(run_gate(shell(step, cwd=tmp_path), repos_file)), step
 
 
 def test_reaching_into_the_primary_is_still_denied_around_the_nested_exemption(

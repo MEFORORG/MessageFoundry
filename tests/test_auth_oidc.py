@@ -256,6 +256,16 @@ def test_verified_exp_is_carried_not_reparsed(rsa_key: rsa.RSAPrivateKey) -> Non
     assert principal.expires_at == 1_002_500
 
 
+def test_federated_principal_carries_issuer(rsa_key: rsa.RSAPrivateKey) -> None:
+    """BACKLOG #1015: the principal carries the pinned ``issuer`` so the relying party can key the local
+    account on the non-reassignable ``(issuer, sub)`` tuple, not on the reassignable username. It is the
+    policy issuer (already proven equal to the token's ``iss`` by the core-claim rung), not sub-only."""
+    jws = _mint(rsa_key, "k1", _good_claims())
+    principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert principal.issuer == "https://idp.example"
+    assert principal.subject == "S-1-5-21-abc"
+
+
 @pytest.mark.parametrize(
     ("mutate", "reason"),
     [
@@ -307,6 +317,50 @@ def test_multi_aud_with_matching_azp_accepted(rsa_key: rsa.RSAPrivateKey) -> Non
     jws = _mint(rsa_key, "k1", _good_claims(aud=["mefor-console", "another"], azp="mefor-console"))
     principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
     assert principal.username == "jdoe"
+
+
+# --- claims: two malformed-IdP shapes reject as audited ClaimsErrors, not 500s (BACKLOG #1016) -----
+
+
+def test_a_non_ascii_nonce_is_a_mismatch_not_a_crash(rsa_key: rsa.RSAPrivateKey) -> None:
+    """A non-ASCII token nonce must reject as an audited ``nonce_mismatch``, not an unhandled 500.
+    ``hmac.compare_digest`` raises ``TypeError`` on a str carrying non-ASCII, so without the encoding
+    guard a hostile ``nonce`` would, on first deployment, surface as a 500 that skips the closed-set
+    audit row every other claim rejection emits. The policy nonce is ASCII ``n-123``."""
+    jws = _mint(rsa_key, "k1", _good_claims(nonce="n-éé"))
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == "nonce_mismatch"
+    assert exc.value.reason in oidc.REASONS
+
+
+@pytest.mark.parametrize("aud", [[["mefor-console"]], [{"a": 1}]])
+def test_an_unhashable_aud_element_is_claim_aud_not_a_crash(
+    rsa_key: rsa.RSAPrivateKey, aud: Any
+) -> None:
+    """A ``list`` aud carrying an unhashable element (a nested list, or a dict) raises ``TypeError``
+    from ``set(aud)`` — the one malformed shape that escapes the fall-through to an empty set. It
+    must reject as an audited ``claim_aud``, not a 500. A top-level dict/int/None already falls
+    through cleanly, so reaching the guard proves it fired: pre-fix the path raises before the
+    membership check below it could run."""
+    jws = _mint(rsa_key, "k1", _good_claims(aud=aud))
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == "claim_aud"
+    assert exc.value.reason in oidc.REASONS
+
+
+def test_the_malformed_shape_guards_do_not_over_reject_a_valid_token(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """Negative control (guard-the-guard): the two malformed-shape guards must not reject an ordinary
+    valid token — an ASCII nonce equal to the policy nonce and a plain str aud validate byte-
+    identically. The existing ``{"nonce": "wrong"}`` rung already proves an ASCII wrong-nonce still
+    routes to ``nonce_mismatch``, so the encoding guard does not swallow real mismatches."""
+    jws = _mint(rsa_key, "k1", _good_claims())
+    principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert principal.username == "jdoe"
+    assert principal.subject == "S-1-5-21-abc"
 
 
 def test_mfa_gate_off_accepts_a_password_only_token(rsa_key: rsa.RSAPrivateKey) -> None:
@@ -587,6 +641,69 @@ def test_exchange_code_without_id_token_raises() -> None:
             code_verifier="v",
             opener=opener,  # type: ignore[arg-type]
         )
+
+
+class _TripwireOpener:
+    """An opener that fails the test if it is ever reached — the shape a "refused before the wire"
+    claim needs. A stub that returned a body could not tell a refusal apart from a completed POST."""
+
+    def open(self, req: Any, timeout: float = 0.0) -> Any:
+        raise AssertionError("an unmeasured token-endpoint request reached the opener")
+
+
+def test_exchange_code_refuses_an_over_length_token_endpoint() -> None:
+    """BACKLOG #1048 (ASVS 4.2.5): the token-exchange POST had no send-time length guard — the whole
+    ``auth`` package carried zero length measurement, so the one outbound request the OIDC relying
+    party makes was the unmeasured limb of the 4.2.5 partial.
+
+    ``token_endpoint`` is operator-static config (validated https at load), so this is the weaker of
+    the two limbs and not attacker-influenced. It still earns the bound: an ``env()`` value that
+    resolved to an unexpected blob surfaces here as a clear refusal instead of a wire-level surprise
+    on the first federated login.
+
+    Mutation: delete the ``find_outbound_length_violation`` call in ``exchange_code``. Red:
+    AssertionError from the tripwire — the over-long request reached the opener."""
+    with pytest.raises(oidc.FlowError, match="over the 8192-char limit"):
+        oidc.exchange_code(
+            token_endpoint="https://idp.example/" + "t" * 9000,
+            client_id="c",
+            client_secret=None,
+            code="x",
+            redirect_uri="http://localhost/cb",
+            code_verifier="v",
+            opener=_TripwireOpener(),  # type: ignore[arg-type]
+        )
+
+
+def test_exchange_code_length_guard_reuses_the_one_outbound_bound() -> None:
+    """The limit is not re-declared in ``auth``: the guard calls the same measurement every other
+    HTTP egress uses, so there is one definition of "too long" and no third constant to drift.
+
+    Live positive control for the refusal above — it proves the number that test matches is the
+    shipped limit rather than a value that merely happens to agree with it."""
+    from messagefoundry.transports.rest import MAX_OUTBOUND_URL_LEN
+
+    assert MAX_OUTBOUND_URL_LEN == 8192, (
+        "the shared outbound URL bound moved; the OIDC guard follows it automatically but the "
+        "message the refusal test matches does not"
+    )
+
+
+def test_exchange_code_still_posts_an_endpoint_that_fits() -> None:
+    """Positive control: a normal endpoint must still reach the opener. Without it, a guard that
+    refused EVERY token exchange would pass the refusal test above."""
+    opener = _FakeOpener(json.dumps({"id_token": "x.y.z"}).encode())
+    payload = oidc.exchange_code(
+        token_endpoint="https://idp.example/token",
+        client_id="c",
+        client_secret=None,
+        code="x",
+        redirect_uri="http://localhost/cb",
+        code_verifier="v",
+        opener=opener,  # type: ignore[arg-type]
+    )
+    assert payload["id_token"] == "x.y.z"
+    assert opener.request is not None, "the request must have been handed to the opener"
 
 
 def test_non_ascii_state_is_a_plain_non_match_not_a_crash() -> None:

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // "Insert Element" — a code-first quick-pick that drops the most-used Handler/Router idioms (field
 // copy, lookups, loops, date conversion, Send, …) as real, editable Python. The element catalog is the
 // bundled `snippets/messagefoundry.code-snippets` file — the SAME source the editor uses for prefix

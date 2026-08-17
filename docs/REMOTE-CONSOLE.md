@@ -167,8 +167,9 @@ carries the recommended hardening for an exposed console (client-certificate dev
 
 Auth is on by default; remote users sign in with local accounts (± TOTP MFA) or AD/LDAP. Note:
 
-- With `[security].require_sign_in = false`, an off-loopback bind is **hard-refused** (loopback is the
-  only no-auth posture).
+- With `[security].require_sign_in = false`, an exposed instance is **hard-refused** — an off-loopback
+  bind, or a loopback bind behind a declared TLS terminator (a bare loopback bind with no declared
+  terminator is the only no-auth posture).
 - `[security].require_mfa` is **on by default**, and MFA is an access gate: an enrolled-pending session
   gets `403` + `X-MFA-Required: 1` on every authorized route. **Leave it on** — that default, not the
   startup gate below, is the control.
@@ -179,11 +180,19 @@ Auth is on by default; remote users sign in with local accounts (± TOTP MFA) or
   `[security].allow_single_factor_admin_when_exposed` is not set
   ([`__main__.py`](../messagefoundry/__main__.py), the `admin_exposed` block). Either switch turns the
   refusal into a loud, audited warning that starts. A non-PHI instance is silent.
-  It also has a **blind spot**: the proxy arm keys on the console actually being *served*, and a
-  default-on console auto-degrades to JSON-only when exposed (§3) — so the recommended
-  loopback-behind-a-terminator topology does **not** trip it, while the JSON operator API is still
-  reachable off-box. Don't treat the refusal as your MFA control; see the
-  `allow_single_factor_admin_when_exposed` row in [`CONFIGURATION.md`](CONFIGURATION.md) and
+  **"Exposed" here is the bind-and-proxy posture, not the console**: an off-loopback bind, **or**
+  `[api].tls_terminated_upstream` — whether or not `/ui` ends up mounted. So the recommended
+  loopback-behind-a-terminator topology in §3 **does** trip it, including when the default-on console
+  auto-degrades to JSON-only, and when `serve_web_console = false` disables the console outright: the
+  single-factor surface being protected is the JSON operator API. (This is a correction —
+  [BACKLOG #326](archive/backlog/BACKLOG-CLOSED.md#326-mfa-at-exposure-refusal-reads-serve_ui-after-it-is-flipped-off); the arm used to read the console flag, which the §3 auto-degrade clears
+  first, and would have missed exactly that topology on first deployment.) An **undeclared** proxy —
+  a set `[security].web_console_public_address` with no `tls_terminated_upstream` — is outside the
+  predicate and does **not** refuse: nothing was declared, so exposure would be an inference. It gets
+  its own **warning** instead, naming single-factor admin explicitly, on a PHI instance with
+  `require_mfa` off. That is a distinct arm — **not** the ADR 0068 §8 undeclared-proxy warning, which
+  is about the `/ui` cookie and HSTS and is suppressed by §3's auto-degrade in the same posture. See
+  the `allow_single_factor_admin_when_exposed` row in [`CONFIGURATION.md`](CONFIGURATION.md) and
   [`SECURITY-LOOSENING.md`](SECURITY-LOOSENING.md).
 - Under the shipped `require_mfa_scope = "every_local_account"`, a non-interactive **local**
   bearer-token service account becomes MFA-pending and cannot enrol unattended. Settle this **before**
@@ -229,7 +238,7 @@ then held for a second, *distinct* approver holding `approvals:approve` instead 
 | Reload the graph from the engine's own startup config dir (executes your config Python) | `/ui/config/reload` | `config:deploy` | step-up; dual control **only if you add `config_reload` to `[approvals].operations`** — see the note above |
 | Replay one message | `/ui/messages/{message_id}/replay` | `messages:replay` | step-up |
 | Replay dead deliveries — for one channel, for one (channel, destination), or all of them | `/ui/dead-letters/{channel_id}/replay`, `/ui/dead-letters/{channel_id}/{destination_name}/replay`, `/ui/dead-letters/replay-all` | `messages:replay` | step-up + dual control |
-| Edit a message body and resend it (re-route, or direct to a chosen outbound) | `/ui/messages/{message_id}/edit-resend` | `messages:edit` | step-up |
+| Edit a message body and resend it (re-route, or direct to a chosen outbound) | `/ui/messages/{message_id}/edit-resend` | `messages:edit` **+** `messages:view_raw` | step-up |
 | Purge an outbound's queued deliveries, for one connection or a selection | `/ui/connections/{name}/purge/{scope}`, `/ui/connections/purge-bulk` | `messages:purge` | step-up + dual control |
 | Acknowledge / resolve / suspend / resume an alert | `/ui/alerts/{alert_id}/ack`, `/resolve`, `/suspend`, `/resume` | `monitoring:diagnose` | — |
 | Reset cumulative statistics — all of them, one connection, or a selection | `/ui/statistics/reset`, `/reset-one`, `/reset-many` | `monitoring:diagnose` | — |

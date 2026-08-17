@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Pure (vscode-free) view-model for the Wiring Map panel (ADR 0091 D3): a focus-first, hop-bounded,
 // node-capped projection of the one wiring graph onto four layout columns — inbound | router |
 // handler | outbound, in pipeline order. Strictly READ-ONLY: this is a projection of graphModel's

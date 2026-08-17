@@ -16,7 +16,7 @@
 | **Date** | July 13, 2026 |
 | **License** | Publishable under the project's open-source license; intended to be shared with adopters and reused across projects. |
 | **Review cadence** | At least annually, and on **any material change to the AI toolchain or threat model** (a new agent framework, MCP server, Claude Code version, or a new probed attack class). |
-| **Aligns to** | NIST SP 800-218 (SSDF): PO.1 / PO.2 / PO.3 / PO.5 / PS.1 / PW.1 / PW.4 / PW.7 / PW.8 / RV.2 · OWASP ASVS 5.0 Level 3 (V8, V11, V14, V15, V16) · a **five-principle synthesis** distilled from the AI-assisted-development literature (§3, §11 — *not* an external standard) · the project standing contract [`../CLAUDE.md`](../CLAUDE.md) · companion to Secure Development Standards. **Deliberately omits any certification framework** — see §8. |
+| **Aligns to** | NIST SP 800-218 (SSDF) **v1.1**: PO.1 / PO.2 / PO.3 / PO.5 / PS.1 / PW.1 / PW.4 / PW.7 / PW.8 / RV.2 — and deliberately **not SP 800-218A**, which profiles organizations *producing* generative-AI and dual-use foundation models, **not** building software *with* an AI assistant; the name is the trap, and it is the wrong document for this one · OWASP ASVS 5.0 Level 3 (V8, V11, V14, V15, V16) · a **five-principle synthesis** distilled from the AI-assisted-development literature (§3, §11 — *not* an external standard) · the project standing contract [`../CLAUDE.md`](../CLAUDE.md) · companion to Secure Development Standards. **Deliberately omits any certification framework** — see §8. |
 
 ---
 
@@ -351,20 +351,39 @@ The maintainer reviews **every** diff against the §6.2 plan. **Reject code you 
 
 Work on a feature branch and open a PR (**direct `main` pushes are blocked**). One coherent layer per commit.
 
-> ### ⛔ The `Co-Authored-By` trailer is NOT IN USE — and cannot be, as things stand
+> ### NOT IN USE: the `Co-Authored-By` trailer is neither prescribed nor enforced
 >
-> This section prescribed the trailer block below. **Measured 2026-07-29: the observed rate is zero** —
-> `git log -n 300` contains **0** `Co-Authored-By` trailers and **0** `Tier:` lines — and **81 tracked
-> files** under `docs/` instruct omitting it. That is not slippage; it is **structurally blocked**:
-> [`cla.yml`](../.github/workflows/cla.yml) allowlists exactly three identities
-> (`wshallwshall`, `dependabot[bot]`, `github-actions[bot]`), the CLA bot treats a trailer co-author as
-> a contributor who must sign, and `cla` is a **required** status check. Adding the trailer therefore
-> reds a required context and blocks the merge.
+> This section prescribed the trailer block below. **Measured 2026-07-29: the observed rate was zero** —
+> `git log -n 300` contained **0** `Co-Authored-By` trailers and **0** `Tier:` lines — and **81 tracked
+> files** under `docs/` instruct omitting it.
 >
-> So the trailer is recorded here as **designed, blocked, and not in use** (§9) — *not* as Built, and
-> **not** as evidence for any claim in the A.4 register. A control with a measured adoption of zero
-> cited as audit evidence is the same integrity failure the doc-drift test family exists to prevent,
-> and this standard is published to adopters and auditors.
+> **Re-measured 2026-08-13, and the count half has moved.** On `origin/main`, **15 commits carry at
+> least one `Co-Authored-By` trailer** (77 trailer lines, because a squash merge concatenates the
+> bodies it absorbs), every one of them dated **2026-07-30 to 2026-08-09** — the first landing the day
+> *after* the original measurement. `Tier:` lines remain at **0**. So the 2026-07-29 count was correct
+> when taken; nothing here was mis-measured.
+>
+> **What the re-measurement refutes is the prediction, and it is the load-bearing half.** This box
+> claimed the trailer was `structurally blocked` (quoted as a token, per CLAUDE.md section 11's rule
+> for naming a withdrawn term without adopting it) — that
+> [`cla.yml`](../.github/workflows/cla.yml)'s three-identity allowlist plus the required `cla` context
+> meant *"adding the trailer reds a required context and blocks the merge"*. Fifteen trailer-bearing
+> commits reached `origin/main` through ordinary numbered PRs, starting one day later. Whatever the
+> CLA action reads to decide who must sign, it is not this trailer, and the merge gate did not fire.
+> **Do not restate "blocked" anywhere.** A compensating control resting on a false premise is the
+> SDS-3.7 defect this document defines, and the premise was this document's own.
+>
+> **The honest state is a third one: unprescribed, unenforced, and intermittently present anyway.**
+> The trailer arrived without a decision and stopped without a withdrawal, across an eleven-day window
+> nobody recorded — the signature of a tooling default, not of a convention. That is *worse* evidence
+> than a clean zero, not better: a provenance record that switches on and off for unknown reasons
+> cannot answer "which model wrote this" for the commits that lack it, and cannot be trusted for the
+> ones that have it.
+>
+> So the trailer stays recorded as **not prescribed, not enforced, and not in use** (§9) — *not* as
+> Built, and **not** as evidence for any claim in the A.4 register. The conclusion is unchanged from
+> 2026-07-29; only the reason is. This standard is published to adopters and auditors, and the
+> integrity failure the doc-drift test family exists to prevent is citing a control nobody operates.
 >
 > **If it is ever adopted**, note the shipped Linux-kernel form is **`Assisted-by:`** — the kernel
 > explicitly **rejected** `Co-developed-by:` for AI attribution because it requires a paired
@@ -607,7 +626,7 @@ The standard requires deviations be documented with a compensating control (SDS 
 
 - **Single-maintainer review (PO.2 / PW.7) — the canonical deviation this doc owns.** *First accepted 2026-06-16 in SDS §A.6; expanded here 2026-06-18; owner: project maintainer.* The T3 "human second reviewer" control cannot mean an independent human today. **Compensating controls:** blocking SAST/SCA/secret-scan (bandit/semgrep/pip-audit/gitleaks), AI-assisted review (`/code-review`, `/security-review`), branch protection + required CI checks, no direct `main` pushes. **Build trigger:** *a second human maintainer joins ⇒ T3 review escalates to a true human second reviewer.* **Design record:** SDS §A.6 + this section (+ an ADR if cut). *Honesty:* wording forbids "AI-reviewed = independently audited" (§8).
 - **"Explain it with AI help" accepted in lieu of unaided comprehension — the anti-SOUP override.** *Risk accepted 2026-06-18; owner: project maintainer.* The floor's *reject code you cannot explain* (§4.4) is satisfied by an explanation reached **with AI assistance** — a deliberate relaxation of the stricter "the human understands it unaided" reading that most directly prevents **SOUP** (Software of Unknown Provenance, §10). **Why override:** the standard governs a solo maintainer who builds with AI; an unaided-comprehension bar would bar that workflow. **Compensating controls:** the maintainer must produce, verify, and **stand behind** the explanation (code opaque *even with AI help* is still rejected; rubber-stamping forbidden); the deterministic gates (tests + blocking SAST/SCA) still apply; at T3 the explanation is captured durably (comment/PR/ADR/test). **Build trigger:** a regulated-device / formal-IEC-62304 deployment requiring documented SOUP assessment or unaided comprehension ⇒ reinstate the strict bar. **Design record:** §4.4, §6.6, §10.
-- **NO per-commit AI-authorship record at all.** *Risk accepted 2026-06-18 as "commit granularity by convention"; **corrected 2026-07-29** — owner: project maintainer.* The earlier wording claimed a commit-level AI-vs-human distinction via `Co-Authored-By`. **Measurement says otherwise:** 0 trailers and 0 `Tier:` lines across 300 commits, 81 tracked files instructing omission, and the required `cla` check structurally blocking the trailer (§6.7). So the honest deviation is broader than first accepted — there is **no** model/version record in the commit stream, at any granularity, and no retained transcript either, which means the project cannot answer "which model wrote this, under what policy" for any commit in its history. **Compensating controls:** the PR thread + the PR template's AI/tier declaration + this standard (a per-PR record, not per-commit). **Build trigger:** a CLA-compatible trailer (e.g. the kernel's `Assisted-by:`) enforced by a `commit-msg` hook **plus** an ungated CI backstop; separately, a hunk-attribution mechanism (§9). **Design record:** §6.7, §9. **Drift guard:** `tests/test_ai_provenance_claims.py` — it fails if the trailer is re-listed as Built or as A.4 evidence while the repo still instructs omitting it.
+- **NO per-commit AI-authorship record at all.** *Risk accepted 2026-06-18 as "commit granularity by convention"; **corrected 2026-07-29** — owner: project maintainer.* The earlier wording claimed a commit-level AI-vs-human distinction via `Co-Authored-By`. **Measurement says otherwise:** 0 `Tier:` lines, 81 tracked files instructing omission, and a `Co-Authored-By` trailer that is neither prescribed nor enforced — present on 15 commits dated 2026-07-30 to 2026-08-09 and absent everywhere else, for reasons nobody recorded (§6.7, re-measured 2026-08-13). *The earlier "structurally blocked by the required `cla` check" reading is withdrawn: those 15 commits merged.* So the honest deviation is broader than first accepted — there is **no** model/version record in the commit stream, at any granularity, and no retained transcript either, which means the project cannot answer "which model wrote this, under what policy" for any commit in its history. **Compensating controls:** the PR thread + this standard (a per-PR record, not per-commit) — **and that is the whole list.** An earlier wording here also cited "the PR template's AI/tier declaration"; [`.github/PULL_REQUEST_TEMPLATE.md`](../.github/PULL_REQUEST_TEMPLATE.md) has no such field and never has, so the citation is withdrawn rather than repaired. Naming a control that does not exist is the SDS-3.7 failure this document defines, and it is more damaging in a deviation register than anywhere else, because a deviation register is read as the list of things that make the gap survivable. **Build trigger:** an AI/tier declaration actually added to the PR template (which would make the withdrawn control real); or a CLA-compatible trailer (e.g. the kernel's `Assisted-by:`) enforced by a `commit-msg` hook **plus** an ungated CI backstop; separately, a hunk-attribution mechanism (§9). **Design record:** §6.7, §9. **Drift guard:** `tests/test_ai_provenance_claims.py` — it fails if the trailer is re-listed as Built or as A.4 evidence while the repo still instructs omitting it.
 - **Automated requirement→design→test traceability not built (T3).** *Risk accepted 2026-06-18; owner: project maintainer.* **Compensating controls:** ADR ↔ test-name ↔ requirement links + the Plan artifact + the tier-declaration. **Build trigger:** the first regulated-release / adopter audit. **Design record:** §10, §9 (+ an ADR if cut).
 - **SPDX-header enforcement by convention.** *Risk accepted 2026-06-18; owner: project maintainer.* No dedicated test asserts header presence. **Compensating controls:** convention + AI memory + the leak/forbidden scan. **Build trigger:** a trivial pytest walking first-party `.py`. **Design record:** §9.
 

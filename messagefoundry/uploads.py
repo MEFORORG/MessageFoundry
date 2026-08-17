@@ -86,9 +86,20 @@ class UploadQuotaError(UploadError):
     The uploaded-logs feature caps how many files and how many aggregate bytes a single uploader may
     retain at once (``[store].max_upload_files_per_user`` / ``max_upload_total_bytes_per_user``, both
     defaults-ON). A would-be over-quota upload is refused at the chokepoint before anything is written;
-    the API maps it to HTTP 409 and a metadata-only ``upload.reject_quota`` audit. Residual: the
-    check-then-write is not atomic, so concurrent in-flight uploads can overshoot by at most one file
-    (itself bounded by ``max_upload_bytes``); the quota is per-process per-``uploads_dir``."""
+    the API maps it to HTTP 409 and a metadata-only ``upload.reject_quota`` audit.
+
+    The check and the write it authorises run as ONE critical section per process (ASVS 2.3.4), so
+    concurrent uploads inside an engine cannot double-book the budget. The quota is scoped to the
+    ``uploads_dir``, not to the process: :meth:`UploadStore._scan_metas_sync` re-reads the sidecars
+    with no cache, so engine shards sharing one dir enforce ONE budget between them (measured
+    2026-08-10). Shards pointed at separate dirs get separate budgets, by construction.
+
+    Residual, stated precisely: the critical section is per-process, so N engine shards sharing one
+    dir can still overshoot by at most **N-1 files** — one per shard that is mid-write when another
+    scans, each bounded by ``max_upload_bytes``. On the shipped single-process deployment N is 1 and
+    the overshoot is zero. Closing the multi-shard remainder needs a cross-process mechanism (an
+    advisory lock on the dir, or moving the accounting into the unified store); it is not closed
+    here, and no comment in this module should imply otherwise."""
 
 
 class UploadNotFoundError(UploadError):
@@ -100,11 +111,26 @@ class UploadedFileMeta:
     """Non-body metadata about one uploaded file (persisted encrypted in the ``.meta`` sidecar).
 
     ``filename`` is the operator-supplied name, sanitized for display; it is never a filesystem path.
-    ``content_type`` is the format tag (``hl7v2``/``xml``/``text``), not an HTTP MIME type."""
+    ``content_type`` is the format tag (``hl7v2``/``xml``/``text``), not an HTTP MIME type.
+
+    TWO owner fields, and the split is deliberate. ``uploader_id`` is the account's **immutable**
+    identifier (``Identity.user_id``, a ``uuid4`` hex minted once per account row) and is the ONLY
+    value ownership and the per-uploader quota key on. ``uploader`` is the username, which is a
+    **display label**: it is unique among live accounts but it is *reusable* — deleting an account
+    frees the name, and recreating it mints a different ``user_id``. Keying either the ownership
+    check or the budget on the name would hand a recycled account the departed operator's files.
+
+    **The id is immutable per ROW, which is not the same as per PERSON on AD.** ``_upsert_ad_user``
+    resolves by ``sAMAccountName`` and mints a new ``user_id`` only when no mirror row survives, so a
+    directory-side rename/recycle WITHOUT a MessageFoundry ``delete_user`` re-binds the EXISTING id
+    to the new principal. A deploying site on AD would need the directory-immutable binding tracked
+    as BACKLOG #1143 for that case; this field closes the local-account path and the AD path that
+    goes through a delete."""
 
     file_id: str
     filename: str
     uploader: str
+    uploader_id: str
     content_type: str
     size: int
     sha256: str
@@ -275,6 +301,12 @@ class UploadStore:
         self._max_files_per_user = max(1, int(max_files_per_user))
         self._max_total_bytes_per_user = max(1, int(max_total_bytes_per_user))
         self._retention_days = max(1, int(retention_days))
+        # ASVS 2.3.4: the quota check and the write that consumes it must be ONE critical section, or
+        # concurrent uploads each read a stale count and double-book the budget. Serialising the whole
+        # build-and-write (not just the check) is what makes it atomic — releasing between them is the
+        # race. The throughput cost is acceptable here and nowhere near the data plane: this is the
+        # operator diagnostic-upload surface, and each pass is bounded by max_bytes.
+        self._quota_lock = asyncio.Lock()
 
     @property
     def max_bytes(self) -> int:
@@ -336,6 +368,12 @@ class UploadStore:
             file_id=str(d["file_id"]),
             filename=str(d.get("filename", "upload")),
             uploader=str(d.get("uploader", "")),
+            # Tolerant, like every other optional field — a sidecar without the key yields "", which
+            # matches NOBODY at the ownership check (api/app.py ``_may_access_upload``) and buckets
+            # into no operator's quota. That is the fail-closed end state, not a migration gap: there
+            # is deliberately no fallback to ``uploader`` here, because a name fallback would
+            # reintroduce exactly the recycled-username reachability this field exists to close.
+            uploader_id=str(d.get("uploader_id", "")),
             content_type=str(d.get("content_type", "hl7v2")),
             size=int(d.get("size", 0)),
             sha256=str(d.get("sha256", "")),
@@ -367,12 +405,26 @@ class UploadStore:
     # --- public API (all disk/crypto/split work off the event loop) --------------------------------
 
     async def save(
-        self, *, data: bytes, filename: str, uploader: str, content_type: str | None = None
+        self,
+        *,
+        data: bytes,
+        filename: str,
+        uploader: str,
+        uploader_id: str,
+        content_type: str | None = None,
     ) -> UploadedFileMeta:
-        """Persist an uploaded file (encrypted at rest) and return its metadata. Raises
-        :class:`UploadTooLargeError` if it exceeds ``max_bytes``, :class:`UploadContentError` on a
-        disallowed extension / content mismatch (ASVS 5.2.2), or :class:`UploadQuotaError` when the
-        uploader's file-count or aggregate-byte quota would be exceeded (ASVS 5.2.4)."""
+        """Persist an uploaded file (encrypted at rest) and return its metadata.
+
+        ``uploader_id`` is the owning account's immutable ``Identity.user_id``; ``uploader`` is its
+        username, kept for display and the audit rows only. Both are required — a file written with
+        no ``uploader_id`` would be readable by nobody but a ``files:access_any`` holder while still
+        billing to nobody's quota, so an empty one is a programming error and is refused here.
+
+        Raises :class:`UploadTooLargeError` if it exceeds ``max_bytes``, :class:`UploadContentError`
+        on a disallowed extension / content mismatch (ASVS 5.2.2), or :class:`UploadQuotaError` when
+        the uploader's file-count or aggregate-byte quota would be exceeded (ASVS 5.2.4)."""
+        if not uploader_id:
+            raise ValueError("uploader_id is required (an upload with no owner id is unreachable)")
         # Only the cheap size check runs on the loop; the sha256, the whole-file split, the cipher, and
         # the disk writes are ALL bounded by max_bytes (25 MiB default), so they run OFF the event loop
         # (a large upload must never stall the shared engine loop — ADR 0134 / CLAUDE.md §6).
@@ -391,9 +443,15 @@ class UploadStore:
         def _build_and_write() -> UploadedFileMeta:
             # Per-uploader quota (ASVS 5.2.4): scan the uploader's existing sidecars and refuse BEFORE
             # writing when this file would exceed their file-count or aggregate-byte cap. Runs in the same
-            # off-loop thread as the write. Residual: the check-then-write is not atomic, so concurrent
-            # in-flight uploads can overshoot by at most one file (bounded by max_bytes).
-            mine = [m for m in self._scan_metas_sync() if m.uploader == uploader]
+            # off-loop thread as the write, and the caller holds _quota_lock across BOTH, so no second
+            # upload in this process can read this count before the write consumes it (ASVS 2.3.4).
+            # The scan is uncached, so shards sharing a dir enforce one budget rather than one each;
+            # the residual that survives the lock is per-shard, not per-upload. See UploadQuotaError.
+            # The bucket key is the IMMUTABLE uploader_id, the same value the ownership check uses, so
+            # the budget and the ownership rule can never disagree about who a file belongs to: a
+            # recycled username is never billed for files it cannot read. The message text below still
+            # names the human username, because an operator reading a 409 needs a name, not a uuid.
+            mine = [m for m in self._scan_metas_sync() if m.uploader_id == uploader_id]
             if len(mine) + 1 > self._max_files_per_user:
                 raise UploadQuotaError(
                     f"uploader {uploader!r} has {len(mine)} uploaded files; the limit is "
@@ -409,6 +467,7 @@ class UploadStore:
                 file_id=file_id,
                 filename=display,
                 uploader=uploader,
+                uploader_id=uploader_id,
                 content_type=ctype,
                 size=len(data),
                 sha256=hashlib.sha256(data).hexdigest(),
@@ -425,7 +484,9 @@ class UploadStore:
             _atomic_write_text(root, meta_path, meta_ct)
             return meta
 
-        return await asyncio.to_thread(_build_and_write)
+        # One critical section per process: quota check + write. See _quota_lock in __init__.
+        async with self._quota_lock:
+            return await asyncio.to_thread(_build_and_write)
 
     async def list_files(self) -> list[UploadedFileMeta]:
         """List all uploaded files (newest first). Undecryptable/foreign sidecars are skipped with a

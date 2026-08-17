@@ -44,8 +44,34 @@
 #                    and the PATTERN written out (the prefix followed by a regex quantifier expression
 #                    or an x-run) — the prefix itself is the secret, so spelling the pattern leaks it.
 #
-# Everything below is SYNTHETIC (ACME / EXAMPLE, and a NON-REAL 99xxxx site prefix). It exercises the
-# mechanism and MUST be replaced for real use. Do NOT commit the filled-in scan-tokens.local.txt.
+# PLACEHOLDERS IN TRACKED CONTENT — read this before you invent an example site code.
+#   The [site_prefix] note above is written for the person filling in the TOKEN LIST, where naming the
+#   shape is necessary. It is NOT guidance for choosing placeholder VALUES, though it reads like it,
+#   and that is the trap: a placeholder written into TRACKED content — a doc, a code comment, a test
+#   fixture, backlog prose — is scanned by the gate this very list configures. So a placeholder built
+#   from any prefix in [site_prefix] (the REAL list or this synthetic example) is a hit, nothing else
+#   warns you, and the hook blocks the commit.
+#     The two detectors above catch DIFFERENT constructs, not one construct twice: a concrete code is
+#     a "site code" hit, a written-out pattern is a "site-code pattern written out" hit, and no single
+#     string can be both. So fixing one form does NOT clear the other — that is the ADR 0030 miss
+#     recorded beside _SITE_CODE_PATTERN_LITERAL in scan_forbidden.py.
+#     Prefer a NON-NUMERIC stand-in: SITEA, or the angle-bracket <site> form this repo already uses
+#     for placeholders. Being non-numeric is what makes it safe — a numeric detector has nothing to
+#     match. (The brackets themselves exempt nothing here; only the home-path detector reads them.)
+#     And describe a numeric shape in words rather than writing it out.
+#     The pre-commit hook and CI both scan FILES; neither sees a commit message. There is no net
+#     behind you in a subject line, so hold the same discipline there.
+#
+#   Running the synthetic set, expect the concrete-code detector to fire on at least one further class:
+#   a delimited digit run that is exactly a configured prefix followed by four more digits — e.g. a
+#   sentinel PID, an out-of-range id, a clamp ceiling, a synthetic MRN. That is an artifact of WHICH
+#   prefix happens to be loaded, not a disclosure. The run banner "[SYNTHETIC EXAMPLE TOKENS …]"
+#   printed before any refusal is what tells such a false positive apart from a real leak — read it
+#   first, and do not assume a hit here predicts a hit in CI.
+#
+# Everything below is SYNTHETIC (ACME / EXAMPLE, plus a NON-REAL site prefix carried in [site_prefix]
+# below — deliberately not restated here, since writing the shape out is itself a hit). It exercises
+# the mechanism and MUST be replaced for real use. Do NOT commit the filled-in scan-tokens.local.txt.
 
 [names]
 \bacme\b | customer name (ACME) | i

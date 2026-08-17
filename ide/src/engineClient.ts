@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Minimal HTTP client for the local MessageFoundry engine API. The IDE otherwise only shells out to
 // the Python CLI; Stage → Promote is the one action that drives the *running* engine over HTTP. Uses
 // the Node built-ins (no global `fetch` dependency, no npm deps) — same zero-dep style as cli.ts.
@@ -38,6 +40,34 @@ export class NetworkError extends Error {
     super(message);
     this.name = "NetworkError";
   }
+}
+
+/**
+ * The negotiated TLS floor for every https request this client makes.
+ *
+ * State the defect precisely, because the overstated version is wrong: Node has defaulted
+ * `tls.DEFAULT_MIN_VERSION` to TLSv1.2 since Node 12, so this client was NOT negotiating TLS 1.0. What
+ * it was doing is INHERITING a process-wide mutable default. `NODE_OPTIONS=--tls-min-v1.0` in the
+ * environment VS Code is launched from lowers that default for the whole process, and every request
+ * here silently followed it down — a security property of a credential-bearing client should not be
+ * settable by an environment variable it never reads. Pinning it per-request costs nothing (it names
+ * the value that was already in force) and removes the override.
+ */
+export const TLS_MIN_VERSION = "TLSv1.2";
+
+/**
+ * TLS options for `url`, empty for plain http (the 127.0.0.1 default flow, where there is no
+ * handshake to constrain and `assertTargetAllowed` separately refuses cleartext off-box).
+ *
+ * NO explicit cipher list, deliberately, and this is a decision rather than an omission. Node's
+ * default suite already excludes the weak families, is maintained upstream, and is negotiated against
+ * whatever the operator's TLS terminator offers. A pinned list would freeze this client at today's
+ * cryptographic opinion — ageing into weakness precisely because it can no longer track the runtime —
+ * and can refuse a handshake a correctly configured proxy would have completed. That is real operator
+ * cost paid for a narrower gain than the version floor above, so only the floor is pinned here.
+ */
+function tlsOptions(url: URL): https.RequestOptions {
+  return url.protocol === "https:" ? { minVersion: TLS_MIN_VERSION } : {};
 }
 
 /** Fold a Node request error into a {@link NetworkError}, preserving its errno. Shared by GET/POST so
@@ -85,7 +115,8 @@ export function postJson<T>(
       headers["Authorization"] = `Bearer ${token}`;
     }
     const transport = url.protocol === "https:" ? https : http;
-    const req = transport.request(url, { method: "POST", headers }, (res) => {
+    const options: https.RequestOptions = { method: "POST", headers, ...tlsOptions(url) };
+    const req = transport.request(url, options, (res) => {
       const chunks: Buffer[] = [];
       res.on("data", (c: Buffer) => chunks.push(c));
       res.on("end", () => {
@@ -140,7 +171,8 @@ export function getJson<T>(
     }
     const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
     const transport = url.protocol === "https:" ? https : http;
-    const req = transport.request(url, { method: "GET", headers }, (res) => {
+    const options: https.RequestOptions = { method: "GET", headers, ...tlsOptions(url) };
+    const req = transport.request(url, options, (res) => {
       const chunks: Buffer[] = [];
       res.on("data", (c: Buffer) => chunks.push(c));
       res.on("end", () => {

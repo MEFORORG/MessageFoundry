@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from pathlib import Path
 from types import MappingProxyType
@@ -372,6 +373,43 @@ async def test_database_source_whole_row_value(
     await runner.sync_all()
     assert store.reference_view()["provider_npi"]["A"] == {"npi": "9", "flag": "Y"}
     await store.close()
+
+
+class _HangingRefPool(_RefPool):
+    """A reference source whose server never hands over a connection (BACKLOG #1052)."""
+
+    async def acquire(self) -> _RefConn:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+async def test_database_source_acquire_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1052: the DatabaseRef throwaway pool's borrow was unbounded, so one unresponsive
+    reference server would hold the sync pass open forever — and the runner walks the declared sets
+    SEQUENTIALLY, so it would stall every OTHER set's refresh too, not just its own. At the limit
+    the set fails like any other source failure: last-good kept, alert raised, the pass completes.
+
+    The outer ``wait_for`` is the assertion: pre-fix, ``sync_all()`` never returns."""
+    pool = _HangingRefPool(_RefConn(_RefCursor(["provider_id", "npi"], [])))
+
+    async def fake_make_pool(dsn: str, pool_max: int, *, autocommit: bool) -> _RefPool:
+        return pool
+
+    import messagefoundry.transports.database as db
+
+    monkeypatch.setattr(db, "_make_pool", fake_make_pool)
+
+    store = await MessageStore.open(tmp_path / "r.db")
+    try:
+        runner = ReferenceSyncRunner(store, lambda: [_db_spec(acquire_timeout=0.05)], REF)
+        result = await asyncio.wait_for(runner.sync_all(), timeout=10.0)
+        assert result.failed == 1 and result.synced == 0
+        assert "provider_npi" not in store.reference_view()  # nothing was materialized
+        assert pool.closed is True  # the throwaway pool is still torn down
+    finally:
+        await store.close()
 
 
 async def test_database_source_egress_denied_keeps_empty(
@@ -816,5 +854,176 @@ async def test_genuine_source_failure_still_retries_and_keeps_last_good(
         assert len(alerts.details) == 2  # alerted on both passes (still transient)
         assert "keeping last-good" in caplog.text
         assert not [r for r in caplog.records if r.levelname == "ERROR"]  # WARNING, not ERROR
+    finally:
+        await store.close()
+
+
+# --- ASVS 14.2.7: purge_reference_snapshots (orphan-scoped) ------------------
+#
+# `reference.value` is PL-2 (PHI.md §2) and until 14.2.7 had NO purge path at all: a set dropped from
+# config kept its decryptable rows forever, because the only thing that ever replaced a snapshot was
+# the next sync's build-new-then-flip — which never comes for a set nobody declares.
+
+
+async def _seed(store: MessageStore, name: str, *, synced_at: float, rows: dict[str, Any]) -> None:
+    """Write a snapshot and backdate its active-version pointer, so age is controllable."""
+    await store.write_reference_snapshot(name=name, version="v1", rows=rows)
+    await store._db.execute(
+        "UPDATE reference_version SET synced_at = ? WHERE name = ?", (synced_at, name)
+    )
+    await store._commit()
+
+
+async def test_purge_deletes_only_undeclared_sets(tmp_path: Path) -> None:
+    """The keep-set is `declared`; age alone is never sufficient.
+
+    Mutation: drop the `r[0] not in declared` filter — reds, because the still-wired set loses its rows.
+    """
+    store = await MessageStore.open(tmp_path / "r.db")
+    try:
+        await _seed(store, "wired", synced_at=0.0, rows={"A": "1"})  # ancient BUT still declared
+        await _seed(store, "orphan", synced_at=0.0, rows={"B": "2"})
+        deleted = await store.purge_reference_snapshots(older_than=1000.0, declared={"wired"})
+        assert deleted == 1
+        view = store.reference_view()
+        assert view["wired"] == {"A": "1"}, "a DECLARED set must survive however old it is"
+        assert view.get("orphan") in (None, {}), "the orphan's rows must be gone"
+    finally:
+        await store.close()
+
+
+async def test_purge_leaves_a_recent_orphan_alone(tmp_path: Path) -> None:
+    """Undeclared but NEWER than the cutoff — the window still applies to orphans.
+
+    Without this, `declared` alone would drive deletion and the age window would be decorative.
+    """
+    store = await MessageStore.open(tmp_path / "r.db")
+    try:
+        await _seed(store, "orphan", synced_at=5000.0, rows={"B": "2"})
+        deleted = await store.purge_reference_snapshots(older_than=1000.0, declared={"other"})
+        assert deleted == 0
+        assert store.reference_view()["orphan"] == {"B": "2"}
+    finally:
+        await store.close()
+
+
+async def test_purge_refuses_an_empty_declared_set(tmp_path: Path) -> None:
+    """An empty keep-set reads as "every set is abandoned" and would wipe the store.
+
+    `registry is None` does not cover it: a registry that LOADS FINE while declaring zero reference
+    sets — a subset --config, a per-team split, a harness redirect aimed at the real DB — yields
+    `references == {}`. Absence-based guards fail open, so this one is positive-signal.
+
+    Mutation: replace the raise with `return 0` — this reds, and so does the row-count assertion.
+    """
+    store = await MessageStore.open(tmp_path / "r.db")
+    try:
+        await _seed(store, "a", synced_at=0.0, rows={"k": "1"})
+        with pytest.raises(ValueError, match="non-empty"):
+            await store.purge_reference_snapshots(older_than=1000.0, declared=frozenset())
+        assert store.reference_view()["a"] == {"k": "1"}, (
+            "nothing may be deleted on the refusal path"
+        )
+    finally:
+        await store.close()
+
+
+async def test_purge_bumps_the_version_so_a_follower_converges(tmp_path: Path) -> None:
+    """The pointer row SURVIVES but its version CHANGES — and that is what carries the deletion.
+
+    `converge_reference_cache` only reloads a set whose active version DIFFERS from the one a handle
+    reflects. Leave the version alone and every cluster follower keeps serving the purged PHI out of
+    RAM until restart; delete the pointer instead and converge never notices, because it only
+    adds/updates names present in a fresh read. Bumping routes the deletion through the mechanism that
+    already exists.
+
+    Mutation: drop the UPDATE — `version` stays 'v1' and this reds. That is the single-handle proxy for
+    the cluster bug; the real two-handle proof lives in the Postgres/SQL Server suites, because SQLite
+    is single-node and its converge is legitimately a no-op.
+    """
+    store = await MessageStore.open(tmp_path / "r.db")
+    try:
+        await _seed(store, "orphan", synced_at=0.0, rows={"B": "2"})
+        await store.purge_reference_snapshots(older_than=1000.0, declared={"keep"})
+        row = await (
+            await store._db.execute(
+                "SELECT version, row_count FROM reference_version WHERE name = 'orphan'"
+            )
+        ).fetchone()
+        assert row is not None, (
+            "the pointer row must SURVIVE — deleting it is invisible to converge"
+        )
+        assert row["version"] == "purged:v1", "the version must change or a follower never reloads"
+        assert row["row_count"] == 0
+    finally:
+        await store.close()
+
+
+async def test_purge_is_idempotent_and_does_not_double_prefix(tmp_path: Path) -> None:
+    """A second pass over an already-purged set must be a no-op, not a churn of 'purged:purged:v1'."""
+    store = await MessageStore.open(tmp_path / "r.db")
+    try:
+        await _seed(store, "orphan", synced_at=0.0, rows={"B": "2"})
+        first = await store.purge_reference_snapshots(older_than=1000.0, declared={"keep"})
+        second = await store.purge_reference_snapshots(older_than=1000.0, declared={"keep"})
+        assert (first, second) == (1, 0)
+        row = await (
+            await store._db.execute("SELECT version FROM reference_version WHERE name = 'orphan'")
+        ).fetchone()
+        assert row["version"] == "purged:v1"
+    finally:
+        await store.close()
+
+
+async def test_a_concurrent_resync_between_decision_and_delete_is_not_destroyed(
+    tmp_path: Path,
+) -> None:
+    """The TOCTOU the eligibility re-assert exists for — the race landed WHERE IT ACTUALLY IS.
+
+    `declared` is computed by the RUNNER outside any store lock, and inside the store the eligibility
+    SELECT and the DELETE are separate statements. The dangerous window is BETWEEN them: a config
+    reload commits a fresh patient-keyed snapshot after the set has been judged eligible but before its
+    rows are removed.
+
+    THE FIRST VERSION OF THIS TEST WAS WORTHLESS and is worth recording. It re-synced *before* calling
+    the purge, so the internal SELECT already filtered the set out and the DELETE never ran — removing
+    the `EXISTS` re-assert changed nothing and the mutation SURVIVED. A test that exercises the
+    candidate filter cannot prove the re-assert. So the re-sync is injected mid-method here, which is
+    the only place the race exists.
+
+    Mutation: drop `AND EXISTS (... synced_at < ?)` from the DELETE — the fresh rows are destroyed and
+    this reds. Verified killed.
+    """
+    store = await MessageStore.open(tmp_path / "r.db")
+    try:
+        await _seed(store, "orphan", synced_at=0.0, rows={"OLD": "x"})
+
+        real_execute = store._db.execute
+        fired = False
+
+        async def racing_execute(sql: str, params: Any = None):  # type: ignore[no-untyped-def]
+            nonlocal fired
+            if not fired and sql.lstrip().upper().startswith("DELETE FROM REFERENCE"):
+                # The reload lands HERE: after eligibility was decided, before the rows are removed.
+                fired = True
+                await real_execute(
+                    "UPDATE reference_version SET synced_at = ? WHERE name = ?", (9999.0, "orphan")
+                )
+            return (
+                await real_execute(sql, params) if params is not None else await real_execute(sql)
+            )
+
+        store._db.execute = racing_execute  # type: ignore[method-assign]
+        try:
+            deleted = await store.purge_reference_snapshots(older_than=1000.0, declared={"keep"})
+        finally:
+            store._db.execute = real_execute  # type: ignore[method-assign]
+
+        assert fired, "the race never fired — the test proved nothing about the re-assert"
+        assert deleted == 0, "a set re-synced mid-purge must survive the DELETE"
+        rows = await (
+            await store._db.execute("SELECT key FROM reference WHERE name = 'orphan'")
+        ).fetchall()
+        assert [r["key"] for r in rows] == ["OLD"], "the freshly-eligible rows were destroyed"
     finally:
         await store.close()

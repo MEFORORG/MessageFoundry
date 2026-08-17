@@ -8,36 +8,70 @@ name: Dependabot auto-merge
 # removes the human-latency on the safe, common case, not the safety net.
 #
 # IN SCOPE (auto-merged):
-#   - any PATCH update (incl. security patches — most security fixes are patches)
-#   - MINOR updates of DEV-only dependencies
+#   - a PATCH update (or a MINOR of a DEV-only dependency) whose EVERY named dependency sits on its
+#     own ecosystem's ALLOW row (guardrail #3 below).
 # OUT OF SCOPE (left for human review, surfaced same-day by the daily security cron + alerts):
-#   - MINOR/MAJOR updates of runtime deps, and ALL MAJOR updates
-#   NOTE the uv ecosystem is review-by-default in practice, not by exception: `python-deps` is
-#   `patterns: ["*"]`, so one weekly batch carries everything, and (a) a grouped update-type is the
-#   MAX across the batch (fetch-metadata's UPDATE_TYPES_PRIORITY) — one minor demotes every patch
-#   riding with it — while (b) the deny-list below names at least eight of this project's directly
-#   declared runtime deps and denies the WHOLE group on any hit. #66 was denied on `fastapi`.
-#   Auto-merge does fire for github-actions (#75, all-patch batch) and npm (#64).
+#   - EVERYTHING ELSE, and that is the default by design. An unnamed dependency, an unrecognised
+#     ecosystem, a MINOR/MAJOR update of a runtime dep, any MAJOR update — every one of them HOLDS.
+#   - EVERY uv and npm bump, because both allow rows ship EMPTY. `python-deps`/`ide-deps` group on
+#     `*`, so one weekly batch carries everything and a non-empty row would have to name each of the
+#     ~98 pinned distributions before it could ever fire. Those two ecosystems were already
+#     review-by-default in practice; they are now review-by-default BY DESIGN rather than by accident.
+#   - a github-actions batch carrying any third-party action, since `actions-deps` also groups on `*`.
+#     Measured: PR #75's five-bump batch carried `pypa/gh-action-pypi-publish`, so that same batch
+#     would HOLD under this allow-set. Expect auto-merge to fire RARELY — that is the intent of
+#     "hold unless named", not a regression.
 #
-# Fresh-release supply-chain poisoning is handled upstream by the dependabot.yml `cooldown`
-# (routine updates age before a PR opens); SECURITY updates bypass cooldown by design, so a real
-# advisory fix still arrives immediately and (if a patch) auto-merges.
+# Fresh-release supply-chain poisoning is handled upstream by the dependabot.yml `cooldown`, which
+# every configured ecosystem carries: a routine update ages before its PR opens. The per-ecosystem
+# windows — and the caveat that `github-actions` ages off the tag's COMMIT date rather than the
+# release date — live in `.github/dependabot.yml` beside each value's rationale. Read them there; a
+# copy here would rot silently. SECURITY updates bypass cooldown by Dependabot design, so that track
+# is aged HERE instead, workflow-side, by guardrail #4.
 #
-# SECURITY-TRACK GUARDRAILS (DEPENDENCY-POSTURE-REVIEW.md #2 and #3 — close SEC-007, CWE-829):
-#   #3 DENY-LIST — the auth/token/crypto stack (cryptography, argon2-cffi, fastapi, …) is NEVER
-#      auto-merged, not even for a patch: any such dep routes the PR to MANUAL review. A grouped
-#      PR that includes ANY denied dep is denied WHOLE (fail-safe — never partial-merge a group).
-#   #2 PUBLISHED-GHSA GATE — a SECURITY-track PR (which bypasses the cooldown by Dependabot design)
-#      auto-merges ONLY when a real, published, non-withdrawn advisory is confirmed against the
-#      dependency's PREVIOUS version (the axios-1.14.1 pattern). The advisory lookup FAILS CLOSED:
-#      a rate-limit/API error or no-matching-advisory routes to manual review, never auto-merge.
-#      The non-security VERSION track keeps its cooldown-aged auto-merge unchanged (already aged by
-#      dependabot.yml, so it does not need the GHSA gate).
+# AUTO-MERGE GUARDRAILS. #2 and #3 keep DEPENDENCY-POSTURE-REVIEW.md's numbering (SEC-007, CWE-829),
+# with two corrections that document does not yet carry: #3 is INVERTED from the deny-list it
+# describes, and #4 is introduced HERE — the posture review does not contain it. Only #2 and #4 are
+# security-track-scoped; #3 gates EVERY PR.
+#   #3 ALLOW-SET — HOLD UNLESS NAMED, on every track. A PR auto-merges only when EVERY dependency it
+#      touches is on its own ecosystem's allow row; an unnamed dependency, or an ecosystem this step
+#      does not recognise, routes the PR to MANUAL review. A grouped PR is denied WHOLE on any single
+#      ineligible member (fail-safe — never partial-merge a group). This INVERTS the former
+#      deny-list, whose default was merge-unless-named across every ecosystem at once.
+#   #2 PUBLISHED-GHSA GATE (security track only) — a SECURITY-track PR (which bypasses the cooldown
+#      by Dependabot design) auto-merges ONLY when a real, published, non-withdrawn advisory is
+#      confirmed against the dependency's PREVIOUS version (the axios-1.14.1 pattern). The advisory
+#      lookup FAILS CLOSED: a rate-limit/API error or no-matching-advisory routes to manual review,
+#      never auto-merge. The non-security VERSION track keeps its cooldown-aged auto-merge unchanged
+#      (already aged by dependabot.yml, so it does not need the GHSA gate).
+#   #4 RELEASE AGE (security track only) — a SECURITY-track PR additionally requires every candidate
+#      version to have been published at least MIN_RELEASE_AGE_HOURS ago, because that track is the
+#      one the upstream cooldown cannot age. FAILS CLOSED identically to #2: an API error, a missing
+#      or unparseable upload timestamp, a package name/version that does not match its expected
+#      shape, or an ecosystem with no publish-date source wired all route to manual review.
+#      READ THIS BEFORE CITING #4 AS A CONTROL: it IS INERT with respect to the merge decision as
+#      shipped, and recording it as operating would be exactly the false premise
+#      docs/Secure_Development_Standards.md §3 forbids.
+#      `age_ok=true` is reachable only for uv/pip (no publish-date source is wired for any
+#      other ecosystem), while `eligible=true` is reachable only for github-actions (the uv/pip/npm
+#      allow rows ship EMPTY). Those two sets are DISJOINT, so no PR can satisfy both conjuncts the
+#      merge `if` requires. #4 is a FORWARD guard — built, tested and gated now, load-bearing the day
+#      a Python allow row is populated or the advisory gate is made ecosystem-aware. Populating an
+#      allow row is the owner's call, not this workflow's.
 #
-# RESIDUAL ACCEPTED RISK: a malicious patch that BOTH rides a real concurrent published advisory
-# AND is not on the deny-list would still auto-merge. The deny-list shields the highest-value
-# (auth/crypto) deps unconditionally; the GHSA gate blocks the no-advisory fast-publish poison on
-# the security track; main's required CI (pip-audit/bandit/tests/lock-sync) backstops both.
+# RESIDUAL ACCEPTED RISK, stated at the ONE path that can actually auto-merge: a VERSION-track patch
+# (or dev-only minor) bumping a GitHub-published action. Its only aging is dependabot.yml's cooldown,
+# which that file itself qualifies as approximate for this ecosystem, so a malicious release from a
+# compromised GitHub-owned publisher would still auto-merge. Neither #2 nor #4 narrows that path —
+# both are security-track-only, and this path is the version track.
+# What main's required CI does and does not backstop, stated precisely: pip-audit reads the
+# committed LOCKS for already-published advisories, and bandit/semgrep read THIS repository's own
+# source — so none of them ever reads a dependency's contents, and a package that was malicious at
+# publish time is not a known CVE. What those required checks DO catch is a bump that breaks the
+# build or regresses a KNOWN advisory. No REQUIRED check reads a dependency's shipped bytes.
+# security.yml's `trivy` job scans the built engine image, but it is advisory (`continue-on-error`)
+# and cron/dispatch-only, so it never runs on this PR — and it matches an advisory database
+# regardless. Treat the allow-set plus the aging above as the control, not a downstream scanner.
 #
 # Why `pull_request` (not pull_request_target): a Dependabot `pull_request` run gets a read-only
 # GITHUB_TOKEN by default, which the `permissions:` block below elevates to exactly what the merge
@@ -70,33 +104,81 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Guardrail #3 (DEPENDENCY-POSTURE-REVIEW.md): the auth/token/crypto stack NEVER auto-merges,
-      # not even a patch. dependency-names is comma-separated for grouped PRs; we deny the WHOLE
-      # group if ANY token matches (fail-safe — never partial-merge a group). Exact token match on
-      # the comma-split names (not a naive substring) so 'cffi' does not match 'argon2-cffi-bindings'
-      # and vice-versa.
-      - name: Reject security-critical deps (deny-list)
-        id: denylist
+      # Guardrail #3 (DEPENDENCY-POSTURE-REVIEW.md), INVERTED from a deny-list to an ALLOW-SET: the
+      # default is HOLD, and only a dependency named on its own ecosystem's allow row is eligible.
+      # dependency-names is comma-separated for grouped PRs; the group is denied WHOLE if ANY member
+      # is ineligible — the same fail-safe the deny-list had, never a partial group merge. Measured
+      # consequence: PR #75's five-bump batch carried `pypa/gh-action-pypi-publish`, which is NOT on
+      # the allow row, so that batch would now HOLD — and that action runs in the `id-token: write`
+      # publish job, which is exactly the case worth holding.
+      #
+      # Every input arrives via `env:`; nothing is interpolated into the body. That is zizmor
+      # template-injection parity, and it is what lets the behavioural tests execute this body
+      # verbatim under `bash -e` — the shell Actions applies by default, which those tests mirror.
+      - name: Hold everything not on the auto-merge allow-set
+        id: allowset
         env:
           DEP_NAMES: ${{ steps.meta.outputs.dependency-names }}
+          DEP_ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
         run: |
-          # Single source of truth for the security-critical deny-list.
-          denylist="cryptography argon2-cffi argon2-cffi-bindings paramiko ldap3 pyspnego \
-            fastapi starlette uvicorn pydantic pydantic-core python-jose pyjwt passlib bcrypt cffi"
-          deny=false
+          set -u
+          # Normalise with bash parameter expansion only (no echo|tr|xargs) so this block depends on
+          # nothing outside bash itself and stays executable from pytest on any platform.
+          eco="${DEP_ECOSYSTEM,,}"
+          eco="${eco//[[:space:]]/}"
+
+          # These tokens are Dependabot BRANCH-NAME forms, not the dependabot.yml spellings:
+          # fetch-metadata derives packageEcosystem from chunks[1] of the branch name. Measured on
+          # live PRs — #135 `dependabot/uv/…`, #75 `dependabot/github_actions/…`, #64
+          # `dependabot/npm_and_yarn/ide/…`. Both spellings are accepted so a future rename of either
+          # side still matches; an UNRECOGNISED token falls to `*)` and holds rather than merging.
+          case "$eco" in
+            github_actions|github-actions)
+              # GitHub-published actions only. GitHub already owns the runner and the job's token, so
+              # these add no trust root that is not already fully trusted. Deliberately NOT here:
+              # pypa/gh-action-pypi-publish, astral-sh/setup-uv, ossf/scorecard-action,
+              # contributor-assistant/github-action — every third-party action holds.
+              allow_prefixes="actions/ github/ dependabot/"
+              ;;
+            uv|pip|npm_and_yarn|npm)
+              # Deliberately EMPTY. `python-deps`/`ide-deps` group on `*`, so one weekly batch carries
+              # everything and a non-empty row would have to name every one of the ~98 pinned
+              # distributions before it could ever fire. These ecosystems were already
+              # review-by-default in practice; this makes it review-by-default BY DESIGN.
+              allow_prefixes=""
+              ;;
+            *)
+              echo "::notice::unrecognised package ecosystem '${eco:-<none>}' — holding for manual review."
+              allow_prefixes=""
+              ;;
+          esac
+
+          eligible=true
+          saw_any=false
           IFS=',' read -ra names <<< "$DEP_NAMES"
           for raw in "${names[@]}"; do
-            # trim surrounding whitespace and lowercase
-            name="$(echo "$raw" | tr '[:upper:]' '[:lower:]' | xargs)"
+            name="${raw,,}"
+            name="${name//[[:space:]]/}"
             [ -z "$name" ] && continue
-            for crit in $denylist; do
-              if [ "$name" = "$crit" ]; then
-                echo "::notice::'$name' is a security-critical dependency — routing to manual review (no auto-merge)."
-                deny=true
-              fi
+            saw_any=true
+            matched=false
+            for p in $allow_prefixes; do
+              # ANCHORED prefix test, and the trailing slash in each prefix is load-bearing. The two
+              # near-misses fail for DIFFERENT reasons, so both are pinned by tests: a substring
+              # match would admit `evil/actions/checkout`, and dropping the trailing slash would
+              # admit `actionsx/foo`.
+              case "$name" in
+                "$p"*) matched=true ;;
+              esac
             done
+            if [ "$matched" != true ]; then
+              echo "::notice::'$name' is not on the '${eco:-<none>}' auto-merge allow-set — routing the WHOLE PR to manual review."
+              eligible=false
+            fi
           done
-          echo "deny=$deny" >> "$GITHUB_OUTPUT"
+          # An empty name list cannot CONFIRM eligibility, so it must not be read as confirming it.
+          [ "$saw_any" = true ] || eligible=false
+          echo "eligible=$eligible" >> "$GITHUB_OUTPUT"
 
       # Guardrail #2 (DEPENDENCY-POSTURE-REVIEW.md): a SECURITY-track PR auto-merges ONLY when a
       # real, published, non-withdrawn advisory covers the dependency's PREVIOUS version. The
@@ -135,7 +217,12 @@ jobs:
           # low first-dep version makes almost every other name match: false confirmation in the
           # PERMISSIVE direction (measured against the live endpoint at @0.7.0: aiohttp 30, pillow 29,
           # urllib3 9, requests 6). `updated-dependencies-json` carries a per-dependency prevVersion.
-          pairs="$(printf '%s' "$DEPS_JSON" | jq -r '.[] | [.dependencyName, .prevVersion] | @tsv' 2>/dev/null || echo "ERR")"
+          # `||` outside the substitution (see the advisory lookup below). It matters here for a
+          # second reason: jq STREAMS, so a mid-array error can leave earlier rows already on stdout,
+          # and the old form would have appended ERR to a TRUNCATED dependency list — iterating a
+          # subset of the PR's dependencies while still reporting success. Assigning on failure
+          # discards the partial output instead of inheriting it.
+          pairs="$(printf '%s' "$DEPS_JSON" | jq -r '.[] | [.dependencyName, .prevVersion] | @tsv' 2>/dev/null)" || pairs="ERR"
           if [ "$pairs" = "ERR" ] || [ -z "$pairs" ]; then
             echo "::warning::no per-dependency metadata — failing closed (manual review)."
             echo "advisory_ok=false" >> "$GITHUB_OUTPUT"
@@ -154,15 +241,30 @@ jobs:
               advisory_ok=false
               break
             fi
+            # The `||` binds the ASSIGNMENT, never the substitution. `x=$(cmd || echo ERR)` APPENDS
+            # the sentinel to whatever cmd already wrote to stdout, and `gh api` copies the JSON
+            # error BODY to stdout on any HTTP error (only the `gh: ... (HTTP nnn)` line goes to
+            # stderr, which `2>/dev/null` eats). The old form left `count` holding
+            # `{"message":"API rate limit exceeded",...}ERR` — neither "ERR" nor empty, so the
+            # sentinel MISSED; `[ "$count" -lt 1 ]` then failed with "integer expression expected"
+            # and returned 2, which an `if` condition is exempt from under `set -e`. The step printed
+            # "advisory confirmed", wrote advisory_ok=true and exited 0 — this guard inverted to
+            # FAIL-OPEN on precisely the rate-limit/API-error class the comment above names first.
             count="$(gh api -X GET /advisories \
               -f ecosystem=pip \
               -f affects="${name}@${prev}" \
-              --jq '[.[] | select(.withdrawn_at == null)] | length' 2>/dev/null || echo "ERR")"
-            if [ "$count" = "ERR" ] || [ -z "$count" ]; then
-              echo "::warning::advisory lookup failed for '$name' — failing closed (manual review)."
-              advisory_ok=false
-              break
-            fi
+              --jq '[.[] | select(.withdrawn_at == null)] | length' 2>/dev/null)" || count="ERR"
+            # A SHAPE check, not equality against one sentinel. The numeric comparison below needs
+            # "is this a number" answered, and only a shape test answers it for values nobody
+            # anticipated — an equality test recognises exactly the failure it was told about, which
+            # is how a JSON body walked through the old guard.
+            case "$count" in
+              ""|*[!0-9]*)
+                echo "::warning::advisory lookup failed for '$name' — failing closed (manual review)."
+                advisory_ok=false
+                break
+                ;;
+            esac
             if [ "$count" -lt 1 ]; then
               echo "::warning::no published advisory covers '${name}@${prev}' — failing closed (manual review)."
               advisory_ok=false
@@ -172,15 +274,150 @@ jobs:
           done <<< "$pairs"
           echo "advisory_ok=$advisory_ok" >> "$GITHUB_OUTPUT"
 
+      # Guardrail #4: the SECURITY track bypasses dependabot.yml's `cooldown` by Dependabot design,
+      # so it is aged HERE instead — the candidate version must have been published at least
+      # MIN_RELEASE_AGE_HOURS ago. This defeats the fast-publish-then-yank pattern (axios-1.14.1) that
+      # a cooldown would have caught on the version track. It costs unattended-merge LATENCY only: a
+      # held PR stays open and a human can still merge a genuine CVE fix immediately.
+      #
+      # The security-track discriminator is CONSUMED from the ghsa step rather than re-derived, so
+      # there is exactly one place that decides what "security track" means.
+      #
+      # The two cheapest fail-closed guards run BEFORE jq deliberately: that keeps them exercisable
+      # off the ubuntu leg, where jq is not guaranteed to exist.
+      #
+      # Gated on the allow-set because the merge `if` ALREADY requires that conjunct, so skipping here
+      # changes no merge outcome: a skipped step emits no `age_ok`, and the merge `if` reads a missing
+      # output as empty, which is not 'true'. What it does remove is an UNAUTHENTICATED outbound GET
+      # made from a job holding `contents: write`, on a PR that was going to be held anyway.
+      - name: Require the candidate release to have aged (security track)
+        id: age
+        if: steps.allowset.outputs.eligible == 'true'
+        env:
+          MIN_RELEASE_AGE_HOURS: "24"
+          SECURITY_TRACK: ${{ steps.ghsa.outputs.security_track }}
+          DEP_ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
+          DEPS_JSON: ${{ steps.meta.outputs.updated-dependencies-json }}
+        run: |
+          set -u
+          if [ "$SECURITY_TRACK" != "true" ]; then
+            # Version track: already aged upstream by dependabot.yml's `cooldown`, so this gate does
+            # not apply. Emit FALSE even on this safe path — never `true` — mirroring the ghsa step
+            # exactly, so that no early exit anywhere in this step can fail OPEN. The merge `if`
+            # requires age_ok only when security_track is true.
+            echo "::notice::version track — aged upstream by dependabot.yml's cooldown; the release-age gate does not apply."
+            echo "age_ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          eco="${DEP_ECOSYSTEM,,}"
+          eco="${eco//[[:space:]]/}"
+          case "$eco" in
+            uv|pip) ;;
+            *)
+              # NOT a new denial: the ghsa step above queries `ecosystem=pip` only, so every
+              # non-pip SECURITY PR already routes to manual review today. If that gate is ever made
+              # ecosystem-aware, wire the matching publish-date source in here at the same time —
+              # registry.npmjs.org's `.time[version]` for npm, the commit/release date for actions.
+              # Until then, writing dated code for ecosystems that cannot reach this step would be
+              # dead code that looks like coverage.
+              echo "::notice::no publish-date source wired for ecosystem '${eco:-<none>}' — routing to manual review."
+              echo "age_ok=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          # `||` outside the substitution, and for the same streaming-jq reason as guardrail #2's.
+          pairs="$(printf '%s' "$DEPS_JSON" | jq -r '.[] | [.dependencyName, .newVersion] | @tsv' 2>/dev/null)" || pairs="ERR"
+          if [ "$pairs" = "ERR" ] || [ -z "$pairs" ]; then
+            echo "::warning::no per-dependency metadata — failing closed (manual review)."
+            echo "age_ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          age_ok=true
+          now="$(date -u +%s)"
+          while IFS="$(printf '\t')" read -r raw ver; do
+            name="${raw,,}"
+            name="${name//[[:space:]]/}"
+            if [ -z "$name" ]; then continue; fi
+            # `newVersion` carries the SAME update_metadata.ts `index === 0` fallback the prevVersion
+            # guard above cites: a non-first dependency can arrive with an empty string. An unknown
+            # candidate version means the age question cannot be asked, so DENY.
+            if [ -z "$ver" ]; then
+              echo "::warning::no new version for '$name' — failing closed (manual review)."
+              age_ok=false
+              break
+            fi
+            # PEP 503 normalisation: lowercase, runs of -_. collapse to a single '-'.
+            name="${name//[-_.]/-}"
+            while [[ "$name" == *--* ]]; do name="${name//--/-}"; done
+            # Both values are PR-DERIVED and are about to be pasted into a URL, so validate their
+            # shape rather than trusting them.
+            case "$name" in
+              ""|*[!a-z0-9-]*)
+                echo "::warning::unexpected package name '$raw' — failing closed (manual review)."
+                age_ok=false
+                break
+                ;;
+            esac
+            case "$ver" in
+              *[!A-Za-z0-9._+!-]*)
+                echo "::warning::unexpected version '$ver' for '$name' — failing closed (manual review)."
+                age_ok=false
+                break
+                ;;
+            esac
+
+            # `--fail` suppresses the 4xx/5xx body, so the old form happened to work for HTTP errors
+            # — but a TRUNCATED transfer (curl 18/56) exits non-zero with partial bytes already on
+            # stdout, and the sentinel would have been appended to a half a JSON document. Outside.
+            body="$(curl -sS --fail --max-time 20 --retry 2 "https://pypi.org/pypi/${name}/${ver}/json" 2>/dev/null)" || body="ERR"
+            if [ "$body" = "ERR" ] || [ -z "$body" ]; then
+              echo "::warning::PyPI lookup failed for '${name}==${ver}' — failing closed (manual review)."
+              age_ok=false
+              break
+            fi
+            published="$(printf '%s' "$body" | jq -r '[.urls[].upload_time_iso_8601] | sort | .[0] // empty' 2>/dev/null)" || published="ERR"
+            if [ "$published" = "ERR" ] || [ -z "$published" ] || [ "$published" = "null" ]; then
+              echo "::warning::no upload timestamp for '${name}==${ver}' — failing closed (manual review)."
+              age_ok=false
+              break
+            fi
+            published_epoch="$(date -u -d "$published" +%s 2>/dev/null)" || published_epoch="ERR"
+            case "$published_epoch" in
+              ""|*[!0-9]*)
+                echo "::warning::unparseable upload timestamp '$published' for '${name}==${ver}' — failing closed."
+                age_ok=false
+                break
+                ;;
+            esac
+            age_hours=$(( (now - published_epoch) / 3600 ))
+            if [ "$age_hours" -lt 0 ]; then
+              echo "::warning::'${name}==${ver}' reports a FUTURE upload time (clock skew?) — failing closed."
+              age_ok=false
+              break
+            fi
+            if [ "$age_hours" -lt "$MIN_RELEASE_AGE_HOURS" ]; then
+              echo "::warning::'${name}==${ver}' is ${age_hours}h old, under the ${MIN_RELEASE_AGE_HOURS}h minimum — routing to manual review."
+              age_ok=false
+              break
+            fi
+            echo "::notice::'${name}==${ver}' was published ${age_hours}h ago (>= ${MIN_RELEASE_AGE_HOURS}h)."
+          done <<< "$pairs"
+          echo "age_ok=$age_ok" >> "$GITHUB_OUTPUT"
+
       - name: Enable auto-merge for in-scope updates
-        # Auto-merge only when: (a) the update is an in-scope type (any patch, or a dev-only minor),
-        # AND (b) no security-critical dep is involved (deny-list #3), AND (c) for the SECURITY track
-        # ONLY, a published advisory is confirmed (#2). A non-security (version-track) patch keeps its
-        # cooldown-aged auto-merge — advisory_ok is not required there.
+        # Auto-merge only when: (a) EVERY dependency is on its ecosystem's allow row (#3), AND (b)
+        # for the SECURITY track ONLY, a published advisory is confirmed (#2) AND the candidate
+        # release has aged (#4), AND (c) the update is an in-scope type (any patch, or a dev-only
+        # minor). A non-security (version-track) patch keeps its cooldown-aged auto-merge — neither
+        # advisory_ok nor age_ok is required there, which is why both are emitted false on that path.
         if: >-
-          steps.denylist.outputs.deny != 'true' &&
+          steps.allowset.outputs.eligible == 'true' &&
           (steps.ghsa.outputs.security_track != 'true' ||
-           steps.ghsa.outputs.advisory_ok == 'true') &&
+           (steps.ghsa.outputs.advisory_ok == 'true' &&
+            steps.age.outputs.age_ok == 'true')) &&
           (steps.meta.outputs.update-type == 'version-update:semver-patch' ||
            (steps.meta.outputs.update-type == 'version-update:semver-minor' &&
             steps.meta.outputs.dependency-type == 'direct:development'))

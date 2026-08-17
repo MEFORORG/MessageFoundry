@@ -13,12 +13,25 @@ This is the first cut (build-order step 1 of docs/CONFIGURATION.md): ``[store]``
 synchronous), ``[api]`` (host/port), and ``[logging]`` (level + structured-JSON ``format`` + off-box
 ``forward_*`` syslog shipping — sec-offbox-log). ``[retention]`` is now enforced (the
 ``RetentionRunner``), except its ``audit_days`` key, which is reserved/keep-forever by design.
-Remaining planned keys (some server-DB ``[store]`` keys) are accepted-but-ignored for now so a
-forward-looking config file still loads.
+
+An unrecognized **key in the TOML file** is **refused** at load (:func:`_reject_unknown_file_keys`) — a
+silently-dropped key leaves the setting it was meant to apply un-applied, with nothing anywhere
+reporting a problem. An unknown top-level **section** is still tolerated.
+
+The refusal is scoped to the **file** on purpose, and the scope is load-bearing rather than an
+oversight: the **env** and **CLI** layers still drop an unrecognized key silently. Env cannot be
+checked the same way because roughly a dozen documented ``MEFOR_*`` variables are read straight from
+``os.environ`` by their consuming module and are not fields on any section (``MEFOR_STORE_VAULT_ADDR``,
+``MEFOR_TLS_REVOCATION_ATTESTED`` and siblings), so a field-membership test would refuse a
+correctly-configured deployment; CLI keys are engine-written, never operator-spelled. The one
+exception is ``[security]``, refused from env as well (the arm inside :func:`_desugar_security`).
+Anything stated to an operator about this refusal must carry that scope — see
+``docs/CONFIGURATION.md``.
 """
 
 from __future__ import annotations
 
+import difflib
 import ipaddress
 import logging
 import os
@@ -171,7 +184,16 @@ class SqlAuth(str, Enum):  # noqa: UP042
 
 
 class _Section(BaseModel):
-    # Ignore unknown keys so a forward-looking file (planned retention/delivery keys) still loads.
+    # extra="ignore" stays on the MODEL; unknown keys are refused by the LOADER instead
+    # (_reject_unknown_file_keys). A model-level extra="forbid" would refuse the engine's OWN writes:
+    # _env_overrides scrapes every MEFOR_<section>_<key> into its section dict, and a dozen documented
+    # variables are read straight from os.environ by their consuming module rather than being fields here
+    # (the Vault KMS/Transit and secret-provider credentials, MEFOR_TLS_REVOCATION_ATTESTED, the two
+    # phase-timing levers) — a Vault-backed store configured exactly as the shipped docs instruct would
+    # fail to start. Two further reasons the model is the wrong surface: pydantic's extra_forbidden error
+    # echoes the offending VALUE and the CLI prints the exception verbatim to a log file, so a mistyped
+    # SECRET key would disclose the secret; and `security show` validates SecuritySettings directly, so a
+    # forbidding model would deny an operator the very view they use to repair the typo.
     model_config = ConfigDict(extra="ignore")
 
 
@@ -213,13 +235,18 @@ def weakened_tls_escape_permitted(posture: HopPosture | None = None) -> bool:
     """Whether ``MEFOR_ALLOW_INSECURE_TLS`` may permit a weakened / verify-off TLS hop under ``posture``,
     CLAMPED so an enforcing PHI hop is NEVER relaxed (#200, ADR 0092 decision 2).
 
-    The is_phi-blind **strict verify-off** cells — the engine<->store TLS gate
+    The is_phi-blind **weakened-TLS / cleartext-escape** cells route their global-escape check through
+    here so the blunt escape can no longer silence an **enforcing PHI** refusal (matching the
+    ``--allow-insecure-bind`` API-bind clamp). That is **at least** the engine<->store TLS gate
     (:func:`~messagefoundry.store.sqlserver.connection_string` / ``store.postgres._build_ssl``), the MLLP
-    and FTPS ``tls_verify=false`` contexts, and the credentialed plain-``ftp`` guard — route their global-
-    escape check through here so the blunt escape can no longer silence an **enforcing PHI** refusal
-    (matching the ``--allow-insecure-bind`` API-bind clamp). Pass the construction-time
-    :func:`~messagefoundry.config.tls_policy.current_hop_posture` (transport cells) or the store's threaded
-    posture. Semantics: the escape must be set at all, AND the hop must not be enforcing PHI. ``None``
+    and FTPS ``tls_verify=false`` contexts and the credentialed plain-``ftp`` guard, **and — since #329 —**
+    the LDAPS ``ad_tls_verify=false`` bind (:mod:`messagefoundry.auth.ldap`), the SFTP unknown-host-key
+    acceptance (:mod:`messagefoundry.transports.remotefile`), and the webhook-alert-sink and AI-broker
+    cleartext-``http`` hops. Pass the construction-time
+    :func:`~messagefoundry.config.tls_policy.current_hop_posture` (in-gate transport cells, via
+    :func:`weakened_tls_escape_permitted_here`) or an explicitly-threaded posture (the store hop and the
+    out-of-gate #329 cells, whose construction never stamps the contextvar). Semantics: the escape must
+    be set at all, AND the hop must not be enforcing PHI. ``None``
     (a backup utility / embedding / test outside the construction gate) falls back to the **unclamped**
     escape — byte-identical to pre-#200 — since the enforced serve/reload gate already vetted the real
     production posture, so this fallback never loosens the clamp."""
@@ -431,8 +458,12 @@ class StoreSettings(_Section):
     # PHI-at-rest is age-pruned. Enforced in `UploadStore.save` (a would-be over-quota upload is refused
     # HTTP 409 before any write, audited `upload.reject_quota`) and by an age-based prune sweep (blob+meta
     # pairs older than `uploads_retention_days` are deleted, opportunistically at save time plus a periodic
-    # task, each prune audited `upload.prune`). Quotas are per-process per-`uploads_dir` (multiple engine
-    # shards at one dir multiply the budget — a documented residual, same shape as the summary-rate cap).
+    # task, each prune audited `upload.prune`). Quotas are enforced per-`uploads_dir`, NOT per-process:
+    # the check reads the sidecars off disk with no cache, so engine shards sharing one dir see each
+    # other's files and the budget does NOT multiply (measured 2026-08-10 — two UploadStores over one
+    # dir, the second refused the same uploader at quota, against a live positive control). What IS
+    # shared across them is the check-then-write race below, which overshoots by at most one file per
+    # concurrently in-flight upload. Shards given SEPARATE dirs get separate budgets, by construction.
     max_upload_files_per_user: int = Field(
         default=100,
         ge=1,
@@ -503,6 +534,17 @@ class StoreSettings(_Section):
     pool_size: int = 40
     connect_timeout: int = 15  # seconds
     command_timeout: int = 30  # seconds
+    # Upper bound (seconds) on ONE pooled-connection borrow from the server-DB store pool, and on the
+    # throwaway pool a DatabaseRef reference sync opens (BACKLOG #1052, ASVS 13.2.6). Server-DB only —
+    # SQLite has no pool. `connect_timeout` bounds the LOGIN and `command_timeout` the STATEMENT;
+    # neither bounds the WAIT for a free pooled connection, which was unbounded, so a pool-exhausted or
+    # unresponsive database could block an acquiring task forever with the queue backing up behind it.
+    # At the limit the borrow raises `StoreAcquireTimeout`, which every store caller already handles as
+    # a transient stage failure (retry / dead-letter) — see docs/CONNECTIONS.md "Behaviour at the
+    # store-pool acquire limit". 30 s matches the connector tier's per-connection `acquire_timeout` and
+    # sits far above a healthy wait; watch p95/p99 in the pool_status acquire-wait histogram before
+    # lowering it. Must be > 0: the point of the knob is that the wait is always bounded.
+    acquire_timeout: float = 30.0
     db_schema: str | None = (
         None  # 'db_schema' avoids shadowing BaseModel.schema; env: MEFOR_STORE_DB_SCHEMA
     )
@@ -595,6 +637,15 @@ class StoreSettings(_Section):
     def _positive_warm_pool_timeout(cls, value: float) -> float:
         if value <= 0:
             raise ValueError("warm_pool_timeout must be > 0")
+        return value
+
+    @field_validator("acquire_timeout")
+    @classmethod
+    def _positive_acquire_timeout(cls, value: float) -> float:
+        # No "0 disables" escape hatch, unlike command_timeout: an unbounded pool wait is the defect
+        # this setting exists to remove, so there is deliberately no way to configure it back.
+        if value <= 0:
+            raise ValueError("acquire_timeout must be > 0 (the pool wait is always bounded)")
         return value
 
     @field_validator("warm_pool_target")
@@ -1023,9 +1074,17 @@ class DeliverySettings(_Section):
     """
 
     # Key names match docs/CONFIGURATION.md's [delivery] catalog (retry_-prefixed so the section can
-    # also grow non-retry keys like outbox_workers/dead_letter later). max_attempts unset (None) =
-    # retry forever (the conservative default — see RetryPolicy); set a finite value to dead-letter.
-    retry_max_attempts: int | None = None
+    # also grow non-retry keys like outbox_workers/dead_letter later). Mirrors RetryPolicy's finite
+    # 100 default (#1051) — a test guards the sync, and the two MUST move together: leaving this at
+    # None would restore retry-forever for every outbound that declares no retry= of its own, which
+    # is the overwhelmingly common shape.
+    # `ge=1` because a configured 0 loaded clean and dead-lettered on the FIRST failure: the delivery
+    # check is `item.attempts >= max_attempts` against a POST-increment count, so 0 means give up
+    # immediately while READING like "no limit". `None` is the documented retry-forever posture and
+    # stays legal. The floor is on the OPERATOR-FACING setting only -- `RetryPolicy(max_attempts=0)`
+    # remains a deliberate internal idiom for a permanent, no-retry failure (store `mark_failed`), and
+    # constraining that instead would delete a used mechanism while claiming to add a guard.
+    retry_max_attempts: int | None = Field(default=100, ge=1)
     retry_backoff_seconds: float = 5.0
     retry_backoff_multiplier: float = 2.0
     retry_max_backoff_seconds: float = 300.0
@@ -1518,6 +1577,18 @@ class RetentionSettings(_Section):
     # in-memory state cache + table bounded. A simple global age purge; per-namespace policy is a
     # follow-up. 0 = keep forever (the default — state correlation data is opt-in to purge).
     state_max_age_days: int = 0
+    # Past N days, DELETE ORPHANED reference snapshots (ADR 0006) — the rows of a set that config no
+    # longer declares, whose active version was synced before the cutoff. `reference.value` is PL-2
+    # (PHI.md §2) and a snapshot row can be patient-keyed, but until ASVS 14.2.7 it had NO purge path at
+    # all: the only thing that ever replaced a snapshot was the next sync's build-new-then-flip, which
+    # never comes for a set nobody declares any more. 0 = keep forever.
+    #
+    # ORPHAN-SCOPED, and the limit is the honest part: a set that IS still declared is never touched
+    # however old its `synced_at`, because its snapshot is live data the engine serves. So the normal
+    # case — a wired set holding live PHI — remains purged by nothing. That is a stated residual, not a
+    # closed cell; do not let a classification table describe this window as covering `reference.value`
+    # generally, which would machine-bless a false claim.
+    reference_snapshot_days: int = 0
     # Past N HOURS, DELETE connection_event rows (#46) — the Corepoint-style transport/lifecycle log can
     # be high-volume (a connect-per-message sender, a probe storm), so it has its own short window in
     # HOURS (not days). 0 = inherit the message-body window (messages_days), the ADR 0021 §7.5 default.
@@ -1600,6 +1671,7 @@ class RetentionSettings(_Section):
         "app_log_days",
         "app_log_compress_days",
         "search_preset_days",
+        "reference_snapshot_days",
     )
     @classmethod
     def _non_negative_days(cls, value: int) -> int:
@@ -2240,6 +2312,22 @@ _KNOWN_ENV_POSTURE: dict[str, tuple[DataClass, bool]] = {
     "prod": (DataClass.PHI, True),
 }
 
+#: BACKLOG #95 -- the ``[ai].provider`` values the engine can actually SERVICE.
+#:
+#: **Its source of truth is ``AiBroker.chat``**
+#: (:mod:`messagefoundry.transports.ai_broker`), which builds ONE wire shape unconditionally: an
+#: Anthropic Messages body with ``x-api-key`` and ``anthropic-version`` headers, and an
+#: ``_extract_text`` that assumes Anthropic's content-block list. There is no provider registry, no
+#: dispatch, and ``AiBroker.provider`` has zero readers -- so the serviceable set is exactly one entry
+#: and NOTHING can derive it. That makes this list hand-maintained, which is a real cost: it decays
+#: the moment a second wire shape is added and nobody widens it.
+#:
+#: **The failure to avoid is the inverse one, and it is the tempting one:** listing aspirational names
+#: (``azure_openai``, ``bedrock``, ``ollama``) would ACCEPT configurations the broker still cannot
+#: service, turning a clean config-time refusal back into the opaque runtime 502 this validator exists
+#: to eliminate. The list must describe what ``chat()`` can send, never what the roadmap intends.
+_SERVICEABLE_AI_PROVIDERS = frozenset({"claude"})
+
 
 class AiSettings(_Section):
     """Central AI-assistance policy plus the instance's active **environment name** and security
@@ -2283,6 +2371,27 @@ class AiSettings(_Section):
     # is REFUSED. Deliberately independent of [egress].allowed_http, which is permissive-when-empty and so
     # cannot be the gate for this new egress surface.
     allowed_endpoints: list[str] = []
+
+    @field_validator("provider")
+    @classmethod
+    def _serviceable_provider(cls, v: str) -> str:
+        # BACKLOG #95: refuse an unserviced provider at CONFIG time. Previously any string was
+        # accepted and the mistake surfaced later as an opaque provider-side failure, or as nothing
+        # at all -- the value is recorded in the per-use audit either way, so a config naming a
+        # provider the engine cannot service made the audit trail assert something untrue.
+        #
+        # FIELD-level, so it refuses in EVERY mode rather than only under managed_endpoint. A
+        # mode-gated model_validator would be narrower and is the defensible alternative, but the
+        # value is audit-visible regardless of mode, and "the engine cannot service this name" is
+        # true independently of whether this instance happens to call the broker today.
+        if v not in _SERVICEABLE_AI_PROVIDERS:
+            allowed = ", ".join(sorted(_SERVICEABLE_AI_PROVIDERS))
+            raise ValueError(
+                f"[ai].provider must be one of [{allowed}]; got {v!r}. The engine brokers exactly "
+                "one wire shape (the Anthropic Messages body in transports/ai_broker.py); a "
+                "provider it cannot service is refused here rather than failing at request time."
+            )
+        return v
 
     @field_validator("environment")
     @classmethod
@@ -2464,14 +2573,6 @@ class EgressSettings(_Section):
     # having to enumerate one list just to flip the posture; pairs with the prod/staging open-egress
     # startup advisory. Default false = the per-list opt-in behavior above (empty = unrestricted).
     deny_by_default: bool = False
-
-    # 1.2.2 (ASPIRATIONAL, ASVS 1.2.2): require the per-value-encoded structured params= form for every
-    # fhir_lookup search. When true, the author-encoded flat '?'-query escape hatch is REFUSED (raised in
-    # FhirLookupExecutor._resolve_read_url before the defense-in-depth screen) so a search value can never
-    # smuggle an extra FHIR search parameter. Default false keeps the flat form (byte-identical to today);
-    # a read-by-id and the structured params= form are unaffected either way.
-    # Env: MEFOR_EGRESS_FHIR_REQUIRE_STRUCTURED_PARAMS.
-    fhir_require_structured_params: bool = False
 
     @field_validator(
         "allowed_mllp",
@@ -3629,6 +3730,60 @@ class SecuritySettings(_Section):
     handles_real_patient_data: bool | None = None  # was [ai].data_class = "phi"
     production_instance: bool | None = None  # was [ai].production
 
+    # ── Leaving the organization: the ASVS 3.7.3 interstitial ────────
+    # Domains that count as INSIDE the organization. ASVS 3.7.3 asks for a notification when the user
+    # is sent somewhere "outside the application's CONTROL", and control is organisational rather than
+    # topological — an operator's own AD FS is a different host, a different origin, and squarely
+    # theirs. Matched on a LABEL boundary, so "hospital.example" covers "adfs.hospital.example" and
+    # NOT "evilhospital.example"; a bare endswith would admit the lookalike.
+    #
+    # EMPTY (the default) is deliberately the strict position, not the lax one: with nothing declared,
+    # every absolute http(s) destination is treated as external and gets the interstitial. An operator
+    # who configures nothing is warned too often, never too little.
+    organization_domains: list[str] = Field(default_factory=list)
+    # The interstitial itself. On by default (ADR-less: this IS the 3.7.3 control). Turning it off is
+    # a posture decision, not a convenience one, and the serve gate says so.
+    external_link_interstitial: bool = True
+    # ⚠️ THE AUDITED ESCAPE, and it LOWERS SECURITY. Destinations here are navigated to with no
+    # notification and no cancel — precisely what 3.7.3 asks for. It exists because operators have
+    # legitimate high-volume external destinations they do not want to declare as their own domain.
+    # Same label-boundary matching. Non-empty produces a startup warning naming every entry; the
+    # method's rule is that a signed relaxation is never a Pass, so this is the delta, not the default.
+    external_link_allowlist: list[str] = Field(default_factory=list)
+
+    @field_validator("organization_domains", "external_link_allowlist", mode="before")
+    @classmethod
+    def _split_domain_list(cls, value: object) -> object:
+        """Accept a comma/whitespace-separated string as well as a list — parity with the other
+        list-valued settings here, so an env-var override does not need TOML array syntax."""
+        if isinstance(value, str):
+            return [part for part in value.replace(",", " ").split() if part]
+        return value
+
+    @field_validator("organization_domains", "external_link_allowlist", mode="after")
+    @classmethod
+    def _check_domains_are_bare_hosts(cls, value: list[str]) -> list[str]:
+        """Reject a URL or a wildcard where a domain belongs.
+
+        ``https://hospital.example/`` and ``*.hospital.example`` both look right and both silently
+        match NOTHING under label-boundary comparison — the operator would believe they had declared
+        an internal domain and get an interstitial on every internal link, or worse, believe they had
+        allowlisted something that is still being warned about. Failing at config load is the only
+        place this is cheap to notice.
+        """
+        cleaned: list[str] = []
+        for raw in value:
+            item = raw.strip().lower().lstrip(".")
+            if not item:
+                continue
+            if "/" in item or ":" in item or "*" in item:
+                raise ValueError(
+                    f"{item!r} must be a bare domain such as 'hospital.example', not a URL, scheme "
+                    "or wildcard — subdomains are matched automatically on a label boundary"
+                )
+            cleaned.append(item)
+        return cleaned
+
     @field_validator("allowed_client_networks", mode="before")
     @classmethod
     def _split_client_networks(cls, v: object) -> object:
@@ -3857,6 +4012,72 @@ def _warn_file_secrets(file_data: Mapping[str, Any], path: Path) -> None:
             )
 
 
+def _section_models() -> dict[str, type[BaseModel]]:
+    """``{section name: its settings model}``, derived from :class:`ServiceSettings` itself so it cannot
+    drift out of step with the sections that exist (a hand-kept list would silently stop checking a
+    section someone added)."""
+    out: dict[str, type[BaseModel]] = {}
+    for name, field in ServiceSettings.model_fields.items():
+        annotation = field.annotation
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            out[name] = annotation
+    return out
+
+
+def _near_field(model: type[BaseModel], key: str) -> str | None:
+    """The closest real field name to ``key``, or ``None`` when nothing is close enough. A refusal that
+    names the typo's likely intent is the difference between a fix and a search."""
+    near = difflib.get_close_matches(key, sorted(model.model_fields), n=1)
+    return near[0] if near else None
+
+
+def _unknown_key_report(items: Sequence[tuple[str, str, str | None]]) -> str:
+    """Render ``(section, key, suggestion)`` triples as ``[section].key (did you mean 'x'?)``.
+
+    Names the section and key only — **never the value**. The offending value is frequently a secret
+    (``_FILE_SECRET_KEYS`` exists because secrets land in this file), and the CLI prints a load failure
+    verbatim to stderr, which the service captures to a log file."""
+    return ", ".join(
+        f"[{section}].{key}" + (f" (did you mean '{suggestion}'?)" if suggestion else "")
+        for section, key, suggestion in items
+    )
+
+
+def _reject_unknown_file_keys(file_data: Mapping[str, Any]) -> None:
+    """Raise ``ValueError`` if the config FILE sets a key its section does not define.
+
+    Owner ruling, 2026-08-16: refuse unknown keys. A key the engine does not recognize used to load
+    clean, do nothing, and say nothing — so a mistyped ``[egress].deny_by_defalt`` left the operator
+    believing a control was configured while the engine applied its permissive default. Refusing at load
+    is the only way that failure surfaces at all: nothing downstream can distinguish "not set" from
+    "set, misspelt, dropped".
+
+    Scoped to the FILE deliberately. The env layer (:func:`_env_overrides`) scrapes any
+    ``MEFOR_<section>_<key>`` into its section dict, including a dozen documented variables that their
+    consuming module reads straight from ``os.environ`` and that are not fields here — refusing there
+    would refuse a variable the shipped docs tell operators to set. The CLI layer and the ``[security]``
+    desugar write only real fields, and the file is the surface the ruling names. Unknown top-level
+    **sections** stay tolerated (``ServiceSettings`` is ``extra="ignore"``) — a separate question."""
+    models = _section_models()
+    offenders: list[tuple[str, str, str | None]] = []
+    for section, values in file_data.items():
+        model = models.get(section)
+        if model is None or not isinstance(values, dict):
+            continue  # unknown SECTION (tolerated) or a non-table value (pydantic reports the type)
+        allowed = set(model.model_fields)
+        for key in values:
+            if key in allowed:
+                continue
+            offenders.append((section, key, _near_field(model, key)))
+    if offenders:
+        raise ValueError(
+            f"unrecognized config key(s): {_unknown_key_report(offenders)}. An unrecognized key is "
+            "REFUSED, not ignored — a dropped key leaves the setting it was meant to apply silently "
+            "un-applied. Check the spelling against docs/CONFIGURATION.md; a key that MOVED to another "
+            "section is reported by name instead."
+        )
+
+
 # --- ADR 0118: the [security] section desugars into the internal fields it replaces ----------------
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
@@ -3924,20 +4145,34 @@ def _desugar_security(data: dict[str, dict[str, Any]]) -> None:
     if not isinstance(raw, dict):
         return
 
-    # Pydantic sections are extra="ignore", so an UNKNOWN [security] key loads clean, does nothing, and
-    # says nothing. For posture switches that is a silent fail-open: mistype `block_unlisted_outbound`
+    # Pydantic sections are extra="ignore", so an UNKNOWN [security] key would load clean, do nothing,
+    # and say nothing. For posture switches that is a silent fail-open: mistype `block_unlisted_outbound`
     # or set a switch that does not exist yet (a key backported from newer docs), and the operator
-    # believes a control is on while the engine applies its permissive default. Relocated keys are the
-    # loud exception (_reject_relocated_keys), which is exactly the signal this restores for the rest.
-    # WARN rather than reject: an unknown key may be a forward-compatible config shared across an estate
-    # mid-upgrade, and refusing would turn a harmless typo into a failed start on every host at once.
+    # believes a control is on while the engine applies its permissive default.
+    #
+    # This arm REFUSES where it used to warn (owner ruling, 2026-08-16: "refuse unknown keys"). The
+    # reasoning it replaces is recorded here rather than deleted, so a future reader can see the decision
+    # instead of re-deriving the old one: warning was chosen because an unknown key might be a
+    # forward-compatible config shared across an estate mid-upgrade, where refusing would turn a harmless
+    # typo into a failed start on every host at once. That argument assumed an INSTALLED ESTATE. There is
+    # none — zero deployments, zero adopters (CLAUDE.md §0) — so the cost it guarded against is zero
+    # today, while the fail-open it accepted in exchange is real on the first deployment. If an estate
+    # ever exists, the answer is a documented upgrade path, not a return to silence: zero deployments
+    # removes the migration cost, it does not make the refusal optional.
+    #
+    # _reject_unknown_file_keys covers the FILE for every section including this one; this arm stays
+    # because it also sees ENV-delivered [security] keys, which the file check cannot. Safe here
+    # specifically: every MEFOR_SECURITY_* variable in the tree maps to a real field, so unlike
+    # [store]/[secrets]/[tls] there is no out-of-band env variable for it to collide with.
     unknown = sorted(set(raw) - set(SecuritySettings.model_fields))
     if unknown:
-        _log.warning(
-            "[security] has unrecognized key(s): %s — IGNORED, so any posture they were meant to set "
-            "is NOT in effect. Check the spelling against docs/CONFIGURATION.md; a switch that moved "
-            "sections is rejected loudly instead.",
-            ", ".join(unknown),
+        raise ValueError(
+            f"unrecognized config key(s): "
+            f"{_unknown_key_report([('security', k, _near_field(SecuritySettings, k)) for k in unknown])}. An "
+            "unrecognized posture switch is REFUSED, not ignored — ignoring it would leave the operator "
+            "believing a control is in effect while the engine applies its permissive default. Check the "
+            "spelling against docs/CONFIGURATION.md; a switch that MOVED sections is reported by name "
+            "instead."
         )
 
     # Validate through the model so env-delivered STRINGS are coerced properly ("false" → False, not the
@@ -3998,6 +4233,8 @@ def security_loosenings(
     auth: AuthSettings,
     alerts: AlertsSettings,
     cleartext_hops: Sequence[str],
+    expiry_relaxed_hops: Sequence[str],
+    unverified_db_hops: Sequence[str],
 ) -> list[tuple[str, str]]:
     """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
     section, as ``(switch, plain-language risk)``.
@@ -4007,7 +4244,8 @@ def security_loosenings(
     that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
     ``[auth].ad_session_recheck_seconds``, ``[alerts].email_use_tls``/``email_tls_verify`` (#323
-    layer 3), and the per-connection ``cleartext_accepted``. It is NOT yet
+    layer 3), and three per-connection deviations — ``cleartext_accepted``, ``tls_allow_expired``, and a
+    generic-ODBC ``DATABASE`` hop with TLS unenforced (#333). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
     ``ad_tls_verify``, ``ad_allow_insecure_ldap``, ``oidc_require_mfa_claim``,
@@ -4020,14 +4258,17 @@ def security_loosenings(
     posture by the back door. An optional parameter is a detector that silently fails to fire; a required
     one makes omission a type error at every call site.
 
-    ``cleartext_hops`` is the list of CONNECTION NAMES that declare ``cleartext_accepted`` (ADR 0153) —
-    the one connection-scoped deviation in this otherwise settings-scoped registry. It arrives as plain
-    names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the caller
-    resolves them (``config.wiring.accepted_cleartext_hops`` is the shared reader, which walks both
-    outbound connections and ``FhirLookup`` read connections). A caller that genuinely has no graph —
-    ``messagefoundry security show``, which reads a settings file and never loads the connection config
-    — passes an empty sequence and SAYS SO in its output, rather than reporting a subset as if it were
-    everything.
+    The last three parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
+    ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
+    ``tls_allow_expired`` (#129 / ADR 0094), and ``unverified_db_hops`` is a generic-ODBC ``DATABASE``
+    connection whose ``odbc_params`` leave TLS unenforced (#66 / ADR 0092's amendment). They arrive as
+    plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
+    caller resolves them through the shared readers in ``config.wiring``
+    (``accepted_cleartext_hops``, which walks both outbound connections and ``FhirLookup`` read
+    connections; ``expiry_relaxed_hops``; ``unverified_generic_db_hops``, which walks inbound as well as
+    outbound). A caller that genuinely has no graph — ``messagefoundry security show``, which reads a
+    settings file and never loads the connection config — passes empty sequences and SAYS SO in its
+    output, rather than reporting a subset as if it were everything.
 
     Shared by the serve-time loosening warning (``__main__``, ADR 0118 AC-4) and the read-only posture
     view (``GET /security/posture``, AC-5), so the two never drift. This is advisory only — it names what
@@ -4073,6 +4314,29 @@ def security_loosenings(
                 "require_encryption_for_remote",
                 "off-machine access is permitted WITHOUT TLS — bearer tokens and PHI would cross the network "
                 "in cleartext (still refused on a production-PHI bind)",
+            )
+        )
+    if not sec.external_link_interstitial:
+        out.append(
+            (
+                "external_link_interstitial",
+                "the console navigates OFF-SITE with no notification and no cancel — an operator can be "
+                "sent to a third-party site (including an identity provider) with no chance to stop it "
+                "(ASVS 3.7.3)",
+            )
+        )
+    if sec.external_link_allowlist:
+        # Reported even though the switch is a LIST rather than a bool, because the completeness floor
+        # only pins bools and an exempted list would be an unreported loosening by omission. Entries
+        # are named individually: a count would say "3 destinations are exempt" without saying which,
+        # which is the shape that lets an entry nobody intended survive a posture review.
+        out.append(
+            (
+                "external_link_allowlist",
+                "these destinations are exempt from the off-site interstitial and are navigated to "
+                "with no notification and no cancel: "
+                + ", ".join(sec.external_link_allowlist)
+                + " (ASVS 3.7.3)",
             )
         )
     if not sec.require_sign_in:
@@ -4199,8 +4463,8 @@ def security_loosenings(
                 "— the serve gate that would otherwise refuse it is acknowledged away",
             )
         )
-    # --- the one CONNECTION-scoped deviation (ADR 0153 decision 2). It is not a [security] switch, but
-    # it is a declared departure from the one shipped posture, so it belongs in the one registry an
+    # --- the CONNECTION-scoped deviations (ADR 0153 decision 2; #333). None is a [security] switch, but
+    # each is a declared departure from the one shipped posture, so they belong in the one registry an
     # operator reads — a deviation the registry cannot see is a second posture by the back door.
     if cleartext_hops:
         named = ", ".join(sorted(cleartext_hops))
@@ -4210,6 +4474,32 @@ def security_loosenings(
                 f"{len(cleartext_hops)} connection(s) cross a CLEARTEXT hop by declaration "
                 f"({named}) — the payload, and any credential the connection carries, ride those hops "
                 "unencrypted and readable by anything on the path",
+            )
+        )
+    if expiry_relaxed_hops:
+        named = ", ".join(sorted(expiry_relaxed_hops))
+        # BOTH halves, deliberately. Stating only the risk would overstate it (this is not verify-off:
+        # ADR 0094 ORs one flag, X509_V_FLAG_NO_CHECK_TIME) and stating only the mitigation would be the
+        # compensating-control-on-a-false-premise shape. An operator deciding whether to keep a bridge
+        # open needs to know exactly which check is off and that nothing expires it.
+        out.append(
+            (
+                "tls_allow_expired",
+                f"{len(expiry_relaxed_hops)} outbound connection(s) accept an EXPIRED server "
+                f"certificate ({named}) — indefinitely, with nothing that expires the relaxation or "
+                "re-checks it; the chain signature, hostname match and key usage are still fully "
+                "verified, so this is narrower than verify-off",
+            )
+        )
+    if unverified_db_hops:
+        named = ", ".join(sorted(unverified_db_hops))
+        out.append(
+            (
+                "generic_odbc_tls_unenforced",
+                f"{len(unverified_db_hops)} generic-ODBC DATABASE connection(s) leave TLS to the "
+                f"driver with no verifying keyword set ({named}) — MessageFoundry cannot introspect an "
+                "arbitrary driver's TLS posture, so the weakened-TLS refusal does not apply and the "
+                "rows, and the DSN credential, may cross in plaintext",
             )
         )
     return out
@@ -4229,6 +4519,7 @@ def load_settings(
     """
     environ = os.environ if environ is None else environ
     data: dict[str, dict[str, Any]] = {}
+    file_data: Mapping[str, Any] = {}
 
     path = Path(config_path) if config_path is not None else Path(_DEFAULT_FILE)
     if config_path is not None and not path.exists():
@@ -4245,6 +4536,9 @@ def load_settings(
     # keys in their old sections (file+env), then desugar [security] into the internal fields it replaces
     # — BEFORE the CLI merge, so a --host/--db override still wins over a [security] value.
     _reject_relocated_keys(data)
+    # After _reject_relocated_keys so a MOVED key keeps its specific "moved to [security].X" message, and
+    # over `file_data` rather than `data` so it never sees a key the env overlay or the desugar wrote.
+    _reject_unknown_file_keys(file_data)
     _desugar_security(data)
 
     if cli:

@@ -1,12 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 <#
 .SYNOPSIS
     UserPromptSubmit hook: tell the other sessions in THIS repo that you exist, and what you intend.
 
 .DESCRIPTION
-    WHY A PROMPT AND NOT AN ACTION. Announcing means the ccd_session_mgmt send_message MCP tool. Hooks
-    are shell commands and cannot call MCP at all, so this hook cannot send anything itself. What it CAN
-    do is put the instruction, the peer list and the id-resolution rule in front of the model at the one
+    WHY A PROMPT AND NOT AN ACTION. Announcing means the ccd_session_mgmt send_message MCP tool, so this
+    hook puts the instruction, the peer list and the id-resolution rule in front of the model at the one
     moment they are actionable. Everything below stdout is injected into the chat.
+
+    This used to say "hooks cannot call MCP at all". That is WRONG: type: "mcp_tool" is a documented hook
+    handler ("call a tool on an already-connected MCP server"), available on every hook event, and its
+    output is treated like command-hook stdout. The real blocker is narrower -- `server` must name an
+    already-CONNECTED, configured server, and ccd_session_mgmt is host-provided. Probed 2026-08-03: a
+    command control in the same hook array fired, while an mcp_tool naming ccd_session_mgmt AND one naming
+    a nonexistent server both produced nothing -- and with no MCP server connected on the box, "not
+    surfaced", "not addressable" and "errored invisibly" are the same bytes. So: UNTESTED, not impossible.
+    If it turns out to work, this whole design collapses to one hook entry and the model stops having to
+    write its own delivery receipt. See docs/WORKTREES.md, "Announcing yourself".
 
     WHY UserPromptSubmit AND NOT SessionStart. At SessionStart a session knows it exists and nothing
     else, so announcing then can only say "hello" -- the interrupt without the information. One prompt
@@ -567,13 +578,19 @@ try {
         $lines += '   extension of the primary checkout''s path, so a prefix match resolves a peer in'
         $lines += '   the primary to some arbitrary worktree session. Measured here: the two rosters'
         $lines += '   print byte-identical cwds, so an exact match is expected to succeed.'
-        $lines += '   No exact row, or isRunning is false -> SKIP that peer. Never guess an id.'
+        $lines += '   No exact row -> SKIP that peer. Never guess an id. The cwd match is the WHOLE'
+        $lines += '   test: DO NOT also filter on isRunning. It means "executing a turn right now",'
+        $lines += '   not "alive" or "reachable", so as a reachability signal it reads BACKWARDS --'
+        $lines += '   false is an idle peer that answers, true is one that queues. Source of record'
+        $lines += '   for the field, with the measurement: scripts\coord\session-registry.ps1.'
         $lines += '3. send_message to the sessionId from that row. It MUST start with ''local_''.'
         $lines += '   The 8-character id in this repo''s coordination banners is the REGISTRY id, a'
         $lines += '   different namespace: measured here, a registry id and an MCP id for ONE session'
         $lines += '   shared no characters. Branch does not join them either -- the two rosters'
         $lines += '   reported different branches for the same checkout. Only cwd joins. A registry id'
-        $lines += '   passed to send_message fails SILENTLY, which reads as the peer ignoring you.'
+        $lines += '   passed to send_message errors LOUDLY ("Session <id> not found.") and delivers'
+        $lines += '   nothing -- measured 2026-08-03. You do not have to detect a wrong id; you will'
+        $lines += '   see it. Do not retry a not-found id against another peer.'
         $lines += "4. Message at most $($targets.Count) peer(s) you actually reached, one message each,"
         $lines += '   this shape and nothing else:'
         $lines += "     [SESSION-ANNOUNCE] $top ($branch)"
@@ -581,7 +598,13 @@ try {
         $lines += '     touching: <one line, if you already know>'
         $lines += '   It lands as a USER turn in their session. Ask nothing, expect no answer.'
         $lines += "5. Append one line per peer to $StateDir/sent/$markerKey.tsv :"
-        $lines += '     <iso8601> TAB <peer cwd> TAB <local_ id | NOT_LISTED | NOT_RUNNING> TAB <sent | failed>'
+        # TWO tokens, not three. The third used to be NOT_RUNNING, and it went with the isRunning SKIP
+        # rule above (BACKLOG #1077): it filed a peer that would have ACCEPTED the message under a word
+        # that reads "gone". The rationale is a comment and not a line of stdout on purpose -- naming a
+        # retired token in the instruction is how a model learns it is available. tests/
+        # test_announce_hook.py asserts the whole announcement is free of it, which is what caught an
+        # earlier draft of this very comment printing it.
+        $lines += '     <iso8601> TAB <peer cwd> TAB <local_ id | NOT_LISTED> TAB <sent | failed>'
         $lines += '   Nothing else records whether anything was delivered.'
         $lines += ''
         $claims = Get-ClaimNotes (Join-Path (Split-Path $StateDir -Parent) 'claims')

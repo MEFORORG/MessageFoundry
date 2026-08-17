@@ -15,6 +15,18 @@
   file-replay loader ([`harness/reconcile/compare.py`](../../harness/reconcile/compare.py),
   [`harness/load/corpus.py`](../../harness/load/corpus.py)); and the publish leak-gate
   [`scripts/security/scan_forbidden.py`](../../scripts/security/scan_forbidden.py) (`FORBIDDEN`).
+- **AMENDED 2026-08-06 (BACKLOG #331):** the leak-check's structural gap that §5 / §7 / Consequences
+  below called *scoped out / a deferred improvement* is now **built** — high-precision structural
+  PHI-shape detectors (dashed SSN, punctuated NANP phone, CX `MR`/`MRN`-typed identifier) over **the
+  fields no rule matched**, an unmapped-field **coverage report** (`LeakReport.unmapped_fields`; address
+  only, never a value, carried into the `LeakError` on a refusal and exposed via `on_report`), and the
+  `token_floor_failure` signal recorded in every report and folded into the fail-closed decision under
+  the `require_live_denylist` **opt-in** lever — default off, so a token-less CI/OSS/fork load still
+  passes with the structural detectors as the live backstop; a deployment that must refuse on an
+  unloaded denylist sets the lever. Mirrored behaviourally-identical into `tee/anon/leak.py`. The
+  *aggressive/broad* shape tier (bare-digit DOB/SSN, name-like runs) stays deferred — it
+  mass-false-positives on HL7 bodies (§5). This bullet is the single source of the change; the stale
+  "deferred" phrasings below point back here.
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —
@@ -207,15 +219,25 @@ original→surrogate pair is ever emitted together with `dataset_key`.
 
 **`dataset_key` is a per-run secret salt.** It is drawn from `secrets.token_bytes`/`os.urandom` with **≥128
 bits** of entropy, held **only in process memory**, classified **PHI-equivalent** (it is itself a
-re-identification key for the seeded PRNG), **never written / logged / committed**, and **discarded at run
-end**. Keying is **one-way** (seeded PRNG, no inverse), so no surrogate can be inverted to its original.
+re-identification key for the keying construction), **never written / logged / committed**, and
+**discarded at run end**. Keying is **one-way** (a keyed hash, no inverse), so no surrogate can be
+inverted to its original. *(This ADR was written against a seeded-PRNG construction; the shipped one is
+a keyed BLAKE2b -- see the correction below and `messagefoundry/anon/keying.py`.)*
 
-**Irreversibility is salt-dependent, not cryptographic.** `random.Random` seeded from a string is **not** a
-keyed hash; the brute-force resistance here rests entirely on the salt never being persisted/logged and on
-**no `(original, surrogate)` pair ever leaking alongside `dataset_key`** — within a run, with a small
-surrogate pool, reversal is feasible if the salt or a plaintext pair leaks. If true cryptographic
-brute-force resistance is later required, switch the seed derivation to an HMAC/BLAKE2 keyed hash; that is a
-*To resolve on acceptance* question, called out below.
+**Irreversibility was salt-dependent rather than cryptographic WHEN THIS ADR WAS WRITTEN. THAT IS NO
+LONGER THE IMPLEMENTATION.** The paragraph below described a `random.Random` seed derived from a
+string, which is not a keyed hash, so brute-force resistance rested entirely on the salt never being
+persisted or logged and on **no `(original, surrogate)` pair ever leaking alongside `dataset_key`** --
+within a run, with a small surrogate pool, reversal was feasible if the salt or a plaintext pair
+leaked. It closed by saying that if true cryptographic brute-force resistance were later required, the
+seed derivation should switch to an HMAC or BLAKE2 keyed hash.
+
+**That switch was made.** The shipped keying is a **keyed BLAKE2b** under the per-dataset salt
+(`messagefoundry/anon/keying.py`), so the "not a keyed hash" premise no longer holds and the *To
+resolve on acceptance* question it raised is answered. **Read the construction from `anon/keying.py`
+rather than from this paragraph.** The operational rules it states are unchanged and still binding:
+the salt is never persisted or logged, and an `(original, surrogate)` pair must never leak alongside
+`dataset_key`.
 
 **Reproducibility model.** The per-run random salt means the **same real message anonymized twice yields a
 *different* fixture** — good for one-shot exports, but it makes a regenerated "committable anonymized
@@ -266,8 +288,11 @@ silently misses a field is worse than none** — though note the limit in the ne
 PHI the rule map **missed** sails through the fail-closed gate *clean* unless that field happens to contain a
 denylisted token — a real MRN is not a denylisted string. **Rule-map completeness is therefore the primary
 control; the leak-check backstops known *strings*, not missed *fields*.** Adding structural detectors
-(MRN/SSN/DOB/phone shape, NANP-reserved vs real) to the post-anon check as a *true* field-level backstop is a
-candidate improvement, scoped out for this slice with the residual called out (Consequences).
+(MRN/SSN/DOB/phone shape, NANP-reserved vs real) to the post-anon check as a *true* field-level backstop was a
+candidate improvement — **built in BACKLOG #331** (AMENDED 2026-08-06; see the status banner): the
+high-precision set (dashed SSN, punctuated NANP phone, CX `MR`/`MRN`-typed id) scoped to the UNMAPPED fields,
+plus an unmapped-field coverage report (`LeakReport.unmapped_fields`) recorded on every pass and surfaced on
+a refusal or via the `on_report` hook. The broad-shape tier stays scoped out (below).
 
 ### 6. Integration points
 
@@ -294,7 +319,9 @@ candidate improvement, scoped out for this slice with the residual called out (C
 0004](0004-payload-agnostic-ingress.md)) so X12 (`parsing/x12/`)/FHIR/raw plug in later — never HL7-parse a
 non-HL7 body. **Out:** statistical expert-determination de-id, free-text NLP scrubbing (NTE-3/OBX-5 narrative
 default to **blunt full-redaction**, §3 — not entity-level NLP), **per-component (bare-leaf) surrogates** (the
-default encoders are field-level `^`-joined, §3), structural PHI detectors in the leak-check (§5), and any
+default encoders are field-level `^`-joined, §3), an **aggressive/broad structural PHI search** (bare-digit
+DOB/SSN, name-like alpha runs — the mass-false-positive tier; note the *high-precision* unmapped-field
+detectors in the leak-check were **built in #331**, AMENDED 2026-08-06, §5), and any
 re-identification/linkage tooling.
 
 ### 8. Relationship to the planned de-id framework
@@ -340,7 +367,9 @@ AI-assistant `deidentified` data-scope source (PHI.md §9 forward-links to it on
   not MRN/SSN/DOB/name *shapes*, so a field the rule map missed passes the "fail-closed" gate clean unless it
   contains a denylisted token. **Rule-map completeness is the primary control**; the leak-check is necessary,
   not sufficient. Free-text (OBX-5/NTE-3) is the **highest-risk residual** — hence its full-redact default
-  (§3). Structural detectors are a deferred improvement (§5/§7).
+  (§3). **AMENDED 2026-08-06 (#331):** high-precision structural detectors over the UNMAPPED fields plus an
+  unmapped-field coverage report are now **built** (that deferral is closed; the broad-shape tier stays
+  deferred, §7) — rule-map completeness remains the primary control.
 - **Vendored-copy drift — bytes *and* behaviour.** Two copies can diverge; the rule/surrogate/token *files*
   are mitigated by a CI **byte-parity** check (the existing tee discipline) under one authority. But the
   engine-side `anon/hl7.py` (delegating to `Message`) and the tee's **standalone stdlib re-encoder** are

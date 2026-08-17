@@ -71,7 +71,9 @@ def test_request_maps_non_2xx_to_apierror(monkeypatch: pytest.MonkeyPatch) -> No
         def json(self) -> dict[str, object]:
             return {"detail": "kaboom"}
 
-    monkeypatch.setattr(client._http, "request", lambda *a, **k: _Resp())
+    # `_request` builds the request (so the #1047 length bound can measure the RESOLVED url) and
+    # dispatches it through `send`, so `send` is the transport seam a stub replaces.
+    monkeypatch.setattr(client._http, "send", lambda *a, **k: _Resp())
     with pytest.raises(ApiError) as excinfo:
         client.health()
     assert excinfo.value.status == 500
@@ -124,3 +126,53 @@ def test_apiclient_refuses_an_over_length_request_path() -> None:
     client = EngineClient("http://127.0.0.1:8765")
     with pytest.raises(ApiError, match="over the 8192-char limit"):
         client._request("GET", "/messages?q=" + "a" * 9000)
+
+
+def test_apiclient_measures_the_query_string_httpx_appends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #1047: the bound must measure the URL httpx actually sends, not the one the caller
+    typed. Every read the console/harness/tray makes goes through ``_get``, which hands its filters
+    to httpx as ``params=`` — appended to the URL AFTER any length measured from ``base_url`` and
+    ``path`` alone. A long filter value (a search needle, a control id) therefore built an over-long
+    request line with nothing refusing it.
+
+    The transport is replaced by a tripwire rather than a stub response: the claim is that the
+    request is refused *before* it reaches the wire, and a stub 200 could not tell that apart from a
+    request that went out and came back. ``httpx.Client.request`` dispatches through
+    ``self.send``, so this one patch covers both the pre-fix (``_http.request``) and post-fix
+    (``build_request`` + ``_http.send``) call shapes.
+
+    Mutation: measure ``len(self.base_url) + len(path)`` again. Red: AssertionError from the
+    tripwire — the over-long request reached the transport."""
+    from messagefoundry.apiclient.client import ApiError, EngineClient
+
+    client = EngineClient("http://127.0.0.1:8765")
+
+    def _tripwire(*args: object, **kwargs: object) -> object:
+        raise AssertionError("an over-length request reached the transport")
+
+    monkeypatch.setattr(client._http, "send", _tripwire)
+    # base_url + path is 33 chars; the query httpx appends is what breaches the limit.
+    with pytest.raises(ApiError, match="over the 8192-char limit"):
+        client._get("/messages", control_id="a" * 9000)
+
+
+def test_apiclient_still_sends_a_query_that_fits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Positive control for the test above: the same call shape with a short query MUST reach the
+    transport. Without this, a bound that refused every query-bearing GET would look identical to a
+    correct one."""
+    from messagefoundry.apiclient.client import EngineClient
+
+    client = EngineClient("http://127.0.0.1:8765")
+    sent: list[str] = []
+
+    def _capture(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        sent.append(str(request.url))
+        return httpx.Response(200, json={}, request=request)
+
+    monkeypatch.setattr(client._http, "send", _capture)
+    client._get("/messages", control_id="MSG1")
+    assert sent == ["http://127.0.0.1:8765/messages?control_id=MSG1"], (
+        "the resolved URL (query included) is what the bound measures, so it is what must go out"
+    )

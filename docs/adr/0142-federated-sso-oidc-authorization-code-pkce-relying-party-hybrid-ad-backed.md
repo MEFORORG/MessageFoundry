@@ -64,7 +64,8 @@ the **same password-free lookup the Kerberos path already uses** —
   to `LOCAL`, which would route `reauth()` to a password check against a NULL hash and permanently 403
   every step-up route. Adding no member leaves that landmine unarmed.
 - **Zero store work.** No column, no migration, no three-backend parity, no group-map namespace
-  decision.
+  decision. **[SUPERSEDED by Amendment A (2026-08-06, BACKLOG #1015): a subject-continuity guard adds two
+  nullable `oidc_issuer` / `oidc_subject` columns with idempotent three-backend migrations; see Amendment A.]**
 - **A principal with no on-prem AD object is refused** (`not_in_directory`). Hybrid-only, by design.
 - **The username claim's UPN suffix is checked against an operator-pinned allow-list**
   (`[auth].oidc_allowed_username_domains`, defaulting to `ad_domain`) **before** the local part is used
@@ -305,3 +306,95 @@ open item 5 — **stays open**, and this ADR's non-sticky OIDC availability flag
       UPN suffix in `oidc_allowed_username_domains` still succeeds. This cell exists because the
       control was added late, after a review found the omission was exploitable.
 - [ ] Confirm whether `truststore` is a base dependency before relying on it for the IdP TLS-trust knob.
+
+---
+
+## Amendment A (2026-08-06) — subject-continuity guard: pin the federated identity to `(issuer, sub)` (BACKLOG #1015)
+
+> **Status: ACCEPTED — owner-ratified 2026-08-06.** Supersedes the **"Zero store work"** Decision bullet and
+> reclassifies the residual that bullet framed as an acceptable *wrong-user login* to a **closed P1 account
+> takeover** (ASVS 10.5.2). Built as BACKLOG #1015 (branch `fix-1015-oidc-sub`). *In force* means the store
+> carries two nullable columns and the federated path enforces subject continuity — **not** that the lab cells
+> are discharged.
+
+### A.1 The gap this closes
+The Decision bounds a claims-parsing bug to a *wrong-user login* ("roles come from LDAP"), and the UPN-suffix
+allow-list closes the *attacker-chosen* username-collision path by checking the token's **domain**. Neither
+closes a **username reassignment**: an IdP that reassigns an already-allowed username to a **different**
+principal (same allowed domain, a **different, non-reassignable `sub`**) resolves — by username — to the
+*prior* person's local account and mints a session on it. No credential is compromised, the domain check
+passes, every ladder rung is green: an account **takeover**, not a benign wrong-user login. The
+non-reassignable `sub` was discarded, so nothing detected the change.
+
+### A.2 The mechanism (Option A — the AD-backed model is preserved)
+The account is **still resolved by its AD username** and roles **still come from LDAP** — every property in the
+Decision is unchanged. Added: the account's federated identity is **pinned to `(issuer, sub)`**. On an OIDC
+login, after `resolve_principal` succeeds, the resolved account's bound `(oidc_issuer, oidc_subject)` is read;
+if it differs from the presented token's, the login is **refused** (`LoginOutcome.reason =
+"federated_subject_conflict"`, audited) **before a session is minted**; a first federated login records the
+binding. AD-password and Kerberos callers pass `None` and stay byte-identical.
+
+### A.3 What this overturns, precisely
+- **"Zero store work" is superseded** by the minimum a continuity guard requires: two **nullable** columns
+  `oidc_issuer` / `oidc_subject` on the users table with **idempotent** migrations in all three backends
+  (SQLite PRAGMA-guarded, SQL Server `COL_LENGTH`-guarded, Postgres `information_schema`-guarded) plus an
+  `AuthStore` setter. No group-map namespace, no per-message store work; the *Out of scope* "any store
+  migration" is narrowed to this one additive, nullable, no-backfill pair.
+- **AC-1 (byte-identical when `oidc_enabled=false`) is reconciled, not broken.** The idempotent `ALTER` runs
+  regardless of `oidc_enabled`, so the *schema* carries two nullable columns even with federation off; they are
+  unread and unwritten on every non-federated path, so **runtime behaviour** with `oidc_enabled=false` is
+  byte-identical (a no-op migration, not a behavioural change). Read AC-1 as a runtime-behaviour guarantee;
+  this footnote keeps the ADR and the shipped DDL from disagreeing.
+
+### A.4 Residual (stated, not hidden)
+A **legitimately** reassigned username — a *new* person taking over an old username and presenting a *new*
+`sub` — is now permanently refused (`federated_subject_conflict`) with **no rebind path**. That is the *safe*
+failure direction (refuse rather than take over) and is narrow, but a real availability edge. **Recommended
+follow-on:** an operator **rebind** action that clears/re-binds an account's `(oidc_issuer, oidc_subject)`
+after an out-of-band identity check, so a genuine reassignment is an admin operation rather than a lockout.
+
+**⚠️ SECOND RESIDUAL, added 2026-08-09 — the guard is trust-on-first-use, so A.1's attack still succeeds
+against an UNBOUND account.** This section previously stated only the availability edge above, which read as
+though the takeover half were fully closed. It is not, and the omission is the more consequential half.
+
+The guard's precondition is that the resolved account *already carries* a binding. AC-12 below says so in
+terms — "WHEN the account is unbound, it SHALL record the binding on that login" — so on an account that has
+never federated-logged-in there is nothing to compare against, the check short-circuits, and the binding is
+recorded for whoever arrives first. That is **exactly the scenario A.1 names**: an IdP reassigns an
+already-allowed username to a different principal, the domain check passes, every ladder rung is green, and a
+session is minted on the prior person's account. The guard then protects the *new* holder's binding against
+everyone else.
+
+Reproduced end to end against the shipped code (in-memory SQLite, RS256 `id_token`, stubbed token exchange,
+fake LDAP): an account created by AD-password login (`oidc_subject` NULL) was taken over by a *different*
+verified subject presenting the same reassigned `preferred_username` — same user row, session minted, the
+incumbent's **LDAP-derived roles inherited** — and a third subject was then refused.
+
+The window is not narrow, because *unbound* is the default state:
+
+- every account that predates enabling federation — i.e. the entire existing population on day one; and
+- every account created afterwards by AD-password or Kerberos login, since those callers pass `None` and
+  write no binding (A.2).
+
+What bounds it: the attacker must be a principal the pinned IdP will mint a token for, within an allow-listed
+UPN suffix, and the target AD object must exist (hybrid-only). The suffix allow-list constrains the *suffix*,
+never the local part, and defaults to the configured `ad_domain` — the very suffix the organisation's own IdP
+mints. So the residual is conditional on IdP tenancy, not on engine configuration.
+
+**Follow-ons (a decision, not a recommendation — both carry a rollout cost, and this ADR does not pick one):**
+either *(a)* refuse an unbound account that predates federation, closing the window at the price of locking out
+every existing user until an operator binds them; or *(b)* an operator **pre-binding** step, which avoids the
+lockout but needs a new admin surface and a migration path. Note *(b)* is the same admin surface the
+availability residual above already recommends, so one control can discharge both.
+
+Assessed downstream as ASVS **10.5.2** (`partial` — a refusing control exists and ships on, but covers only
+bound accounts) and **6.8.1** (`partial` — cross-IdP identity is still keyed on the reassignable username, with
+`(issuer, sub)` able only to veto the row that claim already selected). Neither can reach `pass` while this
+window is open.
+
+### A.5 Acceptance criterion added
+- **AC-12 (subject continuity)** — WHEN an OIDC login's username resolves to an account already bound to an
+  `(issuer, sub)` other than the token's, THE SYSTEM SHALL refuse with an audited `federated_subject_conflict`
+  and mint no session; WHEN the account is unbound, it SHALL record the binding on that login; WHEN the bound
+  tuple matches, the login proceeds unchanged -> the federated-path regression tests (changed-sub / same-username
+  refused; same-sub / changed-username resolves to the same account).

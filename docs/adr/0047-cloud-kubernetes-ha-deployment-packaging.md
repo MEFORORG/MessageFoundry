@@ -8,7 +8,7 @@
   packages an **operator-assembled** L4 load balancer whose VIP *follows* failover via a primary-only
   health check — it does **not** build an engine that *manipulates* a VIP. Any future engine-managed VIP
   is a distinct, deferred item (see *Out of scope* and *To resolve on acceptance*).
-- **Related:** [BACKLOG #41](../BACKLOG.md) (this) · the ratifying research
+- **Related:** [BACKLOG #41](../archive/backlog/BACKLOG-CLOSED.md#41-cloud--kubernetes-ha-deployment-packaging-container-fast-follow-follow-ons) (this) · the ratifying research
   [`research/cloud-deployment-research-2026-06.md`](../research/cloud-deployment-research-2026-06.md) ·
   [ADR 0017](0017-consumer-deployment-model.md) (consumer deployment model, container fast-follow, PR #480) ·
   [ADR 0037](0037-multi-process-sharding-l3.md) (L3 process sharding — the CPU-scaling lever, **not** an HA
@@ -171,11 +171,15 @@ The six deliverables:
    halves of each block: drop *"those listeners have NO startup transport guard"* **and** correct the
    contrasting clause *"MLLP and the DICOM C-STORE SCP are guarded"* to the **complete set** (MLLP, DICOM
    C-STORE SCP, HTTP, **raw-TCP, and X12** are all exposed-gated — a non-loopback bind without TLS is
-   refused at start), plus fix the same gap in the research note. **Off-box log forwarding is a separate
-   open item, not flipped on here:** the built `[logging]` syslog forwarder is **plaintext** (UDP/TCP only;
-   `SyslogProtocol` has **no TLS variant** — `config/settings.py`), so enabling it from a cloud/ephemeral-pod
-   posture would put PHI-adjacent log metadata on the wire in cleartext. Any prod-HA enablement is gated on
-   pairing it with a TLS-forwarding sidecar / TLS collector (tracked in *To resolve*). Note for operators:
+   refused at start), plus fix the same gap in the research note. **Off-box log forwarding was a separate
+   open item, not flipped on here. THAT IS NO LONGER THE POSTURE and the text below is superseded:**
+   it said the built `[logging]` syslog forwarder was **plaintext** with `SyslogProtocol` carrying **no
+   TLS variant**, so a cloud/ephemeral-pod enablement would put PHI-adjacent log metadata on the wire in
+   cleartext, and gated any prod-HA enablement on pairing it with a TLS-forwarding sidecar or TLS
+   collector. **A native TLS transport has since shipped** (ADR 0080), so the sidecar is no longer the
+   only path. **Derive the available transports from `SyslogProtocol` in `config/settings.py` rather
+   than from this ADR** -- an enumeration written here is one that goes stale, which is exactly what
+   happened to this paragraph. Note for operators:
    **API TLS cert rotation needs a pod restart** (uvicorn builds the TLS context once; only MLLP certs
    hot-reload on `/config/reload`) — fold it into the rolling-renewal runbook.
 
@@ -269,8 +273,8 @@ mid-run) — verify current NextGen Helm/Docker specifics before leaning on the 
 failover** (the passive primary-only-health-check LB is the chosen mechanism; an engine that manipulates a
 VIP is a separate reserved item); active-active / a second concurrent writer (#396, deleted); an inbound
 **DICOMweb / HTTP web-service receiver** as a public cloud ingress (a distinct not-yet-built auth/TLS
-surface, ADR 0023 territory); **TLS off-box log forwarding** (the built forwarder is plaintext — a TLS
-syslog variant or a TLS sidecar/collector is a separate item); DB-tier write-scaling (L5 / ADR 0039) and
+surface, ADR 0023 territory); **TLS off-box log forwarding** (out of scope for this ADR;
+the native TLS syslog transport has since shipped under ADR 0080); DB-tier write-scaling (L5 / ADR 0039) and
 loss-of-site DR (ADR 0048) — those are separate levers this ADR only references. This ADR ships **no new
 engine reliability code**; the raw-TCP/X12 guard is ratified-as-built, not re-implemented.
 
@@ -300,9 +304,10 @@ engine reliability code**; the raw-TCP/X12 guard is ratified-as-built, not re-im
   encryption/segmentation/inventory floor — confirm we publish against the **current** Security Rule and
   flag the NPRM as anticipated-not-final (it was unfinalized as of 2026-06), so the doc doesn't assert an
   unenacted requirement.
-- [ ] **Off-box log forwarding hop:** the built `[logging]` syslog forward is **plaintext** today
-  (`SyslogProtocol` is UDP/TCP only — no TLS variant). Decide the prod-posture HA path: pair it with a
-  TLS-forwarding sidecar / TLS collector before any enablement, **or** keep off-box forwarding out of the
+- [x] **Off-box log forwarding hop: RESOLVED by ADR 0080, which shipped a native TLS syslog
+  transport.** This item was written when the built `[logging]` forward had no TLS option and the only
+  answers were a sidecar or omission. It read: decide the prod-posture HA path, pair it with a
+  TLS-forwarding sidecar or TLS collector before any enablement, **or** keep off-box forwarding out of the
   cloud manifest entirely — but do **not** instruct operators to "flip it on" as-is (cleartext PHI-adjacent
   metadata on the wire).
 - [ ] **Manifest-lint CI leg:** confirm the new `kubeconform`/policy-lint job (the verifier named by
@@ -321,5 +326,5 @@ Owner delegated the open items ("you sort it out / do what is best"); resolved a
 - **`terminationGracePeriodSeconds` ≥ `leader_lease_ttl` + serial-drain + margin** (reconcile with the existing single-node `40`).
 - **Edge-relay = the same engine image** (reuse the outbound MLLP/TCP connectors) — **no new code**.
 - **Cloud PHI doc** is published against the **current** HIPAA Security Rule; the 2025 NPRM floor is flagged as anticipated-not-final.
-- **Off-box syslog stays OUT of the cloud manifest as-is** — `[logging]` syslog forwarding is plaintext; pair it with a TLS sidecar/collector before any enablement. Operators are **not** told to "flip it on" (no cleartext PHI-adjacent metadata on the wire).
+- **Off-box syslog stayed OUT of the cloud manifest as-is** — at the time `[logging]` syslog forwarding had no TLS transport, so the decision was to pair it with a TLS sidecar/collector before any enablement and never tell operators to "flip it on" (no cleartext PHI-adjacent metadata on the wire). **A native TLS syslog transport has since shipped under ADR 0080**, so the premise for the sidecar-only answer no longer holds; the manifest decision itself is unrevisited here.
 - **A kubeconform / policy-lint CI leg ships with the build lane** (the verifier AC-4/AC-5 name).

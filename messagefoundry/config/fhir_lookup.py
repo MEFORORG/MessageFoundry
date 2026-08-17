@@ -31,8 +31,8 @@ free of any transport / pool / event-loop import (one-way dependency, CLAUDE.md 
 
 Declare a connection with :func:`~messagefoundry.config.wiring.FhirLookup`; read it in a Handler::
 
-    patient = fhir_lookup("epic", "Patient/123")                  # read-by-id → a resource dict
-    bundle = fhir_lookup("epic", "Patient?identifier=MRN|123")    # search → a searchset Bundle dict
+    patient = fhir_lookup("epic", "Patient/123")                       # read-by-id → a resource dict
+    bundle = fhir_lookup("epic", "Patient", {"identifier": "MRN|123"})  # search → a searchset Bundle
 """
 
 from __future__ import annotations
@@ -64,11 +64,12 @@ class FhirLookupError(RuntimeError):
 
 
 #: The runner the engine publishes for the duration of one off-loop transform: it takes
-#: ``(connection, query, params)`` (``query`` is ``"Patient/123"``, ``"Patient?identifier=..."``, or a
-#: path-only ``"Patient"`` paired with structured ``params``) and returns the parsed read result as a
-#: plain dict (a resource, or a searchset ``Bundle``). ``params`` (ADR 0043, BACKLOG #204) is the
-#: **safely-encoded** search form: each value is percent-encoded by the engine, so an attacker-influenced
-#: value can never inject an extra FHIR search parameter (CWE-88). ``None`` = the flat ``query`` form.
+#: ``(connection, query, params)`` (``query`` is a read-by-id ``"Patient/123"`` or a path-only
+#: ``"Patient"`` paired with structured ``params``) and returns the parsed read result as a plain dict
+#: (a resource, or a searchset ``Bundle``). ``params`` (ADR 0043, BACKLOG #204) is the **safely-encoded**
+#: search form and, since #1243, the only one: each value is percent-encoded by the engine, so an
+#: attacker-influenced value can never inject an extra FHIR search parameter (CWE-88). ``None`` means a
+#: read-by-id (no search); a ``?``-query inside ``query`` is refused.
 FhirLookupRunner = Callable[[str, str, Mapping[str, str | list[str]] | None], dict[str, Any]]
 
 # Active runner as a ContextVar (mirrors db_lookup._active): the runner is published around the off-loop
@@ -117,21 +118,19 @@ def fhir_lookup(
     Call it inside a Handler at run time. ``query`` is **one of two read shapes**, both read-only:
 
     * a **read-by-id**: ``fhir_lookup("epic", "Patient/123")`` → ``GET {base}/Patient/123``;
-    * a **search**: ``fhir_lookup("epic", "Patient?identifier=MRN|123")`` → ``GET {base}/Patient?...``.
+    * a **search**: the path in ``query`` plus the fields in ``params`` —
+      ``fhir_lookup("epic", "Patient", {"identifier": "MRN|123"})`` → ``GET {base}/Patient?...``.
 
-    **Encoding of search values (ASVS 1.2.2, BACKLOG #204).** Two ways to pass search parameters:
+    **Encoding of search values (ASVS 1.2.2, BACKLOG #204, #1243).** There is exactly **one** search
+    form and it is encoded by construction: the engine percent-encodes **each value**
+    (``urlencode(quote_via=quote, safe="")``), so a value can **never** inject an extra search
+    parameter, and a ``list[str]`` value expands to repeated params.
 
-    * the **flat string** form (above) — the query rides the URL as authored, so **you** must
-      percent-encode any attacker-influenceable value (e.g. an HL7 field). This is back-compat and stays
-      supported, but a value like ``f"Patient?identifier=MRN|{pid}"`` with ``pid="123&_count=99999"``
-      would inject an extra FHIR search param. The engine still screens the flat form for unambiguous
-      injection shapes (a ``#`` fragment, a second ``?``, or a percent-decoded control char) and rejects
-      those before dialing out — but it cannot re-encode a legitimate ``&``/``=``/``|`` separator for you.
-    * the **structured** ``params`` form (**preferred, safe**): pass the path in ``query`` and the search
-      fields in ``params`` — ``fhir_lookup("epic", "Patient", params={"identifier": f"MRN|{pid}"})``. The
-      engine percent-encodes **each value** (``urlencode(quote_via=quote, safe="")``), so a value can
-      **never** inject an extra parameter; a ``list[str]`` value expands to repeated params. Pass search
-      fields via ``params`` **or** a ``?``-query in ``query``, not both.
+    A ``?``-query inside ``query`` is **refused** (:class:`FhirLookupError`). It used to be supported and
+    rode the URL exactly as authored, which made per-value encoding the caller's duty — an
+    ``f"Patient?identifier=MRN|{pid}"`` with ``pid="123&_count=99999"`` injected an extra FHIR search
+    parameter. It was removed rather than gated behind a setting, because a setting leaves that sink one
+    config edit away (BACKLOG #1243; supersedes ADR 0043 AC-2).
 
     The GET runs **off the event loop**. The result is read on demand by the Handler via the pure
     ``parsing/fhir/`` codec (``FhirPeek``/``FhirResource``) — never a typed object pushed through the

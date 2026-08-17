@@ -198,6 +198,7 @@ class _Snapshot:
     pool: PoolStatus | None = None
     committed_txns: int = 0
     body_copies: int = 0
+    fenced_writes: int = 0
     # ADR 0114 AC-7's degraded gauge. None when the backend has no fifo_claim_proc lever or the flag
     # is off — the gauges are then ABSENT rather than 0, so a scrape can tell "not requested" from
     # "requested and degraded" (a constant 0 on every SQLite fleet would be pure alert noise).
@@ -233,6 +234,7 @@ async def gather_snapshot(engine: Engine) -> _Snapshot:
     pool = engine.store.pool_status()
     committed_txns = int(getattr(engine.store, "committed_txns", 0))
     body_copies = int(getattr(engine.store, "body_copies", 0))
+    fenced_writes = int(getattr(engine.store, "fenced_writes", 0))
     return _Snapshot(
         sync_replies=sync_replies,
         version=__version__,
@@ -249,6 +251,7 @@ async def gather_snapshot(engine: Engine) -> _Snapshot:
         pool=pool,
         committed_txns=committed_txns,
         body_copies=body_copies,
+        fenced_writes=fenced_writes,
         claim_proc=engine.store.claim_proc_status(),
     )
 
@@ -419,6 +422,14 @@ class _MetricsCollector:
         )
         body_copies.add_metric([], float(s.body_copies))
         yield body_copies
+        # ADR 0157 C3 split-brain signal. A counter rather than a gauge because it only ever grows;
+        # alert on rate(...) > 0, not on an absolute value.
+        fenced = CounterMetricFamily(
+            "messagefoundry_store_fenced_writes",
+            "Terminal queue resolves rejected by the leader-epoch fence (process lifetime).",
+        )
+        fenced.add_metric([], float(s.fenced_writes))
+        yield fenced
 
         # ADR 0114 AC-7 degraded gauge. Emitted ONLY when [store].fifo_claim_proc is on: a constant
         # 0 on every fleet that never asked for the lever is noise a scraper cannot alert on, and

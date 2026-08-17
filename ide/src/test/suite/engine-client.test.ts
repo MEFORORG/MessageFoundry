@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 import * as assert from "assert";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
@@ -81,5 +83,48 @@ suite("engineClient — getJson timeout (F2)", () => {
     assert.notStrictEqual(hung.reason, dead.reason);
     assert.ok(/hung/i.test(hung.reason ?? ""));
     assert.ok(/nothing is listening/i.test(dead.reason ?? ""));
+  });
+});
+
+// BACKLOG #330 — the LAST HOP of the chain. Every other test in this change stops at a call boundary
+// (a recorded argument, a plan constant); this one puts a real request on a real socket and reads the
+// header the engine would see. Without it the item's headline claim — "the read is authenticated" —
+// rests on a header nobody has observed. Both polarities are asserted: that a token becomes a Bearer
+// header, AND that a tokenless call really sends nothing (the status bar's read depends on the latter).
+suite("engineClient — getJson sends the bearer only when given one (BACKLOG #330)", () => {
+  let server: http.Server;
+  let url: string;
+  let seen: string | undefined;
+  let sawHeader = false;
+
+  setup(async () => {
+    seen = undefined;
+    sawHeader = false;
+    server = http.createServer((req, res) => {
+      seen = req.headers.authorization;
+      sawHeader = "authorization" in req.headers;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const addr = server.address() as AddressInfo;
+    url = `http://127.0.0.1:${addr.port}`;
+  });
+
+  teardown(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  test("T15a: a token is sent as `Authorization: Bearer <token>`", async () => {
+    await getJson(url, "/ai/policy", "tok-abc");
+    assert.strictEqual(seen, "Bearer tok-abc");
+  });
+
+  test("T15b: a tokenless call sends NO Authorization header at all", async () => {
+    // Not merely "not a valid token" — the header must be absent. `Bearer undefined` would be a string
+    // the engine tries to resolve, and on the status bar's 15s path any bearer at all is the CWE-613 bug.
+    await getJson(url, "/ai/policy");
+    assert.strictEqual(seen, undefined);
+    assert.strictEqual(sawHeader, false, "the header key must not be present");
   });
 });

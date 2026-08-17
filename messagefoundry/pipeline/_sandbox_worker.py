@@ -24,9 +24,12 @@ direction, in either process.
    The reply echoes the request's ``id``, ``phase`` and ``name`` so the parent can prove the frame
    answers the call it made.
 
-stdout is the binary IPC channel — **nothing else may write to it**. Logging and any diagnostics go
-to stderr (inherited by the engine). The engine parent enforces the wall-clock cap and kills a
-runaway child, so this process never needs its own watchdog.
+stdout is the binary IPC channel — **nothing else may write to it**. Logging and any diagnostics go to
+stderr (inherited by the engine) through the **same PHI-redaction + control-char-scrub filter chain the
+engine installs on its own handlers** (:func:`~messagefoundry.logging_setup.configure_stderr_logging`),
+so a child log line carrying message-derived content is redacted and CR/LF-neutralized here rather than
+arriving raw on the inherited stream. The engine parent enforces the wall-clock cap and kills a runaway
+child, so this process never needs its own watchdog.
 """
 
 from __future__ import annotations
@@ -37,8 +40,13 @@ import sys
 from dataclasses import replace
 from typing import Any
 
-# stdout is the IPC channel; keep the root logger on stderr so a stray log line can't corrupt a frame.
-logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
+from messagefoundry.logging_setup import configure_stderr_logging
+
+# stdout is the IPC channel, so the root logger goes to stderr — a stray log line there cannot corrupt
+# a frame. It is `configure_stderr_logging` rather than a bare `basicConfig` because redaction is a
+# property of the HANDLER: basicConfig's handler carries no filters, so this child's records would
+# reach the engine's stderr with neither PHI redaction nor CR/LF scrubbing (BACKLOG #1054).
+configure_stderr_logging()
 log = logging.getLogger("messagefoundry.sandbox.worker")
 
 
@@ -98,6 +106,7 @@ def _run_one(registry: Any, req: Any, code_sets: Any) -> tuple[bool, object, str
     from messagefoundry.config.db_lookup import DbLookupError
     from messagefoundry.config.fhir_lookup import FhirLookupError
     from messagefoundry.config.run_context import run_contexts
+    from messagefoundry.config.wiring import handler_result_items
     from messagefoundry.pipeline._sandbox_codec import SandboxError
 
     phase = req.phase
@@ -133,6 +142,19 @@ def _run_one(registry: Any, req: Any, code_sets: Any) -> tuple[bool, object, str
     try:
         with run_contexts(run_context, phase=phase_key):
             result = fn(req.payload)
+            if phase == "transform":
+                # Materialise a CONTAINER return here, INSIDE the run context (BACKLOG #341). A
+                # generator Handler's body runs lazily, at whatever point something iterates it — and
+                # the codec's `enc_result`, which is where that would otherwise happen, is called from
+                # `_respond`, OUTSIDE this `with`. Materialising there would execute the Handler body
+                # with no active run context, so a `code_set(...)` inside a generator Handler would
+                # raise CodeSetError under mode=subprocess while working under mode=off: a
+                # mode-dependent disposition, exactly what ADR 0087's parity rule forbids. Applying the
+                # same rule again in `enc_result` is deliberate and free — list(list) is an idempotent
+                # shallow copy, and the codec is also exercised directly (parity table), bypassing this.
+                items = handler_result_items(result)
+                if items is not None:
+                    result = items
         if phase == "accepts":
             # HandlerAccepts is contractually ``(msg) -> bool`` and the PARENT coerces the verdict with
             # ``bool(...)`` (dryrun._accepted). Coerce HERE too, BEFORE the result is described back: a

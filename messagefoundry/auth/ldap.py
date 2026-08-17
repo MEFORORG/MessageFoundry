@@ -27,8 +27,9 @@ from messagefoundry.config.secretprovider import SecretProvider, resolve_connect
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     AuthSettings,
-    insecure_tls_allowed,
+    weakened_tls_escape_permitted,
 )
+from messagefoundry.config.tls_policy import HopPosture
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +88,11 @@ class LdapAuthenticator:
     """Binds against Active Directory over LDAPS and resolves a user's (nested) group membership."""
 
     def __init__(
-        self, settings: AuthSettings, *, secret_provider: SecretProvider | None = None
+        self,
+        settings: AuthSettings,
+        *,
+        secret_provider: SecretProvider | None = None,
+        posture: HopPosture | None = None,
     ) -> None:
         if not settings.ad_server or not settings.ad_user_search_base:
             raise LdapError("AD is enabled but ad_server / ad_user_search_base are not configured")
@@ -105,16 +110,26 @@ class LdapAuthenticator:
         if not settings.ad_bind_dn or not self._bind_password:
             raise LdapError("AD is enabled but the service-account bind is not configured")
         self._s = settings
-        # A disabled-cert-verification posture (ad_tls_verify=false over LDAPS) makes the service-
-        # account and user binds MITM-able, so it now REFUSES at startup unless the operator sets the
-        # explicit MEFOR_ALLOW_INSECURE_TLS dev escape — it can no longer be silently turned on in
-        # production (ASVS 12.3.2). With the escape set, we still warn loudly once at startup.
+        # #329: the instance hop posture (threaded by AuthService from create_app's derived posture).
+        # LDAPS is built OUT of the connector-construction gate (AuthService, not build_check_registry),
+        # so current_hop_posture() would be None here; the posture must be passed explicitly or the
+        # clamp below would be inert. None (a direct/test/embedding construction) falls back to the
+        # unclamped escape — byte-identical to the pre-#329 bare read.
+        self._posture = posture
+        # A disabled-cert-verification posture (ad_tls_verify=false over LDAPS) would make the service-
+        # account and user binds MITM-able on first deployment, so it REFUSES at startup unless the
+        # operator sets the explicit MEFOR_ALLOW_INSECURE_TLS dev escape (ASVS 12.3.2). #329 routes that
+        # escape through the ADR-0092 clamp (weakened_tls_escape_permitted): under an enforcing-PHI
+        # posture the escape is INERT, so it can never silence this refusal on such an instance — the
+        # blunt env var no longer buys verify-off there. With the escape permitted (non-enforcing/non-PHI
+        # or unstamped posture), we still warn loudly once at startup.
         if str(settings.ad_server).lower().startswith("ldaps") and not settings.ad_tls_verify:
-            if not insecure_tls_allowed():
+            if not weakened_tls_escape_permitted(self._posture):
                 raise LdapError(
                     "ad_tls_verify=false disables LDAPS certificate verification (MITM risk). Use a "
                     f"trusted CA via ad_tls_ca_cert_file, or set {INSECURE_TLS_ESCAPE_ENV}=1 to "
-                    "explicitly allow it for a trusted-network dev/test bind."
+                    "explicitly allow it for a trusted-network dev/test bind (refused on an enforcing "
+                    "PHI instance even with that override set, #329)."
                 )
             logger.warning(
                 "AD LDAPS certificate verification is DISABLED (ad_tls_verify=false, permitted by "

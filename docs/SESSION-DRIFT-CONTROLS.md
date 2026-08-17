@@ -62,13 +62,25 @@ there is no defence in depth between them.
 | 4 | `EnterWorktree` (relocating a live session) | tool name only |
 
 The single most important design decision is that **rules 1/3/3b key on the target, never on the cwd**.
-The gate's own docstring records that 29% of Edit/Write calls came from a session *sitting* in the primary
-that wrote *correctly* into a worktree by absolute path; a cwd-keyed gate would have denied all of them.
+The gate's own docstring records that 29% of the Edit/Write calls made by sessions *sitting* in the primary
+wrote *correctly* into a worktree by absolute path; a cwd-keyed gate would have denied all of them.
 Rule 2 is the sole exception, and that exception is the source of the ultracode friction in §4.
 
-**[`scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1)** (project
-scope, [`.claude/settings.json`](../.claude/settings.json)) refuses blanket `git add -A`/`.`/`-u` and
-`git commit -a`, so two sessions in one tree can't sweep each other's files into one commit.
+**[`scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1)** refuses
+blanket `git add -A`/`.`/`-u` and `git commit -a`, so two sessions in one tree can't sweep each other's
+files into one commit.
+
+**It does not travel, and this paragraph used to imply it did** (BACKLOG #327). The script is tracked,
+but the `PreToolUse` matcher that invokes it is project-scope `.claude/settings.json` — untracked, under
+`.gitignore`'s `/.claude/` rule — so a fresh clone and every `git worktree add` come up without it. It is
+a local Claude Code session control, fail-open by design: real and useful inside a configured session,
+and not repo-wide coverage. The publishing boundary it was cited alongside is asserted independently, by
+[`tests/test_private_paths_stay_ignored.py`](../tests/test_private_paths_stay_ignored.py) in CI.
+
+*(The link to that settings file was removed rather than repaired — it named a path no reader outside the
+maintainer's own machine has. `scripts/docs/link_check.py` could not have caught it: `.claude/` is in
+that script's `WITHHELD` set, so such an href is skipped before it is even counted. Measured 2026-08-10 —
+an href to a missing non-withheld path fails the check, the same href under `.claude/` does not.)*
 
 ### Detection — `SessionStart` hooks
 
@@ -91,6 +103,13 @@ Frequently forgotten in discussions of "the gate", but it is the same problem cl
   `-Release` then `-Take` — which drops the claim in between and re-opens the race it exists to close.
   The note is what `announce-session.ps1` broadcasts to every joining session *in preference to the
   worktree name*, so a note that cannot be corrected is announced as current intent indefinitely.
+  Every `-Release` — **`-Force` included** — appends one JSON line to `claims/.history` naming the key,
+  the releasing worktree and branch, the prior holder, its branch and note, and whether `-Force` was
+  used. The flag stays: a claim whose holder's worktree is gone would otherwise be stuck, and the
+  alternative people reach for is hand-deleting the file, which leaves less evidence still. What
+  changed is that the override is no longer invisible. The record is written *before* the claim file
+  is removed, and a release that cannot be recorded is refused rather than performed silently
+  (BACKLOG #1068).
 - **[`scripts/hooks/claim_check.py`](../scripts/hooks/claim_check.py)** — `commit-msg` gate: a commit whose
   *subject* declares `BACKLOG #N` with a code-touching diff must hold a claim on N **for this worktree**.
   Motivated by a recorded incident: three sessions independently fixed one npm advisory; two PRs were
@@ -106,9 +125,14 @@ writes when measured.
   commit-time: the peers of a new session learn nothing until someone trips a gate or writes a commit
   subject, which is too late for two sessions building the same *thing* in different files. This one
   hands the model its live peer roster plus the id-resolution rule at the first prompt that has intent
-  to report, and asks it to introduce itself. It cannot send anything by itself — hooks cannot call MCP
-  — so it is an instruction, and whether a message was actually delivered is recorded by the model in
-  `sent/<key>.tsv`, not by the hook. See [WORKTREES.md](WORKTREES.md), "Announcing yourself".
+  to report, and asks it to introduce itself. It is an *instruction* rather than an action, so whether a
+  message was actually delivered is recorded by the model in `sent/<key>.tsv`, not by the hook — the one
+  control whose audit trail is self-reported by the component being audited. The reason recorded for that
+  design ("hooks cannot call MCP") is **false**: `type: "mcp_tool"` is a documented handler on every hook
+  event. Whether it can reach the host-provided `ccd_session_mgmt` is **untested** — probed 2026-08-03 and
+  the answer was unreadable, because with no MCP server connected on the box "not surfaced", "not
+  addressable" and "errored invisibly" produce identical bytes. That is this section's own lesson landing
+  on the section itself. See [WORKTREES.md](WORKTREES.md), "Announcing yourself".
 
 > **A control that cannot distinguish "ran and resolved" from "ran and found nothing" is not
 > installed, however it looks.** The hook the one above replaced fired on every prompt, printed its
@@ -166,7 +190,7 @@ reading the emitted decision — not by reading source alone.
 | Selfheal — primary auto-repair | user (4 of 5 dirs) | LIVE |
 | Selfheal — hijack warning | user (4 of 5 dirs) | **LIVE and currently mis-firing** (§3, G4) |
 | `session-context.ps1` banner | project | LIVE where the branch carries the file |
-| Announce-on-join (`announce-session.ps1`) | user | **MERGED, NOT INSTALLED — inert by accident, 2026-08-02.** The only **push** control; asks, cannot send, and every decision leaves a receipt. It has never run. See below |
+| Announce-on-join (`announce-session.ps1`) | user | **LIVE** (re-verified 2026-08-03 by receipt *and* by `-Status`). The only **push** control; it asks rather than sends, and every decision leaves a receipt. Was inert-by-accident for ~13h after merge — see below, the lesson outlived the defect |
 | Announce wiring reaches a real script | test | **NEW** — `tests/test_announce_wiring.py`; nothing asserted this for *any* hook before, which is how a wired-but-inert shim survived weeks |
 | Announce missing-script notice | user | **NEW** — the one surface that still reports when the script itself fails to resolve |
 | Collision gate — unresolved notice | user | **NEW** — every fail-open path used to be indistinguishable from an all-clear; it now says which reason, once per 30 min, and still allows |
@@ -180,32 +204,38 @@ Rule 4 being inert is **deliberate and announced** — the commit that landed it
 nothing changes until `install-gate.ps1` is re-run." It is listed as INERT here because a control that
 has never been installed is a source artefact, not an enforcement.
 
-**Announce-on-join is inert too, and that one is an accident.** Measured 2026-08-02, hours after
-[#133](https://github.com/MEFORORG/MessageFoundry/pull/133) merged it to `main`:
+**Announce-on-join was inert too, and that one was an accident — now closed.** It merged in
+[#133](https://github.com/MEFORORG/MessageFoundry/pull/133) on 2026-08-01 at 21:18Z and was still unwired
+the next morning, roughly thirteen hours later:
 
-| Check | Result |
-|---|---|
-| `mefor-announce` UserPromptSubmit entry in any of the 5 config roots | **absent** |
-| The one UserPromptSubmit entry that *is* installed | `# mefor-web-announce`, resolving `scripts/hooks/announce.ps1` — **a different script in a different repo** |
-| `<git-common-dir>/mefor-coord/announce/` | **does not exist**, so there is not one receipt: it has never executed |
+| Check | 2026-08-02 (the defect) | 2026-08-03 (re-verified) |
+|---|---|---|
+| `mefor-announce` UserPromptSubmit entry in any of the 5 config roots | **absent** | **INSTALLED** per `install-coordination.ps1 -Status` |
+| The one UserPromptSubmit entry that *was* installed | `# mefor-web-announce`, resolving `scripts/hooks/announce.ps1` — **a different script in a different repo** | still present, and still nothing to do with this repo |
+| `<git-common-dir>/mefor-coord/announce/` | **did not exist**, so there was not one receipt: it had never executed | 47 markers, 28 receipt files, 23 delivery logs; newest line `out=ANNOUNCED peers=3 reach=3 sent=3 checks=2 ms=616` |
 
-`install-coordination.ps1` was last run before the announce row existed, and merging a hook does not
-install one. The two `mefor-coord` entries it wired then — the SessionStart banner and the collision
-gate — are present, which is exactly why nothing looked wrong.
+`install-coordination.ps1` had last been run before the announce row existed, and **merging a hook does
+not install one**. The two `mefor-coord` entries it wired then — the SessionStart banner and the collision
+gate — were present, which is exactly why nothing looked wrong.
 
-Two things this costs, both observed rather than predicted. A peer session announced itself **by hand**
-on 2026-08-02 and reported the hook as unavailable because it was "on an unmerged branch"; it had
-merged, so the correct diagnosis was never reached. And the missing-script notice listed below — the
-surface built precisely so this class cannot hide — **cannot fire when the hook is not wired at all**,
-because it lives inside the shim. That is this section's own lesson recurring one level up: the
-detector was still downstream of the failure. Re-arm from a plain terminal, then confirm by receipt
-rather than by reading the settings file:
+**Keep the lesson; the defect is the cheap part.** Two things it cost, both observed rather than
+predicted. A peer session announced itself **by hand** on 2026-08-02 and reported the hook as unavailable
+because it was "on an unmerged branch"; it had merged, so the correct diagnosis was never reached. And the
+missing-script notice listed above — the surface built precisely so this class cannot hide — **cannot fire
+when the hook is not wired at all**, because it lives inside the shim. That is this section's own lesson
+recurring one level up: the detector was still downstream of the failure.
+
+Which is why the status in the table above is stated **by receipt, not by reading a settings file** — and
+why re-checking it costs two commands. Reading `settings.json` would have shown the *web* entry and looked
+fine, which is the whole trap:
 
 ```powershell
-pwsh -NoProfile -File scripts\coord\install-coordination.ps1
-# then, after one prompt in any session in this repo:
+pwsh -NoProfile -File scripts\coord\install-coordination.ps1 -Status
+# and, after one prompt in any session in this repo — the load-bearing half:
 ls (Join-Path (git rev-parse --path-format=absolute --git-common-dir) 'mefor-coord/announce/receipts')
 ```
+
+A row in this table that has not been re-established that way is a claim about the past, not a status.
 
 ---
 
@@ -607,9 +637,24 @@ worktrees, which the gate explicitly permits writing into.
 
 **Cited, not re-measured — treat with care:**
 
-- **"29% of Edit/Write calls landed in a worktree; 44% in the primary; 166 sessions over 30 days."** From
-  the gate's own docstring. This is the *sole* quantitative justification for the target-keyed design.
-  Nothing in the repo lets it be recomputed, and nobody has asked whether it still holds.
+- **"Over 30 days, 166 sessions ran with their cwd in the shared primary; 6,075 of *their* Edit/Write
+  calls (44%) landed in the primary's tree and 4,010 (29%) landed in a worktree by absolute path."**
+  From the table in [`WORKTREE-GATE.md`](WORKTREE-GATE.md). This is the *sole* quantitative
+  justification for the target-keyed design. Nothing in the repo lets it be recomputed, and nobody has
+  asked whether it still holds.
+
+  > **CORRECTION 2026-08-13 — this entry stated the denominator wrongly and named the wrong source.**
+  > It originally read *"29% of Edit/Write calls landed in a worktree; 44% in the primary; 166 sessions
+  > over 30 days."* **From the gate's own docstring.** Both halves were wrong. The percentages are
+  > shares of the Edit/Write calls made by those 166 primary-seated sessions — roughly 13,800 — not of
+  > every call in the repo; stated bare, a reader supplies the wider denominator and is not corrected.
+  > And the docstring is not the source: `git log -S '44%'` and `git log -S '166'` over
+  > [`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1) each return **zero commits
+  > across all history**, so it has never carried either figure and only ever carried the 29%. The
+  > table is the only artifact holding both numerators, which is the only context in which their shared
+  > denominator had to be made explicit. Corrected rather than rewritten silently, because the false
+  > attribution is what made the loose reading look authoritative and a later reader will otherwise
+  > re-derive it.
 ~~**"A subagent's denied edits came back with an empty `permission_denials` list."**~~ **Superseded** —
   re-measured above. The denial surfaces clearly to the subagent, the write never lands, and the receipt
   now records it against the subagent's pid.

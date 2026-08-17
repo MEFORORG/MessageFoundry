@@ -66,8 +66,9 @@ def _make_hub(dests: list[str], shape: EstateShape, index: int) -> HandlerFn:
 
     def handle(msg: Message | RawMessage) -> list[Send | SetState | SetMeta]:
         transformed = _apply_transform(msg, shape, index)
-        # Typed to the Handler's list element union (not bare ``list[Send]``) so the fan-out is
-        # assignable to HandlerFn — a ``list`` is invariant, so ``list[Send]`` would not be.
+        # Typed to the Handler's element union (not bare ``list[Send]``) so the annotation states the
+        # full contract. It is no longer required for assignability: since BACKLOG #341 ``HandlerFn``
+        # returns an ``Iterable``, which is covariant, so a plain ``list[Send]`` would assign too.
         sends: list[Send | SetState | SetMeta] = [Send(dest, transformed) for dest in dests]
         return sends
 

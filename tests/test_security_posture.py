@@ -40,6 +40,7 @@ from tests._workflow_contexts import (
     WORKFLOWS,
     context_of,
     jobs_of,
+    load_workflow,
     required_contexts,
     resolve,
 )
@@ -63,6 +64,17 @@ _BLOCKING_SECURITY_JOBS = frozenset(
 # ADVISORY by design: these MUST keep continue-on-error. Both are cron/dispatch-only, so promoting one
 # without also removing its `if:` would wedge every PR (see security.yml's own notes on trivy).
 _ADVISORY_SECURITY_JOBS = frozenset({"sbom", "trivy"})
+
+# ADVISORY BY PLACEMENT: hard-failing, but NOT in branch protection. This is a third posture the file
+# previously could not express, and it is not new to the repo -- `dast.yml` already ships it and
+# .github/required-contexts.txt records it: advisory by placement, not by continue-on-error, so the job
+# goes red on a finding.
+#
+# The distinguishing rule, and the reason this is a separate list rather than an entry in
+# _ADVISORY_SECURITY_JOBS: these jobs MUST NOT carry continue-on-error. A job that can never report on
+# a PR cannot be required, but that is a reason to keep it out of branch protection -- not a reason to
+# discard its findings.
+_ADVISORY_BY_PLACEMENT_SECURITY_JOBS = frozenset({"released-line-audit"})
 
 # Job-level `if:` expressions that CANNOT skip the job on a pull_request, with the reason each is safe.
 # Anything else on a required job is a way for the context to silently not report.
@@ -133,11 +145,14 @@ def test_every_security_job_is_classified() -> None:
     quietly stop covering the file it is named for.
     """
     actual = set(jobs_of(_SECURITY))
-    classified = _BLOCKING_SECURITY_JOBS | _ADVISORY_SECURITY_JOBS
+    classified = (
+        _BLOCKING_SECURITY_JOBS | _ADVISORY_SECURITY_JOBS | _ADVISORY_BY_PLACEMENT_SECURITY_JOBS
+    )
     print(f"[security-posture] classified {len(classified)} of {len(actual)} jobs in {_SECURITY}")
     assert actual == classified, (
         f"security.yml jobs are not all classified.\n"
-        f"  unclassified (add to _BLOCKING_SECURITY_JOBS or _ADVISORY_SECURITY_JOBS): "
+        f"  unclassified (add to _BLOCKING_SECURITY_JOBS, _ADVISORY_SECURITY_JOBS or "
+        f"_ADVISORY_BY_PLACEMENT_SECURITY_JOBS): "
         f"{sorted(actual - classified)}\n"
         f"  named here but gone from the workflow: {sorted(classified - actual)}"
     )
@@ -172,6 +187,51 @@ def test_advisory_security_jobs_are_not_required() -> None:
         "are cron/dispatch-only, so as a required context they would never report on a PR and would "
         "block every merge (docs/CI.md, 'the required-but-absent trap'). Remove the `if:` gate first."
     )
+
+
+def test_advisory_by_placement_jobs_are_not_required() -> None:
+    """Placement is the whole mechanism: these are kept off the merge path by not being required."""
+    required = set(required_contexts())
+    jobs = jobs_of(_SECURITY)
+    promoted = sorted(
+        context_of(k, jobs[k])
+        for k in _ADVISORY_BY_PLACEMENT_SECURITY_JOBS
+        if context_of(k, jobs[k]) in required
+    )
+    assert not promoted, (
+        f"{promoted} is schedule/dispatch-gated but present in the required set. It can never report "
+        "on a PR, so requiring it blocks every merge forever (the required-but-absent trap). Remove "
+        "the job-level `if:` first if promotion is genuinely intended."
+    )
+
+
+def test_advisory_by_placement_jobs_carry_no_continue_on_error() -> None:
+    """The point of this bucket. Off the merge path is NOT the same as findings discarded."""
+    jobs = jobs_of(_SECURITY)
+    for key in sorted(_ADVISORY_BY_PLACEMENT_SECURITY_JOBS):
+        job = jobs[key]
+        assert job.get("continue-on-error") in (None, False), (
+            f"security.yml job {key!r} is advisory BY PLACEMENT and must still go red on a finding; "
+            "it now declares continue-on-error, which discards them. It is already outside branch "
+            "protection, so there is nothing continue-on-error can protect here."
+        )
+        for step in job.get("steps") or []:
+            name = (step or {}).get("name") or (step or {}).get("uses") or "<unnamed step>"
+            assert (step or {}).get("continue-on-error") in (None, False), (
+                f"security.yml job {key!r}, step {name!r} declares continue-on-error"
+            )
+
+
+def test_advisory_by_placement_jobs_cannot_run_on_a_pull_request() -> None:
+    """If one of these could report on a PR it would be requirable, and this bucket would be a lie."""
+    jobs = jobs_of(_SECURITY)
+    for key in sorted(_ADVISORY_BY_PLACEMENT_SECURITY_JOBS):
+        expr = str(jobs[key].get("if") or "")
+        assert "schedule" in expr and "workflow_dispatch" in expr and "pull_request" not in expr, (
+            f"security.yml job {key!r} is classified advisory-by-placement, which asserts it never "
+            f"reports on a PR, but its `if:` is {expr!r}. Either restore the schedule/dispatch gate or "
+            "reclassify it and add its context to .github/required-contexts.txt and branch protection."
+        )
 
 
 def test_advisory_security_jobs_keep_continue_on_error() -> None:
@@ -278,6 +338,89 @@ def test_required_jobs_declare_no_skippable_job_level_if() -> None:
         "does with `needs: changes`, keeping the context present and green on a docs-only PR. If the "
         "expression genuinely cannot skip a pull_request run, add it to _JOB_IF_ALLOWLIST with the "
         "reason."
+    )
+
+
+# --- the header must not become a second definition of the trigger set (BACKLOG #1079) ------------
+#
+# A workflow's triggers are defined once, by its `on:` block. `security.yml`'s header carried a second
+# description of them, and the two disagreed: the header denied a push-to-main trigger that the `on:`
+# block declared ten lines beneath it. CI behaved as the `on:` block said, so nothing was broken --
+# what was damaged is the header's credibility, and the rest of that header is load-bearing (it is
+# where the continue-on-error trap is documented, the very trap the tests above enforce).
+#
+# SCOPE, STATED PLAINLY: this catches a DENIAL adjacent to a declared event name -- the shape that
+# actually occurred -- and nothing subtler. No regex can decide whether a paragraph of English
+# contradicts a YAML block, so this is a tripwire on the known shape, not a proof of consistency. The
+# durable rule is the header's own: it defines no triggers at all. _HISTORICAL_DENIAL below is a LIVE
+# positive control, kept verbatim so the detector is re-proved able to fire on every run rather than
+# being trusted to.
+_HEADER_DENIAL = re.compile(r"\bno\s+(pull_request|push|schedule|cron|workflow_dispatch)\b", re.I)
+_HISTORICAL_DENIAL = "# NO push-to-main trigger (dropped for CI cost): every push to main is an"
+
+
+def _header_block(text: str) -> str:
+    """Every line of the workflow before the `on:` key -- the header comment block.
+
+    Located by CONSTRUCT (the first line that is exactly `on:` at column 0), never by line number:
+    this header has been edited repeatedly and any anchor into it would be stale within a release.
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.rstrip() == "on:":
+            return "\n".join(lines[:i])
+    raise AssertionError(
+        "security.yml has no `on:` key at column 0 -- the header cannot be located"
+    )
+
+
+def _declared_events(name: str) -> set[str]:
+    """The event keys of a workflow's `on:` block.
+
+    YAML 1.1 resolves the bare key `on` to the BOOLEAN True, so `wf["on"]` is a KeyError and a lookup
+    that quietly returns nothing would make every assertion below vacuous. Both keys are tried, and an
+    empty result is an error rather than a pass.
+    """
+    wf = load_workflow(name)
+    block = wf.get("on", wf.get(True))
+    assert isinstance(block, dict) and block, f"{name}: could not read its `on:` block ({block!r})"
+    return {str(k) for k in block}
+
+
+def test_the_security_header_does_not_contradict_its_own_triggers() -> None:
+    """The header must not deny a trigger the `on:` block declares.
+
+    Non-vacuous three ways: the header block is located by construct and asserted substantial, the
+    event set is read from the parsed `on:` block and asserted non-empty, and the detector is fired
+    against the historical text in the same run.
+    """
+    events = _declared_events(_SECURITY)
+    assert "push" in events, (
+        "security.yml no longer declares a `push` trigger. That may be correct (a merge-queue move "
+        "would remove it), but this test's positive control assumes it -- re-derive rather than "
+        "deleting the test, or the header is free to drift again in the other direction."
+    )
+
+    header = _header_block((WORKFLOWS / _SECURITY).read_text(encoding="utf-8"))
+    assert len(header.splitlines()) > 10, (
+        f"security.yml's header block came back as {len(header.splitlines())} lines. That is a "
+        "locator failure, not a small header -- this assertion would otherwise pass over nothing."
+    )
+
+    # LIVE POSITIVE CONTROL: the detector must still fire on the text this test was written for. An
+    # absence claim below is evidence only because this line proves the instrument is not blind.
+    assert _HEADER_DENIAL.search(_HISTORICAL_DENIAL), (
+        "the header-denial detector no longer matches the historical claim it was built for, so its "
+        "silence on the current header proves nothing. Fix the pattern, not this assertion."
+    )
+
+    found = _HEADER_DENIAL.search(header)
+    assert found is None, (
+        f"security.yml's header denies the {found.group(1)!r} trigger its own `on:` block declares "
+        f"(events: {sorted(events)}). Two descriptions of the trigger set, free to disagree -- and "
+        "the header is where the continue-on-error trap is documented, so a paragraph a reader can "
+        "check and find false costs the whole block its credibility. DELETE the header claim; do not "
+        "soften it. The `on:` block is the single definition."
     )
 
 

@@ -91,6 +91,14 @@ cla
 #
 # The quoting in backlog-hygiene.yml is load-bearing: the job name contains " #", which YAML would
 # truncate at the comment marker, and the job NAME is the context string.
+#
+# THIS CONTEXT STRING NOW UNDER-DESCRIBES ITS JOB, deliberately. Since BACKLOG #1095 the job also runs
+# the diff-scoped CITATION gate: every backlog number a PR adds beside a ledger path must name the
+# file that item actually lives in. It rides this context rather than taking its own because a new
+# context would be UNREQUIRED and therefore decoration -- the promotion note above is that reasoning
+# -- and because renaming a job to describe both checks CHANGES the context string, which is the
+# required-but-absent trap and would wedge every PR. The name is frozen; what the job covers is
+# documented in backlog-hygiene.yml's header and here.
 a PR that implements BACKLOG #N must update BACKLOG.md
 
 # (Historical note, kept because it is the reasoning that made the promotion safe: it triggers on
@@ -115,6 +123,14 @@ a PR that implements BACKLOG #N must update BACKLOG.md
 #                                 never report on a PR (required-but-absent trap). Advisory by
 #                                 placement, not by continue-on-error: the job goes red on a finding.
 #                                 See ADR 0155.
+#   security.yml's             -- `released-line-audit (latest release's pinned runtime)` is
+#   released-line-audit           schedule/dispatch only, so it can never report on a PR
+#                                 (required-but-absent trap). Advisory by placement, not by
+#                                 continue-on-error: it goes red on a finding, and
+#                                 tests/test_security_posture.py holds that. It also could not be
+#                                 actioned by a PR author -- its remedy is cutting a release on the
+#                                 latest line (docs/SUPPORT-POLICY.md), not editing the branch under
+#                                 review. BACKLOG #1081.
 #   ingress-rate-probe.yml     -- workflow_dispatch only, so it never reports on a PR. It is also
 #                                 structurally unfit to gate anything: it MEASURES a runner's ingress
 #                                 service rate and exits 0 even when the reconcile fails, because a

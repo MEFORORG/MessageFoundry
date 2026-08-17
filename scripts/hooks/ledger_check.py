@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Ledger gate — stop two concurrent sessions from silently colliding on an ADR / BACKLOG number.
 
 THE DEFECT THIS EXISTS FOR. Two sessions each grep for "the next free number", both pick N, and create
@@ -33,13 +35,83 @@ ADR_FILE = re.compile(r"^docs/adr/(\d{4})-[^/]+\.md$")
 INDEX_ROW = re.compile(r"^\|\s*\[(\d{4})\]", re.M)
 BACKLOG_HEADING = re.compile(r"^#{2,3} (\d+)\.", re.M)
 
+# THE ITEM NUMBER SPACE SPANS MORE THAN ONE FILE.
+#
+# docs/BACKLOG.md carries the OPEN items; retired ones are moved verbatim into docs/archive/backlog/.
+# A number is taken if it appears in EITHER, so every rule below reads their union. Keying on the one
+# published path was safe only while it was the only path, and would leave the archive an unpoliced
+# region: a commit touching only the archive would early-return having checked nothing, and two
+# sessions could file the same number there and merge clean -- the exact collision this gate exists
+# to stop, reintroduced through the back door of a file it does not look at.
+#
+# Reading the union on BOTH sides also disposes of a false positive that a base-only view would
+# create: the move commit RELOCATES 185 items, so head-union == base-union and `head - base` is
+# empty. A per-file view would instead see 185 numbers vanish from BACKLOG.md and, on any worktree
+# whose base straddles the move, report them -- with a remedy that would renumber cited items.
+BACKLOG_PATH = "docs/BACKLOG.md"
+BACKLOG_ARCHIVE_DIR = "docs/archive/backlog"
+
+# THE PUBLIC BACKLOG NUMBER SPACE IS PARTITIONED AT #1000.
+#
+# docs/BACKLOG.md is a published baseline of a larger maintainer-internal ledger. The two sequences
+# diverged around #231 and have been allocated INDEPENDENTLY since, so one number can name two
+# unrelated items: public #248 and internal #248 are different work. That overlap is recorded, not
+# repaired -- renumbering would rewrite ratified ADRs and an operator-facing refusal string that ships
+# inside the wheel, and it would not stop the NEXT one. It would only make stale citations resolve
+# uniquely and WRONGLY, which is worse than resolving ambiguously.
+#
+# The partition stops the next one. New items here are allocated at #1000+, the internal sequence stays
+# below (high-water 314 when this landed), so the overlapping set is CLOSED at the numbers already
+# issued and a cited #N >= 1000 is unambiguously an item in THIS file.
+#
+# Why a constant and not a manifest of reserved numbers: a manifest cannot fire. `## 316.` is already
+# on origin/main and alloc.ps1's floor is max(...)+1 over a sweep that includes it, so every clone
+# issues >= 317 while a manifest of internal numbers tops out at 314 -- the reject set and the emit set
+# never intersect. A manifest would also be born stale (its source refs belong to a remote this clone
+# no longer lists), be regenerable on exactly one machine, and be the very instrument the erratum
+# convicts: "the published baseline is not a safe place to check a number against; only the allocator
+# is." A constant has no source data, so it cannot rot.
+#
+# This is the ONE backlog rule that also runs in --ci. The ownership rule cannot: it reads a per-clone
+# registry under .git and compares a worktree path, and a runner has neither -- which left the CI half
+# of check_backlog() computing a set and discarding it, i.e. unable to fail at all. A floor needs no
+# registry, no worktree, and no sight of the internal ledger (CI checks out origin only).
+#
+# KNOWN RESIDUAL, and it is NOT detected anywhere: this binds only the public side, and nothing in this
+# repository can stop -- or observe -- the maintainer-internal ledger allocating past #1000.
+#
+# This comment used to claim alloc.ps1 "warns at allocation time if the all-refs maximum ever reaches
+# this boundary". That was the wrong instrument twice over, and it was the defect written down:
+#   - The all-refs maximum has NO PROVENANCE. A public item legitimately allocated at the boundary and
+#     an internal breach are the same observation. That guard fired on BACKLOG #1000 -- correct input --
+#     and bricked every backlog allocation in the repo until 2026-08-03.
+#   - It claimed a liveness the ref store does not have. The vault-ish remote-tracking refs it would
+#     read are a FOSSIL: no configured refspec advances them, the newest is older than the partition
+#     itself, and a fresh clone has none at all.
+# alloc.ps1 now warns only on the highest number BELOW the boundary (which over-states the internal
+# high-water, so it warns early), and refuses only on a lowered boundary, which is locally observable.
+#
+# Raising this number is a one-line reviewable source change, deliberately not an allowlist file that
+# would rot out of sight. LOWERING it is the dangerous direction and is the one thing neither this gate
+# nor CI can catch -- both read only the current value and have no memory of the previous one -- so
+# alloc.ps1 keeps a `.boundary-highwater` ratchet beside its registry and refuses when the constant
+# drops beneath a value that clone has already allocated against.
+#
+# THIS LINE IS PARSED, not imported: scripts/coord/alloc.ps1 regex-matches it so the floor is defined
+# exactly once and the allocator can never emit a number this gate refuses. Keep the name and the
+# literal on ONE line. A type annotation is tolerated; splitting, computing, or renaming it is not, and
+# would make every backlog allocation refuse. tests/test_ledger_check.py pins the contract, so that
+# break lands in CI on whoever edits this line rather than on an unrelated session days later.
+PUBLIC_BACKLOG_FLOOR = 1000
+
 
 def git(*args: str) -> str:
     # encoding= is REQUIRED, not cosmetic: `text=True` alone decodes with the LOCALE default, which is
-    # cp1252 on a stock Windows box. docs/BACKLOG.md and docs/adr/README.md are UTF-8 (em-dashes, ✅, ⚠️),
-    # so the decode raised inside subprocess's reader thread, `proc.stdout` came back **None**, and the
-    # caller died on `findall(None)` — blocking every commit that touched either ledger file. The gate's
-    # own failure mode was the one it exists to prevent: silent, and worst on the files it guards.
+    # cp1252 on a stock Windows box. docs/BACKLOG.md and docs/adr/README.md are UTF-8 (em-dashes,
+    # U+2705, U+26A0), so the decode raised inside subprocess's reader thread, `proc.stdout` came back
+    # **None**, and the caller died on `findall(None)` — blocking every commit that touched either
+    # ledger file. The gate's own failure mode was the one it exists to prevent: silent, and worst on
+    # the files it guards.
     proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell, no caller-supplied executable
         ["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace"
     )
@@ -220,25 +292,69 @@ class Ledger:
                 "remove the duplicate row",
             )
 
+    def backlog_paths(self, side: str) -> list[str]:
+        """Every file carrying numbered items on ``side`` ('head' or 'base').
+
+        Enumerated per side rather than assumed, because the archive does not exist on a base that
+        predates it, and a path listed but absent makes `git show` exit 128 — indistinguishable from
+        a real failure, which is the false-clean this gate must never produce.
+        """
+        if side == "base":
+            listing = git("ls-tree", "-r", "--name-only", self.base, f"{BACKLOG_ARCHIVE_DIR}/")
+            have_main = self.base_has(BACKLOG_PATH)
+        elif self.ci:
+            listing = git("ls-tree", "-r", "--name-only", "HEAD", f"{BACKLOG_ARCHIVE_DIR}/")
+            have_main = self.head_has(BACKLOG_PATH)
+        else:
+            # The INDEX, matching head_text() — a staged archive edit must be policed before it lands.
+            listing = git("ls-files", "--", f"{BACKLOG_ARCHIVE_DIR}/")
+            have_main = self.head_has(BACKLOG_PATH)
+        paths = [BACKLOG_PATH] if have_main else []
+        paths += [p for p in listing.split() if p.endswith(".md")]
+        return paths
+
     def check_backlog(self) -> None:
-        if "docs/BACKLOG.md" not in self.changed_files():
+        changed = self.changed_files()
+        if not any(f == BACKLOG_PATH or f.startswith(f"{BACKLOG_ARCHIVE_DIR}/") for f in changed):
             return
-        if not self.base_has("docs/BACKLOG.md"):
+        base_paths = self.backlog_paths("base")
+        if not base_paths:
             # The base has no backlog at all — the file is being ADDED (it was gitignored until the
             # cutover published it). Numbers that do not exist on base cannot be collided with, so
             # there is nothing to police; without this, importing the ledger wholesale would report
             # every one of its ~229 items as "not allocated to this worktree".
             return
-        if not self.head_has("docs/BACKLOG.md"):
+        head_paths = self.backlog_paths("head")
+        if not head_paths:
             # Present on base, absent here: a branch that PREDATES the file's publication. CI diffs
             # against origin/main, so the file shows up as "changed" (a deletion relative to base)
             # although the branch never touched it — and reading HEAD for a copy that was never there
             # exits 128. A stale branch is not a ledger violation.
             return
-        head = set(BACKLOG_HEADING.findall(self.head_text("docs/BACKLOG.md")))
-        base = set(BACKLOG_HEADING.findall(self.base_text("docs/BACKLOG.md")))
+        head: set[str] = set()
+        for p in head_paths:
+            head |= set(BACKLOG_HEADING.findall(self.head_text(p)))
+        base: set[str] = set()
+        for p in base_paths:
+            base |= set(BACKLOG_HEADING.findall(self.base_text(p)))
+        # Only `head - base` is examined, so everything already on origin/main -- including the
+        # pre-partition overlap -- is grandfathered by construction. No allowlist, nothing to maintain.
         for number in sorted(head - base, key=int):
-            if not self.ci and not self.owns("backlog", number):
+            # Floor first: a below-floor number gets the reason that is actionable, rather than
+            # "not allocated to this worktree", which would send you to re-run the allocator and file
+            # at whatever it prints -- correct by luck rather than because you were told why.
+            if int(number) < PUBLIC_BACKLOG_FLOOR:
+                self.fail(
+                    f"BACKLOG item #{number} is below the public floor (#{PUBLIC_BACKLOG_FLOOR})",
+                    "Numbers under the floor belong to the maintainer-internal ledger this file is a "
+                    "published baseline of, or to the pre-partition overlap. Filing one means every "
+                    "citation of it resolves to two unrelated items -- and it looks like success. This "
+                    "also catches a branch cut before the partition whose number has since been "
+                    "re-allocated. See the Ledger erratum at the top of docs/BACKLOG.md.",
+                    'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind backlog -Title "<title>"'
+                    "   # issues >=1000 now; move your heading to the number it prints",
+                )
+            elif not self.ci and not self.owns("backlog", number):
                 self.fail(
                     f"BACKLOG item #{number} was not allocated to this worktree",
                     "BACKLOG numbers are '## N.' headings inside ONE 6.7k-line file. Two sessions adding "

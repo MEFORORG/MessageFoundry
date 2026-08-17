@@ -373,9 +373,16 @@ def test_insert_fhir_lookup_assigned_round_trips_as_lookup_row() -> None:
         _anchor(),
         action="fhir_lookup",
         assign_to="pat",
-        params={"connection": "epic", "query": "Patient?identifier=X"},
+        # #1243: the flat '?'-query is gone, so a SEARCH row must emit the structured params= form.
+        # Emitting "Patient?identifier=X" here would still ast.parse() fine and the test would stay
+        # green while the Steps view handed operators code the engine refuses at runtime.
+        params={
+            "connection": "epic",
+            "query": "Patient",
+            "params": {"expr": '{"identifier": "X"}'},
+        },
     )
-    assert 'pat = fhir_lookup("epic", "Patient?identifier=X")' in out
+    assert 'pat = fhir_lookup("epic", "Patient", {"identifier": "X"})' in out
     assert "from messagefoundry import fhir_lookup" in out
     ast.parse(out)
     assert any(

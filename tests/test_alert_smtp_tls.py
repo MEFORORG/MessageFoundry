@@ -173,7 +173,9 @@ def _names(**kw: Any) -> list[str]:
         email_smtp_host="smtp.example", email_from="mf@example", **kw.pop("alerts", {})
     )
     sec = SecuritySettings(**kw.pop("security", {}))
-    return [n for n, _ in security_loosenings(sec, StoreSettings(), AuthSettings(), alerts, ())]
+    return [
+        n for n, _ in security_loosenings(sec, StoreSettings(), AuthSettings(), alerts, (), (), ())
+    ]
 
 
 def test_the_shipped_alert_defaults_are_not_a_loosening() -> None:
@@ -208,7 +210,7 @@ def test_an_unconfigured_alert_transport_reports_no_hop_deviation() -> None:
     names = [
         n
         for n, _ in security_loosenings(
-            SecuritySettings(), StoreSettings(), AuthSettings(), bare, ()
+            SecuritySettings(), StoreSettings(), AuthSettings(), bare, (), (), ()
         )
     ]
     assert "email_use_tls" not in names

@@ -61,6 +61,7 @@ from messagefoundry.auth.tokens import hash_bytes, hash_token, mint_token
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.store.base import AdminStore
 from messagefoundry.store.store import SessionRecord, UserRecord, WebAuthnCredential
 
@@ -239,6 +240,7 @@ class AuthService:
         security_notifier: SecurityNotifier | None = None,
         secret_provider: SecretProvider | None = None,
         enforcing: bool = True,
+        hop_posture: HopPosture | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
@@ -271,8 +273,12 @@ class AuthService:
             self._ldap: LdapAuthenticator | None = ldap
         elif settings.ad_enabled:
             # Thread the connector SecretProvider (ADR 0019 §5) so an ad_bind_password_secret reference
-            # resolves the bind password from the external backend (fail-closed) at construction.
-            self._ldap = LdapAuthenticator(settings, secret_provider=secret_provider)
+            # resolves the bind password from the external backend (fail-closed) at construction. #329:
+            # thread the instance hop posture too — LDAPS is built out of the connector-construction gate,
+            # so its ad_tls_verify=false escape clamp is inert unless the posture arrives explicitly here.
+            self._ldap = LdapAuthenticator(
+                settings, secret_provider=secret_provider, posture=hop_posture
+            )
         else:
             self._ldap = None
         # Instance-scoped (one event loop per AuthService) so it never crosses loops in tests.
@@ -1007,6 +1013,25 @@ class AuthService:
                 ok=False, error="user not found in directory", reason="not_in_directory"
             )
 
+        # BACKLOG #1015 (ADR 0142): subject-continuity guard. The AD-backed account is still RESOLVED by
+        # its username (roles stay LDAP-sourced), but its federated identity is PINNED to the non-
+        # reassignable OIDC (issuer, sub). If a local account for this resolved username is already bound
+        # to a DIFFERENT verified subject, an IdP has reassigned the username to a new person — refuse
+        # rather than hand the new subject the prior holder's account (the account-takeover-without-
+        # credential-compromise this item closes). An unbound account (never federated-logged-in) binds
+        # on first login below, in _complete_ad_login.
+        bound = await self._store.get_user_by_username(principal.username)
+        if (
+            bound is not None
+            and bound.oidc_subject is not None
+            and (bound.oidc_issuer, bound.oidc_subject)
+            != (principal_claims.issuer, principal_claims.subject)
+        ):
+            await self._directory_reject_audit(username, "oidc", "federated_subject_conflict")
+            return LoginOutcome(
+                ok=False, error="federated sign-in failed", reason="federated_subject_conflict"
+            )
+
         max_expires_at = principal_claims.expires_at
         if self._settings.oidc_session_max_hours:
             max_expires_at = min(
@@ -1041,6 +1066,7 @@ class AuthService:
                 "mfa_verified": mfa_verified,
             },
             max_expires_at=max_expires_at,
+            federated_subject=(principal_claims.issuer, principal_claims.subject),
         )
 
     async def _directory_reject_audit(self, actor: str, mech: str, reason: str) -> None:
@@ -1062,7 +1088,12 @@ class AuthService:
         mech: str | None = None,
         evidence: Mapping[str, object] | None = None,
         max_expires_at: float | None = None,
+        federated_subject: tuple[str, str] | None = None,
     ) -> LoginOutcome:
+        # ``federated_subject`` is the verified OIDC ``(issuer, sub)`` and is passed ONLY by the
+        # federated path (BACKLOG #1015). It defaults to None, so the AD-simple-bind and Kerberos
+        # callers stay byte-identical — no extra store write, no changed audit row. The federated
+        # caller has already enforced the subject-continuity guard before reaching here.
         existing = await self._store.get_user_by_username(principal.username)
         if existing is not None and existing.auth_provider != AuthProvider.AD.value:
             # Never let an AD login adopt/overwrite a like-named LOCAL account (provider confusion).
@@ -1074,6 +1105,20 @@ class AuthService:
             )
             return LoginOutcome(ok=False, error="account conflict")
         user = await self._upsert_ad_user(principal)
+        if (
+            federated_subject is not None
+            and (
+                user.oidc_issuer,
+                user.oidc_subject,
+            )
+            != federated_subject
+        ):
+            # First federated login for this account (or an unbound AD account's first): record the
+            # (issuer, sub) binding so a later reassigned-username login carrying a different subject is
+            # refused by the guard above. A matching binding is left untouched (no updated_at churn).
+            await self._store.set_user_federated_subject(
+                user.id, federated_subject[0], federated_subject[1]
+            )
         role_ids = sorted(await self._store.roles_for_ad_groups(principal.groups))
         previous = set(await self._store.get_user_role_ids(user.id))
         await self._store.set_user_roles(user.id, role_ids, assigned_by="ad-sync")
@@ -1965,7 +2010,8 @@ class AuthService:
         """Confirm a staged enrollment by proving a live TOTP code. On success: activate MFA, mint the
         single-use recovery codes (returned **once**, plaintext, for the user to save), mark the
         current session MFA-verified, audit + notify. Returns the recovery codes, or ``None`` when the
-        code was wrong. Raises :class:`ValueError` if no enrollment is staged / the user isn't local."""
+        code was wrong or its time-step was already consumed (single-use, BACKLOG #1021). Raises
+        :class:`ValueError` if no enrollment is staged / the user isn't local."""
         user = await self._store.get_user(identity.user_id)
         if user is None or user.auth_provider != AuthProvider.LOCAL.value:
             raise ValueError("only local users can enroll a TOTP authenticator")
@@ -1975,8 +2021,19 @@ class AuthService:
         # Verify the enrollment proof under the SAME configured clock-skew window as a login (BACKLOG
         # #187): default 0 = strict current-step only. Enrolling under the same window a login uses
         # avoids the trap of a skewed-clock authenticator that confirms enrollment yet then fails every
-        # login (the mismatch surfaces at enroll time instead).
-        if not totp.verify_totp(secret, code.strip(), window=self._settings.totp_skew_steps):
+        # login (the mismatch surfaces at enroll time instead). The matched step is then CONSUMED
+        # (BACKLOG #1021), single-use per ASVS 6.5.1, mirroring _verify_second_factor's verify-then-
+        # consume so the activating code can't be replayed on POST /auth/mfa-verify inside its step
+        # window (verify_totp alone discarded the step, which would leave a second-factor replay window
+        # at enrollment on first deployment). Consume BEFORE minting recovery codes / enable_totp keeps
+        # enable atomic: a step that no longer advances the high-water mark fails on the same
+        # phase=enroll branch and MFA is not enabled.
+        matched_step = totp.verify_totp_step(
+            secret, code.strip(), window=self._settings.totp_skew_steps
+        )
+        if matched_step is None or not await self._store.consume_totp_step(
+            identity.user_id, matched_step
+        ):
             await self._audit(
                 "auth.mfa_failed",
                 actor=identity.username,

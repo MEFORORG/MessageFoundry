@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Rule 3 must judge what a command DOES, not how its characters are arranged.
 
 Every case here is a regression that an adversarial review found in the first version of the

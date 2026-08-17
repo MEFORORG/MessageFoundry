@@ -124,6 +124,78 @@ def test_invalid_xpath_raises_path_error() -> None:
         msg.get("//[broken(")
 
 
+# --- $variable binding: the safe path for tainted values (BACKLOG #1049) -----
+
+#: A record set a Handler would filter on. ``mrn`` is attacker-influenceable — it arrives in the
+#: message — so it is exactly the value an author is tempted to paste into an XPath string.
+_RECORDS = (
+    b'<?xml version="1.0"?>'
+    b"<records>"
+    b'<record mrn="MRN9001"><note>routine</note></record>'
+    b'<record mrn="MRN9002"><note>restricted</note></record>'
+    b"</records>"
+)
+
+#: The injection. Closing the author's quote and appending a second predicate turns a single-record
+#: lookup into "every record", which for a Handler gating on the match is a filter bypass. Invented
+#: MRNs, never real PHI.
+_TAINTED_MRN = "nope' or @mrn!='"
+
+
+def test_interpolating_a_tainted_value_into_an_xpath_string_is_injectable() -> None:
+    """The threat, demonstrated rather than asserted — the positive control for the safe path below.
+
+    RULE: an absence claim needs a live positive control. Without this, the next test could pass
+    because the payload was inert rather than because binding neutralised it.
+    """
+    msg = XmlMessage.parse(_RECORDS)
+    hits = msg.get_all(f"//record[@mrn='{_TAINTED_MRN}']/note/text()")
+    assert hits == ["routine", "restricted"], (
+        "the payload no longer subverts a string-interpolated expression, so this fixture has "
+        "stopped modelling the injection it exists to model"
+    )
+
+
+def test_a_bound_variable_is_matched_as_a_value_not_parsed_as_expression() -> None:
+    """The framework-provided safe path: the same payload bound as ``$mrn`` matches nothing."""
+    msg = XmlMessage.parse(_RECORDS)
+    assert msg.get_all("//record[@mrn=$mrn]/note/text()", mrn=_TAINTED_MRN) == []
+    # Positive control: the SAME call shape with a legitimate value does select its record, so the
+    # empty result above is the binding working, not the expression being broken.
+    assert msg.get_all("//record[@mrn=$mrn]/note/text()", mrn="MRN9002") == ["restricted"]
+
+
+def test_variable_binding_is_available_on_every_query_method() -> None:
+    """A safe path only one accessor offers is a trap for whoever uses the other four."""
+    msg = XmlMessage.parse(_RECORDS)
+    assert msg.get("//record[@mrn=$mrn]/note/text()", mrn="MRN9001") == "routine"
+    assert msg.exists("//record[@mrn=$mrn]", mrn="MRN9001") is True
+    assert msg.exists("//record[@mrn=$mrn]", mrn=_TAINTED_MRN) is False
+    assert len(msg.find("//record[@mrn=$mrn]", mrn="MRN9002")) == 1
+    msg.set("//record[@mrn=$mrn]/note", "amended", mrn="MRN9001")
+    msg.set_attribute("//record[@mrn=$mrn]", "reviewed", "yes", mrn="MRN9002")
+    again = XmlMessage.parse(msg.encode())
+    assert again.get("//record[@mrn='MRN9001']/note/text()") == "amended"
+    assert again.get("//record[@mrn='MRN9002']/@reviewed") == "yes"
+
+
+def test_binding_works_with_namespaces_and_non_string_values() -> None:
+    msg = XmlMessage.parse(_DOC, namespaces=_NS)
+    assert msg.get("//p:name[text()=$who]/text()", who="Smith") == "Smith"
+    assert msg.get("//p:name[position()=$n]/text()", n=2) == "Smith"
+
+
+def test_an_undeclared_or_unbindable_variable_is_a_path_error() -> None:
+    """A Handler's mistake must surface as the codec's own data error, never an lxml traceback."""
+    msg = XmlMessage.parse(_RECORDS)
+    with pytest.raises(XmlPathError):
+        msg.get("//record[@mrn=$mrn]/note/text()")  # $mrn never bound
+    with pytest.raises(XmlPathError):
+        # Only scalars bind: a node-set- or object-valued variable would let a caller smuggle an
+        # expression result back into the path.
+        msg.get("//record[@mrn=$mrn]/note/text()", mrn={"not": "a scalar"})  # type: ignore[arg-type]
+
+
 # --- console-carve-out purity: the codec imports no engine package -----------
 
 

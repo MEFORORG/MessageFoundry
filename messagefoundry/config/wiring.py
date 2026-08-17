@@ -38,7 +38,7 @@ import os
 import re
 import sys
 import threading
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -135,6 +135,8 @@ __all__ = [
     "load_config",
     "validate_config",
     "accepted_cleartext_hops",
+    "expiry_relaxed_hops",
+    "unverified_generic_db_hops",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -319,6 +321,7 @@ def DatabaseRef(
     app_name: str = "messagefoundry",
     odbc_driver: str = "ODBC Driver 18 for SQL Server",
     pool_max: int = 5,
+    acquire_timeout: float = 30.0,  # cap this source's pooled-connection borrow (s) — BACKLOG #1052
 ) -> ReferenceSourceSpec:
     """A reference **source** backed by a SQL query (ADR 0006 increment 2; SQL Server via the
     ``[sqlserver]`` extra + ODBC Driver 18 — **production / supported**, like the DATABASE connector).
@@ -328,7 +331,12 @@ def DatabaseRef(
     column's value, else the value is a dict of the remaining columns (the multi-column ``code_set``
     shape). Put secrets (``password``) in :func:`env`. TLS is on by default; weakening it needs
     ``MEFOR_ALLOW_INSECURE_TLS``. The dial-out is gated by the **fail-closed** ``[egress].allowed_db``
-    allowlist, exactly like a DATABASE poll source — point the engine only at allowed hosts."""
+    allowlist, exactly like a DATABASE poll source — point the engine only at allowed hosts.
+
+    ``acquire_timeout`` bounds the borrow from this source's throwaway pool (default 30 s, matching
+    the DATABASE connector and ``[store].acquire_timeout``). On expiry the set's sync fails, the
+    last-good snapshot stays active and the AlertSink fires — the runner syncs sets sequentially, so
+    the bound is what stops one unresponsive server from stalling every other set's refresh."""
     return ReferenceSourceSpec(
         "database",
         {
@@ -347,6 +355,7 @@ def DatabaseRef(
             "app_name": app_name,
             "odbc_driver": odbc_driver,
             "pool_max": pool_max,
+            "acquire_timeout": acquire_timeout,
         },
     )
 
@@ -506,8 +515,12 @@ def FhirLookup(
     cleartext_reason: str | None = None,
 ) -> FhirLookupSpec:
     """Declare a named live-lookup FHIR connection (ADR 0043). A Handler reads it at run time with
-    ``fhir_lookup(name, query)`` — a **read-only** read-by-id (``"Patient/123"``) or search
-    (``"Patient?identifier=MRN|123"``); the parsed resource / searchset ``Bundle`` comes back as a dict.
+    ``fhir_lookup(name, query, params)`` — a **read-only** read-by-id (``fhir_lookup(name,
+    "Patient/123")``) or a search whose path is ``query`` and whose fields are the structured ``params``
+    mapping (``fhir_lookup(name, "Patient", {"identifier": "MRN|123"})``). ``params`` is the **only**
+    search form — each value is percent-encoded by the engine, so a value cannot inject an extra search
+    parameter, and a ``?``-query inside ``query`` is refused (BACKLOG #1243). The parsed resource /
+    searchset ``Bundle`` comes back as a dict.
     Side-effecting (it self-registers), like :func:`Reference` / :func:`inbound`, **and** returns the spec
     so SMART auth can be composed onto it::
 
@@ -631,6 +644,15 @@ _SECRET_SETTING_KEYS = frozenset(
         # HTTP Digest / NTLM password). The minted bearer / digest response are runtime-only.
         "oauth2_client_secret",
         "http_auth_password",
+        # BACKLOG #1106 follow-up — the HTTP Digest USERNAME, redacted defence-in-depth alongside
+        # `basic_user`/`proxy_user`/`ws_username`/`credential_username`/`username` on the ground stated
+        # there: a username names a principal and can leak directory structure. It was the sixth member
+        # of a five-member class and the only one unclassified, because `with_http_digest` renames
+        # parameter `user` into setting `http_auth_user` — the SAME parameter-to-setting boundary
+        # `with_signing` crosses (`private_key` -> `sign_private_key`), which is the whole of #1106.
+        # Measured before the fix: served verbatim by /metadata and printed by `graph --json`, with its
+        # env() FALLBACK DEFAULT intact, beside a `proxy_user` that masked on the same object.
+        "http_auth_user",
         # ADR 0126 (#127) — the forward/egress web-proxy credential. The Basic Proxy-Authorization header /
         # Digest response are runtime-only; the password + username inputs are redacted in /metadata (the
         # username alongside `basic_user`/`ws_username`, defence-in-depth).
@@ -668,6 +690,124 @@ _SECRET_HEADER_NAMES = frozenset(
     {"authorization", "proxy-authorization", "x-api-key", "api-key", "cookie"}
 )
 
+#: Substrings that make a header name credential-bearing. BACKLOG #1201.
+#:
+#: The five names above were the WHOLE test, by exact membership. That is the same defect as #1106 and
+#: strictly worse, because header names are OPERATOR-AUTHORED FREE TEXT -- there is no factory, no
+#: signature and no registry to enumerate, so an exhaustive list cannot exist even in principle.
+#: Measured 2026-08-09 against the shipped list: ``X-Auth-Token``, ``X-Amz-Security-Token`` (an AWS
+#: SigV4 session credential) and ``Private-Token`` (GitLab's standard auth header) were all returned
+#: VERBATIM by ``/metadata`` and printed by ``graph --json``.
+#:
+#: So the test is by SHAPE, with the explicit set kept as a floor rather than deleted -- ``cookie``
+#: matches no substring rule and must stay named.
+_SECRET_HEADER_SUBSTRINGS = (
+    "auth",
+    "token",
+    "secret",
+    "credential",
+    "password",
+    "passphrase",
+    "key",
+)
+
+#: Header names that CONTAIN a secret-ish substring and are not credentials. Each is here because
+#: redacting it would destroy operator-visible routing or tracing information that is public by nature.
+#: Suffix-matched, because the convention is consistent: an ``-id`` names something, it is not the thing.
+_NOT_SECRET_HEADER_SUFFIXES = (
+    "-id",
+    "-url",
+    "-uri",
+    "-name",
+    "-type",
+    "-version",
+    "-agent",
+    "-for",
+)
+
+#: Exact non-credential headers whose name defeats the suffix rule. ``Idempotency-Key`` is the live one:
+#: it carries "key" and is a client-generated REQUEST identifier, published in the API docs of every
+#: service that uses it.
+_NOT_SECRET_HEADERS = frozenset({"idempotency-key", "x-idempotency-key"})
+
+
+#: Value shapes that are credentials whatever the header is called. The NAME rule below is a heuristic
+#: over free text and therefore has a permanent blind spot -- a vendor picks ``X-Shared-Signature`` or an
+#: opaque internal name and no substring matches. This is the second arm, and it closes that blind spot
+#: from the other side: it does not matter what the header is called if the VALUE is recognisably a
+#: credential. Deliberately narrow, because a false positive here masks a value an operator may need:
+#:   - an RFC 7235 auth scheme prefix (``Bearer``/``Basic``/``Digest``/``Negotiate``/``AWS4-HMAC-...``)
+#:   - a JWT, which is unmistakable and is what most opaque bearer headers actually carry
+_CREDENTIAL_VALUE_PREFIXES = ("bearer ", "basic ", "digest ", "negotiate ", "aws4-hmac")
+_JWT_SHAPE = re.compile(r"^eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]+$")
+
+
+def _looks_like_a_credential_value(value: object) -> bool:
+    """Is this VALUE a credential regardless of what the header is called?"""
+    if not isinstance(value, str):
+        return False
+    v = value.strip()
+    return v.lower().startswith(_CREDENTIAL_VALUE_PREFIXES) or bool(_JWT_SHAPE.match(v))
+
+
+#: Credential-bearing ODBC/libpq driver keywords, by SHAPE and case-insensitively (BACKLOG #1206).
+#:
+#: A THIRD predicate rather than reuse, and the first attempt at this fix proves why. I reached for
+#: :func:`_is_secret_setting` -- and it returned False for every one of ``PWD``, ``Password`` and
+#: ``sslpassword``, because it matches a fixed frozenset of MessageFoundry SETTINGS names and these are
+#: ODBC DRIVER keywords with different spellings and different case. A fix that shipped on that
+#: predicate would have masked nothing while reading as a fix, in the change closing a defect whose
+#: whole shape is a control whose domain is narrower than its surface.
+#:
+#: ``pwd`` is listed explicitly because it is an ABBREVIATION and matches no substring rule -- it is
+#: also the single most common spelling in a SQL Server DSN.
+_SECRET_ODBC_SUBSTRINGS = (
+    "pwd",
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "credential",
+    "passphrase",
+)
+
+#: ODBC keywords that carry a credential-ish substring and are PATHS, not material. Masking a path
+#: hides configuration an operator needs to see and protects nothing: the file's contents never enter
+#: settings. ``sslkey`` and ``sslcert`` are libpq file paths.
+_NOT_SECRET_ODBC_KEYS = frozenset({"sslkey", "sslcert", "sslrootcert", "sslcrl"})
+
+
+def _is_secret_odbc_key(name: str) -> bool:
+    """Would printing this ODBC keyword's VALUE disclose a credential?"""
+    low = str(name).strip().lower()
+    if low in _NOT_SECRET_ODBC_KEYS or low.endswith(("_file", "_path")):
+        return False
+    return any(tok in low for tok in _SECRET_ODBC_SUBSTRINGS)
+
+
+def _is_secret_header(name: str, value: object = None) -> bool:
+    """Would printing this header's VALUE disclose a credential?
+
+    TWO ARMS, because either alone has a gap. The NAME arm (see :data:`_SECRET_HEADER_SUBSTRINGS`) is a
+    heuristic over operator-authored free text, so an opaque vendor header name defeats it. The VALUE
+    arm catches those, and cannot be defeated by naming, but only recognises shapes it knows. Together
+    they cover a name that looks like a credential OR a value that is one; neither is a proof.
+
+    A false positive costs an operator one redacted value in a diagnostic view and one line in
+    :data:`_NOT_SECRET_HEADERS`; a false negative serves a bearer credential to anyone holding
+    ``MONITORING_READ``. The asymmetry is not close, so this errs toward redacting -- but the VALUE arm
+    is kept narrow (auth-scheme prefixes and JWTs only) rather than "long and high-entropy", because
+    masking every long header value would quietly destroy the view rather than protect it.
+    """
+    if _looks_like_a_credential_value(value):
+        return True
+    low = str(name).strip().lower()
+    if low in _SECRET_HEADER_NAMES:
+        return True
+    if low in _NOT_SECRET_HEADERS or low.endswith(_NOT_SECRET_HEADER_SUFFIXES):
+        return False
+    return any(tok in low for tok in _SECRET_HEADER_SUBSTRINGS)
+
 
 def _is_secret_setting(name: str) -> bool:
     """Is ``name`` a credential-bearing settings key?
@@ -682,8 +822,26 @@ def _is_secret_setting(name: str) -> bool:
     BACKLOG #236): the factory already forbids an inline literal and an ``env()`` default on them, so
     each renders as a bare ``{"env": key}`` regardless — but the prefix is belt-and-suspenders in case
     a value ever reaches a serializer resolved. The paired ``body_secret_tokens`` are **not** secret:
-    a placeholder is public by nature (it sits in the committed Handler source)."""
-    return name in _SECRET_SETTING_KEYS or name.startswith("body_secret_value_")
+    a placeholder is public by nature (it sits in the committed Handler source).
+
+    ``sign_private_key`` / ``sign_private_key_password`` are named EXPLICITLY (BACKLOG #1106), and the
+    reason they were missing is the point. ``with_signing`` takes parameters ``private_key`` and
+    ``private_key_password`` — both of which this function already classified — and RENAMES them on the
+    way into the settings map (``transports/signing.py``). The parameter was covered and the setting it
+    became was not, so both were served verbatim by ``/metadata`` behind ``MONITORING_READ`` alone and
+    printed by ``graph --json``. Measured 2026-08-09; the leak predated the cell that scored it, so no
+    change-detector was ever in play.
+
+    NOT a ``sign_`` prefix rule: ``sign_key_id`` is an identifier, ``sign_algorithm`` and ``sign_header``
+    are configuration, and a prefix would redact all three while reading as more thorough. The domain is
+    guarded instead by ``tests/test_connection_factory_redaction_domain.py``, which calls every
+    spec-returning factory and asserts nothing credential-shaped survives this function — at the level
+    of EMITTED settings rather than parameters, which is the boundary the rename crosses."""
+    return (
+        name in _SECRET_SETTING_KEYS
+        or name.startswith("body_secret_value_")
+        or name in ("sign_private_key", "sign_private_key_password")
+    )
 
 
 #: Connector secret-setting keys that are IDENTIFIERS (usernames), not rotatable credentials — a
@@ -691,11 +849,22 @@ def _is_secret_setting(name: str) -> bool:
 #: They live in :data:`_SECRET_SETTING_KEYS` only so ``/metadata`` redacts them defence-in-depth (a
 #: username can leak directory structure). The **single source of truth** for "which secret settings are
 #: rotatable": imported by ``tests/test_secret_rotation_inventory.py`` (the ASVS-13.1.4 registration gate)
-#: and read by :func:`connector_secret_env_values` (the ASVS-13.3.4 rotation fingerprinter), so the
-#: redaction list, the doc registration gate, and the runtime fingerprint set can never disagree about
-#: which members are credentials you rotate.
+#: and read by :func:`connector_secret_env_values` (the ASVS-13.3.4 rotation fingerprinter). That the
+#: redaction list, the doc registration gate, and the runtime fingerprint set agree about which members
+#: are credentials you rotate is **enforced by two gates, not assumed**: the forward gate
+#: (``test_secret_setting_keys_are_registered``) proves every rotatable key is registered, and the
+#: reverse gate (``test_registered_connector_secrets_are_reachable_by_the_fingerprinter``, BACKLOG #1009)
+#: proves every registered connector secret is reachable by the fingerprinter — the direction a
+#: hand-added registry entry (the SOAP ``body_secret_value`` class) had slipped through.
 _NON_ROTATABLE_SECRET_SETTING_KEYS: frozenset[str] = frozenset(
-    {"username", "basic_user", "proxy_user", "ws_username", "credential_username"}
+    {
+        "username",
+        "basic_user",
+        "proxy_user",
+        "ws_username",
+        "credential_username",
+        "http_auth_user",  # BACKLOG #1106 follow-up — the HTTP Digest principal; you rotate its password
+    }
 )
 
 
@@ -708,8 +877,10 @@ def connector_secret_env_values(
     each with the DEK-derived keyed MAC so a per-Connection connector credential is monitored for rotation
     exactly like the fixed ``MEFOR_*`` classes.
 
-    A setting is included when its key is a **rotatable** credential — in :data:`_SECRET_SETTING_KEYS` and
-    not a non-rotatable identifier in :data:`_NON_ROTATABLE_SECRET_SETTING_KEYS` — AND it is an ``env()``
+    A setting is included when its key is a **rotatable** credential — recognised by
+    :func:`_is_secret_setting` (so the SOAP ``body_secret_value_<i>`` prefix class is covered, not only
+    the fixed :data:`_SECRET_SETTING_KEYS` names) and not a non-rotatable identifier in
+    :data:`_NON_ROTATABLE_SECRET_SETTING_KEYS` — AND it is an ``env()``
     ref whose key resolves to a **non-empty string** in ``env_values``. Values are returned **transiently**
     to be MAC'd — never persisted or logged; the map key is the operator-chosen env name, never the value.
     Connections sharing an env key collapse to one entry (one secret → one rotation clock). Inline (non-
@@ -722,13 +893,57 @@ def connector_secret_env_values(
     specs += [c.spec for c in registry.outbound.values()]
     for spec in specs:
         for name, value in spec.settings.items():
-            if name in _NON_ROTATABLE_SECRET_SETTING_KEYS or name not in _SECRET_SETTING_KEYS:
+            if name in _NON_ROTATABLE_SECRET_SETTING_KEYS or not _is_secret_setting(name):
                 continue
             if isinstance(value, EnvRef):
                 resolved = env_values.get(value.key)
                 if isinstance(resolved, str) and resolved:
                     out[value.key] = resolved
     return out
+
+
+#: Settings whose value is a URL that may carry `user:password@` userinfo. `proxy` has no `_url`
+#: suffix, which is why this is a NAME set plus a suffix rule rather than a suffix rule alone.
+_URL_SETTING_SUFFIXES = ("url", "_url", "_uri", "endpoint", "_endpoint")
+
+
+def _mask_url_userinfo(value: object) -> object:
+    """Replace the PASSWORD half of a URL's userinfo with ``***``, keeping everything else readable.
+
+    BACKLOG #1207. ``url="https://user:SECRET@host/path"`` was returned verbatim by both serializers
+    while ``proxy_password`` on the SAME object masked -- the credential was safe in the typed field
+    and disclosed in the URL beside it.
+
+    The user half and the host and path are PRESERVED deliberately: an operator diagnosing a
+    connection needs to see which account and which host, and masking the whole URL would destroy the
+    view rather than protect it. Only the secret is removed.
+    """
+    if not isinstance(value, str) or "@" not in value or "//" not in value:
+        return value
+    scheme, _, rest = value.partition("//")
+    userinfo, at, hostpart = rest.rpartition("@")
+    if not at or ":" not in userinfo:
+        return value  # no userinfo, or a user with no password -- nothing secret to remove
+    user, _, _pw = userinfo.partition(":")
+    return f"{scheme}//{user}:***@{hostpart}"
+
+
+def _redact_header_value(name: str, value: object) -> object:
+    """One header's value, scrubbed. Handles the ``EnvRef`` case the headers branch used to miss.
+
+    BACKLOG #1207. The headers branch had no ``EnvRef`` arm, so an ``env()`` ref inside a headers
+    table came back as the RAW OBJECT -- not JSON-safe, and carrying its ``default`` intact. The same
+    ``env()`` on a top-level credential correctly emits ``{"env": key}`` with the default dropped, so
+    the hole was INSIDE the one container this control claims to handle.
+
+    THE DEFAULT IS DROPPED FOR EVERY HEADER, not only credential-shaped ones. A header value sourced
+    from ``env()`` is a credential by intent -- nobody env-refs a ``Content-Type`` -- so the name
+    heuristic is the wrong gate here, and it is exactly the gate that failed: the measured instance
+    used ``X-Vendor-Thing``, which matches no substring rule.
+    """
+    if isinstance(value, EnvRef):
+        return {"env": value.key}
+    return "***" if _is_secret_header(name, value) else value
 
 
 def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
@@ -747,11 +962,36 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
             out[name] = ref
         elif is_secret:
             out[name] = "***"
+        elif isinstance(value, str) and name.lower().endswith(_URL_SETTING_SUFFIXES):
+            # BACKLOG #1207 -- a credential in URL userinfo, masked without destroying the view.
+            out[name] = _mask_url_userinfo(value)
         elif name == "headers" and isinstance(value, dict):
-            out[name] = {
-                k: ("***" if str(k).lower() in _SECRET_HEADER_NAMES else v)
-                for k, v in value.items()
-            }
+            out[name] = {k: _redact_header_value(k, v) for k, v in value.items()}
+        elif name == "odbc_params" and isinstance(value, dict):
+            # BACKLOG #1206. This bag is documented as carrying "only static driver keywords", and the
+            # redactor honoured that by not descending -- so a credential inside it was served verbatim
+            # by /metadata behind MONITORING_READ and printed by graph --json, on the SAME object whose
+            # top-level `password` masked correctly.
+            #
+            # It is not merely operator misuse, which is why this masks rather than warns. The typed
+            # fields carry exactly ONE credential (`username`/`password`, key names configurable via
+            # `odbc_user_key`/`odbc_password_key`), and `_reject_envref_odbc_params` refuses `env()`
+            # here. So a connection needing a SECOND driver credential -- libpq `sslpassword` beside
+            # `PWD` -- has no typed home and no env() form, and the inline literal is the only
+            # expressible shape. A refusal that removes the SAFE expression while leaving the UNSAFE
+            # one is not a mitigation.
+            #
+            # Keys only, by the same predicate the rest of this function uses: real static driver
+            # keywords (`Encrypt`, `TrustServerCertificate`, `ApplicationIntent`) are not
+            # credential-shaped, and the ones that are -- `PWD`, `Password`, `sslpassword` -- are
+            # credentials. Values are NOT shape-tested here: a driver keyword's value is opaque and
+            # masking on its content would hide ordinary configuration with nothing to say so.
+            #
+            # THIS IS A DISPLAY FIX, NOT A STORAGE FIX. The credential remains an inline literal in
+            # the config file. Keeping it out of the file needs `env()` to work here, which needs
+            # nested settings to be env-resolved -- filed as #1206's route-onward, deliberately not
+            # folded in, because it changes the resolution path and what the refusal above means.
+            out[name] = {k: ("***" if _is_secret_odbc_key(k) else v) for k, v in value.items()}
         else:
             out[name] = value
     return out
@@ -778,6 +1018,16 @@ def MLLP(
     max_connections: int | None = 256,  # cap concurrent clients (connection-flood guard)
     receive_timeout: float | None = 60.0,  # close a client idle this many seconds (slowloris)
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
+    # INBOUND message-RATE pacing (BACKLOG #1249). Unlike the caps above these default to OFF, and
+    # that is ruled rather than accidental: a rate on a clinical interface is only safe at a number
+    # taken from a real feed profile. The connector has read both keys since the pacer was built --
+    # until now no factory parameter and no connections.toml key could populate them, so the setting
+    # existed and could not be reached. Over budget the listener PAUSES READING so TCP back-pressures
+    # the sender: nothing is dropped, refused, NAK'd or reordered, which the count-and-log invariant
+    # requires (a discarding limiter was never an option here).
+    max_messages_per_second: float | None = None,  # None/0 = no rate bound (the shipped default)
+    message_burst: float
+    | None = None,  # allowance over the sustained rate; None = one second's worth
     connect_timeout: float = 10.0,  # outbound: TCP connect timeout (seconds)
     timeout_seconds: float = 30.0,  # outbound: wait this long for the ACK
     no_ack: bool = False,  # OUTBOUND (MLLP-only): fire-and-forward — skip the ACK read, deliver on the TCP write (at-most-once-confirmation; ADR 0124). Incompatible with capture_response/reingress_to.
@@ -902,6 +1152,8 @@ def MLLP(
             "max_connections": max_connections,
             "receive_timeout": receive_timeout,
             "max_frame_bytes": max_frame_bytes,
+            "max_messages_per_second": max_messages_per_second,
+            "message_burst": message_burst,
             "connect_timeout": connect_timeout,
             "timeout_seconds": timeout_seconds,
             "no_ack": no_ack,
@@ -1455,7 +1707,7 @@ def File(
     sort: str = "name",  # inbound: process order — "name" | "mtime"
     recursive: bool = False,  # inbound: also scan subdirectories
     max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
-    validate_directory: bool = False,  # inbound: fail-fast at start on a missing/unusable dir (#114); default defers to run time
+    validate_directory: bool = False,  # both directions (#114): fail-fast at start on a missing/unusable dir, and never create it; default defers to run time
     overwrite: bool = False,  # outbound: overwrite vs. uniquify a name collision
     processed_subdir: str = ".processed",
     error_subdir: str = ".error",
@@ -1479,9 +1731,13 @@ def File(
     ``after_read`` (inbound) chooses the source-file disposition: ``move`` (→ ``processed_subdir``,
     the default), ``delete``, or ``leave`` — **process in place** for a read-only share / a directory
     another system owns (#142; a HASHED per-file ledger dedups so a left file is ingested once).
-    ``validate_directory`` (inbound, #114) makes a missing/unusable directory **fail startup** (the
-    connection is reported ``failed``) instead of the default deferral to run time; a ``leave`` source
-    validates read-only (a read-only share passes).
+    ``validate_directory`` (#114, **both directions**) makes a missing/unusable directory **fail
+    startup** (the connection is reported ``failed``) instead of the default deferral to run time. On an
+    **inbound** a ``leave`` source validates read-only (a read-only share passes) while ``move``/
+    ``delete`` also need write. On an **outbound** the target must already exist and accept a write, and
+    the directory is then **never created** — not at start, not on write, and not by the on-demand
+    ``POST /connections/{name}/test`` probe. Leaving it off keeps the default: the outbound target is
+    created on first write (now logged as a WARNING when it actually had to be created).
 
     ``credential_username`` / ``credential_domain`` / ``credential_password`` (ADR 0132, #111) give the
     endpoint an **alternate Windows identity** for a UNC/SMB share, distinct from the engine service
@@ -2433,7 +2689,7 @@ def Sftp(
     ] = "move",  # inbound: "move" (to processed_subdir) | "delete" | "leave" (process in place, #142)
     min_age_seconds: float = 0.0,  # inbound: skip files modified within this window (partial writes)
     max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
-    validate_directory: bool = False,  # inbound: fail-fast at start on an unreachable remote dir (#114)
+    validate_directory: bool = False,  # both directions (#114): fail-fast at start on an unreachable remote dir, and never create it
     overwrite: bool = False,  # outbound: overwrite vs. uniquify a name collision
     processed_subdir: str = ".processed",
     error_subdir: str = ".error",
@@ -2448,7 +2704,12 @@ def Sftp(
     refused) — accepting an unknown key needs ``MEFOR_ALLOW_INSECURE_TLS``. Put secrets (``password``/
     ``private_key``/``key_password``) in ``env()``. The host is gated by ``[egress].allowed_remote``
     (both directions). At-least-once: an upload may re-send and a poll may re-emit, so downstreams
-    **must be idempotent**."""
+    **must be idempotent**.
+
+    ``validate_directory`` (#114, both directions) makes an unreachable/missing ``remote_dir`` **fail
+    startup** — the connection is reported ``failed`` — instead of the default deferral to run time; on
+    an outbound it additionally stops the upload directory from ever being created (on send, or by the
+    on-demand test probe). Off by default: an intermittently-available remote dir must still start."""
     return ConnectionSpec(
         ConnectorType.REMOTEFILE,
         {
@@ -2493,7 +2754,7 @@ def Ftp(
     ] = "move",  # inbound: "move" (to processed_subdir) | "delete" | "leave" (process in place, #142)
     min_age_seconds: float = 0.0,  # inbound: skip files modified within this window (partial writes)
     max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
-    validate_directory: bool = False,  # inbound: fail-fast at start on an unreachable remote dir (#114)
+    validate_directory: bool = False,  # both directions (#114): fail-fast at start on an unreachable remote dir, and never create it
     overwrite: bool = False,  # outbound: overwrite vs. uniquify a name collision
     processed_subdir: str = ".processed",
     error_subdir: str = ".error",
@@ -2506,7 +2767,8 @@ def Ftp(
     plain ``ftp`` is **refused** unless ``MEFOR_ALLOW_INSECURE_TLS`` is set (use ``tls=True`` for FTPS,
     or :func:`Sftp`). FTPS encrypts the control + data channels, so credentials are fine there. Put
     secrets (``password``) in ``env()``. The host is gated by ``[egress].allowed_remote`` (both
-    directions). At-least-once → downstreams **must be idempotent**."""
+    directions). At-least-once → downstreams **must be idempotent**. ``validate_directory`` behaves
+    exactly as it does on :func:`Sftp`."""
     return ConnectionSpec(
         ConnectorType.REMOTEFILE,
         {
@@ -2630,12 +2892,59 @@ class SetMeta:
 #: non-HL7 inbound (ADR 0004). The author knows which — a Router/Handler is bound to one inbound.
 Payload = Message | RawMessage
 RouterFn = Callable[[Payload], "list[str] | str | None"]
-#: A Handler returns deliveries and/or writes (ADR 0005 state, ADR 0081 metadata): a single
-#: :class:`Send`/:class:`SetState`/:class:`SetMeta`, a mixed list, or ``None`` (filtered). ``Send``-only
-#: returns are unchanged — backward compatible.
-HandlerFn = Callable[
-    [Payload], "Send | SetState | SetMeta | list[Send | SetState | SetMeta] | None"
-]
+#: What a Handler returns: deliveries and/or writes (ADR 0005 state, ADR 0081 metadata) — a single
+#: :class:`Send`/:class:`SetState`/:class:`SetMeta`, **any non-``str`` iterable** of them (list, tuple,
+#: set, generator — BACKLOG #341), or ``None`` (filtered). ``Send``-only returns are unchanged —
+#: backward compatible. ``Iterable`` is covariant, so a plain ``list[Send]`` is assignable here where
+#: the invariant ``list[Send | SetState | SetMeta]`` used to be required.
+HandlerResult = Send | SetState | SetMeta | Iterable[Send | SetState | SetMeta] | None
+HandlerFn = Callable[[Payload], HandlerResult]
+
+
+def handler_result_items(result: object) -> list[object] | None:
+    """The elements of a Handler's returned **container**, or ``None`` — "this is a single value".
+
+    The ONE materialization rule for a Handler return (BACKLOG #341). It lives here, beside
+    :class:`Send`/:class:`SetState`/:class:`SetMeta`, because **both** consumers already import this
+    module and neither gains a dependency: the in-process partitioner
+    (:func:`messagefoundry.pipeline.dryrun._partition`) and the sandbox child
+    (:mod:`messagefoundry.pipeline._sandbox_codec` / ``_sandbox_worker``). Sharing the rule is what
+    keeps ``[sandbox].mode`` from ever changing WHICH ``Send``\\ s a Handler delivers (ADR 0087).
+
+    A ``list``/``tuple``/``set``/generator of :class:`Send`\\ s all deliver the same ``Send``\\ s. The
+    Router half (``dryrun._handler_names``) has always accepted any iterable; narrowing the Handler half
+    to ``list`` made a returned tuple an **accept-and-drop** — the one thing CLAUDE.md §12 forbids
+    outright. An EMPTY container yields ``[]``, so the documented ``return []`` / ``return ()`` filter
+    idiom keeps filtering rather than delivering or raising.
+
+    **Order is the container's, and a ``set`` has none.** The returned order is preserved verbatim and
+    becomes the order the outbound rows are inserted in (``store.transform_handoff``) — i.e. the FIFO
+    order of two ``Send``\\ s to the SAME outbound. A ``set``'s iteration order is unspecified:
+    :class:`Send` is a frozen dataclass hashed on its fields and ``str`` hashing is seeded per process,
+    so it differs between processes — which means between ``[sandbox].mode=off`` and ``mode=subprocess``
+    (the child is a separate process) AND between a first pass and a **crash re-run**. Purity (CLAUDE.md
+    §2) survives in the sense that carries the reliability invariant — a re-run re-derives the identical
+    *multiset* of outbound rows, and each delivery is independent and idempotent — but their relative
+    order is not reproducible. Ordered containers carry no such caveat, and the user-facing docs steer
+    authors to them; a ``set`` is accepted so that the widen has no arbitrary hole, not recommended.
+
+    Two deliberate carve-outs:
+
+    * ``str``/``bytes``/``bytearray`` are iterable but are **not** containers of ``Send``\\ s —
+      iterating one would partition its characters/bytes. They are single values.
+    * The gate is ``isinstance(result, Iterable)`` — an explicit ``__iter__`` — **not** a duck-typed
+      ``try: list(result)``. A :class:`~messagefoundry.parsing.message.Message` defines
+      ``__getitem__(path: str)`` and no ``__iter__``, so ``list()`` would drive the legacy sequence
+      protocol with an *int* index and raise out of a Handler that merely returned its message by
+      mistake. That slip drops silently today, and this fix must not convert it into a new raise.
+    """
+    if isinstance(result, str | bytes | bytearray):
+        return None
+    if isinstance(result, Iterable):
+        return list(result)
+    return None
+
+
 #: An optional **router-stage** applicability predicate a Handler may declare (``@handler(name,
 #: accepts=...)``; ADR 0084). It is evaluated while the Router's selection is still being computed —
 #: *before* any routed row is materialized — so a handler that declines costs **0** transactions
@@ -3297,6 +3606,110 @@ def accepted_cleartext_hops(registry: Registry) -> list[tuple[str, str]]:
     return sorted(out)
 
 
+def _peer_label(settings: Mapping[str, Any]) -> str:
+    """A readable, secret-free peer address for a connection's settings — the ``url`` if it has one,
+    else ``host``/``server`` with its ``port``, else ``"(unknown peer)"``.
+
+    Three keys because the connectors genuinely use three: ``url`` (Rest/FHIR/Soap), ``host``
+    (MLLP/DICOM/Ftp) and ``server`` (Database, which is also the ``[egress].allowed_db`` allowlist key).
+
+    An unresolved :class:`EnvRef` renders as ``env(<key>)``: the KEY, never the value, because these
+    labels land in a posture report and a resolved value can be a credentialed URL. A resolved ``url``
+    is passed through :func:`_mask_url_userinfo` for the same reason — the password half of
+    ``https://user:SECRET@host/`` must not ride into ``GET /security/posture``."""
+
+    def one(value: object) -> str | None:
+        if isinstance(value, EnvRef):
+            return f"env({value.key})"
+        return str(_mask_url_userinfo(value)) if value else None
+
+    url = one(settings.get("url"))
+    if url:
+        return url
+    host = one(settings.get("host")) or one(settings.get("server"))
+    if not host:
+        return "(unknown peer)"
+    port = one(settings.get("port"))
+    return f"{host}:{port}" if port else host
+
+
+def expiry_relaxed_hops(registry: Registry) -> list[tuple[str, str]]:
+    """Every OUTBOUND connection that declares ``tls_allow_expired``, as ``(name, peer)`` (#129 /
+    ADR 0094, surfaced by #333).
+
+    The sibling of :func:`accepted_cleartext_hops`, and the same contract: the SINGLE reader, so
+    ``messagefoundry check``, ``security_loosenings()`` and ``GET /security/posture`` can never report
+    different sets. Sorted by connection name for a stable, diffable list.
+
+    The flag lands in the connection's ``spec.settings`` dict (the six outbound factories that take it
+    — ``MLLP``/``Rest``/``FHIR``/``DICOM``/``Soap``/``Ftp``) rather than in a typed
+    ``OutboundConnection`` field like ``cleartext_accepted``, so this reads the dict.
+
+    **Outbound only, and that is a fact about the graph rather than a scoping choice.** ``FhirLookup``
+    exposes ``verify_tls`` but no ``tls_allow_expired``, and no inbound factory takes it (an inbound
+    verifies a CLIENT cert, which is a different question). Said here explicitly so that ADDING the
+    parameter to a lookup or an inbound later cannot silently escape this reader: whoever adds it must
+    extend this function, exactly as ``accepted_cleartext_hops`` had to grow its ``fhir_lookups`` arm.
+
+    Pure — it reads the loaded graph and touches nothing else."""
+    return sorted(
+        (oc.name, _peer_label(oc.spec.settings))
+        for oc in registry.outbound.values()
+        if oc.spec.settings.get("tls_allow_expired")
+    )
+
+
+def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
+    """Every generic-ODBC ``DATABASE`` connection whose ``odbc_params`` leave TLS unenforced, as
+    ``(name, reason)`` (#66 / ADR 0092 amendment, surfaced by #333).
+
+    On ``dialect='generic'`` MessageFoundry cannot introspect an arbitrary driver's TLS posture, so the
+    posture-keyed weakened-TLS refusal does not apply and TLS is delegated to the operator's own driver
+    keyword. ADR 0092 accepted that exemption on the strength of ONE mitigation — construction logs it —
+    and a log line emitted once at startup is not the surface anyone queries three months later. This is
+    that surface.
+
+    It walks **both** connection tables, unlike :func:`accepted_cleartext_hops`: a ``DatabasePoll``
+    inbound crosses the same hop in the same dialect with the same credential in the same DSN, so
+    reading only ``outbound`` would report a live unenforced hop as absent. Inbound names are prefixed
+    ``inbound:`` because the two tables are separate namespaces and a name could otherwise collide.
+
+    ``registry.lookups`` is deliberately NOT walked, and the reason is a property of the code rather
+    than a scoping choice: neither ``DatabaseLookup`` nor ``DatabaseRef`` takes a ``dialect`` or
+    ``odbc_params`` parameter, and the ADR 0010 read executor calls ``_build_dsn`` directly, so a live
+    lookup is SQL-Server-only and keeps that preset's posture-keyed refusal. Stated here so that giving
+    a lookup the generic dialect later cannot silently escape this reader — whoever adds it must extend
+    this function.
+
+    The classification is :func:`~messagefoundry.transports.database.generic_odbc_tls_unenforced` — the
+    same predicate the construction WARNING uses, imported here rather than restated, so this reader and
+    that log line can never disagree. Imported lazily inside the function: ``config`` must not take a
+    module-import dependency on ``transports`` (the one-way rule), and this reader runs on operator
+    surfaces, never on the hot path.
+
+    Pure — it reads the loaded graph and touches nothing else."""
+    from messagefoundry.transports.database import generic_odbc_tls_unenforced
+
+    def unenforced(settings: Mapping[str, Any]) -> str | None:
+        if str(settings.get("dialect", "sqlserver")).lower() != "generic":
+            return None
+        params = settings.get("odbc_params") or {}
+        return generic_odbc_tls_unenforced(params) if isinstance(params, Mapping) else None
+
+    out: list[tuple[str, str]] = []
+    for label, table in (
+        ("", registry.outbound),
+        ("inbound:", registry.inbound),
+    ):
+        for conn in table.values():
+            if conn.spec.type is not ConnectorType.DATABASE:
+                continue
+            reason = unenforced(conn.spec.settings)
+            if reason is not None:
+                out.append((f"{label}{conn.name}", f"{reason} ({_peer_label(conn.spec.settings)})"))
+    return sorted(out)
+
+
 def _call_site() -> tuple[str | None, int | None]:
     """File + line of the config module that called the declaration (for IDE go-to-definition)."""
     caller = sys._getframe(2)  # _call_site -> inbound/outbound -> config module
@@ -3782,6 +4195,11 @@ def build_outbound_connection(
             f"outbound connection {name!r}: {kind} outbound requires a host (the downstream peer), "
             f"e.g. {kind.title()}(host=..., port=...)."
         )
+    # BACKLOG #114: validate_directory was rejected here while it was INBOUND-ONLY (no destination read
+    # it, and DestinationConnector had no validate_startup hook, so accepting it was a silent no-op).
+    # Both halves are built now — DestinationConnector.validate_startup, overridden by the FILE and
+    # REMOTEFILE destinations and awaited on the runner's outbound start path — so the option is
+    # honoured in both directions and there is nothing left to refuse.
     _check_metadata(name, metadata)
     # ADR 0013 Increment 2: reingress_to (route this outbound's reply back as a new inbound message)
     # IMPLIES capture (the reply must be captured to re-ingress it). Force capture_response here so the
@@ -4046,10 +4464,10 @@ def router(name: str) -> Callable[[RouterFn], RouterFn]:
 def handler(
     name: str, *, accepts: HandlerAccepts | None = None
 ) -> Callable[[HandlerFn], HandlerFn]:
-    """Register a Handler: ``def handle(msg) -> Send | SetState | SetMeta | list[...] | None``
-    (``None`` => filtered; :class:`SetState` declares a cross-message state write, ADR 0005;
-    :class:`SetMeta` attaches a per-message metadata key/value, ADR 0081 — both applied exactly-once in
-    the handoff).
+    """Register a Handler: ``def handle(msg) -> Send | SetState | SetMeta | Iterable[...] | None``
+    (``None`` => filtered; any non-``str`` iterable — list, tuple, set, generator — fans out, BACKLOG
+    #341; :class:`SetState` declares a cross-message state write, ADR 0005; :class:`SetMeta` attaches a
+    per-message metadata key/value, ADR 0081 — both applied exactly-once in the handoff).
 
     ``accepts`` (ADR 0084) is an optional **pure** router-stage predicate — ``(msg) -> bool`` — that
     lets this handler decline a message at *routing* time, before a routed row is materialized: a

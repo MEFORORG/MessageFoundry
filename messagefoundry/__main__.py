@@ -11,11 +11,12 @@
     messagefoundry codeset upsert --config ./samples/config --data '{...}'         # edit codesets/*.csv
     messagefoundry generate  --type ADT --count 5 --out ./out/adt                 # synthetic HL7
     messagefoundry hl7schema --json                                               # HL7 field schema
+    messagefoundry lens schema --json                                             # Steps-view param widget schema
     messagefoundry init      ./my-config-repo                                      # scaffold a config repo
 
-The introspection subcommands (validate/graph/dryrun/check/hl7schema) print to stdout for the VS
-Code extension / git hooks; they touch no network and start no server. Heavy imports are deferred
-per-command so a quick `validate`/`hl7schema` call doesn't pay for FastAPI/uvicorn.
+The introspection subcommands (validate/graph/dryrun/check/hl7schema/lens schema) print to stdout
+for the VS Code extension / git hooks; they touch no network and start no server. Heavy imports are
+deferred per-command so a quick `validate`/`hl7schema`/`lens schema` call doesn't pay for FastAPI/uvicorn.
 """
 
 from __future__ import annotations
@@ -379,8 +380,8 @@ def main(argv: list[str] | None = None) -> int:
     lens_sub = lens.add_subparsers(dest="lens_command", required=True)
     lens_parse = lens_sub.add_parser(
         "parse",
-        help="statically parse one config module into its @handler row contract (never imports or "
-        "executes the module; routers are out of v1 scope)",
+        help="statically parse one config module into its element row contract (never imports or "
+        "executes the module; @router defs are projected at --contract 2 and above)",
     )
     lens_parse.add_argument(
         "module",
@@ -388,6 +389,15 @@ def main(argv: list[str] | None = None) -> int:
         "the live buffer this way after a structural edit)",
     )
     lens_parse.add_argument("--json", action="store_true", help="emit JSON")
+    lens_parse.add_argument(
+        "--contract",
+        type=int,
+        default=1,
+        help="the row-contract version to emit (default 1). 1 is the shipped grammar; 2 adds the "
+        "'note' and 'route' row kinds and projects @router defs (ADR 0076 Amendments A + D). A "
+        "consumer asks for the version it can RENDER, so a client that omits this can never be handed "
+        "a kind it has no renderer for",
+    )
 
     lens_rewrite = lens_sub.add_parser(
         "rewrite",
@@ -411,6 +421,23 @@ def main(argv: list[str] | None = None) -> int:
         '\'{"line_start":7,"line_end":7,"op":"move_row","direction":"up"}\'; '
         "omit to read the edit spec from stdin (only when 'module' is a file path, not '-')",
     )
+    lens_rewrite.add_argument(
+        "--contract",
+        type=int,
+        default=1,
+        help="the row-contract version the row coordinates were PROJECTED with (default 1) - it must "
+        "match the 'lens parse --contract' that produced them, so a v1 client's coordinates resolve "
+        "against the v1 partition and a v2 client's against the v2 one",
+    )
+
+    lens_schema = lens_sub.add_parser(
+        "schema",
+        help="emit the transform-vocabulary parameter schema as JSON (op -> params with "
+        "kind/choices/required/keyword_only), derived from the action + diagnostic signatures; "
+        "the Steps editor drives its per-param input widgets from it (never imports/executes a "
+        "module, starts no server)",
+    )
+    lens_schema.add_argument("--json", action="store_true", help="emit compact JSON")
 
     import_cmd = sub.add_parser(
         "import",
@@ -576,6 +603,38 @@ def main(argv: list[str] | None = None) -> int:
         help="service settings TOML (default: ./messagefoundry.toml if present)",
     )
     audit_verify.add_argument("--db", default=None, help="store path (overrides [store].path)")
+    # ONE mutually-exclusive group: the two flags carry the same value in two transports, and argparse
+    # refusing both is better than silently letting one win.
+    audit_verify_anchor = audit_verify.add_mutually_exclusive_group()
+    audit_verify_anchor.add_argument(
+        "--expected-anchor",
+        default=None,
+        metavar="COUNT:HEAD",
+        help="also compare against an anchor previously printed by 'audit-anchor'. The hash-chain "
+        "walk alone CANNOT see a truncated tail (the surviving prefix still chains cleanly); this "
+        "is what detects it",
+    )
+    audit_verify_anchor.add_argument(
+        "--expected-anchor-file",
+        default=None,
+        metavar="PATH",
+        help="read the COUNT:HEAD anchor from a UTF-8 text file holding the output of "
+        "'messagefoundry audit-anchor' (on PowerShell 5.1 pipe to 'Set-Content -Encoding utf8' — "
+        "its '>' writes UTF-16, which is refused)",
+    )
+
+    audit_anchor = sub.add_parser(
+        "audit-anchor",
+        help="print the audit log's external anchor (COUNT:HEAD) to hold out-of-band and pass back "
+        "to 'audit-verify --expected-anchor'",
+    )
+    audit_anchor.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present)",
+    )
+    audit_anchor.add_argument("--db", default=None, help="store path (overrides [store].path)")
+    audit_anchor.add_argument("--json", action="store_true", help="emit JSON")
 
     rekey_audit = sub.add_parser(
         "rekey-audit",
@@ -1075,12 +1134,31 @@ def _serve(args: argparse.Namespace) -> int:
     if effective_root is not None and not Path(settings.store.path).is_absolute():
         settings.store.path = str(effective_root / settings.store.path)
 
-    # Fail closed: with auth disabled the API answers as a full-privilege system identity, so a
-    # non-loopback bind would publish admin access to the network. Loopback is the only no-auth posture.
-    if not settings.auth.enabled and not settings.api.is_loopback:
+    # THE SINGLE DEFINITION of "this instance is exposed" (BACKLOG #326): an off-loopback bind OR a
+    # declared upstream TLS terminator. Hoisted here so its earliest consumer — the auth-off arm just
+    # below (BACKLOG #1013) — can read it; the full rationale (why not `serve_ui`, why deliberately
+    # narrow) sits at the MFA-at-exposure gate that was its original first consumer. Defined ONCE: a
+    # second copy is exactly how the ASVS 11.7.1 and 6.3.3 arms once disagreed about the same boot (#326).
+    instance_exposed = not settings.api.is_loopback or settings.api.tls_terminated_upstream
+
+    # Fail closed: with auth disabled the API would answer as a full-privilege system identity, so any
+    # exposed instance would publish admin access to the network with no authentication at all. Exposure
+    # is EITHER a non-loopback bind OR a declared upstream TLS terminator on a loopback bind — the same
+    # `instance_exposed` the MFA-at-exposure gate consults (BACKLOG #1013: this arm previously keyed on
+    # the bind alone, so an auth-off PHI instance behind a declared terminator would have started
+    # silently on first deployment). A true loopback posture with no declared terminator is the only
+    # place no-auth may run.
+    if not settings.auth.enabled and instance_exposed:
+        exposure_desc = (
+            f"non-loopback host {settings.api.host!r}"
+            if not settings.api.is_loopback
+            else "loopback host behind a declared TLS-terminating reverse proxy "
+            "([api].tls_terminated_upstream)"
+        )
         print(
-            "error: refusing to serve with [auth] enabled=false on non-loopback host "
-            f"{settings.api.host!r}; enable auth or bind 127.0.0.1",
+            f"error: refusing to serve with [auth] enabled=false on {exposure_desc}; the API would "
+            "answer as a full-privilege system identity with no authentication. Enable auth or bind a "
+            "loopback host with no declared terminator.",
             file=sys.stderr,
         )
         return 2
@@ -1461,20 +1539,23 @@ def _serve(args: argparse.Namespace) -> int:
     # still refuse a production-PHI weakening (the ADR 0092 clamp is unchanged). The shared
     # security_loosenings() feeds both this warning and the read-only GET /security/posture view.
     # The connection graph is NOT loaded yet here (the Engine loads it inside the ASGI lifespan, well
-    # below), so this early warning covers the SETTINGS-scoped switches only and passes an empty
-    # cleartext-hop list. That is not a silent subset: every ADR 0153 acceptance is reported moments
-    # later — per connection, with its reason — by the construction gate's own loud WARN + audit record,
+    # below), so this early warning covers the SETTINGS-scoped switches only and passes empty lists for
+    # all THREE connection-scoped deviations. That is not a silent subset: each is reported moments
+    # later — per connection — by the connector's own construction-time WARN (the ADR 0153 acceptance
+    # with its reason and an audit record; the #333 generic-ODBC TLS reminder naming the connection),
     # and completely by `messagefoundry check` and GET /security/posture, which both have the graph.
     _loosenings = security_loosenings(
-        settings.security, settings.store, settings.auth, settings.alerts, ()
+        settings.security, settings.store, settings.auth, settings.alerts, (), (), ()
     )
     if _loosenings:
         _seclog = logging.getLogger(__name__)
         _seclog.warning(
             "[security] posture loosened from the secure defaults (%d): %s — see "
             "docs/SECURITY-LOOSENING.md. Production-PHI weakenings are still refused below. "
-            "Per-connection cleartext_accepted declarations (ADR 0153) are reported separately by "
-            "the connector construction gate.",
+            "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired and generic-ODBC "
+            "DATABASE TLS declarations are NOT in this list — the graph is not loaded yet; they are "
+            "reported by the connector construction gate, `messagefoundry check` and "
+            "GET /security/posture.",
             len(_loosenings),
             "; ".join(f"{name} ({risk})" for name, risk in _loosenings),
         )
@@ -1859,6 +1940,31 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+    # THE SINGLE DEFINITION OF "this instance is exposed" (BACKLOG #326) is derived above, before the
+    # auth-off arm (BACKLOG #1013) that also consumes it, from two fields no earlier arm reassigns —
+    # `is_loopback` and `tls_terminated_upstream` are read straight off the loaded config and are never
+    # mutated in place, unlike `serve_ui`.
+    #
+    # WHY IT CANNOT READ `settings.api.serve_ui`: that field is flipped to False IN PLACE twice above —
+    # the ADR 0143 soft-degrade when the console wheel is absent, and the ADR 0143 auto-degrade when a
+    # default-on console meets an exposed bind. By this line it answers "is /ui mounted?", a PRESENTATION
+    # fact, not "is the admin interface reachable from the network?", the EXPOSURE fact these gates need.
+    # Keying an exposure gate on it let one boot call the same instance exposed for ASVS 11.7.1 (the
+    # ADR 0152 arm below, which already used this predicate) and NOT exposed for ASVS 6.3.3 (the MFA arm
+    # here) — so the refusal was unreachable on the runbook's RECOMMENDED loopback-behind-proxy topology.
+    # The admin surface that authenticates with a single factor is the JSON API, which is served whether
+    # or not the browser console is.
+    #
+    # Deliberately NARROW: a set `public_origin` with no declared proxy is NOT exposure here. Widening
+    # it that far would convert a heuristic into a hard refusal, and the signal is genuinely weaker —
+    # nothing has been declared, so the engine is guessing. The residual that leaves is warned about
+    # EXPLICITLY, by the arm below the MFA gate. It must not lean on the ADR 0068 §8 undeclared-proxy
+    # warning at the top of this ladder: that one is about the /ui cookie and HSTS, it says nothing
+    # about admin factors, and it is gated on `serve_ui`, which the ADR 0143 auto-degrade has already
+    # cleared for exactly this input — a DEFAULT-on console plus a set `public_origin` — so on the
+    # commonest shape of this posture it does not print at all. Citing it as the compensating control
+    # would have rested that control on a premise measurement contradicts.
+
     # MFA-at-exposure posture (sec-mfa-on; WP-14, ASVS 6.3.3): an off-loopback bind serving local
     # accounts puts admin authentication on the network, where a single password factor is far weaker.
     # [security].require_mfa adds the native TOTP second factor for the Administrator role; with it off the
@@ -1873,18 +1979,19 @@ def _serve(args: argparse.Namespace) -> int:
     # gates LOCAL Administrator accounts (the bootstrap admin is one) — it is safe to leave on even on
     # an AD-only deployment.
     #
-    # L5b review fix (ADR 0068 §8): the gate keys on the same EXPOSURE signal as the ladder above,
-    # not the bind host alone — the runbook's RECOMMENDED topology (loopback bind BEHIND a declared
-    # proxy, `ui_exposed`) puts the admin interface on the network exactly as an off-loopback bind
-    # does, so a production PHI console exposed through a declared proxy with require_mfa off is
-    # refused identically (extend-never-weaken).
-    admin_exposed = not settings.api.is_loopback or ui_exposed
+    # L5b review fix (ADR 0068 §8), corrected by BACKLOG #326: the gate keys on the same EXPOSURE signal
+    # as the ladder above, not the bind host alone — the runbook's RECOMMENDED topology (loopback bind
+    # BEHIND a declared proxy) puts the admin interface on the network exactly as an off-loopback bind
+    # does, so a production PHI instance reached through a declared proxy with require_mfa off is refused
+    # identically (extend-never-weaken). It reads `instance_exposed`, NOT the mutated console flag: the
+    # single-factor admin surface is the JSON API, so whether /ui happens to be mounted is irrelevant.
+    admin_exposed = instance_exposed
     if admin_exposed and settings.auth.enabled and not settings.auth.require_mfa:
         exposure_desc = (
             f"API bound to non-loopback host {settings.api.host!r}"
             if not settings.api.is_loopback
-            else "browser console exposed through a declared reverse proxy "
-            "([api].serve_ui + tls_terminated_upstream)"
+            else "admin interface reached through a declared reverse proxy "
+            "([api].tls_terminated_upstream)"
         )
         if data_class is DataClass.PHI:
             if enforcing and not settings.security.allow_single_factor_admin_when_exposed:
@@ -1919,14 +2026,42 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+    # --- the UNDECLARED-proxy residual of the gate above, made visible (BACKLOG #326) ---------------
+    # `instance_exposed` is deliberately narrow, so a set `public_origin` on a loopback bind with no
+    # declared terminator does not refuse. That is the right call — nothing was declared, so the engine
+    # is inferring — but it must not be SILENT, and until this arm existed it was: the only other thing
+    # that could have spoken is the ADR 0068 §8 undeclared-proxy warning above, which is scoped to the
+    # /ui cookie and HSTS and is suppressed outright when the ADR 0143 auto-degrade clears `serve_ui`
+    # (which that same `public_origin` triggers). So the documented compensating control did not exist
+    # on the commonest shape of this posture. WARN, never refuse: the ruling that tightened the gate
+    # above was about a DECLARED proxy, and promoting an inference to a refusal is a different decision.
+    # Scoped as tightly as the refusal is: PHI only, and only where require_mfa was EXPLICITLY opted out.
+    if (
+        not instance_exposed
+        and settings.api.public_origin
+        and settings.auth.enabled
+        and not settings.auth.require_mfa
+        and data_class is DataClass.PHI
+    ):
+        print(
+            "warning: [api].public_origin is set with no declared TLS terminator on a PHI instance "
+            f"({env_name!r}) with [security].require_mfa off — if that origin is served by an "
+            "UNDECLARED reverse proxy, the Administrator role is single-factor over the network and "
+            "the MFA-at-exposure refusal cannot see it (an undeclared proxy is not, and cannot be, an "
+            "exposure signal the engine can verify). Declare it with [api].tls_terminated_upstream + "
+            "trusted_proxies, or set [security].require_mfa=true.",
+            file=sys.stderr,
+        )
+
     # --- #189 dual-control-at-exposure posture (ASVS 2.3.5) -----------------------------------------
     # High-value runtime actions (dead-letter replay, connection purge) complete on a SINGLE caller's
     # authority unless [approvals].enabled turns on maker-checker (a distinct second user holding
     # approvals:approve releases the request). On an off-box admin surface that concentration is the
     # weakest link: one compromised/coerced admin session can replay full-PHI dead-letters or purge a
     # connection with no second sign-off. Key on the SAME exposure signal as the MFA gate above
-    # (admin_exposed = off-loopback bind OR declared-proxy ui_exposed), so a loopback default is
-    # byte-identical (admin_exposed is False → this never trips) and a synthetic instance stays quiet
+    # (admin_exposed = instance_exposed = off-loopback bind OR a declared TLS-terminating proxy), so a
+    # plain loopback default is byte-identical (admin_exposed is False → this never trips, BACKLOG #326
+    # preserved that property deliberately) and a synthetic instance stays quiet
     # (gated on data_class is PHI). This is WARN-ONLY by design (the reviewed default): dual-control is
     # off-by-default precisely so a genuine single-operator hospital deployment is never wedged, so
     # refusing to start on its absence would break a supported topology.
@@ -1939,8 +2074,8 @@ def _serve(args: argparse.Namespace) -> int:
         approvals_exposure_desc = (
             f"API bound to non-loopback host {settings.api.host!r}"
             if not settings.api.is_loopback
-            else "browser console exposed through a declared reverse proxy "
-            "([api].serve_ui + tls_terminated_upstream)"
+            else "admin interface reached through a declared reverse proxy "
+            "([api].tls_terminated_upstream)"
         )
         print(
             f"warning: {approvals_exposure_desc} in a PHI-carrying environment ({env_name!r}) with "
@@ -1975,8 +2110,49 @@ def _serve(args: argparse.Namespace) -> int:
     # beyond the declaration itself" — true of a declaration, false of a measurement. A reachable
     # front door that speaks TLS 1.0 is a fact, on loopback or not.
     #
-    # Scope is deliberately the posture the requirement is about: a declared terminator, PHI, and
-    # `enforce`. Every other posture never reaches here and is byte-identical.
+    # REQUIRE `public_origin` IN THIS POSTURE, REGARDLESS OF `serve_ui` (BACKLOG #1026, owner-ruled
+    # 2026-08-14). There IS a refusal for an unset `public_origin`, and it is gated on the console:
+    # `if settings.api.serve_ui and settings.api.tls_terminated_upstream`. With `serve_ui` false
+    # nothing required it, so a PHI instance behind a declared terminator under `enforce` could start
+    # with it unset and the probe below simply never ran -- with nothing reporting the skip.
+    #
+    # That is the failure this same block already refuses twice, one level down. It returns 2 when the
+    # probe's MECHANISM is missing, because "a check that degrades to a no-op when its mechanism
+    # disappears reports success forever afterwards", and it refuses on unreachable because "a gate
+    # that is trivially defeated is not a gate". Leaving `public_origin` unset WAS trivially defeating
+    # this gate, and the outcome WAS a check that reports success forever. The principle was stated
+    # twice here and violated one level up.
+    #
+    # This refuses a posture that starts today. Per CLAUDE.md section 0 there are zero deployments, so
+    # that costs nothing now and will never be cheaper to add -- and the owner was told the cost
+    # rather than it being hidden. It is NOT the reason the answer is (a): the reason is that this is
+    # the only end where the control measures its own posture instead of measuring whether someone
+    # happened to configure an unrelated console setting.
+    if (
+        settings.api.tls_terminated_upstream
+        and data_class is DataClass.PHI
+        and enforcing
+        and not settings.api.public_origin
+    ):
+        print(
+            f"error: refusing to serve on a PHI instance ({env_name!r}) behind a declared TLS "
+            "terminator under `enforce` without [api].public_origin — the ASVS 12.1.1 TLS-floor "
+            "probe dials that origin, so leaving it unset silently disables the check rather than "
+            'failing it. Set [api].public_origin to the origin the browser uses (e.g. "https://'
+            'mefor.example.org"). See docs/security/OFF-LOOPBACK-DEPLOYMENT.md.',
+            file=sys.stderr,
+        )
+        return 2
+
+    # Scope is the posture the requirement is about: a declared terminator, PHI, and `enforce`. Every
+    # other posture never reaches here and is byte-identical.
+    #
+    # `public_origin` appears as a fourth condition and is NOT a fourth scope narrowing: the refusal
+    # directly above guarantees it is set for exactly this posture, so the two agree by construction
+    # rather than by coincidence. It is kept as a belt-and-braces and as the type narrowing the probe
+    # call needs. Before #1026 this comment named three conditions while the gate had four, and the
+    # undocumented fourth was the whole defect -- a reader concluded the probe runs whenever a PHI
+    # instance sits behind a declared terminator under `enforce`, and it did not.
     if (
         settings.api.tls_terminated_upstream
         and data_class is DataClass.PHI
@@ -2037,45 +2213,97 @@ def _serve(args: argparse.Namespace) -> int:
         # default threads through to the RetentionRunner (no forbidden-file edit).
         # messages_days moved to [security].delete_message_bodies_after_days (ADR 0118);
         # dead_letter_days stays [retention] plumbing — label each window at its real home.
-        _RETENTION_WINDOW_LABEL = {
-            "messages_days": "[security].delete_message_bodies_after_days",
-            "dead_letter_days": "[retention].dead_letter_days",
-        }
-        if not enforcing and not settings.retention.allow_unbounded_phi:
-            auto_bounded = [
-                field
-                for field in ("messages_days", "dead_letter_days")
-                if field not in settings.retention.model_fields_set
+        # ASVS 14.2.7: the tier list is GENERATED from the classification in
+        # config/retention_classification.py, which a drift test holds equal — in both directions — to
+        # docs/PHI.md §2's Retention column. It used to be a two-element literal here, and the cell
+        # broke once because a new PHI tier landed and nobody widened it. A wider literal with no
+        # binding to the classification is the same defect with more characters.
+        from messagefoundry.config.retention_classification import (
+            MIN_PHI_RETENTION_WINDOWS,
+            PHI_RETENTION_WINDOWS,
+            auto_bounded_windows,
+        )
+        from messagefoundry.config.retention_classification import (
+            unbounded_windows as _unbounded_windows,
+        )
+
+        # A FLOOR, not an emptiness check. `if not PHI_RETENTION_WINDOWS` passes for a one-element
+        # tuple, so a bad merge dropping most entries would leave this gate checking one window while
+        # reporting success — the precise shape of failure this whole change set exists to remove.
+        if len(PHI_RETENTION_WINDOWS) < MIN_PHI_RETENTION_WINDOWS:
+            print(
+                f"error: the PHI retention classification has shrunk to "
+                f"{len(PHI_RETENTION_WINDOWS)} windows (floor {MIN_PHI_RETENTION_WINDOWS}); refusing "
+                "to start rather than gate on a partial classification. This is a build defect, not a "
+                "configuration one — see messagefoundry/config/retention_classification.py.",
+                file=sys.stderr,
+            )
+            return 2
+
+        # AUTO-BOUND. Owner ruling 2026-07-30: the three PHI-BODY windows default to 30 days when
+        # UNSET, on BOTH dials — previously this ran only when `not enforcing`, so on the shipped
+        # `enforce` posture an unset window took the refusal below instead of a default.
+        #
+        # THE SAFETY TRADE IS DELIBERATE AND WORTH STATING: a production PHI instance with an unset
+        # window used to REFUSE TO START, which forced an operator to choose a number. It now starts
+        # with 30. What survives is the fail-closed path for an EXPLICIT 0 — choosing keep-forever is
+        # still refused unless the audited opt-out is set. So "unbounded by accident" is still
+        # prevented; "unbounded by inattention" becomes "30 days by inattention".
+        #
+        # The warn-only windows are NOT auto-bounded, and that is also a ruling rather than an
+        # omission: `purge_state` and `purge_search_presets` key on timestamps that only move on a
+        # WRITE, so silently bounding them deletes live operational data a Handler is still reading.
+        if not settings.retention.allow_unbounded_phi:
+            defaulted = [
+                w
+                for w in auto_bounded_windows()
+                if w.field not in getattr(settings, w.reads_from.strip("[]")).model_fields_set
             ]
-            for field in auto_bounded:
-                setattr(settings.retention, field, 30)
-            if auto_bounded:
-                auto_desc = ", ".join(_RETENTION_WINDOW_LABEL[field] for field in auto_bounded)
+            for window in defaulted:
+                setattr(
+                    getattr(settings, window.reads_from.strip("[]")),
+                    window.field,
+                    window.auto_bound_days,
+                )
+            if defaulted:
                 print(
-                    f"info: {auto_desc} defaulted ON (30 days) for a PHI instance ({env_name!r}) — "
-                    "PHI message bodies are now bounded at rest (secure-by-default, ASVS 14.2.7). Set an "
-                    "explicit [retention] window to override, or [security].allow_keeping_phi_indefinitely=true to "
-                    "retain indefinitely.",
+                    f"info: {', '.join(w.setting for w in defaulted)} defaulted ON (30 days) for a PHI "
+                    f"instance ({env_name!r}) — these PHI tiers are now bounded at rest "
+                    "(secure-by-default, ASVS 14.2.7). Set an explicit window to override, or "
+                    "[security].allow_keeping_phi_indefinitely=true to retain indefinitely.",
                     file=sys.stderr,
                 )
-        unbounded_windows = [
-            field
-            for field, days in (
-                ("messages_days", settings.retention.messages_days),
-                ("dead_letter_days", settings.retention.dead_letter_days),
+
+        # REFUSE / WARN. `unbounded_windows` skips the tiers where 0 does not mean unbounded
+        # (`connection_event_retention_hours` INHERITS the body window; `uploads_retention_days` has a
+        # ge=1 floor so 0 is unrepresentable) and those whose `requires_setting` is unmet — with no
+        # [logging].log_dir there is nothing for the app-log sweep to sweep.
+        still_unbounded = _unbounded_windows(settings)
+        refusable = [w for w in still_unbounded if w.auto_bound_days is not None]
+        warn_only = [w for w in still_unbounded if w.auto_bound_days is None]
+
+        if warn_only:
+            # Classified and warned, never refused. Naming the tier AND its protection level is the
+            # point: an operator who sees "PL-1" knows a full body is involved.
+            print(
+                "warning: these classified PHI tiers have no retention window on a PHI instance "
+                f"({env_name!r}) and will accumulate without bound: "
+                + ", ".join(f"{w.setting} ({w.level})" for w in warn_only)
+                + ". They are deliberately NOT defaulted — each keys on a timestamp that only moves on "
+                "a write, so a silent default would delete data still in use (ASVS 14.2.7).",
+                file=sys.stderr,
             )
-            if days <= 0
-        ]
-        if unbounded_windows:
-            windows_desc = ", ".join(_RETENTION_WINDOW_LABEL[field] for field in unbounded_windows)
+
+        if refusable:
+            windows_desc = ", ".join(w.setting for w in refusable)
             if not settings.retention.allow_unbounded_phi:
                 if enforcing:
                     print(
-                        f"error: no data-retention window is configured for {windows_desc} on a "
-                        f"{'production ' if production else ''}PHI instance ({env_name!r}); refusing to "
-                        "start — PHI message bodies would be retained indefinitely (unbounded PHI at "
-                        "rest, ASVS 14.2.4). Set the window(s) to a positive number of days (e.g. 30) to "
-                        "bound PHI at rest; or, to deliberately retain forever, set "
+                        f"error: a data-retention window is explicitly disabled for {windows_desc} on "
+                        f"a {'production ' if production else ''}PHI instance ({env_name!r}); refusing "
+                        "to start — PHI message bodies would be retained indefinitely (unbounded PHI "
+                        "at rest, ASVS 14.2.4/14.2.7). Set the window(s) to a positive number of days "
+                        "(e.g. 30); or, to deliberately retain forever, set "
                         "[security].allow_keeping_phi_indefinitely=true (audited).",
                         file=sys.stderr,
                     )
@@ -2237,6 +2465,33 @@ def _serve(args: argparse.Namespace) -> int:
     # should be told about the concrete misconfiguration before the platform-property one, and a
     # gate that jumped the queue would silently change which error every existing exposed-PHI test
     # (and every existing exposed-PHI deployment) reports.
+    # ASVS 3.7.3: the "you are leaving this site" interstitial. Two knobs can weaken it, and BOTH are
+    # announced at start rather than discovered in a later assessment. Warn-only by design: neither is
+    # a PHI-safety property and refusing on an operator's deliberate UX decision would be a
+    # self-inflicted availability failure — the same reasoning as the read-out below.
+    _ext_allow = list(settings.security.external_link_allowlist)
+    if not settings.security.external_link_interstitial:
+        print(
+            "warning: [security].external_link_interstitial=false — the console will navigate "
+            "OFF-SITE with no notification and no cancel. This is the ASVS 3.7.3 control; disabling "
+            "it is a posture decision, not a convenience one.",
+            file=sys.stderr,
+        )
+    elif _ext_allow:
+        # Named individually, never counted. "3 destinations exempted" is the shape of message that
+        # lets an entry nobody intended sit in a list for a year.
+        print(
+            "warning: [security].external_link_allowlist exempts "
+            f"{', '.join(repr(d) for d in _ext_allow)} from the off-site interstitial (ASVS 3.7.3) — "
+            "navigation to these destinations shows no notification and offers no cancel.",
+            file=sys.stderr,
+        )
+    # NOT warned: an empty `organization_domains`. It is the STRICT position (every off-site
+    # destination is interstitialed) and it is the shipped default, so a note here would print on
+    # every stock start — `test_serve_loopback_emits_no_new_stderr` catches exactly that, and it is
+    # right to. Start-time output is for a posture that is WEAKER than the default, not for the
+    # default itself. The guidance that matters — declare your domains rather than reaching for the
+    # allowlist escape — belongs in docs/CONFIGURATION.md, where it is, and not in every boot log.
     #
     # PHI is plaintext in CPython heap while it is being processed — an HL7 body is `str` end to end
     # by design, and every parse/transform step allocates a fresh immutable copy no application code
@@ -2285,8 +2540,12 @@ def _serve(args: argparse.Namespace) -> int:
     # read-out (or a bind-mounted device node) discharged the requirement with no human declaring
     # anything. The read-out now only softens the MESSAGE. What remains true is the asymmetry the
     # contradiction branch rests on: nothing here refuses on a read-out, in either direction.
+    #
+    # `instance_exposed` is NOT re-derived here. It is defined ONCE, above the MFA-at-exposure gate, and
+    # this arm shares that definition — the two must agree by construction. BACKLOG #326: a second copy
+    # is exactly how the ASVS 11.7.1 arm and the ASVS 6.3.3 arm came to disagree about whether the same
+    # boot was exposed.
     memory_declared = settings.security.memory_encryption_operator_declared
-    instance_exposed = not settings.api.is_loopback or settings.api.tls_terminated_upstream
     memory_undeclared_at_exposure = (
         instance_exposed and data_class is DataClass.PHI and not memory_declared
     )
@@ -2596,10 +2855,15 @@ def _serve(args: argparse.Namespace) -> int:
             from messagefoundry.api.tls_client_cert import client_cert_http_protocol_class
 
             run_kwargs["http"] = client_cert_http_protocol_class()
-    from messagefoundry.last_resort import install_excepthook
+    from messagefoundry.last_resort import install_excepthook, install_thread_excepthook
     from messagefoundry.redaction import safe_exc
 
     install_excepthook()  # last-resort main-thread hook: an uncaught exception logs PHI-redacted (16.5.4)
+    # The sibling hook for every OTHER thread (BACKLOG #1055). sys.excepthook does not cover them, and
+    # the engine runs non-asyncio threads whose except clauses are deliberately narrow — the sandbox
+    # session's raw stdout reader catches only OSError — so anything else would otherwise reach the
+    # stdlib default and print an unredacted traceback to the NSSM-captured stderr.
+    install_thread_excepthook()
     try:
         uvicorn.run(app, host=settings.api.host, port=settings.api.port, **run_kwargs)
     except Exception as exc:  # last-resort: log an abnormal server exit PHI-redacted, then re-raise
@@ -2926,7 +3190,22 @@ def _lens(args: argparse.Namespace) -> int:
     exit, matching the IDE's degradation-to-text-editor behavior."""
     if args.lens_command == "rewrite":
         return _lens_rewrite(args)
+    if args.lens_command == "schema":
+        return _lens_schema(args)
     return _lens_parse(args)
+
+
+def _lens_schema(args: argparse.Namespace) -> int:
+    """``lens schema`` — emit the transform-vocabulary param schema (ADR 0076 §5) the Steps editor's
+    per-param input widgets consume.
+
+    Derived from the action + diagnostic signatures via stdlib ``inspect``/``typing`` only (no new
+    runtime dependency, ADR 0076 §6.5); lazy-imported inside the handler like ``_hl7schema`` so a
+    quick call never pays for FastAPI/uvicorn. Starts no server; imports/executes no config module."""
+    from messagefoundry.lens_schema import op_param_schema
+
+    _print_json(op_param_schema(), compact=args.json)
+    return 0
 
 
 def _lens_parse(args: argparse.Namespace) -> int:
@@ -2942,10 +3221,14 @@ def _lens_parse(args: argparse.Namespace) -> int:
         if args.module == "-":
             # Raw UTF-8 (never the Windows locale codepage) so the buffer's non-ASCII round-trips exactly.
             module_label = "<stdin>"
-            handlers = parse_source(sys.stdin.buffer.read().decode("utf-8"), module=module_label)
+            handlers = parse_source(
+                sys.stdin.buffer.read().decode("utf-8"),
+                module=module_label,
+                contract=args.contract,
+            )
         else:
             module_label = args.module
-            handlers = parse_module(args.module)
+            handlers = parse_module(args.module, contract=args.contract)
     except LensParseError as exc:
         return _emit_error(str(exc), as_json=args.json)
     _print_json({"module": module_label, "handlers": handlers}, compact=args.json)
@@ -2986,9 +3269,11 @@ def _lens_rewrite(args: argparse.Namespace) -> int:
 
     try:
         if args.module == "-":
-            rewritten = rewrite_source(_read_stdin(), edit, module="<stdin>")
+            rewritten = rewrite_source(
+                _read_stdin(), edit, module="<stdin>", contract=args.contract
+            )
         else:
-            rewritten = rewrite_module(args.module, edit)
+            rewritten = rewrite_module(args.module, edit, contract=args.contract)
     except (LensParseError, LensRewriteError) as exc:
         return _emit_error(str(exc), as_json=True)
     # The rewritten module source is file content, not a JSON report — write the exact UTF-8 bytes to
@@ -3483,6 +3768,127 @@ def _protect_key(args: argparse.Namespace) -> int:
     return 0
 
 
+_ANCHOR_FORM = (
+    "expected COUNT:HEAD — the row count and the FULL head, copied verbatim from "
+    "'messagefoundry audit-anchor' (the 12-character head printed inside a FAIL message is a display "
+    "truncation, not an anchor); an empty log anchors as '0:'"
+)
+
+#: Every hex character, both cases. The store only ever emits lowercase (``hexdigest()``); uppercase is
+#: admitted and NORMALISED rather than rejected, because an operator who upper-cased the value in a
+#: ticket must get a verify, not a tamper alarm.
+_ANCHOR_HEX = frozenset("0123456789abcdefABCDEF")
+#: ``hashlib.sha256``/``hmac.new(..., sha256)`` ``hexdigest()`` width — the only hex head length the
+#: chain can produce, keyless or keyed (``store/store.py``, ``audit_row_hash``).
+_ANCHOR_DIGEST_HEX_LEN = 64
+#: ADR 0138 ``vault_transit``: the row MAC is computed INSIDE Vault/OpenBao Transit
+#: (``crypto_transit.TransitCipher.audit_hmac``), which returns its own opaque ``vault:v<N>:<base64>``
+#: string — not hex, not 64 characters — and that string lands in ``row_hash`` verbatim. A future
+#: isolated-module MAC provider with a different prefix MUST be added here, or a legitimate anchor from
+#: that deployment is refused as malformed.
+_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
+
+
+def _parse_anchor(text: str) -> tuple[int, str]:
+    """Parse a ``COUNT:HEAD`` audit anchor into the tuple ``verify_audit_chain`` expects.
+
+    Raises ``ValueError`` naming the form. It must RAISE rather than fall back to an unanchored
+    verify: a silently-ignored anchor turns the whole control into a gate that reports green while
+    checking nothing, which is precisely the failure this subcommand exists to close.
+
+    It must ALSO refuse rather than hand the comparator a head the store can never emit.
+    ``verify_audit_chain`` compares the head byte-exactly and reports *any* difference as
+    ``truncated or rewritten``, so an accepted-but-impossible head becomes a FALSE tamper alarm — a
+    red light on an intact chain, indistinguishable from a real detection. A control whose whole value
+    is that a FAIL means something cannot be allowed to manufacture FAILs out of its own input
+    handling — the inverse of the green-while-checking-nothing hole above, and it costs just as much.
+
+    Two head shapes are legal, because exactly two are producible:
+
+    * a **hex digest** — ``audit_row_hash``'s keyless SHA-256 or in-heap HMAC-SHA256 ``hexdigest()``,
+      always exactly 64 lowercase hex characters. Case is normalised, and the length is *required*: a
+      12-character head pasted out of a FAIL message's display truncation is refused as malformed
+      input (rc 2) instead of being reported as tampering (rc 1).
+    * an **isolated-module MAC** — ADR 0138 ``vault_transit`` mode, whose ``vault:v1:…`` string is
+      passed through UNCHANGED. ``partition`` splits on the FIRST colon, so its internal colons
+      survive the ``COUNT:HEAD`` split.
+
+    An EMPTY head is legal and load-bearing — ``audit_anchor()`` returns ``(0, "")`` for an empty log,
+    so ``0:`` must round-trip or a fresh instance is the one state that cannot be anchored.
+    """
+    raw = text.strip()
+    count_text, sep, head = raw.partition(":")
+    if not sep:
+        raise ValueError(f"malformed audit anchor {text!r}: no ':' separator — {_ANCHOR_FORM}")
+    try:
+        count = int(count_text)
+    except ValueError:
+        raise ValueError(
+            f"malformed audit anchor {text!r}: row count {count_text!r} is not an integer — "
+            f"{_ANCHOR_FORM}"
+        ) from None
+    if count < 0:
+        raise ValueError(
+            f"malformed audit anchor {text!r}: row count {count} is negative — {_ANCHOR_FORM}"
+        )
+    head = head.strip()
+    if not head:
+        return count, head
+    if all(c in _ANCHOR_HEX for c in head):
+        if len(head) != _ANCHOR_DIGEST_HEX_LEN:
+            raise ValueError(
+                f"malformed audit anchor {text!r}: head {head!r} is {len(head)} hex characters, not "
+                f"a full {_ANCHOR_DIGEST_HEX_LEN}-character digest — {_ANCHOR_FORM}"
+            )
+        return count, head.lower()
+    if head.startswith(_ANCHOR_ISOLATED_MAC_PREFIX):
+        return count, head  # opaque by construction; never normalise what we do not define
+    raise ValueError(
+        f"malformed audit anchor {text!r}: head {head!r} is neither a "
+        f"{_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an isolated-module "
+        f"{_ANCHOR_ISOLATED_MAC_PREFIX}… MAC (ADR 0138) — {_ANCHOR_FORM}"
+    )
+
+
+def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None | int:
+    """The anchor for ``audit-verify``, or the exit code 2 if the flags are unusable.
+
+    Returns ``None`` when neither flag was given (an unanchored verify, the historical behaviour).
+    Argparse's mutually-exclusive group has already refused both-at-once.
+    """
+    from pathlib import Path
+
+    raw: str | None
+    if args.expected_anchor_file is not None:
+        try:
+            # `utf-8-sig` absorbs a leading BOM: PowerShell 5.1's `Out-File`/`Set-Content -Encoding
+            # utf8` writes UTF-8 WITH one, and this product is deployed as a Windows service, so that
+            # is a first-class way an operator produces this file.
+            raw = Path(args.expected_anchor_file).read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError) as exc:
+            # `UnicodeDecodeError` subclasses `ValueError`, NOT `OSError` — catching only the latter
+            # let a mis-encoded file raise an unhandled traceback and exit 1, the SAME code
+            # `audit-verify` returns for a BROKEN CHAIN, so a compliance job keying on exit codes
+            # would have read a file-encoding problem as a detected tamper. PowerShell 5.1's `>`
+            # writes UTF-16LE, so this is the likely file, not an exotic one.
+            print(
+                f"error: cannot read --expected-anchor-file {args.expected_anchor_file!r}: {exc}. "
+                "It must be a UTF-8 text file holding the COUNT:HEAD line; PowerShell 5.1's '>' "
+                "writes UTF-16 — pipe to 'Set-Content -Encoding utf8' there.",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        raw = args.expected_anchor
+    if raw is None:
+        return None
+    try:
+        return _parse_anchor(raw)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
 def _audit_verify(args: argparse.Namespace) -> int:
     import asyncio
     from pathlib import Path
@@ -3491,6 +3897,13 @@ def _audit_verify(args: argparse.Namespace) -> int:
 
     from messagefoundry.config.settings import StoreBackend, load_settings
     from messagefoundry.store.base import open_store
+
+    # Resolve the anchor FIRST: it is a pure argv/file error, so it should not depend on a config load
+    # succeeding, and refusing it early keeps a typo from costing a store open.
+    resolved = _resolve_expected_anchor(args)
+    if isinstance(resolved, int):
+        return resolved
+    expected_anchor = resolved
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -3514,7 +3927,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
     async def run() -> tuple[bool, str | None]:
         store = await open_store(settings.store)
         try:
-            return await store.verify_audit_chain()
+            return await store.verify_audit_chain(expected_anchor=expected_anchor)
         finally:
             await store.close()
 
@@ -3528,6 +3941,66 @@ def _audit_verify(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     return 0 if ok else 1
+
+
+def _audit_anchor(args: argparse.Namespace) -> int:
+    """Print ``COUNT:HEAD`` — the audit log's external anchor, to be held OUT-OF-BAND.
+
+    The hash chain links each row to its predecessor, so deleting the NEWEST rows leaves a shorter
+    chain that still verifies: ``audit-verify`` alone reports OK on a truncated log. Comparing against
+    an anchor recorded elsewhere is what makes that visible, and this subcommand is how an operator
+    gets one. The anchor is a row count plus a digest — no PHI, no secret — so it is safe to store in
+    a ticket, an object store, or a compliance job's own database.
+    """
+    import asyncio
+    from pathlib import Path
+
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import StoreBackend, load_settings
+    from messagefoundry.store.base import open_store
+
+    cli: dict[str, dict[str, object]] = {}
+    if args.db is not None:
+        cli.setdefault("store", {})["path"] = args.db
+    try:
+        settings = load_settings(config_path=args.service_config, cli=cli)
+    except (FileNotFoundError, ValueError, ValidationError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    # The SAME M-31 guard as _audit_verify, and it matters MORE here: opening a SQLite store creates
+    # it, so a typo'd path would mint a fresh empty DB and print `0:` — an anchor OF NOTHING, which a
+    # later verify against the wrong database would then happily confirm.
+    if settings.store.backend == StoreBackend.SQLITE and not Path(settings.store.path).exists():
+        print(
+            f"error: no audit database at {settings.store.path} — refusing to create one and print "
+            f"an anchor of an empty log (check --db / [store].path)",
+            file=sys.stderr,
+        )
+        return 2
+
+    async def run() -> tuple[int, str]:
+        store = await open_store(settings.store)
+        try:
+            return await store.audit_anchor()
+        finally:
+            await store.close()
+
+    count, head = asyncio.run(run())
+    anchor = f"{count}:{head}"
+    if args.json:
+        _print_json({"count": count, "head": head, "anchor": anchor}, compact=True)
+    else:
+        print(anchor)
+    if count == 0:
+        # Same reasoning as the verify twin: an empty log on a real DB is legitimate, and at a glance
+        # indistinguishable from having anchored the wrong database (M-31).
+        print(
+            "warning: the audit log is empty — confirm this is the intended database.",
+            file=sys.stderr,
+        )
+    return 0
 
 
 def _rekey_audit(args: argparse.Namespace) -> int:
@@ -3910,6 +4383,10 @@ def _check(args: argparse.Namespace) -> int:
         handler_security_allow=frozenset(args.handler_security_allow or ()),
         service_config=service_config,
         suppress_service_toml_search=args.project_root is not None,
+        # The root was already used to anchor --config/--service-config and to REQUIRE that
+        # <root>/<env_dir>/<env>.toml exists; pass it on so the build check READS the values from there
+        # too, rather than from wherever the shell happens to be (BACKLOG #1062).
+        project_root=args.project_root,
     )
     if args.json:
         _print_json(report.to_json(), compact=True)
@@ -4402,23 +4879,26 @@ def _security(args: argparse.Namespace) -> int:
             _loosenings_partial = True
 
     def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
-        # This CLI reads a SETTINGS file and never loads the connection graph, so it cannot see the ADR
-        # 0153 per-connection cleartext_accepted declarations — it passes an empty list and declares the
-        # gap in `loosenings_scope` below, instead of reporting a settings-only view as if it were the
-        # whole posture. `messagefoundry check` and GET /security/posture are the complete surfaces.
+        # This CLI reads a SETTINGS file and never loads the connection graph, so it cannot see ANY of
+        # the three per-connection declarations — it passes empty lists and declares the gap in
+        # `loosenings_scope` below, instead of reporting a settings-only view as if it were the whole
+        # posture. `messagefoundry check` and GET /security/posture are the complete surfaces.
         return [
             {"switch": s, "risk": r}
-            for s, r in security_loosenings(sec, _store, _auth, _alerts, ())
+            for s, r in security_loosenings(sec, _store, _auth, _alerts, (), (), ())
         ]
 
     #: Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
     #: degraded or settings-only report for a complete one. `partial` means [store]/[auth] could not be
-    #: read at all (the file did not load); `connections_not_loaded` is the standing limitation above.
+    #: read at all (the file did not load); the scope string is the standing limitation above. It names
+    #: ALL THREE connection-scoped deviations (#333) — naming only cleartext_accepted made the DECLARED
+    #: scope itself incomplete, which is the same defect one level up.
     _loosenings_scope = {
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
-            "settings only ([security]/[store]/[auth]/[alerts]); per-connection cleartext_accepted "
-            "declarations are NOT included — see `messagefoundry check` or GET /security/posture"
+            "settings only ([security]/[store]/[auth]/[alerts]); the per-connection "
+            "cleartext_accepted, tls_allow_expired and generic-ODBC DATABASE TLS declarations are NOT "
+            "included — see `messagefoundry check` or GET /security/posture"
         ),
     }
 
@@ -4518,6 +4998,7 @@ _DISPATCH = {
     "cert": _cert,
     "protect-key": _protect_key,
     "audit-verify": _audit_verify,
+    "audit-anchor": _audit_anchor,
     "rekey-audit": _rekey_audit,
     "rotate-key": _rotate_key,
     "backup": _backup,

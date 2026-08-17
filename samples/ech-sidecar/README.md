@@ -52,18 +52,67 @@ Candidate implementations (operator-supplied, downloaded beside the engine like 
 sidecar): **sing-box** (Go `crypto/tls` client ECH since 1.23) configured as a TLS-terminating proxy, or a
 purpose-built ~500-line Go re-originator. A generic CONNECT-tunneling proxy is **not** conforming.
 
+**A reference implementation exists in history, not in the tree.** A 312-line stdlib-only Go
+re-originator satisfying all three points above was written here and, on 2026-08-10, retired from the
+repository (BACKLOG #1011): nothing built, tested, linted or version-pinned it, and it shipped in no
+sdist or wheel. Recover it with `git show 62fd628d:tools/ech-sidecar/main.go` (its own README, at
+`62fd628d:tools/ech-sidecar/README.md`, carries the recorded manual proof against
+`crypto.cloudflare.com` — a one-off observation, never re-run by any automated check). Treat it as a
+worked example of the contract, not as supported software.
+
 ## Wire it in MessageFoundry
 
 Per outbound connection (opt-in; off by default → byte-identical):
 
-```toml
-[connections.OB_PARTNER_FHIR.settings]
-ech_egress  = true                     # route this connection's egress through the ECH sidecar
-ech_sidecar = "http://127.0.0.1:1080"  # the sidecar's loopback listener (must be loopback)
+**DO NOT reach for `connections.toml` — this is NOT expressible there today, and the recipe that used
+to sit here could not load.** Two independent reasons, both verified by execution:
+
+1. The loader accepts only `[[inbound]]` / `[[outbound]]` arrays of tables, so a
+   `[connections.<NAME>.settings]` table fails with *"unknown top-level key(s) connections"*
+   ([`config/connections_file.py:168-173`](../../messagefoundry/config/connections_file.py)).
+2. Even with the right shape, **no factory accepts these keys** — `Rest()` raises
+   `TypeError: Rest() got an unexpected keyword argument 'ech_egress'` (same for `FHIR()` / `Soap()`),
+   and the factory *is* the schema (`config/connections_file.py:288-291`).
+
+ADR 0139 **is** reachable code-first — two ways, both executed end-to-end against the shipped
+factories — and it is only `connections.toml` that cannot express it:
+
+```python
+# config/OB_PARTNER_FHIR.py — both forms executed against the shipped code
+
+# (a) the shipped factory, then assign the settings. `Rest()` already RETURNS a
+#     ConnectionSpec, so this form simply never has to import one.
+from messagefoundry import Rest, outbound
+
+_s = Rest(url="https://partner.example/fhir")
+_s.settings["ech_egress"] = True                      # route this connection's egress via the sidecar
+_s.settings["ech_sidecar"] = "http://127.0.0.1:1080"  # the sidecar's loopback listener
+outbound("OB_PARTNER_FHIR", _s)
+
+# (b) a hand-built spec, when you want the settings in one literal
+from messagefoundry.config.wiring import ConnectionSpec, ConnectorType
+
+outbound(
+    "OB_PARTNER_FHIR",
+    ConnectionSpec(
+        ConnectorType.REST,
+        {
+            "url": "https://partner.example/fhir",
+            "ech_egress": True,
+            "ech_sidecar": "http://127.0.0.1:1080",
+        },
+    ),
+)
 ```
 
-`ech_sidecar` must be a loopback address and is **mutually exclusive** with `proxy_url` (the sidecar *is*
-that connection's egress proxy). It composes with the connection's TLS verify/allowlist/signing posture.
+**WARNING: that is a raw-settings escape hatch, not a supported surface.** These keys get no factory
+validation, cannot be authored as data, and are invisible to the connection editor. Giving them a
+factory parameter (and therefore a `connections.toml` form) is tracked as **BACKLOG #NNN**.
+
+`ech_sidecar` must be a loopback address and is **mutually exclusive** with the `proxy_url` settings key
+(the sidecar *is* that connection's egress proxy) — refused at construction,
+[`transports/rest.py:1192-1196`](../../messagefoundry/transports/rest.py). It composes with the
+connection's TLS verify/allowlist/signing posture.
 
 ## Verify before trusting a partner
 

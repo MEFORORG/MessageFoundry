@@ -90,13 +90,16 @@ CASES: list[tuple[str, str, bool, str]] = [
         """,
     ),
     (
-        "fhir_pos_flat_query_fstring",
+        "fhir_pos_path_fstring",
         "unsafe-db-lookup",
         True,
+        # #1243 removed the flat '?'-query this used to interpolate into, so the fixture now
+        # interpolates the PATH -- a live injection vector (it is what #1240's path-segment grammar
+        # gates defend), not a retired one. The rule reads args[1] either way.
         """
         @handler("h")
         def h(msg):
-            res = fhir_lookup("epic", f"Patient?identifier=MRN|{msg['PID-3.1']}")
+            res = fhir_lookup("epic", f"Patient/{msg['PID-3.1']}")
             return Send("OB", msg)
         """,
     ),
@@ -275,10 +278,12 @@ CASES: list[tuple[str, str, bool, str]] = [
         "fhir_pos_keyword_query",
         "unsafe-db-lookup",
         True,
+        # #1243: keyword form, interpolated PATH (see fhir_pos_path_fstring). The rule honours the
+        # query= keyword as well as the 2nd positional, which is the property this case pins.
         """
         @handler("h")
         def h(msg):
-            fhir_lookup("epic", query=f"Patient?x={msg['PID-3.1']}")
+            fhir_lookup("epic", query=f"Patient/{msg['PID-3.1']}")
             return Send("OB", msg)
         """,
     ),
@@ -594,6 +599,65 @@ CASES: list[tuple[str, str, bool, str]] = [
         @handler("h")
         def h(msg):
             return Send("OB", msg)
+        """,
+    ),
+    # --- BACKLOG #337: constant getattr indirection is spliced in _dotted_call_name -------------
+    # A constant getattr(mod, "name") indirection now resolves (getattr(os, "system") -> os.system),
+    # so it is flagged like the bare dotted call; a dynamic getattr(os, name) stays unresolved.
+    (
+        "amb_pos_getattr_os_system",
+        "ambient-authority",
+        True,
+        """
+        import os
+
+        @handler("h")
+        def h(msg):
+            getattr(os, "system")("id")
+            return Send("OB", msg)
+        """,
+    ),
+    (
+        "amb_neg_getattr_dynamic_attr",
+        "ambient-authority",
+        False,
+        """
+        import os
+
+        @handler("h")
+        def h(msg):
+            name = msg["PID-3.1"]
+            getattr(os, name)("x")
+            return Send("OB", msg)
+        """,
+    ),
+    # The splice feeds impure-transform too (shared _dotted_call_name), still import-gated on `time`.
+    (
+        "impure_pos_getattr_time_time",
+        "impure-transform",
+        True,
+        """
+        import time
+
+        @handler("h")
+        def h(msg):
+            stamp = getattr(time, "time")()
+            return Send("OB", msg)
+        """,
+    ),
+    # --- BACKLOG #337: phi-to-log widened to undecorated `_*` transform helpers -----------------
+    # The decompose-by-role convention steers PHI handling into undecorated helpers, so phi-to-log
+    # must reach them; it still keys on the first positional parameter as the message symbol.
+    (
+        "phi_pos_undecorated_helper_logs_msg",
+        "phi-to-log",
+        True,
+        """
+        import logging
+        log = logging.getLogger(__name__)
+
+        def apply(msg):
+            log.info("transforming %s", msg.raw)
         """,
     ),
 ]
@@ -978,6 +1042,39 @@ def test_allow_root_still_flags_its_ambient_use(tmp_path: Path) -> None:
     assert result.blocking is True
     assert "[ambient-authority]" in result.detail
     assert "unvetted-import:httpx" not in result.detail
+
+
+# --- BACKLOG #337: widening phi-to-log must NOT widen impure-transform, and must still discriminate.
+def test_widened_phi_to_log_does_not_widen_impure_transform(tmp_path: Path) -> None:
+    # The exact shipped `_pdf_mdm_transforms.py` ingest-time wall-clock fallback, in an UNDECORATED
+    # helper. phi-to-log now reaches undecorated helpers (#337), but impure-transform stays
+    # decorated-scope, so this timestamp fallback must not be flagged — it has no PHI log sink and the
+    # impure rule must not widen (the trade ADR 0144 records; widening it would red the samples gate).
+    (tmp_path / "_pdf_mdm.py").write_text(
+        "import time\n\n"
+        "def build(pdf, ingest_time=None):\n"
+        "    return time.strftime(\n"
+        '        "%Y%m%d%H%M%S",\n'
+        "        time.gmtime(ingest_time if ingest_time is not None else time.time()),\n"
+        "    )\n",
+        encoding="utf-8",
+    )
+    assert _check_handler_security(tmp_path).skipped
+
+
+def test_phi_to_log_undecorated_helper_non_message_local_is_clean(tmp_path: Path) -> None:
+    # The widened phi-to-log still keys on the message symbol (first positional param): an undecorated
+    # helper that logs a NON-message local (count) must not flag — proving the rule discriminates and
+    # is not "any INFO+ log call in any function".
+    (tmp_path / "_helper.py").write_text(
+        "import logging\n"
+        "log = logging.getLogger(__name__)\n\n"
+        "def build(msg):\n"
+        "    count = 5\n"
+        '    log.info("c=%s", count)\n',
+        encoding="utf-8",
+    )
+    assert _check_handler_security(tmp_path).skipped
 
 
 def test_real_samples_config_is_clean() -> None:

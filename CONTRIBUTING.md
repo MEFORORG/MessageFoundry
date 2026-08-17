@@ -78,13 +78,23 @@ seeing nothing — the failure mode this project has hit more than once. Do not 
 `--require-tokens`, and do not reach for `--no-verify`.
 
 - **Outside contributors** cannot have the real list; it will never be distributable. Run
-  `setup-leak-gate.ps1 -Synthetic` to install the committed synthetic template. Your commits will
-  pass, and **CI runs the real detector set on your PR** — that is the authoritative check.
+  `setup-leak-gate.ps1 -Synthetic` to install the committed synthetic template. It is a DIFFERENT
+  detector set, not a weaker copy of the real one: its placeholders are the fictional customer and
+  partner names this project's own docs and samples use throughout, so staging one of those files
+  can block a commit that leaks nothing. Read the run banner to see which set is loaded, and judge
+  the hit on that. **CI runs the real detector set on your PR** — that is the authoritative check.
 - **Maintainers** install the real list: `setup-leak-gate.ps1 -From <path>`.
 
-The script always finishes by running the scanner and printing its per-section detector counts,
-because a green gate is evidence only if you confirmed it can see. The scanner labels its mode on
-every run, so a synthetic set can never be mistaken for a real one:
+**Writing a placeholder site code?** Use a non-numeric stand-in — `SITEA`, or the angle-bracket
+`<site>` form. The token list's `[site_prefix]` guidance is written for whoever fills that list *in*;
+read as advice for placeholder *values* it points you straight at a prefix this gate then detects in
+your tracked prose, and the hook blocks the commit.
+[`scripts/security/scan-tokens.local.txt.example`](scripts/security/scan-tokens.local.txt.example) is
+the source of record for the detail.
+
+`setup-leak-gate.ps1` always finishes by running the scanner and printing its per-section detector
+counts, because a green gate is evidence only if you confirmed it can see. The scanner labels its
+mode on every run, so a synthetic set can never be mistaken for a real one:
 
 ```
 loaded names=7, estate=13, estate_file_scanned=12, site_prefixes=1
@@ -95,6 +105,14 @@ loaded names=0, estate=0,  ...  [STRUCTURAL-ONLY: no token source configured]
 Only the first is a real local scan. Note that the synthetic template is **below CI's per-section
 floor** (`names=7, estate=13, site_prefixes=1`) by design — passing locally with it does not mean you
 would pass CI's gate, only that nothing structural was found.
+
+It also prints a `token source:` line naming **where those counts came from** — the
+`MEFOR_FORBIDDEN_TOKENS` path, that variable carrying the list inline (named, never printed), or
+`scripts/security/scan-tokens.local.txt` — and says `OVERRIDDEN` when the environment won over the
+file the run just installed. That variable takes precedence, so without the line `-Synthetic` could
+install the template and then truthfully report the *real* set as configured, which reads as a
+contradiction. The scanner's exit code is propagated too: a refusal is reported as `VERIFY FAILED`,
+not as `CONFIGURED`.
 
 ## Finding something to work on
 
@@ -108,6 +126,30 @@ concrete features go in **Issues**; security vulnerabilities go through a
 
 Building two changes in parallel? Don't share one checkout — give each its own **git worktree**
 (`scripts\worktree\new.ps1 -Name <x>`). See [docs/WORKTREES.md](docs/WORKTREES.md).
+
+### If you use Claude Code: this repo ships two hooks
+
+[`.claude/settings.json`](.claude/settings.json) is **tracked**, so cloning this repo configures
+Claude Code, and you should read it before you trust it. It is the only tracked file under
+`.claude/`; everything else there is session state and stays ignored.
+
+- **It wires two PowerShell scripts to run automatically.**
+  [`scripts/hooks/block-blanket-git-stage.ps1`](scripts/hooks/block-blanket-git-stage.ps1) runs
+  before any git command the agent issues, and
+  [`scripts/worktree/session-context.ps1`](scripts/worktree/session-context.ps1) runs at session
+  start. Both are in-repo, reviewable, and covered by the same review as any other script here.
+- **They need PowerShell 7 (`pwsh`).** A hook that cannot start is **non-blocking** — the action
+  proceeds and you get a notice, not a refusal. So on a machine without `pwsh` the staging guard is
+  absent rather than failing loudly. Do not treat it as coverage you can rely on; the leak gate
+  above is the control that fails closed.
+- **The deny rules cover the directory you started the agent in.** They keep `.env`, `secrets/`,
+  keys and the local `*.db` store away from the agent's file tools at any depth *below that
+  directory*. A session started in one checkout that writes into a sibling worktree by absolute path
+  is outside them. The rules are a guard against accident and drift, not against a determined
+  operator, and they are not a substitute for the leak gate.
+
+None of this is required to contribute. Delete the file locally if you would rather configure your
+own; `git update-index --skip-worktree .claude/settings.json` keeps that local.
 
 ## PHI / safety
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // The Steps view editor (ADR 0076 §2 phase 2b + phase 3 / BACKLOG #222). A `CustomTextEditorProvider`
 // over a Handler `.py` that renders it as a Corepoint-style ordered, nested typed Steps view:
 // action / lookup / control / send rows with parameter forms, and in-place read-only `code` rows for
@@ -34,6 +36,9 @@ import {
   codesetList,
   configDir,
   isExecGated,
+  lensParseStdin,
+  lensRewriteStdin,
+  lensSchema,
   messageSetsDir,
   runJson,
   runJsonWithStdin,
@@ -46,11 +51,14 @@ import {
   ADD_MENU_BY_ID,
   EditLoopGuard,
   REDACTED_LIVE_VALUE,
+  RerenderDebouncer,
   TOOLBAR_INSERT_DEFAULTS,
   addMenuGroups,
   buildAddDestinationRequest,
   buildAddMenuRequest,
   buildDeleteRequest,
+  itemAllowedInRole,
+  roleScopeAttr,
   buildEditRequest,
   buildHandlerViewModels,
   buildLensTraceArgs,
@@ -62,6 +70,7 @@ import {
   escapeHtml,
   mergeLiveValues,
   parseRewriteResult,
+  releaseEdit,
   renderHandlersHtml,
   renderStepsContextMenuHtml,
   shouldAttachLiveValues,
@@ -72,6 +81,7 @@ import {
   type HandlerViewModel,
   type LensParseResult,
   type LiveInlineValue,
+  type OpSchema,
   type RowKind,
   type StructuralRequest,
 } from "./stepsModel";
@@ -84,6 +94,7 @@ import {
 } from "./hl7schema";
 import { buildSegmentScope, sampleSegments } from "./hl7scope";
 import { pickHl7Path, type PickScope } from "./hl7Picker";
+import { nonce } from "./cspNonce";
 
 /** Debounce (ms) before re-parsing after the underlying document changes in a split text view. */
 const RERENDER_DEBOUNCE_MS = 250;
@@ -138,15 +149,6 @@ async function runInsertPrompts(item: AddMenuItem): Promise<Record<string, strin
   return values;
 }
 
-function nonce(): string {
-  let s = "";
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 24; i++) {
-    s += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return s;
-}
-
 export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
   static readonly viewType = "messagefoundry.stepsEditor";
 
@@ -164,12 +166,22 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
   // (§2.3 P2/P3; `undefined` until that build lands). Loaded once — pure in-memory data, no per-pick I/O.
   private readonly schema: Hl7Schema | undefined;
   private readonly structures: Hl7Structures | undefined;
+  // The transform-vocabulary param schema (BACKLOG #235) that drives each editable param's input widget
+  // (enum -> dropdown, int -> number field). Shelled ONCE (`lens schema`, config-independent) and cached
+  // for the panel's life — pure signature-derived data, so it never changes between projections. Left
+  // undefined if the fetch fails (an older/unavailable engine) -> every param falls back to a text input.
+  private opSchema: OpSchema | undefined;
+  private opSchemaFetched = false;
   // ADR 0104 §2.3 P2: handler name -> its recognized message type, stashed by render() from the lens parse
   // (a projection of the current parse, never persisted state). Read by scopeFor to rank the picker.
   private handlerTypes = new Map<
     string,
     { acceptsTypes?: string[]; inferredType?: { code?: string; trigger?: string } }
   >();
+  // ADR 0076 Amendment D: each projected element's ROLE, stashed by render() from the same parse (a
+  // projection of THIS parse, never persisted state). The webview greys the out-of-role Add items; this
+  // is the provider-side half of the same rule, because inbound webview data is untrusted.
+  private handlerRoles = new Map<string, "handler" | "router">();
 
   constructor(
     private readonly version: string,
@@ -268,7 +280,6 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       enableScripts: true,
       localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, "media")],
     };
-    let debounce: ReturnType<typeof setTimeout> | undefined;
     let disposed = false;
     // Handshake: the webview posts a `ping` the instant its script starts. If a render sets the html but no
     // ping arrives, the script never initialized (blocked / threw at load, e.g. a double acquireVsCodeApi) —
@@ -276,6 +287,24 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     let sawAlive = false;
     // One edit at a time + the webview↔document update-loop guard (ADR 0076 §5).
     const guard = new EditLoopGuard();
+
+    // The ONE debounced re-projection channel (ADR 0076 §5 "sync on save"). Both a save and a refresh
+    // the guard deferred (BACKLOG #234) go through it, so an owed refresh coalesces with a real save
+    // exactly like two rapid saves do instead of adding a second, differently-timed render. `render()`
+    // CANCELS it on entry, so a release site that forces a full re-projection discharges the debt
+    // rather than racing it into a second one (ADR 0076 Amendment C, AC-C2).
+    const rerender = new RerenderDebouncer<ReturnType<typeof setTimeout>>(
+      () => void render(),
+      RERENDER_DEBOUNCE_MS,
+      (fn, ms) => setTimeout(fn, ms),
+      (handle) => clearTimeout(handle),
+    );
+    const scheduleRerender = (): void => {
+      if (disposed) {
+        return;
+      }
+      rerender.schedule();
+    };
 
     // Reopen the same resource with the built-in text editor (the §4 degradation fallback).
     const fallBackToText = (reason: string): void => {
@@ -285,7 +314,28 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     };
 
     const render = async (): Promise<void> => {
+      // A re-projection reads the WHOLE current buffer below, so it SATISFIES any refresh still owed —
+      // by either route (ADR 0076 Amendment C, AC-C2: "exactly ONE re-projection"). Both discharges run
+      // FIRST and synchronously, before the `lens parse` await, so a save landing mid-render is recorded
+      // afresh and still honoured:
+      //   * the armed debounce, or it would replace the whole webview HTML a second time ~250 ms later
+      //     (the three release sites that force a render immediately after releasing the slot);
+      //   * the guard's owed-refresh debt, for the one path where the forced render happens BEFORE the
+      //     release rather than after it — `drainEdits`' unexpected-rejection handler renders inside the
+      //     drain, and its `finally` would otherwise arm a redundant second pass on the way out.
+      rerender.cancel();
+      guard.takeSuppressedChange();
       const ws = workspaceDir();
+      // Fetch the op-param schema ONCE (BACKLOG #235) — it drives each editable param's input widget and
+      // is config-independent signature data, so a single shell suffices for the panel's life. A failure
+      // leaves it undefined (every param falls back to a text input); it never blocks the projection.
+      if (!this.opSchemaFetched) {
+        this.opSchemaFetched = true;
+        this.opSchema = await lensSchema(ws).catch(() => undefined);
+        if (disposed) {
+          return;
+        }
+      }
       // Project the LIVE buffer (piped over stdin as `lens parse -`), NOT the on-disk file: after a
       // structural edit's WorkspaceEdit the buffer is dirty (buffer != disk), and the row coordinates
       // must describe what the user actually sees. Parsing the same `source` we then slice for the
@@ -295,7 +345,9 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       let parse: LensParseResult | null = null;
       let error: string | null = null;
       try {
-        parse = await runJsonWithStdin<LensParseResult>(["lens", "parse", "-"], source, ws);
+        // At the contract this extension can RENDER, with a one-shot fallback for an older engine that
+        // does not know the flag (ADR 0076 §A.7 / §D.7 — skew is handled, not discovered).
+        parse = await lensParseStdin(source, ws);
       } catch (e) {
         error = e instanceof Error ? e.message : String(e);
       }
@@ -317,6 +369,9 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           { acceptsTypes: h.accepts_types, inferredType: h.inferred_type },
         ]),
       );
+      this.handlerRoles = new Map(
+        (parse as LensParseResult).handlers.map((h) => [h.handler, h.role ?? "handler"]),
+      );
       // Live values come from a SECOND `dryrun --trace` that reads the module FROM DISK, but the rows
       // above are projected from the LIVE buffer. While the buffer is dirty (an unsaved structural edit
       // shifted rows relative to disk — or any unsaved change made buffer != disk) the disk trace's line
@@ -336,7 +391,14 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       const scriptUri = panel.webview.asWebviewUri(
         vscode.Uri.joinPath(this.extensionUri, "media", "stepsWebview.js"),
       );
-      panel.webview.html = pageHtml(panel.webview, handlers, this.sampleLabel, this.version, scriptUri);
+      panel.webview.html = pageHtml(
+        panel.webview,
+        handlers,
+        this.sampleLabel,
+        this.version,
+        scriptUri,
+        this.opSchema,
+      );
       // Arm the handshake: if the freshly-loaded script doesn't ping within 3s, it failed to initialize.
       sawAlive = false;
       setTimeout(() => {
@@ -358,8 +420,10 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // send as stdin — that compares the buffer against itself and the guard always passes (the defect).
     const applyOne = async (msg: EditMessage): Promise<void> => {
       const spec = buildEditRequest(msg);
-      const res = await runWithStdin(
-        ["lens", "rewrite", "-", "--edit", JSON.stringify(spec)],
+      // At the SAME contract the rows were projected with — the engine re-locates the row through that
+      // grammar, so sending v2 coordinates into a v1 partition would miss it (or hit a different row).
+      const res = await lensRewriteStdin(
+        spec,
         document.getText(),
         workspaceDir(),
       );
@@ -392,12 +456,18 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // CLI-refusal path, which `applyOne` handles inline) releases the slot AND keeps draining the queue
     // rather than stranding a pending second edit until the user types again.
     const applyEdit = (msg: EditMessage): Promise<void> =>
-      drainEdits(guard, msg, applyOne, (err) => {
-        void vscode.window.showErrorMessage(
-          `MessageFoundry: could not apply the edit — ${err instanceof Error ? err.message : String(err)}`,
-        );
-        void render(); // revert the optimistic webview change to the true projection
-      });
+      drainEdits(
+        guard,
+        msg,
+        applyOne,
+        (err) => {
+          void vscode.window.showErrorMessage(
+            `MessageFoundry: could not apply the edit — ${err instanceof Error ? err.message : String(err)}`,
+          );
+          void render(); // revert the optimistic webview change to the true projection
+        },
+        scheduleRerender, // a save the guard suppressed mid-drain is deferred, not dropped (#234)
+      );
 
     // Apply a STRUCTURAL op (insert/delete/move). Unlike a param edit these change the file's line count,
     // so every row coordinate the webview holds becomes stale — the op must run ALONE (never batched with
@@ -414,11 +484,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       }
       let applied = false;
       try {
-        const res = await runWithStdin(
-          ["lens", "rewrite", "-", "--edit", JSON.stringify(spec)],
-          document.getText(),
-          workspaceDir(),
-        );
+        const res = await lensRewriteStdin(spec, document.getText(), workspaceDir());
         if (disposed) {
           return false;
         }
@@ -448,9 +514,12 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         // queued while it held the slot references stale PRE-op coordinates. DROP that queue before
         // releasing the slot — never let the next drain apply it against shifted rows (the orphaned-queue
         // hazard; without this the queued edit survives re-projection and is later applied on stale coords,
-        // ADR 0076 §5 v2). clearPending precedes endEdit so nothing can drain in between.
+        // ADR 0076 §5 v2). clearPending precedes the release so nothing can drain in between.
         guard.clearPending();
-        guard.endEdit();
+        // releaseEdit, never a bare endEdit: a save that landed while this op held the slot still owes a
+        // re-projection (#234). Its `clearPending` semantics are unchanged — a DROPPED param edit and a
+        // DEFERRED document refresh are different rules and must not be folded together.
+        releaseEdit(guard, scheduleRerender);
       }
       if (disposed) {
         return applied;
@@ -483,7 +552,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           current = guard.takePending(); // drain a raced typed edit (F5) — NEVER clearPending (that drops it)
         }
       } finally {
-        guard.endEdit();
+        // releaseEdit, never a bare endEdit — a save suppressed during the pick is deferred (#234).
+        releaseEdit(guard, scheduleRerender);
       }
       if (disposed) {
         return;
@@ -511,7 +581,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         );
       } finally {
         guard.clearPending();
-        guard.endEdit();
+        // releaseEdit, never a bare endEdit — a save suppressed during the undo/redo is deferred (#234).
+        releaseEdit(guard, scheduleRerender);
       }
       if (disposed) {
         return;
@@ -527,7 +598,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         lineStart?: number;
         lineEnd?: number;
         name?: string;
-        value?: string;
+        // A number for a number-kind widget (BACKLOG #235); a string for every other field.
+        value?: string | number;
         direction?: "up" | "down";
         toLineStart?: number;
         toLineEnd?: number;
@@ -579,7 +651,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           typeof m.lineStart === "number" &&
           typeof m.lineEnd === "number" &&
           typeof m.name === "string" &&
-          typeof m.value === "string" &&
+          // A number-kind widget posts a JS number (BACKLOG #235); every other field posts a string.
+          (typeof m.value === "string" || typeof m.value === "number") &&
           typeof m.expectSrc === "string"
         ) {
           void applyEdit({
@@ -760,6 +833,15 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           // The ADR 0106 grouped Add menu: look up the catalog item, gather any picker inputs, then build
           // + apply the matching lens op via the SAME byte-stable applyStructural path as every other insert.
           const item = ADD_MENU_BY_ID[m.itemId];
+          // A router stays pure destination-selection (ADR 0076 D.6): refuse an item that authors a
+          // transform verb, a lookup, a diagnostic or an outbound send inside one. The engine refuses it
+          // too; this stops the request before it becomes an error toast the user has to read.
+          if (!itemAllowedInRole(item, this.handlerRoles.get(m.handler) ?? "handler")) {
+            void vscode.window.showWarningMessage(
+              `MessageFoundry: "${item.label}" is not available in a Router — a Router selects destinations, it does not transform the message.`,
+            );
+            return;
+          }
           const anchor = {
             handler: m.handler,
             lineStart: m.lineStart,
@@ -832,34 +914,39 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       },
     );
 
-    // The lens is READ-ONLY and refreshes ON SAVE only (ADR 0076 §5 "sync on save" guardrail): `lens parse`
-    // reads the file from disk, so re-projecting on every keystroke would slice the current (dirty) buffer
-    // against line ranges computed from stale disk content, and re-shell Python per keystroke. Saving makes
-    // disk == buffer, so the projection stays aligned. Debounced to coalesce rapid saves.
+    // The lens is READ-ONLY and refreshes ON SAVE only (ADR 0076 §5 "sync on save" guardrail, adopted
+    // wholesale from the verified InterSystems/VS Code set). Re-projecting per keystroke would re-shell
+    // Python on every character, and each re-projection replaces the whole webview HTML — which would
+    // destroy focus, selection and any half-typed param input mid-word. A save is the natural,
+    // user-chosen commit point. Debounced to coalesce rapid saves.
+    //
+    // NB (BACKLOG #234, corrected 2026-08-04): this comment used to justify the gate by claiming
+    // "`lens parse` reads the file from disk, so re-projecting on every keystroke would slice the current
+    // (dirty) buffer against line ranges computed from stale disk content". That is FALSE — `render()`
+    // above pipes `document.getText()` as `lens parse -` over stdin and slices that SAME snapshot for the
+    // view models, and ADR 0076's addendum says so too ("the rows are projected from the live buffer").
+    // The disk read belongs to the live-value TRACE (`dryrun --trace`), which is separately save-gated by
+    // #225 and is a different rule. A compensating control must not rest on a false premise
+    // (CLAUDE.md §11); whether to relax the gate is #234's other half and is not decided here.
     const sub = vscode.workspace.onDidSaveTextDocument((saved) => {
       if (saved.uri.toString() !== document.uri.toString()) {
         return;
       }
       // Don't re-project while our own edit's WorkspaceEdit is still applying — that is the webview↔
-      // document update loop the guard exists to break (ADR 0076 §5). A save after the edit settles
-      // re-renders normally.
+      // document update loop the guard exists to break (ADR 0076 §5). But the guard cannot tell OUR
+      // WorkspaceEdit apart from a USER save that merely landed mid-rewrite, and returning here used to
+      // DISCARD that save outright, leaving the view on a stale projection until the next one. Record the
+      // debt instead; `releaseEdit` runs it through this same debounced path when the slot frees (#234).
       if (!guard.shouldReactToDocumentChange()) {
+        guard.noteSuppressedChange();
         return;
       }
-      if (debounce) {
-        clearTimeout(debounce);
-      }
-      debounce = setTimeout(() => {
-        debounce = undefined;
-        void render();
-      }, RERENDER_DEBOUNCE_MS);
+      scheduleRerender();
     });
     panel.onDidDispose(() => {
       disposed = true;
       sub.dispose();
-      if (debounce) {
-        clearTimeout(debounce);
-      }
+      rerender.cancel();
     });
 
     void render();
@@ -883,9 +970,10 @@ function pageHtml(
   sampleLabel: string | undefined,
   version: string,
   scriptUri: vscode.Uri,
+  schema: OpSchema | undefined,
 ): string {
   const n = nonce();
-  const body = renderHandlersHtml(handlers);
+  const body = renderHandlersHtml(handlers, schema);
   // The insert-toolbar dropdown: a leading "[select item]" placeholder (value ""), then one option per
   // insertable item, built from the single-source-of-truth ADD_MENU_CATALOG (ADR 0106), grouped into
   // <optgroup>s. Each <option> value is the catalog item id (the ADD_MENU_BY_ID allowlist key the provider
@@ -900,6 +988,7 @@ function pageHtml(
               (item) =>
                 `<option value="${escapeHtml(item.id)}"` +
                 (item.anchorConstraint ? ` data-anchor="${escapeHtml(item.anchorConstraint)}"` : "") +
+                ` data-role-scope="${escapeHtml(roleScopeAttr(item))}"` +
                 `>${escapeHtml(item.label)}</option>`,
             )
             .join("") +

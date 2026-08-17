@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 <#
 .SYNOPSIS
     PreToolUse gate: refuse to edit a file another LIVE session is already changing.
@@ -52,6 +54,37 @@ param(
 
 # No $ErrorActionPreference = Stop: this gate fails OPEN, and a throw would be a deny-by-crash.
 $ErrorActionPreference = "SilentlyContinue"
+
+# Fold a CALLER-SUPPLIED value before it goes into a deny reason or an additionalContext notice.
+#
+# BACKLOG #1040 was filed against the worktree gate, and its closing sentence is the reason this exists
+# here too: "every hook in scripts/hooks/ that emits a remediation an agent is told to run has this
+# shape -- the gate is where it was noticed, not where it is confined." Measured on THIS gate: a
+# PreToolUse payload whose file_path carried embedded newlines produced a notice with TWO
+# "Before overriding:" blocks, the FORGED one FIRST, replacing the real `overlap.ps1` line with a
+# command of the attacker's choosing. A model reading top-down reaches the forged one first. Nothing
+# has to exist on disk -- only the JSON field -- so no other gate sees it either.
+#
+# THE VALUES ARE NOT ONLY THE PATH. The rows come from overlap.ps1, so Branch is a git refname and
+# Worktree a directory name, and a refname is attacker-choosable from a public fork (`gh pr checkout`
+# and `git fetch origin <ref>:<ref>` both create refs/heads/<their-name>). Work is free text from the
+# session registry. All of them are folded, because deciding value by value is what left the last one
+# bare.
+#
+# PROSE ONLY, and that is a statement about this file rather than a general rule. Every command this
+# gate prints is a LITERAL with no interpolation in it, so there is no command-bound value here and no
+# quoting helper. If a command line here ever gains an interpolation, folding is NOT the treatment for
+# it -- see the worktree gate's Get-SafeForCommand, and keep the two named apart.
+#
+# A LOCAL COPY, deliberately, and the alternative is worse. worktree_gate.ps1 is installed OUTSIDE
+# every working tree by install-gate.ps1, so it can dot-source nothing from a checkout; a shared module
+# would therefore be importable by this hook and not by that one, which is two definitions of one rule
+# that drift invisibly. Four lines duplicated, with the divergence visible to grep, beats that.
+function Get-SafeForMessage([string]$Value) {
+    $t = ("$Value" -replace '[\r\n\t]', ' ')
+    if ($t.Length -gt 400) { return $t.Substring(0, 400) + '...' }
+    return $t
+}
 
 function Deny([string]$Reason) {
     # The hookSpecificOutput wrapper is MANDATORY -- a bare permissionDecision is silently ignored,
@@ -117,7 +150,7 @@ function Write-Unresolved([string]$Slug, [string]$Detail) {
         $payload = @{
             hookSpecificOutput = @{
                 hookEventName     = "PreToolUse"
-                additionalContext = "[collision] The collision gate could NOT check this edit ($Slug): $Detail. It allowed the edit without consulting any peer worktree, so an absent collision warning means UNKNOWN here, not clear. Check by hand before assuming nobody else is in this file:  pwsh -NoProfile -File scripts\coord\overlap.ps1"
+                additionalContext = "[collision] The collision gate could NOT check this edit ($(Get-SafeForMessage $Slug)): $(Get-SafeForMessage $Detail). It allowed the edit without consulting any peer worktree, so an absent collision warning means UNKNOWN here, not clear. Check by hand before assuming nobody else is in this file:  pwsh -NoProfile -File scripts\coord\overlap.ps1"
             }
         }
         [Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 6))
@@ -193,21 +226,25 @@ $editing = @($live | Where-Object { $null -eq $_.PSObject.Properties['MatchedDir
 if ($editing.Count -eq 0) {
     # Committed-and-clean in every live worktree: report it, do not block. The peer may well have
     # already done what you are about to do, which is worth knowing and not worth refusing over.
-    $names = (@($live | ForEach-Object { "$($_.Short) [$($_.Branch)]" }) -join ', ')
+    $names = (@($live | ForEach-Object {
+                "$(Get-SafeForMessage $_.Short) [$(Get-SafeForMessage $_.Branch)]" }) -join ', ')
     [Console]::Out.Write((@{
                 hookSpecificOutput = @{
                     hookEventName     = "PreToolUse"
-                    additionalContext = "[collision] $(Split-Path $target -Leaf) was already CHANGED AND COMMITTED on another live session's branch ($names), whose tree is now clean. Not blocking -- but that work may overlap yours, so check its commits before you duplicate or revert it."
+                    additionalContext = "[collision] $(Get-SafeForMessage (Split-Path $target -Leaf)) was already CHANGED AND COMMITTED on another live session's branch ($names), whose tree is now clean. Not blocking -- but that work may overlap yours, so check its commits before you duplicate or revert it."
                 }
             } | ConvertTo-Json -Compress -Depth 6))
     exit 0
 }
 
-$leaf = Split-Path $target -Leaf
+$leaf = Get-SafeForMessage (Split-Path $target -Leaf)
 $lines = @("$leaf has UNCOMMITTED changes in another LIVE session's worktree -- editing it now means one of you loses work at merge.", "")
 foreach ($r in $editing) {
-    $lines += "  $($r.Short) ($($r.Surface)) in $($r.Worktree) [$($r.Branch)]"
-    foreach ($w in @($r.Work | Select-Object -First 2)) { $lines += "      building: $w" }
+    $lines += "  $(Get-SafeForMessage $r.Short) ($(Get-SafeForMessage $r.Surface)) in " +
+              "$(Get-SafeForMessage $r.Worktree) [$(Get-SafeForMessage $r.Branch)]"
+    foreach ($w in @($r.Work | Select-Object -First 2)) {
+        $lines += "      building: $(Get-SafeForMessage $w)"
+    }
 }
 $lines += ""
 $lines += "Before overriding: that session may already be doing what you are about to do."

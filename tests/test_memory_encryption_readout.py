@@ -57,7 +57,7 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
     The registry takes all four inputs as REQUIRED arguments deliberately (ADR 0148: one posture, and a
     deviation the registry cannot see is a second posture by the back door). The tests below are about
     the ``[security]`` switches specifically, so the other three are pinned at shipped values here."""
-    return security_loosenings(sec, StoreSettings(), AuthSettings(), AlertsSettings(), ())
+    return security_loosenings(sec, StoreSettings(), AuthSettings(), AlertsSettings(), (), (), ())
 
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
@@ -77,12 +77,31 @@ def exposed_prod_phi(*security_lines: str) -> str:
         'security.listen_address = "0.0.0.0"\n'
         "security.block_unlisted_outbound = true\n"
         "security.delete_message_bodies_after_days = 30\n"
+        # BACKLOG #1026: a PHI instance behind a declared terminator under `enforce` now REFUSES
+        # without a public address -- the ASVS 12.1.1 probe dials it, and leaving it unset silently
+        # disabled that check. Declared here with the rest of the pre-cleared ladder so these cases
+        # keep testing the ADR 0152 readout rather than the new precondition, exactly as the
+        # docstring above says the Posture-B declarations are pre-cleared.
+        #
+        # THE AUTHORED KEY IS `[security].web_console_public_address`. `[api].public_origin` is the
+        # INTERNAL settings name and ADR 0118 retired the authored form, which is refused outright.
+        # And note WHERE it goes: before the first table header, for the reason the docstring gives.
+        'security.web_console_public_address = "https://mefor.example.org"\n'
         + "".join(security_lines)
         + '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
         "[retention]\ndead_letter_days = 30\n"
         '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
     )
+
+
+class _PassingProbe:
+    """Stand-in for TlsFloorProbe: the startup ladder reads only ``.ok`` and ``.describe()``."""
+
+    ok = True
+
+    def describe(self) -> str:
+        return "stubbed probe (test)"
 
 
 def _serve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str, *, env: str = "prod") -> int:
@@ -92,6 +111,15 @@ def _serve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str, *, env: s
     (tmp_path / "messagefoundry.toml").write_text(toml, encoding="utf-8")
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    # The ASVS 12.1.1 TLS-floor probe makes real TLS handshakes against the declared public address,
+    # which #1026 now requires in this posture -- so it runs in every case here and would return 2
+    # with nothing listening, failing each test for a reason none of them is about. Stubbed to PASS
+    # for the same reason `uvicorn.run` is: these are CONFIG-gate tests. The probe's own network
+    # behaviour is covered by tests/test_tls_floor_probe.py, and stubbing it to FAIL would assert
+    # the probe rather than the ladder.
+    monkeypatch.setattr(
+        "messagefoundry.config.tls_probe.probe_tls_floor", lambda origin: _PassingProbe()
+    )
     return main(["serve", "--config", str(SAMPLES_CONFIG), "--env", env])
 
 
@@ -403,6 +431,13 @@ def test_the_recommended_loopback_behind_proxy_topology_still_starts(
         monkeypatch,
         "security.block_unlisted_outbound = true\n"
         "security.delete_message_bodies_after_days = 30\n"
+        # BACKLOG #1026 CHANGES THIS TOPOLOGY'S MINIMUM CONFIG, and that is a real consequence of the
+        # ruling rather than a test detail. The 12.1.1 probe deliberately runs behind a declared proxy
+        # ON LOOPBACK TOO -- "a reachable front door that speaks TLS 1.0 is a fact, on loopback or
+        # not" -- so the precondition applies here as well, and the runbook's own config now needs a
+        # public address. Flagged for docs/security/OFF-LOOPBACK-DEPLOYMENT.md; this test asserts the
+        # topology STILL STARTS once declared, which is the property its docstring is defending.
+        'security.web_console_public_address = "https://mefor.example.org"\n'
         '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
         "[retention]\ndead_letter_days = 30\n"

@@ -408,6 +408,19 @@ Full references: **[SECURITY.md](SECURITY.md)**, **[PHI.md](PHI.md)**, and **[DE
       surface in `last_error`/`detail`).
 - [ ] Run **`messagefoundry audit-verify`** periodically (the audit log is tamper-*evident*, not
       tamper-*proof*), and set `[retention]` windows — they are **off by default (kept forever)**.
+- [ ] **Seal the audit DB across any gap in custody, with an anchor.** A bare `audit-verify` is clean
+      after the *newest* rows are deleted — the surviving prefix still chains — so on its own it is
+      blind to the attack it is run for. **`messagefoundry audit-anchor`** prints `COUNT:HEAD` (no PHI,
+      no secret) and **`messagefoundry audit-verify --expected-anchor COUNT:HEAD`** (or
+      `--expected-anchor-file`) checks it back. It is an **exact point-in-time seal**, and that fixes
+      how to use it: **stop or quiesce the engine, take the anchor, hold it somewhere the engine's
+      operator cannot rewrite, and re-verify while the chain is still quiesced** — around a maintenance
+      window, a database move, a backup/restore, or a hand-off between custodians. Whatever happened to
+      the DB in that gap is what it detects. **Two ways to get a useless answer:** taking the anchor and
+      verifying it in the same breath compares a value to itself, and re-checking a held anchor against
+      a **running** engine reports `truncated or rewritten` on every ordinary boot, because a running
+      engine writes audit rows. This is **not** a periodic control against a live engine — for that, an
+      off-box log forward / tee is still the answer, and it is the stronger one regardless.
 
 ---
 
@@ -433,21 +446,25 @@ Key semantics to internalize:
   - Transient (`AE`/`CE`) or transport error → **retry per `RetryPolicy`**.
   - Internal/code error → either **STOP** the lane and raise a `connection_stopped` alert, or
     **CONTINUE** (auto-dead-letter the bad message and keep flowing).
-  - **`RetryPolicy.max_attempts` unset = retry forever** (nothing silently lost) with exponential
-    backoff. Under the default **FIFO** ordering, a permanently-failing head **blocks its lane** until
-    it succeeds or is purged.
+  - **`RetryPolicy.max_attempts` defaults to 100 — finite** (about 7 h 50 m under the default
+    exponential backoff), then the row dead-letters into the replayable DLQ. Attempts are per row, so
+    an outage costs roughly the lane heads, not the backlog. Set `max_attempts=None` to retry forever
+    instead; under the default **FIFO** ordering that head then **blocks its lane** until it succeeds
+    or is purged.
 
 **Mandatory before go-live:**
 
 - [ ] **Wire real alerts.** Configure the `[alerts]` **webhook and/or email** notifier — do **not**
       rely on the default logging-only sink. The conservative defaults (FIFO head-of-line blocking,
-      retry-forever, STOP-on-internal-error) are only safe if a human gets paged when a lane stalls.
+      a ~7 h 50 m retry cap, STOP-on-internal-error) are only safe if a human gets paged when a lane
+      stalls.
 - [ ] **Set `[delivery]` buildup thresholds** (`max_oldest_seconds` defaults to 300s; set a `max_depth`
       sized to each connection's throughput) so `queue_buildup` fires before a stuck lane silently
       backs up. Buildup detection now covers the ingress and routed stages too, not just outbound.
-- [ ] **Choose `RetryPolicy` per outbound deliberately:** retry-forever for partners that must never
-      lose a message (accept head-of-line blocking + rely on buildup alerts), or a finite `max_attempts`
-      where stale data is worse than a replayable dead-letter.
+- [ ] **Choose `RetryPolicy` per outbound deliberately:** the finite default where a replayable
+      dead-letter beats a wedged lane, a *shorter* `max_attempts` where stale data is worse still, or
+      `max_attempts=None` (retry forever) for partners that must never be advanced past — the last
+      one accepts head-of-line blocking and depends on buildup alerts reaching a human.
 - [ ] **Choose `InternalErrorPolicy` intentionally:** `CONTINUE` (default) for high-volume feeds where
       uptime matters most; `STOP` for low-volume feeds where ordering/no-loss matters more than uptime.
 - [ ] **Code routers/handlers as pure and idempotent.** At-least-once means a message can re-run after
@@ -666,7 +683,7 @@ lifespan to call `engine.stop()` for a clean drain. Always **drain → stop → 
 
 | Symptom | First moves |
 |---|---|
-| **Stuck FIFO lane** (retry-forever head) | `queue_buildup` alert → inspect `/messages` for the head → fix-and-`replay`, or `dead_letter_now` to unblock the lane (the dead row stays replayable). |
+| **Stuck FIFO lane** (a head retrying toward the cap) | `queue_buildup` alert → inspect `/messages` for the head → fix-and-`replay`, or `dead_letter_now` to unblock the lane (the dead row stays replayable). |
 | **Poison message** | It dead-letters under `CONTINUE` (or stops the lane under `STOP`) → triage via `/dead-letters` → fix the transform → replay. |
 | **Full disk / `storage_threshold`** | Free space / tighten `[retention]` / VACUUM → confirm `/status` disk-free recovers. |
 | **Crash / unexpected restart** | Startup auto-recovers in-flight rows → verify `/health`, the "wiring started" banner, and that backlog drains. |

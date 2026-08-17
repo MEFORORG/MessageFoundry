@@ -33,7 +33,8 @@ The in-process embedding factory `create_app(engine)` is **fail-closed**: with n
 attached it denies every protected route (503) unless the caller explicitly opts out with
 `create_app(..., allow_no_auth=True)` — the deliberate embedding/local-dev escape hatch. The `serve`
 path runs auth-enabled by default; if `[auth] enabled = false` it sets that opt-in itself, and
-`__main__` refuses to serve auth-off on a non-loopback host — and, even with auth enabled, a
+`__main__` refuses to serve auth-off on an exposed instance — a non-loopback host, or a loopback host
+behind a declared TLS terminator — and, even with auth enabled, a
 non-loopback bind requires **TLS**: in-process (`[api].tls_cert_file`, WP-13a) or terminated at a
 trusted upstream proxy (`tls_terminated_upstream` + `trusted_proxies`, WP-15), or — as a dev override —
 an explicit `serve --allow-insecure-bind` (without any of these, bearer tokens + PHI would cross the
@@ -55,7 +56,12 @@ user exists, no further bootstrap occurs.
 self-retires while still **unclaimed** (never password-changed): it is **disabled once a second
 administrator exists**, and — if left unclaimed — **disabled `[auth].bootstrap_expiry_hours` after
 creation** (default 72 h; `0` disables the timer). Once you change its password it becomes a normal
-admin account and is never auto-disabled, so a single-admin deployment can't be locked out. A retired
+admin account and auto-retirement stops touching it: both the expiry timer and the supersession check
+fire only while the bootstrap is still **unclaimed**, which is carried by the `must_change_password`
+flag — so an administrative password reset, which re-sets that flag, **re-arms them**. And
+auto-retirement is not the only way to lose an administrator: the failed-attempt lockout is a
+**separate mechanism** and it does reach a claimed sole administrator (see
+[Brute-force & abuse protection](#brute-force--abuse-protection)). A retired
 bootstrap login is refused like any other invalid credential and the retirement is audited
 (`auth.bootstrap_admin_retired`).
 
@@ -195,7 +201,7 @@ apply. What each **adds** over plain `require()`:
 validates the handshake `Origin` against `[api].ws_allowed_origins` **before** `accept()`, then the
 bearer token, the must-change lockout and the permission.
 
-### Permission catalogue (27)
+### Permission catalogue (28)
 
 The catalogue is `Permission` in [`auth/permissions.py`](../messagefoundry/auth/permissions.py); the
 enum value **is** the wire/storage string. "Routes" counts engine route objects gated on that permission
@@ -210,7 +216,7 @@ under `create_app()` (they sum to 88, not 87, because `GET /messages/export` req
 | `MESSAGES_VIEW_RAW` | `messages:view_raw` | **PHI** | 4 | the whole message body: `GET /messages/{id}`, `/attachments/{id}`, `/outbound`, `/messages/export`; also the per-property switch for the captured-reply `body` |
 | `MESSAGES_REPLAY` | `messages:replay` | | 2 | `POST /dead-letters/replay`, `POST /messages/{id}/replay` |
 | `MESSAGES_RESEND` | `messages:resend` | | 1 | `POST /messages/{id}/resend` — resend a stored body to an **alternate** outbound (ADR 0090) |
-| `MESSAGES_EDIT` | `messages:edit` | **PHI** | 1 | `POST /messages/{id}/edit-resend`. The edited body **is** PHI, so it **implies** `messages:view_raw` **for the built-in roles** — every built-in role granting it also grants view_raw. That implication is a convention, **not enforced**: `messages:edit` is not in `CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`, so a custom role may hold it alone, and `GET /ui/messages/{id}/edit` renders the raw body on that permission |
+| `MESSAGES_EDIT` | `messages:edit` | **PHI** | 1 | `POST /messages/{id}/edit-resend`. The edited body **is** PHI, so it **implies** `messages:view_raw` **for the built-in roles** — every built-in role granting it also grants view_raw. **Minting** does not enforce that implication and deliberately still does not: `messages:edit` is not in `CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`, so a custom role holding it alone stays mintable. The **console editor** enforces it at the gate instead (BACKLOG #324) — `GET /ui/messages/{id}/edit` and `POST /ui/messages/{id}/edit-resend` require `messages:view_raw` **as well**, and fail closed on either, because the editor displays the body it edits |
 | `MESSAGES_EXPORT` | `messages:export` | **PHI** | 1 | `GET /messages/export` — the **largest PHI egress surface**; a capability distinct from `view_raw` (bulk ≠ opening one message), and the route requires **both** plus step-up |
 | `MESSAGES_PURGE` | `messages:purge` | | 1 | `POST /connections/{name}/purge` |
 | `CONNECTIONS_CONTROL` | `connections:control` | | 3 | `POST /connections/{name}/start`, `/stop`, `/restart` |
@@ -229,6 +235,7 @@ under `create_app()` (they sum to 88, not 87, because `GET /messages/export` req
 | `FILES_UPLOAD` | `files:upload` | **PHI** | 1 | `POST /uploads` — writes real HL7 PHI at rest |
 | `FILES_BROWSE` | `files:browse` | **PHI** | 3 | `GET /uploads` (metadata), `GET /uploads/{id}/messages` (bulk decrypt+split), `POST /uploads/{id}/resend` |
 | `FILES_DELETE` | `files:delete` | | 1 | `DELETE /uploads/{id}` — destructive, audited cleanup |
+| `FILES_ACCESS_ANY` | `files:access_any` | **PHI** | 0 | no route — an **object-level** override (ASVS 8.2.2), enforced in the uploaded-files handler bodies rather than at a gate (the console calls those handlers directly over the seam, so a gate would not cover it). Uploaded files are **owner-only**: without this, `files:browse`/`files:delete` reach only what the caller uploaded; with it, every uploader's. It is not a capability of its own — the holder still needs `files:browse` / `files:delete` for the route. Never assignable to a custom role |
 | `APPROVALS_APPROVE` | `approvals:approve` | | 3 | `GET /approvals`, `POST /approvals/{id}/approve`, `/reject` (dual control, ASVS 2.3.5). Never assignable to a custom role |
 
 `config:validate` and `code:edit` have **no API endpoint yet**; they are defined so
@@ -244,7 +251,7 @@ inheritance — where a permission came from is invisible downstream.
 
 | Role | Count | Permissions |
 |---|:--:|---|
-| **Administrator** | 27 | **every permission** — literally `frozenset(Permission)`, so a newly added permission is granted to it automatically |
+| **Administrator** | 28 | **every permission** — literally `frozenset(Permission)`, so a newly added permission is granted to it automatically |
 | **Operator** | 16 | `monitoring:read`, `monitoring:diagnose`, `messages:read`, `messages:view_summary`, `messages:view_raw`, `messages:replay`, `messages:resend`, `messages:edit`, `messages:export`, `messages:purge`, `connections:control`, `connections:test`, `logs:view`, `files:upload`, `files:browse`, `files:delete` |
 | **Deployment** | 4 | `monitoring:read`, `config:deploy`, `config:validate`, `connections:test` |
 | **Coding** | 4 | `monitoring:read`, `code:edit`, `config:validate`, `ai:assist` |
@@ -253,8 +260,9 @@ inheritance — where a permission came from is invisible downstream.
 
 An Operator therefore reaches **five PHI-marked capabilities beyond viewing one message** — counted
 straight off the catalogue's PHI column, minus the two that *are* viewing one message
-(`messages:view_summary`, `messages:view_raw`): edit-and-resubmit (`messages:edit`, which renders the
-full raw body at `GET /ui/messages/{id}/edit` on that permission alone), bulk raw export
+(`messages:view_summary`, `messages:view_raw`): edit-and-resubmit (`messages:edit`, whose console
+editor renders the full raw body at `GET /ui/messages/{id}/edit` — a route that requires
+`messages:view_raw` alongside it, so the grant does not reach the body on its own), bulk raw export
 (`messages:export`), the redacted log tail (`logs:view`), and the two PHI-touching uploaded-file
 capabilities (`files:upload`, `files:browse`). `files:delete` is **not** in that count: it destroys
 PHI, it does not emit it, and the catalogue leaves its PHI column empty. A Viewer holds no PHI-field
@@ -265,11 +273,11 @@ permission at all, so every gated property comes back `null` for them.
 The custom-role builder **is built** and is an *additive overlay* on the six built-ins, not a
 replacement:
 
-- A custom role is a named **subset of the existing 27-permission catalogue** — it can never define a
+- A custom role is a named **subset of the existing 28-permission catalogue** — it can never define a
   new permission kind.
 - Its id must carry the `custom:` prefix (`CUSTOM_ROLE_ID_PREFIX`), so it can never collide with a
   built-in role value or be mis-routed to the built-in resolver.
-- It may **never** grant `users:manage`, `approvals:approve` or `dr:operate`
+- It may **never** grant `users:manage`, `approvals:approve`, `dr:operate` or `files:access_any`
   (`CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`) — the escalation primitives stay admin-only.
 - An empty set or an unknown permission string is rejected on write (`CustomRoleError`); a
   malformed/hand-edited persisted `roles.permissions` row decodes **defensively to the empty set**, and
@@ -326,7 +334,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/me/mfa` | `require` | |
 | `POST` | `/me/mfa/enroll` | `require_reauth_only_action` (action `mfa_enroll`) | password-only step-up — the MFA gate is skipped so a required-but-unenrolled user cannot deadlock |
 | `POST` | `/me/mfa/confirm` | `require_reauth_only_action` (action `mfa_confirm`) | per-actor ceremony limiter; password-only step-up |
-| `DELETE` | `/me/mfa` | `require_step_up_action` (action `mfa_disable`) | refused when it would remove the last factor while MFA is required |
+| `DELETE` | `/me/mfa` | `require_step_up_action` (action `mfa_disable`) | step-up bound to the disable action (current factor + a fresh password). ⚠️ **No last-factor guard** — this is the TOTP path (`disable_mfa`), and it does **not** refuse when it would leave the account with zero enrolled factors. The passkey removal path does refuse; see BACKLOG #1022 for the asymmetry |
 | `GET` | `/me/sessions` | `require` | |
 | `GET` | `/me/security-events` | `require` | |
 | `DELETE` | `/me/sessions/{session_id}` | `require_reauth_only` | password-only step-up |
@@ -422,7 +430,7 @@ tuple: they act only on the caller's own account.
 |---|---|---|---|---|
 | `GET` | `/messages` | `messages:read` | `require_phi_read` | per-property redaction; `messages:view_summary` unlocks `summary`/`error`/`metadata`; per-channel scope |
 | `GET` | `/messages/search` | `messages:read` | `require_step_up` | explicit `enforce_phi_read_hop` + `enforce_phi_read_pacing` (a bulk-selecting GET) |
-| `GET` | `/messages/export` | `messages:export` **+** `messages:view_raw` | `require_step_up` | the only two-permission route **on the JSON plane** (`GET /ui/alerts` is the console's); explicit PHI-read hop + pacing; streams NDJSON, bypassing the response models |
+| `GET` | `/messages/export` | `messages:export` **+** `messages:view_raw` | `require_step_up` | the only two-permission route **on the JSON plane** (the console plane has its own — see the [`/ui` route map](#the-ui-console-plane-serve_uitrue)); explicit PHI-read hop + pacing; streams NDJSON, bypassing the response models |
 | `GET` | `/messages/{message_id}` | `messages:view_raw` | `require_phi_read` | per-property redaction of the wrapper **and** each nested `OutboxInfo`/`EventInfo` |
 | `GET` | `/messages/{message_id}/attachments/{attachment_id}` | `messages:view_raw` | `require_phi_read` | raw attachment bytes |
 | `GET` | `/messages/{message_id}/responses` | `messages:read` | `require_phi_read` | the reply **body** additionally needs `messages:view_raw`, enforced inline at the route |
@@ -447,10 +455,47 @@ tuple: they act only on the caller's own account.
 | Method | Path | Permission | Gate | Extra constraints |
 |---|---|---|---|---|
 | `POST` | `/uploads` | `files:upload` | `require_step_up` | stdlib multipart parse (no `python-multipart`) |
-| `GET` | `/uploads` | `files:browse` | `require` | metadata only — no body, no summary |
-| `GET` | `/uploads/{file_id}/messages` | `files:browse` | `require_step_up` | explicit `enforce_phi_read_hop` + `enforce_phi_read_pacing` (bulk decrypt + split) |
-| `POST` | `/uploads/{file_id}/resend` | `files:browse` | `require_step_up` | per-channel `can_access_channel` check on the target inbound |
-| `DELETE` | `/uploads/{file_id}` | `files:delete` | `require_step_up` | destructive, audited |
+| `GET` | `/uploads` | `files:browse` | `require` | metadata only — no body, no summary; **owner-scoped** (ASVS 8.2.2) — the caller sees only the files they uploaded unless they hold `files:access_any` |
+| `GET` | `/uploads/{file_id}/messages` | `files:browse` | `require_step_up` | explicit `enforce_phi_read_hop` + `enforce_phi_read_pacing` (bulk decrypt + split); **owner-only** — another operator's file answers **404**, before the decrypt |
+| `POST` | `/uploads/{file_id}/resend` | `files:browse` | `require_step_up` | per-channel `can_access_channel` check on the target inbound (403) **and** an owner check on the source file (404) |
+| `DELETE` | `/uploads/{file_id}` | `files:delete` | `require_step_up` | destructive, audited; **owner-only** — another operator's file answers **404** and is never unlinked |
+
+> **Object-level authorization for uploaded files (ASVS 8.2.2).** An uploaded file belongs to the
+> **account** that uploaded it — `UploadedFileMeta.uploader_id`, which is `Identity.user_id` (an
+> immutable `uuid4` hex), and *not* the username. A username is unique among live accounts but it is
+> reusable: deleting a user frees the name and recreating it mints a different `user_id`, so a
+> name-keyed rule would hand the recycled account the departed operator's files.
+> `UploadedFileMeta.uploader` is retained as the **display/audit label** only. The per-uploader quota
+> (ASVS 5.2.4) bills the same `uploader_id`, so ownership and the budget can never disagree about who
+> a file belongs to.
+>
+> **Bound, and stated because the bound is the load-bearing part.** This closes local accounts and any
+> AD account that goes through a MessageFoundry `delete_user`. It does **not** close a
+> `sAMAccountName` recycled in the directory *without* one: `_upsert_ad_user` resolves by username and
+> mints a new `user_id` only when no mirror row survives, so on the default AD path the surviving row
+> is adopted and **its `user_id` is re-bound to the new principal**. A deploying site on AD would
+> therefore still need the directory-immutable binding — AD to `objectGUID`/`objectSid`, the way OIDC
+> binds `(issuer, sub)` — tracked as BACKLOG #1143. `AdPrincipal` carries no such identifier today, so
+> `user_id` is the strongest key currently available, not a complete one.
+>
+> **Owner-only** is the whole rule: list, browse, resend and delete reach the caller's own files.
+> `files:access_any` is the explicit cross-operator override, granted to **Administrator** only (it is
+> the whole catalogue), never to Operator, and never mintable onto a custom role
+> (`CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`). The channel axis is deliberately **not** used here —
+> `Identity.allowed_channels` defaults to `null` (= every channel) and an uploaded file carries no
+> channel, so a channel-scoped rule would protect nobody on a default install and would deny every
+> scoped operator their own file. A denied by-id request answers **404** with the same body as a
+> malformed or absent id; what makes the by-id routes non-enumerable is that a `file_id` is 128 bits
+> of `secrets.token_hex(16)` and the listing no longer hands out another operator's — the denial is
+> still distinguishable by timing and by its audit row. That denial is audited as `upload.denied` with
+> the acting username, the acting `user_id`, the `file_id` and the operation — never the filename, the
+> owner or any content. The id is there because the username is the value this rule exists to distrust:
+> recycle a name and the actor column can no longer say which principal was refused, but the id can. The
+> checks live in the **handler bodies**, not in the route gates, because the console invokes those
+> same handlers over the seam and never runs their `Depends`. A sidecar with no `uploader_id` (a
+> hand-placed one; `save()` refuses to write one) matches nobody and is reachable **only** by an
+> override holder — fail closed. The age-based retention sweep stays owner-blind by design: it
+> deletes by age, for every uploader.
 
 #### Logs & AI
 
@@ -467,20 +512,23 @@ PHI on the wire: the twelve message/search rows above marked PHI (`/messages`, `
 them carry an explicit PHI-read hop refusal + per-actor budget; the other four (`/search/presets` × 3
 and `POST /uploads/{id}/resend`) return no body content of their own.
 
-**With the console served** (`serve_ui=True` — the deployed posture for a console-served instance) **nine more** emit PHI:
+**With the console served** (`serve_ui=True` — the deployed posture for a console-served instance) **at least ten more** emit PHI. ⚠️ **This is deliberately not a closed enumeration**, per CLAUDE.md §11: a fixed count is a liability that the next PHI-emitting route silently falsifies, and this one already was — it read "nine more" and omitted `POST /ui/messages/{id}/edit-resend`, whose `_reject` arm re-renders both the pristine `core.get_message` detail and the operator's edited `raw_value`. **The authority is the code, not this list:** a `/ui` route emits PHI if it renders a message body, and the ones that charge the per-actor read budget are those passing `phi=True` to `require_ui` / `require_ui_step_up` (`messagefoundry_webconsole/_auth.py`) **or** that reach `enforce_phi_read_pacing` some other way — a reused engine handler that paces in its own body (`search_messages` / `layered_search` / `browse_uploaded_file`), or a console route that charges it inline on a short-circuit render (BACKLOG #1025). Known today:
 `GET /ui/messages`, `/ui/messages/{id}`, `/ui/messages/{id}/parse-tree`,
-`/ui/messages/{id}/attachments/{id}`, `/ui/messages/{id}/edit`, `/ui/messages/search`,
-`/ui/messages/search/layered`, `/ui/dead-letters` and `/ui/uploaded-logs/file/{file_id}`. Note
-`GET /ui/messages/{message_id}/edit`: it gates on `messages:edit` **alone** and renders the full
-message detail. The catalogue's "implies `messages:view_raw`" for `messages:edit` is a **built-in-role
-convention, not an enforced rule** — `messages:edit` is not in `CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`, so
-a custom role may hold it without `messages:view_raw` and still read the raw body through that route.
+`/ui/messages/{id}/attachments/{id}`, `/ui/messages/{id}/edit`, `POST /ui/messages/{id}/edit-resend`,
+`GET /ui/messages/search`, `/ui/messages/search/layered`, `/ui/dead-letters` and
+`/ui/uploaded-logs/file/{file_id}` — all four charge the per-actor read budget (BACKLOG #1025): the reused engine handlers behind search, layered and uploaded-browse pace it in their own body, and #1025 additionally charges the two search routes' short-circuit renders (bare-form / no-preset) **inline**, since those return before the handler runs — the uploaded-browse route needs no extra charge (its handler paces every call and it has no short-circuit, so any second charge would double-count). Note
+`GET /ui/messages/{message_id}/edit`: it renders the full message detail, so it requires
+`messages:view_raw` **as well as** `messages:edit` and fails closed on either (BACKLOG #324). The
+catalogue's "implies `messages:view_raw`" for `messages:edit` remains a **built-in-role convention,
+not a minting rule** — `messages:edit` is not in `CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`, so a custom role
+holding it alone is still mintable; on a deploying instance that role would be refused the editor
+rather than shown a body its permission set does not authorize.
 
 #### The `/ui` console plane (`serve_ui=True`)
 
 When the console is served, the `/ui` plane adds **95 routes + one `/ui/static` mount** (federation off,
 the default — the two `/ui/oidc/*` routes are registered only when `[auth].oidc_enabled`). They are
-functions too, and they gate on the **same 27-permission catalogue** through parallel wrappers —
+functions too, and they gate on the **same 28-permission catalogue** through parallel wrappers —
 `require_ui`, `require_ui_step_up`, `require_ui_reauth_only`, `require_ui_step_up_action`,
 `require_ui_reauth_only_action` — but authenticate by the `/ui`-confined `SameSite=Strict` **session
 cookie** rather than a bearer token, and refuse cross-site state changes on `Sec-Fetch-Site`/`Origin`.
@@ -543,8 +591,8 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `POST` | `/ui/messages/search/presets/{preset_id}/delete` | `messages:read` | `require_ui` |
 | `GET` | `/ui/messages/{message_id}` | `messages:view_raw` | `require_ui` |
 | `GET` | `/ui/messages/{message_id}/attachments/{attachment_id}` | `messages:view_raw` | `require_ui` |
-| `GET` | `/ui/messages/{message_id}/edit` | `messages:edit` | `require_ui_step_up` |
-| `POST` | `/ui/messages/{message_id}/edit-resend` | `messages:edit` | `require_ui_step_up` |
+| `GET` | `/ui/messages/{message_id}/edit` | `messages:edit`**+**`messages:view_raw` | `require_ui_step_up` |
+| `POST` | `/ui/messages/{message_id}/edit-resend` | `messages:edit`**+**`messages:view_raw` | `require_ui_step_up` |
 | `GET` | `/ui/messages/{message_id}/parse-tree` | `messages:view_raw` | `require_ui` |
 | `POST` | `/ui/messages/{message_id}/replay` | `messages:replay` | `require_ui_step_up` |
 | `GET` | `/ui/monitoring` | `monitoring:read` | `require_ui` |
@@ -582,8 +630,15 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `POST` | `/ui/users/{user_id}/roles` | `users:manage` | `require_ui_step_up` |
 | `POST` | `/ui/users/{user_id}/update` | `users:manage` | `require_ui_step_up` |
 
-`GET /ui/alerts` requires **both** `monitoring:read` and `monitoring:diagnose` — the page renders the
-active-alert census next to the diagnose-only controls, and it fails closed on either.
+**The two-permission `/ui` routes**, each failing closed on either permission:
+
+- `GET /ui/alerts` requires **both** `monitoring:read` and `monitoring:diagnose` — the page renders
+  the active-alert census next to the diagnose-only controls.
+- `GET /ui/messages/{message_id}/edit` and `POST /ui/messages/{message_id}/edit-resend` require
+  **both** `messages:edit` and `messages:view_raw` (BACKLOG #324) — the editor *displays* the body it
+  edits (the textarea, plus the pristine `data-original` copy behind Revert), and the POST's rejection
+  arm re-renders that pristine copy. Reading the body is part of what the editor exercises, not an
+  adjacent capability, so the read permission is required outright rather than implied.
 
 Rows showing *(authenticated session only)* carry no permission: they are the caller's **own**
 account surface (`/ui/account*`, `/ui/security-events`), authorized by session ownership rather than
@@ -591,7 +646,7 @@ by an RBAC grant — the same basis as the JSON `/me/*` routes.
 
 **Unauthenticated `/ui` routes (10).** `GET`/`POST /ui/login`, `POST /ui/logout`, `GET /ui/sso`,
 `POST /ui/csp-report`, `GET`/`POST /ui/reauth`, `POST /ui/reauth/webauthn` and `GET`/`POST /ui/mfa`
-(plus `GET /ui/oidc/start` and `GET /ui/oidc/callback` when federation is enabled). The three
+(plus `GET`/`POST /ui/oidc/start` and `GET /ui/oidc/callback` when federation is enabled). The three
 `/ui/reauth*` routes authenticate the session cookie **manually** rather than through `require_ui`,
 because a gate that demanded a fresh step-up to *perform* a step-up would deadlock. The two
 `/ui/mfa` routes (ASVS 6.3.3) are the same shape for the same reason: `require_ui` 303s every
@@ -619,13 +674,16 @@ else would need its own authorization rule stated here.
    a multipart body cannot survive the re-auth redirect. So a PHI-at-rest write and a PHI
    re-injection are gated on `files:upload` / `files:browse` alone on this plane.
 4. **The ADR 0092 PHI-read hop refusal does not apply on the `/ui` browse routes.**
-   `enforce_phi_read_hop` appears nowhere in `messagefoundry_webconsole/`; `require_ui(..., phi=True)`
-   applies only the per-actor throttle. So `GET /ui/messages`, `/ui/messages/{message_id}`,
+   `enforce_phi_read_hop` appears nowhere in `messagefoundry_webconsole/`; the console's own gates —
+   `require_ui(..., phi=True)` and `require_ui_step_up(..., phi=True)` — apply only the per-actor
+   throttle. So `GET /ui/messages`, `/ui/messages/{message_id}`,
    `/ui/messages/{message_id}/parse-tree`,
-   `/ui/messages/{message_id}/attachments/{attachment_id}` and `/ui/dead-letters` charge
-   the PHI-read budget but not the posture-keyed refusal that the JSON `require_phi_read` adds. The
-   four inline `enforce_phi_read_hop(request)` call sites (search, export, uploads-browse, layered) DO
-   carry over, so the difference is exactly those five browse routes.
+   `/ui/messages/{message_id}/attachments/{attachment_id}`, `/ui/dead-letters` and the edit pair
+   (`GET /ui/messages/{message_id}/edit`, `POST /ui/messages/{message_id}/edit-resend`) charge
+   the PHI-read budget but not the posture-keyed refusal that the JSON `require_phi_read` adds — at
+   least those; the set is whichever console gates pass `phi=True`, not a fixed list. Where a console
+   route reaches a JSON handler that calls `enforce_phi_read_hop(request)` inline (search, export,
+   uploads-browse, layered), that refusal DOES carry over.
 5. **Three further console routes are weaker than a permission-equivalent JSON route**, each for a
    stated reason: `GET /ui/uploaded-logs` is plain `require_ui` — it mirrors `GET /uploads` (also
    plain `require`), a metadata-only listing, not the step-up'd `GET /uploads/{file_id}/messages`;
@@ -734,7 +792,11 @@ The TOTP secret is stored **encrypted at rest** (the store cipher) and recovery 
 **argon2id-hashed**; verification uses the server clock and a constant-time compare over a **configurable
 clock-skew window** (`[auth].totp_skew_steps`, **default `0` = the current 30 s step only** — strictest
 replay window, ASVS 6.5.5; set `1`/`2` to restore RFC-6238 ±1 network-delay tolerance, the forward step
-clamped to the current step so single-use holds). TOTP is a shared-secret factor — L3 *prefers*
+clamped to the current step to avoid a self-inflicted lockout). ⚠️ **Single-use (ASVS 6.5.1) holds only at
+the default `0`.** At `totp_skew_steps >= 1` the clamp records a tolerated *future* code against the
+current step, leaving that code's own step unspent — so the **same code verifies a second time** once the
+clock reaches it. That is the cost of the opt-out, and it is why the default is `0`. TOTP is a
+shared-secret factor — L3 *prefers*
 phishing-resistant factors: **WebAuthn passkeys are the built WP-14b sibling** (next section), and TOTP
 stays fully supported alongside them (a non-browser client — e.g. the test harness, or CLI/API
 automation — has no `navigator.credentials`, so TOTP remains its usable second factor).
@@ -884,6 +946,15 @@ one place — [`api/field_authz.py`](../messagefoundry/api/field_authz.py) — a
 `redact_unauthorized()` helper applied to every returned row, rather than re-implemented inline per
 endpoint (where a new endpoint or field could silently leak PHI — the BOPLA risk, ASVS 8.1.2 / 8.2.3).
 
+**The default for a mapped model denies.** Each of the six response models below is a `PhiGatedModel`
+([`api/phi_gate.py`](../messagefoundry/api/phi_gate.py)) that withholds every gated property from JSON
+until an authorization decision is recorded on the instance; `redact_unauthorized()` is what records
+one, releasing exactly the properties the caller's permissions unlock. A route that never calls it
+therefore returns `null` — a functional defect its author sees — rather than the whole model in the
+clear. The gate is on JSON serialization, which is every path by which one of these models reaches a
+client; a python-mode `model_dump()` stays ungated by design, because the engine composes
+`MessageDetail` from a `MessageSummary` dump before any authorization decision exists.
+
 **Read rules — one row per (response object, property).** This table is 1:1 with `PHI_FIELDS`: eleven
 entries over six response models. Keying on the *object* (not just the property name) is what makes it
 mechanically comparable to the map — a CI guard asserts set equality in **both** directions, so the
@@ -1005,9 +1076,13 @@ this gate can be forgotten (the previous claim here was overstated: the old pinn
   load-bearing: keyed on names, `last_error` looked covered by `DeadLetterRow.last_error` on
   `/dead-letters` while `OutboxInfo.last_error` had **zero** coverage, because the only message whose
   outbox row carries a non-null `last_error` is the dead-lettered one and its detail route was not in
-  the surface list. It is now, and the coverage assertion is keyed on `(model, property)` pairs. This
-  is the only guard that catches a future PHI route shipped without its `redact_unauthorized` call —
-  which, given the fail-open default, no map-level test can.
+  the surface list. It is now, and the coverage assertion is keyed on `(model, property)` pairs.
+- **The default is fail-closed** — `tests/test_field_authz_fail_closed.py` mounts a PHI-returning
+  route that *omits* the `redact_unauthorized` call and asserts the response carries `null` for every
+  gated property, each assertion paired with a released positive control. It also pins `PHI_FIELDS`
+  against each model's own `phi_gated_properties` in both directions, and proves class creation
+  refuses a gated name the serializer does not cover. The enumeration of call sites above keeps the
+  *shipped* surfaces honest; this is what makes the route nobody has written yet safe.
 
 **Write side (engine → store).** Exception/disposition text is also scrubbed *before* it is stored: a
 Router/Handler is user code that can `raise ValueError(f"...{raw}")`, so every value written to
@@ -1045,8 +1120,10 @@ listener** and deliberately does **not** inherit the loopback carve-out — an a
 must not also admit anything running on the local box. ⚠️ That one is an **`inbound(...)` keyword** (or
 the top-level key in a `connections.toml` `[[inbound]]` table); there is **no**
 `[inbound].source_ip_allowlist` service setting. `[inbound]` carries only `bind_host`, `ack_after` and
-`stream_inflight_budget_bytes`, and every section model ignores unknown keys — so that spelling in
-`messagefoundry.toml` is accepted and **silently discarded**, leaving the listener ungated.
+`stream_inflight_budget_bytes`, and an unrecognized key in a known section is **refused at load** — so
+that spelling in `messagefoundry.toml` **fails the start** (`serve` exit 2), naming the section and the
+key. It used to be accepted and silently discarded, which left the listener ungated with nothing
+reporting a problem; that is the failure mode the refusal exists to remove.
 
 **Action vocabulary (closed set).** Every row below **opens its Action cell** with exactly one of:
 **ALLOW** (pass through), **DENY** (403 / 401 / 400 / 409 / refused connection / DIMSE status /
@@ -1080,10 +1157,10 @@ one-to-one — that is why the bind/exposure posture occupies two rows and the A
 | PHI-read volume, per actor | `identity.user_id` | > 120 reads (`phi_read_rate_limit_per_actor`) per 60 s (`phi_read_rate_limit_window_seconds`); the global dimension `phi_read_rate_limit_global` defaults to `0` = **off** | **THROTTLE** 429 + `Retry-After: 10`, WARNING-logged, charged at **admission** before any store work | on, 120 / 60 s | `[auth].phi_read_rate_limit_enabled` |
 | Admin-write rate, per actor | `identity.user_id` × request method | **non-GET only**; > 12 writes (`admin_write_rate_limit_per_actor`) per 1.0 s (`admin_write_rate_limit_window_seconds`); no global dimension (`glob=0`) | **THROTTLE** 429 + `Retry-After: 1`, WARNING-logged. **JSON API only** — no `/ui` route charges it at this release | on, 12 writes / 1.0 s | `[auth].admin_write_rate_limit_enabled` |
 | Serve-hop security posture | declared data class (`[ai].data_class`, or derived from `[ai].environment`) × `[security].enforcement` × (`api.is_loopback` **or** `exposure_protected`), via `phi_read_hop_disposition` | disposition is REFUSE — a **PHI** instance under `enforcement = enforce` whose serve hop is neither loopback, nor in-process TLS, nor a declared TLS-terminating proxy. Setting `[security].enforcement = warn` turns the refusal into WARN-and-serve; a non-PHI declared data class removes it entirely | **DENY** 403 (PHI-free message) on every **JSON-API** PHI-read route (`require_phi_read`, plus the step-up bulk routes), **before** any identity work. **Not applied on the `/ui` browse routes** — `enforce_phi_read_hop` has no console call site, so those get the per-actor budget only (pinned by `test_the_ui_phi_browse_gap_is_disclosed`) | ALLOW on loopback | `[security].enforcement`, `[ai].data_class`/`environment`, `[api].tls_cert_file`, `tls_terminated_upstream` + `trusted_proxies` |
-| Bind / exposure posture — refusing arms | `[api].host` loopback-ness, `tls_terminated_upstream`, `trusted_proxies`, `public_origin`, `serve_ui`; derived `ui_exposed`, `admin_exposed`; `[security].enforcement`; declared data class | auth off on a non-loopback bind; `/ui` exposed without the required origin/TLS declarations; `admin_exposed` + PHI + `enforcing` + `require_mfa` explicitly opted out | **DENY at startup** — `serve` prints an error and exits **2**. The refuse/warn dial is `[security].enforcement` (default `enforce`), **not** `production`: the auth-off and `/ui`-exposure arms refuse **unconditionally**, and the `require_mfa` arm refuses when the declared data class is PHI **and** enforcement is `enforce` — which includes the non-production `dev` and `staging` environments, both of which derive PHI — and warns otherwise. `[security].allow_single_factor_admin_when_exposed = true` downgrades that one arm to permitted-but-audited. The same attributes force the session cookie's `Secure` flag + HSTS, and permit WebAuthn `rp_id` derivation from the request URL **only** on a loopback bind with no proxy declared | loopback, nothing declared | `[api].*`, `[security].enforcement`, `[security].allow_single_factor_admin_when_exposed`, `[ai].data_class`/`environment` |
-| Bind / exposure posture — dual-control arm | `admin_exposed` × `[approvals].enabled` × declared data class | `admin_exposed` **and** PHI **and** `[approvals].enabled` off — high-value actions complete on one caller's authority | **LOG** — a startup **WARNING only, on every instance including production**; `serve` does **not** refuse. The refuse arm is an explicit unresolved owner fork recorded in `__main__.py`, not a shipped control | approvals off | `[approvals].enabled` |
+| Bind / exposure posture — refusing arms | `[api].host` loopback-ness, `tls_terminated_upstream`, `trusted_proxies`, `public_origin`; derived `instance_exposed` (loopback-ness **or** a declared terminator) and `admin_exposed`, plus `ui_exposed` for the `/ui` arms only; `[security].enforcement`; declared data class | auth off on an exposed instance — a non-loopback bind **or** a declared terminator (`instance_exposed`); `/ui` exposed without the required origin/TLS declarations; `admin_exposed` + PHI + `enforcing` + `require_mfa` explicitly opted out | **DENY at startup** — `serve` prints an error and exits **2**. The refuse/warn dial is `[security].enforcement` (default `enforce`), **not** `production`: the auth-off and `/ui`-exposure arms refuse **unconditionally**, and the `require_mfa` arm refuses when the declared data class is PHI **and** enforcement is `enforce` — which includes the non-production `dev` and `staging` environments, both of which derive PHI — and warns otherwise. `[security].allow_single_factor_admin_when_exposed = true` downgrades that one arm to permitted-but-audited. **`admin_exposed` is `instance_exposed`, and reads no console flag** (BACKLOG #326): the ADR 0143 degrade arms rewrite `serve_ui` in place earlier in the same startup, so deriving an exposure decision from it made this arm and the dual-control arm below miss a declared-proxy instance whose console had been degraded or disabled — while the ASVS 11.7.1 arm called that same boot exposed. The same attributes force the session cookie's `Secure` flag + HSTS, and permit WebAuthn `rp_id` derivation from the request URL **only** on a loopback bind with no proxy declared | loopback, nothing declared | `[api].*`, `[security].enforcement`, `[security].allow_single_factor_admin_when_exposed`, `[ai].data_class`/`environment` |
+| Bind / exposure posture — dual-control arm | `admin_exposed` (= `instance_exposed`: an off-loopback bind **or** a declared TLS terminator — never the console flag, BACKLOG #326) × `[approvals].enabled` × declared data class | `admin_exposed` **and** PHI **and** `[approvals].enabled` off — high-value actions complete on one caller's authority | **LOG** — a startup **WARNING only, on every instance including production**; `serve` does **not** refuse. The refuse arm is an explicit unresolved owner fork recorded in `__main__.py`, not a shipped control | approvals off | `[approvals].enabled` |
 | Pending federated-login flows, per client IP | the `client_ip` recorded on each staged flow | ≥ **16** pending flows from this address (`DEFAULT_PER_IP_CAP`, no knob), or ≥ `oidc_flow_cache_max` (**512**) engine-wide; 300 s TTL; **reject-when-full, never evict** (evict-oldest would turn a start-leg flood into a login DoS) | **DENY** the start leg — `FlowCacheFullError` → **303** to `/ui/login?e=rate_limited`, WARNING-logged, deliberately **never** audited so a flood cannot amplify into `audit_log` growth | 16 / 512 / 300 s | `[auth].oidc_flow_cache_max`, `oidc_flow_ttl_seconds` |
-| `Sec-Fetch-Mode` on the federated sign-in legs | the browser fetch-metadata header on `GET /ui/sso`, `GET /ui/oidc/start`, `GET /ui/oidc/callback` | header **present** and not `navigate` (absent = allowed, for non-browser clients). Distinct from the `Sec-Fetch-Site` row below: a different header, a different surface, and `assert_same_origin` deliberately does **not** run on the callback leg, whose `Sec-Fetch-Site` is legitimately cross-site | **DENY** — 303 → `/ui/login?e=sso_failed`\|`oidc_failed`, plus an **audited** `auth.login_failed` row carrying the closed-set slug `non_navigation_fetch`. Evaluated **after** the login limiter, so the audit write is itself rate-bounded | on | (no knob) |
+| `Sec-Fetch-Mode` on the federated sign-in legs | the browser fetch-metadata header on `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback` | header **present** and not `navigate` (absent = allowed, for non-browser clients). Distinct from the `Sec-Fetch-Site` row below: a different header, a different surface, and `assert_same_origin` deliberately does **not** run on the callback leg, whose `Sec-Fetch-Site` is legitimately cross-site | **DENY** — 303 → `/ui/login?e=sso_failed`\|`oidc_failed`, plus an **audited** `auth.login_failed` row carrying the closed-set slug `non_navigation_fetch`. Evaluated **after** the login limiter, so the audit write is itself rate-bounded | on | (no knob) |
 | Instance environment posture × claimed AI data scope | `[ai].derived_posture()` (from `[ai].environment` / `data_class` / `production`; an unresolved posture defaults to the **strictest** ceiling) re-resolved server-side through `resolve_effective_policy` on every `POST /ai/chat` | the effective mode is not `managed_endpoint`, or the request's `data_scope` exceeds the server-enforced ceiling (the engine-broker MVP enforces `code_only` regardless of what the caller claims) | **DENY** — **409** on the mode mismatch, **403** on scope excess; each audited `ai.assist` with PHI-safe metadata only | `mode = byo`, `data_scope = code_only` | `[ai].mode`, `[ai].data_scope`, `[ai].environment`/`data_class`/`production` |
 | Gated operation × requester-vs-approver identity × hold age | the pending-approval record: the operation name, the requesting identity, and the hold's creation time | `[approvals].enabled` **and** the operation is in `[approvals].operations` and has no approved unexpired release; the approver is the requester; the hold is older than `expiry_hours` | **DENY** the immediate execution — **202** hold + `approval.requested` audit; **403** on self-approval; **409** once expired or already decided | off; `['connection_purge','dead_letter_replay']`; 72 h | `[approvals].enabled`, `operations`, `expiry_hours` |
 | mTLS client-certificate subject | the qualified subject-RDN / SAN names of a **verified** peer certificate | exact match against a deny-by-default map (empty map = feature off) | **ALLOW** — resolve to that principal's Identity (RBAC then authorizes); a disabled account grants none | `{}` = off | `[api].tls_client_cert_identities` (requires `tls_client_ca_file`) |
@@ -1409,7 +1486,7 @@ Comparative properties on the dimensions the table's four columns cannot carry:
 **Where each pathway is enforced, and what turns it on:** Local → `POST /auth/login` + `POST /ui/login`
 (always available); AD → the same two routes with `provider=ad` (`[auth].ad_enabled`); Kerberos →
 `POST /auth/negotiate` + `GET /ui/sso` (`[auth].kerberos_enabled`, default off); OIDC →
-`GET /ui/oidc/start` + `GET /ui/oidc/callback`, registered **only** when `[auth].oidc_enabled` (default
+`GET`/`POST /ui/oidc/start` + `GET /ui/oidc/callback`, registered **only** when `[auth].oidc_enabled` (default
 off, and it additionally requires `ad_enabled`); mTLS → `GET /service/identity`, active only when
 `[api].tls_client_cert_identities` **and** `[api].tls_client_ca_file` are both set (default `{}` = off).
 
@@ -1471,15 +1548,54 @@ threshold, the switch that disables it, and — the part that matters for "not d
 
 | # | Control | Protects | Threshold / window | Disable switch | What remains when off |
 |---|---|---|---|---|---|
-| 1 | **Per-account lockout** | one account's credential-guessing, on the password **and** TOTP/recovery legs | 5 consecutive failures → 15 min; a lapsed window restarts the counter (auto-expiring, so an attacker cannot maliciously lock an account indefinitely) | **no dedicated off switch.** `lockout_minutes = 0` makes the lock expire instantly, which is the effective opt-out; `lockout_threshold = 0` is **not** an off switch — it locks on the *first* failure | limiters 2 + 3 only |
+| 1 | **Per-account lockout** | one account's credential-guessing, on the password **and** TOTP/recovery legs | 5 consecutive failures → 15 min; a lapsed window restarts the counter, so each lock expires on its own — but **repetition is unbounded**: an attacker who keeps failing re-locks the account as each window lapses. Signal, recovery and what to arrange in advance: below the table | **no dedicated off switch.** `lockout_minutes = 0` makes the lock expire instantly, which is the effective opt-out; `lockout_threshold = 0` is **not** an off switch — it locks on the *first* failure | limiters 2 + 3 only |
 | 2 | **Sign-in sliding window** (`allow_login_attempt`) | password-spraying across many usernames, which never trips a single account's lockout | > 10 attempts per client IP **or** > 60 across all clients, per 60 s (either dimension alone refuses — `global_full or key_full`) | `[auth].login_rate_limit_enabled = false` | lockout only — **and limiter 3 disappears with it** (see below) |
 | 3 | **Per-actor credential-ceremony budget** (`allow_reauth_attempt`) | a session holder guessing a password at the re-proof surface, where lockout does **not** apply | > 10 ceremonies per acting **user**, per 60 s. **No global dimension** (`glob=0`) | *the same* `[auth].login_rate_limit_enabled` | **nothing** — `POST /me/reauth` and `POST /me/password` then have no anti-automation control at all |
 | 4 | **argon2 concurrency cap** | executor exhaustion under a login flood | an instance semaphore sized `max(2, min(8, cpu_count))`; every hash/verify runs off the event loop | none | n/a |
 | 5 | **Request-body cap + field limits** | oversized/ambiguous auth requests | 1 MiB (the `/uploads` routes alone admit up to `[store].max_upload_bytes`), a **required** `Content-Length` for any body (a chunked body is refused **411**), and CL+TE ambiguous framing refused **400** — all as ASGI middleware ahead of every route | none | n/a |
 | 6 | **Pre-auth client-network gate** | reaching the auth surface at all from an unlisted network | membership in `[security].allowed_client_networks` | `[]` = no restriction (the default) | limiters 1–3 |
-| 7 | **Federated pending-flow bound** (`FlowCache.put`, **reject-when-full**) | flooding the OIDC start leg (`GET /ui/oidc/start`) to exhaust engine memory or deny federated sign-in | 16 pending flows per client IP, 512 engine-wide, 300 s TTL. It **rejects** rather than evicts — evict-oldest would turn a start-leg flood into a login DoS for legitimate users | **none** — and `oidc_flow_cache_max = 0` is not an opt-out either: `put` refuses at `len(entries) >= global_cap`, so `0` rejects **every** federated sign-in (`FlowCacheFullError` on the first flow, an OIDC denial of service). No validator floors it; treat it as a security-relevant value | limiter 2 (the same routes charge `allow_login_attempt` first) |
+| 7 | **Federated pending-flow bound** (`FlowCache.put`, **reject-when-full**) | flooding the OIDC start leg (`POST /ui/oidc/start` — the GET renders the 3.7.3 interstitial and stages nothing, so it is not a lever) to exhaust engine memory or deny federated sign-in | 16 pending flows per client IP, 512 engine-wide, 300 s TTL. It **rejects** rather than evicts — evict-oldest would turn a start-leg flood into a login DoS for legitimate users | **none** — and `oidc_flow_cache_max = 0` is not an opt-out either: `put` refuses at `len(entries) >= global_cap`, so `0` rejects **every** federated sign-in (`FlowCacheFullError` on the first flow, an OIDC denial of service). No validator floors it; treat it as a security-relevant value | limiter 2 (the same routes charge `allow_login_attempt` first) |
 | 8 | **WebAuthn pending-ceremony bound** (`ChallengeCache.put`) | flooding passkey registration/assertion ceremonies | 16 pending ceremonies per **user** (evicts that *same* user's oldest, so one principal can never deny another's), 4096 engine-wide (**refuses** with a cause-naming `ChallengeCacheFullError`), 120 s TTL | none | limiter 3 on the assertion **finish** leg only — `POST /ui/reauth/webauthn` (`routes/core.py:689`) and the error re-render inside `POST /ui/reauth` (`:612`) charge `allow_reauth_attempt`. The routes that *stage* a ceremony — the thing `ChallengeCache.put` actually bounds — charge **no** limiter: `POST /ui/account/webauthn/enroll`, `POST /ui/account/webauthn/verify`, and `GET /ui/reauth`, which re-stages fresh assertion options on **every** render. There this bound plus cookie-holder-only reachability is all there is |
 | 9 | **JWKS min-refetch floor** (`JwksCache.get_key`) | unauthenticated `kid`-driven refetch amplification against the IdP on the OIDC callback leg — the sibling of control 7 on the *other* federated leg | one upstream fetch per **300 s**, globally (`[auth].oidc_jwks_min_refetch_seconds`), plus a `_MAX_JWKS_BYTES` **512 KiB** response-body cap and a 3600 s key TTL. Within the floor an unknown `kid` raises `JwksError` and that login fails (a still-cached key is served even past the soft TTL rather than fail while throttled) | `oidc_jwks_min_refetch_seconds = 0` — no validator floor, so this **is** a genuine opt-out, and it restores the amplification | limiter 2 and control 7 (the same legs charge `allow_login_attempt` and stage a bounded flow first) |
+
+**Control 1 bounds the lock, not the campaign.** Each lockout releases itself after
+`lockout_minutes`, but `_register_failure` restarts the counter on a lapsed window and re-locks on the
+next run to the threshold, and the account row persists a failure count and an expiry — never a count
+of locks — so nothing accumulates across cycles and the number of cycles has no ceiling. The account
+is reachable in the gap between one lock expiring and the next being set, and no longer. Sustaining
+the re-lock costs far fewer attempts than control 2's sign-in window admits from a single client
+address, so control 2 does not bound it either. The exposure is availability, not credential
+disclosure, and its scope is narrow: only **local** accounts can be locked at all (the
+lockout-asymmetry note above says why), and control 6 refuses an off-network client before any
+failure is counted — but only where client addresses are meaningful. Behind an undeclared proxy or
+NAT control 6 is **inert**, by its own honest-limit note above, so it narrows who can reach the
+account rather than closing the case.
+
+**Signal.** The account holder gets an `ACCOUNT_LOCKED` security event — mailed only under the
+conditions the security-event notification section above states (an alert sink configured, the
+notification setting on, and an address on the account), and recorded on `GET /me/security-events`,
+which is a self-scoped feed the holder can read only while they still hold a live, fully-authenticated
+session. Each refusal is also audited, so a campaign is visible in the audit log while it runs. What
+is **not** available anywhere is **current lock state**: no API or console surface reports whether an
+account is locked right now, and a locked account still lists as enabled. Diagnose a suspected lockout
+from the audit log, not the user list.
+
+**Recovery.** Absent a sustained attacker nothing is needed — the lock expires on its own. Against a
+sustained one: across all three store backends the writes that clear `locked_until` are
+`set_password`, the successful-login write and the failed-attempt write, and only `set_password` can
+run while a lock is live — control 1 refuses before any credential is verified, so neither the
+successful-login write nor the login-time rehash beside it is ever reached, and the failed-attempt
+write only clears an **already lapsed** lock. Two routes reach `set_password` while an account is
+locked, both local-account-only, and **both issue a new password rather than merely lifting the
+lock**: the holder's own `POST /me/password`, reachable only while they still have a live session
+(session validation never consults `locked_until`, and that route is exempt from both the must-change
+and the MFA-pending gates), and the
+[administrator's reset](#admin-password-reset-wp-l3-12-asvs-646). No shipped command clears a lock
+without going through one of those two — the CLI manages no users.
+
+**Arrange in advance.** Keep a **second administrator who can sign in**: the administrator reset
+refuses a self-reset, so a sole administrator holding no live session has no in-band route back for as
+long as an attacker sustains the lock.
 
 > **Binding conditionality — controls 2 and 3 are one switch, not two.**
 > `[auth].login_rate_limit_enabled = false` constructs **neither** limiter: `_login_limiter` and
@@ -1522,7 +1638,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 | `POST /auth/mfa-verify` | sign-in window | an **authenticated** route drawing the sign-in budget (it is a mid-login challenge); also feeds the per-account lockout |
 | `POST /ui/login` | sign-in window | 429 carries `Retry-After: 30` |
 | `GET /ui/sso` | sign-in window | the token-bearing leg only; the RFC 4559 challenge leg is deliberately unthrottled |
-| `GET /ui/oidc/start`, `GET /ui/oidc/callback` | sign-in window | one browser login charges it **twice** |
+| `POST /ui/oidc/start`, `GET /ui/oidc/callback` | sign-in window | one browser login charges it **twice**. ⚠️ The start leg is a **POST** since the ASVS 3.7.3 interstitial: `GET /ui/oidc/start` now renders the "you are leaving this site" page and mints **no** flow, so it charges no limiter — the flow starts only when the operator confirms. |
 | `POST /me/password` | per-actor ceremony budget | **not** the sign-in window |
 | `POST /me/reauth` | per-actor ceremony budget | |
 | `POST /me/mfa/confirm` | per-actor ceremony budget | |
@@ -1560,7 +1676,7 @@ multi-host deployment must additionally front the API with a proxy/WAF limiter a
 | Request body | `[store].max_upload_bytes` (the `/uploads` routes only) | 1 MiB elsewhere | per request | no | no | no | **stateless** — every route, in ASGI middleware | **413** over the cap, **400** on ambiguous CL+TE framing or an invalid `Content-Length`, **411** on a chunked body |
 | OIDC pending flows | `[auth].oidc_flow_cache_max` (global), `DEFAULT_PER_IP_CAP` (per-IP, no knob), `oidc_flow_ttl_seconds` | 512 / 16 / 300 s | 300 s TTL | no | **yes** (512) | **yes** (16) | **in-process** — `GET /ui/oidc/start` — reject-when-full, never evict | 303 → `/ui/login?e=rate_limited`, WARNING-logged, **never** audited |
 | WebAuthn pending ceremonies | `GLOBAL_PENDING_CAP`, `PER_USER_PENDING_CAP`, `CHALLENGE_TTL_SECONDS` (module constants, no knobs) | 4096 / 16 / 120 s | 120 s TTL | **yes** (16) | **yes** (4096) | no | **in-process** — every passkey registration + assertion ceremony | per-user: evicts that user's **own** oldest pending ceremony (silent); global: `ChallengeCacheFullError` naming the cause + the `admin_reset_mfa` recovery path |
-| **Ingest plane** | *(none)* | — | — | — | — | — | **n/a** — inbound connections | **no message-rate or volume limit exists.** Inbound carries resource caps only — `max_connections` (256), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `source_ip_allowlist` — and nothing in `transports/`, `config/` or `pipeline/` exposes a messages-per-second control |
+| **Ingest plane** | `max_messages_per_second`, `message_burst` (MLLP inbound) | **off** (unset = no rate bound) | per message | no | no | no | **in-process** — one bucket per MLLP connection, so it neither coordinates across engine shards nor aggregates per peer | **Ships OFF, and the off default is ruled rather than accidental** — a rate on a clinical interface is only safe at a number taken from a real feed profile. **So a default install has NO message-RATE bound on the ingest plane**, and that is a deliberate posture, not a gap in the control. Both keys are parameters of the `MLLP()` factory, and `connections.toml` desugars through that same factory, so **the code-first and the TOML surface both express them** (BACKLOG #1249 — until that landed the pacer was built and no documented configuration could turn it on, which is a different and worse thing than being off). *What it does when set:* the listener **pauses reading** over budget so TCP back-pressures the sender; no message is dropped, refused, NAK'd or reordered — the count-and-log invariant forbids accept-and-drop, so a discarding limiter was never available. **Not covered even when set:** the raw-TCP inbound, and any per-peer bound (MLLP peers are unauthenticated, so the only key would be source IP, which NAT collapses). **Resource bounds that DO ship on** — `max_connections` (256), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `source_ip_allowlist` |
 
 **What these limits defend, and what they do not.** The full inventory of resource-demanding
 functionality — including the surfaces that remain **unbounded** at this release — is
@@ -1623,7 +1739,18 @@ inherited from another caller. It is surfaced on `GET /audit` and in the `audit:
 
 **Tamper-evidence (AUDIT-INTEGRITY).** Each `audit_log` row carries a `row_hash` that chains the
 previous row's hash with this row's content (SHA-256), so deleting, editing, or reordering any row is
-detectable. Verify the chain with `messagefoundry audit-verify` (exit 0 = intact). Rows written
+detectable. Verify the chain with `messagefoundry audit-verify` — exit 0 means at least that no
+surviving row was edited or reordered. It does **not** mean nothing was removed: deleting the *newest*
+rows leaves a prefix that still chains cleanly, so a bare verify is clean after a tail-truncation. For
+that, snapshot `messagefoundry audit-anchor` (`COUNT:HEAD`) and pass it back as `messagefoundry
+audit-verify --expected-anchor`. It is an exact point-in-time seal, which fixes what it is for: it
+seals a chain **at rest across a gap** — quiesce the engine, anchor, hold the value off-box, re-verify
+while the chain is still quiesced (a maintenance window, a DB move, a backup/restore, a custodian
+hand-off). Anchoring and re-verifying in one breath compares a value to itself, and a held anchor
+re-checked against a **running** engine alarms on every boot, because a running engine writes audit
+rows; for continuous coverage the off-box tee is still the control ([BACKLOG #328](BACKLOG.md); the
+`[retention].audit_days` row in [`CONFIGURATION.md`](CONFIGURATION.md) is the source of record). Rows
+written
 before the feature are chained on first start. The `client` address is folded **inside** the chained
 payload — deliberately, since attribution an attacker could rewrite without breaking tamper-evidence
 would be worse than none — as a **conditional trailing element**, appended only when non-`NULL`. A
@@ -1694,15 +1821,23 @@ BACKLOG #190 bundled three integrity residuals; #190 closes with **one built** a
   ask was a *runbook decision* (does the exposure runbook mandate it), not new engine code. Every
   PHI-plane surface already carries integrity: outbound bodies (ADR 0018), the audit trail (the HMAC
   hash-chain), and data at rest (AES-256-GCM AEAD).
-- **ECH (Encrypted Client Hello) for outbound SNI — infeasible, documented risk acceptance
-  (12.1.5).** Hiding the destination hostname in the outbound TLS ClientHello is not buildable here:
-  Python 3.14's stdlib `ssl` exposes **no ECH API**, there is **no SVCB/HTTPS DNS resolver** (ECHConfig
-  is DNS-published) and adding one is out of scope, and a working ECH client would require a
-  **third-party TLS stack** — violating the no-new-dependency rule for a security-core path. The
-  destination SNI is therefore visible on the outbound handshake. Compensating context: on-prem, a
+- **ECH (Encrypted Client Hello) for outbound SNI — buildable, deliberately not owned; accepted
+  residual (12.1.5).** The destination hostname is visible in the outbound TLS ClientHello. CPython's
+  stdlib `ssl` cannot hide it — ECH is an **OpenSSL 4.0** feature and the bundled OpenSSL 3.5.x
+  exports no ECH symbols (CPython PR #135435 is still open) — but it **is** buildable off-stdlib (Go
+  `crypto/tls`, rustls, sing-box), and one such terminating re-originator was written here and proven
+  against a real ECH endpoint. So "infeasible" is **not** the reason and must not be offered as one.
+  The reason is that it would hide nothing: a 2026-07-20 DoH probe found **no** partner endpoint
+  publishing an `ECHConfig`. The engine therefore ships only the opt-in, fail-closed **routing** half
+  (per-connection `ech_egress` / `ech_sidecar`, refused when the sidecar is non-loopback or paired
+  with `proxy_url`), and the re-originator was retired from the tree on 2026-08-10 rather than carried
+  as a second language nothing builds, tests or pins. Evidence, the retrieval SHA and the re-score
+  trigger: [ADR 0139](adr/0139-ech-egress-sidecar-sni-hiding-for-asvs-12-1-5-demand-gated.md);
+  operator contract: [`samples/ech-sidecar/`](../samples/ech-sidecar/README.md). The residual is
+  metadata only — which partner, how often — with at least these compensating conditions: on-prem, a
   trusted network segment, an operator-configured `[egress]`-allowlisted destination, and TLS still
-  protects the payload. Re-open when the stdlib gains a first-class ECH API (no new dep) and an
-  SVCB/HTTPS resolver is in scope.
+  protecting the payload. Re-open when a destination begins publishing an `ECHConfig`, or when CPython
+  ships a first-class ECH API.
 
 ### In-use memory protection — best-effort partial + deployment requirement (13.3.3 / 11.7.1 / 11.7.2, #198)
 

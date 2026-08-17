@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 import * as assert from "assert";
 
 import {
@@ -198,7 +200,7 @@ suite("connectionMerge — retry merges FIELD-WISE (only max_attempts is form-ow
     });
   });
 
-  test("an emptied retry table drops the key entirely (absent = retry-forever default)", () => {
+  test("an emptied retry table drops the key entirely (absent = inherit [delivery])", () => {
     const initial = maximalOutbound();
     initial.retry = { max_attempts: 5 }; // max_attempts was the only field
     const posted: ConnObj = {

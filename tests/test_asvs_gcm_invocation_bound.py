@@ -619,6 +619,7 @@ async def test_uploaded_logs_encrypts_charge_the_SAME_persisted_bound(tmp_path: 
             data=b"MSH|test synthetic log",  # valid HL7 head: 5.2.2 sniff requires MSH/FHS/BHS
             filename="up.hl7",
             uploader="tester",
+            uploader_id="u-tester",
         )
         # One encrypt for the blob, one for the metadata — both on the key's budget.
         assert cipher.cumulative_invocations() >= before + 2

@@ -38,7 +38,6 @@ pytestmark = pytest.mark.skipif(
 _RESET_TABLES = (
     "messages",
     "queue",
-    "outbox",
     "response",
     "leader_lease",
     "nodes",

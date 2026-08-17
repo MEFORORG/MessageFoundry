@@ -34,7 +34,7 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
     The registry takes all four inputs as REQUIRED arguments deliberately (ADR 0148: one posture, and a
     deviation the registry cannot see is a second posture by the back door). The tests below are about
     the ``[security]`` switches specifically, so the other three are pinned at shipped values here."""
-    return security_loosenings(sec, StoreSettings(), AuthSettings(), AlertsSettings(), ())
+    return security_loosenings(sec, StoreSettings(), AuthSettings(), AlertsSettings(), (), (), ())
 
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
@@ -380,36 +380,42 @@ def test_debug_logging_gate_keys_on_tier_not_enforcement(
     assert "DEBUG logging is refused" not in capsys.readouterr().err
 
 
-# --- unknown [security] keys are IGNORED by pydantic, so say so out loud -------
+# --- an unknown [security] key is REFUSED, never silently dropped --------------
 
 
-def test_unknown_security_key_warns_and_is_ignored(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Sections are ``extra="ignore"``, so a mistyped posture switch loads clean and applies NOTHING.
-    That is a silent fail-open on exactly the keys that matter, so the loader names them."""
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.config.settings"):
-        s = _load(tmp_path, "security.block_unlisted_outboud = true\nsecurity.require_mfa = true\n")
-    # The typo applied nothing — egress keeps its permissive default...
-    assert s.egress.deny_by_default is False
-    # ...while the correctly-spelled switch beside it still took effect (the warning is not a refusal).
-    assert s.auth.require_mfa is True
-    assert "block_unlisted_outboud" in caplog.text
-    assert "IGNORED" in caplog.text
+def test_unknown_security_key_is_refused(tmp_path: Path) -> None:
+    """A mistyped posture switch used to load clean and apply NOTHING — a silent fail-open on exactly
+    the keys that matter, since the operator then believes a control is on. It now refuses."""
+    with pytest.raises(ValueError) as excinfo:
+        _load(tmp_path, "security.block_unlisted_outboud = true\nsecurity.require_mfa = true\n")
+    message = str(excinfo.value)
+    assert "[security].block_unlisted_outboud" in message
+    assert "block_unlisted_outbound" in message  # the near-miss suggestion
 
 
-def test_known_security_keys_warn_about_nothing(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Byte-identical for every valid config: no spurious warning, including for a switch added later
-    (allowed_client_networks) that an older engine would not have recognised."""
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.config.settings"):
+def test_unknown_security_key_delivered_by_env_is_refused(tmp_path: Path) -> None:
+    """The [security] arm covers ENV as well as the file — the file-level check cannot see a
+    MEFOR_SECURITY_* variable. Safe for this section specifically: every MEFOR_SECURITY_* name in the
+    tree maps to a real field, so there is no out-of-band variable here to collide with."""
+    with pytest.raises(ValueError, match=r"\[security\]\.block_unlisted_outboud"):
         _load(
+            tmp_path,
+            "[security]\nrequire_sign_in = true\n",
+            {"MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUD": "true"},
+        )
+
+
+def test_known_security_keys_load_clean(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The negative control: a valid config still loads, with no warning and no refusal — including a
+    switch added later (allowed_client_networks) that an older engine would not have recognised."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.config.settings"):
+        s = _load(
             tmp_path,
             "security.block_unlisted_outbound = true\n"
             'security.allowed_client_networks = ["10.20.4.0/24"]\n',
         )
-    assert "unrecognized key" not in caplog.text
+    assert s.egress.deny_by_default is True
+    assert "unrecognized" not in caplog.text
 
 
 def test_open_egress_gate_counts_smtp_and_direct_when_deny_by_default_is_unset(

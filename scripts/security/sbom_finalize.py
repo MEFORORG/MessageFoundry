@@ -6,8 +6,11 @@ and assert the fields a downstream operator relies on are present before we ship
 
 WHY THIS EXISTS (ADR 0149). The SBOM generators we run — ``cyclonedx-py environment`` (Python),
 ``@cyclonedx/cyclonedx-npm`` (the VS Code extension), and ``trivy image`` (the container) — emit a
-CycloneDX BOM with components, hashes, licenses, and ``metadata.tools`` (the generating tool, i.e.
-the draft-2025 CISA "Tool Name" minimum element). Two gaps remain that this closes:
+CycloneDX BOM carrying at least components, licenses, and ``metadata.tools`` (the generating tool, i.e.
+the draft-2025 CISA "Tool Name" minimum element). Per-component *hashes* are NOT among them for the
+Python SBOM: ``cyclonedx-py environment`` emits none at all, so do not describe the finalized artifact
+as hash-bearing (docs/SUPPLY-CHAIN.md says so to operators, and the two must not drift apart again).
+Two gaps remain that this closes:
 
   1. None of them set ``metadata.lifecycles`` — the CycloneDX field that records WHERE in the SDLC
      the BOM was produced. That maps to CISA's "Build" SBOM Type and the draft-2025 CISA "Generation

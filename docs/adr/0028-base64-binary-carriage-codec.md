@@ -100,7 +100,7 @@ The existing str accessors are unchanged. (`content_type` stays the **format** t
 - **NOT a new `content_type`.** Carriage is **orthogonal** to format. `content_type` stays the format tag; `mfb64:` is how bytes ride, whatever the format.
 - **NOT a pipeline routing-logic edit.** `parsing/` stays pure; the **only** seams are the source-boundary `from_bytes` call site and the `RawMessage` accessors. Routing/filtering logic is untouched.
 - **NOT a "channel"/"route" element.** No graph-bundling object is added.
-- **NOT a declarative/visual transform surface, and NOT a `BLOB`/`bytea` store migration** — encode/decode stays code-first via the `RawMessage` API ([CLAUDE.md](../../CLAUDE.md) §12, [BACKLOG #26](../BACKLOG.md)) and all three backends stay TEXT/NVARCHAR(MAX), preserving the encoded-TEXT cipher seam (both also listed under Consequences → Out of scope).
+- **NOT a declarative/visual transform surface, and NOT a `BLOB`/`bytea` store migration** — encode/decode stays code-first via the `RawMessage` API ([CLAUDE.md](../../CLAUDE.md) §12, [BACKLOG #26](../archive/backlog/BACKLOG-CLOSED.md#26-visual--template-driven-channel-authoring--decision-decline-by-design-no-build)) and all three backends stay TEXT/NVARCHAR(MAX), preserving the encoded-TEXT cipher seam (both also listed under Consequences → Out of scope).
 
 ### 7. HL7 OBX-5 ED embedding (secondary)
 

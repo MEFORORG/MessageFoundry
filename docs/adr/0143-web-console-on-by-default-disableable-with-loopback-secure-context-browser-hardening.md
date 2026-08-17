@@ -172,3 +172,23 @@ Posture-A ASVS re-score is owner-gated and handled separately.
 - [x] `security_loosenings()` untouched (the switch is not a loosening); `docs/SECURITY-LOOSENING.md` reframed + switch-table default flipped.
 - [x] Docs (`CONFIGURATION.md`, `SECURITY.md`, `PHI.md`, `OFF-LOOPBACK-DEPLOYMENT.md`) + `ide/src/securityEditor.ts` flip "off by default" → on by default.
 - [ ] Posture-A ASVS re-score (3.3.1/3.3.3 stay Partial on loopback; auto-TLS deferred) — **owner-gated, separate**.
+
+## Cross-reference (2026-08-04) — the in-place `serve_ui = False` flips feed no exposure predicate (BACKLOG #326)
+
+Both degrade arms decided here — the package-absent soft-degrade and the exposed-bind auto-degrade —
+rewrite `settings.api.serve_ui` **in place** during `serve`, deliberately, so the JSON-only decision
+threads through the remaining gates and `create_managed_app`. That is unchanged.
+
+What changed is downstream: the MFA-at-exposure and #189 dual-control arms used to derive
+`admin_exposed` from that already-rewritten field, so an auto-degrade silently cleared an exposure
+refusal it was never meant to touch. Those arms now read a single console-independent
+`instance_exposed` (an off-loopback bind **or** `[api].tls_terminated_upstream`). See the
+[ADR 0140](0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md)
+amendment of the same date.
+
+Consequence for this ADR: an in-place flip decided here is now purely a **presentation** decision — it
+determines whether `/ui` is mounted, and nothing else. `ui_exposed` remains, scoped to the
+`/ui`-specific origin/TLS refusals and browser-console advisories that legitimately depend on the
+console being served. This ADR mentioned neither `require_mfa` nor `admin_exposed`, which is how the
+interaction came to exist without ever being adjudicated; recording it here is what puts it on the
+record.

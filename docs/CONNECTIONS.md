@@ -202,9 +202,26 @@ real transform) is also fine as a **single module** — the shipped `IB_ACME_ADT
 non-trivial transform logic.
 
 A **router fans out** by returning multiple handler names (`return ["to_a", "to_b"]`); a **single
-handler fans out** by returning multiple `Send`s (`return [Send("OB_A", msg), Send("OB_B", msg)]`).
+handler fans out** by returning multiple `Send`s (`return [Send("OB_A", msg), Send("OB_B", msg)]`) —
+a list is the idiom shown throughout these docs, but **any non-`str` iterable** delivers the same
+`Send`s (a tuple, a set, or a generator that `yield`s them). An **empty** one (`return []` /
+`return ()`) is the filter: nothing is delivered and the message is logged `FILTERED`.
 Namespace router/handler names uniquely (e.g. by site/partner) — `messagefoundry check` flags a
 duplicate name (across **any** of these files) and an inbound that binds a router that doesn't exist.
+
+> **Prefer a list, tuple or generator — they have an order; a `set` does not.** Fan-out is delivered
+> in iteration order, and a `set`'s iteration order is not defined: it varies from process to process
+> (`Send` hashes on its fields, and string hashing is seeded per process). Two `Send`s to the **same**
+> outbound therefore queue in an arbitrary relative order, and a re-run after a crash — a different
+> process — can queue them in a different one, so a `set` gives up both FIFO order between siblings and
+> the identical-output-on-re-run property the staged pipeline leans on (CLAUDE.md §2). Which `Send`s
+> are delivered is unaffected. **Use an ordered container whenever order matters.**
+>
+> A **generator** Handler delivers exactly like a list, but its body runs *after* the execution tracer
+> behind `dryrun --trace` (and the Test Bench that reads it) has detached. That invocation's trace
+> record therefore carries no executed lines and no sends, marked `"lazy_result": true` so the omission
+> is declared rather than read as a handler that did nothing; the run's message-level `sends` are still
+> exact. Return a list or tuple if you want the handler's body traced line-by-line.
 
 > **Transforms & HL7 escaping.** Writing a **component/subcomponent** (`msg["PID-5.1"] = value`)
 > stores `value` as a literal: HL7 delimiters in it (`^ ~ & |`) are **escaped** so they stay data
@@ -269,6 +286,8 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 | `max_connections` | in | `256` | cap on concurrent client connections (connection-flood guard). `None`/`0` = unlimited. |
 | `receive_timeout` | in | `60.0` | close a client idle this many seconds (slowloris guard). `None`/`0` = no timeout. |
 | `max_frame_bytes` | both | `16 MiB` | reject a single MLLP frame larger than this before buffering it whole (OOM guard); applies to inbound frames and outbound ACKs. `None`/`0` = unlimited. |
+| `max_messages_per_second` | in | **off** | sustained message-rate ceiling per **connection** (ASVS 2.4.1 / 15.2.2). Over budget the listener **pauses reading**, so TCP back-pressures the sender — **no message is ever dropped, refused or NAK'd**, and none is reordered. Unset = no bound, which is a deliberate exception to this table's usual secure-default rule: a guessed rate on a clinical interface throttles real traffic, so the number has to come from your own feed profile. |
+| `message_burst` | in | = the rate | tokens the bucket holds, i.e. how large a burst passes unpaced before the sustained rate applies. Only meaningful with `max_messages_per_second` set. Floor of 1 so a connection can always make progress. |
 | `connect_timeout` | out | `10.0` | TCP connect timeout (s) |
 | `timeout_seconds` | out | `30.0` | wait this long for the ACK |
 | `no_ack` | out | `false` | **(BACKLOG #117, ADR 0124) fire-and-forward (MLLP outbound only):** when `true`, deliver on the successful TCP **write** and read **no** ACK — delivery is confirmed on write, **not** on a positive MSA-1 ACK, so there is **no NAK- or timeout-driven retry** (*at-most-once-confirmation*). A connect/drain failure is still charged and retried (at-least-once for the write; a retry may duplicate — receivers stay idempotent). Composes with `persistent=true` (no handshake **and** no ACK wait — the max-throughput non-acking posture). **Incompatible with `capture_response`/`reingress_to`** (nothing to capture) and MLLP-only — both rejected at `check`. `false` (default) = **byte-identical** (read + validate one ACK). |
@@ -629,7 +648,7 @@ def route(msg):
 | `sort` | in | `name` | process order: `name` or `mtime` |
 | `recursive` | in | `false` | also scan subdirectories |
 | `max_file_bytes` | in | `16 MiB` | route files larger than this to the error dir instead of reading them into memory (OOM guard). `None`/`0` = unlimited. |
-| `validate_directory` | in | `false` | validate the poll directory **at startup** (#114): a missing/unusable dir reports the connection **`failed`** (ADR 0031) instead of the default deferral to run time. No mkdir — a merely-missing dir fails. A `leave` source validates read-only (a read-only share passes); `move`/`delete` also require write. |
+| `validate_directory` | both | `false` | validate the directory **at startup** (#114): a missing/unusable dir reports the connection **`failed`** (ADR 0031) instead of the default deferral to run time. **No mkdir** — a merely-missing dir fails. **In:** a `leave` source validates read-only (a read-only share passes); `move`/`delete` also require write. **Out:** the target must already exist and accept a write, and is then **never created** — not at start, not on write (a delivery into a vanished dir fails retryably instead), and not by `POST /connections/{name}/test`. Left off (the default) the outbound target is still created on first write, but the creation is now logged as a `WARNING`. |
 | `processed_subdir` / `error_subdir` | in | `.processed` / `.error` | where read/failed files go |
 | `filename` | out | `{MSH-10}.hl7` | output name (supports `{HL7-path}` placeholders). Resolved values are sanitized to a **single safe filename** — path separators/unsafe chars stripped, leading dots removed, and `.`/`..`/reserved device names fall back — so a message field can never write outside the directory. |
 | `overwrite` | out | `false` | overwrite vs. uniquify a name collision (collisions are resolved by an **atomic** exclusive create, so concurrent writes never clobber) |
@@ -799,9 +818,18 @@ upload chokepoint enforces a fixed policy independent of the directory-source po
   (There is **no** antivirus/content-malware scan on the upload path — the `ScanRejected` pre-ingest
   scan-hook seam applies only to the `File(...)`/remote directory sources above, not to HTTP uploads.)
 - **Consent affordance (ASVS 14.2.8).** The `/ui/uploaded-logs/upload` form states, above its submit
-  button, that the original filename and the uploader's username are stored and shown to authorized
-  operators and recorded in the audit log — **submitting the form is the consent**; the POST `/uploads`
-  OpenAPI docstring states the same for programmatic callers.
+  button, that the original filename and the uploader's username are stored and shown to the uploader
+  and to authorized operators holding `files:access_any`, and recorded in the audit log — **submitting
+  the form is the consent**; the POST `/uploads` OpenAPI docstring states the same for programmatic
+  callers.
+- **Owner-only access (ASVS 8.2.2).** An uploaded file is reachable only by the **account** that
+  uploaded it — keyed on the immutable `Identity.user_id`, not the reusable username: the listing is
+  filtered to the caller, and browse / resend / delete answer **404** for anyone else, audited as
+  `upload.denied` (which principal was refused, which file, which operation — never a filename or
+  content). `files:access_any` (Administrator) is the explicit cross-operator override. The rule and
+  its rationale live in
+  [SECURITY.md](SECURITY.md#uploaded-files-phi-at-rest); the age-based retention prune above is
+  deliberately owner-blind.
 
 **Downloads are made safe at serve (ASVS 1.3.4).** The attachment download route (GET
 `/messages/{message_id}/attachments/{attachment_id}`, and its `/ui` delegate) serves the stored bytes
@@ -823,9 +851,11 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   (`pip install 'messagefoundry[sftp]'`, lazily imported so an install that never uses SFTP skips it).
   **Host-key verification is ON by default** (the system host keys plus an optional extra `known_hosts`,
   paramiko `RejectPolicy`); an unknown key is **refused** unless `MEFOR_ALLOW_INSECURE_TLS` is set (and
-  loudly logged when it is). **This one cell reads the raw escape and is *not* clamped** — unlike the
-  `tls_verify` / `encrypt` cells elsewhere in this document, the variable still works here on a
-  production-PHI enforcing instance, so it is the SFTP setting to audit for rather than assume inert.
+  loudly logged when it is). **Since #329 this cell routes the escape through the clamped
+  `weakened_tls_escape_permitted_here()`** — like the `tls_verify` / `encrypt` cells elsewhere in this
+  document, so on a production-PHI enforcing instance the escape is inert and an unknown host key stays
+  refused (`RejectPolicy`) even with the variable set; it takes effect only on a non-enforcing / non-PHI
+  instance.
 - **`Ftp(...)`** — stdlib `ftplib`, **no extra**: `tls=False` is plain FTP, `tls=True` is **FTPS**
   (explicit TLS + `PROT P`, encrypting the control *and* data channels). FTPS **verifies the server
   certificate and hostname by default** (a verifying `SSLContext`, not ftplib's no-verify fallback).
@@ -850,7 +880,7 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `min_age_seconds` | in | `0.0` | **accepted but not honoured on a remote source today** — the connector never reads it (a remote directory listing carries no reliable mtime). Only `File(...)` implements it; use `after_read`/the partner's own write-then-rename to avoid partial reads. |
 | `after_read` | in | `move` | `move` (→ `processed_subdir`), `delete`, or `leave` (process **in place**, #142 — a durable dedup ledger keyed on a hash of the **full remote path** + size ensures a left file is ingested once) |
 | `max_file_bytes` | in | `16 MiB` | move a file larger than this to `error_subdir` instead of retrieving it (OOM guard). `None`/`0` = unlimited. |
-| `validate_directory` | in | `false` | validate `remote_dir` **at startup** (#114): unreachable/unusable reports the connection **`failed`** (ADR 0031) instead of deferring to run time |
+| `validate_directory` | both | `false` | validate `remote_dir` **at startup** (#114): unreachable/unusable reports the connection **`failed`** (ADR 0031) instead of deferring to run time. The probe is a **listing** — it never creates. **Out:** the upload dir is then never `ensure_dir`ed either, on send or by `POST /connections/{name}/test`; an upload into a vanished dir fails **retryably** rather than dead-lettering on the partner's permanent no-such-dir. Left off (the default) the upload dir is still created on first send, but the creation is now logged as a `WARNING`. |
 | `processed_subdir` / `error_subdir` | in | `.processed` / `.error` | where read / failed files go |
 | `filename` | out | `{MSH-10}.hl7` | upload name (supports `{HL7-path}` placeholders, sanitized to a **single safe filename** exactly as `File(...)`) |
 | `overwrite` | out | `false` | overwrite vs. uniquify a name collision (never a silent clobber) |
@@ -1041,8 +1071,12 @@ The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};]
 > driver's TLS posture — so the weakened-TLS refusal does **not** apply here. Configure **verifying** TLS
 > via the driver's own keyword in `odbc_params` (psqlODBC `SSLmode=verify-full`, MySQL
 > `SSLMODE=VERIFY_IDENTITY`, Oracle wallet). Never point PHI at an unverified generic hop. So the
-> delegation is never *silent*, a generic connection with **no** ssl/tls/encrypt keyword in `odbc_params`
-> logs a **WARNING** at construction (dropped to DEBUG once a TLS keyword is set); this exemption is
+> delegation is never *silent*, a generic connection logs a **WARNING** at construction, naming itself,
+> when `odbc_params` carries **no** ssl/tls/encrypt keyword **or** carries one set to a no-TLS value
+> (`SSLmode=disable`/`allow`/`prefer`, MySQL `DISABLED`/`PREFERRED`, `Encrypt=no`/`0`/`false`/`off`) —
+> dropped to DEBUG only once a keyword is set to something outside that deny-list. It is also reported
+> by `security_loosenings()` / `GET /security/posture` and by `messagefoundry check`'s `generic-db-tls`
+> line, for `DatabasePoll` inbounds as well as `Database` outbounds (#333). This exemption is
 > recorded in the [ADR 0092 amendment (2026-07-12)](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md).
 
 > **Scope / limitations.** Native async DB drivers (`asyncpg`-as-connector, `oracledb`, `mysqlclient`) are
@@ -1577,7 +1611,7 @@ MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 | `tls_key_password` | `None` → unencrypted key | passphrase for a PKCS#8-encrypted `tls_key_file` (`env()`-sourced, mirroring MLLP's `MEFOR_*_TLS_KEY_PASSWORD`). An encrypted key supplied with **no/wrong** passphrase **fails fast** at startup/`check` rather than hanging on an interactive TTY prompt (there is no TTY under an NSSM service account / in a container). |
 | `tls_ca_file` | — | opt-in **mTLS**: require + verify a calling peer's client certificate |
 
-The **bind interface** is the service-level `[inbound].bind_host` (or a per-connection `bind_address`) and the **peer-IP gate** is the per-connection **`source_ip_allowlist`** — both are set on the `inbound(...)` call, not as `DICOM()` arguments. ⚠️ **`source_ip_allowlist` is *not* a key of the `[inbound]` section in `messagefoundry.toml`.** That section carries only `bind_host`, `ack_after` and `stream_inflight_budget_bytes`, and every settings section is pydantic `extra="ignore"` — so writing `source_ip_allowlist` under `[inbound]` in the service TOML is **accepted silently and does nothing**. (Verified: `InboundSettings.model_fields` is exactly those three; a loaded `[inbound].source_ip_allowlist` leaves no attribute behind, while a sibling `bind_host` survives.) `bind_address` is the same story — a per-connection keyword, not a `[inbound]` key. The reachable forms are `inbound("IB_…", DICOM(...), source_ip_allowlist=["10.20.0.0/16"])` and, for the transports available as data, the **top-level** `source_ip_allowlist` key in `connections.toml` (shown in the [`connections.toml` example](#connections-as-data--connectionstoml-adr-0007) above) — `DICOM()` is code-first only, so for a SCP it is the `inbound(...)` keyword. A non-loopback cleartext SCP is **refused at startup** unless `tls=true` (the generalized [cleartext] bind-guard — `check_dimse_tls_exposure`). `serve --allow-insecure-bind` downgrades that refusal to a warning, but the flag is **clamped** exactly as it is for the MLLP/HTTP/TCP listeners: on a PHI-classified instance under the default `[security].enforcement = enforce` the bind is refused *even with it*, so on a stock instance `tls=true` is the only way to bind off-loopback. (`host` / `called_ae_title` / `connect_timeout` on `DICOM()` are for the **Phase-2 outbound SCU** and are unused by the inbound SCP.)
+The **bind interface** is the service-level `[inbound].bind_host` (or a per-connection `bind_address`) and the **peer-IP gate** is the per-connection **`source_ip_allowlist`** — both are set on the `inbound(...)` call, not as `DICOM()` arguments. ⚠️ **`source_ip_allowlist` is *not* a key of the `[inbound]` section in `messagefoundry.toml`.** That section carries only `bind_host`, `ack_after` and `stream_inflight_budget_bytes`, and an unrecognized key in a known section is **refused at load** — so writing `source_ip_allowlist` under `[inbound]` in the service TOML **fails the start** (`serve` exit 2), naming the section and the key. It used to be accepted silently and do nothing, which is the failure mode the refusal exists to remove. (Verified: `InboundSettings.model_fields` is exactly those three; `[inbound].source_ip_allowlist` raises `unrecognized config key(s)`, while a sibling `bind_host` loads.) `bind_address` is the same story — a per-connection keyword, not a `[inbound]` key. The reachable forms are `inbound("IB_…", DICOM(...), source_ip_allowlist=["10.20.0.0/16"])` and, for the transports available as data, the **top-level** `source_ip_allowlist` key in `connections.toml` (shown in the [`connections.toml` example](#connections-as-data--connectionstoml-adr-0007) above) — `DICOM()` is code-first only, so for a SCP it is the `inbound(...)` keyword. A non-loopback cleartext SCP is **refused at startup** unless `tls=true` (the generalized [cleartext] bind-guard — `check_dimse_tls_exposure`). `serve --allow-insecure-bind` downgrades that refusal to a warning, but the flag is **clamped** exactly as it is for the MLLP/HTTP/TCP listeners: on a PHI-classified instance under the default `[security].enforcement = enforce` the bind is refused *even with it*, so on a stock instance `tls=true` is the only way to bind off-loopback. (`host` / `called_ae_title` / `connect_timeout` on `DICOM()` are for the **Phase-2 outbound SCU** and are unused by the inbound SCP.)
 
 > **Fail-closed peer controls (deny-by-default).** DICOM has no transport authentication on its own, so a **non-loopback** SCP **MUST** set a **verifiable** peer control — either a per-connection `source_ip_allowlist` (an `inbound(...)` keyword — **not** a `[inbound]` service-TOML key, see the ⚠️ above), or **mTLS** (`tls=true` **and** `tls_ca_file`, which makes the SCP require + verify a client cert). With **neither** set, a non-loopback SCP is **refused at construction** (the connection degrades per ADR 0031 startup fault isolation; surfaced under `check`/dry-run). This is the **authentication** analog of the `check_dimse_tls_exposure` cleartext bind-guard above (which is the orthogonal **confidentiality** guard): TLS-without-mTLS encrypts the channel but does **not** authenticate the peer. A **loopback** bind (`127.0.0.1`/`localhost`/`::1`, the common dev/single-box case) is exempt.
 >
@@ -2193,14 +2227,45 @@ Four facts that are easy to get wrong, stated plainly first:
   `acquire_timeout`, and there is **no** `timeout_seconds` on this connector. A long-running
   statement is therefore unbounded; keep lookup/write statements indexed and narrow. (The *store's*
   own SQL Server / Postgres connections do apply `[store].command_timeout`, default 30 s.)
-- **The store's connection pool has no acquire timeout on either server backend.** Both the SQL
-  Server and Postgres stores call `pool.acquire()` with no timeout argument; the borrow is bounded
-  by `[store].pool_size` (default 40) plus the warm-pool pre-open (`[store].warm_pool`, timeout
-  `[store].warm_pool_timeout` default 15 s), not by an acquire deadline. The `timeout=` the Postgres
-  backend hands `asyncpg.create_pool` is a pool-construction parameter carrying
-  `[store].connect_timeout`; it is **not** relied on here as a bound on waiting for a free
-  connection. **SQLite is the same shape at a smaller scale** — its four-connection read pool
-  (`_READ_POOL_SIZE`) is borrowed with `await pool.get()`, which carries no deadline either.
+- **The store's message-pipeline pool acquire is bounded on both server backends.**
+  `[store].acquire_timeout` (default **30 s**, must be > 0) caps one borrow from the SQL Server or
+  Postgres store pool, and the throwaway pool a `DatabaseRef` reference sync opens takes its own
+  `acquire_timeout` (same default). It is a *distinct* bound from the two either backend already had:
+  `[store].connect_timeout` (default 15 s) bounds the **login** and `[store].command_timeout`
+  (default 30 s) the **statement** — neither bounds the wait for a free pooled connection. The
+  `timeout=` the Postgres backend hands `asyncpg.create_pool` is a pool-construction parameter
+  carrying `[store].connect_timeout`; it is **not** a bound on waiting for a free connection either.
+  `[store].pool_size` (default 40) and the warm-pool pre-open (`[store].warm_pool`, timeout
+  `[store].warm_pool_timeout` default 15 s) size the pool; they are not a deadline.
+
+  **What it covers, stated as a scope rather than a completeness claim.** On **SQL Server**
+  `_acquire` is the sole borrow site, so it bounds every store call. On **Postgres** it bounds at
+  least the message-pipeline borrows — the transactional claim/handoff sites and the internal
+  `_fetchall` / `_fetchone` / `_execute` helpers, which were routed through the same chokepoint for
+  that reason. Take the scope as written; the two backends reach it differently and this setting is
+  not a statement about every code path that can touch a pool.
+
+  **Behaviour at the store-pool acquire limit.** The borrow raises `StoreAcquireTimeout` with a
+  numeric, PHI-free message naming the backend and the knob. It is an ordinary `Exception`, so it
+  reaches the stage worker's existing handling and is treated exactly like any other transient store
+  failure — the row stays claimable, the stage handoff re-runs idempotently, and nothing is
+  accepted-and-dropped. It is deliberately **not** a `TimeoutError` (since Python 3.11 an `OSError`
+  subclass, which connector-error handling reads as a network fault). A borrow abandoned at the limit
+  never strands a pooled connection: if the pool hands one over after the borrower gave up it is
+  released back, so a wedged pool does not shrink by a slot per retry. For a `DatabaseRef` sync the
+  set fails like any other source failure — the last-good snapshot keeps serving reads and the
+  AlertSink fires; because the runner walks the declared sets sequentially, this bound is also what
+  stops one unresponsive reference server from stalling every *other* set's refresh.
+
+  **Sizing.** 30 s sits far above a healthy wait (cold ODBC acquires measured 340–958 ms on the
+  dogfood box), so reaching it means the pool is wedged or the database is unresponsive, not that the
+  pool is busy. Read p95/p99 from the acquire-wait histogram in `pool_status()` before lowering it.
+  There is no "0 disables" value — an unbounded pool wait is what the setting exists to remove.
+
+  **SQLite is out of scope for this setting and does not need it**: its four-connection read pool
+  (`_READ_POOL_SIZE`) is borrowed with `await pool.get()`, which carries no deadline, but it is
+  in-process with no network leg — a borrow waits only for a sibling read to finish, itself bounded by
+  `PRAGMA busy_timeout` (5000 ms) and the query.
 
 *Outbound* concurrency is bounded either way: in `per_lane` mode by **exactly one delivery worker per
 outbound connection**, and in the default `pooled` mode by the per-stage processing-slot budget
@@ -2219,13 +2284,17 @@ none (filesystem I/O is unbounded by design). The MLLP/TCP/X12/HTTP listeners ex
 `receive_timeout`; the DICOM SCP instead applies `timeout_seconds` to its three pynetdicom timers. For
 **synchronous** request→response feeds (REST/SOAP, X12 270/271) set a **short** `timeout_seconds`.
 
-**Retry strategy (13.1.3).** Delivery failures retry per the connection's `RetryPolicy`. **Note the
-default `retry_max_attempts` is `None` = retry forever** (with backoff: `retry_backoff_seconds` 5 s,
-multiplier 2.0, capped at 300 s). Under strict FIFO a forever-retrying head blocks its lane until it
-succeeds or an operator purges it. For synchronous HTTP (REST/SOAP) **set a finite
-`retry_max_attempts` and a short `timeout_seconds`** to prevent cascading delays / resource
+**Retry strategy (13.1.3).** Delivery failures retry per the connection's `RetryPolicy`. **The
+default `retry_max_attempts` is 100 — finite** (with backoff: `retry_backoff_seconds` 5 s,
+multiplier 2.0, capped at 300 s), which is a 28,215 s (7 h 50 m 15 s) window before a row gives up.
+Two properties make that safe as a default: attempts are counted **per row**, so an outage burns the
+cap on roughly the lane heads rather than the whole backlog; and an exhausted row **dead-letters into
+the replayable DLQ** rather than being discarded. For synchronous HTTP (REST/SOAP) **keep the finite
+`retry_max_attempts` and set a short `timeout_seconds`** to prevent cascading delays / resource
 exhaustion; failures classified *permanent* (e.g. an MLLP `AR` reject) go straight to the
-dead-letter path rather than retrying. **Every infrastructure hop in Table B that performs a
+dead-letter path rather than retrying. `retry_max_attempts=None` remains expressible and still means
+retry forever, for a partner that must never be advanced past — under strict FIFO that head blocks
+its lane until it succeeds or an operator purges it, so it is a written decision, not a default. **Every infrastructure hop in Table B that performs a
 synchronous request/response is single-shot** — AD, OIDC, SMART, generic OAuth2, the AI broker, both
 Vault clients, both SMTP sinks, the webhook sink, syslog and SNTP: one attempt, no retry loop, which
 is what the requirement's "disable or strictly limit retries" clause asks for. The **store backends
@@ -2310,13 +2379,13 @@ for the Router/Handler and the SMB worker — nothing but a restart.
 | EMAIL (SMTP) destination | one SMTP connection per send, bounded by the lane budget | the relay's own limit surfaces as an SMTP error | transient → retry; permanent → dead-letter |
 | DIRECT (S/MIME over SMTP) | one SMTP connection per send, bounded by the lane budget | as EMAIL | as EMAIL |
 | DATABASE destination / poll source / `db_lookup` | `pool_max` default 5 connections per connection definition | a borrow that cannot be satisfied within `acquire_timeout` (default 30 s) fails **transiently** with a PHI-free "pool exhausted or DB unresponsive" error | the row re-queues into the `RetryPolicy` path; the pool self-heals as borrows return |
-| Reference-set sync (`DatabaseRef`) | `pool_max` default 5, in a **throwaway pool built per sync** | **`DatabaseRef` exposes no `acquire_timeout` and its borrow is not wrapped** — this is the one remaining unbounded connector-tier pool acquire | the sync task is isolated per reference set; a wedged sync leaves the previous snapshot serving reads |
+| Reference-set sync (`DatabaseRef`) | `pool_max` default 5, in a **throwaway pool built per sync** | a borrow that cannot be satisfied within `DatabaseRef(acquire_timeout=…)` (default 30 s) raises `StoreAcquireTimeout`, failing that set's sync | the sync task is isolated per reference set; the previous snapshot keeps serving reads and the AlertSink fires. The bound also keeps one wedged source from stalling the sequential pass over the other sets |
 | Internal sources — Timer / Loopback / PassThrough | n/a — they open no socket and reach no external system | n/a | n/a |
 | Engine API + `/ui` + `/ws/stats` (`[api].port`) | uvicorn's own defaults (no `limit_concurrency` / `timeout_keep_alive` is passed); per-actor 429 throttles bound abuse: login 10 per IP and 60 global per 60 s, PHI reads 120 per actor per 60 s, admin writes 12 per actor per second | over a throttle the request gets `429` and an audit row; the connection stays usable | the caller backs off; the window rolls |
 | Reverse proxy → engine segment (`[api].trusted_proxies`) | bounded by the proxy's own connection limits — the engine sets none on this hop | whatever the proxy does at its limit; the engine sees fewer connections | operator-owned (proxy config) |
 | Store — SQLite (`[store].backend = sqlite`) | one writer connection plus a **bounded read pool of 4** read-only WAL connections (`store/store.py` `_READ_POOL_SIZE`; deliberately not a setting); no network | writes serialize behind the single writer lock; a read that finds all four borrowed **waits on the pool queue with no deadline** (`await pool.get()`), and lock contention inside SQLite waits out `PRAGMA busy_timeout` 5000 ms | the borrow is returned in `finally`; every pooled connection is closed on store close |
-| Store — SQL Server (`[store].backend = sqlserver`) | `[store].pool_size` default 40, pre-warmed by `[store].warm_pool` | **no acquire timeout** — a borrow waits for a free connection; sizing plus the warm pool is the bound | a wedged pool surfaces as stalled stage workers; restart re-opens the pool and `reset_stale_inflight` recovers in-flight rows |
-| Store — Postgres (`[store].backend = postgres`) | `[store].pool_size` default 40 (`asyncpg` `max_size`) | as SQL Server — the engine passes **no timeout** to `pool.acquire()`; the `timeout=` given to `asyncpg.create_pool` is a pool-construction parameter, not an engine-owned acquire deadline | as SQL Server |
+| Store — SQL Server (`[store].backend = sqlserver`) | `[store].pool_size` default 40, pre-warmed by `[store].warm_pool` | a borrow that cannot be satisfied within `[store].acquire_timeout` (default 30 s) raises `StoreAcquireTimeout` — an ordinary `Exception`, handled like any other transient store failure | the row stays claimable and the stage handoff re-runs idempotently; a connection handed over after the borrower gave up is released back, so the pool does not shrink per retry; `reset_stale_inflight` recovers in-flight rows on restart |
+| Store — Postgres (`[store].backend = postgres`) | `[store].pool_size` default 40 (`asyncpg` `max_size`) | the same `[store].acquire_timeout` bounds at least the **message-pipeline** borrows (claim/handoff plus the internal `_fetchall`/`_fetchone`/`_execute` helpers) — see the coverage note above, which is a scope, not a completeness claim. The `timeout=` given to `asyncpg.create_pool` is a pool-construction parameter, not an acquire deadline | as SQL Server on the bounded paths |
 | Active Directory — login binds (`[auth].ad_server`) | one `authenticate()` = **two sequential binds** plus 1–2 SUBTREE searches; concurrency is bounded by the API login rate limiter and the thread executor | at the login limiter the request gets `429`; a DC that is at capacity fails the bind | the login fails closed with `LdapError`; the user retries |
 | Active Directory — session reconciler (`ad_session_recheck_seconds`) | one bind per signed-in directory user per pass, capped by `ad_session_recheck_max_users` (200); interval floored at 60 s | the remainder is deferred to later passes (least-recently-probed first), degrading to a longer effective interval rather than a bind storm | the mass-revoke breaker (`ad_session_revoke_max` 5 **and** `ad_session_revoke_max_fraction` 0.34) aborts a pass that would revoke too much |
 | Kerberos / SPNEGO SSO (`kerberos_spn`) | no engine socket — one SPNEGO server step per login against the OS provider | the OS provider's own limits apply | a failed step is an audited login reject; a boot preflight degrades SSO legibly when no provider exists |
@@ -2342,7 +2411,7 @@ for the Router/Handler and the SMB worker — nothing but a restart.
 | Service/hop | Timeout setting + default | Release procedure | Failure handling | Retry posture |
 |---|---|---|---|---|
 | MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace | a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row | n/a — the sender retries |
-| MLLP destination | `connect_timeout` 10 s, `timeout_seconds` 30 s (drain + ACK read) | the socket is closed per delivery, or reused and aged out via `idle_timeout_seconds` / `max_connection_age_seconds` when `persistent` | transient errors re-queue; a `NegativeAckError` (AR) dead-letters immediately | `RetryPolicy` — **default `retry_max_attempts` is unset = retry forever**; set a finite limit |
+| MLLP destination | `connect_timeout` 10 s, `timeout_seconds` 30 s (drain + ACK read) | the socket is closed per delivery, or reused and aged out via `idle_timeout_seconds` / `max_connection_age_seconds` when `persistent` | transient errors re-queue; a `NegativeAckError` (AR) dead-letters immediately | `RetryPolicy` — **default `retry_max_attempts` is 100, finite**; lower it, or set `None` to retry forever |
 | Raw TCP listener (inbound) | `receive_timeout` 60 s | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path | n/a |
 | X12 listener (inbound) | `receive_timeout` 60 s; `max_interchange_bytes` bounds one ISA/IEA frame | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; an allow-list refusal is **log-only** (no connection_event) and a **capacity refusal is silent — no event and no log** | n/a |
 | Raw TCP / X12 destination | `connect_timeout` 10 s, `timeout_seconds` 30 s | a fresh connection per delivery, closed in `finally` | transient vs permanent classification as MLLP | `RetryPolicy` |
@@ -2352,7 +2421,7 @@ for the Router/Handler and the SMB worker — nothing but a restart.
 | SFTP (remote-file) | 30 s on the **TCP connect only** — the hard-coded module fallback in `transports/remotefile.py` is passed to `paramiko.SSHClient.connect(timeout=…)`. The SSH banner and auth legs ride paramiko's own defaults (the engine sets neither `banner_timeout` nor `auth_timeout`), and the SFTP **channel read/write has no timeout at all**, so a server that stalls after connect blocks its `to_thread` worker until the engine restarts. `Sftp()` exposes no timeout argument, so none of this is operator-configurable | the `paramiko` session is closed in `finally` per poll or delivery | SSH failures map to transient | `RetryPolicy` |
 | FTP / FTPS (remote-file) | 30 s **whole-socket** — the same hard-coded module fallback, handed to `ftplib.FTP_TLS(timeout=…)` / `ftplib.FTP(timeout=…)`, which sets it on the control **and** data connections. `Ftp()` exposes no timeout argument, so it is **not** operator-configurable | the `ftplib` session is closed in `finally` per poll or delivery | `ftplib.all_errors` maps to transient | `RetryPolicy` |
 | Reference-set sync (`FileRef`) | **none engine-owned** — filesystem / SMB-redirector I/O, the same posture as the File connector | the file handle is context-managed and closed per pass | a load error is logged and the previous encrypted snapshot is retained | one attempt per `refresh_seconds` (default 3600) — **no inner retry** |
-| REST destination | `timeout_seconds` 30 s — the **only** timeout (no separate connect timeout on the HTTP family) | the `urllib` response is context-managed and closed per request | HTTP status is classified transient vs permanent; redirects are never followed | `RetryPolicy`; **set a finite `retry_max_attempts` + a short `timeout_seconds` for synchronous feeds** |
+| REST destination | `timeout_seconds` 30 s — the **only** timeout (no separate connect timeout on the HTTP family) | the `urllib` response is context-managed and closed per request | HTTP status is classified transient vs permanent; redirects are never followed | `RetryPolicy`; the finite `retry_max_attempts` default is what a synchronous feed needs — **keep it and set a short `timeout_seconds`** |
 | SOAP destination | `timeout_seconds` 30 s | as REST | as REST | as REST |
 | FHIR destination + `fhir_lookup` | `timeout_seconds` 30 s on both (the lookup carries its own per-connection value), plus the same 30 s Handler-side result bridge (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker without cancelling the in-flight request | as REST; the lookup runs on the thread executor and returns the connection immediately | a lookup failure raises into the Handler and fails the message — never a silent empty result | destination: `RetryPolicy`. `fhir_lookup`: **single-shot, no retry** |
 | DICOMweb STOW-RS destination | `timeout_seconds` 30 s | as REST | STOW-RS status classified transient vs permanent | `RetryPolicy` |
@@ -2361,13 +2430,13 @@ for the Router/Handler and the SMB worker — nothing but a restart.
 | EMAIL (SMTP) destination | `timeout_seconds` 30 s passed to the `smtplib` constructor (covers connect and each command) | the SMTP session is closed per send | SMTP errors classified transient vs permanent | `RetryPolicy` |
 | DIRECT (S/MIME over SMTP) | `timeout_seconds` 30 s on the `smtplib` constructor | as EMAIL; key/cert material is loaded once at construction | as EMAIL | `RetryPolicy` |
 | DATABASE destination / poll source / `db_lookup` | `connect_timeout` 15 s (DSN **login** timeout only) and `acquire_timeout` 30 s on the pool borrow — **no per-statement timeout exists on this connector**. For `db_lookup` there is additionally a 30 s Handler-side **result bridge** (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker; it does **not** cancel the statement, which completes on the loop and only then releases its connection | every acquire is paired with a `pool.release()` in `finally`; the pool is closed on connection stop | an acquire expiry raises a **transient** PHI-free `DeliveryError`; SQLSTATE drives transient vs permanent | `RetryPolicy`. `db_lookup` itself is **single-shot** — it raises into the Handler |
-| Reference-set sync (`DatabaseRef`) | `connect_timeout` 15 s; **no `acquire_timeout` — the borrow is unbounded** | the connection is released and the throwaway pool closed in nested `finally` blocks | a sync error is logged and the previous snapshot keeps serving | one attempt per `refresh_seconds` (default 3600) — **no inner retry** |
+| Reference-set sync (`DatabaseRef`) | `connect_timeout` 15 s (DSN login) and `acquire_timeout` 30 s on the pool borrow | the connection is released and the throwaway pool closed in nested `finally` blocks | a sync error (including an acquire expiry) is logged, the AlertSink fires and the previous snapshot keeps serving | one attempt per `refresh_seconds` (default 3600) — **no inner retry** |
 | Internal sources — Timer / Loopback / PassThrough | n/a — no socket, no timeout | the worker task is cooperatively cancelled on stop | n/a | n/a |
 | Engine API + `/ui` + `/ws/stats` (`[api].port`) | uvicorn defaults (the engine passes no `timeout_keep_alive`) | the ASGI lifespan calls `engine.stop()`, cancelling every worker | throttled requests get `429` + an audit row | n/a — the caller retries |
 | Reverse proxy → engine segment (`[api].trusted_proxies`) | **none the engine owns** — the proxy's timeouts govern | connection lifetime is the proxy's | operator-owned | n/a |
 | Store — SQLite (`[store].backend = sqlite`) | `PRAGMA busy_timeout` 5000 ms on the writer and on every read-pool connection; **the pool borrow itself carries no timeout**; no network timeout applies | connections are closed on store close | a busy database retries inside the store layer | n/a |
-| Store — SQL Server (`[store].backend = sqlserver`) | `[store].connect_timeout` 15 s (DSN login) and `[store].command_timeout` 30 s applied per acquire as the pyodbc connection attribute; `[store].warm_pool_timeout` 15 s bounds the warm-up | every acquire releases back to the pool; the pool is closed on shutdown | a driver error propagates to the stage worker and the row stays claimable | stage handoffs re-run idempotently; `reset_stale_inflight` recovers on restart |
-| Store — Postgres (`[store].backend = postgres`) | `[store].connect_timeout` 15 s (`create_pool(timeout=…)`) and `[store].command_timeout` 30 s as `asyncpg`'s per-statement bound | as SQL Server | as SQL Server | as SQL Server |
+| Store — SQL Server (`[store].backend = sqlserver`) | three distinct bounds: `[store].connect_timeout` 15 s (DSN **login**), `[store].command_timeout` 30 s (**statement**, applied per acquire as the pyodbc connection attribute) and `[store].acquire_timeout` 30 s (the **pool borrow**); `[store].warm_pool_timeout` 15 s bounds the warm-up | every acquire releases back to the pool; the pool is closed on shutdown; a borrow the pool satisfies after the borrower gave up is released back rather than stranded | a driver error — or a `StoreAcquireTimeout` — propagates to the stage worker and the row stays claimable | stage handoffs re-run idempotently; `reset_stale_inflight` recovers on restart |
+| Store — Postgres (`[store].backend = postgres`) | `[store].connect_timeout` 15 s (`create_pool(timeout=…)`), `[store].command_timeout` 30 s as `asyncpg`'s per-statement bound, and `[store].acquire_timeout` 30 s on the message-pipeline pool borrows (see the coverage note above) | as SQL Server | as SQL Server | as SQL Server |
 | Active Directory — login binds (`[auth].ad_server`) | `[auth].ad_connect_timeout` 10 s on the LDAP TCP connect and `[auth].ad_receive_timeout` 10 s on every LDAP response read — threaded into **every** `ldap3` `Server`/`Connection` construction | the service-account connection is context-managed; the user bind is unbound in a `finally`, so a **rejected** password releases it too (the common adversarial case) | fails closed with `LdapError`; the login is rejected and audited | **single-shot** — two binds, no retry loop |
 | Active Directory — session reconciler (`ad_session_recheck_seconds`) | the same `ad_connect_timeout` / `ad_receive_timeout` | as the login path — context-managed connections | a pass that fails is retried on the next interval; strike state is process-local | **single-shot per pass**; `ad_session_recheck_strikes` (2) required before a revoke |
 | Kerberos / SPNEGO SSO (`kerberos_spn`) | **none engine-owned** — the OS provider owns any KDC timeout | the SPNEGO context is per-request | a failed step raises `LdapError` and audits a login reject | **single-shot**, single-leg — no NTLM fallback, no multi-leg handshake |
@@ -2416,7 +2485,7 @@ Legend: ✅ native · ~ partial / via extension / via another transport · ❌ n
 | **IBM MQ / MSMQ** | ~ | ❌ | ✅ | ❌ | not on roadmap |
 | **Kafka / streaming** | ~ | ❌ | ✅ | ❌ | not on roadmap |
 | **DICOM** (imaging) | ✅ | ~ | ✅ | ✅ | `DICOM-IN` C-STORE SCP (Phase 1) + `DICOM-OUT` C-STORE SCU/C-ECHO + `DICOMWEB-OUT` STOW-RS all shipped (ADR 0025); DICOMweb send exceeds both incumbents |
-| **Serial (RS‑232)** + X/Y‑Modem/Kermit + **ASTM E1381/E1394/E1318** | ~ | ❌ | ✅ | ❌ | **declined-by-design (v0.2+)** — legacy/niche lab-instrument connectivity, no feed demand ([BACKLOG.md](BACKLOG.md) #27) |
+| **Serial (RS‑232)** + X/Y‑Modem/Kermit + **ASTM E1381/E1394/E1318** | ~ | ❌ | ✅ | ❌ | **declined-by-design (v0.2+)** — legacy/niche lab-instrument connectivity, no feed demand ([BACKLOG #27](archive/backlog/BACKLOG-CLOSED.md#27-serial-rs-232--astm-e1381e1394e1318--decision-decline-unless-lab-analyzer-demand-no-build)) |
 | **FHIR** endpoint/client | ✅ | ✅ | ✅ | ~ | `FHIR-OUT` shipped (`FHIR()`, ADR 0022) + SMART Backend Services client auth (ADR 0024); the inbound **server facade** is deferred (BACKLOG #20) |
 | **Internal channel‑to‑channel** | ✅ | ✅ | ✅ | ✅ | the routing graph (wired by name) — plus two first-class internal inbounds: `Loopback()` (a captured reply) and `PassThrough()` (1:N internal re-ingress), ADR 0013 |
 | Printer / command‑line / screen‑scrape | ~ | ❌ | ✅ | ❌ | not on roadmap (niche) |

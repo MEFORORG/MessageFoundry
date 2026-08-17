@@ -1,8 +1,10 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 import * as assert from "assert";
 import * as fs from "fs";
 import * as path from "path";
 
-import { findElements, hasHandler, isConfigFile } from "../../editorToolbar";
+import { findElements, hasHandler, hasRouter, hasStepsElement, isConfigFile } from "../../editorToolbar";
 
 // An absolute workspace root for the active platform, so isConfigFile's path.resolve is a no-op prefix
 // (resolve would otherwise inject the cwd drive on win32 and skew path.relative).
@@ -55,13 +57,34 @@ suite("findElements", () => {
   });
 });
 
-suite("hasHandler", () => {
-  test("true only when the file defines a @handler (gates the Steps affordance)", () => {
+suite("hasHandler / hasRouter", () => {
+  test("each answers only about its own decorator", () => {
     assert.strictEqual(hasHandler('@handler("h")\ndef handle(msg): ...'), true);
-    // A router-only / connection-only file cannot open as Steps.
     assert.strictEqual(hasHandler('@router("IB")\ndef route(msg): ...'), false);
+    assert.strictEqual(hasRouter('@router("IB")\ndef route(msg): ...'), true);
+    assert.strictEqual(hasRouter('@handler("h")\ndef handle(msg): ...'), false);
     assert.strictEqual(hasHandler("OB = outbound(File())"), false);
     assert.strictEqual(hasHandler(""), false);
+  });
+});
+
+suite("hasStepsElement", () => {
+  // This assertion INVERTED with BACKLOG #232: a router-only file could not open as Steps before ADR 0076
+  // Amendment D widened the grammar with the `route` row kind, and can now. The pre-#232 test asserted
+  // `hasHandler(router) === false` AS the Steps gate; `hasHandler` still answers that narrower question
+  // (above), but the gate itself is `hasStepsElement`.
+  test("true for a file with a @handler, a @router, or both — the Steps affordance gate", () => {
+    assert.strictEqual(hasStepsElement('@handler("h")\ndef handle(msg): ...'), true);
+    assert.strictEqual(hasStepsElement('@router("IB")\ndef route(msg): ...'), true);
+    assert.strictEqual(
+      hasStepsElement('@router("IB")\ndef route(msg): ...\n@handler("h")\ndef handle(msg): ...'),
+      true,
+    );
+  });
+
+  test("false for a file with neither — a connection-only or empty module", () => {
+    assert.strictEqual(hasStepsElement("OB = outbound(File())"), false);
+    assert.strictEqual(hasStepsElement(""), false);
   });
 });
 
@@ -112,8 +135,9 @@ suite("editor toolbar contributions", () => {
 });
 
 // The "View as Steps" affordance must appear only where a file/row can actually open as Steps —
-// i.e. Handlers. In the editor it is gated on the activeFileHasHandler context key; in the tree it is
-// an inline action on Handler rows only (contextValue meforElementHandler).
+// Handlers and, since ADR 0076 Amendment D (BACKLOG #232), Routers. In the editor it is gated on the
+// activeFileHasSteps context key; in the tree it is an inline action on Handler rows
+// (contextValue meforElementHandler).
 suite("View as Steps gating", () => {
   test("openSteps is a distinct icon from Group Components (no shared glyph)", () => {
     const cmds = pkg().contributes.commands ?? [];
@@ -124,19 +148,19 @@ suite("View as Steps gating", () => {
     assert.notStrictEqual(steps?.icon, group?.icon);
   });
 
-  test("the editor-title button and submenu item are gated on activeFileHasHandler", () => {
+  test("the editor-title button and submenu item are gated on activeFileHasSteps", () => {
     const menus = pkg().contributes.menus;
     const titleBtn = (menus["editor/title"] ?? []).find((e) => e.command === "messagefoundry.openSteps");
     assert.ok(
-      titleBtn?.when?.includes("messagefoundry.activeFileHasHandler"),
-      "the editor-title View as Steps button must be gated on activeFileHasHandler",
+      titleBtn?.when?.includes("messagefoundry.activeFileHasSteps"),
+      "the editor-title View as Steps button must be gated on activeFileHasSteps",
     );
     const menuItem = (menus["messagefoundry.editorMenu"] ?? []).find(
       (e) => e.command === "messagefoundry.openSteps",
     );
     assert.ok(
-      menuItem?.when?.includes("messagefoundry.activeFileHasHandler"),
-      "the submenu View as Steps item must be gated on activeFileHasHandler",
+      menuItem?.when?.includes("messagefoundry.activeFileHasSteps"),
+      "the submenu View as Steps item must be gated on activeFileHasSteps",
     );
   });
 

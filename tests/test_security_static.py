@@ -832,6 +832,16 @@ _XML_PARSER_ALLOWLIST = {
         "HARNESS surface no engine data reaches. The formula-injection half of this write-back is "
         "ASVS 1.2.10's, held by tests/test_csv_formula_consistency.py"
     ),
+    "scripts/ci/tooling_receipt.py": (
+        "defusedxml.ElementTree.parse over pytest's junit.xml, written by the `tooling` job's own "
+        "pytest invocation seconds earlier in the same runner workspace — the same shape as "
+        "harness/acceptance/runner.py above, and a CI surface no engine data reaches. defusedxml "
+        "rather than the stdlib parser that entry uses: its parse() forbids entity expansion and "
+        "external references by default, so the XXE class is closed at the construction site even "
+        "though the input is locally produced. Trusted-input arguments are the ones that rot when a "
+        "file is later reused, so the safe parser is the entry's justification and the provenance is "
+        "only why the residual risk is nil"
+    ),
 }
 
 #: Modules allowed to reach lxml through ``parsing/xml/_deps.py``'s lazy loaders. The import clause
@@ -1013,6 +1023,9 @@ def test_xml_import_scanner_sees_indented_imports() -> None:
 _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     # ADR 0156: SHA-256 over the ASVS corpus FILE to pin it to the tagged release. No key.
     "scripts/asvs/scorecard.py": frozenset({"hashlib"}),
+    # ADR 0156: SHA-256 over the ASVS SCORECARD file, printed truncated so a --prove-absences run
+    # states which revision of the record it read. No key.
+    "scripts/asvs/prove_report.py": frozenset({"hashlib"}),
     "messagefoundry_webconsole/_security.py": frozenset({"secrets"}),
     "tee/__main__.py": frozenset({"ssl"}),
     "tee/anon/keying.py": frozenset({"hashlib"}),
@@ -1020,6 +1033,10 @@ _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     # ADR 0155: the DAST scan target mints a throwaway per-run password for the two ephemeral scan
     # identities it provisions into a temp-directory store it destroys with the run.
     "scripts/security/dast_target.py": frozenset({"secrets"}),
+    # BACKLOG #1220: SHA-256 over the discovered engine/console seam surface, giving ENGINE_UI_SEAM an
+    # identity nobody picks by hand. A change detector over public type signatures and field names --
+    # no key, no secret, nothing user- or PHI-derived.
+    "scripts/webconsole_seam_snapshot.py": frozenset({"hashlib"}),
 }
 
 

@@ -307,14 +307,9 @@ The checklist behind those steps:
 
 - [ ] **Greenfield database.** There is no in-place migration from SQLite; drain and cut over
       ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) "greenfield-only"). The schema is created on
-      first `open()` as idempotent DDL, so either grant the engine login create rights for the
-      first run or pre-create the schema. The exact bootstrap privileges are still a
-      *filled-by-staging* item in that doc. Until it is filled in, use this known-good interim
-      posture: grant the engine login **`db_owner` on the `mefor` database only** (no server-level
-      roles) for the first run, then after schema creation you may reduce toward
-      `db_datareader` + `db_datawriter` + `EXECUTE`, validated in staging. With RCSI and
-      `ALLOW_SNAPSHOT_ISOLATION` pre-set per step 2 above, the engine login never needs
-      `ALTER DATABASE` rights.
+      first `open()` as idempotent DDL, so either give the engine login the bootstrap grants
+      (*Login grants* below) or pre-create the schema. With RCSI and `ALLOW_SNAPSHOT_ISOLATION`
+      pre-set per step 2 above, the engine login never needs `ALTER DATABASE` rights.
 - [ ] **Pre-enable RCSI on the primary before first engine start:**
       `ALTER DATABASE [mefor] SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;`
       (the database name must match `[store].database`). The store auto-enables RCSI at open if the
@@ -336,11 +331,24 @@ The checklist behind those steps:
       account on every instance. **Verify by connecting to each replica directly with the engine's
       credentials**, and make that check part of the pre-go-live failover drill; if it is missed,
       the very first failover to R2 leaves the engine in a login-failed retry loop.
-- [ ] **Login grants.** The store reads only `sys.databases` and `sys.database_files` for status
-      display, so it has no `VIEW SERVER STATE` dependency of its own. Still, validate the real
-      low-privilege login in staging: MessageFoundry's CI runs the SQL Server leg as `sa`, so a
-      green build does not prove a locked-down production login works. Missing grants surface as
-      errors 297/300 only in production.
+- [ ] **Login grants — least privilege, never `db_owner`.** The engine's database user needs
+      `db_datareader` + `db_datawriter` + `db_ddladmin` on `mefor` and **no server-level role**;
+      [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §1.1 carries the T-SQL and §2 the
+      bootstrap-vs-steady-state rule. `db_ddladmin` is a **schema-change-window** grant, not a
+      first-run-only one: the store skips its whole DDL batch whenever the `schema_meta` marker
+      already records the shipped batch, so DDL is issued only against a virgin database and on the
+      first start of a build whose schema moved — and a login without it **fails that start
+      outright**, it does not degrade. Re-grant it for an upgrade window rather than discovering the
+      gap mid-change. `EXECUTE` on a **user** procedure is **not** in the set: the only
+      user procedures the engine calls are the two lane-family claim procs, and only under
+      `[store].fifo_claim_proc` ([`CONFIGURATION.md`](CONFIGURATION.md)), which is off by
+      default. The `sp_getapplock` calls the APPLOCK bullet above describes are a **system**
+      procedure `public` can already execute — no grant. The store reads only
+      `sys.databases` and `sys.database_files` for status display, so it has no `VIEW SERVER STATE`
+      dependency of its own. Still, validate the real low-privilege login in staging:
+      MessageFoundry's CI runs the SQL Server leg as `sa`, so a green build does not prove a
+      locked-down production login works. Missing grants surface as errors 297/300 only in
+      production.
 - [ ] **ODBC Driver 18** must be installed on every engine host. The driver name is hardcoded in
       the store's connection string; there is no override.
 - [ ] **Connection budget.** `[store].pool_size` defaults to **40 per engine** (the measured
@@ -378,7 +386,7 @@ cross-subnet listener:
 > the store connection takes exactly one AG-aware keyword, and **it has shipped**:
 > **`[store].multi_subnet_failover`** emits ODBC `MultiSubnetFailover=Yes` so the driver races the
 > subnets instead of serially waiting out each one
-> ([backlog #100](BACKLOG.md#100-multisubnetfailoveryes-opt-in-for-the-sql-server-store-connection-p2),
+> ([backlog #100](archive/backlog/BACKLOG-CLOSED.md#100-multisubnetfailoveryes-opt-in-for-the-sql-server-store-connection-p2),
 > shipped 2026-07-10; see [`CONFIGURATION.md`](CONFIGURATION.md)). It is **opt-in and defaults to
 > `false`** — a deployment that sets nothing gets nothing. **Turn it on** for any multi-subnet AG.
 >
@@ -410,6 +418,20 @@ and `HostRecordTTL 300` cuts client DNS caching from the 1,200 s default to 5 mi
 trade-off is that cross-subnet failover client recovery then depends on DNS TTL expiry plus
 cross-site DNS/AD replication. Plan and **drill** the cross-DC connect path (§5.3), and keep DNS
 replication to the DR site fast.
+
+> **Note — this outage may not be necessary for much longer (2026-07-31, engine 0.3.2).**
+> The listener configuration above, **including its brief outage, remains the recommendation** and is
+> what this guide supports today. It is possible that `[store].multi_subnet_failover` alone is
+> sufficient and the DNS-side change is not needed — but that setting is **unit-tested only and has
+> never been exercised against a live cross-subnet AG**, so this guide does not yet rely on it.
+> Proving it is tracked as [**BACKLOG #1002**](BACKLOG.md#1002-ag-rig-validation-prove-the-multi-subnet-failover-reconnect).
+>
+> Two things will **not** change even if that validation passes, so plan around them either way:
+> the keyword covers the **store** connection only — the `db_lookup` connector builds its own
+> connection string and emits nothing — and a listener **already** at `RegisterAllProvidersIP = 0`
+> will likely still need a restart to undo it, so an existing deployment may not escape the outage
+> regardless. If you are reading this well after the date above, check #1002 before assuming the
+> outage is still required.
 
 ### 4.6 Listener TLS certificate
 
@@ -451,7 +473,7 @@ two hospital engines and the DR engine. Give each an **identical config dir** an
   engine**: every one of its ~7 commits/message now crosses the WAN to the AG primary (§3.3), and
   there is **no automatic fail-back** to the hospital once an engine there returns — leadership stays
   put until you deliberately move it (the §6 *Failback* runbook). **Leader preference IS built** —
-  [backlog #101](BACKLOG.md#101-cluster-leader-preference--non-promotable-standby-p2) shipped
+  [backlog #101](archive/backlog/BACKLOG-CLOSED.md#101-cluster-leader-preference--non-promotable-standby-p2) shipped
   2026-07-12 ([ADR 0096](adr/0096-cluster-leader-preference-and-non-promotable-standby.md)): two
   per-node `[cluster]` knobs, `acquire_delay_seconds` (handicaps take-over of an **expired** lease
   only — renews are never delayed, so there is no two-leader window) and `promotable = false` (the

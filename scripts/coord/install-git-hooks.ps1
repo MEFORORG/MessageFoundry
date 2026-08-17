@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 <#
 .SYNOPSIS
     Install the CLAIM gate (commit-msg) in the SHARED .git/hooks — one copy governs every worktree at
@@ -17,7 +19,7 @@
     the worktree gate inspects tool arguments, so a file written by a shell command is invisible to it.
     This is that backstop.
 
-    ⭐ WHY THE LEDGER GATE MOVED OUT OF HERE (2026-07-27). It used to be installed as a standalone
+    WHY THE LEDGER GATE MOVED OUT OF HERE (2026-07-27). It used to be installed as a standalone
     .git/hooks/pre-commit. Two tools cannot both own that file: this script refused to overwrite a
     foreign hook, and `pre-commit install` responded by renaming ours to pre-commit.legacy and calling
     it from its own shim. That works on POSIX and FAILS ON WINDOWS -- pre-commit invokes the legacy hook
@@ -71,6 +73,44 @@ $commitMsg = Join-Path $hooksDir "commit-msg"
 $claimMarker = "MessageFoundry claim gate"
 $prePush = Join-Path $hooksDir "pre-push"
 $pushMarker = "MessageFoundry push guard"
+# The durability hook is a POST-commit hook, and it must be: it needs a commit to exist before it can
+# push one. It is also the only hook here installed VERBATIM rather than as a shim -- it has no Python
+# payload to locate, so there is nothing for a shim to resolve.
+$postCommit = Join-Path $hooksDir "post-commit"
+$durabilityMarker = "MessageFoundry durability hook"
+
+# The .py PAYLOADS the install path below Copy-Items into $hooksDir, listed for -Status to audit. The
+# install path still names its own file per section, because each carries its own why -- so a THIRD
+# payload has to be added in both places. tests/test_installed_coord_hooks.py reads this list out of
+# this script rather than carrying its own copy, so at least the test cannot fall behind it.
+$payloads = @("claim_check.py", "push_guard.py")
+
+function Get-HookPayloadHash([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    # A CONTENT hash, not a byte hash, and byte-for-byte the SAME fold as scripts\worktree\
+    # install-gate.ps1's Get-GateHash and tests\test_gate_installed_parity.py's content_hash. Three
+    # instruments that fold differently would disagree about one file, which is the same defect one
+    # level up; the reasoning for folding at all is stated once, in Get-GateHash. Short version: the
+    # install below is a Copy-Item, which translates nothing, so the installed copy carries whatever
+    # line endings the checkout that installed it had -- raw bytes answer "are these the same bytes",
+    # which is a different question from the one asked here.
+    #
+    # Folded on BYTES (drop the CR of each CRLF pair) rather than by decoding to text: the payload need
+    # not be valid UTF-8, and a decode/re-encode round trip could move a BOM or a lone high byte and
+    # change the digest for a reason that has nothing to do with content.
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $out = [System.Collections.Generic.List[byte]]::new($bytes.Length)
+    for ($i = 0; $i -lt $bytes.Length; $i++) {
+        if ($bytes[$i] -eq 13 -and ($i + 1) -lt $bytes.Length -and $bytes[$i + 1] -eq 10) { continue }
+        $out.Add($bytes[$i])
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        (($sha.ComputeHash($out.ToArray()) | ForEach-Object { $_.ToString('x2') }) -join '').ToUpperInvariant()
+    } finally {
+        $sha.Dispose()
+    }
+}
 
 if ($Status) {
     $stale = (Test-Path $preCommit) -and ((Get-Content $preCommit -Raw -EA SilentlyContinue) -match [regex]::Escape($marker))
@@ -87,6 +127,79 @@ if ($Status) {
     }
     $pushInstalled = (Test-Path $prePush) -and ((Get-Content $prePush -Raw -EA SilentlyContinue) -match [regex]::Escape($pushMarker))
     Write-Host "pre-push   : $(if ($pushInstalled) { 'INSTALLED (push guard)' } elseif (Test-Path $prePush) { 'present, but NOT ours' } else { 'NOT INSTALLED' })"
+
+    # The durability hook reports on TWO axes, because installed and armed are different states and
+    # only one of them protects anything. An installed hook with no nominated remote is a no-op by
+    # design (fail-safe by absence), and reporting it as INSTALLED alone would be the same
+    # manufactured confidence the check in scripts/coord/unbacked_check.ps1 exists to avoid.
+    $durInstalled = (Test-Path $postCommit) -and ((Get-Content $postCommit -Raw -EA SilentlyContinue) -match [regex]::Escape($durabilityMarker))
+    $durRemote = (& git -C $RepoRoot config --get mefor.durabilityRemote)
+    Write-Host "post-commit: $(if ($durInstalled) { 'INSTALLED (durability hook)' } elseif (Test-Path $postCommit) { 'present, but NOT ours' } else { 'NOT INSTALLED' })"
+    if ($durInstalled -and -not $durRemote) {
+        Write-Host "             ^ INSTALLED BUT NOT ARMED. mefor.durabilityRemote is unset, so the hook" -ForegroundColor Yellow
+        Write-Host "               exits 0 without pushing. Nothing is being made durable. Arm it with:" -ForegroundColor Yellow
+        Write-Host "                 git config mefor.durabilityRemote <private-remote>" -ForegroundColor Yellow
+        Write-Host "               Confirm the remote is PRIVATE first: gh repo view <owner>/<repo> --json visibility" -ForegroundColor Yellow
+    } elseif ($durInstalled -and $durRemote) {
+        $durUrl = (& git -C $RepoRoot remote get-url $durRemote 2>$null)
+        if (-not $durUrl) {
+            Write-Host "             ^ ARMED at remote '$durRemote', which DOES NOT EXIST in this repo." -ForegroundColor Red
+            Write-Host "               The hook exits 0 silently, so this looks identical to working." -ForegroundColor Red
+        } elseif ($durUrl -match 'MEFORORG/MessageFoundry') {
+            Write-Host "             ^ POINTED AT THE PUBLIC CANONICAL REPO. The hook refuses this target," -ForegroundColor Red
+            Write-Host "               so nothing is being made durable AND nothing is being published." -ForegroundColor Red
+        } else {
+            Write-Host "             ^ armed -> $durRemote ($durUrl)"
+            Write-Host "               Visibility is NOT verified here -- git cannot see it. Confirm once:"
+            Write-Host "                 gh repo view <owner>/<repo> --json visibility"
+        }
+    }
+
+    # PAYLOAD parity. Everything above this point tests a marker in a SHIM -- for commit-msg/pre-push
+    # the marker this script writes, for pre-commit that tool's own "File generated by pre-commit"
+    # (a file this script deliberately never writes; see the DIAGNOSE-never-write note below). Either
+    # way it answers "is a hook of the right shape present" and NOT "is the .py that hook execs the
+    # one in this checkout".
+    # The shims are here-strings that change once in months, so they keep reading INSTALLED across an
+    # arbitrarily old payload -- and the payload is where every rule the gate enforces actually lives.
+    # Measured 2026-08-04: the installed push_guard.py hashed d4a57428cb2c against a committed source of
+    # 82f4adbfde30 -- a whole class of drift with no instrument pointed at it. (Digests, not byte counts:
+    # a size delta is itself a function of line endings, the very thing being folded out.) It matters
+    # more here than for a per-worktree file because .git/hooks lives in the COMMON git dir: one stale
+    # copy governs EVERY worktree at once, and the source-side tests keep passing while it does.
+    # tests/test_installed_coord_hooks.py asserts the same parity from the pytest side.
+    #
+    # Both payloads are reported every run, never just the offender: the install path copies both, so
+    # "re-install to fix this one" is the wrong mental model of what re-running does.
+    $shortSha = { param($h) if ($h) { $h.Substring(0, 12).ToLowerInvariant() } else { "(absent)" } }
+    foreach ($payload in $payloads) {
+        $srcPy = Join-Path $RepoRoot "scripts\hooks\$payload"
+        $dstPy = Join-Path $hooksDir $payload
+        $iSha = Get-HookPayloadHash $dstPy
+        $sSha = Get-HookPayloadHash $srcPy
+        Write-Host "payload    : $payload  installed $(& $shortSha $iSha) / source $(& $shortSha $sSha)"
+        if (-not $iSha) {
+            Write-Host "             ^ NOT INSTALLED at $dstPy." -ForegroundColor Yellow
+            Write-Host "               If the matching hook above reads INSTALLED, its shim execs this missing" -ForegroundColor Yellow
+            Write-Host "               file; where python resolves it exits nonzero and fails closed, blocking" -ForegroundColor Yellow
+            Write-Host "               every worktree. Where python does NOT resolve the shim now refuses too" -ForegroundColor Yellow
+            Write-Host "               (it used to exit 0 and let the push through unchecked)." -ForegroundColor Yellow
+        } elseif (-not $sSha) {
+            Write-Host "             ^ no source at $srcPy -- the installed copy cannot be judged." -ForegroundColor Yellow
+        } elseif ($iSha -eq $sSha) {
+            Write-Host "             ^ IN SYNC -- identical CONTENT (line endings are folded out, not compared)."
+        } else {
+            Write-Host "             ^ *** STALE *** the payload that RUNS differs in CONTENT from this checkout's." -ForegroundColor Red
+            Write-Host "               CRLF vs LF cannot produce this. Until the installed copy is replaced," -ForegroundColor Red
+            Write-Host "               changes made to the source have no effect. Only" -ForegroundColor Red
+            Write-Host "               tests/test_installed_coord_hooks.py notices; source-side tests stay green." -ForegroundColor Red
+            Write-Host "               WORK OUT WHICH COPY IS OLDER FIRST. Re-installing from a checkout older" -ForegroundColor Yellow
+            Write-Host "               than the installed hook downgrades it for every worktree on this box:" -ForegroundColor Yellow
+            Write-Host "                 git log --oneline -5 -- scripts/hooks/$payload"
+            Write-Host "               Only once THIS checkout is confirmed newer, from a PLAIN terminal:" -ForegroundColor Yellow
+            Write-Host "                 pwsh -NoProfile -File scripts\coord\install-git-hooks.ps1"
+        }
+    }
     # Report WHERE the shim's interpreter points. This script does not (and must not) rewrite that file
     # -- see the "DIAGNOSE, never write" note below -- so this is a diagnostic with a remedy, not a
     # pending action. It matters because the path is baked in at `pre-commit install` time and can name
@@ -170,6 +283,11 @@ if ($Uninstall) {
         Write-Host "Push guard pre-push hook REMOVED." -ForegroundColor Yellow
         $removed = $true
     }
+    if ((Test-Path $postCommit) -and ((Get-Content $postCommit -Raw) -match [regex]::Escape($durabilityMarker))) {
+        Remove-Item -LiteralPath $postCommit -Force
+        Write-Host "Durability post-commit hook REMOVED. New commits are single-copy again until pushed." -ForegroundColor Yellow
+        $removed = $true
+    }
     if (-not $removed) { Write-Host "Nothing to remove (no MessageFoundry hooks installed)." }
     return
 }
@@ -179,6 +297,9 @@ if ((Test-Path $commitMsg) -and ((Get-Content $commitMsg -Raw) -notmatch [regex]
 }
 if ((Test-Path $prePush) -and ((Get-Content $prePush -Raw) -notmatch [regex]::Escape($pushMarker))) {
     throw "A pre-push hook that is not ours already exists at $prePush. Refusing to overwrite it -- merge them by hand."
+}
+if ((Test-Path $postCommit) -and ((Get-Content $postCommit -Raw) -notmatch [regex]::Escape($durabilityMarker))) {
+    throw "A post-commit hook that is not ours already exists at $postCommit. Refusing to overwrite it -- merge them by hand."
 }
 
 New-Item -ItemType Directory -Force -Path $hooksDir | Out-Null
@@ -214,8 +335,11 @@ HOOK_DIR=$(dirname "$0")
 PY=python
 command -v python >/dev/null 2>&1 || PY=python3
 if ! command -v "$PY" >/dev/null 2>&1; then
-  echo "MessageFoundry: python not found -- THE CLAIM GATE IS OFF for this commit." >&2
-  exit 0
+  echo "MessageFoundry: neither python nor python3 resolves, so the claim gate cannot run." >&2
+  echo "REFUSING this commit rather than allowing it unchecked -- a gate that cannot run" >&2
+  echo "must not report success. Fix PATH so python resolves, then commit again." >&2
+  echo "To commit without the gate, deliberately:  git commit --no-verify" >&2
+  exit 1
 fi
 exec "$PY" "$HOOK_DIR/claim_check.py" "$1"
 '@ -replace "`r`n", "`n"
@@ -224,8 +348,9 @@ exec "$PY" "$HOOK_DIR/claim_check.py" "$1"
 
 # --- push guard ------------------------------------------------------------------------------------
 # Since the MEFORORG cutover this repo IS the published artifact -- a push to main is publication, with
-# no publish step left to catch anything. Server-side protection requires a PR and 12 checks, but
-# enforce_admins is false, so the owner bypasses all of it and VS Code's Sync button does not
+# no publish step left to catch anything. Server-side protection requires a PR and the checks listed
+# in .github/required-contexts.txt -- never a count written down here, which has gone stale before --
+# but enforce_admins is false, so the owner bypasses all of it and VS Code's Sync button does not
 # distinguish main from a feature branch. This restores the class of protection the old mirror clone's
 # Gate-Provenance pre-push hook provided before it was quarantined at cutover.
 Copy-Item (Join-Path $RepoRoot "scripts\hooks\push_guard.py") (Join-Path $hooksDir "push_guard.py") -Force
@@ -239,13 +364,41 @@ HOOK_DIR=$(dirname "$0")
 PY=python
 command -v python >/dev/null 2>&1 || PY=python3
 if ! command -v "$PY" >/dev/null 2>&1; then
-  echo "MessageFoundry: python not found -- THE PUSH GUARD IS OFF for this push." >&2
-  exit 0
+  echo "MessageFoundry: neither python nor python3 resolves, so the push guard cannot run." >&2
+  echo "REFUSING this push rather than allowing it unchecked -- a guard that cannot run" >&2
+  echo "must not report success. This repo IS the published artifact: a push to main is" >&2
+  echo "publication, and nothing downstream would catch it." >&2
+  echo "Fix PATH so python resolves, then push again." >&2
+  echo "To push without the guard, deliberately:  git push --no-verify" >&2
+  exit 1
 fi
 exec "$PY" "$HOOK_DIR/push_guard.py" "$@"
 '@ -replace "`r`n", "`n"
 
 [System.IO.File]::WriteAllText($prePush, $pushHook, (New-Object System.Text.UTF8Encoding $false))
+
+# --- durability hook -------------------------------------------------------------------------------
+# The gates above stop the WRONG thing happening. This one stops the RIGHT thing being lost.
+#
+# Measured on this machine 2026-08-16: 802 commits across 239 branches existed on no remote at all,
+# the oldest 17 days old, and nothing had reported it -- because a session may commit on its own
+# judgment but may not push, `origin` being the published artifact. Work therefore accumulates in one
+# checkout, and a session that stops at a usage cap takes the only copy with it. A worktree deleted in
+# that state loses the commits AND the coordination record naming what they were for.
+#
+# A tag under rescue/auto/ on a PRIVATE remote breaks that coupling: durability without review and
+# without disclosure, so it needs no approval -- which matters because the sessions that most need it
+# are the ones that cannot stop and ask.
+#
+# Installed VERBATIM, not via a shim. Every other hook here execs a .py and needs a shim to find an
+# interpreter; this one is already /bin/sh and has no payload, so a shim would add a failure mode
+# (see the INSTALL_PYTHON note below for what that costs) and buy nothing.
+#
+# FAIL-SAFE BY ABSENCE: with mefor.durabilityRemote unset the hook exits 0 without pushing, so
+# installing it here can never make a fresh clone, a CI checkout or a fork push anywhere. Arming is a
+# separate, deliberate, per-repository act. -Status reports installed and armed as two different
+# things, because only one of them protects anything.
+Copy-Item (Join-Path $RepoRoot "scripts\hooks\durability_push.sh") $postCommit -Force
 
 # --- pre-commit's generated shim: DIAGNOSE, never write -------------------------------------------
 # This script deliberately does NOT touch .git/hooks/pre-commit. pre-commit owns that file alone, and
@@ -276,15 +429,38 @@ exec "$PY" "$HOOK_DIR/push_guard.py" "$@"
 # not have, and stripping `# noqa` directives the pinned 0.15.22 still wants.
 
 # Git for Windows does not need the exec bit, but a WSL/Linux checkout of the same repo would.
-if ($IsLinux -or $IsMacOS) { & chmod +x $commitMsg; & chmod +x $prePush }
+if ($IsLinux -or $IsMacOS) { & chmod +x $commitMsg; & chmod +x $prePush; & chmod +x $postCommit }
 
 Write-Host ""
 Write-Host "MessageFoundry hooks INSTALLED." -ForegroundColor Green
-Write-Host "  commit-msg: $commitMsg"
-Write-Host "              $(Join-Path $hooksDir 'claim_check.py')   (claim gate, BACKLOG #309)"
-Write-Host "  pre-push  : $prePush"
-Write-Host "              $(Join-Path $hooksDir 'push_guard.py')    (refuses a direct push to main)"
-Write-Host "  governs   : all $(@(& git -C $RepoRoot worktree list).Count) worktree(s) of this repo, immediately"
+Write-Host "  commit-msg : $commitMsg"
+Write-Host "               $(Join-Path $hooksDir 'claim_check.py')   (claim gate, BACKLOG #309)"
+Write-Host "  pre-push   : $prePush"
+Write-Host "               $(Join-Path $hooksDir 'push_guard.py')    (refuses a direct push to main)"
+Write-Host "  post-commit: $postCommit  (durability hook)"
+Write-Host "  governs    : all $(@(& git -C $RepoRoot worktree list).Count) worktree(s) of this repo, immediately"
+Write-Host ""
+
+# ARMING IS SEPARATE FROM INSTALLING, and saying so here is the point: an operator who reads
+# "INSTALLED" and stops has protected nothing. The hook is deliberately inert until a remote is
+# nominated, so the install path must state the second step rather than imply one was enough.
+$armedRemote = (& git -C $RepoRoot config --get mefor.durabilityRemote)
+if ($armedRemote) {
+    Write-Host "Durability : ARMED -> $armedRemote" -ForegroundColor Green
+    Write-Host "             Every commit now also lands as refs/tags/rescue/auto/<branch> there."
+} else {
+    Write-Host "!! DURABILITY HOOK IS INSTALLED BUT NOT ARMED." -ForegroundColor Yellow
+    Write-Host "   mefor.durabilityRemote is unset, so it exits 0 without pushing and nothing is" -ForegroundColor Yellow
+    Write-Host "   being made durable. Measured 2026-08-16 before this existed: 802 commits on 239" -ForegroundColor Yellow
+    Write-Host "   branches existed on no remote at all. Arm it with:" -ForegroundColor Yellow
+    Write-Host "       git config mefor.durabilityRemote <private-remote>" -ForegroundColor Yellow
+    Write-Host "   CONFIRM THE REMOTE IS PRIVATE FIRST -- git cannot see visibility and neither can" -ForegroundColor Yellow
+    Write-Host "   this script. A public remote turns durability into unreviewed publication:" -ForegroundColor Yellow
+    Write-Host "       gh repo view <owner>/<repo> --json visibility" -ForegroundColor Yellow
+    Write-Host ""
+}
+Write-Host "Audit what is unbacked at any time (per REF, not per HEAD -- the distinction matters):"
+Write-Host "    pwsh -NoProfile -File scripts\coord\unbacked_check.ps1"
 Write-Host ""
 
 # The ledger gate now rides on pre-commit. If pre-commit is not installed, say so LOUDLY -- a gate that

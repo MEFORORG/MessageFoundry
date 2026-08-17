@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Pure (vscode-free) model behind the multi-step QuickInput new-connection wizard (#221e). The
 // wizard (connectionQuickInput.ts) is a keyboard-first alternative to the connectionEditor webview
 // form; both write via the SAME `messagefoundry connection upsert` CLI. Keeping the answer→ConnObj

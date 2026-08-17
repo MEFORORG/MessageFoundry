@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 <#
 .SYNOPSIS
     SessionStart hook: surface project working-defaults + git-worktree coordination to a Claude Code chat.
@@ -24,9 +26,31 @@ $ErrorActionPreference = "SilentlyContinue"
 $lines = @()
 
 # (1) Always surface the project's working default so every new window keeps it top-of-mind.
+#
+# THIS BLOCK MUST NOT IMPLY A STATE, and the disclaimer must stay louder than the advice. It prints
+# UNCONDITIONALLY, so anything a reader concludes about the current state from seeing it was concluded
+# from a constant.
+#
+# The previous wording ended "so enable it for this session (include 'ultracode' in your prompt) when
+# you want it" -- which reads as "it is off right now, here is how to turn it on". Measured 2026-08-14:
+# a session read exactly that, observed no "Ultracode is on" system-reminder, concluded ultracode was
+# OFF, and told the owner so -- while the indicator in the app's input bar said it was ON. It then
+# declined to run a Workflow and asked the owner to re-enable something already enabled.
+#
+# The defect is a null with no mechanism, in both directions at once: the ABSENCE of a confirming
+# signal is not evidence of the negative, and the PRESENCE of an unconditional one is not evidence of
+# anything. A message that prints either way cannot discriminate between the states it describes.
 $lines += "[MessageFoundry] This project prefers Ultracode (multi-agent workflow-by-default) for"
-$lines += "substantive tasks. Ultracode is session-only — it can't be auto-enabled from a memory or"
-$lines += "config, so enable it for this session (include 'ultracode' in your prompt) when you want it."
+$lines += "substantive tasks."
+$lines += "THIS NOTICE PRINTS EVERY SESSION AND TELLS YOU NOTHING ABOUT WHETHER ULTRACODE IS ON RIGHT NOW."
+$lines += "It is a standing preference, not a state reading. Do NOT conclude ultracode is off because you"
+$lines += "see this, and do NOT conclude it from the absence of an 'Ultracode is on' reminder. A message"
+$lines += "that prints either way carries no information about the state, in either direction."
+$lines += "WHAT ACTUALLY REPORTS THE STATE: an 'Ultracode is on' system-reminder when one is present, and"
+$lines += "the Ultracode indicator in the app's input bar. If you can see neither and the answer would"
+$lines += "change what you do, ASK. Do not infer it, and do not tell the owner it is off."
+$lines += "Ultracode is session-only and no memory or config can auto-enable it, so when it genuinely is"
+$lines += "off the way on is the owner including 'ultracode' in a prompt."
 $lines += "Offer to run a Workflow proactively for non-trivial work; don't auto-run one without the opt-in."
 
 # (2) Add parallel-session coordination only when 2+ worktrees share this .git (real collision risk).
@@ -72,10 +96,18 @@ if ($root) {
             if ($others.Count -gt 0) {
                 $lines += ""
                 $lines += "LIVE sessions in this repo right now ($($others.Count) besides you):"
+                # LABEL THE ID IN EVERY ROW (BACKLOG #1098). Bare, the 8-hex token reads as an
+                # abbreviated commit SHA -- and it reads that way for a concrete reason, not a vague
+                # one: the `git worktree list` block a few lines above puts a REAL abbreviated SHA in
+                # exactly this shape, before a bracketed branch. It is a registry session id, resolves
+                # to no git object, and a session that compared "is that worktree ahead of mine"
+                # against it got an error at best and the wrong tree if the prefix happened to resolve.
+                # The word goes on the ROW, not in a legend, so the column cannot mean one thing in one
+                # row and something else in the next.
                 foreach ($p in $others) {
                     $where = if ($p.IsPrimary) { "the SHARED PRIMARY" } else { $p.Worktree }
                     $flag = if ($p.State -ne "LIVE") { "  [$($p.State)]" } else { "" }
-                    $lines += "  $($p.Short)  $($p.Surface)  in $where  [$($p.Branch)]$flag"
+                    $lines += "  session $($p.Short)  $($p.Surface)  in $where  [$($p.Branch)]$flag"
                 }
                 # The surfaces differ in what can reach them, and that changes how you coordinate.
                 if (@($others | Where-Object { $_.Surface -ne "desktop" }).Count -gt 0) {
@@ -103,7 +135,8 @@ if ($root) {
                     $lines += ""
                     $lines += "WHAT THEY ARE BUILDING -- check before you start, so you don't build it twice:"
                     foreach ($b in $busy) {
-                        $lines += "  $($b.Short) [$($b.Branch)] -- $(@($b.Files).Count) file(s) changed"
+                        # Same id, same banner, same label -- see the note on the roster rows above.
+                        $lines += "  session $($b.Short) [$($b.Branch)] -- $(@($b.Files).Count) file(s) changed"
                         foreach ($w in @($b.Work | Select-Object -First 3)) { $lines += "      $w" }
                     }
                     $lines += "  Everything in flight:  pwsh -NoProfile -File scripts\coord\overlap.ps1"

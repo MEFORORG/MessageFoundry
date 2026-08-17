@@ -594,18 +594,35 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # Edit-and-resubmit (ADR 0090 §9, BACKLOG #153). GET renders the editor (a COPY of the raw); the
     # step-up gate opens it inside a fresh window (unlock continuation). The origin row is only READ
     # here (the audited get_message path); nothing is written until the operator POSTs /edit-resend.
+    #
+    # view_raw is required ALONGSIDE edit (BACKLOG #324) because the editor inherently DISPLAYS the
+    # body: it renders `detail.raw` into the textarea and ships a second pristine copy in
+    # `data-original`. `messages:edit` stays mintable on a custom role (ADR 0045 D1 is unchanged), so
+    # without this a role meaning "may resubmit, must not read" would read raw PHI here — the read
+    # permission its grant deliberately withheld. Such a role is still mintable and still resubmits
+    # via the API; it simply cannot open this editor, which is correct: you cannot edit-and-resend
+    # without seeing what you are editing. phi=True charges the per-actor PHI-read budget, matching
+    # the sibling raw views above (message detail, parse-tree, attachment download).
     @app.get("/ui/messages/{message_id}/edit", response_class=HTMLResponse)
     async def ui_message_edit(
         message_id: str,
         request: Request,
         engine: Any = Depends(deps.get_engine),
-        identity: Identity = Depends(require_ui_step_up(Permission.MESSAGES_EDIT)),
+        identity: Identity = Depends(
+            require_ui_step_up(Permission.MESSAGES_EDIT, Permission.MESSAGES_VIEW_RAW, phi=True)
+        ),
     ) -> HTMLResponse:
         detail = await core.get_message(message_id, request, engine=engine, identity=identity)
         # A fresh per-open idempotency token: a double-submit of THIS rendered form is an idempotent
         # no-op; re-opening the editor mints a new token (a genuine second resubmit).
         return HTMLResponse(pages.message_edit(detail, uuid4().hex))
 
+    # Same two-permission gate as the GET (BACKLOG #324), because this verb ALSO renders the body: the
+    # `_reject` arm below re-reads the origin via the audited `core.get_message` and re-ships the
+    # PRISTINE stored copy through `data_original`. Gating it on `messages:edit` alone would leave the
+    # rejection path as an unauthorized read of exactly the body the GET now refuses. phi=True for the
+    # same reason — otherwise the reject path is an UNTHROTTLED channel for re-reading stored bodies
+    # while the equivalent GET is throttled.
     @app.post("/ui/messages/{message_id}/edit-resend")
     async def ui_message_edit_resend(
         message_id: str,
@@ -614,6 +631,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(
             require_ui_step_up(
                 Permission.MESSAGES_EDIT,
+                Permission.MESSAGES_VIEW_RAW,
+                phi=True,
                 # Stale-window step-up on this body-carrying POST → re-open the /edit form (fresh
                 # window), never the POST path (a re-POST would drop the edited body).
                 reauth_next=lambda r: r.url.path.removesuffix("/edit-resend") + "/edit",

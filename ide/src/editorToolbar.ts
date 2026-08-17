@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Editor-area "build toolbar" for MessageFoundry config files. Two non-intrusive surfaces around the
 // REAL Python editor (Pylance, debugpy, our completion all untouched):
 //   * editor/title actions (Validate / Test Bench / Promote) — declared in package.json, gated on the
@@ -59,10 +61,24 @@ export function findElements(text: string): ConfigElement[] {
   return out;
 }
 
-/** True when `text` defines at least one `@handler` — the only element the Steps view can render, so
- *  the "View as Steps" editor-title button / menu item is offered only for files that have one. */
+/** True when `text` defines at least one `@handler`. */
 export function hasHandler(text: string): boolean {
   return findElements(text).some((el) => el.kind === "handler");
+}
+
+/** True when `text` defines at least one `@router` (ADR 0076 Amendment D / BACKLOG #232). */
+export function hasRouter(text: string): boolean {
+  return findElements(text).some((el) => el.kind === "router");
+}
+
+/**
+ * True when the Steps view can render SOMETHING in `text` — a `@handler` or, since ADR 0076 Amendment D,
+ * a `@router`. The "View as Steps" editor-title button / menu item and the `messagefoundry.activeFileHasSteps`
+ * context key are gated on this, so a router-only module is no longer a file the Steps view silently
+ * declines. (`hasHandler` is kept as the narrower question, which other callers still ask.)
+ */
+export function hasStepsElement(text: string): boolean {
+  return findElements(text).some((el) => el.kind === "handler" || el.kind === "router");
 }
 
 class ConfigCodeLensProvider implements vscode.CodeLensProvider {
@@ -84,12 +100,16 @@ class ConfigCodeLensProvider implements vscode.CodeLensProvider {
     const lenses: vscode.CodeLens[] = [];
     for (const el of findElements(document.getText())) {
       const range = new vscode.Range(el.line, 0, el.line, 0);
-      // Handlers get the Steps toggle first, so the row reads as a toolbar: View as Steps · Test · Validate · Insert.
-      if (el.kind === "handler") {
+      // Handlers AND routers get the Steps toggle first, so the row reads as a toolbar:
+      // View as Steps · Test · Validate · Insert. (ADR 0076 Amendment D widened the grammar to routers.)
+      if (el.kind === "handler" || el.kind === "router") {
         lenses.push(
           new vscode.CodeLens(range, {
             title: "$(list-ordered) View as Steps",
-            tooltip: "Open this Handler as the read-only Steps view (ADR 0076)",
+            tooltip:
+              el.kind === "router"
+                ? "Open this Router as the Steps view — its destination selection as ordered steps"
+                : "Open this Handler as the read-only Steps view (ADR 0076)",
             command: "messagefoundry.openSteps",
             arguments: [document.uri],
           }),
@@ -126,10 +146,11 @@ export function registerEditorToolbar(context: vscode.ExtensionContext): void {
   const update = (editor: vscode.TextEditor | undefined): void => {
     const isCfg = !!editor && isConfigFile(editor.document.uri.fsPath, workspaceDir(), configDir());
     void vscode.commands.executeCommand("setContext", "messagefoundry.isConfigFile", isCfg);
-    // The Steps view only renders Handlers, so its editor-title button / submenu item appears only when
-    // the active config file actually defines one (the per-@handler CodeLens is already so gated).
-    const hasH = !!(editor && isCfg && hasHandler(editor.document.getText()));
-    void vscode.commands.executeCommand("setContext", "messagefoundry.activeFileHasHandler", hasH);
+    // The Steps view renders Handlers and (since ADR 0076 Amendment D) Routers, so its editor-title
+    // button / submenu item appears when the active config file defines EITHER — the per-element CodeLens
+    // is already so gated.
+    const hasSteps = !!(editor && isCfg && hasStepsElement(editor.document.getText()));
+    void vscode.commands.executeCommand("setContext", "messagefoundry.activeFileHasSteps", hasSteps);
   };
   update(vscode.window.activeTextEditor);
 

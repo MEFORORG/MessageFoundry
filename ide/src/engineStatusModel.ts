@@ -1,7 +1,16 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Pure (vscode-free) logic for the engine status-bar item — the IDE's window onto the engine it
 // promotes to. Separated from statusBar.ts so every decision here ("what does this probe outcome
 // MEAN?", "what may the user do about it?", "what does the item say?") is unit-testable node-side
 // without launching an Extension Host (mirrors promoteTarget.ts / engineTarget.ts). No vscode, no I/O.
+//
+// It also holds the IDE's SHARED PROBE-PLAN VOCABULARY — `ProbePlanEntry`, `PROBE_ENDPOINTS`, and the
+// named plans below (ADR 0110, amended by BACKLOG #330). Those are no longer private to the status
+// bar: `aiPolicy.ts` drives its own read of `/ai/policy` off `ASSIST_GATE_PLAN`. The plans are the
+// place where "does this caller attach a bearer?" is DATA that CI asserts, rather than a literal
+// argument at a call site that a later tidy-up could silently flip. Read the two /ai/policy plans
+// together — they name the same route and give opposite answers, deliberately.
 //
 // THE RULE THIS MODULE EXISTS TO ENFORCE (ADR — engine-link doctor):
 //   Green means "the IDE can USE this engine", not "a socket answered".
@@ -126,6 +135,11 @@ export const PROBE_ENDPOINTS = ["/ai/policy", "/config/provenance", "/health"] a
 /** The tokenless liveness probe. Cheap, and safe on a timer precisely BECAUSE it is tokenless. */
 export const HEALTH_ROUTE = "/health";
 
+/** The policy read that names the engine's active environment (ADR 0017 owns `[ai].environment`).
+ *  Declared here, beside HEALTH_ROUTE, because the probe plans below reference it — a `const` read
+ *  before its declaration is a TDZ ReferenceError at module load, not a compile error. */
+export const POLICY_ROUTE = "/ai/policy";
+
 /** One planned HTTP probe. `authenticated` decides whether a bearer is attached — and it is the whole
  *  ballgame, so it is DATA (asserted in CI) rather than a decision buried in the shell. */
 export interface ProbePlanEntry {
@@ -154,9 +168,32 @@ export const VERIFY_PLAN: readonly ProbePlanEntry[] = [
   { route: HEALTH_ROUTE, authenticated: true }, // learns the version, which a tokenless probe never sees
 ];
 
-/** The tokenless policy read that names the engine's active environment (ADR 0017). Best-effort: any
- *  failure just means the hover omits the environment line. */
-export const POLICY_ROUTE = "/ai/policy";
+/**
+ * The status bar's environment read. **TOKENLESS** — it wants `environment`, which is
+ * identity-INDEPENDENT, and it runs off the 15s timer, where a bearer would refresh the session's idle
+ * clock and make the engine's 30-minute idle timeout unreachable (CWE-613; see the file header and
+ * ADR 0110 §2). Best-effort: any failure just means the hover omits the environment line.
+ *
+ * Same route as {@link ASSIST_GATE_PLAN}, opposite answer. That is not an oversight — it IS the
+ * distinction, and both halves are asserted in CI so a later reader cannot "unify" them.
+ */
+export const ENVIRONMENT_PLAN: readonly ProbePlanEntry[] = [
+  { route: POLICY_ROUTE, authenticated: false },
+];
+
+/**
+ * `aiPolicy.ts`'s gate read of the same route. **AUTHENTICATED** — it wants `assist_permitted`, which
+ * is identity-DEPENDENT and is `null` for every tokenless caller (`api/app.py`: `permitted = None if
+ * identity is None else identity.has(Permission.AI_ASSIST)`), so without a bearer the deny branch can
+ * never fire at all.
+ *
+ * Safe here for exactly the reason {@link VERIFY_PLAN} is: its only callers are user-initiated — a chat
+ * turn (`chat.ts`) and the "Show AI Policy" command (`aiPolicy.ts`) — never a timer, so refreshing the
+ * idle clock is honest activity rather than a forgery.
+ */
+export const ASSIST_GATE_PLAN: readonly ProbePlanEntry[] = [
+  { route: POLICY_ROUTE, authenticated: true },
+];
 
 /**
  * The route that EARNS a green check. It must be (a) authenticated, (b) permission-gated, and (c) NOT

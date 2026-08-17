@@ -6,14 +6,22 @@ These are the wire contract the console (and any other client) sees — delibera
 separate from the internal SQLite rows and channel-config models so storage/runtime
 changes don't leak into the API. Message *list* responses carry metadata only; the raw
 body (PHI) appears only in the single-message detail view, which is audited.
+
+A model that carries a PHI *property* subclasses :class:`~messagefoundry.api.phi_gate.PhiGatedModel`
+and declares it in ``phi_gated_properties``: the property is then withheld from JSON until
+:func:`~messagefoundry.api.field_authz.redact_unauthorized` releases what the caller may see, so a
+route that forgets that call denies rather than exposes (BACKLOG #1045). Which permission unlocks
+which property stays in :mod:`messagefoundry.api.field_authz`; the two are pinned to each other by
+``tests/test_field_authz_fail_closed.py``.
 """
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
+from messagefoundry.api.phi_gate import PhiGatedModel
 from messagefoundry.config.ai_policy import (
     AiDataScope,
     AiMode,
@@ -31,7 +39,11 @@ class ChannelInfo(BaseModel):
     destinations: list[str]
 
 
-class MessageSummary(BaseModel):
+class MessageSummary(PhiGatedModel):
+    # Withheld from JSON until released (BACKLOG #1045). MessageDetail INHERITS this declaration,
+    # which is deliberate: a future subclass of a PHI-bearing model is gated by default.
+    phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"summary", "error", "metadata"})
+
     id: str
     channel_id: str
     received_at: float
@@ -67,7 +79,9 @@ class MessageSearchResults(BaseModel):
     scan_limit: int
 
 
-class OutboxInfo(BaseModel):
+class OutboxInfo(PhiGatedModel):
+    phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"last_error"})
+
     id: str
     destination_name: str
     status: str
@@ -76,7 +90,9 @@ class OutboxInfo(BaseModel):
     last_error: str | None
 
 
-class EventInfo(BaseModel):
+class EventInfo(PhiGatedModel):
+    phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"detail"})
+
     ts: float
     event: str
     destination: str | None
@@ -107,10 +123,12 @@ class MessageDetail(MessageSummary):
     attachments: list[AttachmentInfo] = Field(default_factory=list)
 
 
-class CapturedResponseInfo(BaseModel):
+class CapturedResponseInfo(PhiGatedModel):
     """One captured request/response reply (ADR 0013). ``outcome``/``detail`` are visible with the
     message-read permission; ``body`` is PHI and populated only when the caller also holds the raw-body
     permission (``None`` otherwise, and ``None`` once retention has purged it)."""
+
+    phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"detail"})
 
     destination_name: str
     response_seq: int
@@ -213,8 +231,10 @@ class PurgeResult(BaseModel):
     cancelled: int
 
 
-class DeadLetterRow(BaseModel):
+class DeadLetterRow(PhiGatedModel):
     """One dead-lettered delivery (a message→destination that exhausted its retries)."""
+
+    phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"summary", "last_error"})
 
     outbox_id: str
     message_id: str
@@ -488,6 +508,11 @@ class StatsResponse(BaseModel):
     # backend reports 0 (counting is wired on SQLite + SQL Server).
     committed_txns: int = 0
     body_copies: int = 0
+    # ADR 0157 C3: terminal queue resolves rejected by the H1 leader-epoch fence (Postgres only; 0
+    # elsewhere). Non-zero == a superseded ex-leader was stopped mid-write. MUST be declared here:
+    # this model takes Pydantic's default extra='ignore', so an undeclared kwarg is dropped SILENTLY
+    # and /stats would never grow the field.
+    fenced_writes: int = 0
 
 
 class MetricsHistorySample(BaseModel):
@@ -964,6 +989,11 @@ class SecurityPosture(BaseModel):
     # cryptography-wheel OpenSSL that encrypts PHI at rest — so it is "reported", never "certified".
     fips_mode: bool | None = None
     openssl_version: str | None = None
+    # TLS key-exchange groups read-out (report-only, #338 / ASVS 11.6.2). A read of whether the approved
+    # KEX groups are PINNED on built contexts or INHERITED from OpenSSL's default group list — today
+    # always inherited, because ``SSLContext.set_groups`` is a Python 3.15 API. Report-only: it reflects,
+    # and changes, NO live TLS behaviour (the TLS 1.2+ floor is the enforced control; see docs/PHI.md §4).
+    kex_groups: str | None = None
     # Platform memory-encryption READ-OUT (report-only, ADR 0152 Phase 1 / ASVS 11.7.1) + the operator
     # declaration (Phase 2). Named "self_reported" on purpose: these are values the host OS emits
     # about ITSELF (/proc/cpuinfo flags, guest device-node presence), and 11.7.1 exists precisely
@@ -1130,8 +1160,17 @@ class UploadedFileInfo(BaseModel):
 
 
 class UploadedFileList(BaseModel):
+    """The caller's visible uploaded files (metadata only).
+
+    ``scope`` says WHOSE files ``total`` counted (ASVS 8.2.2): ``own`` for the owner-scoped default,
+    ``any_owner`` when the caller holds ``files:access_any``. It is the same value the ``upload.list``
+    audit row records, computed once at the route — so a reader of the response and a reader of the
+    audit interpret the same count the same way, and a UI can state which listing it is showing
+    instead of asserting one of the two unconditionally. It is a fixed enum, never operator text."""
+
     total: int
     files: list[UploadedFileInfo]
+    scope: Literal["own", "any_owner"]
 
 
 class UploadedMessageSummary(BaseModel):

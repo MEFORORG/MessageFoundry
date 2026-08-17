@@ -35,7 +35,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import (
@@ -61,6 +61,13 @@ from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.api.auth_routes import add_auth_routes
 from messagefoundry.api.client_networks import ClientNetworkMiddleware
 from messagefoundry.api.field_authz import count_exposed, redact_unauthorized
+from messagefoundry.api.header_floor import (
+    BASELINE_SECURITY_HEADERS,
+    HSTS_HEADER,
+    HSTS_VALUE,
+    SecurityHeaderFloorMiddleware,
+    hsts_applies,
+)
 from messagefoundry.api.metrics import (
     METRICS_CONTENT_TYPE,
     MetricsHistory,
@@ -161,6 +168,7 @@ from messagefoundry.api.multipart import (
     MultipartTooLargeError,
     parse_single_file_upload,
 )
+from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     authorize_ws,
     client_ip,
@@ -242,14 +250,20 @@ from messagefoundry.config.settings import (
     hop_posture_from_ai,
     security_loosenings,
 )
-from messagefoundry.config.tls_policy import fips_attestation, phi_read_hop_disposition
+from messagefoundry.config.tls_policy import (
+    fips_attestation,
+    kex_groups_report,
+    phi_read_hop_disposition,
+)
 from messagefoundry.config.wiring import (
     EnvRef,
     Registry,
     WiringError,
     accepted_cleartext_hops,
+    expiry_relaxed_hops,
     load_config,
     redacted_settings,
+    unverified_generic_db_hops,
 )
 from messagefoundry.integrity import run_startup_attestation
 from messagefoundry.last_resort import install_loop_exception_handler
@@ -499,7 +513,10 @@ def _build_approval_gate(engine: Engine, settings: ApprovalsSettings) -> Approva
         # Load-bearing dual-control guard (findings #1/#4/#11): ApprovalGate.approve runs THIS executor
         # directly (purge_connection is NOT re-entered on the release path), and it flips the row to
         # 'approved' BEFORE executing — so the require-quiesced precondition must be re-checked HERE, and
-        # a failure must NOT raise (a raise would strand the row approved-but-unexecuted). A non-quiesced
+        # a failure should NOT raise. (Since ASVS 2.3.3 the gate compensates a raise by rolling the row
+        # to 'failed' and auditing it, so a raise no longer strands it approved-but-unexecuted; skipping
+        # is still the better outcome HERE, because a non-quiesced outbound is a retryable precondition
+        # miss the operator can clear, not a failed operation.) A non-quiesced
         # (running/stopping) outbound could have an INFLIGHT row cancel_queued cannot cancel, so purging
         # it would mis-fire; skip fail-closed and record cancelled=0/skipped in the approval audit. The
         # operator re-Stops (lets it quiesce) and re-requests.
@@ -1037,6 +1054,9 @@ def create_app(
     # app.state.auth -- create_managed_app attaches the service in the lifespan, AFTER mount_ui
     # has already fixed the route table.
     oidc_enabled: bool = False,
+    # ASVS 3.7.3 (seam v17): the configured IdP authorization endpoint, for the interstitial's
+    # DISPLAY host. Config, never request input — see UiDeps.oidc_authorization_host.
+    oidc_authorization_endpoint: str = "",
     webauthn_rp_from_request: bool = True,
     exposure_protected: bool = False,
     loopback: bool = False,
@@ -1202,7 +1222,16 @@ def create_app(
         _log.error(
             "unhandled error on %s %s: %s", request.method, request.url.path, type(exc).__name__
         )
-        return JSONResponse({"detail": "internal error"}, status_code=500)
+        # The baseline security headers are set HERE, not left to the middleware that sets them on
+        # every other response. Starlette routes a handler registered for Exception/500 to
+        # ServerErrorMiddleware, which build_middleware_stack places OUTSIDE user_middleware by
+        # construction — so neither _security_headers below nor the outermost
+        # SecurityHeaderFloorMiddleware is in this response's path, and a 500 shipped with none of
+        # them. Status and body are unchanged: this adds headers only.
+        headers = dict(BASELINE_SECURITY_HEADERS)
+        if hsts_applies(request.url.scheme, exposure_protected):
+            headers[HSTS_HEADER] = HSTS_VALUE
+        return JSONResponse({"detail": "internal error"}, status_code=500, headers=headers)
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -1251,13 +1280,13 @@ def create_app(
                 "docs/security/OFF-LOOPBACK-DEPLOYMENT.md."
             )
         response = await call_next(request)
-        response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("Referrer-Policy", "no-referrer")
-        response.headers.setdefault("X-Frame-Options", "DENY")
-        if request.url.scheme == "https" or exposure_protected:
-            response.headers.setdefault(
-                "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
-            )
+        # The header names/values and the HSTS condition come from api/header_floor.py so this
+        # middleware and the outermost floor that backstops it cannot drift apart. This one still
+        # exists for the PATH-CONDITIONAL work below, which the floor deliberately does not duplicate.
+        for name, value in BASELINE_SECURITY_HEADERS:
+            response.headers.setdefault(name, value)
+        if hsts_applies(request.url.scheme, exposure_protected):
+            response.headers.setdefault(HSTS_HEADER, HSTS_VALUE)
         # /ui browser surface (ADR 0065 §5): a strict CSP (no unsafe-*) and no-store on every HTML
         # response; the vendored /ui/static assets keep StaticFiles' own cache. PHI JSON reads also get
         # no-store (every _NO_STORE_PREFIXES family, ASVS 14.2.2) so a browser/proxy never caches a
@@ -1424,8 +1453,13 @@ def create_app(
             )
         # Build the broker from the SERVER's settings (never the request body). The SSRF endpoint-allowlist
         # + cleartext-credential checks run in the constructor; a misconfiguration is an operator error.
+        # #329: thread the derived instance posture (the same _phi_read_posture derived at create_app time
+        # from ai_settings, which == app.state.ai == `ai` on the managed path) so the broker's cleartext-
+        # http credential refusal is clamped on an enforcing-PHI instance — the escape can no longer put
+        # the api_key on the wire. Without this the route would build the broker with an unclamped escape
+        # (green and inert), the exact failure mode #329 exists to close.
         try:
-            broker = ai_broker_from_settings(ai)
+            broker = ai_broker_from_settings(ai, posture=_phi_read_posture)
         except AiBrokerError as exc:
             _log.warning("engine AI broker misconfigured: %s", exc)
             raise HTTPException(503, "engine-brokered AI assistance is not available") from exc
@@ -1496,30 +1530,39 @@ def create_app(
         # stash-or-default pattern — settings-scoped, so this route reports it completely even with no
         # graph loaded, unlike the connection-scoped cleartext_accepted set below.
         alerts_settings = getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
-        # ADR 0153: the ONE connection-scoped deviation. Read LIVE off the running graph (so a reload is
-        # reflected) — this route is where an operator learns a cleartext hop is being crossed by
-        # declaration, and a stale or absent list would understate the posture. An engine with no
+        # ADR 0153 + #333: the THREE connection-scoped deviations. Read LIVE off the running graph (so a
+        # reload is reflected) — this route is where an operator learns a cleartext hop is being crossed
+        # by declaration, an expired certificate is being honoured, or a generic DB hop has no verifying
+        # TLS keyword, and a stale or absent list would understate the posture. An engine with no
         # registry runner (an embedding, or an app queried before start) cannot see them at all, so it
         # DECLARES that in `loosenings_scope` rather than returning a settings-only subset that reads as
         # the whole posture — the same discipline `messagefoundry security show` follows.
         runner = engine.registry_runner
-        cleartext_hops = (
-            [name for name, _ in accepted_cleartext_hops(runner.registry)]
-            if runner is not None
-            else []
-        )
+        if runner is not None:
+            cleartext_hops = [name for name, _ in accepted_cleartext_hops(runner.registry)]
+            expired_hops = [name for name, _ in expiry_relaxed_hops(runner.registry)]
+            db_hops = [name for name, _ in unverified_generic_db_hops(runner.registry)]
+        else:
+            cleartext_hops, expired_hops, db_hops = [], [], []
         loosenings_scope = (
             None
             if runner is not None
             else (
-                "settings only — no connection graph is loaded on this engine, so per-connection "
-                "cleartext_accepted declarations are NOT included (see `messagefoundry check`)"
+                "settings only — no connection graph is loaded on this engine, so the per-connection "
+                "cleartext_accepted / tls_allow_expired / generic-ODBC-DATABASE-TLS declarations are "
+                "NOT included (see `messagefoundry check`)"
             )
         )
         loosenings = [
             SecurityLoosening(switch=name, risk=risk)
             for name, risk in security_loosenings(
-                security, store, auth_settings, alerts_settings, cleartext_hops
+                security,
+                store,
+                auth_settings,
+                alerts_settings,
+                cleartext_hops,
+                expired_hops,
+                db_hops,
             )
         ]
         synthetic_relaxation = (
@@ -1532,6 +1575,9 @@ def create_app(
         # FIPS-provider attestation of the interpreter's ssl/_hashlib OpenSSL (report-only, #73 / ADR 0120):
         # metadata (a boolean + version string), never key material, never enforced.
         fips_mode, openssl_version = fips_attestation()
+        # TLS key-exchange groups read-out (report-only, #338). Pure helper over a throwaway probe
+        # context; reflects/changes NO live TLS behaviour, reports "inherited" until Python 3.15.
+        kex_groups = kex_groups_report()
         # Platform memory-encryption READ-OUT (report-only, ADR 0152 Phase 1). Pure platform read
         # (/proc/cpuinfo flags + guest device presence on Linux; all-None everywhere else), no engine
         # state, never raises. It reports what the HOST SAYS ABOUT ITSELF and therefore satisfies
@@ -1573,6 +1619,7 @@ def create_app(
             synthetic_relaxation=synthetic_relaxation,
             fips_mode=fips_mode,  # interpreter ssl/_hashlib OpenSSL FIPS-provider state; None=undeterminable
             openssl_version=openssl_version,  # that OpenSSL's version string (public metadata)
+            kex_groups=kex_groups,  # report-only: are the approved KEX groups pinned or inherited (#338)?
             # ADR 0152: a SELF-REPORT plus the operator's claim. Neither satisfies ASVS 11.7.1 at any
             # value — see the field comments on SecurityPosture. The disclaimer ships IN THE BODY
             # (memory_encryption_note), unconditionally: this endpoint is the designated evidence
@@ -3667,6 +3714,85 @@ def create_app(
             raise HTTPException(503, "uploaded logs are not configured (set [store].uploads_dir)")
         return us
 
+    def _may_access_upload(identity: Identity, meta: UploadedFileMeta) -> bool:
+        """Object-level authorization for ONE uploaded file (ASVS 8.2.2): owner-only, plus an explicit
+        cross-operator override (``files:access_any``, an ADMINISTRATOR grant).
+
+        The owner key is ``Identity.user_id`` — the account's immutable ``uuid4`` hex — and NOT the
+        username. A username is unique among live accounts but reusable: deleting a user frees the
+        name, and recreating it mints a NEW ``user_id``, so a name comparison would hand the recycled
+        account the departed operator's uploaded PHI. The exact same value keys the per-uploader quota
+        (``uploads.py`` ``save()``), so ownership and the budget can never disagree about who a file
+        belongs to — a recycled account is neither billed for nor able to read the old files.
+
+        **WHAT THIS DOES NOT REACH, and it is the primary enterprise path.** ``_upsert_ad_user``
+        (``auth/service.py``) resolves an AD principal by ``sAMAccountName`` and mints a fresh
+        ``user_id`` ONLY when no mirror row survives — i.e. only after a MessageFoundry
+        ``delete_user``. On the DEFAULT path the surviving row is adopted and **its ``user_id`` is
+        re-bound**, so a deploying site that recycles a ``sAMAccountName`` in the directory without
+        also deleting the MessageFoundry user would give the new person the old person's id, and this
+        check would match. No better key exists here: ``AdPrincipal`` carries no ``objectGUID`` or
+        ``objectSid``. Closing it means binding AD to a directory-immutable id the way OIDC binds
+        ``(issuer, sub)`` — tracked as BACKLOG #1143, not solvable inside this function.
+
+        The channel axis is deliberately NOT used: ``Identity.allowed_channels`` defaults to ``None``
+        (= every channel) and an uploaded file carries no channel at all, so a channel-scoped rule
+        would protect nobody on a default install and would deny every scoped operator their own file.
+
+        FAIL CLOSED on a sidecar with no ``uploader_id``. ``save()`` refuses to write one, but the
+        tolerant loader yields ``""`` for a sidecar missing the key (a hand-placed one under the no-key
+        identity cipher), and ``""`` matches no real ``user_id``. Such a file is reachable ONLY by an
+        override holder — never by "everyone", which is what an equality test alone would give it if
+        the caller's id were ever empty too."""
+        if identity.has(Permission.FILES_ACCESS_ANY):
+            return True
+        return bool(meta.uploader_id) and meta.uploader_id == identity.user_id
+
+    async def _authorized_upload_meta(
+        request: Request, engine: Engine, us: UploadStore, identity: Identity, file_id: str, op: str
+    ) -> UploadedFileMeta:
+        """Load one uploaded file's metadata and enforce :func:`_may_access_upload` (ASVS 8.2.2).
+
+        A denial answers **404 "no such uploaded file"** — the same status and the same response BODY
+        as a malformed or absent id. That is a bound on the response, not on the whole observation: the
+        denied path additionally reads and decrypts the sidecar and writes an ``upload.denied`` audit
+        row, so it is distinguishable by timing and permanently distinguishable in the audit log. What
+        makes the by-id routes non-enumerable is the id itself — a ``file_id`` is 128 bits of
+        ``secrets.token_hex(16)`` and the listing no longer hands out another operator's — not the
+        indistinguishability of the answer. The denial is audited: the acting username, the acting
+        ``user_id``, the ``file_id`` and the operation — never the filename, the owner or any content.
+
+        Every by-id route calls this BEFORE it decrypts a body or unlinks anything, which is the point:
+        the check has to sit in the handler BODY, not in a ``Depends`` gate, because the web console
+        invokes these handlers directly through the CoreHandlers seam and never runs their gates."""
+        try:
+            meta = await us.get_meta(file_id)
+        except (UploadPathError, UploadNotFoundError):
+            raise HTTPException(404, "no such uploaded file") from None
+        if not _may_access_upload(identity, meta):
+            await engine.store.record_audit(
+                "upload.denied",
+                actor=identity.username,
+                # ``actor`` stays the username — that is the codebase-wide audit convention and every
+                # reader/query already assumes it. But this control exists precisely BECAUSE a username
+                # is reusable, so the column alone cannot say WHICH principal was refused: after a name
+                # is recycled, two different accounts wear the same string and the departed operator's
+                # denials read as the successor's. The immutable id disambiguates them, and it is an
+                # account identifier, not PHI. Nothing else joins it: no filename, no owner name, no
+                # content — the audit is not a PHI sink.
+                detail=json.dumps(
+                    {
+                        "file_id": file_id,
+                        "operation": op,
+                        "reason": "not_owner",
+                        "actor_user_id": identity.user_id,
+                    }
+                ),
+                client=client_ip(request),
+            )
+            raise HTTPException(404, "no such uploaded file")
+        return meta
+
     def _upload_info(meta: UploadedFileMeta) -> UploadedFileInfo:
         return UploadedFileInfo(
             file_id=meta.file_id,
@@ -3695,7 +3821,9 @@ def create_app(
         (EXIF/XMP/docProps) can ever be stored.
 
         **Consent (ASVS 14.2.8).** The original filename you supply and your username are stored and shown
-        to authorized operators, and recorded in the audit log; submitting an upload is your consent."""
+        to you and to authorized operators holding ``files:access_any`` (administrators), and recorded in
+        the audit log; submitting an upload is your consent. The file itself is **owner-only** (ASVS
+        8.2.2): only you and an override holder can list, browse, resend or delete it."""
         us = _require_upload_store(request)
         body = await request.body()
         try:
@@ -3723,7 +3851,14 @@ def create_app(
             )
             raise HTTPException(415, nontext) from None
         try:
-            meta = await us.save(data=part.data, filename=part.filename, uploader=identity.username)
+            # uploader_id (the immutable account id) is the ownership + quota key; uploader (the
+            # username) rides along as the display/audit label. See uploads.UploadedFileMeta.
+            meta = await us.save(
+                data=part.data,
+                filename=part.filename,
+                uploader=identity.username,
+                uploader_id=identity.user_id,
+            )
         except UploadTooLargeError as exc:
             raise HTTPException(413, str(exc)) from None
         except UploadContentError as exc:
@@ -3768,13 +3903,35 @@ def create_app(
         # ASVS 5.2.4: opportunistic age-based retention sweep at save time (off-loop, best-effort). A prune
         # error must never fail the upload the operator just made — it is logged and retried by the
         # periodic task. Each pruned file is audited (file_id + uploader, never content).
+        #
+        # BACKLOG #1224: the sweep is AUTOMATED and owner-blind, so it is attributed to the system,
+        # not to the pruned file's uploader. `prune_expired()` is deliberately UNSCOPED (it has to be:
+        # the per-uploader quota and the sweep both need to see every file), so the operator whose
+        # upload triggered this pass is in general NOT the owner of what it prunes. Naming the owner
+        # as actor while stamping the TRIGGERING operator's address made the row assert that X deleted
+        # their own file from Y's host. `client` is dropped for the same reason rather than as tidying:
+        # _record_reload_audit's contract is that `client` is the address OF THE ACTOR NAMED IN THE
+        # ROW, and once the actor is the system principal no address is in scope (ADR 0150 decision 4
+        # rejects exactly this pairing for dual-control config reload). The owner survives as DATA in
+        # `detail.uploader`, which is where it belongs.
         try:
             for pruned in await us.prune_expired():
                 await engine.store.record_audit(
                     "upload.prune",
-                    actor=pruned.uploader or None,
-                    detail=json.dumps({"file_id": pruned.file_id, "uploader": pruned.uploader}),
-                    client=client_ip(request),
+                    actor="system",
+                    detail=json.dumps(
+                        {
+                            "file_id": pruned.file_id,
+                            "uploader": pruned.uploader,
+                            # The IMMUTABLE owner key beside the display name. A prune row is a
+                            # permanent record of a deletion whose subject cannot be recovered
+                            # afterwards -- the file is gone -- and a username is reassignable
+                            # (BACKLOG #1225), so a row read later could name a different person
+                            # than it meant. UploadedFileMeta carries both deliberately
+                            # (uploads.py:116); this records both.
+                            "uploader_id": pruned.uploader_id,
+                        }
+                    ),
                 )
         except OSError:
             _log.warning("opportunistic uploaded-logs retention prune failed", exc_info=True)
@@ -3786,16 +3943,32 @@ def create_app(
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.FILES_BROWSE)),
     ) -> UploadedFileList:
-        """List uploaded files (metadata only — no bodies). Audited."""
+        """List the caller's OWN uploaded files (metadata only — no bodies). Audited.
+
+        Object-level authorization (ASVS 8.2.2): the listing is owner-scoped, so one operator never
+        sees another's filenames, sizes, digests or ``file_id`` s — the ``file_id`` being the token the
+        browse/resend/delete routes accept. ``files:access_any`` widens it to every uploader's files.
+        The scope is returned in the response AND recorded in the audit row — computed once, here — so
+        a count means the same thing to every reader and no consumer has to re-derive whose files it
+        is holding. The web console renders the sentence that matches it rather than asserting the
+        owner-scoped case at an override holder, for whom it is false."""
         us = _require_upload_store(request)
-        files = await us.list_files()
+        # Filtered HERE, not in UploadStore.list_files(): the store's unscoped scan is what the
+        # per-uploader quota and the age-based retention sweep are built on, and both must keep seeing
+        # every uploader's sidecars (uploads.py save()/prune_expired()).
+        files = [m for m in await us.list_files() if _may_access_upload(identity, m)]
+        scope: Literal["own", "any_owner"] = (
+            "any_owner" if identity.has(Permission.FILES_ACCESS_ANY) else "own"
+        )
         await engine.store.record_audit(
             "upload.list",
             actor=identity.username,
-            detail=json.dumps({"count": len(files)}),
+            detail=json.dumps({"count": len(files), "scope": scope}),
             client=client_ip(request),
         )
-        return UploadedFileList(total=len(files), files=[_upload_info(m) for m in files])
+        return UploadedFileList(
+            total=len(files), files=[_upload_info(m) for m in files], scope=scope
+        )
 
     @app.get("/uploads/{file_id}/messages", response_model=UploadedMessagesResult)
     async def browse_uploaded_file(
@@ -3814,7 +3987,12 @@ def create_app(
     ) -> UploadedMessagesResult:
         """Browse an uploaded file's split messages as a filterable log (BACKLOG #125). Decrypts + splits
         real PHI, so it is step-up-gated + PHI-read-hop-guarded (like content search) and audited with the
-        needle SHAPE only (never its value). Returns metadata only — never a decrypted body."""
+        needle SHAPE only (never its value). Returns metadata only — never a decrypted body.
+
+        Owner-only (ASVS 8.2.2): a file the caller did not upload answers 404. The response shape does
+        not bound what this route releases — ``matched`` plus the per-message metadata answer "does this
+        needle occur in that file", so an unscoped browse is a content oracle over another operator's
+        PHI, which is why the check runs BEFORE the body is decrypted."""
         enforce_phi_read_hop(request)
         enforce_phi_read_pacing(request, identity)  # bulk decrypt+split on a step-up GET
         us = _require_upload_store(request)
@@ -3829,8 +4007,8 @@ def create_app(
                 )
             except ContentSearchError as exc:
                 raise HTTPException(400, str(exc)) from exc
+        meta = await _authorized_upload_meta(request, engine, us, identity, file_id, "browse")
         try:
-            meta = await us.get_meta(file_id)
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
@@ -3895,7 +4073,12 @@ def create_app(
         the DISTINCT inject path ``engine.inject_message`` (``enqueue_ingress``) — a fresh ``RECEIVED`` on
         the target inbound's channel — NOT ``reingress`` (which presupposes an origin row an uploaded file
         never had). The target inbound must be registered + running, and the caller channel-scoped to it.
-        Step-up-gated + audited."""
+        Step-up-gated + audited.
+
+        TWO authorization axes, both enforced: the TARGET (per-channel ``can_access_channel`` on the
+        inbound, 403) and the SOURCE file (owner-only, ASVS 8.2.2, 404). Without the source check the
+        route is a two-step read of another operator's bodies — inject their message into an inbound you
+        are authorized for, then read it as an ordinary message on your own channel."""
         us = _require_upload_store(request)
         # Cross-channel authorization: the inbound name is treated as a channel for per-channel RBAC, so a
         # scoped operator cannot inject PHI into an inbound they can't reach. 403 (target denied).
@@ -3912,6 +4095,8 @@ def create_app(
                 )
         except KeyError:
             raise HTTPException(404, f"no such inbound connection: {body.to}") from None
+        # Object-level authorization on the SOURCE file, in ADDITION to the target-channel check above.
+        await _authorized_upload_meta(request, engine, us, identity, file_id, "resend")
         try:
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
@@ -3948,9 +4133,15 @@ def create_app(
         identity: Identity = Depends(require_step_up(Permission.FILES_DELETE)),
     ) -> UploadDeleteResult:
         """Delete an uploaded file from the server (BACKLOG #126) — destructive + irreversible. Guarded
-        by the path-traversal-safe ``file_id`` (a bad id 404s without a filesystem touch), step-up, and an
-        ``upload.delete`` audit row."""
+        by the path-traversal-safe ``file_id`` (a bad id 404s without a filesystem touch), step-up, an
+        owner-only object check (ASVS 8.2.2 — another operator's file answers 404, and is never
+        unlinked), and an ``upload.delete`` audit row.
+
+        The check reads the metadata FIRST, because ``UploadStore.delete`` returns the metadata only
+        after it has already unlinked both sidecars — a check bolted onto that call would fire too
+        late. The age-based retention sweep is deliberately owner-blind and unaffected."""
         us = _require_upload_store(request)
+        await _authorized_upload_meta(request, engine, us, identity, file_id, "delete")
         try:
             meta = await us.delete(file_id)
         except (UploadPathError, UploadNotFoundError):
@@ -3975,7 +4166,7 @@ def create_app(
     ) -> SearchPresetList:
         """List the caller's saved presets — names + timestamps only (NEVER the criteria; the
         PHI-shaped content term is returned only by the step-up-gated layered compose). Audited."""
-        rows = await engine.store.list_search_presets(identity.username)
+        rows = await engine.store.list_search_presets(identity.user_id)
         await engine.store.record_audit(
             "preset.list",
             actor=identity.username,
@@ -4020,7 +4211,10 @@ def create_app(
             needle_shape = _needle_shape(crit.content) if crit.content else "field_path"
         effective_id, replaced = await engine.store.upsert_search_preset(
             preset_id=uuid4().hex,
-            owner=identity.username,
+            # BACKLOG #1225: the OWNER KEY is the immutable Identity.user_id, never the reassignable
+            # username. This is the WRITE the other three sites read; re-keying only the readers
+            # would make every newly created preset invisible to its own creator.
+            owner=identity.user_id,
             name=body.name,
             criteria=crit.model_dump_json(),
         )
@@ -4050,7 +4244,7 @@ def create_app(
     ) -> SearchPresetDeleteResult:
         """Delete one of the caller's presets (owner-scoped). Audited."""
         deleted = await engine.store.delete_search_preset(
-            preset_id=preset_id, owner=identity.username
+            preset_id=preset_id, owner=identity.user_id
         )
         if not deleted:
             raise HTTPException(404, f"no such preset: {preset_id}")
@@ -4085,7 +4279,7 @@ def create_app(
             raise HTTPException(400, f"at most {_MAX_PRESET_LAYERS} presets may be layered")
         criterias: list[dict[str, Any]] = []
         for preset_id in ids:
-            row = await engine.store.get_search_preset(preset_id=preset_id, owner=identity.username)
+            row = await engine.store.get_search_preset(preset_id=preset_id, owner=identity.user_id)
             if row is None:
                 raise HTTPException(404, f"no such preset: {preset_id}")
             try:
@@ -4160,6 +4354,7 @@ def create_app(
             # (or a future one) reports 0 rather than 500ing the stats read.
             committed_txns=getattr(engine.store, "committed_txns", 0),
             body_copies=getattr(engine.store, "body_copies", 0),
+            fenced_writes=getattr(engine.store, "fenced_writes", 0),
         )
 
     @app.get("/metrics")
@@ -4988,9 +5183,34 @@ def create_app(
         # Either source may know: create_managed_app passes the config flag; a caller that
         # constructs with auth= directly (tests, embedders) gets it from the live service.
         ui_oidc_enabled = oidc_enabled or bool(getattr(auth, "oidc_enabled", False))
+        # ASVS 3.7.3 (seam v17). Read off security_settings when present; the fallbacks are the
+        # STRICT position, so a caller that constructs without them gets the interstitial on every
+        # absolute destination rather than silently getting none.
+        _sec = security_settings
+
+        def _oidc_authorization_host(endpoint: str) -> str:
+            """ASCII/punycode host of the configured IdP endpoint, for DISPLAY only.
+
+            Local rather than imported from ``messagefoundry_webconsole._external``: the console is
+            deliberately not imported at module scope here (see the note above ``create_app``). An
+            unparseable endpoint yields ``""``, which the console treats as *unknown destination* and
+            therefore as a reason to SHOW the interstitial, never to skip it.
+            """
+            from urllib.parse import urlsplit
+
+            try:
+                host = (urlsplit(endpoint).hostname or "").strip().lower()
+                return host.encode("idna").decode("ascii").lower() if host else ""
+            except (ValueError, UnicodeError):
+                return ""
+
         deps = UiDeps(
             engine_seam=ENGINE_UI_SEAM,
             oidc_enabled=ui_oidc_enabled,
+            organization_domains=tuple(getattr(_sec, "organization_domains", ()) or ()),
+            external_link_interstitial=bool(getattr(_sec, "external_link_interstitial", True)),
+            external_link_allowlist=tuple(getattr(_sec, "external_link_allowlist", ()) or ()),
+            oidc_authorization_host=_oidc_authorization_host(oidc_authorization_endpoint),
             get_engine=_get_engine,
             get_gate=_get_gate,
             cookie_secure=_cookie_secure,
@@ -5055,19 +5275,46 @@ def create_app(
     # OUTSIDE the serve_ui guard so the JSON-only deployment is covered identically.
     app.add_middleware(AttachmentSecurityHeadersMiddleware)
 
-    # [security].allowed_client_networks — registered LAST, so Starlette makes it the OUTERMOST user
-    # middleware (add_middleware inserts at index 0; the stack is built from reversed(user_middleware)).
-    # It therefore runs above the attachment CSP re-assert, the console's UiSecurityHeadersMiddleware,
-    # the body cap, the security-headers middleware, the /ui/static mount and every auth dependency — a
-    # refused address reaches no route, no dependency and no body buffer. Registered OUTSIDE serve_ui so a
-    # JSON-only deployment is equally covered, and unconditionally so the control can never be
-    # silently missing after a config edit (an empty list short-circuits inside it).
+    # ASVS 15.1.3/15.2.2 (BACKLOG #1044) — the server-side deadline on BUILDING a response. Nothing
+    # bounded a handler before this: the only asyncio.wait_for in api/ caps the connection-test
+    # probe, so a slow handler held its worker for as long as it ran and the client's own timeout
+    # was the only thing that ever gave up (which does not free the server).
+    #
+    # Registered here so it lands OUTSIDE every earlier registration — the attachment CSP re-assert,
+    # the console's UiSecurityHeadersMiddleware, the body cap, the security-headers middleware and
+    # every auth dependency are all inside the deadline, which is what makes it a bound on the whole
+    # request rather than on the route function alone. It stays INSIDE ClientNetworkMiddleware
+    # (registered after it, so further out): a refused address must be rejected before it can occupy
+    # a deadline at all. The clock is cancelled at http.response.start, so a response that has begun
+    # streaming is never cut mid-body — see api/request_timeout.py.
+    app.add_middleware(RequestTimeoutMiddleware)
+
+    # [security].allowed_client_networks — registered so that only the response-header floor below is
+    # further out. It therefore runs above the attachment CSP re-assert, the console's
+    # UiSecurityHeadersMiddleware, the body cap, the security-headers middleware, the /ui/static mount
+    # and every auth dependency — a refused address reaches no route, no dependency and no body buffer.
+    # The floor does not weaken that: it runs NOTHING on the request path (it wraps `send` only), so it
+    # adds no reachable surface ahead of the gate. Registered OUTSIDE serve_ui so a JSON-only deployment
+    # is equally covered, and unconditionally so the control can never be silently missing after a
+    # config edit (an empty list short-circuits inside it).
     #
     # It must stay INSIDE uvicorn's ProxyHeadersMiddleware, which it is automatically by being part of
     # the app uvicorn wraps. Do NOT wrap the app in __main__ before uvicorn.run: that would put the
     # gate OUTSIDE the XFF rewrite, where scope["client"] is still the raw socket peer, and the
     # declared-proxy topology (R2) would break completely — every client would look like the proxy.
     app.add_middleware(ClientNetworkMiddleware)
+
+    # ASVS 3.4.4/3.4.5 — registered LAST, so Starlette makes it the OUTERMOST user middleware
+    # (add_middleware inserts at index 0; the stack is built from reversed(user_middleware)) and its
+    # response-path send wrapper runs after every other emitter. That position is the whole point:
+    # _security_headers is the INNERMOST user middleware, so the body cap's four short-circuits above
+    # shipped with no baseline headers at all, and both middlewares that hand-copy the baseline
+    # (client_networks._DENIAL_HEADERS, request_timeout._TIMEOUT_HEADERS) omit HSTS. The floor
+    # setdefaults, never assigns, so the attachment sandbox CSP re-asserted above and every other
+    # last-writer-wins header is untouched. See api/header_floor.py — including why it CANNOT cover the
+    # unhandled 500 (ServerErrorMiddleware sits outside user_middleware; _unhandled_exception sets the
+    # same baseline itself) and why the path-conditional Cache-Control/CSP is deliberately not copied.
+    app.add_middleware(SecurityHeaderFloorMiddleware)
 
     return app
 
@@ -5302,19 +5549,27 @@ def create_managed_app(
         # WITHOUT changing capacity. A no-op returning None in production / every other test, so the
         # engine is byte-identical when the gate is unset. Stashed for /stats + shut down in finally.
         app.state.connscale_executor = maybe_install_executor_shim(asyncio.get_running_loop())
+        # #329: the derived instance hop posture, computed ONCE here for the OUT-OF-GATE cells this
+        # lifespan builds — the alerts webhook sink (notifier_from_settings) and the LDAPS bind
+        # (AuthService → LdapAuthenticator). Neither is built inside an active_hop_posture scope, so
+        # current_hop_posture() is None there and their weakened-TLS escape would ship UNCLAMPED (green
+        # and inert) without an explicit posture; threading this makes the ADR-0092 clamp apply on first
+        # deployment. None when the instance declares no [ai] (SQLite/test) → the unclamped escape,
+        # byte-identical. Reuses the same hop_posture_from_ai derivation the store hop and the runner use.
+        _hop_posture = (
+            hop_posture_from_ai(
+                ai_settings, enforcement=(security_settings or SecuritySettings()).enforcement
+            )
+            if ai_settings is not None
+            else None
+        )
         # #200 (ADR 0092 decision 2): thread the derived instance posture so the engine<->store weakened-
         # TLS refusal (connection_string / _build_ssl) clamps MEFOR_ALLOW_INSECURE_TLS — the escape can
         # never relax a production-PHI store hop. None when no [ai] (SQLite/test) → unclamped, unchanged.
         store = await open_store(
             resolved,
             message_events=message_events,
-            posture=(
-                hop_posture_from_ai(
-                    ai_settings, enforcement=(security_settings or SecuritySettings()).enforcement
-                )
-                if ai_settings
-                else None
-            ),
+            posture=_hop_posture,
         )
         # Offline uploaded-logs store (BACKLOG #125/#126, ADR 0134), on the LIVE store's cipher instance.
         # DISABLED (None) unless [store].uploads_dir is set, so no PHI-at-rest surface exists unless an
@@ -5356,6 +5611,8 @@ def create_managed_app(
                 # #323 layer 3: the instance [tls] internal-CA policy reaches the alerts SMTP hop too, so
                 # an estate on a private CA needs no per-alert CA path.
                 trust_anchor_policy=tls_settings.policy() if tls_settings else None,
+                # #329: clamp the webhook sink's cleartext-http escape to the derived instance posture.
+                posture=_hop_posture,
             )
             if alerts_settings is not None
             else None
@@ -5554,10 +5811,22 @@ def create_managed_app(
         if _upload_store is not None:
 
             async def _audit_upload_prune(meta: UploadedFileMeta) -> None:
+                # BACKLOG #1224: the retention runner has no operator and no request behind it, so
+                # the row is attributed to the system principal (matching pipeline/retention.py's
+                # `retention_purge`) rather than to the pruned file's uploader. The uploader is
+                # carried as DATA in `detail`, where a reader can still see whose file went. Both
+                # this site and the request-path sweep had to change together: fixing one would have
+                # left the same false attribution reachable by the other path.
                 await store.record_audit(
                     "upload.prune",
-                    actor=meta.uploader or None,
-                    detail=json.dumps({"file_id": meta.file_id, "uploader": meta.uploader}),
+                    actor="system",
+                    detail=json.dumps(
+                        {
+                            "file_id": meta.file_id,
+                            "uploader": meta.uploader,
+                            "uploader_id": meta.uploader_id,
+                        }
+                    ),
                 )
 
             upload_retention_runner = UploadRetentionRunner(
@@ -5604,6 +5873,10 @@ def create_managed_app(
                 # central run_anchor_preflight above) rather than refusing at enforce-only. Central
                 # preflight already ran before any listener bound; this keeps the seam consistent.
                 enforcing=trust_anchors_enforcing,
+                # #329: thread the derived instance posture to the LDAPS bind so its ad_tls_verify=false
+                # escape is clamped on an enforcing-PHI instance (LdapAuthenticator is built out of the
+                # connector-construction gate, so the clamp is inert unless the posture arrives here).
+                hop_posture=_hop_posture,
             )
             bootstrap = await auth.initialize()
             app.state.auth = auth
@@ -5726,6 +5999,9 @@ def create_managed_app(
         ws_allowed_origins=ws_allowed_origins,
         serve_ui=serve_ui,
         oidc_enabled=bool(auth_settings is not None and auth_settings.oidc_enabled),
+        oidc_authorization_endpoint=(
+            (auth_settings.oidc_authorization_endpoint or "") if auth_settings is not None else ""
+        ),
         public_origin=public_origin,
         webauthn_rp_from_request=webauthn_rp_from_request,
         exposure_protected=exposure_protected,

@@ -11,6 +11,10 @@ These assert the two things the cutover depends on for scripts/security/scan_for
   2. the committed scan-tokens.local.txt.example is SYNTHETIC -- it parses to exactly the ACME/EXAMPLE
      placeholders and the non-real ``99`` site prefix, so any real token slipping into it fails here.
 
+A later group, marked by its own section banner below, pins something adjacent rather than part of the
+cutover: the PLACEHOLDER-GUIDANCE prose that the same token list configures, which is self-colliding
+for authors and had no guard at all.
+
 The scanner is loaded by path (scripts/ is not a package). Every routable test IP is assembled from
 octets at runtime so THIS test file contains no literal routable dotted-quad of its own to trip the
 gate that scans it.
@@ -20,6 +24,7 @@ from __future__ import annotations
 
 import importlib.util
 import itertools
+import re
 from pathlib import Path
 from types import ModuleType
 
@@ -28,6 +33,13 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[1]
 _SCANNER = _ROOT / "scripts" / "security" / "scan_forbidden.py"
 _EXAMPLE = _ROOT / "scripts" / "security" / "scan-tokens.local.txt.example"
+_CONTRIBUTING = _ROOT / "CONTRIBUTING.md"
+_SETUP_SCRIPT = _ROOT / "scripts" / "dev" / "setup-leak-gate.ps1"
+
+#: The non-numeric stand-in this project tells contributors to use for a site code in tracked prose.
+#: Written here as a plain word on purpose: a stand-in that is itself a digit run would recreate the
+#: collision the convention exists to avoid.
+_STANDIN = "SITEA"
 
 # A routable probe IP, built from parts so no literal dotted-quad appears in this tracked file --
 # including in this comment, which is scanned like any other line.
@@ -198,6 +210,109 @@ def test_site_code_pattern_written_out_is_flagged(
     p = tmp_path / "d.md"
     p.write_text("dob = 19990123\nratio = 75.995512\n", encoding="utf-8")
     assert mod.scan_file(p, "docs/d.md") == []  # type: ignore[attr-defined]
+
+
+# --------------------------------------------------------------------------------------------------
+# The convention is self-colliding for its SECOND audience. `[site_prefix]` guidance is written for
+# the person filling in the TOKEN LIST, where naming a prefix shape is necessary. Read as guidance for
+# placeholder VALUES it is a trap: a placeholder built from a configured prefix and written into
+# TRACKED prose is then scanned by the very gate that list configures. The prefix compiles into two
+# detectors, but they catch DIFFERENT constructs -- the concrete code and the pattern written out --
+# and no single string is both, so clearing one form does NOT clear the other. That is the ADR 0030
+# miss pinned by test_site_code_pattern_written_out_is_flagged above. The tests below pin the guidance
+# text and the header's own arithmetic.
+# --------------------------------------------------------------------------------------------------
+
+
+def test_guidance_prose_does_not_self_collide_with_the_synthetic_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The GUIDANCE files must not perform the construct they forbid.
+
+    Two tiers, because the files differ in what they are allowed to contain:
+
+    * CONTRIBUTING.md and the setup script are pure prose. They must be COMPLETELY clean under the
+      synthetic set -- not merely free of site codes. Measured while writing this: naming the
+      synthetic placeholders outright, to explain why they false-positive, blocks a fork contributor
+      on the very file that tells them the gate exists. Describe them, do not spell them.
+    * The .example necessarily carries the token list itself, so it matches its own [names] entries by
+      construction. Only the site-code classes are assertable there.
+
+    Deliberately not widened to the tree. A DETECTOR test has to contain matching fixtures to be
+    evidence at all -- this module does so above, and tests/test_scan_forbidden.py does so throughout
+    -- and unrelated tracked files carry incidental delimited digit runs that begin with the synthetic
+    prefix. A tree-wide version would be permanently red and therefore worthless as a signal.
+    """
+    mod = _load(_EXAMPLE, monkeypatch)
+    # With no prefix loaded every site-code regex falls back to the always-failing _NEVER sentinel and
+    # the emptiness below would be vacuous -- passing while seeing nothing, the exact failure this
+    # module exists to prevent. Pin the precondition here rather than lean on a sibling test.
+    assert mod.loaded_token_counts()["site_prefixes"] > 0, (  # type: ignore[attr-defined]
+        "precondition: the site-code detectors are armed"
+    )
+    # Pass the REPO-RELATIVE display path: a hit string carries it, and these assertion messages land
+    # in a world-readable Actions log. The absolute form would put the checkout's own user-home path
+    # there -- a disclosure the scanner has a dedicated detector for.
+    for path in (_CONTRIBUTING, _SETUP_SCRIPT):
+        hits = mod.scan_file(path, path.relative_to(_ROOT).as_posix())  # type: ignore[attr-defined]
+        assert hits == [], f"{path.name} trips the gate it documents: {hits}"
+    example_hits = mod.scan_file(_EXAMPLE, _EXAMPLE.relative_to(_ROOT).as_posix())  # type: ignore[attr-defined]
+    offending = [h for h in example_hits if "site code" in h or "site-code pattern" in h]
+    assert offending == [], f"{_EXAMPLE.name} spells a site code / its pattern: {offending}"
+
+
+def test_example_header_counts_match_what_it_compiles_to(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The header's stated counts must equal what the file compiles to, with nothing quietly dropped.
+
+    This is the structural guard for the mistake the guidance block is one edit away from: prose
+    dropped INSIDE a section body is parsed as token data (``_parse_tokens`` skips only blank and
+    ``#``-prefixed lines). Counts alone cover only HALF of that. Prose that COMPILES as a regex
+    becomes a detector and breaks the arithmetic; prose that does NOT compile is discarded with a
+    stderr warning and leaves the counts identical, so the count assertion would read green over a
+    file that had silently lost a line. The warning assertion is the missing half. Between them it
+    fails from every side -- an entry added, an entry lost, or a header edited to claim a count the
+    sections do not produce.
+    """
+    claimed = re.search(
+        r"names=(\d+), estate=(\d+), site_prefix=(\d+)", _EXAMPLE.read_text("utf-8")
+    )
+    assert claimed is not None, "the .example header no longer states its own detector counts"
+    mod = _load(_EXAMPLE, monkeypatch)
+    # Drain first, then re-parse, so the captured stderr is THIS file's parse and nothing else: the
+    # first load inside ``_load`` runs against the ambient token source, which differs between a
+    # maintainer checkout, a fork and CI, and would make the assertion environment-dependent.
+    capsys.readouterr()
+    mod.reload_tokens()  # type: ignore[attr-defined]
+    err = capsys.readouterr().err
+    # Every ``_parse_tokens`` path that DISCARDS an entry says "ignoring"/"IGNORED"; the paths that
+    # keep one (a malformed CASE flag, a REASON that echoes its own token) do not. So this fires
+    # exactly when the file lost content -- the case the counts are blind to.
+    assert "ignor" not in err.lower(), f"the .example lost an entry while parsing: {err}"
+    counts = mod.loaded_token_counts()  # type: ignore[attr-defined]
+    assert (int(claimed[1]), int(claimed[2]), int(claimed[3])) == (
+        counts["names"],
+        counts["estate"],
+        counts["site_prefixes"],
+    ), "the .example header's counts disagree with what it compiles to"
+
+
+def test_placeholder_guidance_is_mirrored_in_contributing() -> None:
+    """The stand-in convention is stated in the .example and mirrored where a reader meets it.
+
+    Honestly, a PRESENCE guard only: it cannot tell whether the texts still SAY the same thing, only
+    that no mirror silently vanished. Nothing else in the tree holds these three files together.
+    """
+    assert _STANDIN in _SETUP_SCRIPT.read_text("utf-8"), (
+        f"{_SETUP_SCRIPT.name} no longer names the non-numeric stand-in"
+    )
+    assert _STANDIN in _EXAMPLE.read_text("utf-8"), (
+        f"{_EXAMPLE.name} no longer names the non-numeric stand-in"
+    )
+    assert _STANDIN in _CONTRIBUTING.read_text("utf-8"), (
+        "CONTRIBUTING.md no longer mirrors the non-numeric stand-in"
+    )
 
 
 @pytest.mark.parametrize(
@@ -581,6 +696,54 @@ def test_absolute_home_path_is_flagged_but_placeholders_are_not(
         "absolute user-home path" in h
         for h in mod.scan_file(ok, "docs/ok.md")  # type: ignore[attr-defined]
     ), "placeholders / CI / shared accounts must not fire"
+
+
+def test_home_path_casing_variants_all_fire_but_the_posix_users_route_does_not(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Windows paths are case-INSENSITIVE: all four spellings name the SAME account.
+
+    The ``/users/`` non-match at the end is asserted deliberately, not incidentally -- it pins the
+    asymmetry that keeps the case-fold scoped to the drive-letter arm, so the next reader cannot
+    quietly widen it to a whole-pattern ``re.I``. The scanner's ``_HOME_PATH`` comment says why.
+    """
+    mod = _load(None, monkeypatch)
+    variants = tmp_path / "variants.md"
+    # Assembled like the fixtures above so no SOURCE line here is itself a match -- this file is
+    # scanned by the gate it tests.
+    variants.write_text(
+        f"c:{_BS}users{_BS}Carol{_BS}Code\n"
+        f"C:{_BS}USERS{_BS}Dave{_BS}Code\n" + "c:/" + "users/Erin/Code\n",
+        encoding="utf-8",
+    )
+    hits = mod.scan_file(variants, "docs/variants.md")  # type: ignore[attr-defined]
+    assert sum("absolute user-home path" in h for h in hits) == 3
+    assert not any(n in h for h in hits for n in ("Carol", "Dave", "Erin"))
+
+    route = tmp_path / "route.md"
+    route.write_text("/users/list\nGET /ui/users/{id}/roles\n", encoding="utf-8")
+    assert not any(
+        "absolute user-home path" in h
+        for h in mod.scan_file(route, "docs/route.md")  # type: ignore[attr-defined]
+    ), "a lower-cased POSIX /users/ segment is a REST route, not a home path"
+
+
+def test_worktree_slug_casing_variant_is_flagged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An upper-cased slug is reachable, so it must not slip the gate.
+
+    ``scripts/worktree/new.ps1`` hands ``-Branch`` to ``git worktree add -b`` after validating it
+    with ``git check-ref-format`` (which permits mixed case), and ``-Name`` reaches the worktree
+    DIRECTORY verbatim. Nothing lowercases anywhere on either path.
+    """
+    mod = _load(None, monkeypatch)
+    f = tmp_path / "notes.md"
+    # Split for the same reason as the fixtures above.
+    f.write_text("see .claude/work" + "trees/Some-Task-Name-a1b2c3 for details\n", encoding="utf-8")
+    hits = mod.scan_file(f, "docs/notes.md")  # type: ignore[attr-defined]
+    assert any("worktree/branch slug" in h for h in hits)
+    assert not any("Some-Task-Name" in h for h in hits)
 
 
 # --------------------------------------------------------------------------------------------------

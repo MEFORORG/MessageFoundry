@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Tests for scripts/quality/c901_delta.py -- the PR-caused complexity reporter.
 
 The script exists because raw C901 is unshippable as a diff signal (all 122 findings on this tree

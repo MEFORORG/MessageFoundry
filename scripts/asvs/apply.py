@@ -1,0 +1,428 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
+"""Apply re-verified ASVS cells into the scorecard TOML, replacing whole [[cell]] blocks.
+
+Rewrites only the named cells and leaves every other byte of the file alone, because the vault
+working tree is shared and a whole-file re-emit would silently reformat another session's work.
+
+Input JSON: [ {id, level, verdict, residual, evidence:[{path,line,expect}],
+               absence:[{pattern,positive_control,mutation}]}, ... ]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import tomllib
+from pathlib import Path
+from typing import Any
+
+VERDICTS = {"pass", "partial", "fail", "na", "needs-review", "unverified"}
+
+#: The banner alphabet and the general emoji planes. CLAUDE.md section 11 bans these in prose; the
+#: only sanctioned holdout is docs/BACKLOG.md, which this file is not. Fail closed rather than
+#: writing one into a security record where a later reader would copy the vocabulary forward.
+_BANNED = re.compile(
+    "["
+    "\u26a0\u26d4\u2705\u2b50\u274c\u2714\u2716\u2717\u2718"  # warning, no-entry, check, star, crosses
+    # ONE range, not the adjacent pair 1f000-1f2ff + 1f300-1faff it replaces. Those are contiguous,
+    # so the union is identical (asserted at the seam by
+    # test_the_banned_class_is_one_contiguous_emoji_range); splitting them read as an overlapping
+    # range to CodeQL, which analyses the class in UTF-16 where both halves share a high surrogate.
+    "\U0001f000-\U0001faff"  # emoji planes
+    "\u2190-\u21ff"  # arrows
+    "\u2022"  # bullet
+    "\ufe0f\ufe0e"  # variation selectors
+    "]"
+)
+
+
+def toml_str(s: str) -> str:
+    """A TOML basic string. JSON escaping is a strict subset of TOML's, so json.dumps is safe."""
+    return json.dumps(s, ensure_ascii=False)
+
+
+#: Scalar keys this writer knows how to emit. ANY OTHER scalar key found on the live cell is carried
+#: through verbatim rather than dropped.
+#:
+#: This list was an ALLOWLIST once, and it silently deleted `decision_closed`, `decision_closed_verdict`,
+#: `decision_closed_on` and `decision_closed_by` from the two owner-closed cells during an anchor
+#: repair -- un-closing them. The gate passed, because an absent `decision_closed` is a valid False.
+#: A green gate cannot distinguish PRESERVED from DROPPED, so the writer must never enumerate what it
+#: keeps; it enumerates only what it ORDERS, and everything else survives by default.
+_ORDERED = ("id", "level", "verdict", "residual", "last_verified", "verified_at", "reviewed_by")
+
+#: Every field that can carry free text. anchor_repair must hold ALL of these byte-identical, not just
+#: the one the glyph check reads -- otherwise the exemption is a bypass with a narrow mouth.
+_PROSE_FIELDS = (
+    "residual",
+    "reviewed_by",
+    "decision_closed_by",
+    "decision_reopen_requires",
+    "decision_permits_without_owner",
+)
+_SUBTABLES = ("evidence", "absence")
+
+#: The keys each sub-table entry is ORDERED by. Exactly the same distinction as `_ORDERED` one level
+#: down: these fix the emission order, they do NOT define the set that survives. #1242 limb 4 -- the
+#: entries were re-emitted as precisely these keys and nothing else, so a field inside an evidence or
+#: absence entry was dropped on every rewrite. The promotion of this writer was specified to carry the
+#: union through so the schema could grow without hand-editing the record; that was delivered for
+#: top-level scalars and silently not for sub-table entries.
+_EVIDENCE_ORDERED = ("path", "line", "expect")
+_ABSENCE_ORDERED = ("pattern", "positive_control", "mutation")
+
+
+#: A TOML bare key. Anything else must be QUOTED, and the reason is not cosmetic: a DOTTED key is not
+#: a syntax error in TOML, it is a NESTING OPERATOR. `{1.2.2 = "x"}` is VALID and parses to
+#: `{'1': {'2': {'2': 'x'}}}` -- the file loads, the gate stays green, the structure silently differs.
+#: Every other bad key (spaces, quotes, empty) fails LOUDLY and is therefore safe. The dot is the only
+#: one that corrupts quietly, and dotted identifiers are this record's native shape: requirement ids
+#: like 1.2.2, version strings, file paths. So the rule is unconditional -- quote unless it matches
+#: this exactly. "Quote the odd-looking ones" fails here, because 1.2.2 does not look odd.
+_BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _toml_value(value: object) -> str:
+    """Render any value as TOML. Recurses, so the quoting rule above applies at EVERY depth and
+    inside arrays of tables -- measured, not assumed: a dot at depth 3 re-nests exactly as one at
+    depth 1, and so does one inside a list.
+
+    NOT ``json.dumps``. `{"a": 1}` is JSON, not TOML; an inline table is `{a = 1}`, key EQUALS value.
+    Arrays happen to coincide between the two and tables do not, so a serializer that looks right on
+    arrays emits a file that will not parse the moment a table appears.
+    """
+    if isinstance(value, bool):  # before int -- bool IS an int in Python
+        return str(value).lower()
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, dict):
+        inner = ", ".join(
+            f"{k if _BARE_KEY.match(str(k)) else toml_str(str(k))} = {_toml_value(v)}"
+            for k, v in value.items()
+        )
+        return "{ " + inner + " }" if inner else "{}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
+    return toml_str(str(value))
+
+
+def _scalar(key: str, value: object) -> str:
+    """#1242: the name is now a misnomer kept for its call sites -- it renders ANY value, not just a
+    scalar. It used to fall through to ``toml_str(str(value))`` for anything that was not a bool or
+    an int, so a TABLE or ARRAY became a quoted PYTHON REPR: `sym_table = "{'a': 1}"`. That parses,
+    so nothing went red, and re-reading returned the STRING -- the value was not recoverable from the
+    file. Every carry path routes through here (the top-level union walk, the rewrite, and
+    ``_carried``), which is why one branch closes all three.
+    """
+    return f"{key} = {_toml_value(value)}"
+
+
+def _carried(entry: dict[str, Any], ordered: tuple[str, ...]) -> list[str]:
+    """Every key of a sub-table entry the writer does not ORDER, emitted verbatim after the ordered
+    ones. The same rule the top-level loop follows -- enumerate what you ORDER, never what you KEEP.
+
+    Deliberately NOT keyed on the field names that happen to exist today: a name-keyed fix satisfies
+    the symptom and drops the next field anyone adds, which is the defect itself with a longer list.
+    """
+    return [f"  {_scalar(key, value)}" for key, value in entry.items() if key not in ordered]
+
+
+def render(cell: dict[str, Any], live: dict[str, Any] | None = None) -> str:
+    out = ["[[cell]]", f'id = "{cell["id"]}"', f"level = {int(cell['level'])}"]
+    out.append(f'verdict = "{cell["verdict"]}"')
+    if cell.get("residual"):
+        out.append(f"residual = {toml_str(cell['residual'])}")
+    out.append(f'last_verified = "{cell["last_verified"]}"')
+    out.append(f'verified_at = "{cell["verified_at"]}"')
+    if cell.get("reviewed_by"):
+        out.append(f"reviewed_by = {toml_str(cell['reviewed_by'])}")
+    # Carry through every other scalar from BOTH SOURCES -- decision_closed and friends off the live
+    # cell, and anything a future schema adds that this writer has never heard of, from either side.
+    #
+    # The source is the UNION deliberately. Walking `live` alone meant a key arriving on the PAYLOAD
+    # and absent from the vault was never iterated, so the `key in cell` skip never even evaluated for
+    # it and the value was dropped -- the same silent loss as the allowlist incident above, one
+    # direction over, and equally invisible downstream because an absent field reads as a valid
+    # default. `cell` wins on a collision: the payload is the update.
+    #
+    # Skipping ONLY _ORDERED and _SUBTABLES keeps the rule the header states -- enumerate what you
+    # ORDER, never what you KEEP. The old `key in cell` clause was an enumeration of the second kind
+    # wearing a de-duplication's clothes: every key it legitimately suppressed is already in _ORDERED.
+    for key, value in {**(live or {}), **cell}.items():
+        if key in _ORDERED or key in _SUBTABLES:
+            continue
+        out.append(_scalar(key, value))
+    # The three explicit emissions in each loop below are an ORDERING, not a membership test, and the
+    # `_carried` tail is what makes that true (#1242 limb 4). They are left spelled out rather than
+    # generated so the ordered keys keep their exact typing -- `line` stays an int through int(), the
+    # rest stay TOML basic strings -- which keeps every byte of today's output identical.
+    for a in cell.get("evidence") or []:
+        out.append("  [[cell.evidence]]")
+        out.append(f"  path = {toml_str(a['path'])}")
+        out.append(f"  line = {int(a['line'])}")
+        out.append(f"  expect = {toml_str(a['expect'])}")
+        out.extend(_carried(a, _EVIDENCE_ORDERED))
+    for a in cell.get("absence") or []:
+        out.append("  [[cell.absence]]")
+        out.append(f"  pattern = {toml_str(a['pattern'])}")
+        out.append(f"  positive_control = {toml_str(a['positive_control'])}")
+        out.append(f"  mutation = {toml_str(a['mutation'])}")
+        out.extend(_carried(a, _ABSENCE_ORDERED))
+    return "\n".join(out) + "\n"
+
+
+def block_spans(text: str) -> dict[str, tuple[int, int]]:
+    """Map cell id -> (start, end) character offsets of its whole top-level [[cell]] block."""
+    starts = [m.start() for m in re.finditer(r"^\[\[cell\]\]$", text, re.M)]
+    spans: dict[str, tuple[int, int]] = {}
+    for i, s in enumerate(starts):
+        e = starts[i + 1] if i + 1 < len(starts) else len(text)
+        m = re.search(r'^id = "([^"]+)"$', text[s:e], re.M)
+        if not m:
+            raise SystemExit(f"a [[cell]] block at offset {s} has no id")
+        spans[m.group(1)] = (s, e)
+    return spans
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        description="Apply re-verified ASVS cells into the scorecard TOML (ADR 0156).",
+    )
+    ap.add_argument("payload", type=Path, help="JSON array of cells to write")
+    # REQUIRED, and deliberately not defaulted. This was a hardcoded absolute path into the SHARED
+    # vault checkout -- a tree several sessions edit at once -- so running the writer from a worktree
+    # silently rewrote a record the operator was not looking at. A default here would restore that
+    # failure with a nicer spelling: the one thing a writer must never guess is WHICH record it is
+    # rewriting.
+    ap.add_argument("--scorecard", type=Path, required=True, help="path to asvs-scorecard.toml")
+    ap.add_argument(
+        "--apply",
+        action="store_true",
+        help="write. Omitted, the run is a dry run and the file is not touched.",
+    )
+    ap.add_argument(
+        "--allow-verdict-change",
+        action="store_true",
+        help=(
+            "permit a payload to move a cell's verdict. Refused by default: a verdict move is an "
+            "assessor decision, and this writer's failure mode is making one during a pass whose "
+            "stated purpose was mechanical."
+        ),
+    )
+    args = ap.parse_args(argv)
+    allow_verdict_change = args.allow_verdict_change
+    SCORECARD = args.scorecard
+    payload = json.loads(args.payload.read_text(encoding="utf-8"))
+    dry = not args.apply
+
+    live_text = SCORECARD.read_text(encoding="utf-8")
+    live_cells = {x["id"]: x for x in tomllib.loads(live_text)["cell"]}
+
+    problems: list[str] = []
+    for c in payload:
+        live = live_cells.get(c.get("id"), {})
+        # An ANCHOR REPAIR re-points citations after the code moved; it must not touch anything else.
+        # Declaring it lets two guards relax in a way that is strictly more conservative than the
+        # alternative: the residual passes through BYTE-IDENTICAL, so no retired glyph can enter the
+        # record that was not already in it, and an existing empty `reviewed_by` is preserved rather
+        # than invented. Any difference in verdict or residual takes it out of this mode immediately.
+        anchor_repair = bool(c.get("anchor_repair"))
+        if anchor_repair:
+            # Assert byte-identity on EVERY prose-bearing field, not just the two the glyph check
+            # reads. Holding only verdict+residual was sound by argument -- the writer never rewrites
+            # the others -- but an argument is worth less than a check, and it left the next reader to
+            # reconstruct why two were sufficient.
+            for f in _PROSE_FIELDS:
+                if c.get(f, live.get(f, "")) != live.get(f, ""):
+                    problems.append(
+                        f"{c.get('id')}: declared anchor_repair but {f!r} differs from the record; "
+                        "that is a rescore, not a repair"
+                    )
+            if c.get("verdict") != live.get("verdict"):
+                problems.append(
+                    f"{c.get('id')}: declared anchor_repair but the verdict differs from the "
+                    "record; that is a rescore, not a repair"
+                )
+        required: tuple[str, ...] = ("id", "level", "verdict", "last_verified", "verified_at")
+        if not anchor_repair:
+            required = required + ("reviewed_by",)
+        for field in required:
+            if not c.get(field) and c.get(field) != 0:
+                problems.append(f"{c.get('id')}: missing {field}")
+        if c.get("verdict") not in VERDICTS:
+            problems.append(f"{c.get('id')}: bad verdict {c.get('verdict')!r}")
+        # A VERDICT MOVE IS AN ASSESSOR ACT AND MUST BE DECLARED. This writer's whole failure mode is
+        # silent verdict movement during a pass whose stated purpose was mechanical: an anchor repair,
+        # a re-render, a bulk transform. Everything else here is a refusal against malformed input;
+        # this is the one refusal against a WELL-FORMED payload that means more than its author
+        # intended. So the safe thing is the default and the dangerous thing is explicit.
+        #
+        # The message names the cell and BOTH verdicts on purpose. A refusal that says only "verdict
+        # changed" leaves the operator's actual next question -- which cell, and to what -- unanswered,
+        # and an unanswerable refusal gets re-run with the override flag reflexively, which converts
+        # the guard into a speed bump.
+        if live and c.get("verdict") != live.get("verdict") and not allow_verdict_change:
+            problems.append(
+                f"{c['id']}: verdict would change {live.get('verdict')!r} -> {c.get('verdict')!r}. "
+                "That is an assessor decision, not a mechanical edit. Re-run with "
+                "--allow-verdict-change if you mean it"
+            )
+        if c.get("verdict") == "na" and not (c.get("residual") or "").strip():
+            problems.append(f"{c['id']}: verdict 'na' requires a written rationale in residual")
+        if c.get("verdict") in {"pass", "partial", "fail"} and not (
+            c.get("evidence") or c.get("absence")
+        ):
+            problems.append(f"{c['id']}: {c['verdict']} needs at least one anchor or absence claim")
+        blob = "" if anchor_repair else " ".join(str(v) for v in (c.get("residual", ""),))
+        hit = _BANNED.search(blob)
+        if hit:
+            # Report the codepoint, never the character: echoing it to a cp1252 console raises
+            # UnicodeEncodeError and the refusal turns into a traceback that hides its own reason.
+            problems.append(
+                f"{c['id']}: residual contains a banned glyph U+{ord(hit.group()):04X} "
+                f"at offset {hit.start()}"
+            )
+    if problems:
+        print("REFUSING TO APPLY:")
+        for p in problems:
+            print("  " + p)
+        return 1
+
+    text = SCORECARD.read_text(encoding="utf-8")
+    spans = block_spans(text)
+
+    edits = []
+    for c in payload:
+        if c["id"] not in spans:
+            print(f"REFUSING: cell {c['id']} not present in the scorecard")
+            return 1
+        s, e = spans[c["id"]]
+        old = text[s:e]
+        if "decision_closed = true" in old:
+            # The method permits exactly ONE change to a closed cell without the owner: repairing a
+            # broken evidence anchor, re-anchored by content. So allow it only when the verdict and
+            # the residual are byte-identical to what is already recorded -- i.e. anchors only.
+            import tomllib as _t
+
+            live = {x["id"]: x for x in _t.loads(text)["cell"]}[c["id"]]
+            if c["verdict"] != live["verdict"] or c.get("residual", "") != live.get("residual", ""):
+                print(
+                    f"REFUSING: cell {c['id']} is decision_closed and this edit changes its "
+                    "verdict or residual; only an anchor repair is permitted without the owner"
+                )
+                return 1
+            print(
+                f"  note: {c['id']} is decision_closed - anchor-only repair, verdict and residual unchanged"
+            )
+        edits.append((s, e, render(c, live_cells.get(c["id"], {})), old))
+
+    new_text = text
+    for s, e, rendered, _old in sorted(edits, key=lambda t: -t[0]):
+        new_text = new_text[:s] + rendered + new_text[e:]
+
+    # Parse before writing: a scorecard that does not load is worse than one not updated.
+    parsed = tomllib.loads(new_text)
+    by_id = {c["id"]: c for c in parsed["cell"]}
+    for c in payload:
+        got = by_id[c["id"]]["verdict"]
+        if got != c["verdict"]:
+            print(f"REFUSING: round-trip mismatch on {c['id']}: {got!r} != {c['verdict']!r}")
+            return 1
+    if len(parsed["cell"]) != len(spans):
+        print(f"REFUSING: cell count changed {len(spans)} -> {len(parsed['cell'])}")
+        return 1
+
+    # FIELD-PRESERVATION INVARIANT. A rewrite must never silently DROP a key, and the anchor gate
+    # cannot see that: an absent `decision_closed` is a valid False, so un-closing an owner-closed
+    # cell reads as green. Assert cardinality too - a repair that deletes working anchors also passes
+    # a resolution check, because fewer anchors that all resolve is a passing state.
+    for c in payload:
+        was, now = live_cells[c["id"]], by_id[c["id"]]
+        lost = set(was) - set(now)
+        if lost:
+            print(f"REFUSING: cell {c['id']} would LOSE field(s) {sorted(lost)}")
+            return 1
+        # ...and the same question about the VALUE rather than the key (#1242). The check above is a
+        # pure KEY-SET difference, so a field whose value was type-mangled -- a table rewritten as a
+        # quoted Python repr -- KEEPS ITS KEY and passes it. That is not an oversight in the check
+        # above; it was written to catch DROPPED KEYS and it does. It is simply blind to this, and a
+        # rewrite that corrupts every value while preserving every key would report green.
+        #
+        # SCOPED TO KEYS THE PAYLOAD DID NOT TOUCH, deliberately: the corruption is the WRITER
+        # changing a type nobody asked it to change. A payload that INTENTIONALLY retypes a field --
+        # schema evolution, a scalar becoming a table -- is an edit, not damage, and an unscoped
+        # check would refuse it. A guard that refuses legitimate edits is a guard someone disables.
+        #
+        # THE INTENT ABOVE IS RIGHT AND THIS IMPLEMENTATION OF IT IS KNOWN-INCOMPLETE -- see the open
+        # BACKLOG #1242. `k not in c` scopes by "the payload did not MENTION this key", which is not
+        # the same question as "the payload asked for this type". A payload that CARRIES the key is
+        # skipped entirely, so this guard cannot see a corruption arriving through a mentioned key,
+        # while the same corruption through an omitted key is refused. That asymmetry is the defect:
+        # of the whole record exactly one cell holds a top-level non-scalar, and the natural payload
+        # for rewriting that cell ECHOES the key -- so the guard covers every cell that cannot be
+        # hurt and stops looking at the one that can.
+        #
+        # THE EXPOSURE IS LATENT, NOT LIVE, AND THE DISTINCTION IS LOAD-BEARING. Measured on this
+        # writer by a seat other than its author: the table is PRESERVED whether the payload carries
+        # the key or omits it. Corruption requires a BROKEN writer -- and then only when the payload
+        # carries the key, which is exactly the case this guard does not inspect. So the correct
+        # sentence is "WOULD fail to catch a regression here", not "corrupts today"; the second reads
+        # as 12.1.5 being at risk now, and it is not. Written conditionally on purpose: a false
+        # present-tense claim propagates into severity language and security records, which is the
+        # defect this comment exists to prevent, one level up.
+        #
+        # This note exists because the paragraph above ARGUES for the boundary and argues well. An
+        # unguarded gap invites the question; a well-reasoned wrong boundary suppresses it, and an
+        # auditor reading this function would otherwise find a guard, find a persuasive rationale,
+        # and stop. Do not read the presence of this check as "the writer's type corruption is
+        # guarded". Read #1242's open row first.
+        retyped = sorted(
+            k
+            for k in was
+            if k in now and k not in c and type(was[k]) is not type(now[k])  # noqa: E721
+        )
+        if retyped:
+            print(
+                f"REFUSING: cell {c['id']} would CHANGE the TYPE of field(s) {retyped} "
+                f"(key kept, value corrupted -- the key-set check above cannot see this)"
+            )
+            return 1
+        for sub in ("evidence", "absence"):
+            if len(now.get(sub, [])) < len(was.get(sub, [])):
+                print(
+                    f"REFUSING: cell {c['id']} {sub} count would DROP "
+                    f"{len(was.get(sub, []))} -> {len(now.get(sub, []))}"
+                )
+                return 1
+            # ...and the same question one level down (#1242 limb 4). Counting ENTRIES cannot see a
+            # FIELD vanish from inside one, so a sub-table entry could be rewritten with fewer keys
+            # while the count matched and this invariant reported green -- exactly the state the
+            # top-level `set(was) - set(now)` above exists to prevent.
+            for i, (wsub, nsub) in enumerate(zip(was.get(sub, []), now.get(sub, []), strict=False)):
+                lost_sub = set(wsub) - set(nsub)
+                if lost_sub:
+                    print(
+                        f"REFUSING: cell {c['id']} {sub}[{i}] would LOSE field(s) {sorted(lost_sub)}"
+                    )
+                    return 1
+
+    print(f"{len(edits)} cell blocks re-rendered; file parses; {len(parsed['cell'])} cells intact")
+    for c in payload:
+        print(
+            f"  {c['id']:<8} -> {c['verdict']:<12} "
+            f"({len(c.get('evidence') or [])} anchors, {len(c.get('absence') or [])} absence)"
+        )
+    if dry:
+        print("\nDRY RUN. Re-run with --apply to write.")
+        return 0
+    SCORECARD.write_text(new_text, encoding="utf-8", newline="")
+    print(f"\nWROTE {SCORECARD}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 import * as assert from "assert";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -80,6 +82,105 @@ suite("symbolIndex — scanModuleSymbols (top-level defs + classification)", () 
   });
 });
 
+// #228 remainder (b): the outbound connections a handler Sends to. A `Send(…)` sits INSIDE a def body,
+// so the column-0 def regex can never reach one — this is a separate extraction pass, and these tests
+// pin its BOUND as hard as its reach. The scan is line-scoped and text-only, so what it DROPS (a
+// computed target, a ruff-wrapped call, a commented one) is asserted alongside what it finds — a bound
+// that is only asserted in a docstring is a claim, not a control.
+suite("symbolIndex — scanModuleSymbols (Send targets)", () => {
+  test("a literal Send target indexes as kind 'send' at the CALL-SITE line", () => {
+    const src = ["@mf.handler", "def handle(msg):", '    return Send("OB_ACME_ADT", msg)'].join("\n");
+    const sends = scanModuleSymbols("/c/feed.py", src).filter((d) => d.kind === "send");
+    assert.deepStrictEqual(sends, [{ name: "OB_ACME_ADT", kind: "send", file: "/c/feed.py", line: 3 }]);
+  });
+
+  test("two Send calls on ONE line each yield a row", () => {
+    const src = ["def handle(msg):", '    return [Send("OB_A", msg), Send("OB_B", msg)]'].join("\n");
+    assert.deepStrictEqual(
+      scanModuleSymbols("/c/feed.py", src)
+        .filter((d) => d.kind === "send")
+        .map((d) => d.name),
+      ["OB_A", "OB_B"],
+    );
+  });
+
+  test("a commented-out Send is not a call site — whole-line OR trailing", () => {
+    // The trailing form is the one a whole-line `#` guard misses, and it is the likelier one in real
+    // source: a call site edited in place leaves the old target in a comment on the SAME line.
+    const src = [
+      "def handle(msg):",
+      '    # return Send("OB_GHOST_LEADING", msg)',
+      '    return Send("OB_REAL", msg)  # was Send("OB_GHOST_TRAILING", msg)',
+    ].join("\n");
+    assert.deepStrictEqual(
+      scanModuleSymbols("/c/feed.py", src)
+        .filter((d) => d.kind === "send")
+        .map((d) => d.name),
+      ["OB_REAL"],
+      "neither commented target may contribute a row",
+    );
+  });
+
+  test("a `#` INSIDE a string literal does not truncate the line", () => {
+    // The failure mode a naive split-at-first-`#` would introduce: it would silently drop OB_B, i.e.
+    // fix the comment bug by creating a worse one — a real call site missing from the index.
+    const src = ["def handle(msg):", '    return Send("OB_A", msg) if "#" in msg.text else Send("OB_B", msg)'].join(
+      "\n",
+    );
+    assert.deepStrictEqual(
+      scanModuleSymbols("/c/feed.py", src)
+        .filter((d) => d.kind === "send")
+        .map((d) => d.name),
+      ["OB_A", "OB_B"],
+    );
+  });
+
+  test("a module constant with a trailing comment still resolves", () => {
+    const src = [
+      'OB_DEMO = "OB_DEMO_ORU"  # the relay outbound',
+      "",
+      "def handle(msg):",
+      "    return Send(OB_DEMO, msg)",
+    ].join("\n");
+    assert.deepStrictEqual(
+      scanModuleSymbols("/c/feed.py", src)
+        .filter((d) => d.kind === "send")
+        .map((d) => d.name),
+      ["OB_DEMO_ORU"],
+    );
+  });
+
+  // Pins the BOUND rather than the reach: the scan is line-scoped, so a target ruff wrapped onto its own
+  // line is invisible to it. Asserting this keeps the documented bound honest — "a quoted literal target
+  // is indexed" is false for the wrapped form, and a silent [] is what actually happens.
+  test("a line-wrapped Send is DROPPED, not half-indexed — the scan is line-scoped", () => {
+    const src = ["def handle(msg):", "    return Send(", '        "OB_WRAPPED",', "        msg,", "    )"].join("\n");
+    assert.deepStrictEqual(
+      scanModuleSymbols("/c/feed.py", src).filter((d) => d.kind === "send"),
+      [],
+      "the bound must be a drop, never a phantom row",
+    );
+  });
+
+  test("an unresolvable Send target is dropped, never indexed as a phantom name", () => {
+    const src = ["def handle(msg, some_var):", "    return Send(some_var, msg)"].join("\n");
+    assert.deepStrictEqual(
+      scanModuleSymbols("/c/feed.py", src).filter((d) => d.kind === "send"),
+      [],
+      "a computed/unknown target is invisible to a text scan — dropping it is the honest answer",
+    );
+  });
+
+  // The repo's own flagship decomposition sample (samples/config/IB_DEMO_ORU_handler.py) sends through a
+  // module constant, so without this the feature would miss the file docs/CONNECTIONS.md holds up as THE
+  // "decomposing by role" example.
+  test("a module-level constant target indexes its RESOLVED literal, not the constant's name", () => {
+    const src = ['OB_DEMO = "OB_DEMO_ORU"', "", "def handle(msg):", "    return Send(OB_DEMO, msg)"].join("\n");
+    const sends = scanModuleSymbols("/c/feed.py", src).filter((d) => d.kind === "send");
+    assert.deepStrictEqual(sends, [{ name: "OB_DEMO_ORU", kind: "send", file: "/c/feed.py", line: 4 }]);
+  });
+});
+
 suite("symbolIndex — matchSymbols (filter, exclude, dedup, order)", () => {
   const index: SymbolDef[] = [
     { name: "xform_acme_to_premier", kind: "transform", file: "/c/feed.py", line: 12 },
@@ -113,6 +214,27 @@ suite("symbolIndex — matchSymbols (filter, exclude, dedup, order)", () => {
     assert.deepStrictEqual(
       got.map((d) => d.name),
       ["handle_acme_mfn", "route_acme", "xform_acme_to_premier"],
+    );
+  });
+
+  // The one defect in remainder (b) that the compiler is blind to. A send row's name IS an outbound
+  // connection name, so it is in excludeNames whenever the graph loaded (graphTree passes
+  // collectElementNames(vms)). Without the carve-out every send row is filtered out and the feature
+  // ships DEAD — built, compiling, and rendering nothing.
+  test("a send row survives excludeNames — a call site is not the element", () => {
+    const withSend: SymbolDef[] = [...index, { name: "OB_ACME_ADT", kind: "send", file: "/c/feed.py", line: 29 }];
+    assert.deepStrictEqual(
+      matchSymbols(withSend, "OB_ACME", new Set(["OB_ACME_ADT"])).map((d) => `${d.kind}:${d.name}`),
+      ["send:OB_ACME_ADT"],
+    );
+  });
+
+  test("...and the carve-out is not too wide: an excluded HANDLER row is still dropped", () => {
+    const withSend: SymbolDef[] = [...index, { name: "OB_ACME_ADT", kind: "send", file: "/c/feed.py", line: 29 }];
+    assert.deepStrictEqual(
+      matchSymbols(withSend, "acme", new Set(["handle_acme_mfn", "route_acme", "OB_ACME_ADT"])).map((d) => d.name),
+      ["OB_ACME_ADT", "xform_acme_to_premier"],
+      "only the send row is exempt; the handler/router still must not double-list",
     );
   });
 });

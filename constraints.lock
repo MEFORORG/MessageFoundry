@@ -49,7 +49,7 @@ colorama==0.4.6 ; sys_platform == 'win32'
     #   click
     #   pytest
     #   uvicorn
-cryptography==49.0.0
+cryptography==50.0.0
     # via
     #   messagefoundry
     #   paramiko
@@ -63,7 +63,9 @@ defusedxml==0.7.1
     #   pyx12
 elementpath==5.1.3
     # via xmlschema
-fastapi==0.140.4
+execnet==2.1.2
+    # via pytest-xdist
+fastapi==0.141.1
     # via messagefoundry
 fhir-core==1.1.9
     # via fhir-resources
@@ -188,7 +190,7 @@ pynetdicom==3.0.4
     # via messagefoundry
 pyodbc==5.3.0
     # via aioodbc
-pyopenssl==26.3.0
+pyopenssl==26.4.0
     # via webauthn
 pyside6==6.11.1
     # via messagefoundry
@@ -206,11 +208,14 @@ pytest==9.1.1
     #   pytest-asyncio
     #   pytest-rerunfailures
     #   pytest-timeout
+    #   pytest-xdist
 pytest-asyncio==1.4.0
     # via messagefoundry
 pytest-rerunfailures==16.4
     # via messagefoundry
 pytest-timeout==2.4.0
+    # via messagefoundry
+pytest-xdist==3.8.0
     # via messagefoundry
 python-dateutil==2.9.0.post0
     # via fhirpathpy
@@ -237,7 +242,7 @@ six==1.17.0
     # via python-dateutil
 sspilib==0.5.0 ; sys_platform == 'win32'
     # via pyspnego
-starlette==1.3.1
+starlette==1.6.0
     # via
     #   fastapi
     #   messagefoundry

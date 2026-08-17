@@ -9,7 +9,7 @@
   — established with **win32 ctypes** `LogonUser` + per-thread `ImpersonateLoggedOnUser` (**no pywin32,
   no privilege**), with the connector's blocking filesystem I/O run on a **dedicated impersonated
   thread**; **win32-only** (a non-Windows host fails loud, never a silent no-op).
-- **Backlog:** [BACKLOG #111](../BACKLOG.md). Corepoint-parity gap: the File connector today reads/writes
+- **Backlog:** [BACKLOG #111](../archive/backlog/BACKLOG-CLOSED.md#111-file-endpoint-alternate-windows--network-share-credentials). Corepoint-parity gap: the File connector today reads/writes
   local/UNC paths **only** under the engine service account's ambient token, and
   [`transports/remotefile.py`](../../messagefoundry/transports/remotefile.py)'s username/password auth
   covers **FTP/FTPS/SFTP**, not SMB/UNC Windows-share credentials.

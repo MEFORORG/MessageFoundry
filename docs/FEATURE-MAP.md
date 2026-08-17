@@ -1,8 +1,8 @@
 # MessageFoundry — Feature Map
 
 A capability catalog across every area of the engine, with status. The companion **execution**
-view (workstreams, gates, sequencing for the next release) is the
-[v0.1 Release Plan](releases/v0.1-PLAN.md); this is the **capability** view.
+view (workstreams, gates, sequencing for the next release) is the v0.1 release plan, a
+maintainer-internal document; this is the **capability** view.
 
 **Status legend**
 
@@ -10,7 +10,7 @@ view (workstreams, gates, sequencing for the next release) is the
 |------|---------|
 | ✅ | **Shipped** — on `main` today |
 | 🔬 | **Shipped but experimental** — present, not yet production-labeled |
-| 🔨 | **v0.1** — planned for the `0.1.0` release ([plan](releases/v0.1-PLAN.md)) |
+| 🔨 | **v0.1** — planned for the `0.1.0` release |
 | ⏭️ | **0.2+** — deferred (see the plan's *Out of scope*) |
 | 🧭 | **Later** — on the long-term vision, not yet scheduled |
 
@@ -226,7 +226,7 @@ The PySide6 **desktop console was retired** and `messagefoundry/console/` delete
 | Environments + deferred `env()` values (`environments/<env>.toml`) | ✅ | |
 | Env-aware promote (dry-run pre-flight) | ✅ | |
 | Config reload (`POST /config/reload`, allow-list-confined + audited) | ✅ | #85/#101 |
-| CLI — 30 subcommands | ✅ | Run/author (`serve`, `supervise`, `init`, `import`, `validate`, `graph`, `dryrun`, `check`, `impact`, `connection`, `codeset`, `alert`, `security`, `generate`, `lens`, `hl7schema`, `hl7structures`, `adr-analyze`, `ai-policy`) + operate (`backup`, `restore-verify`, `rotate-key`, `rekey-audit`, `audit-verify`, `gen-key`, `protect-key`, `cert`, `verify`, `support-bundle`, `service`) — `_DISPATCH` in `__main__.py` is the registry |
+| CLI — 31 subcommands | ✅ | Run/author (`serve`, `supervise`, `init`, `import`, `validate`, `graph`, `dryrun`, `check`, `impact`, `connection`, `codeset`, `alert`, `security`, `generate`, `lens`, `hl7schema`, `hl7structures`, `adr-analyze`, `ai-policy`) + operate (`backup`, `restore-verify`, `rotate-key`, `rekey-audit`, `audit-verify`, `audit-anchor`, `gen-key`, `protect-key`, `cert`, `verify`, `support-bundle`, `service`) — `_DISPATCH` in `__main__.py` is the registry |
 | Synthetic HL7 generators (ADT, …) | ✅ | `messagefoundry generate`; corpus git-ignored |
 | Windows service via NSSM | ✅ | docs/SERVICE.md |
 

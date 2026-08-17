@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Tests for scripts/quality/liveness.py.
 
 The core of this file is a replay of the three real incidents that motivated the check. A liveness

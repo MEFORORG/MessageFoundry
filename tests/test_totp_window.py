@@ -14,7 +14,10 @@ The verify window is an operator knob: ``AuthService`` threads ``[auth].totp_ske
   authenticator can still log in) but the returned step is **clamped to the current step**, so consuming
   a tolerated future code never advances the single-use high-water mark past ``now`` — otherwise the
   user's own genuine current-step code (a non-greater step) would be rejected for up to ~30 s, a
-  self-inflicted lockout, not a bypass. The clamp only lowers the recorded step, so single-use holds.
+  self-inflicted lockout, not a bypass. ⚠️ The clamp does NOT preserve single-use here — it is what
+  costs it: recording a tolerated future code at ``now`` leaves that code's OWN step unspent, so the
+  same code verifies again one step later (two successful uses, ASVS 6.5.1). Single-use holds only at
+  the strict default. See test_optout_lets_one_tolerated_future_code_be_used_twice.
 
 These call ``verify_totp_step`` directly with an EXPLICIT ``window`` so both the strict default and the
 opt-out are pinned regardless of the module-level ``DEFAULT_WINDOW`` (which stays 1 for callers that
@@ -97,6 +100,39 @@ def test_optout_fast_clock_future_code_causes_no_self_lockout() -> None:
     # step, so a single-use store rejecting a non-greater step still lets it through (no lockout).
     genuine = totp.verify_totp_step(SECRET, totp.totp(SECRET, now=t), now=t, window=1)
     assert genuine is not None and genuine > consumed
+
+
+def test_optout_lets_one_tolerated_future_code_be_used_twice() -> None:
+    """The clamp's COST, pinned — one code, two successful uses, at ``totp_skew_steps >= 1``.
+
+    This is the gap the neighbouring tests leave. ``test_single_use_step_is_stable_for_the_same_code``
+    replays the same code at the SAME ``now``; ``test_optout_fast_clock...no_self_lockout`` replays a
+    DIFFERENT (genuine) code at a later ``now``. Nobody replayed the SAME code at a LATER ``now``, which
+    is where the clamp bites: recording a tolerated ``counter+1`` code at ``counter`` leaves its own step
+    unspent, so it verifies again when the clock arrives there. A high-water store that rejects a
+    non-greater step accepts BOTH, because the second resolution is strictly greater.
+
+    Three docstrings previously drew the opposite conclusion from the same true premise ("the clamp only
+    lowers the recorded step, so single-use is preserved"). It lowers the step, and that is precisely
+    why the code survives. ASVS 6.5.1 requires TOTPs be "only successfully usable once"; that holds at
+    the shipped default and not at the opt-out, so the opt-out carries a real cost the docs now name.
+    """
+    t = 5_000 * PERIOD + 5.0
+    future = totp.totp(SECRET, now=t + PERIOD)
+
+    first = totp.verify_totp_step(SECRET, future, now=t, window=1)
+    second = totp.verify_totp_step(SECRET, future, now=t + PERIOD, window=1)
+    assert first == _step(t)  # clamped down, per SEC-014
+    assert second == _step(t + PERIOD)  # its own step, still unspent
+    assert second is not None and first is not None and second > first, (
+        "the second resolution must be STRICTLY GREATER — that is what makes a high-water store "
+        "accept the same code a second time"
+    )
+
+    # The strict default is the control: the same code cannot be used twice, because the first
+    # presentation is refused outright rather than clamped.
+    assert totp.verify_totp_step(SECRET, future, now=t, window=0) is None
+    assert totp.verify_totp_step(SECRET, future, now=t + PERIOD, window=0) == _step(t + PERIOD)
 
 
 def test_single_use_step_is_stable_for_the_same_code_and_now() -> None:

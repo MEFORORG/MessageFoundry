@@ -6,7 +6,50 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **`messagefoundry audit-anchor`, and `audit-verify --expected-anchor` / `--expected-anchor-file` to
+  check one back.** The audit hash chain links each row to its predecessor, so deleting the *newest*
+  rows leaves a shorter chain that still walks cleanly — `audit-verify` on its own reports OK after a
+  tail-truncation, which is the shape an attacker hiding what they just did leaves behind. The store
+  could always compare against an external anchor; nothing exposed it, so the capability was
+  unreachable. `audit-anchor` prints `COUNT:HEAD` (a row count plus a digest — no PHI, no secret, safe
+  to hold in a ticket or an object store); passing it back reports `truncated or rewritten` when the
+  live chain differs.
+  **Know what it is before you build a job on it: an EXACT point-in-time seal**, comparing the count
+  *and* the head hash. The head half is not redundant — an attacker who cuts the newest rows and forges
+  the same number of replacements restores the count and leaves a chain that walks cleanly, so the head
+  is the only thing that differs. The cost of that detection is that a chain which merely **grew** also
+  reports `truncated or rewritten`. So it seals a chain **at rest across a gap in custody**: quiesce the
+  engine, anchor, hold the value off-box, re-verify while the chain is still quiesced — around a
+  maintenance window, a database move, a backup/restore, a hand-off. Anchoring and immediately
+  re-verifying compares a value to itself; re-checking a held anchor against a **running** engine alarms
+  on every ordinary boot. For continuous coverage of a live engine the off-box log forward / tee remains
+  the control, and `[integrity].audit_verify_on_start` is unchanged — it is a bare walk and stays blind
+  to a truncated tail. ([BACKLOG #328](docs/BACKLOG.md))
+
 ### Changed
+- **A PHI instance reached through a declared reverse proxy with `[security].require_mfa` explicitly
+  off would refuse to start on first deployment, where it previously would not have.** The
+  MFA-at-exposure gate derived "is this instance exposed?" from `[api].serve_ui`, a field the ADR 0143
+  console degrade arms rewrite **in place** earlier in the same startup. On the topology the runbooks
+  recommend — a loopback bind behind a declared TLS terminator, with the web console left at its
+  default — the auto-degrade cleared that flag first, so the gate evaluated "not exposed" and the
+  refusal was unreachable, while the ASVS 11.7.1 arm in the same startup classified the identical boot
+  as exposed. The gate now reads a single console-independent predicate (an off-loopback bind **or**
+  `[api].tls_terminated_upstream`), so it also fires when the console is auto-degraded, when
+  `serve_web_console = false` disables it outright, and when the console package is simply not
+  installed: the surface authenticating with one factor is the JSON operator API, which the proxy
+  serves either way. The `#189` dual-control advisory reads the same predicate and gains the same reach
+  (still warn-only).
+  **Who this would bite:** a deploying site that has explicitly set `require_mfa = false` on a
+  PHI-carrying environment behind a declared TLS terminator, under `enforcement = enforce`. **Two
+  remedies, both existing:** set `[security].require_mfa = true`, or set the already-shipped
+  acknowledgment `[security].allow_single_factor_admin_when_exposed = true`, which downgrades the
+  refusal to a loud audited warning. A plain loopback bind with nothing declared is **not** exposed and
+  is byte-identical. An **undeclared** proxy (`web_console_public_address` set, no
+  `tls_terminated_upstream`) deliberately still does not refuse — exposure there would be an inference —
+  but it no longer passes in silence: a new warning names single-factor admin directly on a PHI instance
+  with `require_mfa` off. ([BACKLOG #326](docs/archive/backlog/BACKLOG-CLOSED.md#326-mfa-at-exposure-refusal-reads-serve_ui-after-it-is-flipped-off), [ADR 0140](docs/adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md) amendment)
 - **BREAKING — an `[[alerts.rules]]` block that routes to an unconfigured transport now refuses at
   startup instead of being silently ignored.** `notifier_from_settings` returned early when **no**
   transport was configured, *before* the loop that cross-checks each rule's `transports` against the
@@ -62,8 +105,64 @@ All notable changes to MessageFoundry are documented here. The format follows
   surface — and the refusal names it. Keep the AE list; it is still doing work.
   Tracked as **BACKLOG #316**. Options considered and declined: an audited opt-out switch, and
   documenting the weakness without changing the gate.
+- **BREAKING — an unrecognized key in a known config section now fails the start instead of loading
+  silently.** Every section model inherits `extra="ignore"`, so a mistyped or stale key in
+  `messagefoundry.toml` loaded clean, did nothing, and said nothing: an operator could misspell
+  `block_unlisted_outbound` and believe a posture control was on while the engine applied its
+  permissive default. Exactly one section, `[security]`, warned about it; the other 27 were silent.
+  The loader now refuses, naming the section and the offending key and suggesting the closest valid
+  field name.
+  **Scope, and it is deliberate — the refusal covers the config FILE only.** `MEFOR_*` environment
+  variables and CLI flags are still accepted silently, because about a dozen documented `MEFOR_*`
+  variables (the Vault store and secrets providers, the TLS revocation attestation, the lane timing
+  probes) are read straight from `os.environ` by consumers that are not settings fields — so refusing
+  an unrecognized environment key would refuse a deployment configured exactly as the shipped
+  documentation instructs. `[security]` is the exception and is refused from the environment too.
+  The check lives in the loader rather than a pydantic `extra="forbid"` for a second reason: pydantic
+  echoes the offending **value** in its error, and the CLI prints validation errors verbatim to
+  stderr, which the Windows service captures to a log file — so a mistyped secret key would have
+  written the secret to disk. Both existing config refusals name keys only, never values.
+  **Who this would bite on first deployment:** a config file carrying a key that is not a field of
+  its section — a typo, a key copied from newer documentation, or a setting since removed from the
+  engine. **Remedy:** correct the spelling; the error names the section and the key. Nothing needs
+  migrating, because a key that is refused now was doing nothing before.
+
+### Security
+- **The web console's message editor would have opened the raw body to a custom role holding
+  `messages:edit` without `messages:view_raw`.** `GET /ui/messages/{id}/edit` and
+  `POST /ui/messages/{id}/edit-resend` gated on `messages:edit` alone, while the JSON handler they
+  call in-process (`GET /messages/{id}`, `require_phi_read(messages:view_raw)`) has its own gate
+  skipped by that direct call — so the console re-asserted a *different* permission than the one it
+  stood in for. Both verbs now require **both** permissions and fail closed on either, and both charge
+  the per-actor PHI-read budget (`require_ui_step_up` gained `phi=`). Custom-role minting is
+  deliberately unchanged: `messages:edit` is still not in `CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`, so a
+  role meaning "may resubmit, must not read" remains mintable — it simply cannot open an editor that
+  displays the body it edits. **Who this would bite:** a deploying org whose admin had minted such a
+  custom role; that role would have exceeded its stated scope (HIPAA minimum-necessary) on first
+  deployment. No built-in role reaches it — `ADMINISTRATOR` and `OPERATOR` grant both permissions —
+  and every such read was already audited. ([BACKLOG #324](docs/archive/backlog/BACKLOG-CLOSED.md#324-custom-role-with-messagesedit-alone-reads-raw-phi-via-the-ui-editor))
 
 ### Fixed
+- **The shipped VS Code snippet generated a FHIR lookup the engine now refuses.** The
+  `meforfhirlookup` snippet built its search by concatenating a message field into a flat `?`-query —
+  the form removed along with `[egress].fhir_require_structured_params` — so the snippet emitted a
+  Handler that raises on first use. The `FhirLookup` docstring, the `fhir_lookup` docstring and the
+  Steps palette taught the same removed form. All now use the per-value-encoded `params=` form; the
+  read-by-id form is unchanged. **Why it shipped broken:** nothing read that file. A new test parses
+  every shipped snippet body and asserts none teaches the removed form — a test that merely checked
+  the JSON parses would not have caught it.
+  ([ADR 0043](docs/adr/0043-fhir-read-lookup.md))
+- **A CR/LF inside an exception message could forge a whole log line on the text sink.**
+  `ControlCharScrubFilter` escaped only the rendered message, and `logging.Formatter` appends a record's
+  traceback (`exc_text`) and stack dump (`stack_info`) **verbatim** — so a newline-bearing exception
+  string landed at column 0 on its own physical line, where a payload padded to the record layout was
+  byte-indistinguishable from a real entry to an operator or a line-oriented SIEM parser. Both fields
+  are now scrubbed too (ASVS 16.4.1; the residual ADR 0034 §1 disclosed, BACKLOG #335). **Visible
+  change:** a traceback is *not* collapsed onto one line — its line breaks are kept and every line is
+  indented with `    | `, so it stays readable while no line of it can start at column 0. A log parser
+  keyed on `Traceback (most recent call last):` at the start of a line needs that prefix added. The
+  JSON sink is unchanged in substance (`json.dumps` already escaped these fields); its `exception`
+  and `stack` values now carry the same indent.
 - **The DICOM C-STORE SCP's fail-closed refusal named a settings key that does not exist.** It told
   the operator to set `[inbound].source_ip_allowlist`; `InboundSettings` has no such field and section
   models ignore unknown keys, so an operator following the engine's **own error message** wrote a key
@@ -384,7 +483,7 @@ is additive / opt-in.
   gate never fired (adopters are pip + IT-covered), and it only ever shipped unsigned. **The desktop console
   is unaffected** — it stays installable via `pip install messagefoundry[console]` + the ADR 0032 Phase A
   `gui-script` and shortcut scripts; only the *frozen, zero-Python* conveyance is gone. The zero-install
-  audience is now served by the browser ops dashboard ([BACKLOG #75](docs/BACKLOG.md)).
+  audience is now served by the browser ops dashboard ([BACKLOG #75](docs/archive/backlog/BACKLOG-CLOSED.md#75-browser--web-operator-monitor)).
 
 ### Changed
 - **Server-DB store opens now skip the schema DDL batch when it already ran** ([ADR 0064](docs/adr/0064-schema-init-fastpath.md)).

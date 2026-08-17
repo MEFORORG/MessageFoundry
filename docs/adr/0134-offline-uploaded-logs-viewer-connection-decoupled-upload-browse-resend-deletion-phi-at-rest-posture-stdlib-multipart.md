@@ -165,3 +165,57 @@ document extraction; retention/auto-purge of the uploads dir (operator-managed, 
 - [x] Reuse `enqueue_ingress` (not a bespoke store method) for the distinct inject path — resolved.
 - [x] Encrypt vs. document-only the at-rest tier — resolved: **encrypt under the store DEK when a key is set**,
       and document the no-key plaintext degradation in PHI.md.
+
+## Amendment A (2026-08-11) — object-level authorization: owner-only, keyed on the immutable `user_id` (ASVS 8.2.2, BACKLOG #1152)
+
+**Owner-ratified 2026-08-11.** This ADR shipped the uploaded-logs surface with **route**-level permissions
+(`files:upload` / `files:browse` / `files:delete`) and no **object**-level rule, so any holder of the route
+permission reached every uploaded file regardless of who put it there.
+
+**The decision: owner-only, plus an explicit `files:access_any` override granted to Administrator and never
+mintable onto a custom role** (it sits in `CUSTOM_ROLE_FORBIDDEN_PERMISSIONS` beside `users:manage`, so the
+catalogue's "Administrator only" is enforced rather than merely documented). The override is not a capability
+of its own — a holder still needs `files:browse` / `files:delete` for the route itself.
+
+**The channel axis was rejected, and the reason generalizes.** `Identity.allowed_channels` defaults to `None`
+meaning *every* channel, and an uploaded file carries no channel at all — so a channel-scoped rule would
+protect nobody on a default install while denying every scoped operator their own files. A control whose
+protection depends on configuration nobody has set is a control resting on a false premise (CLAUDE.md §11,
+SDS-3.7). Owner-only protects with zero configuration.
+
+**Ownership is keyed on `uploader_id` (`Identity.user_id`), never on `username`.** A username is reassignable:
+deleting a local account and recreating the name is unblocked, and the AD leg auto-provisions a fresh row for
+a returning name with no administrator action at all. Keying an object-level control on it would mean that
+recycling a departed operator's account name — routine IT practice, and not an act anyone would read as a PHI
+grant — would silently transfer their uploaded files to a different person, with no denial to review. The
+sidecar therefore carries `uploader_id` alongside `uploader`; `uploader` is retained purely as the human
+display and audit label, so listings and prune rows still name a person rather than a uuid.
+
+**Fail closed in both directions.** `save()` requires a non-empty `uploader_id` and raises on an empty one, so
+the failure is refused at the WRITE rather than only at the read. A sidecar without the field (hand-placed, or
+written under the no-key plaintext degradation above) matches nobody — including whoever uploaded it — and is
+reachable only with the override. There is deliberately **no fallback to `username`**: a fallback would
+reintroduce the entire defect, and with zero deployments (CLAUDE.md §0) there is no migration to justify one.
+
+**The per-uploader quota (ASVS 5.2.4) was re-keyed onto the same `uploader_id`.** Splitting the keys would let
+ownership and the budget disagree — a recycled account would be *billed* for files it cannot *read*.
+
+**The check lives in the handler BODIES, not in a `Depends` gate.** The web console invokes all five handlers
+*by reference* across the `CoreHandlers` seam (ADR 0065) and never runs their dependency gates, so a
+gate-based rule would have covered the JSON plane and left `/ui` unprotected. This is a property of the seam,
+not of these routes, and any future object-level rule on a console-reachable surface inherits it.
+
+**A denial answers 404, not 403**, matching the existing malformed-id and absent-file responses so the by-id
+routes are not an existence oracle; non-enumerability rests on `file_id` being 128 bits of
+`secrets.token_hex(16)` plus an owner-scoped listing. Denials are audited (`upload.denied`) with the actor,
+the acting `user_id`, the `file_id` and the operation — never the filename, the owner, or any content.
+
+Pinned in `tests/test_upload_api.py` (including a recreated-username regression) and in
+`packaging/messagefoundry-webconsole/tests/test_uploaded_logs_ui.py` for the `/ui` plane.
+
+This satisfies the **second clause only** of exit criterion 12 in
+[the engine-API master test plan](../testing/master-test-plan/09-engine-api.md) — *"`GET /uploads`
+visibility is pinned as a reviewed decision naming ADR 0134 (Q6)"*. Criterion 12 is a two-clause
+conjunction, and **its first clause is untouched by this amendment**: every pageless list route must
+still either page or appear on the drift-guarded `_UNPAGED_EXEMPT` constant with a one-line reason.
+`GET /uploads` remains pageless. So criterion 12 as a whole is **not** met by this work.

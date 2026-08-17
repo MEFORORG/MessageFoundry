@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // "New Route Wizard" — a stepped webview that builds an end-to-end interface in one go:
 // Inbound connection -> Router -> Handler -> Outbound connection, all wired (router returns the
 // handler; handler Sends to the OB), generated into a single config module. Required fields are
@@ -5,6 +7,7 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { configDir, workspaceDir } from "./cli";
+import { nonce } from "./cspNonce";
 
 interface RoutePayload {
   ib: { kind: "mllp-in" | "file-in"; name: string; port?: string; directory?: string; pattern?: string };
@@ -111,15 +114,6 @@ function generateRouteCode(p: RoutePayload): string {
     `    return Send(${q(p.ob.name)}, msg)`,
   ];
   return `from messagefoundry import ${[...imports].sort().join(", ")}\n\n${body.join("\n")}\n`;
-}
-
-function nonce(): string {
-  let s = "";
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 24; i++) {
-    s += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return s;
 }
 
 function wizardHtml(webview: vscode.Webview): string {

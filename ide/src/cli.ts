@@ -1,8 +1,13 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Thin bridge to the `messagefoundry` Python CLI: shell out to a subcommand and parse its JSON.
 import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
+
+import { LENS_CONTRACT, isUnknownArgumentError, looksLikeUnknownArgument } from "./stepsModel";
+import type { LensParseResult, OpSchema } from "./stepsModel";
 
 export interface CliResult {
   stdout: string;
@@ -274,6 +279,76 @@ export interface CodeSetDetail {
 /** `codeset list` — every code set under codesets/ as a SUMMARY, sorted by name. */
 export function codesetList(cwd?: string): Promise<CodeSetSummary[]> {
   return runJson<CodeSetSummary[]>(["codeset", "list", "--config", configDir()], cwd);
+}
+
+// ---- lens contract negotiation (ADR 0076 §A.7 / §D.7) -----------------------------------------
+//
+// `lens parse` emits no schema version of its own and the extension shells whatever `messagefoundry` is
+// on PATH, so the two skew directions are handled EXPLICITLY here rather than discovered at render time:
+//
+//  * an OLDER extension meeting a NEWER engine passes no `--contract`, so the engine defaults to the
+//    shipped contract and never sends a kind that extension cannot title (it would render blank); and
+//  * a NEWER extension meeting an OLDER engine passes `--contract`, which that engine rejects as an
+//    unknown argument — so {@link lensParseStdin} RETRIES without it and degrades to the v1 projection
+//    (no note rows, no router Steps) instead of surfacing an argument-parsing error to the user.
+
+/**
+ * `lens parse -` over the LIVE buffer at {@link LENS_CONTRACT}, falling back to the engine's default
+ * contract when the installed engine predates the flag.
+ *
+ * The fallback is deliberately narrow: it retries ONCE, and only when the first attempt failed in a way
+ * an older CLI's argument parser produces. A genuine parse refusal (a syntax error in the module) fails
+ * on the retry too and propagates, so this can never mask a real error as a silent downgrade.
+ */
+export async function lensParseStdin(
+  source: string,
+  cwd?: string,
+  contract: number = LENS_CONTRACT,
+): Promise<LensParseResult> {
+  try {
+    return await runJsonWithStdin<LensParseResult>(
+      ["lens", "parse", "-", "--contract", String(contract)],
+      source,
+      cwd,
+    );
+  } catch (err) {
+    if (!isUnknownArgumentError(err)) {
+      throw err;
+    }
+    return runJsonWithStdin<LensParseResult>(["lens", "parse", "-"], source, cwd);
+  }
+}
+
+/**
+ * `lens rewrite -` at {@link LENS_CONTRACT}, with the same one-shot fallback as {@link lensParseStdin}.
+ *
+ * The contract must match the one the rows were PROJECTED with: the engine re-locates the row through
+ * the same grammar, so sending v2 coordinates to a v1 partition would miss the row (or, worse, hit a
+ * different one). Returns the raw {@link CliResult} because a rewrite's success payload is module SOURCE
+ * on stdout, not JSON — the caller parses it (`parseRewriteResult`).
+ */
+export async function lensRewriteStdin(
+  spec: unknown,
+  source: string,
+  cwd?: string,
+  contract: number = LENS_CONTRACT,
+): Promise<CliResult> {
+  const args = ["lens", "rewrite", "-", "--edit", JSON.stringify(spec)];
+  const first = await runWithStdin([...args, "--contract", String(contract)], source, cwd);
+  if (first.code !== 0 && looksLikeUnknownArgument(first.stderr + first.stdout)) {
+    return runWithStdin(args, source, cwd);
+  }
+  return first;
+}
+
+/**
+ * `lens schema` — the transform-vocabulary parameter schema (BACKLOG #235; op -> editable params with
+ * their widget kind/choices), derived by the engine from its own action + diagnostic signatures. The
+ * Steps editor drives its per-param input widgets from it. Config-independent (a pure signature
+ * introspection), so it takes no `--config`; the CLI is lazy-imported engine-side and starts no server.
+ */
+export function lensSchema(cwd?: string): Promise<OpSchema> {
+  return runJson<OpSchema>(["lens", "schema"], cwd);
 }
 
 /** `codeset show NAME` — the DETAIL/grid for one code set (a .toml one comes back read-only). */

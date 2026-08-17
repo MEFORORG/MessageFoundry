@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 <#
 .SYNOPSIS
     Claim a piece of WORK, atomically, so two concurrent sessions cannot build the same thing twice.
@@ -29,6 +31,12 @@
     original signal and it was actively misleading: a 21h claim whose holder had committed two minutes
     earlier was labelled STALE and recommended for release.
 
+    EVERY RELEASE IS RECORDED, `-Force` included, as one JSON line appended to
+    <git-common-dir>/mefor-coord/claims/.history: the key, the releasing worktree and branch, the
+    prior holder, its branch and note, when the claim was taken, and whether -Force was used. The
+    record is written BEFORE the claim file is removed and the release is refused if it cannot be
+    written -- a release nobody can trace is the outcome this will not produce (BACKLOG #1068).
+
 .EXAMPLE
     pwsh -NoProfile -File scripts\coord\claim.ps1 -Take 105 -Note "corepoint xml importer"
     pwsh -NoProfile -File scripts\coord\claim.ps1 -List
@@ -51,11 +59,37 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$repo = (& git rev-parse --path-format=absolute --show-toplevel).Trim()
-if (-not $repo) { throw "Not inside a git repository." }
-$common = (& git rev-parse --path-format=absolute --git-common-dir).Trim()
+# Anchored on the SCRIPT, not the current directory -- the reasoning is written out once, at the head of
+# alloc.ps1 (BACKLOG #1060). It applies here identically and was found here by inspection rather than by
+# a second reproduction: this file recorded `worktree = $repo` from the same unanchored call, so an
+# absolute `-File` invocation from another worktree took the claim in the caller's name. A claim is
+# advisory for free-text keys and ENFORCED for numbered ones by scripts/hooks/claim_check.py, which reads
+# the repo from cwd correctly because it runs as a commit hook -- cwd IS the committing worktree there.
+# Hook right, tool wrong, and only the tool can be invoked from somewhere else.
+$repo = (& git -C $PSScriptRoot rev-parse --path-format=absolute --show-toplevel 2>$null)
+if (-not $repo) { throw "scripts/coord/ is not inside a git repository: $PSScriptRoot" }
+$repo = $repo.Trim()
+$common = (& git -C $repo rev-parse --path-format=absolute --git-common-dir).Trim()
 $claims = Join-Path $common "mefor-coord/claims"
 New-Item -ItemType Directory -Force -Path $claims | Out-Null
+
+# THE RELEASE LEDGER (BACKLOG #1068). A release used to be `Remove-Item` and nothing else, so a
+# `-Force` takeover -- one session releasing a claim held by another -- left no record of who released
+# whose claim, when, or why. `-Force` has a real job and stays: a claim whose holder's worktree is
+# gone would otherwise be stuck forever, and hand-deleting the file leaves even less evidence. The
+# answer is a RECORD, not a refusal.
+#
+# Measured 2026-08-10. A coordinator force-released a claim after establishing on evidence that the
+# holder's worktree was gone and that the work its note guarded had already merged, while the note
+# still read "UNPUSHED, NO PR, GitHub finds NOTHING". That release was CORRECT and it left nothing
+# behind to find, which is the whole gap: the registry is a shared coordination artifact, and a stale
+# note in it has already blocked a lane from claiming an item.
+#
+# JSON Lines, LF-terminated, one object per release. It sits INSIDE the claims directory, which is
+# safe because every reader of that directory keys on a file NAME -- `-List` and prune-merged.ps1 glob
+# `*.json`, scripts/hooks/claim_check.py opens `<item>.json` -- and ConvertTo-KeyFile always appends
+# ".json", so no key can ever fold onto this name.
+$history = Join-Path $claims ".history"
 
 # A key is free text but becomes a FILENAME, so fold it to a safe, case-insensitive form. The original is
 # kept inside the json so `-List` can show what the human actually typed.
@@ -82,6 +116,64 @@ function Get-Mine([string]$Path) {
     [pscustomobject]@{ Claim = $c; IsMine = ($held -ieq $me) }
 }
 
+# ONE record, appended exclusively, retried. FileMode::Append + FileShare::Read excludes a second
+# WRITER -- two worktrees can release in the same instant -- while leaving readers alone, and the whole
+# line goes out in a SINGLE Write to a handle already positioned at end-of-file, so a concurrent
+# release cannot interleave half a record into another's.
+#
+# LF, not the platform newline: this is a machine-readable ledger read from PowerShell, python and
+# git-bash on the same clone, and a mixed-newline JSONL file is one of those things nothing complains
+# about until a parser splits differently from the writer.
+#
+# The catch is deliberately UNTYPED, for the reason written out at the claim-refresh Move below:
+# PowerShell wraps an exception thrown by a .NET METHOD in a MethodInvocationException, so a typed
+# `catch [System.IO.IOException]` here would never match and the failure would escape to
+# $ErrorActionPreference = "Stop" instead of being retried.
+function Add-HistoryLine([string]$Line) {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Line + "`n")
+    foreach ($attempt in 1..5) {
+        try {
+            $fs = [System.IO.File]::Open($history, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+            try { $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Dispose() }
+            return $true
+        }
+        catch { Start-Sleep -Milliseconds (20 * $attempt) }
+    }
+    return $false
+}
+
+# ONE liveness rule, three call sites (BACKLOG #345 Half B).
+#
+# `-List` learned this first, and that was the wrong half to fix alone: -List is where you BROWSE, and
+# `-Take`/`-Release` are where you are STOPPED. Both blocking paths printed the same "held by another
+# worktree" block whether the holder had been deleted, had died, or was committing that minute -- and
+# `-Release` went further and RECOMMENDED `-Force` ("If that session is gone...") on a holder it had
+# never looked at. Advice that cannot distinguish the two cases is advice to guess, and the guess that
+# frees a live session's key causes the duplicate build this whole registry exists to prevent.
+#
+# Reports only what it can PROVE. A vanished directory is a fact and the one state safe to act on
+# unasked. Everything else is 'unknown' or a quiet-hours count -- never "probably fine": a session can
+# be alive and simply not committing, so silence is not evidence of death.
+function Get-HolderLiveness([string]$HeldPath) {
+    try {
+        if (-not (Test-Path -LiteralPath $HeldPath)) {
+            return [pscustomobject]@{ State = 'gone'; QuietHours = $null }
+        }
+        $ct = & git -C $HeldPath log -1 --format=%ct 2>$null
+        if ($ct) {
+            $quiet = [int]((Get-Date) - [System.DateTimeOffset]::FromUnixTimeSeconds([long]$ct).LocalDateTime).TotalHours
+            return [pscustomobject]@{ State = 'present'; QuietHours = $quiet }
+        }
+        # Present on disk but no commit to date it by -- a brand-new worktree looks exactly like this.
+        return [pscustomobject]@{ State = 'unknown'; QuietHours = $null }
+    }
+    catch {
+        # Say so rather than returning 'gone'. A failed probe that reported death would turn an
+        # unreadable path into a licence to release someone's live claim.
+        return [pscustomobject]@{ State = 'failed'; QuietHours = $null }
+    }
+}
+
 function Show-List {
     $files = @(Get-ChildItem $claims -Filter *.json -EA SilentlyContinue | Sort-Object Name)
     if (-not $files) { Write-Host "No active claims."; return }
@@ -102,20 +194,16 @@ function Show-List {
         $age = ""
         try {
             $hrs = [int]((Get-Date) - [datetime]::Parse($c.claimed)).TotalHours
-            if (-not (Test-Path $held)) {
-                # The only state that is genuinely safe to act on without asking anyone.
-                $age = "  [HOLDER GONE -- worktree no longer exists; release with -Force]"
-            }
-            else {
-                $ct = & git -C $held log -1 --format=%ct 2>$null
-                if ($ct) {
-                    $quiet = [int]((Get-Date) - [System.DateTimeOffset]::FromUnixTimeSeconds([long]$ct).LocalDateTime).TotalHours
-                    $age = "  [held ${hrs}h; holder last committed ${quiet}h ago]"
-                    if ($quiet -ge 12) { $age += " -- QUIET, confirm with the holder before releasing" }
+            # Shared with -Take and -Release, so all three surfaces answer "is the holder there?" the
+            # same way. They used to disagree: this one probed, the other two did not probe at all.
+            $live = Get-HolderLiveness $held
+            switch ($live.State) {
+                'gone'    { $age = "  [HOLDER GONE -- worktree no longer exists; release with -Force]" }
+                'present' {
+                    $age = "  [held ${hrs}h; holder last committed $($live.QuietHours)h ago]"
+                    if ($live.QuietHours -ge 12) { $age += " -- QUIET, confirm with the holder before releasing" }
                 }
-                else {
-                    $age = "  [held ${hrs}h; holder liveness UNKNOWN -- confirm before releasing]"
-                }
+                default   { $age = "  [held ${hrs}h; holder liveness UNKNOWN -- confirm before releasing]" }
             }
         } catch {
             # Say so. An empty annotation reads as "nothing notable about this claim", which is the same
@@ -129,6 +217,12 @@ function Show-List {
     Write-Host ""
 }
 
+# Resolved for BOTH paths, not just -Take. A release record that names who released the claim is only
+# half an answer without the branch they were standing on -- the same question -Take records.
+$branch = & git -C $repo branch --show-current
+if ([string]::IsNullOrWhiteSpace($branch)) { $branch = "detached@" + (& git -C $repo rev-parse --short HEAD) }
+$branch = $branch.Trim()
+
 if ($Release) {
     $file = Join-Path $claims ((ConvertTo-KeyFile $Release) + ".json")
     if (-not (Test-Path $file)) { Write-Host "No claim on '$Release' -- nothing to release."; exit 0 }
@@ -139,12 +233,82 @@ if ($Release) {
         Write-Host "  held by: $($info.Claim.worktree) [$($info.Claim.branch)]"
         Write-Host "  since  : $($info.Claim.claimed)"
         Write-Host "  note   : $($info.Claim.note)"
+        # DO NOT recommend -Force without looking. This line used to read "If that session is gone,
+        # re-run with -Force" unconditionally -- an instruction to guess, printed at exactly the moment
+        # the operator is deciding whether to take someone else's key. Now the recommendation is only
+        # made in the one state that can be proven, and the live case says the opposite.
+        $live = Get-HolderLiveness $info.Claim.worktree
         Write-Host ""
-        Write-Host "If that session is gone, re-run with -Force."
+        switch ($live.State) {
+            'gone' {
+                Write-Host "  HOLDER GONE -- that worktree no longer exists on disk." -ForegroundColor Green
+                Write-Host "  Safe to take over:  claim.ps1 -Release $Release -Force"
+            }
+            'present' {
+                Write-Host "  HOLDER IS STILL THERE -- that worktree exists and last committed $($live.QuietHours)h ago." -ForegroundColor Red
+                Write-Host "  Do NOT -Force it on the strength of a quiet period: a session can be alive and"
+                Write-Host "  simply not committing. Ask that session first -- releasing a live claim is how two"
+                Write-Host "  sessions end up building the same thing."
+            }
+            default {
+                Write-Host "  HOLDER LIVENESS UNKNOWN -- the worktree exists but could not be dated." -ForegroundColor Yellow
+                Write-Host "  Confirm with that session before using -Force."
+            }
+        }
         exit 1
     }
-    Remove-Item -LiteralPath $file -Force
+    # RECORD FIRST, then act. Both orders can lie once and only one lie is recoverable: removing first
+    # and recording after reproduces this item exactly (a completed release with no trace, and nothing
+    # left to write the record from), whereas recording first can at worst claim a release that then
+    # failed -- which the catch below corrects in the same ledger. Refusing when the record cannot be
+    # written is safe because a release is always retryable: the claim stays where it was.
+    #
+    # ConvertTo-Stamp on every field carried over from the claim file, not just the timestamp:
+    # ConvertFrom-Json date-coerces ANY ISO-8601-shaped string, and note/branch/worktree are free text.
+    $record = [ordered]@{
+        ts              = (Get-Date).ToString("o")
+        event           = "release"
+        key             = $Release
+        released_by     = $repo
+        released_branch = $branch
+        prior_holder    = ConvertTo-Stamp $info.Claim.worktree
+        prior_branch    = ConvertTo-Stamp $info.Claim.branch
+        # The note is what a later reader judges the release BY -- it is the field that was stale and
+        # wrong in the incident above -- so the record keeps it rather than pointing at a deleted file.
+        prior_note      = ConvertTo-Stamp $info.Claim.note
+        claimed         = ConvertTo-Stamp $info.Claim.claimed
+        # The flag AS PASSED. Whether this was a takeover is already readable from prior_holder against
+        # released_by, and a record should not restate a fact it already carries.
+        force           = [bool]$Force
+    } | ConvertTo-Json -Compress
+    if (-not (Add-HistoryLine $record)) {
+        Write-Host ""
+        Write-Host "REFUSING to release '$Release': the release record could not be written." -ForegroundColor Yellow
+        Write-Host "  ledger : $history"
+        Write-Host "  Your claim is UNCHANGED and still yours. Retry in a moment -- an untraceable"
+        Write-Host "  release is the one outcome this refuses to produce."
+        exit 1
+    }
+    try {
+        Remove-Item -LiteralPath $file -Force
+    }
+    catch {
+        # The line above says a release happened; it did not. Correct it in the same ledger rather than
+        # leave a record that is now false.
+        Add-HistoryLine ([ordered]@{
+                ts          = (Get-Date).ToString("o")
+                event       = "release-failed"
+                key         = $Release
+                released_by = $repo
+                reason      = $_.Exception.Message
+            } | ConvertTo-Json -Compress) | Out-Null
+        throw
+    }
     Write-Host "Released claim on '$Release'." -ForegroundColor Green
+    if (-not $info.IsMine) {
+        Write-Host "  TOOK OVER a claim held by $($info.Claim.worktree) [$($info.Claim.branch)]." -ForegroundColor Yellow
+    }
+    Write-Host "  recorded in $history"
     exit 0
 }
 
@@ -153,10 +317,6 @@ if ($List) { Show-List; exit 0 }
 
 $safe = ConvertTo-KeyFile $Take
 $file = Join-Path $claims "$safe.json"
-
-$branch = & git branch --show-current
-if ([string]::IsNullOrWhiteSpace($branch)) { $branch = "detached@" + (& git rev-parse --short HEAD) }
-$branch = $branch.Trim()
 
 try {
     # ATOMIC test-and-set -- identical to alloc.ps1. 'CreateNew' + FileShare::None throws IOException if a
@@ -250,10 +410,30 @@ try {
     Write-Host "  held by: $($info.Claim.worktree) [$($info.Claim.branch)]"
     Write-Host "  since  : $($info.Claim.claimed)"
     Write-Host "  note   : $($info.Claim.note)"
+    # THE BLOCKING PATH IS WHERE THIS MATTERS MOST. -List is where you browse; this is where a session
+    # is stopped and has to decide between waiting, picking other work, and taking the key. It used to
+    # offer -Force as a flat third option with no way to tell a dead holder from a live one, so the
+    # cheapest way past the gate was also the one that causes the duplicate build it exists to prevent.
+    $live = Get-HolderLiveness $info.Claim.worktree
     Write-Host ""
-    Write-Host "Do NOT build it in parallel -- that is the duplicate-work this gate exists to stop."
-    Write-Host "Coordinate with that session, pick different work, or if it is dead:"
-    Write-Host "    pwsh -NoProfile -File scripts\coord\claim.ps1 -Release $Take -Force"
+    switch ($live.State) {
+        'gone' {
+            Write-Host "  HOLDER GONE -- that worktree no longer exists on disk, so nobody is building this." -ForegroundColor Green
+            Write-Host "  Take it over with:"
+            Write-Host "      pwsh -NoProfile -File scripts\coord\claim.ps1 -Release $Take -Force"
+            Write-Host "      pwsh -NoProfile -File scripts\coord\claim.ps1 -Take $Take -Note ""<what>"""
+        }
+        'present' {
+            Write-Host "  HOLDER IS STILL THERE -- that worktree exists and last committed $($live.QuietHours)h ago." -ForegroundColor Red
+            Write-Host "  Do NOT build it in parallel -- that is the duplicate-work this gate exists to stop,"
+            Write-Host "  and do NOT -Force it: quiet is not dead. Coordinate with that session or pick"
+            Write-Host "  different work. Its note above says what it is doing."
+        }
+        default {
+            Write-Host "  HOLDER LIVENESS UNKNOWN -- the worktree exists but could not be dated." -ForegroundColor Yellow
+            Write-Host "  Treat it as live: coordinate with that session before -Force."
+        }
+    }
     exit 1
 }
 try {
@@ -277,4 +457,17 @@ Write-Host "CLAIMED '$Take'" -ForegroundColor Green
 Write-Host "  by   : $repo [$branch]"
 Write-Host "  note : $(if ($Note) { $Note } else { '(no note)' })"
 Write-Host "  release when done:  pwsh -NoProfile -File scripts\coord\claim.ps1 -Release $Take"
+
+# Same note alloc.ps1 prints, for the same reason (BACKLOG #1060): anchoring is correct but surprising,
+# and a claim recorded to a worktree the caller is not standing in otherwise surfaces only as a refused
+# commit later. Silent on the ordinary same-tree invocation.
+$cwdTop = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
+if ($cwdTop) {
+    $a = ($cwdTop.Trim() -replace '\\', '/').TrimEnd('/')
+    $b = ($repo -replace '\\', '/').TrimEnd('/')
+    if ($a -ine $b) {
+        Write-Host "  NOTE: your shell is in $a, but this script lives in $b, so the claim is" -ForegroundColor Yellow
+        Write-Host "        recorded to $b. -Release must be run against that same worktree." -ForegroundColor Yellow
+    }
+}
 exit 0

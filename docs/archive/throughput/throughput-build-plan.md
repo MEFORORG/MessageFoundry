@@ -21,7 +21,7 @@ parallelism, method, coordination.
 > permanently (`inline: bool = False`, [`config/wiring.py:2452`](../../../messagefoundry/config/wiring.py)), and **no
 > throughput claim may be made for it** — the "aggregate-commit lever" note on its row is retained as the
 > reasoning of the time, not as a measured effect. **B9** (Postgres `commit_delay` / group-commit) is
-> **⛔ DECLINED** ([BACKLOG #217](../../BACKLOG.md)).
+> **⛔ DECLINED** ([BACKLOG #217](../backlog/BACKLOG-CLOSED.md#217-group-commit--durable-write--sequenced-after-the-claim-path)).
 >
 > The rest of this plan — the connection-scale items, the claim-storm program, and the engine-side per-message CPU
 > frontier — is **unaffected** and is left exactly as written. Measured throughput lives in
@@ -176,7 +176,7 @@ re-profile on the production platform before final box sizing; (c) a clean 4-eng
 | **B6** | shared **ingest sub-pool** / writer path | ⬜ TODO | B11/B13 | Give pre-ACK intake its own commit path so ACK-on-receipt latency doesn't queue behind the worker-claim + idle-poll storm. **Shared sub-pool carved from B13's pool — NOT per-listener** (1,500 dedicated conns is infeasible). |
 | **B14** | per-listener accept-cap default | ⬜ TODO | B11 | `DEFAULT_MAX_CONNECTIONS=256` × 1,500 listeners = 384k socket ceiling. Lower the default (most HL7 partners hold 1–4), keep the per-connection override. |
 | **B10** | rename-based FIFO index migration | ✅ **DONE** (ADR 0060, #676) | B3 | renames to `ix_queue_fifo_*_seq` + idempotent on-open DROP-old/CREATE-new on all 3 backends, so B3's cut lands on **upgraded** DBs. |
-| **B9** | Postgres `commit_delay` (group-commit) | ⛔ **DECLINED** (was ⏸ DEFERRED) | — | ~~only meaningful once B8 shows durable-write-bound AND the store presents concurrent in-flight txns~~ — B8/ADR 0069 showed the commit tier is **~9% utilised**, ADR 0099 withdrew ADR 0055, and ADR 0107 measured the whole `txn/event` class flat (elasticity **−0.115**). Dead by measurement three times over ([BACKLOG #217](../../BACKLOG.md)). Still unbuilt in code — `commit_delay` is described as a planned PG-only increment at `config/settings.py:281-284`. |
+| **B9** | Postgres `commit_delay` (group-commit) | ⛔ **DECLINED** (was ⏸ DEFERRED) | — | ~~only meaningful once B8 shows durable-write-bound AND the store presents concurrent in-flight txns~~ — B8/ADR 0069 showed the commit tier is **~9% utilised**, ADR 0099 withdrew ADR 0055, and ADR 0107 measured the whole `txn/event` class flat (elasticity **−0.115**). Dead by measurement three times over ([BACKLOG #217](../backlog/BACKLOG-CLOSED.md#217-group-commit--durable-write--sequenced-after-the-claim-path)). Still unbuilt in code — `commit_delay` is described as a planned PG-only increment at `config/settings.py:281-284`. |
 | **T8** | backend-parametric test/measurement | ⬜ TODO | — | run every connection-scale + commit result across SQLite/SQL Server/Postgres. |
 
 ## Execution sequence

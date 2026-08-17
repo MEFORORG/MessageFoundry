@@ -56,6 +56,8 @@ def _names(
     auth: AuthSettings | None = None,
     alerts: AlertsSettings | None = None,
     cleartext_hops: tuple[str, ...] = (),
+    expiry_hops: tuple[str, ...] = (),
+    db_hops: tuple[str, ...] = (),
 ) -> list[str]:
     """The loosening SWITCH NAMES for a settings combination (defaults where not overridden)."""
     return [
@@ -66,6 +68,8 @@ def _names(
             auth or AuthSettings(),
             alerts or AlertsSettings(),
             cleartext_hops,
+            expiry_hops,
+            db_hops,
         )
     ]
 
@@ -92,7 +96,13 @@ def test_the_shipped_defaults_are_not_themselves_loosenings() -> None:
 def test_aad_bind_off_is_a_named_loosening() -> None:
     named = dict(
         security_loosenings(
-            SecuritySettings(), StoreSettings(aad_bind=False), AuthSettings(), AlertsSettings(), ()
+            SecuritySettings(),
+            StoreSettings(aad_bind=False),
+            AuthSettings(),
+            AlertsSettings(),
+            (),
+            (),
+            (),
         )
     )
     assert "aad_bind" in named
@@ -108,7 +118,13 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
     the list — the failure mode a loosening registry can least afford."""
     named = dict(
         security_loosenings(
-            SecuritySettings(), StoreSettings(aad_bind=False), AuthSettings(), AlertsSettings(), ()
+            SecuritySettings(),
+            StoreSettings(aad_bind=False),
+            AuthSettings(),
+            AlertsSettings(),
+            (),
+            (),
+            (),
         )
     )
     assert "no effect without a store key" in named["aad_bind"]
@@ -120,7 +136,7 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
 def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
     auth = _ad(ad_session_recheck_seconds=0)
     named = dict(
-        security_loosenings(SecuritySettings(), StoreSettings(), auth, AlertsSettings(), ())
+        security_loosenings(SecuritySettings(), StoreSettings(), auth, AlertsSettings(), (), (), ())
     )
     assert "ad_session_recheck_seconds" in named
     assert "revocation" in named["ad_session_recheck_seconds"]
@@ -158,7 +174,9 @@ def _load(tmp_path: Path, toml: str) -> ServiceSettings:
 def test_shipped_default_does_not_break_a_non_ad_deployment(tmp_path: Path) -> None:
     """The reason the refusal had to be re-keyed: with a non-zero SHIPPED default, an unconditional
     'requires ad_enabled' rule would fail startup on every deployment that does not use AD."""
-    settings = _load(tmp_path, "[auth]\nlocal_users = true\n")
+    # `local_users` was not an AuthSettings field, so this fixture used to say nothing at all — the very
+    # silence the unknown-key refusal now removes. `ad_enabled = false` states "no AD" in a real field.
+    settings = _load(tmp_path, "[auth]\nad_enabled = false\n")
     assert settings.auth.ad_session_recheck_seconds == 300
     assert settings.auth.ad_enabled is False
 
@@ -220,6 +238,131 @@ def test_every_security_bool_at_its_insecure_value_is_reported() -> None:
         )
 
 
+#: Every per-connection parameter name the connection-factory census below classifies, mapped to the
+#: reader that reports it. #333 step 7: the `[security]`/`[store]`/`[auth]` floors iterate
+#: `model_fields`, so a CONNECTION-scoped deviation is outside their reach BY CONSTRUCTION — which is
+#: exactly why `cleartext_accepted` needed a hand-written entry, why `tls_allow_expired` and the
+#: generic-ODBC hop had none for as long as they did, and why nothing would have caught the next one.
+_CONNECTION_DEVIATIONS_REPORTED = {
+    "cleartext_accepted": "accepted_cleartext_hops",
+    "tls_allow_expired": "expiry_relaxed_hops",
+}
+
+#: Per-connection parameters the readers do NOT report, each with the reason. Same discipline as the
+#: `[store]`/`[auth]` exemption sets: the gap is a written decision a new parameter cannot silently
+#: join, not an accident of a regex.
+_CONNECTION_DEVIATIONS_EXEMPT = {
+    # Not switches — the reason string beside a declaration, and TLS key/cert material or paths.
+    "cleartext_reason": "the reason text for cleartext_accepted, not a second switch",
+    "tls_cert_file": "material/path, not a posture switch",
+    "tls_key_file": "material/path, not a posture switch",
+    "tls_key_password": "material/path, not a posture switch",
+    "tls_ca_file": "material/path, not a posture switch",
+    # Not TLS at all — the regex matches the word 'verify' in an HL7 ACK correlation check.
+    "verify_ack_control_id": "HL7 ACK control-id correlation, unrelated to transport TLS",
+    # Verify-off and TLS-off are GATED rather than reported: the ADR 0092 posture-keyed cell refuses
+    # them on a production-PHI hop unless attested, and ADR 0153's cleartext_accepted is the declared
+    # escape that IS reported. A connection-scoped verify-off READER is owed work (it would report the
+    # connectors' tls_verify=false the way this pass reports tls_allow_expired), recorded here rather
+    # than done silently — #333 scoped itself to the expiry flag and the generic-ODBC hop.
+    "tls": "TLS-off is gated by the ADR 0092 hop cell; the declared escape (cleartext_accepted) is reported",
+    "use_tls": "same as tls",
+    "tls_verify": "verify-off is gated by the ADR 0092 hop cell; a connection-scoped reader is owed",
+    "verify_tls": "same as tls_verify",
+    "tls_check_hostname": "gated by the same ADR 0092 hop cell",
+    "encrypt": "SQL Server preset only — _build_dsn's posture-keyed weakened-TLS refusal gates it",
+}
+
+
+def test_every_per_connection_tls_parameter_is_reported_or_exempt() -> None:
+    """The CONNECTION-scoped completeness floor (#333 step 7).
+
+    The floors above iterate `SecuritySettings` / `StoreSettings` / `AuthSettings` `model_fields`, and a
+    per-connection deviation lives in none of those — it is a keyword argument on a connection factory
+    that lands in `spec.settings`. So this floor censuses the FACTORIES instead: every parameter whose
+    name is TLS-shaped must be either reported by one of the connection-scoped readers or exempt with a
+    written reason. A new one is a test failure rather than a re-audit three months later."""
+    import inspect
+    import re
+
+    from messagefoundry.config import wiring
+
+    shaped = re.compile(r"tls|ssl|cleartext|verify|insecure|encrypt", re.IGNORECASE)
+    census: dict[str, list[str]] = {}
+    for name in wiring.__all__:
+        obj = getattr(wiring, name, None)
+        if not callable(obj):
+            continue
+        try:
+            sig = inspect.signature(obj)
+        except (
+            TypeError,
+            ValueError,
+        ):  # builtins / C-level callables have no introspectable signature
+            continue
+        params = [p for p in sig.parameters if shaped.search(p)]
+        if params:
+            census[name] = params
+
+    # LIVE POSITIVE CONTROL. A census that silently stopped seeing anything — a renamed `__all__`, an
+    # import that started failing, a regex typo — would make every assertion below vacuously true. This
+    # is the blindness guard: name factories that certainly carry these parameters and require them.
+    assert {"MLLP", "Rest", "FHIR", "Soap", "Ftp", "DICOM"} <= set(census), sorted(census)
+    for factory in ("MLLP", "Rest", "FHIR", "Soap", "Ftp", "DICOM"):
+        assert "tls_allow_expired" in census[factory], (factory, census[factory])
+
+    classified = set(_CONNECTION_DEVIATIONS_REPORTED) | set(_CONNECTION_DEVIATIONS_EXEMPT)
+    unclassified = {p for params in census.values() for p in params} - classified
+    assert not unclassified, (
+        f"per-connection parameter(s) {sorted(unclassified)} are TLS-shaped and are neither reported "
+        "by a connection-scoped reader nor exempt with a reason. Report them (extend "
+        "config.wiring's readers and security_loosenings), or add them to "
+        "_CONNECTION_DEVIATIONS_EXEMPT with the reason — silence is not an option. "
+        f"Scanned {len(census)} factories: "
+        + "; ".join(f"{k}({', '.join(v)})" for k, v in sorted(census.items()))
+    )
+
+
+def test_the_reported_connection_deviations_are_actually_wired() -> None:
+    """The other half of the floor: the map above claims two parameters are REPORTED, and a claim that
+    nothing executes is exactly what this lane exists to prevent. Drive each through its reader AND
+    through `security_loosenings`, so "reported" means reported."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import (
+        ConnectionSpec,
+        Registry,
+        accepted_cleartext_hops,
+        build_outbound_connection,
+        expiry_relaxed_hops,
+    )
+
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_EXPIRED",
+            ConnectionSpec(
+                type=ConnectorType.MLLP,
+                settings={"host": "h", "port": 1, "tls_allow_expired": True},
+            ),
+        )
+    )
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_CLEAR",
+            ConnectionSpec(type=ConnectorType.TCP, settings={"host": "h", "port": 2}),
+            cleartext_accepted=True,
+            cleartext_reason="vendor firmware predates TLS",
+        )
+    )
+    assert _CONNECTION_DEVIATIONS_REPORTED["tls_allow_expired"] == "expiry_relaxed_hops"
+    assert _CONNECTION_DEVIATIONS_REPORTED["cleartext_accepted"] == "accepted_cleartext_hops"
+    names = _names(
+        expiry_hops=tuple(n for n, _ in expiry_relaxed_hops(reg)),
+        cleartext_hops=tuple(n for n, _ in accepted_cleartext_hops(reg)),
+    )
+    assert "tls_allow_expired" in names and "cleartext_accepted" in names
+
+
 # --- the API surface: GET /security/posture reports store + auth deviations --------------------
 
 
@@ -274,6 +417,8 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             AuthSettings(),
             AlertsSettings(),
             ("OB_LEGACY", "OB_LAB"),
+            (),
+            (),
         )
     )
     assert "cleartext_accepted" in named
@@ -286,6 +431,205 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
 
 def test_no_declared_hops_is_not_a_loosening() -> None:
     assert "cleartext_accepted" not in _names(cleartext_hops=())
+    assert "tls_allow_expired" not in _names(expiry_hops=())
+    assert "generic_odbc_tls_unenforced" not in _names(db_hops=())
+
+
+# --- the two OTHER connection-scoped deviations (#333) -----------------------------------------
+
+
+def test_expiry_relaxation_is_a_named_loosening() -> None:
+    """#333(a). ``tls_allow_expired`` reached NO reporting surface: it was absent from
+    ``config/settings.py``, ``api/app.py``, ``checks.py`` and ``__main__.py``, so an auditor querying
+    ``GET /security/posture`` got a list that said nothing about it. The one thing that fired was a
+    construction log line, and a log line emitted once at startup is not what anyone reads later."""
+    named = dict(
+        security_loosenings(
+            SecuritySettings(),
+            StoreSettings(),
+            AuthSettings(),
+            AlertsSettings(),
+            (),
+            ("OB_PARTNER_ADT", "OB_LAB_ORU"),
+            (),
+        )
+    )
+    assert "tls_allow_expired" in named
+    risk = named["tls_allow_expired"]
+    assert "OB_PARTNER_ADT" in risk and "OB_LAB_ORU" in risk
+    # BOTH halves. Omitting the mitigation would overstate it into verify-off (ADR 0094 ORs exactly one
+    # flag); omitting the risk would leave an operator thinking a lapsed bridge closes itself.
+    assert "EXPIRED" in risk
+    assert "nothing that expires the relaxation" in risk
+    assert "hostname" in risk and "chain" in risk
+
+
+def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
+    """#333(b). ADR 0092 accepted the generic-ODBC delegation on the strength of ONE mitigation —
+    "construction logs it". That mitigation was defeatable (the detector was value-blind), anonymous,
+    and lived in a log stream rather than any surface a reviewer reads. This is the surface."""
+    named = dict(
+        security_loosenings(
+            SecuritySettings(),
+            StoreSettings(),
+            AuthSettings(),
+            AlertsSettings(),
+            (),
+            (),
+            ("OB_PG_RESULTS", "inbound:IB_PG_ORDERS"),
+        )
+    )
+    assert "generic_odbc_tls_unenforced" in named
+    risk = named["generic_odbc_tls_unenforced"]
+    assert "OB_PG_RESULTS" in risk and "inbound:IB_PG_ORDERS" in risk
+    # The DSN credential rides the same hop as the rows; an operator weighing the risk needs both.
+    assert "credential" in risk and "plaintext" in risk
+
+
+def test_expiry_relaxed_hops_reads_the_graph() -> None:
+    """The shared reader. The flag lands in ``spec.settings`` (six outbound factories take it), NOT in a
+    typed ``OutboundConnection`` field like ``cleartext_accepted`` — so a reader copied from its sibling
+    without noticing that would report every graph as clean."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import (
+        ConnectionSpec,
+        Registry,
+        build_outbound_connection,
+        expiry_relaxed_hops,
+    )
+
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_STRICT",
+            ConnectionSpec(
+                type=ConnectorType.MLLP,
+                settings={"host": "a.example", "port": 1, "tls_allow_expired": False},
+            ),
+        )
+    )
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_BRIDGE",
+            ConnectionSpec(
+                type=ConnectorType.MLLP,
+                settings={"host": "b.example", "port": 2, "tls_allow_expired": True},
+            ),
+        )
+    )
+    assert expiry_relaxed_hops(reg) == [("OB_BRIDGE", "b.example:2")]
+
+
+def test_expiry_relaxed_hops_never_leaks_a_url_credential() -> None:
+    """These labels land in ``GET /security/posture``. A REST/SOAP/FHIR outbound's peer is a ``url``,
+    which can carry ``user:password@`` userinfo — the exact hole #1207 closed on the metadata
+    serializers. An unresolved ``env()`` shows its KEY, never a resolved value, for the same reason."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import (
+        ConnectionSpec,
+        Registry,
+        build_outbound_connection,
+        env,
+        expiry_relaxed_hops,
+    )
+
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_REST",
+            ConnectionSpec(
+                type=ConnectorType.REST,
+                settings={
+                    "url": "https://svc:hunter2@api.example/ingest",
+                    "tls_allow_expired": True,
+                },
+            ),
+        )
+    )
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_ENV",
+            ConnectionSpec(
+                type=ConnectorType.MLLP,
+                settings={"host": env("partner_host"), "port": 7, "tls_allow_expired": True},
+            ),
+        )
+    )
+    peers = dict(expiry_relaxed_hops(reg))
+    assert "hunter2" not in peers["OB_REST"]
+    assert peers["OB_REST"] == "https://svc:***@api.example/ingest"
+    assert peers["OB_ENV"] == "env(partner_host):7"
+
+
+def test_unverified_generic_db_hops_walks_inbound_as_well_as_outbound() -> None:
+    """``accepted_cleartext_hops`` reads outbound + FHIR lookups; a ``DatabasePoll`` INBOUND crosses the
+    same generic hop, in the same dialect, with the same credential in the same DSN. Reading only
+    outbound would report a live unenforced hop as absent — the failure this whole registry exists to
+    prevent."""
+    from messagefoundry.config.wiring import (
+        Database,
+        DatabasePoll,
+        Registry,
+        build_inbound_connection,
+        build_outbound_connection,
+        unverified_generic_db_hops,
+    )
+
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_PG_OK",
+            Database(
+                server="ok.example",
+                dialect="generic",
+                odbc_driver="PostgreSQL Unicode",
+                statement="INSERT INTO t (a) VALUES (:a)",
+                odbc_params={"SSLmode": "verify-full"},
+            ),
+        )
+    )
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_PG_BARE",
+            Database(
+                server="bare.example",
+                dialect="generic",
+                odbc_driver="PostgreSQL Unicode",
+                statement="INSERT INTO t (a) VALUES (:a)",
+            ),
+        )
+    )
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_SQLSERVER",
+            Database(
+                server="ss.example",
+                database="MFDB",
+                statement="INSERT INTO t (a) VALUES (:a)",
+            ),
+        )
+    )
+    reg.add_inbound(
+        build_inbound_connection(
+            "IB_PG_ORDERS",
+            DatabasePoll(
+                server="poll.example",
+                dialect="generic",
+                odbc_driver="PostgreSQL Unicode",
+                poll_statement="SELECT 1",
+                odbc_params={"SSLmode": "disable"},
+            ),
+            router="R",
+        )
+    )
+    hops = dict(unverified_generic_db_hops(reg))
+    # The sqlserver dialect is NOT here: it keeps the byte-identical posture-keyed refusal, so it is
+    # gated rather than merely reported, and listing it would be noise.
+    assert set(hops) == {"OB_PG_BARE", "inbound:IB_PG_ORDERS"}
+    assert "no TLS keyword" in hops["OB_PG_BARE"]
+    # The value-blind detector fixed in step 1 is what makes this arm real: `SSLmode=disable` used to
+    # read as "the operator has taken TLS ownership".
+    assert "SSLmode=disable" in hops["inbound:IB_PG_ORDERS"]
 
 
 def test_accepted_cleartext_hops_reads_the_graph() -> None:

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 <#
 .SYNOPSIS
     Which worktree is each live session sitting in -- the shared occupancy matcher.
@@ -42,8 +44,9 @@
 
     WHAT IT CANNOT SEE -- state this wherever it is consumed:
       * A session that writes into a worktree BY ABSOLUTE PATH from somewhere else. Records carry the
-        cwd a session was launched in, and measurement on this repo says 29% of writes come from a
-        session sitting in the primary and land in a sibling worktree. Those are invisible here, so a
+        cwd a session was launched in, and measurement on this repo says 29% of the writes made by
+        sessions sitting in the primary land in a sibling worktree -- a share of THOSE sessions'
+        writes, not of every write in the repo. Those are invisible here, so a
         cwd-keyed fence alone is not sufficient protection for a destructive action. Measured
         2026-07-30 on this repo: 5 live sessions, 9 worktrees, and ZERO of the four `<primary>-<slug>`
         siblings drew a veto -- including the one a session was demonstrably building in. A caller that
@@ -55,7 +58,8 @@
     every surface (the Desktop app's own session tooling lists just what it spawned). The match is
     purely path-based, so the launching surface is irrelevant to it.
 
-    NESTED WORKTREES. `EnterWorktree`/new.ps1 put worktrees at <checkout>/.claude/worktrees/<slug>, so
+    NESTED WORKTREES. `EnterWorktree` puts worktrees at <checkout>/.claude/worktrees/<slug> (new.ps1
+    makes SIBLINGS, <repo-parent>/<repo-name>-<Name>), so
     a worktree can live INSIDE another one. Get-WorktreeOccupancy attributes a session to the LONGEST
     matching worktree, which is right for a roster (report the innermost checkout) and wrong for a
     destructive caller: a session in the nested tree does not then veto its ANCESTOR, whose --force
@@ -83,6 +87,11 @@ function ConvertTo-Norm([string]$p) {
 
 # Every worktree sharing one .git. Keyed on the worktree SET rather than a single path, because the
 # whole point is seeing siblings, not just yourself.
+# The Branch this returns is the WORKTREE's, read live from git, and is therefore current at the moment
+# of the call. It is NOT a session attribute: a session record carries no branch at all (see
+# session-registry.ps1). The session-list MCP tool reports the branch a session STARTED on, which does
+# not follow a later `git switch` -- so the two legitimately disagree for a checkout that has moved, and
+# a disagreement is not evidence that either is broken. Use this one for "what is that checkout on now".
 function Get-RepoWorktrees([string]$RepoHint) {
     $gitArgs = @()
     if ($RepoHint) { $gitArgs = @("-C", $RepoHint) }

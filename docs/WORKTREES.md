@@ -21,6 +21,10 @@ a new branch `alerts` (off `origin/main`, the freshly fetched remote tip — so 
 can't seed it), then bootstraps `..\MessageFoundry-alerts\.venv` with `pip install -e ".[dev,harness]"`.
 Options:
 
+- `-Branch <ref>` — the git branch to reuse or create, when it should differ from `-Name`. `-Name` is
+  the **directory** component and can never contain `/`; `-Branch` is a real refname and can, so a
+  namespaced branch needs both: `-Name my-task -Branch claude/my-task`. Defaults
+  to `-Name`, which is the ordinary case. Validated by `git check-ref-format`, not by a character class.
 - `-Base <ref>` — branch off something other than `origin/main`. If you point it at a local branch
   that lags its upstream, you get a loud warning (it would start the worktree from stale code).
 - `-Sqlserver` — also install the `[sqlserver]` extra.
@@ -33,7 +37,41 @@ Then work in it independently:
 ```powershell
 cd ..\MessageFoundry-alerts
 .\.venv\Scripts\Activate.ps1
-# build / commit / push on branch 'alerts'; open a PR as usual
+# build / commit; the FIRST push is:
+git push -u origin alerts
+# thereafter `git push`; open a PR as usual
+```
+
+### The first push needs `-u`, and that is the fix, not a rough edge
+
+A new branch is created with **`--no-track`**, so it starts with **no upstream** and `git push -u`
+is what gives it one — pointing at the branch's **own** remote ref, which is the only value that
+answers the question anything keyed on `@{u}` is asking.
+
+It used to inherit the **base**. `git worktree add <path> -b alerts origin/main` plus git's default
+`branch.autoSetupMerge` set `@{u}` to `origin/main`, so **`@{u}..HEAD` reported a branch's own
+commits as unpushed forever, including immediately after a successful push**. A session checking
+whether its worktrees were safe to remove read **2 and 1 unpushed commits** on two branches that
+were byte-identical to their remotes. The loud symptom — `git pull --ff-only` refusing — was the
+harmless half; bare `git pull` did **not** fail, it merged `origin/main` in and produced a merge
+commit. (BACKLOG #1087.)
+
+> **Do not "fix" the extra `-u` with `git config push.default upstream`.** It is the first thing
+> anyone reaches for and it is **strictly worse than the defect it appears to fix**: with the
+> upstream pointing at `origin/main`, a bare `git push` writes the feature branch **onto `main`** —
+> and push to `main` is not blocked server-side here. `push.default` being **unset** is what makes
+> git use `simple`, which refuses when the upstream's name differs from the branch's. Measured under
+> the old configuration, git's own remediation text read `git push origin HEAD:main`.
+> `tests/test_worktree_new_no_track.py` scans every `.ps1` under `scripts/` and fails if one sets it.
+
+**The flag only reaches worktrees created after it landed.** Every worktree made before it still
+carries `@{u} = origin/main`, and nothing retroactively corrects them — so a reading taken in one of
+those is still wrong. The same command fixes it, because `-u` overwrites an existing upstream:
+
+```powershell
+git push -u origin <branch>                 # pushed branch: point @{u} at its own remote ref
+git branch --unset-upstream                 # never-pushed branch: leave it unresolvable
+git rev-list --count '@{u}..HEAD'           # confirm: 0, or a loud "no upstream configured"
 ```
 
 Point a second Claude Code chat (or VS Code window / EDH) at that directory and the two sessions build
@@ -44,16 +82,35 @@ in parallel without touching each other's files.
 
 ## Remove one
 
-Run from the **main** checkout (git can't remove the worktree you're standing in):
+**Which copy you run decides which checkout it searches.** `remove.ps1` anchors on its own location,
+not on your cwd, so run the copy that lives in the checkout the worktree was created **from** — which
+is not necessarily the primary, because `new.ps1` anchors the same way and creates its worktree
+beside *itself*. Invoked by absolute path it works from any cwd outside the worktree being removed
+(git can't remove the worktree you're standing in). This page used to say "run from the main
+checkout"; that was false for every worktree created from a linked one, and `new.ps1` now prints the
+exact command with the root already filled in. (BACKLOG #1078.)
 
 ```powershell
 scripts\worktree\remove.ps1 -Name alerts            # refuses if there are uncommitted tracked changes
 scripts\worktree\remove.ps1 -Name alerts -DeleteBranch
 scripts\worktree\remove.ps1 -Name alerts -Force     # discard uncommitted tracked changes too
+pwsh -NoProfile -File <that-checkout>\scripts\worktree\remove.ps1 -Name alerts   # from any cwd
 ```
 
 The untracked `.venv` / `node_modules` are expected and removed automatically; only uncommitted
 **tracked** changes block removal (unless `-Force`).
+
+`-Name` always names the **directory**. `-DeleteBranch` deletes whichever branch that worktree
+actually has checked out — read from git, not assumed from the directory name, since `-Branch` lets
+the two differ. It deletes losslessly: `git branch -d` first, and the forceful `-D` only after
+re-verifying at that moment that the branch has nothing beyond `origin/main`. A branch holding
+unmerged commits is **kept** and named, with its tip printed so you can act on it deliberately.
+
+`-RepoRoot <path>` points the script at a checkout other than its own. It exists so the most
+destructive script in this directory can be **execution-tested**
+([`tests/test_worktree_remove.py`](../tests/test_worktree_remove.py) drives it against a synthetic
+repo); without it the only repository a test could reach was this one, so the branch-delete path was
+covered by review alone. (BACKLOG #1037.)
 
 ## Prune the finished ones — `prune-merged.ps1`
 
@@ -112,8 +169,9 @@ segment, is now excluded outright and listed as a non-candidate; `-Name` cannot 
 
 ### Why signal 2 is not a nicety
 
-Signal 1 only sees where a session was **launched**. Measured on this repo: 29% of writes come from a
-session sitting in the primary and landing in a sibling by absolute path — and on 2026-07-30, with 5
+Signal 1 only sees where a session was **launched**. Measured on this repo: 29% of the writes made by
+sessions sitting in the primary land in a sibling by absolute path — a share of those sessions' own
+writes, not of every write here — and on 2026-07-30, with 5
 live sessions across 9 worktrees, signal 1 vetoed **none** of the four `<primary>-<slug>` siblings,
 including one a session was demonstrably building in. Signal 2 was the only thing standing between
 that session and this script. The run therefore prints how many candidates signal 1 actually vetoed,
@@ -217,6 +275,11 @@ Three things that cost real time here:
   update a `BEHIND` branch. Landing PR A puts PR B `BEHIND`, and B
   sits armed and stalled indefinitely. Someone has to rebase it. If you queue two PRs, expect to rebase
   the second after the first lands.
+  *Measured 2026-08-02, when `allow_update_branch` was `false` on this repo. It was set `true` later
+  that day; whether GitHub then auto-updates an armed `BEHIND` branch when `main` moves is
+  **unverified** — no back-fill has been observed, and GitHub's documentation does not connect the
+  setting to that behaviour. Until someone records one, assume the above and keep a capped
+  `update-branch` loop.*
 - **`BEHIND` and `DIRTY` are easy to confuse and the wrong fix is destructive.** Treating `DIRTY` as
   `BEHIND` means resolving conflicts in a hurry to make a force-push succeed.
 
@@ -250,6 +313,96 @@ original edit — conflict fixup is exactly when a sweep gets re-run carelessly.
 `316` across `CHANGELOG.md` will happily turn `cp1252` into `cp1316`, in a file nobody re-reads. Scope
 replacements to the anchored forms (`BACKLOG #252`, `## 252.`), never the bare number.
 
+### A branch cut from a pre-squash commit hides its staleness behind a clean-looking diff
+
+`main` squash-merges, so a branch's own commits never become ancestors of `main` even after its PR
+lands — their *content* arrives as one new commit. Branch again from one of those commits (a trailing
+commit pushed after the PR merged, say, or an old branch you are rescuing work from) and the new
+branch inherits a merge base from *before* the squash. Everything that landed in between is missing
+from it.
+
+Measured 2026-08-02, rescuing an ADR from a commit pushed 1h37m after its own PR had squash-merged.
+Merge base `002be182` — **11 squash-merged PRs behind `main`**. A two-dot diff reported **58 files,
+959 insertions and 5,726 deletions**, and `git merge-tree` conflicted on **five** files
+(`docs/SESSION-DRIFT-CONTROLS.md`, `docs/WORKTREES.md`, `scripts/hooks/announce-session.ps1`,
+`tests/test_collision_gate.py`, `tests/test_coord_overlap_signals.py`).
+
+**What that does *not* mean.** The PR did **not** propose deleting `main`'s work, and nothing was
+about to be reverted. A three-way merge keeps `main`'s side of every file the branch never touched,
+so the change actually on offer was **13 files, 2,967 insertions and 19 deletions**. Those 5,726
+deletions are an artefact of *how you asked*, not a change anyone proposed. **The hazard is the five
+conflicts and the chance of resolving one wrongly — not reversion.** That is a smaller claim than
+"this would have reverted a dozen merged PRs", and it is the one the measurements support.
+
+**Two questions, two diffs. Asking one and reading its answer as the other is the trap:**
+
+| Question | What answers it |
+|---|---|
+| *Does merging this revert anything?* | **three-dot** — `git diff origin/main...HEAD` |
+| *Is this branch missing `main`'s work?* | **two-dot** — `git diff origin/main HEAD` — or `git merge-base --is-ancestor` |
+
+**A three-dot diff cannot see staleness, which is the trap.** `git diff origin/main...HEAD` and
+GitHub's "Files changed" tab both resolve the merge base, and the merge base is exactly what is
+stale — so the diff describes your branch against a `main` from 11 PRs ago. On the branch above it
+reported 13 files / 2,967 insertions / 19 deletions: an accurate account of what the PR *adds*, and
+no indication whatever that five files would conflict. Two checks that do see it:
+
+```powershell
+git merge-base --is-ancestor origin/main HEAD   # exit 0 = your branch CONTAINS main
+git diff --stat origin/main HEAD                # two-dot: tree vs tree, no merge base
+```
+
+A non-zero deletion count from the second, on a branch that only adds files, is the signal.
+
+> **This section was wrong when first written, and the way it was wrong is the lesson.** Every number
+> it published was real. It paired a **post-merge** three-dot reading ("the two files you added") with
+> a **pre-merge** two-dot reading (58 files, 5,726 deletions) and presented them as a single
+> comparison — so a diff that never proposed a revert was described as proposing one. Each figure
+> checked out individually; only the *join* between them was false, and the join carried the argument.
+> It survived its author's review, a coordinator's review, an independent verification and a green CI
+> run, because nothing anywhere checks joins. **Before two numbers share a sentence, confirm they
+> describe the same commit at the same moment.**
+
+**The first check is the load-bearing one; the second only confirms it.** Once `--is-ancestor` passes,
+the merge base *is* `origin/main`, so two-dot and three-dot are computing the same thing and cannot
+disagree — a matching diff at that point proves nothing you did not already know. The trap only exists
+in the window where that check fails. Measured on this branch, minutes apart:
+
+| `--is-ancestor` | two-dot | three-dot |
+|---|---|---|
+| fails (stale checkout) | 2 files, 52 insertions, **22 deletions** | 1 file, 50 insertions — deletions **hidden** |
+| passes | 1 file, 50 insertions | 1 file, 50 insertions — identical |
+
+So run `--is-ancestor` first and treat a failure as the finding. Reaching for the diff alone is how the
+trap survives a check: on the branch you are most likely to test, it agrees with itself.
+
+The fix is to **merge `origin/main` into the branch**, not to rebase: the conflicting files are work
+that already landed via the squash, so main's side is authoritative and taking it drops nothing. Then
+re-run both checks — the acceptance test is that the two-dot diff shows only your own change.
+
+**Prefer merge over rebase generally when your commits all touch one block, for a second and nastier
+reason.** A rebase replays each commit against the new base, so a seam every commit rewrites — an item
+appended at the same EOF point, say — re-raises the same conflict once *per commit*. The hazard is not
+the tedium. A mid-stack resolution can keep an **earlier draft** of the block, and that result has no
+conflict markers, leaves `git status` clean, and passes a structural check: an item that lost half its
+prose still has exactly one banner and still counts as one item. Nothing anywhere reports it. One
+`git merge origin/main` raises the seam once, against the final text. Verify by grepping for strings
+only your latest revision contains — **a structural check tells you the block is complete, not that it
+is the version you meant**, and those are different properties. *Measured 2026-08-02 on `docs/BACKLOG.md`
+EOF appends.*
+
+Do not expect `gh pr update-branch` to rescue that class. Its documented default is to update **by
+merging the base into the PR branch**, server-side, and the endpoint accepts no resolution — so there
+is nothing it can do with a conflicting merge. Resolve locally and push, as the `DIRTY` row above
+already says. *(GitHub does not document that endpoint's behaviour on conflict; this follows from the
+documented mechanism, not from a measurement.)*
+
+Blob-comparing a few files is **not** a substitute, and it is the check most likely to be reached for.
+It was run here and reported all five files identical. That was correct when measured and false twenty
+minutes later, because an in-flight PR touching exactly those five files merged in between. A
+content spot-check answers *"are these equal right now"*, not *"will this merge cleanly"* — and if an
+armed PR is queued against the same files, the first question stops predicting the second.
+
 ## What's isolated vs shared
 
 | Isolated per worktree | Shared across worktrees |
@@ -262,6 +415,22 @@ replacements to the anchored forms (`BACKLOG #252`, `## 252.`), never the bare n
 `mf-*.md` files) lives outside the repo and is shared by all sessions. Reads are fine; if two chats
 **write** memory at the same time the last write wins, so coordinate memory updates (or let one chat
 own them).
+
+**WHERE A COMMAND RUNS IS NOT WHERE THE CALLER IS, and tooling here keeps assuming it is.** Much of
+this repo's coordination machinery resolves "which worktree is this about?" from the **current
+directory** — `git rev-parse --show-toplevel`, `getcwd`, an unqualified relative path — even when it
+was handed an explicit path. That assumption is false about **one primary-seated write in three**:
+`occupancy.ps1` measures a session acting on a worktree by absolute path from elsewhere at **29% of the
+writes made by sessions sitting in the primary**. So `pwsh -File <abs>/scripts/coord/alloc.ps1` run
+from worktree A while you intend to commit
+from worktree B records A, and `cd "$D" && git ...` is resolved against your session's cwd rather
+than `$D`, because a hook cannot expand a shell variable.
+
+The failure mode is the dangerous one: these read as working answers rather than raising. A refusal
+naming the wrong worktree, an owner recorded as the wrong worktree, an occupancy of zero for a
+worktree in active use — none of them errors. **So run these tools with the shell actually inside the
+worktree they are about, and prefer literal paths over variables in any command a hook has to
+judge.** Instances: BACKLOG #1057, #1059, #1060.
 
 ## Automatic coordination context (SessionStart hook)
 
@@ -313,9 +482,11 @@ times the 10-minute `-MinIdleMinutes` default — while its process was alive an
 consults the registry *and* mtime, and **refuses if either says live**, because nothing here can prove a
 session is gone; only the positive answer is trustworthy.
 
-**Creating a worktree is serialised.** `git worktree add -b <name> <base>` writes `.git/config`, so two
-sessions creating worktrees at once race `.git/config.lock` — on Windows that surfaces as `could not
-lock config file .git/config: File exists`, leaving orphaned branches behind. `new.ps1` wraps that call
+**Creating a worktree is serialised.** Two sessions running `git worktree add` at once race
+`.git/config.lock` — on Windows that surfaces as `could not lock config file .git/config: File
+exists`, leaving orphaned branches behind. (That was measured while the add still wrote an upstream,
+which is the write `--no-track` now removes; nobody has re-measured the race without it, so the lock
+stays until someone does.) `new.ps1` wraps that call
 in a cross-session mutex ([../scripts/coord/lock.ps1](../scripts/coord/lock.ps1)), which uses the same
 atomic exclusive-create as `claim.ps1`. It **retries and never steals**: on timeout it fails loudly and
 names the holder, because breaking a lock you cannot prove is abandoned re-opens the very race it exists
@@ -433,9 +604,27 @@ closes the push direction.
 else, so it can only say "hello" — the interrupt without the information. One prompt later it knows its
 **intent**, and intent is the whole payload.
 
-**Why it's a prompt and not an action.** Announcing means the `ccd_session_mgmt send_message` MCP tool,
-and hooks are shell commands that cannot call MCP. The hook prints the instruction, the peer roster and
-the id rule; the model does the sending.
+**Why it's a prompt and not an action — and this rationale is now only half true.** Announcing means the
+`ccd_session_mgmt send_message` MCP tool, so the hook prints the instruction, the peer roster and the id
+rule, and the model does the sending.
+
+The reason recorded here used to be "hooks are shell commands and cannot call MCP." **That is wrong.**
+`type: "mcp_tool"` is a documented hook handler — one of five (`command`, `http`, `mcp_tool`, `prompt`,
+`agent`) — described as *"call a tool on an already-connected MCP server"*, available on every hook event,
+with the tool's text output treated like command-hook stdout. So a hook calling `send_message` directly is
+not categorically impossible, and if it works the whole prompt-and-hope design collapses into one hook
+entry — including the delivery receipt the model currently has to write by hand.
+
+What actually blocks it here is narrower and is a *measurement*, not a category: `server` must name an
+**already-connected, configured** MCP server ("the hook never triggers an OAuth or connection flow"), and
+`ccd_session_mgmt` is host-provided rather than a configured entry — `claude mcp list` on this box lists
+one server, unauthenticated. Probed 2026-08-03 with three hooks in one `UserPromptSubmit` array: a
+`command` control fired and its stdout reached the model verbatim; an `mcp_tool` naming `ccd_session_mgmt`
+produced nothing; an `mcp_tool` naming a **deliberately nonexistent** server also produced nothing, where
+the docs promise a non-blocking error. With no connected server anywhere on the box, those three outcomes
+are indistinguishable — output not surfacing, the server not being addressable, and every call correctly
+erroring with the error never reaching the model all produce identical bytes. **So this is untested, not
+impossible.** Re-run the probe against any genuinely connected MCP server before trusting either answer.
 
 **The id rule — stated here as the source of record.** The 8-character id in this repo's coordination
 banners is the **registry** id. `ccd_session_mgmt` uses a *different* id for the same session. **The cwd
@@ -446,8 +635,17 @@ match, since a session may sit in any subdirectory, and it took the **first** hi
 absorbed whichever nested-worktree session the hash table enumerated first and reported the primary LIVE
 on `main`. Where a prefix match is genuinely required, the rule has to be **longest prefix wins**.)
 Branch is not a join key either: measured 2026-08-01, the two rosters reported different
-branches for the same checkout in 2 of 6 cases. A usable id starts with `local_`. **A registry id passed
-to `send_message` fails silently**, which reads as the peer ignoring you.
+branches for the same checkout in 2 of 6 cases. A usable id starts with `local_`.
+
+**A registry id passed to `send_message` does NOT fail silently — it errors loudly.** Measured 2026-08-03
+by calling `send_message` with a syntactically valid id belonging to no session: it returned
+`Session <id> not found.` and delivered nothing. Since the two namespaces carry *different* UUIDs for the
+same session, a registry id is precisely an id `send_message` does not know, so this is the path it takes.
+This doc previously asserted the opposite — that the call "fails silently, which reads as the peer ignoring
+you" — which was an inference stated as a measurement, and it was teaching every session to expect a
+failure mode that does not occur. Getting the id wrong is *self-announcing*; you do not need to detect it.
+(Tested only with an id that matches no session. If a registry uuid ever collided with a live MCP id the
+behaviour would differ, but they are distinct by construction.)
 
 **What it asks the model to send.** A fixed `[SESSION-ANNOUNCE]` envelope, one line of intent, one line
 of expected footprint, no question. It arrives in the recipient as a **user turn**, so an announcement is
@@ -461,10 +659,17 @@ per session. It stays silent, and keeps its powder dry, when there's nobody to t
 resume mints a new session id, so a 30-minute per-checkout cooldown suppresses the immediate re-announce.
 
 **Expect about half the roster to be unreachable.** `presence.ps1` is authoritative for who **exists**;
-`list_sessions` is authoritative only for who can be **messaged**, and the two disagree. Measured
-2026-08-01: of 6 registry-LIVE peers, `list_sessions` reported `isRunning: true` for one. The hook cannot
-call MCP and so cannot filter on that, which is why the cap is a budget of *delivered* messages the model
-tops up past unreachable peers, rather than a candidate list the hook trims.
+`list_sessions` is authoritative only for who can be **messaged**, and the two disagree. The cap is
+therefore a budget of *delivered* messages the model tops up past unreachable peers, rather than a
+candidate list the hook trims.
+
+**Reachability is an exact `cwd` match and nothing else — never `isRunning`.** That flag means *"executing
+a turn right now"*, so as a reachability test it reads **backwards**: `false` is an idle peer that answers,
+`true` is one that queues. The field, its measurement and the cross-surface caveat are recorded once, in
+[`scripts/coord/session-registry.ps1`](../scripts/coord/session-registry.ps1)'s header. The announce hook
+instructed every session to skip on `isRunning: false` until **BACKLOG #1077**; an earlier reading of this
+paragraph counted `isRunning: true` for 1 of 6 registry-LIVE peers and treated that as a reachability
+rate, when it was a count of who happened to be mid-turn.
 
 **State, receipts and the kill switch.** `<git-common-dir>/mefor-coord/announce/` holds one
 `<session-id>.json` marker per session (delete it to force a re-announce), `receipts/<key>.tsv` — one
@@ -608,7 +813,7 @@ it never moves anything — and `-Rehome` refuses on a session that still looks 
 `-MinIdleMinutes`, default 10; override with `-Force`) and honours `-WhatIf` for a no-op preview.
 
 **It keys on the write's target path, never on the session's cwd.** In that same 30-day window, **29% of
-writes came from a session sitting in the primary but landed inside a sibling worktree by absolute
+the writes made by those same 166 primary-seated sessions landed inside a sibling worktree by absolute
 path** — already correct. A cwd-keyed gate would have denied every one of them. So a session may stay
 where it is and simply write into its worktree; there is no need to `cd`, relocate, or restart.
 

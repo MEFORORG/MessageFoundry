@@ -29,12 +29,17 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Ftp, Sftp, WiringError
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed, check_source_allowed
 from messagefoundry.transports import build_destination, build_source, remotefile
-from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.base import (
+    DeliveryError,
+    DestinationStartupError,
+    NegativeAckError,
+)
 from messagefoundry.transports.remotefile import (
     RemoteFileDestination,
     RemoteFileSource,
     _FtpClient,
     _ftps_ssl_context,
+    _is_contained_name,
     _RemoteClient,
     _RemoteError,
     _SftpClient,
@@ -55,16 +60,21 @@ class _FakeClient(_RemoteClient):
         store_exc: _RemoteError | None = None,
         rename_exc: _RemoteError | None = None,
         retrieve_exc: _RemoteError | None = None,
+        list_exc: _RemoteError | None = None,
     ) -> None:
         self.files: dict[str, bytes] = dict(files or {})
         self._sizes = sizes or {}
         self.ops: list[tuple[str, str]] = []  # (op, path)
         self.dirs: list[str] = []
+        self._existing_dirs: set[str] = set()  # #114: which dirs ensure_dir has already created
         self._store_exc = store_exc
         self._rename_exc = rename_exc
         self._retrieve_exc = retrieve_exc
+        self._list_exc = list_exc  # #114: an unreachable/missing remote_dir
 
     def list_dir(self, remote_dir: str) -> list[tuple[str, int]]:
+        if self._list_exc is not None:
+            raise self._list_exc
         out: list[tuple[str, int]] = []
         for path, data in self.files.items():
             if posixpath.dirname(path) == remote_dir:
@@ -94,8 +104,14 @@ class _FakeClient(_RemoteClient):
         self.ops.append(("remove", path))
         self.files.pop(path, None)
 
-    def ensure_dir(self, remote_dir: str) -> None:
+    def ensure_dir(self, remote_dir: str) -> bool:
+        # #114: the contract now reports whether THIS call created the directory, so the caller can log
+        # a delivery that landed in a directory the engine just invented.
         self.dirs.append(remote_dir)
+        if remote_dir in self._existing_dirs:
+            return False
+        self._existing_dirs.add(remote_dir)
+        return True
 
 
 def _install_client(monkeypatch: pytest.MonkeyPatch, client: _FakeClient) -> None:
@@ -1032,3 +1048,179 @@ def test_ftps_encrypted_client_key_wrong_password_raises(tmp_path: Path) -> None
         _ftps_ssl_context(
             {"host": "h", "tls_cert_file": cert, "tls_key_file": key, "tls_key_password": "WRONG"}
         )
+
+
+# --- #114 opt-in startup directory validation: the OUTBOUND half -------------
+
+_UPLOAD_BODY = "MSH|^~\\&|A|B|C|D|20260810||ADT^A01|MSGX|P|2.5"
+
+
+async def test_remote_destination_test_probe_creates_the_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The REMOTEFILE half of the same measured claim as the File sibling: the on-demand probe ENSURES
+    # (creates) remote_dir, so it cannot answer the question a startup-validation toggle asks.
+    client = _FakeClient()
+    await _dest(monkeypatch, client).test_connection()
+    assert client.dirs == ["/in"]  # ensure_dir, not a listing — the probe creates
+
+
+async def test_remote_destination_validate_directory_off_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The item's own trigger: an intermittently-available remote directory (a listing fails right now)
+    # must NOT fail startup with the toggle off. Default = defer to run time, exactly as before.
+    client = _FakeClient(list_exc=_RemoteError("no such dir", permanent=True))
+    await _dest(monkeypatch, client).validate_startup()  # no raise
+    assert client.dirs == []  # and the hook created nothing
+
+
+async def test_remote_destination_intermittent_dir_starts_and_then_delivers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The item's trigger end to end, on the default (lenient) setting: remote_dir is unreachable at
+    # start, so startup validation must NOT refuse the lane — and once the share comes back the upload
+    # goes through. This is why the toggle is opt-in rather than the default.
+    client = _FakeClient(list_exc=_RemoteError("share is down", permanent=False))
+    dest = _dest(monkeypatch, client, filename="msg.hl7")
+    await dest.validate_startup()  # start is not blocked by a share that is down right now
+    client._list_exc = None  # the mount returns
+    await dest.send(_UPLOAD_BODY)
+    assert client.files["/in/msg.hl7"] == _UPLOAD_BODY.encode("utf-8")
+
+
+async def test_remote_destination_validate_directory_refuses_unreachable_dir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeClient(list_exc=_RemoteError("no such dir", permanent=True))
+    dest = _dest(monkeypatch, client, validate_directory=True)
+    with pytest.raises(DestinationStartupError):
+        await dest.validate_startup()
+    assert client.dirs == []  # LIST is the no-create probe — ensure_dir is never called
+
+
+async def test_remote_destination_validate_directory_passes_when_listable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeClient()
+    await _dest(monkeypatch, client, validate_directory=True).validate_startup()
+    assert client.dirs == []
+
+
+async def test_remote_destination_created_directory_is_logged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Default arm, unchanged except that a CREATED upload directory is now loud.
+    client = _FakeClient()
+    dest = _dest(monkeypatch, client)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.remotefile"):
+        await dest.send(_UPLOAD_BODY)
+    assert "CREATED missing directory" in caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.remotefile"):
+        await dest.send(_UPLOAD_BODY)
+    assert "CREATED missing directory" not in caplog.text  # only a real creation is loud
+
+
+async def test_remote_destination_validate_directory_upload_never_creates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Under the toggle the upload directory is never created at delivery time either, and the failure is
+    # deliberately RECLASSIFIED as transient: an SFTP/FTP no-such-dir is a PERMANENT error, so letting
+    # the upload fail naturally would dead-letter live traffic over a merely-unmounted share.
+    client = _FakeClient(list_exc=_RemoteError("no such dir", permanent=True))
+    dest = _dest(monkeypatch, client, validate_directory=True)
+    with pytest.raises(DeliveryError) as exc:
+        await dest.send(_UPLOAD_BODY)
+    assert not isinstance(exc.value, NegativeAckError)  # retried, never dead-lettered
+    assert client.dirs == []  # never created
+    assert client.ops == []  # and nothing was stored
+
+
+async def test_remote_destination_validate_directory_test_probe_never_creates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeClient(list_exc=_RemoteError("no such dir", permanent=True))
+    dest = _dest(monkeypatch, client, validate_directory=True)
+    with pytest.raises(DeliveryError):
+        await dest.test_connection()
+    assert client.dirs == []
+
+
+# --- #1238 (ASVS 5.3.2): a server-chosen listing name is REJECTED, never rewritten ---------------
+
+
+class _HostileListingClient(_FakeClient):
+    """A client whose listing returns names the SERVER chose, verbatim.
+
+    ``_FakeClient.list_dir`` derives names with ``posixpath.basename`` off its ``files`` keys, so it
+    structurally cannot produce a traversal name -- it would sanitize the very input under test. This
+    subclass returns the raw listing instead, which is what a hostile partner server does.
+    """
+
+    def __init__(self, names: list[str], **kw: Any) -> None:
+        super().__init__(**kw)
+        self._names = names
+
+    def list_dir(self, remote_dir: str) -> list[tuple[str, int]]:
+        return [(n, 10) for n in self._names]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../../etc/passwd.hl7",  # traversal, and the default *.hl7 pattern MATCHES it
+        "/etc/passwd.hl7",  # absolute
+        "..\..\etc\passwd.hl7",  # Windows separators -- posixpath.basename is a NO-OP on this
+        "sub/dir.hl7",  # a subdirectory component
+        ".",
+        "..",
+        "",
+        "a\x00b.hl7",  # NUL
+        "a\nb.hl7",  # newline
+        "C:evil.hl7",  # drive-relative: NO separator at all, so a separator-only check misses it
+    ],
+)
+def test_unsafe_listing_names_are_refused(name: str) -> None:  # #1238
+    assert _is_contained_name(name) is False
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["a.hl7", "adt_20260812.hl7", "A-1.2_3.hl7", "file with spaces.hl7", "unicode-\u00e9.hl7"],
+)
+def test_legitimate_listing_names_are_accepted(name: str) -> None:  # #1238
+    # The refusal must not be so broad that it rejects ordinary partner filenames -- a check that
+    # refuses everything is not a control either.
+    assert _is_contained_name(name) is True
+
+
+async def test_traversal_entry_is_never_retrieved(monkeypatch: pytest.MonkeyPatch) -> None:  # #1238
+    """The whole point: a hostile listing entry reaches NO consumer.
+
+    Asserted on the client's recorded ops, not on the handler alone, because the raw name reaches at
+    least four consumers (retrieve, the error/oversize move, the after_read disposition, and the
+    leave-mode dedup key). Checking only "the handler was not called" would pass even if the engine
+    had already moved or deleted at the hostile path.
+    """
+    client = _HostileListingClient(["../../etc/passwd.hl7"])
+    src = _src(monkeypatch, client)
+    h = _RecordingHandler()
+    src._handler = h
+    await src._poll_once()
+    assert h.bodies == []  # nothing ingested
+    assert client.ops == []  # and NOTHING was retrieved, moved, renamed or removed
+
+
+async def test_a_safe_entry_beside_a_hostile_one_still_flows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1238
+    # Refusing one entry must not abort the poll -- the legitimate file beside it is still delivered.
+    # Without this, a hostile server could suppress a real feed by planting one bad name.
+    client = _HostileListingClient(["../../etc/passwd.hl7", "good.hl7"])
+    client.files["/in/good.hl7"] = b"MSH|^~\&|A"
+    src = _src(monkeypatch, client)
+    h = _RecordingHandler()
+    src._handler = h
+    await src._poll_once()
+    assert h.bodies == [b"MSH|^~\&|A"]

@@ -14,9 +14,12 @@ import pytest
 from messagefoundry.config.wiring import (
     API_LISTENER_LABEL,
     MLLP,
+    ConnectionSpec,
     File,
+    Ftp,
     PortConflictError,
     Registry,
+    Sftp,
     WiringError,
     build_inbound_connection,
     build_outbound_connection,
@@ -538,3 +541,51 @@ def test_streaming_knobs_accepted() -> None:
     )
     assert ic.stream_threshold_bytes == 1024
     assert ic.max_message_bytes == 100 * 1024 * 1024
+
+
+# --- #114: validate_directory works in BOTH directions ------------------------
+#
+# It was inbound-only for one reason — no destination read it, and DestinationConnector had no
+# validate_startup hook — so an outbound carrying validate_directory=True was first silently ignored
+# and then (2026-08-03) rejected outright. Both halves are built now, so the rejection is gone and the
+# option is honoured on an outbound: the destination hook fails start on a missing target directory.
+
+
+def _spec_with_validate_directory(kind: str, directory: str) -> ConnectionSpec:
+    if kind == "file":
+        return File(directory=directory, validate_directory=True)
+    if kind == "sftp":
+        return Sftp(host="sftp.example.org", remote_dir=directory, validate_directory=True)
+    return Ftp(host="ftp.example.org", remote_dir=directory, validate_directory=True)
+
+
+@pytest.mark.parametrize("kind", ["file", "sftp", "ftp"])
+def test_outbound_validate_directory_now_builds(kind: str, tmp_path: Path) -> None:
+    spec = _spec_with_validate_directory(kind, str(tmp_path / "out"))
+    oc = build_outbound_connection("OB_X", spec)
+    assert oc.spec.settings["validate_directory"] is True  # reaches the connector, not rejected
+
+
+@pytest.mark.parametrize("kind", ["file", "sftp", "ftp"])
+def test_inbound_validate_directory_still_builds(kind: str, tmp_path: Path) -> None:
+    # The guard must not over-reject: the inbound half (ADR 0031 amendment) still honours the option.
+    spec = _spec_with_validate_directory(kind, str(tmp_path / "in"))
+    ic = build_inbound_connection("IB_X", spec, router="r")
+    assert ic.spec.settings["validate_directory"] is True
+
+
+@pytest.mark.parametrize("kind", ["file", "sftp", "ftp"])
+def test_outbound_without_validate_directory_is_unaffected(kind: str, tmp_path: Path) -> None:
+    # The factories write validate_directory=False into settings unconditionally, so the toggle has to
+    # be truthy-only — every outbound authored today must keep building byte-identically.
+    directory = str(tmp_path / "out")
+    spec = (
+        File(directory=directory)
+        if kind == "file"
+        else Sftp(host="h", remote_dir=directory)
+        if kind == "sftp"
+        else Ftp(host="h", remote_dir=directory)
+    )
+    assert spec.settings["validate_directory"] is False  # present, but false
+    oc = build_outbound_connection("OB_X", spec)
+    assert oc.name == "OB_X"

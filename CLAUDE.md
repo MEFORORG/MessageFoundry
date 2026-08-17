@@ -14,6 +14,43 @@ stops matching the code, fix the doc.
 
 ---
 
+## 0. Deployment status — read this before writing any severity claim
+
+> **CRITICAL — MessageFoundry is a NOT-DEPLOYED beta. There are ZERO production instances. Nobody is
+> running it.** **Published to PyPI is *not* deployed** — a release artifact on an index is not a
+> running instance, and the two get conflated constantly. Distinguish **shipped** (on `main`, on
+> PyPI), **deployable**, and **deployed**: only the first two are true today.
+
+This is load-bearing because the wrong premise silently corrupts severity, urgency, and prose
+across the repo. **Two consequences, and they pull in opposite directions — apply both:**
+
+1. **Present-tense impact claims are factually false.** *"PHI is exposed"*, *"customers are
+   affected"*, *"operators rely on this today"*, *"live feeds are shipping X"*, *"this needs an
+   incident response"* — none of these are true of anything here. Write beta defects in the
+   conditional: **"would expose X on first deployment"**, *"a deploying site would hit Y"*, *"is
+   wrong in the shipped code"*. False present tense does not stay local; it propagates into
+   security scorecards, review registers, BACKLOG banners and public docs, and a security record
+   asserting a live exposure that does not exist is exactly the *"compensating control resting on
+   a false premise"* defect §11 forbids.
+2. **Hypothetical migration costs are vacuous.** *"breaks a running deployment on upgrade"*,
+   *"operators need notice / a migration window / a deprecation period"*, *"backward compatibility
+   with what sites have configured"* — there is nothing to break and nobody to notify, so the cost
+   of a breaking change is currently **zero**. Prefer the simple, correct end state over a staged
+   migration or compatibility shim; those are real costs paid to protect users who do not exist.
+
+**IT CUTS ONE WAY ONLY — never cite "not deployed" to relax a rule.** It removes false urgency
+and vacuous costs. It does **not** downgrade a fix, justify skipping a gate, weaken a control, or
+make a finding unimportant. The security, PHI (§9) and leak-gate rules exist so the **first**
+deployment is safe; zero deployments is why there is still time to get them right, not permission
+to lower the bar. Note that §9's *"this engine carries PHI"* is a statement about the design and
+intended use — **not** evidence of a live PHI-carrying instance.
+
+This is an **owner-stated fact**, repeatedly. Do not re-derive it, do not go looking for
+deployments to confirm it, and do not soften it to "as far as I can tell". If an adopter ever goes
+live, this section must be revised first — check with the owner before assuming it still holds.
+
+---
+
 ## 1. Project Overview
 
 MessageFoundry routes, transforms, and validates HL7 v2.x messages between **connections**,
@@ -152,6 +189,10 @@ messagefoundry/
   api/             # FastAPI app.py + models.py + security.py (auth deps) + auth_routes.py (the engine's only external surface)
   apiclient/       # Qt-free / FastAPI-free engine-client library (ADR 0088) — the shared HTTP client (httpx)
   generators/      # conformant synthetic HL7 generators (adt.py, …) — `messagefoundry generate`; corpus git-ignored
+  security/        # security assets shipped in the wheel (ADR 0144)
+  support/         # support-bundle assembly + redaction (bundle.py, redact.py)
+  verify/          # deployment verifier — `messagefoundry verify` (checks.py, smoke.py, federation.py)
+  tray/            # Windows tray service-manager (ADR 0113) — stdlib ctypes, no PySide6; wraps service/service_status only
   checks.py        # `messagefoundry check` commit/CI gate (validate + dryrun + advisory lint)
 ide/               # VS Code extension (TypeScript): setup, promote, test bench, AI commands
 environments/      # per-environment <env>.toml value files for env() lookups (dev/staging/prod)
@@ -238,15 +279,37 @@ diverge enough to warrant it; keep this root file general.
   one-layer-per-commit changes and narrate each (respect the ledger gate — never `--no-verify` or a
   rename workaround). **Pushes, PRs, and merges need the owner's approval**: they are outward-facing
   and, with auto-merge on, a PR effectively merges to `main`.
+- **Whoever executes a push or merge announces it** — one `mail.ps1 -Send -To all` line, before
+  (heads-up: `"pushing #N now, touches X"`) and/or after (`"landed #N at <sha>, touches X, rebase if
+  BEHIND"`). Worded around the *action*, not a fixed identity — no gate enforces *who* may push a
+  branch or merge a PR, only *which* refs (`push_guard.py` blocks direct pushes to protected refs; it
+  cannot see `gh pr merge` at all), so hard-coding this to a role would leave the exact lapse case
+  silently uncovered. **Never a hold/freeze/wait request or a promise about future state** — a
+  2026-08-01 rehearsal of exactly that shape stayed "in force" for hours after the condition it named
+  had already resolved, while `main` moved four times underneath it (`docs/WORKTREES.md`, "Announcing
+  yourself"). This is an **unenforced courtesy norm, not a substitute** for `gh pr view <N> --json
+  mergeStateStatus`, which stays the only authoritative merge-state check.
 - **Never grep for the next free ADR / BACKLOG number.** Two sessions that both grep pick the *same*
   number, create differently-named files, **merge clean**, and silently corrupt the ledger (it has fired
   three times). Allocate it atomically — `pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -Title
   "<title>"` — and add the ADR's index row in the *same* commit. A `pre-commit` hook rejects a number you
   did not allocate; see [`docs/LEDGER-GATE.md`](docs/LEDGER-GATE.md).
+- **Never CITE a `#N` you have not allocated — allocate first, or write a reference that cannot resolve.**
+  The counterpart of the rule above, and the more insidious half. While the number is unissued the citation
+  resolves to **nothing**, which is honest. The day someone legitimately allocates it, that citation
+  begins resolving — **to unrelated work, and with nothing anywhere reporting a problem**. A dangling
+  reference advertises its own brokenness; a wrongly-resolving one reads as a working cross-reference
+  forever. If you need to gesture at unfiled work, **name the subject, not a number** (*"the retention
+  runbook step, unallocated"*) — that costs nothing and cannot arm. See
+  [`docs/LEDGER-GATE.md`](docs/LEDGER-GATE.md) §"Citing a number you have not allocated".
 - **Building in two sessions at once?** Don't share the working tree — give each its own **git
   worktree** (`scripts/worktree/new.ps1 -Name <x>`, cleanup with `remove.ps1`). Each gets an isolated
   checkout + branch + `.venv`; same remote, same PR flow. See [`docs/WORKTREES.md`](docs/WORKTREES.md).
   (The AI project memory is shared across sessions — coordinate memory writes.)
+
+### Before you verify
+- Run `/simplify` on the changed code before the verification quartet below. See
+  [`docs/Code_Quality_Standards.md`](docs/Code_Quality_Standards.md) §5.1.
 
 ### Verification expectations (a task isn't "done" until these pass)
 - New behavior gets a test. Run, in order: `ruff check` + `ruff format --check`, `mypy`
@@ -293,6 +356,7 @@ diverge enough to warrant it; keep this root file general.
 
 ```
 # tests (PySide6 harness/Qt tests need the offscreen platform)
+# testpaths now also collects packaging/messagefoundry-webconsole/tests, so this covers the web console suite too.
 QT_QPA_PLATFORM=offscreen pytest -q          # PowerShell: $env:QT_QPA_PLATFORM="offscreen"; pytest -q
 
 # format / lint / types
@@ -370,6 +434,10 @@ python samples/send_mllp.py samples/messages/adt_a01.hl7
 This engine carries PHI. The full PHI map — threat model, data-at-rest inventory, redaction rules,
 and the retention/encryption roadmap + secure-ops checklist — is [`docs/PHI.md`](docs/PHI.md). Treat
 these as hard rules:
+
+> "Carries PHI" describes the **design and intended use** — it is not a claim that a live instance is
+> holding PHI today (§0: zero deployments). That changes how you word a *finding*, never whether these
+> rules apply: they are what make the first deployment safe, so none of them relax.
 - **Never log full message bodies at INFO or above.** Full payloads go only to the secured
   store, never to the general log. (Logging is stdlib today; structlog + redaction is planned —
   until then, don't raise the service to `DEBUG` in production.)
@@ -418,17 +486,66 @@ harness process only.)
 
 ## 11. Documentation
 
+- **NO GLYPHS OR EMOJI — in prose, comments, commit messages, PR bodies, or anything written back to
+  the user.** Say the word. `SHIPPED`, `BLOCKED`, `WARNING`, `DO NOT` all survive grep, copy-paste,
+  a cp1252 terminal and a screen reader; a pictograph does none of those reliably.
+
+  **The one allowed use is QUOTING a glyph as a token, in backticks** — naming the thing under
+  discussion, as this rule does below. That is code, not decoration, and it is how you talk about the
+  banner alphabet without adopting it.
+
+  **Why this is a correctness rule and not a style preference.** A glyph's meaning is *positional*, and
+  that is invisible to anyone who learns it from examples rather than from its definition. Measured
+  2026-08-04: the backlog's `✅` means "this item is closed" **only** in the leading blockquote — quoted
+  in an item's prose it is narrative. Two parsers of the same file disagreed on exactly that, one
+  reading "the glyph appears in this item" and the other "this item declares closed status", and they
+  **agreed on the current corpus by luck** because no item happens to have the discriminating shape.
+  Words carry their scope in the sentence around them; a bare glyph does not, so it invites
+  presence-equals-meaning reading and hides the ambiguity from review.
+
+  Secondary but real: emoji need variation-selector handling (`️`) in every regex that touches
+  them, and they raise `UnicodeEncodeError` on a stock Windows cp1252 console — which cost four
+  separate failures in one session.
+
+  **ONE HOLDOUT, and it is a machine-parsed contract, not an exemption.** `docs/BACKLOG.md` and
+  `docs/archive/backlog/BACKLOG-CLOSED.md` encode item status as a banner alphabet
+  (`scripts/docs/backlog_status_check.py`: `_CLOSED = "✅⛔🪦"`, `_OPEN = "🔢🚧"`), and
+  `.github/workflows/backlog-hygiene.yml` quotes it in its remediation text. **283 banners across the
+  two files and 12 referencing files** — changing it is a migration with its own item, not a doc edit,
+  and until it lands those five glyphs stay. **No NEW glyph vocabulary may be introduced anywhere**,
+  and nothing outside those two files may adopt one.
+
+  **THE WARNING SIGN (U+26A0) IS NOT A SIXTH HOLDOUT — owner-ruled 2026-08-14, "not sanctioned".** It
+  is in neither `_CLOSED` nor `_OPEN`, so `parse_items` ignores it and it carries no status semantics
+  anywhere; it is decoration, which the rule above forbids outright. **The measured population is
+  recorded here so nobody re-derives the false zero that stalled this question once already: 496
+  occurrences across 80 files** at `ae76b9f9` — 447 under `docs/` (121 in `BACKLOG.md`, 93 in
+  `BACKLOG-CLOSED.md`, 35 in `docs/adr/`), 10 in `tests/`, 4 in `ide/`, 3 in engine source, and **zero
+  in `scripts/`, in the web console, and in this file**. Retiring them is **BACKLOG #1265**, a filed
+  migration — *not* a licence to start editing those 496 lines, and not a cp1252 hazard (the cp1252
+  gate covers `scripts/**/*.py`, which contains none of them). **Census this population only with the
+  ledger counts as a positive control** — the first attempt returned a false zero off a broken shell
+  escape, and a pattern that finds nothing anywhere is indistinguishable from a clean repo.
+
+  **When you must read that alphabet, import `parse_items` from `backlog_status_check.py`. Never
+  re-derive it.** It *defines* item status — the banner block ends at the first line that is neither
+  blank nor a blockquote — and a hand-rolled scan is a second, silently different definition. That is
+  the same single-source rule `ledger_check.py` already states for `PUBLIC_BACKLOG_FLOOR`.
 - Specs/requirements in **Markdown**, kept consistent across the project.
 - Document each connector/transport and transform with its config schema and an example
   message.
 - When asked for tabular results, provide the final table directly — not code that generates it.
-- **Review security prose by asking what a reader would DO with it, not whether it is accurate.** The
-  three rules below are instances of it. Reasoning, evidence and dates:
-  [`docs/Secure_Development_Standards.md`](docs/Secure_Development_Standards.md) §3 *"Reviewing
-  security prose"* — the source of record.
-- **State a load-bearing fact ONCE and link to it; never restate it.**
-- **A completeness claim is a liability — prefer "at least" to an enumeration.**
-- **A compensating control must not rest on a false premise.**
+- **Review security prose by asking what a reader would DO with it, not whether it is accurate**
+  (**SDS-3.4**). The rules below are instances of it. Reasoning, evidence and dates:
+  [`docs/Secure_Development_Standards.md`](docs/Secure_Development_Standards.md) **SDS-3.4 to SDS-3.8**,
+  under *"Reviewing security prose"* — the source of record.
+- **State a load-bearing fact ONCE and link to it; never restate it** (**SDS-3.5**).
+- **A completeness claim is a liability — prefer "at least" to an enumeration** (**SDS-3.6**).
+- **A compensating control must not rest on a false premise** (**SDS-3.7**).
+- **Confirm your instrument answers the question you asked, not one adjacent to it** (**SDS-3.8**) —
+  `git diff` on a staged file, `--is-ancestor` under squash-merge, `$?` after a pipe, a *job*
+  conclusion for a *step* question. Name the question and what the tool returns; check they are the
+  same sentence.
 
 ---
 
@@ -450,6 +567,24 @@ harness process only.)
   ([ADR 0039](docs/adr/0039-database-tier-sharding-l5.md), L5 — **shelved**). The two axes are different
   (e.g. "cross-shard reads span K stores" is true only of *database* shards; *engine* shards share one
   store), and conflating them causes real errors.
+- **ASVS vocabulary: the SUBJECT is the engine, and the record lives elsewhere — never let the storage
+  location name the thing.** An **ASVS cell** is one requirement's graded row (verdict + reasoning +
+  citations; the scorecard is literally `[[cell]]`). An **anchor** is a citation from a cell to a line
+  of engine code. The **verifier** is `scripts/asvs/scorecard.py` — the INSTRUMENT, not the record.
+  When a cell's anchor points at code that has moved or gone, say **"the cell has a stale anchor"**:
+  the engine is not insecure and the vault is not broken, the *evidence* went stale — usually
+  **because the code got better and the fix deleted the line the anchor quoted**.
+  - **Never say "vault cell", "gate cell", or "vault gate cell".** All three name the filing cabinet
+    instead of the subject, and the third also fuses the checker with the checked — a cell exists
+    whether or not any job is running. Measured 2026-08-12: that phrasing sent a reader looking at the
+    vault, where nothing was wrong, for a defect that lived in engine code.
+  - **Keep "verifier" and "verification" apart.** *Verifier drift* = a copy of the tool differs from
+    the engine's. *Stale anchors* = the evidence moved. Different failures with adjacent names; the
+    gate's own comment says the two "are easy to confuse", and instrument drift once made the gate
+    **not run at all** on every matching pull request.
+  - **The VOCABULARY is public; the CONTENT is not.** Cell ids, coverage and gaps stay vaulted — a
+    path-to-cell map enumerates what IS covered over a closed public domain, so it hands out what is
+    NOT by subtraction. Naming the terms discloses nothing; pasting the scorecard does.
 
 **Don't**
 - Don't manipulate HL7 with raw string slicing.
@@ -465,12 +600,39 @@ harness process only.)
   accept-and-drop a received message.
 - Don't build **visual / template-driven authoring** (drag-drop transformer, declarative
   field-mapping) — **declined-by-design (v0.2+)**: code-first Routers/Handlers *are* the
-  differentiator ([`docs/BACKLOG.md`](docs/BACKLOG.md) #26). *Narrow carve-out (2026-07-10, #26
-  amendment):* a **structured Steps view** over real Python Handlers via a typed action
-  vocabulary (BACKLOG #222, ADR-gated) is permitted — plain `.py` stays the only artifact and
-  execution path; declarative logic execution, declarative field-mapping, and drag-drop canvas
-  logic authoring remain declined.
+  differentiator (BACKLOG #26 — closed, so it lives in
+  [`docs/archive/backlog/BACKLOG-CLOSED.md`](docs/archive/backlog/BACKLOG-CLOSED.md), not in the
+  live ledger). *Narrow carve-out (2026-07-10, #26 amendment; widened to Routers 2026-08-05 per
+  [ADR 0076](docs/adr/0076-typed-action-vocabulary-action-list-lens.md) Amendment D, BACKLOG
+  #232):* a **structured Steps view** over real Python Handlers **and Routers** via a typed action
+  vocabulary (BACKLOG #222 — closed, same archive; the router `route` row kind is #232, still open
+  in [`docs/BACKLOG.md`](docs/BACKLOG.md), ADR-gated) is permitted — the
+  carve-out was granted because the `.py` stays the **only artifact and the only execution path**,
+  and that property holds identically for a `@router` (a byte-splice Steps view over a real
+  `@router` projects destination selection from reviewable Python; it introduces no declarative
+  artifact and no second execution path), so naming Routers does not cross the #26 line;
+  declarative logic execution, declarative field-mapping, and drag-drop canvas logic authoring
+  remain declined.
 - Don't build **Serial (RS-232) / ASTM E1381/E1394/E1318** lab-instrument connectivity —
   **declined-by-design (v0.2+)**: no real feed demand, outside the HL7/FHIR/X12/DICOM scope
-  ([`docs/BACKLOG.md`](docs/BACKLOG.md) #27, [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md)).
+  (BACKLOG #27 — closed, so it lives in
+  [`docs/archive/backlog/BACKLOG-CLOSED.md`](docs/archive/backlog/BACKLOG-CLOSED.md), not in the
+  live ledger; the connector-parity row is [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md)).
+- Don't adopt **ISO/IEC 5055:2021 / OMG ASCQM** as a quality **measure** — **declined-by-design
+  (2026-08-07)**, three reasons each independently sufficient: no free or open-source
+  5055-conformant **Python** analyser exists (the conformant ecosystem is C/C++/Java/C#/COBOL-
+  weighted), there is no contract counterparty for the clause the standard exists to support (it is
+  written into development and outsourcing contracts; this is OSS on PyPI), and a weakness-**count**
+  score collides with the anti-metric rule in
+  [`docs/Code_Quality_Standards.md`](docs/Code_Quality_Standards.md) §4.1. **The catalogue is a
+  different question and was adopted:** the ASCQM 1.1 weakness list is free from OMG, one bounded
+  pass over it ran under **#1073**, and its findings are **#1089–#1093**. Re-running that pass is
+  legitimate; adopting the score is not. *(#1073 is closed, so it lives in
+  [`docs/archive/backlog/BACKLOG-CLOSED.md`](docs/archive/backlog/BACKLOG-CLOSED.md) once archived,
+  not in [`docs/BACKLOG.md`](docs/BACKLOG.md) — a marker here has to outlive its item by
+  construction, so it must not cite only the live file.)*
 - Don't keep grinding in a polluted context — `/clear` after repeated failures.
+- Don't use **glyphs or emoji** in prose, comments, commit messages, PR bodies or replies — say the
+  word (§11). The backlog status-banner alphabet is the one machine-parsed holdout; read it with
+  `parse_items`, never a hand-rolled scan, and introduce no new glyph vocabulary anywhere.
+

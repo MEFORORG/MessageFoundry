@@ -18,10 +18,12 @@ talks to the engine.
 > The two share the word "AI" and nothing else.
 
 > **Status (MVP).** The policy model + config + RBAC + the engine policy endpoint + the CLI + gating
-> of the existing **provider-agnostic, bring-your-own** IDE chat assistant are built. **No
-> model-provider or engine broker integration exists yet** — `managed_claude` / `managed_claude_baa`
-> are accepted as policy values but the IDE cannot service them, and the `deidentified` / `phi`
-> scopes are not reachable in the MVP (see *Future direction*).
+> of the existing **provider-agnostic, bring-your-own** IDE chat assistant are built. **One engine
+> broker IS built:** `managed_endpoint` ([ADR 0135](adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md))
+> brokers a single `code_only` prompt to a customer-managed / self-hosted LLM over `POST /ai/chat`,
+> audited per use; it never reaches `phi` scope. `managed_claude` / `managed_claude_baa` are accepted
+> as policy values but the IDE cannot service them, and the `deidentified` / `phi` scopes are not
+> reachable in the MVP (see *Future direction*).
 
 ---
 
@@ -36,6 +38,7 @@ The policy is two independent axes, then **clamped** by the instance's **product
   |---|---|
   | `off` | No AI assistance at all. |
   | `byo` | **Bring-your-own** provider, configured in the IDE; the engine never sees the traffic. Code-only by construction (PHI-safe). |
+  | `managed_endpoint` | **BUILT** ([ADR 0135](adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md)) — the engine brokers one `code_only` prompt to a **customer-managed / self-hosted** LLM over `POST /ai/chat`, audited per use, behind a fail-closed SSRF allowlist. Never reaches `phi` scope. |
   | `managed_claude` | Engine-brokered managed provider. **Future** — not serviceable by this IDE version. |
   | `managed_claude_baa` | Engine-brokered managed provider under a **BAA** + zero-data-retention connection — the only mode that can reach `phi` scope. **Future.** |
 
@@ -104,12 +107,12 @@ Set in `messagefoundry.toml`, with the usual `MEFOR_AI_*` env overrides
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `mode` | enum | `byo` | `off` · `byo` · `managed_claude` · `managed_claude_baa` |
+| `mode` | enum | `byo` | `off` · `byo` · `managed_endpoint` (**built**, ADR 0135) · `managed_claude` · `managed_claude_baa` |
 | `data_scope` | enum | `code_only` | `code_only` · `synthetic` · `deidentified` · `phi` |
 | `environment` | str | — | free-form active-environment **name** (ADR 0017); selects `environments/<name>.toml` + `current_environment()`. **Required** for `serve` (no default). |
 | `data_class` | enum | derived | `synthetic` · `phi` — does this instance carry real PHI (drives the at-rest/egress advisories). Derived from a built-in name (`dev`→synthetic, `staging`/`prod`→phi) when unset; **required** for a custom name. |
 | `production` | bool | derived | production-tier posture (drives the AI ceiling + prod DEBUG refusal), decoupled from the name. Derived (`dev`/`staging`→false, `prod`→true) when unset; **required** for a custom name. |
-| `provider` | str | `claude` | **forward-compat, unused in MVP** (P1 broker) |
+| `provider` | str | `claude` | names the provider the broker addresses; recorded in the per-use audit. Does **not** select a request shape (the broker builds one wire shape unconditionally). **Validated at config load** — only a serviceable provider is accepted (BACKLOG #95) |
 | `model` | str | `claude-opus-4-8` | **forward-compat, unused in MVP** |
 | `baa_attested` | bool | `false` | **forward-compat, unused in MVP** |
 | `endpoint` | str | — | **forward-compat, unused in MVP** |
@@ -175,9 +178,11 @@ stdout); on error it prints `{"error": "..."}`. It prints **config only, never m
 ## IDE gating behavior
 
 The IDE assistant ([ide/src/chat.ts](../ide/src/chat.ts)) resolves the policy **before** every
-request: it first calls `GET /ai/policy` (authoritative); on any error it falls back to the local
-`messagefoundry ai-policy` CLI; if that also fails it uses a conservative built-in default
-(`byo` / `code_only` / `prod`, `assist_permitted: null`) so the safe assistant still works offline.
+request: it first calls `GET /ai/policy` (authoritative, and cached on success); on any error it falls
+back to that cached authoritative policy, then to the local `messagefoundry ai-policy` CLI; if none of
+those can positively confirm a policy it uses a fail-closed built-in default (`mode: unverified`),
+which **disables** assistance rather than re-enabling BYO — a central *off* must not be bypassable by
+taking the engine offline (SEC-022).
 
 Then it applies the effective policy:
 
@@ -186,13 +191,32 @@ Then it applies the effective policy:
 | `mode == off` | **Disabled.** "AI assistance is turned off by your MessageFoundry policy." |
 | `mode == managed_claude` / `managed_claude_baa` | **Disabled.** This IDE version can't service a managed provider; it does **not** silently fall back to BYO (that would violate operator intent). |
 | `mode == byo` and `assist_permitted == false` | **Disabled.** "Your role does not include the `ai:assist` permission." |
-| `mode == byo` and `assist_permitted` is `true` **or** `null` | **Enabled** (proceeds as today). |
+| `mode == byo` and `assist_permitted` is `true` **or** `null` | **Enabled** — *unless* an authoritative `false` was previously observed; see the sticky-deny rule below. |
+| `mode == unverified` (nothing could confirm a policy) | **Disabled.** Fail-closed; see above. |
 
-**The tokenless-IDE / `assist_permitted == null` trust note.** Under BYO, `null` (RBAC not evaluable
-offline) is **allowed**. This is safe by construction: BYO sends only **code-only** context to the
-developer's own provider — it never sees the engine or any message data, so there is no PHI to
-protect with RBAC at this stage. The central *off* switch is still honored because `mode` is read
+**The `assist_permitted == null` trust note.** Under BYO, `null` (RBAC not evaluable) is **allowed**.
+This is safe by construction: BYO sends only **code-only** context to the developer's own provider —
+it never sees the engine or any message data, so there is no PHI to protect with RBAC at this stage.
+The central *off* switch is honored regardless, because `mode` is identity-independent and is read
 straight from the policy, token or not.
+
+**The IDE's gate read is authenticated (BACKLOG #330).** `assist_permitted` is computed from the
+acting identity, so a tokenless caller can only ever be told `null` and the deny row above could never
+fire. `resolveAiPolicy` therefore attaches the cached bearer — never prompting for one, and never over
+plain `http://` to a non-loopback host. Two things this does **not** change: the engine endpoint stays
+tokenless-*readable* (the `GET /ai/policy` section above is unchanged and still true), and the status
+bar's **separate**, timer-driven read of the same route stays **tokenless** — it wants only the
+identity-independent `environment`, and a bearer on that timer would keep refreshing the session's
+idle clock and make the engine's 30-minute idle timeout unreachable (CWE-613).
+
+**The sticky-deny rule (ADR 0035 AC-7).** Because `null` means "could not be evaluated" rather than
+"permitted", a fresh `null` must not *upgrade* assistance a central policy switched off: an
+authoritative `assist_permitted: false` the IDE has already observed is **retained** over a later
+`null`, so under BYO that combination resolves to **Disabled**. The rule is deliberately one-way — a
+cached `true` is *not* sticky, since fabricating a permit from stale state is the fail-open direction
+— and any evaluable `true`/`false` replaces the cached value outright, so signing in is the escape
+hatch. Anything that is not the literal `true`/`false`, **including a response that omits the field**,
+counts as "not evaluated" and never as a permit.
 
 `messagefoundry.showAiPolicy` (command **"MessageFoundry: Show AI Policy"**) displays the current
 resolved policy in the IDE.

@@ -37,9 +37,11 @@ session — accumulated 12 stale worktrees. Advisory text has no measurable effe
 human or on the model.
 
 **Second — and this is the part that is easy to get wrong — the gate must key on the write's TARGET PATH,
-never on the session's cwd.** 29% of writes already come from a session sitting in the primary that
-correctly writes *into a worktree* by absolute path. A cwd-keyed gate would have denied all 4,010 of them.
-Where a session *sits* is irrelevant; only where it *writes* matters.
+never on the session's cwd.** The worktree row of the table above is the 29%: those sessions already
+write *correctly* into a worktree by absolute path, and a cwd-keyed gate would have denied all 4,010 of
+them. Both percentages are shares of the same 166 sessions' Edit/Write calls, so the 29% and the 44%
+are two numerators over one denominator rather than two measurements. Where a session *sits* is
+irrelevant; only where it *writes* matters.
 
 ## What it blocks
 
@@ -164,7 +166,12 @@ confirm every config dir shows hook entries.
 Two structural choices worth understanding:
 
 - **Every config dir, not just `~/.claude`.** The hook is registered into `~/.claude/settings.json` **and**
-  every `~/.claude-account-*/settings.json` (the VS Code launchers that set `CLAUDE_CONFIG_DIR`), mirroring
+  every `~/.claude-account-<N>/settings.json` (the VS Code launchers that set `CLAUDE_CONFIG_DIR`) — that
+  name shape **exactly**, anchored on a decimal N, because an unanchored `.claude-account-*` also matched
+  `~/.claude-account-2.lock`, a directory the installer then wrote gate wiring into on every run while the
+  wiring check read it back as evidence (BACKLOG #1024). `-Status` now enumerates `~/.claude*`
+  independently of that predicate, so its audit cannot agree with the writer by construction, and it names
+  any dir outside the wire set that still carries gate wiring. This mirrors
   what `install-selfheal.ps1` already does. This is not a detail: the gate originally wired only
   `~/.claude`, which left every account-N session **ungated** — and those are where the parallel VS Code
   chats run. A session under an ungoverned account then checked its own branch out inside another session's

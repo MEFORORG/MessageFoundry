@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """ADR 0114 sub-lever A — live SQL Server legs (env-gated: MEFOR_TEST_SQLSERVER=1 + MEFOR_STORE_*).
 
 The offline suite (test_adr0114_claim_proc.py) freezes the DDL text, the gate logic, and the
@@ -65,7 +67,7 @@ async def _open(**flag_overrides: Any) -> SqlServerStore:
 async def _clean(store: SqlServerStore) -> None:
     # The canonical live-suite cleanup order (test_claim_fifo_heads._open_sqlserver): children
     # before messages (response FKs it), so no 547 on a shared live DB.
-    for table in ("message_events", "queue", "response", "delivered_keys", "outbox", "messages"):
+    for table in ("message_events", "queue", "response", "delivered_keys", "messages"):
         await store._execute(f"DELETE FROM {table}")  # noqa: S608 - test cleanup, fixed names
 
 

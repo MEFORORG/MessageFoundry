@@ -1,24 +1,37 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""Structured Steps view over Python Handlers — the static ``ast`` parser (ADR 0076 §3–§4).
+"""Structured Steps view over Python Handlers and Routers — the static ``ast`` parser (ADR 0076 §3–§4).
 
-:func:`parse_module` classifies each ``@handler`` body in a config module into the **row contract** of
-ADR 0076 §3: ordered, nested rows of kind ``action`` / ``lookup`` / ``control`` / ``send`` / ``code``.
-It is a **static parse** — it uses only the stdlib :mod:`ast` and **never imports or executes** the
-config module, so a module whose top level would raise (or whose imports are unavailable) still parses
-(ADR 0076 §5, gate 4). Routers are **out of v1 scope** (handlers only).
+:func:`parse_module` classifies each ``@handler`` (and, at contract v2, each ``@router``) body in a
+config module into the **row contract** of ADR 0076 §3: ordered, nested rows of kind ``action`` /
+``lookup`` / ``control`` / ``send`` / ``diagnostic`` / ``code``, plus ``note`` (Amendment A) and
+``route`` (Amendment D). It is a **static parse** — it uses only the stdlib :mod:`ast` and **never
+imports or executes** the config module, so a module whose top level would raise (or whose imports are
+unavailable) still parses (ADR 0076 §5, gate 4).
 
 The load-bearing property (ADR 0076 §6, gate 1 — the **coverage invariant**): the emitted rows'
-line ranges **exactly partition** each handler's def body (the statement suite from the first body
+line ranges **exactly partition** each element's def body (the statement suite from the first body
 statement through the function's last line) — every line is in exactly one row; nothing is dropped,
 reordered, or synthesized. Unrecognized constructs become in-place ``code`` rows (the degradation
 ladder: typed row → code row → whole-file refusal only on parse failure).
 
+**Contract versions (ADR 0076 §A.7 / §D.7 — skew is handled, not discovered).** ``parse_source`` emits
+no schema version of its own, and the IDE shells whatever ``messagefoundry`` is on ``PATH``, so a NEW
+row kind reaching an OLD consumer renders a blank, titleless row. Both new kinds are therefore gated
+behind an explicit ``contract`` argument (``lens parse --contract N``):
+
+* :data:`CONTRACT_V1` (the default) is the shipped contract — no ``note`` rows, no ``route`` rows, no
+  ``@router`` projection, no ``role``/``contract_version`` fields. A consumer that passes nothing gets
+  **byte-identical** output to the pre-amendment parser.
+* :data:`CONTRACT_V2` adds the ``note`` and ``route`` kinds, projects ``@router`` defs, and stamps each
+  entry with ``role`` + ``contract_version`` so a consumer can tell the two projections apart.
+
 Two contract details worth stating for L3 consumers: a ``lookup`` row may carry an extra ``assign_to``
-field (the assignment target of e.g. ``row = db_lookup(...)`` — within §3's contract, optional). And a
-trailing comment *after the last statement* in a def lives **outside** the partition (beyond the def's
-``node.end_lineno``, which the AST fixes to the last statement's last line), by design — the partition
-covers ``[first_stmt_line, node.end_lineno]``, so nothing after it is a row (safe for phase-3 splices).
+field (the assignment target of e.g. ``row = db_lookup(...)`` — within §3's contract, optional). And at
+:data:`CONTRACT_V1` a trailing comment *after the last statement* in a def lives **outside** the
+partition (beyond the def's ``node.end_lineno``, which the AST fixes to the last statement's last
+line); at :data:`CONTRACT_V2` the partition is extended over that trailing comment run so it projects
+as a ``note`` row instead of vanishing (Amendment A §A.3 defect 1).
 
 The engine owns the grammar so it lives beside the vocabulary; the IDE consumes the JSON contract
 only (``messagefoundry lens parse <module.py> --json``). This module adds **no runtime dependency** —
@@ -34,6 +47,9 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 __all__ = [
+    "CONTRACT_LATEST",
+    "CONTRACT_V1",
+    "CONTRACT_V2",
     "LensParseError",
     "LensRewriteError",
     "parse_module",
@@ -41,6 +57,18 @@ __all__ = [
     "rewrite_module",
     "rewrite_source",
 ]
+
+#: The shipped ADR 0076 §3 contract — ``action``/``lookup``/``control``/``send``/``diagnostic``/``code``
+#: rows for ``@handler`` defs only. The DEFAULT, so a consumer that asks for nothing (an IDE older than
+#: the grammar amendments) can never be handed a kind it has no renderer for (§A.7 / §D.7).
+CONTRACT_V1 = 1
+#: Adds the ``note`` kind (Amendment A) and the ``route`` kind + ``@router`` projection (Amendment D),
+#: and stamps each entry with ``role`` ("handler"/"router") + ``contract_version``.
+CONTRACT_V2 = 2
+#: The newest contract this parser can emit. A consumer asks for the version it can RENDER, never this.
+CONTRACT_LATEST = CONTRACT_V2
+
+_CONTRACTS = frozenset({CONTRACT_V1, CONTRACT_V2})
 
 
 class LensParseError(ValueError):
@@ -88,7 +116,10 @@ _ACTION_PARAMS: dict[str, list[str]] = {
 # as DBSelect-style ``lookup`` rows (ADR 0076 §3). db_lookup/fhir_lookup take no ``msg`` argument.
 _LOOKUP_PARAMS: dict[str, list[str]] = {
     "db_lookup": ["connection", "statement", "params"],
-    "fhir_lookup": ["connection", "query"],
+    # ``params`` is not optional garnish here: since #1243 removed the flat '?'-query, the structured
+    # params= form is the ONLY way to express a fhir_lookup SEARCH, so without it a Steps row could
+    # only ever emit a read-by-id. Same shape db_lookup already uses.
+    "fhir_lookup": ["connection", "query", "params"],
     "code_lookup": ["msg", "path", "table"],  # default is keyword-only
 }
 
@@ -267,26 +298,35 @@ def _native_action_row(
 # --- public entry points -----------------------------------------------------
 
 
-def parse_module(path: str | Path) -> list[dict[str, Any]]:
-    """Parse the config module file at ``path`` and return its ``@handler`` row contracts (ADR 0076 §3).
+def parse_module(path: str | Path, *, contract: int = CONTRACT_V1) -> list[dict[str, Any]]:
+    """Parse the config module file at ``path`` and return its element row contracts (ADR 0076 §3).
 
     Statically parses the file text with :mod:`ast` — the module is **never imported or executed**.
-    Returns one contract dict per handler, ``{"handler", "module", "def_line", "rows"}``; a module with
-    no handlers returns ``[]``. Raises :class:`LensParseError` if the file cannot be read or parsed."""
+    Returns one contract dict per element, ``{"handler", "module", "def_line", "rows"}``; a module with
+    no handlers returns ``[]``. ``contract`` selects the emitted grammar (:data:`CONTRACT_V1` default —
+    see the module docstring). Raises :class:`LensParseError` if the file cannot be read or parsed."""
     p = Path(path)
     try:
         source = p.read_text(encoding="utf-8")
     except OSError as exc:
         raise LensParseError(f"{p}: cannot read ({exc})") from exc
     # posix slashes keep the emitted contract (and the committed L3 fixtures) OS-neutral.
-    return parse_source(source, module=p.as_posix())
+    return parse_source(source, module=p.as_posix(), contract=contract)
 
 
-def parse_source(source: str, *, module: str = "<source>") -> list[dict[str, Any]]:
-    """Parse Python ``source`` text and return the ``@handler`` row contracts (see :func:`parse_module`).
+def parse_source(
+    source: str, *, module: str = "<source>", contract: int = CONTRACT_V1
+) -> list[dict[str, Any]]:
+    """Parse Python ``source`` text and return the element row contracts (see :func:`parse_module`).
 
     The file-free entry point (used by tests). ``module`` is echoed into each contract's ``module``
-    field. Raises :class:`LensParseError` on a syntax error."""
+    field. ``contract`` selects the emitted grammar — :data:`CONTRACT_V1` (the default) is the shipped
+    handler-only contract, :data:`CONTRACT_V2` adds ``note`` + ``route`` rows and ``@router``
+    projection. Raises :class:`LensParseError` on a syntax error or an unknown ``contract``."""
+    if contract not in _CONTRACTS:
+        raise LensParseError(
+            f"unknown contract version {contract!r} (supported: {sorted(_CONTRACTS)})"
+        )
     # A leading UTF-8 BOM (U+FEFF) is invalid in a ``str`` handed to :func:`ast.parse` (it is only
     # stripped on the *bytes* path), so drop it up front; line numbers are unaffected (it sits on line 1).
     source = source.removeprefix("\ufeff")
@@ -301,54 +341,98 @@ def parse_source(source: str, *, module: str = "<source>") -> list[dict[str, Any
     for node in tree.body:
         if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
-        name = _handler_name(node)
-        if name is None:
-            continue  # not a @handler (router or plain def) — out of v1 scope
+        found = _element_name(node, contract)
+        if found is None:
+            continue  # not a projectable element (a plain def, or a @router below CONTRACT_V2)
+        name, role = found
+        ctx = _Ctx(source=source, lines=lines, role=role, contract=contract)
         body_start = node.body[0].lineno
-        body_end = node.end_lineno or body_start
+        body_end = _body_end(node, ctx)
         # The def body is the top suite; its id is the def line (unique per module, so sibling handlers
         # never share a suite id in the flat webview row list).
-        rows = _partition_suite(node.body, body_start, body_end, 0, source, lines, str(node.lineno))
-        # ADR 0104 fan-out: an append-send only counts when its collector is a DELIVERING accumulator;
-        # demote the orphans to code rows BEFORE merge (so they coalesce), then (post-merge) tag the
-        # ``sends = []`` init + ``return sends`` footer of the accumulators that kept a visible append.
-        delivering = _delivering_accumulators(node)
-        used = _demote_orphan_appends(rows, node, delivering)
-        # Tag scaffold BEFORE merge (the init/footer are still their own single-statement code rows), then
-        # merge — which leaves scaffold rows standalone — so a `sends = []` preceded by another statement
-        # still renders as its own muted row instead of blending into a code block.
-        _tag_scaffold(rows, node, used)
+        rows = _partition_suite(node.body, body_start, body_end, 0, ctx, str(node.lineno))
+        if role == "handler":
+            # ADR 0104 fan-out: an append-send only counts when its collector is a DELIVERING accumulator;
+            # demote the orphans to code rows BEFORE merge (so they coalesce), then (post-merge) tag the
+            # ``sends = []`` init + ``return sends`` footer of the accumulators that kept a visible append.
+            # A router has no send rows at all (§D.6), so the whole fan-out pass is handler-only.
+            delivering = _delivering_accumulators(node)
+            used = _demote_orphan_appends(rows, node, delivering)
+            # Tag scaffold BEFORE merge (the init/footer are still their own single-statement code rows),
+            # then merge — which leaves scaffold rows standalone — so a `sends = []` preceded by another
+            # statement still renders as its own muted row instead of blending into a code block.
+            _tag_scaffold(rows, node, used)
         rows = _merge_code_rows(rows)
         entry: dict[str, Any] = {
+            # The key stays ``handler`` for a router too: it carries the ELEMENT's registered name and is
+            # also the rewrite addressing key (``lens rewrite --edit {"handler": …}``). Renaming it would
+            # fork every locator in the rewrite half for no gain; ``role`` is what discriminates.
             "handler": name,
             "module": module,
             "def_line": node.lineno,
             "rows": rows,
         }
-        # ADR 0104 §2.3 P2: the handler's recognized message type, for the field-picker scope. Emitted only
-        # when present, so a typeless handler / an older contract is byte-identical (→ generic scope).
-        accepts = _handler_accepts(node)
-        if accepts is not None:
-            entry["accepts_types"] = accepts
-        inferred = _handler_inferred_type(node)
-        if inferred is not None:
-            entry["inferred_type"] = inferred
+        if contract >= CONTRACT_V2:
+            # Additive discriminators, emitted only where a consumer asked for the newer grammar, so a
+            # CONTRACT_V1 payload stays byte-identical to the pre-amendment parser (§A.7 / §D.7).
+            entry["role"] = role
+            entry["contract_version"] = contract
+        if role == "handler":
+            # ADR 0104 §2.3 P2: the handler's recognized message type, for the field-picker scope. Emitted
+            # only when present, so a typeless handler / an older contract is byte-identical (→ generic
+            # scope). A router selects destinations rather than editing fields — it has no field picker to
+            # scope and no transform verbs in its palette (§D.6) — so no type hint is emitted for one.
+            accepts = _handler_accepts(node)
+            if accepts is not None:
+                entry["accepts_types"] = accepts
+            inferred = _handler_inferred_type(node)
+            if inferred is not None:
+                entry["inferred_type"] = inferred
         handlers.append(entry)
     return handlers
 
 
-# --- handler discovery -------------------------------------------------------
+# --- element discovery (handler / router) ------------------------------------
 
 
-def _handler_name(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
-    """The registered name of a ``@handler("name")`` def, or None if it is not a handler.
+class _Ctx(NamedTuple):
+    """The per-def parse context threaded through the partition.
 
-    A ``@router`` (or any other decoration) returns None — routers are out of v1 scope. A ``@handler``
-    with a non-literal name falls back to the def name so the handler still appears."""
+    ``role`` is the enclosing def's decorator role ("handler" / "router") — it is what disambiguates a
+    ``return []`` (an explicit FILTER in a handler, ROUTED NOWHERE in a router; ADR 0076 §D.4).
+    ``contract`` is the requested grammar version, so a v1 consumer never receives a v2 row kind."""
+
+    source: str
+    lines: list[str]
+    role: str
+    contract: int
+
+
+def _element_name(
+    node: ast.FunctionDef | ast.AsyncFunctionDef, contract: int
+) -> tuple[str, str] | None:
+    """``(registered name, role)`` for a projectable def, or None for anything else.
+
+    A ``@router`` is projectable only at :data:`CONTRACT_V2` and above (ADR 0076 Amendment D); below it
+    the parser behaves exactly as the shipped one did and skips routers entirely."""
+    name = _handler_name(node)
+    if name is not None:
+        return name, "handler"
+    if contract >= CONTRACT_V2:
+        name = _router_name(node)
+        if name is not None:
+            return name, "router"
+    return None
+
+
+def _decorated_name(node: ast.FunctionDef | ast.AsyncFunctionDef, decorator: str) -> str | None:
+    """The registered name of a ``@<decorator>("name")`` def, or None if it carries no such decorator.
+
+    A decoration with a non-literal name falls back to the def name so the element still appears."""
     for dec in node.decorator_list:
         if not isinstance(dec, ast.Call):
             continue
-        if _callee_name(dec.func) != "handler":
+        if _callee_name(dec.func) != decorator:
             continue
         if (
             dec.args
@@ -358,6 +442,16 @@ def _handler_name(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
             return dec.args[0].value
         return node.name
     return None
+
+
+def _handler_name(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+    """The registered name of a ``@handler("name")`` def, or None if it is not a handler."""
+    return _decorated_name(node, "handler")
+
+
+def _router_name(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+    """The registered name of a ``@router("name")`` def, or None if it is not a router (Amendment D)."""
+    return _decorated_name(node, "router")
 
 
 def _callee_name(func: ast.expr) -> str | None:
@@ -467,13 +561,44 @@ def _handler_inferred_type(node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict
 # --- partition (the coverage invariant) --------------------------------------
 
 
+def _body_end(node: ast.FunctionDef | ast.AsyncFunctionDef, ctx: _Ctx) -> int:
+    """The last line of the def body the partition covers.
+
+    At :data:`CONTRACT_V1` this is ``node.end_lineno`` — the AST fixes it to the last *statement's* last
+    line, so a comment written after it falls outside every row and is not rendered at all (Amendment A
+    §A.3 defect 1: the Add-palette's own Comment step, inserted after the last statement, disappears).
+    At :data:`CONTRACT_V2` the range is extended over the trailing run of blank/comment lines that are
+    indented **into the def body**, so that comment projects as a ``note`` row.
+
+    The indent test is what keeps the extension inside the def: a comment at column 0 (or shallower than
+    the body) belongs to module scope — a section banner above the next element — and is left outside,
+    as are the shebang/SPDX/import lines the partition has never covered (§A.5 "no module scope")."""
+    end = node.end_lineno or node.body[0].lineno
+    if ctx.contract < CONTRACT_V2:
+        return end
+    body_indent = len(_leading_ws(ctx.lines[node.body[0].lineno - 1]).expandtabs())
+    last = end
+    for lineno in range(end + 1, len(ctx.lines) + 1):
+        text = ctx.lines[lineno - 1]
+        stripped = text.strip()
+        if not stripped:
+            continue  # a blank line is carried only if a qualifying comment follows it
+        if not stripped.startswith("#"):
+            break
+        if len(_leading_ws(text).expandtabs()) < body_indent:
+            break  # dedented out of the body — module scope
+        last = lineno
+    return last
+
+
 def _partition_suite(
-    stmts: list[ast.stmt], lo: int, hi: int, nesting: int, source: str, lines: list[str], suite: str
+    stmts: list[ast.stmt], lo: int, hi: int, nesting: int, ctx: _Ctx, suite: str
 ) -> list[dict[str, Any]]:
     """Tile the inclusive line range ``[lo, hi]`` occupied by ``stmts`` into contiguous rows.
 
     Every line in ``[lo, hi]`` lands in exactly one row: each statement contributes its own row(s), and
-    any gap between them (blank lines, standalone comments) becomes a ``code`` row in place.
+    any gap between them (blank lines, standalone comments) is tiled by :func:`_tile_gap` — one ``code``
+    row at :data:`CONTRACT_V1`, split into ``note``/``code`` sub-rows at :data:`CONTRACT_V2`.
 
     Statements that **share a physical line** (a semicolon-compound line such as ``a; b``, or a
     multi-line statement whose last line carries a ``;``-joined sibling) are outside the bounded grammar,
@@ -492,9 +617,9 @@ def _partition_suite(
         g_start = group[0].lineno
         g_end = max((s.end_lineno or s.lineno) for s in group)
         if g_start > cursor:
-            rows.append(_code_row(cursor, g_start - 1, nesting))
+            rows.extend(_tile_gap(cursor, g_start - 1, nesting, ctx))
         if len(group) == 1:
-            emitted = _emit_stmt(group[0], nesting, source, lines)
+            emitted = _emit_stmt(group[0], nesting, ctx)
             # The first row is the statement's OWN row (a control header for a block, else the simple/code
             # row) — it lives in THIS suite. Any further rows are a block's body/else, stamped by their own
             # recursive `_partition_suite` with the child suite id, so only stamp `emitted[0]` here.
@@ -506,10 +631,53 @@ def _partition_suite(
             rows.append(_code_row(g_start, g_end, nesting))
         cursor = g_end + 1
     if cursor <= hi:
-        rows.append(_code_row(cursor, hi, nesting))
+        rows.extend(_tile_gap(cursor, hi, nesting, ctx))
     # Stamp the in-suite code rows (gaps/trailing) that were appended directly, not via `_emit_stmt`.
     for row in rows:
         row.setdefault("suite", suite)
+    return rows
+
+
+def _tile_gap(lo: int, hi: int, nesting: int, ctx: _Ctx) -> list[dict[str, Any]]:
+    """Tile a statement-free line range ``[lo, hi]`` — blank lines and standalone comments.
+
+    At :data:`CONTRACT_V1` the whole range is one ``code`` row, exactly as the shipped parser emitted it.
+    At :data:`CONTRACT_V2` a **run of standalone comment lines at the same indent** becomes a ``note``
+    row (ADR 0076 §A.1) and everything else stays a ``code`` row; the sub-rows are contiguous and
+    exhaustive over the same exact range, so the coverage partition (§6 gate 1) is preserved by
+    construction (§A.4).
+
+    A **pragma** comment (``# noqa``, ``# fmt: off``, …) always forms its OWN note row rather than
+    joining a neighbouring run: it is functional code and must stay individually read-only, and folding
+    it into an editable run would let one text edit relocate or destroy it (§A.4)."""
+    if ctx.contract < CONTRACT_V2 or hi < lo:
+        return [_code_row(lo, hi, nesting)]
+    rows: list[dict[str, Any]] = []
+    run: list[int] = []  # the comment lines accumulated for the pending note row
+
+    def flush() -> None:
+        if run:
+            rows.append(_note_row(run[0], run[-1], nesting, ctx.lines))
+            run.clear()
+
+    for lineno in range(lo, hi + 1):
+        text = ctx.lines[lineno - 1] if lineno - 1 < len(ctx.lines) else ""
+        if not text.strip().startswith("#"):
+            flush()
+            # Blank / unclassifiable lines stay code rows; `_merge_code_rows` coalesces the run later.
+            rows.append(_code_row(lineno, lineno, nesting))
+            continue
+        pragma = _is_pragma(text)
+        # Break the run when the indent changes (a different suite reading) or a pragma is involved on
+        # either side — a pragma is always alone.
+        if run and (
+            pragma
+            or _is_pragma(ctx.lines[run[-1] - 1])
+            or _leading_ws(ctx.lines[run[-1] - 1]) != _leading_ws(text)
+        ):
+            flush()
+        run.append(lineno)
+    flush()
     return rows
 
 
@@ -534,65 +702,86 @@ def _group_shared_lines(stmts: list[ast.stmt]) -> list[list[ast.stmt]]:
     return groups
 
 
-def _emit_stmt(s: ast.stmt, nesting: int, source: str, lines: list[str]) -> list[dict[str, Any]]:
+def _emit_stmt(s: ast.stmt, nesting: int, ctx: _Ctx) -> list[dict[str, Any]]:
     """Rows tiling exactly ``[s.lineno, s.end_lineno]`` for one statement (recursing into control blocks)."""
     if isinstance(s, ast.If):
-        return _emit_if(s, nesting, "if", source, lines)
+        return _emit_if(s, nesting, "if", ctx)
     if isinstance(s, ast.For | ast.AsyncFor):
-        return _emit_for(s, nesting, source, lines)
+        return _emit_for(s, nesting, ctx)
     if isinstance(s, ast.Raise):
         # ``raise ...`` — a recognized single-line control row (ADR 0106); no nested body. It maps to the
         # post-ACK ERROR/dead-letter + AlertSink path and does NOT NAK the already-ACKed sender.
         return [
             _control_row(
                 "raise",
-                _src(s.exc, source) if s.exc is not None else None,
+                _src(s.exc, ctx.source) if s.exc is not None else None,
                 True,
                 s.lineno,
                 s.end_lineno or s.lineno,
                 nesting,
             )
         ]
-    recognized = _classify_simple(s, nesting, source)
+    recognized = _classify_simple(s, nesting, ctx)
     if recognized is not None:
         return [recognized]
     return [_code_row(s.lineno, s.end_lineno or s.lineno, nesting)]
 
 
-def _emit_if(
-    node: ast.If, nesting: int, kind: str, source: str, lines: list[str]
-) -> list[dict[str, Any]]:
+def _header_end(header_line: int, body_first: int, ctx: _Ctx) -> int:
+    """The last line of a control HEADER, shrunk off any comment/blank lines that lead its body.
+
+    The shipped parser emits a control header as ``[node.lineno, body_first - 1]``, so a comment written
+    as the FIRST line of an ``if``/``for``/``else`` body is swallowed into the header row (Amendment A
+    §A.4 — "control-header spans must shrink, and that is a fixture-visible contract change"). At
+    :data:`CONTRACT_V2` the trailing run of comment/blank lines is handed back to the BODY suite, where
+    it tiles at the body's nesting as ``note``/``code`` rows.
+
+    Scanning backwards is safe for a multi-line header (``if (\\n  a\\n):``): the header's own last line
+    ends in ``:`` — never a bare comment — so the scan stops there. The header keeps at least its own
+    first line, so the span can never invert."""
+    if ctx.contract < CONTRACT_V2:
+        return body_first - 1
+    end = body_first - 1
+    while end > header_line:
+        text = ctx.lines[end - 1] if end - 1 < len(ctx.lines) else ""
+        if text.strip() and not text.strip().startswith("#"):
+            break
+        end -= 1
+    return end
+
+
+def _emit_if(node: ast.If, nesting: int, kind: str, ctx: _Ctx) -> list[dict[str, Any]]:
     """Rows for an ``if``/``elif`` block: a control header row, the nested body, then its ``elif``/``else``."""
     first = node.body[0].lineno
     if first <= node.lineno:
         # Inline suite (``if x: y``) — the bounded grammar does not cover it; degrade to one code row.
         return [_code_row(node.lineno, node.end_lineno or node.lineno, nesting)]
-    match = _classify_if_control(node.test, source)
+    match = _classify_if_control(node.test, ctx.source)
     recognized = _is_bounded(node.test) or match is not None
+    header_end = _header_end(node.lineno, first, ctx)
     rows = [
         _control_row(
             kind,
-            _src(node.test, source),
+            _src(node.test, ctx.source),
             recognized,
             node.lineno,
-            first - 1,
+            header_end,
             nesting,
             match.label if match else None,
             match.operand if match else None,
         )
     ]
     body_end = node.body[-1].end_lineno or first
-    # The body is a child suite keyed by this block's header line (unique per module).
+    # The body is a child suite keyed by this block's header line (unique per module). It starts at the
+    # line after the (possibly shrunk) header, so a leading comment tiles INSIDE the body, at its nesting.
     rows.extend(
-        _partition_suite(node.body, first, body_end, nesting + 1, source, lines, str(node.lineno))
+        _partition_suite(node.body, header_end + 1, body_end, nesting + 1, ctx, str(node.lineno))
     )
-    rows.extend(_emit_orelse(node, body_end, nesting, source, lines))
+    rows.extend(_emit_orelse(node, body_end, nesting, ctx))
     return rows
 
 
-def _emit_orelse(
-    node: ast.If, body_end: int, nesting: int, source: str, lines: list[str]
-) -> list[dict[str, Any]]:
+def _emit_orelse(node: ast.If, body_end: int, nesting: int, ctx: _Ctx) -> list[dict[str, Any]]:
     """Rows tiling ``(body_end, node.end_lineno]`` — the ``elif``/``else`` tail of an ``if`` (or ``[]``)."""
     orelse = node.orelse
     if not orelse:
@@ -603,49 +792,49 @@ def _emit_orelse(
     # if's column, an indented ``else: if`` does not.
     if len(orelse) == 1 and isinstance(first_or, ast.If) and first_or.col_offset == node.col_offset:
         if first_or.lineno > body_end + 1:
-            rows.append(_code_row(body_end + 1, first_or.lineno - 1, nesting))
-        rows.extend(_emit_if(first_or, nesting, "elif", source, lines))
+            rows.extend(_tile_gap(body_end + 1, first_or.lineno - 1, nesting, ctx))
+        rows.extend(_emit_if(first_or, nesting, "elif", ctx))
         return rows
 
     # Plain ``else`` block. Locate the ``else:`` header line in the region before the else body.
     end_lineno = node.end_lineno or body_end
     else_body_first = first_or.lineno
-    else_line = _find_keyword(lines, body_end + 1, else_body_first - 1, "else")
+    else_line = _find_keyword(ctx.lines, body_end + 1, else_body_first - 1, "else")
     if else_line is None or else_body_first <= else_line:
         # No locatable header, or an inline ``else: y`` — degrade the whole tail to one code row.
         return [_code_row(body_end + 1, end_lineno, nesting)]
     if else_line > body_end + 1:
-        rows.append(_code_row(body_end + 1, else_line - 1, nesting))
-    rows.append(_control_row("else", None, True, else_line, else_body_first - 1, nesting))
+        rows.extend(_tile_gap(body_end + 1, else_line - 1, nesting, ctx))
+    else_header_end = _header_end(else_line, else_body_first, ctx)
+    rows.append(_control_row("else", None, True, else_line, else_header_end, nesting))
     else_body_end = orelse[-1].end_lineno or else_body_first
     # The else body is its own suite, keyed by the ``else:`` header line.
     rows.extend(
         _partition_suite(
-            orelse, else_body_first, else_body_end, nesting + 1, source, lines, str(else_line)
+            orelse, else_header_end + 1, else_body_end, nesting + 1, ctx, str(else_line)
         )
     )
     return rows
 
 
-def _emit_for(
-    node: ast.For | ast.AsyncFor, nesting: int, source: str, lines: list[str]
-) -> list[dict[str, Any]]:
+def _emit_for(node: ast.For | ast.AsyncFor, nesting: int, ctx: _Ctx) -> list[dict[str, Any]]:
     """Rows for a ``for`` block: a control header row (recognized iff a Message iteration) + nested body.
 
     A ``for ... else`` tail (rare) is emitted as a trailing ``code`` row so the partition stays exact."""
     first = node.body[0].lineno
     if first <= node.lineno:
         return [_code_row(node.lineno, node.end_lineno or node.lineno, nesting)]
-    test_src = f"{_src(node.target, source)} in {_src(node.iter, source)}"
+    test_src = f"{_src(node.target, ctx.source)} in {_src(node.iter, ctx.source)}"
     match = _classify_for_control(node)
     recognized = _is_message_iteration(node.iter) or match is not None
+    header_end = _header_end(node.lineno, first, ctx)
     rows = [
         _control_row(
             "for",
             test_src,
             recognized,
             node.lineno,
-            first - 1,
+            header_end,
             nesting,
             match.label if match else None,
             match.operand if match else None,
@@ -653,7 +842,7 @@ def _emit_for(
     ]
     body_end = node.body[-1].end_lineno or first
     rows.extend(
-        _partition_suite(node.body, first, body_end, nesting + 1, source, lines, str(node.lineno))
+        _partition_suite(node.body, header_end + 1, body_end, nesting + 1, ctx, str(node.lineno))
     )
     end_lineno = node.end_lineno or body_end
     if node.orelse and body_end < end_lineno:
@@ -664,10 +853,20 @@ def _emit_for(
 # --- simple-statement classification -----------------------------------------
 
 
-def _classify_simple(s: ast.stmt, nesting: int, source: str) -> dict[str, Any] | None:
-    """A recognized ``action`` / ``lookup`` / ``send`` row for a simple statement, or None (→ ``code``)."""
+def _classify_simple(s: ast.stmt, nesting: int, ctx: _Ctx) -> dict[str, Any] | None:
+    """A recognized ``action`` / ``lookup`` / ``send`` / ``route`` row for a simple statement, or None."""
     line_start = s.lineno
     line_end = s.end_lineno or s.lineno
+    source = ctx.source
+
+    if ctx.role == "router":
+        # A router SELECTS DESTINATIONS; it does not mutate ``msg`` (ADR 0076 §D.6). Its only recognized
+        # simple statement is the routing return — every transform verb, lookup and diagnostic stays a
+        # read-only ``code`` row, which is also why a ``db_lookup``/``fhir_lookup`` in a router body never
+        # projects as a ``lookup`` row (those RAISE outside a live Handler, ADR 0010/0043).
+        if isinstance(s, ast.Return):
+            return _route_row(s.value, line_start, line_end, nesting)
+        return None
 
     # ``return Send(...)`` / ``return [Send(...), ...]`` — a send row.
     if isinstance(s, ast.Return) and s.value is not None:
@@ -776,6 +975,47 @@ def _classify_simple(s: ast.stmt, nesting: int, source: str) -> dict[str, Any] |
             row["assign_to"] = assign_to
         return row
     return None
+
+
+def _route_row(
+    value: ast.expr | None, line_start: int, line_end: int, nesting: int
+) -> dict[str, Any]:
+    """The ``route`` row for a ``@router``'s return statement (ADR 0076 §D.3 / §D.4).
+
+    ``handlers`` carries the selected **handler** names — a different namespace from a ``send`` row's
+    ``outbounds`` (outbound-connection names, a different pipeline stage), which is why this is a new
+    kind rather than a widened ``send`` (§D.5). Its literal-or-empty rule mirrors ``send``'s: a
+    non-literal element yields ``handlers: []``.
+
+    ``unrouted: true`` is the additive discriminator for a **routed-nowhere** return (``return []`` /
+    ``()`` / ``None`` / a bare ``return``) — the store disposition **UNROUTED**: logged, never dropped,
+    and distinct from a handler's ``filtered``. A DYNAMIC return (``return [pick(msg)]``) also yields an
+    empty list but carries **no** ``unrouted``, because the lens cannot see whether it routes."""
+    row: dict[str, Any] = {
+        "kind": "route",
+        "handlers": [],
+        "line_start": line_start,
+        "line_end": line_end,
+        "nesting": nesting,
+    }
+    if value is None or (isinstance(value, ast.Constant) and value.value is None):
+        row["unrouted"] = True
+        return row
+    if isinstance(value, ast.List | ast.Tuple):
+        if not value.elts:
+            row["unrouted"] = True
+            return row
+        names = [
+            e.value for e in value.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)
+        ]
+        # Partial literalness is NOT partially captured: one dynamic element makes the whole selection
+        # unknowable, so the row degrades to "dynamic" rather than asserting the names it happened to see.
+        if len(names) == len(value.elts):
+            row["handlers"] = names
+        return row
+    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+        row["handlers"] = [value.value]
+    return row
 
 
 def _send_outbounds(value: ast.expr) -> list[str] | None:
@@ -1194,6 +1434,56 @@ def _code_row(line_start: int, line_end: int, nesting: int) -> dict[str, Any]:
     return {"kind": "code", "line_start": line_start, "line_end": line_end, "nesting": nesting}
 
 
+# A comment matching this allowlist is FUNCTIONAL CODE, not prose: it changes what ruff/mypy do to the
+# file. Such a note is emitted with ``pragma: true`` and is read-only (ADR 0076 §A.4) — without that, a
+# text edit could turn a ``fmt: off`` pragma into prose and break gate 3 (``ruff format --check``), or a
+# delete could drop a standalone lint-suppression pragma and turn lint red. The list is a prefix
+# allowlist, deliberately small; anything not on it is ordinary prose and stays editable.
+# (The pragma spellings are written WITHOUT their leading hash in this comment on purpose: ruff reads a
+# hash-prefixed suppression token inside ANY comment as a directive on that line, so naming one literally
+# here would emit a lint warning about this very comment. The regex itself carries the real spellings.)
+_PRAGMA_RE = re.compile(
+    r"^#\s*(?:fmt\s*:\s*(?:off|on|skip)\b"
+    r"|noqa\b|ruff\s*:\s*noqa\b|type\s*:\s*ignore\b"
+    r"|region\b|endregion\b)"
+)
+
+
+def _is_pragma(line: str) -> bool:
+    """Whether a standalone-comment physical ``line`` is a read-only pragma (see :data:`_PRAGMA_RE`)."""
+    return _PRAGMA_RE.match(line.strip()) is not None
+
+
+def _note_body(line: str) -> str:
+    """The comment body of a standalone-comment physical ``line`` — everything AFTER its first ``#``.
+
+    Verbatim (§A.1): the indent, the ``#`` run and any interior spacing are all preserved, so ``## banner``
+    reads back as ``# banner`` and re-renders byte-identically. This is deliberately NOT the
+    ``insert_comment`` normalizer (``text.strip().lstrip("#").strip()``), which is correct for AUTHORING
+    and lossy for EDITING — it would rewrite ``## banner`` to ``# banner`` and ``#region Setup`` to
+    ``# region Setup`` (§A.4)."""
+    return line[line.index("#") + 1 :]
+
+
+def _note_row(line_start: int, line_end: int, nesting: int, lines: list[str]) -> dict[str, Any]:
+    """A ``note`` row over a run of standalone comment lines (ADR 0076 §A.1).
+
+    ``raw`` is the physical line(s) verbatim and ``text`` is the same lines with their leading ``#``
+    dropped; both join a multi-line run with ``\\n``. A note is a LEAF row with no membership semantics —
+    no grouping, no collapse, no ``#region`` folding (§A.5, which is the line between this and the
+    owner-declined BACKLOG #231)."""
+    raws = [lines[ln - 1] if ln - 1 < len(lines) else "" for ln in range(line_start, line_end + 1)]
+    return {
+        "kind": "note",
+        "text": "\n".join(_note_body(r) for r in raws),
+        "raw": "\n".join(raws),
+        "pragma": any(_is_pragma(r) for r in raws),
+        "line_start": line_start,
+        "line_end": line_end,
+        "nesting": nesting,
+    }
+
+
 def _control_row(
     control: str,
     test_src: str | None,
@@ -1246,7 +1536,14 @@ def _merge_code_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Coalesce consecutive, line-contiguous ``code`` rows at the same nesting into one (in place, in order).
 
     Keeps the partition exact (contiguity preserved) while collapsing spurious blank-line/comment splits
-    so a run of unrecognized lines renders as a single opaque step."""
+    so a run of unrecognized lines renders as a single opaque step.
+
+    **Kind-aware (ADR 0076 §A.4).** The merge tests ``kind == "code"`` on BOTH sides, so a ``note`` row
+    can never be absorbed into a neighbouring code row — which is Amendment A §A.3 defect 2 (an inserted
+    Comment adjacent to any other opaque or blank line produced no row at all, the existing Code row
+    silently growing by one line). It is also what keeps a note off the handler DOCSTRING: the docstring
+    is ``body[0]``, a real ``ast.Expr(Constant)`` statement, so it stays its own ``code`` row (which
+    ``_apply_delete_row`` already handles correctly) and a comment beneath it stays a separate note."""
     merged: list[dict[str, Any]] = []
     for row in rows:
         if (
@@ -1269,9 +1566,10 @@ def _merge_code_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _is_collector_init(s: ast.stmt, collectors: set[str]) -> bool:
     """Whether ``s`` is a ``NAME = []`` accumulator init for a NAME in ``collectors``.
 
-    A LIST only (never ``()``): a tuple has no ``.append`` and the runtime's ``_partition`` keys on
-    ``isinstance(result, list)``, so a tuple collector is not a valid accumulator — it stays a plain
-    code row."""
+    A LIST only (never ``()``): a tuple has no ``.append``, so a tuple collector cannot be an
+    accumulator — it stays a plain code row. (The runtime no longer narrows on ``list`` at all —
+    ``_partition`` accepts any non-``str`` iterable, BACKLOG #341 — but ``.append`` is the reason that
+    governs here, and it is unchanged.)"""
     return (
         isinstance(s, ast.Assign)
         and len(s.targets) == 1
@@ -1374,7 +1672,18 @@ _SEND_TO = "to"
 
 # ``diagnostic`` rows (log_note/checkpoint) are editable too (ADR 0106 §5 K) — but only their template/
 # label LITERAL: their operands fall past the signature and are skipped by _editable_slots/literal_params.
-_EDITABLE_KINDS = frozenset({"action", "lookup", "send", "diagnostic"})
+# ``note`` (ADR 0076 Amendment A) and ``route`` (Amendment D) join them at CONTRACT_V2: a note's text and
+# a route's handler list are both editable, each through its own splice path (a note has no ``ast`` node,
+# so no existing locator applies; a route splices the return's value expression).
+_EDITABLE_KINDS = frozenset({"action", "lookup", "send", "diagnostic", "note", "route"})
+
+# Ops that AUTHOR a transform verb, a lookup or an outbound send. They are refused inside a ``@router``
+# (ADR 0076 §D.6 / AC-R5): a router stays pure destination-selection, and ``db_lookup``/``fhir_lookup``
+# RAISE outside a live Handler. The IDE's router Add-palette does not offer them; this is the engine-side
+# half of the same rule, so a hand-built edit spec cannot smuggle one in either.
+_HANDLER_ONLY_OPS = frozenset(
+    {"insert_row", "insert_code_lookup", "insert_send", "add_destination"}
+)
 
 # v2 adds three STRUCTURAL ops (delete/insert/move) + multi-line param edits to v1's ``set_params``
 # (ADR 0076 §2 phase 3 v2); ``paste_block`` adds the Steps block-paste (re-indenting a captured block into
@@ -1403,7 +1712,7 @@ _SUPPORTED_OPS = frozenset(
 _MAX_LINE_LENGTH = 100
 
 
-def rewrite_module(path: str | Path, edit: dict[str, Any]) -> str:
+def rewrite_module(path: str | Path, edit: dict[str, Any], *, contract: int = CONTRACT_V1) -> str:
     """Apply one row edit to the config module at ``path`` and return the rewritten source (ADR 0076 §5).
 
     Statically parses the file text with :mod:`ast` — the module is **never imported or executed**. The
@@ -1417,10 +1726,12 @@ def rewrite_module(path: str | Path, edit: dict[str, Any]) -> str:
         source = p.read_bytes().decode("utf-8")
     except OSError as exc:
         raise LensParseError(f"{p}: cannot read ({exc})") from exc
-    return rewrite_source(source, edit, module=p.as_posix())
+    return rewrite_source(source, edit, module=p.as_posix(), contract=contract)
 
 
-def rewrite_source(source: str, edit: dict[str, Any], *, module: str = "<source>") -> str:
+def rewrite_source(
+    source: str, edit: dict[str, Any], *, module: str = "<source>", contract: int = CONTRACT_V1
+) -> str:
     """Apply one row edit to ``source`` text and return the rewritten source (see :func:`rewrite_module`).
 
     ``edit`` is the **edit spec** (ADR 0076 §5):
@@ -1433,8 +1744,10 @@ def rewrite_source(source: str, edit: dict[str, Any], *, module: str = "<source>
     parameters. A parameter *value* is either a JSON scalar (rendered as a Python **literal** — only when
     the current argument is itself a literal) or ``{"expr": "<python source>"}`` (spliced **verbatim** as
     an expression, e.g. a bounded ``Message`` read). ``params={}`` is a valid **no-op** and returns the
-    source byte-identically. Raises :class:`LensParseError` on a syntax error, :class:`LensRewriteError`
-    on any refusal."""
+    source byte-identically. ``contract`` must match the version the caller PROJECTED with
+    (:data:`CONTRACT_V1` default): the row is located through the same grammar the client saw, so a v1
+    client's coordinates resolve against the v1 partition and a v2 client's against the v2 one. Raises
+    :class:`LensParseError` on a syntax error, :class:`LensRewriteError` on any refusal."""
     op = edit.get("op", "set_params")
     if op not in _SUPPORTED_OPS:
         raise LensRewriteError(f"unsupported op {op!r} (supported: {sorted(_SUPPORTED_OPS)})")
@@ -1462,7 +1775,7 @@ def rewrite_source(source: str, edit: dict[str, Any], *, module: str = "<source>
     _check_expect_src(edit, src, line_start, line_end)
 
     # Locate the row via the SAME grammar the parser emits, so an edit can only target what parse shows.
-    contracts = parse_source(src, module=module)
+    contracts = parse_source(src, module=module, contract=contract)
     row = _find_contract_row(contracts, line_start, line_end, handler_filter)
     if row is None:
         raise LensRewriteError(
@@ -1470,6 +1783,16 @@ def rewrite_source(source: str, edit: dict[str, Any], *, module: str = "<source>
             + (f" in handler {handler_filter!r}" if handler_filter else "")
         )
     kind = row["kind"]
+    role = row.get("_role", "handler")
+    if role == "router" and (
+        op in _HANDLER_ONLY_OPS or (op == "template" and edit.get("template") == "send")
+    ):
+        raise LensRewriteError(
+            f"op {op!r} authors a transform verb, lookup or outbound send — refused inside the "
+            f"@router {row['_handler']!r}, which stays pure destination-selection (ADR 0076 §D.6)"
+        )
+    if kind == "note":
+        _check_note_op(row, op, line_start, line_end)
     # ``insert_row``/``move_row``/``paste_block`` use the target only as a POSITION (an anchor to insert/
     # paste before/after, or the block a move repositions), re-indenting across nesting as needed — so they
     # may target a read-only code/control row (moving a whole if/for block is exactly a control-row move).
@@ -1480,16 +1803,25 @@ def rewrite_source(source: str, edit: dict[str, Any], *, module: str = "<source>
         if not (op == "delete_row" and kind == "control" and row.get("control") in ("if", "for")):
             raise LensRewriteError(
                 f"row at lines {line_start}-{line_end} is a {kind!r} row — only action/lookup/send/"
-                "diagnostic rows are editable (code and control rows are read-only, ADR 0076 §5)"
+                "diagnostic/note/route rows are editable (code and control rows are read-only, "
+                "ADR 0076 §5)"
             )
 
-    handler_node = _handler_def(tree, row["_handler"])
+    handler_node = _element_def(tree, row["_handler"], role)
     if handler_node is None:
         raise LensRewriteError(
-            f"internal: could not locate handler {row['_handler']!r} for lines {line_start}-{line_end}"
+            f"internal: could not locate {role} {row['_handler']!r} for lines {line_start}-{line_end}"
         )
 
-    if op == "set_params":
+    if op == "set_params" and kind == "note":
+        # A note has no ``ast`` node, so every statement locator is unusable — this is the lens's only
+        # whole-physical-line regeneration, and it takes the indent + ``#`` form from the EXISTING line.
+        result = _apply_set_note(src, row, edit, line_start, line_end)
+    elif op == "delete_row" and kind == "note":
+        result = _apply_delete_note(src, line_start, line_end)
+    elif op == "set_params" and kind == "route":
+        result = _apply_set_route(src, handler_node, row, edit, line_start, line_end)
+    elif op == "set_params":
         result = _apply_set_params(src, handler_node, row, edit, line_start, line_end)
     elif op == "delete_row":
         result = _apply_delete_row(src, handler_node, line_start, line_end)
@@ -1634,26 +1966,173 @@ def _apply_set_params(
     return _splice_slots(src, slots, params)
 
 
+# --- note rows (ADR 0076 Amendment A) ----------------------------------------
+
+
+def _check_note_op(row: dict[str, Any], op: str, line_start: int, line_end: int) -> None:
+    """Refuse the note operations the v1 grammar does not support (ADR 0076 §A.4 / §A.6).
+
+    Two refusals, for two different reasons:
+
+    * **A pragma note is read-only.** ``# fmt: off`` / ``# noqa`` / ``# type: ignore`` are functional
+      code: editing one to prose, moving it, or deleting it changes what ruff and mypy do to the file, so
+      it would break §6 gate 3 (``ruff format --check``) or turn lint red.
+    * **No note is movable in v1.** A comment is not an ``ast`` statement, so the move path has nothing to
+      relocate — and §A.6 records that move/delete of a *recognized* row already re-attaches neighbouring
+      comments to the wrong step. Making notes movable on top of that would render a confidently
+      mis-positioned caption; the honest v1 answer is that a note holds its place in the file."""
+    if op == "move_row":
+        raise LensRewriteError(
+            f"row at lines {line_start}-{line_end} is a note row — notes are not movable in v1 "
+            "(a comment is not a statement); edit it as text to relocate it"
+        )
+    if row.get("pragma") and op in ("set_params", "delete_row"):
+        raise LensRewriteError(
+            f"row at lines {line_start}-{line_end} is a PRAGMA note ({row.get('text', '').strip()!r}) — "
+            "it is functional code (it changes what ruff/mypy do to this file) and is read-only"
+        )
+
+
+def _apply_set_note(
+    src: str, row: dict[str, Any], edit: dict[str, Any], line_start: int, line_end: int
+) -> str:
+    """Set a ``note`` row's text, preserving each line's indentation and ``#`` prefix form (§A.3 / AC-N3).
+
+    This is the lens's first regeneration of a whole physical line — a comment has no ``ast`` node, so
+    there is no verbatim argument segment to reuse the way :func:`_splice_slots` does. The compensating
+    rule is that only the text AFTER the first ``#`` is replaced: the leading whitespace, the ``#`` run
+    (``##``, ``#region``) and the line terminator all come from the EXISTING line, never from the
+    ``insert_comment`` authoring normalizer (which is deliberately lossy: ``## banner`` → ``# banner``).
+
+    Setting the text to its current value therefore returns the source byte-identically, and the line
+    COUNT is fixed — a text with a different number of lines is refused rather than silently shifting
+    every row coordinate below it."""
+    params = edit.get("params", {})
+    if not isinstance(params, dict):
+        raise LensRewriteError("edit 'params' must be an object of {name: value}")
+    if not params:
+        return src  # a no-op edit round-trips byte-identically
+    unknown = set(params) - {"text"}
+    if unknown:
+        raise LensRewriteError(
+            f"unknown parameter(s) {sorted(unknown)!r} for a note row (it exposes only 'text')"
+        )
+    text = params["text"]
+    if not isinstance(text, str):
+        raise LensRewriteError("a note row's 'text' must be a string")
+    if text == row.get("text"):
+        return src  # unchanged → byte-identical (AC-N3)
+    if "\r" in text:
+        raise LensRewriteError("a note row's 'text' must not contain a carriage return")
+    new_bodies = text.split("\n")
+    span = line_end - line_start + 1
+    if len(new_bodies) != span:
+        raise LensRewriteError(
+            f"the note spans {span} line(s) but the new text has {len(new_bodies)} — editing a note "
+            "may not change the file's line count; insert or delete a note row instead"
+        )
+    lines = _physical_lines_keepends(src)
+    for offset, body in enumerate(new_bodies):
+        original = lines[line_start - 1 + offset]
+        term = _line_terminator(original)
+        content = original[: len(original) - len(term)]
+        prefix = content[: content.index("#") + 1]  # indent + the '#' run's first hash
+        physical = prefix + body
+        if len(physical) > _MAX_LINE_LENGTH:
+            raise LensRewriteError(
+                f"the edited comment would be {len(physical)} columns — over the {_MAX_LINE_LENGTH}-"
+                "column limit; shorten it"
+            )
+        lines[line_start - 1 + offset] = physical + term
+    return "".join(lines)
+
+
+def _apply_delete_note(src: str, line_start: int, line_end: int) -> str:
+    """Remove a ``note`` row's physical lines; every other byte is preserved (gate 2).
+
+    A comment is never a statement, so unlike :func:`_apply_delete_row` this can never empty a suite."""
+    lines = _physical_lines_keepends(src)
+    del lines[line_start - 1 : line_end]
+    return "".join(lines)
+
+
+# --- route rows (ADR 0076 Amendment D) ---------------------------------------
+
+
+def _apply_set_route(
+    src: str,
+    element_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    row: dict[str, Any],
+    edit: dict[str, Any],
+    line_start: int,
+    line_end: int,
+) -> str:
+    """Set a ``route`` row's handler list — a byte-splice of the return's value expression (AC-R4).
+
+    Setting the list to its current value returns the source byte-identically, which also means a
+    DYNAMIC return (``return [pick(msg)]``, projected as ``handlers: []`` with no ``unrouted``) is never
+    silently flattened to ``[]``: an edit that "changes nothing" changes nothing."""
+    params = edit.get("params", {})
+    if not isinstance(params, dict):
+        raise LensRewriteError("edit 'params' must be an object of {name: value}")
+    if not params:
+        return src
+    unknown = set(params) - {"handlers"}
+    if unknown:
+        raise LensRewriteError(
+            f"unknown parameter(s) {sorted(unknown)!r} for a route row (it exposes only 'handlers')"
+        )
+    handlers = params["handlers"]
+    if not isinstance(handlers, list) or not all(isinstance(h, str) for h in handlers):
+        raise LensRewriteError("a route row's 'handlers' must be a list of handler-name strings")
+    if handlers == row.get("handlers"):
+        return src  # unchanged → byte-identical (AC-R4)
+    stmt = _find_stmt(element_node.body, line_start, line_end)
+    if not isinstance(stmt, ast.Return):
+        raise LensRewriteError(
+            f"internal: could not locate the routing return at lines {line_start}-{line_end}"
+        )
+    if stmt.value is None:
+        raise LensRewriteError(
+            f"row at lines {line_start}-{line_end} is a bare 'return' — there is no destination list to "
+            "splice; edit it as text"
+        )
+    rendered = "[" + ", ".join(_str_lit(h) for h in handlers) + "]"
+    # Route through the audited slot splice: it works in UTF-8 byte space, refuses a multi-line value
+    # (which would change the line count), and validates the rendered expression parses.
+    return _splice_slots(src, {"handlers": stmt.value}, {"handlers": {"expr": rendered}})
+
+
 # --- rewrite helpers ---------------------------------------------------------
 
 
 def _find_contract_row(
     contracts: list[dict[str, Any]], line_start: int, line_end: int, handler_filter: str | None
 ) -> dict[str, Any] | None:
-    """The contract row whose span is exactly ``[line_start, line_end]`` (annotated with ``_handler``)."""
+    """The contract row whose span is exactly ``[line_start, line_end]``, annotated with its element.
+
+    ``_handler`` is the enclosing element's registered name and ``_role`` its decorator role — the pair
+    the rewrite half needs to re-locate the def (a router is looked up by ``@router``, not ``@handler``)."""
     for contract in contracts:
         if handler_filter is not None and contract["handler"] != handler_filter:
             continue
         for row in contract["rows"]:
             if row["line_start"] == line_start and row["line_end"] == line_end:
-                return {**row, "_handler": contract["handler"]}
+                return {
+                    **row,
+                    "_handler": contract["handler"],
+                    "_role": contract.get("role", "handler"),
+                }
     return None
 
 
-def _handler_def(tree: ast.Module, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
-    """The ``@handler`` FunctionDef registered as ``name`` (or None)."""
+def _element_def(
+    tree: ast.Module, name: str, role: str
+) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    """The ``@handler``/``@router`` FunctionDef registered as ``name`` for ``role`` (or None)."""
+    resolve = _router_name if role == "router" else _handler_name
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and _handler_name(node) == name:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and resolve(node) == name:
             return node
     return None
 
@@ -1999,19 +2478,34 @@ def _paste_anchor_indent(lines: list[str], line_start: int, line_end: int, posit
     A ``code`` row can span a leading/trailing BLANK line + a comment; indenting to the blank line's
     0-indent would dedent the new step/block out of its suite (an "unexpected indent" on the following line,
     or a reparse refusal). Scanning from the insertion side for the first non-blank line finds the suite's
-    real indent; a fully-blank row (defensive — a real row always has a non-blank line) falls back to
-    ``line_start``. Shared by :func:`_apply_insert_row` and :func:`_apply_paste_block` so the two derive the
-    landing indent identically."""
+    real indent. Shared by :func:`_apply_insert_row` and :func:`_apply_paste_block` so the two derive the
+    landing indent identically.
+
+    A **fully blank** anchor row used to fall back to ``line_start`` — i.e. to indent ``""`` — which
+    dedented the insert out of its suite and refused with "unexpected indent". ADR 0076 §A.4 records that
+    as already broken before ``note`` rows existed (its own docstring called the case "defensive", which
+    was already untrue); splitting notes away from adjacent blanks makes blank-only rows common, so it is
+    fixed here. The fallback now scans OUTWARD from the row for the nearest non-blank line — backwards
+    first, since the preceding statement is what establishes the suite — and only an entirely blank file
+    yields ``""``."""
     scan = (
         range(line_end, line_start - 1, -1)
         if position == "after"
         else range(line_start, line_end + 1)
     )
-    ref = next(
-        (lines[ln - 1] for ln in scan if 0 <= ln - 1 < len(lines) and lines[ln - 1].strip()),
-        lines[line_start - 1] if 0 <= line_start - 1 < len(lines) else "",
+
+    def _text(ln: int) -> str | None:
+        """The physical line ``ln`` when it has content, else None (so ``next`` skips blanks)."""
+        return lines[ln - 1] if 0 <= ln - 1 < len(lines) and lines[ln - 1].strip() else None
+
+    within = next((t for ln in scan if (t := _text(ln)) is not None), None)
+    if within is not None:
+        return _leading_ws(within)
+    outward = next(
+        (t for ln in range(line_start - 1, 0, -1) if (t := _text(ln)) is not None),
+        next((t for ln in range(line_end + 1, len(lines) + 1) if (t := _text(ln)) is not None), ""),
     )
-    return _leading_ws(ref)
+    return _leading_ws(outward)
 
 
 def _module_bound_names(tree: ast.Module) -> tuple[set[str], bool]:
@@ -2234,9 +2728,11 @@ def _is_send_return(s: ast.Return) -> bool:
     if isinstance(v, ast.List | ast.Tuple) and not v.elts:
         return True  # `return []` / `return ()` — the filter, converts to an accumulator with just the new send
     if isinstance(v, ast.Tuple):
-        # A NON-empty tuple return is dropped by the runtime ``_partition`` (it keys on
-        # ``isinstance(result, list)``), so it already delivers nothing; converting it to a list-building
-        # accumulator would silently flip 0→N deliveries. Refuse it — leave it a code row / edit-as-text.
+        # A NON-empty tuple return DELIVERS at runtime (``_partition`` accepts any non-``str`` iterable,
+        # BACKLOG #341), so converting it to a list-building accumulator would now be delivery-neutral
+        # rather than a silent 0→N flip. It is refused anyway, on CONSERVATIVE SCOPE: the palette never
+        # authors this form, and enabling the rewrite carries its own byte-stability obligations
+        # (ADR 0108 §6/§7) that belong to a Steps-view item, not here. Leave it a code row / edit-as-text.
         return False
     return _send_outbounds(v) is not None
 
@@ -2859,8 +3355,17 @@ def _render_template(edit: dict[str, Any]) -> str:
         return f"    for i in range(1, msg.count_segments({_str_lit(seg)}) + 1):\n        pass"
     if template == "if":
         return f"    if {_render_if_test(edit)}:\n        pass"
+    if template == "route":
+        # ADR 0076 Amendment D — the router palette's "Route to handler(s)". An empty list is a
+        # deliberate ``return []``: routed nowhere, the store disposition UNROUTED (logged, never dropped).
+        handlers = edit.get("handlers")
+        if not isinstance(handlers, list) or not all(isinstance(h, str) and h for h in handlers):
+            raise LensRewriteError(
+                "template 'route' requires 'handlers': a list of non-empty handler-name strings"
+            )
+        return f"    return [{', '.join(_str_lit(h) for h in handlers)}]"
     raise LensRewriteError(
-        f"unknown template {template!r} (expected if / for_each / filter / raise)"
+        f"unknown template {template!r} (expected if / for_each / filter / raise / send / route)"
     )
 
 

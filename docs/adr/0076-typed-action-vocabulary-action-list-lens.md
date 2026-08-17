@@ -3,7 +3,7 @@
 **Status:** Accepted (2026-07-10) — ratified by the owner 2026-07-10; the PLAN-8 lanes may build. Gating rule: **phase 1 (the vocabulary) requires only the #26-amendment merge; phases 2–3 require this ADR Accepted.** In practice phase 1 builds after Acceptance anyway — its v1 roster is fixed by §2 and MULTISESSION-PLAN-8 bundles it with phase 2a in one lane. **Amendment A — ACCEPTED, ratified by the owner 2026-07-30 and IN FORCE:** a `note` row kind so comment-only rows stop projecting as opaque `code`, superseding ADR 0106 §5 (L); §3's enum and §4's ladder read as amended, and BACKLOG #248 is the build. **Amendment B — ⛔ DECLINED by owner ruling 2026-07-30 (too risky):** ADR 0089 Phase D "helper descent" is **not adopted and not to be built** — aliasing across duplicate call sites has no solution in any ADR, and the yield is unmeasured and may be negative. The specification is retained so the decline is auditable, not as a plan; reopening needs a **new** amendment. The better lever, explicitly not declined, is teaching Phase A the `msg["X"] = v` subscript form — it widens what is editable without touching the row shape.
 **Deciders:** owner + IDE/DX working group
 **Related:** BACKLOG **#222** (this build), **#26 amendment** (the narrow carve-out this ADR operates under), **#221** (sibling IDE-polish lane), the deep-research findings ([`docs/research/ide-low-code-options.md`](../research/ide-low-code-options.md) — verified precedents: InterSystems low-code custom editors, Kaoto/Karavan/AWS Workflow Studio, Iguana annotations, Corepoint action-lists), ADR 0007/0033/0014 (the sanctioned config-as-data GUIs), ADR 0072 (traced dry-run — the live values rendered beside action rows), ADR 0010/0043 (`db_lookup`/`fhir_lookup` — the sanctioned read-only lookups the lens renders as DBSelect-style rows), ADR 0035 (IDE workspace-trust — `lens` CLI calls are exec-gated like every CLI call), CLAUDE.md §9 (PHI), §12 (the amended bright line).
-Plan: [`docs/releases/MULTISESSION-PLAN-8.md`](../releases/MULTISESSION-PLAN-8.md) (L2 builds phases 1+2a; L3 builds phase 2b; L4 = phase 3, owner-gated).
+Plan: `docs/releases/MULTISESSION-PLAN-8.md` (L2 builds phases 1+2a; L3 builds phase 2b; L4 = phase 3, owner-gated).
 **Code references** are `origin/main @ 954bd22`; line numbers drift — locate exactly at implementation time.
 
 ---
@@ -139,11 +139,17 @@ Phase 2b shipped the lens with the live-value slot **stubbed** (each row rendere
 > The evidence in §A.3 was verified against `main` before ratification.
 >
 > **In force means the grammar changed, not that the build is done.** §3's row enum now includes `note`
-> and `diagnostic`; §4's ladder gains `note` as a sibling of the typed rows. BACKLOG #248 is the build
-> and is now unblocked. The invariants in §A.4 are **build gates, not caveats** — in particular the
-> pragma allowlist, the `_merge_code_rows` docstring exclusion, and the rule that a note edit takes its
-> indentation and `#` prefix form from the existing line rather than the insert normalizer. §A.6's two
-> known-wrong behaviours are **not** fixed by this amendment and must not be reported as fixed.
+> and `diagnostic`; §4's ladder gains `note` as a sibling of the typed rows. The invariants in §A.4 are
+> **build gates, not caveats** — in particular the pragma allowlist, the `_merge_code_rows` docstring
+> exclusion, and the rule that a note edit takes its indentation and `#` prefix form from the existing
+> line rather than the insert normalizer. §A.6's two known-wrong behaviours are **not** fixed by this
+> amendment and must not be reported as fixed.
+>
+> **Build status: BACKLOG #248 is BUILT** (branch `steps-grammar`, not yet merged). The `note` kind is
+> emitted at `lens parse --contract 2` and threaded through both IDE implementations; every AC-N below
+> carries the node id that proves it. §A.6's two known-wrong behaviours remain unfixed **by design** —
+> the build discharges §A.6's requirement by making notes non-movable rather than by landing the extent
+> fix. §A.8's #239 re-run is **still owed** and is NOT part of this build.
 
 §3's row enum ends at `{ "kind": "code", … } // verbatim, unrecognized`, and §4's ladder sends
 "everything else" there. A standalone comment is therefore projected as an opaque `Code` step. This
@@ -290,8 +296,10 @@ the comment merged into an unrelated row. **The build lands failing tests for (1
   `delete_row` would begin failing with "internal: could not locate the statement" on **every** action
   that has a leading comment. Attachment ("a statement travels with its leading comment block") is a
   separate, larger item and is gated on BACKLOG #233 — `blockExtent` / `walkMove` / `resolveDrop` are
-  implemented twice (`ide/src/stepsModel.ts:1767` vs `ide/media/stepsWebview.js:68`) with no
-  differential test.
+  implemented twice (`blockExtent` in `ide/src/stepsModel.ts` vs `ide/media/stepsWebview.js:68`) with no
+  differential test. *(2026-08-04: the "no differential test" half is closed —
+  `ide/src/test/suite/steps-mirror.test.ts` is that test. The duplication itself stands; the owner chose
+  the differential gate over de-duplication.)*
 - **No inline/trailing-comment extraction.** Verified working today: `set_params` on
   `msg.set("PID-3.1", "X")  # noqa: E501` preserves the pragma exactly, and interior comments in a
   multi-line call are absorbed into the action row's span. A note kind must not touch either.
@@ -344,24 +352,48 @@ New residual: pragma notes are visible but read-only, an intentional and documen
 
 ## Acceptance Criteria
 
-- **AC-N1** — WHEN a handler def body contains a run of standalone comment lines, THE SYSTEM SHALL emit
-  a `note` row spanning exactly those lines at the enclosing suite's nesting, and the emitted rows SHALL
-  still exactly partition the def body → coverage-partition property test, extended with
-  comment/blank/pragma corpora.
-- **AC-N2** — WHEN a Comment is inserted after the last statement of a handler, THE SYSTEM SHALL either
-  render it as a `note` row or refuse the insert with a clean error; it SHALL NOT accept the insert and
-  render nothing → regression test for the vanishing-comment defect, written failing first.
-- **AC-N3** — WHEN a `note` row's text is set to its current value, THE SYSTEM SHALL produce a
+- [x] **AC-N1** — WHEN a handler def body contains a run of standalone comment lines, THE SYSTEM SHALL
+  emit a `note` row spanning exactly those lines at the enclosing suite's nesting, and the emitted rows
+  SHALL still exactly partition the def body →
+  `tests/test_lens_grammar_v2.py::test_note_runs_split_on_blank_indent_and_pragma`,
+  `::test_adversarial_partition_is_total`, `::test_samples_partition_is_total_at_every_contract`.
+- [x] **AC-N2** — WHEN a Comment is inserted after the last statement of a handler, THE SYSTEM SHALL
+  either render it as a `note` row or refuse the insert with a clean error; it SHALL NOT accept the insert
+  and render nothing →
+  `tests/test_lens_grammar_v2.py::test_comment_after_the_last_statement_projects_as_a_note_row`. The
+  defect was reproduced against the shipped parser first: the row set covered line 6 only, with the
+  comment on line 7 in no row at all.
+- [x] **AC-N3** — WHEN a `note` row's text is set to its current value, THE SYSTEM SHALL produce a
   byte-identical file; WHEN it is set to a new value, THE SYSTEM SHALL change only that row's line
   range, SHALL preserve the original indentation and `#` prefix form, and the result SHALL re-parse to
-  the same kind, span, nesting, and suite → byte-stability + round-trip test refs.
-- **AC-N4** — WHERE a comment matches the pragma allowlist, THE SYSTEM SHALL emit `"pragma": true` and
-  SHALL refuse `set_params`, `delete_row`, and `move_row` on that row → pragma-immutability test refs.
-- **AC-N5** — THE SYSTEM SHALL NOT emit a `note` row at module scope, for a handler docstring, or for a
-  comment sharing a line with a statement; a trailing `# noqa` SHALL survive a `set_params` on its
-  statement byte-for-byte → negative test refs.
-- **AC-N6** — WHEN a construct is unrecognized, THE SYSTEM SHALL emit a `code` row; a whole-file refusal
-  SHALL occur only on `ast.parse` failure → unchanged ladder assertion, re-run over the note corpus.
+  the same kind, span, nesting, and suite →
+  `tests/test_lens_grammar_v2.py::test_note_edit_preserves_indent_and_hash_form_and_round_trips`,
+  `::test_setting_a_row_to_its_current_value_is_byte_identical`,
+  `::test_byte_stability_survives_crlf_and_a_bom`. A text with a different line count is refused rather
+  than silently shifting every row below it (`::test_note_edit_refuses_a_line_count_change`).
+- [x] **AC-N4** — WHERE a comment matches the pragma allowlist, THE SYSTEM SHALL emit `"pragma": true`
+  and SHALL refuse `set_params`, `delete_row`, and `move_row` on that row →
+  `tests/test_lens_grammar_v2.py::test_pragma_note_refuses_edit_delete_and_move`; the client greys the
+  controls rather than surfacing the refusal as a toast (`ide/src/test/suite/steps-contract.test.ts`,
+  "a PRAGMA note is read-only in every op"). **No** note is movable in v1
+  (`::test_no_note_is_movable_in_v1`) — A.6's misattribution is why.
+- [x] **AC-N5** — THE SYSTEM SHALL NOT emit a `note` row at module scope, for a handler docstring, or for
+  a comment sharing a line with a statement; a trailing lint-suppression pragma SHALL survive a
+  `set_params` on its statement byte-for-byte →
+  `tests/test_lens_grammar_v2.py::test_note_never_covers_the_docstring_module_scope_or_a_trailing_comment`,
+  `::test_module_scope_comment_after_a_handler_is_not_a_note`,
+  `::test_trailing_pragma_on_a_statement_survives_a_param_edit_byte_for_byte`.
+- [x] **AC-N6** — WHEN a construct is unrecognized, THE SYSTEM SHALL emit a `code` row; a whole-file
+  refusal SHALL occur only on `ast.parse` failure →
+  `tests/test_lens_grammar_v2.py::test_unrecognized_construct_is_still_a_code_row_and_only_a_syntax_error_refuses`.
+
+**Not claimed by this build, stated so it is not read as done.** A.6's two known-wrong behaviours are
+unfixed: a move/delete of a *recognized* row still re-attaches a neighbouring comment to the wrong step,
+and a comment at the END of an `if`/`for` body still projects at the PARENT nesting. A.6 required v1 to
+either land the extent fix or keep notes explicitly positional; this build takes the second option — **no
+note is movable**, in the engine and in the client — so the lens never renders a confidently
+mis-positioned caption. A.8's measurement discipline (the BACKLOG #239 re-run with `note` in its own
+bucket, excluded from the editable-share numerator) is **not** part of this build and is still owed.
 
 ## Amendment B (DECLINED, 2026-07-30) — ADR 0089 Phase D "helper descent"
 
@@ -539,3 +571,291 @@ Acceptance Criteria bucket. Promote to the block above if and when the owner acc
 - **AC-D5** — Descended rows SHALL either carry live values (requiring an accepted ADR 0072 amendment
   widening the tracer's frame scope) or SHALL render an explicit "not traced" state distinguishable from
   PHI redaction — never a redacted placeholder that can never resolve.
+
+## Amendment C (2026-08-04) — the update-loop guard DEFERS a save-triggered re-projection instead of dropping it (BACKLOG #234)
+
+> **Status of this amendment: ACCEPTED — owner-ratified 2026-08-10.** It was written and built ahead of
+> ratification because BACKLOG #234 requires the guardrail it touches to be re-argued in a dated
+> amendment in the same change; the owner has now ruled, so its acceptance criteria join this ADR's
+> counted bucket under the plain heading below, as Amendment A's and Amendment D's did on ratification.
+> Ratification covers this amendment only: whether to relax the save gate itself stays open (see §C.4).
+>
+> **What it does:** it **strengthens** the §5 "sync on save only" guardrail and does **not** relax it.
+> The projection still syncs on save and on save only. What changes is what happens to a save that
+> arrives while a `lens rewrite` holds the single edit slot: it is now **deferred to slot release**
+> instead of being **silently discarded**. Nothing here widens the sync trigger, adds a keystroke path,
+> or touches the #225 live-value save gate.
+
+### C.1 The defect
+
+`EditLoopGuard.shouldReactToDocumentChange()` returns `false` while an edit is in flight — the correct
+answer for the `WorkspaceEdit` the provider itself is applying, which must not feed back into a re-render
+that fights the webview (the update loop §5's guardrail set exists to break).
+
+The provider's save subscription consumed that answer as an unconditional **return**. But the guard
+cannot distinguish *our own* `WorkspaceEdit` from a *user* save that merely happened to land inside an
+in-flight rewrite — and on that second case the early return **dropped the save**. The view would then
+keep rendering a projection of the pre-save buffer with no signal, until the user saved again. On the
+shipped code this would surface on first deployment as "I saved and the Steps view did not update";
+there are no deployments today, which is why there is still time to fix it properly rather than
+document it.
+
+### C.2 The change
+
+- `EditLoopGuard` gains `noteSuppressedChange()` / `takeSuppressedChange()` — a single clear-on-read
+  boolean, mirroring the existing `queue()` / `takePending()` shape. One boolean, not a queue: a
+  re-projection reads the whole buffer, so any number of suppressed saves owe exactly **one** refresh.
+- A new pure `releaseEdit(guard, onRefreshOwed?)` is **the only sanctioned way to release the slot**:
+  it calls `endEdit()` and then, only if a change was suppressed, invokes the callback. `drainEdits`
+  releases through it in its `finally`, including on the unexpected-rejection path.
+- The provider records the debt in the save subscription's guard-rejected branch and pays it through the
+  **same 250 ms debounced `render()`** a real save uses — so a deferred refresh coalesces with a
+  subsequent save exactly like two rapid saves do, rather than adding a second, differently-timed render.
+- That channel is a pure `RerenderDebouncer` (in `stepsModel.ts`, timer functions injected) with two
+  operations: `schedule()` and **`cancel()`**. **A re-projection DISCHARGES an owed refresh** — it reads
+  the whole current buffer, so the run starting now already satisfies whatever was owed — and `render()`
+  therefore begins by discharging both routes, synchronously, before its `lens parse` await (so a save
+  landing mid-render is recorded afresh and still honoured):
+  - `rerender.cancel()`, for the release-then-force order. Three of the four release sites
+    (`applyStructural`, `applyPickedEdit`, `applyUndoRedo`) release the slot and then FORCE a full
+    re-projection a few lines later; without the cancel a suppressed save produces **two** — the forced
+    one, then the armed one ~250 ms afterwards, replacing the whole webview HTML again.
+  - `guard.takeSuppressedChange()`, for the force-then-release order. `drainEdits`' unexpected-rejection
+    handler renders to revert the optimistic webview change *inside* the drain, and only then does the
+    `finally` release; nothing is armed yet, so a cancel cannot reach that path.
+  The paths that return BEFORE any render (a `lens rewrite` refusal, a disposed panel) reach neither
+  discharge, which is exactly where the deferral is the only route.
+- A source-scan test asserts `ide/src/stepsView.ts` contains no bare `guard.endEdit()`, so a future
+  fourth release site cannot silently reintroduce the drop, and that `render()` opens with both
+  discharges.
+
+### C.3 Guardrail accounting (what is NOT changed)
+
+- **"Sync on save only" stands.** No keystroke, `onDidChangeTextDocument`, or timer path is added. The
+  deferred refresh is a *save* that already happened; it is being honoured late, not invented.
+- **"One editor at a time" stands.** The slot semantics are untouched; `releaseEdit` releases exactly
+  when `endEdit()` did.
+- **The update-loop guard stands.** `shouldReactToDocumentChange()` still returns `false` in flight, so
+  our own `WorkspaceEdit` still cannot trigger a re-render. The deferral fires *after* the slot frees,
+  which is precisely when a re-render is safe.
+- **`clearPending()` is unchanged and NOT folded in.** Dropping a queued *param edit* on a structural op
+  (the orphaned-queue rule, §5 v2) and deferring a *document refresh* are different rules with different
+  reasons; both release sites keep their existing `clearPending()` / `takePending()` behaviour.
+- **The #225 live-value save gate is untouched** — an explicit non-goal of BACKLOG #234.
+
+### C.4 A correction this amendment depends on
+
+The comment in `ide/src/stepsView.ts` that justified the save gate claimed "`lens parse` reads the file
+from disk, so re-projecting on every keystroke would slice the current (dirty) buffer against line ranges
+computed from stale disk content". **That premise is false**, and is corrected in the same change:
+`render()` pipes `document.getText()` to `lens parse -` over stdin and slices that same snapshot for the
+view models, exactly as this ADR's 2026-07-10 addendum states ("the rows are projected from the **live
+buffer**"). The disk read belongs to the live-value **trace**, which is separately save-gated by #225.
+
+This matters beyond tidiness: BACKLOG #234's *other* half asks whether a bounded relaxation of the save
+gate is safe, and that question was about to be argued against a premise that does not hold. A
+compensating control must not rest on a false premise (CLAUDE.md §11). The real, surviving reasons for
+the gate are re-shelling Python per keystroke and the fact that each re-projection replaces the entire
+webview HTML — which would destroy focus, selection and any half-typed input mid-word.
+
+**Deliberately not decided here.** Whether to relax the gate to a debounced re-projection on *change* is
+BACKLOG #234's remaining half. It stays open, and it should be decided against the corrected premise
+above rather than the false one. This amendment lands the race fix **first**, on purpose: the dropped
+refresh is a defect under the current gate and would widen materially under any relaxation.
+
+## Acceptance Criteria
+
+- **AC-C1** — WHILE an edit holds the single edit slot, WHEN a document save for the projected document
+  is observed, THE SYSTEM SHALL record it and SHALL NOT re-project immediately → guard unit test refs.
+- **AC-C2** — WHEN the edit slot is released after one or more suppressed saves, THE SYSTEM SHALL run
+  exactly ONE re-projection, in EITHER order relative to a forced one: the deferred run goes through the
+  same debounced channel a direct save uses, and any `render()` discharges the owed refresh on entry —
+  cancelling the armed channel (release-then-force) and taking the guard's debt (force-then-release)
+  → `releaseEdit` / `drainEdits` / `RerenderDebouncer` test refs, including a kept-in-tree falsification
+  showing a render that does not discharge yields two.
+- **AC-C3** — WHERE no save was suppressed, releasing the slot SHALL NOT trigger any additional
+  re-projection → negative test ref.
+- **AC-C4** — WHEN `apply` rejects unexpectedly during a drain, THE SYSTEM SHALL still release the slot
+  AND still run an owed re-projection → rejected-apply test ref.
+- **AC-C5** — THE SYSTEM SHALL release the edit slot only through `releaseEdit`; a bare `endEdit()` call
+  in the provider SHALL fail a source-scan test, as SHALL a `render()` whose first statement is not the
+  debounce cancel → inventory test refs.
+
+## Amendment D (2026-08-05) — a `route` row kind: `@router` functions get a Steps view (BACKLOG #232)
+
+> **Status of this amendment: ACCEPTED — owner-ratified 2026-08-05.** It widens the grammar so a
+> `@router` def gets the same Steps projection a `@handler` already has: §3's row enum gains a `route`
+> kind and §4's recognition grammar gains one router-return rule. The evidence below was verified
+> against `main` before ratification.
+>
+> **In force means the grammar changed, not that the build is done.** The design was handed off in
+> `HANDOFF-232-router-steps.md`, a maintainer-internal document carrying the files, the verified anchors
+> and the falsifications. The Acceptance Criteria below are **build gates, not caveats**.
+>
+> **Build status: BACKLOG #232 is BUILT** (branch `steps-grammar`, not yet merged). A `@router` projects
+> at `lens parse --contract 2`; every AC-R below carries the node id that proves it. The Acceptance
+> Criteria are the counted block at the end of this amendment — the §D.6 reference above pointed at the
+> non-goals section, and is corrected here.
+
+### D.1 What this widens, and the §2 rule it widens under
+
+§2's rule is: **"widening the roster is an ordinary addition, widening the *grammar* (§4) requires
+amending this ADR."** A `route` row is a grammar widening, not a roster addition — so, exactly as
+Amendment A did under this same clause, this amendment touches **both** sections that clause spans:
+
+- **§3's row enum gains `route`.** Per `@router`, the contract now emits `route` / `control` / `note` /
+  `code` rows — the enum grows the same way Amendment A grew it with `note` / `diagnostic`.
+- **§4's recognition grammar gains one rule** — the router-return recognizer (§D.4). §3's statement that
+  routers are "out of v1 scope" is superseded for `@router` defs by this amendment.
+
+The BACKLOG #232 item and its ranked-table row cite "the §3 grammar". Per §2 the *grammar* rule is **§4**;
+§3 is the row **enum**. The `route` kind touches §3's enum **and** §4's grammar, and is cited that way
+here — as Amendment A cited it (`:150-152`). The stale item/table wording is surfaced to the owner in the
+handoff rather than propagated into this ADR.
+
+### D.2 This reverses a recorded scope decision — the original reasoning, and whether it still holds
+
+Two documents put routers outside the lens; both are quoted so the reversal is auditable:
+
+- **ADR 0076 §3** — `lens parse` "emits, per `@handler` (routers are **out of v1 scope**)"; the shipped
+  parser encodes it as `continue  # not a @handler (router or plain def) — out of v1 scope`
+  (`messagefoundry/lens.py:306`).
+- **The #26 carve-out** (the 2026-07-10 amendment in `docs/archive/backlog/BACKLOG-CLOSED.md`) permits "a
+  structured action-list *lens* … that renders/edits real Python **Handlers** … **because the artifact and
+  the only execution path remain plain reviewable `.py`** (the decline's rationale, diffable code-first
+  config, is preserved)." It says Handlers.
+
+**The finding: "Handlers" in the #26 carve-out is INCIDENTAL, not a design position against routing.** The
+carve-out's stated reason is a *property* — the plain-`.py`, single-artifact, single-execution-path shape
+— and that property holds identically for a `@router` (authored as reviewable Python, run on the one
+execution path, no declarative artifact). The set the amendment still declines is "drag-drop / canvas
+*logic* authoring, declarative field-mapping, and any declarative logic **execution** layer" — none of
+which is routing. "Handlers" named the only lens that existed at the time (#222). The bright line is the
+declarative-vs-plain-Python artifact/execution model, not handler-vs-router.
+
+**What was genuinely blocking, and what merely dictated the shape.** §3's "out of v1 scope" is real, but it
+is a *grammar* gap, not a veto: the v1 vocabulary is a field-**mutation** roster
+(`copy_field`/`set_field`/…, §2) mapped onto the mutable `Message` API, and a router does not mutate `msg`
+— it **selects destinations**. So the v1 row enum had **no kind** for a routing return, and that — not any
+objection to routing being legible — is why routers were out of v1. **Nothing here is a live blocker; it
+dictates *how* to add routers (a new `route` row kind, not vocabulary reuse), not *whether*.** Consequently
+naming Routers in the CLAUDE.md §12 carve-out is essentially a **formality** (it extends the same carve-out
+to a construct sharing the exact property it was granted for), while the `route` row kind is a **genuine
+grammar expansion** on the owner's judgement — the one non-incidental fact.
+
+### D.3 The `route` row contract
+
+`lens parse` emits, per `@router` (keyed on the enclosing decorator, §D.4), a `route` row:
+
+```
+{ "kind": "route", "handlers": ["<handler name>", …], "unrouted": true,
+  "line_start": <int>, "line_end": <int>, "nesting": <int> }
+```
+
+- `handlers` is the **handler-name** list the router selected — a different namespace from a `send` row's
+  `outbounds`, which are **outbound-connection** names (§D.5). Its literal-or-empty rule mirrors `send`'s:
+  string-literal names are captured; a non-literal element yields `handlers: []`.
+- `unrouted` is an **additive discriminator** (older consumers ignore it, per §A.7) present only on a
+  **routed-nowhere** return, distinct from a `send` row's `filtered`. It maps to the store disposition
+  **UNROUTED** ("routed nowhere, logged, never dropped") — never FILTERED, never dropped.
+
+The coverage partition (§3) is unchanged in kind: a `@router` body tiles into `route` / `control` / `note`
+/ `code` rows that exactly partition the def body.
+
+### D.4 `return []` disambiguation — by the enclosing decorator
+
+`return []` is ambiguous across roles: in a `@handler` it is an explicit **filter** (a `send` row with
+`filtered: true`, `messagefoundry/lens.py:678-686`); in a `@router` it is **routed nowhere** (UNROUTED).
+The recognizer therefore branches on the enclosing def's role, threaded from `parse_source` through
+`_partition_suite` → `_emit_stmt` → `_classify_simple`:
+
+| router return | `route` row |
+|---|---|
+| `return []` / `return ()` / `return None` / a bare `return` | `handlers: []`, `unrouted: true` |
+| `return ["a", "b"]` / `return ("a",)` (string-literal names) | `handlers: ["a", "b"]` |
+| `return "a"` (bare string literal) | `handlers: ["a"]` |
+| a non-literal element (`return [pick(msg)]`, `return names`) | `handlers: []`, **no** `unrouted` (dynamic; mirrors `send`'s empty-on-non-literal) |
+
+A `@handler` `return []` is **unchanged and byte-identical** to today — the role branch is the only thing
+that makes a router return classify as `route`. The router return shape is verified against the engine's
+own normalizer `_handler_names` (`messagefoundry/pipeline/dryrun.py:98-101`): `list[str] | str | None`,
+where `[]` == routed nowhere.
+
+### D.5 `route` vs widening `send` — decided
+
+The build uses a **new `route` kind**, not a widened `send`. A `send` row carries outbound-connection names
+and belongs to the outbound delivery stage; a `route` row carries handler names and belongs to the routed
+stage. They are different namespaces at different pipeline stages, and the editors (Add-palette, field
+pickers, rewrite templates) must not offer outbound-connection completions on a routing return or vice
+versa. Overloading `send` would fuse the two.
+
+### D.6 Non-goals for v1 (each keeps a router a router)
+
+- **A router body recognizes routing constructs only** — `route` returns, control rows (`if` / `elif` /
+  `else` / `for` guards), `note` rows, and `code` rows for everything else. It does **not** recognize
+  action / lookup / send / diagnostic rows, and the router Add-palette offers only routing-relevant items
+  (route-to-handler, a guard, a comment). A router stays pure destination-selection: `db_lookup` /
+  `fhir_lookup` **raise** outside a live Handler (ADR 0010/0043, the router/handler boundary), so a lookup
+  call in a router body projects as a `code` row, never a `lookup` row.
+- **No cross-module and no helper descent** — the handler path's ceilings (ADR 0089 §4; Amendment B) are
+  inherited unchanged.
+- **No relaxation of the §5 guardrails** — sync-on-save, one-editor-at-a-time, degrade-to-text-editor, and
+  the byte-stable row-scoped splice apply to a `route` edit exactly as to a handler-row edit.
+
+### D.7 Contract-version skew (must be handled, not discovered)
+
+Same hazard Amendment A §A.7 records: `parse_source` emits no schema version and the extension shells
+whatever `messagefoundry` is on `PATH`. An older IDE receiving `kind: "route"` would hit the default-less
+title switch and render a **blank, titleless row**. `route` emission is therefore **gated behind a flag or
+a contract version**, and the kind is threaded through **both** implementations — `ide/src/stepsModel.ts`
+and the CSP-isolated `ide/media/stepsWebview.js` (which cannot import from `src/`) — never one alone.
+
+### D.8 Consequence deltas
+
+§3's coverage invariant is unchanged in kind and gains the `@router` corpus. §4's ladder gains one
+recognition rule (router return → `route`). §6 gate 1 (coverage partition) gains router cases; gate 2
+(byte-stability) gains the `route` edit op class. `lens parse`'s JSON stays additively back-compatible for
+handlers (a `route` kind appears only for a `@router`), which is why §A.7's flag/contract gate is the whole
+compatibility story.
+
+## Acceptance Criteria
+
+- [x] **AC-R1** — WHEN `lens parse` encounters a `@router` def body, THE SYSTEM SHALL emit rows whose
+  line ranges exactly partition the def body (`route` / `control` / `note` / `code`) — never dropped,
+  reordered, or synthesized →
+  `tests/test_lens_grammar_v2.py::test_samples_routers_are_projected_and_partitioned`,
+  `::test_adversarial_partition_is_total`. The assertion COUNTS each covered line, so a doubled line fails
+  as loudly as a dropped one, and the def-body range is derived independently of the parser.
+- [x] **AC-R2** — WHEN a `@router` returns string-literal handler names (list, tuple, or a bare string),
+  THE SYSTEM SHALL emit a `route` row whose `handlers` is exactly those names; WHEN it returns `[]` / `()`
+  / `None` or a bare `return`, THE SYSTEM SHALL emit `handlers: []` with `unrouted: true`; WHEN any
+  element is non-literal, THE SYSTEM SHALL emit `handlers: []` WITHOUT `unrouted` →
+  `tests/test_lens_grammar_v2.py::test_router_return_classification` (the whole D.4 table, in one test).
+- [x] **AC-R3** — WHERE the enclosing decorator is `@handler`, a `return []` SHALL remain byte-identical
+  to the current `send` / `filtered` projection — no `route` row, no `unrouted` — so the role branch never
+  regresses the handler path →
+  `tests/test_lens_grammar_v2.py::test_handler_return_empty_list_is_unchanged_by_the_role_branch`, which
+  asserts the handler leg FIRST and then asserts the two contracts' handler payloads are equal.
+- [x] **AC-R4** — WHEN a `route` row's handler list is set to its current value THE SYSTEM SHALL produce
+  a byte-identical file, and WHEN set to a new list THE SYSTEM SHALL change only that row's line range and
+  re-parse to the same kind, span, nesting, and suite →
+  `tests/test_lens_grammar_v2.py::test_setting_a_row_to_its_current_value_is_byte_identical`,
+  `::test_route_edit_changes_only_its_own_line_and_reparses_the_same`. The no-op is compared
+  SEMANTICALLY, which is also what stops a dynamic `return [pick(msg)]` (projected `handlers: []`) being
+  flattened to a literal `[]` (`::test_route_edit_never_flattens_a_dynamic_return`).
+- [x] **AC-R5** — THE SYSTEM SHALL NOT offer transform verbs (action / lookup / send / diagnostic) in a
+  `@router`'s Add-palette, and a `db_lookup` / `fhir_lookup` call inside a router body SHALL project as a
+  `code` row, never a `lookup` row → `ide/src/test/suite/steps-mirror.test.ts`, "the router palette offers
+  routing constructs ONLY (AC-R5)"; `tests/test_lens_grammar_v2.py::test_router_body_recognizes_routing_constructs_only`,
+  `::test_router_refuses_ops_that_author_transform_verbs_or_sends`. Enforced in three places because each
+  covers a different failure: the palette greys the item, the provider refuses the item id (webview input
+  is untrusted, so client-side greying is not a control), and the engine refuses the op.
+- [x] **AC-R6** — WHERE the consuming IDE predates the `route` kind, THE SYSTEM SHALL gate `route`
+  emission behind a flag or contract version so an older IDE never renders a blank, titleless router row →
+  `lens parse --contract` (default 1), asserted in
+  `tests/test_lens_grammar_v2.py::test_an_older_consumer_never_receives_a_v2_kind`,
+  `::test_the_v1_payload_is_unchanged_across_the_whole_samples_corpus`,
+  `::test_cli_contract_flag_gates_the_new_kinds_and_refuses_an_unknown_version`. The OTHER direction — a
+  newer IDE meeting an older engine — is a one-shot retry without the flag, asserted in
+  `ide/src/test/suite/steps-contract.test.ts` under "contract negotiation", including the negative case
+  that a genuine refusal is never retried away as an argument problem.

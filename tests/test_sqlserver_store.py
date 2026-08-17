@@ -97,7 +97,6 @@ async def store() -> AsyncIterator[object]:
             #                    key-rotation reencrypt scan, and this suite asserts EXACT rotate
             #                    counts (the == 6 / == 2 above), so a preset left behind by one test
             #                    silently miscounts an unrelated one
-            "outbox",
             "messages",
             "sessions",
             "webauthn_credentials",  # ADR 0068: FK to users(id) — must clear before users
@@ -1042,7 +1041,7 @@ async def test_reencrypt_to_active_rotates_all_columns_including_state(store) ->
         try:
             async with rotated._pool.acquire() as conn:
                 cur = await conn.cursor()
-                for table in ("message_events", "state", "response", "queue", "outbox", "messages"):
+                for table in ("message_events", "state", "response", "queue", "messages"):
                     await cur.execute(f"DELETE FROM {table}")
                 await conn.commit()
         finally:
@@ -1837,7 +1836,7 @@ async def test_keyless_open_of_encrypted_state_fails_closed(store) -> None:
         try:
             async with cleanup._pool.acquire() as conn:
                 cur = await conn.cursor()
-                for table in ("message_events", "state", "response", "queue", "outbox", "messages"):
+                for table in ("message_events", "state", "response", "queue", "messages"):
                     await cur.execute(f"DELETE FROM {table}")
                 await conn.commit()
         finally:
@@ -3568,6 +3567,44 @@ async def test_audit_verify_cli_server(store, capsys) -> None:
     assert "OK:" in out and "verified 2" in out
 
 
+async def test_audit_anchor_cli_server(store, capsys) -> None:
+    """BACKLOG #328: ``audit-anchor`` + ``audit-verify --expected-anchor`` on the LIVE server store.
+
+    ``audit_anchor()`` is implemented separately per backend (``store.py`` / ``sqlserver.py`` /
+    ``postgres.py``), so a SQLite-only test is not evidence for this one. The ``expected_anchor``
+    COMPARISON is byte-equivalent across all three, so what this case actually exercises is this
+    backend's own anchor SQL plus the CLI wrapper's connection handling.
+
+    Same idiom as CLI-22 above: backend from ``MEFOR_STORE_*`` env, NO ``--db`` (the M-31 missing-DB
+    guard is SQLite-only and inert here), driven through ``asyncio.to_thread`` because ``_audit_anchor``
+    calls ``asyncio.run`` internally. The anchor is captured at RUNTIME and never written as a literal:
+    DELETE does not reseed SQL Server IDENTITY, so a hard-coded count or head would be wrong."""
+    from messagefoundry.__main__ import main
+
+    await store.record_audit("message_view", actor="alice", detail="v1")
+    await store.record_audit("export", actor="bob", detail="e1")
+
+    rc = await asyncio.to_thread(main, ["audit-anchor"])  # backend from env; NO --db
+    assert rc == 0
+    anchor = capsys.readouterr().out.strip()
+    count_text, _, head = anchor.partition(":")
+    assert count_text == "2" and len(head) == 64
+
+    # Round-trips against the unchanged chain.
+    rc = await asyncio.to_thread(main, ["audit-verify", "--expected-anchor", anchor])
+    assert rc == 0
+    assert "OK:" in capsys.readouterr().out
+
+    # Cut the NEWEST row: the walk still verifies the surviving prefix; only the anchor sees it.
+    await store._execute("DELETE FROM audit_log WHERE id = (SELECT MAX(id) FROM audit_log)")
+    rc = await asyncio.to_thread(main, ["audit-verify"])
+    assert rc == 0
+    assert "OK:" in capsys.readouterr().out
+    rc = await asyncio.to_thread(main, ["audit-verify", "--expected-anchor", anchor])
+    assert rc == 1
+    assert "truncated or rewritten" in capsys.readouterr().out
+
+
 async def test_rekey_audit_cli_server(store, capsys, monkeypatch) -> None:
     """CLI-23: the ``rekey-audit`` CLI wrapper enables HMAC keying of an existing keyless chain
     (#190-D). It reaches the live SQL Server store purely via ``MEFOR_STORE_*`` env (no ``--db``; the
@@ -4006,7 +4043,7 @@ async def test_the_BOUNDED_path_survives_a_keyed_reopen(store) -> None:
         try:
             async with cleanup._pool.acquire() as conn:
                 cur = await conn.cursor()
-                for table in ("message_events", "queue", "outbox", "response", "messages"):
+                for table in ("message_events", "queue", "response", "messages"):
                     await cur.execute(f"DELETE FROM {table}")  # FK order: children first
                 await cur.execute("DELETE FROM cipher_meta WHERE key_id = ?", (key_id,))
                 await conn.commit()

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 <#
 .SYNOPSIS
     Who is ACTUALLY live in this repo right now -- across every Claude Code surface, including VS Code.
@@ -118,7 +120,17 @@ function Get-SelfPids([int]$Override) {
 # --- Collect ------------------------------------------------------------------------------------
 $occ = Get-WorktreeOccupancy -Repo $Repo -ConfigRoot $ConfigRoot -StartSkewMinutes $StartSkewMinutes
 if (-not $occ.RepoFound) {
-    if ($Json) { "[]" | Write-Output } else { Write-Host "Not inside a git repository -- nothing to scope presence to." }
+    # THE STDERR RECEIPT BELONGS HERE TOO, and its absence was a hole in the control this script
+    # already documents. The -Json block further down emits an UNAVAILABLE receipt so that "the fence
+    # could not look" stops rendering as an indistinguishable `[]` -- but THIS path returned the same
+    # empty array with no receipt at all, so one of the two ways of being unable to look stayed
+    # silent on exactly the channel a machine consumer reads. A caller that correctly checks stderr
+    # for the receipt would still read "not a git repository" as "nobody is live".
+    if ($Json) {
+        [Console]::Error.WriteLine("presence: roster UNAVAILABLE -- not inside a git repository, so there is nothing to scope presence to. An empty list here is NOT 'nobody is live'.")
+        "[]" | Write-Output
+    }
+    else { Write-Host "Not inside a git repository -- nothing to scope presence to." }
     exit 0
 }
 
@@ -180,6 +192,13 @@ if ($rows.Count -eq 0) {
 
 Write-Host ""
 Write-Host "Live Claude sessions in this repo ($($rows.Count)):"
+# NAME EVERY COLUMN (BACKLOG #1098). The leading token is an 8-hex REGISTRY SESSION ID and reads exactly
+# like an abbreviated commit SHA: session-context.ps1's banner, which points readers here, prints a real
+# one in the same shape (`git worktree list` = path, sha, branch). Unlabelled, a reader resolves it
+# against git and gets an error at best, the wrong tree if the prefix happens to resolve. A header row
+# rather than a per-row word because this is a fixed-width table -- the header governs every row, which
+# is the property the item asks for.
+Write-Host ("  {0,-8} {1,-7} {2,-34} {3}" -f "sess-id", "surface", "worktree", "branch")
 foreach ($r in $rows) {
     $me = if ($r.IsSelf) { "  <-- THIS session" } else { "" }
     $warn = if ($r.IsPrimary -and -not $r.IsSelf) { "  [in the SHARED PRIMARY]" } else { "" }

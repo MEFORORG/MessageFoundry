@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 <#
 .SYNOPSIS
     Create a parallel-session worktree (via new.ps1) AND open a new editor window in it - one step.
@@ -17,7 +19,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidatePattern('^[A-Za-z0-9._-]+$')]
+    # \A..\z for the reason given in new.ps1's param block; keep all four copies identical.
+    [ValidatePattern('\A[A-Za-z0-9._-]+\z')]
     [string]$Name,
     [string]$Base = "origin/main",  # forwarded to new.ps1; matches its fetched-remote-tip default
     [string]$Python = "python",

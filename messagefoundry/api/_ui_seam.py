@@ -24,10 +24,27 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-#: The contract version the engine ships. Bump on ANY incompatible change to the injected surface
-#: (a CoreHandlers/AdminHandlers field, a rendered DTO field set, the app.state attributes the
-#: console reads, the ``api.security`` deps it imports directly, or the ``/ws`` push shape). The
-#: console declares ``SUPPORTED_ENGINE_SEAMS`` and refuses a skew at startup (``assert_engine_seam``).
+#: The contract identity the engine ships: a 16-hex-character SHA-256 DIGEST of the discovered seam
+#: surface, produced by ``scripts/webconsole_seam_snapshot.py --write``. The console declares
+#: ``SUPPORTED_ENGINE_SEAMS`` and refuses a skew at startup (``assert_engine_seam``).
+#:
+#: **NOBODY CHOOSES THIS VALUE, AND IT IS NOT ORDERED.** It was a hand-picked incrementing integer
+#: until BACKLOG #1220, which is the defect the two entries below record: two unlanded branches both
+#: bumped to 19 for two independent contract changes, git raised a COSMETIC conflict in this comment
+#: block, and the golden snapshot AUTO-MERGED CLEAN carrying both changes under one seam. Resolving
+#: the visible conflict correctly still shipped the fault. A digest cannot collide that way -- two
+#: branches changing different surfaces derive different values, and their MERGED surface derives a
+#: third that matches neither, so the merge reds.
+#:
+#: It is a ``str`` rather than a truncated integer on purpose. An integer seam stays hand-typable
+#: (someone can write ``21`` and it looks legitimate) and lets ordering assumptions survive silently:
+#: the skew test used to assert ``ENGINE_UI_SEAM - 1`` is refused, which under an int digest would
+#: keep PASSING while its own docstring became false. Nobody types a hex digest by hand and believes
+#: it, and the type change makes every arithmetic site fail loudly instead.
+#:
+#: The history below is kept because it is what made #1220 visible, and because "why did the contract
+#: change" is a question a digest cannot answer. The ``vN`` labels are RETIRED as identifiers -- they
+#: no longer name the shipped value, they date the change.
 #: seam v4: MessageDetail gained the additive `attachments` list + a `download_attachment` handler
 #: (the streaming-attachment operator read surface, BACKLOG #149 / ADR 0105 Phase 3b).
 #: seam v5: SecurityPosture gained the additive report-only `fips_mode` + `openssl_version` fields
@@ -81,7 +98,37 @@ from typing import Any
 #: backend without the lever, so an older console simply ignores it; a separate seam rather than a
 #: correction to v15 because v15 is a SecurityPosture change and folding an unrelated DTO into it would
 #: make that note describe a field set it does not cover.
-ENGINE_UI_SEAM: int = 16
+#: v17 (ASVS 3.7.3): the external-navigation interstitial policy — `organization_domains`,
+#: `external_link_interstitial`, `external_link_allowlist` and `oidc_authorization_host`. Passed as
+#: CONFIG for the same reason `oidc_enabled` is: `create_managed_app` attaches the AuthService inside
+#: the lifespan, long after `mount_ui` has fixed the route table, so a registrar reading it off
+#: `app.state.auth` would register nothing in production while passing every test that constructs the
+#: app with `auth=` directly. Additive with defaults, and the defaults are the STRICT position — an
+#: older or partial caller gets the interstitial on every absolute destination, never none.
+#: seam v18 (ASVS 11.6.2, #338): SecurityPosture gained the additive REPORT-ONLY `kex_groups` field — a
+#: read-out of whether the approved TLS key-exchange groups are PINNED on built contexts or INHERITED
+#: from OpenSSL's default group list (today always inherited: `SSLContext.set_groups` is a Python 3.15
+#: API). Report-only, reflects/changes NO live TLS behaviour; additive with a default, so an older
+#: console simply ignores it. Bumped because the golden seam snapshot introspects SecurityPosture's
+#: field set, so any added field trips the handshake even when it is purely additive.
+#: seam v20 (ASVS 8.2.2, BACKLOG #1152): ``UploadedFileList`` gained a REQUIRED
+#: ``scope: Literal["own", "any_owner"]`` naming which population the listing actually contains, and
+#: ``pages/uploaded_logs.py`` reads it unconditionally to render the matching sentence. NOT additive
+#: with a default: a console carrying that render against an engine without the field would pass the
+#: handshake and then AttributeError, which is exactly the skew this constant exists to refuse.
+#:
+#: **v19 WAS DELIBERATELY SKIPPED, and the reason was a defect rather than an accident.** Two unlanded
+#: branches — ``w3-log-write-failure`` (``SystemStatus.log_sinks``, #122) and
+#: ``w3-store-privilege-preflight`` (``SecurityPosture.store_privilege``, #1008) — BOTH bumped to 19,
+#: for two independent contract changes. Skipping to 20 bought room but fixed nothing: the next pair
+#: of branches would collide identically. BACKLOG #1220 removed the hand-chosen number entirely.
+#:
+#: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
+#: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
+#: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
+#: unconditionally while touching no seam file at all. Regenerate with
+#: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
+ENGINE_UI_SEAM: str = "494a51230dce5730"
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,8 +136,14 @@ class CoreHandlers:
     """The ``create_app``-nested JSON handlers the moved ``/ui`` routes call directly.
 
     Each is the exact in-process handler the JSON API registers, reached by reference so the console
-    reuses the single audited PHI path (its own ``Depends`` gate is skipped — the ``/ui`` route
-    re-asserts the equivalent permission via ``require_ui*``). Async unless noted.
+    reuses the single audited PHI path. Calling it as a plain function SKIPS its own ``Depends`` gate,
+    so the ``/ui`` route standing in front of it must re-assert **at least** the permissions that gate
+    carries — re-asserting a *different* one is this seam's failure mode, and it is silent, because
+    the skipped gate never runs to disagree. Measured instance: ``GET /ui/messages/{id}/edit`` reached
+    ``get_message`` (``require_phi_read(MESSAGES_VIEW_RAW)``) while itself asserting only
+    ``messages:edit``, so a custom role holding ``messages:edit`` alone would have read the raw body on
+    a deployed instance; both edit verbs now assert ``messages:edit`` **and** ``messages:view_raw``
+    (BACKLOG #324). Async unless noted.
     """
 
     list_connections: Callable[..., Awaitable[Any]]
@@ -198,7 +251,7 @@ class UiDeps:
     scope even so (a re-signature there is seam-bumping).
     """
 
-    engine_seam: int
+    engine_seam: str
     get_engine: Callable[..., Any]
     get_gate: Callable[..., Any]
     cookie_secure: Callable[..., Any]
@@ -211,3 +264,17 @@ class UiDeps:
     #: table. A registrar that gated on ``app.state.auth`` would therefore register nothing in
     #: production while passing every test that constructs the app with ``auth=`` directly.
     oidc_enabled: bool = False
+    #: ASVS 3.7.3 (seam v17). Domains that count as INSIDE the organization — the interstitial is
+    #: shown for anything else. Matched on a LABEL boundary by ``messagefoundry_webconsole._external``.
+    #: EMPTY is the STRICT position, not the lax one: every absolute http(s) destination is external.
+    organization_domains: tuple[str, ...] = ()
+    #: Whether to interpose the "you are leaving this site" page at all. On by default; off is a
+    #: posture decision and the serve gate says so.
+    external_link_interstitial: bool = True
+    #: ⚠️ The audited escape — destinations navigated to with NO notification and NO cancel, which is
+    #: exactly what 3.7.3 asks for. Non-empty produces a startup warning naming every entry.
+    external_link_allowlist: tuple[str, ...] = ()
+    #: Host of the configured IdP authorization endpoint, for DISPLAY on the interstitial. Derived
+    #: from settings, never from request input — if the destination came from the request the
+    #: interstitial would itself be an open redirect, which is worse than having no interstitial.
+    oidc_authorization_host: str = ""

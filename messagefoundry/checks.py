@@ -120,6 +120,7 @@ def run_checks(
     handler_security_allow: frozenset[str] = frozenset(),
     service_config: str | Path | None = None,
     suppress_service_toml_search: bool = False,
+    project_root: str | Path | None = None,
 ) -> CheckReport:
     """Run the gate against ``config_dir``; ``messages_dir`` enables the dry-run check when it has
     fixtures. Set ``run_lint=False`` to skip the advisory ruff/mypy pass. ``strict_handler_security``
@@ -133,6 +134,14 @@ def run_checks(
     given) suppresses the legacy upward-walk so ``check`` matches ``serve``'s resolution. With both
     defaulted (today's ``messagefoundry check --config config``), the upward-walk is preserved — no
     regression.
+
+    ``project_root`` (``--project-root``) is the anchor for ``environments/<env>.toml``, and it exists
+    because the gate previously VALIDATED that file under the supplied root and then READ the values
+    from the process working directory (BACKLOG #1062). It is threaded to the build check and applied
+    the way ``serve`` applies it — as a ``[environments].base_dir`` CLI override, which by
+    ``load_settings``' CLI > env > file precedence overrides a file-set ``base_dir`` exactly as
+    ``__main__.py``'s ``serve`` does. Left ``None`` the resolution is unchanged and still falls back to
+    the process directory, so the documented ``check --config config`` invocation is untouched.
     """
     results = [
         _check_validate(config_dir),
@@ -151,6 +160,7 @@ def run_checks(
             config_dir,
             service_config=service_config,
             suppress_search=suppress_service_toml_search,
+            project_root=project_root,
         ),
         _check_reference_backend(
             config_dir,
@@ -160,6 +170,11 @@ def run_checks(
         # ADR 0153: name every outbound that declares cleartext_accepted, so the accepted set is visible
         # in review rather than discoverable only by reading each connection. Advisory — see the check.
         _check_cleartext_accepted(config_dir),
+        # #333: the two OTHER connection-scoped TLS deviations, same shape and same reason. Both were
+        # reported by a construction log line and nothing else, and a log line emitted once at startup
+        # is not the surface anyone queries three months later. Advisory — see the checks.
+        _check_expiry_relaxed(config_dir),
+        _check_generic_db_tls(config_dir),
         # #323 layer 3: report whether the [alerts] SMTP hop authenticates the relay. The defect this
         # closes was invisible for exactly as long as nothing reported it. Advisory — see the check.
         _check_alert_smtp_tls(
@@ -374,10 +389,10 @@ def _opens_with_guard_filter(body: list[ast.stmt]) -> bool:
     """True when the def's first executable statement is a bare guard-filter ``if <cond>: return []``.
 
     "Bare filter" = an ``if`` with no ``else``/``elif`` whose body is a single filter-return (``return``,
-    ``return None``, or ``return []`` — the empty list). A leading docstring is skipped. This is
-    deliberately conservative: a filter buried after real transform work is a genuine handler concern
-    (not an applicability rule) and is not flagged — the advisory only targets the leading guard that
-    belongs in ``accepts=``.
+    ``return None``, ``return []`` or ``return ()`` — either empty container). A leading docstring is
+    skipped. This is deliberately conservative: a filter buried after real transform work is a genuine
+    handler concern (not an applicability rule) and is not flagged — the advisory only targets the
+    leading guard that belongs in ``accepts=``.
     """
     stmts = list(body)
     # Skip a docstring first statement.
@@ -392,12 +407,18 @@ def _opens_with_guard_filter(body: list[ast.stmt]) -> bool:
     if not isinstance(inner, ast.Return):
         return False
     val = inner.value
-    # bare ``return`` / ``return None`` / ``return []`` are all filter-drops.
+    # bare ``return`` / ``return None`` / ``return []`` / ``return ()`` are all filter-drops. The tuple
+    # half matters as much as the list half: an EMPTY container of either kind partitions to no
+    # deliveries (``dryrun._partition`` materialises any non-``str`` iterable — BACKLOG #341), and
+    # ``return ()`` is a documented filter idiom the Steps lens already recognizes alongside ``return []``
+    # (``lens.py::_is_send_return`` / ``_is_collector_init``'s sibling gate, ADR 0108 §6). Recognizing
+    # only the list form made this advisory the sole place in the codebase that treated the two
+    # differently — it under-flagged a `return ()` guard rather than mis-flagging, but silently.
     if val is None:
         return True
     if isinstance(val, ast.Constant) and val.value is None:
         return True
-    return isinstance(val, ast.List) and not val.elts
+    return isinstance(val, ast.List | ast.Tuple) and not val.elts
 
 
 def _check_accepts_candidate(config_dir: str | Path) -> CheckResult:
@@ -531,8 +552,14 @@ _DATETIME_NOW_ATTRS = frozenset({"now", "utcnow", "today"})
 # (``time.gmtime(0)`` is deterministic; ``time.gmtime()`` reads the current clock).
 _TIME_WALLCLOCK_NOARG = frozenset({"time.localtime", "time.gmtime", "time.ctime", "time.asctime"})
 
-# db_lookup/fhir_lookup: the SQL statement / FHIR query is the 2nd positional or the
-# statement=/query= keyword; the params dict (parameterized / percent-encoded) is safe.
+# db_lookup/fhir_lookup: this rule inspects the SQL statement / FHIR query-or-path argument ONLY --
+# the 2nd positional or the statement=/query= keyword. The params dict is NOT inspected at all. That is
+# a statement of SCOPE, not a clearance: params values are bound (SQL) or percent-encoded (FHIR,
+# urlencode(quote_via=quote, safe="")), which defeats STRUCTURE injection -- an extra parameter -- and
+# nothing else. It does NOT defeat FHIR VALUE-layer injection: ',' '|' '$' are FHIR search-value
+# separators, not URL delimiters, so they survive percent-decoding with their meaning intact
+# (BACKLOG #1243 limb B). Since #1243 removed the flat '?'-query, the inspected argument on a
+# fhir_lookup is the PATH, and interpolating into it is still flagged.
 _LOOKUP_NAMES = frozenset({"db_lookup", "fhir_lookup"})
 _LOOKUP_QUERY_KW = frozenset({"statement", "query"})
 
@@ -558,14 +585,50 @@ def _message_fn_decorator(
     return None
 
 
+def _const_getattr_target(node: ast.expr) -> tuple[str, ast.expr] | None:
+    """For a ``getattr(receiver, "<str literal>")`` call, return ``(attr_name, receiver)`` so the chain
+    resolver can splice the constant attribute in — turning ``getattr(os, "system")`` into ``os.system``.
+
+    Returns None for anything else: a non-``getattr`` call, a *dynamic* attribute
+    (``getattr(os, name)`` — a variable, not a str constant), or a ``*args`` splat in the first two
+    positions (which makes positional indexing meaningless). Only a statically-known constant attribute
+    name is spliced; a dynamic indirection stays unresolvable, so benign reflection is not flagged."""
+    if not (
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr"
+    ):
+        return None
+    if len(node.args) < 2 or any(isinstance(a, ast.Starred) for a in node.args[:2]):
+        return None
+    attr = node.args[1]
+    if isinstance(attr, ast.Constant) and isinstance(attr.value, str):
+        attr_name: str = attr.value  # bound locally for mypy-strict narrowing
+        return attr_name, node.args[0]
+    return None
+
+
 def _dotted_call_name(func: ast.expr) -> str | None:
     """Reconstruct a dotted Name/Attribute chain (``os.path.join``) from a call's ``func``, or None
-    when it is not a pure Name/Attribute chain (e.g. the receiver is itself a call or subscript)."""
+    when the chain does not bottom out in a plain Name (e.g. the receiver is a subscript or a
+    non-``getattr`` call).
+
+    A *constant* ``getattr`` indirection is spliced: ``getattr(os, "system")`` resolves to ``os.system``
+    (and ``getattr(pkg, "sub").fn`` to ``pkg.sub.fn``). A *dynamic* ``getattr(os, name)``, a subscript
+    (``globals()["os"]``), or any other call-shaped receiver stays unresolvable → None. Each iteration
+    strictly descends a finite AST (Attribute → its value, or a getattr splice → its receiver), so the
+    loop always terminates."""
     parts: list[str] = []
     cur: ast.expr = func
-    while isinstance(cur, ast.Attribute):
-        parts.append(cur.attr)
-        cur = cur.value
+    while True:
+        if isinstance(cur, ast.Attribute):
+            parts.append(cur.attr)
+            cur = cur.value
+            continue
+        target = _const_getattr_target(cur)
+        if target is None:
+            break
+        attr_name, receiver = target
+        parts.append(attr_name)
+        cur = receiver
     if isinstance(cur, ast.Name):
         parts.append(cur.id)
         return ".".join(reversed(parts))
@@ -893,9 +956,10 @@ def _check_handler_security(
     that wants a hard gate on its own CI. The runtime half is the opt-in ADR 0087 sandbox. Mirrors
     :func:`_check_raise_fstring`: static ``ast`` only (never imports/executes the config), globs
     ``*.py`` under ``config_dir`` (helpers included), and skips a broken/unreadable file (``validate``
-    reports those) so it never crashes the gate. ``phi-to-log`` and ``impure-transform`` are scoped to
-    ``@router``/``@handler`` bodies (so an undecorated helper's wall-clock fallback is not a false
-    positive); the other three scan the whole module."""
+    reports those) so it never crashes the gate. ``impure-transform`` is scoped to ``@router``/``@handler``
+    bodies (so an undecorated helper's wall-clock fallback is not a false positive); ``phi-to-log`` scans
+    every function body — decorated or an undecorated ``_*`` transform helper — keying on the first
+    positional parameter as the message symbol (BACKLOG #337); the other three scan the whole module."""
     base = Path(config_dir)
     if not base.is_dir():
         return CheckResult(
@@ -930,19 +994,25 @@ def _check_handler_security(
                 file_hits.append((node.lineno, "unsafe-db-lookup"))
             if _ambient_authority_hit(node):
                 file_hits.append((node.lineno, "ambient-authority"))
-        # Decorated-scope rules — phi-to-log + impure-transform, over each router/handler's own body
+        # Per-FunctionDef body rules — phi-to-log + impure-transform, over each function's own body
         # only (not nested defs, not the signature), so each call is scanned once with its own message
-        # symbol and an import-time default arg is never mistaken for per-message impurity.
+        # symbol and an import-time default arg is never mistaken for per-message impurity. phi-to-log
+        # runs over EVERY function body — a decorated @router/@handler AND an undecorated `_*` transform
+        # helper (BACKLOG #337, CLAUDE.md §9; the decompose-by-role convention steers PHI handling into
+        # `_*` helpers, so a lint that only saw decorated bodies skipped the file the convention names),
+        # keying on the first positional parameter as the message symbol. impure-transform stays
+        # decorated-scope only, so the shipped `_pdf_mdm_transforms.py` ingest-time wall-clock fallback
+        # in an undecorated helper is not a false positive (the trade ADR 0144 records).
         for node in ast.walk(tree):
-            if _message_fn_decorator(node) is None:
+            if not isinstance(node, ast.FunctionDef):
                 continue
-            assert isinstance(node, ast.FunctionDef)  # narrowed by _message_fn_decorator
+            decorated = _message_fn_decorator(node) is not None
             params = node.args.posonlyargs + node.args.args
             msg_sym = params[0].arg if params else None
             for sub in _body_calls(node):
                 if msg_sym is not None and _phi_to_log_hit(sub, msg_sym):
                     file_hits.append((sub.lineno, "phi-to-log"))
-                if _impure_transform_hit(sub, imported):
+                if decorated and _impure_transform_hit(sub, imported):
                     file_hits.append((sub.lineno, "impure-transform"))
         hits += [f"{path.name}:{lineno} [{rule}]" for lineno, rule in sorted(file_hits)]
     if not hits:
@@ -1228,6 +1298,7 @@ def _check_build(
     *,
     service_config: str | Path | None = None,
     suppress_search: bool = False,
+    project_root: str | Path | None = None,
 ) -> CheckResult:
     """Run the **posture-stamped** ``build_check_registry`` that ``serve``/``reload`` run, so a config
     ``serve`` would REFUSE — most importantly a production-PHI cleartext / weakened-TLS transport hop
@@ -1269,8 +1340,20 @@ def _check_build(
         return CheckResult(
             "build-check", ok=True, required=True, skipped=True, detail="no messagefoundry.toml"
         )
+    # --project-root anchors the env VALUES, applied exactly as `serve` applies it (__main__.py, the
+    # `cli["environments"]["base_dir"] = args.project_root` line): as a [environments].base_dir CLI
+    # override, which load_settings' CLI > env > file precedence puts above a file-set base_dir.
+    #
+    # Without it the caller's root was used to VALIDATE that <root>/<env_dir>/<env>.toml EXISTS and then
+    # discarded, while the values below were read from the PROCESS directory -- so the ADR 0092
+    # posture-keyed insecure-hop refusal could be decided against a different environment's hosts and
+    # schemes than the one the operator named (BACKLOG #1062). Left None, resolution is unchanged and
+    # still falls back to the process directory, so `check --config config` is untouched.
+    cli: dict[str, dict[str, object]] | None = (
+        {"environments": {"base_dir": str(project_root)}} if project_root is not None else None
+    )
     try:
-        settings = load_settings(config_path=toml)
+        settings = load_settings(config_path=toml, cli=cli)
     except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
         return CheckResult(
             "build-check",
@@ -1476,6 +1559,97 @@ def _check_cleartext_accepted(
         ok=True,
         required=False,
         detail=(f"{len(accepted)} connection(s) cross a cleartext hop by declaration — {listed}"),
+    )
+
+
+def _check_expiry_relaxed(config_dir: str | Path) -> CheckResult:
+    """Surface every outbound that declares ``tls_allow_expired`` (#129 / ADR 0094), with its peer.
+
+    The sibling of :func:`_check_cleartext_accepted`, built for the same reason (#333): the relaxation
+    was reported by a construction-time WARN and by nothing else, so an operator who set a two-week
+    bridge when a partner's certificate lapsed had nothing that expired it, re-checked it, or listed it.
+    ``check`` runs at commit/CI time and prints the whole set, which is where a stale bridge gets
+    noticed.
+
+    Advisory (``required=False``) on the same reasoning: ADR 0094 built this as the *narrow, honest*
+    alternative to ``tls_verify=False``, and blocking on it would push operators back toward the blunt
+    switch. It exists so the set is visible in review, next to the hosts.
+
+    SKIPs when the graph will not load — same convention and same reason as its sibling."""
+    from messagefoundry.config.wiring import WiringError, expiry_relaxed_hops, load_config
+
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            "tls-allow-expired",
+            ok=True,
+            required=False,
+            skipped=True,
+            detail=f"config did not load: {exc}",
+        )
+    relaxed = expiry_relaxed_hops(registry)
+    if not relaxed:
+        return CheckResult(
+            "tls-allow-expired",
+            ok=True,
+            required=False,
+            detail="no connection declares tls_allow_expired",
+        )
+    listed = "; ".join(f"{name} -> {peer}" for name, peer in relaxed)
+    return CheckResult(
+        "tls-allow-expired",
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(relaxed)} outbound connection(s) accept an EXPIRED server certificate "
+            f"indefinitely — {listed} (chain, hostname and key usage are still verified)"
+        ),
+    )
+
+
+def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
+    """Surface every generic-ODBC ``DATABASE`` connection whose ``odbc_params`` leave TLS unenforced.
+
+    #66 / ADR 0092's 2026-07-12 amendment delegates TLS to the operator's driver keyword on
+    ``dialect='generic'``, because MessageFoundry cannot enumerate an arbitrary driver's keywords — that
+    delegation is right and this check does not challenge it. What #333 fixes is that the delegation's
+    ONLY control was a construction log line, which is not a surface anyone reviews. Covers inbound
+    (``DatabasePoll``) as well as outbound: the poll link crosses the same hop with the same credential
+    in the same DSN.
+
+    Advisory (``required=False``): the engine cannot prove a given driver keyword verifies anything, so
+    a refusal here would be guess-based and would break legitimate drivers — exactly what ADR 0092
+    declined. SKIPs when the graph will not load, same convention as its siblings."""
+    from messagefoundry.config.wiring import WiringError, load_config, unverified_generic_db_hops
+
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            "generic-db-tls",
+            ok=True,
+            required=False,
+            skipped=True,
+            detail=f"config did not load: {exc}",
+        )
+    hops = unverified_generic_db_hops(registry)
+    if not hops:
+        return CheckResult(
+            "generic-db-tls",
+            ok=True,
+            required=False,
+            detail="no generic-ODBC DATABASE connection leaves TLS unenforced",
+        )
+    listed = "; ".join(f"{name}: {reason}" for name, reason in hops)
+    return CheckResult(
+        "generic-db-tls",
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(hops)} generic-ODBC DATABASE connection(s) may cross in plaintext — {listed}; "
+            "set a verifying keyword in odbc_params (e.g. SSLmode=verify-full)"
+        ),
     )
 
 
