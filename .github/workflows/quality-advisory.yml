@@ -268,13 +268,36 @@ jobs:
     # lines CHANGED by this PR (diff-cover) -- never a whole-repo % gate, which the rubric (section 4.1)
     # calls a gameable signal. ADVISORY: --fail-under=0 + `|| true` so it never fails a build, and this
     # job is not a required status check. PR-only (needs a base ref to diff against). It re-runs the
-    # ubuntu suite (~a few min) per PR; add a paths filter if that cost bites. (This used to say
+    # ubuntu suite per PR -- MEASURED at 17:00-26:14 for the pytest step, NOT "a few min" as this
+    # comment claimed until BACKLOG #1274. That estimate is how a 20-minute cap came to look
+    # generous, which is why it is corrected here rather than left as harmless colour.
+    # Add a paths filter if that cost bites. (This used to say
     # "move it to the mirror" -- there is no mirror since the cutover; development happens directly
     # on the public repo.)
     name: diff-coverage (advisory)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # SIZED BY ci.yml's RULE, NOT PICKED (BACKLOG #1274 limb 1):
+    #   step_timeout = ceil_minute(1.35 x anchor)                        ci.yml:509
+    #   job_timeout  = step_timeout + ceil_minute(1.5 x worst OVERHEAD)  ci.yml:585
+    # Anchor 26:14 -> step_timeout 36. Worst measured ubuntu setup is 5:22 (ci.yml:594), so
+    # ceil_minute(1.5 x 5:22) = 9, and 36 + 9 = 45.
+    #
+    # THE OVERHEAD TERM IS ci.yml's WORST-MEASURED FIGURE, NOT THIS JOB'S OWN 0:29. Using 0:29
+    # would yield 37 off a SAMPLE OF ONE -- and that single observation comes from the only run
+    # that ever finished, which is the same selection bias that produced this defect. The rule
+    # says worst measured; the repo's worst measured ubuntu setup is 5:22.
+    #
+    # THE ANCHOR IS MODELLED, NOT MEASURED, and that is the honest limit of this number. No run of
+    # this job has completed above 19:31 of pytest time under the old cap, so 26:14 is extrapolated
+    # from 75 censored logs against the completion profile of the runs whose pytest did finish,
+    # corroborated bottom-up by the serial equivalent of ci.yml's three ubuntu legs (25:07).
+    # RE-DERIVE THE ANCHOR ONCE UNCENSORED RUNS EXIST, and tighten if it lands lower.
+    #
+    # The old value was 20 -- BELOW ci.yml's own ubuntu anchor of 22:50, for strictly MORE work
+    # (that leg excludes the web console via --ignore-glob and gives it a separate budget; this job
+    # excludes nothing and adds coverage instrumentation on top). It was never viable.
+    timeout-minutes: 45
     permissions:
       contents: read
     outputs:
@@ -320,6 +343,17 @@ jobs:
           python -m pip install --require-hashes -r ci/locks/ci-quality.lock
       - name: Tests under coverage (advisory - never fails)
         continue-on-error: true
+        # step_timeout, per ci.yml's discipline (BACKLOG #1274 limb 1). Until now the JOB cap was
+        # the only cap this job had, so a process-level hang below pytest was indistinguishable
+        # from a suite that simply needed longer -- both arrived as one `cancelled` job with no
+        # inner signal about which had happened. ci.yml gives its test legs exactly this inner
+        # backstop for exactly that reason.
+        #
+        # NESTING INVARIANT, the one ci.yml requires: setup(max) + step_timeout < job_timeout.
+        # Worst measured ubuntu setup is 5:22 (ci.yml:594), so 6 + 36 = 42 < 45. It holds against
+        # the WORST setup rather than this job's observed 0:29, because a cap sized on the good
+        # case fires on the bad one -- which is the defect this whole change is fixing.
+        timeout-minutes: 36
         env:
           QT_QPA_PLATFORM: offscreen
         run: pytest -q --cov=messagefoundry --cov-report=xml --cov-report=term-missing:skip-covered || true

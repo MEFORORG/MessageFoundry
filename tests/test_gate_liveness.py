@@ -272,6 +272,90 @@ def test_a_failed_job_cannot_launder_itself_as_not_applicable() -> None:
 
 
 # --------------------------------------------------------------------------------------------
+# BACKLOG #1274: a timeout arrives wearing the "never ran" label.
+#
+# GitHub reports a `timeout-minutes` expiry as `cancelled`, never `failure`. `cancelled` used to
+# sit in _DID_NOT_RUN beside `skipped`, so a job killed at the wall after twenty minutes of real
+# work was excused exactly like one that never started. Measured 2026-08-17: 93 of the last 100
+# quality-advisory runs had `diff-coverage (advisory)` cancelled at its cap while this gate
+# reported success.
+# --------------------------------------------------------------------------------------------
+
+
+def test_a_timed_out_job_owes_a_receipt() -> None:
+    """The #1274 case itself. A job killed at its `timeout-minutes` wall reports `cancelled` and
+    publishes no outputs, which is indistinguishable from never having started IF the result label
+    is all you look at. It did twenty minutes of work and measured nothing, so it owes a receipt
+    like any other dead gate."""
+    needs = _all_healthy()
+    needs["coverage"] = {"result": "cancelled", "outputs": {}}
+
+    violations, _ = liveness.verify(needs)
+
+    assert [v["signal"] for v in violations] == ["coverage"]
+    assert "NO liveness receipt" in violations[0]["message"]
+
+
+def test_a_cancelled_job_cannot_launder_itself_as_not_applicable() -> None:
+    """The half a one-line fix misses. Narrowing _DID_NOT_RUN without widening the laundering guard
+    leaves the same hole one branch over: the job stops being excused up front, then excuses itself
+    with the softest receipt available. `failure` was already blocked here; `cancelled` is the label
+    a timeout actually wears."""
+    needs = _all_healthy()
+    needs["coverage"] = _job(
+        result="cancelled",
+        receipt={
+            "signal": "coverage",
+            "status": "not-applicable",
+            "reason": "no lines with coverage information in this diff",
+        },
+    )
+
+    violations, _ = liveness.verify(needs)
+
+    assert [v["signal"] for v in violations] == ["coverage"]
+    assert "dead, not inapplicable" in violations[0]["message"]
+
+
+def test_a_timed_out_job_that_recorded_itself_dead_is_reported() -> None:
+    """The `Record gate liveness` step carries `if: always()`, so a job that dies at the wall can
+    still record `status=failed` before the runner tears it down. That receipt was being discarded
+    unread: the _DID_NOT_RUN short-circuit fired BEFORE the receipt was ever parsed. The detector
+    was accurate the whole time and its consumer was configured to ignore it."""
+    needs = _all_healthy()
+    needs["coverage"] = _job(
+        result="cancelled",
+        receipt={
+            "signal": "coverage",
+            "status": "failed",
+            "reason": "coverage.xml was not produced; the measurement never happened",
+        },
+    )
+
+    violations, _ = liveness.verify(needs)
+
+    assert [v["signal"] for v in violations] == ["coverage"]
+    assert "reported ITSELF dead" in violations[0]["message"]
+
+
+def test_skipped_and_cancelled_are_not_the_same_thing() -> None:
+    """THE DISCRIMINATING PAIR, in one test so it cannot half-pass.
+
+    The lazy fix is to delete the _DID_NOT_RUN short-circuit entirely, which does make the timeout
+    case red -- and also breaks the legitimate PR-only skip that the short-circuit exists to
+    protect. This asserts BOTH directions against the same signal, so an over-fix reds it just as
+    surely as no fix at all."""
+    skipped = _all_healthy()
+    skipped["coverage"] = {"result": "skipped", "outputs": {}}
+
+    cancelled = _all_healthy()
+    cancelled["coverage"] = {"result": "cancelled", "outputs": {}}
+
+    assert liveness.verify(skipped)[0] == []
+    assert [v["signal"] for v in liveness.verify(cancelled)[0]] == ["coverage"]
+
+
+# --------------------------------------------------------------------------------------------
 # The check must not go blind itself.
 # --------------------------------------------------------------------------------------------
 

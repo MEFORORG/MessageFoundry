@@ -55,9 +55,24 @@ FAILED = "failed"
 _STATUSES = (MEASURED, NOT_APPLICABLE, FAILED)
 
 # Job results that mean "this job did not run", so no receipt is owed. Anything else -- including
-# `failure` -- owes one: a job that crashed still has to be visible as a dead gate rather than
-# quietly absent.
-_DID_NOT_RUN = ("skipped", "cancelled")
+# `failure` and `cancelled` -- owes one: a job that died still has to be visible as a dead gate
+# rather than quietly absent.
+#
+# `cancelled` USED TO BE IN THIS SET, and taking it out is BACKLOG #1274. GitHub reports a
+# `timeout-minutes` expiry as `cancelled`, never `failure` (recorded in-repo at ci.yml:559), so a
+# job KILLED AT THE WALL after twenty minutes of real work arrived wearing the same label as one
+# that never started. Measured 2026-08-17: 93 of the last 100 quality-advisory runs had
+# `diff-coverage (advisory)` cancelled at its cap while THIS gate reported success -- the control
+# built to catch a dead gate excusing the deadest gate in the workflow.
+#
+# The set was built by asking which results mean "nobody did any work". `skipped` answers that
+# honestly. `cancelled` is the one result that answers it wrongly.
+_DID_NOT_RUN = ("skipped",)
+
+# Results that mean the job DIED, as opposed to never running. A dead gate has no standing to
+# declare itself `not-applicable` (see the laundering guard in verify()). `cancelled` belongs here
+# for exactly the reason it no longer belongs above.
+_DEAD_RESULTS = ("failure", "cancelled")
 
 
 class Violation(Exception):
@@ -193,7 +208,7 @@ def verify(needs: dict[str, Any]) -> tuple[list[dict[str, str]], list[dict[str, 
 
         result = str(job.get("result", "")).lower()
         if result in _DID_NOT_RUN:
-            continue  # legitimately did not run (e.g. coverage is PR-only)
+            continue  # never dispatched (coverage is PR-only, so the nightly cron skips it)
 
         raw = (job.get("outputs") or {}).get("receipt", "")
         if not str(raw).strip():
@@ -233,15 +248,22 @@ def verify(needs: dict[str, Any]) -> tuple[list[dict[str, str]], list[dict[str, 
             if not str(receipt.get("reason", "")).strip():
                 violations.append(_fail(signal, f"status={NOT_APPLICABLE} with no reason given"))
                 continue
-            if result == "failure":
+            if result in _DEAD_RESULTS:
                 # A job that DIED has no standing to declare itself inapplicable. Without this, the
                 # softest possible receipt launders a hard failure into a pass -- and every step in
                 # these jobs is continue-on-error, so nothing else would be red either.
+                #
+                # This tested `result == "failure"` alone until BACKLOG #1274. Narrowing
+                # _DID_NOT_RUN without widening this leaves the SAME hole one branch over: a
+                # timed-out job reports `cancelled`, so it would have walked past this guard and
+                # laundered its own death into a pass on the strength of a `not-applicable`
+                # receipt. Both edits are one fix; either alone is a half-open door.
                 violations.append(
                     _fail(
                         signal,
                         f"job result={result!r} but the receipt claims {NOT_APPLICABLE} "
-                        f"({receipt.get('reason')!r}). A failed gate is dead, not inapplicable.",
+                        f"({receipt.get('reason')!r}). A gate that failed or was killed is dead, "
+                        "not inapplicable.",
                     )
                 )
                 continue

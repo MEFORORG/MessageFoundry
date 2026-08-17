@@ -514,3 +514,94 @@ def test_no_expression_interpolation_inside_run_bodies(workflow: dict) -> None:
         body = step.get("run")
         if body:
             assert "${{" not in body, f"{job}/{step.get('name')!r} interpolates into a run body"
+
+
+# --------------------------------------------------------------------------------------------
+# BACKLOG #1274: the coverage job's timeout budget, and the coupling that makes the liveness
+# fix safe. Both are properties nothing else in the repo would notice changing.
+# --------------------------------------------------------------------------------------------
+
+#: The `setup(max)` term in ci.yml's nesting invariant: worst measured ubuntu setup, 5:22
+#: (ci.yml:594), rounded up.
+#:
+#: NOT this job's own 0:29 from run 32024368245. That is a sample of ONE, drawn from the only run
+#: that ever finished under the old cap -- the same selection bias that produced BACKLOG #1274.
+#: An invariant asserted against the good case does not hold in the bad one.
+_COVERAGE_SETUP_ALLOWANCE_MIN = 6
+
+#: Top of the coverage step's measured range (26:14), rounded up. Derived by extrapolating 75
+#: censored job logs against the completion profile of the runs whose pytest actually finished,
+#: and corroborated bottom-up by the serial-equivalent of ci.yml's three ubuntu legs (25:07).
+#: A budget at or under this is the BACKLOG #1274 defect returning.
+_COVERAGE_STEP_WORST_MEASURED_MIN = 27
+
+
+def _coverage_pytest_step(workflow: dict) -> dict:
+    """The step that runs the suite under coverage, found by what it DOES rather than by name."""
+    job = workflow["jobs"]["coverage"]
+    for step in job["steps"]:
+        if "--cov=" in (step.get("run") or ""):
+            return step
+    raise AssertionError("the coverage job no longer has a step running pytest under --cov")
+
+
+def test_the_coverage_job_carries_a_step_timeout_nested_inside_its_job_timeout(
+    workflow: dict,
+) -> None:
+    """Until BACKLOG #1274 the JOB cap was the only cap this job had, so a process-level hang below
+    pytest and a suite that merely needed longer both arrived as one `cancelled` job carrying no
+    information about which had happened. ci.yml gives its test legs an inner step cap for exactly
+    that reason; this pins the same discipline here.
+
+    The nesting invariant is ci.yml's: setup(max) + step_timeout must stay UNDER job_timeout, so the
+    step cap fires first and names pytest, rather than the job cap firing and naming nothing."""
+    job = workflow["jobs"]["coverage"]
+    job_timeout = job.get("timeout-minutes")
+    assert isinstance(job_timeout, int), "the coverage job must carry a job-level timeout-minutes"
+
+    step_timeout = _coverage_pytest_step(workflow).get("timeout-minutes")
+    assert isinstance(step_timeout, int), (
+        "the step running the suite under coverage must carry its own timeout-minutes; without one "
+        "a hang below pytest is indistinguishable from a suite that needed longer"
+    )
+    assert _COVERAGE_SETUP_ALLOWANCE_MIN + step_timeout < job_timeout, (
+        f"nesting invariant broken: setup({_COVERAGE_SETUP_ALLOWANCE_MIN}) + step({step_timeout}) "
+        f"is not under job({job_timeout}), so the JOB cap can fire before the STEP cap and the "
+        "failure stops naming its own cause"
+    )
+
+
+def test_the_coverage_budget_stays_above_its_measured_worst_case(workflow: dict) -> None:
+    """The original defect was not a hang -- it was a budget set at the middle of the job's own
+    runtime distribution, so 92% of pull_request runs were killed at the wall while the meta-gate
+    reported success. A budget at or below the measured worst case is that defect returning."""
+    step_timeout = _coverage_pytest_step(workflow)["timeout-minutes"]
+    assert step_timeout > _COVERAGE_STEP_WORST_MEASURED_MIN, (
+        f"coverage step budget {step_timeout} is not above the measured worst case "
+        f"{_COVERAGE_STEP_WORST_MEASURED_MIN}: the job would be killed at the wall again, and "
+        "under-budgeting is invisible because GitHub reports the kill as `cancelled`"
+    )
+
+
+def test_quality_advisory_declares_no_concurrency_group(workflow: dict) -> None:
+    """LOAD-BEARING FOR scripts/quality/liveness.py, and invisible from either side alone.
+
+    liveness.py no longer excuses a `cancelled` job, because a `timeout-minutes` kill reports
+    exactly that label. That is only safe while `cancelled` cannot ALSO mean "a newer push
+    superseded this run" -- and an `if: always()` job does keep running after a whole-run cancel
+    (measured: six superseded ci.yml runs, six for six), so `always()` is NOT the protection.
+
+    The actual protection is that this workflow declares no concurrency group, so it is never
+    superseded-cancelled at all. Adding `concurrency:` with `cancel-in-progress: true` here would
+    silently arm a false-alarm mode in a DIFFERENT file, and a gate that fires on good news gets
+    muted -- which would cost the meta-gate as well as the coverage signal."""
+    assert "concurrency" not in workflow, (
+        "quality-advisory.yml declares a workflow-level concurrency group. liveness.py treats a "
+        "`cancelled` signal job as a dead gate (BACKLOG #1274); with cancel-in-progress that would "
+        "fire on ordinary supersedes. Read liveness.py's _DID_NOT_RUN comment before changing this."
+    )
+    for name, job in workflow["jobs"].items():
+        assert "concurrency" not in job, (
+            f"job {name!r} declares a concurrency group -- see this test's docstring; liveness.py's "
+            "treatment of `cancelled` depends on supersede-cancellation not happening here"
+        )
