@@ -174,7 +174,9 @@ def _load(tmp_path: Path, toml: str) -> ServiceSettings:
 def test_shipped_default_does_not_break_a_non_ad_deployment(tmp_path: Path) -> None:
     """The reason the refusal had to be re-keyed: with a non-zero SHIPPED default, an unconditional
     'requires ad_enabled' rule would fail startup on every deployment that does not use AD."""
-    settings = _load(tmp_path, "[auth]\nlocal_users = true\n")
+    # `local_users` was not an AuthSettings field, so this fixture used to say nothing at all — the very
+    # silence the unknown-key refusal now removes. `ad_enabled = false` states "no AD" in a real field.
+    settings = _load(tmp_path, "[auth]\nad_enabled = false\n")
     assert settings.auth.ad_session_recheck_seconds == 300
     assert settings.auth.ad_enabled is False
 

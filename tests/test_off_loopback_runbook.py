@@ -10,9 +10,9 @@ Two independent classes of copy-paste defect, both of which have actually shippe
    (``0118-secure-by-default-security-configuration-section.md``) key relocation and **aborted at
    config load** (``[diagnostics].audit_all_authz``, ``[ai].data_class``), so an operator following the
    runbook verbatim got an immediate start failure. ``test_every_runbook_toml_block_loads`` runs
-   every block through the real ``load_settings`` and additionally fails on a **silently ignored**
-   key — an unrecognized key only warns, so "it loads" alone would not have caught a misspelling
-   that leaves the posture it was meant to set switched off.
+   every block through the real ``load_settings``. An unrecognized key is now **refused** by the
+   loader, so a misspelling that would leave the posture it was meant to set switched off fails the
+   load itself; the test keeps a residual warn-capture for any ignored-key path that still only warns.
 3. **connections.toml drift** — the runbook also prints ``[[inbound]]`` blocks for the *other*
    copy-pasteable TOML file (ADR 0007). Those go through a different loader with a different (strict,
    unknown-key-rejecting) contract, so they are marked with a leading ``# connections.toml`` comment
@@ -181,16 +181,18 @@ def test_every_runbook_toml_block_loads(
 ) -> None:
     """Each fenced ``toml`` block loads, and no key in it is silently ignored.
 
-    ``environ={}`` so the result is the block's own content, never the developer's ``MEFOR_*``. The
-    ignored-key half matters as much as the load half: an unrecognized ``[section]`` key only
-    *warns*, so a relocated or misspelled switch loads clean and leaves the posture it was meant to
-    arm switched OFF — the failure mode this runbook can least afford.
+    ``environ={}`` so the result is the block's own content, never the developer's ``MEFOR_*``.
 
-    That half is captured from **stdlib logging**, which is where the loader actually emits it
-    (``_log.warning("[security] has unrecognized key(s): ...")`` in ``config/settings.py``). An
-    earlier revision of this test watched only ``warnings.catch_warnings``; the loader calls
-    ``warnings.warn`` nowhere, so the assertion could never fire. The ``warnings`` capture is kept
-    alongside it so a future ``warnings.warn``-based emitter is caught too.
+    A misspelled or relocated switch loads clean under a tolerant loader and leaves the posture it was
+    meant to arm switched OFF — the failure mode this runbook can least afford. That is now caught by
+    ``load_settings`` **raising**: an unrecognized key in a known section is refused, so the call below
+    fails outright rather than returning a settings object with the switch quietly at its default.
+
+    The capture that follows is a **residual** net, not the primary detector: it still fires on any
+    ignored-key path that only warns. It is kept because an assertion that provably cannot fire is
+    worse than none — a green gate is evidence only if it can still see the class it is watching for.
+    Both sources are read, stdlib logging (where the loader emits) and ``warnings.catch_warnings`` (so
+    a future ``warnings.warn``-based emitter is covered too).
     """
     from messagefoundry.config.settings import load_settings
 

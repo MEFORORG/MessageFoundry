@@ -36,7 +36,7 @@ recognizes back as an editable step, so the `.py` file stays the only artifact a
 |---|---|---|
 | Code Lookup | `code_lookup(msg, "<path>", TABLE)` + module `TABLE = code_set("<set>")` | Translate a field via a named code set (ADR 0033) |
 | DB Lookup | `row = db_lookup("<conn>", "<sql>", {})` | Read-only DB enrichment (`[egress].allowed_db`, ADR 0010) |
-| FHIR Lookup | `pat = fhir_lookup("<conn>", "<query>")` | Read-only FHIR read/search (`[egress].allowed_http`, ADR 0043) |
+| FHIR Lookup | `pat = fhir_lookup("<conn>", "<path>", {})` | Read-only FHIR read/search — search fields go in the `params` mapping, never a `?`-query (`[egress].allowed_http`, ADR 0043) |
 
 ## Structure & flow (8)
 

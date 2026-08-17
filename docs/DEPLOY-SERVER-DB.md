@@ -89,8 +89,8 @@ Windows machine trust store (§5); **no secret in the file or env**:
 
 ```toml
 [store]
-type = "sqlserver"
-host = "sql01.corp.example.com"
+backend = "sqlserver"
+server = "sql01.corp.example.com"
 database = "MessageFoundry"
 auth = "integrated"                # Trusted_Connection=yes — the gMSA's identity authenticates
 encrypt = true                     # default; TLS to the DB
