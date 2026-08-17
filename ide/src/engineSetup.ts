@@ -14,15 +14,7 @@
 // the panel-shell template only; its handler inserts snippets and dispatches nothing.
 import * as vscode from "vscode";
 import { SETUP_LEDE, SETUP_SECTIONS, SETUP_TITLE, buttonById } from "./engineSetupContent";
-
-function nonce(): string {
-  let s = "";
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 24; i++) {
-    s += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return s;
-}
+import { nonce } from "./cspNonce";
 
 function esc(s: string): string {
   // Escape quotes too, not just &<>: these values land inside double-quoted HTML attributes

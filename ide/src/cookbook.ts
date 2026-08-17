@@ -12,15 +12,7 @@
 // around it (follows home.ts's pattern: CSP, nonce, message passing, styling).
 import * as vscode from "vscode";
 import { RECIPES, searchBlob } from "./cookbookRecipes";
-
-function nonce(): string {
-  let s = "";
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 24; i++) {
-    s += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return s;
-}
+import { nonce } from "./cspNonce";
 
 function esc(s: string): string {
   // Escape quotes too, not just &<>: these values land inside double-quoted HTML attributes

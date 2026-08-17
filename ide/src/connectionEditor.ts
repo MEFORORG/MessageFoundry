@@ -10,6 +10,7 @@ import { configDir, runJson, workspaceDir } from "./cli";
 import { type ConnObj, nameCollisionError, planSave } from "./connectionMerge";
 import { type FieldGroup, buildForm } from "./connectionForm";
 import { connectionSchema } from "./connectionSchema";
+import { nonce } from "./cspNonce";
 
 // The ConnObj shape lives in the pure connectionMerge.ts (the mocha-run unit tests import it and
 // must not pull vscode); re-exported here so existing consumers keep their import path.
@@ -235,15 +236,6 @@ async function remove(name: string, current: vscode.WebviewPanel, onSaved?: () =
   current.dispose();
   onSaved?.();
   void vscode.window.showInformationMessage(`MessageFoundry: removed ${name} from connections.toml.`);
-}
-
-function nonce(): string {
-  let s = "";
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 24; i++) {
-    s += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return s;
 }
 
 // Embed a value as JSON safe to drop inside a <script> (escape < so a "</script>" in data can't break out).
@@ -638,6 +630,7 @@ export function connectionFormHtml(
     $('cancel').addEventListener('click', () => vscode.postMessage({ command: 'cancel' }));
     $('delete').addEventListener('click', () => vscode.postMessage({ command: 'delete', name: INITIAL.name }));
 
+    // Origin is NOT checked here — see webviewMessaging.ts.
     window.addEventListener('message', (e) => {
       if (e.data && e.data.command === 'error') { errorEl.textContent = e.data.message; errorEl.style.display = ''; }
       // Rebuilt descriptors after a transport/direction change. The grouping rules stay in the tested
