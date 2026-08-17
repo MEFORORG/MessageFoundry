@@ -971,6 +971,35 @@ def test_no_registry_record_stands_down_without_spending_the_budget(
     assert m.get("state") != "announced", f"a stand-down recorded an announcement: {m}"
 
 
+def test_repeated_stand_downs_do_not_arm_the_kill_ladder(repo: Path, tmp_path: Path) -> None:
+    """A STAND-DOWN MUST BE RECOVERABLE, and one invocation cannot show that.
+
+    Section 14 writes state='checking' with attempts+1 BEFORE the lookup, and the kill ladder fires on
+    state='checking' AND attempts >= 2. A stand-down that returned without resetting the marker
+    therefore reached the ladder on the THIRD prompt: a LOOKUP_KILLED line injected into the user's
+    prompt, whose note claims the lookup did not return when it returned in under a second, plus an
+    hour-long floor. `checks` never advanced either, so the SETTLED cap could not end it -- it repeated
+    for the life of the session. That is permanent silence, which is the failure this whole path exists
+    to avoid, so it is asserted over THREE runs rather than one.
+    """
+    home = _registry(tmp_path / "home", "00000000-0000-0000-0000-000000000000", ".claude")
+    sd = tmp_path / "sd"
+    for _ in range(3):
+        p = run(
+            repo,
+            tmp_path=tmp_path,
+            state_dir=sd,
+            rows=[PEER, ACCT],
+            env={"USERPROFILE": str(home)},
+        )
+        assert "LOOKUP_KILLED" not in p.stdout, f"a stand-down armed the kill ladder: {p.stdout!r}"
+    assert set(outcomes(sd)) == {"NO_LOGIN"}, outcomes(sd)
+    m = marker_obj(sd)
+    assert m.get("state") == "pending", f"the marker was left armed: {m}"
+    assert int(m.get("attempts", 0)) == 0, f"attempts kept climbing toward the ladder: {m}"
+    assert "floorSeconds" not in m, f"a stand-down installed a silence floor: {m}"
+
+
 def test_the_hook_script_is_ascii_only() -> None:
     """This script's stdout IS an instruction to a model, so a mangled byte is a corrupted
     instruction. The default console encoding has already broken a consumer once in this repo."""

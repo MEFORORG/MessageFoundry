@@ -503,9 +503,40 @@ try {
         # therefore no session id, so the lookup cannot succeed BY CONSTRUCTION there -- standing down
         # would make the diagnostic report nothing on every invocation, including on the healthy repo
         # path it exists to inspect. It sends nothing and debits no budget, so the reason for standing
-        # down does not apply; it says the login is unknown instead, at the roster below.
+        # down does not apply. It prints the login, and says so when it is unknown, in the block below --
+        # which also states that the login filter is OFF for that run, because an empty login makes the
+        # filter's branch unreachable and every cross-login peer therefore renders as MESSAGE. A
+        # diagnostic that quietly disables a filter would misreport reachability as good news.
         if (-not $myLogin -and -not $SelfTest) {
-            Write-Receipt 'NO_LOGIN' @{ peers = $peers.Count; note = 'no registry record for this session id; cannot compute reachability' }
+            # RESET THE MARKER, exactly as every other stand-down here does. Section 14 already wrote
+            # state='checking' with attempts+1 BEFORE this lookup, so returning without clearing it
+            # leaves the session one prompt from the kill ladder above -- which fires on
+            # state='checking' AND attempts >= 2, injects a LOOKUP_KILLED line whose note ("previous
+            # lookup did not return") is false, and installs an hour-long floor. Measured: three
+            # consecutive stand-downs produced that cycle, and because `checks` never advanced past 0
+            # the SETTLED cap could not end it either, so it repeated for the life of the session.
+            # Standing down must be RECOVERABLE; the next prompt has to be able to try again.
+            $upd = if ($m) { $m } else { [pscustomobject]@{ schema = 2; sessionId = $selfId } }
+            $upd | Add-Member -NotePropertyName state -NotePropertyValue 'pending' -Force
+            $upd | Add-Member -NotePropertyName attempts -NotePropertyValue 0 -Force
+            $upd | Add-Member -NotePropertyName checks -NotePropertyValue ([int]$upd.checks + 1) -Force
+            $upd | Add-Member -NotePropertyName lastCheck -NotePropertyValue (Get-Date).ToString('o') -Force
+            $upd.PSObject.Properties.Remove('floorSeconds')
+            try { $upd | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $marker -Encoding ascii } catch { }
+
+            # THE NOTE CLAIMS ONLY WHAT WAS ESTABLISHED. An unreadable record and an absent one are
+            # indistinguishable here by construction: a record that fails to parse has no sessionId to
+            # attribute it by, so this cannot say WHOSE record it was. Reporting "no record" outright
+            # would send an operator looking for a missing file that may be present and corrupt --
+            # which is the launch-moment case this registry library is built around. Count them
+            # instead, on this rare path only, and let the number speak.
+            $unreadable = @(Get-SessionRecords -IncludeUnreadable | Where-Object { $_.Unreadable }).Count
+            $why = if ($unreadable -gt 0) {
+                "could not determine this session's login; $unreadable registry record(s) unreadable, possibly still being written"
+            } else {
+                "could not determine this session's login; no registry record matched this session id"
+            }
+            Write-Receipt 'NO_LOGIN' @{ peers = $peers.Count; checks = [int]$upd.checks; note = $why }
             exit 0
         }
 
@@ -543,6 +574,15 @@ try {
             Write-Output "  state dir  : $StateDir"
             Write-Output "  MessageFoundry guard: passed"
             Write-Output "  marker state found  : $st"
+            if ($myLogin) {
+                Write-Output "  this session's login: $myLogin"
+            } else {
+                Write-Output "  this session's login: UNKNOWN (a hand-run carries no session id, so the"
+                Write-Output "        registry lookup has nothing to match). THE LOGIN FILTER IS OFF for"
+                Write-Output "        this run, so a peer on another login shows as MESSAGE here and"
+                Write-Output "        would be SKIPped on the real path. Reachability below is therefore"
+                Write-Output "        an UPPER BOUND, not what a real session would send."
+            }
             if ($st -eq 'settled' -or $st -eq 'exhausted') { Write-Output "  would exit silently: already $st" }
             if (-not $me) {
                 # Say so rather than quietly listing this session as its own peer. Run by hand there is
