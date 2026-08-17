@@ -156,6 +156,7 @@ def run(
     env: dict[str, str] | None = None,
     extra: tuple[str, ...] = (),
     stdin: bool = True,
+    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if presence is None:
         presence = presence_stub(tmp_path, rows, body=body)
@@ -172,9 +173,11 @@ def run(
     if session_id is not None:
         payload["session_id"] = session_id
     full_env = {**os.environ, **(env or {})}
+    # cwd is separable from repo because the CONTAINER case is defined by them differing: the hook runs
+    # in a directory that is not a worktree while -CommonDir names the repo it should coordinate with.
     proc = subprocess.run(
         args,
-        cwd=str(repo),
+        cwd=str(cwd or repo),
         input=json.dumps(payload) if stdin else None,
         capture_output=True,
         text=True,
@@ -855,6 +858,143 @@ def test_two_concurrent_runs_announce_once(repo: Path, tmp_path: Path) -> None:
     announced = [r for r in results if "[ANNOUNCE YOURSELF" in r.stdout]
     assert len(announced) == 1, f"{len(announced)} of 2 concurrent runs announced"
     assert outcomes(sd).count("ANNOUNCED") == 1
+
+
+# --------------------------------------------------------------------------------------------------
+# THE CONTAINER PATH. A session whose cwd is not a worktree of the scoped repo -- a directory holding
+# several clones -- cannot scope presence from its cwd, and can never appear in presence's own roster,
+# because that roster is built from worktree cwds. So $me is null there BY CONSTRUCTION, not by a
+# heuristic miss, and every decision downstream of $me has to be correct under that null. This path
+# previously had no tests at all, which is why three defects in it survived to review.
+# --------------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def container(tmp_path: Path) -> Path:
+    """A directory that is NOT a git repo, asserted rather than assumed.
+
+    If the temp root were ever inside a checkout these tests would silently exercise the ordinary
+    in-repo path and prove nothing about the container case.
+    """
+    c = tmp_path / "container"
+    c.mkdir()
+    proc = subprocess.run(
+        ["git", "-C", str(c), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0, f"{c} resolves a git toplevel, so it is not the container case"
+    return c
+
+
+def _recording_stub(tmp_path: Path, rows: list[dict[str, Any]], sink: Path) -> Path:
+    """A presence stub that records the -Repo it was handed, then answers normally."""
+    payload = json.dumps(rows).replace("'", "''")
+    body = f"Set-Content -LiteralPath '{sink}' -Value \"repo=$Repo\" -Encoding ascii\n"
+    body += f"Write-Output '{payload}'\n"
+    return presence_stub(tmp_path, None, body=body)
+
+
+def test_presence_is_scoped_by_repo_when_the_cwd_cannot_scope_it(
+    repo: Path, container: Path, tmp_path: Path
+) -> None:
+    """The positive arm. Without -Repo, presence outside a repo returns an empty roster and the hook
+    stands down with LOOKUP_FAILED -- telling a caller that already named the repo there are no peers."""
+    sd = tmp_path / "sd"
+    sink = tmp_path / "repo-arg.txt"
+    stub = _recording_stub(tmp_path, [PEER], sink)
+    p = run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        presence=stub,
+        cwd=container,
+        extra=("-CommonDir", str(repo / ".git")),
+    )
+    assert sink.read_text(encoding="ascii").strip() == f"repo={repo}", (
+        "presence was not scoped to the anchor repo"
+    )
+    assert outcomes(sd) == ["ANNOUNCED"], outcomes(sd)
+    assert PEER["Cwd"] in p.stdout
+
+
+def test_presence_is_not_handed_a_repo_when_the_cwd_resolves(repo: Path, tmp_path: Path) -> None:
+    """In-repo behaviour is measured and working, so it must stay byte-identical: an explicit -Repo
+    there would substitute an argument for a default that is already right."""
+    sd = tmp_path / "sd"
+    sink = tmp_path / "repo-arg.txt"
+    stub = _recording_stub(tmp_path, [SELF_ROW, PEER], sink)
+    run(repo, tmp_path=tmp_path, state_dir=sd, presence=stub)
+    assert sink.read_text(encoding="ascii").strip() == "repo=", (
+        "an in-repo run passed -Repo, changing a path that was already correct"
+    )
+
+
+def test_an_unknown_login_does_not_withhold_from_a_peer(
+    repo: Path, container: Path, tmp_path: Path
+) -> None:
+    """The defect that made this unshippable.
+
+    $myLogin used to fall back to the literal 'default'. That is a GUESS, and on the container path
+    $me is always null, so the guess is always applied. For a session actually running under another
+    root it inverts the filter: every default-login peer is marked unreachable. Withholding from a
+    reachable peer is silent; attempting an unreachable one is a visible failed send.
+    """
+    sd = tmp_path / "sd"
+    other = {**PEER, "Login": "account-1"}
+    p = run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[other],
+        cwd=container,
+        extra=("-CommonDir", str(repo / ".git")),
+    )
+    assert "different login" not in p.stdout, (
+        "a login this session could not determine was used to withhold from a peer"
+    )
+    assert peer_lines(p.stdout, "MESSAGE"), "the peer was not offered as reachable"
+
+
+def test_a_known_login_still_withholds_from_another_login(repo: Path, tmp_path: Path) -> None:
+    """The negative control. The filter must still fire where the login IS known -- otherwise the fix
+    above would have removed the protection rather than stopped it guessing.
+
+    A same-login peer rides along deliberately: with only unreachable peers the hook is silent by
+    design (see test_only_unreachable_peers_means_silence), so the reason would never be rendered and
+    this test would pass against a filter that had stopped working entirely.
+    """
+    sd = tmp_path / "sd"
+    other = {**PEER, "Login": "account-1"}
+    p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER2, other])
+    assert "different login" in p.stdout, "the login filter stopped firing where the login is known"
+    assert peer_lines(p.stdout, "MESSAGE"), "the same-login peer was not offered"
+
+
+def test_the_clear_cooldown_fires_outside_a_repo(
+    repo: Path, container: Path, tmp_path: Path
+) -> None:
+    """The /clear suppressor was keyed on the git toplevel, and an empty toplevel IS the container
+    discriminator -- so it was off for the one caller that re-announces most. A container session has
+    no worktree identity, so nothing else distinguishes it across the id a /clear mints."""
+    sd = tmp_path / "sd"
+    common = ("-CommonDir", str(repo / ".git"))
+    first = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[PEER], cwd=container, extra=common)
+    assert "[ANNOUNCE YOURSELF" in first.stdout
+    second = run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[PEER],
+        session_id="77777777-6666-5555-4444-333333333333",
+        cwd=container,
+        extra=common,
+    )
+    assert "RECENT_CWD" in outcomes(sd), outcomes(sd)
+    assert "[ANNOUNCE YOURSELF" not in second.stdout, (
+        "the same directory re-announced under a new id"
+    )
 
 
 def test_the_hook_script_is_ascii_only() -> None:

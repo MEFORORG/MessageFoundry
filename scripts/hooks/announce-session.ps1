@@ -195,10 +195,14 @@ try {
     # another repo, but a manual or test invocation could, and creating state in someone else's .git
     # plus a visible line in their prompts once a minute is not acceptable. Same discriminator the
     # shim's missing-script notice uses.
+    # $repoRoot is the base that SATISFIED the guard, kept rather than recomputed: it is the only repo
+    # this invocation has proven it may touch, and step 14 needs exactly that to scope presence when
+    # the cwd cannot scope it. Recomputing it there would be a second answer to a settled question.
     $bases = @((Split-Path $cd -Parent), $top) | Where-Object { $_ }
     $isMf = $false
+    $repoRoot = ''
     foreach ($b in $bases) {
-        if (Test-Path -LiteralPath (Join-Path $b 'scripts/coord/presence.ps1')) { $isMf = $true; break }
+        if (Test-Path -LiteralPath (Join-Path $b 'scripts/coord/presence.ps1')) { $isMf = $true; $repoRoot = $b; break }
     }
     if (-not $isMf) { exit 0 }
 
@@ -330,10 +334,20 @@ try {
         # --- 12. CWD COOLDOWN: the /clear suppressor ------------------------------------------------
         # A /clear or a resume mints a new session_id. Without this the same session re-announces to the
         # same peers several times an afternoon.
+        # KEYED ON $top WHERE THERE IS ONE, ON THE PROCESS CWD WHERE THERE IS NOT. Keying on $top alone
+        # disabled this suppressor on exactly the path a container session takes, because $top being
+        # empty IS that path's discriminator. The cooldown would then be off for the one caller that
+        # re-announces most: a container session has no worktree identity of its own, so nothing else
+        # distinguishes it across the new session id a /clear mints.
+        #
+        # The identity wanted here is "the checkout or directory this session is sitting in", and
+        # outside a repo that is the process cwd. Same normalisation either way, so a repo session's
+        # key is unchanged and its cooldown behaviour is untouched.
         $cwdKey = ''
-        if ($top) {
+        $cooldownPath = if ($top) { $top } else { (Get-Location).Path }
+        if ($cooldownPath) {
             $sha2 = [System.Security.Cryptography.SHA256]::Create()
-            $h2 = $sha2.ComputeHash([System.Text.Encoding]::UTF8.GetBytes((Get-Norm $top)))
+            $h2 = $sha2.ComputeHash([System.Text.Encoding]::UTF8.GetBytes((Get-Norm $cooldownPath)))
             $sha2.Dispose()
             $cwdKey = -join ($h2[0..3] | ForEach-Object { $_.ToString('x2') })
         }
@@ -383,11 +397,26 @@ try {
         # DO NOT pass -SelfPid. It saves a measured ~0.4 s by skipping presence's ancestry walk, but that
         # walk is our SECOND self-identification net, and a roster that lists you as your own peer makes
         # the session message ITSELF -- the most damaging failure this class of code has.
+        # SCOPE PRESENCE EXPLICITLY ONLY WHEN THE CWD CANNOT. presence defaults to the current worktree's
+        # repo family; outside a repo it has nothing to scope to, returns an empty roster and says so on
+        # stderr, which this hook then reads as 'presence returned nothing usable' and stands down. That
+        # is right when there is no repo to find and wrong when the caller already named one.
+        #
+        # PASSED ONLY IN THAT CASE. Inside a repo the default is measured and working, and $top is empty
+        # exactly when git could not resolve a toplevel, so it is the discriminator and costs no git call.
+        #
+        # A HASHTABLE SPLAT, NEVER AN ARRAY ONE, and this is measured rather than stylistic.
+        # @('-Json','-Repo',$path) binds POSITIONALLY: the path landed on presence's [int] -SelfPid, the
+        # transformation error was swallowed by the catch below, and it surfaced as the same generic
+        # 'nothing usable' -- indistinguishable from the empty roster this hook exists to report.
+        $presenceArgs = @{ Json = $true }
+        if (-not $top -and $repoRoot) { $presenceArgs['Repo'] = $repoRoot }
+
         $peers = @()
         $ok = $false
         if (Test-Path -LiteralPath $PresenceScript) {
             try {
-                $out = & $PresenceScript -Json
+                $out = & $PresenceScript @presenceArgs
                 if ($out) {
                     $parsed = @($out | ConvertFrom-Json)
                     if ($parsed.Count -gt 0 -and $parsed[0].PSObject.Properties.Name -contains 'SessionId') {
@@ -425,6 +454,13 @@ try {
             # of a filter measured to be currently unexercised, and a wrong filter would then produce
             # evidence identical to a right one. DO NOT invert this to fail closed when $me is null:
             # the ancestry walk is a heuristic, and a heuristic miss must not become permanent silence.
+            #
+            # THIS GUARD IS SKIPPED ENTIRELY ON THE CONTAINER PATH, and that is deliberate rather than an
+            # oversight. $me is null there BY CONSTRUCTION -- presence's roster is built from worktree
+            # cwds and a container is not one -- so the kind cannot be read at all. Reviewed and left as
+            # is: the rule above already decides this case, and "unknown kind" is exactly the heuristic
+            # miss it says must not become silence. Skipping means such a session announces; the cost is
+            # a message to a peer that may not be attended, which is visible and recoverable.
             $upd = if ($m) { $m } else { [pscustomobject]@{ schema = 2; sessionId = $selfId } }
             $upd | Add-Member -NotePropertyName state -NotePropertyValue 'pending' -Force
             $upd | Add-Member -NotePropertyName attempts -NotePropertyValue 0 -Force
@@ -437,14 +473,29 @@ try {
 
         # BOTH self-identification nets.
         $others = @($peers | Where-Object { (-not $_.IsSelf) -and -not ($_.SessionId -ieq $selfId) })
-        $myLogin = if ($me) { [string]$me.Login } else { 'default' }
+
+        # AN UNKNOWN LOGIN MUST NOT MANUFACTURE A VERDICT. This used to fall back to the literal
+        # 'default', which is a GUESS, and the guess inverts the filter below rather than degrading it:
+        # on any non-default root every default-login peer is marked 'different login' and every peer
+        # sharing this session's root is marked reachable -- exactly backwards, and silently.
+        #
+        # $me is null far more often than the ancestry walk missing. presence builds its roster from
+        # WORKTREE cwds, so a session whose cwd is not a worktree of the scoped repo -- the container
+        # case this change exists for -- can never appear in it and $me is null BY CONSTRUCTION.
+        #
+        # Empty therefore means "not known", and the filter below is skipped rather than guessed. That
+        # fails toward ATTEMPTING a peer that may be unreachable, whose cost is one failed send that the
+        # operator can see, instead of silently withholding from a reachable one. It is the same
+        # direction step 15's UNATTENDED guard already argues for: a heuristic miss must not become
+        # silence. Non-default roots are in live use on this machine, so this is not hypothetical.
+        $myLogin = if ($me) { [string]$me.Login } else { '' }
 
         $ranked = @()
         foreach ($p in $others) {
             $reason = ''
             if ([string]$p.Surface -ne 'desktop') {
                 $reason = 'the MCP cannot enumerate this surface'
-            } elseif (([string]$p.Login) -and -not ([string]$p.Login -ieq $myLogin)) {
+            } elseif ($myLogin -and ([string]$p.Login) -and -not ([string]$p.Login -ieq $myLogin)) {
                 # presence spans every config root, and a peer under another login is unreachable by
                 # THIS session's tools.
                 $reason = 'different login -- invisible to this session''s MCP'
@@ -477,7 +528,9 @@ try {
                 # hook runs as a child of the session process and carries its id, and both nets work.
                 Write-Output "  NOTE: could not identify THIS session in the roster (no session_id on a"
                 Write-Output "        hand-run, and the ancestry walk sees a shell). The list below may"
-                Write-Output "        therefore include this session. That cannot happen on the real path."
+                Write-Output "        therefore include this session. On the real path this is rare in a"
+                Write-Output "        worktree, but NORMAL outside one: presence builds its roster from"
+                Write-Output "        worktree cwds, so a session rooted elsewhere is never in it."
             }
             Write-Output "  peers=$($others.Count) reachable=$($reachable.Count) unreachable=$($unreachable.Count)"
             foreach ($r in $ranked) {
