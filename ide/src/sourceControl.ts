@@ -9,6 +9,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { configDir, messageSetsDir, run, workspaceDir } from "./cli";
 import { findGit, getHooksPath, getRemoteUrl, git, isRepo } from "./git";
+import { nonce as scNonce } from "./cspNonce";
 
 const GITIGNORE_MARKER = "# --- MessageFoundry ---";
 // Kept deliberately minimal; NOTE we do NOT ignore .vscode/ (so a team shares messagefoundry.*
@@ -431,15 +432,6 @@ export async function setRepoStorage(): Promise<void> {
   );
 }
 
-function scNonce(): string {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  let s = "";
-  for (let i = 0; i < 24; i++) {
-    s += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return s;
-}
-
 function scEscape(v: string): string {
   return v
     .replace(/&/g, "&amp;")
@@ -517,6 +509,7 @@ function renderRepoStorageHtml(current: string): string {
     document.getElementById('cancel').addEventListener('click', function () {
       vscode.postMessage({ command: 'cancel' });
     });
+    // Origin is NOT checked here — see webviewMessaging.ts.
     window.addEventListener('message', function (e) {
       if (e.data && e.data.command === 'error') { err.textContent = e.data.text; }
     });

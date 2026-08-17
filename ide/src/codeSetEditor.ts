@@ -13,6 +13,7 @@
 // Promote is offered (the same messagefoundry.promote command the connection editor reuses).
 import * as vscode from "vscode";
 import { configDir, runJson, workspaceDir } from "./cli";
+import { nonce } from "./cspNonce";
 
 // §2 DETAIL/GRID — the shape `show` emits and `upsert` consumes. Rows are an array-of-arrays (a grid
 // is positional; headers carry the names once in `columns`), each inner row aligned to `columns`.
@@ -205,15 +206,6 @@ async function remove(name: string, current: vscode.WebviewPanel, onSaved?: () =
   current.dispose();
   onSaved?.();
   void vscode.window.showInformationMessage(`MessageFoundry: removed code set ${name}.`);
-}
-
-function nonce(): string {
-  let s = "";
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 24; i++) {
-    s += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return s;
 }
 
 // Embed a value as JSON safe to drop inside a <script> (escape < so a "</script>" in data can't break out).
@@ -526,6 +518,7 @@ export function codeSetFormHtml(
     $('delete').addEventListener('click', () => { if (originalName) vscode.postMessage({ command: 'delete', name: originalName }); });
 
     // CLI/validation errors arrive here and stay inline so the grid is still editable (file unchanged).
+    // Origin is NOT checked here — see webviewMessaging.ts.
     window.addEventListener('message', (e) => {
       if (e.data && e.data.command === 'error') { errorEl.textContent = e.data.message; errorEl.style.display = ''; }
     });
