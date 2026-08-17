@@ -230,19 +230,72 @@ def sleeper() -> Iterator[int]:
         proc.wait(timeout=30)
 
 
+def _clone(template: Path, dest: Path) -> Fixture:
+    """Copy a prebuilt fixture family and rebind every absolute path git recorded inside it.
+
+    ``_build`` is ~30 git subprocesses and, measured on this checkout, **2.4s of the 3.9s an average
+    test in this file costs** -- 61 per cent of the file, spent rebuilding a byte-identical repo 43
+    times. This is the cheap half: copy the tree, then fix the two things a copy gets wrong.
+
+    Only two kinds of absolute path survive a copy, and both are repairable in one subprocess each:
+
+    * the primary's ``origin`` remote URL, which still names the TEMPLATE's bare repo -- so a
+      ``-Fetch`` test would silently reach the wrong origin rather than fail;
+    * the worktree registrations, in BOTH directions (each tree's ``.git`` file names its gitdir, and
+      each ``.git/worktrees/<name>/gitdir`` names its tree). ``git worktree repair`` exists for exactly
+      this and rewrites the whole family in a single call.
+
+    ``decoy`` is deliberately excluded: it is a SEPARATE repo that only shares the name prefix, so
+    ``worktree repair`` rejects it and fails the whole call.
+
+    Mtimes are preserved (``copytree`` uses ``copy2``), which is load-bearing -- the activity veto
+    reads the newest mtime of the private git metadata, and ``_backdate`` moves it. The template ages
+    by at most the file's own runtime, minutes against a 36h window, and no test asserts an exact age.
+    """
+    shutil.copytree(template, dest, symlinks=True, dirs_exist_ok=True)
+    fx = Fixture(dest)
+    _git(fx.primary, "remote", "set-url", "origin", str(dest / "origin.git"))
+    trees = [
+        p
+        for p in sorted(fx.primary.parent.glob(f"{fx.primary.name}-*"))
+        if p.name != f"{fx.primary.name}-decoy"
+    ]
+    trees.append(fx.primary / ".claude" / "worktrees" / "nested")
+    _git(fx.primary, "worktree", "repair", *(str(p) for p in trees))
+    return fx
+
+
 @pytest.fixture(scope="session")
-def readonly_fx(tmp_path_factory: pytest.TempPathFactory) -> Fixture:
-    """Shared by the dry-run tests, which provably mutate nothing."""
-    return _build(tmp_path_factory.mktemp("prune-ro"))
+def _template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The one real ``_build`` per worker. Never handed to a test.
+
+    Kept pristine on purpose: every other fixture in this file is a copy of it, so a test that
+    mutated it would poison every LATER test in the worker -- an order-dependent failure, which is
+    the expensive kind. Tests get clones; nothing gets this.
+    """
+    root = tmp_path_factory.mktemp("prune-template")
+    _build(root)
+    return root
+
+
+@pytest.fixture(scope="session")
+def readonly_fx(_template: Path, tmp_path_factory: pytest.TempPathFactory) -> Fixture:
+    """Shared by the dry-run tests, which provably mutate nothing.
+
+    Still its own clone rather than the template itself, so "provably mutates nothing" stays an
+    assertion about these tests instead of a load-bearing precondition for the whole file.
+    """
+    return _clone(_template, tmp_path_factory.mktemp("prune-ro"))
 
 
 @pytest.fixture
-def fx(tmp_path: Path) -> Fixture:
+def fx(_template: Path, tmp_path: Path) -> Fixture:
     """Function-scoped, for the -Apply tests.
 
-    Worktree registrations are absolute-path-bound, so a mutated fixture must be rebuilt, not copied.
+    Worktree registrations are absolute-path-bound, so a mutated fixture cannot be REUSED -- but it
+    can be copied and rebound, which is what ``_clone`` does and why this is no longer a full rebuild.
     """
-    return _build(tmp_path)
+    return _clone(_template, tmp_path)
 
 
 def _argv(
