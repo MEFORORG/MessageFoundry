@@ -153,6 +153,35 @@
     ASCII-only on purpose; run under pwsh 7 by the hook.
 #>
 
+param(
+    # WHERE THE QUEUE LIVES, for a session whose cwd is NOT inside a git repository. Empty is the
+    # normal case and leaves every existing behaviour byte-identical.
+    #
+    # WHY THIS IS NOT SIMPLY "THE REPO". One variable used to answer two different questions: WHICH
+    # QUEUE do I read, and WHICH BOX is mine. Deriving both from cwd is right inside a repo and
+    # unanswerable outside one, so a session rooted at a worktree CONTAINER -- a plain directory
+    # holding several clones -- could not be delivered to at all. This parameter answers only the
+    # FIRST question. The box key below stays a function of the session's OWN cwd, so an anchored
+    # session reads its own box and is never handed the anchor repo's primary checkout's mail.
+    #
+    # NO SHIPPED CALLER PASSES THIS, AND THAT IS NOT AN OVERSIGHT TO BE READ AS A GAP. The shim
+    # scripts/coord/install-coordination.ps1 writes is gated on the SAME git probe and invokes the
+    # drain with no arguments, so outside a repo it never starts this script rather than reaching a
+    # stand-down inside it. The anchor therefore exists for an out-of-repo caller the OPERATOR
+    # wires; installing this file alone changes nothing about the container case. Do not describe
+    # the container gap as closed on the strength of this parameter existing.
+    #
+    # WHAT THE ORDERING BUYS, STATED NO STRONGER THAN IT IS. The anchor is consulted only after the
+    # cwd probe has failed AND git has been shown to work AND the cwd still exists, because
+    # "git -C $cwd rev-parse failed" is a WEAKER sentence than "cwd is not a repo": a dubious-
+    # ownership refusal, a missing administrative gitdir, a MAX_PATH checkout or a stray GIT_DIR all
+    # fail that probe on a directory that IS a worktree. Measured: with GIT_DIR pointed at a
+    # nonexistent path, the probe exits 128 inside a real worktree. The three-part test narrows that
+    # gap; it does not close it, and a residual failure sends a real worktree's drain at the
+    # anchor's queue, where its own box is empty and its mail goes unread rather than misdelivered.
+    [string]$AnchorRepo = ''
+)
+
 $ErrorActionPreference = 'SilentlyContinue'
 
 # --- Receiver-side caps. THESE ARE THE CONTROL. ---------------------------------------------------
@@ -473,9 +502,29 @@ try {
 
     $cwd = if ($hook -and $hook.cwd) { [string]$hook.cwd } else { (Get-Location).Path }
 
-    # --- Locate the queue. Outside a repo this is not our business; say nothing and go.
+    # --- Locate the queue. Outside a repo this is not our business unless the caller passed an
+    # anchor; say nothing and go.
     $common = & git -C $cwd rev-parse --path-format=absolute --git-common-dir 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $common) { exit 0 }
+    if ($LASTEXITCODE -ne 0 -or -not $common) {
+        # A FAILED PROBE IS NOT PROOF OF "NOT A REPO", so three things must hold before the anchor is
+        # honoured. Each one closes a measured way a REAL worktree fails this probe, and the whole
+        # point is to stand down rather than send a worktree session at a foreign queue.
+        if (-not $AnchorRepo) { exit 0 }
+        # 1. An anchor must be ABSOLUTE. A relative one resolves against the hook PROCESS's working
+        #    directory, which is not the payload cwd this parameter is documented in terms of, so it
+        #    silently names a different queue depending on who launched the hook.
+        if (-not [System.IO.Path]::IsPathRooted($AnchorRepo)) { exit 0 }
+        # 2. The cwd must EXIST. A payload naming a deleted directory fails the probe for a reason
+        #    that says nothing about repo-ness, and nothing here can address a box for it sensibly.
+        if (-not (Test-Path -LiteralPath $cwd)) { exit 0 }
+        # 3. GIT ITSELF MUST WORK. Without this, a git that cannot launch -- non-terminating under
+        #    this file's SilentlyContinue preference, leaving $LASTEXITCODE unset -- reads exactly
+        #    like "not a repo" and routes a real worktree's drain to the anchor.
+        & git --version 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { exit 0 }
+        $common = & git -C $AnchorRepo rev-parse --path-format=absolute --git-common-dir 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $common) { exit 0 }
+    }
     $root = Join-Path $common.Trim() 'mefor-coord/mail'
     if (-not (Test-Path -LiteralPath $root)) { exit 0 }   # nothing has ever been sent; silence is correct
 
