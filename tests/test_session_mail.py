@@ -241,6 +241,7 @@ def run_drain(
     session_id: str | None = SELF_ID,
     cwd: Path | None = None,
     anchor_repo: Path | None = None,
+    run_from: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Drive the hook exactly as Claude Code does.
 
@@ -260,9 +261,13 @@ def run_drain(
     argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(DRAIN)]
     if anchor_repo is not None:
         argv += ["-AnchorRepo", str(anchor_repo)]
+    # run_from exists because the PAYLOAD cwd and the PROCESS cwd are separable in production and
+    # must be separable here: a payload can name a directory that no longer exists, which Windows
+    # refuses as a process working directory. Defaulting it to the payload keeps every other test
+    # driving the pair exactly as the client does.
     proc = subprocess.run(
         argv,
-        cwd=str(cwd or repo),
+        cwd=str(run_from or cwd or repo),
         input=json.dumps(payload),
         capture_output=True,
         text=True,
@@ -2285,9 +2290,51 @@ def test_an_unresolvable_anchor_is_silent_rather_than_fatal(
     repo: Path, container: Path, tmp_path: Path
 ) -> None:
     """A hook that throws takes the turn with it. An anchor naming nothing is a stand-down."""
-    seed(repo, tmp_path, [{"body": "unreachable"}], box_cwd=container)
+    info = seed(repo, tmp_path, [{"body": "unreachable"}], box_cwd=container)
     proc = run_drain(repo, cwd=container, anchor_repo=container / "nope")
     assert not proc.stdout.strip(), f"a bad anchor emitted: {proc.stdout!r}"
+    assert box_files(repo, str(info["key"]), "inbox"), "a bad anchor consumed the message"
+
+
+def test_a_relative_anchor_is_refused(repo: Path, container: Path, tmp_path: Path) -> None:
+    """A relative anchor resolves against the HOOK PROCESS's cwd, not the payload cwd it is
+    documented in terms of, so the same string names different queues for different launchers.
+    Refusing it is the only reading that cannot silently mean two things."""
+    info = seed(repo, tmp_path, [{"body": "relative anchor"}], box_cwd=container)
+    proc = run_drain(repo, cwd=container, anchor_repo=Path("..") / repo.name)
+    assert not proc.stdout.strip(), f"a relative anchor was honoured: {proc.stdout!r}"
+    assert box_files(repo, str(info["key"]), "inbox"), "a relative anchor consumed the message"
+
+
+def test_an_anchor_is_refused_when_the_cwd_does_not_exist(
+    repo: Path, container: Path, tmp_path: Path
+) -> None:
+    """A probe failure is not proof of "not a repo".
+
+    A payload naming a deleted directory fails the git probe for a reason that says nothing about
+    repo-ness. Honouring the anchor there would address a box for a path nothing occupies.
+    """
+    info = seed(repo, tmp_path, [{"body": "vanished cwd"}], box_cwd=container)
+    proc = run_drain(repo, cwd=container / "gone", anchor_repo=repo, run_from=container)
+    assert not proc.stdout.strip(), f"a vanished cwd was anchored: {proc.stdout!r}"
+    assert box_files(repo, str(info["key"]), "inbox")
+
+
+def test_an_anchored_drain_consumes_at_stop(repo: Path, container: Path, tmp_path: Path) -> None:
+    """The anchored path must CONSUME, not merely render.
+
+    Section 9 previously asserted only on rendered text, so an anchored drain that displayed
+    forever and never claimed, receipted or moved to seen/ would have passed every test here --
+    duplicate delivery on every turn, which is the half of this channel that is not accepted.
+    """
+    info = seed(repo, tmp_path, [{"body": "anchored consume"}], box_cwd=container)
+    key = str(info["key"])
+    assert injection(run_drain(repo, cwd=container, anchor_repo=repo, event="Stop"))
+    assert not box_files(repo, key, "inbox"), "the anchored drain did not claim the message"
+    assert box_files(repo, key, "seen"), "the anchored drain wrote nothing to seen/"
+    assert receipts(repo), "the anchored drain wrote no receipt"
+    second = injection(run_drain(repo, cwd=container, anchor_repo=repo, event="Stop"))
+    assert "anchored consume" not in second, "a consumed message was delivered twice"
 
 
 # --------------------------------------------------------------------------------------------------
