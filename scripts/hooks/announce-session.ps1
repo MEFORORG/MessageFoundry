@@ -195,10 +195,15 @@ try {
     # another repo, but a manual or test invocation could, and creating state in someone else's .git
     # plus a visible line in their prompts once a minute is not acceptable. Same discriminator the
     # shim's missing-script notice uses.
+    # $repoRoot is the base that SATISFIED the guard, kept rather than recomputed: it is the only
+    # repo this invocation has proven it may touch, and step 5 needs exactly that to scope presence
+    # when the cwd cannot scope it. Recomputing it there would be a second answer to a question
+    # already settled here.
     $bases = @((Split-Path $cd -Parent), $top) | Where-Object { $_ }
     $isMf = $false
+    $repoRoot = ''
     foreach ($b in $bases) {
-        if (Test-Path -LiteralPath (Join-Path $b 'scripts/coord/presence.ps1')) { $isMf = $true; break }
+        if (Test-Path -LiteralPath (Join-Path $b 'scripts/coord/presence.ps1')) { $isMf = $true; $repoRoot = $b; break }
     }
     if (-not $isMf) { exit 0 }
 
@@ -383,11 +388,30 @@ try {
         # DO NOT pass -SelfPid. It saves a measured ~0.4 s by skipping presence's ancestry walk, but that
         # walk is our SECOND self-identification net, and a roster that lists you as your own peer makes
         # the session message ITSELF -- the most damaging failure this class of code has.
+        # SCOPE PRESENCE EXPLICITLY ONLY WHEN THE CWD CANNOT. presence.ps1 defaults to the current
+        # worktree's repo family, and outside a repo it has nothing to scope to: it returns an empty
+        # roster and reports the reason on stderr, which this hook then reads as "presence returned
+        # nothing usable" and stands down. That is correct when there is no repo to be found and
+        # wrong when the caller already named one, which is the container case.
+        #
+        # PASSED ONLY IN THAT CASE, DELIBERATELY. Inside a repo the default is already the right
+        # answer, and handing presence an explicit -Repo there would substitute an argument for a
+        # behaviour that is measured and working. $top is empty exactly when git could not resolve a
+        # toplevel from the cwd, so it is the discriminator, and it costs no extra git call.
+        # A HASHTABLE SPLAT, NEVER AN ARRAY ONE, and this is a measured failure rather than a style
+        # preference. @('-Json','-Repo',$path) binds POSITIONALLY: the path landed on presence's
+        # -SelfPid, which is [int], and the transformation error was swallowed by the catch below and
+        # surfaced as the generic 'presence returned nothing usable'. That reads identically to a
+        # genuinely empty roster, so the argument bug was indistinguishable from the condition this
+        # hook exists to report.
+        $presenceArgs = @{ Json = $true }
+        if (-not $top -and $repoRoot) { $presenceArgs['Repo'] = $repoRoot }
+
         $peers = @()
         $ok = $false
         if (Test-Path -LiteralPath $PresenceScript) {
             try {
-                $out = & $PresenceScript -Json
+                $out = & $PresenceScript @presenceArgs
                 if ($out) {
                     $parsed = @($out | ConvertFrom-Json)
                     if ($parsed.Count -gt 0 -and $parsed[0].PSObject.Properties.Name -contains 'SessionId') {
