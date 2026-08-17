@@ -869,26 +869,40 @@ jobs:
   # tests/tooling_manifest.txt; the `test` legs deselect it with `-m 'not tooling'` and this job is the
   # only place it runs. Measured 2026-08-16: 94 files, 1,882 tests, 66 percent of the suite's time.
   #
-  # UBUNTU ONLY, and this is the one real coverage change in the split -- state it rather than bury it.
-  # The tier previously ran on all three legs because it rode inside `test`. Its subject is scripts/ and
-  # the workflow files, most of it is shell/git/filesystem behaviour that is not OS-divergent, and it is
-  # the Windows legs where its ~1.0s-per-test child-spawn cost hurts most. The Windows-specific members
-  # -- the gate's own path handling, the cp1252 console guard -- are the argument for adding a
-  # windows-2025 leg here later; that is a sizing decision to make against a measured run of THIS job,
-  # not a guess made while writing it. If a harness regression ever lands that only Windows would have
-  # caught, this comment is the thing that was wrong.
+  # UBUNTU + WINDOWS, and the ubuntu-only version of this job was WRONG -- recorded because the
+  # reasoning that produced it was superficially sound. The first cut argued the tier is mostly
+  # OS-agnostic shell/git behaviour and that Windows is where its child-spawn cost hurts most. Measured
+  # instead of argued: 18 of the 89 manifest entries carry a module-level skipif on os.name/sys.platform
+  # and they hold 337 of the tier's 1,882 tests -- 18 percent. Those ran on windows-2022 and
+  # windows-2025 before the split; under ubuntu-only they would have executed on NO leg, on any event.
+  # They are the coordination and worktree-gate core: session_mail (89), prune_merged (71),
+  # announce_hook (45), collision_gate (31), every coord_*.
+  #
+  # The sizing number in the first cut was invalid on its own terms too: the 391.4s attributed to
+  # test_worktree_prune_merged.py is a WINDOWS figure for a file that has always skipped on ubuntu, so
+  # it could never have been that leg's `--dist loadfile` floor.
+  #
+  # windows-2025 only, not both Windows legs. The engine matrix carries 2022 and 2025 because the
+  # ENGINE ships onto both; this tier tests scripts/ against the local git and pwsh, where the
+  # 2022-vs-2025 difference is not a surface any listed test asserts on. That is a deliberate reduction
+  # from the pre-split state and the honest cost of the split -- if a harness regression ever lands that
+  # only windows-2022 would have caught, THIS is the sentence that was wrong.
   #
   # NOT a required context of its own: it rides the `ci-gate` roll-up, exactly as `webconsole` does and
   # for the same reason recorded there -- a new required context needs a branch-protection change, and
   # until that lands every PR carries a check it can never satisfy.
   tooling:
-    name: repo harness tests
+    name: repo harness tests (${{ matrix.os }})
     needs: changes
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2025]
     # The push arm is the safety net, not redundancy: the PR arm only fires when the harness itself
     # changed, so an ENGINE change that breaks a harness test is invisible on its own PR by
     # construction, and push-to-main is where it surfaces. See the `tooling` output on `changes`.
     if: needs.changes.outputs.tooling == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     defaults:
       run:
@@ -928,21 +942,43 @@ jobs:
       # own module-scoped fixtures, so a file's tests must stay in one worker.
       - name: Harness tests (pytest)
         timeout-minutes: 18
-        run: pytest -q -n 4 --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' --timeout=120
+        run: pytest -q -n 4 --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' --timeout=120 --junitxml=tooling-junit.xml
 
       # A marker typo, a manifest rename, or a conftest hook that silently stops firing all produce the
       # same thing: zero selected tests and a GREEN job. Deselection cannot be distinguished from success
       # by exit code -- pytest exits 5 on "no tests collected", which `-q` reports in one line nobody
-      # reads. Assert the count directly.
+      # reads.
+      #
+      # COUNT WHAT EXECUTED, NOT WHAT WAS COLLECTED. The first version of this step grepped
+      # `--collect-only`, and pytest COLLECTS skipif-marked tests -- verified against a synthetic file
+      # whose every test was skipped: "2 tests collected". So it would have printed a healthy ~1,900 and
+      # passed while 337 Windows-gated tests skipped on an ubuntu-only job. A receipt that cannot tell
+      # green-because-it-ran from green-because-it-skipped is not a receipt. This parses the junit the
+      # run itself produced, so the number is the number that happened.
+      #
+      # The floor is deliberately loose (1,000 against ~1,545 executing on ubuntu and ~1,882 on
+      # Windows). It is a DEAD-MARKER backstop, not a coverage assertion: a tight floor would go red
+      # every time the tier legitimately grows or a platform gate moves, and a gate that cries wolf gets
+      # deleted. Coverage drift is tests/test_tooling_partition.py's job, on evidence, not this one's.
       - name: Prove the tier actually ran
+        if: always()
+        shell: bash
         run: |
-          n=$(pytest -q -m tooling --ignore-glob='*messagefoundry-webconsole*' --collect-only 2>/dev/null \
-                | grep -cE '^tests/' || true)
-          echo "tooling tests collected: $n"
-          if [ "$n" -lt 1000 ]; then
-            echo "::error::the tooling marker selected $n tests (expected ~1900) -- the partition is not being applied; check tests/tooling_manifest.txt and the conftest hook that reads it"
-            exit 1
-          fi
+          python - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          tree = ET.parse("tooling-junit.xml")
+          ran = skipped = 0
+          for tc in tree.iter("testcase"):
+              if tc.find("skipped") is not None:
+                  skipped += 1
+              else:
+                  ran += 1
+          print(f"tooling tests EXECUTED: {ran}   skipped: {skipped}")
+          if ran < 1000:
+              print(f"::error::the tooling marker EXECUTED only {ran} tests -- the partition is not "
+                    f"being applied; check tests/tooling_manifest.txt and the conftest hook reading it")
+              sys.exit(1)
+          PY
 
   # Build + type-check the VS Code extension, and run its integration tests. The Python jobs never
   # touch ide/, so a dep bump or IDE code change that breaks the bundle or the types would otherwise
@@ -1214,7 +1250,21 @@ jobs:
           #
           # NOT gated on `code`: a docs-only PR that rewrites docs/BACKLOG.md must still face the ledger
           # and backlog-status tests, and those live in this tier.
-          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/(BACKLOG\.md|adr/)|\.claude/|tests/(conftest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
+          # `.gitignore` IS IN THIS LIST AND IT IS NOT COSMETIC -- it closes a reintroduction of BACKLOG
+          # #327. tests/test_private_paths_stay_ignored.py is a manifest entry, and six .gitignore rules
+          # are the sole control keeping maintainer-internal material out of a public commit. #327's fix
+          # was to force-classify .gitignore as CODE so the test legs run it. This split broke that at a
+          # layer above: code=true still runs the legs, but they now DESELECT the guard, and .gitignore
+          # matched no arm here -- so the tooling job skipped, ci-gate reads a skipped need as pass, and
+          # a .gitignore-only PR faced the guard on no leg at all. Same defect as #327, new route.
+          # `.gitattributes` rides along for the same reason its sibling does in `alwayscodepath`.
+          # docs/** in full, plus CLAUDE.md, pyproject.toml, ide/ and LICENSE: each is the declared
+          # SUBJECT of a listed test (link_resolution and docs_runbooks read all of docs/;
+          # claude_section_citations reads the root CLAUDE.md, which `\.claude/` does NOT match --
+          # that arm is the DIRECTORY; new_dependency_check reads pyproject; ide_licence_packaging reads
+          # ide/ and LICENSE). Docs-only PRs were never the gap -- code=false already skipped the pytest
+          # step. The gap is MIXED code+docs PRs, which are the common shape.
+          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|pyproject\.toml|\.gitignore|\.gitattributes|tests/(conftest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
             || echo "$changed" | grep -qxFf <(grep -vE '^[[:space:]]*(#|$)' tests/tooling_manifest.txt); then
             echo "tooling=true" >> "$GITHUB_OUTPUT"
           else

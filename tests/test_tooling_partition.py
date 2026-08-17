@@ -37,7 +37,21 @@ _TESTS = _ROOT / "tests"
 _MANIFEST = _TESTS / "tooling_manifest.txt"
 _CI = _ROOT / ".github" / "workflows" / "ci.yml"
 
-_ENGINE_IMPORT = re.compile(r"^\s*(from|import)\s+(messagefoundry|harness|tee)\b", re.M)
+# `messagefoundry_webconsole` MUST be named explicitly. `\b` does not end the alternation after
+# `messagefoundry`, because `_` is a word character and there is no boundary between them -- so a bare
+# `(messagefoundry|...)\b` does NOT match `from messagefoundry_webconsole...`. That is not a passive
+# hole. This pattern is used in BOTH directions: test_no_listed_test_imports_the_engine stays green on
+# a listed test that imports the shipped console, and test_every_non_engine_test_is_classified runs it
+# in reverse and therefore DEMANDS every console-importing test be listed as tooling. It admitted
+# test_webconsole_monitoring_fips.py to the manifest, where it then ran in no CI job at all.
+#
+# The console is shipped product source (packaging/messagefoundry-webconsole, mounted in-process at
+# /ui), so a test importing it is an engine test by subject. Keep the `_webconsole` arm explicit
+# rather than widening to `messagefoundry\w*`: the point is to name what counts as the product, and a
+# wildcard would silently absorb any future `messagefoundry_`-prefixed helper that is not.
+_ENGINE_IMPORT = re.compile(
+    r"^\s*(from|import)\s+(messagefoundry(?:_webconsole)?|harness|tee)\b", re.M
+)
 
 # Tests that do NOT import the engine and nonetheless belong on the engine legs, because their
 # SUBJECT is engine source: they read messagefoundry/** off disk and assert something about it. A
@@ -60,6 +74,22 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_scan_tokens_source.py",
         "test_seam_discovery.py",
         "test_security_static.py",
+        # The four below were WRONGLY LISTED as tooling in the first cut of the manifest and were
+        # caught by adversarial review, not by any guard here. Each reads real engine source without
+        # importing it, so the marker took them off every engine leg while the tooling job's path gate
+        # (scripts/**, .github/**, the ledger) is not tripped by an engine diff -- they ran on ZERO
+        # legs for the change that would break them. Named individually, with what each reads, because
+        # the whole point of this list is that a reviewer can check the claim:
+        #   sqlserver_encrypt_pass_tables -> messagefoundry/store/sqlserver.py. Its own docstring is
+        #     the reason it cannot move: every SQL Server CI step runs keyless, so the encrypt loop is
+        #     unreachable at runtime and source-reading on the plain leg is the ONLY coverage there is.
+        "test_sqlserver_encrypt_pass_tables.py",
+        #   reply_hint_thread_affinity -> messagefoundry/pipeline/wiring_runner.py
+        "test_reply_hint_thread_affinity.py",
+        #   adr0071_statement_rt_inventory -> drives a real SqlServerStore through its bench module
+        "test_adr0071_statement_rt_inventory.py",
+        #   install_instruction_provenance -> globs messagefoundry/**/*.py
+        "test_install_instruction_provenance.py",
         # this file: it guards the partition, so it must run wherever the partition matters
         "test_tooling_partition.py",
     }

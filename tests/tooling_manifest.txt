@@ -23,7 +23,6 @@
 # tests/test_tooling_partition.py pins this file against the tree and fails if a new non-engine test
 # lands in neither this list nor its explicit stay-list.
 tests/test_adr0071_crossing_count.py
-tests/test_adr0071_statement_rt_inventory.py
 tests/test_ai_provenance_claims.py
 tests/test_announce_hook.py
 tests/test_announce_wiring.py
@@ -64,7 +63,6 @@ tests/test_gate_rule_scan_agreement.py
 tests/test_ide_licence_packaging.py
 tests/test_incomplete_run_banner.py
 tests/test_install_gate_wiring.py
-tests/test_install_instruction_provenance.py
 tests/test_installed_coord_hooks.py
 tests/test_key_usage_scope_inventory.py
 tests/test_ledger_check.py
@@ -78,7 +76,6 @@ tests/test_private_paths_stay_ignored.py
 tests/test_push_guard.py
 tests/test_quality_advisory_invariants.py
 tests/test_quality_record_scope_claims.py
-tests/test_reply_hint_thread_affinity.py
 tests/test_required_contexts.py
 tests/test_required_workflow_state.py
 tests/test_sbom_finalize.py
@@ -91,10 +88,8 @@ tests/test_session_context_presence.py
 tests/test_session_mail.py
 tests/test_session_registry.py
 tests/test_setup_leak_gate_reports_source.py
-tests/test_sqlserver_encrypt_pass_tables.py
 tests/test_stalled_prs.py
 tests/test_testpaths_webconsole_coverage.py
-tests/test_webconsole_monitoring_fips.py
 tests/test_workflow_shell_syntax.py
 tests/test_worktree_gate.py
 tests/test_worktree_gate_command_parsing.py
