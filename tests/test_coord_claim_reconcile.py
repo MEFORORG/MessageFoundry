@@ -246,3 +246,57 @@ def test_an_unreachable_probe_holds_rather_than_downgrading_to_unknown(
     unmerged_branch(repo, "unreachable")
     write_claim(repo, "k-unreachable", tmp_path / "vanished", "unreachable")
     assert verdicts(repo, "-NoPullRequests")["k-unreachable"] == "HOLD"
+
+
+def live_worktree(repo: Path, name: str) -> str:
+    """A worktree that stays: registered AND present, so its leaf name is a live reference."""
+    path = repo.parent / name
+    git(repo, "worktree", "add", "-q", str(path), "-b", f"{name}-branch")
+    return name
+
+
+def test_a_note_naming_a_LIVE_worktree_withdraws_the_release(repo: Path, tmp_path: Path) -> None:
+    """Found by a peer on the real registry, and the three tests above cannot see it.
+
+    Claim 1020's ``worktree`` field names a directory that is gone while its note pins the head of a
+    DIFFERENT directory that is present and carries unmerged commits. Path matching is blind to that
+    association. 1020 itself lands on HOLD only because its branch work is unmerged -- the dangerous
+    shape is a claim whose branch HAS landed while its note points at live work elsewhere, which
+    passes every other test here.
+    """
+    landed_branch(repo, "landed")
+    leaf = live_worktree(repo, "sibling-alive")
+    write_claim(
+        repo, "k-note", tmp_path / "vanished", "landed", note=f"CHECKING {leaf} before release"
+    )
+    assert verdicts(repo)["k-note"] == "NOTE-POINTS-ELSEWHERE"
+
+
+def test_a_note_pinning_an_unmerged_sha_withdraws_the_release(repo: Path, tmp_path: Path) -> None:
+    unmerged_branch(repo, "elsewhere")
+    sha = git(repo, "rev-parse", "elsewhere").strip()
+    landed_branch(repo, "landed")
+    write_claim(repo, "k-sha", tmp_path / "vanished", "landed", note=f"work is at {sha[:12]}")
+    assert verdicts(repo)["k-sha"] == "NOTE-POINTS-ELSEWHERE"
+
+
+def test_an_ordinary_note_still_releases(repo: Path, tmp_path: Path) -> None:
+    """The negative control: the guard must not swallow every releasable claim."""
+    landed_branch(repo, "landed")
+    write_claim(
+        repo, "k-plain", tmp_path / "vanished", "landed", note="ROLE=builder2; tidy up docs"
+    )
+    assert verdicts(repo)["k-plain"] == "RELEASABLE"
+
+
+def test_the_script_carries_no_control_characters() -> None:
+    """An escape that collapses into a control byte is invisible in every normal view.
+
+    2026-08-16: `\b` was written into a regex in claim-reconcile.ps1 as a literal backspace (0x08).
+    The pattern then matched nothing, silently, and the debug line that appeared to prove it worked
+    had the pattern retyped by hand -- so the instrument measured a different regex than the code
+    ran. Nothing about the file looked wrong; `cat -A` was the only view that showed it.
+    """
+    text = RECONCILE.read_text(encoding="utf-8")
+    bad = {hex(ord(c)) for c in text if ord(c) < 32 and c not in "\r\n\t"}
+    assert not bad, f"control characters in claim-reconcile.ps1: {sorted(bad)}"

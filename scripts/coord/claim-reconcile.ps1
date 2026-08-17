@@ -155,26 +155,27 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
         # An unreadable claim belongs to the registry, not to any worktree. It is reported and never
         # released: we could not read whose it is, and claim_check.py reads a malformed claim as
         # UNCLAIMED, so the key is already ungated -- deleting the file would hide that, not fix it.
-        $rows += [pscustomobject]@{ key = $key; holder = ""; branch = ""; verdict = "UNREADABLE"; why = $_.Exception.Message }
+        $rows += [pscustomobject]@{ key = $key; holder = ""; branch = ""; note = ""; verdict = "UNREADABLE"; why = $_.Exception.Message }
         continue
     }
 
     $key = if ($c.key) { [string]$c.key } else { $f.BaseName }
     $holder = ConvertTo-Norm ([string]$c.worktree)
     $branch = [string]$c.branch
+    $note = [string]$c.note
 
     if (-not $holder) {
-        $rows += [pscustomobject]@{ key = $key; holder = ""; branch = $branch; verdict = "UNKNOWN"; why = "claim names no worktree" }
+        $rows += [pscustomobject]@{ key = $key; holder = ""; branch = $branch; note = $note; verdict = "UNKNOWN"; why = "claim names no worktree" }
         continue
     }
     if (Test-Path -LiteralPath $holder) {
-        $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; verdict = "HELD"; why = "holder directory exists" }
+        $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "HELD"; why = "holder directory exists" }
         continue
     }
     if ($registered.ContainsKey($holder)) {
         # Gone from disk but still registered: half a removal. prune-merged completes it and releases
         # the claim as it goes; doing it here would race that and skip its merged/clean proof.
-        $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; verdict = "STRANDED-REGISTERED"
+        $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "STRANDED-REGISTERED"
             why = "directory gone but the worktree is still registered -- run prune-merged.ps1, which releases as it removes" }
         continue
     }
@@ -194,7 +195,7 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
         # The branch is gone everywhere. That is consistent with a squash-merge plus remote deletion,
         # and equally with somebody deleting unmerged work. Both look identical from here, so this is
         # reported rather than released -- the whole point of the tool is to not guess.
-        $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; verdict = "STRANDED-UNKNOWN"
+        $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "STRANDED-UNKNOWN"
             why = "branch '$branch' exists neither locally nor on origin -- squash-merged or deleted, and those are indistinguishable here" }
         continue
     }
@@ -204,33 +205,74 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
     $ahead = [int](& git -C $repo rev-list --count "$mainRef..$ref")
 
     if ($contained -or $ahead -eq 0) {
-        $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; verdict = "RELEASABLE"
+        $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "RELEASABLE"
             why = "holder gone and deregistered; '$branch' carries no commit that $mainRef lacks" }
     }
     else {
         $tip = (& git -C $repo rev-parse $ref 2>$null)
         $pr = Test-LandedByPullRequest -Branch $branch -Tip ($tip ? $tip.Trim() : "")
         if ($pr -is [pscustomobject]) {
-            $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; verdict = "RELEASABLE"
+            $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "RELEASABLE"
                 why = "holder gone and deregistered; PR #$($pr.Number) merged $($pr.MergedAt) with head at this exact tip -- squashed, so the $ahead commit(s) are the same work" }
         }
         elseif ($null -eq $pr -and -not $NoPullRequests) {
             # HOLD, not UNKNOWN. The local evidence already proves work exists here; a probe that
             # could not run only means the verdict cannot be UPGRADED to releasable. Downgrading a
             # proven hold to "could not tell" would lose the one fact we do have.
-            $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; verdict = "HOLD"
+            $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "HOLD"
                 why = "$ahead commit(s) on '$branch' are not on $mainRef; PR state could NOT be established, so a squash-merge cannot be ruled out either" }
         }
         else {
-            $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; verdict = "HOLD"
+            $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "HOLD"
                 why = "$ahead commit(s) on '$branch' are not on $mainRef and no merged PR has this tip -- releasing invites a rebuild of work that exists" }
+        }
+    }
+}
+
+
+# --- A note can pin work the `worktree` field does not name (found by a peer, 2026-08-16) --------
+# Claim 1020 is the live example: its worktree field names a directory that is gone, while its NOTE
+# reads "CHECKING w3-l2-auth-policy a46f7a83" and pins the exact head of a DIFFERENT directory that
+# is present and carries 4 unmerged commits. Path matching cannot see that association, and neither
+# can the three tests above -- 1020 only lands on HOLD because its branch work is unmerged.
+#
+# The dangerous shape is the other one: a claim whose named holder is gone AND whose branch work HAS
+# landed, while its note points at live work somewhere else. That passes all three tests and would be
+# released wrongly. So a releasable verdict is withdrawn when its note names a live worktree or a
+# commit that origin/main does not contain. This is a REPORT, not a release: the tool cannot read
+# intent out of free text and does not try to (FR-009's reasoning, one repository over).
+$liveLeaves = @()
+foreach ($w in $registered.Keys) {
+    if (Test-Path -LiteralPath $w) { $liveLeaves += (Split-Path $w -Leaf).ToLowerInvariant() }
+}
+foreach ($r in @($rows | Where-Object { $_.verdict -eq "RELEASABLE" -and $_.note })) {
+    $n = $r.note.ToLowerInvariant()
+    $leaf = @($liveLeaves | Where-Object { $_ -and $n.Contains($_) }) | Select-Object -First 1
+    if ($leaf) {
+        $r.verdict = "NOTE-POINTS-ELSEWHERE"
+        $r.why = "would be releasable, but its note names '$leaf', a worktree that EXISTS -- read the note before releasing"
+        continue
+    }
+    # No word-boundary anchors, deliberately. This regex is a FILTER and `git rev-parse` below is
+    # the gate, so a sloppy match costs one cheap lookup and a tight one cost a literal backspace
+    # byte: an earlier edit wrote a backslash-b word boundary into this pattern as a literal 0x08,
+    # it matched nothing, and the debug line that "proved" it worked had the pattern retyped by
+    # hand -- measuring a different regex than the code ran. The suite now refuses control bytes here.
+    foreach ($m in [regex]::Matches($r.note, '[0-9a-f]{7,40}')) {
+        $sha = $m.Value
+        if (-not (& git -C $repo rev-parse --verify --quiet "$sha^{commit}")) { continue }
+        & git -C $repo merge-base --is-ancestor $sha $mainRef 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            $r.verdict = "NOTE-POINTS-ELSEWHERE"
+            $r.why = "would be releasable, but its note pins $sha, which $mainRef does not contain"
+            break
         }
     }
 }
 
 $releasable = @($rows | Where-Object { $_.verdict -eq "RELEASABLE" })
 $hold = @($rows | Where-Object { $_.verdict -eq "HOLD" })
-$unknown = @($rows | Where-Object { $_.verdict -in @("STRANDED-UNKNOWN", "STRANDED-REGISTERED", "UNKNOWN", "UNREADABLE") })
+$unknown = @($rows | Where-Object { $_.verdict -in @("STRANDED-UNKNOWN", "STRANDED-REGISTERED", "UNKNOWN", "UNREADABLE", "NOTE-POINTS-ELSEWHERE") })
 
 if ($Json) {
     [pscustomobject]@{
