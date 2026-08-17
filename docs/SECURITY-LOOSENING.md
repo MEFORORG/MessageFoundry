@@ -59,7 +59,7 @@ section reference.
 | Data handling | `block_unlisted_outbound` | `true` |
 | | `delete_message_bodies_after_days` | `30` (`0` = keep forever) |
 | | `allow_keeping_phi_indefinitely` | `false` |
-| | `audit_all_authorization_decisions` | `false` (see note) |
+| | `audit_all_authorization_decisions` | `true` (see note) |
 | Enforcement dial | `enforcement` | `enforce` (refuse; `warn` = loud audited loosening) |
 | Posture lever | `handles_real_patient_data` | *derived from environment* |
 | | `production_instance` | *derived from environment* |
@@ -99,11 +99,20 @@ a custom-named environment must declare them or `serve` fails closed. `handles_r
 *master data-class lever* — the PHI-only gates below key on it — and now defaults to PHI on every built-in
 env (a genuinely-synthetic box must set it `false` explicitly; see its deviation below).
 
-`audit_all_authorization_decisions = false` is a deliberate **secure-and-usable** default, not a loosening
-(ADR 0118 §5, owner-confirmed): ePHI access is already always audited, and forcing full authz tracing on
-would flood the hash-chained audit log (console polling + the `/ws/stats` feed), which itself degrades
-security monitoring. Turn it **on** for an off-loopback deployment that wants the full L3 authorization
-trail.
+`audit_all_authorization_decisions` **now defaults `true`, and turning it OFF is a loosening**
+([ADR 0168](adr/0168-default-the-authorization-grant-audit-on-the-console-cannot-flood-it.md),
+BACKLOG #1277). It is listed among the deviations below like any other switch.
+
+**This reverses what this note used to say**, and the retraction is kept rather than deleted because
+the reasoning is the useful part. The old text called `false` a *secure-and-usable* default on the
+ground that full tracing *"would flood the hash-chained audit log (console polling + the `/ws/stats`
+feed)"* — ADR 0118 §5, owner-confirmed. **That flood was measured afterwards and is not connected to
+this switch:** the browser console never traverses the JSON gate that records grants (it is
+server-rendered in-process behind its own gate, which records denials only), and WebSocket
+authorization fires once per *connection* rather than per message. What the ON default does cost is
+one grant row per authenticated request on the `require()`-gated JSON API — bounded by client polling
+cadence. ePHI access is audited unconditionally at **either** setting; what an operator gives up by
+turning this off is the **read** history.
 
 ---
 
@@ -220,6 +229,23 @@ trail.
   (`enforcement = enforce`, the default) unless `allow_keeping_phi_indefinitely = true` (which downgrades the
   refusal to a loud audited warning); at `enforcement = warn` a PHI instance auto-bounds each unset window to
   30 days.
+
+### `audit_all_authorization_decisions = false` — record only the sensitive authorization grants
+- **What you lose:** the **read** history. Only the state-changing / configuration / user-management
+  surface writes an `auth.grant` row, so every authenticated read is authorized and **not recorded** —
+  and it cannot be reconstructed afterwards, because the rows were never written. The question an audit
+  trail exists to answer, *what did this account actually reach*, stops having an answer.
+- **What you do NOT lose:** ePHI access. That is audited unconditionally at either setting (the
+  tamper-evident chain and the message-event compliance floor), and PHI-view grants are excluded from
+  this switch at **both** settings so the two paths do not write double rows.
+- **When acceptable:** a measured volume problem on a specific deployment. **Note the remedy that is
+  not this switch:** a rate or sampling bound on read grants keeps the trail; turning the trail off
+  does not.
+- **Compensating controls:** none that restore the lost rows. `[retention].audit_days` is reserved and
+  not enforced, so audit volume is a storage question rather than a retention one.
+- **Direction of travel:** this default was `false` until
+  [ADR 0168](adr/0168-default-the-authorization-grant-audit-on-the-console-cannot-flood-it.md)
+  (BACKLOG #1277) measured the flood risk it rested on and found it unconnected to the switch.
 
 ### `allow_single_factor_admin_when_exposed = true` — lift the strict-enforcement single-factor-admin refusal
 - **What you lose:** on a **PHI** instance under **strict enforcement** (`enforcement = enforce`, the default)

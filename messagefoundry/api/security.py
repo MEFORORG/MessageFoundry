@@ -126,10 +126,13 @@ def _grant_audit_permission(
 ) -> Permission | None:
     """The permission whose GRANT should be audited (BACKLOG #195a), or ``None`` when none qualifies.
 
-    Default (the shipped 16.3.2 read-polling deviation): the first permission in the sensitive
-    ``_GRANT_AUDIT_PERMISSIONS`` set, so only the state-changing / config / user-mgmt surface is audited.
-    Under ``audit_all`` (the ``[diagnostics].audit_all_authz`` Posture-B verbosity, BACKLOG #244 / ASVS
-    16.3.2): audit EVERY route — the first permission that is **not** a PHI-view grant. PHI-view grants
+    Without ``audit_all``: the first permission in the sensitive ``_GRANT_AUDIT_PERMISSIONS`` set, so
+    only the state-changing / config / user-mgmt surface is audited. **This is no longer the shipped
+    position** — ``[security].audit_all_authorization_decisions`` defaults **true** (BACKLOG #1277 /
+    ADR 0168), so a stock engine takes the ``audit_all`` branch and this one is what an operator gets
+    after deliberately turning the trail down.
+    Under ``audit_all`` (``[diagnostics].audit_all_authz``, BACKLOG #244 / ASVS 16.3.2): audit EVERY
+    route — the first permission that is **not** a PHI-view grant. PHI-view grants
     (``MESSAGES_VIEW_SUMMARY`` / ``_VIEW_RAW``) stay excluded even under 'all' because the PHI-access
     audit path already records those accesses (avoid double rows). Returning a single permission keeps
     the grant to ONE audit row per request even on a multi-permission route."""
@@ -157,8 +160,14 @@ def _allow_no_auth(app_state: object) -> bool:
 
 def _audit_all_authz(app_state: object) -> bool:
     """Whether to audit EVERY authorization grant, not just the sensitive set (ASVS 16.3.2 'all'
-    verbosity, ``[diagnostics].audit_all_authz``, BACKLOG #244). Threaded onto ``app.state`` by
-    ``create_app``; default off, so the shipped audit-grant behaviour is byte-identical."""
+    verbosity, ``[diagnostics].audit_all_authz``, BACKLOG #244).
+
+    THE FALSE HERE IS NOT THE PRODUCT DEFAULT, and the distinction is the same one every other
+    ``create_app`` keyword carries (``serve_ui``, ``allow_no_auth``, ``expose_docs``): it is what an
+    app that never threaded the setting gets. The serve path always passes the resolved value, and the
+    shipped setting is **true** (BACKLOG #1277 / ADR 0168). An embedder that builds an app without the
+    keyword audits the sensitive set only.
+    """
     return bool(getattr(app_state, "audit_all_authz", False))
 
 
@@ -238,12 +247,14 @@ def require(
                 raise HTTPException(
                     status.HTTP_403_FORBIDDEN, f"missing permission: {permission.value}"
                 )
-        # BACKLOG #195a (ASVS 16.3.2): record the authorization GRANT. By DEFAULT only the
-        # sensitive/state-changing surface on a NON-GET request is audited — the method guard drops the
-        # polled GET /approvals (APPROVALS_APPROVE) and the permission set drops every read/monitoring
-        # grant (console polling would otherwise flood the audit chain). Under [diagnostics].audit_all_authz
-        # (BACKLOG #244, Posture-B verbosity, threaded onto app.state) EVERY satisfied route is audited —
-        # including GETs — except the PHI-view grants, still recorded by the PHI-access audit path.
+        # BACKLOG #195a (ASVS 16.3.2): record the authorization GRANT. Under
+        # [diagnostics].audit_all_authz — which SHIPS ON (BACKLOG #1277 / ADR 0168), threaded onto
+        # app.state — EVERY satisfied route is audited, including GETs, except the PHI-view grants
+        # already recorded by the PHI-access audit path. Turned off, this narrows to the
+        # sensitive/state-changing surface on a NON-GET request: the method guard drops the polled
+        # GET /approvals (APPROVALS_APPROVE) and the permission set drops every read/monitoring grant.
+        # The browser console is not what that narrowing protects — it never reaches this dependency
+        # (server-rendered in-process behind require_ui, which records denials only).
         audit_all = _audit_all_authz(request.app.state)
         if audit_all or request.method != "GET":
             audited = _grant_audit_permission(permissions, audit_all=audit_all)
@@ -764,11 +775,12 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
             # user probing the stats feed leaves a trail too (review low-9).
             await auth.audit_permission_denied(identity, permission, websocket.url.path)
             return None
-    # BACKLOG #195a (ASVS 16.3.2): audit the grant for the sensitive surface only by default. The shipped
-    # stats feed (/ws/stats) requires MONITORING_READ, which is deliberately NOT in
-    # _GRANT_AUDIT_PERMISSIONS, so a reconnecting/polling console never floods the audit chain. Under
-    # [diagnostics].audit_all_authz (BACKLOG #244) every satisfied WS route is audited (PHI-view still
-    # excluded); authorize_ws runs once per connection, not per message, so 'all' cannot flood either.
+    # BACKLOG #195a (ASVS 16.3.2): under [diagnostics].audit_all_authz — which SHIPS ON (BACKLOG #1277 /
+    # ADR 0168) — every satisfied WS route is audited, PHI-view still excluded. THIS PATH CANNOT FLOOD
+    # AT EITHER SETTING, and that is a property of the code rather than of the default: authorize_ws
+    # runs once per CONNECTION, not per message. Turned off it narrows to the sensitive surface, and
+    # the shipped stats feed (/ws/stats) requires MONITORING_READ, deliberately NOT in
+    # _GRANT_AUDIT_PERMISSIONS, so a reconnecting console writes one row per connect rather than none.
     audit_all = _audit_all_authz(websocket.app.state)
     audited = _grant_audit_permission(permissions, audit_all=audit_all)
     if audited is not None:

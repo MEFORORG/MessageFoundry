@@ -214,9 +214,9 @@ def test_every_security_bool_at_its_insecure_value_is_reported() -> None:
     as exemptions so the exemption itself is visible rather than an accident of the loop."""
     #: Bools this floor deliberately does NOT require, each with the reason it is exempt.
     exempt = {
-        # Owner-confirmed secure-and-usable default; turning it ON is the hardening move, not the
-        # loosening (ADR 0118 §5) — it is documented as "not a loosening" in SECURITY-LOOSENING.md.
-        "audit_all_authorization_decisions",
+        # NOT exempt any more (BACKLOG #1277). It was, while it shipped false and turning it ON was the
+        # hardening move. The default is now true, so its false value is an ordinary deviation and the
+        # floor below covers it — which is the point of keeping this set small.
         # ADR 0152: these ASSERT / REQUIRE a host property rather than giving one up. Neither is a
         # loosening at either value; both are documented as such.
         "memory_encryption_operator_declared",

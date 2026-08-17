@@ -161,7 +161,10 @@ def test_secure_defaults_applied(tmp_path: Path) -> None:
     assert d.block_unlisted_outbound is True
     assert d.delete_message_bodies_after_days == 30
     assert d.allow_keeping_phi_indefinitely is False
-    assert d.audit_all_authorization_decisions is False  # owner-confirmed scoped default (§5)
+    # BACKLOG #1277 / ADR 0168: was ADR 0118 §5's owner-confirmed false. The flood risk that default
+    # rested on was measured afterwards and does not hold -- the console never traverses require() and
+    # authorize_ws fires once per connection -- so the full authorization trail ships ON.
+    assert d.audit_all_authorization_decisions is True
     # Two production-PHI acknowledgment switches (ADR 0140 No-loosen carve-out): default false = byte-identical.
     assert d.allow_single_factor_admin_when_exposed is False
     assert d.allow_unencrypted_phi_under_strict_enforcement is False
@@ -206,13 +209,24 @@ def test_loosening_warns_and_prod_phi_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # security_loosenings() names each opt-out in plain language (the serve warning + the posture view
-    # both consume it) — audit_all_authorization_decisions=false is NOT a loosening (secure default).
+    # both consume it).
     loos = dict(_loosenings(SecuritySettings(require_mfa=False, block_unlisted_outbound=False)))
     assert "require_mfa" in loos and "single-factor" in loos["require_mfa"]
     assert (
         "block_unlisted_outbound" in loos and "any destination" in loos["block_unlisted_outbound"]
     )
     assert _loosenings(SecuritySettings()) == []  # all-secure defaults → nothing named
+
+    # BACKLOG #1277 / ADR 0168 flipped this switch's default, so its FALSE value is now a deviation
+    # rather than the shipped position. The completeness floor in test_security_posture_defaults.py
+    # asserts it is named at all; this asserts WHAT it says, which the floor cannot see -- an entry
+    # that named the switch and described nothing would satisfy membership and tell an operator
+    # nothing about what they gave up.
+    off = dict(_loosenings(SecuritySettings(audit_all_authorization_decisions=False)))
+    assert "audit_all_authorization_decisions" in off
+    assert "READ" in off["audit_all_authorization_decisions"]
+    # ...and it does NOT overclaim: PHI access stays audited at either setting.
+    assert "PHI access is audited regardless" in off["audit_all_authorization_decisions"]
 
     # The serve-time consolidated warning fires naming the loosened switch (AC-4). It rides the logging
     # path (post-configure_logging), which routes to stdout — the gate REFUSE messages print to stderr.

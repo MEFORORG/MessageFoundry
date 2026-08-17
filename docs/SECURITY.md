@@ -174,9 +174,11 @@ route handler only when all of them pass.
    required` when the identity is flagged `must_change_password` and the path is not one of the three
    exempt paths (`/auth/logout`, `/auth/me`, `/me/password`) → **403** `missing permission: <value>`
    plus an `auth.permission_denied` audit row for the first unheld permission. On success it may write
-   one `auth.permission_granted` row (sensitive permission set, non-GET only, unless
-   `[security].audit_all_authorization_decisions` is on — ADR 0118 relocated the knob, and the old
-   `[diagnostics].audit_all_authz` TOML spelling is **refused at load**).
+   one `auth.permission_granted` row — for **every** satisfied route on the shipped default, since
+   `[security].audit_all_authorization_decisions` is **on** ([ADR 0168](adr/0168-default-the-authorization-grant-audit-on-the-console-cannot-flood-it.md));
+   turned off it narrows to the sensitive permission set on non-GET requests. PHI-view grants are
+   excluded either way (the PHI-access path records those). ADR 0118 relocated the knob, and the old
+   `[diagnostics].audit_all_authz` TOML spelling is **refused at load**.
 4. **A second axis: per-channel scope** — `users.channel_scope` narrows operational routes to a set of
    connections. Out-of-scope *message* access returns **404** (existence-hiding); connection control and
    inbound injection return **403**. Denials are audited `auth.channel_denied`.

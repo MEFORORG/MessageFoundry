@@ -216,9 +216,11 @@ install. All three shipped defaults are unchanged and byte-identical.
   (RFC 4330), not NTS — a coarse drift check for a trusted management network.
 - **16.3.2 — all-authz audit verbosity.** The `[diagnostics].audit_all_authz` gate is **built in this
   WP** (`api/security.py`). The runbook (§"Authorization audit verbosity") instructs
-  `audit_all_authz = true` for the full authorization trail off-loopback. Default **off is
-  byte-identical**; PHI-view grants stay excluded even under `true` (the PHI-access audit path already
-  records them).
+  `audit_all_authz = true` for the full authorization trail off-loopback. PHI-view grants stay
+  excluded even under `true` (the PHI-access audit path already records them). **The default has since
+  flipped ON** ([ADR 0168](0168-default-the-authorization-grant-audit-on-the-console-cannot-flood-it.md),
+  BACKLOG #1277), so the "default off is byte-identical" this bullet used to end on no longer holds —
+  the runbook instruction is now what a stock engine already does.
 - **16.4.2 — tamper-evident audit chain.** Two levers, both instructed (§"Tamper-evident audit chain"):
   (A) `[integrity].audit_verify_on_start = true` re-walks the chain at startup — **alert-only, never
   crashes** (a broken chain WARNs + fires `integrity_drift`); (B) keying the chain against forgery

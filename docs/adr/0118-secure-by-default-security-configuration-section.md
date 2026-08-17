@@ -99,7 +99,8 @@ max_session_hours            = 12
 block_unlisted_outbound      = true          # deny-by-default egress; only allow-listed destinations send
 delete_message_bodies_after_days = 30        # 0 = keep indefinitely (audited)
 allow_keeping_phi_indefinitely   = false
-audit_all_authorization_decisions = false    # PHI access is ALWAYS audited; this adds full authz tracing
+audit_all_authorization_decisions = true     # PHI access is ALWAYS audited; this adds full authz tracing
+                                             # (was false here; flipped by ADR 0168 / BACKLOG #1277)
 
 # ── What this instance handles (the master posture lever) ────────
 handles_real_patient_data    = true          # was [ai].data_class = "phi"
@@ -153,6 +154,12 @@ acceptable / compensating controls* — the inverted-hardening-guide CISA prescr
 
 ### 5. Two default-value judgments (owner veto points)
 
+- **SUPERSEDED 2026-08-17 by [ADR 0168](0168-default-the-authorization-grant-audit-on-the-console-cannot-flood-it.md)
+  (BACKLOG #1277): the default is now `true`.** The bullet below is kept verbatim rather than edited,
+  because the *reason* it gives is the part that was later falsified and a reader needs to see it. The
+  flood it names was never measured when this was written; measured afterwards, it is not connected to
+  this switch — the browser console never traverses the gate that records grants, and WebSocket
+  authorization fires once per connection. Everything else in this ADR stands.
 - **`audit_all_authorization_decisions` defaults `false`.** ePHI access is **already always audited** (the
   tamper-evident audit hash-chain and the message-event compliance floor are unconditional, independent of
   this key). This toggle only extends tracing to *every* authorization decision including non-sensitive

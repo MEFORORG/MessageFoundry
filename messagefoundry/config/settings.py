@@ -1331,13 +1331,16 @@ class DiagnosticsSettings(_Section):
     # message-view trail must never be dropped) and the terminal failure events `dead`/`error`/`failed`.
     message_events: Literal["all", "errors", "off"] = "all"
     # ASVS 16.3.2 (BACKLOG #244): audit EVERY authorization GRANT, not just the sensitive/state-changing
-    # set. OFF by default — only the sensitive surface (state-change/config/user-mgmt) writes an
-    # `auth.grant` row, because require()/authorize_ws fire on every protected request and auditing every
-    # read grant would flood the hash-chained `audit_log` (console polling + the /ws/stats feed). Turn ON
-    # for an off-loopback deployment that wants the full L3 authorization trail; PHI-view grants stay
-    # excluded even under 'all' (the PHI-access audit path already records those). Threaded onto
-    # app.state by create_app (api/security.py `_audit_all_authz`).
-    audit_all_authz: bool = False
+    # set. ON by default (BACKLOG #1277) — an audit trail that records only the decisions somebody
+    # already judged sensitive cannot answer the question a trail exists to answer, and a site cannot
+    # reconstruct a read history after the fact because the rows were never written. The flood this
+    # defaulted OFF against was measured and is not connected to this switch: the browser console never
+    # traverses require() (it is server-rendered in-process behind its own cookie-world gate, which
+    # records denials only), and authorize_ws fires once per CONNECTION rather than per message. What
+    # the ON default does change is the JSON API — see the ADR for the surface and the bound.
+    # PHI-view grants stay excluded even under 'all' (the PHI-access audit path already records those).
+    # Threaded onto app.state by create_app (api/security.py `_audit_all_authz`).
+    audit_all_authz: bool = True
 
 
 class EnvironmentsSettings(_Section):
@@ -3718,9 +3721,10 @@ class SecuritySettings(_Section):
     delete_message_bodies_after_days: int = 30  # 0 = keep indefinitely (audited)
     allow_keeping_phi_indefinitely: bool = False
     # PHI access is ALWAYS audited (the tamper-evident chain + message-event floor are unconditional);
-    # this only extends tracing to EVERY authz decision (defence-in-depth, not a HIPAA requirement).
-    # Default false — forcing it on risks flooding the audit log (ADR 0118 §5, owner-confirmed).
-    audit_all_authorization_decisions: bool = False
+    # this extends tracing to EVERY authz decision, so a site can answer WHAT DID THIS ACCOUNT REACH.
+    # Default true (BACKLOG #1277). This REVERSES ADR 0118 §5's owner-confirmed false, and the reason
+    # that default was confirmed — flooding — was measured afterwards and does not hold: see the ADR.
+    audit_all_authorization_decisions: bool = True
 
     # ── What this instance handles (the master posture lever) ────────
     # None (the default) = DERIVE from the [ai].environment name (dev→synthetic, staging/prod→phi; a
@@ -4273,8 +4277,9 @@ def security_loosenings(
     Shared by the serve-time loosening warning (``__main__``, ADR 0118 AC-4) and the read-only posture
     view (``GET /security/posture``, AC-5), so the two never drift. This is advisory only — it names what
     a deliberate opt-out gives up; the posture GATES (which still refuse a production-PHI weakening) are
-    unchanged. ``audit_all_authorization_decisions=false`` is the owner-confirmed SECURE default, so it is
-    NOT a loosening. See ``docs/SECURITY-LOOSENING.md``."""
+    unchanged. ``audit_all_authorization_decisions=false`` USED to be exempt here as the owner-confirmed
+    secure default; it now ships **true** and its false value is reported like any other deviation
+    (BACKLOG #1277). See ``docs/SECURITY-LOOSENING.md``."""
     out: list[tuple[str, str]] = []
     if sec.enforcement is SecurityEnforcement.WARN:
         out.append(
@@ -4409,6 +4414,19 @@ def security_loosenings(
         )
     if sec.allow_keeping_phi_indefinitely:
         out.append(("allow_keeping_phi_indefinitely", "unbounded PHI retention is permitted"))
+    if not sec.audit_all_authorization_decisions:
+        # NEW SIDE OF THIS SWITCH (BACKLOG #1277). It was exempt from the completeness floor while it
+        # shipped false, on the ground that turning it ON was the hardening move; with the default
+        # flipped, turning it OFF is the deviation, so it joins the registry and the floor now covers
+        # it. PHI access stays audited either way -- what an operator gives up is the READ history.
+        out.append(
+            (
+                "audit_all_authorization_decisions",
+                "only the sensitive/state-changing surface writes an authorization-grant row -- every "
+                "authenticated READ is authorized and NOT recorded, so what an account actually "
+                "reached cannot be reconstructed afterwards (PHI access is audited regardless)",
+            )
+        )
     # --- switches outside [security] that are still posture deviations (ADR 0148: one posture, loosen
     # only). They live in [store]/[auth] for cohesion, but an operator turning either off is loosening the
     # shipped posture, so they belong in the same registry rather than a parallel one that could drift.
