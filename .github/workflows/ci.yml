@@ -704,7 +704,17 @@ jobs:
         # binds a real port window; keeping a file's tests together keeps that window inside one
         # process. The cost of `loadfile` is that the run cannot finish faster than its single largest
         # FILE, which is why the per-file hot spots are worth attacking next.
-        run: pytest -q -n "$PYTEST_WORKERS" --dist loadfile --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
+        # `-m 'not tooling'` DESELECTS the repo-harness tier, which the `tooling` job runs instead.
+        # Measured 2026-08-16 on a 20-core box: 1,882 of 12,990 tests carry the mark but they are 66
+        # percent of the suite's TIME, and the single largest file in the tier (test_worktree_prune_
+        # merged.py, 391.4s) was setting this step's `--dist loadfile` floor on every engine leg.
+        #
+        # Deselection is by MARKER, applied in tests/conftest.py from tests/tooling_manifest.txt. Not by
+        # path, and not by a second `--ignore-glob`: the webconsole exclusion right above already shows
+        # what happens when the selection lives in the run body -- the obvious spelling (`--ignore`) was
+        # the one that silently did nothing. One list, read in one place, asserted by
+        # tests/test_tooling_partition.py, which also pins the two halves of this wiring.
+        run: pytest -q -n "$PYTEST_WORKERS" --dist loadfile -m 'not tooling' --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
 
       # THE MARGIN CHECK (BACKLOG #344 proposal 1). Last in the job so a LOW margin cannot skip a suite
       # that has not run yet -- a step `if:` with no status function carries an implicit `success()`,
@@ -855,6 +865,85 @@ jobs:
             --since before-webconsole --until now || rc=$?
           exit $rc
 
+  # The repo-HARNESS tier, lifted off the engine legs' critical path. Membership is
+  # tests/tooling_manifest.txt; the `test` legs deselect it with `-m 'not tooling'` and this job is the
+  # only place it runs. Measured 2026-08-16: 94 files, 1,882 tests, 66 percent of the suite's time.
+  #
+  # UBUNTU ONLY, and this is the one real coverage change in the split -- state it rather than bury it.
+  # The tier previously ran on all three legs because it rode inside `test`. Its subject is scripts/ and
+  # the workflow files, most of it is shell/git/filesystem behaviour that is not OS-divergent, and it is
+  # the Windows legs where its ~1.0s-per-test child-spawn cost hurts most. The Windows-specific members
+  # -- the gate's own path handling, the cp1252 console guard -- are the argument for adding a
+  # windows-2025 leg here later; that is a sizing decision to make against a measured run of THIS job,
+  # not a guess made while writing it. If a harness regression ever lands that only Windows would have
+  # caught, this comment is the thing that was wrong.
+  #
+  # NOT a required context of its own: it rides the `ci-gate` roll-up, exactly as `webconsole` does and
+  # for the same reason recorded there -- a new required context needs a branch-protection change, and
+  # until that lands every PR carries a check it can never satisfy.
+  tooling:
+    name: repo harness tests
+    needs: changes
+    # The push arm is the safety net, not redundancy: the PR arm only fires when the harness itself
+    # changed, so an ENGINE change that breaks a harness test is invisible on its own PR by
+    # construction, and push-to-main is where it surfaces. See the `tooling` output on `changes`.
+    if: needs.changes.outputs.tooling == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # several of these tests read git history (ledger, claim, cutover guards)
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          cache-dependency-glob: |
+            pyproject.toml
+            requirements.lock
+
+      # THE SAME INSTALL LINE AS `test`, and it cannot be trimmed even though no listed test imports the
+      # engine: tests/conftest.py itself does (`from messagefoundry.config.settings import ...`), so the
+      # package must be importable for collection to happen at all. Keeping the line identical also
+      # shares the uv cache entry with the sibling jobs.
+      - name: Install project (dev + console + fhir + dicom + x12 + xml extras)
+        run: |
+          uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
+
+      # `-m tooling` SELECTS what the engine legs deselected. The two spellings are a pair and
+      # tests/test_tooling_partition.py asserts BOTH are present in this file, because either one alone
+      # is a silent half-failure: without the engine-side `not tooling` the split buys nothing, and
+      # without this the tier stops running anywhere while both jobs still report green.
+      #
+      # `--dist loadfile` for the same reason as the engine step: these tests bind real port windows and
+      # own module-scoped fixtures, so a file's tests must stay in one worker.
+      - name: Harness tests (pytest)
+        timeout-minutes: 18
+        run: pytest -q -n 4 --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' --timeout=120
+
+      # A marker typo, a manifest rename, or a conftest hook that silently stops firing all produce the
+      # same thing: zero selected tests and a GREEN job. Deselection cannot be distinguished from success
+      # by exit code -- pytest exits 5 on "no tests collected", which `-q` reports in one line nobody
+      # reads. Assert the count directly.
+      - name: Prove the tier actually ran
+        run: |
+          n=$(pytest -q -m tooling --ignore-glob='*messagefoundry-webconsole*' --collect-only 2>/dev/null \
+                | grep -cE '^tests/' || true)
+          echo "tooling tests collected: $n"
+          if [ "$n" -lt 1000 ]; then
+            echo "::error::the tooling marker selected $n tests (expected ~1900) -- the partition is not being applied; check tests/tooling_manifest.txt and the conftest hook that reads it"
+            exit 1
+          fi
+
   # Build + type-check the VS Code extension, and run its integration tests. The Python jobs never
   # touch ide/, so a dep bump or IDE code change that breaks the bundle or the types would otherwise
   # pass CI unbuilt (this job exists because an esbuild bump merged "green" without anything having
@@ -943,6 +1032,15 @@ jobs:
       # `ide`: run the ide build job only when a PR touches ide/** or this workflow (true on
       # push/dispatch for full coverage; false on the nightly cron). Not a required check.
       ide: ${{ steps.f.outputs.ide }}
+      # `tooling`: the repo-HARNESS test tier — worktree gate, coordination claims, session mail,
+      # ledger, announce, and the workflow files themselves. Measured 2026-08-16: 94 files and 1,882
+      # tests, 17 percent of the suite by count but 66 percent by TIME, because every one of them
+      # spawns real pwsh/git children (~1.0s per test against 0.10s for an engine test). Its SUBJECT is
+      # the development harness, so an engine-only PR cannot change its result — yet before this it set
+      # the `--dist loadfile` floor for all three engine legs. The `test` legs now deselect it with
+      # `-m 'not tooling'` and the `tooling` job below runs it, path-gated. Membership is
+      # tests/tooling_manifest.txt, NOT a filename pattern — see that file for why.
+      tooling: ${{ steps.f.outputs.tooling }}
       # `matrix`: the `test` job's include list, per-repo — full ubuntu+windows matrix HERE (this repo is
       # public, so hosted runners are free; the self-hosted Windows runners are retired), ubuntu-only on
       # a fork. Consumed as `matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}` in `test`.
@@ -1038,6 +1136,7 @@ jobs:
             echo "docker=true" >> "$GITHUB_OUTPUT"
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "ide=true" >> "$GITHUB_OUTPUT"
+            echo "tooling=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Push-to-main: the FUNCTIONAL gate (code) stays true — the required test legs re-run on
@@ -1051,6 +1150,13 @@ jobs:
             echo "docker=false" >> "$GITHUB_OUTPUT"
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "ide=true" >> "$GITHUB_OUTPUT"
+            # TRUE on push, unlike serverdb/docker above, and the asymmetry is deliberate. Those two are
+            # re-runs of container legs a PR already path-gated minutes earlier. This one is the SAFETY
+            # NET for the whole gating scheme: the PR arm below only fires when the harness itself
+            # changed, so an ENGINE change that breaks a harness test is invisible on its PR by
+            # construction. Push-to-main is where that gets caught. Set this false and the tier is
+            # effectively unguarded against everything except its own edits.
+            echo "tooling=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ "$EVENT_NAME" = "schedule" ]; then
@@ -1060,6 +1166,7 @@ jobs:
             echo "docker=false" >> "$GITHUB_OUTPUT"
             echo "code=false" >> "$GITHUB_OUTPUT"
             echo "ide=false" >> "$GITHUB_OUTPUT"
+            echo "tooling=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Remaining case: pull_request. Compute the path-based filters from the PR diff.
@@ -1092,6 +1199,26 @@ jobs:
             echo "ide=true" >> "$GITHUB_OUTPUT"
           else
             echo "ide=false" >> "$GITHUB_OUTPUT"
+          fi
+          # `tooling`: the harness tier's SUBJECT is scripts/, the workflows, and the ledger, so those are
+          # what can change its result on a PR. Plus the two files that define the partition itself: edit
+          # the manifest or the conftest hook that reads it and the tier must re-run to prove the new
+          # split still holds.
+          #
+          # THE SECOND ARM MATCHES THE MANIFEST AGAINST ITSELF, and that is the point. Editing one of the
+          # 94 listed tests has to run them, and the obvious spelling -- an alternation of test-name
+          # prefixes -- is a SECOND definition of the tier that drifts from the first silently, in the
+          # direction where an edited test simply stops being covered. `grep -xF -f` reads the one
+          # definition there is. Comments and blanks are stripped first: a blank pattern under -F -x
+          # would match nothing here, but an unfiltered `#` line is still a pattern nobody intended.
+          #
+          # NOT gated on `code`: a docs-only PR that rewrites docs/BACKLOG.md must still face the ledger
+          # and backlog-status tests, and those live in this tier.
+          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/(BACKLOG\.md|adr/)|\.claude/|tests/(conftest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
+            || echo "$changed" | grep -qxFf <(grep -vE '^[[:space:]]*(#|$)' tests/tooling_manifest.txt); then
+            echo "tooling=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tooling=false" >> "$GITHUB_OUTPUT"
           fi
           # `code`: CONSERVATIVE docs-only detector. Default to running everything (code=true), and only
           # short-circuit when EVERY changed path matches the docs/non-code allowlist below. We compute it
@@ -2231,6 +2358,12 @@ jobs:
       # `cancelled`, and `CI gate` is required. Before this, the console suite gated merges by being a
       # step inside the required `test` legs; it must not silently stop gating them now that it is not.
       - webconsole
+      # `tooling` rides here for the same reason, and the precedent above is the whole argument: it was
+      # a set of steps inside the required `test` legs until the manifest split it out, so without this
+      # line the harness tier would stop gating merges the moment it stopped being part of `test`. It IS
+      # path-gated (unlike webconsole), so it skips on most PRs -- and a skipped need is not a failure
+      # to the `contains(needs.*.result, ...)` check below, which is the behaviour wanted.
+      - tooling
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any gated leg failed or was cancelled

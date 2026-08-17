@@ -392,3 +392,50 @@ def pytest_report_header() -> list[str]:
 
 def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
     write_incomplete_run_summary(terminalreporter)
+
+
+# ---------------------------------------------------------------------------------------------------
+# THE TOOLING PARTITION -- marks the repo-harness tier so ci.yml can run it as its own path-gated job.
+#
+# The tier is 17 percent of the suite's tests and 66 percent of its TIME (measured 2026-08-16: 94
+# files, 2,145s of 3,249s), because each test spawns real pwsh/git children. Its subject is the
+# development harness, not the engine, so an engine-only PR cannot change its result -- yet it sets
+# the `--dist loadfile` floor for every engine leg. `-m 'not tooling'` takes it off that path.
+#
+# MEMBERSHIP IS A MANIFEST, NOT A PATTERN, AND NOT A DIRECTORY. Three regex classifiers were tried
+# and each got a different obvious case wrong (one would have moved `test_dependency_boundaries` --
+# the one-way import rule -- off the engine legs). Relocating the files into tests/tooling/ was then
+# tried and reverted: they are coupled to their location in at least five ways, two of which only
+# surfaced by running the suite. Both failure modes are the same one CLAUDE.md section 11 records for
+# the backlog glyph parser -- a classifier that agrees with the corpus by luck. So the list is
+# written down, and tests/test_tooling_partition.py pins it against the tree.
+#
+# A MISSING OR UNREADABLE MANIFEST RAISES. It must not degrade to "mark nothing": that spelling keeps
+# `-m 'not tooling'` correct-but-slow while making `-m tooling` collect ZERO, so the entire harness
+# tier would stop running and its job would go green having tested nothing. Loud beats silent in the
+# direction that loses coverage.
+#
+# Scoped to files sitting DIRECTLY in tests/. The other testpath
+# (packaging/messagefoundry-webconsole/tests) is a separate suite with its own pytest config; keying
+# on the basename alone would let a same-named file there inherit a mark meant for this directory.
+# ---------------------------------------------------------------------------------------------------
+
+_TESTS_DIR = Path(__file__).resolve().parent
+_TOOLING_MANIFEST = _TESTS_DIR / "tooling_manifest.txt"
+
+
+def _tooling_basenames() -> frozenset[str]:
+    text = _TOOLING_MANIFEST.read_text(encoding="utf-8")  # raises if absent -- see above
+    return frozenset(
+        line.strip().rsplit("/", 1)[-1]
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    names = _tooling_basenames()
+    for item in items:
+        path = getattr(item, "path", None)
+        if path is not None and path.parent == _TESTS_DIR and path.name in names:
+            item.add_marker(pytest.mark.tooling)

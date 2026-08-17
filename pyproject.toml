@@ -330,6 +330,10 @@ testpaths = ["tests", "packaging/messagefoundry-webconsole/tests"]
 addopts = "--timeout=60 --timeout-method=thread"
 markers = [
     "win2025_acceptance: Windows Server 2025 on-server acceptance probes (env-gated; skip off-server).",
+    # Applied by tests/conftest.py from tests/tooling_manifest.txt -- never written on a test by hand,
+    # so `-m tooling` and `-m 'not tooling'` partition the suite from ONE reviewed list. ci.yml runs
+    # the engine legs with `not tooling` and this tier as its own path-gated job.
+    "tooling: repo-harness tests (worktree gate, coordination, ledger, CI workflows) -- subject is the development harness, not the engine.",
 ]
 
 [tool.ruff]
