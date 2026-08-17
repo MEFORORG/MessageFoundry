@@ -357,7 +357,7 @@ function Remove-QuotedSpans([string]$s) {
     hands the shell two harmless arguments and leaves the middle LIVE. The double-quote pass pairs
     those two literal quotes ACROSS the live command and deletes it, so no rule ever sees it -> ALLOW.
 
-    THE ASYMMETRY IS THE PROOF, and it is why the defect is invisible from one side: the mirrored
+    THE ASYMMETRY IS THE PROOF, and it is why the defect is invisible from one side: the inverted
     shape (a stray apostrophe inside double-quoted words) still DENIES, because the double-quote pass
     runs first and consumes those spans before the single-quote pass can straddle. The cause is the
     blanking ORDER, not any command classifier -- a fix aimed at the classifiers would not touch it.
