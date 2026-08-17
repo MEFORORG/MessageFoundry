@@ -358,7 +358,12 @@ if ($Json) {
 }
 else {
     Write-Host ""
-    Write-Host "Claim reconciliation against $mainRef ($($rows.Count) claims)"
+    # The count names its POPULATION and its FILTER. It printed "(N claims)" over a report that
+    # silently omits every HELD row, so the header said 30 while the registry held 48 and the JSON
+    # said 48 -- a count without its filter, which is the defect this repository keeps finding and
+    # the one FR-015 exists for one repository over.
+    $shown = $releasable.Count + $hold.Count + $unknown.Count
+    Write-Host "Claim reconciliation against $mainRef -- $shown of $($rows.Count) claims shown; $($rows.Count - $shown) held by a directory that still exists and are not listed"
     Write-Host ""
     foreach ($group in @(
             @{ n = "RELEASABLE -- holder gone, deregistered, work is on $mainRef"; v = $releasable; c = "Green" },
