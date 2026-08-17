@@ -75,9 +75,11 @@ _LOG_TRACKED_ADDRESSES = 64
 _MONOCULTURE_MIN_OBSERVATIONS = 50
 
 _DENIAL_HEADERS = {
-    # Being the OUTERMOST middleware, a denial short-circuits both the engine's _security_headers and
-    # the console's UiSecurityHeadersMiddleware, so set the baseline directly rather than ship a 403
-    # with none of them.
+    # A denial short-circuits both the engine's _security_headers and the console's
+    # UiSecurityHeadersMiddleware, so set the baseline directly rather than ship a 403 with none of
+    # them. api.header_floor.SecurityHeaderFloorMiddleware is registered further out still and
+    # setdefaults the same names, so these are now a belt to its braces — and it, not this dict, is
+    # what supplies the Strict-Transport-Security a static header set cannot decide on.
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     "X-Frame-Options": "DENY",

@@ -611,10 +611,16 @@ async def test_websocket_from_an_allowed_address_reaches_the_route(engine: Engin
 
 async def test_gate_stays_outermost_with_the_console_mounted(engine: Engine) -> None:
     """mount_ui installs UiSecurityHeadersMiddleware; the gate is registered AFTER it and so must
-    still be outermost. If it slipped inside, the console's middleware (and the /ui/static mount)
-    would run for a refused address."""
+    still precede it. If it slipped inside, the console's middleware (and the /ui/static mount)
+    would run for a refused address.
+
+    Only SecurityHeaderFloorMiddleware may be further out, and it is not an exception to the claim:
+    it does no request-path work at all, so nothing it adds is reachable by a refused address."""
+    from messagefoundry.api.header_floor import SecurityHeaderFloorMiddleware
+
     app = _app(engine, WARD, serve_ui=True)
-    assert app.user_middleware[0].cls is ClientNetworkMiddleware
+    assert app.user_middleware[0].cls is SecurityHeaderFloorMiddleware
+    assert app.user_middleware[1].cls is ClientNetworkMiddleware
     assert len([m for m in app.user_middleware if m.cls is ClientNetworkMiddleware]) == 1
 
 
@@ -624,8 +630,12 @@ async def test_gate_is_not_a_basehttpmiddleware(engine: Engine) -> None:
     registered = [m for m in app.user_middleware if m.cls is ClientNetworkMiddleware]
     assert len(registered) == 1
     assert not issubclass(ClientNetworkMiddleware, BaseHTTPMiddleware)
-    # ...and it is registered LAST, i.e. OUTERMOST (add_middleware inserts at index 0).
-    assert app.user_middleware[0].cls is ClientNetworkMiddleware
+    # ...and it precedes everything that builds a response (add_middleware inserts at index 0, so
+    # index 0 is outermost). Only the request-path-free header floor is allowed above it.
+    from messagefoundry.api.header_floor import SecurityHeaderFloorMiddleware
+
+    assert app.user_middleware[0].cls is SecurityHeaderFloorMiddleware
+    assert app.user_middleware[1].cls is ClientNetworkMiddleware
 
 
 def test_web_console_keys_on_the_same_denial_marker() -> None:
