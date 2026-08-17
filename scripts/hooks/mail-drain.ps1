@@ -153,6 +153,25 @@
     ASCII-only on purpose; run under pwsh 7 by the hook.
 #>
 
+param(
+    # WHERE THE QUEUE LIVES, for a session whose cwd is NOT inside a git repository. Empty is the
+    # normal case and leaves every existing behaviour byte-identical.
+    #
+    # WHY THIS IS NOT SIMPLY "THE REPO". One variable used to answer two different questions: WHICH
+    # QUEUE do I read, and WHICH BOX is mine. Deriving both from cwd is right inside a repo and
+    # unanswerable outside one, which is why a session rooted at a worktree CONTAINER -- a plain
+    # directory holding several clones -- exited here in silence while mail addressed to it queued
+    # up unread. This parameter answers only the FIRST question. The box key below stays a function
+    # of the session's OWN cwd, so an anchored session reads its own box and can never be handed the
+    # anchor repo's primary checkout's mail.
+    #
+    # IT NEVER OVERRIDES A REAL REPO, AND THAT ORDERING IS THE CONTROL. If cwd resolves to a repo,
+    # this is ignored outright. The failure that prevents is the worst one this transport has: a
+    # stray anchor silently redirecting a worktree session's drain to a foreign queue would strand
+    # that session's mail while every observable on both ends still reported success.
+    [string]$AnchorRepo = ''
+)
+
 $ErrorActionPreference = 'SilentlyContinue'
 
 # --- Receiver-side caps. THESE ARE THE CONTROL. ---------------------------------------------------
@@ -473,9 +492,15 @@ try {
 
     $cwd = if ($hook -and $hook.cwd) { [string]$hook.cwd } else { (Get-Location).Path }
 
-    # --- Locate the queue. Outside a repo this is not our business; say nothing and go.
+    # --- Locate the queue. Outside a repo this is not our business unless the caller passed an
+    # anchor; say nothing and go. The anchor is consulted ONLY where cwd resolved nothing, never as
+    # an override -- the parameter's comment records the failure that ordering prevents.
     $common = & git -C $cwd rev-parse --path-format=absolute --git-common-dir 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $common) { exit 0 }
+    if ($LASTEXITCODE -ne 0 -or -not $common) {
+        if (-not $AnchorRepo) { exit 0 }
+        $common = & git -C $AnchorRepo rev-parse --path-format=absolute --git-common-dir 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $common) { exit 0 }
+    }
     $root = Join-Path $common.Trim() 'mefor-coord/mail'
     if (-not (Test-Path -LiteralPath $root)) { exit 0 }   # nothing has ever been sent; silence is correct
 
