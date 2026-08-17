@@ -234,19 +234,28 @@ def _clone(template: Path, dest: Path) -> Fixture:
     """Copy a prebuilt fixture family and rebind every absolute path git recorded inside it.
 
     ``_build`` is ~30 git subprocesses and, measured on this checkout, **2.4s of the 3.9s an average
-    test in this file costs** -- 61 per cent of the file, spent rebuilding a byte-identical repo 43
-    times. This is the cheap half: copy the tree, then fix the two things a copy gets wrong.
+    test in this file costs**. The file runs it 60 times (59 function-scoped ``fx`` + one
+    ``readonly_fx``) to produce 60 byte-identical repos. This is the cheap half: copy the tree, then
+    fix the two things a copy gets wrong. Serial, same 71 tests passing: 250.7s -> 166.3s.
 
     Only two kinds of absolute path survive a copy, and both are repairable in one subprocess each:
 
     * the primary's ``origin`` remote URL, which still names the TEMPLATE's bare repo -- so a
-      ``-Fetch`` test would silently reach the wrong origin rather than fail;
+      ``-Fetch`` test would silently reach the wrong origin rather than fail. Not hypothetical:
+      ``test_apply_fetches_for_real`` pushes, and without this line the push lands in the template.
     * the worktree registrations, in BOTH directions (each tree's ``.git`` file names its gitdir, and
       each ``.git/worktrees/<name>/gitdir`` names its tree). ``git worktree repair`` exists for exactly
       this and rewrites the whole family in a single call.
 
-    ``decoy`` is deliberately excluded: it is a SEPARATE repo that only shares the name prefix, so
-    ``worktree repair`` rejects it and fails the whole call.
+    WHICH TREES TO REPAIR IS DERIVED FROM THE FILESYSTEM, NEVER FROM A NAME PATTERN. A linked worktree
+    has a ``.git`` FILE; a repository has a ``.git`` DIRECTORY. That one distinction excludes both the
+    primary and ``decoy`` (a SEPARATE repo that merely shares the name prefix) by construction, so
+    adding a worktree to ``_build`` needs no matching edit here. A ``repo-*`` glob would have gone
+    quietly wrong instead: an unmatched tree keeps TEMPLATE-absolute registrations in both directions
+    and the test then exercises the wrong tree while passing.
+
+    Note ``git worktree list`` cannot be used for this -- before the repair its registrations still
+    name the template, so it reports the paths we are trying to correct.
 
     Mtimes are preserved (``copytree`` uses ``copy2``), which is load-bearing -- the activity veto
     reads the newest mtime of the private git metadata, and ``_backdate`` moves it. The template ages
@@ -255,13 +264,20 @@ def _clone(template: Path, dest: Path) -> Fixture:
     shutil.copytree(template, dest, symlinks=True, dirs_exist_ok=True)
     fx = Fixture(dest)
     _git(fx.primary, "remote", "set-url", "origin", str(dest / "origin.git"))
-    trees = [
-        p
-        for p in sorted(fx.primary.parent.glob(f"{fx.primary.name}-*"))
-        if p.name != f"{fx.primary.name}-decoy"
-    ]
-    trees.append(fx.primary / ".claude" / "worktrees" / "nested")
+    trees = sorted(p.parent for p in dest.rglob(".git") if p.is_file())
+    assert trees, f"no linked worktrees found under {dest} -- the copy is not a fixture family"
     _git(fx.primary, "worktree", "repair", *(str(p) for p in trees))
+
+    # Post-condition, because everything downstream rests on git's repair semantics rather than on any
+    # code here: a registration still naming the template means this clone shares state with every
+    # other clone, which is silent cross-test contamination rather than a failure. Plain file reads,
+    # not another subprocess -- this runs 60 times a session.
+    stale = sorted(
+        p
+        for p in (fx.primary / ".git" / "worktrees").glob("*/gitdir")
+        if str(template) in p.read_text(encoding="utf-8")
+    )
+    assert not stale, f"worktree repair left {len(stale)} registration(s) on the template: {stale}"
     return fx
 
 
