@@ -659,7 +659,7 @@ _ALLOWLIST_CANARIES: tuple[str, ...] = (
 
 
 #: Identifier separators neutralised before the second name-pattern pass. Only ``_`` today: it is
-#: the one separator that is also a WORD character, so it is the only one that defeats . Kept as
+#: the one separator that is also a WORD character, so it is the only one that defeats `\b`. Kept as
 #: a pattern (not str.replace) so a future separator is a one-character edit.
 _IDENT_SEP = re.compile(r"_")
 
