@@ -1445,9 +1445,32 @@ MFA step-up is now built (WP-14 native TOTP); a web console banner for the feed 
 Local passwords follow an **ASVS 5.0-aligned** policy (WP-3): **min length 15**, **no mandatory
 character-class composition** (the `require_*` class flags are opt-in, default off — ASVS forbids
 mandatory composition), plus **offline breached/common-password screening** (a bundled top-10k list,
-no live HIBP call) and a small **context-word deny-list** (app/vendor/HL7 terms like `messagefoundry`,
-`mefor`, `hl7`, `corepoint`). Enforced identically on create-user and change-password; tune via
-`[auth]` (see [CONFIGURATION.md](CONFIGURATION.md)). AD passwords are governed by Active Directory.
+no live HIBP call) and a fixed **context-word deny-list**, enumerated in full below. Enforced
+identically on create-user and change-password; tune via `[auth]` (see
+[CONFIGURATION.md](CONFIGURATION.md)). AD passwords are governed by Active Directory.
+
+**The context-word deny-list, in full.** A local password is refused if it *contains* any of these
+twelve terms as a case-insensitive substring, anywhere in the value — not only as a prefix, and not
+only as a whole word:
+
+`messagefoundry`, `mefor`, `mllp`, `hl7`, `corepoint`, `mirth`, `rhapsody`, `changeme`, `bootstrap`,
+`admin`, `administrator`, `password`
+
+An earlier revision of this page described the list as "app/vendor/HL7 terms" and showed four of the
+twelve as examples. That description was wrong in a way a reader could act on: five members —
+`changeme`, `bootstrap`, `admin`, `administrator`, `password` — are generic credential words with no
+connection to this application, to a vendor, or to HL7, so a passphrase chosen on the strength of the
+old sentence could still be refused with no indication of which rule fired. The list above is the
+whole of it, mirrored from `CONTEXT_WORDS` in
+[`auth/policy.py`](../messagefoundry/auth/policy.py); the code is the authority if the two diverge.
+
+**What a deploying site can and cannot tune here.** `password_check_context` is a whole-list on/off
+switch, on by default. There is **no** setting that adds a site's own terms — its hospital
+abbreviation, a partner or product name, the local domain — and none that removes a member whose
+substring collides with a legitimate local word. A site that wants wider coverage supplies it through
+`password_breach_corpus_file` below, which answers a different question: that corpus is matched
+against the **whole** password, so a term added there is refused only when it *is* the password, never
+when it appears inside a longer passphrase.
 
 Two further screens (ASVS 6.2.11 / 6.2.12), both on by default and fully offline:
 
