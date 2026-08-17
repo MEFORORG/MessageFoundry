@@ -934,6 +934,21 @@ jobs:
         with:
           python-version: "3.14"
 
+      # NEEDED EVEN THOUGH NO HARNESS TEST TOUCHES Qt, because `-m tooling` FILTERS AFTER COLLECTION.
+      # pytest imports every module under `testpaths` to collect it and only then applies the marker
+      # expression, so this job still imports the four PySide6 modules (test_harness_compose,
+      # test_harness_file, test_harness_monitor, test_console_messages_refresh) and dies on
+      # `ImportError: libEGL.so.1` before a single tooling test runs. Measured on this job's first real
+      # CI run: 1494 passed, 388 skipped, 4 COLLECTION ERRORS -- deselection does not mean not-imported.
+      #
+      # That is also why the install line below cannot be trimmed to a harness-only set: collection
+      # imports the whole suite regardless of what this job intends to execute.
+      - name: Install Qt offscreen system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
+
       - name: Set up uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
@@ -958,6 +973,10 @@ jobs:
       # own module-scoped fixtures, so a file's tests must stay in one worker.
       - name: Harness tests (pytest)
         timeout-minutes: 30 # see the job cap above for the derivation; must stay under it with setup
+        env:
+          # Same reason as the apt step above: collection imports the Qt modules whether or not this
+          # job executes them, and the shipped ones construct QApplication at import on some paths.
+          QT_QPA_PLATFORM: offscreen
         run: pytest -q -n 4 --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' --timeout=120 --junitxml=tooling-junit.xml
 
       # A marker typo, a manifest rename, or a conftest hook that silently stops firing all produce the
