@@ -90,6 +90,12 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_adr0071_statement_rt_inventory.py",
         #   install_instruction_provenance -> globs messagefoundry/**/*.py
         "test_install_instruction_provenance.py",
+        #   sds_rule_ids_are_stable -> :397 rglobs messagefoundry/**/*.py. Milder than the four above
+        #     (it catches a dangling SDS-N.N citation in an engine docstring, not a correctness bug),
+        #     and it is listed here anyway: the value of this list is that it is exhaustive for its
+        #     stated rule, and "same class but it does not matter much" is how the next exception gets
+        #     argued in.
+        "test_sds_rule_ids_are_stable.py",
         # this file: it guards the partition, so it must run wherever the partition matters
         "test_tooling_partition.py",
     }
@@ -152,6 +158,29 @@ def test_every_non_engine_test_is_classified() -> None:
 def test_stay_list_holds_only_real_files() -> None:
     missing = sorted(n for n in _STAYS_WITHOUT_IMPORTING if not (_TESTS / n).is_file())
     assert not missing, f"_STAYS_WITHOUT_IMPORTING names files that do not exist: {missing}"
+
+
+def test_the_two_lists_are_disjoint() -> None:
+    """The stay list must have POWER over the manifest, not merely opinions about it.
+
+    Without this the stay list is inert: ``test_every_non_engine_test_is_classified`` skips anything
+    already in the manifest, so a file can sit in BOTH and the manifest silently wins. Mutation-
+    verified before this assertion existed -- appending ``tests/test_dependency_boundaries.py`` to the
+    manifest left the whole pin file at 8 passed, while ``-m tooling`` then collected its 3 tests. That
+    file is the engine's one-way import rule, and it is the case the commit history records a regex
+    classifier nearly shipping. The one artifact naming the files that must not move had no way to stop
+    them moving -- including this file, despite the comment above asserting it must run wherever the
+    partition matters.
+
+    Disjointness is the whole guarantee: a name in both lists is a contradiction the author has to
+    resolve, not a precedence rule to be quietly applied in the manifest's favour.
+    """
+    both = sorted(set(_manifest_names()) & _STAYS_WITHOUT_IMPORTING)
+    assert not both, (
+        "these files are in BOTH tests/tooling_manifest.txt and _STAYS_WITHOUT_IMPORTING; the manifest "
+        "would win silently and the file would leave the engine legs. Decide which list it belongs in: "
+        f"{both}"
+    )
 
 
 def test_marker_is_registered() -> None:
