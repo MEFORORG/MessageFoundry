@@ -1052,12 +1052,31 @@ anywhere**. Config: [CONFIGURATION.md](CONFIGURATION.md#retention).
 **"Off by default" is no longer the whole truth on a PHI instance.** The raw `[retention]` fields do
 still default to `0`, but `serve` applies a posture gate on top of them:
 
-- On a **non-enforcing PHI instance**, each **unset** PHI-body window is **auto-bounded to 30 days**
-  (secure-by-default) — an explicitly-set value, including an explicit `0`, is respected and only warns.
-- On a **PHI instance under `[security].enforcement = enforce`** (the default) with either PHI-body
-  window unbounded, `serve` **refuses to start (exit code 2)**.
+- On **any** PHI instance, under **both** `[security].enforcement` dials, each **unset** window that
+  carries an auto-bound is **defaulted to 30 days** at startup, and the defaulted settings are named
+  on stderr. The three are `[security].delete_message_bodies_after_days`,
+  `[retention].dead_letter_days` and `[retention].reference_snapshot_days`, generated from
+  [config/retention_classification.py](../messagefoundry/config/retention_classification.py)
+  (`auto_bounded_windows`) rather than listed at the gate.
+- These bullets used to say the auto-bound applied only to a *non-enforcing* PHI instance, and that a
+  PHI instance under `enforcement = enforce` with a PHI-body window unbounded **refused to start (exit
+  code 2)**. Both halves were wrong about the shipped code: the auto-bound in
+  [`__main__.py`](../messagefoundry/__main__.py) is keyed on the retention opt-out alone
+  (`if not settings.retention.allow_unbounded_phi:`), not on the enforcement dial. A site that read
+  the old text and deliberately left a window unset — expecting the refusal to hold the boot until
+  someone chose a number — would instead get a started instance that begins purging PHI bodies at 30
+  days.
+- What survives is the fail-closed path for an **explicit** `0`. An explicitly-zeroed window is not
+  auto-bounded, and `serve` then **refuses to start (exit code 2)** under `enforcement = enforce`, or
+  warns and continues under `warn`. So "unbounded by accident" is still prevented; "unbounded by
+  inattention" becomes "30 days by inattention".
+- The classified windows that carry **no** auto-bound are warned about at startup and left alone —
+  never silently defaulted and never refused over. `[retention].state_max_age_days` and
+  `[retention].search_preset_days` are the clearest case, because each keys on a timestamp that only
+  moves on a **write**, so a silent default would delete data a Handler is still reading; the others
+  are excluded for their own per-window reasons recorded alongside the classification.
 - The explicit, **audited** opt-out is `[security].allow_keeping_phi_indefinitely = true`, which
-  downgrades the refusal to a loud audited warning and suppresses the auto-bound.
+  suppresses the auto-bound **and** downgrades the refusal to a loud audited warning.
 - The canonical operator-facing home of the message-body window is now
   **`[security].delete_message_bodies_after_days`**; its *model* default is 30, but the desugar
   is **presence-gated** — only an EXPLICITLY-set switch is written through — so an **unset**
@@ -1065,7 +1084,13 @@ still default to `0`, but `serve` applies a posture gate on top of them:
   refusal) is what actually bounds a PHI instance. An explicitly-set value writes through onto
   `[retention].messages_days`. `[retention].dead_letter_days` stays at its own home.
 
-So a PHI instance cannot run with PHI-body retention "off" without a loud, audited opt-out.
+So a PHI instance cannot run with PHI-body retention "off" **by accident** — an unset window is
+bounded for you. It can still be run that way deliberately: an explicit `0` plus the audited opt-out
+under `enforce`, or an explicit `0` alone under `warn`, which warns and starts.
+
+**Thirty days is the engine's floor against an accidentally unbounded window, not a retention
+policy.** The engine picks that number; a deploying site with a retention obligation of its own must
+set each window explicitly, because an auto-bounded window is a number nobody decided.
 
 **The pass itself.** It is **leader-gated twice** — at entry and again immediately before the purges, so
 a node demoted mid-pass never nulls PHI as a stale ex-leader. An optional between-phase wall-clock cap
