@@ -26,9 +26,18 @@ unreachable.
 
 The coordination banner (`scripts/worktree/session-context.ps1`) is a *different* hook that shares the
 `SessionStart` event and is deliberately still absent. **Install one tier at a time with
-`-Only <event> -Script mail-drain`**: `-Only SessionStart` alone would wire the banner too. The urgent
-tier ([`scripts/hooks/mail-watch.ps1`](../scripts/hooks/mail-watch.ps1)) is armed in code and
-registered nowhere, by decision.
+`-Only <event> -Script mail-drain`**: `-Only SessionStart` alone would wire the banner too.
+
+The urgent tier ([`scripts/hooks/mail-watch.ps1`](../scripts/hooks/mail-watch.ps1)) **is registered on
+`Stop`, on all five roots** -- re-measured 2026-08-17 by two independent instruments that agree:
+`install-coordination.ps1 -Status` reports it INSTALLED in every root, and a direct read of each
+`settings.json` finds the `mefor-wake` shim resolving `scripts/hooks/mail-watch.ps1`. This line
+previously read "armed in code and registered nowhere, by decision", which was true when written on
+2026-08-06 and is not true now. It is recorded rather than silently overwritten because the direction
+of the drift is the instructive part: **a doc that understates what is armed is the safer of the two
+errors and therefore the one nobody goes looking for.** Its opposite -- a doc asserting a control is
+live when it is wired nowhere -- is live today for the coordination banner, in
+[`SESSION-DRIFT-CONTROLS.md`](SESSION-DRIFT-CONTROLS.md) and [`WORKTREES.md`](WORKTREES.md).
 
 **VERIFIED END TO END, through the installed hook command rather than a convenient stand-in.** The
 earlier VS Code run drove the drain by absolute path, which does not exercise the thing that actually
