@@ -91,7 +91,21 @@
     is precisely the half this tool exists to rescue, which is why it is the wrong half to rely on
     alone.
 
-    WHAT THIS DOES NOT MEASURE. Uncommitted and untracked work (use `git status`), and whether a
+    UNCOMMITTED WORK IS REPORTED, NOT COUNTED, AND THE DISTINCTION IS THE POINT. Nothing here can
+    make an uncommitted change durable -- a post-commit hook needs a commit, and this check measures
+    commits. But printing "0 unbacked commits" while a checkout holds unpushed EDITS is the same
+    manufactured confidence this script exists to prevent: measured 2026-08-16, the primary checkout
+    carried 43 uncommitted insertions in `scripts/coord/mail.ps1` while every commit-based
+    instrument on the machine read clean. It was found by a person reading `git status`, not by any
+    of them.
+
+    So dirty checkouts are surfaced on their own line and deliberately do NOT change the exit code:
+    uncommitted work is a normal state of a working tree, and failing on it would train an operator
+    to ignore the result. The severity difference is real -- an unbacked commit is recoverable from
+    the reflog, an uncommitted edit is not recoverable from anything -- which is the argument for
+    showing it, not for treating it as an error.
+
+    WHAT THIS DOES NOT MEASURE. Whether an uncommitted change is worth keeping, and whether a
     remote-tracking ref is up to date with what the server has now (run `git fetch --prune` first if
     that matters). Reachability from ANY remote-tracking ref counts as backed, including a rescue
     tag -- durable is not the same as landed, and this measures durability only.
@@ -146,6 +160,7 @@ $totalWorktrees = 0
 $totalUnbacked = 0
 $totalCommits = 0
 $totalDetached = 0
+$totalDirty = 0
 
 foreach ($p in $Path) {
     if (-not (Test-Path -LiteralPath $p)) {
@@ -184,9 +199,21 @@ foreach ($p in $Path) {
         if ($line -match '^worktree (.+)$') { $wtHeads += $Matches[1] }
     }
     $detached = @()
+    $dirty = @()
     foreach ($wp in $wtHeads) {
         $native = $wp -replace '/', '\'
         if (-not (Test-Path -LiteralPath $native)) { continue }
+        # Reported, never counted -- see the DESCRIPTION. An uncommitted edit cannot be made durable
+        # by anything here, and is the one loss no reflog recovers, so silence about it is the
+        # dangerous option.
+        $st = @(& git -C $native status --porcelain 2>$null)
+        if ($st.Count -gt 0) {
+            $dirty += [pscustomobject]@{
+                Worktree = $native
+                Tracked  = @($st | Where-Object { $_ -notmatch '^\?\?' }).Count
+                Untracked = @($st | Where-Object { $_ -match '^\?\?' }).Count
+            }
+        }
         # symbolic-ref fails on a detached HEAD; that failure IS the test.
         & git -C $native symbolic-ref --quiet HEAD 2>$null | Out-Null
         if ($LASTEXITCODE -eq 0) { continue }
@@ -234,6 +261,7 @@ foreach ($p in $Path) {
         Commits             = $sum
         Findings            = $findings
         DetachedUnbacked    = $detached
+        DirtyCheckouts      = $dirty
     }
     $totalRefs += $refs.Count
     $totalWorktrees += $wtHeads.Count
@@ -241,6 +269,7 @@ foreach ($p in $Path) {
     $totalCommits += $sum
     $totalDetached += $detached.Count
     $totalCommits += (($detached | Measure-Object -Property Commits -Sum).Sum)
+    $totalDirty += $dirty.Count
 }
 
 if ($Json) {
@@ -312,8 +341,20 @@ if ($unverifiableRepos.Count -gt 0) {
     Write-Host "result   : UNVERIFIABLE in $($unverifiableRepos.Count) repositor$(if ($unverifiableRepos.Count -eq 1) { 'y' } else { 'ies' }) -- see above. Not reporting clean." -ForegroundColor Red
     exit 1
 }
+# Printed BEFORE the result line, and on every run, so "0 unbacked commits" can never be read alone.
+# Deliberately not part of the exit code: see the DESCRIPTION.
+if ($totalDirty -gt 0) {
+    Write-Host "uncommitted: $totalDirty checkout$(if ($totalDirty -ne 1) { 's' }) hold uncommitted changes -- NOT durable, and nothing here can make them so" -ForegroundColor Yellow
+    if (-not $Quiet) {
+        foreach ($r in $repos) {
+            foreach ($x in $r.DirtyCheckouts) {
+                Write-Host ("             {0,-55} {1} tracked, {2} untracked" -f $x.Worktree, $x.Tracked, $x.Untracked)
+            }
+        }
+    }
+}
 if ($totalUnbacked -eq 0 -and $totalDetached -eq 0) {
-    Write-Host "result   : 0 unbacked commits" -ForegroundColor Green
+    Write-Host "result   : 0 unbacked commits$(if ($totalDirty -gt 0) { ' (but see uncommitted, above)' })" -ForegroundColor Green
     exit 0
 }
 $where = @()
