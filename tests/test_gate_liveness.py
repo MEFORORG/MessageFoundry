@@ -355,6 +355,25 @@ def test_skipped_and_cancelled_are_not_the_same_thing() -> None:
     assert [v["signal"] for v in liveness.verify(cancelled)[0]] == ["coverage"]
 
 
+def test_a_cancelled_job_that_still_recorded_a_receipt_is_judged_on_the_receipt() -> None:
+    """`cancelled` is NOT itself the violation -- the missing receipt is, and the difference is the
+    whole design.
+
+    The `Record gate liveness` step is `if: always()` and runs inside the cancellation grace period,
+    so a job killed after its measurement finished can still have recorded a good one. The tempting
+    shape of this fix is to redden on the job RESULT, which is simpler and wrong: it would fire on
+    any cancellation, including a whole-run cancel, and report dead gates where nothing died. A gate
+    that fires on good news gets muted, which would cost this control as well as the signal it
+    guards. Rule on the evidence, never on the label."""
+    needs = _all_healthy()
+    needs["coverage"] = _job(result="cancelled", receipt=_healthy("coverage", units=41))
+
+    violations, accepted = liveness.verify(needs)
+
+    assert violations == []
+    assert any(r["signal"] == "coverage" for r in accepted)
+
+
 # --------------------------------------------------------------------------------------------
 # The check must not go blind itself.
 # --------------------------------------------------------------------------------------------

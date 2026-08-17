@@ -522,12 +522,16 @@ def test_no_expression_interpolation_inside_run_bodies(workflow: dict) -> None:
 # --------------------------------------------------------------------------------------------
 
 #: The `setup(max)` term in ci.yml's nesting invariant: worst measured ubuntu setup, 5:22
-#: (ci.yml:594), rounded up.
+#: (ci.yml:594), IN SECONDS.
+#:
+#: Seconds rather than whole minutes because the compound margin is 38 seconds, and rounding 5:22
+#: up to 6 minutes would consume it and turn a holding invariant into a failing one. A test that
+#: rounds away the quantity it is measuring cannot police it.
 #:
 #: NOT this job's own 0:29 from run 32024368245. That is a sample of ONE, drawn from the only run
 #: that ever finished under the old cap -- the same selection bias that produced BACKLOG #1274.
 #: An invariant asserted against the good case does not hold in the bad one.
-_COVERAGE_SETUP_ALLOWANCE_MIN = 6
+_COVERAGE_SETUP_ALLOWANCE_SEC = 322
 
 #: Top of the coverage step's measured range (26:14), rounded up. Derived by extrapolating 75
 #: censored job logs against the completion profile of the runs whose pytest actually finished,
@@ -564,10 +568,19 @@ def test_the_coverage_job_carries_a_step_timeout_nested_inside_its_job_timeout(
         "the step running the suite under coverage must carry its own timeout-minutes; without one "
         "a hang below pytest is indistinguishable from a suite that needed longer"
     )
-    assert _COVERAGE_SETUP_ALLOWANCE_MIN + step_timeout < job_timeout, (
-        f"nesting invariant broken: setup({_COVERAGE_SETUP_ALLOWANCE_MIN}) + step({step_timeout}) "
-        f"is not under job({job_timeout}), so the JOB cap can fire before the STEP cap and the "
-        "failure stops naming its own cause"
+
+    # COMPOUND, because the job has more than one capped step and they run SEQUENTIALLY: the worst
+    # case is every cap firing in turn, not the largest one firing alone. ci.yml reached the same
+    # form when its web console suite gained its own budget.
+    capped = [
+        s["timeout-minutes"] for s in job["steps"] if isinstance(s.get("timeout-minutes"), int)
+    ]
+    worst_sec = _COVERAGE_SETUP_ALLOWANCE_SEC + sum(capped) * 60
+    assert worst_sec < job_timeout * 60, (
+        f"nesting invariant broken: setup({_COVERAGE_SETUP_ALLOWANCE_SEC}s) + step caps {capped} "
+        f"= {worst_sec}s is not under job({job_timeout}m = {job_timeout * 60}s). The JOB cap would "
+        "fire before the STEP caps, and the failure would stop naming its own cause -- which is the "
+        "condition BACKLOG #1274 exists to prevent. Raise the job cap in the same edit."
     )
 
 

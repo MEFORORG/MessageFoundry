@@ -359,6 +359,15 @@ jobs:
         run: pytest -q --cov=messagefoundry --cov-report=xml --cov-report=term-missing:skip-covered || true
       - name: Diff-coverage vs the PR base (advisory - never fails)
         continue-on-error: true
+        # diff-cover reads one coverage.xml against one diff and measures in SECONDS; this is a hang
+        # backstop, not a budget. Kept deliberately small because the nesting invariant is COMPOUND
+        # once a job has two capped steps -- they run sequentially, so the worst case is both hitting
+        # their caps at once: 5:22 setup(max) + 36 + 3 = 44:22 against the 45-minute job cap.
+        #
+        # THAT LEAVES 38 SECONDS, WHICH IS THIN, AND IT IS STATED RATHER THAN ROUNDED AWAY. Anyone
+        # raising either step cap must raise the job cap in the same edit; the invariant test asserts
+        # this in seconds precisely so the margin cannot be lost to rounding.
+        timeout-minutes: 3
         env:
           BASE_REF: ${{ github.base_ref }}
         run: |
