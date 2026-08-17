@@ -832,6 +832,16 @@ _XML_PARSER_ALLOWLIST = {
         "HARNESS surface no engine data reaches. The formula-injection half of this write-back is "
         "ASVS 1.2.10's, held by tests/test_csv_formula_consistency.py"
     ),
+    "scripts/ci/tooling_receipt.py": (
+        "defusedxml.ElementTree.parse over pytest's junit.xml, written by the `tooling` job's own "
+        "pytest invocation seconds earlier in the same runner workspace — the same shape as "
+        "harness/acceptance/runner.py above, and a CI surface no engine data reaches. defusedxml "
+        "rather than the stdlib parser that entry uses: its parse() forbids entity expansion and "
+        "external references by default, so the XXE class is closed at the construction site even "
+        "though the input is locally produced. Trusted-input arguments are the ones that rot when a "
+        "file is later reused, so the safe parser is the entry's justification and the provenance is "
+        "only why the residual risk is nil"
+    ),
 }
 
 #: Modules allowed to reach lxml through ``parsing/xml/_deps.py``'s lazy loaders. The import clause
