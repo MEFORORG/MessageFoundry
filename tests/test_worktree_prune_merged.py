@@ -296,10 +296,25 @@ def _template(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 @pytest.fixture(scope="session")
 def readonly_fx(_template: Path, tmp_path_factory: pytest.TempPathFactory) -> Fixture:
-    """Shared by the dry-run tests, which provably mutate nothing.
+    """Shared by the dry-run tests, which mutate no GIT state. They do mutate the config tree.
 
-    Still its own clone rather than the template itself, so "provably mutates nothing" stays an
-    assertion about these tests instead of a load-bearing precondition for the whole file.
+    The precise claim matters, because the loose one ("these tests mutate nothing") was wrong and
+    would have made the accumulation below look impossible rather than merely harmless. Every test
+    here calls ``live_record``, which writes ``cfg/sessions/<pid>.json``; ``sleeper`` is
+    function-scoped, so each writes a DIFFERENT filename and none is ever cleaned up. A test late in
+    the file therefore sees every earlier test's record, all but its own belonging to a pid that has
+    since been killed.
+
+    Harmless today, and only by luck of what is asserted: those leftovers are well-formed and dead,
+    and a dead record is neither a veto nor a permission (``test_dead_record_is_not_a_veto_and_not_a
+    _permission``), so decisions are unaffected. It stops being harmless the moment a test here
+    asserts on a COUNT -- records examined, unplaceable, or live-in-repo -- because that count then
+    depends on how many tests ran first. Add such an assertion and this fixture must gain a cleanup,
+    or that test must take function-scoped ``fx`` instead.
+
+    Still its own clone rather than the template itself: the template must stay pristine for every
+    other clone in the worker, so sharing it here would turn this accumulation from harmless into
+    contamination of the whole file.
     """
     return _clone(_template, tmp_path_factory.mktemp("prune-ro"))
 
