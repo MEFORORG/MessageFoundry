@@ -16,6 +16,8 @@
         fleet.ps1 -Text -All       # do not fold stale rows
         fleet.ps1 -Json            # machine-readable
         fleet.ps1 -Chip <boxKey> <sessionKey>   # the standalone briefing for one spawn_task call
+        fleet.ps1 -ColdStart       # receipt + EVERY respawn-eligible briefing, for the first
+                                   # session after an account switch. See docs/FLEET-CONTINUITY.md.
 
     WHY THE RECEIPT COMES BEFORE THE ROSTER, AND WHY IT CAN REFUSE.
 
@@ -53,6 +55,7 @@ param(
     [switch]$Json,
     [switch]$All,
     [switch]$Chip,
+    [switch]$ColdStart,
     [string]$BoxKey,
     [string]$SessionKey,
     [int]$FoldDays = 7,
@@ -295,31 +298,66 @@ $receipt = [ordered]@{
 # Render.
 # ---------------------------------------------------------------------------------------------
 
-if ($Chip) {
-    $row = $rows | Where-Object { $_.Box -eq $BoxKey -and $_.SessionKey -eq $SessionKey } | Select-Object -First 1
-    if (-not $row) { Write-Error "fleet.ps1: no record for $BoxKey/$SessionKey"; exit 2 }
+# Set-StrictMode makes a bare $rec.<missing> a TERMINATING error, and the cold start reads records
+# written by the PREVIOUS writer version -- precisely where a field can be absent. The failure mode
+# is worse than a crash: the briefing header has already been emitted, so the operator is handed a
+# TRUNCATED briefing that looks like output. Every optional read goes through here.
+function Get-Field($Obj, [string]$Name) {
+    if ($null -eq $Obj) { return $null }
+    if ($Obj.PSObject.Properties.Name -contains $Name) { return $Obj.$Name }
+    return $null
+}
+
+# @($null) is a ONE-element array holding $null, NOT an empty array -- so a missing list field piped
+# into Where-Object hands $null to the filter, and $null.attribution is another terminating error
+# under StrictMode. Every list-shaped read goes through here so the absent case is genuinely empty.
+# CALL SITES STILL WRAP IN @(): a PowerShell function RETURN unrolls a one-element array to a
+# scalar, and a scalar has no .Count -- which is a terminating error under StrictMode too.
+function Get-FieldArray($Obj, [string]$Name) {
+    $v = Get-Field $Obj $Name
+    if ($null -eq $v) { return @() }
+    return @($v | Where-Object { $null -ne $_ })
+}
+
+# ONE briefing generator, called by BOTH -Chip and -ColdStart. A second copy of this text is how the
+# version nobody reads becomes the version the owner pastes -- the same argument this file's header
+# already makes about not re-defining the liveness fence.
+function New-ChipBriefing {
+    param($Row)
+
+    $row = $Row
     $rec = $row.Rec
+
+    $asOf       = Get-Field $rec 'asOf'
+    $recWt      = Get-Field $rec 'worktree'
+    $tip        = Get-Field $rec 'tip'
+    $seat       = Get-Field $rec 'seat'
+    $goal       = Get-Field $rec 'goal'
+    $doneMeans  = Get-Field $rec 'done'
+    $outOfScope = Get-Field $rec 'outOfScope'
+    $stashSha   = Get-Field $rec 'stashSha'
+
     $lines = @()
     $lines += "You are a REPLACEMENT SEAT. The session that held this work is gone. You inherit NOTHING"
-    $lines += "from it except what is written below. Everything here was measured at $($rec.asOf) and the"
+    $lines += "from it except what is written below. Everything here was measured at $asOf and the"
     $lines += "world has moved since -- RE-VERIFY BEFORE YOU ACT, do not trust a line because it is specific."
     $lines += ""
-    $lines += "PREDECESSOR CHECKOUT: $($rec.worktree)"
+    $lines += "PREDECESSOR CHECKOUT: $recWt"
     $lines += "BRANCH: $($row.Branch)   (identified by NAME, never by a commit id -- a rebase reissues the id)"
-    if ($rec.tip) { $lines += "ITS TIP WAS: $($rec.tip)  AS OF $($rec.asOf). Resolve the branch yourself; do not use this id as an identifier." }
+    if ($tip) { $lines += "ITS TIP WAS: $tip  AS OF $asOf. Resolve the branch yourself; do not use this id as an identifier." }
     $lines += ""
-    if ($rec.seat) { $lines += "SEAT: $($rec.seat)" } else { $lines += "SEAT: NOT DECLARED. The predecessor never declared one; do not invent a role." }
-    if ($rec.goal) { $lines += "GOAL AS DECLARED: $($rec.goal)" } else { $lines += "GOAL: NOT DECLARED." }
-    if ($rec.done) { $lines += "DONE MEANS: $($rec.done)" }
-    if ($rec.outOfScope) { $lines += "OUT OF SCOPE: $($rec.outOfScope)" }
+    if ($seat) { $lines += "SEAT: $seat" } else { $lines += "SEAT: NOT DECLARED. The predecessor never declared one; do not invent a role." }
+    if ($goal) { $lines += "GOAL AS DECLARED: $goal" } else { $lines += "GOAL: NOT DECLARED." }
+    if ($doneMeans) { $lines += "DONE MEANS: $doneMeans" }
+    if ($outOfScope) { $lines += "OUT OF SCOPE: $outOfScope" }
     $lines += ""
     $lines += "FIRST ACTIONS, IN THIS ORDER, BEFORE ANY BUILDING:"
     $lines += "  1. Look at the predecessor checkout. Uncommitted work there is the ONLY thing that truly dies:"
-    $lines += "     git -C `"$($rec.worktree)`" status --porcelain"
-    $lines += "     git -C `"$($rec.worktree)`" log --oneline origin/main..HEAD"
-    if ($rec.stashSha) {
-        $lines += "     A stash commit was captured at record time, covering TRACKED edits only: $($rec.stashSha)"
-        $lines += "     Recover with: git -C `"$($rec.worktree)`" checkout $($rec.stashSha) -- ."
+    $lines += "     git -C `"$recWt`" status --porcelain"
+    $lines += "     git -C `"$recWt`" log --oneline origin/main..HEAD"
+    if ($stashSha) {
+        $lines += "     A stash commit was captured at record time, covering TRACKED edits only: $stashSha"
+        $lines += "     Recover with: git -C `"$recWt`" checkout $stashSha -- ."
     }
     # The loudest thing in the whole briefing, because it is the only category that is GONE if the
     # checkout is removed. `git stash create` has no -u, so an untracked file is held by no git
@@ -339,8 +377,9 @@ if ($Chip) {
     }
     $lines += "  2. git fetch origin FIRST, then decide whether the work already landed. Compare CONTENT, not"
     $lines += "     ancestry -- squash-merge makes 'commits ahead' and 'content ahead' disagree routinely:"
-    if ($rec.touchedPaths -and @($rec.touchedPaths).Count -gt 0) {
-        $lines += "       git diff --name-only origin/main $($row.Branch) -- " + (@($rec.touchedPaths) -join ' ')
+    $touched = @(Get-FieldArray $rec 'touchedPaths')
+    if ($touched.Count -gt 0) {
+        $lines += "       git diff --name-only origin/main $($row.Branch) -- " + ($touched -join ' ')
         $lines += "     Empty output means the content is already on main. DO NOT REBUILD IT."
     } else {
         $lines += "       (no touched paths were recorded, so this check is UNCHECKABLE here -- derive the"
@@ -348,26 +387,29 @@ if ($Chip) {
     }
     $lines += "  3. Re-check claims and allocations BEFORE taking any. This briefing was written at generate"
     $lines += "     time and you are reading it at click time; a hold may have been declared in between."
-    $ownClaims = @($rec.claims | Where-Object { $_.attribution -eq 'this-episode' })
-    $inhClaims = @($rec.claims | Where-Object { $_.attribution -ne 'this-episode' })
+    $recClaims = @(Get-FieldArray $rec 'claims')
+    $ownClaims = @($recClaims | Where-Object { $_.attribution -eq 'this-episode' })
+    $inhClaims = @($recClaims | Where-Object { $_.attribution -ne 'this-episode' })
     if ($ownClaims.Count -gt 0) { $lines += "     CLAIMS HELD BY THE PREDECESSOR EPISODE: " + (($ownClaims | ForEach-Object { $_.key }) -join ', ') }
     else { $lines += "     CLAIMS HELD BY THE PREDECESSOR EPISODE: none" }
     if ($inhClaims.Count -gt 0) {
         $lines += "     ALSO PRESENT IN THAT WORKTREE BUT FROM EARLIER OCCUPANTS -- NOT YOURS, DO NOT REHOME:"
         $lines += "       " + (($inhClaims | ForEach-Object { $_.key }) -join ', ')
     }
-    $ownAlloc = @($rec.allocations | Where-Object { $_.attribution -eq 'this-episode' })
-    $inhAlloc = @($rec.allocations | Where-Object { $_.attribution -ne 'this-episode' })
+    $recAlloc = @(Get-FieldArray $rec 'allocations')
+    $ownAlloc = @($recAlloc | Where-Object { $_.attribution -eq 'this-episode' })
+    $inhAlloc = @($recAlloc | Where-Object { $_.attribution -ne 'this-episode' })
     if ($ownAlloc.Count -gt 0) { $lines += "     LEDGER NUMBERS ALLOCATED BY THIS EPISODE: " + (($ownAlloc | ForEach-Object { "$($_.kind) #$($_.number)" }) -join ', ') }
     else { $lines += "     LEDGER NUMBERS ALLOCATED BY THIS EPISODE: none" }
     if ($inhAlloc.Count -gt 0) {
         $lines += "     $($inhAlloc.Count) MORE are allocated to that worktree PATH by earlier occupants."
         $lines += "     THEY ARE NOT YOURS. Do not rehome them and do not cite them."
     }
-    if ($rec.handoff -and $rec.handoff.path) {
+    $handoff = Get-Field $rec 'handoff'
+    if ($handoff -and (Get-Field $handoff 'path')) {
         $lines += ""
-        $lines += "  4. READ THE HANDOFF: $($rec.handoff.path)"
-        if ($rec.handoff.PSObject.Properties.Name -contains 'unresolved' -and $rec.handoff.unresolved) {
+        $lines += "  4. READ THE HANDOFF: $(Get-Field $handoff 'path')"
+        if (Get-Field $handoff 'unresolved') {
             $lines += "     WARNING: that path DID NOT RESOLVE when it was recorded. Treat it as a lead, not a document."
         }
     }
@@ -378,7 +420,76 @@ if ($Chip) {
     $lines += "ACCOUNT BOUNDARY -- these do NOT cross and must not be inherited: usage figures, project"
     $lines += "memory, artifact capabilities, workflow caches, and the realtime send channel. Read your own."
     $lines -join "`n"
+}
+
+# The receipt, as data. Rendered by the default text path AND by -ColdStart; a cold start that
+# printed briefings without it would be the confident-empty-answer failure this file exists to
+# refuse, one level up.
+function Get-ReceiptLines {
+    $out = @()
+    $out += "RECEIPT -- what was EXAMINED, not merely what was found:"
+    foreach ($k in $receipt.Keys) {
+        if ($k -eq 'stopConditions') { continue }
+        $out += "  {0,-26} {1}" -f $k, $receipt[$k]
+    }
+    $out += ""
+    if ($stops.Count -gt 0) {
+        $out += "STOP CONDITIONS FIRED -- $($stops.Count). DO NOT TREAT WHAT FOLLOWS AS COMPLETE:"
+        foreach ($s in $stops) { $out += "  - $s" }
+    } else {
+        $out += "NO STOP CONDITIONS. What follows is as complete as this instrument can establish."
+    }
+    $out
+}
+
+if ($Chip) {
+    $row = $rows | Where-Object { $_.Box -eq $BoxKey -and $_.SessionKey -eq $SessionKey } | Select-Object -First 1
+    if (-not $row) { Write-Error "fleet.ps1: no record for $BoxKey/$SessionKey"; exit 2 }
+    New-ChipBriefing -Row $row
     exit 0
+}
+
+# -ColdStart: the whole transfer in one command, for a virgin session under a DIFFERENT account.
+# It emits the receipt first and every respawn-eligible briefing after it, so the owner pastes one
+# sentence instead of hand-carrying documents. Same filesystem only: a briefing names paths (the
+# predecessor checkout, its handoff document) rather than carrying their bytes.
+if ($ColdStart) {
+    "FLEET COLD START -- rendered $($receipt.renderedAtUtc)"
+    ""
+    "You are the FIRST session after an account switch. Everything below was read from disk just"
+    "now; you inherit nothing else. Read the receipt BEFORE the briefings -- if a stop condition"
+    "fired, the briefing list is not the whole fleet and respawning from it will silently drop seats."
+    ""
+    Get-ReceiptLines
+    ""
+
+    $respawn = @($rows | Where-Object { $_.State -in @('INTERRUPTED', 'HANDED') })
+    "RESPAWN POPULATION: $($respawn.Count) seat(s) -- states INTERRUPTED and HANDED."
+    "  Deliberately excluded: RUNNING, POSSIBLY RUNNING, SUPERSEDED, CLOSED."
+    ""
+    if ($respawn.Count -eq 0) {
+        "NO SEAT IS RESPAWN-ELIGIBLE. Read that against the receipt above, not as an all-clear:"
+        "an empty population and an instrument that could not look produce the SAME output here."
+    }
+    $n = 0
+    foreach ($row in ($respawn | Sort-Object Box)) {
+        $n++
+        ""
+        "=" * 94
+        "BRIEFING $n OF $($respawn.Count) -- $($row.Box) / $($row.SessionKey)"
+        "  regenerate alone with: fleet.ps1 -Chip -BoxKey $($row.Box) -SessionKey $($row.SessionKey)"
+        "=" * 94
+        ""
+        New-ChipBriefing -Row $row
+    }
+    ""
+    "=" * 94
+    "AFTER RESPAWNING: bump the pool epoch ONCE, so every record written from here dates itself"
+    "against this switch rather than leaving it to be inferred from a credential directory label:"
+    "  pwsh -NoProfile -File scripts\coord\seat.ps1 -BumpEpoch"
+
+    $code = if ($fenceAvailable) { 0 } else { 2 }
+    exit $code
 }
 
 if ($Json) {
@@ -394,20 +505,8 @@ exit $code
 "FLEET CONTINUITY ROSTER"
 "rendered $($receipt.renderedAtUtc)"
 ""
-"RECEIPT -- what was EXAMINED, not merely what was found:"
-foreach ($k in $receipt.Keys) {
-    if ($k -eq 'stopConditions') { continue }
-    "  {0,-26} {1}" -f $k, $receipt[$k]
-}
+Get-ReceiptLines
 ""
-if ($stops.Count -gt 0) {
-    "STOP CONDITIONS FIRED -- $($stops.Count). DO NOT TREAT THE ROSTER BELOW AS COMPLETE:"
-    foreach ($s in $stops) { "  - $s" }
-    ""
-} else {
-    "NO STOP CONDITIONS. The roster below is as complete as this instrument can establish."
-    ""
-}
 
 $shown = if ($All) { $rows } else { $rows | Where-Object { $_.State -ne 'ORPHANED-STALE' } }
 $folded = @($rows).Count - @($shown).Count
