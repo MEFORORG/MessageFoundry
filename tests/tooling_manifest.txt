@@ -44,12 +44,14 @@ tests/test_claude_section_citations.py
 tests/test_claude_settings_contract.py
 tests/test_collision_gate.py
 tests/test_coord_claim_liveness.py
+tests/test_coord_claim_reconcile.py
 tests/test_coord_claim_refresh.py
 tests/test_coord_claim_release_history.py
 tests/test_coord_lock.py
 tests/test_coord_overlap_attribution.py
 tests/test_coord_overlap_signals.py
 tests/test_coord_presence.py
+tests/test_coord_unbacked_check.py
 tests/test_cutover_slug_rot.py
 tests/test_dangling_citation_check.py
 tests/test_dast_claims.py
@@ -100,6 +102,7 @@ tests/test_worktree_gate_git.py
 tests/test_worktree_gate_hijack.py
 tests/test_worktree_gate_interpreter_flags.py
 tests/test_worktree_gate_interpreter_sigils.py
+tests/test_worktree_gate_quote_straddle.py
 tests/test_worktree_gate_receipts.py
 tests/test_worktree_gate_remedy_families.py
 tests/test_worktree_gate_shell_semantics.py
