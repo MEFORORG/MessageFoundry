@@ -127,8 +127,13 @@ def repo(tmp_path: Path) -> Path:
 
 
 def mail_root(repo: Path) -> Path:
-    """Mirror of what the drain computes at mail-drain.ps1:275-277. Never a parameter -- the drain
-    takes no root override, so a test that got this wrong would silently test nothing."""
+    """Mirror of what the drain computes from the git common dir.
+
+    The drain accepts ``-AnchorRepo``, which names WHICH REPO'S QUEUE to read and nothing else; the
+    layout under it is still computed, never passed. So this stays a mirror rather than becoming a
+    parameter, and a test that got it wrong would still silently test nothing. Section 9 covers the
+    anchor, including the rule that it never overrides a cwd that does resolve.
+    """
     return repo / ".git" / "mefor-coord" / "mail"
 
 
@@ -189,8 +194,14 @@ def _seeder(tmp_path: Path) -> Path:
     return p
 
 
-def seed(repo: Path, tmp_path: Path, specs: list[dict[str, Any]]) -> dict[str, Any]:
+def seed(
+    repo: Path, tmp_path: Path, specs: list[dict[str, Any]], *, box_cwd: Path | None = None
+) -> dict[str, Any]:
     """Write messages straight into the inbox, the way anything running as this user can.
+
+    ``box_cwd`` addresses a box OTHER than the repo's own, which section 9 needs: an anchored session
+    reads a box keyed by ITS cwd inside a queue belonging to another repo, so the two halves that are
+    one path everywhere else have to be set independently here.
 
     Deliberately NOT via ``mail.ps1 -Send`` for most tests: the send-side body cap is advisory and is
     bypassed by exactly this route, so the caps arm has to use it. It mints ids and claim tokens by
@@ -207,7 +218,7 @@ def seed(repo: Path, tmp_path: Path, specs: list[dict[str, Any]]) -> dict[str, A
             "-Root",
             str(mail_root(repo)),
             "-Cwd",
-            str(repo),
+            str(box_cwd or repo),
             "-KeyLib",
             str(MAIL_KEY),
             "-ClaimLib",
@@ -229,6 +240,8 @@ def run_drain(
     event: str = "Stop",
     session_id: str | None = SELF_ID,
     cwd: Path | None = None,
+    anchor_repo: Path | None = None,
+    run_from: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Drive the hook exactly as Claude Code does.
 
@@ -245,9 +258,16 @@ def run_drain(
     payload: dict[str, Any] = {"hook_event_name": event, "cwd": str(cwd or repo)}
     if session_id is not None:
         payload["session_id"] = session_id
+    argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(DRAIN)]
+    if anchor_repo is not None:
+        argv += ["-AnchorRepo", str(anchor_repo)]
+    # run_from exists because the PAYLOAD cwd and the PROCESS cwd are separable in production and
+    # must be separable here: a payload can name a directory that no longer exists, which Windows
+    # refuses as a process working directory. Defaulting it to the payload keeps every other test
+    # driving the pair exactly as the client does.
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(DRAIN)],
-        cwd=str(cwd or repo),
+        argv,
+        cwd=str(run_from or cwd or repo),
         input=json.dumps(payload),
         capture_output=True,
         text=True,
@@ -2173,6 +2193,148 @@ def test_the_held_count_only_counts_names_this_channel_minted(repo: Path, tmp_pa
     run_drain(repo, event="SessionStart", session_id=SESSION_A)
     (mail_root(repo) / "box" / key / "shown" / "evil.marker").write_text("{}", encoding="ascii")
     assert json.loads(mail_cmd(repo, "-Status", "-Json").stdout)["ShownHeld"] == 1
+
+
+# --------------------------------------------------------------------------------------------------
+# 9. THE QUEUE ANCHOR. A session rooted at a worktree CONTAINER -- a plain directory holding several
+# clones -- has no git common dir, so the drain could not answer "which queue" and exited in silence
+# while mail addressed to it piled up unread. -AnchorRepo answers that ONE question. The box key is
+# still computed from the session's own cwd, and the anchor is consulted ONLY where cwd resolved
+# nothing. Both halves are asserted below, because the second is the control: an anchor that could
+# override a real repo would silently redirect a worktree session's drain to a foreign queue.
+# --------------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def container(tmp_path: Path) -> Path:
+    """A directory that is NOT a git repository, with that asserted rather than assumed.
+
+    If the temp root were ever inside a checkout, every test here would pass through the ordinary
+    in-repo path and prove nothing about the anchor. That failure is invisible without this check.
+    """
+    c = tmp_path / "container"
+    c.mkdir()
+    proc = subprocess.run(
+        ["git", "-C", str(c), "rev-parse", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0, (
+        f"{c} resolves a git common dir, so it is not the container case this section tests"
+    )
+    return c
+
+
+def test_an_anchored_session_outside_a_repo_receives_its_mail(
+    repo: Path, container: Path, tmp_path: Path
+) -> None:
+    """The positive arm. Everything else in this section asserts an absence."""
+    seed(repo, tmp_path, [{"body": "anchored delivery"}], box_cwd=container)
+    text = injection(run_drain(repo, cwd=container, anchor_repo=repo))
+    assert "anchored delivery" in text, "the anchored drain delivered nothing"
+
+
+def test_the_anchored_box_is_keyed_by_the_session_cwd_not_the_anchor(
+    repo: Path, container: Path, tmp_path: Path
+) -> None:
+    """The addressing half, and the one whose failure is silent on both ends.
+
+    A drain that keyed the box off the ANCHOR would read the anchor repo's own box, so an anchored
+    session would be handed that checkout's mail and its own would sit unread forever -- with the
+    sender still reporting a successful queue.
+
+    Both boxes are seeded on purpose. Asserting only the absence would pass just as well against a
+    drain that delivered NOTHING, which is precisely the state this section exists to leave behind.
+    """
+    anchors_own = seed(repo, tmp_path, [{"body": "addressed to the anchor repo"}])
+    seed(repo, tmp_path, [{"body": "addressed to the container"}], box_cwd=container)
+    text = injection(run_drain(repo, cwd=container, anchor_repo=repo))
+    assert "addressed to the container" in text, "the anchored drain delivered nothing at all"
+    assert "addressed to the anchor repo" not in text, (
+        "the anchored drain read the ANCHOR's box instead of its own"
+    )
+    assert box_files(repo, str(anchors_own["key"]), "inbox"), (
+        "the anchor repo's own message was consumed by a session that does not occupy it"
+    )
+
+
+def test_without_an_anchor_a_container_session_is_still_silent(
+    repo: Path, container: Path, tmp_path: Path
+) -> None:
+    """The unchanged path. Outside a repo with nothing named, this is not the drain's business."""
+    info = seed(repo, tmp_path, [{"body": "should not be delivered"}], box_cwd=container)
+    proc = run_drain(repo, cwd=container)
+    assert not proc.stdout.strip(), f"the unanchored drain emitted: {proc.stdout!r}"
+    assert box_files(repo, str(info["key"]), "inbox"), "an unanchored drain consumed a message"
+
+
+def test_an_anchor_never_overrides_a_cwd_that_resolves(
+    repo: Path, tmp_path: Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """The control, and the reason the anchor is consulted second rather than first.
+
+    A session whose cwd IS a repo must read that repo's queue however wrong the anchor is. If this
+    ever inverts, a stray anchor strands a worktree session's mail while both ends report success.
+    """
+    foreign = tmp_path_factory.mktemp("foreign")
+    _git_init(foreign)
+    seed(repo, tmp_path, [{"body": "from the session's own repo"}])
+    seed(foreign, tmp_path, [{"body": "from the foreign anchor"}], box_cwd=repo)
+    text = injection(run_drain(repo, anchor_repo=foreign))
+    assert "from the session's own repo" in text, "the anchor displaced a cwd that resolved"
+    assert "from the foreign anchor" not in text
+
+
+def test_an_unresolvable_anchor_is_silent_rather_than_fatal(
+    repo: Path, container: Path, tmp_path: Path
+) -> None:
+    """A hook that throws takes the turn with it. An anchor naming nothing is a stand-down."""
+    info = seed(repo, tmp_path, [{"body": "unreachable"}], box_cwd=container)
+    proc = run_drain(repo, cwd=container, anchor_repo=container / "nope")
+    assert not proc.stdout.strip(), f"a bad anchor emitted: {proc.stdout!r}"
+    assert box_files(repo, str(info["key"]), "inbox"), "a bad anchor consumed the message"
+
+
+def test_a_relative_anchor_is_refused(repo: Path, container: Path, tmp_path: Path) -> None:
+    """A relative anchor resolves against the HOOK PROCESS's cwd, not the payload cwd it is
+    documented in terms of, so the same string names different queues for different launchers.
+    Refusing it is the only reading that cannot silently mean two things."""
+    info = seed(repo, tmp_path, [{"body": "relative anchor"}], box_cwd=container)
+    proc = run_drain(repo, cwd=container, anchor_repo=Path("..") / repo.name)
+    assert not proc.stdout.strip(), f"a relative anchor was honoured: {proc.stdout!r}"
+    assert box_files(repo, str(info["key"]), "inbox"), "a relative anchor consumed the message"
+
+
+def test_an_anchor_is_refused_when_the_cwd_does_not_exist(
+    repo: Path, container: Path, tmp_path: Path
+) -> None:
+    """A probe failure is not proof of "not a repo".
+
+    A payload naming a deleted directory fails the git probe for a reason that says nothing about
+    repo-ness. Honouring the anchor there would address a box for a path nothing occupies.
+    """
+    info = seed(repo, tmp_path, [{"body": "vanished cwd"}], box_cwd=container)
+    proc = run_drain(repo, cwd=container / "gone", anchor_repo=repo, run_from=container)
+    assert not proc.stdout.strip(), f"a vanished cwd was anchored: {proc.stdout!r}"
+    assert box_files(repo, str(info["key"]), "inbox")
+
+
+def test_an_anchored_drain_consumes_at_stop(repo: Path, container: Path, tmp_path: Path) -> None:
+    """The anchored path must CONSUME, not merely render.
+
+    Section 9 previously asserted only on rendered text, so an anchored drain that displayed
+    forever and never claimed, receipted or moved to seen/ would have passed every test here --
+    duplicate delivery on every turn, which is the half of this channel that is not accepted.
+    """
+    info = seed(repo, tmp_path, [{"body": "anchored consume"}], box_cwd=container)
+    key = str(info["key"])
+    assert injection(run_drain(repo, cwd=container, anchor_repo=repo, event="Stop"))
+    assert not box_files(repo, key, "inbox"), "the anchored drain did not claim the message"
+    assert box_files(repo, key, "seen"), "the anchored drain wrote nothing to seen/"
+    assert receipts(repo), "the anchored drain wrote no receipt"
+    second = injection(run_drain(repo, cwd=container, anchor_repo=repo, event="Stop"))
+    assert "anchored consume" not in second, "a consumed message was delivered twice"
 
 
 # --------------------------------------------------------------------------------------------------

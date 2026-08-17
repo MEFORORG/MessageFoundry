@@ -12,6 +12,7 @@
 // obvious"). A change takes effect on the next engine restart (the TOML is read at startup).
 import * as vscode from "vscode";
 import { runJson, serviceConfig, workspaceDir } from "./cli";
+import { nonce } from "./cspNonce";
 
 type FieldType = "bool" | "int" | "string" | "tristate";
 
@@ -178,15 +179,6 @@ async function save(
   );
 }
 
-function nonce(): string {
-  let s = "";
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 24; i++) {
-    s += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return s;
-}
-
 function embed(value: unknown): string {
   return JSON.stringify(value ?? null).replace(/</g, "\\u003c");
 }
@@ -325,6 +317,7 @@ function formHtml(webview: vscode.Webview): string {
     $('save').addEventListener('click', () => vscode.postMessage({ command: 'save', updates: collectUpdates() }));
     $('close').addEventListener('click', () => vscode.postMessage({ command: 'cancel' }));
 
+    // Origin is NOT checked here — see webviewMessaging.ts.
     window.addEventListener('message', (e) => {
       const d = e.data || {};
       if (d.command === 'state') { render(d.state || {}); }

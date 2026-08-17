@@ -7,6 +7,7 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { configDir, workspaceDir } from "./cli";
+import { nonce } from "./cspNonce";
 
 interface RoutePayload {
   ib: { kind: "mllp-in" | "file-in"; name: string; port?: string; directory?: string; pattern?: string };
@@ -113,15 +114,6 @@ function generateRouteCode(p: RoutePayload): string {
     `    return Send(${q(p.ob.name)}, msg)`,
   ];
   return `from messagefoundry import ${[...imports].sort().join(", ")}\n\n${body.join("\n")}\n`;
-}
-
-function nonce(): string {
-  let s = "";
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 24; i++) {
-    s += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return s;
 }
 
 function wizardHtml(webview: vscode.Webview): string {

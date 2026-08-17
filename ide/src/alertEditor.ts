@@ -11,6 +11,7 @@
 // at startup, so it takes effect on the next engine restart (not via Promote/reload) — the UI says so.
 import * as vscode from "vscode";
 import { runJson, serviceConfig, workspaceDir } from "./cli";
+import { nonce } from "./cspNonce";
 
 const EVENT_TYPES = [
   "any",
@@ -141,15 +142,6 @@ async function remove(index: number, current: vscode.WebviewPanel): Promise<void
     return;
   }
   await refresh(current);
-}
-
-function nonce(): string {
-  let s = "";
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 24; i++) {
-    s += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return s;
 }
 
 function embed(value: unknown): string {
@@ -320,6 +312,7 @@ function formHtml(webview: vscode.Webview): string {
     });
     $('close').addEventListener('click', () => vscode.postMessage({ command: 'cancel' }));
 
+    // Origin is NOT checked here — see webviewMessaging.ts.
     window.addEventListener('message', (e) => {
       const d = e.data || {};
       if (d.command === 'rules') { renderRules(d.rules || []); errorEl.style.display = 'none'; }
