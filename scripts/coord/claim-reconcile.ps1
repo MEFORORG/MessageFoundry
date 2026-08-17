@@ -55,7 +55,7 @@
       * work that landed under a DIFFERENT head -- #1097's fix merged as PR #343 from
         `claude/1097-1064-gate-family`, not from the `g1097` the claim names;
       * a squash whose PR head OID no longer equals the branch tip, because the branch took a later
-        merge from main -- true of the five claims on `instruments-config-handoff-e64adc` (PR #346);
+        merge from main -- true of five claims sharing one squash-merged seat branch here;
       * content-level equivalence -- byte-identical blobs on both sides, which is how the hand pass
         proved several of these and is not a rule that survives being automated.
 
@@ -79,7 +79,12 @@ param(
     [switch]$NoPullRequests,
     # The probe itself, injectable so a test can stub it -- the pattern test_announce_hook.py uses
     # for presence.ps1. Must accept: <cmd> pr list --head <branch> --state merged --json ...
-    [string]$GhCommand = "gh"
+    [string]$GhCommand = "gh",
+    # Audit a set of claims that is not the live registry. Exists for one job: replaying these rules
+    # over claims that have ALREADY been released, reconstructed from claims/.history, so a release
+    # somebody else performed can be cross-checked by a different instrument without writing a second
+    # copy of these rules. A second implementation of a rule is two rules by the end of the week.
+    [string]$ClaimsDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -91,7 +96,7 @@ $repo = (& git -C $PSScriptRoot rev-parse --path-format=absolute --show-toplevel
 if (-not $repo) { throw "scripts/coord/ is not inside a git repository: $PSScriptRoot" }
 $repo = $repo.Trim()
 $common = (& git -C $repo rev-parse --path-format=absolute --git-common-dir).Trim()
-$claimsDir = Join-Path $common "mefor-coord/claims"
+$claimsDir = if ($ClaimsDir) { $ClaimsDir } else { Join-Path $common "mefor-coord/claims" }
 $claimTool = Join-Path $PSScriptRoot "claim.ps1"
 
 function ConvertTo-Norm([string]$Path) {
@@ -286,8 +291,12 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
 # commit that origin/main does not contain. This is a REPORT, not a release: the tool cannot read
 # intent out of free text and does not try to (FR-009's reasoning, one repository over).
 $liveLeaves = @()
+$liveHeads = @{}
 foreach ($w in $registered.Keys) {
-    if (Test-Path -LiteralPath $w) { $liveLeaves += (Split-Path $w -Leaf).ToLowerInvariant() }
+    if (-not (Test-Path -LiteralPath $w)) { continue }
+    $liveLeaves += (Split-Path $w -Leaf).ToLowerInvariant()
+    $head = (& git -C $w rev-parse --verify --quiet HEAD 2>$null)
+    if ($head) { $liveHeads[$head.Trim()] = (Split-Path $w -Leaf) }
 }
 foreach ($r in @($rows | Where-Object { $_.verdict -eq "RELEASABLE" -and $_.note })) {
     $n = $r.note.ToLowerInvariant()
@@ -305,12 +314,29 @@ foreach ($r in @($rows | Where-Object { $_.verdict -eq "RELEASABLE" -and $_.note
     foreach ($m in [regex]::Matches($r.note, '[0-9a-f]{7,40}')) {
         $sha = $m.Value
         if (-not (& git -C $repo rev-parse --verify --quiet "$sha^{commit}")) { continue }
+        # Already on main? Then it is a reference point, not live work. Notes routinely cite the base
+        # they branched from ("based origin/main c5c4108b"), and a base is an ancestor of every live
+        # worktree by construction -- so liveness alone flagged 1241 and adr-0158-land on their own
+        # base commits. Both halves are needed: NOT on main, and reachable from something alive.
         & git -C $repo merge-base --is-ancestor $sha $mainRef 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            $r.verdict = "NOTE-POINTS-ELSEWHERE"
-            $r.why = "would be releasable, but its note pins $sha, which $mainRef does not contain"
-            break
+        if ($LASTEXITCODE -eq 0) { continue }
+        # REACHABLE FROM LIVE WORK, not merely absent from main. "Not on origin/main" was the first
+        # rule here and it was wrong in the common case: a squash leaves the branch's own commits off
+        # main forever, so a note citing its own work sha ALWAYS looked like it pointed elsewhere.
+        # Measured 2026-08-16 against a peer's release of 11 claims: that rule blocked 1241
+        # (3525deca, its own squash-merged branch, no live worktree) and adr-0158-land (0fdc326e, a
+        # branch that is on origin), both wrongly -- while the case it exists for, 1010, pins
+        # a sha on a branch whose worktree IS alive -- was the one it caught. Two false positives and
+        # one true one, and the difference between them is liveness rather than merged-ness.
+        foreach ($live in $liveHeads.Keys) {
+            & git -C $repo merge-base --is-ancestor $sha $live 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                $r.verdict = "NOTE-POINTS-ELSEWHERE"
+                $r.why = "would be releasable, but its note pins $sha, which is reachable from $($liveHeads[$live]) -- a worktree that EXISTS"
+                break
+            }
         }
+        if ($r.verdict -eq "NOTE-POINTS-ELSEWHERE") { break }
     }
 }
 

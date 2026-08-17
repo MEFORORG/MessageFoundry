@@ -272,12 +272,36 @@ def test_a_note_naming_a_LIVE_worktree_withdraws_the_release(repo: Path, tmp_pat
     assert verdicts(repo)["k-note"] == "NOTE-POINTS-ELSEWHERE"
 
 
-def test_a_note_pinning_an_unmerged_sha_withdraws_the_release(repo: Path, tmp_path: Path) -> None:
-    unmerged_branch(repo, "elsewhere")
-    sha = git(repo, "rev-parse", "elsewhere").strip()
+def test_a_note_pinning_a_sha_reachable_from_a_LIVE_worktree_withdraws(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The 1010 case, and the rule is LIVENESS rather than merged-ness."""
+    leaf = live_worktree(repo, "still-working")
+    wt = repo.parent / leaf
+    (wt / "wip.txt").write_text("in progress", encoding="utf-8")
+    git(wt, "add", "-A")
+    git(wt, "commit", "-qm", "work in progress")
+    sha = git(wt, "rev-parse", "HEAD").strip()
+
     landed_branch(repo, "landed")
-    write_claim(repo, "k-sha", tmp_path / "vanished", "landed", note=f"work is at {sha[:12]}")
-    assert verdicts(repo)["k-sha"] == "NOTE-POINTS-ELSEWHERE"
+    write_claim(repo, "k-live", tmp_path / "vanished", "landed", note=f"CHECKING {sha[:12]}")
+    assert verdicts(repo)["k-live"] == "NOTE-POINTS-ELSEWHERE"
+
+
+def test_a_note_pinning_a_sha_on_a_DEAD_branch_still_releases(repo: Path, tmp_path: Path) -> None:
+    """The false positive that a peer's release of 11 claims exposed, on its first outing.
+
+    The rule was once "the sha is not on origin/main". A squash leaves a branch's own commits off
+    main forever, so a note citing its own work sha always looked like it pointed elsewhere: it
+    blocked 1241 (its own squash-merged branch) and adr-0158-land (a branch that is on origin), both
+    wrongly, while the case the guard exists for -- 1010, pinning a sha on a worktree that is ALIVE
+    -- was the one it caught. Two false positives and one true one, and the difference is liveness.
+    """
+    unmerged_branch(repo, "dead-branch")  # committed, then its worktree removed
+    sha = git(repo, "rev-parse", "dead-branch").strip()
+    landed_branch(repo, "landed")
+    write_claim(repo, "k-dead", tmp_path / "vanished", "landed", note=f"work was at {sha[:12]}")
+    assert verdicts(repo)["k-dead"] == "RELEASABLE"
 
 
 def test_an_ordinary_note_still_releases(repo: Path, tmp_path: Path) -> None:
@@ -355,3 +379,31 @@ def test_a_merged_pr_with_no_readable_landing_commit_holds(repo: Path, tmp_path:
         '"mergedAt":"2026-08-01T00:00:00Z","mergeCommit":{"oid":""}}]',
     )
     assert verdicts(repo, "-GhCommand", str(stub))["k-other"] == "HOLD"
+
+
+def test_claims_dir_can_audit_a_set_that_is_not_the_live_registry(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Replaying the rules over ALREADY-RELEASED claims, reconstructed from the ledger.
+
+    A release performed by another session cannot be cross-checked against the registry, because the
+    claim files are gone by definition. Rebuilding them from claims/.history and pointing this tool
+    at the copy is how one instrument checks another without a second implementation of the rules --
+    and two implementations of one rule are two rules by the end of the week.
+    """
+    landed_branch(repo, "landed")
+    audit = tmp_path / "reconstructed"
+    audit.mkdir()
+    (audit / "k-gone.json").write_bytes(
+        json.dumps(
+            {
+                "key": "k-gone",
+                "note": "reconstructed from a release record",
+                "branch": "landed",
+                "worktree": str(tmp_path / "vanished").replace("\\", "/"),
+                "claimed": "2026-08-01T00:00:00.0000000-05:00",
+            }
+        ).encode("utf-8")
+    )
+    out = verdicts(repo, "-ClaimsDir", str(audit))
+    assert out == {"k-gone": "RELEASABLE"}, out
