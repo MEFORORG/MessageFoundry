@@ -880,14 +880,23 @@ allow-listed provider values only, one session per form POST (the AD role-resync
 effect fires once at login, never per navigation), MFA stays delegated to the directory.
 
 `require_mfa` defaults **on** (BACKLOG #187 — secure-by-default, including the loopback bind; the
-documented org opt-out is `[auth].require_mfa = false`). The exposure gate now guards the **explicit
+documented org opt-out is `[security].require_mfa = false` — the `[auth]` spelling of this key is
+**rejected at load** and `serve` exits 2 naming the replacement). The exposure gate now guards the **explicit
 opt-out**: when the API is bound **off-loopback** with `require_mfa` *turned off*, `serve` makes the
 posture explicit at startup — it **refuses to start** on a **production PHI** instance and **warns** on a
 non-production PHI instance (a synthetic instance stays quiet), mirroring the keyless-store and
 open-egress startup gates. So an exposed PHI deployment can't silently run the Administrator interface
-single-factor. `require_mfa` is safe to keep on even on an **AD-only** deployment — it gates only
-**local** Administrator accounts (AD/Kerberos MFA stays delegated to the directory), so an operator who
-opts out at exposure simply re-enables `[auth].require_mfa=true` (or keeps the bind on loopback).
+single-factor. `require_mfa` is safe to keep on for an **AD-only** deployment's *directory* users:
+AD/Kerberos identities are exempt under either `require_mfa_scope` value, their factor delegated to the
+directory. An earlier revision of this sentence said it "gates only **local** Administrator accounts";
+that was wrong. Under the shipped `require_mfa_scope = "every_local_account"` it covers **every** local
+account, which on an AD-only deployment still means the local bootstrap admin and any local service
+accounts — a non-interactive local bearer-token account becomes MFA-pending and cannot enrol
+unattended. **That is a decision a deploying site must make before first start:** either such an
+account becomes an AD principal, or the scope is set to `administrators`. An operator who opts out at
+exposure re-enables `[security].require_mfa = true` (or keeps the bind on loopback).
+[CONFIGURATION.md](CONFIGURATION.md) `[security].require_mfa_scope` is the authority on the two
+remedies and on why mTLS is not a third.
 
 ### Administrative-interface defense-in-depth (WP-L3-13, ASVS 8.4.2)
 
@@ -1144,7 +1153,7 @@ one-to-one — that is why the bind/exposure posture occupies two rows and the A
 | New client IP during a session | this request's address vs `session.client` | knob on **and** a session exists, is unrevoked, has an anchor, and the two are not the same host (both-loopback counts as one host) | **CHALLENGE** — force a fresh step-up; first sighting also writes `auth.admin_action_new_ip` + an out-of-band notice; repeats WARNING-log only. **Never** an RBAC deny | **off** | `[auth].admin_new_ip_step_up` |
 | Credential recency | age of `session.reauth_at` | `now − reauth_at > step_up_max_age_seconds`, or `reauth_at is None` | **DENY** 403 + `X-Step-Up-Required: 1` (console: 303 → `/ui/reauth`) | 300 s | `[auth].step_up_max_age_seconds` |
 | Action-bound step-up grant | a single-use grant minted only by `reauth(purpose=…)`, on the **monotonic** clock | no unconsumed grant for this route's action | **DENY** 403 + `X-Step-Up-Required` + `X-Step-Up-Action: <action>`; opting out falls back to the session window | on | `[auth].require_action_step_up` |
-| MFA state | `session.mfa_verified_at` × factor enrollment × account roles | non-LOCAL account → never required; LOCAL + enrolled → always; LOCAL + un-enrolled → required when the knob is on **and** the account holds Administrator | **DENY** 403 + `X-MFA-Required: 1` at the step-up boundary | on | `[auth].require_mfa` |
+| MFA state | `session.mfa_verified_at` × factor enrollment × account roles | AD account → never required here (directory MFA is delegated); LOCAL + enrolled → always, whatever the scope says; LOCAL + un-enrolled → required when the knob is on **and** the scope covers the account — **`every_local_account` by default**, i.e. every local account, or the Administrator role only under `administrators` | **DENY** 403 + `X-MFA-Required: 1` on **every** authorized route — an **access gate**, not only a step-up gate; the console twin is a 303 to `/ui/mfa`, with the account and factor-enrolment routes exempt so an un-enrolled user is not stranded. An earlier revision of this row said Administrator-only and step-up-boundary-only; both were wrong | on; scope `every_local_account` | `[security].require_mfa`, `[security].require_mfa_scope` (the `[auth]` spellings are rejected at load) |
 | Identity provider — local credential rotation | `identity.auth_provider` | the provider is AD (the credential is the directory's, not the engine's) | **DENY** `POST /me/password` with **400**; the step-up re-proof for that identity becomes a **live directory re-bind** instead of a local hash compare, so a disabled AD account cannot refresh its window, and the engine MFA gate never fires for it | n/a | `[auth].ad_enabled` |
 | Authentication ambience | how the session was minted | browser Kerberos SSO and the OIDC callback mint with `seed_reauth=False` | **CHALLENGE** — the session is born **without** step-up freshness, so its first sensitive action forces an explicit credential step-up (the *second* signal in this table whose action is a challenge rather than a hard decision) | n/a | (by design) |
 | Session age | `created_at` / `last_used_at` / `expires_at` vs wall clock, on **every** request | idle > 30 min; past the absolute expiry (12 h, or a tighter signature-verified federated `id_token.exp` cap); or a **backward** wall-clock step (NTP step-back, VM snapshot revert) | **DENY** — the session is revoked in the store, then 401. The idle clock is refreshed only by user-driven requests, so a background poll cannot keep a session alive | 30 min / 12 h | `[security].sign_out_after_idle_minutes`, `max_session_hours` (the ADR 0118 homes; `[auth].session_idle_timeout_minutes` / `session_absolute_hours` are the retired aliases), plus `[auth].oidc_session_max_hours` for a tighter federated cap |
@@ -1490,7 +1499,7 @@ service-identity plane.
 
 | Pathway | Factor | Brute-force defense | Notes |
 |---|---|---|---|
-| **Local** (argon2id) | **password** (argon2id) **plus an engine second factor** — RFC 6238 TOTP, single-use recovery codes, or a WebAuthn/FIDO2 passkey. Since ASVS 6.3.3 that factor is an **access gate, not merely a step-up boundary**: an MFA-pending session is refused on *every* authorized route with `X-MFA-Required: 1` (browser sessions are confined to `/ui/mfa`). It binds any local account that has enrolled a factor, plus every account `[auth].require_mfa_scope` covers — **`every_local_account` by default** (`[auth].require_mfa` defaults **on**). Set the scope to `administrators` for the pre-6.3.3 posture, in which a non-admin, un-enrolled local session is **password-only end to end**. Caveat: a passkey is asserted at `user_verification=preferred`, so for a passkey-only account the second factor may be **device possession alone** | **per-account lockout** (5/15 min), fed by **both** the password and the TOTP/recovery leg + breach/context policy + the per-IP **and** global sign-in window | the only pathway the engine itself can lock out; the only one with a phishing-resistant factor |
+| **Local** (argon2id) | **password** (argon2id) **plus an engine second factor** — RFC 6238 TOTP, single-use recovery codes, or a WebAuthn/FIDO2 passkey. That factor is an **access gate, not merely a step-up boundary**: an MFA-pending session is refused on *every* authorized route with `X-MFA-Required: 1`, and a browser session is **redirected** to `/ui/mfa` — *not* confined to it, as an earlier revision of this cell said, because the account and factor-enrolment routes are declared MFA-pending-exempt, so a user with no factor yet enrols at `/ui/account`. It binds any local account that has enrolled a factor, plus every account `[security].require_mfa_scope` covers — **`every_local_account` by default** (`[security].require_mfa` defaults **on**; both keys are rejected under `[auth]` and fail the start). Set the scope to `administrators` for the earlier, narrower posture, in which a non-admin, un-enrolled local session is **password-only end to end**. Caveat: a passkey is asserted at `user_verification=preferred`, so for a passkey-only account the second factor may be **device possession alone** | **per-account lockout** (5/15 min), fed by **both** the password and the TOTP/recovery leg + breach/context policy + the per-IP **and** global sign-in window | the only pathway the engine itself can lock out; the only one with a phishing-resistant factor |
 | **AD** (LDAP simple-bind, LDAPS by default) | password, verified by a bind **as the user** against the DC; MFA is **delegated and unverifiable at the engine** — the simple-bind call site issues the session MFA-satisfied under the owner-signed delegated-directory relaxation, regardless of what the directory enforced, and no `amr`-equivalent evidence is received. The grant is now a per-mechanism argument rather than a blanket literal, so the federated leg can differ (see OIDC) | the **directory's** lockout/complexity policy; engine-side, the per-IP **and** global sign-in window (`[auth].login_rate_limit_enabled`, default on — **off leaves this pathway with no engine-side control at all**) — and **no** engine per-account lockout | password strength + lockout are the AD domain's responsibility. LDAPS is the default, not a structural guarantee: `[auth].ad_allow_insecure_ldap` opts into a plain bind, and `ad_tls_verify=false` is refused at startup unless the `MEFOR_ALLOW_INSECURE_TLS` dev escape is set |
 | **Kerberos / SPNEGO** | domain ticket; MFA is **delegated and unverifiable at the engine** — the session is issued MFA-satisfied and no `amr`-equivalent evidence is received | the **domain's** controls; engine-side, the sign-in window on the token-bearing leg (`[auth].login_rate_limit_enabled`, default on — **off leaves this pathway with no engine-side control at all**; the RFC 4559 challenge leg is deliberately unthrottled either way) | experimental, off by default, **single-leg — no mutual authentication**, channel binding deliberately un-enforced. The browser leg (`GET /ui/sso`) mints with no step-up window, so the first sensitive action forces a step-up; the JSON `POST /auth/negotiate` seeds it |
 | **OIDC federation** (browser only, hybrid AD-backed) | IdP-asserted, gated on a **signature-verified** `amr`/`acr` claim (`[auth].oidc_require_mfa_claim` defaults **on**) — an assertion, not a proof | no engine credential to guess, so no per-account lockout; both legs (`/ui/oidc/start`, `/ui/oidc/callback`) charge the sign-in window (`[auth].login_rate_limit_enabled`, default on — **off leaves this pathway with no engine-side control at all**, though the bounded pending-flow cache still caps concurrent start legs), plus the IdP's own lockout | hybrid-only: a federated principal with no on-prem AD object is refused. Roles come from LDAP, never from a token claim. When `[auth].oidc_username_strip_domain` is on (default), the claim's UPN suffix must match `oidc_allowed_username_domains` (or `[auth].ad_domain`); with stripping **off** the claim is used verbatim and no suffix check applies. The session's absolute lifetime is capped at the verified `id_token.exp`; minted with no step-up window |
@@ -1551,15 +1560,28 @@ delegated pathways rather than narrowing it, and an operator turning it off must
 lockout policy carrying the whole load. OIDC has no engine credential to lock out; the mTLS plane has
 no guessable secret at all, so no rate limit or lockout applies to it. **A genuine second factor is built
 for local accounts only** — TOTP (WP-14) *and* WebAuthn passkeys (WP-14b), the latter being the only
-phishing-resistant factor shipped; `[auth].require_mfa` defaults on but scopes to local Administrator
-accounts, and it is enforced at the **step-up boundary, not as an access gate** (see
-[Multi-factor authentication](#multi-factor-authentication-totp-wp-14) and the separate 6.3.3 scoring).
+phishing-resistant factor shipped; `[security].require_mfa` defaults **on** and its shipped scope is
+**`every_local_account`** rather than the Administrator role, and it is enforced as an **access gate, not
+only at the step-up boundary** — an MFA-pending session is refused on every authorized route. An earlier
+revision of this sentence asserted the opposite on both counts and named the `[auth]` keys the loader
+rejects; it also contradicted the Local row of the table above, which was right (see
+[Multi-factor authentication](#multi-factor-authentication-totp-wp-14)).
 AD/Kerberos MFA is delegated to the directory; OIDC's is asserted by the IdP and gated on a
-signature-verified claim. **The consequence, stated plainly:** every directory pathway satisfies the
-engine's MFA gates without an engine-verified factor — `_complete_ad_login` mints AD, Kerberos and OIDC
-sessions `mfa_verified=True` unconditionally — so a *password* on the AD pathway reaches the same PHI
-surface as a passkey-backed local Administrator. OIDC is the only delegated pathway that carries any
-engine-side evidence at all (the signature-verified `amr`/`acr` gate); AD and Kerberos carry none.
+signature-verified claim. **The consequence, stated plainly:** the AD and Kerberos pathways satisfy the
+engine's MFA gates without an engine-verified factor, so a *password* on the AD pathway reaches the same
+PHI surface as a passkey-backed local Administrator. The mechanism is a **per-mechanism argument**, not a
+blanket literal: `mfa_verified` is a keyword parameter of `_complete_ad_login`, and the simple-bind and
+Kerberos legs pass `True` under the signed delegated-directory relaxation while the federated leg passes
+`[auth].oidc_require_mfa_claim` itself — on by default, and reached only after the claim gate has already
+refused any token carrying no configured `amr`/`acr`, so the grant there is engine-verified rather than
+assumed. Turn that setting off and the federated session mints **un**verified, and `mfa_satisfied`
+refuses it while `[security].require_mfa` is on (the default). An earlier revision of this sentence said
+`_complete_ad_login` mints all three `mfa_verified=True` unconditionally; that was wrong about the
+mechanism and contradicted the OIDC row of the table above. OIDC therefore remains the only delegated
+pathway carrying engine-side evidence at all; AD and Kerberos carry none, and **closing that gap is the
+deploying site's job, in the directory** — the engine accepts whatever the directory asserts, so the
+domain's own MFA policy (Entra Conditional Access or an MFA proxy) is the only control over those two
+pathways.
 
 ## Brute-force & abuse protection
 

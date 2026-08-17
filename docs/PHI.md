@@ -1302,7 +1302,7 @@ separate follow-up.
 | Item | Closes | Maps to | Effort |
 |---|---|---|---|
 | **P2-1** TLS on the engine API | Tokens + PHI cleartext over the network | §164.312(e) · SC-8 | M |
-| **P2-2** MFA for console/API auth — ✅ **Built (WP-14, native TOTP, local accounts)** | Single-factor auth (mitigated for local accounts: `[auth].require_mfa` gates **step-up / sensitive admin operations** for the Administrator role — not every PHI read; AD MFA delegated) | §164.312(d) · IA-2(1) (NPRM-mandated) | M–L |
+| **P2-2** MFA for console/API auth — ✅ **Built (WP-14, native TOTP, local accounts)** | Single-factor auth (mitigated for local accounts: `[security].require_mfa` is an **access gate on every authorized route**, and its shipped `require_mfa_scope` is `every_local_account`, not the Administrator role alone; AD MFA delegated) | §164.312(d) · IA-2(1) (NPRM-mandated) | M–L |
 | **P2-3** Network-segmentation guidance + periodic integrity checks | Lateral movement; tamper detection | §164.312(c) · SC-7/SI-7 | S–M |
 | **P2-4** Strict-parse CPU/time budget on the hl7apy path | Malformed input pinning a worker — message size/segment caps are built, but the opt-in strict parse itself has no time bound | NIST SC-5 (DoS; not a §164.312 safeguard) | S |
 
