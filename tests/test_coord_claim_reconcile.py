@@ -34,7 +34,12 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 CLAIM = ROOT / "scripts" / "coord" / "claim.ps1"
 RECONCILE = ROOT / "scripts" / "coord" / "claim-reconcile.ps1"
-TIMEOUT = 90
+# Deliberately BELOW pytest's own bound. addopts carries --timeout=60 and CI overrides per leg
+# (60 on ubuntu, 120 on Windows), so a 90s guard fired first on Windows and never on ubuntu --
+# live on one platform, decorative on the other, and silently so. A backstop is only worth
+# having if it is the FIRST thing to fire, because then the failure says 'a pwsh spawn hung'
+# instead of pytest's generic timeout. Measured worst case is ~1.3s per test.
+TIMEOUT = 45
 
 pytestmark = pytest.mark.skipif(
     shutil.which("pwsh") is None or os.name != "nt",
