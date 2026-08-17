@@ -10074,3 +10074,132 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Security tooling / single-source hardening. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) -- no value is mis-screened today, every copy agrees. The cost is **future-tense and is exactly the one #1239 named**: a later hardening applied to one copy silently does not apply to the rest, and **nothing reports the omission**. It is filed now because the copies are two files apart and agree, which is the state in which drift is cheapest to prevent and hardest to notice.
+## 1276. generate a self-signed TLS certificate on first run when no certificate is configured
+
+> 🔢 **Filed 2026-08-16 - not started. THE ENGINE SERVES PLAIN HTTP WHEN NOBODY HAS SUPPLIED A CERTIFICATE, AND IT ALREADY OWNS EVERY PIECE NEEDED TO MINT ONE.** `[api].tls_cert_file` and `[api].tls_key_file` both ship `None` ([`config/settings.py:758-759`](../messagefoundry/config/settings.py)), `tls_enabled` is literally `bool(self.tls_cert_file)` (`settings.py:828-831`), and [`__main__.py:2840`](../messagefoundry/__main__.py) builds an SSL context **only** when that property is true. With no certificate configured, `uvicorn.run` at `__main__.py:2868` opens a cleartext socket. **THE CHANGE: when no certificate is configured, mint a self-signed one on first start, persist it, and serve HTTPS.**
+
+> **OPERATOR-SUPPLIED CERTIFICATES KEEP PRECEDENCE, and the mechanism is already that way round.** The generated certificate is a **first-run fallback beneath** `[api].tls_cert_file`/`tls_key_file`, never a replacement: the fallback is reached only when `tls_enabled` is false, which is exactly the state in which no operator certificate exists. A site that sets those keys sees no behaviour change at all.
+
+> **THE MINTING PRIMITIVE IS BUILT AND ALREADY DRIVEN END TO END BY A CLI VERB -- this is wiring, not cryptography:**
+>
+>     messagefoundry/pki.py:136                 make_self_signed(cn, sans, days) -> (cert_pem, key_pem)
+>                                               EC P-256, SHA-256, CA=false, SAN = cn + sans
+>     messagefoundry/__main__.py:3638           `messagefoundry cert self-signed` drives it today
+>     messagefoundry/__main__.py:3661           _write_private_key: O_EXCL + 0o600, refuses to overwrite
+>     messagefoundry/pipeline/cert_expiry.py:114  the expiry monitor already watches the API certificate
+>
+> A generated pair inherits the existing key-permission handling and the existing expiry alerting for free.
+
+> **FIVE WRITTEN "DEV ONLY" PROHIBITIONS MUST BE REWRITTEN IN THE SAME CHANGE, or the tree ships a control its own docstring forbids.** `pki.py:141-143` records that the returned key is unencrypted PKCS#8 and that a self-signed certificate *"has no chain of trust and must never front production PHI"*; `__main__.py:578`, `:3642`, `:3677` and `:3689` repeat the restriction in the CLI help, the docstring, the JSON note and the console note. **The owner has authorised the override (2026-08-16).** The honest replacement text is that an untrusted certificate is strictly better than cleartext and strictly worse than an operator-supplied chain, so the generated pair is a **placeholder to be replaced**, not an endorsed production terminator.
+
+> **WHAT AN OPERATOR NOTICES, and half of it is unpleasant.** A browser reaching the console gets a full-page trust interstitial until the certificate is imported into Local Computer / Trusted Root ([`docs/TRAY.md:133`](TRAY.md) already documents that import). More importantly, **the first-party clients infer the scheme from CONFIGURATION, not from the socket**: the tray reads `[api].tls_cert_file` out of the service TOML to choose `http` or `https` ([`messagefoundry/tray/config.py:207-219`](../messagefoundry/tray/config.py)). A generated certificate that does not surface through that key would leave the tray, the harness, `apiclient` and the IDE dialling `http` at an `https` listener.
+
+> **SCOPE, AND THE PART DELIBERATELY OUTSIDE IT.** [ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md) sec. *"Deferred (considered, not built): auto-TLS on loopback"* sized the whole move as **XL**, precisely because it forces a lockstep client migration across the harness, `apiclient`, the tray and the IDE. **This item is the mint-and-serve half plus whatever minimum makes those four agree on the scheme.** If the client work turns out to be the bulk, split it rather than letting this item quietly become ADR 0143's XL.
+
+**Cluster:** Transport security / first-run defaults. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- zero instances, so nothing is served in the clear today and no upgrade breaks anyone. The change is cheap now and gets dearer with every client that learns the scheme its own way.
+
+## 1277. record an audit entry for every authorization grant by default
+
+> 🔢 **Filed 2026-08-16 - not started. THE FULL AUTHORIZATION TRAIL IS BUILT, CORRECT, AND SHIPS OFF.** `[diagnostics].audit_all_authz` and its friendly alias `[security].audit_all_authorization_decisions` both default `False` ([`config/settings.py:1340`](../messagefoundry/config/settings.py), `settings.py:3723`). On the shipped default only a fixed set of state-changing, configuration and user-management permissions writes an `auth.grant` row; **every authenticated read is authorized and not recorded.** **THE CHANGE: default both to `True`.**
+
+> **THE STATED REASON FOR THE OFF DEFAULT DOES NOT SURVIVE MEASUREMENT, and the comment asserting it must be rewritten with the flip.** `settings.py:3720-3722` reads *"Default false -- forcing it on risks flooding the audit log"*, and `settings.py:1333-1339` names the flooders as *"console polling + the /ws/stats feed"*. Measured at `origin/main`:
+>
+>     grant-recording call sites, whole tree   EXACTLY 2  api/security.py:251 (require), :775 (authorize_ws)
+>     grant calls in messagefoundry_webconsole/  ZERO     positive control in the SAME sweep:
+>                                                         audit_permission_denied at _auth.py:258
+>     authorize_ws frequency                    once per CONNECTION, not per message (security.py:767-771)
+>     rows written per request                  at most 1 (_grant_audit_permission, security.py:124-144)
+>
+> **The browser console never traverses `require()`.** It is server-rendered in-process, its routes call engine functions directly, and its gate is its own cookie-world `require_ui`, which records **denials only**. Turning the setting on therefore cannot make `/ui/nav-status` -- the roughly-15-second poller on every navigated page ([`messagefoundry_webconsole/routes/status.py:126-128`](../messagefoundry_webconsole/routes/status.py)) -- write a single audit row. **The named flooder is not connected to the switch.**
+
+> **WHAT DOES CHANGE, because "the console cannot flood" is not "nothing changes".** The JSON API is a different surface: **33** `require()`-gated GET routes in `api/app.py` go from zero grant rows to one row per authenticated request, for the harness, `apiclient`, the IDE and operator scripts -- and the harness does poll `/stats` ([`harness/__main__.py:206-210`](../harness/__main__.py)). WebSocket authorization fires once per connect, so it cannot flood. Net volume is bounded by JSON-API client polling cadence, not by console page views. **Size that against the retention settings before landing**; if it is genuinely too much, the answer is a rate or sampling bound on read grants, not an off switch on the whole trail.
+
+> **WHY A DEPLOYING SITE IS BETTER OFF.** An audit trail that records only the decisions someone already judged sensitive cannot answer the question an audit trail exists to answer -- *what did this account actually reach* -- and a site cannot reconstruct a read history after the fact, because the rows were never written. Grants on the patient-data view stay excluded even under the new default, since the dedicated patient-data audit path already records those.
+
+**Cluster:** Audit completeness / secure defaults. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). Nobody is missing an audit trail today; the point is that the first deployment should not have to find the switch.
+
+## 1278. run Routers and Handlers in the subprocess sandbox by default
+
+> 🔢 **Filed 2026-08-16 - not started. THE ISOLATION MODE IS BUILT, EXERCISED, AND OFF.** `[sandbox].mode` is `Literal["off", "subprocess"]` defaulting to `"off"` ([`config/settings.py:1295`](../messagefoundry/config/settings.py); mirrored as `SandboxMode.OFF` at [`pipeline/sandbox.py:131-154`](../messagefoundry/pipeline/sandbox.py)). On the shipped default, Router and Handler code runs in the engine's own address space. **THE CHANGE: default `mode` to `"subprocess"`.**
+
+> **IT DOES NOT STOP CONFIG PYTHON EXECUTING IN THE ENGINE PROCESS. SAY THAT FIRST, so nobody buys a boundary that is not there.** The loader executes every `*.py` in the config directory **as the service account, in-process, at every `serve` and every reload, ungated by `mode`**: `load_config` ([`config/wiring.py:4558`](../messagefoundry/config/wiring.py)) calls `_exec_module` (`wiring.py:4956`), and `wiring.py:4915` states it outright -- *"``_exec_module`` runs arbitrary Python as the engine's service account"*. The call sites are `pipeline/engine.py:1448`, `api/app.py:5725` and `pipeline/supervisor.py:146`; **none of them consults the sandbox setting.** [ADR 0087](adr/0087-sandbox-subprocess-isolation.md) is equally plain that *"the boundary confines the address space, not the machine"* -- `os`, `subprocess`, `ctypes`, `sqlite3` and `http.client` remain importable inside the child, and the forbidden-import guard *"is bypassable (a module imported before it goes up keeps a live reference) and carries no compensating-control weight"*.
+
+> **THE TWO SANCTIONED COSTS, both already measured in ADR 0087:**
+>
+>     live enrichment  db_lookup / fhir_lookup are fail-closed REFUSED inside the child -- they
+>                      re-enter the event loop, which a process boundary breaks. A Handler needing
+>                      one must run with mode=off. (pipeline/sandbox.py:49-51, settings.py:1287-1288)
+>     throughput       ~0.19 ms per dispatch with no reference view; a 20k-entry crosswalk costs
+>                      ~4.5 ms marshalling and ~6.2 ms end-to-end, ~1.4x the pickle round-trip --
+>                      "well inside the ~60 msg/s per-interface end-to-end bound the pipeline
+>                      already has". Each per-inbound worker also serializes that inbound's calls.
+>
+> Release-note detail: `mode` is read **once at engine construction**, so `/config/reload` does not re-read it and changing it needs a restart (`settings.py:1291-1292`).
+
+> **THE SHIPPED SAMPLES LOOK COMPATIBLE ON INSPECTION, AND THAT IS NOT THE SAME AS HAVING RUN THEM.** All 14 modules under `samples/config/` import only the public `messagefoundry` surface, `messagefoundry.parsing.{binary,dicom,fhir,x12}`, `hashlib`, `time`, `html.escape` and `_`-prefixed siblings -- none of which appears in `DEFAULT_FORBIDDEN_MODULES` (`sandbox.py:117-128`) -- and a sweep for `db_lookup`/`fhir_lookup` across `samples/` returns nothing, against the 14-file listing as its positive control. **But `tests/test_sandbox.py` and a `serve` smoke under `mode=subprocess` were NOT executed for this filing.** Do not write *"the samples still load and run"* into a release note until that has actually been run.
+
+> **WHY A DEPLOYING SITE IS BETTER OFF.** Handler code is the part of a deployment most likely to be written under time pressure by whoever is porting a feed, and on today's default a defect in it shares an address space with the message store, the credentials and every other connection's in-flight data. The failure behaviour is already correct and does not change: any isolation denial raises `SandboxError` and routes that message to the error/dead-letter path **after** the ACK -- never a NAK, never an accept-and-drop, never a crashed connection (`sandbox.py:55-59`).
+
+**Cluster:** Handler isolation / secure defaults. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). No site runs unsandboxed handler code, because no site runs. The default should be the safe one before the first one does.
+
+## 1279. treat every instance as carrying patient data and retire the synthetic-data declaration
+
+> 🔢 **Filed 2026-08-16 - not started. THE PRODUCT LETS AN OPERATOR DECLARE THAT AN INSTANCE HOLDS ONLY SYNTHETIC DATA, AND THAT DECLARATION UNLOCKS NINETEEN START-UP RELAXATIONS.** The lever is `[security].handles_real_patient_data` ([`config/settings.py:3730`](../messagefoundry/config/settings.py)), translated to `[ai].data_class` at `settings.py:4226-4227`, over the `DataClass` enum at [`config/ai_policy.py:66-75`](../messagefoundry/config/ai_policy.py). **THE CHANGE: remove the distinction entirely and treat every instance as carrying patient data.**
+
+> **THIS REMOVES AN OPT-OUT; IT DOES NOT FLIP A DEFAULT -- state it that way or the item overstates itself.** `dev` **already** derives the patient-data posture: `_KNOWN_ENV_POSTURE["dev"] = (DataClass.PHI, False)` (`settings.py:2310`, [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) GIVEN 1), and `serve` requires an environment (`settings.py:2348-2350`, enforced by `require_posture()` at `__main__.py:1191`). **A stock development box is treated as carrying patient data today.** The only configurations that are not are those that explicitly declared `handles_real_patient_data = false`. Those are what stop working.
+
+> **MEASURED SURFACE:**
+>
+>     data_class in messagefoundry/**.py    75 occurrences across 8 files
+>       __main__.py 29 | config/settings.py 24 | api/app.py 6 | config/tls_policy.py 4
+>       checks.py 4   | api/models.py 4     | scaffold.py 3 | config/ai_policy.py 1
+>     DataClass (the enum type)             35 occurrences across 5 files
+>     tests                                 43 occurrences across 15 files, plus a golden snapshot
+>
+> Positive control: the sweep returning 75 for `data_class` returns 35 for `DataClass` and 0 for an absent token, in the same run.
+
+> **WHAT A DEVELOPER WHO HAD OPTED OUT NOTICES.** Their box will refuse to start keyless, refuse to start with `[security].require_mfa` off, refuse to start with no out-of-band security-notification channel, and take the cleartext-hop refusals in `config/tls_policy.py:430,449,464,519`. **The owner has accepted this**, and it is arguably the point: a development box that exercises the same refusals is one that meets them before a deployment does.
+
+> **THE ONE PIECE THAT IS NOT A LOCAL DELETION.** `api/models.py:901,946,953,966` carry `data_class` as **wire-model fields**, and `messagefoundry_webconsole/pages/monitoring.py` consumes one. Removing them changes the engine-client contract, so that half needs the owner's call on the seam rather than a settings edit.
+
+> **A STALE COMMENT TO FIX IN THE SAME CHANGE.** `settings.py:3726-3727` still describes the derivation as taking `dev` to **synthetic** and `staging`/`prod` to phi. `settings.py:2310` has contradicted that since ADR 0148 landed. **Whatever happens to this item, that sentence is wrong today.**
+
+**Cluster:** Posture simplification / secure defaults. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). **Effort L** -- 19 start-up branches, a client-contract change and 15 test files. Do not attempt it in the same pass as the smaller default flips.
+
+## 1280. ship the threat model, the handler shared-responsibility note and the dependency-handling note with the source
+
+> 🔢 **Filed 2026-08-16 - not started. THREE DOCUMENTS A DEPLOYING SITE NEEDS ARE WRITTEN AND MAINTAINED, AND NONE OF THEM IS IN THE REPOSITORY.** A threat model (380 lines), a note on what responsibility Handler code carries and what the engine carries for it (173 lines), and a note on how third-party dependencies are tracked and responded to (133 lines). **THE CHANGE: publish redacted versions in-tree, so someone reading the source can read them too.** Owner-approved 2026-08-16.
+
+> **WHAT COMES OUT FIRST, and the rule is one line: PUBLISH DECISIONS, NOT DEFICITS.**
+>
+>     STRIP  every reference to the private review record and its per-requirement verdicts
+>     STRIP  every cross-reference to a review document, by filename or by content
+>     STRIP  every customer, site, partner and network-topology identifier
+>     STRIP  every sentence whose substance is that a control is ABSENT or a residual UNBOUNDED
+>     KEEP   the control description, the operator's own responsibility, the decision, the rationale
+>
+> **The fourth line is the one that bites, and it is why this cannot be done sentence by sentence.** Enumerating what IS covered, over a closed and publicly-published catalogue, hands out what is NOT by subtraction -- so the aggregate map is the thing that cannot be published even when no individual sentence looks sensitive. **Calibration so the rule does not swallow the documents:** a residual already published in an ADR is not newly disclosed by restating it. [ADR 0087](adr/0087-sandbox-subprocess-isolation.md)'s honest-residuals section is public in this repository today.
+
+> **REDACTION BURDEN, MEASURED PER FILE, so nobody sizes this as a copy:**
+>
+>     threat model (380 lines)         20 lines carry a catalogue/verdict marker; 21 carry
+>                                      residual-or-absence language; 1 links a record named
+>                                      for a customer, which is both problems at once
+>     handler responsibility (173)     35 catalogue markers -- roughly one line in five, by far
+>                                      the densest of the three; 3 residual lines
+>     dependency handling (133)        0 catalogue markers; 1 residual line; 1 line naming a
+>                                      customer feed, which is ALSO a present-tense deployment
+>                                      claim and false under sec. 0
+>
+> Note the shape: the densest file is the shortest, and the file with zero catalogue markers still cannot be published unedited. **Line count does not predict effort here.**
+
+> **A TEST SUITE THAT EXISTS TODAY IS INERT BECAUSE OF THIS, which is a second reason to do it.** [`tests/test_threat_model_doc_drift.py`](../tests/test_threat_model_doc_drift.py) collects **102 tests** against the threat model, and on a public checkout it raises `ThreatModelDocUnenforced` and reports that *"EVERY doc-content assertion ... is INERT in this run"* -- the heading and table structure, both anchor registries, the planted-omission self-tests, the setting-name resolution, the numeric parity loop and the absence-claim tripwire. The module already supports `MEFOR_THREAT_MODEL_DOC` to point at a copy elsewhere, so **publishing the document turns an existing, written, currently-unenforced drift gate on** without anyone writing a new test.
+
+> **EACH PUBLISHED TEXT NEEDS THE OWNER'S SIGN-OFF BEFORE IT LANDS.** A redaction that is 95 percent right is a redaction that published something, and a public repository's history cannot be unpublished. This is not a mechanical pass and must not be run as one.
+
+**Cluster:** Documentation / adopter-facing. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). The cost today is that someone evaluating the project cannot see how its authors think about the threat surface, or what responsibility their own Handler code would carry.
