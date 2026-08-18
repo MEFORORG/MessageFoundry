@@ -695,24 +695,35 @@ def test_a_session_reusing_a_phantoms_id_cannot_consume_mail_it_never_saw(
     assert len(box_files(repo, key, "seen")) == 1
 
 
-# THE SAME 300s ITS SIBLING AT :593 CARRIES, AND THIS TEST NEEDS IT TEN TIMES MORE. That one runs
-# ROUNDS=60 (~960 pwsh spawns) and is marked; this one runs VERDICT_ROUNDS=600 (~9600 spawns) and was
-# NOT, so it inherited the leg default -- 120s on Windows (ci.yml:58). The cheap test had 300 seconds
-# and the expensive one had 120, on the slowest leg in the fleet.
+# A CONFIGURATION ASYMMETRY, FIXED ON ITS OWN MERITS -- AND EXPLICITLY *NOT* THE FIX FOR THE
+# 2026-08-18 WORKER CRASH. Read this before citing either.
 #
-# HOW THAT PRESENTED, and it is why four seats read the source and all missed it: UNDER xdist A
-# PER-TEST TIMEOUT KILL IS REPORTED AS `worker 'gwN' crashed`, NOT as a timeout. The worker dies
-# before it can say why, so the failure names neither this test's assertions nor a cap. Everyone
-# enumerated what the TEST could report and nobody asked what the HARNESS reports on its behalf.
+# THE ASYMMETRY IS REAL. The sibling at :593 runs ROUNDS=60 (~960 pwsh spawns) and carries
+# timeout(300); this runs VERDICT_ROUNDS=600 (~9600 spawns, ten times the work) and carried no
+# marker, so it inherited the leg default -- 120s on Windows (ci.yml:58). The cheap test had 300
+# seconds and the expensive one 120, on the slowest leg in the fleet. That is worth correcting
+# whether or not it has ever bitten.
 #
-# NOT PROVEN, deliberately stated: `node down: Not properly terminated` does not name a cause. The
-# signature fits -- 9600 process spawns, four xdist workers sharing a 4-CPU runner, 15.6s measured on
-# 20 IDLE cores, passing alone on a quiet box and failing repeatedly on a loaded one -- and nothing
-# contradicts it. That is a working theory with a marker attached, not a diagnosis.
+# IT HAS NOT BITTEN, AND THE MEASUREMENT SAYS SO PLAINLY. On the 2026-08-18 failure this marker was
+# first proposed for -- `[gw3] node down: Not properly terminated`, then `worker 'gw3' crashed` --
+# the worker died about 345 SECONDS in, while the per-test cap was 120s and the faulthandler belt
+# 150s. NEITHER REPORTED. A cap firing produces a Timeout with thread dumps at the cap. So NO CAP
+# FIRED, and this marker would not have changed that outcome by one second.
 #
-# IF IT RECURS, THE NEXT LEVER IS VERDICT_ROUNDS, NOT A BIGGER NUMBER HERE. 600 rounds was chosen to
-# resolve a 5.75% false-win rate; fewer rounds costs resolution, which is a real trade to weigh. A
-# timeout that keeps growing is a gate being tuned to pass rather than sized against the work.
+# WHY THE WARNING IS HERE RATHER THAN ONLY IN A COMMIT MESSAGE. A timeout marker added during a
+# timing-shaped incident reads, forever after, as the fix for it. That is the shape this repository
+# calls out by name: a change that looks like a fix, alters nothing, and closes the question while
+# the cause goes uninvestigated. The native worker death is a DIFFERENT defect and is tracked as
+# BACKLOG #1260 (a native crash reporting as a test failure), where it is the third recorded
+# instance.
+#
+# AND NOTHING HERE IS EVIDENCE ABOUT THE CLAIM PRIMITIVE. No assertion in this test ever evaluated
+# on that run, so the failure says nothing about phantom wins or double delivery in either
+# direction. Do not file against the primitive on it.
+#
+# IF THE CAP EVER DOES BITE, THE NEXT LEVER IS VERDICT_ROUNDS, NOT A BIGGER NUMBER HERE. 600 rounds
+# was chosen to resolve a 5.75% false-win rate, so cutting it costs resolution and is a real trade;
+# a timeout that keeps growing is a gate tuned to pass rather than sized against its work.
 @pytest.mark.timeout(300)
 def test_the_claim_verdict_agrees_with_the_filesystem(tmp_path: Path) -> None:
     """DEFECT 4, the verdict half -- and the half that was nearly shipped broken.
