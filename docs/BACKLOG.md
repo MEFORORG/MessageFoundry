@@ -10244,3 +10244,37 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Coordination / ledger tooling. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0). The cost is that any worktree removal which happens to hold an allocation mints a permanently unfilable number -- two exist today -- and that one open PR (#397) is blocked in a way no amount of conflict resolution can clear.
+
+
+## 1286. an unguarded apt-get sits on every ubuntu leg, and the sites that are visibly hurting the queue are the bounded ones
+
+> 🔢 **Filed 2026-08-18 - not started. THREE SEATS MEASURED THIS AND THE PRIORITY INVERTED HALFWAY THROUGH.** Every ubuntu leg runs `sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3` with no retry and no step-level timeout. When the mirror stalls, the step hangs until something above it kills the job -- and what kills it, or whether anything does, differs by job.
+
+> **ATTRIBUTION, because no one seat had it.** The **Lander** measured the hang and its recurrence on PR #427 -- three hangs across two attempts on three different jobs, same step each time -- called it transient after attempt 1, predicted in advance that a recurrence would make it systemic, and withdrew the transient call when it recurred. **Builder 2** measured the wider site list (five sites across three workflow files, ODBC installs as well as Qt) with a positive control, and deliberately declined to guess the job-timeout half. The **ASVS Tracker** confirmed the vault carries the identical install, bounding their claim to the pattern's PRESENCE. The Lander then measured the job timeouts, and that is what inverted the priority.
+
+> **THE INVERSION, AND IT IS THE POINT OF THE ITEM.**
+>
+>     BOUNDED -- an apt hang dies at the job cap
+>       ci.yml  test               timeout-minutes: matrix-driven
+>       ci.yml  webconsole         timeout-minutes: matrix-driven
+>       ci.yml  tooling            timeout-minutes: 40
+>       quality-advisory coverage  timeout-minutes: 20   (45 once BACKLOG #1274 lands)
+>       quality-advisory mutation  timeout-minutes: 30
+>
+>     UNBOUNDED -- no job-level timeout at all
+>       ci.yml      sqlserver-store
+>       ci.yml      load-test-sqlserver
+>       benchmark.yml  baseline-sqlserver
+>
+> **ALL FIVE Qt SITES SIT IN BOUNDED JOBS. THE THREE ODBC SITES DO NOT.** So the sites that announced themselves did so *because* they were bounded -- they die at 20 to 40 minutes and someone notices. The unbounded ones fail quietly up to the platform default, which is why nobody reported them. **Visibility and severity ran in opposite directions**, and the single most useful consequence is the Lander's: *a fix scoped to the step that is visibly hurting the queue would harden the safe half and leave the dangerous half alone.*
+
+> **IT INTERACTS WITH BACKLOG #1274, IN THE WRONG DIRECTION, AND THAT IS THIS ITEM'S CLAIM ON URGENCY.** #1274 raises the coverage job's cap from 20 to 45 for a well-measured reason -- the suite genuinely needs it -- and the Qt step in that job carries no step-level cap, so the same apt hang becomes **2.25x more expensive** there once #1274 lands. That is not an argument against #1274; it is the argument for fixing the hang at the STEP rather than relying on a job cap, **because otherwise every job that legitimately raises its cap silently buys a longer hang.**
+
+> **TWO CAUSES, ONE OBSERVABLE, AND THE DISCRIMINATOR IS FREE.** Both an apt hang and a genuine over-run surface as a job whose conclusion is `cancelled`. The distinguishing field is **which step died**: `Qt headless system deps` cancelled with the test step `skipped` means the mirror; `Qt headless` success with `Tests under coverage` cancelled means the budget. Measured 2026-08-18 on `diff-coverage (advisory)`: runs `32068906295`, `32063933087`, `32058343431`, `32047518020`, `32035065272`, `32030886919`, `32028806723`, `32027340564` are all the second shape (11:56Z-21:01Z, eight of eight); run `32085499836` **attempt 1** is the first. Two seats read the same job on different attempts and reached opposite conclusions, each correctly, before the attempt number was noticed.
+
+> **FIX DIRECTION, not prescribed in detail.** A retry around the install plus a step-level `timeout-minutes`, applied to ALL EIGHT sites rather than the five that hurt. The step normally completes in 10-58 seconds (measured), so a small cap bounds the hang tighter than any job cap does today.
+
+> **NOT ESTABLISHED, and carried deliberately:** what the matrix-driven timeout values on `test` and `webconsole` evaluate to -- "bounded" there means bounded by a number nobody has read. No hang has been observed on an ODBC leg, so **the unbounded claim is about CONFIGURATION, not about an observed six-hour run.** Root cause beyond the step is unestablished; it looks like a mirror problem on GitHub's runners, and no other repository or time of day has been sampled.
+
+**Cluster:** CI / reliability. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- CI only. The cost today is a blocked merge queue: `test (ubuntu-latest, py3.14)` is a REQUIRED context, so a hang there blocks merges outright, and one was observed still hanging past 27 minutes. The latent cost is the unbounded half, where the same stall runs to the platform default and consumes hosted-runner time with nothing to show.
