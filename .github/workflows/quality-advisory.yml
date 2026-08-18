@@ -294,10 +294,32 @@ jobs:
     # corroborated bottom-up by the serial equivalent of ci.yml's three ubuntu legs (25:07).
     # RE-DERIVE THE ANCHOR ONCE UNCENSORED RUNS EXIST, and tighten if it lands lower.
     #
+    # COMPOSITION WITH THE apt GUARD (BACKLOG #1286) IS WHY THIS IS 53 AND NOT 45.
+    # That change puts `timeout-minutes: 8` on the Qt step. Step caps within one job are
+    # SEQUENTIAL, so the invariant sums them: with Qt bounded the sum is 8 + 36 + 3 = 47, and
+    # 5:22 setup + 47 = 52:22 -- which does NOT fit under 45. This branch and that guard were
+    # INDIVIDUALLY SAFE AND JOINTLY UNSAFE. Measured, not predicted: the guard was applied to this
+    # file in a scratch copy and the invariant test went red.
+    #
+    # 53 IS CHOSEN TO BE SAFE IN EITHER LANDING ORDER -- 44:22 without the guard, 52:22 with it,
+    # both under 53. A number that only worked in one order would make queue sequencing
+    # load-bearing for correctness, which is a coupling nobody can see from inside one PR.
+    #
+    # WHY NOT LOWER A STEP CAP INSTEAD. The margin under 45 was 38 seconds, so ANY Qt cap breaches
+    # it by construction: only a 1-minute cap fits, against a step measured at 10-58s -- it would
+    # fire on an ordinary slow run. Lowering the TESTS cap works arithmetically and is deliberately
+    # NOT done: nobody has measured what headroom the suite needs, and a guessed cap there kills
+    # real work.
+    #
+    # THE 322s SETUP TERM STILL COUNTS Qt, which over-counts once Qt is separately capped. That is
+    # deliberate and conservative. Correcting it needs a measured worst case for the REMAINING
+    # setup steps, which nobody has; deriving one by subtracting Qt's NORMAL time from a WORST case
+    # would be unsound in the dangerous direction.
+    #
     # The old value was 20 -- BELOW ci.yml's own ubuntu anchor of 22:50, for strictly MORE work
     # (that leg excludes the web console via --ignore-glob and gives it a separate budget; this job
     # excludes nothing and adds coverage instrumentation on top). It was never viable.
-    timeout-minutes: 45
+    timeout-minutes: 53
     permissions:
       contents: read
     outputs:
