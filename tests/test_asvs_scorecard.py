@@ -203,8 +203,12 @@ def test_the_gate_summary_line_prints_all_six_states_and_states_a_total_they_sum
     assertion goes RED and the reconciliation below it goes RED with a real arithmetic gap. Restored.
     """
     corpus = _corpus_file(tmp_path, {"1.1.1": 1, "1.1.2": 1, "2.1.1": 1})
-    (tmp_path / "messagefoundry").mkdir()
-    (tmp_path / "messagefoundry" / "m.py").write_text("SIZE = 64\n", encoding="utf-8")
+    # The engine tree is a SIBLING of the record, matching production: the record lives in the vault
+    # and `--root` names a separate engine checkout. A fixture that put the scorecard inside its own
+    # `--root` is now refused by `main`, and rightly -- that shape is the wrong-tree defect.
+    engine = tmp_path / "engine"
+    (engine / "messagefoundry").mkdir(parents=True)
+    (engine / "messagefoundry" / "m.py").write_text("SIZE = 64\n", encoding="utf-8")
     sc = _scorecard_file(
         tmp_path,
         f'[scorecard]\nasvs_version = "5.0.0"\ncorpus_sha256 = "{corpus_digest(corpus)}"\n'
@@ -214,7 +218,7 @@ def test_the_gate_summary_line_prints_all_six_states_and_states_a_total_they_sum
         '[[cell]]\nid = "1.1.2"\nlevel = 1\nverdict = "needs-review"\n'
         '[[cell]]\nid = "2.1.1"\nlevel = 1\nverdict = "unverified"\n',
     )
-    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(tmp_path)])
+    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(engine)])
     out = capsys.readouterr().out
     assert rc == 0
     # Every state named, including the one that used to have no landing site.
@@ -913,8 +917,12 @@ def test_unknown_verdict_is_refused(tmp_path: Path) -> None:
 
 
 def test_verify_end_to_end_clean(tmp_path: Path) -> None:
-    (tmp_path / "messagefoundry").mkdir()
-    (tmp_path / "messagefoundry" / "m.py").write_text("tls_cert_file = None\n", encoding="utf-8")
+    # Engine tree as a SIBLING of the record. `verify` itself now refuses a root that CONTAINS the
+    # scorecard, so this fixture's old shape -- record and code in one directory -- is the wrong-tree
+    # defect. It was accepted here for as long as the guard lived only in `main`.
+    engine = tmp_path / "engine"
+    (engine / "messagefoundry").mkdir(parents=True)
+    (engine / "messagefoundry" / "m.py").write_text("tls_cert_file = None\n", encoding="utf-8")
     corpus = _corpus_file(tmp_path)
     sc = _scorecard_file(
         tmp_path,
@@ -949,7 +957,7 @@ line = 1
 expect = "tls_cert_file"
 """,
     )
-    findings = verify(sc, corpus, tmp_path)
+    findings = verify(sc, corpus, engine)
     assert findings.ok, findings.problems
 
 
@@ -1907,8 +1915,10 @@ def test_main_summary_says_RESOLVED_not_VERIFIED_and_carries_the_form_split(
     assertions go RED while the wording ones stay green. Both restored.
     """
     corpus = _corpus_file(tmp_path, {"1.1.1": 1})
-    (tmp_path / "messagefoundry").mkdir()
-    (tmp_path / "messagefoundry" / "m.py").write_text(
+    # Engine tree as a SIBLING of the record -- see the note in the six-states test above.
+    engine = tmp_path / "engine"
+    (engine / "messagefoundry").mkdir(parents=True)
+    (engine / "messagefoundry" / "m.py").write_text(
         '"""Prose about the gate."""\n\nSIZE = 64\n', encoding="utf-8"
     )
     sc = _scorecard_file(
@@ -1920,7 +1930,7 @@ def test_main_summary_says_RESOLVED_not_VERIFIED_and_carries_the_form_split(
         "  [[cell.evidence]]\n"
         '  path = "messagefoundry/m.py"\n  line = 1\n  expect = "Prose about the gate"\n',
     )
-    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(tmp_path)])
+    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(engine)])
     out = capsys.readouterr().out
     assert rc == 0
     assert "resolved 2 evidence anchors" in out
@@ -1947,7 +1957,12 @@ def test_main_verify_without_corpus_returns_exit_2(tmp_path: Path) -> None:
         '  mutation = "import x"\n',
         encoding="utf-8",
     )
-    rc = main(["--scorecard", str(sc), "--root", str(tmp_path)])
+    # A SIBLING root, not `tmp_path`. With the scorecard inside the root, `verify`'s containment
+    # refusal pre-empts the corpus guard and this test returns 2 for a reason it does not name --
+    # green with the corpus branch deleted, which reads as coverage and is not.
+    engine = tmp_path / "engine"
+    engine.mkdir()
+    rc = main(["--scorecard", str(sc), "--root", str(engine)])
     assert rc == 2
 
 
@@ -2958,3 +2973,208 @@ def test_overdue_is_computed_not_asserted(tmp_path: Path) -> None:
     fresh = load_scorecard(_scorecard_file(tmp_path, _BLOCKED_CELL))[0]
     assert fresh.blocker is not None
     assert fresh.blocker.days_overdue(datetime.date.fromisoformat("2026-07-21")) == 0
+
+
+# ---------------------------------------------------------------------------------------------
+# The coordinates of a number: --root required in verify mode, the ratio's real numerator and
+# denominator, and both refs inside the sentence.
+#
+# All three close ONE mechanism. Measured across 60 incidents in the vault history, not one ASVS
+# number was arithmetically wrong; every one was correct output published without the coordinates
+# that make it a fact. So these do not make the tool more accurate -- it was already accurate --
+# they make a correct number harder to transcribe into a false one.
+# ---------------------------------------------------------------------------------------------
+
+
+def _sibling_fixture(tmp_path: Path, module_body: str, cell_body: str) -> tuple[Path, Path, Path]:
+    """Record and engine tree as SIBLINGS, which is the production topology.
+
+    The record lives in the vault; ``--root`` names a separate engine checkout. Returns
+    (scorecard, corpus, engine).
+    """
+    corpus = _corpus_file(tmp_path, {"1.1.1": 1})
+    engine = tmp_path / "engine"
+    (engine / "messagefoundry").mkdir(parents=True)
+    (engine / "messagefoundry" / "m.py").write_text(module_body, encoding="utf-8")
+    sc = _scorecard_file(
+        tmp_path,
+        f'[scorecard]\nasvs_version = "5.0.0"\ncorpus_sha256 = "{corpus_digest(corpus)}"\n'
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\n' + cell_body,
+    )
+    return sc, corpus, engine
+
+
+def test_verify_refuses_to_run_without_an_explicit_root(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--root`` used to default to ``Path.cwd()``, so a verify pass that named no tree still
+    produced a confident, self-consistent number about whatever tree the shell happened to be in.
+
+    Measured 2026-08-18 from the vault, which carries its own tracked copy of ``messagefoundry/``:
+    the explicit root gave 183 stale / 0 fatal / exit 0, the default gave 1273 stale / 269 fatal /
+    exit 1. Both printed without naming a tree.
+
+    Falsified by restoring ``default=Path.cwd()``: this returns 0 or 1 instead of 2.
+    """
+    sc, corpus, _engine = _sibling_fixture(
+        tmp_path,
+        "SIZE = 64\n",
+        '  [[cell.evidence]]\n  path = "messagefoundry/m.py"\n  line = 1\n  expect = "SIZE = 64"\n',
+    )
+    rc = main(["--scorecard", str(sc), "--corpus", str(corpus)])
+    err = capsys.readouterr().err
+    # 2 is "could not measure", never 0 and never confused with clean.
+    assert rc == 2
+    assert "--root is required to verify" in err
+    assert "unattributable" in err
+
+
+def test_verify_refuses_a_root_that_contains_the_scorecard(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The second half: an EXPLICIT ``--root`` that happens to be the tree holding the record.
+
+    That resolves the anchors against the repo which stores the record rather than the engine --
+    the same wrong answer, arrived at deliberately instead of by default.
+
+    Falsified by deleting the ``is_relative_to`` guard: this returns 0.
+    """
+    sc, corpus, _engine = _sibling_fixture(
+        tmp_path,
+        "SIZE = 64\n",
+        '  [[cell.evidence]]\n  path = "messagefoundry/m.py"\n  line = 1\n  expect = "SIZE = 64"\n',
+    )
+    # tmp_path holds the scorecard, so it is exactly the tree that must be refused.
+    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(tmp_path)])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "CONTAINS the scorecard" in err
+    assert "self-consistent, wrong answer" in err
+
+
+def test_the_containment_guard_permits_the_shape_ci_actually_runs(tmp_path: Path) -> None:
+    """CONTAINMENT, not same-repository, and the difference decides whether the gate can run at all.
+
+    The vault's own workflow runs from the vault root with ``--root engine`` and
+    ``--scorecard docs/security/asvs-scorecard.toml``. Those share a workspace, so a same-repo or
+    common-ancestor test would refuse the sanctioned run and the gate would fail closed forever on
+    its own correct invocation. ``vault/engine`` does not CONTAIN ``vault/docs/security/...``, so
+    this shape must pass.
+
+    Falsified by widening the guard to a common-ancestor test: this returns 2.
+    """
+    workspace = tmp_path / "workspace"
+    engine = workspace / "engine"
+    (engine / "messagefoundry").mkdir(parents=True)
+    (engine / "messagefoundry" / "m.py").write_text("SIZE = 64\n", encoding="utf-8")
+    record_dir = workspace / "docs" / "security"
+    record_dir.mkdir(parents=True)
+    corpus = _corpus_file(tmp_path, {"1.1.1": 1})
+    sc = record_dir / "asvs-scorecard.toml"
+    sc.write_text(
+        f'[scorecard]\nasvs_version = "5.0.0"\ncorpus_sha256 = "{corpus_digest(corpus)}"\n'
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "pass"\n'
+        '  [[cell.evidence]]\n  path = "messagefoundry/m.py"\n  line = 1\n  expect = "SIZE = 64"\n',
+        encoding="utf-8",
+    )
+    assert main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(engine)]) == 0
+
+
+def test_status_still_defaults_the_root(tmp_path: Path) -> None:
+    """``--status`` is the one-second answer to "what does the record say" and needs NO engine tree.
+
+    Requiring ``--root`` there would put an engine checkout between a person and the only fast,
+    correct read of the record -- which is the other half of the problem this change exists to fix.
+    So the requirement is scoped to verify mode, and that scoping is pinned here.
+
+    Falsified by moving the ``args.root is None`` check above the ``--status`` branch: returns 2.
+    """
+    sc = _scorecard_file(
+        tmp_path,
+        '[scorecard]\nasvs_version = "5.0.0"\n[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "na"\n'
+        'residual = "not applicable, with a reason"\n',
+    )
+    assert main(["--scorecard", str(sc), "--status"]) == 0
+
+
+def test_a_sym_mismatch_does_not_inflate_the_stale_line_count(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """THE HEADLINE DEFECT. The sentence divided ``len(advisories)`` by an anchor count while saying
+    "anchors carry a stale line number". ``advisories`` holds five different facts.
+
+    Measured 2026-08-18 against the live record: injecting ONE wrong ``sym`` moved the printed figure
+    from 183 to 184 while 183 anchors still carried a stale line. The 184th was a displacement -- a
+    different fact about a different property -- and the label absorbed it silently.
+
+    Here the anchor's line is CORRECT and only its ``sym`` is wrong, so the honest stale-line count
+    is ZERO. Falsified by restoring ``len(findings.advisories)`` as the numerator: it reports 1.
+    """
+    sc, corpus, engine = _sibling_fixture(
+        tmp_path,
+        "def real_home():\n    SIZE = 64\n",
+        '  [[cell.evidence]]\n  path = "messagefoundry/m.py"\n  line = 2\n'
+        '  expect = "SIZE = 64"\n  sym = "not_the_real_home"\n  ctx = ""\n',
+    )
+    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(engine)])
+    err = capsys.readouterr().err
+    assert rc == 0  # a displacement is advisory, never fatal
+    # The line number is right, so NO anchor carries a stale line number.
+    assert "0 of 1 LOCATED anchors" in err
+    # And the displacement is still reported -- counted apart, not dropped.
+    assert "NOT line drift" in err and "1 sym" in err
+
+
+def test_the_stale_line_sentence_carries_both_refs_inside_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The refs go INSIDE the sentence, not in a header above it.
+
+    Two independent reasons. ``form_summary`` prints to stdout and this prints to stderr, so a header
+    attaches the coordinates to a different stream. And a number leaves a log by being copied as a
+    sentence, never as a neighbourhood -- every transcription defect on record kept the figure and
+    dropped the qualification that bounded it.
+
+    Falsified by moving the refs into their own ``print`` above: ``measured at`` leaves the sentence
+    and the substring assertion goes RED.
+    """
+    sc, corpus, engine = _sibling_fixture(
+        tmp_path,
+        "SIZE = 64\n",
+        '  [[cell.evidence]]\n  path = "messagefoundry/m.py"\n  line = 99\n'
+        '  expect = "SIZE = 64"\n',
+    )
+    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(engine)])
+    err = capsys.readouterr().err
+    assert rc == 0
+    line = next(x for x in err.splitlines() if "carry a stale line number" in x)
+    # ONE sentence, carrying the count, the population it is over, and both refs.
+    assert "1 of 1 LOCATED anchors" in line
+    assert "measured at scorecard=" in line and "engine=" in line
+    assert "DIFFERENT MEASUREMENT" in line
+
+
+def test_the_denominator_is_located_anchors_not_checked_anchors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A GONE anchor is CHECKED but never LOCATED, and cannot contribute a line-drift advisory.
+
+    Counting it in the denominator understated the ratio. The two populations agree only while GONE
+    and AMBIGUOUS are both zero, which is why no run against the clean live record could tell them
+    apart -- the same shape as the anchor totals, which agree at 2,090 for exactly that reason.
+
+    Falsified by restoring ``findings.checked_anchors`` as the denominator: this reads "1 of 2".
+    """
+    sc, corpus, engine = _sibling_fixture(
+        tmp_path,
+        "SIZE = 64\n",
+        '  [[cell.evidence]]\n  path = "messagefoundry/m.py"\n  line = 99\n'
+        '  expect = "SIZE = 64"\n'
+        '  [[cell.evidence]]\n  path = "messagefoundry/m.py"\n  line = 1\n'
+        '  expect = "THIS TOKEN IS NOT IN THE FILE"\n',
+    )
+    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(engine)])
+    err = capsys.readouterr().err
+    assert rc == 1  # the GONE anchor is fatal, as it should be
+    # Two anchors CHECKED, one LOCATED. The ratio is over the one that could have drifted.
+    assert "1 of 1 LOCATED anchors" in err

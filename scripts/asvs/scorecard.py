@@ -298,6 +298,31 @@ class Findings:
     #: :func:`check_anchors`. These still print, because letting them accumulate silently is how the
     #: recorded line numbers rot; they just do not red the gate.
     advisories: list[str] = field(default_factory=list)
+    #: The SAME advisories, counted by PRODUCER. This list holds five different facts and the summary
+    #: line used to divide its LENGTH by an anchor count while calling the result "anchors carrying a
+    #: stale line number". Only one producer means that.
+    #:
+    #: One anchor can contribute THREE (line drift, then a sym mismatch, then a ctx mismatch), and
+    #: :func:`prove_absences` contributes a scratch-tree advisory that is not about an anchor at all,
+    #: so the ratio was not merely imprecise — it could exceed 100%. Driven with a single well-formed
+    #: anchor whose line number was CORRECT, the sentence printed ``2 of 1 anchors (200.0%)``.
+    #:
+    #: Measured 2026-08-18 against the live record: injecting ONE wrong ``sym`` moved the printed
+    #: sentence from 183 to **184 of 2090 anchors carry a stale line number** while 183 still did.
+    #: The 184th was a displacement, which is a different fact about a different property, and the
+    #: label absorbed it silently.
+    #:
+    #: **The defect is invisible exactly when the data is clean.** With zero sym/ctx mismatches on the
+    #: record the length and the line-drift count coincide, so no test over real data and no green CI
+    #: run can tell them apart — the same shape as the anchor denominators, which agree at 2,090 only
+    #: while GONE and AMBIGUOUS are both zero. Keys: ``line``, ``sym``, ``ctx``, ``unparseable``,
+    #: ``scratch``.
+    #:
+    #: **Never append to :attr:`advisories` directly — call :meth:`advise`.** The counter and the list
+    #: are two records of one event, and the pairing is what the summary divides by. Five call sites
+    #: maintaining it by hand is five chances to add a sixth that forgets, which would print a
+    #: too-LOW stale count with no error, no traceback and nothing that goes red.
+    advisory_kinds: Counter[str] = field(default_factory=Counter)
     checked_anchors: int = 0
     #: The POPULATION of absence claims a pass looked at. Set by BOTH :func:`check_absences` and
     #: :func:`prove_absences` — the two passes read the same population, and without it neither one's
@@ -345,6 +370,29 @@ class Findings:
     proved_absences: int = 0
     static_screened: int = 0
     skipped_absences: int = 0
+
+    def advise(self, kind: str, message: str) -> None:
+        """Record an advisory AND what produced it, in one act that cannot half-happen.
+
+        The list and the counter are two records of one event. Appending to one by hand and
+        incrementing the other by hand is a pairing maintained by discipline, and the failure is
+        silent in the direction that matters: an untagged advisory still prints its own DRIFT line,
+        so the run looks complete while the summary divides by a numerator that is too low.
+        """
+        self.advisory_kinds[kind] += 1
+        self.advisories.append(message)
+
+    @property
+    def located_anchors(self) -> int:
+        """Anchors that resolved to a landing site, so they COULD carry a line-drift advisory.
+
+        Single-sourced because it is printed twice on two streams — :func:`form_summary` says
+        "anchor(s) that located" on stdout, the stale-line sentence divides by it on stderr. Derived
+        twice, a future bucket in :attr:`anchor_forms` that is not a located anchor moves one of them
+        and not the other, both stay self-consistent, and nothing compares them. That is the shape
+        this whole change exists to close, so it must not be reintroduced one level up.
+        """
+        return self.anchor_forms.total()
 
     @property
     def ok(self) -> bool:
@@ -1003,10 +1051,12 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
             ] += 1
             actual = text.count("\n", 0, start) + 1
             if actual != a.line:
-                findings.advisories.append(
+                # The ONLY producer the summary's "carry a stale line number" sentence describes.
+                findings.advise(
+                    "line",
                     f"{c.id}: {a.path} — {a.expect!r} is unique and present, recorded at line "
                     f"{a.line} but actually at {actual} (offset {actual - a.line:+d}). "
-                    "Advisory: the line is a navigation aid, not the proof"
+                    "Advisory: the line is a navigation aid, not the proof",
                 )
             _check_sym_ctx(c.id, a, text, actual, ast_cache, target, findings)
 
@@ -1074,23 +1124,26 @@ def _check_sym_ctx(
         ast_cache[target] = parse_or_none(text)
     tree = ast_cache[target]
     if tree is None:
-        findings.advisories.append(
+        findings.advise(
+            "unparseable",
             f"{cell_id}: {a.path} — sym/ctx recorded but the file will not parse, so neither could "
-            "be derived. Advisory: UNDETERMINED, which is not the same as agreeing"
+            "be derived. Advisory: UNDETERMINED, which is not the same as agreeing",
         )
         return
     got_sym, got_ctx = sym_ctx_at(tree, actual)
     if a.sym is not None and a.sym != got_sym:
-        findings.advisories.append(
+        findings.advise(
+            "sym",
             f"{cell_id}: {a.path} — {a.expect!r} recorded sym={a.sym!r} but now sits in "
             f"sym={got_sym!r} (line {actual}). Advisory: DISPLACEMENT, not a defect — re-read the "
-            "cell's reasoning, do not assume anything is wrong"
+            "cell's reasoning, do not assume anything is wrong",
         )
     if a.ctx is not None and a.ctx != got_ctx:
-        findings.advisories.append(
+        findings.advise(
+            "ctx",
             f"{cell_id}: {a.path} — {a.expect!r} recorded ctx={a.ctx!r} but now sits in "
             f"ctx={got_ctx!r} (line {actual}). Advisory: DISPLACEMENT, not a defect — the control "
-            "flow around this token changed, which may be a HARDENING (10.5.4 was)"
+            "flow around this token changed, which may be a HARDENING (10.5.4 was)",
         )
 
 
@@ -1575,10 +1628,13 @@ def prove_absences(
                     scratch = _copy_scratch(resolved_root, base / f"tree_{generation}")
                     inventory = _inventory(scratch)
                     baselines.clear()
-                    findings.advisories.append(
+                    # NOT an anchor fact at all. Counted apart because it used to land in the
+                    # numerator of a sentence about anchors, under --prove-absences.
+                    findings.advise(
+                        "scratch",
                         f"{c.id}: the scratch tree was written to during this claim's run, so it was "
                         "rebuilt and cached baselines were dropped. The claim's own result stands; "
-                        "an observable that writes into the tree it is measuring is worth a look"
+                        "an observable that writes into the tree it is measuring is worth a look",
                     )
     return findings
 
@@ -1639,6 +1695,27 @@ def check_pinning(scorecard: Path, corpus: Path) -> list[str]:
 
 
 def verify(scorecard: Path, corpus: Path, root: Path) -> Findings:
+    # THE ROOT IS PART OF THE MEASUREMENT, so the refusal lives here rather than in `main`, where only
+    # the CLI would get it. A scorecard sitting INSIDE the tree being checked means the anchors are
+    # resolved against the repository that stores the record instead of the engine — a self-consistent
+    # answer about the wrong tree, which is the hardest kind to notice.
+    #
+    # Measured 2026-08-18 from the vault, which carries its own tracked copy of `messagefoundry/`:
+    # the engine root gave 183 stale / 0 fatal, the vault root gave 1273 stale / 269 fatal. Neither
+    # printed which tree it read.
+    #
+    # DELIBERATELY containment, NOT "same repository". The vault's own CI runs from the vault root
+    # with `--root engine` and `--scorecard docs/security/asvs-scorecard.toml`; those share a
+    # workspace, so a same-repo test would refuse the sanctioned run and the gate would fail closed
+    # forever on its own correct invocation. `vault/engine` does not CONTAIN
+    # `vault/docs/security/asvs-scorecard.toml`, so containment passes it and still catches the
+    # default-to-cwd case.
+    if scorecard.resolve().is_relative_to(root.resolve()):
+        raise ScorecardError(
+            f"--root {root} CONTAINS the scorecard {scorecard}, so the evidence anchors would be "
+            "resolved against the tree that holds the record instead of the engine. That produces a "
+            "self-consistent, wrong answer. Pass the engine checkout as the root."
+        )
     findings = Findings()
     cells = load_scorecard(scorecard)
     findings.problems.extend(check_pinning(scorecard, corpus))
@@ -2004,11 +2081,24 @@ def provenance_lines(scorecard: Path, root: Path, *, now: float | None = None) -
 
     ``upstream=`` is likewise additive: "BEHIND 37" is not a claim until you know behind what.
     """
-    sc = repo_stamp(scorecard, now=now)
-    en = repo_stamp(root, now=now)
+    return provenance_from(
+        repo_stamp(scorecard, now=now), repo_stamp(root, now=now), label="asvs-status"
+    )
+
+
+def provenance_from(sc: RepoStamp, en: RepoStamp, *, label: str) -> list[str]:
+    """:func:`provenance_lines` with the stamps already taken, and a caller-chosen label.
+
+    Split out so VERIFY mode can emit the same header without paying for a second pair of stamps —
+    each :func:`repo_stamp` shells out to git up to seven times, and the verify path already needs
+    both stamps for the stale-anchor sentence. One pair, two consumers.
+
+    ``label`` exists because the header names the mode that produced it. A verify run printing
+    ``asvs-status`` would misattribute its own numbers to the query command.
+    """
     generated = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
     return [
-        f"# asvs-status scorecard={sc.ref()} engine={en.ref()}",
+        f"# {label} scorecard={sc.ref()} engine={en.ref()}",
         f"#   scorecard: freshness={sc.freshness} upstream={sc.upstream} "
         f"remote-knowledge={sc.remote_knowledge}",
         f"#   engine:    freshness={en.freshness} upstream={en.upstream} "
@@ -2088,7 +2178,7 @@ def form_summary(findings: Findings) -> list[str]:
     which is a fact about the CHECK, not about the cell.
     """
     n = findings.anchor_forms
-    located = sum(n.values())
+    located = findings.located_anchors
     unlocated = findings.checked_anchors - located
     prose = n["doc"] + n["foreign"]
     pct = (100.0 * prose / located) if located else 0.0
@@ -2177,8 +2267,25 @@ def main(argv: list[str] | None = None) -> int:
     # Not required: --prove-absences applies mutations and never greps for patterns, so it needs no
     # corpus. Verify mode still does; that is enforced after parsing, not by argparse.
     ap.add_argument("--corpus", type=Path, required=False)
+    # DEFAULT None, not Path.cwd(), so verify mode can tell "the caller chose this tree" from "the
+    # caller said nothing and got wherever the shell happened to be". Those printed identically and
+    # the difference is a factor of seven.
+    #
+    # Measured 2026-08-18. The vault carries its own tracked copy of `messagefoundry/` (279 files,
+    # last touched 2026-07-26) because the publish machinery maintains one. Run from the vault, which
+    # is where the record lives and therefore where a person naturally runs this:
+    #
+    #     --root <engine>   ->   183 of 2090 stale,    0 fatal, exit 0
+    #     --root <default>  ->  1273 of 2033 stale,  269 fatal, exit 1
+    #
+    # Both self-consistent, both silent about which tree they read. `--status` then printed
+    # `engine=<the vault's own commit>` labelled `freshness=CURRENT` -- the one field that would have
+    # exposed the substitution inherited it, because the substituted tree really was current.
     ap.add_argument(
-        "--root", type=Path, default=Path.cwd(), help="tree the evidence anchors point into"
+        "--root",
+        type=Path,
+        default=None,
+        help="tree the evidence anchors point into (REQUIRED to verify; defaults to cwd elsewhere)",
     )
     ap.add_argument("--render", type=Path, help="write the generated CURRENT.md here")
     # A separate, opt-in mode: prove each absence claim BITES by applying its mutation to a scratch
@@ -2204,12 +2311,28 @@ def main(argv: list[str] | None = None) -> int:
     # green is as useless as one that cannot go red, and this one shipped that way.
     args = ap.parse_args(argv)
 
+    # `--status` is the one-second answer to "what does the record say" and needs NO engine tree, so
+    # it keeps the cwd default. Making it required here would put an engine checkout between a person
+    # and the only fast, correct read of the record -- which is the other half of the problem.
     if args.status:
-        return _run_status(args.scorecard, args.root)
+        return _run_status(args.scorecard, args.root or Path.cwd())
 
     if args.prove_absences:
-        return _run_prove_absences(args.scorecard, args.root)
+        return _run_prove_absences(args.scorecard, args.root or Path.cwd())
 
+    # VERIFY MODE ONLY from here. The anchors are claims about a specific tree, so a verify pass that
+    # did not name one is not a measurement of anything in particular.
+    if args.root is None:
+        print(
+            "error: --root is required to verify -- the anchors are claims about a specific tree, "
+            "and an unnamed tree makes the result unattributable. Pass the engine checkout "
+            "explicitly. (--status and --prove-absences still default to the working directory.)",
+            file=sys.stderr,
+        )
+        return 2  # could not measure — never 0, never confused with "clean"
+
+    # The containment refusal is NOT here: it moved into `verify`, which every caller reaches. The
+    # `except ScorecardError` below already maps it to exit 2, so the CLI behaviour is unchanged.
     if args.corpus is None:
         print(
             "error: --corpus is required to verify the scorecard (only --prove-absences may omit it)",
@@ -2234,6 +2357,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2  # could not measure — never 0, never confused with "clean"
     breakdown = " / ".join(f"{c} {v}" for v, c in parts)
+    # THE HEADLINE CARRIES ITS COORDINATES TOO, on the same stream as the numbers it describes.
+    #
+    # Fixing only the stale-anchor sentence would have left the line people actually quote — the
+    # verdict breakdown — bare, and on a CLEAN record (no advisories) the whole run printed no ref
+    # anywhere at all. That is the same defect one line up from where it was fixed.
+    #
+    # Stamps are taken ONCE here and reused by the stale-anchor sentence below, so this costs no
+    # extra git work; it moved the existing cost earlier and made it unconditional.
+    sc_stamp = repo_stamp(args.scorecard)
+    en_stamp = repo_stamp(args.root)
+    for line in provenance_from(sc_stamp, en_stamp, label="asvs-verify"):
+        print(line)
     print(
         f"scanned {total} cells "
         f"({breakdown}); "
@@ -2257,19 +2392,44 @@ def main(argv: list[str] | None = None) -> int:
     for a in findings.advisories:
         print(f"  DRIFT {a}", file=sys.stderr)
     if findings.advisories:
-        pct = (
-            100.0 * len(findings.advisories) / findings.checked_anchors
-            if findings.checked_anchors
-            else 0.0
-        )
+        # DENOMINATOR: anchors that LOCATED, not anchors that were CHECKED. Only a located anchor can
+        # produce a line-drift advisory — a GONE or AMBIGUOUS one raises a problem and returns before
+        # the line is ever compared — so `checked_anchors` counted a population part of which cannot
+        # contribute to the numerator. The two agree only while GONE and AMBIGUOUS are both zero,
+        # which is to say the error is invisible on a clean record and appears on a dirty one.
+        located = findings.located_anchors
+        # NUMERATOR: the one producer this sentence describes. See `Findings.advisory_kinds`.
+        stale = findings.advisory_kinds["line"]
+        # THE REFS GO INSIDE THE SENTENCE, not in a header above it, for two independent reasons.
+        # `form_summary` prints to stdout and this prints to stderr, so a header would attach the
+        # coordinates to a different stream and interleave unpredictably. And a number leaves a log
+        # by being copied as a sentence, never as a neighbourhood — every transcription defect on
+        # record kept the figure and dropped the surrounding qualification.
+        sc_ref, en_ref = sc_stamp.ref(), en_stamp.ref()
+        pct = 100.0 * stale / located if located else 0.0
         print(
-            f"  {len(findings.advisories)} of {findings.checked_anchors} anchors "
-            f"({pct:.1f}%) carry a stale line number: the evidence is present and unique, only the "
-            "recorded position is wrong. NOT fatal, and re-anchoring is bookkeeping rather than "
-            "assessment — but the percentage is the thing to watch, because it only ever grows "
-            "between re-anchor passes.",
+            f"  {stale} of {located} LOCATED anchors ({pct:.1f}%) carry a stale line number, "
+            f"measured at scorecard={sc_ref} engine={en_ref}: the evidence is present and unique, "
+            "only the recorded position is wrong. NOT fatal, and re-anchoring is bookkeeping rather "
+            "than assessment — but the percentage is the thing to watch, because it only ever grows "
+            "between re-anchor passes. THOSE TWO REFS ARE PART OF THE NUMBER: re-derived at any "
+            "other pair this is a DIFFERENT MEASUREMENT, not a correction of this one.",
             file=sys.stderr,
         )
+        # Every other producer, named and counted apart. Folding these in is what let one injected
+        # `sym` mismatch print as a 184th anchor "carrying a stale line number" while 183 did.
+        # No `and n` filter: `advisory_kinds` is only ever written by `advise`, and `Counter` returns
+        # 0 for a missing key WITHOUT inserting one, so a zero-valued kind is unreachable. Guarding
+        # against it would tell a reader the opposite.
+        others = [(k, n) for k, n in sorted(findings.advisory_kinds.items()) if k != "line"]
+        if others:
+            named = ", ".join(f"{n} {k}" for k, n in others)
+            print(
+                f"  plus {sum(n for _, n in others)} advisory(ies) that are NOT line drift "
+                f"({named}), counted apart: one anchor can raise three, and a scratch-tree advisory "
+                "is not about an anchor at all.",
+                file=sys.stderr,
+            )
     for p in findings.problems:
         print(f"  FAIL {p}", file=sys.stderr)
 
