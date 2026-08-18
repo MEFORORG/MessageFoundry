@@ -10254,11 +10254,12 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **THE INVERSION, AND IT IS THE POINT OF THE ITEM.**
 >
->     BOUNDED -- an apt hang dies at the job cap
+>     BOUNDED -- an apt hang dies at the job cap   (ENGINE repo; the vault's ci.yml is a
+>     DIFFERENT FILE with tighter caps -- a cap figure belongs to one repository)
 >       ci.yml  test               timeout-minutes: matrix-driven
 >       ci.yml  webconsole         timeout-minutes: matrix-driven
 >       ci.yml  tooling            timeout-minutes: 40
->       quality-advisory coverage  timeout-minutes: 20   (45 once BACKLOG #1274 lands)
+>       quality-advisory coverage  timeout-minutes: 20   (53 once BACKLOG #1274 lands)
 >       quality-advisory mutation  timeout-minutes: 30
 >
 >     UNBOUNDED -- no job-level timeout at all
@@ -10268,7 +10269,11 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 >
 > **ALL FIVE Qt SITES SIT IN BOUNDED JOBS. THE THREE ODBC SITES DO NOT.** So the sites that announced themselves did so *because* they were bounded -- they die at 20 to 40 minutes and someone notices. The unbounded ones fail quietly up to the platform default, which is why nobody reported them. **Visibility and severity ran in opposite directions**, and the single most useful consequence is the Lander's: *a fix scoped to the step that is visibly hurting the queue would harden the safe half and leave the dangerous half alone.*
 
-> **IT INTERACTS WITH BACKLOG #1274, IN THE WRONG DIRECTION, AND THAT IS THIS ITEM'S CLAIM ON URGENCY.** #1274 raises the coverage job's cap from 20 to 45 for a well-measured reason -- the suite genuinely needs it -- and the Qt step in that job carries no step-level cap, so the same apt hang becomes **2.25x more expensive** there once #1274 lands. That is not an argument against #1274; it is the argument for fixing the hang at the STEP rather than relying on a job cap, **because otherwise every job that legitimately raises its cap silently buys a longer hang.**
+> **IT INTERACTED WITH BACKLOG #1274 IN THE WRONG DIRECTION, AND THAT DROVE BOTH THE LANDING ORDER AND #1274's FINAL NUMBER.** As originally sized, #1274 raised the coverage job's cap from 20 to 45 while the Qt step in that job stayed uncapped -- making the same apt hang 2.25x more expensive on the very job where it was measured. That was disclosed by the #1274 author against their own branch, and it decided the sequencing: THE GUARD LANDS FIRST, #1274 SECOND.
+>
+> **THEN THE TWO PROVED JOINTLY UNSAFE, WHICH NEITHER VERIFICATION COULD SEE.** Step caps within one job are SEQUENTIAL, so #1274's nesting invariant sums them. With the guard's `timeout-minutes: 8` on the Qt step the sum is 8 + 36 + 3 = 47, and 5:22 setup + 47 = 52:22, which does not fit under 45 -- measured by applying the guard to #1274's branch and watching its own invariant test go red. #1274 now carries **53**, chosen to fit in EITHER landing order (44:22 without the guard, 52:22 with it), so correctness no longer depends on the queue's sequencing.
+>
+> **THE GENERAL FORM IS THE PART TO KEEP:** every job that legitimately raises its cap silently buys a longer hang for as long as its steps are unbounded, and two edits each verified against the same baseline can be unsafe together with nothing in either verification hinting at it.
 
 > **TWO CAUSES, ONE OBSERVABLE, AND THE DISCRIMINATOR IS FREE.** Both an apt hang and a genuine over-run surface as a job whose conclusion is `cancelled`. The distinguishing field is **which step died**: `Qt headless system deps` cancelled with the test step `skipped` means the mirror; `Qt headless` success with `Tests under coverage` cancelled means the budget. Measured 2026-08-18 on `diff-coverage (advisory)`: runs `32068906295`, `32063933087`, `32058343431`, `32047518020`, `32035065272`, `32030886919`, `32028806723`, `32027340564` are all the second shape (11:56Z-21:01Z, eight of eight); run `32085499836` **attempt 1** is the first. Two seats read the same job on different attempts and reached opposite conclusions, each correctly, before the attempt number was noticed.
 
