@@ -6,7 +6,7 @@
 // demand or after a 401.
 import * as vscode from "vscode";
 import { getJson, HttpError, postJson } from "./engineClient";
-import { assertTargetAllowed } from "./engineTarget";
+import { assertBrowsableUrl, assertTargetAllowed } from "./engineTarget";
 
 const SECRET_PREFIX = "messagefoundry.token:";
 
@@ -55,9 +55,20 @@ export async function clearToken(ctx: vscode.ExtensionContext, url: string): Pro
 async function showConsoleFix(url: string, problem: string, path: string): Promise<void> {
   const open = "Open the web console";
   const pick = await vscode.window.showWarningMessage(`MessageFoundry: ${problem}`, open);
-  if (pick === open) {
-    await vscode.env.openExternal(vscode.Uri.parse(url.replace(/\/+$/, "") + path));
+  if (pick !== open) {
+    return;
   }
+  // `url` is the configured engine URL, so it is operator-typed rather than attacker-supplied — but
+  // openExternal routes to the OS handler, which will launch an APPLICATION for a scheme it
+  // recognises. A typo or a pasted `file:`/`ms-msdt:` value must not become a launch, so the scheme
+  // is screened positively here rather than assumed from where the value came from.
+  const target = url.replace(/\/+$/, "") + path;
+  const check = assertBrowsableUrl(target);
+  if (!check.ok) {
+    await vscode.window.showErrorMessage(`MessageFoundry: ${check.reason}`);
+    return;
+  }
+  await vscode.env.openExternal(vscode.Uri.parse(target));
 }
 
 /**

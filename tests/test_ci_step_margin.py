@@ -43,10 +43,28 @@ _ROOT = Path(__file__).resolve().parents[1]
 _CI = _ROOT / ".github" / "workflows" / "ci.yml"
 _BASELINE_FILE = _ROOT / "scripts" / "ci" / "step_margin_baseline.toml"
 
-#: The steps in `test` that carry their own `timeout-minutes` and are therefore in scope. Named here
-#: rather than discovered, so a step that LOSES its cap is a failure rather than a silently smaller
-#: scan -- an empty scan and a clean scan must not look alike.
-_GATED_STEPS = ("Tests (pytest)", "Web console tests (pytest)")
+#: The gated steps, each with the JOB that owns it and the matrix knobs that cap it. Named here rather
+#: than discovered, so a step that LOSES its cap is a failure rather than a silently smaller scan -- an
+#: empty scan and a clean scan must not look alike.
+#:
+#: ONE ENTRY PER (JOB, STEP), because the web console suite moved out of `test` into its own
+#: `webconsole` job. Every invariant below used to be written against `test` alone and is now applied
+#: per job; none of them was relaxed to accommodate the move. The pair that must fit under a job cap is
+#: now a single step per job rather than two sharing one, which is the easier obligation -- see the
+#: `webconsole` job header in ci.yml for why that completes BACKLOG #344 proposal 5 instead of undoing
+#: it.
+_GATED: dict[str, tuple[str, str, str]] = {
+    # job name: (gated step name, its step-cap matrix key, that job's job-cap matrix key)
+    "test": ("Tests (pytest)", "step_timeout", "job_timeout"),
+    "webconsole": (
+        "Web console tests (pytest)",
+        "webconsole_step_timeout",
+        "webconsole_job_timeout",
+    ),
+}
+
+#: Flat view, for the assertions that only care about which steps are gated at all.
+_GATED_STEPS = tuple(step for step, _, _ in _GATED.values())
 
 
 def _uncensored(seconds: int = 600) -> Baseline:
@@ -451,10 +469,12 @@ def test_the_summary_block_prints_what_it_scanned() -> None:
 # --- the wiring, which is where this class of guard actually dies -----------------------------------
 
 
-def _test_job() -> dict:
+def _job(name: str) -> dict:
     yaml = pytest.importorskip("yaml")
     doc = yaml.safe_load(_CI.read_text(encoding="utf-8"))
-    return doc["jobs"]["test"]  # type: ignore[no-any-return]
+    jobs = doc["jobs"]
+    assert name in jobs, f"ci.yml has no {name!r} job -- jobs are {sorted(jobs)}"
+    return jobs[name]  # type: ignore[no-any-return]
 
 
 def _matrix_legs() -> list[dict]:
@@ -470,29 +490,33 @@ def _matrix_legs() -> list[dict]:
     return legs
 
 
-def test_the_margin_check_is_wired_into_the_test_job_after_both_gated_steps() -> None:
+def test_the_margin_check_is_wired_into_every_gated_job_after_its_gated_step() -> None:
     """A margin script in the tree and absent from the workflow measures nothing.
 
     Placement is load-bearing and not cosmetic: a step `if:` carrying no status function has an
-    implicit `success()`, so a failing check placed BETWEEN the two gated steps would silently skip
-    the second suite. It runs last.
+    implicit `success()`, so a failing check placed AHEAD of its gated step would silently skip that
+    suite. It runs last in each job that owns one.
 
-    Falsified by moving the check above `Web console tests (pytest)`: the ordering assertion goes RED.
-    Restored.
+    Falsified by moving either check above its gated step: the ordering assertion goes RED. Restored.
     """
-    steps = _test_job()["steps"]
-    names = [str(s.get("name", "")) for s in steps]
-    print(f"[step-margin] test-job steps scanned: {len(names)}")
-    check = [i for i, n in enumerate(names) if n.startswith("Step margin -- both gated steps")]
-    assert len(check) == 1, f"expected exactly one margin check step, found {check} in {names}"
-    for gated in _GATED_STEPS:
-        assert gated in names, f"{gated!r} is gone from ci.yml -- re-scope this guard deliberately"
+    for job_name, (gated, _, _) in _GATED.items():
+        steps = _job(job_name)["steps"]
+        names = [str(s.get("name", "")) for s in steps]
+        # The CHECK is the step that READS a mark (`--since`); the mark-writers use `--mark`. Matching
+        # on the flag rather than the name is deliberate -- "Step margin -- start the clock" also
+        # starts with "Step margin", so a name prefix would match a writer and pass for the wrong step.
+        check = [i for i, s in enumerate(steps) if "--since" in str(s.get("run", ""))]
+        print(f"[step-margin] {job_name}-job steps scanned: {len(names)}; check at {check}")
+        assert len(check) == 1, f"expected exactly one margin check in {job_name}, found {check}"
+        assert gated in names, (
+            f"{gated!r} is gone from {job_name} -- re-scope this guard deliberately"
+        )
         assert names.index(gated) < check[0], f"the margin check must run after {gated!r}"
-    assert steps[check[0]].get("if") == "always()", (
-        "the margin check must run even when a gated step failed -- otherwise the one case it exists "
-        "for (a step killed at its cap) is the one case it never reports"
-    )
-    assert "scripts/ci/step_margin.py" in str(steps[check[0]].get("run", ""))
+        assert steps[check[0]].get("if") == "always()", (
+            "the margin check must run even when a gated step failed -- otherwise the one case it "
+            "exists for (a step killed at its cap) is the one case it never reports"
+        )
+        assert "scripts/ci/step_margin.py" in str(steps[check[0]].get("run", ""))
 
 
 def test_every_mark_the_check_reads_is_written_by_a_step_that_runs_first() -> None:
@@ -502,23 +526,24 @@ def test_every_mark_the_check_reads_is_written_by_a_step_that_runs_first() -> No
     Falsified by renaming either `--mark` label without renaming its reader: RED, naming the label.
     Restored.
     """
-    steps = _test_job()["steps"]
-    written: dict[str, int] = {}
-    for i, step in enumerate(steps):
-        for label in re.findall(r"--mark\s+(\S+)", str(step.get("run", ""))):
-            written[label] = i
-    check_index = next(
-        i for i, s in enumerate(steps) if str(s.get("name", "")).startswith("Step margin -- both")
-    )
-    read = set(re.findall(r"--(?:since|until)\s+(\S+)", str(steps[check_index].get("run", ""))))
-    read.discard("now")  # the live clock, written by nobody
-    print(f"[step-margin] marks written: {sorted(written)}; marks read: {sorted(read)}")
-    assert read, "the check reads no marks at all -- it is no longer timing anything"
-    for label in sorted(read):
-        assert label in written, f"the check reads mark {label!r} that no step writes"
-        assert written[label] < check_index, f"mark {label!r} is written after it is read"
-    unread = sorted(set(written) - read)
-    assert not unread, f"marks written and never read: {unread}"
+    for job_name in _GATED:
+        steps = _job(job_name)["steps"]
+        written: dict[str, int] = {}
+        for i, step in enumerate(steps):
+            for label in re.findall(r"--mark\s+(\S+)", str(step.get("run", ""))):
+                written[label] = i
+        check_index = next(i for i, s in enumerate(steps) if "--since" in str(s.get("run", "")))
+        read = set(re.findall(r"--(?:since|until)\s+(\S+)", str(steps[check_index].get("run", ""))))
+        read.discard("now")  # the live clock, written by nobody
+        print(f"[step-margin] {job_name}: marks written {sorted(written)}; read {sorted(read)}")
+        assert read, f"{job_name}'s check reads no marks at all -- it is no longer timing anything"
+        for label in sorted(read):
+            assert label in written, f"{job_name}'s check reads mark {label!r} that no step writes"
+            assert written[label] < check_index, f"mark {label!r} is written after it is read"
+        # Marks are per-JOB now (each job writes and reads its own), so an unread mark means a
+        # half-finished move rather than a harmless leftover: the two jobs cannot see each other's.
+        unread = sorted(set(written) - read)
+        assert not unread, f"{job_name}: marks written and never read: {unread}"
 
 
 def test_the_margin_check_keys_on_the_STEPS_OWN_CONCLUSION_never_the_jobs() -> None:
@@ -530,38 +555,53 @@ def test_the_margin_check_keys_on_the_STEPS_OWN_CONCLUSION_never_the_jobs() -> N
 
     Falsified by substituting `job.status` for either outcome expression: RED. Restored.
     """
-    steps = _test_job()["steps"]
-    ids = {str(s.get("name", "")): s.get("id") for s in steps}
-    for gated in _GATED_STEPS:
+    for job_name, (gated, _, _) in _GATED.items():
+        steps = _job(job_name)["steps"]
+        ids = {str(s.get("name", "")): s.get("id") for s in steps}
         assert ids.get(gated), (
-            f"{gated!r} carries no `id:`, so its own outcome cannot be referenced"
+            f"{gated!r} in {job_name} carries no `id:`, so its own outcome cannot be referenced"
         )
-    check = next(s for s in steps if str(s.get("name", "")).startswith("Step margin -- both"))
-    env = check.get("env") or {}
-    referenced = {str(v) for v in env.values()}
-    for gated in _GATED_STEPS:
+        check = next(s for s in steps if "--since" in str(s.get("run", "")))
+        env = check.get("env") or {}
+        referenced = {str(v) for v in env.values()}
         expected = "${{ steps." + str(ids[gated]) + ".outcome }}"
-        assert expected in referenced, f"the check does not read {expected}; env is {referenced}"
-    joined = " ".join(referenced) + str(check.get("run", ""))
-    assert "job.status" not in joined and "job.conclusion" not in joined
+        assert expected in referenced, (
+            f"{job_name}'s check does not read {expected}; env is {referenced}"
+        )
+        joined = " ".join(referenced) + str(check.get("run", ""))
+        assert "job.status" not in joined and "job.conclusion" not in joined
 
 
-def test_the_web_console_step_no_longer_shares_the_engine_suites_budget() -> None:
+def test_the_web_console_suite_shares_neither_budget_nor_job_with_the_engine_suite() -> None:
     """BACKLOG #344 proposal 5. Two steps on one `timeout-minutes` is why the nesting invariant could
     not hold for the second one on any leg: reaching it has already spent setup plus `Tests`, so its
     cap could never fire first.
 
     Falsified by restoring `timeout-minutes: matrix.step_timeout` on that step: RED. Restored.
     """
-    steps = _test_job()["steps"]
-    console = next(s for s in steps if s.get("name") == "Web console tests (pytest)")
-    engine = next(s for s in steps if s.get("name") == "Tests (pytest)")
-    assert console["timeout-minutes"] == "${{ matrix.webconsole_step_timeout }}"
-    assert engine["timeout-minutes"] == "${{ matrix.step_timeout }}"
-    assert console["timeout-minutes"] != engine["timeout-minutes"]
+    caps: dict[str, str] = {}
+    for job_name, (gated, step_key, _) in _GATED.items():
+        steps = _job(job_name)["steps"]
+        step = next(s for s in steps if s.get("name") == gated)
+        expected = "${{ matrix." + step_key + " }}"
+        assert step["timeout-minutes"] == expected, (
+            f"{gated!r} in {job_name} must be capped by {expected}, found "
+            f"{step.get('timeout-minutes')!r}"
+        )
+        caps[gated] = str(step["timeout-minutes"])
+
+    # STRONGER THAN BEFORE, not weaker. The two suites no longer merely carry DIFFERENT caps inside one
+    # job -- they are in DIFFERENT JOBS, so neither can spend the other's wall-clock at all. Assert the
+    # separation structurally as well as by cap name, since the cap names alone would still pass if the
+    # console step were moved back beside the engine one with its own knob.
+    assert len(set(caps.values())) == len(caps), f"gated steps share a cap expression: {caps}"
+    owners = {gated: job for job, (gated, _, _) in _GATED.items()}
+    assert len(set(owners.values())) == len(owners), (
+        f"two gated steps share a job, so one is again queued behind the other: {owners}"
+    )
 
 
-def test_every_leg_sizes_both_gated_steps_and_the_pair_fits_inside_the_job_cap() -> None:
+def test_every_leg_sizes_each_gated_step_inside_its_own_job_cap() -> None:
     """The machine-checkable half of the nesting invariant, per leg.
 
     WHAT THIS DOES NOT CHECK, said so it is not read as more: the real invariant is
@@ -574,13 +614,20 @@ def test_every_leg_sizes_both_gated_steps_and_the_pair_fits_inside_the_job_cap()
     print(f"[step-margin] matrix legs scanned: {[leg['os'] for leg in legs]}")
     assert len(legs) == 3, f"expected three legs, found {[leg['os'] for leg in legs]}"
     for leg in legs:
-        assert "webconsole_step_timeout" in leg, f"{leg['os']} does not size the web console step"
-        both = leg["step_timeout"] + leg["webconsole_step_timeout"]
-        assert both < leg["job_timeout"], (
-            f"{leg['os']}: step_timeout {leg['step_timeout']} + webconsole_step_timeout "
-            f"{leg['webconsole_step_timeout']} = {both} does not fit under job_timeout "
-            f"{leg['job_timeout']}, before setup is even counted"
-        )
+        # ONE gated step per job now, so the obligation is per (job, leg) rather than a SUM of two step
+        # budgets under a single job cap. Each job's own step cap must fit under its own job cap. This
+        # is the same invariant, applied where the steps actually live -- and it stays deliberately
+        # weaker than the real rule, which adds a measured setup term that lives in a comment and is
+        # unreadable from here.
+        for job_name, (_, step_key, job_key) in _GATED.items():
+            assert step_key in leg, (
+                f"{leg['os']} does not size {job_name}'s gated step ({step_key})"
+            )
+            assert job_key in leg, f"{leg['os']} does not cap the {job_name} job ({job_key})"
+            assert leg[step_key] < leg[job_key], (
+                f"{leg['os']}: {step_key} {leg[step_key]} does not fit under {job_key} "
+                f"{leg[job_key]}, before setup is even counted"
+            )
 
 
 def test_the_baseline_covers_every_gated_step_on_every_leg() -> None:

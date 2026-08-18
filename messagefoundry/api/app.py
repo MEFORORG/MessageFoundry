@@ -61,6 +61,13 @@ from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.api.auth_routes import add_auth_routes
 from messagefoundry.api.client_networks import ClientNetworkMiddleware
 from messagefoundry.api.field_authz import count_exposed, redact_unauthorized
+from messagefoundry.api.header_floor import (
+    BASELINE_SECURITY_HEADERS,
+    HSTS_HEADER,
+    HSTS_VALUE,
+    SecurityHeaderFloorMiddleware,
+    hsts_applies,
+)
 from messagefoundry.api.metrics import (
     METRICS_CONTENT_TYPE,
     MetricsHistory,
@@ -1215,7 +1222,16 @@ def create_app(
         _log.error(
             "unhandled error on %s %s: %s", request.method, request.url.path, type(exc).__name__
         )
-        return JSONResponse({"detail": "internal error"}, status_code=500)
+        # The baseline security headers are set HERE, not left to the middleware that sets them on
+        # every other response. Starlette routes a handler registered for Exception/500 to
+        # ServerErrorMiddleware, which build_middleware_stack places OUTSIDE user_middleware by
+        # construction — so neither _security_headers below nor the outermost
+        # SecurityHeaderFloorMiddleware is in this response's path, and a 500 shipped with none of
+        # them. Status and body are unchanged: this adds headers only.
+        headers = dict(BASELINE_SECURITY_HEADERS)
+        if hsts_applies(request.url.scheme, exposure_protected):
+            headers[HSTS_HEADER] = HSTS_VALUE
+        return JSONResponse({"detail": "internal error"}, status_code=500, headers=headers)
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -1264,13 +1280,13 @@ def create_app(
                 "docs/security/OFF-LOOPBACK-DEPLOYMENT.md."
             )
         response = await call_next(request)
-        response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("Referrer-Policy", "no-referrer")
-        response.headers.setdefault("X-Frame-Options", "DENY")
-        if request.url.scheme == "https" or exposure_protected:
-            response.headers.setdefault(
-                "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
-            )
+        # The header names/values and the HSTS condition come from api/header_floor.py so this
+        # middleware and the outermost floor that backstops it cannot drift apart. This one still
+        # exists for the PATH-CONDITIONAL work below, which the floor deliberately does not duplicate.
+        for name, value in BASELINE_SECURITY_HEADERS:
+            response.headers.setdefault(name, value)
+        if hsts_applies(request.url.scheme, exposure_protected):
+            response.headers.setdefault(HSTS_HEADER, HSTS_VALUE)
         # /ui browser surface (ADR 0065 §5): a strict CSP (no unsafe-*) and no-store on every HTML
         # response; the vendored /ui/static assets keep StaticFiles' own cache. PHI JSON reads also get
         # no-store (every _NO_STORE_PREFIXES family, ASVS 14.2.2) so a browser/proxy never caches a
@@ -5273,19 +5289,32 @@ def create_app(
     # streaming is never cut mid-body — see api/request_timeout.py.
     app.add_middleware(RequestTimeoutMiddleware)
 
-    # [security].allowed_client_networks — registered LAST, so Starlette makes it the OUTERMOST user
-    # middleware (add_middleware inserts at index 0; the stack is built from reversed(user_middleware)).
-    # It therefore runs above the attachment CSP re-assert, the console's UiSecurityHeadersMiddleware,
-    # the body cap, the security-headers middleware, the /ui/static mount and every auth dependency — a
-    # refused address reaches no route, no dependency and no body buffer. Registered OUTSIDE serve_ui so a
-    # JSON-only deployment is equally covered, and unconditionally so the control can never be
-    # silently missing after a config edit (an empty list short-circuits inside it).
+    # [security].allowed_client_networks — registered so that only the response-header floor below is
+    # further out. It therefore runs above the attachment CSP re-assert, the console's
+    # UiSecurityHeadersMiddleware, the body cap, the security-headers middleware, the /ui/static mount
+    # and every auth dependency — a refused address reaches no route, no dependency and no body buffer.
+    # The floor does not weaken that: it runs NOTHING on the request path (it wraps `send` only), so it
+    # adds no reachable surface ahead of the gate. Registered OUTSIDE serve_ui so a JSON-only deployment
+    # is equally covered, and unconditionally so the control can never be silently missing after a
+    # config edit (an empty list short-circuits inside it).
     #
     # It must stay INSIDE uvicorn's ProxyHeadersMiddleware, which it is automatically by being part of
     # the app uvicorn wraps. Do NOT wrap the app in __main__ before uvicorn.run: that would put the
     # gate OUTSIDE the XFF rewrite, where scope["client"] is still the raw socket peer, and the
     # declared-proxy topology (R2) would break completely — every client would look like the proxy.
     app.add_middleware(ClientNetworkMiddleware)
+
+    # ASVS 3.4.4/3.4.5 — registered LAST, so Starlette makes it the OUTERMOST user middleware
+    # (add_middleware inserts at index 0; the stack is built from reversed(user_middleware)) and its
+    # response-path send wrapper runs after every other emitter. That position is the whole point:
+    # _security_headers is the INNERMOST user middleware, so the body cap's four short-circuits above
+    # shipped with no baseline headers at all, and both middlewares that hand-copy the baseline
+    # (client_networks._DENIAL_HEADERS, request_timeout._TIMEOUT_HEADERS) omit HSTS. The floor
+    # setdefaults, never assigns, so the attachment sandbox CSP re-asserted above and every other
+    # last-writer-wins header is untouched. See api/header_floor.py — including why it CANNOT cover the
+    # unhandled 500 (ServerErrorMiddleware sits outside user_middleware; _unhandled_exception sets the
+    # same baseline itself) and why the path-conditional Cache-Control/CSP is deliberately not copied.
+    app.add_middleware(SecurityHeaderFloorMiddleware)
 
     return app
 

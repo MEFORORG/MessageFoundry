@@ -193,6 +193,12 @@ dev = [
     "pytest-asyncio>=0.26",  # >=0.26 adds asyncio_default_test_loop_scope (BACKLOG #17 shared-loop fix)
     "pytest-timeout>=2.3",  # per-test watchdog: a hung test dumps stacks + fails fast in 60s, never wedges the leg
     "pytest-rerunfailures>=16.0",  # in-run auto-retry for the known harness-monitor timing flake: a single flake occurrence self-heals instead of reding the whole matrix + blocking auto-merge
+    # The engine suite runs across processes in CI (`-n` in ci.yml's `Tests (pytest)` step). Serial,
+    # it was 91 percent of the whole CI critical path. Two things had to be fixed before it worked and
+    # both are pinned by tests, so this is not a flag that can be dropped back in casually:
+    # collection-time timestamps must not reach a test id (tests/test_dependabot_automerge_guardrails.py)
+    # and the per-process port slot must not be inherited by workers (tests/conftest.py).
+    "pytest-xdist>=3.6",
     # Pinned BELOW 0.16: ruff 0.16.0 turned on stricter defaults (RUF022/RUF100/BLE001) that flag
     # hundreds of findings in existing code — at least ~870 on PR #66's ubuntu leg (whole-repo scope,
     # 2026-08-01). An unbounded ">=" lets `uv lock` adopt that new baseline, and it flows out through
@@ -311,11 +317,23 @@ asyncio_default_fixture_loop_scope = "session"
 testpaths = ["tests", "packaging/messagefoundry-webconsole/tests"]
 # Per-test watchdog: a single hung await/socket is killed at 60s with a full thread-stack dump naming
 # the culprit, instead of burning the CI job's wall-clock. `thread` method works cross-platform (no
-# SIGALRM) and fires even when the main thread is blocked in a C call. Individual tests run well under
-# 60s (the whole suite is ~2–5 min).
+# SIGALRM) and fires even when the main thread is blocked in a C call. The cap is per TEST, and every
+# leg passes under it, so no single test exceeds it. This value binds LOCAL runs only: ci.yml passes an
+# explicit --timeout= per leg from its matrix (60s ubuntu, 120s Windows), which overrides it.
+#
+# NO SUITE TOTAL HERE, DELIBERATELY. This line carried "~2-5 min" long after that stopped being true,
+# and the figure has since moved again -- #411 took the engine suite across processes, so the serial
+# number it implied is now two revisions stale rather than one. A duplicated measurement rots silently
+# because nothing points at it; the fix is to not keep a second copy. Suite timing, its provenance, the
+# serial-vs-parallel comparison and the worker sizing are recorded ONCE, in the comments above the
+# `Tests (pytest)` step and the matrix in .github/workflows/ci.yml. Read it there.
 addopts = "--timeout=60 --timeout-method=thread"
 markers = [
     "win2025_acceptance: Windows Server 2025 on-server acceptance probes (env-gated; skip off-server).",
+    # Applied by tests/conftest.py from tests/tooling_manifest.txt -- never written on a test by hand,
+    # so `-m tooling` and `-m 'not tooling'` partition the suite from ONE reviewed list. ci.yml runs
+    # the engine legs with `not tooling` and this tier as its own path-gated job.
+    "tooling: repo-harness tests (worktree gate, coordination, ledger, CI workflows) -- subject is the development harness, not the engine.",
 ]
 
 [tool.ruff]

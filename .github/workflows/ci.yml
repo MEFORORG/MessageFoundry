@@ -332,6 +332,24 @@ jobs:
         if: runner.os == 'Linux'
         run: python scripts/quality/licence_header_check.py
 
+      # Control bytes. Mirrors the `control-char` pre-commit hook, and exists for the reason zizmor.yml
+      # states for actionlint: the hook is the load-bearing half and this step is the backstop for
+      # `git commit --no-verify` and for a fresh clone whose hooks are not installed until
+      # scripts/coord/install-git-hooks.ps1 runs. The hook shipped without this step, so for one day the
+      # gate ran only where hooks happened to be installed -- a gate against bytes no human view shows,
+      # itself invisible when skipped.
+      #
+      # Scope AND the ide/src NUL allowance live in the script, not here, for the reason the licence
+      # step above gives: two callers that restate a scope drift apart, and the drift is silent.
+      #
+      # DELIBERATELY NOT PATHS-FILTERED, and the argument is sharper than for licence headers. This
+      # gate covers .md, .json and .txt, none of which appear in `changes.code`'s alwayscode pattern --
+      # so a docs-only PR sets code=false, and a filter would skip the gate on exactly the prose where
+      # a pasted escape most often lands. ~1,850 files, stdlib only, well under a second.
+      - name: Control bytes (invisible)
+        if: runner.os == 'Linux'
+        run: python scripts/quality/control_char_check.py
+
       # Two mypy passes on Linux so BOTH platforms' typed branches are checked without paying for a
       # Windows mypy: the default linux-platform run, plus an explicit --platform win32 run that types
       # the sys.platform=='win32' branches (ctypes.windll / DPAPI / service_control) the linux run
@@ -665,8 +683,10 @@ jobs:
       # twice now.
       #
       # The remaining margin is a SHARED budget across every PR that lands, and it is now ACCOUNTED
-      # FOR: `scripts/ci/step_margin.py` runs after both gated steps below and reds the leg when a
-      # step's own duration comes within 1.30x of its own cap (BACKLOG #344 proposal 1). Three PRs
+      # FOR: `scripts/ci/step_margin.py` runs after the gated step below and reds the leg when a
+      # step's own duration comes within 1.30x of its own cap (BACKLOG #344 proposal 1). It used to run
+      # after BOTH gated steps; the web console suite moved to its own `webconsole` job and took its
+      # half of the check with it, so each job now measures the one gated step it owns. Three PRs
       # each adding a minute of Windows time is still individually blameless -- the difference is that
       # the third one now says so instead of the fourth one dying at the cap with zero failing
       # assertions. It is NOT a request to raise a cap; the underlying slowness is #320.
@@ -699,6 +719,7 @@ jobs:
           # every OS, so $VAR resolves the same on the Windows legs (Git Bash).
           FAULT_TIMEOUT: ${{ matrix.fault_timeout }}
           PYTEST_TIMEOUT: ${{ matrix.pytest_timeout }}
+          PYTEST_WORKERS: ${{ matrix.pytest_workers }}
         # `--ignore-glob` subtracts the web console package, which runs as its OWN step below. BACKLOG
         # #1027 added that package to the root `testpaths` so a bare local `pytest` stops silently
         # excluding it; without this subtraction the SAME 356 tests would then run TWICE on every leg.
@@ -710,89 +731,44 @@ jobs:
         # third entry in `testpaths`, which is the exact drift #1027 exists to prevent. Subtracting FROM
         # `testpaths` keeps it the single source of truth for what the suite is.
         # `tests/test_ci_engine_step_excludes_webconsole.py` pins all three of those decisions.
-        run: pytest -q --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
-
-      - name: Step margin -- boundary between the two gated steps
-        if: always()
-        run: python scripts/ci/step_margin.py --mark between
-
-      # The web console's OWN suite (Option B, ADR 0065): the moved /ui tests live in the package's
-      # tests/. They ARE in the root `testpaths` since BACKLOG #1027, so a bare local `pytest` collects
-      # them -- the engine step above subtracts them explicitly via `--ignore-glob` rather than relying
-      # on `testpaths` to exclude them, which it no longer does. They still run as a SECOND step on the
-      # SAME leg, under the package's OWN pytest configuration. The package was installed editable in the install
-      # step above (`-e packaging/messagefoundry-webconsole`), so both suites exercise the same
-      # engine build. Its pyproject sets asyncio_mode="auto" + session loop scopes; the timeout flags
-      # mirror the engine step (a hung ASGI test fails fast + named, not at the silent job cap).
-      # SEAM MATRIX — KNOWN GAP, deliberately recorded rather than silently carried. This runs the
-      # package against the ONE installed engine (whatever ENGINE_UI_SEAM is at HEAD). The original
-      # comment said "only ENGINE_UI_SEAM==1 exists today ... when a seam 2 lands, expand this into a
-      # matrix" — that trigger fired long ago and was never actioned: the console now supports a
-      # RANGE (SUPPORTED_ENGINE_SEAMS), so the back-compat claim that an older engine still renders
-      # is NOT exercised anywhere. Closing it means installing the MIN and MAX supported engine
-      # builds and running the package suite against each.
-      #
-      # THIS STEP HAS ITS OWN CAP AS OF BACKLOG #344 PROPOSAL 5, and that is a structural change, not a
-      # tidy-up. It used to carry `matrix.step_timeout` -- the same 25/55 the engine suite holds -- so a
-      # 2-to-4-minute suite sat behind a budget it could never reach: reaching this step has already
-      # spent setup plus `Tests`, so its cap could not fire first at any `job_timeout` worth setting
-      # (~55 min on ubuntu, ~114 on Windows). A hang HERE was therefore an unattributed JOB-level kill
-      # with no step conclusion at all, which is exactly the failure the nesting invariant exists to
-      # prevent, arriving by the one path that invariant did not cover.
-      #
-      # SIZING. Same rule as `step_timeout` -- ceil_minute(1.35 x the leg's measured max) -- then
-      # FLOORED at 5:00, because at these absolute durations 1.35x is under a minute of real headroom
-      # and hosted-runner provisioning noise alone has been observed at 4:30 (`Set up job`, ubuntu run
-      # 31109989006). Maxima are the 2026-08-08 pool recorded above and in
-      # `scripts/ci/step_margin_baseline.toml`:
-      #
-      #   leg      measured max   x1.35   floored   cap    margin over the measured max
-      #   ubuntu   2:22 (n=441)   3:12    5:00      5      2.113x
-      #   W22      2:51           3:51    5:00      6      2.105x  (takes the shared Windows value)
-      #   W25      3:59 (n=360)   5:23    6:00      6      1.506x
-      #
-      # THOSE MAXIMA ARE THEMSELVES RIGHT-CENSORED, and by the JOB cap rather than by a step cap: this
-      # step runs second, so a job-level kill lands inside it. Run 30724385719 is the exhibit -- `Tests`
-      # SUCCESS at 25:51, then this step CANCELLED at 30:14. So the numbers above are lower bounds, and
-      # the floor is doing real work rather than being generosity.
-      #
-      # NESTING INVARIANT, SECOND GATED STEP -- setup(max) + step_timeout + webconsole_step_timeout must
-      # stay under job_timeout. This is the line that could not be satisfied before, on ANY leg:
-      #   ubuntu  5:22 + 25:00 + 5:00 = 35:22 < 37:00  (gap 1:38)
-      #   W22     4:05 + 55:00 + 6:00 = 65:05 < 66:00  (gap 0:55)
-      #   W25     2:32 + 55:00 + 6:00 = 63:32 < 66:00  (gap 2:28)
-      # It now holds on all three, so a hang in the web console suite fails as a NAMED STEP.
-      #
-      # WORST CASE THE CAPS ADMIT, with both gated steps passing one second under their own caps --
-      # the quantity the job paragraph above could not previously bound at all, because the second
-      # gated step's cap was the first one's:
-      #   ubuntu  5:22 + 30:59 + 4:59 = 41:20 vs 43:00  (+1:40)   was 5:22 + 24:59 + 24:59 = 55:20  NEGATIVE
-      #   W22     4:05 + 54:59 + 5:59 = 65:03 vs 66:00  (+0:57)   was 4:05 + 54:59 + 54:59 = 114:03 NEGATIVE
-      #   W25     2:32 + 54:59 + 5:59 = 63:30 vs 66:00  (+2:30)   was 2:32 + 54:59 + 54:59 = 112:30 NEGATIVE
-      # The old table stated a worst case built from the MEASURED web-console maxima, which is a
-      # different quantity: it described what had been observed, not what the caps permitted.
-      #
-      # THE RE-DERIVE TRIGGER IS THE MARGIN CHECK ITSELF, not a second number written here to drift
-      # against it. The check below reds at 1.30x of the cap -- 3:51 on ubuntu, 4:37 on Windows -- and
-      # a run reaching that is 1.6x to 1.9x this leg's maximum over hundreds of observations, which is
-      # an event rather than a slow morning. It also prints the percent-of-cap on every run, so the
-      # approach is visible before the refusal. The old habit of writing a separate trigger into this
-      # file is exactly what produced a permanently-tripped 28:00 alarm nobody could act on.
-      - name: Web console tests (pytest)
-        id: webconsole
-        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        timeout-minutes: ${{ matrix.webconsole_step_timeout }}
-        env:
-          QT_QPA_PLATFORM: offscreen
-          PYTHONFAULTHANDLER: "1"
-          # env-passed (not a ${{ }} expansion into run:) — see the Tests step above for why.
-          FAULT_TIMEOUT: ${{ matrix.fault_timeout }}
-          PYTEST_TIMEOUT: ${{ matrix.pytest_timeout }}
-        run: pytest packaging/messagefoundry-webconsole/tests -q -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
+        #
+        # `-n` RUNS THE SUITE ACROSS PROCESSES (pytest-xdist), and it is the whole reason this step
+        # stopped being 40 minutes. Measured 2026-08-16 on this branch: serial 2191s vs `-n 4
+        # --dist loadfile` 511s locally, with the failure set IDENTICAL in both runs (the same six
+        # pre-existing environment failures, zero parallelism-induced). That box has 20 cores and a
+        # hosted runner has 4, so the CI figure is expected to be lower than that 4.29x -- re-read
+        # the step duration from the first runs rather than quoting the local number.
+        #
+        # `--dist loadfile` IS LOAD-BEARING, NOT A PREFERENCE. xdist's default is `--dist load`, which
+        # scatters individual tests from one file across workers, and this suite has two things that
+        # breaks. (1) 44 module-scoped fixtures live outside conftest and would be rebuilt once PER
+        # WORKER instead of once -- `tests/test_worktree_prune_merged.py` alone pays ~3s of setup per
+        # test. (2) `tests/test_multishard_smoke.py` is the sole consumer of MEFOR_TEST_PORT_BASE and
+        # binds a real port window; keeping a file's tests together keeps that window inside one
+        # process. The cost of `loadfile` is that the run cannot finish faster than its single largest
+        # FILE, which is why the per-file hot spots are worth attacking next.
+        # `-m 'not tooling'` DESELECTS the repo-harness tier, which the `tooling` job runs instead.
+        # Measured 2026-08-16 on a 20-core box: 1,882 of 12,990 tests carry the mark but they are 66
+        # percent of the suite's TIME, and the single largest file in the tier (test_worktree_prune_
+        # merged.py, 391.4s) was setting this step's `--dist loadfile` floor on every engine leg.
+        #
+        # Deselection is by MARKER, applied in tests/conftest.py from tests/tooling_manifest.txt. Not by
+        # path, and not by a second `--ignore-glob`: the webconsole exclusion right above already shows
+        # what happens when the selection lives in the run body -- the obvious spelling (`--ignore`) was
+        # the one that silently did nothing. One list, read in one place, asserted by
+        # tests/test_tooling_partition.py, which also pins the two halves of this wiring.
+        run: pytest -q -n "$PYTEST_WORKERS" --dist loadfile -m 'not tooling' --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
 
       # THE MARGIN CHECK (BACKLOG #344 proposal 1). Last in the job so a LOW margin cannot skip a suite
       # that has not run yet -- a step `if:` with no status function carries an implicit `success()`,
-      # so a failing check placed between the two gated steps would silently skip the second one.
+      # so a failing check placed ahead of a gated step would silently skip it.
+      #
+      # IT NOW GUARDS ONE STEP, NOT TWO. The web console suite moved to its own `webconsole` job and
+      # took its half of this check with it, so the `between` mark is gone: this reads
+      # `before-tests .. now`, which is the whole of the only gated step left in this job. The
+      # invariant did not weaken -- it was RE-SCOPED. Each job now holds exactly one gated step, its
+      # own cap, and its own check, which is a stronger shape than one check straddling two steps
+      # whose budgets had to be summed under a single job cap.
       #
       # It keys on `steps.<id>.outcome` -- THE STEP'S OWN CONCLUSION, never the job's. That substitution
       # is not pedantry: a step that nearly exhausts its cap is the most likely to push its job into
@@ -802,26 +778,274 @@ jobs:
       # A skipped step (docs-only PR) reports NO OBSERVATION in words rather than a healthy-looking
       # ratio, and the script runs its own red/green control pair on every invocation and prints both
       # into the job summary -- a gate that has never been red is a claim, not a control.
-      - name: Step margin -- both gated steps
+      - name: Step margin -- engine suite
         if: always()
         env:
           TESTS_OUTCOME: ${{ steps.tests.outcome }}
-          WEBCONSOLE_OUTCOME: ${{ steps.webconsole.outcome }}
           STEP_CAP: ${{ matrix.step_timeout }}
-          WEBCONSOLE_CAP: ${{ matrix.webconsole_step_timeout }}
           LEG: ${{ matrix.os }}
         run: |
           rc=0
           # `|| rc=$?` OUTSIDE the command, so a non-zero exit is captured rather than swallowed by
-          # `set -e` or absorbed into a pipeline. Both checks always run: reporting only the first
-          # would hide the leg that is actually tight.
+          # `set -e` or absorbed into a pipeline.
           python scripts/ci/step_margin.py --step "Tests (pytest)" --leg "$LEG" \
             --cap-minutes "$STEP_CAP" --outcome "$TESTS_OUTCOME" \
-            --since before-tests --until between || rc=$?
+            --since before-tests --until now || rc=$?
+          exit $rc
+
+  # THE WEB CONSOLE SUITE, IN ITS OWN PARALLEL JOB (was a second step on every `test` leg).
+  #
+  # WHY IT MOVED. It was ~170s sitting SERIALLY behind a ~1090s engine suite on the critical-path leg,
+  # for no reason other than sharing a checkout. Run alongside instead of after, it costs zero
+  # wall-clock: its whole job (setup + suite) finishes far inside the engine job it now runs beside.
+  #
+  # THIS REVERSES THE PLACEMENT HALF OF BACKLOG #344 PROPOSAL 5, AND KEEPS ITS SUBSTANCE. That proposal
+  # gave this suite its own `webconsole_step_timeout` because two steps sharing one `timeout-minutes`
+  # meant the second one's cap could never fire first -- reaching it had already spent setup plus the
+  # engine suite. Moving it to its own job does not undo that; it completes it. The suite keeps its own
+  # STEP cap, gains its own JOB cap (`webconsole_job_timeout`), and keeps its own margin check. The
+  # nesting invariant is now setup(max) + webconsole_step_timeout < webconsole_job_timeout in ONE job,
+  # instead of a sum of two step budgets straddling a single job cap -- strictly easier to satisfy and
+  # to check, which is why the guard in tests/test_ci_step_margin.py is re-scoped per job rather than
+  # relaxed.
+  #
+  # IT IS NOT A REQUIRED CONTEXT AND DOES NOT NEED TO BE. `ci-gate` lists it in `needs:` and fails on
+  # any needed job's `failure` or `cancelled`, and `CI gate` IS required -- the same mechanism that
+  # already gates the six path-gated legs. Adding a new required context would instead have meant a
+  # branch-protection change and the required-but-absent trap on every docs-only PR.
+  #
+  # THE DOCS-ONLY GATE IS PER-STEP, NOT PER-JOB, exactly as in `test` and for the same reason: a
+  # job-level `if:` would skip the job outright, and `ci-gate` reads `needs.*.result`, where a skipped
+  # job reports `skipped` rather than `success`. Keeping the job running and no-oping its steps keeps
+  # that roll-up honest on a docs-only PR.
+  webconsole:
+    name: web console tests (${{ matrix.os }}, py${{ matrix.python-version }})
+    needs: changes
+    strategy:
+      fail-fast: false
+      # Same per-repo matrix as `test`: this suite is as platform-sensitive as the engine one (it runs
+      # under the package's OWN pytest config, against a real ASGI test client), so it gets the same
+      # legs rather than a cheaper ubuntu-only run.
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}
+    runs-on: ${{ matrix.hosted }}
+    timeout-minutes: ${{ matrix.webconsole_job_timeout }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Qt offscreen system libraries
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
+
+      - name: Set up uv
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          cache-dependency-glob: |
+            pyproject.toml
+            requirements.lock
+
+      # THE SAME INSTALL LINE AS `test`, deliberately. The console suite imports the engine, so it must
+      # be exercised against the same build; keeping the commands identical (rather than trimming to a
+      # console-only set) means the two jobs cannot drift into testing different resolutions of the same
+      # lock. It also shares the uv cache entry -- same key, already warm from the sibling job.
+      - name: Install project (dev + console + fhir + dicom + x12 + xml extras)
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
+
+      - name: Step margin -- start the clock
+        if: always()
+        run: python scripts/ci/step_margin.py --mark before-webconsole
+
+      # The web console's OWN suite (Option B, ADR 0065): the moved /ui tests live in the package's
+      # tests/. They ARE in the root `testpaths` since BACKLOG #1027, so a bare local `pytest` collects
+      # them -- the engine step in `test` subtracts them explicitly via `--ignore-glob` rather than
+      # relying on `testpaths` to exclude them, which it no longer does. The package is installed
+      # editable above, so both suites exercise the same engine source.
+      #
+      # NO `-n` HERE, deliberately. xdist buys the engine suite ~2x across ~13,000 tests; this is ~356
+      # tests in 2-to-4 minutes, where worker startup would eat most of the gain, and the job now runs
+      # concurrently with the engine one anyway -- its wall-clock is already off the critical path.
+      # Adding workers would spend the contention risk the -n 8 trial measured to buy nothing.
+      - name: Web console tests (pytest)
+        id: webconsole
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        timeout-minutes: ${{ matrix.webconsole_step_timeout }}
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONFAULTHANDLER: "1"
+          # env-passed (not a ${{ }} expansion into run:) -- see the engine Tests step for why.
+          FAULT_TIMEOUT: ${{ matrix.fault_timeout }}
+          PYTEST_TIMEOUT: ${{ matrix.pytest_timeout }}
+        run: pytest packaging/messagefoundry-webconsole/tests -q -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
+
+      # This job's half of the margin check (BACKLOG #344 proposal 1), moved here with the suite it
+      # measures. Same contract as the engine one: last in the job, `if: always()` so a step killed at
+      # its cap is still reported, and keyed on `steps.webconsole.outcome` -- the STEP's own conclusion,
+      # never the job's, because a step that nearly exhausts its cap is the most likely to push its job
+      # into `timeout-minutes` and filtering on the job would delete exactly those rows.
+      - name: Step margin -- web console suite
+        if: always()
+        env:
+          WEBCONSOLE_OUTCOME: ${{ steps.webconsole.outcome }}
+          WEBCONSOLE_CAP: ${{ matrix.webconsole_step_timeout }}
+          LEG: ${{ matrix.os }}
+        run: |
+          rc=0
           python scripts/ci/step_margin.py --step "Web console tests (pytest)" --leg "$LEG" \
             --cap-minutes "$WEBCONSOLE_CAP" --outcome "$WEBCONSOLE_OUTCOME" \
-            --since between --until now || rc=$?
+            --since before-webconsole --until now || rc=$?
           exit $rc
+
+  # The repo-HARNESS tier, lifted off the engine legs' critical path. Membership is
+  # tests/tooling_manifest.txt; the `test` legs deselect it with `-m 'not tooling'` and this job is the
+  # only place it runs. Measured 2026-08-16: 94 files, 1,882 tests, 66 percent of the suite's time.
+  #
+  # UBUNTU + WINDOWS, and the ubuntu-only version of this job was WRONG -- recorded because the
+  # reasoning that produced it was superficially sound. The first cut argued the tier is mostly
+  # OS-agnostic shell/git behaviour and that Windows is where its child-spawn cost hurts most. Measured
+  # instead of argued: 18 of the 89 manifest entries carry a module-level skipif on os.name/sys.platform
+  # and they hold 337 of the tier's 1,882 tests -- 18 percent. Those ran on windows-2022 and
+  # windows-2025 before the split; under ubuntu-only they would have executed on NO leg, on any event.
+  # They are the coordination and worktree-gate core: session_mail (89), prune_merged (71),
+  # announce_hook (45), collision_gate (31), every coord_*.
+  #
+  # The sizing number in the first cut was invalid on its own terms too: the 391.4s attributed to
+  # test_worktree_prune_merged.py is a WINDOWS figure for a file that has always skipped on ubuntu, so
+  # it could never have been that leg's `--dist loadfile` floor.
+  #
+  # windows-2025 only, not both Windows legs. The engine matrix carries 2022 and 2025 because the
+  # ENGINE ships onto both; this tier tests scripts/ against the local git and pwsh, where the
+  # 2022-vs-2025 difference is not a surface any listed test asserts on. That is a deliberate reduction
+  # from the pre-split state and the honest cost of the split -- if a harness regression ever lands that
+  # only windows-2022 would have caught, THIS is the sentence that was wrong.
+  #
+  # NOT a required context of its own: it rides the `ci-gate` roll-up, exactly as `webconsole` does and
+  # for the same reason recorded there -- a new required context needs a branch-protection change, and
+  # until that lands every PR carries a check it can never satisfy.
+  tooling:
+    name: repo harness tests (${{ matrix.os }})
+    needs: changes
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2025]
+    # The push arm is the safety net, not redundancy: the PR arm only fires when the harness itself
+    # changed, so an ENGINE change that breaks a harness test is invisible on its own PR by
+    # construction, and push-to-main is where it surfaces. See the `tooling` output on `changes`.
+    if: needs.changes.outputs.tooling == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    # SIZED FOR THE WINDOWS LEG, NOT THE UBUNTU ONE, and the first cut (25 job / 18 step) was too
+    # tight to survive it. Derivation, stated so it can be re-derived rather than trusted: the tier
+    # runs 431s at -n 4 on a 20-PHYSICAL-core box, with the pwsh/git children this tier spawns landing
+    # on spare cores. A hosted runner has 4 vCPU and no spare -- ci.yml already records ~1.12 cores of
+    # average child occupancy for exactly this work, and the -n 8 trial documented above shows what
+    # oversubscription does here. Windows adds its ~2.4x process-spawn tax on top, and the Windows leg
+    # is the ONLY leg that executes the 337 platform-gated tests at all. A 2.5-3x factor on 431s is
+    # 18-21 minutes, which the old 18-minute step cap sat directly on top of.
+    #
+    # These are DEADLOCK BACKSTOPS, not tightness gates -- the same reasoning the engine matrix records
+    # for its own 66/55. Sizing a cap close to the observed run buys no detection and costs red builds
+    # on green suites, and a gate that cries wolf gets deleted. The engine Windows legs carry 66/55 for
+    # a bigger suite; 40/30 here is proportionate and still well clear.
+    #
+    # RE-DERIVE IF the tier's -n 4 wall clock is ever observed above 25 minutes on the Windows leg, or
+    # if pytest_workers changes.
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # several of these tests read git history (ledger, claim, cutover guards)
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      # NEEDED EVEN THOUGH NO HARNESS TEST TOUCHES Qt, because `-m tooling` FILTERS AFTER COLLECTION.
+      # pytest imports every module under `testpaths` to collect it and only then applies the marker
+      # expression, so this job still imports the four PySide6 modules (test_harness_compose,
+      # test_harness_file, test_harness_monitor, test_console_messages_refresh) and dies on
+      # `ImportError: libEGL.so.1` before a single tooling test runs. Measured on this job's first real
+      # CI run: 1494 passed, 388 skipped, 4 COLLECTION ERRORS -- deselection does not mean not-imported.
+      #
+      # That is also why the install line below cannot be trimmed to a harness-only set: collection
+      # imports the whole suite regardless of what this job intends to execute.
+      - name: Install Qt offscreen system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          cache-dependency-glob: |
+            pyproject.toml
+            requirements.lock
+
+      # THE SAME INSTALL LINE AS `test`, and it cannot be trimmed even though no listed test imports the
+      # engine: tests/conftest.py itself does (`from messagefoundry.config.settings import ...`), so the
+      # package must be importable for collection to happen at all. Keeping the line identical also
+      # shares the uv cache entry with the sibling jobs.
+      - name: Install project (dev + console + fhir + dicom + x12 + xml extras)
+        run: |
+          uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
+
+      # `-m tooling` SELECTS what the engine legs deselected. The two spellings are a pair and
+      # tests/test_tooling_partition.py asserts BOTH are present in this file, because either one alone
+      # is a silent half-failure: without the engine-side `not tooling` the split buys nothing, and
+      # without this the tier stops running anywhere while both jobs still report green.
+      #
+      # `--dist loadfile` for the same reason as the engine step: these tests bind real port windows and
+      # own module-scoped fixtures, so a file's tests must stay in one worker.
+      - name: Harness tests (pytest)
+        timeout-minutes: 30 # see the job cap above for the derivation; must stay under it with setup
+        env:
+          # Same reason as the apt step above: collection imports the Qt modules whether or not this
+          # job executes them, and the shipped ones construct QApplication at import on some paths.
+          QT_QPA_PLATFORM: offscreen
+        run: pytest -q -n 4 --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' --timeout=120 --junitxml=tooling-junit.xml
+
+      # A marker typo, a manifest rename, or a conftest hook that silently stops firing all produce the
+      # same thing: zero selected tests and a GREEN job. Deselection cannot be distinguished from success
+      # by exit code -- pytest exits 5 on "no tests collected", which `-q` reports in one line nobody
+      # reads.
+      #
+      # COUNT WHAT EXECUTED, NOT WHAT WAS COLLECTED. The first version of this step grepped
+      # `--collect-only`, and pytest COLLECTS skipif-marked tests -- verified against a synthetic file
+      # whose every test was skipped: "2 tests collected". So it would have printed a healthy ~1,900 and
+      # passed while 337 Windows-gated tests skipped on an ubuntu-only job. A receipt that cannot tell
+      # green-because-it-ran from green-because-it-skipped is not a receipt. This parses the junit the
+      # run itself produced, so the number is the number that happened.
+      #
+      # The floor is deliberately loose (1,000 against ~1,545 executing on ubuntu and ~1,882 on
+      # Windows). It is a DEAD-MARKER backstop, not a coverage assertion: a tight floor would go red
+      # every time the tier legitimately grows or a platform gate moves, and a gate that cries wolf gets
+      # deleted. Coverage drift is tests/test_tooling_partition.py's job, on evidence, not this one's.
+      # A SCRIPT, NOT AN INLINE HEREDOC. The logic and its reasoning live in the script, where they can
+      # be read, linted, type-checked and run locally -- and where a shell that handles heredocs
+      # differently cannot change the answer. This job is the first in this workflow to run a `run:`
+      # body on BOTH ubuntu and Windows, so an inline heredoc here would have been the first of its
+      # kind on the Windows leg; that is not a thing to discover from a red build.
+      - name: Prove the tier actually ran
+        if: always() # a timeout or a crash is exactly when the receipt matters most
+        run: python scripts/ci/tooling_receipt.py --report tooling-junit.xml
 
   # Build + type-check the VS Code extension, and run its integration tests. The Python jobs never
   # touch ide/, so a dep bump or IDE code change that breaks the bundle or the types would otherwise
@@ -911,6 +1135,15 @@ jobs:
       # `ide`: run the ide build job only when a PR touches ide/** or this workflow (true on
       # push/dispatch for full coverage; false on the nightly cron). Not a required check.
       ide: ${{ steps.f.outputs.ide }}
+      # `tooling`: the repo-HARNESS test tier — worktree gate, coordination claims, session mail,
+      # ledger, announce, and the workflow files themselves. Measured 2026-08-16: 94 files and 1,882
+      # tests, 17 percent of the suite by count but 66 percent by TIME, because every one of them
+      # spawns real pwsh/git children (~1.0s per test against 0.10s for an engine test). Its SUBJECT is
+      # the development harness, so an engine-only PR cannot change its result — yet before this it set
+      # the `--dist loadfile` floor for all three engine legs. The `test` legs now deselect it with
+      # `-m 'not tooling'` and the `tooling` job below runs it, path-gated. Membership is
+      # tests/tooling_manifest.txt, NOT a filename pattern — see that file for why.
+      tooling: ${{ steps.f.outputs.tooling }}
       # `matrix`: the `test` job's include list, per-repo — full ubuntu+windows matrix HERE (this repo is
       # public, so hosted runners are free; the self-hosted Windows runners are retired), ubuntu-only on
       # a fork. Consumed as `matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}` in `test`.
@@ -945,9 +1178,65 @@ jobs:
           # used to take `step_timeout` -- a 2-to-4-minute suite holding a 25-to-55-minute budget --
           # which is why the nesting invariant could not hold for it on any leg. Derived in the note
           # above the `Web console tests (pytest)` step, which is also where to re-derive it.
-          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":43,"step_timeout":31,"webconsole_step_timeout":5,"pytest_timeout":60,"fault_timeout":90}'
-          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":6,"pytest_timeout":120,"fault_timeout":150}'
-          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":6,"pytest_timeout":120,"fault_timeout":150}'
+          # `pytest_workers` is the xdist worker count for the engine suite. It is a MATRIX knob rather
+          # than a literal in the run body for the same reason every other per-leg number here is one:
+          # the trial dispatches that size it are then a one-line edit, and a leg can differ from its
+          # siblings without touching the step. Sized at 4 because GitHub's hosted ubuntu and Windows
+          # runners are 4-vCPU; `-n auto` would resolve to the same 4 today but would silently
+          # over-subscribe if the runner size ever changes, and this suite spawns pwsh/git children
+          # that compete for those same cores (measured: ~1.12 cores of average child occupancy), so
+          # the count is stated rather than inferred. IF TIMING-SENSITIVE TESTS START FLAKING, 2 IS THE
+          # CONSERVATIVE RUNG -- it leaves 2 vCPU of headroom for the dispatcher and connscale
+          # assertions that measure elapsed time, at roughly two thirds of the saving.
+          #
+          # DO NOT RE-RUN THE "MORE WORKERS MIGHT BE FREE" EXPERIMENT: 8 WAS MEASURED AND IT IS WORSE ON
+          # EVERY LEG. The tempting argument is that a worker blocked waiting on a pwsh/git child is not
+          # holding a core, so 4 workers on 4 vCPU are under-subscribed. It is wrong. Dispatched
+          # 2026-08-16 on branch claude/ci-worker-count-trial at 2bb733915 (run 31968796353), all three
+          # legs raised to 8 together so each compares against its own baseline:
+          #
+          #   leg             -n 4 baseline (n=2)   -n 8 (n=1)   delta   -n 8 outcome
+          #   ubuntu-latest   630 / 633s            731s         +16%    RED, 2 timing assertions
+          #   windows-2022    967 / 1004s           1067s         +8%    green
+          #   windows-2025    1084 / 1092s          1366s        +25%    RED, 3 tests
+          #
+          # The -n 4 baselines are two runs agreeing within 4 percent (PR #411 and its post-merge push).
+          #
+          # -n 4 IS NOT CLEAR OF THE TIMING FLOOR, ONLY FURTHER FROM IT. Recorded because the paragraph
+          # below reads as "8 is unsafe, 4 is settled" and the second half is now known to be too
+          # strong. Observed 2026-08-17 on PR #420, run 32005389065, ubuntu-latest, at -n 4:
+          #     FAILED tests/test_send_pacing.py::test_single_message_seam_is_paced
+          #     assert 0.03876582899999903 >= (0.05 * 0.8)
+          # Missed by 1.2 ms -- 0.0388 against a required 0.0400 -- on a PR whose diff does not touch
+          # that file (two coordination files, one of them pwsh-gated and skipped on ubuntu). So a 20
+          # percent tolerance on a 50 ms interval does not reliably clear a shared runner even at the
+          # merged worker count. If this is to be fixed, the lever is the TOLERANCE or the pacing
+          # mechanism, not pytest_workers -- lowering workers to 2 would buy margin by accident and
+          # cost wall clock everywhere.
+          #
+          # ONE THING THAT SHOULD HELP, and is stated as a prediction rather than a result: the tooling
+          # partition takes ~1,880 subprocess-spawning tests off this leg, and those are precisely the
+          # contention this floor is sensitive to. All 7 pacing tests passed on a local -n 4 engine leg
+          # under the partition, the seam test at 0.194s. That is one green run on a 20-core box, which
+          # is not evidence about a 4-vCPU runner -- if the flake recurs on a partitioned leg, this
+          # prediction was wrong and the tolerance is the only remaining lever.
+          # What went red is the mechanism, not bad luck: ubuntu lost the two elapsed-time assertions
+          # (test_outbound_batch.py's pacing floor and a super-linear-scaling ratio), and windows-2025
+          # lost the three heaviest multi-process tests -- connscale_smoke, multishard_smoke and
+          # session_mail's claim-verdict test, which is the slowest single test in the suite. Contention
+          # hits exactly the tests that measure time or bind real ports, which is why the failures
+          # cluster there rather than scattering.
+          # `webconsole_job_timeout` caps the SEPARATE web console job. It exists because that suite
+          # moved out of `test` into its own parallel job, so it now needs a job cap of its own -- and
+          # the nesting invariant has to hold there too: setup(max) + webconsole_step_timeout must fit
+          # under it. Recorded setup maxima are 5:22 ubuntu / 4:05 W22 / 2:32 W25, and ci.yml records
+          # provisioning noise alone at 4:30, so the worst case is about 5:22 + 4:30 + 5:00 = 14:52 on
+          # the widest leg. 20 clears that with room. It is a DEADLOCK BACKSTOP, not a tightness gate:
+          # the drift detector is the margin check against `webconsole_step_timeout`, so sizing this
+          # close to the observed run would buy no detection and cost false reds on green suites.
+          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":43,"step_timeout":31,"webconsole_step_timeout":5,"webconsole_job_timeout":20,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
+          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":6,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
+          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_step_timeout":6,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
             echo "matrix={\"include\":[$U,$W22,$W25]}" >> "$GITHUB_OUTPUT"
           else
@@ -969,6 +1258,7 @@ jobs:
             echo "docker=true" >> "$GITHUB_OUTPUT"
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "ide=true" >> "$GITHUB_OUTPUT"
+            echo "tooling=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Push-to-main: the FUNCTIONAL gate (code) stays true — the required test legs re-run on
@@ -982,6 +1272,13 @@ jobs:
             echo "docker=false" >> "$GITHUB_OUTPUT"
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "ide=true" >> "$GITHUB_OUTPUT"
+            # TRUE on push, unlike serverdb/docker above, and the asymmetry is deliberate. Those two are
+            # re-runs of container legs a PR already path-gated minutes earlier. This one is the SAFETY
+            # NET for the whole gating scheme: the PR arm below only fires when the harness itself
+            # changed, so an ENGINE change that breaks a harness test is invisible on its PR by
+            # construction. Push-to-main is where that gets caught. Set this false and the tier is
+            # effectively unguarded against everything except its own edits.
+            echo "tooling=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ "$EVENT_NAME" = "schedule" ]; then
@@ -991,6 +1288,7 @@ jobs:
             echo "docker=false" >> "$GITHUB_OUTPUT"
             echo "code=false" >> "$GITHUB_OUTPUT"
             echo "ide=false" >> "$GITHUB_OUTPUT"
+            echo "tooling=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Remaining case: pull_request. Compute the path-based filters from the PR diff.
@@ -1023,6 +1321,40 @@ jobs:
             echo "ide=true" >> "$GITHUB_OUTPUT"
           else
             echo "ide=false" >> "$GITHUB_OUTPUT"
+          fi
+          # `tooling`: the harness tier's SUBJECT is scripts/, the workflows, and the ledger, so those are
+          # what can change its result on a PR. Plus the two files that define the partition itself: edit
+          # the manifest or the conftest hook that reads it and the tier must re-run to prove the new
+          # split still holds.
+          #
+          # THE SECOND ARM MATCHES THE MANIFEST AGAINST ITSELF, and that is the point. Editing one of the
+          # 94 listed tests has to run them, and the obvious spelling -- an alternation of test-name
+          # prefixes -- is a SECOND definition of the tier that drifts from the first silently, in the
+          # direction where an edited test simply stops being covered. `grep -xF -f` reads the one
+          # definition there is. Comments and blanks are stripped first: a blank pattern under -F -x
+          # would match nothing here, but an unfiltered `#` line is still a pattern nobody intended.
+          #
+          # NOT gated on `code`: a docs-only PR that rewrites docs/BACKLOG.md must still face the ledger
+          # and backlog-status tests, and those live in this tier.
+          # `.gitignore` IS IN THIS LIST AND IT IS NOT COSMETIC -- it closes a reintroduction of BACKLOG
+          # #327. tests/test_private_paths_stay_ignored.py is a manifest entry, and six .gitignore rules
+          # are the sole control keeping maintainer-internal material out of a public commit. #327's fix
+          # was to force-classify .gitignore as CODE so the test legs run it. This split broke that at a
+          # layer above: code=true still runs the legs, but they now DESELECT the guard, and .gitignore
+          # matched no arm here -- so the tooling job skipped, ci-gate reads a skipped need as pass, and
+          # a .gitignore-only PR faced the guard on no leg at all. Same defect as #327, new route.
+          # `.gitattributes` rides along for the same reason its sibling does in `alwayscodepath`.
+          # docs/** in full, plus CLAUDE.md, pyproject.toml, ide/ and LICENSE: each is the declared
+          # SUBJECT of a listed test (link_resolution and docs_runbooks read all of docs/;
+          # claude_section_citations reads the root CLAUDE.md, which `\.claude/` does NOT match --
+          # that arm is the DIRECTORY; new_dependency_check reads pyproject; ide_licence_packaging reads
+          # ide/ and LICENSE). Docs-only PRs were never the gap -- code=false already skipped the pytest
+          # step. The gap is MIXED code+docs PRs, which are the common shape.
+          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|pyproject\.toml|\.gitignore|\.gitattributes|tests/(conftest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
+            || echo "$changed" | grep -qxFf <(grep -vE '^[[:space:]]*(#|$)' tests/tooling_manifest.txt); then
+            echo "tooling=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tooling=false" >> "$GITHUB_OUTPUT"
           fi
           # `code`: CONSERVATIVE docs-only detector. Default to running everything (code=true), and only
           # short-circuit when EVERY changed path matches the docs/non-code allowlist below. We compute it
@@ -2154,6 +2486,20 @@ jobs:
       - load-test
       - load-test-sqlserver
       - windows-service-smoke
+      # `webconsole` rides this roll-up rather than taking a required context of its own. It is NOT
+      # path-gated like the five above -- it runs on every PR -- so it COULD have been required
+      # directly; riding here is the cheaper correct choice, because adding a context means a
+      # branch-protection change and, until that lands, a PR that can never satisfy it. The coverage is
+      # identical either way: this job is `if: always()` and fails on any needed job's `failure` or
+      # `cancelled`, and `CI gate` is required. Before this, the console suite gated merges by being a
+      # step inside the required `test` legs; it must not silently stop gating them now that it is not.
+      - webconsole
+      # `tooling` rides here for the same reason, and the precedent above is the whole argument: it was
+      # a set of steps inside the required `test` legs until the manifest split it out, so without this
+      # line the harness tier would stop gating merges the moment it stopped being part of `test`. It IS
+      # path-gated (unlike webconsole), so it skips on most PRs -- and a skipped need is not a failure
+      # to the `contains(needs.*.result, ...)` check below, which is the behaviour wanted.
+      - tooling
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any gated leg failed or was cancelled

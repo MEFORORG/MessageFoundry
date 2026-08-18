@@ -26,9 +26,18 @@ unreachable.
 
 The coordination banner (`scripts/worktree/session-context.ps1`) is a *different* hook that shares the
 `SessionStart` event and is deliberately still absent. **Install one tier at a time with
-`-Only <event> -Script mail-drain`**: `-Only SessionStart` alone would wire the banner too. The urgent
-tier ([`scripts/hooks/mail-watch.ps1`](../scripts/hooks/mail-watch.ps1)) is armed in code and
-registered nowhere, by decision.
+`-Only <event> -Script mail-drain`**: `-Only SessionStart` alone would wire the banner too.
+
+The urgent tier ([`scripts/hooks/mail-watch.ps1`](../scripts/hooks/mail-watch.ps1)) **is registered on
+`Stop`, on all five roots** -- re-measured 2026-08-17 by two independent instruments that agree:
+`install-coordination.ps1 -Status` reports it INSTALLED in every root, and a direct read of each
+`settings.json` finds the `mefor-wake` shim resolving `scripts/hooks/mail-watch.ps1`. This line
+previously read "armed in code and registered nowhere, by decision", which was true when written on
+2026-08-06 and is not true now. It is recorded rather than silently overwritten because the direction
+of the drift is the instructive part: **a doc that understates what is armed is the safer of the two
+errors and therefore the one nobody goes looking for.** Its opposite -- a doc asserting a control is
+live when it is wired nowhere -- is live today for the coordination banner, in
+[`SESSION-DRIFT-CONTROLS.md`](SESSION-DRIFT-CONTROLS.md) and [`WORKTREES.md`](WORKTREES.md).
 
 **VERIFIED END TO END, through the installed hook command rather than a convenient stand-in.** The
 earlier VS Code run drove the drain by absolute path, which does not exercise the thing that actually
@@ -540,6 +549,28 @@ read the queue with `ls` when it misbehaves. The only hashing is for box-key inj
 
 The flip side of that location is stated above and is the reason the content rule exists: what git
 cannot commit, the leak gate cannot scan.
+
+**A session outside a repo can be delivered to, but nothing shipped wires it.** The drain resolves the
+queue from the session's cwd, so a session rooted at a worktree CONTAINER -- a plain directory holding
+several clones -- has no common dir and cannot be reached at all. `mail-drain.ps1 -AnchorRepo <path>`
+answers only WHERE THE QUEUE LIVES; the box key stays a function of the session's own cwd, so an
+anchored session reads its own box and never the anchor repo's primary checkout's.
+
+Three things about it are load-bearing and easy to get wrong:
+
+- **No shipped caller passes it.** The shim `install-coordination.ps1` writes is gated on the same git
+  probe and invokes the drain with no arguments, so outside a repo the drain is never *started* rather
+  than standing down inside itself. The anchor is for a caller the OPERATOR wires. Do not read the
+  parameter's existence as the container gap being closed.
+- **One anchor names one queue.** A container spans many clones, so mail sent from any other clone is
+  queued into a queue the anchored drain never reads -- successfully, and reported as queued.
+- **The fallback is narrowed, not airtight.** A failed git probe is a weaker fact than "not a repo": a
+  stray `GIT_DIR`, a dubious-ownership refusal or a MAX_PATH checkout all fail it inside a real
+  worktree. The drain additionally requires an absolute anchor, an existing cwd, and a working git
+  before honouring one. A residual failure sends a real worktree's drain at the anchor's queue, where
+  its box is empty, so its mail goes unread rather than misdelivered.
+
+The urgent tier (`mail-watch.ps1`) takes no anchor, so a container session stays blind to it.
 
 **Atomicity comes from a unique name.** Every message is written to a unique name under `tmp/` and then
 moved into place. A move onto a name that does not exist is atomic on NTFS, so minting a unique id

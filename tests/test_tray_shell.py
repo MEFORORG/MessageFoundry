@@ -8,6 +8,7 @@ logic and prove the Windows modules import + construct their structs cleanly.
 
 from __future__ import annotations
 
+import os
 import sys
 
 import pytest
@@ -95,8 +96,15 @@ def test_tray_windows_modules_import_and_build_structs() -> None:
 def test_single_instance_second_acquire_detects_running() -> None:
     from messagefoundry.tray.instance import SingleInstance
 
-    first = SingleInstance("Local\\MessageFoundryTrayTest")
-    second = SingleInstance("Local\\MessageFoundryTrayTest")
+    # SLOT-SCOPED, because a named mutex is global to the Windows SESSION, not to this process. A
+    # fixed name means any second pytest running concurrently -- an xdist sibling worker, or simply a
+    # developer's run overlapping a CI-like run on the same box -- holds the mutex this test asserts
+    # it can take, and the `is False` below then passes for the wrong reason while `is True` fails.
+    # MEFOR_TEST_SLOT is unique per process under xdist (see tests/conftest.py) and falls back to the
+    # serial default, so this is the same name as before on a single serial run.
+    name = f"Local\\MessageFoundryTrayTest-{os.environ.get('MEFOR_TEST_SLOT', '0')}"
+    first = SingleInstance(name)
+    second = SingleInstance(name)
     try:
         assert first.acquire() is True
         assert second.acquire() is False  # first holds it
