@@ -695,48 +695,47 @@ def test_a_session_reusing_a_phantoms_id_cannot_consume_mail_it_never_saw(
     assert len(box_files(repo, key, "seen")) == 1
 
 
-# A CONFIGURATION ASYMMETRY, FIXED ON ITS OWN MERITS. Whether it also explains the 2026-08-18
-# worker crash is UNRESOLVED, and this comment states the evidence rather than a verdict -- see the
-# last paragraph for why it is written that way.
+# A CONFIGURATION ASYMMETRY, FIXED ON ITS OWN MERITS -- AND NOT THE FIX FOR THE 2026-08-18 WORKER
+# CRASH, which was settled that night as a NATIVE worker death with no cap involved.
 #
-# THE ASYMMETRY IS SOLID, verified independently by four seats. The sibling race tests at :594,
-# :615 and :647 each carry timeout(300); this one, directly below that block, runs ten times their
-# work -- VERDICT_ROUNDS=600, about 9600 pwsh spawns against their ~960 -- and carried no marker, so
-# it inherited the leg default of 120s on Windows (ci.yml:58). The cheap tests had 300 seconds and
-# the expensive one 120, on the slowest leg in the fleet. That is worth correcting on its own.
+# THE ASYMMETRY, verified independently by four seats. The sibling race tests at :594, :615 and
+# :647 each carry timeout(300); this one runs ten times their work -- VERDICT_ROUNDS=600, about
+# 9600 pwsh spawns against their ~960 -- and carried no marker, so it inherited the leg default of
+# 120s on Windows (ci.yml:58). The cheap tests had 300 seconds and the expensive one 120, on the
+# slowest leg in the fleet. Worth correcting whether or not it has ever bitten. It has not.
 #
-# WHETHER THE CAP FIRED ON 2026-08-18 CANNOT BE DECIDED FROM THAT RUN'S LOG, and two tempting
-# arguments in each direction are both invalid:
+# WHY NO CAP FIRED ON 2026-08-18, and the argument is a MECHANISM rather than an interval, which is
+# what makes it hold where two earlier readings did not:
 #
-#   "345 seconds elapsed against a 120s cap, so no cap fired" -- INVALID. 345s is PYTEST-START to
-#   worker death. The cap is PER-TEST, and the leg runs `--dist loadfile` (ci.yml:751), so gw3 ran
-#   other files first and this test began at an unknown later time. The interval is the wrong one.
+#   pytest-timeout runs IN-PROCESS and REPORTS BEFORE IT KILLS. `--timeout-method=thread` (set in
+#   pyproject addopts, and the only method available on Windows) dumps ALL thread stacks at the cap,
+#   naming the stuck frame. Verified locally: an unmarked test under `--timeout=1` prints a
+#   `+++ Timeout +++` banner followed by `Stack of Thread-N` for every thread.
 #
-#   "no Timeout report appeared, so no cap fired" -- INVALID, and circular: under xdist the worker
-#   dies before it can report, which is what the cap hypothesis PREDICTS. The absence is evidence
-#   FOR the hypothesis being untestable this way, never against it.
+#   The faulthandler belt (`-o faulthandler_timeout=`) only DUMPS and never kills at all (ci.yml:379).
 #
-#   And nothing confirms it either: the leg passes no `--durations`, so the log carries no per-test
-#   timing and the test's start cannot be pinned. `node down: Not properly terminated` names no cause.
+#   The failing log carried ZERO of either -- no faulthandler output, no `Stack of`, no `+++`,
+#   across 531 readable lines. Both belts print in-process, so their SILENCE is the signature of a
+#   death that took the process out from under them: a native crash, not a cap.
 #
-# SO: TRY THE MARKER, CLOSE NOTHING ON IT. A pass afterwards is equally consistent with the cap
-# having fired and with runner load easing -- and a green re-run under a quiet queue discriminates
-# neither, so whatever else was in flight has to be recorded for a result to mean anything. The
-# native worker death is tracked as BACKLOG #1260 (a native crash reporting as a test failure),
-# where a retry wrapper was already DECLINED as laundering.
+# THAT LOG SETTLES THE CAP QUESTION AND SETTLES NOTHING ELSE. `node down: Not properly terminated`
+# still names no cause, and nobody has pulled the worker's own output -- which is where the cause
+# lives. The native worker death is BACKLOG #1260 (a native crash reporting as a test failure),
+# third recorded instance, where a retry wrapper was already DECLINED as laundering.
 #
-# NOTHING HERE IS EVIDENCE ABOUT THE CLAIM PRIMITIVE. No assertion in this test evaluated on that
-# run, so it says nothing about phantom wins or double delivery in either direction.
+# NOTHING IN THAT RUN IS EVIDENCE ABOUT THE CLAIM PRIMITIVE. No assertion in this test evaluated, so
+# it says nothing about phantom wins or double delivery in either direction.
 #
-# IF THE CAP EVER IS SHOWN TO BITE, THE NEXT LEVER IS VERDICT_ROUNDS, NOT A BIGGER NUMBER HERE. 600
-# rounds was chosen to resolve a 5.75% false-win rate, so cutting it costs resolution and is a real
-# trade; a timeout that keeps growing is a gate tuned to pass rather than sized against its work.
+# IF THE CAP EVER DOES BITE, THE NEXT LEVER IS VERDICT_ROUNDS, NOT A BIGGER NUMBER HERE. 600 rounds
+# was chosen to resolve a 5.75% false-win rate, so cutting it costs resolution and is a real trade;
+# a timeout that keeps growing is a gate tuned to pass rather than sized against its work.
 #
-# WHY THIS COMMENT RECORDS EVIDENCE INSTEAD OF A CONCLUSION. Its first two versions each asserted
-# the then-current verdict -- "the cap explains it", then "no cap fired" -- and each was overturned
-# within the hour by an argument neither had considered. A comment that states what is KNOWN and
-# what CANNOT be decided from the available log does not need rewriting every time the reading
-# swings, and the swinging is what a reader six months from now most needs to see.
+# THIS COMMENT WAS WRONG THREE TIMES BEFORE IT WAS RIGHT, and the sequence is kept because the
+# failure mode repeats: "the cap explains it", then "no cap fired, 345s beats 120s" (the wrong
+# interval -- that is pytest-start to death, and `--dist loadfile` means this test began later),
+# then "unresolvable from this log" (overstated -- the belts' silence does resolve it). Each
+# version read as confident. What finally decided it was a mechanism someone could check, not a
+# number someone could quote.
 @pytest.mark.timeout(300)
 def test_the_claim_verdict_agrees_with_the_filesystem(tmp_path: Path) -> None:
     """DEFECT 4, the verdict half -- and the half that was nearly shipped broken.
