@@ -73,11 +73,8 @@ $ErrorActionPreference = "Stop"
 # DELETES one. Two copies of a safety check drift, and the copy that drifts is the one nobody tests.
 . "$PSScriptRoot\occupancy.ps1"
 
-function Get-LoginLabel([string]$RootPath) {
-    $leaf = Split-Path $RootPath -Leaf
-    if ($leaf -ieq ".claude") { return "default" }
-    return ($leaf -replace '^\.claude-account-', 'acct-') -replace '^\.claude-?', ''
-}
+# Get-LoginLabel now lives in session-registry.ps1, reached through the occupancy.ps1 dot-source above.
+# It moved because the announce hook needs the same mapping and a second copy would drift.
 
 # The surface a session was launched from. This is the field that makes VS Code sessions visible at all,
 # so it is reported verbatim when it is something we do not recognise rather than folded into "other".
