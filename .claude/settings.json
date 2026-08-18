@@ -43,7 +43,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "pwsh -NoProfile -NonInteractive -File \"$CLAUDE_PROJECT_DIR/scripts/hooks/seat-declare-prompt.ps1\"",
+            "command": "pwsh",
+            "args": [
+              "-NoProfile",
+              "-NonInteractive",
+              "-File",
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/seat-declare-prompt.ps1"
+            ],
             "statusMessage": "Asking this seat to declare its goal"
           }
         ]
