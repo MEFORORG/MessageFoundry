@@ -1550,7 +1550,11 @@ jobs:
       - name: Install Microsoft ODBC Driver 18 + sqlcmd
         # THIS IS THE DANGEROUS HALF OF THE apt CLASS, and it is the opposite of the one that was
         # visibly hurting. The Qt sites sit in jobs carrying a job-level `timeout-minutes`, so a
-        # mirror hang there dies at the job cap (20-40 min, measured). THIS JOB HAS NO JOB-LEVEL
+        # mirror hang there dies at the job cap -- 20 to 43 minutes IN THIS REPOSITORY, resolved from
+        # the matrix literals at the `changes` job (ubuntu job_timeout 43, webconsole 20) plus tooling
+        # 40 and quality-advisory 20/30. The windows leg's 66 does NOT apply: the Qt step is Linux-only.
+        # A CAP FIGURE BELONGS TO ONE REPOSITORY -- the vault's equivalent jobs are capped far tighter,
+        # so quoting these numbers there would assume headroom that does not exist. THIS JOB HAS NO JOB-LEVEL
         # TIMEOUT, so the same hang runs to GitHub's 360-minute default -- a whole runner-hour
         # budget burned on a stalled mirror, on a leg nobody is watching because it is path-gated.
         #
@@ -2151,7 +2155,11 @@ jobs:
       - name: Install Microsoft ODBC Driver 18 + sqlcmd
         # THIS IS THE DANGEROUS HALF OF THE apt CLASS, and it is the opposite of the one that was
         # visibly hurting. The Qt sites sit in jobs carrying a job-level `timeout-minutes`, so a
-        # mirror hang there dies at the job cap (20-40 min, measured). THIS JOB HAS NO JOB-LEVEL
+        # mirror hang there dies at the job cap -- 20 to 43 minutes IN THIS REPOSITORY, resolved from
+        # the matrix literals at the `changes` job (ubuntu job_timeout 43, webconsole 20) plus tooling
+        # 40 and quality-advisory 20/30. The windows leg's 66 does NOT apply: the Qt step is Linux-only.
+        # A CAP FIGURE BELONGS TO ONE REPOSITORY -- the vault's equivalent jobs are capped far tighter,
+        # so quoting these numbers there would assume headroom that does not exist. THIS JOB HAS NO JOB-LEVEL
         # TIMEOUT, so the same hang runs to GitHub's 360-minute default -- a whole runner-hour
         # budget burned on a stalled mirror, on a leg nobody is watching because it is path-gated.
         #
