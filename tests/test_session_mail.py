@@ -717,12 +717,19 @@ def test_a_session_reusing_a_phantoms_id_cannot_consume_mail_it_never_saw(
 # CRASH produce the SAME controller-side signature, and the banner is written to the dying worker's
 # own terminal rather than through the channel that feeds the controller's log.
 #
-#   NOT ESTABLISHED BY ME: whether xdist relays a worker's terminal output before an os._exit. I read
-#   the exit path, not execnet's relay. That gap is the whole point -- it is unknown, not disproven.
+#   MEASURED, not inferred -- two arms, one deliberate 3s cap against a 30s sleep, reproduced
+#   independently by two seats:
+#
+#     no xdist   dump lines 4   crash lines 0   tail: `+++ Timeout +++`
+#     -n 2       dump lines 0   crash lines 1   tail: `worker 'gw0' crashed`
+#
+#   Both arms provably ran (zero `unrecognized arguments` in either). SO THE DUMP DOES NOT SURVIVE
+#   THE RELAY: under xdist a fired cap manufactures EXACTLY the CI signature -- a crashed worker and
+#   no banner.
 #
 # SO THE ABSENCE OF A TIMEOUT BANNER IS NOT EVIDENCE THAT NO CAP FIRED. An earlier version of this
 # comment said exactly that, and it was wrong for a reason no one could see without opening the
-# plugin: silence is what BOTH hypotheses predict.
+# plugin -- and now demonstrable in six seconds: silence is what BOTH hypotheses predict.
 #
 # THE ONLY FIX THAT ENDS THIS IS INSTRUMENTATION, NOT A GUESS AT THE CAUSE: pass `--durations` on
 # that leg, or run this test off xdist, so the cap's firing becomes OBSERVABLE rather than inferred.
