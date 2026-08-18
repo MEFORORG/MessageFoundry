@@ -82,9 +82,8 @@ def _add_worktree(primary: Path, path: Path, branch: str) -> None:
     _git(primary, "worktree", "add", "-q", "-b", branch, str(path))
 
 
-def _backdate(primary: Path, worktree: Path, hours: float) -> None:
-    """Age a worktree's PRIVATE git metadata so the activity veto releases it."""
-    gitdir = Path(
+def _gitdir(worktree: Path) -> Path:
+    return Path(
         subprocess.run(
             ["git", "-C", str(worktree), "rev-parse", "--absolute-git-dir"],
             check=True,
@@ -92,11 +91,45 @@ def _backdate(primary: Path, worktree: Path, hours: float) -> None:
             text=True,
         ).stdout.strip()
     )
+
+
+def _age_reflog(gitdir: Path, when: float) -> None:
+    """Rewrite every ``logs/HEAD`` entry's epoch, which is what actually ages a reflog now.
+
+    Signal 2 reads the reflog by CONTENT, not by mtime, because a ``git gc`` rewrites the file in
+    place and used to move all of them to one identical mtime. So a fixture that only calls
+    ``os.utime`` on ``logs/HEAD`` is no longer aging anything the script looks at -- it would be
+    setting a field that is read only as a fallback.
+    """
+    log = gitdir / "logs" / "HEAD"
+    if not log.exists():
+        return
+    lines = log.read_text(encoding="utf-8").splitlines()
+    out = []
+    for line in lines:
+        head, tab, msg = line.partition("\t")
+        # "<old> <new> <name> <<email>> <epoch> <tz>" -- replace the epoch, keep the offset.
+        head = re.sub(r"\d{9,11}(?=\s+[+-]\d{4}\s*$)", str(int(when)), head)
+        out.append(head + tab + msg)
+    log.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+    # Put the mtime back where the caller asked for it. Writing the file moved it to NOW -- which is
+    # the gc's own signature -- so without this the fixture ages the CONTENT while leaving the
+    # timestamp fresh, and `_backdate` silently stops setting the field it appears to set. That is
+    # harmless only while the script reads content, and becomes a fixture that lies the moment anyone
+    # reads the mtime again. Found by mutating the script: the CONTROL line failed instead of the
+    # assertion under test, which is the tell.
+    os.utime(log, (when, when))
+
+
+def _backdate(primary: Path, worktree: Path, hours: float) -> None:
+    """Age a worktree's PRIVATE git metadata so the activity veto releases it."""
+    gitdir = _gitdir(worktree)
     when = time.time() - hours * 3600
     for rel in (*_GITDIR_FILES, "logs/HEAD"):
         f = gitdir / rel
         if f.exists():
             os.utime(f, (when, when))
+    _age_reflog(gitdir, when)
 
 
 class Fixture:
@@ -258,8 +291,11 @@ def _clone(template: Path, dest: Path) -> Fixture:
     name the template, so it reports the paths we are trying to correct.
 
     Mtimes are preserved (``copytree`` uses ``copy2``), which is load-bearing -- the activity veto
-    reads the newest mtime of the private git metadata, and ``_backdate`` moves it. The template ages
-    by at most the file's own runtime, minutes against a 36h window, and no test asserts an exact age.
+    reads the newest mtime of the private git metadata, and ``_backdate`` moves it. The reflog is
+    carried by CONTENT for the same reason: since 2026-08-18 the veto reads ``logs/HEAD``'s last
+    ENTRY rather than its mtime, so a copy that preserved only the timestamp would age nothing the
+    script actually looks at. The template ages by at most the file's own runtime, minutes against a
+    36h window, and no test asserts an exact age.
     """
     shutil.copytree(template, dest, symlinks=True, dirs_exist_ok=True)
     fx = Fixture(dest)
@@ -1826,3 +1862,115 @@ def test_an_empty_registry_reports_SCANNED(fx: Fixture, sleeper: int) -> None:
 
     assert res["claims"]["scanned"] is True
     assert res["claims"]["unreadable"] == []
+
+
+# --------------------------------------------------------------------------------------------------
+# Signal 2 reads the reflog by CONTENT, not by mtime
+#
+# MEASURED 2026-08-18 on the real repository: a `git gc` rewrote every reflog in place and left 48 of
+# 50 worktree `logs/HEAD` files carrying the IDENTICAL mtime, to the second, while their contents were
+# days older. Signal 2 took the newest mtime, so one gc made the entire repository read "recently
+# active" for the next 36 hours -- 11 of 14 candidates were vetoed on that basis alone and the tool
+# removed nothing.
+#
+# The pair that matters is the first two tests below. Reading the entry instead of the mtime is only
+# correct if it still SEES a real session, so the gc test is worthless without the one directly after
+# it, which proves the signal was narrowed rather than deleted.
+# --------------------------------------------------------------------------------------------------
+
+
+def _reflog(worktree: Path) -> Path:
+    return _gitdir(worktree) / "logs" / "HEAD"
+
+
+def _set_mtime(path: Path, when: float) -> None:
+    os.utime(path, (when, when))
+
+
+def test_a_gc_touching_every_reflog_does_not_veto(fx: Fixture, sleeper: int) -> None:
+    """The bug, reproduced: a write that appends NOTHING must not read as activity."""
+    live_record(fx, sleeper, fx.primary)
+    _backdate(fx.primary, fx.sibling("gone"), hours=100)
+    _backdate(fx.primary, fx.sibling("clean"), hours=100)
+    assert by_leaf(run(fx), "clean")["Decision"] == "PRUNE", "control: released before the gc"
+
+    # Exactly what `git gc` does to a reflog it expires: same bytes, new mtime.
+    before = _reflog(fx.sibling("clean")).read_bytes()
+    _set_mtime(_reflog(fx.sibling("clean")), time.time())
+    assert _reflog(fx.sibling("clean")).read_bytes() == before, "the fixture must change no content"
+
+    res = run(fx)
+    assert by_leaf(res, "clean")["Decision"] == "PRUNE", by_leaf(res, "clean")["Reason"]
+    assert by_leaf(res, "gone")["Decision"] == "PRUNE", "anti-vacuity: the pass still prunes"
+
+
+def test_a_fresh_reflog_entry_vetoes_even_when_every_mtime_is_old(
+    fx: Fixture, sleeper: int
+) -> None:
+    """The other direction, and the one that stops the fix from being a deletion of signal 2.
+
+    A session that ran a real git command appended an entry stamped now. Here every mtime says the
+    worktree is 100 hours idle and ONLY the reflog's content says otherwise -- so a script that had
+    simply stopped reading `logs/HEAD` would prune a worktree somebody is working in, and pass the
+    gc test above while doing it.
+    """
+    live_record(fx, sleeper, fx.primary)
+    _backdate(fx.primary, fx.sibling("gone"), hours=100)
+    _backdate(fx.primary, fx.sibling("clean"), hours=100)
+    assert by_leaf(run(fx), "clean")["Decision"] == "PRUNE", "control: released before the entry"
+
+    log = _reflog(fx.sibling("clean"))
+    _age_reflog(_gitdir(fx.sibling("clean")), time.time())  # the entry says: used just now
+    _set_mtime(log, time.time() - 100 * 3600)  # ...while every timestamp still says old
+
+    res = run(fx)
+    d = by_leaf(res, "clean")
+    assert d["Decision"] == "SKIP"
+    assert d["Reason"].startswith("recently active")
+    assert by_leaf(res, "gone")["Decision"] == "PRUNE", "anti-vacuity: the pass still prunes"
+
+
+def test_an_unparseable_reflog_falls_back_to_the_mtime_and_keeps_vetoing(
+    fx: Fixture, sleeper: int
+) -> None:
+    """A shape this does not recognise is a reason to keep vetoing, never a reason to stop.
+
+    A parse failure that returned "no signal" would make an unreadable reflog the QUIETEST possible
+    state -- the one input that removes a worktree instead of protecting it.
+    """
+    live_record(fx, sleeper, fx.primary)
+    _backdate(fx.primary, fx.sibling("gone"), hours=100)
+    _backdate(fx.primary, fx.sibling("clean"), hours=100)
+    assert by_leaf(run(fx), "clean")["Decision"] == "PRUNE", "control: released before the damage"
+
+    log = _reflog(fx.sibling("clean"))
+    log.write_text("this line is not a reflog entry\n", encoding="utf-8")
+    _set_mtime(log, time.time())
+
+    res = run(fx)
+    d = by_leaf(res, "clean")
+    assert d["Decision"] == "SKIP"
+    assert d["Reason"].startswith("recently active")
+    assert by_leaf(res, "gone")["Decision"] == "PRUNE", "anti-vacuity: the pass still prunes"
+
+
+def test_an_empty_reflog_contributes_nothing_rather_than_its_mtime(
+    fx: Fixture, sleeper: int
+) -> None:
+    """Every entry expired: the reflog holds no evidence either way, and the six mtimes still speak.
+
+    Reading its mtime here would reinstate the bug on the OLDEST worktrees in the repository -- the
+    ones whose entries a gc has already expired, which are exactly the ones most likely to be
+    prunable.
+    """
+    live_record(fx, sleeper, fx.primary)
+    _backdate(fx.primary, fx.sibling("gone"), hours=100)
+    _backdate(fx.primary, fx.sibling("clean"), hours=100)
+
+    log = _reflog(fx.sibling("clean"))
+    log.write_text("", encoding="utf-8")
+    _set_mtime(log, time.time())
+
+    res = run(fx)
+    assert by_leaf(res, "clean")["Decision"] == "PRUNE", by_leaf(res, "clean")["Reason"]
+    assert by_leaf(res, "gone")["Decision"] == "PRUNE", "anti-vacuity: the pass still prunes"
