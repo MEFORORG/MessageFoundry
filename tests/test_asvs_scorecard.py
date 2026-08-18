@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, get_args
 
@@ -35,10 +36,12 @@ from scripts.asvs.scorecard import (
     Findings,
     ScorecardError,
     Verdict,
+    _base_line,
     _copy_scratch,
     _humanise_age,
     _signature,
     anchor_form,
+    base_spread,
     check_absences,
     check_anchors,
     check_completeness,
@@ -3178,3 +3181,153 @@ def test_the_denominator_is_located_anchors_not_checked_anchors(
     assert rc == 1  # the GONE anchor is fatal, as it should be
     # Two anchors CHECKED, one LOCATED. The ratio is over the one that could have drifted.
     assert "1 of 1 LOCATED anchors" in err
+
+
+# ---------------------------------------------------------------------------------------------
+# The rendered entry point: written even when anchors are red, and honest about how many trees the
+# record's verdicts were actually decided against.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_the_render_is_written_even_when_anchors_are_red(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--render` used to be gated on `findings.ok`, coupling two unrelated things.
+
+    The render is derived from CELLS -- verdicts, levels, dates. `problems` is overwhelmingly about
+    ANCHORS: a token that moved, went ambiguous, or vanished. An anchor problem changes no number in
+    the rendered table, yet it made the only sanctioned command refuse to write it. So anchor red
+    became render red, render red became a stale committed entry point, and that is what reddened the
+    scheduled arm for eight consecutive days through 2026-08-18 -- the fix for a drifted render was to
+    run the render, and the drift was blocking it.
+
+    Falsified by restoring `and findings.ok`: the file is not written and this goes RED.
+    """
+    sc, corpus, engine = _sibling_fixture(
+        tmp_path,
+        "SIZE = 64\n",
+        '  [[cell.evidence]]\n  path = "messagefoundry/m.py"\n  line = 1\n'
+        '  expect = "THIS TOKEN IS NOT IN THE FILE"\n',
+    )
+    out = tmp_path / "CURRENT.md"
+    rc = main(
+        [
+            "--scorecard",
+            str(sc),
+            "--corpus",
+            str(corpus),
+            "--root",
+            str(engine),
+            "--render",
+            str(out),
+        ]
+    )
+    # The exit code is UNCHANGED -- this makes the artifact current, it does not make a failing run
+    # look clean.
+    assert rc == 1
+    assert out.is_file(), "the render must be written even though the anchor is GONE"
+    assert "| **Total** |" in out.read_text(encoding="utf-8")
+
+
+def test_the_base_line_reports_the_spread_not_one_commit(tmp_path: Path) -> None:
+    """The header led with `**Anchor commit:** <sha>` in bold, which reads as THE base of the record.
+
+    Measured 2026-08-18 against the live record: 345 cells carry 24 distinct `verified_at` SHAs,
+    spanning 1 to 501 commits behind the checked tree, and exactly 2 of 345 sit at `anchor_commit`.
+    The bolded ref described 0.6% of the record, and a reader dating the record by it is wrong in both
+    directions at once.
+
+    Falsified by restoring the single-commit line: the spread assertions go RED.
+    """
+    cells = [
+        Cell(id="1.1.1", level=1, verdict="pass", last_verified="2026-08-01", verified_at="a" * 40),
+        Cell(id="1.1.2", level=1, verdict="pass", last_verified="2026-08-02", verified_at="b" * 40),
+        Cell(id="2.1.1", level=1, verdict="pass", last_verified="2026-08-03", verified_at="a" * 40),
+    ]
+    spread = base_spread(cells, "a" * 40)
+    assert spread.refs == 2  # two DISTINCT trees, not three cells
+    assert spread.with_ref == 3 and spread.without_ref == 0
+    assert spread.at_anchor == 2
+    line = _base_line("a" * 40, spread)
+    assert "2 distinct engine tree(s) across 3 of 3 cell(s)" in line
+    assert "where 2 of 3 cell(s) sit" in line
+    # The anchor is DEMOTED, not deleted -- it is still a real fact about the evidence.
+    assert "evidence last re-anchored at" in line
+
+    # AND THE WIRING, which the assertions above do not touch. Calling `_base_line` directly proves
+    # the helper works and proves NOTHING about whether `render_current` uses it: the first version of
+    # this test passed with the old single-commit line still hard-coded at the call site, because the
+    # mutation lived somewhere the test never executed. A guard that cannot see the line it guards is
+    # the "green that never ran" this file exists to refuse.
+    doc = render_current(cells, anchor_sha="a" * 40, spread=spread)
+    assert "**Verdict bases:**" in doc
+    assert "**Anchor commit:**" not in doc
+
+
+def test_an_unmeasured_distance_says_so_and_is_never_rendered_as_zero(tmp_path: Path) -> None:
+    """An absent distance and a distance of ZERO are different claims.
+
+    Silently omitting the span would restore exactly the one-number impression this line exists to
+    remove -- the reader would take the remaining figures as complete.
+
+    Falsified by dropping the `else` branch in `_base_line`: NOT MEASURED disappears and the line
+    renders as though distance were simply not relevant.
+    """
+    cells = [
+        Cell(id="1.1.1", level=1, verdict="pass", last_verified="2026-08-01", verified_at="a" * 40)
+    ]
+    spread = base_spread(cells, "a" * 40)
+    assert spread.behind == {}  # base_spread is pure: it never measures distance
+    assert "NOT MEASURED" in _base_line("a" * 40, spread)
+    # And when it IS measured, the span renders as a range.
+    measured = replace(spread, behind={"a" * 40: 7})
+    assert "spanning 7 commit(s) behind" in _base_line("a" * 40, measured)
+
+
+def test_at_anchor_compares_on_the_prefix_because_the_two_fields_have_different_widths(
+    tmp_path: Path,
+) -> None:
+    """`verified_at` is normalised to 40 characters by the vault's `asvs-verified-at.py`;
+    `anchor_commit` is written short. A raw string comparison reports 0 at-anchor cells FOREVER.
+
+    That is the worst possible failure for this figure, because 0 is exactly the number it exists to
+    make surprising -- it would read as a finding rather than as a units error.
+
+    Falsified by comparing `c.verified_at == anchor_sha`: `at_anchor` goes to 0 and this goes RED.
+    """
+    full = "c" * 40
+    cells = [
+        Cell(id="1.1.1", level=1, verdict="pass", last_verified="2026-08-01", verified_at=full)
+    ]
+    assert base_spread(cells, full[:8]).at_anchor == 1  # short anchor, full verified_at
+    assert base_spread(cells, full).at_anchor == 1  # both full
+    assert base_spread(cells, "d" * 8).at_anchor == 0  # genuinely different commit
+
+
+def test_cells_with_no_recorded_base_are_counted_and_named(tmp_path: Path) -> None:
+    """A cell carrying no `verified_at` has no recorded base at all, which is a DIFFERENT gap from a
+    stale one and must not be folded into the distinct-tree count.
+
+    Falsified by counting `total` instead of `with_ref` in the denominator: the line then claims every
+    cell has a base.
+    """
+    cells = [
+        Cell(id="1.1.1", level=1, verdict="pass", last_verified="2026-08-01", verified_at="a" * 40),
+        Cell(id="1.1.2", level=1, verdict="pass", last_verified="2026-08-02"),
+    ]
+    spread = base_spread(cells, "a" * 40)
+    assert spread.with_ref == 1 and spread.without_ref == 1 and spread.refs == 1
+    line = _base_line("a" * 40, spread)
+    assert "1 distinct engine tree(s) across 1 of 2 cell(s)" in line
+    assert "1 cell(s) record no base at all" in line
+
+
+def test_render_without_a_spread_still_renders_the_old_single_commit_form(tmp_path: Path) -> None:
+    """A caller holding only the cells -- every existing unit test, and any future one -- must still
+    get a true line rather than a crash or an empty header.
+
+    Falsified by making `spread` a required argument: every render test in this file goes RED.
+    """
+    cells = [Cell(id="1.1.1", level=1, verdict="pass", last_verified="2026-08-01")]
+    doc = render_current(cells, anchor_sha="deadbeef")
+    assert "**Anchor commit:** `deadbeef`" in doc
