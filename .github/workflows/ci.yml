@@ -1062,8 +1062,18 @@ jobs:
           #
           # 90 is BELOW the unchanged 120 cap on purpose: faulthandler only ever DUMPS, never kills,
           # so the worst case is a stack dump on a slow-but-passing test, while the best case is the
-          # only configuration measured to yield a readable dump under xdist. Re-derive it from the
-          # --durations output below rather than inheriting this number.
+          # only configuration measured to yield a readable dump under xdist.
+          #
+          # USE --durations TO CONFIRM THE BACKSTOP HAS CLEARANCE, NEVER TO SIZE IT TIGHTLY. This
+          # job's own cap rationale (find it by text -- "DEADLOCK BACKSTOPS, not tightness gates";
+          # line numbers here drift every time this file is edited) says sizing a cap close to the
+          # observed run "buys no detection and costs red builds on green suites, and a gate that
+          # cries wolf gets deleted". It argues that for the JOB and STEP caps and is SILENT on the
+          # per-test one -- `per-test` appears zero times in that block -- so extending it here is a
+          # reader's inference rather than the file's instruction. Stated because the obvious reading
+          # of a new --durations line is "now tighten to what it measures", and that is the opposite
+          # of what the surrounding doctrine wants: if ubuntu turns out to take 20s, that is an
+          # argument for LEAVING 120 alone.
         # --durations is the point of this change as much as the belt is: this leg has never emitted
         # per-test timing, so nobody can say what its tests cost, and `belt` above had to be set by
         # parity rather than measurement. With it, the next person picks a number instead of matching
