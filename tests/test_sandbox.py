@@ -996,12 +996,24 @@ def test_worker_kill_reaps_the_whole_process_tree(tmp_path: Path) -> None:
         )
         # SECONDARY: the process half, asserted directly -- POLLED, not sampled once.
         #
-        # THE ONE-SHOT FORM WAS A RACE AGAINST AN EVENTUALLY-CONSISTENT CONDITION. The primary
-        # above accepts pipe EOF, which arrives the instant the last holder of fd 1 releases it --
-        # i.e. DURING the grandchild's teardown. On Windows `_pid_alive` answers through
-        # `GetExitCodeProcess`, which keeps reporting STILL_ACTIVE until the process object is
-        # signalled, so there is a real window in which the pipe has EOF'd and the pid still reads
-        # alive. Checking once inside that window fails a test whose subject is fine.
+        # THE ONE-SHOT FORM WAS A RACE AGAINST AN EVENTUALLY-CONSISTENT CONDITION, and the window
+        # exists on BOTH platforms by DIFFERENT mechanisms -- which matters, because the observed
+        # CI failures were on ubuntu and the first version of this comment explained only Windows.
+        #
+        # The primary above accepts pipe EOF, which arrives the instant the last holder of fd 1
+        # releases it -- i.e. DURING the grandchild's teardown. Then:
+        #
+        #   POSIX (where the failures actually happened): `_pid_alive` is `os.kill(pid, 0)` at
+        #   :925-931, False ONLY on ProcessLookupError. SIGKILL closes the fds at once, so the pipe
+        #   EOFs and the primary passes -- but the pid lingers as a ZOMBIE until it is re-parented
+        #   and reaped, and a zombie is still visible to `os.kill(pid, 0)`. Reaping waits on the
+        #   subreaper being SCHEDULED, which is exactly what degrades on a loaded runner.
+        #
+        #   Windows: `_pid_alive` answers through `GetExitCodeProcess`, which keeps reporting
+        #   STILL_ACTIVE until the process object is signalled.
+        #
+        # Either way there is a real window in which the pipe has EOF'd and the pid still reads
+        # alive, and checking once inside it fails a test whose subject is fine.
         #
         # THE PRIMARY WAS ALREADY BOUNDED (8s) AND THIS WAS NOT -- the same assertion pair, one
         # tolerant of scheduling and one not. On a loaded 4-CPU runner the window widens and only
