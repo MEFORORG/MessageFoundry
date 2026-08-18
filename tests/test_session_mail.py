@@ -695,47 +695,53 @@ def test_a_session_reusing_a_phantoms_id_cannot_consume_mail_it_never_saw(
     assert len(box_files(repo, key, "seen")) == 1
 
 
-# A CONFIGURATION ASYMMETRY, FIXED ON ITS OWN MERITS -- AND NOT THE FIX FOR THE 2026-08-18 WORKER
-# CRASH, which was settled that night as a NATIVE worker death with no cap involved.
+# A CONFIGURATION ASYMMETRY, FIXED ON ITS OWN MERITS. Whether it would also have prevented the
+# 2026-08-18 worker crash is UNDETERMINABLE FROM THAT RUN'S LOG -- for a mechanical reason, read out
+# of the installed pytest_timeout source, that no amount of re-reading the log can get past.
 #
-# THE ASYMMETRY, verified independently by four seats. The sibling race tests at :594, :615 and
-# :647 each carry timeout(300); this one runs ten times their work -- VERDICT_ROUNDS=600, about
-# 9600 pwsh spawns against their ~960 -- and carried no marker, so it inherited the leg default of
-# 120s on Windows (ci.yml:58). The cheap tests had 300 seconds and the expensive one 120, on the
-# slowest leg in the fleet. Worth correcting whether or not it has ever bitten. It has not.
+# THE ASYMMETRY, verified independently by four seats and the whole justification for the marker.
+# The sibling race tests at :594, :615 and :647 each carry timeout(300); this one runs ten times
+# their work -- VERDICT_ROUNDS=600, about 9600 pwsh spawns against their ~960 -- and carried none,
+# so it inherited the leg default of 120s on Windows (ci.yml:58). The cheap tests had 300 seconds
+# and the expensive one 120, on the slowest leg in the fleet. Correct on its own; close nothing on it.
 #
-# WHY NO CAP FIRED ON 2026-08-18, and the argument is a MECHANISM rather than an interval, which is
-# what makes it hold where two earlier readings did not:
+# WHY THE LOG CANNOT DECIDE, from `pytest_timeout.timeout_timer` (the `thread` method, set in
+# pyproject addopts and the only one available on Windows) -- read verbatim at
+# site-packages/pytest_timeout.py:505-542:
 #
-#   pytest-timeout runs IN-PROCESS and REPORTS BEFORE IT KILLS. `--timeout-method=thread` (set in
-#   pyproject addopts, and the only method available on Windows) dumps ALL thread stacks at the cap,
-#   naming the stuck frame. Verified locally: an unmarked test under `--timeout=1` prints a
-#   `+++ Timeout +++` banner followed by `Stack of Thread-N` for every thread.
+#   it writes a `+++ Timeout +++` banner and every thread's stack to the config's terminal writer,
+#   flushes terminal / stdout / stderr, and then calls **os._exit(1)** in a `finally`.
 #
-#   The faulthandler belt (`-o faulthandler_timeout=`) only DUMPS and never kills at all (ci.yml:379).
+# `os._exit` terminates immediately with no interpreter shutdown -- which is EXACTLY what xdist
+# reports as `[gw3] node down: Not properly terminated`. So a per-test TIMEOUT KILL and a NATIVE
+# CRASH produce the SAME controller-side signature, and the banner is written to the dying worker's
+# own terminal rather than through the channel that feeds the controller's log.
 #
-#   The failing log carried ZERO of either -- no faulthandler output, no `Stack of`, no `+++`,
-#   across 531 readable lines. Both belts print in-process, so their SILENCE is the signature of a
-#   death that took the process out from under them: a native crash, not a cap.
+#   NOT ESTABLISHED BY ME: whether xdist relays a worker's terminal output before an os._exit. I read
+#   the exit path, not execnet's relay. That gap is the whole point -- it is unknown, not disproven.
 #
-# THAT LOG SETTLES THE CAP QUESTION AND SETTLES NOTHING ELSE. `node down: Not properly terminated`
-# still names no cause, and nobody has pulled the worker's own output -- which is where the cause
-# lives. The native worker death is BACKLOG #1260 (a native crash reporting as a test failure),
-# third recorded instance, where a retry wrapper was already DECLINED as laundering.
+# SO THE ABSENCE OF A TIMEOUT BANNER IS NOT EVIDENCE THAT NO CAP FIRED. An earlier version of this
+# comment said exactly that, and it was wrong for a reason no one could see without opening the
+# plugin: silence is what BOTH hypotheses predict.
 #
-# NOTHING IN THAT RUN IS EVIDENCE ABOUT THE CLAIM PRIMITIVE. No assertion in this test evaluated, so
-# it says nothing about phantom wins or double delivery in either direction.
+# THE ONLY FIX THAT ENDS THIS IS INSTRUMENTATION, NOT A GUESS AT THE CAUSE: pass `--durations` on
+# that leg, or run this test off xdist, so the cap's firing becomes OBSERVABLE rather than inferred.
+# Until then the next occurrence is another round of five seats reading a log that cannot answer.
 #
-# IF THE CAP EVER DOES BITE, THE NEXT LEVER IS VERDICT_ROUNDS, NOT A BIGGER NUMBER HERE. 600 rounds
-# was chosen to resolve a 5.75% false-win rate, so cutting it costs resolution and is a real trade;
-# a timeout that keeps growing is a gate tuned to pass rather than sized against its work.
+# WHAT REMAINS OPEN: why gw3 died. Nobody has pulled the worker's own output, which is where any
+# cause lives. Tracked as BACKLOG #1260 (a native crash reporting as a test failure), third
+# instance, where a retry wrapper was already DECLINED as laundering.
 #
-# THIS COMMENT WAS WRONG THREE TIMES BEFORE IT WAS RIGHT, and the sequence is kept because the
-# failure mode repeats: "the cap explains it", then "no cap fired, 345s beats 120s" (the wrong
-# interval -- that is pytest-start to death, and `--dist loadfile` means this test began later),
-# then "unresolvable from this log" (overstated -- the belts' silence does resolve it). Each
-# version read as confident. What finally decided it was a mechanism someone could check, not a
-# number someone could quote.
+# NOTHING IN THAT RUN IS EVIDENCE ABOUT THE CLAIM PRIMITIVE, in either direction: no assertion in
+# this test ever evaluated.
+#
+# IF THE CAP IS EVER SHOWN TO BITE, THE NEXT LEVER IS VERDICT_ROUNDS, NOT A BIGGER NUMBER HERE. 600
+# rounds resolves a 5.75% false-win rate, so cutting it costs resolution -- a real trade, where a
+# timeout that keeps growing is a gate tuned to pass rather than sized against its work.
+#
+# FIVE VERSIONS OF THIS COMMENT IN ONE HOUR, ACROSS FIVE SEATS, AND THE PATTERN IS THE LESSON: each
+# reading was an INFERENCE FROM AN INSTRUMENT THAT COULD NOT ANSWER, mistaken for the instrument's
+# output. What finally bounded it was opening the tool's source instead of re-reading its silence.
 @pytest.mark.timeout(300)
 def test_the_claim_verdict_agrees_with_the_filesystem(tmp_path: Path) -> None:
     """DEFECT 4, the verdict half -- and the half that was nearly shipped broken.
