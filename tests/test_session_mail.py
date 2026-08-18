@@ -695,35 +695,48 @@ def test_a_session_reusing_a_phantoms_id_cannot_consume_mail_it_never_saw(
     assert len(box_files(repo, key, "seen")) == 1
 
 
-# A CONFIGURATION ASYMMETRY, FIXED ON ITS OWN MERITS -- AND EXPLICITLY *NOT* THE FIX FOR THE
-# 2026-08-18 WORKER CRASH. Read this before citing either.
+# A CONFIGURATION ASYMMETRY, FIXED ON ITS OWN MERITS. Whether it also explains the 2026-08-18
+# worker crash is UNRESOLVED, and this comment states the evidence rather than a verdict -- see the
+# last paragraph for why it is written that way.
 #
-# THE ASYMMETRY IS REAL. The sibling at :593 runs ROUNDS=60 (~960 pwsh spawns) and carries
-# timeout(300); this runs VERDICT_ROUNDS=600 (~9600 spawns, ten times the work) and carried no
-# marker, so it inherited the leg default -- 120s on Windows (ci.yml:58). The cheap test had 300
-# seconds and the expensive one 120, on the slowest leg in the fleet. That is worth correcting
-# whether or not it has ever bitten.
+# THE ASYMMETRY IS SOLID, verified independently by four seats. The sibling race tests at :594,
+# :615 and :647 each carry timeout(300); this one, directly below that block, runs ten times their
+# work -- VERDICT_ROUNDS=600, about 9600 pwsh spawns against their ~960 -- and carried no marker, so
+# it inherited the leg default of 120s on Windows (ci.yml:58). The cheap tests had 300 seconds and
+# the expensive one 120, on the slowest leg in the fleet. That is worth correcting on its own.
 #
-# IT HAS NOT BITTEN, AND THE MEASUREMENT SAYS SO PLAINLY. On the 2026-08-18 failure this marker was
-# first proposed for -- `[gw3] node down: Not properly terminated`, then `worker 'gw3' crashed` --
-# the worker died about 345 SECONDS in, while the per-test cap was 120s and the faulthandler belt
-# 150s. NEITHER REPORTED. A cap firing produces a Timeout with thread dumps at the cap. So NO CAP
-# FIRED, and this marker would not have changed that outcome by one second.
+# WHETHER THE CAP FIRED ON 2026-08-18 CANNOT BE DECIDED FROM THAT RUN'S LOG, and two tempting
+# arguments in each direction are both invalid:
 #
-# WHY THE WARNING IS HERE RATHER THAN ONLY IN A COMMIT MESSAGE. A timeout marker added during a
-# timing-shaped incident reads, forever after, as the fix for it. That is the shape this repository
-# calls out by name: a change that looks like a fix, alters nothing, and closes the question while
-# the cause goes uninvestigated. The native worker death is a DIFFERENT defect and is tracked as
-# BACKLOG #1260 (a native crash reporting as a test failure), where it is the third recorded
-# instance.
+#   "345 seconds elapsed against a 120s cap, so no cap fired" -- INVALID. 345s is PYTEST-START to
+#   worker death. The cap is PER-TEST, and the leg runs `--dist loadfile` (ci.yml:751), so gw3 ran
+#   other files first and this test began at an unknown later time. The interval is the wrong one.
 #
-# AND NOTHING HERE IS EVIDENCE ABOUT THE CLAIM PRIMITIVE. No assertion in this test ever evaluated
-# on that run, so the failure says nothing about phantom wins or double delivery in either
-# direction. Do not file against the primitive on it.
+#   "no Timeout report appeared, so no cap fired" -- INVALID, and circular: under xdist the worker
+#   dies before it can report, which is what the cap hypothesis PREDICTS. The absence is evidence
+#   FOR the hypothesis being untestable this way, never against it.
 #
-# IF THE CAP EVER DOES BITE, THE NEXT LEVER IS VERDICT_ROUNDS, NOT A BIGGER NUMBER HERE. 600 rounds
-# was chosen to resolve a 5.75% false-win rate, so cutting it costs resolution and is a real trade;
-# a timeout that keeps growing is a gate tuned to pass rather than sized against its work.
+#   And nothing confirms it either: the leg passes no `--durations`, so the log carries no per-test
+#   timing and the test's start cannot be pinned. `node down: Not properly terminated` names no cause.
+#
+# SO: TRY THE MARKER, CLOSE NOTHING ON IT. A pass afterwards is equally consistent with the cap
+# having fired and with runner load easing -- and a green re-run under a quiet queue discriminates
+# neither, so whatever else was in flight has to be recorded for a result to mean anything. The
+# native worker death is tracked as BACKLOG #1260 (a native crash reporting as a test failure),
+# where a retry wrapper was already DECLINED as laundering.
+#
+# NOTHING HERE IS EVIDENCE ABOUT THE CLAIM PRIMITIVE. No assertion in this test evaluated on that
+# run, so it says nothing about phantom wins or double delivery in either direction.
+#
+# IF THE CAP EVER IS SHOWN TO BITE, THE NEXT LEVER IS VERDICT_ROUNDS, NOT A BIGGER NUMBER HERE. 600
+# rounds was chosen to resolve a 5.75% false-win rate, so cutting it costs resolution and is a real
+# trade; a timeout that keeps growing is a gate tuned to pass rather than sized against its work.
+#
+# WHY THIS COMMENT RECORDS EVIDENCE INSTEAD OF A CONCLUSION. Its first two versions each asserted
+# the then-current verdict -- "the cap explains it", then "no cap fired" -- and each was overturned
+# within the hour by an argument neither had considered. A comment that states what is KNOWN and
+# what CANNOT be decided from the available log does not need rewriting every time the reading
+# swings, and the swinging is what a reader six months from now most needs to see.
 @pytest.mark.timeout(300)
 def test_the_claim_verdict_agrees_with_the_filesystem(tmp_path: Path) -> None:
     """DEFECT 4, the verdict half -- and the half that was nearly shipped broken.
