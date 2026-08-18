@@ -80,6 +80,19 @@ param(
     [Parameter(ParameterSetName = 'Close')][switch]$Close,
     [Parameter(ParameterSetName = 'Close')][switch]$Handback,
     [Parameter(ParameterSetName = 'Epoch')][switch]$BumpEpoch,
+    # THE HOOK PATH FOR DECLARATION. -Prompt records that a seat was ASKED for a goal and had not
+    # given one at that moment. It never invents a goal: a hook cannot know intent, and a goal a
+    # machine wrote is not a declaration of anything.
+    #
+    # It exists because "this seat has no goal" was indistinguishable from "nobody ever asked it
+    # for one", and those want opposite responses. Measured 2026-08-18: 1 of 22 episode records
+    # carried a goal, with no way to tell whether the other 21 ignored a prompt or never saw one.
+    [Parameter(ParameterSetName = 'Prompt')][switch]$Prompt,
+    # A seat label the CALLER derived mechanically -- e.g. from the session record's own name.
+    # Written only when nothing has been declared, and always with seatSource='derived:caller' so
+    # it can never be read as a declaration. A derived label is a measurement; a declaration is a
+    # statement of intent, and this file does not let one wear the other's clothes.
+    [Parameter(ParameterSetName = 'Prompt')][string]$DerivedSeat,
     # Only for tests and for -Declare from a different cwd. Normally derived.
     [string]$Worktree,
     [string]$SessionId
@@ -505,10 +518,23 @@ try {
         configRootLabel  = $cr.Label
         configRootSource = $cr.Source
         poolEpoch        = Get-PoolEpoch -SeatsDir $script:SeatsDir
-        seat             = if ($Declare -and $Seat) { $Seat } else { Prior 'seat' $null }
-        seatSource       = if ($Declare -and $Seat) { 'declared' } else { Prior 'seatSource' $null }
+        # A DERIVED label never overwrites a DECLARED one, and never claims to be one. The order
+        # here is the whole rule: declared wins, derived fills only a vacuum, prior survives both.
+        seat             = if ($Declare -and $Seat) { $Seat }
+                           elseif ($Prompt -and $DerivedSeat -and -not (Prior 'seat' $null)) { $DerivedSeat }
+                           else { Prior 'seat' $null }
+        seatSource       = if ($Declare -and $Seat) { 'declared' }
+                           elseif ($Prompt -and $DerivedSeat -and -not (Prior 'seat' $null)) { 'derived:caller' }
+                           else { Prior 'seatSource' $null }
+        # Only a declaration is dated as one. A derived seat leaves this null on purpose, so
+        # "somebody said what this seat is for" stays answerable from the record alone.
         declaredAt       = if ($Declare -and $Seat) { $now } else { Prior 'declaredAt' $null }
         goal             = if ($Declare -and $Goal) { $Goal } else { Prior 'goal' $null }
+        # WHEN THE SEAT WAS LAST ASKED, and only ever set while the goal is still missing. Once a
+        # goal exists the question is answered and re-stamping it would turn a silence into noise.
+        # This is the field that makes an undeclared seat readable: asked-and-ignored and
+        # never-asked are different failures with different fixes.
+        goalPromptedAt   = if ($Prompt -and -not (Prior 'goal' $null)) { $now } else { Prior 'goalPromptedAt' $null }
         done             = if ($Declare -and $Done) { $Done } else { Prior 'done' $null }
         outOfScope       = if ($Declare -and $OutOfScope) { $OutOfScope } else { Prior 'outOfScope' $null }
         branch           = $g.branch
@@ -529,7 +555,9 @@ try {
 
     Write-RecordAtomic -Path $recPath -Object $rec
 
-    if (-not $Record) { Write-Host "wrote $recPath" }
+    # -Prompt is a hook path like -Record: it must not narrate into a session's context. What the
+    # session should SEE is the prompt itself, and that is the hook's line to write, not this one's.
+    if (-not $Record -and -not $Prompt) { Write-Host "wrote $recPath" }
 } catch {
     Write-WriterError -Stage 'main' -Message $_.Exception.Message
     Write-Error "seat.ps1: $($_.Exception.Message)" -EA Continue

@@ -271,6 +271,31 @@ diverge enough to warrant it; keep this root file general.
 - `/compact` before long sessions hit the limit; focus the summary on API shape and decisions
   (e.g. "preserve the connector registry and the inbound/outbound/@router/@handler interface").
 
+### Declare what your seat is for
+- **Declare at the start of a session, before the work.** A SessionStart hook asks; answering takes
+  one command, and it is what every fleet view reads:
+
+  ```
+  pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare -Seat <role> -Goal "<one line>"
+  ```
+
+  Optional on the same call: `-Done "<what finished looks like>"`, `-OutOfScope "<what you will not
+  touch>"`, `-Handoff <path>`.
+- **Why this is a rule and not a nicety.** The mechanical half of the episode record has always
+  worked — a Stop hook fires `seat.ps1 -Record` and every episode carries `writes`, `touchedPaths`,
+  `dirty`, `unpushed` and `tip`. The declared half did not. Measured 2026-08-18 across the live
+  seats directory: **22 records, 1 with a goal, 1 with a seat.** So the fleet could always answer
+  *"is this seat alive and writing"* and never *"what is it trying to do"* — which is the question a
+  person actually asks. The schema was never missing; nothing fed it.
+- **The hook cannot do it for you, by design.** It stamps `goalPromptedAt`, and where the payload
+  names the session it writes a `seat` label marked `seatSource: derived:caller`. It will never
+  write a `goal`: a goal is intent, and a machine that invents one produces a record that looks
+  declared and says nothing — the hollow-record failure this repo refuses elsewhere. A derived label
+  never overwrites a declared one, and `declaredAt` stays null until somebody actually says
+  something.
+- **An undeclared seat is now visible rather than silent.** `goalPromptedAt` separates *asked and
+  ignored* from *never asked* — two states with opposite fixes that used to render identically.
+
 ### Git discipline
 - Work on a **feature branch and open a PR**; commit at logical stops, **one coherent layer per
   commit**, with clear messages. (Direct pushes to `main` are blocked by the harness, so

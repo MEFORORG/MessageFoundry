@@ -52,6 +52,7 @@ tests/test_coord_lock.py
 tests/test_coord_overlap_attribution.py
 tests/test_coord_overlap_signals.py
 tests/test_coord_presence.py
+tests/test_coord_seat_prompt.py
 tests/test_coord_unbacked_check.py
 tests/test_cutover_slug_rot.py
 tests/test_dangling_citation_check.py
