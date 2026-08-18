@@ -10318,6 +10318,23 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **THERE IS ALSO NO PER-TEST TIMING.** The invocation is `pytest -q -n 4 --dist loadfile` with no `--durations`, and `-q` suppresses per-test lines. Measured on a real failing log (50,686 bytes): `durations` 0, `PASSED` 0, and **exactly two `[gw3]` lines** -- the node-down notice and the platform banner. Under `--dist loadfile` a worker runs several files before dying, so elapsed-since-pytest-start does not bound any single test's runtime. **The log cannot show a per-test cap fired AND cannot show it did not.**
 
+> **SCOPE CORRECTION 2026-08-18, THIRD AND CURRENT STATE OF THIS REMEDY: ARMING THE BELT IS WORTH DOING, FOR THE CLASS IT EXISTS FOR.** The retraction immediately below is correct about KILLABLE hangs and too broad as written. Every arm before this used `time.sleep`, which pytest-timeout's thread method CAN interrupt; `ci.yml:357` says the belt exists for a hang it CANNOT. That class was never tested until now -- manufactured with catastrophic regex backtracking, which holds the GIL inside C:
+>
+>     arm 5a  no xdist, cap 4 belt 8   belt fired at "Timeout (0:00:08)"   "Thread 0x" 2   "Stack of" 0
+>     arm 5b  -n 2,     cap 4 belt 8   "Thread 0x" 3   "Stack of" 0   "bringing up nodes" 2, errors 0
+>     both dumps name it: [pytest_timeout ::test_gil_holding_hang]
+>
+> **5a is the key reading:** the belt fires at its own setting DURING the hang even though it sits ABOVE the cap, because pytest-timeout cannot interrupt a held GIL and therefore never reports at all. **5b: that native dump SURVIVES xdist and names the stuck test, where pytest-timeout's does not.**
+>
+> **SO THE TWO CLASSES SPLIT CLEANLY, AND THE REMEDY IS SCOPED, NOT GENERAL:**
+>
+>     hang pytest-timeout CAN kill      belt above cap never fires; under xdist neither dump
+>                                       survives -> arming buys NOTHING (arm 4)
+>     hang pytest-timeout CANNOT kill   belt fires, dump survives xdist, names the test
+>                                       -> arming is the ONLY thing that speaks (arm 5)
+>
+> **AND WHICH CLASS THE ORIGINATING FAILURE WAS IS UNKNOWN.** Nothing measured tells us whether gw3's hang was killable. So arming `:998` is justified on the belt's own purpose, NOT on a claim that it would have made that particular failure legible -- which is the claim retracted below and still retracted.
+
 > **RETRACTED 2026-08-18: THE PARAGRAPH BELOW DEMONSTRATED THE REMEDY IN A CONFIGURATION `ci.yml` FORBIDS, AND THE REMEDY DOES NOT HOLD AT CI'S ORDERING.** Left standing rather than deleted, because the arms are correct and only the conclusion drawn from them was wrong.
 >
 > `ci.yml:360` mandates `fault_timeout` ABOVE that leg's `pytest_timeout` -- 150 over 120 on Windows, 90 over 60 on ubuntu. **Arm 3 inverted it** (belt 4 under cap 30), which is the only reason the native dump appeared: the belt fired before pytest-timeout could kill. Re-measured at CI's actual ordering (belt 10, cap 6):
