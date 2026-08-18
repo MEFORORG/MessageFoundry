@@ -92,6 +92,60 @@ function Get-ClaudeConfigRoots {
     )
 }
 
+# The config root -> login label mapping. It lives HERE, beside the root enumeration it interprets,
+# rather than in presence.ps1 where it started: two callers now need it and a second copy of a mapping
+# is the drift this file already exists to prevent for the liveness fence.
+function Get-LoginLabel([string]$RootPath) {
+    $leaf = Split-Path $RootPath -Leaf
+    if ($leaf -ieq ".claude") { return "default" }
+    return ($leaf -replace '^\.claude-account-', 'acct-') -replace '^\.claude-?', ''
+}
+
+# WHICH LOGIN AM I ON. Answered from the session's OWN registry record, which is the only place the
+# answer actually lives, and deliberately NOT from any repo-scoped roster.
+#
+# WHY THIS EXISTS AT ALL. A roster is built from the worktrees of one repo, so a session whose cwd is
+# not one of them can never appear in it. The announce hook used to infer its login from its own row
+# in that roster and fall back to the literal 'default' when the row was absent. That fallback is a
+# GUESS, and on a non-default root it inverts every login comparison downstream rather than degrading
+# it. Registry records are enumerated across every root, so this answers for a session the roster
+# cannot see -- and returns '' honestly when there is no record rather than inventing one.
+#
+# RETURNS AN OBJECT, NOT A BARE LABEL, and the second field is the whole reason. An empty Login means
+# "not known", never a default, because a wrong login is worse than an absent one -- but "not known"
+# has two causes that a caller must be able to tell apart:
+#
+#   Matched = 0   no record carries this id. Usually transient: a session announcing on its first
+#                 prompt while its record is still being written resolves itself next prompt.
+#   Matched > 1   two or more config roots each claim this id. NOT transient and NOT self-resolving:
+#                 duplicate roots do not converge, so a caller that treats it as "try again later"
+#                 waits forever.
+#
+# Collapsing both to '' cost a real defect: the announce hook reported "no registry record matched
+# this session id" while two matched, sending an operator to look for a missing file that was in fact
+# present twice -- the one place the cause was visible.
+function Get-LoginForSession {
+    [CmdletBinding()]
+    # NOT Mandatory, and that is a correctness decision rather than laxity. A mandatory [string] REJECTS
+    # the empty string and prompts, which in a non-interactive hook throws -- and the announce hook
+    # catches broadly, so the throw became a silent exit 0 with no output and no receipt. Measured while
+    # building this: it took out -SelfTest entirely, which passes no session id by construction. The
+    # same shape is on record in mail-drain.ps1's header, where a mandatory parameter rejecting an empty
+    # string stranded a message inside a bare catch. An absent id is a legitimate question here and its
+    # answer is '' -- the caller decides what that means.
+    param([string]$SessionId, [string[]]$ConfigRoot)
+    if (-not $SessionId) { return [pscustomobject]@{ Login = ''; Matched = 0 } }
+    # EXACTLY ONE match is the only answer worth acting on. More than one means the same id is
+    # registered under two roots, which this function cannot adjudicate and must not pick a winner
+    # for -- but it REPORTS the count, so the caller can say which of the two silences it is in.
+    $hits = @(
+        Get-SessionRecords -ConfigRoot $ConfigRoot |
+            Where-Object { $_.Record -and $_.Record.sessionId -and ($_.Record.sessionId -ieq $SessionId) }
+    )
+    $login = if ($hits.Count -eq 1) { Get-LoginLabel $hits[0].Root } else { '' }
+    return [pscustomobject]@{ Login = $login; Matched = $hits.Count }
+}
+
 # Every registry record, with the root it came from attached.
 #
 # -IncludeUnreadable also returns a row for every file that could NOT be parsed (Record = $null,
