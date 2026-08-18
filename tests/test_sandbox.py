@@ -1006,8 +1006,15 @@ def test_worker_kill_reaps_the_whole_process_tree(tmp_path: Path) -> None:
         #   POSIX (where the failures actually happened): `_pid_alive` is `os.kill(pid, 0)` at
         #   :925-931, False ONLY on ProcessLookupError. SIGKILL closes the fds at once, so the pipe
         #   EOFs and the primary passes -- but the pid lingers as a ZOMBIE until it is re-parented
-        #   and reaped, and a zombie is still visible to `os.kill(pid, 0)`. Reaping waits on the
-        #   subreaper being SCHEDULED, which is exactly what degrades on a loaded runner.
+        #   and reaped, and a zombie is still visible to `os.kill(pid, 0)`.
+        #
+        #   WHY THIS TEST PASSES LOCALLY IS **UNATTRIBUTED**, and an earlier version of this comment
+        #   claimed otherwise. It said the window "degrades on a loaded runner and not on an idle
+        #   20-core box", citing 10/10 local passes. THOSE PASSES WERE ON WINDOWS -- they exercised
+        #   the win32 branch above, not this one, so they say nothing about the POSIX path at all.
+        #   Comparing quiet-Windows against loaded-Linux and calling the difference LOAD leaves
+        #   PLATFORM as an uncontrolled confound. The run that would separate them -- these tests on
+        #   Linux, loaded and unloaded -- has not been done by anyone.
         #
         #   Windows: `_pid_alive` answers through `GetExitCodeProcess`, which keeps reporting
         #   STILL_ACTIVE until the process object is signalled.
