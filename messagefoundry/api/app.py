@@ -4348,6 +4348,7 @@ def create_app(
             empty_claims=ec.total if ec is not None else 0,
             empty_claims_idle_poll=ec.idle_poll if ec is not None else 0,
             empty_claims_wake_fanout=ec.wake_fanout if ec is not None else 0,
+            empty_claims_contended=getattr(ec, "contended", 0) if ec is not None else 0,
             executor_queue_depth=exec_depth,
             executor_busy=exec_busy,
             # A1 live cost counters (read-only, additive). getattr-with-default so a backend without them

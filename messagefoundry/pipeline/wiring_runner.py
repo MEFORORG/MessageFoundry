@@ -515,15 +515,30 @@ class EmptyClaimCounters:
     total: int = 0
     idle_poll: int = 0
     wake_fanout: int = 0
+    #: BACKLOG #1270. Empty claims the STORE attributed to contention -- something else held the row
+    #: this claim wanted. A SEPARATE AXIS from the split above, not a third bucket: the two existing
+    #: counters classify by why the WORKER was awake, and are structurally blind to why the STORE
+    #: returned nothing. A contended empty claim increments `total` and one of the two, AND this.
+    #:
+    #: **Zero does NOT mean "no contention".** A backend that cannot tell a contended lane from an
+    #: empty one reports nothing, so this reads as not-established rather than as a clean bill --
+    #: the same absence-of-a-veto rule the occupancy fence carries.
+    contended: int = 0
 
-    def record_empty(self, *, woken: bool) -> None:
+    def record_empty(self, *, woken: bool, contended: bool = False) -> None:
         """Account one empty claim, classified by whether the worker was last *woken* (wake-fanout) or
-        timed out on the poll interval (idle-poll)."""
+        timed out on the poll interval (idle-poll), and separately by whether the STORE said the lane
+        was contended rather than empty (BACKLOG #1270).
+
+        ``contended`` defaults False so every existing call site keeps its exact meaning: a caller that
+        cannot distinguish the two says nothing, rather than asserting the absence of contention."""
         self.total += 1
         if woken:
             self.wake_fanout += 1
         else:
             self.idle_poll += 1
+        if contended:
+            self.contended += 1
 
 
 # --- bench-gated per-delivery phase timing (default OFF) --------------------------------------------

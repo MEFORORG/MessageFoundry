@@ -7030,13 +7030,20 @@ class SqlServerStore:
                     # contended, so YIELD: return EMPTY-all (exactly the EMPTY-on-locked-head
                     # semantics; the head stays PENDING, attempts untouched, the sweep re-tries it).
                     # Contention is normal at scale, so log at DEBUG, not WARNING.
+                    # BACKLOG #1270: the DEBUG line stays -- it carries the mechanism, and contention
+                    # at scale is normal and must not fill an operator's log. What changes is that the
+                    # yield is no longer INDISTINGUISHABLE from "there was nothing to claim": the
+                    # lanes ride out on `contended`, so the dispatcher can say WHY its claim was empty
+                    # instead of dropping to IDLE with every observable reading "no work".
                     log.debug(
                         "claim_fifo_heads: lock-timeout (1222) at stage %s on %d lane(s) — head"
                         " contended, yielding EMPTY (never-block guarantee)",
                         stage,
                         len(lane_list),
                     )
-                    return ClaimedHeads(by_lane={}, rearm=frozenset())
+                    return ClaimedHeads(
+                        by_lane={}, rearm=frozenset(), contended=frozenset(lane_list)
+                    )
                 raise
             finally:
                 # ADR 0114 sub-lever C: on the folded clean path (reset_committed True ⇔ commit#1

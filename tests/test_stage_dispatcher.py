@@ -30,6 +30,7 @@ wall-clock reliance. Seeded values are therefore chosen relative to the test's M
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import random
 import warnings
@@ -335,6 +336,10 @@ class _ClaimShim:
             self._fired = True
             if self._mode == "rearm_once":  # T10: head consumed in-store → lane in rearm, no items
                 return ClaimedHeads(by_lane={}, rearm=frozenset({self._lane}))
+            if self._mode == "contended_once":  # BACKLOG #1270: EMPTY *because* the head was held
+                return ClaimedHeads(
+                    by_lane={}, rearm=frozenset(), contended=frozenset({self._lane})
+                )
             if self._block is not None:
                 await (
                     self._block.wait()
@@ -1030,6 +1035,67 @@ async def test_t10_rearm_reready_then_reclaim(store: Any) -> None:
         assert d.busy_violations == 0
     finally:
         await d.stop()
+
+
+async def test_a_contended_empty_claim_is_counted_and_named_while_a_real_empty_is_not(
+    store: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #1270. An empty claim caused by CONTENTION must become visible; an empty claim caused
+    by an empty lane must stay quiet. **Both arms are required and neither is worth anything alone.**
+
+    THE DEFECT THIS PINS. Both cases reach the same T12 branch -- release the slot, record an empty
+    claim, drop to IDLE with no timer armed -- so from outside, a lane that has silently stopped
+    claiming is indistinguishable from a system with nothing to do. There was no counter, no log line,
+    and nothing else that could tell them apart; the only observable was a number that had not moved,
+    which is what a healthy idle lane also looks like.
+
+    WHAT IS DELIBERATELY *NOT* ASSERTED: any change of behaviour. The lane still drops to IDLE and the
+    sweep still re-readies it. The item's proof bar is that the SILENT case becomes LOUD, explicitly
+    not that the lane recovers -- it already did, which is exactly why this went unnoticed.
+
+    THE THIRD ASSERTION IS A PHI GUARD, not tidiness. A lane is a `destination_name`, so lane NAMES
+    may never reach the log; the line carries counts only, and this fails if a name ever rides along.
+
+    Falsified in both directions: drop the `contended=` argument from `_record_empty` and the counter
+    arm goes red; make the branch fire unconditionally and the empty-lane arm goes red naming the
+    count it did not expect.
+    """
+    mc = ManualClock(1000.0)
+    stub = RecordingStub(store, mc.time)
+    lane = "IB_CONTENDED"
+    await _seed(store, lane, [100.0])
+
+    # ARM 1 -- the store says CONTENDED. Counted on the new axis, and named in the log.
+    shim = _ClaimShim(store, lane, mode="contended_once")
+    d = _make(shim, stub, set(), clock=mc)
+    await d.start()
+    try:
+        with caplog.at_level(logging.INFO, logger="messagefoundry.pipeline.stage_dispatcher"):
+            d.mark_ready(lane)
+            assert await _wait_until(lambda: getattr(d._empty, "contended", 0) > 0)
+        assert d.empty_claims[0] > 0, "a contended claim must still count as an EMPTY claim"
+        lines = [r.getMessage() for r in caplog.records if "CONTENDED" in r.getMessage()]
+        assert lines, "the contended empty claim emitted no line at INFO or above"
+        assert lane not in lines[0], (
+            f"a lane NAME reached the log -- a lane is a destination_name (PHI): {lines[0]!r}"
+        )
+    finally:
+        await d.stop()
+
+    # ARM 2, THE NEGATIVE CONTROL -- a genuinely empty lane. Counted as empty, NOT as contended.
+    mc2 = ManualClock(1000.0)
+    stub2 = RecordingStub(store, mc2.time)
+    d2 = _make(store, stub2, set(), clock=mc2)
+    await d2.start()
+    try:
+        d2.mark_ready("IB_NOTHING_HERE")
+        assert await _wait_until(lambda: d2.empty_claims[0] > 0)
+        assert getattr(d2._empty, "contended", 0) == 0, (
+            "an empty LANE was reported as contention -- the counter no longer discriminates, so its "
+            "non-zero value would stop meaning anything"
+        )
+    finally:
+        await d2.stop()
 
 
 async def test_t11_wake_during_claiming_empty_dirty_rereadies(store: Any) -> None:

@@ -926,7 +926,13 @@ async def test_ac9_differential_proc_vs_batch_identical_results_and_post_execute
 async def test_ac12_in_proc_1222_translates_to_empty_all() -> None:
     ops, store, result = await _drive_proc("ingress", ["lane-0"], fail_batch=_lock_timeout_error())
     assert ops[0][1] == _CALL_CID  # the failure came from the CALL
-    assert result == ClaimedHeads(by_lane={}, rearm=frozenset())
+    # BACKLOG #1270: the EMPTY-all contract is unchanged -- `by_lane` and `rearm` are still
+    # empty and no row moves. What is new is that the yield is ATTRIBUTED: the lanes ride out
+    # on `contended`, so a caller can tell this apart from a genuinely empty lane. Asserting
+    # the exact set rather than truthiness -- a bare `if result.contended` would pass on any
+    # non-empty set, including a wrong one.
+    assert result.by_lane == {} and result.rearm == frozenset()
+    assert result.contended == frozenset({"lane-0"})
     kinds = _op_kinds(ops)
     assert "rollback" in kinds and kinds[-1] == "commit"  # guard ran
 
