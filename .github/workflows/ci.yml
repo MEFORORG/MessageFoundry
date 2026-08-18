@@ -976,7 +976,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-2025]
+        # PER-LEG TIMEOUT KNOBS, extending the matrix this job already had rather than adding a
+        # second `strategy:` block. `cap` is DERIVED from this file's own convention -- the matrix
+        # builder rows set pytest_timeout 60 on ubuntu and 120 on Windows -- which the single
+        # hardcoded `--timeout=120` here violated on the ubuntu leg, giving it TWICE the cap the
+        # file's rule allows. `belt` is PARITY, not derivation: it matches the siblings' 90/150 and
+        # nothing has measured what this leg actually wants, because it has never had --durations.
+        include:
+          - { os: ubuntu-latest, cap: 60, belt: 90 }
+          - { os: windows-2025, cap: 120, belt: 150 }
     # The push arm is the safety net, not redundancy: the PR arm only fires when the harness itself
     # changed, so an ENGINE change that breaks a harness test is invisible on its own PR by
     # construction, and push-to-main is where it surfaces. See the `tooling` output on `changes`.
@@ -1072,7 +1080,19 @@ jobs:
           # Same reason as the apt step above: collection imports the Qt modules whether or not this
           # job executes them, and the shipped ones construct QApplication at import on some paths.
           QT_QPA_PLATFORM: offscreen
-        run: pytest -q -n 4 --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' --timeout=120 --junitxml=tooling-junit.xml
+          # THE NATIVE-STACK BELT, which every sibling pytest leg arms and this one did not. It needs
+          # BOTH halves -- the env var AND the `-o` below; the flag alone does not arm it. Measured
+          # 2026-08-18: under xdist a pytest-timeout kill DUMPS then calls os._exit(1), which xdist
+          # reports as `node down: Not properly terminated` with the dump swallowed -- so on this leg
+          # a hang produced `worker 'gwN' crashed` and NOTHING ELSE, and five seats spent forty
+          # minutes inferring what a stack would have named. The faulthandler dump is written to the
+          # raw stderr FD from C and DOES survive the relay.
+          PYTHONFAULTHANDLER: "1"
+        # --durations is the point of this change as much as the belt is: this leg has never emitted
+        # per-test timing, so nobody can say what its tests cost, and `belt` above had to be set by
+        # parity rather than measurement. With it, the next person picks a number instead of matching
+        # one.
+        run: pytest -q -n 4 --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout=${{ matrix.belt }} --timeout=${{ matrix.cap }} --durations=25 --junitxml=tooling-junit.xml
 
       # A marker typo, a manifest rename, or a conftest hook that silently stops firing all produce the
       # same thing: zero selected tests and a GREEN job. Deselection cannot be distinguished from success
