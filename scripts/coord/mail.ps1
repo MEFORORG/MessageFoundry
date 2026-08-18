@@ -451,7 +451,14 @@ if ($Send) {
         # The sender is told what queuing does and does NOT mean. A queued message is not a delivered one,
         # and the difference is the entire failure mode this channel is designed to make visible.
         Write-Host "  Queued is not delivered. It is delivered when that session's drain hook next runs and"
-        Write-Host "  writes a receipt under mefor-coord/mail/receipts/. Check with -Status."
+        Write-Host "  writes a receipt under mefor-coord/mail/receipts/<id>.json, keyed on the id above."
+        # NAMING THE RECEIPT, NOT -Status, AND THAT IS A CORRECTION (BACKLOG #1228). -Status reports
+        # THIS worktree's own box -- what was sent TO you -- so it can never answer "was the message I
+        # SENT ever read". Pointing the sender at it sent them to a view that cannot contain the
+        # answer, which is worse than silence because it looks like the check was performed.
+        Write-Host "  Read that file to see what became of it. disposition 'shown-consumed' or"
+        Write-Host "  'shown-held' means it was rendered; 'expired-unshown' means it reached its TTL"
+        Write-Host "  first and NOBODY EVER SAW IT; no file at all means no drain has run yet."
         Write-Host ""
     }
     if (@($written | Where-Object { $_.Status -ne 'queued' }).Count -gt 0) { exit 1 }

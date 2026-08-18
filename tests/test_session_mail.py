@@ -1552,3 +1552,69 @@ def test_the_injection_is_ascii_even_with_a_hostile_message(repo: Path, tmp_path
     # Newlines survive -- the last-net scrub must not collapse the injection onto one line.
     assert "\n" in text
     assert re.fullmatch(r"[\x20-\x7E\n]*", text), "a non-printable byte reached the injection"
+
+
+def test_an_expired_message_is_named_and_receipted_so_the_sender_can_see_it(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Expiry must be observable in BOTH directions, which is the whole of BACKLOG #1228.
+
+    Before this, a swept message was reported to the recipient as a bare ``1 expired`` -- no id, no
+    sender, no subject -- and to the SENDER as nothing at all. The send call had already returned
+    success and no receipt was ever written, so ``mail.ps1`` could only say "delivery UNPROVEN (no
+    receipt)", which is indistinguishable from a message sitting in an inbox nobody has drained.
+    Every observable on both sides said the message had been delivered.
+
+    A test asserting only the recipient half leaves the sender blind, which is the direction that
+    made this invisible in the first place, so both are asserted here against ONE drain run.
+
+    The fresh message is a NEGATIVE CONTROL and is load-bearing: without it a drain that swept
+    everything, or one that rendered nothing at all, would satisfy the expiry assertions.
+    """
+    info = seed(
+        repo,
+        tmp_path,
+        [
+            # Unambiguously past, so there is no timing race to lose.
+            {
+                "body": "SWEPT-BODY: must never be rendered",
+                "expiresUtc": "2020-01-01T00:00:00.0000000Z",
+            },
+            {"body": "FRESH-CONTROL: must be shown instead"},
+        ],
+    )
+    swept_stem = str(info["rows"][0]["stem"])
+    out = injection(run_drain(repo, event="Stop"))
+
+    # --- recipient half: told WHICH, not merely how many ---------------------------------------
+    assert "1 expired" in out, out
+    assert "EXPIRED AND NEVER SHOWN" in out, out
+    assert swept_stem in out, f"the swept id was not named: {out!r}"
+    assert "SWEPT-BODY" not in out, "an expired message's body was rendered"
+    assert "FRESH-CONTROL" in out, "the negative control was not shown, so the run proves nothing"
+
+    # --- sender half: a receipt exists, and it says the message was never observed ---------------
+    receipt = mail_root(repo) / "receipts" / f"{swept_stem}.json"
+    assert receipt.exists(), (
+        "no receipt for a swept message leaves the sender with no signal at all"
+    )
+    data = json.loads(receipt.read_text(encoding="utf-8"))
+    assert data["disposition"] == "expired-unshown", data
+    # The assertion, not an omission: this text was never emitted to anyone.
+    assert data["observedUtc"] == "", data
+    # It did leave the inbox, and that did happen.
+    assert data["consumedUtc"], data
+
+
+def test_the_fresh_control_alone_produces_no_expiry_line(repo: Path, tmp_path: Path) -> None:
+    """The other direction: a drain with nothing expired must not emit the naming line.
+
+    Guards the common path. The naming line is appended conditionally, and a false ``if`` inside the
+    counter array literal was measured to contribute a ``$null`` element -- which would have emitted
+    a blank line into every drain that swept nothing.
+    """
+    seed(repo, tmp_path, [{"body": "FRESH-ONLY: nothing here has expired"}])
+    out = injection(run_drain(repo, event="Stop"))
+    assert "FRESH-ONLY" in out
+    assert "0 expired" in out, out
+    assert "EXPIRED AND NEVER SHOWN" not in out, out

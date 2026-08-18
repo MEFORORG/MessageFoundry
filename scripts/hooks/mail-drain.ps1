@@ -573,6 +573,12 @@ try {
     $delivered = @()
     $unreadable = 0
     $expired = 0
+    # The ids swept this pass, so the counter block can NAME them. A count alone cannot be turned
+    # into "whose message did I lose" (BACKLOG #1228).
+    $expiredIds = @()
+    # Receipts that could not be written for a swept message. Counted rather than swallowed: it is
+    # the sender's only signal, so a silent failure here reproduces the defect being closed.
+    $expiredReceiptFailures = 0
     $malformed = 0    # files whose NAME this channel did not mint. Counted, never parsed, never moved.
     $filtered = 0     # addressed to a different session id
     $deferred = 0     # over the caps this pass; still in the inbox, shown next drain
@@ -806,7 +812,38 @@ try {
             # arm that was measured to return success for every racer. A lost sweep must NOT
             # increment $expired: that counter asserts "I swept it", and a loser did not.
             $er = Move-Claimed -Source $f.FullName -DestinationDir $expiredDir -Stem $id -Token (New-ClaimToken)
-            if ($er.Won) { $expired++ } else { $ceded++ }
+            if ($er.Won) {
+                $expired++
+                # NAMED, NOT JUST COUNTED (BACKLOG #1228). "1 expired" carries no id, no sender and no
+                # subject, so it cannot be turned into "whose message did I lose" without reading
+                # expired/ by hand -- which is the reading nobody does.
+                $expiredIds += $id
+                # A RECEIPT ON THE SWEEP, WHICH IS THE HALF NO RECIPIENT-SIDE COUNTER CAN SUPPLY.
+                # Before this, an expired message left NO receipt at all, so `mail.ps1 -Status` could
+                # only report "delivery UNPROVEN (no receipt)" -- indistinguishable from a message
+                # sitting in an inbox nobody has drained yet. The send call had already returned
+                # success, so every observable on both sides said the message was delivered.
+                #
+                # ObservedUtc is EMPTY and that is the assertion, not an omission: this text was never
+                # emitted to anyone. ConsumedUtc records when it left the inbox, which did happen.
+                try {
+                    Write-MailReceipt -Path (Join-Path $receiptDir "$id.json") -MessageId $id `
+                        -Disposition 'expired-unshown' -ObservedUtc '' `
+                        -ClaimToken ([string]$er.Token) `
+                        -ConsumedUtc ([DateTime]::UtcNow.ToString('o')) `
+                        -ConsumedByHookEvent $eventName `
+                        -ByWorktree $cwd -BySessionId $sessionId -SessionIdValid $markable `
+                        -ByHookEvent $eventName -BoxKey $key -ExaminedPath $inboxDir
+                }
+                catch {
+                    # The sweep already succeeded and the message is in expired/. A receipt that could
+                    # not be written must not undo that or abort the drain for every other message in
+                    # the box -- it costs the sender's signal for this one message, which is the state
+                    # that existed before this receipt was written at all.
+                    $expiredReceiptFailures++
+                }
+            }
+            else { $ceded++ }
             continue
         }
 
@@ -957,6 +994,23 @@ try {
         "them; it can also mean the move could not complete, in which case they are still in the inbox."
         "See docs/SESSION-MAIL.md."
     )
+    # EXPIRY IS THE ONE DISPOSITION THAT DESTROYS A HAND-OFF RATHER THAN DELAYING IT, so it is the one
+    # that must name its victims. A bare count cannot be turned into "whose message did I lose"
+    # without reading expired/ by hand, and nobody does (BACKLOG #1228).
+    #
+    # Appended here rather than written as `$(if ...)` inside the literal above, and that is not a
+    # style choice: measured on this box, a false `if` inside an array literal contributes a $null
+    # element -- `@('a', $(if($false){'b'}), 'c')` has Count 3 -- which would emit a blank line into
+    # the counter block on the common path where nothing expired.
+    if ($expired -gt 0) {
+        $counterLines += ("EXPIRED AND NEVER SHOWN, so these hand-offs were lost rather than delayed: " +
+            ($expiredIds -join ', ') + ". They are in box/$key/expired/, and each sender can now see " +
+            "disposition 'expired-unshown' for its own message.")
+    }
+    if ($expiredReceiptFailures -gt 0) {
+        $counterLines += ("$expiredReceiptFailures swept message(s) could NOT be receipted, so their " +
+            "senders have no signal at all. Those messages are still in expired/.")
+    }
     if ($filtered -gt 0) { $counterLines += "$filtered message(s) are addressed to a different session id and were left in the inbox." }
     if ($duplicateStems -gt 0) { $counterLines += "$duplicateStems file(s) repeat a message id already seen this pass and were left in the inbox." }
     if ($sweepFailed) { $counterLines += "A housekeeping sweep of seen/, expired/ or shown/ could not complete; delivery was unaffected." }
