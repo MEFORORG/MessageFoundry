@@ -10362,7 +10362,11 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 >
 > *Grep the right tool's format:* faulthandler emits `Thread 0x... [name]`, pytest-timeout emits `Stack of ...`. Searching for the latter in a faulthandler dump returns zero and reads as "swallowed" -- a false negative that cost one seat a near-miss, and is why `Stack of` is 0 in arm 3b while the dump is plainly present.
 
-> **A THIRD GAP ON THE SAME LEG, pinned to `origin/main` @ `3a7a2cd1`:** `:998` hardcodes `--timeout=120` where both siblings use `--timeout="$PYTEST_TIMEOUT"` (`:735`, `:866`), fed from `matrix.pytest_timeout` at `:696` and `:865`. **So this leg's cap does not track a matrix tune** -- the value is right today and silently stops tracking the moment anyone retunes the matrix.
+> **A THIRD GAP ON THE SAME LEG, AND IT IS WORSE THAN A MISSING VARIABLE. Pinned to `origin/main` @ `3a7a2cd1`.** `:998` hardcodes `--timeout=120` where both siblings use `--timeout="$PYTEST_TIMEOUT"` (`:735`, `:866`) fed from `matrix.pytest_timeout` (`:696`, `:865`).
+>
+> **THE TOOLING JOB DOES HAVE A MATRIX -- `:916-918`, `os: [ubuntu-latest, windows-2025]` -- IT JUST CARRIES NO TIMEOUT KEYS.** So one hardcoded `120` is applied to BOTH legs, while `ci.yml:58` records the deliberate per-OS split its siblings use: **60s ubuntu / 120s Windows**. **The ubuntu tooling leg therefore runs at DOUBLE the cap its ubuntu sibling gets**, and no comment anywhere says that is intended.
+>
+> This makes the fix SMALLER than 'the leg has no source of truth' suggests: the matrix is already there, so adding `pytest_timeout` and `fault_timeout` keys to it is exactly the pattern `:735` and `:866` already follow -- not a structural change. *Recorded because a seat working the remedy reported this leg as having NO matrix and concluded the cap needed a literal or a new env; it has one, and the distinction is the difference between a two-key edit and a redesign.*
 
 > **THE FIX IS INSTRUMENTATION AND IT IS CHEAP:** add `--durations` to that leg, and arm the native-stack belt the way `:735` and `:866` already do. Either alone converts the next occurrence from an inference into a reading; together they make the leg as legible as the ones beside it. **Do not "fix" this by raising a cap or adding a retry** -- neither makes the failure legible, and the second is declined for this class in [#1260](BACKLOG.md).
 
