@@ -695,6 +695,25 @@ def test_a_session_reusing_a_phantoms_id_cannot_consume_mail_it_never_saw(
     assert len(box_files(repo, key, "seen")) == 1
 
 
+# THE SAME 300s ITS SIBLING AT :593 CARRIES, AND THIS TEST NEEDS IT TEN TIMES MORE. That one runs
+# ROUNDS=60 (~960 pwsh spawns) and is marked; this one runs VERDICT_ROUNDS=600 (~9600 spawns) and was
+# NOT, so it inherited the leg default -- 120s on Windows (ci.yml:58). The cheap test had 300 seconds
+# and the expensive one had 120, on the slowest leg in the fleet.
+#
+# HOW THAT PRESENTED, and it is why four seats read the source and all missed it: UNDER xdist A
+# PER-TEST TIMEOUT KILL IS REPORTED AS `worker 'gwN' crashed`, NOT as a timeout. The worker dies
+# before it can say why, so the failure names neither this test's assertions nor a cap. Everyone
+# enumerated what the TEST could report and nobody asked what the HARNESS reports on its behalf.
+#
+# NOT PROVEN, deliberately stated: `node down: Not properly terminated` does not name a cause. The
+# signature fits -- 9600 process spawns, four xdist workers sharing a 4-CPU runner, 15.6s measured on
+# 20 IDLE cores, passing alone on a quiet box and failing repeatedly on a loaded one -- and nothing
+# contradicts it. That is a working theory with a marker attached, not a diagnosis.
+#
+# IF IT RECURS, THE NEXT LEVER IS VERDICT_ROUNDS, NOT A BIGGER NUMBER HERE. 600 rounds was chosen to
+# resolve a 5.75% false-win rate; fewer rounds costs resolution, which is a real trade to weigh. A
+# timeout that keeps growing is a gate being tuned to pass rather than sized against the work.
+@pytest.mark.timeout(300)
 def test_the_claim_verdict_agrees_with_the_filesystem(tmp_path: Path) -> None:
     """DEFECT 4, the verdict half -- and the half that was nearly shipped broken.
 
