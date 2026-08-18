@@ -10306,6 +10306,16 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 >
 > So a missing dump means "nothing fired", "it fired and we cannot see it", or "it was never switched on" -- **three states, one observable.** Every discriminator five seats proposed was derived from an artefact that never carried the field any of them needed.
 
+> **REPRODUCED, SO THIS IS NO LONGER AN INFERENCE FROM SOURCE.** Two arms, same interpreter, same cap, one deliberate 30s sleep against `--timeout=3`:
+>
+>     ARM 1  no xdist          "Stack of" 2   "crashed" 0    tail: +++ Timeout +++
+>     ARM 2  -n 2 --dist loadfile  "Stack of" 0   "crashed" 18   tail: worker 'gw8' crashed while...
+>     controls on ARM 2: "unrecognized arguments" 0, INTERNALERROR 0
+>
+> **A FIRED CAP UNDER xdist PRODUCES THE CI SIGNATURE EXACTLY -- worker crashed, no dump.** So that signature does not distinguish a timeout kill from a native crash, and no reading of the existing log can.
+>
+> *The first attempt at ARM 2 was VOID and is recorded because it nearly confirmed the wrong thing:* with the repo's plugins auto-loading it returned `INTERNALERROR: KeyError <WorkerController gw5>` and "4 failed" from 2 tests -- zero dump lines, but because the run never properly happened. Scored naively that is a confirmation. **The controls above exist for that reason: a zero dump count means nothing unless the arm provably ran.** The Lander hit the identical trap from the other direction (xdist absent, `unrecognized arguments: -n`).
+
 > **THERE IS ALSO NO PER-TEST TIMING.** The invocation is `pytest -q -n 4 --dist loadfile` with no `--durations`, and `-q` suppresses per-test lines. Measured on a real failing log (50,686 bytes): `durations` 0, `PASSED` 0, and **exactly two `[gw3]` lines** -- the node-down notice and the platform banner. Under `--dist loadfile` a worker runs several files before dying, so elapsed-since-pytest-start does not bound any single test's runtime. **The log cannot show a per-test cap fired AND cannot show it did not.**
 
 > **THE FIX IS INSTRUMENTATION AND IT IS CHEAP:** add `--durations` to that leg, and arm the native-stack belt the way `:735` and `:866` already do. Either alone converts the next occurrence from an inference into a reading; together they make the leg as legible as the ones beside it. **Do not "fix" this by raising a cap or adding a retry** -- neither makes the failure legible, and the second is declined for this class in [#1260](BACKLOG.md).
