@@ -10203,3 +10203,56 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Documentation / adopter-facing. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0). The cost today is that someone evaluating the project cannot see how its authors think about the threat surface, or what responsibility their own Handler code would carry.
+
+## 1283. asvs apply.py carries its own control flag into the record, and the preservation guard refuses only field loss
+
+> 🔢 **Filed 2026-08-18 - not started. THE WRITER ADDS AN UNRECOGNISED PAYLOAD KEY TO THE RECORD, AND THE GUARD MEANT TO PROTECT THE RECORD CANNOT SEE ADDITIONS.** `main()` passes the payload dict straight to `render()` with no strip (`scripts/asvs/apply.py:321`), so the `anchor_repair` control flag -- a directive telling the writer which path to take, read off that same dict at `:233` -- is carried through as a record field on every cell an anchor-repair pass touches.
+
+> **THE MECHANISM IS BACKLOG #1242's OWN LANDED FIX, AND #1242's BANNER DOES NOT SAY SO.** The union walk at `render()` (`:155`) was introduced by PR #382 so a key arriving on the payload would not be dropped; the comment at `:148-154` states that union was deliberate. **That same union is what lets a control flag reach the file. Closing the loss limb opened an addition limb.** This is **not** a duplicate of #1242 -- that item is about the writer LOSING fields and this is about it ADDING one -- but filing it without naming the causal link loses the one part a reader could not re-derive.
+
+> **THE GUARD ASYMMETRY IS THE TRANSFERABLE PART.** `lost_sub` (`:406-409`) refuses REMOVED sub-entry fields; **nothing refuses ADDED top-level ones.** The dry run reports blocks re-rendered, file parses, cells intact -- every word true and all of it silent about an added field. **An entry claiming that guard protects the record would be a compensating control whose stated coverage exceeds its real coverage (SDS-3.7).**
+
+> **IT IS A ONE-WAY RATCHET.** The flag is simultaneously the directive and a carried field, so the writer cannot express "repair the anchors and drop this key" -- measured by the reporting seat: a payload built to remove it re-renders it. The present mitigation is to run the pass without declaring the flag, which costs byte-identical prose preservation and closed-cell handling.
+
+> **SEQUENCE IT BEFORE #1242 LIMB 4.** Limb 4 (evidence emitter carries unknown keys) is carried by open PR #394, and #432 carries a related payload-types limb. Landing limb 4 without the strip extends the same class one nesting level down, into evidence entries.
+
+> **FIX:** strip control keys before `render`, and add an invariant refusing added top-level keys the way `lost_sub` refuses removed ones.
+
+> **PROVENANCE.** Reported by the ASVS Tracker seat; the mechanism was verified independently against the engine tree before filing -- all four sub-claims, being the no-strip call, the flag read, the union walk and the guard asymmetry. Impact figures are vault coverage data and are deliberately not reproduced here.
+
+**Cluster:** Tooling / record integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). The cost is that a security record acquires a field nobody put there deliberately, the writer cannot express its removal, and further repair passes are held while it stands.
+
+## 1284. roles/ can reach the public engine remote and neither gitignore nor the leak gate stops it
+
+> 🔢 **Filed 2026-08-18 - not started. THIS IS AN OPEN PATH, NOT AN INCIDENT, AND NOTHING HAS LEAKED.** Measured 2026-08-17: zero `roles` refs on the public remote, against a positive control of 2282 refs on the private one. It is written that way on purpose -- the value is closing a route before it is used, not responding to a disclosure.
+
+> **THE PATH.** The engine clone carries TWO remotes: `origin` is the PUBLIC engine repository, and a second remote points at the private vault, so vault refs resolve from an engine worktree. **`roles/` is neither gitignored in the engine repo nor listed in the leak gate's location detector** -- `scripts/security/scan_forbidden.py` `FORBIDDEN_PATHS` carries exactly one entry, covering `docs/security/`. A `roles/` file pushed from an engine worktree to `origin` would therefore reach the public repository unstopped.
+
+> **THE GATE'S OWN COMMENT ALREADY DESCRIBES THIS DELIVERY ROUTE, for the folder it DOES cover:** a branch made from a fetched vault ref carries the files inside a commit TREE, so no ignore rule is ever consulted. The route is understood; only the path list is short.
+
+> **A SECOND, INDEPENDENT GAP FOUND WHILE VERIFYING THIS ONE.** `scan_forbidden.py` has **no email or domain detector at all** -- zero matches for `email` or `mailto`, against a positive control of 14 `re.compile` calls proving the file was read. Its structural detectors are a routable-IPv4 pattern, a worktree slug and a home path, and none matches an address. Any address class is caught only if the domain sits in the externalized token-name list. **Do not rely on the gate for that class.**
+
+> **DISCRIMINATE THE TWO REPOSITORIES BY `--git-common-dir`, NEVER BY REMOTE URL AND NEVER BY THE BARE WORD "main".** They are different repositories with the same name and different owners, and on a machine carrying both, `main` names at least two branches.
+
+> **FIX DIRECTION:** add `roles/` to the gate's location detector and to the engine `.gitignore`, with a negative test per class so the guard is proven able to fire. **Free extra found in passing:** that gate's comment cites a `.gitignore` line number for `docs/security/` that has since moved -- a file:line citation is a search hint, not an address.
+
+**Cluster:** Security tooling / leak prevention. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0), and nothing has leaked. The cost would be paid on the first careless push from an engine worktree holding vault content.
+
+## 1285. CLAUDE.md section 11's no-discriminating-shape claim is false as measured, and a parser ambiguity rests on it
+
+> 🔢 **Filed 2026-08-18 - not started. SECTION 11 USES A CLAIMED ABSENCE TO JUSTIFY LEAVING A KNOWN AMBIGUITY IN A MACHINE-PARSED CONTRACT, AND THE ABSENCE IS NOT THERE.** The text argues that two parsers of the backlog agreed by luck because no item happens to have the discriminating shape. **Measured at `origin/main` 3a7a2cd1f, via `parse_items` imported from `backlog_status_check.py`: 3 open items carry the closed-class character U+2705 in their bodies -- the exact character section 11 names -- and 14 carry U+26D4.** Positive control: 54 closed items also carry U+2705.
+
+> **WHY THE DIRECTION MATTERS.** A false OPEN reading is noise. **A false CLOSED reading removes an item from the queue so nobody looks again.** An item's banner block ends at the first line that is neither blank nor a blockquote, so a closed-class character used as emphasis inside an item body can parse as a status banner.
+
+> **A LARGER RELATED FINDING FROM THE SAME PASS, NOT SEPARATELY AUDITED.** At least 46 lines across the two ledger files carry both a closed-class and an open-class character on ONE line, 11 of them blockquote lines, and three owning items were observed resolving silently to open. **4 were spot-checked and 46 were not** -- that scope is stated rather than rounded up, and the remainder is the work.
+
+> **THIS ITEM IS ABOUT THE JUSTIFICATION, NOT THE ALPHABET.** The banner alphabet is a deliberate machine-parsed holdout and retiring it is a separate filed migration. What is wrong here is a load-bearing sentence asserting an absence that measurement contradicts, and a rule that declines to close an ambiguity *because* of that absence.
+
+> **FIX DIRECTION:** correct the sentence to state the measured population, and decide separately whether to close the ambiguity by forbidding both alphabets inside item bodies, with a test that proves the guard fires. **Characters are named by codepoint throughout this item on purpose, so that filing it cannot itself perturb the parser.**
+
+> **PROVENANCE.** Measured by the seat field-testing the dispatcher playbook, using the canonical parser rather than a hand-rolled scan. **Not re-measured by the lander before filing** -- the instrument and both controls are stated so that it can be.
+
+**Cluster:** Documentation / machine-parsed contracts. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). The cost is a status parser whose known ambiguity is defended by a false premise, in the file that defines item status.
