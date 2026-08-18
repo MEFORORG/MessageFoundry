@@ -10283,3 +10283,34 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** CI / reliability. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0) -- CI only. The cost today is a blocked merge queue: `test (ubuntu-latest, py3.14)` is a REQUIRED context, so a hang there blocks merges outright, and one was observed still hanging past 27 minutes. The latent cost is the unbounded half, where the same stall runs to the platform default and consumes hosted-runner time with nothing to show.
+
+
+## 1287. the harness leg is the one Windows leg with no native-stack belt and no per-test timing, so the repo's own hang-versus-slow discriminator silently does not apply there
+
+> 🔢 **Filed 2026-08-18 - not started. FIVE SEATS SPENT ~30 MINUTES AND FOUR REVERSALS ON A QUESTION THE NEIGHBOURING LEGS WOULD HAVE ANSWERED FROM THEIR OWN LOGS.** This is a defect in what an artefact can ever report, not in any test. It is filable now precisely because it is INDEPENDENT of the unresolved failure that exposed it.
+
+> **THE ARMING ASYMMETRY. All line numbers pinned to `origin/main` @ `3a7a2cd1`** -- read them with `git show 3a7a2cd1:.github/workflows/ci.yml`, because this file's line numbers differ between branches and two seats already quoted different ones for the same facts.
+>
+>     :735   -m 'not tooling'   -o faulthandler_timeout=$FAULT_TIMEOUT   PYTHONFAULTHANDLER at :689
+>     :866   web console        -o faulthandler_timeout=$FAULT_TIMEOUT   PYTHONFAULTHANDLER at :862
+>     :998   -m tooling         NO -o faulthandler_timeout                NO PYTHONFAULTHANDLER
+>
+> The harness leg's full invocation carries `--timeout=120` and `--junitxml=`, and nothing else. Its two neighbours arm the native-stack belt; it does not.
+
+> **WHY THAT IS A CONTROL FAILING, NOT MERELY THIN LOGGING.** [`ci.yml:436`](../.github/workflows/ci.yml) states the repository's own diagnostic rule: *"No faulthandler native-stack dump appears in any kill log. That settles the hang-versus-slow question."* **A leg that cannot PRODUCE that dump is a leg where that rule silently does not apply** -- the discriminator is cited generally and holds only where the belt is armed. That is a compensating control not covering the path it is invoked for.
+
+> **BOTH SILENCES ARE UNINFORMATIVE, FOR DIFFERENT REASONS, AND THE LOG CANNOT TELL THEM APART.**
+>
+>   * **faulthandler** is silent because it was **never armed** on this leg.
+>   * **pytest-timeout** is silent because of where it writes. Read from the installed `pytest_timeout` 2.4.0 source: `timeout_timer()` calls `dump_stacks(terminal)` and then `os._exit(1)` in its `finally` -- it DOES dump before dying, but `terminal` is `item.config.get_terminal_writer()`, i.e. **the worker's** terminal under xdist, and the process is killed immediately after. Whether that output reaches the controller's captured log is not something the controller's log can establish.
+>
+> So a missing dump means "nothing fired", "it fired and we cannot see it", or "it was never switched on" -- **three states, one observable.** Every discriminator five seats proposed was derived from an artefact that never carried the field any of them needed.
+
+> **THERE IS ALSO NO PER-TEST TIMING.** The invocation is `pytest -q -n 4 --dist loadfile` with no `--durations`, and `-q` suppresses per-test lines. Measured on a real failing log (50,686 bytes): `durations` 0, `PASSED` 0, and **exactly two `[gw3]` lines** -- the node-down notice and the platform banner. Under `--dist loadfile` a worker runs several files before dying, so elapsed-since-pytest-start does not bound any single test's runtime. **The log cannot show a per-test cap fired AND cannot show it did not.**
+
+> **THE FIX IS INSTRUMENTATION AND IT IS CHEAP:** add `--durations` to that leg, and arm the native-stack belt the way `:735` and `:866` already do. Either alone converts the next occurrence from an inference into a reading; together they make the leg as legible as the ones beside it. **Do not "fix" this by raising a cap or adding a retry** -- neither makes the failure legible, and the second is declined for this class in [#1260](BACKLOG.md).
+
+> **PROVENANCE.** Found while five seats tried to classify one worker death on this leg. The arming asymmetry and the missing per-test timing were measured from this seat; the Lander verified both independently after they were named, and asked that the item be filed here rather than on their branch to avoid worsening a `docs/BACKLOG.md` tail collision they had already agreed to absorb. **The failure that exposed it is deliberately NOT the subject of this item** and remains undetermined.
+
+**Cluster:** CI / observability. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- CI only. The measured cost is diagnostic: one worker death on this leg consumed roughly thirty minutes across five seats and produced four reversals, with the correct answer being that the artefact could not answer. The same failure on either neighbouring leg would have carried a native-stack dump and been read once.
