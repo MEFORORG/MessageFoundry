@@ -10203,3 +10203,44 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Documentation / adopter-facing. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0). The cost today is that someone evaluating the project cannot see how its authors think about the threat surface, or what responsibility their own Handler code would carry.
+
+
+## 1281. install-gate -Status crashes on any config root with zero wired matchers, so the parity report dies before it prints
+
+> 🔢 **Filed 2026-08-18 - FIXED IN THE SAME COMMIT; close this when it lands.** `scripts/worktree/install-gate.ps1 -Status` exits 1 with `You cannot call a method on a null-valued expression`, and does so on `main`.
+
+> **THE DEFECT IS ONE MISSING ARRAY WRAP, THREE LINES FROM A CORRECT ONE.** `:294` wraps its result -- `$handled = @(Get-HandledTools $GateDst)` -- and `:297` does not: `$wired = Get-WiredMatchers $sp`. When a config root yields no wired matchers PowerShell collapses the empty result to `$null` rather than an empty array, so `:302`'s `$wired.Contains($_)` throws. One of the two adjacent lines was wrapped and the other was not.
+
+> **THE TRIGGER PASSES #1024's ANCHOR, SO NARROWING THE GLOB AGAIN CANNOT FIX IT.** Measured 2026-08-18: `%USERPROFILE%\.claude-account-5` is a directory, matches the anchored predicate `\A\.claude-account-\d+\z` that #1024 shipped, survives the `Test-Path -PathType Container` filter -- and carries NO `settings.json`. `Read-Settings` returns an empty hashtable for a missing file (`:148`), so that root yields zero matchers and `$wired` is `$null`. The five roots that DO carry a settings.json print their wiring and pass; the sixth kills the command before it prints.
+>
+> **I FIRST BLAMED THE WRONG DIRECTORY, AND RECORD IT BECAUSE THE WRONG ONE IS MORE PLAUSIBLE.** `%USERPROFILE%\.claude-account-2.lock` also carries a `settings.json` declaring zero hooks and looks like the obvious culprit -- but the anchored predicate returns **False** for it, so it is never scanned at all. #1024 closed that hole on 2026-08-10 and closed it correctly. A reader who inherited my first reading would go and re-narrow a glob that is already right, reopening shipped work to fix a defect that would survive it untouched.
+
+> **WHY NOTHING CAUGHT IT.** [`tests/test_install_gate_wiring.py`](../tests/test_install_gate_wiring.py)`::test_status_prints_a_sha_beside_each_version` DOES catch it and fails locally. It is invisible in CI because that family compares INSTALLED artifacts against committed source and CI has no user settings, so those tests skip there. `main` reads clean on GitHub while every local full-suite run on an affected box is red -- for a reason unrelated to whatever change is under test, which is the expensive part.
+
+> **THE FIX AND ITS CONTROL.** `$wired = @(Get-WiredMatchers $sp)`. Verified in both directions rather than asserted: in the fixed worktree `-Status` exits 0 and all 11 tests in that module pass; in an unfixed worktree at the same base, the same test still FAILS.
+
+**Cluster:** Developer tooling / worktree gate. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- a local developer script, no engine code. The cost is that `-Status`, the command an operator runs to ask whether the gate is wired at all, dies before printing its wiring report; and that a local suite run on an affected box is red in a way CI cannot see.
+
+
+## 1282. an allocation whose worktree is deleted can never be filed, and alloc.ps1 has no transfer path
+
+> 🔢 **Filed 2026-08-18 - not started. TWO ITEMS ARE ALREADY IN THIS STATE and neither can be filed by anybody.** The ledger gate keys ownership to the worktree that ran `alloc.ps1`; remove that worktree and the number stays allocated forever while its row can never be committed.
+
+> **MEASURED BY EXECUTING THE GATE, NOT BY READING IT.** [`scripts/hooks/ledger_check.py`](../scripts/hooks/ledger_check.py) `:229-231` compares `str(self.repo)` -- from `git rev-parse --path-format=absolute --show-toplevel` at `:145` -- against the alloc record's `worktree` field, casefolded and slash-normalised. `:357` refuses when they differ, with `BACKLOG item #N was not allocated to this worktree`. Running the real `check_backlog()` with a `## 1274.` heading staged returns exactly 1 failure carrying that message; with no backlog file staged, 0; in CI mode, 0.
+
+> **THE TWO LIVE INSTANCES.**
+>
+>     #1264   alloc names  ...\.claude\worktrees\desktop-session-stoppage-bug-141f74   GONE
+>     #1274   alloc names  ...\MessageFoundry-lander-livenessblind                       GONE
+>
+> #1264 is PR #397's content, which is why that PR's DIRTY state cannot be cleared even in principle -- resolving the conflict requires a commit the gate refuses. #1274's text exists only on `origin/snapshot/lander-1274-liveness-blindspot-20260815`.
+
+> **`alloc.ps1` HAS NO REMEDY, AND THE ADJACENT REGISTRY DOES.** Its full parameter set is `-Kind -Title -List -ShowFloor`, and [`docs/LEDGER-GATE.md`](LEDGER-GATE.md) documents no adoption path. `claim.ps1`, which guards work claims rather than numbers, carries `-Release` and `-Force`, so a dead holder there is recoverable in one command. The asymmetry reads as accidental rather than decided.
+
+> **THE SHAPE OF THE FIX, AND THE TRAP INSIDE IT.** An `-Adopt <n>` that reassigns the record to the current worktree. The guard must be *"is the recorded worktree ABSENT from `git worktree list`"* and NEVER *"is it idle"* -- an idleness test steals allocations from live sessions, which is exactly the corruption this gate exists to prevent. It must REFUSE when it cannot determine, and PRINT what it compared against: a check that returns a confident answer when it could not actually look has cost this repository repeatedly.
+
+> **DO NOT HAND-EDIT THE ALLOCATION RECORD.** That is tampering with the registry the gate protects. It was proposed and explicitly refused once already, when #1264 first hit this.
+
+**Cluster:** Coordination / ledger tooling. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). The cost is that any worktree removal which happens to hold an allocation mints a permanently unfilable number -- two exist today -- and that one open PR (#397) is blocked in a way no amount of conflict resolution can clear.

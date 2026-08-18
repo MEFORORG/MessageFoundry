@@ -294,7 +294,7 @@ if ($Status) {
     $handled = @(Get-HandledTools $GateDst)
     foreach ($cd in $ConfigDir) {
         $sp = Join-Path $cd "settings.json"
-        $wired = Get-WiredMatchers $sp
+        $wired = @(Get-WiredMatchers $sp)
         # Rules that are deliberately unwired are reported as such, never as UNWIRED. A status line that
         # cries wolf about a known-and-intended state is one a reader learns to skip, which is how a real
         # UNWIRED would go unnoticed -- the exact failure this whole block exists to surface.
