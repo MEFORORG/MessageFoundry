@@ -31,7 +31,7 @@ import time
 import tokenize
 import tomllib
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Final, Literal, get_args
 
@@ -1818,7 +1818,119 @@ def _verdict_rows(parts: list[tuple[str, int]]) -> list[str]:
     return rows
 
 
-def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
+@dataclass(frozen=True)
+class BaseSpread:
+    """How many distinct engine trees the record's verdicts were actually read against.
+
+    **The line this replaces named ONE commit and implied the record sat on it.** The rendered entry
+    point led with ``**Anchor commit:** <sha>`` in bold, which reads as *the* base of the assessment.
+    Measured 2026-08-18 against the live record: 345 cells carry **24 distinct** ``verified_at`` SHAs,
+    the widest 501 commits behind engine ``origin/main`` and the narrowest 6, and **exactly 2 of 345
+    sit at ``anchor_commit`` itself**. So the bolded ref described 0.6% of the record.
+
+    That is not a formatting complaint. A reader who takes the anchor commit as the base will date the
+    whole record by it, and be wrong in both directions at once -- too new for the 74-cell cohort 424
+    commits back, too old for the cells verified last week.
+
+    ``anchor_commit`` is not thereby useless and is still rendered: it is where the EVIDENCE was last
+    re-read, which is a real and different fact from where each VERDICT was decided. What changes is
+    that it stops being presented as the record's single base.
+
+    ``behind`` is empty when distance could not be measured -- no engine tree, no git, or a ref that
+    does not resolve there. Empty means NOT MEASURED and is rendered as such, never as zero: a
+    silently-omitted distance would restore the same one-number impression this exists to remove.
+    """
+
+    #: Distinct non-empty ``verified_at`` values across all cells.
+    refs: int
+    #: Cells carrying a ``verified_at`` at all.
+    with_ref: int
+    #: Cells carrying none. Their verdict has no recorded base, which is a different gap from a stale one.
+    without_ref: int
+    #: Cells whose ``verified_at`` equals ``anchor_commit``.
+    at_anchor: int
+    #: Total cells, so every figure above is readable against its denominator without leaving the line.
+    total: int
+    #: ``ref -> commits behind the root's HEAD``. EMPTY means not measured, never zero.
+    behind: dict[str, int] = field(default_factory=dict)
+
+
+def base_spread(cells: list[Cell], anchor_sha: str) -> BaseSpread:
+    """The :class:`BaseSpread` derivable from the record alone — no git, no engine tree, no network.
+
+    Split from the distance measurement on purpose: this half is pure and total, so it renders
+    identically in a unit test and in CI, and the half that can fail to measure is the half that is
+    allowed to be absent.
+    """
+    refs = {c.verified_at for c in cells if c.verified_at}
+    with_ref = sum(1 for c in cells if c.verified_at)
+    return BaseSpread(
+        refs=len(refs),
+        with_ref=with_ref,
+        without_ref=len(cells) - with_ref,
+        # Compared on the recorded prefix, because `verified_at` is normalised to 40 characters by
+        # the vault's `asvs-verified-at.py` while `anchor_commit` is written short. Comparing the raw
+        # strings would report 0 at-anchor cells forever, and 0 is exactly the answer this figure is
+        # meant to make surprising -- it would look like a finding rather than a units error.
+        at_anchor=sum(
+            1
+            for c in cells
+            if c.verified_at
+            and anchor_sha
+            and (c.verified_at.startswith(anchor_sha) or anchor_sha.startswith(c.verified_at))
+        ),
+        total=len(cells),
+    )
+
+
+def ref_distances(root: Path, refs: set[str]) -> dict[str, int]:
+    """``ref -> commits between it and the root's HEAD``, skipping every ref that does not resolve.
+
+    Read-only and best-effort by design. A ref that does not resolve in this checkout is OMITTED
+    rather than recorded as 0 — see :class:`BaseSpread`, where absent means not measured.
+    """
+    out: dict[str, int] = {}
+    for ref in refs:
+        n = _git(root, "rev-list", "--count", f"{ref}..HEAD")
+        if n is not None and n.isdigit():
+            out[ref] = int(n)
+    return out
+
+
+def _base_line(anchor_sha: str, spread: BaseSpread | None) -> str:
+    """The header line naming what the record's verdicts were decided against.
+
+    Falls back to the old single-commit form when no spread is supplied, so a caller that has only the
+    cells still renders something true rather than something absent.
+    """
+    method = "**Method:** `docs/ASVS-ASSESSMENT-METHOD.md`"
+    if spread is None:
+        return f"**Anchor commit:** `{anchor_sha}` · {method}"
+    bits = [
+        f"**Verdict bases:** {spread.refs} distinct engine tree(s) across "
+        f"{spread.with_ref} of {spread.total} cell(s)"
+    ]
+    if spread.behind:
+        lo, hi = min(spread.behind.values()), max(spread.behind.values())
+        # ONE number when they coincide. "spanning 6 to 6 commits" reads as a measurement error.
+        span = f"{lo}" if lo == hi else f"{lo} to {hi}"
+        bits.append(f"spanning {span} commit(s) behind the checked tree")
+    else:
+        # NEVER silently omit this. An absent distance and a distance of zero are different claims,
+        # and the whole defect being fixed here is a number presented without what bounds it.
+        bits.append("distance to the checked tree NOT MEASURED")
+    if spread.without_ref:
+        bits.append(f"{spread.without_ref} cell(s) record no base at all")
+    # The anchor stays, demoted to what it actually is: where the EVIDENCE was last re-read, with the
+    # share of the record that sits there stated so it cannot be read as the record's base.
+    bits.append(
+        f"evidence last re-anchored at `{anchor_sha}`, where {spread.at_anchor} of "
+        f"{spread.total} cell(s) sit"
+    )
+    return " · ".join(bits) + f" · {method}"
+
+
+def render_current(cells: list[Cell], *, anchor_sha: str, spread: BaseSpread | None = None) -> str:
     """The generated entry point — survey progress FIRST, verdict counts second.
 
     **Phase 0 of the fix (ADR 0156 / ASSESSMENT-METHOD §4).** A headline count computed over cells
@@ -1845,7 +1957,7 @@ def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
         "",
         "# ASVS 5.0 L3 — current state",
         "",
-        f"**Anchor commit:** `{anchor_sha}` · **Method:** `docs/ASVS-ASSESSMENT-METHOD.md`",
+        _base_line(anchor_sha, spread),
         "",
         "## Survey progress",
         "",
@@ -2433,9 +2545,36 @@ def main(argv: list[str] | None = None) -> int:
     for p in findings.problems:
         print(f"  FAIL {p}", file=sys.stderr)
 
-    if args.render and findings.ok:
+    # RENDER IS NOT GATED ON `findings.ok`, and un-gating it is the point.
+    #
+    # It used to be `if args.render and findings.ok`, which coupled two unrelated things: the render is
+    # derived from CELLS (verdicts, levels, dates), while `problems` is overwhelmingly about ANCHORS --
+    # a token that moved, went ambiguous, or vanished. An anchor problem does not change a single
+    # number in the rendered table, yet it made the only sanctioned command refuse to write it.
+    #
+    # So ANCHOR RED BECAME RENDER RED, and then render red became a stale committed entry point, which
+    # is what reddened the scheduled arm for eight consecutive days through 2026-08-18. The fix for a
+    # drifted render was to run the render -- and the drift itself was blocking that.
+    #
+    # The exit code is UNCHANGED and still `findings.ok`: this makes the artifact current, it does not
+    # make a failing run look clean. `load_scorecard` has already succeeded by here (a malformed record
+    # raises and returns 2 far above), so `cells` is valid whatever the anchors are doing.
+    if args.render:
         anchor = load_meta(args.scorecard).get("anchor_commit", "unrecorded")
-        args.render.write_text(render_current(cells, anchor_sha=anchor), encoding="utf-8")
+        # The spread is computed HERE rather than inside `render_current`, because measuring how far
+        # each base is from the checked tree needs the engine checkout and `render_current` is a pure
+        # function of the cells. Keeping it pure is what lets the renderer be unit-tested against a
+        # fixture with no repository at all.
+        spread = base_spread(cells, anchor)
+        distances = ref_distances(args.root, {c.verified_at for c in cells if c.verified_at})
+        args.render.write_text(
+            render_current(
+                cells,
+                anchor_sha=anchor,
+                spread=replace(spread, behind=distances),
+            ),
+            encoding="utf-8",
+        )
         print(f"rendered {args.render}")
 
     return 0 if findings.ok else 1
