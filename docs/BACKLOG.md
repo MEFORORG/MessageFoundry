@@ -10318,6 +10318,19 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **THERE IS ALSO NO PER-TEST TIMING.** The invocation is `pytest -q -n 4 --dist loadfile` with no `--durations`, and `-q` suppresses per-test lines. Measured on a real failing log (50,686 bytes): `durations` 0, `PASSED` 0, and **exactly two `[gw3]` lines** -- the node-down notice and the platform banner. Under `--dist loadfile` a worker runs several files before dying, so elapsed-since-pytest-start does not bound any single test's runtime. **The log cannot show a per-test cap fired AND cannot show it did not.**
 
+> **THE REMEDY IS DEMONSTRATED, NOT HOPED -- THE NATIVE DUMP SURVIVES xdist.** The earlier arms measured pytest-timeout's dump, which goes through pytest's terminal writer and is lost. faulthandler is a DIFFERENT MECHANISM: it writes the native stack to the raw stderr FD from C. Measured with the belt armed (`PYTHONFAULTHANDLER=1` plus `-o faulthandler_timeout=`):
+>
+>     arm 3a  belt armed, no xdist   "Thread 0x" 2   "bringing up nodes" 0
+>     arm 3b  belt armed, -n 2       "Thread 0x" 3   "bringing up nodes" 2   "Stack of" 0
+>
+> and the surviving dump NAMES THE STUCK TEST: `Thread 0x0000890c [pytest_timeout ::test_sleeps_past_the_cap]`. **Had `:998` been armed, the failure that prompted this item would have carried a dump naming the frame.** The `bringing up nodes` counts are the control that xdist genuinely engaged in 3b and not in 3a; without it, 3b would be indistinguishable from a re-run of 3a.
+>
+> **BOTH HALVES ARE REQUIRED.** `:998` has neither `PYTHONFAULTHANDLER` nor `-o faulthandler_timeout=`; the `-o` flag alone does not arm it.
+>
+> *Grep the right tool's format:* faulthandler emits `Thread 0x... [name]`, pytest-timeout emits `Stack of ...`. Searching for the latter in a faulthandler dump returns zero and reads as "swallowed" -- a false negative that cost one seat a near-miss, and is why `Stack of` is 0 in arm 3b while the dump is plainly present.
+
+> **A THIRD GAP ON THE SAME LEG, pinned to `origin/main` @ `3a7a2cd1`:** `:998` hardcodes `--timeout=120` where both siblings use `--timeout="$PYTEST_TIMEOUT"` (`:735`, `:866`), fed from `matrix.pytest_timeout` at `:696` and `:865`. **So this leg's cap does not track a matrix tune** -- the value is right today and silently stops tracking the moment anyone retunes the matrix.
+
 > **THE FIX IS INSTRUMENTATION AND IT IS CHEAP:** add `--durations` to that leg, and arm the native-stack belt the way `:735` and `:866` already do. Either alone converts the next occurrence from an inference into a reading; together they make the leg as legible as the ones beside it. **Do not "fix" this by raising a cap or adding a retry** -- neither makes the failure legible, and the second is declined for this class in [#1260](BACKLOG.md).
 
 > **PROVENANCE.** Found while five seats tried to classify one worker death on this leg. The arming asymmetry and the missing per-test timing were measured from this seat; the Lander verified both independently after they were named, and asked that the item be filed here rather than on their branch to avoid worsening a `docs/BACKLOG.md` tail collision they had already agreed to absorb. **The failure that exposed it is deliberately NOT the subject of this item** and remains undetermined.
