@@ -994,8 +994,31 @@ def test_worker_kill_reaps_the_whole_process_tree(tmp_path: Path) -> None:
             "response pipe never reached EOF -- a grandchild still holds it; the worker tree "
             "was not reaped"
         )
-        # SECONDARY: the process half, asserted directly.
-        assert not _pid_alive(grandchild_pid), "the grandchild survived the worker kill"
+        # SECONDARY: the process half, asserted directly -- POLLED, not sampled once.
+        #
+        # THE ONE-SHOT FORM WAS A RACE AGAINST AN EVENTUALLY-CONSISTENT CONDITION. The primary
+        # above accepts pipe EOF, which arrives the instant the last holder of fd 1 releases it --
+        # i.e. DURING the grandchild's teardown. On Windows `_pid_alive` answers through
+        # `GetExitCodeProcess`, which keeps reporting STILL_ACTIVE until the process object is
+        # signalled, so there is a real window in which the pipe has EOF'd and the pid still reads
+        # alive. Checking once inside that window fails a test whose subject is fine.
+        #
+        # THE PRIMARY WAS ALREADY BOUNDED (8s) AND THIS WAS NOT -- the same assertion pair, one
+        # tolerant of scheduling and one not. On a loaded 4-CPU runner the window widens and only
+        # the intolerant half fires.
+        #
+        # POLL, DON'T SAMPLE-AND-HOPE is the house idiom, established in
+        # tests/test_connscale_cpu_probe.py for exactly this class: that test's comment records it
+        # "used to be `time.sleep(1.0)` then ONE `sample_proc()`" before the same defect was found.
+        # The deadline is generous because a false RED here costs a queue and a false GREEN costs
+        # nothing this test is for -- a surviving grandchild never exits, so no wait rescues it.
+        reap_deadline = time.monotonic() + 10.0
+        while _pid_alive(grandchild_pid) and time.monotonic() < reap_deadline:
+            time.sleep(0.05)
+        assert not _pid_alive(grandchild_pid), (
+            "the grandchild survived the worker kill (polled to a 10s deadline, so this is a "
+            "SURVIVING process rather than one still being reaped)"
+        )
     finally:
         if grandchild_pid is not None:
             _best_effort_kill_pid(grandchild_pid)
