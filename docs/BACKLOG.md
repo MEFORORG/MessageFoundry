@@ -10318,6 +10318,19 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **THERE IS ALSO NO PER-TEST TIMING.** The invocation is `pytest -q -n 4 --dist loadfile` with no `--durations`, and `-q` suppresses per-test lines. Measured on a real failing log (50,686 bytes): `durations` 0, `PASSED` 0, and **exactly two `[gw3]` lines** -- the node-down notice and the platform banner. Under `--dist loadfile` a worker runs several files before dying, so elapsed-since-pytest-start does not bound any single test's runtime. **The log cannot show a per-test cap fired AND cannot show it did not.**
 
+> **FOURTH AND FINAL STATE, 2026-08-18: BELT *BELOW* CAP DOMINATES ON AN xdist LEG, AND MY RETRACTION'S PREMISE WAS A SCOPE ERROR.** The retraction below says arm 3 "demonstrated the remedy in a configuration `ci.yml` forbids", citing `:360`'s always-set-the-belt-ABOVE-the-cap rule. **`:360` sits inside the `test:` job (begins `:41`) and governs THAT job.** It does not govern `tooling:`, so nothing forbade arm 3's ordering there -- I made the same mis-scoped-citation error this item exists to document, inside the correction to it.
+>
+> **AND `:360`'s OWN RATIONALE FAILS UNDER xdist.** It sets the belt above the cap *"so the per-test dump is attributed first"* -- but arm 4 measured that pytest-timeout's dump never reaches the controller under xdist. The attribution the ordering buys does not arrive. So on an xdist leg the orderings compare:
+>
+>     belt BELOW cap   killable: dumps at the belt, then the cap kills   -> READABLE
+>                      unkillable: dumps at the belt                     -> READABLE
+>     belt ABOVE cap   killable: cap kills first, belt never fires       -> BLIND (arm 4)
+>                      unkillable: belt fires, dump survives             -> readable (arm 5)
+>
+> **Readable in two cases of two, versus one of two.** The cost of below-cap is that a slow-but-PASSING test dumps once at the belt -- log noise only, since faulthandler never kills (`:363`).
+>
+> **SO ARM 3's CONFIGURATION WAS NOT FORBIDDEN; IT WAS THE BETTER ONE FOR THIS LEG.** What survives from the retraction is narrower and still true: at the `test:` job's ABOVE-cap ordering, arming buys nothing for a killable hang.
+
 > **SCOPE CORRECTION 2026-08-18, THIRD AND CURRENT STATE OF THIS REMEDY: ARMING THE BELT IS WORTH DOING, FOR THE CLASS IT EXISTS FOR.** The retraction immediately below is correct about KILLABLE hangs and too broad as written. Every arm before this used `time.sleep`, which pytest-timeout's thread method CAN interrupt; `ci.yml:357` says the belt exists for a hang it CANNOT. That class was never tested until now -- manufactured with catastrophic regex backtracking, which holds the GIL inside C:
 >
 >     arm 5a  no xdist, cap 4 belt 8   belt fired at "Timeout (0:00:08)"   "Thread 0x" 2   "Stack of" 0
