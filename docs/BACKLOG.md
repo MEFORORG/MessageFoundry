@@ -10391,3 +10391,26 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** CI / observability. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0) -- CI only. The measured cost is diagnostic: one worker death on this leg consumed roughly thirty minutes across five seats and produced four reversals, with the correct answer being that the artefact could not answer. The same failure on either neighbouring leg would have carried a native-stack dump and been read once.
+
+
+## 1288. the test job is blind to a killable hang under xdist, because its own belt-above-cap rule buys an attribution that xdist discards
+
+> 🔢 **Filed 2026-08-18 - not started. THIS IS ABOUT HANGS IN THE `test:` JOB ONLY, AND IT IS NOT A CHANGE REQUEST.** Two seats verified it independently; neither proposes altering `test:` tonight, for a measured reason given below. Filed because it was found while working a different leg and would otherwise survive only in mail.
+
+> **THE THREE CONDITIONS, all pinned to `origin/main` @ `3a7a2cd1`.** (1) The `test:` job runs xdist -- `:735`, `-n "$PYTEST_WORKERS"`. (2) Its belt sits ABOVE its cap on every matrix row: 60/90, 120/150, 120/150. (3) Measured under those conditions, a KILLABLE hang produces **neither dump**: pytest-timeout writes to the worker's terminal and is discarded, and the belt at the higher value never fires because the cap killed first.
+>
+>     belt ABOVE cap, xdist   killable hang     cap kills first, belt never fires   -> NEITHER DUMP
+>     belt ABOVE cap, xdist   unkillable hang   belt fires, native dump survives    -> readable
+>     belt BELOW cap, xdist   killable hang     dumps at the belt, then cap kills   -> readable
+>     belt BELOW cap, xdist   unkillable hang   dumps at the belt                   -> readable
+
+> **THE RULE IS SOUND WHERE IT WAS WRITTEN AND EMPTY WHERE IT LANDS.** `ci.yml:360` sets the belt above the cap *"so the per-test dump is attributed first"*. That rationale assumes the per-test dump ARRIVES. Under xdist it does not -- which is measured, not argued: the same experiment that produced the table above shows `Stack of` at zero on every xdist arm. **So the ordering pays a cost for an attribution the harness discards.**
+
+> **SCOPE THAT MUST TRAVEL WITH THIS ITEM: IT IS ABOUT HANGS, NOT ABOUT ANY FAILURE OBSERVED TONIGHT.** The `test:`-job failures on 2026-08-18 were `AssertionError: the grandchild survived the worker kill` -- assertions, which report normally through xdist. **The blind cell is a latent diagnostic gap, not the cause of anything anyone has seen.** Quoting this item as an explanation for an observed `test:` failure would be wrong.
+
+> **WHY NEITHER SEAT PROPOSES FLIPPING `test:` TO BELT-BELOW-CAP, and the reason is a cost, not caution.** Belt-below-cap dumps a native stack on every slow-but-PASSING test that crosses the belt. On `tooling:` that is a handful of tests and the noise is negligible; **on `test:` it is the repository's LARGEST suite and nobody has measured the volume.** faulthandler never kills (`:363`), so the risk is log noise rather than red builds -- but unmeasured noise on the main suite is a real cost and the change should not be made blind.
+
+> **WHAT WOULD DECIDE IT:** measure how many `test:`-job tests would cross a below-cap belt on a hosted runner -- which needs the same per-test timing that [#1287](BACKLOG.md) asks for on the harness leg. **Do not flip the ordering first and measure the noise afterwards.**
+
+**Cluster:** CI / observability. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- CI only, and latent. Nothing is broken today; the cost appears the first time a test in the main suite hangs in a way pytest-timeout can kill, at which point the job reports a worker crash with no dump and the diagnosis starts from nothing. That is the same position five seats spent roughly forty minutes in on the harness leg, on a suite an order of magnitude larger.
