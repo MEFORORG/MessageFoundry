@@ -10318,6 +10318,22 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **THERE IS ALSO NO PER-TEST TIMING.** The invocation is `pytest -q -n 4 --dist loadfile` with no `--durations`, and `-q` suppresses per-test lines. Measured on a real failing log (50,686 bytes): `durations` 0, `PASSED` 0, and **exactly two `[gw3]` lines** -- the node-down notice and the platform banner. Under `--dist loadfile` a worker runs several files before dying, so elapsed-since-pytest-start does not bound any single test's runtime. **The log cannot show a per-test cap fired AND cannot show it did not.**
 
+> **RETRACTED 2026-08-18: THE PARAGRAPH BELOW DEMONSTRATED THE REMEDY IN A CONFIGURATION `ci.yml` FORBIDS, AND THE REMEDY DOES NOT HOLD AT CI'S ORDERING.** Left standing rather than deleted, because the arms are correct and only the conclusion drawn from them was wrong.
+>
+> `ci.yml:360` mandates `fault_timeout` ABOVE that leg's `pytest_timeout` -- 150 over 120 on Windows, 90 over 60 on ubuntu. **Arm 3 inverted it** (belt 4 under cap 30), which is the only reason the native dump appeared: the belt fired before pytest-timeout could kill. Re-measured at CI's actual ordering (belt 10, cap 6):
+>
+>     arm 4a  no xdist   "Thread 0x" 0   "Stack of" 1    tail: +++ Timeout +++
+>     arm 4b  -n 2       "Thread 0x" 0   "Stack of" 0    node down / crashed 27
+>     arm 4b controls: "bringing up nodes" 2, invocation errors 0 -- xdist provably engaged
+>
+> **4a proves the belt never fires when it sits above the cap** -- pytest-timeout kills at 6 and the watchdog at 10 never arrives. **4b is the gw3 signature exactly: worker crashed, NEITHER dump reaching the controller.**
+>
+> **SO ARMING `:998` BUYS NOTHING FOR A HANG pytest-timeout CAN KILL.** It helps only for the case the belt exists for -- a hang the thread method CANNOT kill (a Proactor operation, a blocking accept, native code). The arming asymmetry in this item is still real; the CONSEQUENCE drawn from it was not.
+>
+> **AND THE BLIND SET IS WIDER THAN ONE LEG.** A predicate of "xdist AND lacks the belt" selects only `:998`. But `:735` runs xdist WITH its belt ABOVE its cap, which arm 4b shows is equally blind for killable hangs. The refined predicate is **xdist AND (no belt OR belt above cap)** -- and by that test the repo's main suite leg is blind too. **The remedy needs re-deriving before anyone builds it.**
+>
+> *Control-string note, since it cost two seats: the xdist worker banner is not one string. This box prints `bringing up nodes`, another prints `created: 2/2 workers`. A control that greps one format returns 0 on the other and reads as "xdist never ran".*
+
 > **THE REMEDY IS DEMONSTRATED, NOT HOPED -- THE NATIVE DUMP SURVIVES xdist.** The earlier arms measured pytest-timeout's dump, which goes through pytest's terminal writer and is lost. faulthandler is a DIFFERENT MECHANISM: it writes the native stack to the raw stderr FD from C. Measured with the belt armed (`PYTHONFAULTHANDLER=1` plus `-o faulthandler_timeout=`):
 >
 >     arm 3a  belt armed, no xdist   "Thread 0x" 2   "bringing up nodes" 0
