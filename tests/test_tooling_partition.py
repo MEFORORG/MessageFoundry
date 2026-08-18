@@ -90,6 +90,14 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_scan_tokens_source.py",
         "test_seam_discovery.py",
         "test_security_static.py",
+        # Engine-subject for the same reason as control_char_check and escape_sequence_check above,
+        # and the reason is the one arm that does not use tmp_path: the screen's DEFAULT SCOPE is
+        # messagefoundry/api/app.py and auth_routes.py, so test_the_live_api_scope_still_surfaces_the
+        # _unjudged_candidate parses real engine source. A username re-appearing as an access key
+        # arrives in an API route -- an engine diff -- and the tooling job's path gate (scripts/**,
+        # .github/**, the ledger) is not tripped by one, so gating this behind scripts/** would
+        # leave exactly the change that reintroduces the defect facing nothing.
+        "test_username_access_key_screen.py",
         # The four below were WRONGLY LISTED as tooling in the first cut of the manifest and were
         # caught by adversarial review, not by any guard here. Each reads real engine source without
         # importing it, so the marker took them off every engine leg while the tooling job's path gate
