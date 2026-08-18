@@ -162,6 +162,7 @@ function Get-MailRoot {
 $MAIL_CAP_MESSAGES = 5
 $MAIL_CAP_BODY_BYTES = 2000
 $MAIL_CAP_TOTAL_BYTES = 8000
+$MAIL_CAP_LINE_CHARS = 240
 
 function Initialize-Box {
     param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Key)
@@ -317,8 +318,33 @@ if ($Send) {
     if ($Body.Length -gt $MAIL_CAP_BODY_BYTES) {
         throw ("-Body is $($Body.Length) characters; the receiver renders at most $MAIL_CAP_BODY_BYTES per message and " +
             "truncates the rest. Write the long form to a file in your worktree and mail the PATH. " +
+            "There is AT LEAST ONE MORE CAP this sender also checks -- a per-line one -- and the drain " +
+            "may apply others: passing here is not a prediction that your message renders whole. " +
             "(This check is a courtesy, NOT a control: the cap that binds is in mail-drain.ps1, because " +
             "anyone who can write a file into the inbox never runs this code.)")
+    }
+    # SECOND ARM, and the two are disjoint: a body well under the byte cap still loses any line over
+    # $MAIL_CAP_LINE_CHARS, cut mid-sentence at render. Measured 2026-08-18 across five senders, the
+    # byte arm alone missed every line-cap truncation in the corpus -- the caps bind independently, so
+    # one test cannot stand in for the other.
+    #
+    # Deliberately measured on the RAW line, not a folded copy. The drain folds before it cuts, and
+    # folding only ever SHORTENS (control chars and non-ASCII map 1:1, whitespace runs collapse, Trim
+    # trims), so raw <= cap implies folded <= cap and this arm has no false negatives. It can refuse a
+    # whitespace-heavy line the renderer would have kept -- accepted, because the alternative is a
+    # SECOND copy of Get-Fold in the sender, and this file's own header says why duplicated logic here
+    # is the thing that drifts. The over-refusal is visible in the message below rather than silent.
+    $long = @($Body -split "`r?`n" | Where-Object { $_.Length -gt $MAIL_CAP_LINE_CHARS })
+    if ($long.Count -gt 0) {
+        $worst = ($long | Measure-Object -Property Length -Maximum).Maximum
+        throw ("-Body has $($long.Count) line(s) over $MAIL_CAP_LINE_CHARS characters (longest $worst); " +
+            "the receiver folds each line and cuts what is left over $MAIL_CAP_LINE_CHARS, so those lines " +
+            "arrive truncated mid-sentence even though the body is under the $MAIL_CAP_BODY_BYTES-byte cap. " +
+            "Wrap the body, or write the long form to a file and mail the PATH. A line just over may " +
+            "survive intact if it carries runs of whitespace, which the fold collapses first. " +
+            "This arm and the byte arm above are what THIS sender checks; the drain may cut for reasons " +
+            "neither of them models, so clearing both is not a guarantee of an intact render. " +
+            "(A courtesy like the byte check above, NOT a control: mail-drain.ps1 holds the cap that binds.)")
     }
     if (-not $To) { throw "-To is required (a worktree path). Refusing to guess a recipient." }
 

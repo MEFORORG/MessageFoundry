@@ -425,6 +425,55 @@ def test_a_plain_message_is_delivered_end_to_end(repo: Path, tmp_path: Path) -> 
     assert len(box_files(repo, key, "seen")) == 1
 
 
+def _send(repo: Path, body: str) -> subprocess.CompletedProcess[str]:
+    """Drive the REAL sender. The seeder deliberately bypasses these arms, so they need this route."""
+    return subprocess.run(
+        [
+            "pwsh", "-NoProfile", "-NonInteractive", "-File", str(MAIL),
+            "-Send", "-MailRoot", str(mail_root(repo)), "-To", str(repo), "-Body", body,
+        ],
+        cwd=str(repo), capture_output=True, text=True, timeout=TIMEOUT, check=False,
+    )  # fmt: skip
+
+
+def test_the_send_line_arm_refuses_at_the_boundary_and_passes_one_below(repo: Path) -> None:
+    """The adjacent pair, not a 300-char probe.
+
+    A single long probe proves the arm fires on SOMETHING; it cannot distinguish a threshold of 240
+    from one of 250. Only the adjacent pair pins the number, and an arm off by ten at the boundary is
+    exactly the failure that ships a body cut by one line. Measured 2026-08-18: of four independent
+    implementations that pinned this boundary, one sat one character low and its author found it only
+    by running this pair.
+    """
+    at_cap = _send(repo, "x" * MAX_LINE_CHARS)
+    assert at_cap.returncode == 0, f"a line AT the cap must send: {at_cap.stdout}\n{at_cap.stderr}"
+
+    one_over = _send(repo, "x" * (MAX_LINE_CHARS + 1))
+    assert one_over.returncode != 0, "a line ONE over the cap must be refused"
+    assert str(MAX_LINE_CHARS) in one_over.stderr, one_over.stderr
+
+
+def test_the_send_line_arm_is_disjoint_from_the_byte_arm(repo: Path) -> None:
+    """The reason a second arm exists at all: the byte arm cannot see this body.
+
+    A long line inside a SHORT body is under the byte cap by a wide margin and is still cut at render.
+    Measured across five senders on 2026-08-18, a rendered-cost check alone missed 55 of 69 real
+    truncations, so the arms are not redundant and neither test stands in for the other.
+    """
+    body = "\n".join(["short line", "y" * (MAX_LINE_CHARS + 1), "short line"])
+    assert len(body) < MAX_BODY_BYTES, "the point of this case is that the BYTE arm would pass it"
+
+    proc = _send(repo, body)
+    assert proc.returncode != 0, "a long line in a short body must be refused by the line arm"
+    assert str(MAX_LINE_CHARS) in proc.stderr, proc.stderr
+
+    # The buried-line case: the arm must read every line, not the first or the longest-looking one.
+    buried = "\n".join(["a", "b", "z" * (MAX_LINE_CHARS + 40), "c"])
+    assert _send(repo, buried).returncode != 0, (
+        "a long line BURIED among short ones must be refused"
+    )
+
+
 def test_a_second_drain_shows_nothing_and_says_so(repo: Path, tmp_path: Path) -> None:
     """THE DISCRIMINATOR for the delivery test above: the same fixture, drained twice.
 
