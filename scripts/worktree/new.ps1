@@ -245,10 +245,19 @@ try {
     # pyproject's ranges and a fresh worktree gets whatever PyPI serves today.
     #
     # Not hypothetical: a worktree created 2026-07-29 came up with ruff 0.16.0 while constraints.lock
-    # pinned 0.15.22. That worktree then reported ~829 findings CI does not have — and because the
-    # ruff pre-commit hook runs `ruff check --fix`, it REWROTE files to match, stripping `# noqa`
-    # directives the pinned ruff still wants. A venv that lints differently from CI does not merely
-    # mislead; it edits your source on commit.
+    # pinned 0.15.22. That worktree then reported ~829 findings CI does not have — and `ruff check
+    # --fix` REWROTE files to match, stripping `# noqa` directives the pinned ruff still wants. A venv
+    # that lints differently from CI does not merely mislead; it edits your source.
+    #
+    # NARROWED 2026-08-18. That `--fix` WAS the pre-commit hook at the time — `language: system`, so
+    # it ran whatever ruff the shell's PATH offered — which is what made the rewrite land on commit,
+    # unasked. The ruff hooks now install their own pinned ruff (see .pre-commit-config.yaml's ruff
+    # block), so a commit still rewrites source — `ruff-format` writes and `ruff-check` keeps
+    # `args: [--fix]` — but it is the PINNED ruff doing it, which agrees with CI. What THIS venv's
+    # ruff still drives is the hand run: CLAUDE.md section 7's bare `ruff format .` writes with
+    # whatever ruff this venv resolved. The flag below is not thereby less needed — nothing in
+    # .pre-commit-config.yaml pins mypy or pytest, so a freely re-resolved venv still moves at least
+    # those two off CI.
     #
     # This is the same reasoning as the DEP-1 `--require-hashes` install, one rung down: CI proves the
     # lock installs, this makes a developer's environment agree with it.

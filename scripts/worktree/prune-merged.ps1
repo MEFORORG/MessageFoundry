@@ -48,11 +48,15 @@
          fences it on pid + process start time. Only LIVE / UNVERIFIED / UNREADABLE veto, for the
          veto-only reason above. A session in a NESTED worktree vetoes its ancestor too.
       2. RECENT ACTIVITY (-IdleHours, default 36). Newest mtime of the worktree's PRIVATE git metadata
-         (index, HEAD, logs/HEAD, ...). This is the signal that does NOT depend on a recorded cwd, and
-         it is what covers the fence's biggest blind spot -- so it is not a nicety, it is the load-
-         bearing one for the class of worktree this tool actually prunes. If it cannot be read, that is
-         a veto too. Confirm a specific worktree past this veto with -Name <slug>; -Name never
-         overrides signal 1, a nested worktree, or a lock.
+         (index, HEAD, ORIG_HEAD, FETCH_HEAD, COMMIT_EDITMSG, MERGE_MSG) crossed with the timestamp of
+         the LAST ENTRY IN logs/HEAD -- the reflog is read by CONTENT, never by mtime, because a
+         `git gc` rewrites every reflog in place and moved all 48 of them to one identical mtime on
+         2026-08-18, vetoing the whole repository at once (Get-ReflogLastEntry has the measurement).
+         This is the signal that does NOT depend on a recorded cwd, and it is what covers the fence's
+         biggest blind spot -- so it is not a nicety, it is the load-bearing one for the class of
+         worktree this tool actually prunes. If it cannot be read, that is a veto too. Confirm a
+         specific worktree past this veto with -Name <slug>; -Name never overrides signal 1, a nested
+         worktree, or a lock.
 
     WHAT THE FENCE CANNOT SEE (printed on every run, because a fence believed to be wider than it is
     is worse than no fence):
@@ -65,8 +69,13 @@
       * a cwd recorded as a UNC (\\host\C$\...) or 8.3 short path -- the match is a normalised string
         compare, and neither spelling normalises to the worktree's own path;
       * a session that never registered;
-      * a session that only Writes/Edits files and runs no git command: it touches none of the seven
-        metadata files, so signal 2 goes quiet on it as well.
+      * a session that only Writes/Edits files and runs no git command: it touches none of the metadata
+        signal 2 reads, so signal 2 goes quiet on it as well;
+      * a session whose ONLY git command rewrites the reflog without appending to it -- in practice
+        `git gc` or `git reflog expire`. Signal 2 stopped counting that on 2026-08-18 and this is the
+        price: the same write that used to veto the entire repository for 36 hours now vetoes nothing.
+        It is a deliberate trade and the cheap half of it, because a session doing real work runs
+        commands that DO append, and every one of those is still seen.
     It DOES see VS Code sessions: the file registry carries every surface, and the match is purely
     path-based (the Desktop app's own session tooling only lists what it spawned).
 
@@ -409,6 +418,47 @@ function Test-Merged {
 }
 
 # --- Occupancy signal 2: recent activity, which does not depend on a recorded cwd ----------------
+
+#: Metadata whose MTIME is the activity reading. `logs/HEAD` is deliberately NOT in this list; it is
+#: read by content instead, for the reason written out over Get-ReflogLastEntry.
+$ACTIVITY_MTIME_FILES = @('index', 'HEAD', 'ORIG_HEAD', 'FETCH_HEAD', 'COMMIT_EDITMSG', 'MERGE_MSG')
+
+function Get-ReflogLastEntry {
+    param([string]$LogPath)
+    # THE REFLOG IS READ BY CONTENT, NOT BY MTIME, AND THAT IS THE WHOLE POINT.
+    #
+    # A reflog line is:  <old-oid> <new-oid> <name> <<email>> <epoch> <tz>\t<message>
+    # The epoch is stamped by the operation that APPENDED the entry. Nothing which rewrites the file
+    # without appending to it can move that number. The file's mtime is exactly the opposite: it
+    # moves for any write at all, including one that changes nothing.
+    #
+    # MEASURED 2026-08-18 on this repository. A `git gc` ran at 08:15:34-08:16:05 -- packed-refs
+    # rewritten at 08:15:34, the packs at 08:16:02-08:16:05 -- and its reflog expiry rewrote every
+    # reflog in place. **48 of 50** worktree `logs/HEAD` files came out carrying the IDENTICAL mtime
+    # `2026-08-18 08:15:42`, to the second, while their contents were days older: one worktree's last
+    # entry is `2026-08-14 12:55:35`, four days before its own mtime.
+    #
+    # Signal 2 took the newest mtime, so that single gc made EVERY worktree in the repository read
+    # "recently active -- someone may be working here" for the next -IdleHours. On the run that found
+    # it, 11 of 14 candidates were vetoed on that basis alone and the tool removed nothing. With 50
+    # worktrees and 9 live sessions producing loose objects, gc is frequent enough that the veto can
+    # sit permanently on -- and a veto that always fires carries no more information than one that
+    # never fires, which is the failure class docs/adr/0158 names.
+    #
+    # Returns $null when there is no entry to read. The CALLER decides what that means, because "the
+    # file is empty" and "the file would not parse" are not the same fact and must not act alike.
+    try { $last = Get-Content -LiteralPath $LogPath -Tail 1 -ErrorAction Stop } catch { return $null }
+    if (-not $last) { return $null }
+    # Split at the tab FIRST, so a committer name containing '>' cannot be mistaken for the closing
+    # bracket of the email. What remains ends with "<epoch> <tz>", and anchoring the match on that end
+    # is what makes it exact rather than merely plausible.
+    $head = ([string]$last -split "`t", 2)[0]
+    $m = [regex]::Match($head, '(\d{9,11})\s+[+-]\d{4}\s*$')
+    if (-not $m.Success) { return $null }
+    try { return [DateTimeOffset]::FromUnixTimeSeconds([long]$m.Groups[1].Value).LocalDateTime }
+    catch { return $null }
+}
+
 function Get-WorktreeActivity {
     param([string]$Path)
     # The worktree's PRIVATE git metadata only. Deliberately NOT the working files: a venv install or a
@@ -421,12 +471,29 @@ function Get-WorktreeActivity {
     $gitdir = ([string]$gitdir).Trim()
     if (-not (Test-Path -LiteralPath $gitdir)) { return $null }
     $newest = $null
-    foreach ($rel in @('index', 'HEAD', 'ORIG_HEAD', 'FETCH_HEAD', 'COMMIT_EDITMSG', 'MERGE_MSG', 'logs/HEAD')) {
+    foreach ($rel in $ACTIVITY_MTIME_FILES) {
         $f = Join-Path $gitdir $rel
         if (Test-Path -LiteralPath $f) {
             $t = (Get-Item -LiteralPath $f -Force).LastWriteTime
             if ($null -eq $newest -or $t -gt $newest) { $newest = $t }
         }
+    }
+    $log = Join-Path $gitdir 'logs/HEAD'
+    if (Test-Path -LiteralPath $log) {
+        $item = Get-Item -LiteralPath $log -Force
+        $t = Get-ReflogLastEntry -LogPath $log
+        if ($null -eq $t -and $item.Length -gt 0) {
+            # Non-empty, and it would not parse. FALL BACK TO THE MTIME, which is the reading this
+            # had before. A parse failure must never be the thing that makes a worktree look idle,
+            # because idle is the direction that REMOVES one: a reflog shape this does not recognise
+            # is a reason to keep vetoing, not a reason to stop.
+            $t = $item.LastWriteTime
+        }
+        # A zero-length logs/HEAD contributes NOTHING, and that is not an error: every entry has
+        # expired, so the reflog holds no evidence in either direction and the six mtimes above still
+        # speak. Reading its mtime here would reinstate the exact bug this function exists to remove,
+        # on the oldest worktrees in the repository -- which are the ones most likely to be prunable.
+        if ($null -ne $t -and ($null -eq $newest -or $t -gt $newest)) { $newest = $t }
     }
     return $newest
 }

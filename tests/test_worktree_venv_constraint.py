@@ -12,10 +12,21 @@ Measured 2026-07-29: a worktree came up with **ruff 0.16.0** while ``constraints
 **0.15.22**. Two consequences, and the second is why this is a guard rather than a nicety:
 
 * it reported ~829 findings CI does not have (0.16 enabled stricter defaults), and
-* the ``ruff-check`` pre-commit hook runs ``ruff check --fix``, so it **rewrote files** to match —
-  stripping ``# noqa`` directives the pinned ruff still wants.
+* ``ruff check --fix`` **rewrote files** to match — stripping ``# noqa`` directives the pinned ruff
+  still wants.
 
-A venv that lints differently from CI does not merely mislead; it edits your source on commit.
+A venv that lints differently from CI does not merely mislead; it edits your source.
+
+NARROWED 2026-08-18, because half of that stopped being true and a stale reason sends a reader to the
+wrong file. When the measurement was taken, the ``ruff-check`` pre-commit hook WAS ``ruff check
+--fix`` under ``language: system``, so the rewrite above landed on commit, unasked. The ruff hooks
+now install their own pinned ruff, so a commit's rewrite is that ruff's rather than this venv's, and
+it agrees with CI because ``tests/test_lint_scope_parity.py`` holds the hook's ``rev`` to
+``constraints.lock``. Everything this guard is actually about is unchanged: the venv's ruff is what
+a developer runs by hand, and at least one of those hand runs WRITES — CONTRIBUTING.md's pre-push
+pass is read-only (``ruff check .``, ``ruff format --check .``), but CLAUDE.md section 7's bare
+``ruff format .`` is not. And ruff was never the only tool at stake: the same free re-resolution
+reaches at least mypy and pytest, and nothing in ``.pre-commit-config.yaml`` pins either.
 
 WHY A TEXT TEST. Nothing in the suite can run ``new.ps1`` — it creates a git worktree and a venv, which
 is minutes of I/O and mutates the repo's worktree list. The invariant that actually matters is a
@@ -63,7 +74,11 @@ def test_new_worktree_installs_against_the_constraint_lock() -> None:
         + "\n  ".join(unconstrained)
         + "\nThat lets pip re-resolve inside pyproject's ranges, so the worktree can lint, typecheck "
         "and test against different tool versions than CI. It has already happened: ruff 0.16.0 "
-        "against a lock pinning 0.15.22, whose `ruff check --fix` hook then rewrote files."
+        "against a lock pinning 0.15.22, and `ruff check --fix` then rewrote files. Since 2026-08-18 "
+        "a commit's rewrite is the pre-commit hooks' own pinned ruff, not this venv's -- what this "
+        "venv still drives is the hand run, and CLAUDE.md section 7's bare `ruff format .` writes. "
+        "Nothing in .pre-commit-config.yaml pins mypy or pytest either, so this flag is what holds "
+        "at least those two to CI."
     )
 
 
