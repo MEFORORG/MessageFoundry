@@ -10261,10 +10261,15 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **SEVERITY, STATED IN THE CONDITIONAL PER SECTION 0.** If it is the harness, cost is CI noise. If it is real, it **would** mean a deploying site could lose an acked message at intake -- the one thing the staged pipeline's ACK-on-receipt design exists to prevent. **No live instance is affected, because there are none.** The item is P1 on the strength of the branch that has not been ruled out, not on a demonstrated defect.
 
+> **A THIRD SIGHTING, 2026-08-19, AND ITS MAGNITUDE ARGUES AGAINST THE ALARMING BRANCH.** PR #431 run `32278742105`, `test (windows-2025, py3.14)`: `sweep_mode='fixed_aggregate', count=12, sent=36, acked=13`. **Twenty-three of thirty-six sends unacked** -- against `lost 1 of 35` in the first sighting. **A count-and-log invariant failure does not plausibly scale like that**; an engine that persists-then-acks either does so or does not, and a 64 percent shortfall looks like the harness measuring an engine that could not keep up, not one silently dropping. **It is EVIDENCE, not a verdict:** the item stays open and the discriminator below is still the thing that settles it. Recorded because the magnitude is the first data that distinguishes the two branches at all.
+>
+> Corroborating, same run: `test_connscale_cpu_probe.py`'s walk-timeout (#1290) failed **in the same job**, with no apt failure and 10,488 tests passing. **Two independent connscale probes failing together, both of them timing/measurement-shaped, is the signature of a loaded runner** rather than of two unrelated defects.
+
 > **IT IS ON `main`, AND IT IS CROSS-PLATFORM -- so it is not one runner's bad day.**
 >
 >     main    run 32255231838  head de896e0f  test (windows-2022, py3.14)   FAILED
 >     PR #448 run 32259244062  rebased head   test (ubuntu-latest, py3.14)  FAILED
+>     PR #431 run 32278742105  rebased head   test (windows-2025, py3.14)   FAILED  (sent=36 acked=13)
 >
 > Two operating systems, two branches. On `main` the record read `count=12, sent=36, acked=36`; on #448 `count=24, engine_read=34, sent=35`. **Same assertion, different shapes** -- which is itself evidence against a single fixed off-by-one.
 
