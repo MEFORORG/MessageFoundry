@@ -171,7 +171,22 @@ def run(
     payload: dict[str, Any] = {"hook_event_name": "UserPromptSubmit", "prompt": "do a thing"}
     if session_id is not None:
         payload["session_id"] = session_id
-    full_env = {**os.environ, **(env or {})}
+    # ISOLATE THE SESSION REGISTRY. The hook resolves its own login from the records under
+    # $env:USERPROFILE\.claude*, so without this every test reads the DEVELOPER'S real registry and its
+    # result depends on which sessions happen to be running on the machine. Default to a fixture home
+    # carrying a record for this run's session id, so the hook sees a session that exists; a test that
+    # is ABOUT the registry passes its own USERPROFILE and wins, because caller env is merged last.
+    # Only for a WELL-FORMED id. The hostile-id tests pass separators and absolute paths on purpose, and
+    # a record cannot be filed under those -- nor should it be: those tests are about what the hook does
+    # with an id it cannot trust, and handing it a valid registry entry would soften the case.
+    reg_env: dict[str, str] = {}
+    if (
+        session_id is not None
+        and re.fullmatch(r"[A-Za-z0-9._-]+", session_id)
+        and not (env or {}).get("USERPROFILE")
+    ):
+        reg_env["USERPROFILE"] = str(_registry(tmp_path / "reg-home", session_id, ".claude"))
+    full_env = {**os.environ, **reg_env, **(env or {})}
     proc = subprocess.run(
         args,
         cwd=str(repo),
@@ -855,6 +870,166 @@ def test_two_concurrent_runs_announce_once(repo: Path, tmp_path: Path) -> None:
     announced = [r for r in results if "[ANNOUNCE YOURSELF" in r.stdout]
     assert len(announced) == 1, f"{len(announced)} of 2 concurrent runs announced"
     assert outcomes(sd).count("ANNOUNCED") == 1
+
+
+# --------------------------------------------------------------------------------------------------
+# WHICH LOGIN AM I ON. The hook used to read its own login out of the peer roster and fall back to the
+# literal 'default' when it was not in there. A roster is built from the WORKTREES of one repo, so a
+# session rooted anywhere else is missing from it by construction and the fallback fired every time.
+# A guessed login does not degrade the comparison, it INVERTS it. The login is now looked up from the
+# session's own registry record, which is where the answer actually lives.
+# --------------------------------------------------------------------------------------------------
+
+
+def _registry(home: Path, session_id: str, root_leaf: str) -> Path:
+    """A fake USERPROFILE carrying one session record under a named config root.
+
+    Get-ClaudeConfigRoots enumerates ``$env:USERPROFILE\\.claude*`` and requires a ``sessions``
+    subdirectory, so pointing USERPROFILE at a fixture is the whole injection -- the hook needs no
+    test-only parameter, and the real discovery code is what runs.
+    """
+    d = home / root_leaf / "sessions"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{session_id}.json").write_text(
+        json.dumps(
+            {
+                "pid": 4242,
+                "sessionId": session_id,
+                "cwd": "D:\\t\\me",
+                "startedAt": 1786886406236,
+                "kind": "interactive",
+                "entrypoint": "claude-desktop",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return home
+
+
+def test_a_default_root_session_withholds_from_another_login(repo: Path, tmp_path: Path) -> None:
+    """The ordinary case, which the old guess also got right -- so it is the control, not the proof."""
+    home = _registry(tmp_path / "home", SELF_ID, ".claude")
+    sd = tmp_path / "sd"
+    p = run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[PEER, ACCT],
+        env={"USERPROFILE": str(home)},
+    )
+    assert peer_lines(p.stdout, "MESSAGE"), "the same-login peer was not offered"
+    assert "different login" in p.stdout, "the acct-1 peer was not withheld from"
+
+
+def test_an_acct_root_session_withholds_from_default_not_from_its_own(
+    repo: Path, tmp_path: Path
+) -> None:
+    """THE PROOF, and the case the old fallback got exactly backwards.
+
+    With the session registered under .claude-account-1 the old code still guessed 'default', so it
+    withheld from the acct-1 peer it COULD reach and offered the default peer it could not. Looking the
+    login up inverts that back.
+    """
+    home = _registry(tmp_path / "home", SELF_ID, ".claude-account-1")
+    sd = tmp_path / "sd"
+    p = run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[PEER, ACCT],
+        env={"USERPROFILE": str(home)},
+    )
+    messaged = " ".join(peer_lines(p.stdout, "MESSAGE"))
+    assert ACCT["Worktree"] in messaged, "the peer on this session's own root was not offered"
+    assert PEER["Worktree"] not in messaged, "a peer on another login was offered as reachable"
+
+
+def test_no_registry_record_stands_down_without_spending_the_budget(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Standing down is the only safe branch when the login cannot be computed.
+
+    Skipping the filter instead LOOKS safe and is not: offering a peer debits the lifetime send budget
+    at print time and nothing refunds it when the model finds no session row, so an uncomputable filter
+    would walk the session to the terminal 'exhausted' state and permanent silence.
+    """
+    home = _registry(tmp_path / "home", "00000000-0000-0000-0000-000000000000", ".claude")
+    sd = tmp_path / "sd"
+    p = run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[PEER, ACCT],
+        env={"USERPROFILE": str(home)},
+    )
+    assert not p.stdout.strip(), f"announced without knowing its own login: {p.stdout!r}"
+    assert outcomes(sd) == ["NO_LOGIN"], outcomes(sd)
+    # The BUDGET is `sent`, not the marker. A 'checking' marker is written before the lookup and is not
+    # a spend; asserting its absence would be asserting the wrong thing and would fail on a healthy run.
+    m = marker_obj(sd)
+    assert int(m.get("sent", 0)) == 0, f"a stand-down debited the send budget: {m}"
+    assert m.get("state") != "announced", f"a stand-down recorded an announcement: {m}"
+
+
+def test_a_duplicated_session_id_is_reported_as_ambiguous_not_missing(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Two roots claiming one id is a CONFIGURATION, not a race, and the receipt has to say so.
+
+    The lookup refuses to adjudicate between them, which is right -- it cannot know which login the
+    session is actually on. What it must not do is let the hook report "no registry record matched",
+    which is what happened while the lookup collapsed zero-matches and many-matches to the same empty
+    string. That note sends an operator looking for a missing file that is present twice, which is the
+    one place the cause is visible. Unlike a half-written record, this does not resolve on its own.
+    """
+    home = tmp_path / "home"
+    _registry(home, SELF_ID, ".claude")
+    _registry(home, SELF_ID, ".claude-account-1")
+    sd = tmp_path / "sd"
+    p = run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[PEER, ACCT],
+        env={"USERPROFILE": str(home)},
+    )
+    assert not p.stdout.strip(), f"announced without knowing its own login: {p.stdout!r}"
+    assert outcomes(sd) == ["NO_LOGIN"], outcomes(sd)
+    # Asserted against the RENDERED receipt, which Get-Clean caps at 80 chars. The first version of
+    # this note put its distinguishing word at the end of a sentence and the cap ate it, leaving a
+    # receipt that read the same for a missing record as for a duplicated one.
+    note = " ".join(receipts(sd))
+    assert "AMBIGUOUS" in note, f"the ambiguous case was not named within the cap: {note}"
+    assert "MISSING" not in note, f"reported missing when it was duplicated: {note}"
+
+
+def test_repeated_stand_downs_do_not_arm_the_kill_ladder(repo: Path, tmp_path: Path) -> None:
+    """A STAND-DOWN MUST BE RECOVERABLE, and one invocation cannot show that.
+
+    Section 14 writes state='checking' with attempts+1 BEFORE the lookup, and the kill ladder fires on
+    state='checking' AND attempts >= 2. A stand-down that returned without resetting the marker
+    therefore reached the ladder on the THIRD prompt: a LOOKUP_KILLED line injected into the user's
+    prompt, whose note claims the lookup did not return when it returned in under a second, plus an
+    hour-long floor. `checks` never advanced either, so the SETTLED cap could not end it -- it repeated
+    for the life of the session. That is permanent silence, which is the failure this whole path exists
+    to avoid, so it is asserted over THREE runs rather than one.
+    """
+    home = _registry(tmp_path / "home", "00000000-0000-0000-0000-000000000000", ".claude")
+    sd = tmp_path / "sd"
+    for _ in range(3):
+        p = run(
+            repo,
+            tmp_path=tmp_path,
+            state_dir=sd,
+            rows=[PEER, ACCT],
+            env={"USERPROFILE": str(home)},
+        )
+        assert "LOOKUP_KILLED" not in p.stdout, f"a stand-down armed the kill ladder: {p.stdout!r}"
+    assert set(outcomes(sd)) == {"NO_LOGIN"}, outcomes(sd)
+    m = marker_obj(sd)
+    assert m.get("state") == "pending", f"the marker was left armed: {m}"
+    assert int(m.get("attempts", 0)) == 0, f"attempts kept climbing toward the ladder: {m}"
+    assert "floorSeconds" not in m, f"a stand-down installed a silence floor: {m}"
 
 
 def test_the_hook_script_is_ascii_only() -> None:

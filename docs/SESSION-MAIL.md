@@ -665,6 +665,26 @@ re-argue that number.
 
 ---
 
+## Replying: one line, and mail arriving is not a reason to produce output
+
+**The rule: `<who mailed you>: <minimal reply>`, on ONE line.** Examples --
+`steward: pool warning, noted`, `builder-2bee12: no action`, `lander: their retraction, nothing owed`.
+
+**Why it is a rule and not a style preference.** The drain hook **blocks the Stop**, so every delivery
+re-invokes the session and forces a turn. That turn is billed with the **entire conversation context
+re-sent**, whether it says one word or six paragraphs. On 2026-08-18 a paused session with nothing to
+do produced roughly a dozen consecutive turns of multi-paragraph peer-traffic digests -- none
+requested, each one a full-context charge, while the owner was actively watching pool burn.
+
+**Do not summarise or relay peer traffic to the owner.** Peers correcting each other is the channel
+working; it is not news. Surface a message only when it needs the **owner's** decision -- a merge, an
+approval, an outward-facing action -- and then say only that, in one line.
+
+**This rule is printed by the hook itself**, in the footer of every delivery, for the reason a peer
+seat established the same day about announce-before-fan-out: a norm with zero observable consequence
+for skipping it gets skipped. The doc is the record; the footer is what reaches the moment the reply
+is composed.
+
 ## Related
 
 - [WORKTREES.md](WORKTREES.md) -- parallel sessions, the SessionStart coordination context, and the

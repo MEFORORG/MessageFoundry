@@ -189,7 +189,15 @@ function Get-WiredMatchers([string]$SettingsPath) {
             foreach ($t in "$($e.matcher)".Split("|")) { if ($t) { $null = $wired.Add($t) } }
         }
     }
-    return $wired
+    # THE COMMA IS LOAD-BEARING -- do not delete it. A bare `return $wired` UNROLLS the set into the
+    # pipeline and no caller ever sees a HashSet: zero matchers arrive as $null, ONE arrives as a
+    # [String] whose .Contains() is a SUBSTRING test rather than set membership, and two or more as
+    # [Object[]]. The one-element arm is the dangerous one because it is silent -- exit code 0 and a
+    # clean wrong answer -- while the empty arm at least crashes the caller below.
+    #
+    # Stated once here and made EXECUTABLE, not restated, in tests/test_install_gate_wiring.py: the
+    # three tests named for the substring, empty and audit arms each fail on a bare return.
+    return ,$wired
 }
 
 function Get-GateVersion([string]$Path) {
@@ -351,6 +359,11 @@ if ($Status) {
         }
         # An unreadable settings.json must not take -Status down over a directory nobody asked about,
         # and must not read as "no wiring here" either. Say which it was.
+        #
+        # $null MEANS "Read-Settings THREW", and nothing else -- which is true only because
+        # Get-WiredMatchers returns its set without unrolling (see the comma there). Remove it and
+        # $null also means "valid JSON, zero gate matchers", so this branch defames a readable dir and
+        # the "carries no gate wiring" arm below becomes unreachable.
         $wired = $null
         try { $wired = Get-WiredMatchers (Join-Path $d.FullName "settings.json") } catch { $wired = $null }
         if ($null -eq $wired) {
