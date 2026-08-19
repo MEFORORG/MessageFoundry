@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Pure (vscode-free) logic for the engine status-bar item — the IDE's window onto the engine it
 // promotes to. Separated from statusBar.ts so every decision here ("what does this probe outcome
 // MEAN?", "what may the user do about it?", "what does the item say?") is unit-testable node-side

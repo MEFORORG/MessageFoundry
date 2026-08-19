@@ -1,7 +1,10 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // "Home" — a webview view at the top of the MessageFoundry sidebar: grouped action cards that run
 // extension commands. Every action is live; the `soon` flag renders a "soon" badge for any action
 // still queued in the backlog. Monitoring + engine run/stop deliberately live in the Console, not here.
 import * as vscode from "vscode";
+import { nonce } from "./cspNonce";
 
 interface Action {
   id: string; // command id
@@ -44,15 +47,6 @@ const GROUPS: { title: string; actions: Action[]; collapsed?: boolean }[] = [
     ],
   },
 ];
-
-function nonce(): string {
-  let s = "";
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 24; i++) {
-    s += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return s;
-}
 
 function esc(s: string): string {
   // Escape quotes too, not just &<>: these values land inside double-quoted HTML attributes
@@ -172,6 +166,7 @@ export class HomeView implements vscode.WebviewViewProvider {
         vscode.postMessage({ command: 'filter', text: '' });
       }
     });
+    // Origin is NOT checked here — see webviewMessaging.ts.
     window.addEventListener('message', (e) => {
       if (e.data && e.data.command === 'setFilter' && e.data.text !== search.value) {
         search.value = e.data.text;

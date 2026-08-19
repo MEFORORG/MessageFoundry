@@ -515,8 +515,12 @@ def FhirLookup(
     cleartext_reason: str | None = None,
 ) -> FhirLookupSpec:
     """Declare a named live-lookup FHIR connection (ADR 0043). A Handler reads it at run time with
-    ``fhir_lookup(name, query)`` — a **read-only** read-by-id (``"Patient/123"``) or search
-    (``"Patient?identifier=MRN|123"``); the parsed resource / searchset ``Bundle`` comes back as a dict.
+    ``fhir_lookup(name, query, params)`` — a **read-only** read-by-id (``fhir_lookup(name,
+    "Patient/123")``) or a search whose path is ``query`` and whose fields are the structured ``params``
+    mapping (``fhir_lookup(name, "Patient", {"identifier": "MRN|123"})``). ``params`` is the **only**
+    search form — each value is percent-encoded by the engine, so a value cannot inject an extra search
+    parameter, and a ``?``-query inside ``query`` is refused (BACKLOG #1243). The parsed resource /
+    searchset ``Bundle`` comes back as a dict.
     Side-effecting (it self-registers), like :func:`Reference` / :func:`inbound`, **and** returns the spec
     so SMART auth can be composed onto it::
 
@@ -1014,6 +1018,16 @@ def MLLP(
     max_connections: int | None = 256,  # cap concurrent clients (connection-flood guard)
     receive_timeout: float | None = 60.0,  # close a client idle this many seconds (slowloris)
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
+    # INBOUND message-RATE pacing (BACKLOG #1249). Unlike the caps above these default to OFF, and
+    # that is ruled rather than accidental: a rate on a clinical interface is only safe at a number
+    # taken from a real feed profile. The connector has read both keys since the pacer was built --
+    # until now no factory parameter and no connections.toml key could populate them, so the setting
+    # existed and could not be reached. Over budget the listener PAUSES READING so TCP back-pressures
+    # the sender: nothing is dropped, refused, NAK'd or reordered, which the count-and-log invariant
+    # requires (a discarding limiter was never an option here).
+    max_messages_per_second: float | None = None,  # None/0 = no rate bound (the shipped default)
+    message_burst: float
+    | None = None,  # allowance over the sustained rate; None = one second's worth
     connect_timeout: float = 10.0,  # outbound: TCP connect timeout (seconds)
     timeout_seconds: float = 30.0,  # outbound: wait this long for the ACK
     no_ack: bool = False,  # OUTBOUND (MLLP-only): fire-and-forward — skip the ACK read, deliver on the TCP write (at-most-once-confirmation; ADR 0124). Incompatible with capture_response/reingress_to.
@@ -1138,6 +1152,8 @@ def MLLP(
             "max_connections": max_connections,
             "receive_timeout": receive_timeout,
             "max_frame_bytes": max_frame_bytes,
+            "max_messages_per_second": max_messages_per_second,
+            "message_burst": message_burst,
             "connect_timeout": connect_timeout,
             "timeout_seconds": timeout_seconds,
             "no_ack": no_ack,

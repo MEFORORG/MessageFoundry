@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Tray service-control wrapper (ADR 0113 §4) — pure helpers + the delegating perform()."""
 
 from __future__ import annotations

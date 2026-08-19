@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 <#
 .SYNOPSIS
     PreToolUse gate: keep concurrent Claude Code sessions from BUILDING in a shared primary checkout.
@@ -342,6 +344,50 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
 #
 # Three false positives came from scanning the raw string: a two-line command whose second line read
 # `echo about to merge stuff` denied with verb=merge; `echo "git checkout main"` denied; and
+function Remove-QuotedSpans([string]$s) {
+    <#
+    Blank every quoted span in ONE LEFT-TO-RIGHT PASS, so the quote that OPENS FIRST owns the span and
+    the other quote character is an ordinary literal inside it -- which is what a POSIX shell does.
+
+    THIS REPLACES TWO SEQUENTIAL REGEXES AND THE ORDER WAS A LIVE FAIL-OPEN (BACKLOG #1229):
+        $s = $s -replace '"[^"]*"', '""'    # double quotes blanked FIRST
+        $s = $s -replace "'[^']*'", "''"
+    Inside a SINGLE-quoted shell word a `"` is a literal, so a command like
+        echo 'say "hi' ; <a gated git command> ; echo 'bye" now'
+    hands the shell two harmless arguments and leaves the middle LIVE. The double-quote pass pairs
+    those two literal quotes ACROSS the live command and deletes it, so no rule ever sees it -> ALLOW.
+
+    THE ASYMMETRY IS THE PROOF, and it is why the defect is invisible from one side: the inverted
+    shape (a stray apostrophe inside double-quoted words) still DENIES, because the double-quote pass
+    runs first and consumes those spans before the single-quote pass can straddle. The cause is the
+    blanking ORDER, not any command classifier -- a fix aimed at the classifiers would not touch it.
+    Two independent regexes cannot express "whichever opened first wins", which is why this is a scan.
+
+    AN UNTERMINATED QUOTE IS DELIBERATELY NOT BLANKED, and that preserves the old behaviour rather
+    than changing it. `'[^']*'` requires a closing quote, so an unpaired one never matched and the
+    text stayed VISIBLE to the rules -- which fails CLOSED. A scanner that swallowed everything after
+    a lone quote would fail OPEN, turning one stray character into a total bypass, so on reaching the
+    end still inside a quote this emits the original text from the opener onward.
+    #>
+    $out = [System.Text.StringBuilder]::new()
+    $quote = [char]0
+    $openAt = -1
+    for ($i = 0; $i -lt $s.Length; $i++) {
+        $ch = $s[$i]
+        if ($quote -eq [char]0) {
+            if ($ch -eq '"' -or $ch -eq "'") { $quote = $ch; $openAt = $i }
+            else { [void]$out.Append($ch) }
+        }
+        elseif ($ch -eq $quote) {
+            # Emit the blanked pair only on a CLOSED span, matching what the regexes produced.
+            [void]$out.Append($quote); [void]$out.Append($quote)
+            $quote = [char]0; $openAt = -1
+        }
+    }
+    if ($quote -ne [char]0) { [void]$out.Append($s.Substring($openAt)) }
+    $out.ToString()
+}
+
 # `git commit -m "chore: clean up dead code"` denied on `clean`. Blanking every quoted span fixed those --
 # and broke something worse. The argument of an interpreter flag (`pwsh -Command "..."`, `bash -c "..."`,
 # `cmd /c "..."`) is quoted, but it is CODE THAT RUNS: blanking it made `pwsh -Command "git reset --hard"`
@@ -605,8 +651,7 @@ function Get-ScannableSegments([string]$Cmd) {
         # to a bare token first, then blank every remaining quoted span.
         $s = $line -replace '"[^"]*[\\/](git(?:\.exe)?)"', '$1'
         $s = $s -replace "'[^']*[\\/](git(?:\.exe)?)'", '$1'
-        $s = $s -replace '"[^"]*"', '""'
-        $s = $s -replace "'[^']*'", "''"
+        $s = Remove-QuotedSpans $s
         [pscustomobject]@{ Raw = $line; Scan = $s }
     }
 }

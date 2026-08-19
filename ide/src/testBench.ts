@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Test Bench: load a message set, dry-run it through the config (no sending), show a results table,
 // and a Before/After view per message (side-by-side or above/below) with an HL7 segment/field-aware
 // diff — inserted/deleted segments are aligned so they don't cascade false changes, and changed
@@ -12,6 +14,7 @@ import { configDir, messageSetsDir, pythonPath, runJson, workspaceDir } from "./
 import { hexdump } from "./hexdump";
 import { diffMessages } from "./hl7diff";
 import { buildTraceDetail, type TraceDetail, type TraceEntry } from "./traceView";
+import { nonce } from "./cspNonce";
 import {
   compareCase,
   type DeliveryComparison,
@@ -52,15 +55,6 @@ type Incoming =
   | { command: "saveCollection" }
   | { command: "runCollection"; name: string }
   | { command: "deleteCollection"; name: string };
-
-function nonce(): string {
-  let s = "";
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 24; i++) {
-    s += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return s;
-}
 
 function esc(s: string): string {
   // Escape quotes too, not just &<>: these dry-run-derived values (source/disposition, themselves
@@ -787,6 +781,7 @@ export class TestBench {
       b.addEventListener('click', () => vscode.postMessage({ command: b.dataset.act, index: Number(b.dataset.i) }));
     }
 
+    // Origin is NOT checked here — see webviewMessaging.ts.
     window.addEventListener('message', (ev) => {
       const m = ev.data;
       if (!m) return;

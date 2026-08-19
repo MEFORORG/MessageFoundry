@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Wiring Map (ADR 0091 D3): a READ-ONLY, focus-first graph panel over the one wiring graph — an
 // on-demand editor-area webview (the Nx Console pattern), never a sidebar surface and never the
 // whole estate by default. Strictly a projection of wiringMapModel's output: four labelled columns
@@ -12,6 +14,7 @@ import * as vscode from "vscode";
 import type { ElementKind } from "./graphModel";
 import { buildWiringMap, MAX_HOPS, type MapFocus } from "./wiringMapModel";
 import type { GraphProvider } from "./graphTree";
+import { nonce } from "./cspNonce";
 
 type Incoming =
   | { command: "ready" }
@@ -19,15 +22,6 @@ type Incoming =
   | { command: "refresh" }
   | { command: "open"; file: string; line: number }
   | { command: "reveal"; kind: ElementKind; name: string };
-
-function nonce(): string {
-  let s = "";
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 24; i++) {
-    s += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return s;
-}
 
 export class WiringMapPanel {
   private panel: vscode.WebviewPanel | undefined;
@@ -400,6 +394,7 @@ export class WiringMapPanel {
       }
     });
 
+    // Origin is NOT checked here — see webviewMessaging.ts.
     window.addEventListener('message', (ev) => {
       const m = ev.data;
       if (m && m.type === 'map') { state = m; render(); }

@@ -13,12 +13,25 @@ This is the first cut (build-order step 1 of docs/CONFIGURATION.md): ``[store]``
 synchronous), ``[api]`` (host/port), and ``[logging]`` (level + structured-JSON ``format`` + off-box
 ``forward_*`` syslog shipping — sec-offbox-log). ``[retention]`` is now enforced (the
 ``RetentionRunner``), except its ``audit_days`` key, which is reserved/keep-forever by design.
-Remaining planned keys (some server-DB ``[store]`` keys) are accepted-but-ignored for now so a
-forward-looking config file still loads.
+
+An unrecognized **key in the TOML file** is **refused** at load (:func:`_reject_unknown_file_keys`) — a
+silently-dropped key leaves the setting it was meant to apply un-applied, with nothing anywhere
+reporting a problem. An unknown top-level **section** is still tolerated.
+
+The refusal is scoped to the **file** on purpose, and the scope is load-bearing rather than an
+oversight: the **env** and **CLI** layers still drop an unrecognized key silently. Env cannot be
+checked the same way because roughly a dozen documented ``MEFOR_*`` variables are read straight from
+``os.environ`` by their consuming module and are not fields on any section (``MEFOR_STORE_VAULT_ADDR``,
+``MEFOR_TLS_REVOCATION_ATTESTED`` and siblings), so a field-membership test would refuse a
+correctly-configured deployment; CLI keys are engine-written, never operator-spelled. The one
+exception is ``[security]``, refused from env as well (the arm inside :func:`_desugar_security`).
+Anything stated to an operator about this refusal must carry that scope — see
+``docs/CONFIGURATION.md``.
 """
 
 from __future__ import annotations
 
+import difflib
 import ipaddress
 import logging
 import os
@@ -171,7 +184,16 @@ class SqlAuth(str, Enum):  # noqa: UP042
 
 
 class _Section(BaseModel):
-    # Ignore unknown keys so a forward-looking file (planned retention/delivery keys) still loads.
+    # extra="ignore" stays on the MODEL; unknown keys are refused by the LOADER instead
+    # (_reject_unknown_file_keys). A model-level extra="forbid" would refuse the engine's OWN writes:
+    # _env_overrides scrapes every MEFOR_<section>_<key> into its section dict, and a dozen documented
+    # variables are read straight from os.environ by their consuming module rather than being fields here
+    # (the Vault KMS/Transit and secret-provider credentials, MEFOR_TLS_REVOCATION_ATTESTED, the two
+    # phase-timing levers) — a Vault-backed store configured exactly as the shipped docs instruct would
+    # fail to start. Two further reasons the model is the wrong surface: pydantic's extra_forbidden error
+    # echoes the offending VALUE and the CLI prints the exception verbatim to a log file, so a mistyped
+    # SECRET key would disclose the secret; and `security show` validates SecuritySettings directly, so a
+    # forbidding model would deny an operator the very view they use to repair the typo.
     model_config = ConfigDict(extra="ignore")
 
 
@@ -3990,6 +4012,72 @@ def _warn_file_secrets(file_data: Mapping[str, Any], path: Path) -> None:
             )
 
 
+def _section_models() -> dict[str, type[BaseModel]]:
+    """``{section name: its settings model}``, derived from :class:`ServiceSettings` itself so it cannot
+    drift out of step with the sections that exist (a hand-kept list would silently stop checking a
+    section someone added)."""
+    out: dict[str, type[BaseModel]] = {}
+    for name, field in ServiceSettings.model_fields.items():
+        annotation = field.annotation
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            out[name] = annotation
+    return out
+
+
+def _near_field(model: type[BaseModel], key: str) -> str | None:
+    """The closest real field name to ``key``, or ``None`` when nothing is close enough. A refusal that
+    names the typo's likely intent is the difference between a fix and a search."""
+    near = difflib.get_close_matches(key, sorted(model.model_fields), n=1)
+    return near[0] if near else None
+
+
+def _unknown_key_report(items: Sequence[tuple[str, str, str | None]]) -> str:
+    """Render ``(section, key, suggestion)`` triples as ``[section].key (did you mean 'x'?)``.
+
+    Names the section and key only — **never the value**. The offending value is frequently a secret
+    (``_FILE_SECRET_KEYS`` exists because secrets land in this file), and the CLI prints a load failure
+    verbatim to stderr, which the service captures to a log file."""
+    return ", ".join(
+        f"[{section}].{key}" + (f" (did you mean '{suggestion}'?)" if suggestion else "")
+        for section, key, suggestion in items
+    )
+
+
+def _reject_unknown_file_keys(file_data: Mapping[str, Any]) -> None:
+    """Raise ``ValueError`` if the config FILE sets a key its section does not define.
+
+    Owner ruling, 2026-08-16: refuse unknown keys. A key the engine does not recognize used to load
+    clean, do nothing, and say nothing — so a mistyped ``[egress].deny_by_defalt`` left the operator
+    believing a control was configured while the engine applied its permissive default. Refusing at load
+    is the only way that failure surfaces at all: nothing downstream can distinguish "not set" from
+    "set, misspelt, dropped".
+
+    Scoped to the FILE deliberately. The env layer (:func:`_env_overrides`) scrapes any
+    ``MEFOR_<section>_<key>`` into its section dict, including a dozen documented variables that their
+    consuming module reads straight from ``os.environ`` and that are not fields here — refusing there
+    would refuse a variable the shipped docs tell operators to set. The CLI layer and the ``[security]``
+    desugar write only real fields, and the file is the surface the ruling names. Unknown top-level
+    **sections** stay tolerated (``ServiceSettings`` is ``extra="ignore"``) — a separate question."""
+    models = _section_models()
+    offenders: list[tuple[str, str, str | None]] = []
+    for section, values in file_data.items():
+        model = models.get(section)
+        if model is None or not isinstance(values, dict):
+            continue  # unknown SECTION (tolerated) or a non-table value (pydantic reports the type)
+        allowed = set(model.model_fields)
+        for key in values:
+            if key in allowed:
+                continue
+            offenders.append((section, key, _near_field(model, key)))
+    if offenders:
+        raise ValueError(
+            f"unrecognized config key(s): {_unknown_key_report(offenders)}. An unrecognized key is "
+            "REFUSED, not ignored — a dropped key leaves the setting it was meant to apply silently "
+            "un-applied. Check the spelling against docs/CONFIGURATION.md; a key that MOVED to another "
+            "section is reported by name instead."
+        )
+
+
 # --- ADR 0118: the [security] section desugars into the internal fields it replaces ----------------
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
@@ -4057,20 +4145,34 @@ def _desugar_security(data: dict[str, dict[str, Any]]) -> None:
     if not isinstance(raw, dict):
         return
 
-    # Pydantic sections are extra="ignore", so an UNKNOWN [security] key loads clean, does nothing, and
-    # says nothing. For posture switches that is a silent fail-open: mistype `block_unlisted_outbound`
+    # Pydantic sections are extra="ignore", so an UNKNOWN [security] key would load clean, do nothing,
+    # and say nothing. For posture switches that is a silent fail-open: mistype `block_unlisted_outbound`
     # or set a switch that does not exist yet (a key backported from newer docs), and the operator
-    # believes a control is on while the engine applies its permissive default. Relocated keys are the
-    # loud exception (_reject_relocated_keys), which is exactly the signal this restores for the rest.
-    # WARN rather than reject: an unknown key may be a forward-compatible config shared across an estate
-    # mid-upgrade, and refusing would turn a harmless typo into a failed start on every host at once.
+    # believes a control is on while the engine applies its permissive default.
+    #
+    # This arm REFUSES where it used to warn (owner ruling, 2026-08-16: "refuse unknown keys"). The
+    # reasoning it replaces is recorded here rather than deleted, so a future reader can see the decision
+    # instead of re-deriving the old one: warning was chosen because an unknown key might be a
+    # forward-compatible config shared across an estate mid-upgrade, where refusing would turn a harmless
+    # typo into a failed start on every host at once. That argument assumed an INSTALLED ESTATE. There is
+    # none — zero deployments, zero adopters (CLAUDE.md §0) — so the cost it guarded against is zero
+    # today, while the fail-open it accepted in exchange is real on the first deployment. If an estate
+    # ever exists, the answer is a documented upgrade path, not a return to silence: zero deployments
+    # removes the migration cost, it does not make the refusal optional.
+    #
+    # _reject_unknown_file_keys covers the FILE for every section including this one; this arm stays
+    # because it also sees ENV-delivered [security] keys, which the file check cannot. Safe here
+    # specifically: every MEFOR_SECURITY_* variable in the tree maps to a real field, so unlike
+    # [store]/[secrets]/[tls] there is no out-of-band env variable for it to collide with.
     unknown = sorted(set(raw) - set(SecuritySettings.model_fields))
     if unknown:
-        _log.warning(
-            "[security] has unrecognized key(s): %s — IGNORED, so any posture they were meant to set "
-            "is NOT in effect. Check the spelling against docs/CONFIGURATION.md; a switch that moved "
-            "sections is rejected loudly instead.",
-            ", ".join(unknown),
+        raise ValueError(
+            f"unrecognized config key(s): "
+            f"{_unknown_key_report([('security', k, _near_field(SecuritySettings, k)) for k in unknown])}. An "
+            "unrecognized posture switch is REFUSED, not ignored — ignoring it would leave the operator "
+            "believing a control is in effect while the engine applies its permissive default. Check the "
+            "spelling against docs/CONFIGURATION.md; a switch that MOVED sections is reported by name "
+            "instead."
         )
 
     # Validate through the model so env-delivered STRINGS are coerced properly ("false" → False, not the
@@ -4417,6 +4519,7 @@ def load_settings(
     """
     environ = os.environ if environ is None else environ
     data: dict[str, dict[str, Any]] = {}
+    file_data: Mapping[str, Any] = {}
 
     path = Path(config_path) if config_path is not None else Path(_DEFAULT_FILE)
     if config_path is not None and not path.exists():
@@ -4433,6 +4536,9 @@ def load_settings(
     # keys in their old sections (file+env), then desugar [security] into the internal fields it replaces
     # — BEFORE the CLI merge, so a --host/--db override still wins over a [security] value.
     _reject_relocated_keys(data)
+    # After _reject_relocated_keys so a MOVED key keeps its specific "moved to [security].X" message, and
+    # over `file_data` rather than `data` so it never sees a key the env overlay or the desugar wrote.
+    _reject_unknown_file_keys(file_data)
     _desugar_security(data)
 
     if cli:

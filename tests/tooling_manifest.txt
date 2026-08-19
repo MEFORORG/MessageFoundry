@@ -1,0 +1,120 @@
+# Repo-HARNESS test tier -- the partition behind ci.yml's `tooling` job.
+#
+# These tests' SUBJECT is the development harness (worktree gate, coordination claims, session mail,
+# ledger, announce, the CI workflows themselves), not the MessageFoundry engine. They are 17 percent
+# of the suite's tests and 66 percent of its wall-clock time, because each spawns real pwsh/git
+# children (~1.0s per test against 0.10s for an engine test). An engine-only PR cannot change their
+# result, so running them on the engine legs buys nothing and dominates the critical path.
+#
+# WHY A MANIFEST AND NOT A DIRECTORY. Moving these into tests/tooling/ was tried and reverted: the
+# files are coupled to their location in at least five ways (parents[N] anchors, .parent.parent
+# anchors, cross-test imports like `from tests.test_worktree_gate`, references from scripts/ and
+# docs/, and relative literals), and two of those classes only surfaced by running the suite. A
+# manifest is the same explicit reviewed list without moving anything.
+#
+# WHY NOT A FILENAME PATTERN. Three separate regex classifiers were tried and each got a different
+# obvious case wrong -- CLAUDE.md section 11 records the same failure for the backlog glyph parser.
+# Membership is a judgment, so it is written down rather than inferred.
+#
+# THE RULE FOR A NEW ENTRY: when ambiguous, LEAVE IT OFF. A test that reads real engine source stays
+# on the engine leg; wrongly listing one means it stops running on the PRs it guards. Mirrors ci.yml's
+# own docs-only filter: "when in doubt a path is CODE".
+#
+# tests/test_tooling_partition.py pins this file against the tree and fails if a new non-engine test
+# lands in neither this list nor its explicit stay-list.
+tests/test_adr0071_crossing_count.py
+tests/test_ai_provenance_claims.py
+tests/test_announce_hook.py
+tests/test_announce_wiring.py
+tests/test_asvs_file_surface_doc_drift.py
+tests/test_asvs_prove_absences_wiring.py
+tests/test_asvs_scorecard.py
+tests/test_asvs_tally_lint.py
+tests/test_asvs_verifier_vault_contract.py
+tests/test_backlog_citation_check.py
+tests/test_backlog_status_check.py
+tests/test_ci_docs_only_detector.py
+tests/test_ci_engine_step_excludes_webconsole.py
+tests/test_ci_leg_data_class.py
+tests/test_ci_step_margin.py
+tests/test_ci_tooling_gate.py
+tests/test_ci_venv_pinning.py
+tests/test_claim_check.py
+tests/test_claude_section_citations.py
+tests/test_claude_settings_contract.py
+tests/test_collision_gate.py
+tests/test_coord_claim_adjudicate.py
+tests/test_coord_claim_liveness.py
+tests/test_coord_claim_reconcile.py
+tests/test_coord_claim_refresh.py
+tests/test_coord_claim_release_history.py
+tests/test_coord_lock.py
+tests/test_coord_overlap_attribution.py
+tests/test_coord_overlap_cache.py
+tests/test_coord_overlap_signals.py
+tests/test_coord_presence.py
+tests/test_coord_seat_prompt.py
+tests/test_coord_unbacked_check.py
+tests/test_cutover_slug_rot.py
+tests/test_dangling_citation_check.py
+tests/test_dast_claims.py
+tests/test_dep1_lock_resync_lockstep.py
+tests/test_dependabot_automerge_guardrails.py
+tests/test_docs_runbooks.py
+tests/test_feature_map_claims.py
+tests/test_freethread_smoke_liveness.py
+tests/test_gate_installed_parity.py
+tests/test_gate_liveness.py
+tests/test_gate_rule_scan_agreement.py
+tests/test_ide_licence_packaging.py
+tests/test_incomplete_run_banner.py
+tests/test_install_gate_wiring.py
+tests/test_installed_coord_hooks.py
+tests/test_key_usage_scope_inventory.py
+tests/test_ledger_check.py
+tests/test_link_resolution.py
+tests/test_lint_scope_parity.py
+tests/test_merge_gate_controls.py
+tests/test_negative_controls.py
+tests/test_new_dependency_check.py
+tests/test_nightly_notice.py
+tests/test_private_paths_stay_ignored.py
+tests/test_push_guard.py
+tests/test_quality_advisory_invariants.py
+tests/test_quality_record_scope_claims.py
+tests/test_required_contexts.py
+tests/test_required_workflow_state.py
+tests/test_sbom_finalize.py
+tests/test_script_root_anchoring.py
+tests/test_security_posture.py
+tests/test_selfheal_installed_parity.py
+tests/test_serverdb_ci_coverage.py
+tests/test_session_context_presence.py
+tests/test_session_mail_held.py
+tests/test_session_mail.py
+tests/test_session_registry.py
+tests/test_setup_leak_gate_reports_source.py
+tests/test_stalled_prs.py
+tests/test_testpaths_webconsole_coverage.py
+tests/test_workflow_shell_syntax.py
+tests/test_worktree_gate_command_parsing.py
+tests/test_worktree_gate_control_plane.py
+tests/test_worktree_gate_default_reposfile.py
+tests/test_worktree_gate_emitter.py
+tests/test_worktree_gate_git.py
+tests/test_worktree_gate_hijack.py
+tests/test_worktree_gate_interpreter_flags.py
+tests/test_worktree_gate_interpreter_sigils.py
+tests/test_worktree_gate_quote_straddle.py
+tests/test_worktree_gate_receipts.py
+tests/test_worktree_gate_remedy_families.py
+tests/test_worktree_gate_shell_semantics.py
+tests/test_worktree_gate.py
+tests/test_worktree_new_cleanup_advice.py
+tests/test_worktree_new_no_track.py
+tests/test_worktree_prune_merged.py
+tests/test_worktree_remove.py
+tests/test_worktree_selfheal_wiring.py
+tests/test_worktree_venv_constraint.py
+tests/test_write_share_denominator.py
+tests/test_zizmor_config_hygiene.py

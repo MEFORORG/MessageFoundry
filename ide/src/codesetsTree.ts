@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Sidebar tree "Translation Tables" — every code set under codesets/ from `messagefoundry codeset
 // list --json`, each shown as name + entry count (and key/shape detail). A code set is read-only
 // reference data (CSV-first; the first column is the lookup key); the GUI grid editor (codeSetEditor.ts)

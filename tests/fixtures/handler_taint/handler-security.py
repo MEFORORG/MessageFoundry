@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 # Semgrep --test fixture (ADR 0144 Inc 3). Its basename MUST match the rule file
 # (messagefoundry/security/semgrep/handler-security.yml) so `semgrep --test` pairs them and checks the
 # `# ruleid:` / `# ok:` annotations below. ast-parsed only, never executed; undefined names are fine.

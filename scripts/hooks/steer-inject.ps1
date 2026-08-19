@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 # PreToolUse hook: deliver a queued steering note mid-task.
 #
 # Workaround for https://github.com/anthropics/claude-code/issues/30492 (no way to reach a session

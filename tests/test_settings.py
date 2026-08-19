@@ -116,16 +116,129 @@ def test_cli_overrides_env_and_file(tmp_path: Path) -> None:
     assert s.store.path == "cli.db"  # CLI is highest precedence
 
 
-def test_unknown_sections_and_keys_ignored(tmp_path: Path) -> None:
-    # A forward-looking config (an as-yet-unmodelled section + an unknown store key) must still load.
+def test_unknown_section_is_still_tolerated(tmp_path: Path) -> None:
+    # An as-yet-unmodelled top-level SECTION still loads. Unknown KEYS are refused (below); sections
+    # are a separate tolerance (ServiceSettings is extra="ignore") and were not changed with them.
     cfg = _write(
         tmp_path / "messagefoundry.toml",
-        '[store]\nbackend = "sqlite"\nregion = "us-east"\n[telemetry]\nendpoint = "x"\n',
+        '[store]\nbackend = "sqlite"\n[telemetry]\nendpoint = "x"\n',
     )
     s = load_settings(config_path=cfg, environ={})
     assert s.store.backend is StoreBackend.SQLITE
-    assert not hasattr(s.store, "region")  # unknown key ignored, not an error
-    assert not hasattr(s, "telemetry")  # unknown section ignored
+    assert not hasattr(s, "telemetry")
+
+
+def test_unknown_key_in_a_known_section_is_refused(tmp_path: Path) -> None:
+    # Owner ruling: refuse unknown keys. It used to load clean, do nothing and say nothing, so the
+    # operator kept believing the setting was in effect.
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "sqlite"\nregion = "us-east"\n',
+    )
+    with pytest.raises(ValueError) as excinfo:
+        load_settings(config_path=cfg, environ={})
+    message = str(excinfo.value)
+    assert "[store].region" in message  # names the section AND the key
+    assert "docs/CONFIGURATION.md" in message  # points somewhere the operator can act on
+    assert "us-east" not in message  # never the VALUE — the file carries secrets
+
+
+def test_unknown_key_refusal_suggests_the_near_miss(tmp_path: Path) -> None:
+    cfg = _write(tmp_path / "messagefoundry.toml", '[store]\npathh = "x.db"\n')
+    with pytest.raises(ValueError, match=r"\[store\]\.pathh \(did you mean 'path'\?\)"):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_unknown_key_refusal_reports_every_offender_at_once(tmp_path: Path) -> None:
+    # One pass, not one restart per typo.
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nregion = "us-east"\n[api]\nprot = 8765\n',
+    )
+    with pytest.raises(ValueError) as excinfo:
+        load_settings(config_path=cfg, environ={})
+    assert "[store].region" in str(excinfo.value)
+    assert "[api].prot" in str(excinfo.value)
+
+
+def test_a_relocated_key_keeps_its_specific_message(tmp_path: Path) -> None:
+    # [auth].enabled IS a real field, so it is refused by _reject_relocated_keys with the message that
+    # names its new home — the generic unknown-key refusal must not shadow it.
+    cfg = _write(tmp_path / "messagefoundry.toml", "[auth]\nenabled = true\n")
+    with pytest.raises(ValueError, match=r"moved to \[security\]\.require_sign_in"):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_an_engine_written_config_still_loads(tmp_path: Path) -> None:
+    """The regression guard for the failure mode the loader-level check exists to avoid.
+
+    A model-level ``extra="forbid"`` would refuse keys the ENGINE ITSELF writes into the section dicts:
+    the ``[security]`` desugar, the ``MEFOR_*`` env overlay (which scrapes documented variables that are
+    read out-of-band from ``os.environ`` and are not fields), and the CLI merge. All three must survive.
+    """
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        # [security] desugars into api/auth/egress/retention/store/diagnostics/ai fields.
+        "[security]\n"
+        "require_sign_in = true\n"
+        "block_unlisted_outbound = true\n"
+        "serve_web_console = true\n"
+        "local_access_only = true\n"
+        "delete_message_bodies_after_days = 30\n"
+        "handles_real_patient_data = false\n",
+    )
+    s = load_settings(
+        config_path=cfg,
+        environ={
+            "MEFOR_STORE_PATH": "env.db",
+            # Read straight from os.environ by store/keyprovider_vault.py and config/tls_policy.py —
+            # NOT StoreSettings/TlsSettings fields, but the env overlay scrapes them in anyway.
+            "MEFOR_STORE_VAULT_ADDR": "https://vault.example.org",
+            "MEFOR_STORE_VAULT_TOKEN": "not-a-real-token",
+            "MEFOR_TLS_REVOCATION_ATTESTED": "1",
+            "MEFOR_DELIVERY_PHASE_TIMING": "1",
+            "MEFOR_PIPELINE_LANE_EPISODE_TIMING": "1",
+        },
+        cli={"store": {"path": "cli.db"}, "api": {"port": 9001}},
+    )
+    assert s.store.path == "cli.db"
+    assert s.api.port == 9001
+    assert s.auth.enabled is True  # desugared from [security].require_sign_in
+    assert s.egress.deny_by_default is True
+    assert s.api.host == "127.0.0.1"
+    assert s.retention.messages_days == 30
+
+
+def test_the_refusal_is_scoped_to_the_file_not_env_or_cli(tmp_path: Path) -> None:
+    """Pins the SCOPE of the refusal, so the gap reads as the decision it is rather than an oversight.
+
+    Refusing an unrecognized env key would refuse the documented out-of-band ``MEFOR_*`` variables
+    exercised by ``test_an_engine_written_config_still_loads``; CLI keys are engine-written, never
+    operator-spelled. Whatever the docs say about this refusal has to carry that scope — a reader who
+    believes env is checked stops proof-reading the surface where secrets and posture switches live.
+    """
+    cfg = _write(tmp_path / "messagefoundry.toml", '[store]\nbackend = "sqlite"\n')
+
+    # Positive control: the SAME typo in the FILE is refused, so a silent pass below is a real scope
+    # boundary and not a checker that stopped running.
+    bad = _write(tmp_path / "bad.toml", '[store]\nbackend = "sqlite"\npathh = "typo.db"\n')
+    with pytest.raises(ValueError, match=r"\[store\]\.pathh"):
+        load_settings(config_path=bad, environ={})
+
+    from_env = load_settings(config_path=cfg, environ={"MEFOR_STORE_PATHH": "typo.db"})
+    assert from_env.store.path == "messagefoundry.db"  # dropped, and nothing said
+
+    from_cli = load_settings(config_path=cfg, environ={}, cli={"store": {"pathh": "typo.db"}})
+    assert from_cli.store.path == "messagefoundry.db"
+
+
+def test_an_unknown_security_key_from_env_is_still_refused(tmp_path: Path) -> None:
+    # The one exception to the file-only scope: every shipped MEFOR_SECURITY_* name maps to a real
+    # field, so there is no out-of-band variable to collide with, and a posture switch the operator
+    # believes is on is the worst case of the class.
+    cfg = _write(tmp_path / "messagefoundry.toml", '[store]\nbackend = "sqlite"\n')
+    with pytest.raises(ValueError, match=r"\[security\]\.block_unlisted_outboud"):
+        load_settings(config_path=cfg, environ={"MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUD": "true"})
 
 
 def test_retention_section_loads(tmp_path: Path) -> None:

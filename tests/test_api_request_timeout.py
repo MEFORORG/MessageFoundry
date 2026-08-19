@@ -131,20 +131,29 @@ def test_the_deadline_sits_inside_the_network_gate_and_outside_everything_else()
     """The registration order is the claim, so it is pinned rather than described in a comment.
 
     `add_middleware` inserts at index 0 and the stack is built from `reversed(user_middleware)`, so
-    index 0 is OUTERMOST. `ClientNetworkMiddleware` must stay there — a refused address is rejected
-    before it can occupy a deadline — and the timeout must be next, i.e. outside the attachment CSP
-    re-assert, the console's own middleware, the body cap, the security-headers middleware and every
-    auth dependency. It must also be pure ASGI: a `BaseHTTPMiddleware` here would add a task hop and
-    hide the response-start signal the deadline is cancelled on."""
+    index 0 is OUTERMOST. Only `SecurityHeaderFloorMiddleware` may sit above `ClientNetworkMiddleware`:
+    the floor runs NOTHING on the request path (it wraps `send` only), so the gate's substantive claim
+    is unchanged — a refused address is still rejected before it can occupy a deadline, reach a route,
+    a dependency or a body buffer. The deadline must be next after the gate, i.e. outside the
+    attachment CSP re-assert, the console's own middleware, the body cap, the security-headers
+    middleware and every auth dependency. It must also be pure ASGI: a `BaseHTTPMiddleware` here would
+    add a task hop and hide the response-start signal the deadline is cancelled on."""
     from starlette.middleware.base import BaseHTTPMiddleware
 
     from messagefoundry.api.client_networks import ClientNetworkMiddleware
+    from messagefoundry.api.header_floor import SecurityHeaderFloorMiddleware
     from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 
     app = create_app()
     registered = [m.cls for m in app.user_middleware]
-    assert registered[0] is ClientNetworkMiddleware, "the network gate must stay outermost"
-    assert registered[1] is RequestTimeoutMiddleware, (
+    assert registered[0] is SecurityHeaderFloorMiddleware, (
+        "only the response-header floor may sit outside the network gate; "
+        f"the stack is {registered}"
+    )
+    assert registered[1] is ClientNetworkMiddleware, (
+        f"the network gate must precede everything that builds a response; the stack is {registered}"
+    )
+    assert registered[2] is RequestTimeoutMiddleware, (
         f"the request deadline must sit directly inside the network gate; the stack is {registered}"
     )
     assert registered.count(RequestTimeoutMiddleware) == 1
