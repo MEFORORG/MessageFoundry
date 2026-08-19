@@ -10386,7 +10386,58 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 >
 > **Whichever is chosen, it must not be "widen the gate".** The `--ci` leg already skips ownership by design (`not self.ci and not self.owns(...)`, `ledger_check.py:266` and `:355`), so a green CI is **not** evidence a number was properly allocated -- that hole should not be made bigger.
 
+> **ROUTE 1 WAS TESTED ON THE LIVE INSTANCE, 2026-08-19, AND IT WORKS.** Owner-directed. `git worktree add` at the exact recorded path, on the stranded PR's own branch; resolve there; commit there. **The ledger gate reported `Passed`** on a commit that could not have been made from anywhere else, and PR #397 went `DIRTY` to `MERGEABLE`. **Note what this does and does not settle:** it confirms the mechanism -- `owns()` compares a path string, so restoring the path restores the referent -- and it settles nothing about whether this should be the *documented* remedy, because it is still uncomfortably adjacent to the rename-workaround CLAUDE.md sec. 5 forbids. **The distinction worth preserving: this RESTORES the condition the gate tests rather than bypassing the test.** A reassign flag would be the honest version of the same intent.
+>
+> Two details a repeat of this must not skip. **`git worktree add -B` resets the local branch**, and here it moved one from `91a24061` -- verify what that ref held before accepting the reset (it was an old `main` commit, reachable from many refs, so nothing was stranded; that was checked, not assumed). And **resolve the ledger conflict against a computed target, never by eye**: merge-base `292/212`, branch `293/213`, `origin/main` `310/230`, so the only correct result was `311/231`, and `parse_items` returning exactly that is what made "keep both sides" a verified claim instead of a hopeful one.
+
 > **THE OPERATIONAL RULE THAT FALLS OUT, AND IT IS WORTH ADOPTING EVEN IF THE FIX IS DEFERRED:** before removing a worktree, check whether it owns any allocation whose item is not yet on `main`. That sweep is cheap -- read each `alloc/*/<n>.json`, match `worktree` against the removal list, and grep `origin/main`'s ledger for the heading. **It was run against the 16 worktrees proposed for removal on 2026-08-19 and returned zero**, with #1264 used as the positive control to prove the sweep can actually detect the class.
 
 **Cluster:** Ledger gate / worktree lifecycle. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0) -- this is developer tooling. The cost is a PR that cannot be landed by anyone and a ledger number burned with no way to reuse it, plus the sweep above being folk knowledge until it is written into the removal path.
+
+## 1294. no cleanup path exists for the 70 percent of worktrees the prune tool must never touch, so they accumulate until a human removes them by hand
+
+> 🔢 **Filed 2026-08-19 -- not started. THIS IS NOT "THE PRUNE TOOL HAS A COVERAGE BUG". ITS EXCLUSIONS ARE DELIBERATE, WERE PAID FOR BY AN INCIDENT, AND MUST STAY.** `scripts/worktree/prune-merged.ps1` refuses anything with a `.claude/worktrees/` path segment, anything nested inside another registered worktree, detached trees, Temp scratchpad trees, and the primary. Its header states why: that directory is **"the exact place EnterWorktree relocates a live session to"**, the tool **once removed an occupied worktree** -- deregistering it and then failing to delete the directory, after which every git command in the working session failed -- and the resulting bias is recorded as **"a false SKIP is a minor annoyance, a false PRUNE destroys a session"**. **THE CHANGE: give the excluded population a REPORTING path, not a removal path.**
+
+> **MEASURED 2026-08-19 on this clone:**
+>
+>     total registered worktrees        36
+>     reachable by prune-merged.ps1     11   (<repo>-<name> siblings)
+>     .claude/worktrees/*               12   excluded BY DESIGN -- live sessions live here
+>     other (C:/mfw*, Temp, detached)   13   excluded
+>
+> So **30 percent** is reachable. On the same day the owner removed **12** of the excluded ones by hand, from a list assembled manually, because nothing produces that list.
+
+> **THE ACTUAL DEFECT IS THE ABSENCE OF A SAFE MIDDLE.** Today there are two states: the tool removes it, or nobody knows it exists. There is no artifact that says *"these excluded trees look finished -- here are the commands, you decide"*. That gap is what turns routine hygiene into a manual audit, and a manual audit is what gets skipped until 53 worktrees accumulate.
+
+> **WHY A REPORTER AND NOT A WIDER FENCE.** The occupancy fence's own receipt states it cannot see **"a session writing into a worktree by absolute path from elsewhere (29% of the writes by primary-seated sessions, measured on this repo)"**, a cwd recorded as UNC or 8.3, a session that never registered, or one that only edits files. The 36h git-metadata veto exists to cover that hole and is a proxy, not a fact. **Automating deletion of the directory where live sessions live, behind a fence with a measured 29 percent blind spot in one of its two signals, trades the exact property the incident bought.** A reporter carries none of that risk because it removes nothing.
+
+> **SHAPE THAT WOULD BE SAFE:** extend the existing decision table to *evaluate* every registered worktree, and for the excluded classes emit `REPORT-ONLY` rows plus a copy-pasteable command block -- never an `-Apply` path, no `-Name` override, no force. The dirty check, the branch-keeping rule, the orphan ledger and the fence receipt all already exist and would be reused unchanged. **The human stays the actuator for the dangerous population; only the discovery is automated.**
+
+> **A SECOND, SMALLER FINDING FROM THE SAME PASS.** `git worktree remove` is refused to an agent by `scripts/hooks/worktree_gate.ps1` for every tree but its own, and that refusal names the user as the only actor. That is consistent with the above and should NOT be relaxed to close this item -- the reporter makes the refusal cheap to live with, which is the correct order of operations.
+
+**Cluster:** Worktree lifecycle / developer tooling. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). The cost is unbounded worktree accumulation, a manual audit nobody schedules, and disk. **Explicitly NOT a licence to widen the prune fence** -- the item is closed by adding reporting, and would be mis-implemented by adding reach.
+
+## 1295. the manual worktree-removal path strands coordination claims, and 19 of 30 are already orphaned
+
+> 🔢 **Filed 2026-08-19 -- not started. A STRANDED CLAIM IS UNRELEASABLE BY ANYONE, AND IT READS AS ACTIVELY-BEING-BUILT FOREVER.** `claim.ps1 -Release` is **worktree-scoped** -- deliberately, so no session can free a key another is mid-build on. The consequence nobody designed for: once the holding worktree is gone, **the normal release path can never be satisfied again**, and the item looks claimed to every future session. `CLAUDE.md` section 5 already records the cost -- *"a held claim on finished work looks exactly like someone actively building, and stalls the next session for days."* **THE CHANGE: release claims on the removal path that is actually used, and provide a sweep for the ones already stranded.**
+
+> **MEASURED 2026-08-19, from the claim files on disk rather than from `-List` prose:**
+>
+>     holder gone    19
+>     holder alive   11
+>     unreadable      0
+>
+> Positive control: 11 resolved **alive** in the same pass, so the directory test is not returning a blanket "gone". The 19 trace to just **six** long-dead worktrees, one of which holds eight of them.
+
+> **THE GAP IS THE PATH, NOT THE TOOL.** `prune-merged.ps1` **already** releases claims when it removes a worktree (`Remove-ClaimsHeldBy`, BACKLOG #345). But it reaches only `<repo>-<name>` siblings -- 11 of 36 registered worktrees on this clone (#1294) -- and `worktree_gate.ps1` directs everything else to a plain **`git worktree remove`**, which releases nothing. **So the sanctioned path for the majority of worktrees is precisely the one that strands claims**, and the covered path is the minority case.
+
+> **THIS ALREADY BIT THE FEATURE FILED BESIDE IT.** #1294's report-only rows emit exactly that plain `git worktree remove`, so as first written they handed the operator a command that would strand any claim the reported tree held. Fixed by withholding a claim-holding tree from the report -- but that fix protects **one** consumer of the command, not the command itself, which is why this item is separate and is about the path.
+
+> **A SWEEP IS NOT THE WHOLE FIX, AND SHOULD NOT BE CONFUSED FOR ONE.** `claim.ps1 -Release <key> -Force` clears a stranded claim today, so the 19 are recoverable by hand. That restores the registry; it does nothing to stop the twentieth. **Both halves are needed, and the ordering matters: fix the path first**, or the sweep is repeated work with a known expiry.
+
+> **DO NOT AUTO-RELEASE ON A "HOLDER GONE" TEST ALONE.** A worktree directory can be momentarily absent -- mid-move, on a disconnected drive, during a failed removal that left it deregistered (the orphan case this script already tracks). Releasing on that reading hands a live session's key away, which is the failure `Remove-ClaimsHeldBy`'s own comment calls **strictly worse than the orphan being fixed**. Whatever lands must fold the same full-path normalisation and refuse anything it cannot read.
+
+**Cluster:** Coordination registry / worktree lifecycle. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- developer coordination only. The cost is 19 backlog items currently presenting as claimed-and-in-progress when nobody is working them, which is the exact signal the registry exists to make trustworthy.
