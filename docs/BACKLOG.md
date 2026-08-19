@@ -10276,3 +10276,35 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** CI reliability / intake accounting. **Priority:** P1. **Verdict:** build.
 **Severity:** no deployment axis today (sec. 0 -- zero instances). Rated P1 because the unexcluded branch is a count-and-log invariant failure, and because it is currently red on `main` inside a required context.
+
+## 1293. removing a worktree orphans every unlanded ledger number it allocated, permanently stranding those PRs
+
+> 🔢 **Filed 2026-08-19 -- not started. LEDGER OWNERSHIP IS A PATH-STRING COMPARISON AGAINST A DIRECTORY THAT CAN CEASE TO EXIST, AND WHEN IT DOES, `owns()` RETURNS FALSE FOR EVERY SESSION FOREVER.** `Checker.owns` ([`scripts/hooks/ledger_check.py:219-231`](../scripts/hooks/ledger_check.py)) reads `<git-common-dir>/mefor-coord/alloc/<kind>/<number>.json` and compares `self.repo` to the recorded `worktree`, casefolded. **There is no fallback for a recorded worktree that is gone.** Ownership is documented as non-transferable, so nothing can re-key it. **THE CHANGE: give an orphaned allocation a defined recovery path.**
+
+> **THIS IS NOT HYPOTHETICAL -- PR #397 IS STRANDED BY IT RIGHT NOW, AND IT IS SITTING IN THE MERGE QUEUE.** Measured:
+>
+>     BACKLOG #1264 allocated by   a session worktree, recorded in its alloc claim
+>     that directory                does not exist, and is not in `git worktree list`
+>     #1264 on origin/main          NO  (0 occurrences of its heading)
+>     PR #397                       DIRTY, and its only conflict is docs/BACKLOG.md
+>
+> **The combination is what strands it.** The conflict needs a resolution commit; the resolution re-introduces a heading that is not yet on `main`, which the gate treats as an **addition**, so ownership is consulted; and ownership can never again be satisfied. **A one-file, purely mechanical ledger conflict is therefore unresolvable by anybody.**
+
+> **THE FAILURE IS SILENT UNTIL THE COMMIT, WHICH IS THE EXPENSIVE MOMENT.** Nothing warns at worktree-removal time, nothing warns when the PR goes DIRTY, and the refusal arrives only when someone has already done the resolution work. The gate is **failing closed and is behaving correctly** -- the defect is that there is no route back, not that it refuses.
+
+> **THREE CANDIDATE ROUTES, none obviously right, which is why this needs a decision rather than a patch:**
+>
+>     recreate a worktree at the recorded PATH   restores the comparison's referent; the gate keys on
+>                                                the string, so this works -- but it is uncomfortably
+>                                                close to the rename-workaround CLAUDE.md sec. 5 forbids
+>     an explicit `alloc.ps1 -Reassign <n>`      honest and auditable, but it puts a hole in the
+>                                                non-transferable rule the gate rests on
+>     let a MISSING owner directory fall through  narrowest, and it fails OPEN exactly once per number --
+>       to the CI behaviour (ownership skipped)   needs care that "missing" cannot be forged
+>
+> **Whichever is chosen, it must not be "widen the gate".** The `--ci` leg already skips ownership by design (`not self.ci and not self.owns(...)`, `ledger_check.py:266` and `:355`), so a green CI is **not** evidence a number was properly allocated -- that hole should not be made bigger.
+
+> **THE OPERATIONAL RULE THAT FALLS OUT, AND IT IS WORTH ADOPTING EVEN IF THE FIX IS DEFERRED:** before removing a worktree, check whether it owns any allocation whose item is not yet on `main`. That sweep is cheap -- read each `alloc/*/<n>.json`, match `worktree` against the removal list, and grep `origin/main`'s ledger for the heading. **It was run against the 16 worktrees proposed for removal on 2026-08-19 and returned zero**, with #1264 used as the positive control to prove the sweep can actually detect the class.
+
+**Cluster:** Ledger gate / worktree lifecycle. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- this is developer tooling. The cost is a PR that cannot be landed by anyone and a ledger number burned with no way to reuse it, plus the sweep above being folk knowledge until it is written into the removal path.
