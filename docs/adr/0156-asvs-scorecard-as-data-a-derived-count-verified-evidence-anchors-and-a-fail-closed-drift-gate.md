@@ -148,6 +148,41 @@ That last row is the fix for **15.1.3**: the guards stop being inspection-only t
 > exists to prevent. It was caught only because ratification was gated on answering the open question
 > rather than on the argument reading well.
 
+> ### Amendment 2 (2026-08-17) — the hook the amendment above calls "the enforcement that works today" HAS NEVER BEEN INSTALLED
+>
+> Amendment 1 closes by naming its own lesson: a confident, plausible statement about system state that
+> nobody had checked. **Its replacement claim was never checked either, and it is wrong in the same
+> way.** Measured on the vault checkout, 2026-08-17, twice about three hours apart:
+>
+> | | measured |
+> |---|---|
+> | the hook is **defined** | **yes** — `.pre-commit-config.yaml`, local hook id `asvs-scorecard`, named for this ADR and path-filtered to the scorecard, engine and `scripts/asvs/` paths |
+> | the hook is **installed** | **no** — `core.hooksPath` is unset and there are **zero** non-sample hooks under the vault's `hooks` directory, so `pre-commit install` has never been run in this clone |
+> | what enforces the drift gate today | the daily crons and `.github/workflows/asvs-scorecard.yml`. **Not** a pre-commit hook |
+>
+> **So the sentence is wrong in a specific and repairable way, and the distinction matters for the
+> remedy.** The mechanism was built exactly as designed; what does not exist is the per-clone
+> installation step, which this ADR never names and which nobody performed. The fix is
+> `pre-commit install`, not authoring anything.
+>
+> **AND INSTALLING IT NAIVELY WOULD MAKE THINGS WORSE, WHICH IS WHY THIS IS NOT A ONE-LINE ACTION
+> ITEM.** The hook hard-requires `MEFOR_ENGINE_ROOT` to point at an engine checkout at
+> `[scorecard].anchor_commit`, and its own config states that when unset it **fails rather than
+> skips**. Installed without that environment, every vault commit goes red — which is precisely the
+> *"a gate that is red by construction teaches everyone to ignore it"* hazard that
+> `scripts/asvs/register_check.py` cites as its reason for staying advisory. Whoever installs it must
+> set that variable in the same change.
+>
+> **WHY THIS IS RECORDED RATHER THAN QUIETLY FIXED.** The claim is load-bearing in a security record:
+> it tells a reader that authoring-time enforcement is in place, and a reader who believes it will not
+> look for the gap. That is a compensating control resting on a false premise, which
+> `CLAUDE.md` SDS-3.7 forbids, and the record has to stop asserting it whether or not the hook is ever
+> installed.
+>
+> **The lesson of Amendment 1 held for exactly one iteration.** §7 was checked because ratification was
+> gated on answering an open question; Amendment 1's own replacement claim carried no such gate, and
+> went unchecked for sixteen days. **A correction is not self-verifying because it is a correction.**
+
 ### 8. A generated entry point
 
 `ASVS-CURRENT.md` is rendered, never hand-written: the count, the anchor commit, the open cells, and

@@ -170,33 +170,93 @@ def _status_against(home: Path) -> str:
     return r.stdout
 
 
-def _fake_home(root: Path, names: list[str], *, wired: set[str] | None = None) -> Path:
-    """A home holding `names` as directories, each with a settings.json carrying gate wiring."""
-    home = root / "home"
-    home.mkdir()
-    settings = json.dumps(
+def _settings_json(matcher: str = "Bash|PowerShell", *, gate_marked: bool = True) -> str:
+    """One PreToolUse entry, as a settings.json body.
+
+    ``gate_marked`` is the only difference the reader under test can see: Get-WiredMatchers keys off
+    the hook COMMAND naming worktree_gate.ps1, never off the matcher. So a hook with some other
+    command is a dir that is present, readable, valid JSON, and carries no gate wiring -- a state
+    ``-Status`` could not distinguish from unparseable JSON until the unroll defect was fixed.
+    """
+    command = (
+        'pwsh -NoProfile -File "~/worktree_gate.ps1"'
+        if gate_marked
+        else "pwsh -NoProfile -File some-other-unrelated-hook.ps1"
+    )
+    return json.dumps(
         {
             "hooks": {
                 "PreToolUse": [
                     {
-                        "matcher": "Bash|PowerShell",
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": 'pwsh -NoProfile -File "~/worktree_gate.ps1"',
-                            }
-                        ],
+                        "matcher": matcher,
+                        "hooks": [{"type": "command", "command": command}],
                     }
                 ]
             }
         }
     )
+
+
+def _fake_home(root: Path, names: list[str], *, wired: set[str] | None = None) -> Path:
+    """A home holding `names` as directories, each with a settings.json carrying gate wiring."""
+    home = root / "home"
+    home.mkdir()
+    settings = _settings_json()
     for name in names:
         d = home / name
         d.mkdir()
         if wired is None or name in wired:
             (d / "settings.json").write_text(settings, encoding="utf-8")
     return home
+
+
+def _plant_gate(home: Path) -> Path:
+    """Copy this checkout's gate to ``<home>/.claude/hooks/worktree_gate.ps1``.
+
+    WITHOUT THIS, EVERY WIRING ASSERTION IS VACUOUS. ``-Status`` compares the wired matchers against
+    the rules the INSTALLED gate implements, and under a redirected USERPROFILE that file does not
+    exist -- so Get-HandledTools returns nothing, and absent/missing/stray are all computed over the
+    empty set. Measured 2026-08-18: an unplanted fake home prints ``scanned 1 config dir(s) against 0
+    implemented rule(s)`` and no UNWIRED line can ever appear, whatever the installer does. Callers
+    must pair this with ``_assert_the_gate_was_planted`` so the fixture cannot silently degrade.
+    """
+    dst = home / ".claude" / "hooks" / "worktree_gate.ps1"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(GATE, dst)
+    return dst
+
+
+def _assert_the_gate_was_planted(out: str) -> None:
+    """Guard the guard for ``_plant_gate``: prove the rule set under comparison is the real one."""
+    expected = len(tools_the_gate_handles())
+    assert f"against {expected} implemented rule(s)" in out, (
+        "the planted gate was not read back, so $handled is not the real tool set and every wiring "
+        f"assertion below would pass vacuously.\n{out}"
+    )
+
+
+def _unwired_for(out: str, config_dir_name: str) -> set[str]:
+    """The tools ``-Status`` reports UNWIRED for ONE config dir.
+
+    Scoped to the dir's own block rather than grepped out of the whole run: ``-Status`` prints one
+    block per config dir and they are distinguished only by the ``wiring      :`` header above them,
+    so a whole-output search answers a neighbouring question -- "does any dir report this" -- and
+    would go green on a fixture where the wrong dir carried the line.
+    """
+    lines = out.splitlines()
+    for i, ln in enumerate(lines):
+        if not ln.startswith("wiring      :"):
+            continue
+        if Path(ln.split(":", 1)[1].strip()).parent.name != config_dir_name:
+            continue
+        for body in lines[i + 1 :]:
+            if not body.startswith("              "):
+                break  # end of this dir's block
+            if "UNWIRED  :" in body:
+                names = body.split("UNWIRED  :", 1)[1].split("<-")[0]
+                return {n.strip() for n in names.split(",") if n.strip()}
+        return set()  # a block with no UNWIRED line means nothing is unwired
+    raise AssertionError(f"-Status printed no wiring block for {config_dir_name}:\n{out}")
 
 
 def test_the_writer_wires_exactly_the_dirs_the_reader_agrees_to_judge(tmp_path: Path) -> None:
@@ -372,3 +432,144 @@ def test_a_hidden_account_dir_is_still_wired(tmp_path: Path) -> None:
         f"  wired: {sorted(wired)}\n"
         "  On Linux every dot-dir is hidden, so this is the whole account population, not an edge case."
     )
+
+
+def test_a_config_dir_with_valid_json_and_no_gate_wiring_is_reported_not_defamed(
+    tmp_path: Path,
+) -> None:
+    """The EMPTY arm of the Get-WiredMatchers unroll, which took ``-Status`` down and mislabelled a dir.
+
+    Measured 2026-08-18. ``Get-WiredMatchers`` ended in a bare ``return $wired``, and PowerShell
+    UNROLLS an enumerable return value into the pipeline -- so a HashSet holding nothing arrived at the
+    caller as ``$null``, one element arrived as a ``[String]``, and two or more as ``[Object[]]``. The
+    empty arm therefore produced BOTH failures this test pins, in one run:
+
+    1. The wire-set scan called ``$wired.Contains($_)`` on ``$null`` and the whole command exited 1 with
+       "You cannot call a method on a null-valued expression", after printing part of its output. Every
+       later config dir, the entire independent audit, and the footer never printed.
+    2. The independent audit tested ``$null -eq $wired`` to mean "Read-Settings THREW on invalid JSON".
+       The unroll made ``$null`` mean that OR "valid JSON, zero gate matchers", so a perfectly readable
+       config dir was reported as ``UNREADABLE: settings.json is not valid JSON``, and the arm that says
+       "carries no gate wiring" was unreachable dead code that had never once run.
+
+    Symptom 1 CRASHES FIRST, so on the unfixed installer this test goes red at ``_status_against``'s
+    returncode check and its symptom-2 assertions below are never reached. They are kept here because
+    both symptoms are one defect and this is the fixture that produces both at once -- but the
+    assertion that can be watched failing on symptom 2 alone is the next test, which steers the scan
+    into the arm that does not crash.
+
+    CI could not see this: a hosted runner has no ~/.claude at all, so the wire set is empty and the
+    loop never runs. It fired on the developer box, where ~/.claude-account-5 exists as a directory with
+    no settings.json -- which is enough, since the wire set requires only that the directory exist.
+    """
+    home = _fake_home(tmp_path, [".claude", ".claude-account-2.lock"])
+    _plant_gate(home)
+    # Valid JSON, a real PreToolUse hook, and NOT ours: the state the audit could not name.
+    unwired = _settings_json(gate_marked=False)
+    (home / ".claude" / "settings.json").write_text(unwired, encoding="utf-8")
+    (home / ".claude-account-2.lock" / "settings.json").write_text(unwired, encoding="utf-8")
+
+    out = _status_against(home)  # asserts returncode 0 -- symptom 1 exited 1 here
+    _assert_the_gate_was_planted(out)
+
+    # Not tools_registered_by_default(): that is what the INSTALLER would write, and the question here
+    # is what the GATE implements minus the deliberate opt-in, which is what UNWIRED is computed from.
+    expected = tools_the_gate_handles() - {"EnterWorktree"}
+    assert _unwired_for(out, ".claude") == expected, (
+        "a config dir with no gate wiring must report every implemented rule as UNWIRED.\n"
+        f"  expected: {sorted(expected)}\n"
+        f"  reported: {sorted(_unwired_for(out, '.claude'))}\n{out}"
+    )
+    assert "UNREADABLE" not in out, (
+        "symptom 2: a dir whose settings.json is valid JSON was reported as unparseable. $null from "
+        f"Get-WiredMatchers must mean 'Read-Settings threw', and nothing else.\n{out}"
+    )
+    assert (
+        "not judged: .claude-account-2.lock (not a launcher name) -- carries no gate wiring" in out
+    ), (
+        "the audit's 'carries no gate wiring' arm is the correct verdict for an unjudged dir with a "
+        f"readable, un-gated settings.json, and it must actually be reachable.\n{out}"
+    )
+
+
+def test_a_readable_but_ungated_settings_json_is_not_called_unparseable(tmp_path: Path) -> None:
+    """Symptom 2 of the empty arm, ISOLATED so it can fail on its own.
+
+    The test above pins symptoms 1 and 2 together, and symptom 1 gets there first: the wire-set scan
+    crashes and the run exits 1 before the audit prints anything, so its ``UNREADABLE`` assertion
+    never executes against the defect and cannot be seen to fail. An assertion that has never been
+    observed red is a claim, not a control -- and a partial fix that repaired only the crash would be
+    graded by it.
+
+    So this fixture steers the wire-set scan into the NON-crashing arm: the dir under ``-ConfigDir``
+    carries TWO gate matchers, which unrolled to ``[Object[]]``, whose ``.Contains`` is real membership.
+    The run therefore reaches the audit on the unfixed installer, and the audit is where ``$null``
+    stops discriminating: it is set from a caught throw, so an empty set arriving as ``$null`` is read
+    as "not valid JSON" for a file that parses fine.
+
+    NO ``_plant_gate`` here, deliberately. The audit does not consult the installed gate's rule set at
+    all -- it reads settings.json and nothing else -- so planting one would add a moving part without
+    adding coverage. The vacuity risk this test carries is a different one (an audit that never looked
+    at the dir), and it is guarded below by naming the dir in the population line.
+    """
+    home = _fake_home(tmp_path, [".claude", ".claude-account-2.lock"], wired={".claude"})
+    # Two matchers in the wire-set dir, so the scan takes the [Object[]] arm and does NOT crash.
+    assert _settings_json().count("|") == 1, "the default fixture must wire two matchers, not one"
+
+    ungated = _settings_json(gate_marked=False)
+    # Measured, not asserted: the whole finding is that a file which PARSES was called unparseable, so
+    # the premise has to be checked rather than assumed from the fact that we wrote it.
+    json.loads(ungated)
+    (home / ".claude-account-2.lock" / "settings.json").write_text(ungated, encoding="utf-8")
+
+    out = _status_against(home)
+
+    # The audit must actually have examined it -- otherwise the two assertions below are satisfied by
+    # a run that never looked, which is the same shape as the clean verdict this file already rejects.
+    found = next((ln for ln in out.splitlines() if "found    :" in ln), "")
+    assert ".claude-account-2.lock" in found, f"the audit never examined the fixture dir:\n{out}"
+
+    assert "UNREADABLE" not in out, (
+        "a settings.json that parses as JSON was reported as unparseable. That verdict is reached by "
+        "testing `$null -eq $wired`, which is only a discriminator while $null means 'Read-Settings "
+        f"threw' -- the unroll made an empty set mean it too.\n{out}"
+    )
+    assert (
+        "not judged: .claude-account-2.lock (not a launcher name) -- carries no gate wiring" in out
+    ), f"the correct verdict for a readable, un-gated, unjudged dir was not printed.\n{out}"
+
+
+def test_one_wired_matcher_is_membership_not_a_substring_search(tmp_path: Path) -> None:
+    """The SINGLE-ELEMENT arm of the same unroll -- the dangerous one, because it is SILENT.
+
+    Measured 2026-08-18. With exactly one matcher the bare ``return $wired`` handed the caller a
+    ``[String]``, so ``$wired.Contains("Edit")`` stopped being set membership and became
+    ``String.Contains`` -- a SUBSTRING test. The gate branches on both ``MultiEdit`` and
+    ``NotebookEdit``, and "Edit" is a strict substring of each, so a config dir wiring only
+    ``NotebookEdit`` reported "Edit" as wired and OMITTED it from the UNWIRED line. Exit code 0, no
+    warning, nothing in the output to read as wrong: a rule that never fires, reported as fine.
+
+    The asymmetry is the proof and is why this fixture uses ``NotebookEdit`` specifically:
+    ``"NotebookEdit".Contains("MultiEdit")`` is False, so MultiEdit survived into the UNWIRED line
+    while Edit vanished from beside it. That is a shape no correct implementation can produce.
+    """
+    home = _fake_home(tmp_path, [".claude"])
+    _plant_gate(home)
+    (home / ".claude" / "settings.json").write_text(
+        _settings_json("NotebookEdit"), encoding="utf-8"
+    )
+
+    out = _status_against(home)
+    _assert_the_gate_was_planted(out)
+    unwired = _unwired_for(out, ".claude")
+
+    assert "Edit" in unwired, (
+        "'Edit' is implemented by the gate and NOT wired here, so -Status must report it UNWIRED. Its "
+        "absence is the substring bug, not a missing rule: String.Contains('Edit') is True against the "
+        "single wired matcher 'NotebookEdit', so the set test degenerated into a substring test and a "
+        "dead rule was reported as live.\n"
+        f"  reported UNWIRED: {sorted(unwired)}\n{out}"
+    )
+    # The contrast that localises it: same dir, same single matcher, but not a substring of it.
+    assert "MultiEdit" in unwired, f"MultiEdit is not wired here either:\n{out}"
+    assert "NotebookEdit" not in unwired, f"NotebookEdit IS wired here:\n{out}"
