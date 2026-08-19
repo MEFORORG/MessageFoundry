@@ -10336,3 +10336,26 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Worktree lifecycle / developer tooling. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0). The cost is unbounded worktree accumulation, a manual audit nobody schedules, and disk. **Explicitly NOT a licence to widen the prune fence** -- the item is closed by adding reporting, and would be mis-implemented by adding reach.
+
+## 1295. the manual worktree-removal path strands coordination claims, and 19 of 30 are already orphaned
+
+> 🔢 **Filed 2026-08-19 -- not started. A STRANDED CLAIM IS UNRELEASABLE BY ANYONE, AND IT READS AS ACTIVELY-BEING-BUILT FOREVER.** `claim.ps1 -Release` is **worktree-scoped** -- deliberately, so no session can free a key another is mid-build on. The consequence nobody designed for: once the holding worktree is gone, **the normal release path can never be satisfied again**, and the item looks claimed to every future session. `CLAUDE.md` section 5 already records the cost -- *"a held claim on finished work looks exactly like someone actively building, and stalls the next session for days."* **THE CHANGE: release claims on the removal path that is actually used, and provide a sweep for the ones already stranded.**
+
+> **MEASURED 2026-08-19, from the claim files on disk rather than from `-List` prose:**
+>
+>     holder gone    19
+>     holder alive   11
+>     unreadable      0
+>
+> Positive control: 11 resolved **alive** in the same pass, so the directory test is not returning a blanket "gone". The 19 trace to just **six** long-dead worktrees, one of which holds eight of them.
+
+> **THE GAP IS THE PATH, NOT THE TOOL.** `prune-merged.ps1` **already** releases claims when it removes a worktree (`Remove-ClaimsHeldBy`, BACKLOG #345). But it reaches only `<repo>-<name>` siblings -- 11 of 36 registered worktrees on this clone (#1294) -- and `worktree_gate.ps1` directs everything else to a plain **`git worktree remove`**, which releases nothing. **So the sanctioned path for the majority of worktrees is precisely the one that strands claims**, and the covered path is the minority case.
+
+> **THIS ALREADY BIT THE FEATURE FILED BESIDE IT.** #1294's report-only rows emit exactly that plain `git worktree remove`, so as first written they handed the operator a command that would strand any claim the reported tree held. Fixed by withholding a claim-holding tree from the report -- but that fix protects **one** consumer of the command, not the command itself, which is why this item is separate and is about the path.
+
+> **A SWEEP IS NOT THE WHOLE FIX, AND SHOULD NOT BE CONFUSED FOR ONE.** `claim.ps1 -Release <key> -Force` clears a stranded claim today, so the 19 are recoverable by hand. That restores the registry; it does nothing to stop the twentieth. **Both halves are needed, and the ordering matters: fix the path first**, or the sweep is repeated work with a known expiry.
+
+> **DO NOT AUTO-RELEASE ON A "HOLDER GONE" TEST ALONE.** A worktree directory can be momentarily absent -- mid-move, on a disconnected drive, during a failed removal that left it deregistered (the orphan case this script already tracks). Releasing on that reading hands a live session's key away, which is the failure `Remove-ClaimsHeldBy`'s own comment calls **strictly worse than the orphan being fixed**. Whatever lands must fold the same full-path normalisation and refuse anything it cannot read.
+
+**Cluster:** Coordination registry / worktree lifecycle. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- developer coordination only. The cost is 19 backlog items currently presenting as claimed-and-in-progress when nobody is working them, which is the exact signal the registry exists to make trustworthy.
