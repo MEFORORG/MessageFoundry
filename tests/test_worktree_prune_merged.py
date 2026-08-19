@@ -1974,3 +1974,120 @@ def test_an_empty_reflog_contributes_nothing_rather_than_its_mtime(
     res = run(fx)
     assert by_leaf(res, "clean")["Decision"] == "PRUNE", by_leaf(res, "clean")["Reason"]
     assert by_leaf(res, "gone")["Decision"] == "PRUNE", "anti-vacuity: the pass still prunes"
+
+
+# --- REPORT-ONLY rows (BACKLOG #1294) -------------------------------------------------------------
+# The population this script must never remove was previously invisible to every line of its report:
+# not a candidate, not an `excluded` row, absent from the JSON. An operator had to assemble the list
+# by hand. These cover the reporting path and, more importantly, that it stays a REPORTING path.
+
+
+def test_a_nested_claude_worktree_is_reported_but_never_a_candidate(
+    readonly_fx: Fixture, sleeper: int
+) -> None:
+    """`.claude/worktrees/nested` must appear in reportOnly and never in candidates.
+
+    The two halves are separately load-bearing. Appearing in `reportOnly` is the whole feature --
+    before it, the tree was indistinguishable from one the script had never seen. Staying out of
+    `candidates` is the safety property the exclusion exists for, and a reporting feature that
+    quietly widened the candidate set would be the exact regression this file's header warns about.
+    """
+    live_record(readonly_fx, sleeper, readonly_fx.primary, "cafe0002-0000")
+    res = run(readonly_fx, "-IdleHours", "0")
+
+    assert "nested" not in {c["Leaf"] for c in res["candidates"]}
+    assert "nested" in {r["leaf"] for r in res["reportOnly"]}
+
+
+def test_report_only_rows_are_never_removed_by_apply(readonly_fx: Fixture, sleeper: int) -> None:
+    """-Apply must not act on a reported row. This is the property the whole section rests on."""
+    live_record(readonly_fx, sleeper, readonly_fx.primary, "cafe0003-0000")
+    res = run(readonly_fx, "-IdleHours", "0", "-Apply")
+
+    reported = {r["path"] for r in res["reportOnly"]}
+    assert reported, "nothing was reported, so this asserts nothing -- fixture regression"
+    # Every reported path must still be a registered worktree afterwards.
+    for path in reported:
+        assert Path(path).exists(), f"-Apply removed a REPORT-ONLY worktree: {path}"
+
+
+def test_a_detached_tree_held_by_no_other_ref_is_withheld_not_reported(
+    fx: Fixture, sleeper: int
+) -> None:
+    """The one case that must never be suggested, and the reason the content test was rewritten.
+
+    `git worktree remove` does NOT delete a branch, so a tree ON A BRANCH keeps its commits through
+    the ref and is safe to suggest whatever its merge state. A DETACHED tree is rung 3 of the
+    recoverability ladder: once the tree is gone its commits are reachable from nothing and survive
+    only until something collects them. So a detached tip that no other ref contains is withheld --
+    and it is precisely the tree that looks most finished, being clean and idle.
+    """
+    live_record(fx, sleeper, fx.primary)
+    lone = fx.primary.parent / "detached-unique"
+    _add_worktree(fx.primary, lone, "tmp-unique")
+    _commit(lone, "only-here.txt", "exists nowhere else")
+    tip = _head(lone)
+    # Drop the only ref that holds it, leaving the worktree detached at an unreferenced commit.
+    _git(lone, "checkout", "--detach", "HEAD")
+    _git(fx.primary, "branch", "-D", "tmp-unique")
+    _backdate(fx.primary, lone, 200.0)
+
+    # -IdleHours 0, not 1. The fixture's other worktrees are created seconds ago, so at 1 they are all
+    # withheld as recently-active and reportOnly comes back EMPTY -- which made every absence
+    # assertion below vacuous. The positive control caught exactly that.
+    res = run(fx, "-IdleHours", "0")
+
+    # POSITIVE CONTROL FIRST, and it is not decoration. Every other assertion here is of the form
+    # "this tree is ABSENT from reportOnly", which is trivially satisfied when reportOnly is empty --
+    # so with the feature fully broken this test passed. Measured: neutering the collection reddened
+    # the sibling tests and left this one green. Assert the list is populated before reading anything
+    # from its absence.
+    assert res["reportOnly"], (
+        "reportOnly is empty, so the absence assertions below prove nothing -- "
+        "either the fixture stopped producing report-only trees or the feature is broken"
+    )
+
+    assert tip not in {r.get("safety", "") for r in res["reportOnly"]}
+    assert str(lone) not in {r["path"] for r in res["reportOnly"]}, (
+        "a detached worktree whose commits exist in no other ref was suggested for removal"
+    )
+    assert res["counts"]["reportOnlyHeld"] >= 1
+
+
+def test_a_worktree_holding_a_coordination_claim_is_never_reported(
+    fx: Fixture, sleeper: int
+) -> None:
+    """The commands the report emits are plain `git worktree remove`, which does NOT release claims.
+
+    This script's own -Apply path releases them (``Remove-ClaimsHeldBy``, BACKLOG #345). The reported
+    commands do not, so a reported row whose tree holds a claim hands the operator a command that
+    strands it -- and a stranded claim is worse than an orphaned worktree, because ``claim.ps1
+    -Release`` is worktree-scoped and nobody can release it once the holder is gone. Measured
+    2026-08-19: 19 of 28 live claims were already orphaned exactly that way.
+    """
+    live_record(fx, sleeper, fx.primary)
+    nested = fx.primary / ".claude" / "worktrees" / "nested"
+
+    before = run(fx, "-IdleHours", "0")
+    assert "nested" in {r["leaf"] for r in before["reportOnly"]}, (
+        "fixture regression: 'nested' must be reported BEFORE the claim, or this proves nothing"
+    )
+
+    # Derive the common dir, never type `.git/...`: in a worktree `.git` is a FILE, so the bare form
+    # resolves against the wrong place and the claim would be written where nothing reads it -- which
+    # looks exactly like the feature working.
+    common = Path(
+        _git(fx.primary, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    )
+    claims = common / "mefor-coord" / "claims"
+    claims.mkdir(parents=True, exist_ok=True)
+    (claims / "9999.json").write_text(
+        json.dumps({"key": "9999", "worktree": str(nested).replace("\\", "/"), "note": "held"}),
+        encoding="utf-8",
+    )
+
+    after = run(fx, "-IdleHours", "0")
+    assert "nested" not in {r["leaf"] for r in after["reportOnly"]}, (
+        "a worktree holding a coordination claim was suggested for removal"
+    )
+    assert after["counts"]["reportOnlyHeld"] > before["counts"]["reportOnlyHeld"]
