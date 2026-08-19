@@ -53,12 +53,16 @@ immediately (enforced — the account is flagged `must_change_password`), and de
 user exists, no further bootstrap occurs.
 
 **Auto-retirement (WP-3).** The bootstrap account exists only to seed the first real admin, so it
-self-retires while still **unclaimed** (never password-changed): it is **disabled once a second
-administrator exists**, and — if left unclaimed — **disabled `[auth].bootstrap_expiry_hours` after
-creation** (default 72 h; `0` disables the timer). Once you change its password it becomes a normal
-admin account and auto-retirement stops touching it: both the expiry timer and the supersession check
-fire only while the bootstrap is still **unclaimed**, which is carried by the `must_change_password`
-flag — so an administrative password reset, which re-sets that flag, **re-arms them**. And
+self-retires while still **unclaimed** — while its holder has never rotated the password themselves:
+it is **disabled once a second administrator exists**, and — if left unclaimed — **disabled
+`[auth].bootstrap_expiry_hours` after creation** (default 72 h; `0` disables the timer). Rotate its
+password through self-service change-password and the account is **claimed**: it becomes a normal
+admin account and is never auto-disabled, so a single-admin deployment can't be locked out. The claim
+is **recorded** — `users.password_claimed_at`, stamped by that rotation and never cleared — rather
+than inferred from the credential state the account currently carries
+([ADR 0164](adr/0164-record-bootstrap-claimed-ness-never-infer-a-monotonic-lifecycle-fact-from-mutable-credential-state.md)),
+so an [admin password reset](#admin-password-reset-wp-l3-12-asvs-646) of a claimed bootstrap account
+does not un-claim it: the temp it issues must still be rotated, but retirement stays off. And
 auto-retirement is not the only way to lose an administrator: the failed-attempt lockout is a
 **separate mechanism** and it does reach a claimed sole administrator (see
 [Brute-force & abuse protection](#brute-force--abuse-protection)). A retired
@@ -1177,7 +1181,7 @@ one-to-one — that is why the bind/exposure posture occupies two rows and the A
 | Declared token class of a federated assertion | the `typ` JOSE header, and the presence of an `events` claim, on a **signature-verified** JWS | `typ` present and — normalised `.strip().lower()` then `application/`-stripped — not `jwt`, so `at+jwt` (RFC 9068 access token), `logout+jwt` and `secevent+jwt` are refused while an **absent** `typ` is allowed (RFC 7519 §5.1 makes the header advisory); or the claim set carries `events`, i.e. an RFC 8417 security event token. Every such token is minted by the **same issuer under the same key**, so no signature or key rung distinguishes it | **DENY** the sign-in — `ClaimsError("wrong_token_type")` at the key-selection rung, `ClaimsError("unexpected_events_claim")` ahead of the nonce compare (a logout token carries no nonce, so a later check would misreport it as a browser-binding failure) | on | (no knob) |
 | Federated authentication-context claims (`amr` / `acr`) | the `amr` list / `acr` string of a **signature-verified** `id_token` | `oidc_require_mfa_claim` on **and** neither an `amr` value in `[auth].oidc_mfa_amr_values` (default `["mfa"]`) nor an `acr` in `oidc_required_acr_values` (default `[]`, so the `amr` arm alone decides) | **DENY** the sign-in — `ClaimsError("mfa_claim_missing")`. An IdP **assertion**, never a proof | on, `["mfa"]` / `[]` | `[auth].oidc_require_mfa_claim`, `oidc_mfa_amr_values`, `oidc_required_acr_values` |
 | UPN suffix of the federated username claim | the suffix after the FIRST `@` of the username claim | `oidc_username_strip_domain` on (default) **and** the suffix is not in `oidc_allowed_username_domains` (or `[auth].ad_domain`). With stripping **off** the claim is used verbatim and no suffix check runs | **DENY** the sign-in — `ClaimsError("username_domain_not_allowed")` | on | `[auth].oidc_allowed_username_domains`, `oidc_username_strip_domain` |
-| Bootstrap-admin age × admin population | `users.created_at` for the built-in bootstrap account × whether a second enabled Administrator exists | still unclaimed (`must_change_password` set) **and** (`now ≥ created_at + bootstrap_expiry_hours × 3600` **or** another enabled admin exists); `0` = no time expiry | **DENY** — the account is disabled, **all** its sessions revoked, `auth.bootstrap_admin_retired` audited. A *claimed* (password-changed) bootstrap account is never touched | 72 h | `[auth].bootstrap_expiry_hours` |
+| Bootstrap-admin claim state × age × admin population | `users.password_claimed_at` and `users.created_at` for the built-in bootstrap account × whether a second enabled Administrator exists | still unclaimed (`password_claimed_at` unset — only the holder's own self-service rotation stamps it, and nothing clears it) **and** (`now ≥ created_at + bootstrap_expiry_hours × 3600` **or** another enabled admin exists); `0` = no time expiry | **DENY** — the account is disabled, **all** its sessions revoked, `auth.bootstrap_admin_retired` audited. A *claimed* bootstrap account is never touched, and an admin password reset does not un-claim it (ADR 0164) | 72 h | `[auth].bootstrap_expiry_hours` |
 | Browser `Origin` at the WebSocket handshake | the `Origin` header on the upgrade | absent (a native client) → allowed; present → must be an exact member of the list, whose default `[]` rejects **every** browser Origin | **DENY** before `accept()`, so the route never runs | `[]` | `[api].ws_allowed_origins` |
 | Cross-site request signal on a `/ui` state change | `Sec-Fetch-Site` (preferred) else `Origin` vs our own origin (`[api].public_origin` is authoritative when set; `Host` is the fallback) | `Sec-Fetch-Site` ∈ {cross-site, same-site}, or a non-matching `Origin` | **DENY** 403 — defence-in-depth over the `SameSite=Strict` cookie, deliberately token-free | on | `[api].public_origin` |
 
@@ -1916,8 +1920,12 @@ runs bulk AES-256-GCM. #198 closes the **application-code-feasible** half and ac
 - **Person/entity authentication** (required) — local argon2id and/or AD bind; lockout on brute force.
 - **Audit controls** (required) — durable, user-attributed audit trail (append-only via the store API).
 - **Automatic logoff** (addressable) — idle + absolute session timeouts.
-- **Emergency access** (required) — the bootstrap admin provides break-glass; treat its credential as
-  a sealed secret.
+- **Emergency access** (required) — **not applicable to this component.** Break-glass exists so a
+  clinician can reach a *patient's record* when normal authorisation would refuse it. This engine
+  holds no point-of-care record: it routes and transforms messages in transit, and the record of
+  authority lives in the systems on either side, which is where an emergency-access path belongs.
+  The bootstrap admin is **not** a break-glass mechanism and is not a compliance control — it seeds
+  the first real administrator and then self-retires (see *Auto-retirement (WP-3)* above).
 
 ---
 

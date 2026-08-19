@@ -843,6 +843,69 @@ async def test_mark_session_reauthed_reanchors_client(store) -> None:
     await store.delete_user("u2")
 
 
+async def test_set_password_claim_stamp_round_trip(store) -> None:
+    """BACKLOG #1245 ``users.password_claimed_at`` on the real Postgres backend.
+
+    ``password_claim_set`` is shared by all three backends, so the SQL TEXT of the claim term is
+    single-sourced — but the ARGUMENT BINDING around it is hand-written per backend and nothing
+    else on this leg executes ``set_password`` at all. Here the term reuses ``$2`` (already
+    ``now``) so the argument list is unchanged; a regression that renumbered it would bind the
+    wrong value into the column while the shared helper still produced correct-looking SQL.
+
+    Every assertion below compares against the EXACT timestamp passed, never merely ``is not
+    None``: a mis-bound placeholder that landed the ``must_change_password`` flag in the column
+    would still read as non-NULL and pass a presence check. The neighbouring columns the term sits
+    between in the SET list (``password_changed_at``, ``updated_at``, ``failed_attempts``) are
+    asserted for the same reason.
+    """
+    await store.create_user(
+        user_id="u3",
+        username="carol",
+        auth_provider="local",
+        display_name=None,
+        email=None,
+        password_hash="h0",
+        now=1_000.0,
+    )
+    # Precondition: the INSERT does not list the column, so a stamp seen later came from set_password.
+    seeded = await store.get_user("u3")
+    assert seeded is not None and seeded.password_claimed_at is None
+    # A non-zero lock state, so the statement's own `failed_attempts=0, locked_until=NULL` reset is a
+    # positive control that the UPDATE actually executed rather than silently matching zero rows.
+    await store.record_login_failure("u3", failed_attempts=3, locked_until=5_000.0, now=1_500.0)
+
+    # must_change_password False = a credential the holder chose, so this call records the claim.
+    await store.set_password("u3", password_hash="h1", must_change_password=False, now=2_000.0)
+    claimed = await store.get_user("u3")
+    assert claimed is not None
+    assert claimed.password_claimed_at == 2_000.0
+    assert claimed.password_hash == "h1"
+    assert claimed.password_changed_at == 2_000.0
+    assert claimed.updated_at == 2_000.0
+    assert claimed.must_change_password is False
+    assert claimed.failed_attempts == 0 and claimed.locked_until is None
+
+    # Second rotation: COALESCE makes the claim write-once, so the stamp must NOT move. The other two
+    # timestamps moving to 3000.0 is what makes that a real assertion — it proves this UPDATE ran.
+    await store.set_password("u3", password_hash="h2", must_change_password=False, now=3_000.0)
+    rotated = await store.get_user("u3")
+    assert rotated is not None
+    assert rotated.password_claimed_at == 2_000.0
+    assert rotated.password_changed_at == 3_000.0 and rotated.updated_at == 3_000.0
+
+    # must_change_password True (an admin reset) takes the OTHER argument arity — the claim term is
+    # empty, so the column is absent from the SET list and the statement can neither stamp nor clear
+    # it. Both arities are hand-bound, and neither was executed on this leg before this test.
+    await store.set_password("u3", password_hash="h3", must_change_password=True, now=4_000.0)
+    reset = await store.get_user("u3")
+    assert reset is not None
+    assert reset.password_claimed_at == 2_000.0  # an admin reset leaves the claim alone
+    assert reset.must_change_password is True
+    assert reset.password_changed_at == 4_000.0 and reset.updated_at == 4_000.0
+
+    await store.delete_user("u3")
+
+
 async def test_http_grant_deny_audit_precision(store) -> None:
     """RBAC-4 (ASVS 16.3.2) on the real Postgres backend: the HTTP ``require()`` grant/deny audit set is
     EXACT and the ``method != "GET"`` guard REFUSES to audit a sensitive-permission READ. Reuses the

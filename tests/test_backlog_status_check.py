@@ -292,3 +292,47 @@ def test_nothing_else_in_the_repo_re_derives_item_status() -> None:
         "defines where an item's banner block ENDS, and a hand-rolled scan is a second, silently "
         "different definition of 'closed'."
     )
+
+
+def test_parse_items_REFUSES_a_source_carrying_conflict_markers() -> None:
+    """BACKLOG #1259: a conflicted ledger used to census cleanly, and that is the whole danger.
+
+    ``>>>>>>> branch`` starts with ">", so the banner-block scanner read it as a blockquote line and
+    kept going; items from BOTH sides were counted and the total looked plausible. It bit a landing
+    seat that ran this reader on a merge-tree blob before checking the merge's exit status.
+
+    The poison is applied to a COPY OF THE REAL LEDGER rather than a synthetic fixture, because the
+    finding was that the REAL file parses identically poisoned and clean.
+    """
+    live = _BACKLOG.read_text(encoding="utf-8")
+
+    # POSITIVE CONTROL, load-bearing: the refusal below proves nothing unless the genuine ledger
+    # still parses. A reader that refused every input would satisfy the raises-assertion alone.
+    assert bsc.parse_items(live), "the live ledger parsed to zero items — the control is broken"
+
+    lines = live.splitlines()
+    first_item = next(i for i, line in enumerate(lines) if line.startswith("## "))
+    poisoned = "\n".join(
+        [
+            *lines[:first_item],
+            "<<<<<<< HEAD",
+            *lines[first_item : first_item + 4],
+            "=======",
+            *lines[first_item : first_item + 4],
+            ">>>>>>> theirs",
+            *lines[first_item + 4 :],
+        ]
+    )
+    with pytest.raises(ValueError) as exc:
+        bsc.parse_items(poisoned)
+    assert "conflict marker" in str(exc.value)
+
+
+def test_a_setext_heading_underline_is_NOT_read_as_a_conflict_marker() -> None:
+    # The `=======` marker is deliberately excluded from detection: a Markdown setext H1 underline
+    # is a run of "=" and can be exactly seven, so matching it would refuse a legitimate document.
+    # This pins that exclusion, because the cost of getting it wrong is a gate that refuses the real
+    # ledger — a false positive on a merge-integrity check is not a small failure.
+    text = "A Heading\n=======\n\n## 1. An item\n\nprose\n"
+    items = bsc.parse_items(text)
+    assert [it.num for it in items] == [1]

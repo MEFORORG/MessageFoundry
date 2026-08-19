@@ -562,10 +562,12 @@ class SoapDestination(DestinationConnector):
         """Best-effort reverse-map of any configured secret (raw and XML-escaped forms) to ``"***"`` in
         a captured partner reply (ADR 0015 amendment, #236).
 
-        **Defence in depth, not a seal:** a base64'd / hashed / re-encoded echo defeats it. Only secrets
-        of at least :data:`_SCRUB_MIN_LEN` chars are masked — a reverse-map replace of a short,
-        low-entropy value (a facility code a CDC-IIS ACK legitimately echoes) would shred the operator's
-        reconciliation text."""
+        **Defence in depth, not a seal:** the match is literal, so a secret the partner echoes in any
+        transformed form passes through unmasked. Treat a captured reply as potentially secret-bearing
+        regardless of this pass — that is the operator-facing consequence, and it holds whatever the
+        transformation was. Only secrets of at least :data:`_SCRUB_MIN_LEN` chars are masked — a
+        reverse-map replace of a short, low-entropy value (a facility code a CDC-IIS ACK legitimately
+        echoes) would shred the operator's reconciliation text."""
         if not self._body_secrets or not text:
             return text
         for _token, secret in self._body_secrets:

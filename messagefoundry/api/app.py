@@ -188,7 +188,7 @@ from messagefoundry.api.security import (
 # mount_ui), so the engine imports + boots + serves the JSON API with the console ABSENT. serve_ui-on
 # behavior is preserved via three seams the console installs: app.state.ui_csp,
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
-from messagefoundry.auth import Identity, Permission
+from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.service import AuthService, BootstrapAdmin
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
@@ -5319,6 +5319,68 @@ def create_app(
     return app
 
 
+async def _assert_security_notice_is_deliverable(
+    store: Store,
+    *,
+    auth_settings: AuthSettings | None,
+    alerts_settings: AlertsSettings | None,
+    ai_settings: AiSettings | None,
+    security_settings: SecuritySettings | None,
+) -> None:
+    """BACKLOG #1020: refuse to serve a PHI instance whose security notices reach NOBODY.
+
+    The serve gate in ``messagefoundry/__main__.py`` already refuses without a notification channel,
+    but it computes readiness from ``notify_security_events`` + ``email_smtp_host`` + ``email_from``
+    -- **SMTP wiring alone**. That asks *"is a transport configured"* and never *"can the account
+    that matters actually receive"*: the instrument answering the adjacent question (SDS-3.8). On a
+    first run the only account that exists is the bootstrap administrator, created with no address,
+    so the gate passes green while every one of the ten notice types about the account holding
+    ``frozenset(Permission)`` silently no-ops -- including ``LOGIN_AFTER_FAILURES``, the classic
+    someone-guessed-it signal.
+
+    **This check must live here and not beside the transport gate.** ``_serve`` is synchronous and
+    opens no store, so at that point there is no user table to ask. The ASGI lifespan is the only
+    place the store and the freshly minted bootstrap admin are both in hand -- which is why the
+    owner's ruling (option (b), 2026-08-13) corrected the item's own stated fix location.
+
+    **Why deliverability rather than "require an email at creation".** ``update_user_profile`` issues
+    ``UPDATE users SET display_name=?, email=?`` unconditionally on every directory login, so any
+    address a human sets on an AD or OIDC account is overwritten at that holder's next sign-in. A fix
+    resting on an OPERATOR ACTION cannot cover that population; a startup assertion about the state
+    of the table can.
+
+    Deliberately narrow: it asks only whether SOME enabled administrator carries an address, not
+    whether mail to it would arrive. Proving actual delivery needs an SMTP round trip at startup,
+    which is a different and much larger change.
+    """
+    auth_settings = auth_settings or AuthSettings()
+    if not auth_settings.enabled or not auth_settings.notify_security_events:
+        return  # no notices to deliver; the transport gate already governs whether that is allowed
+    alerts = alerts_settings or AlertsSettings()
+    if not alerts.security_notifications_required:
+        return  # the audited, in-writing opt-out -- the pull-only feed is accepted
+    data_class, _production = (ai_settings or AiSettings()).derived_posture()
+    if data_class is not DataClass.PHI:
+        return
+    for user in await store.list_users():
+        if user.disabled or not user.email:
+            continue
+        if Role.ADMINISTRATOR.value in await store.get_user_role_ids(user.id):
+            return
+    detail = (
+        "no enabled Administrator has an email address, so every out-of-band security notice about "
+        "the most privileged accounts would be silently dropped (SecurityEventNotifier returns "
+        "early when the recipient has no address). The [alerts] SMTP transport being configured "
+        "does not make a notice deliverable -- on a first run the bootstrap administrator is created "
+        "without one. Set an address on at least one enabled Administrator, or accept the pull-only "
+        "/me/security-events feed in writing via [alerts].security_notifications_required=false."
+    )
+    enforcement = (security_settings or SecuritySettings()).enforcement
+    if enforcement is SecurityEnforcement.ENFORCE:
+        raise RuntimeError(f"refusing to start a PHI instance: {detail}")
+    _log.warning("PHI instance with no deliverable security-notice recipient: %s", detail)
+
+
 def _emit_bootstrap_admin(bootstrap: BootstrapAdmin, store_settings: StoreSettings) -> None:
     """Persist the one-time bootstrap password to a restricted file — never the rotating log.
 
@@ -5757,198 +5819,216 @@ def create_managed_app(
             if registry_filter is not None:
                 loaded = registry_filter(loaded)
             engine.add_registry(loaded)
-        await engine.start()
-        # #144 (ADR 0128): inject the connection-control callback INTO the notifier (the sink never imports
-        # RegistryRunner). A rule's control_action then auto-remediates via restart_inbound/restart_outbound;
-        # re-reading engine.registry_runner each call keeps it correct across a config reload that swaps the
-        # runner. The sink dispatches this off-worker + never-raise, so exceptions here are logged, not fatal.
-        if notifier is not None:
-
-            async def _alert_control(action: str, target: str) -> None:
-                rr = engine.registry_runner
-                if rr is None:
-                    return
-                if action == "restart_inbound":
-                    await rr.restart_inbound(target)
-                elif action == "restart_outbound":
-                    await rr.restart_outbound(target)
-
-            notifier.set_control_callback(_alert_control)
-        app.state.engine = engine
-        # #285: stash the trust anchors so /config/reload re-verifies the on-disk PEMs (a swapped anchor
-        # is caught + audited, a pinned-but-substituted anchor refuses the deploy) — the reload seam.
-        app.state.trust_anchor_specs = tuple(trust_anchor_specs)
-        app.state.trust_anchors_enforcing = trust_anchors_enforcing
-        app.state.store_settings = resolved  # back GET /security/posture (M5)
-        app.state.alerts_settings = alerts_settings
-        # #143: expose the running notifier so POST /alerts/{id}/suspend|resume can update its in-memory
-        # suspend cache live (None here in a JSON-only/no-transport deployment — the durable store governs).
-        app.state.notifier = notifier
-        # ASVS 6.4.5: the cert-identity resolver reads [cert_monitor].warn_days off app.state to decide
-        # whether a service caller's client cert, observed at the mTLS handshake, is inside the warn
-        # window. None (the direct create_app / embedding path) leaves that check inert — deny-by-default
-        # for a monitoring signal, and byte-identical to before.
-        app.state.cert_monitor_settings = cert_monitor_settings
-        # #118: expose the connector SecretProvider so POST /alerts/test-email can resolve an
-        # email_password_secret reference (fail-closed) exactly as notifier_from_settings does. None on
-        # the embedded/test path — then only a plain env-sourced email_password can be tested.
-        app.state.secret_provider = secret_provider
-        # #323 layer 3: expose the [tls] trust-anchor policy so POST /alerts/test-email builds its
-        # EmailTransport with the SAME anchors as the live notifier. None on the embedded/test path.
-        app.state.tls_settings = tls_settings
-        app.state.service_settings = service_settings  # back GET /service/status (L6a)
-        app.state.log_dir = log_dir  # back GET /status app-log metering (#50)
-        app.state.approval_gate = _build_approval_gate(
-            engine, approvals_settings or ApprovalsSettings()
-        )
-        # ASVS 5.2.4: age-based retention prune for the uploaded-logs surface. Owned by this lifespan
-        # (started here, stopped in the finally) — the runner pattern of cert_expiry, but wired where the
-        # UploadStore lives (built in create_app from store_settings). None when [store].uploads_dir is
-        # unset (the subsystem is opt-in), so a deployment without uploaded logs spawns no task. The audit
-        # callback closes over the opened store so the leaf uploads module never imports it.
+        # #1257: hoisted above the try because the finally below now guards STARTUP too, and it
+        # reaches these names before it reaches engine.stop(). Left in place inside the span, a
+        # failure before they were bound raises UnboundLocalError IN THE TEARDOWN, which aborts it
+        # early -- so the store never closes and the process hangs exactly as it did before the
+        # fix, with the real startup error replaced by the UnboundLocalError. Measured by removing
+        # one of these five: the hang came straight back. They are load-bearing, not tidiness.
         upload_retention_runner: UploadRetentionRunner | None = None
-        _upload_store: UploadStore | None = getattr(app.state, "upload_store", None)
-        if _upload_store is not None:
-
-            async def _audit_upload_prune(meta: UploadedFileMeta) -> None:
-                # BACKLOG #1224: the retention runner has no operator and no request behind it, so
-                # the row is attributed to the system principal (matching pipeline/retention.py's
-                # `retention_purge`) rather than to the pruned file's uploader. The uploader is
-                # carried as DATA in `detail`, where a reader can still see whose file went. Both
-                # this site and the request-path sweep had to change together: fixing one would have
-                # left the same false attribution reachable by the other path.
-                await store.record_audit(
-                    "upload.prune",
-                    actor="system",
-                    detail=json.dumps(
-                        {
-                            "file_id": meta.file_id,
-                            "uploader": meta.uploader,
-                            "uploader_id": meta.uploader_id,
-                        }
-                    ),
-                )
-
-            upload_retention_runner = UploadRetentionRunner(
-                _upload_store, audit=_audit_upload_prune
-            )
-            upload_retention_runner.start()
         reaper: asyncio.Task[None] | None = None
         reconciler: asyncio.Task[None] | None = None
         bootstrap_reminder: asyncio.Task[None] | None = None
         security_notifier = None
-        # Back the COMPLETE loosening list on GET /security/posture: [auth] carries posture switches
-        # (ad_session_recheck_seconds) that security_loosenings() must see. Stashed here, OUTSIDE the
-        # `enabled` guard below, deliberately — a settings object that exists but is disabled is still
-        # the resolved settings, and stashing it only on the enabled path would make the route silently
-        # fall back to AuthSettings() defaults and report a subset. Mirrors store_settings above.
-        if auth_settings is not None:
-            app.state.auth_settings = auth_settings
-        if auth_settings is not None and auth_settings.enabled:
-            # Out-of-band security-event push (#188, ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP
-            # transport, sent to each affected user's own address. The notifier is wired only when the
-            # [auth].notify_security_events kill-switch is on AND a transport can be built (SMTP
-            # configured): security_notifier_from_settings returns None when SMTP is unset, so we never
-            # fabricate a transport — then only the audited /me/security-events pull feed records events.
-            # The effective-by-default guarantee (an exposed PHI instance MUST have a real push channel,
-            # or opt out in writing via [alerts].security_notifications_required) is enforced fail-closed
-            # at startup by the serve gate (messagefoundry/__main__.py), which checks these SAME two
-            # conditions — not here. This task is owned by the lifespan (started here, drained + closed
-            # after the engine in the finally below).
-            if auth_settings.notify_security_events and alerts_settings is not None:
-                security_notifier = security_notifier_from_settings(
-                    alerts_settings,
-                    secret_provider=secret_provider,
-                    trust_anchor_policy=tls_settings.policy() if tls_settings else None,
-                )
-                if security_notifier is not None:
-                    security_notifier.start()
-            auth = AuthService(
-                store,
-                auth_settings,
-                security_notifier=security_notifier,
-                secret_provider=secret_provider,
-                # #285 (ASVS 6.7.1): pass the enforcement dial so the OIDC anchor's construction-site
-                # preflight in build_idp_opener honors [security].enforcement — warn+audit (via the
-                # central run_anchor_preflight above) rather than refusing at enforce-only. Central
-                # preflight already ran before any listener bound; this keeps the seam consistent.
-                enforcing=trust_anchors_enforcing,
-                # #329: thread the derived instance posture to the LDAPS bind so its ad_tls_verify=false
-                # escape is clamped on an enforcing-PHI instance (LdapAuthenticator is built out of the
-                # connector-construction gate, so the clamp is inert unless the posture arrives here).
-                hop_posture=_hop_posture,
-            )
-            bootstrap = await auth.initialize()
-            app.state.auth = auth
-            if bootstrap is not None:
-                _emit_bootstrap_admin(bootstrap, resolved)
-            if not auth.webauthn_available() and await store.any_webauthn_credentials():
-                # L5b (ADR 0068 decision 5): enrolled passkeys exist but the [webauthn] extra is
-                # not installed (engine moved/reinstalled, same DB) — affected users stay
-                # MFA-required while every assertion path is unavailable. The reauth page renders
-                # a legible notice; this is the loud operator-facing half.
-                _log.warning(
-                    "WebAuthn passkeys are enrolled in this store but the [webauthn] extra is "
-                    "NOT installed — affected users cannot complete passkey step-up on this "
-                    "install. pip install messagefoundry[webauthn], or clear a stranded user's "
-                    "factors with POST /users/{id}/reset-mfa (admin_reset_mfa)."
-                )
-            if auth.kerberos_enabled:
-                # L5c (ADR 0068 §9): boot-once SPNEGO acceptor preflight — a missing keytab/SPN
-                # credential degrades browser SSO legibly (providers kerberos=false, the login
-                # link hidden, /ui/sso -> e=sso_unavailable) instead of failing per-request. The
-                # JSON /auth/negotiate deliberately keeps its per-request attempt (additive-only).
-                from messagefoundry.auth.ldap import LdapError, kerberos_acceptor_preflight
-
-                try:
-                    await asyncio.to_thread(kerberos_acceptor_preflight, auth_settings)
-                except LdapError as exc:
-                    _log.warning(
-                        "Kerberos SSO acceptor preflight failed — browser SSO is disabled until "
-                        "restart (the JSON /auth/negotiate still attempts per-request). Check the "
-                        "HTTP/<fqdn> SPN + keytab/service identity (see "
-                        "docs/security/OFF-LOOPBACK-DEPLOYMENT.md): %s",
-                        exc,
-                    )
-                    auth.mark_kerberos_unavailable(str(exc))
-            if auth.oidc_enabled:
-                # ADR 0142: a CONFIG-ONLY preflight. Deliberately NOT the Kerberos shape above —
-                # it performs no network I/O and cannot mark the IdP unavailable, because
-                # "must not make a reachable IdP a precondition for operating the engine" is an
-                # explicit ADR constraint and AC-8 wants recovery without a restart. The settings
-                # validators already refuse a misconfigured [auth].oidc_* at load (AC-9), so this
-                # only surfaces the posture an operator should see in the boot log.
-                _log.info(
-                    "Federated sign-in (OIDC) is ENABLED for the browser console: issuer=%s "
-                    "redirect=%s. The engine verifies what the IdP ASSERTS about MFA, "
-                    "cryptographically — it cannot prove the IdP enforced it.",
-                    auth_settings.oidc_issuer,
-                    auth_settings.oidc_redirect_path,
-                )
-            reaper = asyncio.create_task(_session_reaper(store))
-            if auth_settings.bootstrap_expiry_hours > 0:
-                # ASVS 6.4.5 arm 2: nudge an operator BEFORE an unclaimed first-run bootstrap admin is
-                # auto-disabled. API-lifespan-owned (like the session reaper), NOT engine-owned — it
-                # reaches the AuthService directly. The warn method latches once-per-window; the sink logs
-                # (LoggingAlertSink fallback) or notifies. No task when time-expiry is off (byte-identical).
-                bootstrap_reminder = asyncio.create_task(
-                    _bootstrap_expiry_reminder(auth, notifier or LoggingAlertSink())
-                )
-            if auth.directory_reconcile_enabled:
-                # ADR 0079 mechanism 2: propagate an AD disable/delete to live engine sessions.
-                # Default OFF (ad_session_recheck_seconds = 0) — no task, no behaviour change.
-                _log.info(
-                    "Directory session reconciliation is ENABLED: live AD sessions are "
-                    "re-resolved every %ds; a principal absent from the directory for %d "
-                    "consecutive passes has its sessions revoked. A directory outage revokes "
-                    "NOTHING, and a pass that would revoke too many at once aborts and alerts.",
-                    auth_settings.ad_session_recheck_seconds,
-                    auth_settings.ad_session_recheck_strikes,
-                )
-                reconciler = asyncio.create_task(
-                    _directory_reconciler(auth, auth_settings.ad_session_recheck_seconds)
-                )
+        # The teardown guards this ENTIRE span, not just the yield. Everything started below --
+        # the engine, both notifiers, the retention runner, the three tasks -- was otherwise
+        # abandoned in place on a startup failure. engine.stop() ends in store.close(), and
+        # aiosqlite's connection worker is NON-DAEMON, so skipping it left the process unable to
+        # exit: uvicorn refused correctly, printed 'Exiting.', and then hung forever.
         try:
+            await engine.start()
+            # #144 (ADR 0128): inject the connection-control callback INTO the notifier (the sink never imports
+            # RegistryRunner). A rule's control_action then auto-remediates via restart_inbound/restart_outbound;
+            # re-reading engine.registry_runner each call keeps it correct across a config reload that swaps the
+            # runner. The sink dispatches this off-worker + never-raise, so exceptions here are logged, not fatal.
+            if notifier is not None:
+
+                async def _alert_control(action: str, target: str) -> None:
+                    rr = engine.registry_runner
+                    if rr is None:
+                        return
+                    if action == "restart_inbound":
+                        await rr.restart_inbound(target)
+                    elif action == "restart_outbound":
+                        await rr.restart_outbound(target)
+
+                notifier.set_control_callback(_alert_control)
+            app.state.engine = engine
+            # #285: stash the trust anchors so /config/reload re-verifies the on-disk PEMs (a swapped anchor
+            # is caught + audited, a pinned-but-substituted anchor refuses the deploy) — the reload seam.
+            app.state.trust_anchor_specs = tuple(trust_anchor_specs)
+            app.state.trust_anchors_enforcing = trust_anchors_enforcing
+            app.state.store_settings = resolved  # back GET /security/posture (M5)
+            app.state.alerts_settings = alerts_settings
+            # #143: expose the running notifier so POST /alerts/{id}/suspend|resume can update its in-memory
+            # suspend cache live (None here in a JSON-only/no-transport deployment — the durable store governs).
+            app.state.notifier = notifier
+            # ASVS 6.4.5: the cert-identity resolver reads [cert_monitor].warn_days off app.state to decide
+            # whether a service caller's client cert, observed at the mTLS handshake, is inside the warn
+            # window. None (the direct create_app / embedding path) leaves that check inert — deny-by-default
+            # for a monitoring signal, and byte-identical to before.
+            app.state.cert_monitor_settings = cert_monitor_settings
+            # #118: expose the connector SecretProvider so POST /alerts/test-email can resolve an
+            # email_password_secret reference (fail-closed) exactly as notifier_from_settings does. None on
+            # the embedded/test path — then only a plain env-sourced email_password can be tested.
+            app.state.secret_provider = secret_provider
+            # #323 layer 3: expose the [tls] trust-anchor policy so POST /alerts/test-email builds its
+            # EmailTransport with the SAME anchors as the live notifier. None on the embedded/test path.
+            app.state.tls_settings = tls_settings
+            app.state.service_settings = service_settings  # back GET /service/status (L6a)
+            app.state.log_dir = log_dir  # back GET /status app-log metering (#50)
+            app.state.approval_gate = _build_approval_gate(
+                engine, approvals_settings or ApprovalsSettings()
+            )
+            # ASVS 5.2.4: age-based retention prune for the uploaded-logs surface. Owned by this lifespan
+            # (started here, stopped in the finally) — the runner pattern of cert_expiry, but wired where the
+            # UploadStore lives (built in create_app from store_settings). None when [store].uploads_dir is
+            # unset (the subsystem is opt-in), so a deployment without uploaded logs spawns no task. The audit
+            # callback closes over the opened store so the leaf uploads module never imports it.
+            _upload_store: UploadStore | None = getattr(app.state, "upload_store", None)
+            if _upload_store is not None:
+
+                async def _audit_upload_prune(meta: UploadedFileMeta) -> None:
+                    # BACKLOG #1224: the retention runner has no operator and no request behind it, so
+                    # the row is attributed to the system principal (matching pipeline/retention.py's
+                    # `retention_purge`) rather than to the pruned file's uploader. The uploader is
+                    # carried as DATA in `detail`, where a reader can still see whose file went. Both
+                    # this site and the request-path sweep had to change together: fixing one would have
+                    # left the same false attribution reachable by the other path.
+                    await store.record_audit(
+                        "upload.prune",
+                        actor="system",
+                        detail=json.dumps(
+                            {
+                                "file_id": meta.file_id,
+                                "uploader": meta.uploader,
+                                "uploader_id": meta.uploader_id,
+                            }
+                        ),
+                    )
+
+                upload_retention_runner = UploadRetentionRunner(
+                    _upload_store, audit=_audit_upload_prune
+                )
+                upload_retention_runner.start()
+            # Back the COMPLETE loosening list on GET /security/posture: [auth] carries posture switches
+            # (ad_session_recheck_seconds) that security_loosenings() must see. Stashed here, OUTSIDE the
+            # `enabled` guard below, deliberately — a settings object that exists but is disabled is still
+            # the resolved settings, and stashing it only on the enabled path would make the route silently
+            # fall back to AuthSettings() defaults and report a subset. Mirrors store_settings above.
+            if auth_settings is not None:
+                app.state.auth_settings = auth_settings
+            if auth_settings is not None and auth_settings.enabled:
+                # Out-of-band security-event push (#188, ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP
+                # transport, sent to each affected user's own address. The notifier is wired only when the
+                # [auth].notify_security_events kill-switch is on AND a transport can be built (SMTP
+                # configured): security_notifier_from_settings returns None when SMTP is unset, so we never
+                # fabricate a transport — then only the audited /me/security-events pull feed records events.
+                # The effective-by-default guarantee (an exposed PHI instance MUST have a real push channel,
+                # or opt out in writing via [alerts].security_notifications_required) is enforced fail-closed
+                # at startup by the serve gate (messagefoundry/__main__.py), which checks these SAME two
+                # conditions — not here. This task is owned by the lifespan (started here, drained + closed
+                # after the engine in the finally below).
+                if auth_settings.notify_security_events and alerts_settings is not None:
+                    security_notifier = security_notifier_from_settings(
+                        alerts_settings,
+                        secret_provider=secret_provider,
+                        trust_anchor_policy=tls_settings.policy() if tls_settings else None,
+                    )
+                    if security_notifier is not None:
+                        security_notifier.start()
+                auth = AuthService(
+                    store,
+                    auth_settings,
+                    security_notifier=security_notifier,
+                    secret_provider=secret_provider,
+                    # #285 (ASVS 6.7.1): pass the enforcement dial so the OIDC anchor's construction-site
+                    # preflight in build_idp_opener honors [security].enforcement — warn+audit (via the
+                    # central run_anchor_preflight above) rather than refusing at enforce-only. Central
+                    # preflight already ran before any listener bound; this keeps the seam consistent.
+                    enforcing=trust_anchors_enforcing,
+                    # #329: thread the derived instance posture to the LDAPS bind so its ad_tls_verify=false
+                    # escape is clamped on an enforcing-PHI instance (LdapAuthenticator is built out of the
+                    # connector-construction gate, so the clamp is inert unless the posture arrives here).
+                    hop_posture=_hop_posture,
+                )
+                bootstrap = await auth.initialize()
+                app.state.auth = auth
+                if bootstrap is not None:
+                    _emit_bootstrap_admin(bootstrap, resolved)
+                await _assert_security_notice_is_deliverable(
+                    store,
+                    auth_settings=auth_settings,
+                    alerts_settings=alerts_settings,
+                    ai_settings=ai_settings,
+                    security_settings=security_settings,
+                )
+                if not auth.webauthn_available() and await store.any_webauthn_credentials():
+                    # L5b (ADR 0068 decision 5): enrolled passkeys exist but the [webauthn] extra is
+                    # not installed (engine moved/reinstalled, same DB) — affected users stay
+                    # MFA-required while every assertion path is unavailable. The reauth page renders
+                    # a legible notice; this is the loud operator-facing half.
+                    _log.warning(
+                        "WebAuthn passkeys are enrolled in this store but the [webauthn] extra is "
+                        "NOT installed — affected users cannot complete passkey step-up on this "
+                        "install. pip install messagefoundry[webauthn], or clear a stranded user's "
+                        "factors with POST /users/{id}/reset-mfa (admin_reset_mfa)."
+                    )
+                if auth.kerberos_enabled:
+                    # L5c (ADR 0068 §9): boot-once SPNEGO acceptor preflight — a missing keytab/SPN
+                    # credential degrades browser SSO legibly (providers kerberos=false, the login
+                    # link hidden, /ui/sso -> e=sso_unavailable) instead of failing per-request. The
+                    # JSON /auth/negotiate deliberately keeps its per-request attempt (additive-only).
+                    from messagefoundry.auth.ldap import LdapError, kerberos_acceptor_preflight
+
+                    try:
+                        await asyncio.to_thread(kerberos_acceptor_preflight, auth_settings)
+                    except LdapError as exc:
+                        _log.warning(
+                            "Kerberos SSO acceptor preflight failed — browser SSO is disabled until "
+                            "restart (the JSON /auth/negotiate still attempts per-request). Check the "
+                            "HTTP/<fqdn> SPN + keytab/service identity (see "
+                            "docs/security/OFF-LOOPBACK-DEPLOYMENT.md): %s",
+                            exc,
+                        )
+                        auth.mark_kerberos_unavailable(str(exc))
+                if auth.oidc_enabled:
+                    # ADR 0142: a CONFIG-ONLY preflight. Deliberately NOT the Kerberos shape above —
+                    # it performs no network I/O and cannot mark the IdP unavailable, because
+                    # "must not make a reachable IdP a precondition for operating the engine" is an
+                    # explicit ADR constraint and AC-8 wants recovery without a restart. The settings
+                    # validators already refuse a misconfigured [auth].oidc_* at load (AC-9), so this
+                    # only surfaces the posture an operator should see in the boot log.
+                    _log.info(
+                        "Federated sign-in (OIDC) is ENABLED for the browser console: issuer=%s "
+                        "redirect=%s. The engine verifies what the IdP ASSERTS about MFA, "
+                        "cryptographically — it cannot prove the IdP enforced it.",
+                        auth_settings.oidc_issuer,
+                        auth_settings.oidc_redirect_path,
+                    )
+                reaper = asyncio.create_task(_session_reaper(store))
+                if auth_settings.bootstrap_expiry_hours > 0:
+                    # ASVS 6.4.5 arm 2: nudge an operator BEFORE an unclaimed first-run bootstrap admin is
+                    # auto-disabled. API-lifespan-owned (like the session reaper), NOT engine-owned — it
+                    # reaches the AuthService directly. The warn method latches once-per-window; the sink logs
+                    # (LoggingAlertSink fallback) or notifies. No task when time-expiry is off (byte-identical).
+                    bootstrap_reminder = asyncio.create_task(
+                        _bootstrap_expiry_reminder(auth, notifier or LoggingAlertSink())
+                    )
+                if auth.directory_reconcile_enabled:
+                    # ADR 0079 mechanism 2: propagate an AD disable/delete to live engine sessions.
+                    # Default OFF (ad_session_recheck_seconds = 0) — no task, no behaviour change.
+                    _log.info(
+                        "Directory session reconciliation is ENABLED: live AD sessions are "
+                        "re-resolved every %ds; a principal absent from the directory for %d "
+                        "consecutive passes has its sessions revoked. A directory outage revokes "
+                        "NOTHING, and a pass that would revoke too many at once aborts and alerts.",
+                        auth_settings.ad_session_recheck_seconds,
+                        auth_settings.ad_session_recheck_strikes,
+                    )
+                    reconciler = asyncio.create_task(
+                        _directory_reconciler(auth, auth_settings.ad_session_recheck_seconds)
+                    )
             yield
         finally:
             if upload_retention_runner is not None:

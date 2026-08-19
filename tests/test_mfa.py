@@ -226,8 +226,16 @@ async def test_disable_and_admin_reset_clear_mfa(monkeypatch: pytest.MonkeyPatch
     store = await _store()
     try:
         notifier = _FakeNotifier()
+        # require_mfa=False is DELIBERATE and new (BACKLOG #1022) — read this before "simplifying" it.
+        # This test's subject is that disable and admin-reset CLEAR MFA. The self-service disable
+        # below was incidentally exercising a defect: with MFA required, stripping your last second
+        # factor is now refused, exactly as delete_webauthn_credential already refused it (ADR 0068
+        # decision 5). Turning the requirement off keeps this test on its own subject; the refusal
+        # and the still-allowed cases have their own tests below.
         service = AuthService(
-            store, AuthSettings(mfa_recovery_code_count=2), security_notifier=notifier
+            store,
+            AuthSettings(mfa_recovery_code_count=2, require_mfa=False),
+            security_notifier=notifier,
         )
         identity, token, _ = await _bootstrap_login(service)
         enroll = await service.begin_mfa_enrollment(identity)
@@ -343,5 +351,74 @@ async def test_mfa_failures_trip_the_per_account_lockout() -> None:
         # ...and the lock is shared with the password path (a fresh login is locked too).
         relogin = await service.login("admin", password)
         assert relogin.ok is False and relogin.error == "account locked"
+    finally:
+        await store.close()
+
+
+async def _enrol_totp(service: AuthService, monkeypatch: pytest.MonkeyPatch) -> Identity:
+    """Bootstrap, log in, and activate TOTP — leaving the caller with exactly ONE second factor."""
+    identity, token, _ = await _bootstrap_login(service)
+    enroll = await service.begin_mfa_enrollment(identity)
+    t0 = 1_000_000.0
+    pin_totp_clock(monkeypatch, t0)
+    await service.confirm_mfa_enrollment(identity, totp.totp(enroll.secret, now=t0), token=token)
+    assert (await service.mfa_status(identity)).enabled is True
+    return identity
+
+
+async def test_disable_mfa_REFUSES_stripping_the_last_factor_when_mfa_is_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #1022: the asymmetry with delete_webauthn_credential.
+
+    Both are self-service, both sit behind the same step-up gate, and both can take an account to
+    ZERO second factors. delete_webauthn_credential asked whether MFA was still required and refused;
+    this one never asked. require_mfa defaults to True, so this is the DEFAULT posture, not an exotic
+    configuration.
+    """
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())  # require_mfa defaults True
+        identity = await _enrol_totp(service, monkeypatch)
+        with pytest.raises(ValueError) as exc:
+            await service.disable_mfa(identity)
+        assert "last second factor" in str(exc.value)
+        # AND IT MUST NOT HAVE DISABLED ANYWAY. A refusal that already mutated the store is worse
+        # than no refusal, because the error says the state was preserved when it was not.
+        assert (await service.mfa_status(identity)).enabled is True
+    finally:
+        await store.close()
+
+
+async def test_disable_mfa_is_ALLOWED_when_mfa_is_not_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # POSITIVE CONTROL for the refusal above. Without it, a disable_mfa that raised unconditionally
+    # would satisfy that test while breaking every account that is permitted to turn MFA off.
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(require_mfa=False))
+        identity = await _enrol_totp(service, monkeypatch)
+        await service.disable_mfa(identity)
+        assert (await service.mfa_status(identity)).enabled is False
+    finally:
+        await store.close()
+
+
+async def test_the_ADMIN_recovery_path_is_not_narrowed_by_the_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard above must not cost the escape hatch, and this is what proves it did not.
+
+    admin_reset_mfa is "the always-available recovery for a locked-out passkey user" — a DIFFERENT
+    method from disable_mfa, deliberately unguarded. Under exactly the conditions that make the
+    self-service path refuse (MFA required, TOTP the only factor), the admin path must still clear.
+    """
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())  # require_mfa defaults True
+        identity = await _enrol_totp(service, monkeypatch)
+        await service.admin_reset_mfa(identity.user_id, actor="another-admin")
+        assert (await service.mfa_status(identity)).enabled is False
     finally:
         await store.close()
