@@ -218,7 +218,12 @@ def test_companion_table_covers_the_remaining_strength_dimensions() -> None:
             True,
             "`[auth].oidc_require_mfa_claim` defaults **on**",
         ),
-        (AuthSettings, "require_mfa", True, "`[auth].require_mfa` defaults **on**"),
+        # The MODEL field stays `AuthSettings.require_mfa` (the internal desugared field), but the
+        # OPERATOR-FACING key is `[security].require_mfa`: `("auth", "require_mfa")` is in
+        # `_RELOCATED_TO_SECURITY`, so the `[auth]` spelling raises at load and `serve` exits 2. The
+        # rendered token has to quote the key an operator can actually set, or this guard pins the
+        # documentation to a config that cannot start.
+        (AuthSettings, "require_mfa", True, "`[security].require_mfa` defaults **on**"),
         (
             AuthSettings,
             "ad_session_recheck_seconds",

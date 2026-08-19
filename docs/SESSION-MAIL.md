@@ -26,9 +26,18 @@ unreachable.
 
 The coordination banner (`scripts/worktree/session-context.ps1`) is a *different* hook that shares the
 `SessionStart` event and is deliberately still absent. **Install one tier at a time with
-`-Only <event> -Script mail-drain`**: `-Only SessionStart` alone would wire the banner too. The urgent
-tier ([`scripts/hooks/mail-watch.ps1`](../scripts/hooks/mail-watch.ps1)) is armed in code and
-registered nowhere, by decision.
+`-Only <event> -Script mail-drain`**: `-Only SessionStart` alone would wire the banner too.
+
+The urgent tier ([`scripts/hooks/mail-watch.ps1`](../scripts/hooks/mail-watch.ps1)) **is registered on
+`Stop`, on all five roots** -- re-measured 2026-08-17 by two independent instruments that agree:
+`install-coordination.ps1 -Status` reports it INSTALLED in every root, and a direct read of each
+`settings.json` finds the `mefor-wake` shim resolving `scripts/hooks/mail-watch.ps1`. This line
+previously read "armed in code and registered nowhere, by decision", which was true when written on
+2026-08-06 and is not true now. It is recorded rather than silently overwritten because the direction
+of the drift is the instructive part: **a doc that understates what is armed is the safer of the two
+errors and therefore the one nobody goes looking for.** Its opposite -- a doc asserting a control is
+live when it is wired nowhere -- is live today for the coordination banner, in
+[`SESSION-DRIFT-CONTROLS.md`](SESSION-DRIFT-CONTROLS.md) and [`WORKTREES.md`](WORKTREES.md).
 
 **VERIFIED END TO END, through the installed hook command rather than a convenient stand-in.** The
 earlier VS Code run drove the drain by absolute path, which does not exercise the thing that actually
@@ -655,6 +664,26 @@ latency on anything that is not urgent. Any proposal to move the drain to a per-
 re-argue that number.
 
 ---
+
+## Replying: one line, and mail arriving is not a reason to produce output
+
+**The rule: `<who mailed you>: <minimal reply>`, on ONE line.** Examples --
+`steward: pool warning, noted`, `builder-2bee12: no action`, `lander: their retraction, nothing owed`.
+
+**Why it is a rule and not a style preference.** The drain hook **blocks the Stop**, so every delivery
+re-invokes the session and forces a turn. That turn is billed with the **entire conversation context
+re-sent**, whether it says one word or six paragraphs. On 2026-08-18 a paused session with nothing to
+do produced roughly a dozen consecutive turns of multi-paragraph peer-traffic digests -- none
+requested, each one a full-context charge, while the owner was actively watching pool burn.
+
+**Do not summarise or relay peer traffic to the owner.** Peers correcting each other is the channel
+working; it is not news. Surface a message only when it needs the **owner's** decision -- a merge, an
+approval, an outward-facing action -- and then say only that, in one line.
+
+**This rule is printed by the hook itself**, in the footer of every delivery, for the reason a peer
+seat established the same day about announce-before-fan-out: a norm with zero observable consequence
+for skipping it gets skipped. The doc is the record; the footer is what reaches the moment the reply
+is composed.
 
 ## Related
 

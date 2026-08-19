@@ -43,14 +43,17 @@ tests/test_claim_check.py
 tests/test_claude_section_citations.py
 tests/test_claude_settings_contract.py
 tests/test_collision_gate.py
+tests/test_coord_claim_adjudicate.py
 tests/test_coord_claim_liveness.py
 tests/test_coord_claim_reconcile.py
 tests/test_coord_claim_refresh.py
 tests/test_coord_claim_release_history.py
 tests/test_coord_lock.py
 tests/test_coord_overlap_attribution.py
+tests/test_coord_overlap_cache.py
 tests/test_coord_overlap_signals.py
 tests/test_coord_presence.py
+tests/test_coord_seat_prompt.py
 tests/test_coord_unbacked_check.py
 tests/test_coord_usage.py
 tests/test_cutover_slug_rot.py

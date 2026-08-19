@@ -189,7 +189,7 @@ reading the emitted decision — not by reading source alone.
 | Blanket-stage guard | project | **LIVE but leaky** — 7 of 8 trivial rephrasings bypass it |
 | Selfheal — primary auto-repair | user (4 of 5 dirs) | LIVE |
 | Selfheal — hijack warning | user (4 of 5 dirs) | **LIVE and currently mis-firing** (§3, G4) |
-| `session-context.ps1` banner | project | LIVE where the branch carries the file |
+| `session-context.ps1` banner | user | **NOT WIRED ANYWHERE** — MISSING in all 5 config roots, and project settings carry no hook rows at all (measured 2026-08-17, `install-coordination.ps1 -Status` plus an independent read of each `settings.json`). The scope column said `project`; the installer wires this row at USER scope. This row previously read "LIVE where the branch carries the file", which is the dangerous direction of doc drift — see [`SESSION-MAIL.md`](SESSION-MAIL.md) |
 | Announce-on-join (`announce-session.ps1`) | user | **LIVE** (re-verified 2026-08-03 by receipt *and* by `-Status`). The only **push** control; it asks rather than sends, and every decision leaves a receipt. Was inert-by-accident for ~13h after merge — see below, the lesson outlived the defect |
 | Announce wiring reaches a real script | test | **NEW** — `tests/test_announce_wiring.py`; nothing asserted this for *any* hook before, which is how a wired-but-inert shim survived weeks |
 | Announce missing-script notice | user | **NEW** — the one surface that still reports when the script itself fails to resolve |
