@@ -230,9 +230,25 @@ jobs:
       # headless. Linux-only; Windows runners need no equivalent.
       - name: Install Qt offscreen system libraries
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
+        # BOUNDED AND RETRIED. Unguarded, this step turns an external apt-mirror hiccup into a
+        # blocked merge queue: measured 2026-08-18, three hangs across two attempts on three
+        # different jobs, one of them 27+ minutes on `test (ubuntu-latest, py3.14)` -- a REQUIRED
+        # context, so the queue stops. Two levers, because they answer different failures. The
+        # per-command `timeout` kills a HANG and lets the retry run; `timeout-minutes` is the
+        # backstop that stops this step ever eating a job budget again if the loop is edited wrong.
+        # The failure text names the cause, so the next reader is not sent hunting in their diff --
+        # a check whose label points at the wrong subject is what BACKLOG #1254 is about.
+        timeout-minutes: 8
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
+          for attempt in 1 2 3; do
+            if sudo timeout 120 apt-get update && sudo timeout 180 apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3; then
+              exit 0
+            fi
+            echo "::warning::apt attempt ${attempt}/3 failed or timed out; retrying"
+            sleep $((attempt * 5))
+          done
+          echo "::error::apt-get failed 3 times. This is the UBUNTU RUNNER MIRROR, not the change under test."
+          exit 1
 
       # uv is the installer for every leg (was pip): it resolves + installs the pyproject extras far
       # faster than pip, into the same setup-python interpreter via `uv pip install --system`. Pinned
@@ -277,8 +293,12 @@ jobs:
       # BOTH platforms on the cheap Linux leg (below). Running them on the 2x-billed Windows legs was
       # duplicate cost, so gate them to Linux. The Windows legs keep pytest — the one check whose
       # result genuinely differs by OS (real sockets, ProactorEventLoop, Windows service paths).
-      # `.` — the WHOLE repo, matching the format check below and the pre-commit ruff hook, which has no
-      # `exclude` and so lints every changed Python file. This was an explicit allow-list of six paths,
+      # `.` — the WHOLE repo, matching the format check below and the pre-commit ruff hook. NARROWED
+      # 2026-08-18: that hook used to lint every changed Python file, because `language: system` ran a
+      # bare `ruff check` with no `--force-exclude`, so an explicitly-passed path was linted even when
+      # pyproject excluded it. The hook is now upstream's, whose entry carries `--force-exclude`, so
+      # BOTH sides honour extend-exclude and the two agree for the first time — the hook was previously
+      # STRICTER than CI on excluded paths, not looser. This step was an explicit allow-list of six paths,
       # and the mismatch was not academic: harness/ (73 findings), tee/ (12), samples/ and docker/ were
       # linted by the hook and by nothing in CI, so touching any file there blocked the commit on errors
       # CI could not see and no CI run could ever have reported. Scope now lives in ONE place —
@@ -818,9 +838,25 @@ jobs:
 
       - name: Install Qt offscreen system libraries
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
+        # BOUNDED AND RETRIED. Unguarded, this step turns an external apt-mirror hiccup into a
+        # blocked merge queue: measured 2026-08-18, three hangs across two attempts on three
+        # different jobs, one of them 27+ minutes on `test (ubuntu-latest, py3.14)` -- a REQUIRED
+        # context, so the queue stops. Two levers, because they answer different failures. The
+        # per-command `timeout` kills a HANG and lets the retry run; `timeout-minutes` is the
+        # backstop that stops this step ever eating a job budget again if the loop is edited wrong.
+        # The failure text names the cause, so the next reader is not sent hunting in their diff --
+        # a check whose label points at the wrong subject is what BACKLOG #1254 is about.
+        timeout-minutes: 8
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
+          for attempt in 1 2 3; do
+            if sudo timeout 120 apt-get update && sudo timeout 180 apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3; then
+              exit 0
+            fi
+            echo "::warning::apt attempt ${attempt}/3 failed or timed out; retrying"
+            sleep $((attempt * 5))
+          done
+          echo "::error::apt-get failed 3 times. This is the UBUNTU RUNNER MIRROR, not the change under test."
+          exit 1
 
       - name: Set up uv
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
@@ -963,9 +999,25 @@ jobs:
       # imports the whole suite regardless of what this job intends to execute.
       - name: Install Qt offscreen system libraries
         if: runner.os == 'Linux'
+        # BOUNDED AND RETRIED. Unguarded, this step turns an external apt-mirror hiccup into a
+        # blocked merge queue: measured 2026-08-18, three hangs across two attempts on three
+        # different jobs, one of them 27+ minutes on `test (ubuntu-latest, py3.14)` -- a REQUIRED
+        # context, so the queue stops. Two levers, because they answer different failures. The
+        # per-command `timeout` kills a HANG and lets the retry run; `timeout-minutes` is the
+        # backstop that stops this step ever eating a job budget again if the loop is edited wrong.
+        # The failure text names the cause, so the next reader is not sent hunting in their diff --
+        # a check whose label points at the wrong subject is what BACKLOG #1254 is about.
+        timeout-minutes: 8
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
+          for attempt in 1 2 3; do
+            if sudo timeout 120 apt-get update && sudo timeout 180 apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3; then
+              exit 0
+            fi
+            echo "::warning::apt attempt ${attempt}/3 failed or timed out; retrying"
+            sleep $((attempt * 5))
+          done
+          echo "::error::apt-get failed 3 times. This is the UBUNTU RUNNER MIRROR, not the change under test."
+          exit 1
 
       - name: Set up uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -1325,7 +1377,25 @@ jobs:
           # that arm is the DIRECTORY; new_dependency_check reads pyproject; ide_licence_packaging reads
           # ide/ and LICENSE). Docs-only PRs were never the gap -- code=false already skipped the pytest
           # step. The gap is MIXED code+docs PRs, which are the common shape.
-          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|pyproject\.toml|\.gitignore|\.gitattributes|tests/(conftest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
+          # `.pre-commit-config.yaml` and `constraints.lock` close that same shape one layer further
+          # out, added 2026-08-18. tests/test_lint_scope_parity.py is a manifest entry, and its subject
+          # is a three-way agreement: the ruff `rev:` the hook pins, the `ruff==` constraints.lock
+          # installs, and pyproject's cap. Measured against this regex as it stood that day, NEITHER file
+          # matched EITHER arm. So on a `pre-commit autoupdate` PR -- which by construction rewrites revs
+          # in .pre-commit-config.yaml and touches nothing else -- the engine legs deselected that guard
+          # with `-m 'not tooling'`, this job skipped, ci-gate read the skipped need as a pass, and the PR
+          # merged green with the guard having run nowhere. The push arm above is no backstop for it:
+          # push fires on `branches: [main]`, i.e. AFTER the merge the gate existed to hold.
+          #
+          # `constraints.lock` IS THE EXPENSIVE ENTRY, AND THE COST IS ACCEPTED -- recorded here so it is
+          # not rediscovered later as a surprise. The lock moves on essentially every dependency PR, so
+          # this job now fires on essentially every dependency PR. The hole if it is dropped is concrete
+          # rather than theoretical: `uv lock --upgrade-package ruff` edits the lockfiles and does NOT
+          # edit pyproject.toml, so a lock-only ruff bump past the cap changes exactly what that test
+          # asserts while matching no other arm here. This lock is listed rather than its siblings
+          # because it is the file the test READS -- uv.lock and requirements.lock move with it in one
+          # re-export, but a uv.lock edit that was never exported has not changed the guard's subject.
+          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|pyproject\.toml|\.gitignore|\.gitattributes|\.pre-commit-config\.yaml|constraints\.lock|tests/(conftest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
             || echo "$changed" | grep -qxFf <(grep -vE '^[[:space:]]*(#|$)' tests/tooling_manifest.txt); then
             echo "tooling=true" >> "$GITHUB_OUTPUT"
           else
@@ -1453,13 +1523,35 @@ jobs:
           python-version: "3.14"
 
       - name: Install Microsoft ODBC Driver 18 + sqlcmd
+        # THIS IS THE DANGEROUS HALF OF THE apt CLASS, and it is the opposite of the one that was
+        # visibly hurting. The Qt sites sit in jobs carrying a job-level `timeout-minutes`, so a
+        # mirror hang there dies at the job cap (20-40 min, measured). THIS JOB HAS NO JOB-LEVEL
+        # TIMEOUT, so the same hang runs to GitHub's 360-minute default -- a whole runner-hour
+        # budget burned on a stalled mirror, on a leg nobody is watching because it is path-gated.
+        #
+        # The step cap bounds EVERY command here, including the two curls, which are equally
+        # unguarded network calls. The retry wraps only the apt pair: re-running that is idempotent,
+        # whereas re-fetching the signing key and repo list is not the part that hangs.
+        #
+        # THE DEEPER FIX IS A JOB-LEVEL `timeout-minutes` ON THIS JOB, which would bound every step
+        # rather than the one that bit. Deliberately NOT done here: choosing that number needs a
+        # measurement of how long this job legitimately runs, and a guessed cap on a server-DB leg
+        # would kill real work. Recorded as a direction, not applied as a guess.
+        timeout-minutes: 10
         run: |
-          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+          curl -fsSL --max-time 60 https://packages.microsoft.com/keys/microsoft.asc \
             | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc > /dev/null
-          curl -fsSL "https://packages.microsoft.com/config/ubuntu/$(. /etc/os-release; echo "$VERSION_ID")/prod.list" \
+          curl -fsSL --max-time 60 "https://packages.microsoft.com/config/ubuntu/$(. /etc/os-release; echo "$VERSION_ID")/prod.list" \
             | sudo tee /etc/apt/sources.list.d/mssql-release.list > /dev/null
-          sudo apt-get update
-          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 mssql-tools18 unixodbc-dev
+          for attempt in 1 2 3; do
+            if sudo timeout 120 apt-get update && sudo ACCEPT_EULA=Y timeout 240 apt-get install -y msodbcsql18 mssql-tools18 unixodbc-dev; then
+              exit 0
+            fi
+            echo "::warning::apt attempt ${attempt}/3 failed or timed out; retrying"
+            sleep $((attempt * 5))
+          done
+          echo "::error::apt-get failed 3 times. This is the UBUNTU RUNNER MIRROR, not the change under test."
+          exit 1
 
       - name: Wait for SQL Server and create the database
         run: |
@@ -2032,13 +2124,35 @@ jobs:
           python-version: "3.14"
 
       - name: Install Microsoft ODBC Driver 18 + sqlcmd
+        # THIS IS THE DANGEROUS HALF OF THE apt CLASS, and it is the opposite of the one that was
+        # visibly hurting. The Qt sites sit in jobs carrying a job-level `timeout-minutes`, so a
+        # mirror hang there dies at the job cap (20-40 min, measured). THIS JOB HAS NO JOB-LEVEL
+        # TIMEOUT, so the same hang runs to GitHub's 360-minute default -- a whole runner-hour
+        # budget burned on a stalled mirror, on a leg nobody is watching because it is path-gated.
+        #
+        # The step cap bounds EVERY command here, including the two curls, which are equally
+        # unguarded network calls. The retry wraps only the apt pair: re-running that is idempotent,
+        # whereas re-fetching the signing key and repo list is not the part that hangs.
+        #
+        # THE DEEPER FIX IS A JOB-LEVEL `timeout-minutes` ON THIS JOB, which would bound every step
+        # rather than the one that bit. Deliberately NOT done here: choosing that number needs a
+        # measurement of how long this job legitimately runs, and a guessed cap on a server-DB leg
+        # would kill real work. Recorded as a direction, not applied as a guess.
+        timeout-minutes: 10
         run: |
-          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+          curl -fsSL --max-time 60 https://packages.microsoft.com/keys/microsoft.asc \
             | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc > /dev/null
-          curl -fsSL "https://packages.microsoft.com/config/ubuntu/$(. /etc/os-release; echo "$VERSION_ID")/prod.list" \
+          curl -fsSL --max-time 60 "https://packages.microsoft.com/config/ubuntu/$(. /etc/os-release; echo "$VERSION_ID")/prod.list" \
             | sudo tee /etc/apt/sources.list.d/mssql-release.list > /dev/null
-          sudo apt-get update
-          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 mssql-tools18 unixodbc-dev
+          for attempt in 1 2 3; do
+            if sudo timeout 120 apt-get update && sudo ACCEPT_EULA=Y timeout 240 apt-get install -y msodbcsql18 mssql-tools18 unixodbc-dev; then
+              exit 0
+            fi
+            echo "::warning::apt attempt ${attempt}/3 failed or timed out; retrying"
+            sleep $((attempt * 5))
+          done
+          echo "::error::apt-get failed 3 times. This is the UBUNTU RUNNER MIRROR, not the change under test."
+          exit 1
 
       - name: Wait for SQL Server and create the database (RCSI on, like the store suite)
         run: |

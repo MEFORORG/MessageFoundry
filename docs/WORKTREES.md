@@ -248,6 +248,74 @@ same invocation wherever one is possible (a refusal test refuses the whole run b
 a session arrives, the fence dies, the metadata is touched — before answering, which reproduces the
 race deterministically with no threads and no sleeps.
 
+## Claims stranded by every other removal path — `claim-reconcile.ps1`, `claim-adjudicate.ps1`
+
+`prune-merged.ps1` releases the claims held by a worktree **it** removes, behind a merged-and-clean-and
+-unoccupied proof. That is one removal path and there are several: `git worktree remove` by hand,
+`git worktree prune`, deleting the folder in Explorer, bulk cleanup by path list. Every one of them
+strands the claim, and `claim.ps1 -Take` hard-blocks on a claim file that exists — so the key becomes
+**unclaimable by every future session**, and it stays that way until somebody looks.
+
+Two sweeps read that population. They ask different questions and neither subsumes the other.
+
+```
+scripts\coord\claim-reconcile.ps1        # did the BRANCH land?  -Apply releases what it proves
+scripts\coord\claim-adjudicate.ps1       # is the KEY protected on origin/main?  never writes
+```
+
+**`claim-reconcile.ps1` asks about the branch**, on four arms: containment in `origin/main`, a merged
+PR at this exact tip, blob-identity against the landing commit, and the branch being gone everywhere.
+Where it proves a landing, `-Apply` releases through `claim.ps1` and the ledger records it.
+
+**`claim-adjudicate.ps1` asks about the key**, because a branch is not the unit a claim is about.
+Measured 2026-08-18 on the live registry: 20 stranded claims sat on **six** branches, one carrying
+**nine** keys, and reconcile cleared **none** of them. That is not a defect in it — a seat branch
+accumulates commits from every item the seat ever touched, so branch containment can only ever clear
+a whole seat at once, and a long-lived seat branch never clears.
+
+### The criterion is the project's own, and it is not "is the work done"
+
+Item #1010's banner on `origin/main` states it: the registry is **machine-local and unversioned**, so
+"*this banner is the protection that travels; the claim is not*". A claim is not valuable in itself —
+it is a **weak** guard against a duplicate build, weak because it exists on one machine. So the
+question is not whether the work finished but whether something durable has replaced the guard:
+
+> **SUPERSEDED** = the item exists in the backlog namespace on `origin/main` **and** its banner there
+> already protects it — a CLOSED status glyph, or a do-not-rebuild banner naming the landing.
+
+Nothing else is ever proposed for release. Not age, not quiet, not a note saying the work is done.
+The tool has **no `-Apply`** and will not grow one: `claim.ps1` owns the `.history` ledger and writes
+the record before removing the file (BACKLOG #1068), and a second writer would be a second definition
+of it. Adjudicate prints the `claim.ps1 -Release` line; a human runs it.
+
+### Three things that look like evidence and are not
+
+Each was tried against the live data on 2026-08-18 and produced a wrong answer.
+
+| Tempting signal | What it actually is |
+| --- | --- |
+| A `BACKLOG #N` citation in a landed commit | `BACKLOG #340` hits a commit reading "…and in BACKLOG #340, making this the third document to…" — **prose reference**. `BACKLOG #328` hits "Also BACKLOG #328, **sections 1-2**" — part of an item. `backlog-hygiene.yml` matches the bare token on purpose; it enforces that a claiming PR updates the banner and is not a closure oracle. Citations are **printed, never scored**. |
+| A note saying the work landed | A note may *nominate* a hypothesis; only `origin/main` may confirm it. #1010's note said "ALREADY LANDED ON MAIN … Verify before believing me" and was right — and what licensed acting on it was the banner saying so independently. |
+| A banner reading OPEN | Cuts one way only. #1010 carries **no status glyph at all** while landed, because the flip was written on an unmerged branch and "a banner protects nobody until it is on `main`". OPEN means *not superseded here*, never *not landed*. |
+
+### Reading the report
+
+`SUPERSEDED` is a **floor** on what is safe to release, never a ceiling on what has landed. Every
+other verdict is a question the instrument could not close, not a finding that the work is live:
+
+- **BLOCKING** — nothing on `origin/main` protects the item, so the key is stuck in the worst way:
+  unclaimable *and* unbuilt. These are **grouped by branch**, because that is where the decision
+  lives — one *land it or abandon it* call cleared nine keys at once on the day this was written.
+- **NO-ITEM** — the key is outside the backlog namespace (`ha-recheck-inc145`, `usage-forecast` on
+  the live registry). The instrument does not reach it. That is not a finding about the work.
+- **STRANDED-REGISTERED** — half a removal. `prune-merged.ps1` owns it and releases as it removes.
+- **UNREADABLE** — `claim_check.py` reads a malformed claim as *unclaimed*, so the key is already
+  ungated. Deleting the file would hide that rather than fix it.
+
+Tests: [`tests/test_coord_claim_adjudicate.py`](../tests/test_coord_claim_adjudicate.py). Every
+releasing test is paired with the case that would **also** pass if the tool released what it cannot
+see, and one test asserts the registry is byte-identical after every code path.
+
 ## Your PR won't merge — triage before you touch anything
 
 With several sessions merging into one `main`, a PR that was green ten minutes ago routinely stops

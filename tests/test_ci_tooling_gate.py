@@ -86,6 +86,29 @@ _CASES = [
     (["LICENSE"], True, "same test reads LICENSE"),
     (["tests/tooling_manifest.txt"], True, "edit the partition, re-run the tier it defines"),
     (["tests/conftest.py"], True, "the hook that applies the marker"),
+    # The four rows below pin the arm widened on 2026-08-18, and they are the only thing that does.
+    # tests/test_lint_scope_parity.py is a manifest entry whose subject is a three-way agreement: the
+    # ruff `rev:` pinned in .pre-commit-config.yaml, the `ruff==` constraints.lock installs, and the
+    # cap in pyproject.toml. Measured against this regex as it stood that morning, NEITHER file
+    # matched EITHER arm -- so a `pre-commit autoupdate` PR, which by construction rewrites revs and
+    # touches nothing else, met that guard on no leg at all: the engine legs deselect it with
+    # `-m 'not tooling'`, this job skipped, and ci-gate reads a skipped need as a pass. Dropping
+    # either alternative from ci.yml again leaves every other row in this table green, which is the
+    # silent-removal shape the module docstring describes, one layer further out.
+    ([".pre-commit-config.yaml"], True, "an autoupdate PR must face test_lint_scope_parity"),
+    (["constraints.lock"], True, "a lock-only ruff bump edits no other file this gate names"),
+    # Two negatives, one per way those two alternatives can go wrong, because neither way reds
+    # anything else here. `uv.lock` is the SCOPE guard: ci.yml lists constraints.lock rather than its
+    # two siblings because it is the file the test READS, and a widening (an added sibling, or a
+    # `\.lock$`-shaped alternative) would run this whole tier on every dependency PR while quietly
+    # replacing a reasoned choice. `constraints_lock` is the SHAPE guard: it is not a path and cannot
+    # become one, which is exactly why it works -- it matches only if `constraints\.lock` loses its
+    # backslash, and an unescaped dot reads as correct in review. The leading `\.` of
+    # `\.pre-commit-config\.yaml` gets no equivalent probe: under the `^` anchor an unescaped one
+    # matches any single leading character, so every candidate is a path nobody would ever add, and a
+    # row nobody believes gets deleted the first time it is inconvenient.
+    (["uv.lock"], False, "sibling locks are unlisted: constraints.lock is what the test READS"),
+    (["constraints_lock"], False, "not a path: reds only if `constraints\\.lock` loses its escape"),
     (
         ["messagefoundry/api/app.py", "docs/ARCHITECTURE.md"],
         True,
