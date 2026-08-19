@@ -278,7 +278,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui_step_up_action(STEP_UP_ACTION_MFA_DISABLE)),
     ) -> Response:
         assert_same_origin(request)
-        await admin.disable_my_mfa(request=request, service=service, identity=identity)
+        try:
+            await admin.disable_my_mfa(request=request, service=service, identity=identity)
+        except HTTPException as exc:
+            # #1022: the JSON handler refuses with a 400 when TOTP is the caller's LAST second factor
+            # and MFA is still required. This route DELEGATES to it, so without this the refusal
+            # reaches a browser form navigation as FastAPI's raw JSON body -- a bare {"detail": ...}
+            # where every sibling refusal above renders the account page with the message. The
+            # condition is the operator's to fix (enroll another factor first), so it has to arrive
+            # somewhere they can act on it.
+            if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+                raise  # rate-limited — keep the Retry-After semantics (the ui_reauth precedent)
+            return await _account_response(
+                service, identity, request, error=str(exc.detail), status_code=exc.status_code
+            )
         return RedirectResponse("/ui/account?m=mfa_off", status_code=303)
 
     # --- L6b: self-service session management (#75 parity — desktop sessions.py twin) ---

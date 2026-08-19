@@ -407,6 +407,70 @@ async def test_same_subject_changed_username_is_same_account(
         await store.close()
 
 
+async def test_one_subject_cannot_bind_two_accounts(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1256: the direction #1015's guard cannot look.
+
+    That guard resolves the account by USERNAME and asks whether *this account* carries a different
+    subject. It therefore constrains WHICH subject may bind to a given account, and is structurally
+    incapable of seeing a SECOND ACCOUNT already bound to the subject now presenting. Nothing else
+    sees it either -- there is no UNIQUE constraint naming the federated columns on any backend.
+
+    Distinguish this from ``test_same_subject_changed_username_is_same_account`` above, which passes
+    on the DEFECTIVE code and is not evidence about it: there both usernames resolve through AD to
+    the SAME object (``by_username`` maps them to one principal), so there is only ever one account.
+    Here they resolve to genuinely DIFFERENT AD objects, which is the only way a single verified
+    identity can reach two rows.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        other = AdPrincipal(
+            username="bsmith",  # a DIFFERENT on-prem object, not a rename of the first
+            display_name="B Smith",
+            email="bsmith@corp.example",
+            dn="CN=bsmith,DC=corp,DC=example",
+            groups=PRINCIPAL.groups,
+        )
+        ldap = _FakeLdap(by_username={"jdoe": PRINCIPAL, "bsmith": other})
+        service = await _service(store, rsa_key, ldap=ldap)
+
+        first = await _oidc_login(
+            service, monkeypatch, rsa_key, sub="S-1-alice", preferred_username="jdoe@corp.example"
+        )
+        assert first.ok
+        bound = await store.get_user_by_username("jdoe")
+        assert bound is not None and bound.oidc_subject == "S-1-alice"
+
+        # POSITIVE CONTROL: the second username really does resolve to a DIFFERENT AD object, so a
+        # refusal below cannot be the fixture collapsing both logins onto one account. Asserted
+        # through the same seam the service uses rather than the fake's internals.
+        assert ldap.resolve_principal("bsmith") is other
+        assert other.username != PRINCIPAL.username
+
+        # The SAME verified identity now arrives at a different on-prem object.
+        second = await _oidc_login(
+            service, monkeypatch, rsa_key, sub="S-1-alice", preferred_username="bsmith@corp.example"
+        )
+        assert not second.ok and second.token is None
+        assert second.reason == "federated_subject_already_bound"
+
+        # Refused, not re-pointed: the ORIGINAL account keeps the binding and the second account
+        # never acquires it. Re-pointing would strand the first holder -- the same takeover shape
+        # #1015 prevents, arriving from the other side.
+        after = await store.get_user_by_username("jdoe")
+        assert after is not None and after.id == bound.id
+        assert after.oidc_subject == "S-1-alice"
+        forked = await store.get_user_by_username("bsmith")
+        assert forked is None or forked.oidc_subject is None
+        rows = await _audit_rows(store, "auth.login_failed")
+        assert any(
+            '"reason": "federated_subject_already_bound"' in (r["detail"] or "") for r in rows
+        )
+    finally:
+        await store.close()
+
+
 async def test_username_reused_across_two_subjects_does_not_collide(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:

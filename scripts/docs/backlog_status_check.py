@@ -81,6 +81,18 @@ _OPEN = "🔢🚧"
 _BANNER = re.compile(rf"^>\s(?P<emoji>[{_CLOSED}{_OPEN}])️?\s")
 _HEADING = re.compile(r"^## (?P<num>\d+)\.\s")
 
+# BACKLOG #1259: an unresolved git conflict parses CLEANLY here without this check, and the reason is
+# specific -- `>>>>>>> branch` starts with ">", so the banner-block scanner below treats it as a
+# blockquote line and keeps scanning rather than ending the block. Both sides' items are then read,
+# and the census counts them all. Measured: the live ledger and a marker-poisoned copy of it produced
+# IDENTICAL counts with no exception raised. The counts agreeing is what made it undetectable -- a
+# reader handed a conflicted source reports a plausible number, not an error.
+#
+# `=======` is deliberately NOT matched. A Markdown setext H1 underline is a run of "=" and can be
+# exactly seven, so matching it could refuse a legitimate ledger; every real conflict carries the
+# other two markers, so leaving it out costs no detection and removes the false positive.
+_CONFLICT = re.compile(r"^(?:<{7}|>{7})(?:\s|$)", re.M)
+
 # Unambiguous CHANGELOG citations of a *backlog item* (not a PR number), considered only on a change
 # *entry* (a list bullet). Narrative prose that merely mentions an item — "the correctness edge is
 # closed (… BACKLOG #82) or field-confirmed benign" — is a reference, not a shipped claim, and a
@@ -111,7 +123,21 @@ def parse_items(text: str) -> list[Item]:
 
     The banner block runs from the heading to the first line that is neither blank nor a blockquote,
     so a status banner must appear *before* the item's prose (Cluster/Scope/Why...).
+
+    Raises :class:`ValueError` when ``text`` still carries git conflict markers (#1259). The refusal
+    lives in the READER, not in a pre-commit hook, because the way this bit was a gate handed a tree
+    IN MEMORY -- a merge-tree blob read before its exit code was checked. A hook on the working copy
+    would not have been running at all.
     """
+    conflict = _CONFLICT.search(text)
+    if conflict is not None:
+        line_no = text.count("\n", 0, conflict.start()) + 1
+        raise ValueError(
+            f"refusing to parse a source with an unresolved conflict marker (line {line_no}). "
+            "This is not a formatting complaint: a conflicted ledger parses WITHOUT error here and "
+            "yields a census that silently counts items from BOTH sides, so the number looks right. "
+            "Resolve the merge, or check the merge's exit status, before reading it."
+        )
     lines = text.splitlines()
     items: list[Item] = []
     i = 0

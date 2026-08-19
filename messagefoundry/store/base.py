@@ -1549,12 +1549,20 @@ class AuthStore(Protocol):
 
     async def count_users(self) -> int: ...
 
+    # ``must_change_password`` DEFAULTS TO TRUE, and the default is a security control rather than a
+    # style choice (BACKLOG #1245). Passing False is what records the credential claim in
+    # ``users.password_claimed_at``, and that stamp is write-once and monotonic -- once set it can
+    # never be undone, and an account carrying it is permanently exempt from WP-3 auto-retirement.
+    # So the DANGEROUS branch must never be the one a caller gets by omission. With False as the
+    # default a caller that simply forgot the keyword would silently stamp a claim on an account
+    # nobody claimed, which is the very shape #1245 documents. Every existing caller passes the
+    # argument explicitly, so this default is unreachable today -- it exists to bound the NEXT caller.
     async def set_password(
         self,
         user_id: str,
         *,
         password_hash: str,
-        must_change_password: bool = False,
+        must_change_password: bool = True,
         now: float | None = None,
     ) -> None: ...
 
@@ -1698,6 +1706,21 @@ class AuthStore(Protocol):
         """Bind a user's verified federated ``(issuer, sub)`` identity (BACKLOG #1015). Recorded on the
         first federated login so a later login whose reassignable username resolves to this account but
         carries a different subject is refused, not handed the account."""
+        ...
+
+    async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
+        """The account bound to this verified ``(issuer, sub)``, or ``None`` (BACKLOG #1256).
+
+        **The inverse of the #1015 guard, and the direction that guard cannot look.** That check
+        resolves a user by USERNAME and asks whether *this account* carries a different subject --
+        so it constrains WHICH subject may bind to a given account, and is structurally incapable of
+        seeing a SECOND ACCOUNT already holding the same subject. Nothing else could see it either:
+        measured, there is no UNIQUE constraint naming the federated columns on any of the three
+        backends (0/0/0, against 13/8/10 total UNIQUE declarations as the positive control).
+
+        Deliberately a lookup rather than a scan: it sits on the federated login path, and
+        ``list_users()`` would make every sign-in O(number of accounts).
+        """
         ...
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]: ...
