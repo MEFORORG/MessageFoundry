@@ -10220,3 +10220,27 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** CI reliability / load-harness probe. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0) -- `harness/load/` is test infrastructure and ships in no engine path. The cost is a required context that randomly blocks the merge queue, and a regression assertion that is inert exactly when the probe is under stress.
+
+## 1291. Get-HandledTools returns NULL on its zero-tool and missing-file paths, correct only by its caller's grace
+
+> 🔢 **Filed 2026-08-19 -- not started. THIS IS A LATENT TRAP, NOT A LIVE DEFECT, AND THE DISTINCTION IS THE ITEM.** `Get-HandledTools` in [`scripts/worktree/install-gate.ps1`](../scripts/worktree/install-gate.ps1) returns `$null` rather than an empty array on two of its paths. **Shipped behaviour is correct today** because its single caller (around line 294) wraps the result in `@(...)`. **A commit message or item claiming a present-tense bug here would be false.** The honest claim: the function is correct only by its caller's grace, and the guarantee belongs in the function. **THE CHANGE: make both exit paths return an array unconditionally.**
+
+> **MEASURED, in pwsh 7, by extracting the function through the PowerShell AST rather than running it:**
+>
+>     missing file   ->  NULL
+>     zero tools     ->  NULL
+>     one tool       ->  type=String    count=1
+>     two tools      ->  type=Object[]  count=2
+>
+> The one-tool arm is the sharp edge: a bare `String` answers `.Contains('Edi')` with **True**, so a membership test against a single handled tool silently succeeds on a substring of it.
+
+> **BOTH EXIT PATHS UNROLL -- a tail-only fix leaves the worse one broken.** The early `if (-not (Test-Path ...)) { return @() }` returns NULL exactly as the closing `@($tools)` does, and **that early path is the normal one on a box where the gate was never installed** -- which is every fresh checkout. Fixing only the tail repairs the case that is already hardest to reach and leaves the common one.
+
+> **A TEST THROUGH `-Status` CANNOT DISTINGUISH FIXED FROM UNFIXED**, because that caller re-wraps. The discriminating test must call `Get-HandledTools` **directly** and assert **type and count** on the zero-element, one-element and missing-file arms.
+
+> **AND IT CANNOT BE REACHED BY DOT-SOURCING: loading `install-gate.ps1` PERFORMS A MACHINE-GLOBAL INSTALL.** The sanctioned route is AST extraction -- `ParseFile` plus `FunctionDefinitionAst` -- which is about five lines and was confirmed working while measuring the table above. Any test written for this item must use it; a dot-source in a test would install the gate on whatever machine ran the suite.
+
+> **Fix, and it should match the one spelling its sibling introduces:** `return ,@($tools)` at the tail and `return ,@()` at the early return. PR #447 fixes the adjacent `-Status` unroll in the same file with `return ,$wired`; this is the same class, found while measuring that one, and left unfixed there because that branch was already pushed and its author stopped writing code.
+
+**Cluster:** Worktree gate / PowerShell correctness. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0), and no live defect axis either -- `scripts/worktree/` is developer tooling and the caller currently compensates. The cost is that the next caller written against this function inherits a NULL its signature does not advertise.
