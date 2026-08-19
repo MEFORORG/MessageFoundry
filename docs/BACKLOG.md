@@ -10203,3 +10203,20 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Documentation / adopter-facing. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0). The cost today is that someone evaluating the project cannot see how its authors think about the threat surface, or what responsibility their own Handler code would carry.
+
+## 1290. connscale CPU-probe process-table walk times out on hosted Windows runners, reddening a required context on main
+
+> 🔢 **Filed 2026-08-19 -- not started. A REQUIRED STATUS CHECK IS INTERMITTENTLY RED ON `main`, AND THE TEST THAT FAILS CANNOT ASSESS THE REGRESSION IT EXISTS TO CATCH WHEN IT DOES.** `tests/test_connscale_cpu_probe.py::test_subtree_re_resolution_picks_up_a_late_spawned_child` fails on the `walked_ok` assertion ([`test_connscale_cpu_probe.py:309`](../tests/test_connscale_cpu_probe.py)): the process-table walk returned `None` on **every one of 6 attempts in 30s**, the Windows path allowing 5s per walk. **THE CHANGE: make the walk's deadline survive a loaded hosted runner, or degrade a walk-level timeout to a skip rather than a failure.**
+
+> **IT IS ON `main`, NOT ON A BRANCH -- that is what makes it a queue problem rather than one PR's problem.** CI run `32255231838`, head `de896e0f`, event `push`, failing job **`test (windows-2022, py3.14)`** -- which is one of the 13 REQUIRED contexts. Every PR that follows inherits the same exposure.
+
+> **IT IS NONDETERMINISTIC, AND THAT IS MEASURED RATHER THAN ASSUMED.** The identical leg on PR #448 (`test (windows-2022, py3.14)`, same runner image, same hour) returned **SUCCESS**. Same test, same required leg, opposite outcomes, and neither branch touches this subsystem -- #448 changes `scripts/coord/overlap.ps1`. **Do not read this as "flaky, ignore it":** this repository's two famous flakes turned out to be a livelock and a test that was right, so the label is earned here only by the cross-branch pair above.
+
+> **THE FAILING ASSERTION IS THE ONE THE TEST'S OWN AUTHOR SEPARATED OUT AS AN ENVIRONMENT PROBLEM.** The test deliberately splits *"the probe could not enumerate at all"* from *"it enumerated and missed a live child"*, so the two cannot be confused. It fails on the **first**; the re-resolution regression assertion below it **never runs**. So while this is red, the test is not merely failing -- it is **silent on the defect it was written to detect**, which is the worse half.
+
+> **THIS IS NOT NEW, AND THE RECORD IS IN THE TEST.** Its own comment records the same class on 2026-07-30: *failed twice in one job on windows-2025, while windows-2022 and ubuntu passed the identical commit.* The runner that fails has since changed; the class has not.
+
+> **DO NOT MERGE THIS INTO EITHER NEIGHBOURING ITEM -- different causes, same file family.** #1014 is a **fixed 24-port block collision** in `test_connscale_smoke_end_to_end`, whose `flaky(reruns=2)` marker hides a determinate resource contention. #1210 arm 2 is **FD/RSS provenance** in the same probe -- the sum carries no record of the PID set it covered. Neither is a walk that never completes. `docs/BACKLOG.md` carried **zero** items on the walk timing out when this was filed; the search that returned that zero returns hits for the same tokens in the test file, so the null is a real null.
+
+**Cluster:** CI reliability / load-harness probe. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- `harness/load/` is test infrastructure and ships in no engine path. The cost is a required context that randomly blocks the merge queue, and a regression assertion that is inert exactly when the probe is under stress.
