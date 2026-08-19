@@ -10308,3 +10308,27 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Ledger gate / worktree lifecycle. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0) -- this is developer tooling. The cost is a PR that cannot be landed by anyone and a ledger number burned with no way to reuse it, plus the sweep above being folk knowledge until it is written into the removal path.
+
+## 1294. no cleanup path exists for the 70 percent of worktrees the prune tool must never touch, so they accumulate until a human removes them by hand
+
+> 🔢 **Filed 2026-08-19 -- not started. THIS IS NOT "THE PRUNE TOOL HAS A COVERAGE BUG". ITS EXCLUSIONS ARE DELIBERATE, WERE PAID FOR BY AN INCIDENT, AND MUST STAY.** `scripts/worktree/prune-merged.ps1` refuses anything with a `.claude/worktrees/` path segment, anything nested inside another registered worktree, detached trees, Temp scratchpad trees, and the primary. Its header states why: that directory is **"the exact place EnterWorktree relocates a live session to"**, the tool **once removed an occupied worktree** -- deregistering it and then failing to delete the directory, after which every git command in the working session failed -- and the resulting bias is recorded as **"a false SKIP is a minor annoyance, a false PRUNE destroys a session"**. **THE CHANGE: give the excluded population a REPORTING path, not a removal path.**
+
+> **MEASURED 2026-08-19 on this clone:**
+>
+>     total registered worktrees        36
+>     reachable by prune-merged.ps1     11   (<repo>-<name> siblings)
+>     .claude/worktrees/*               12   excluded BY DESIGN -- live sessions live here
+>     other (C:/mfw*, Temp, detached)   13   excluded
+>
+> So **30 percent** is reachable. On the same day the owner removed **12** of the excluded ones by hand, from a list assembled manually, because nothing produces that list.
+
+> **THE ACTUAL DEFECT IS THE ABSENCE OF A SAFE MIDDLE.** Today there are two states: the tool removes it, or nobody knows it exists. There is no artifact that says *"these excluded trees look finished -- here are the commands, you decide"*. That gap is what turns routine hygiene into a manual audit, and a manual audit is what gets skipped until 53 worktrees accumulate.
+
+> **WHY A REPORTER AND NOT A WIDER FENCE.** The occupancy fence's own receipt states it cannot see **"a session writing into a worktree by absolute path from elsewhere (29% of the writes by primary-seated sessions, measured on this repo)"**, a cwd recorded as UNC or 8.3, a session that never registered, or one that only edits files. The 36h git-metadata veto exists to cover that hole and is a proxy, not a fact. **Automating deletion of the directory where live sessions live, behind a fence with a measured 29 percent blind spot in one of its two signals, trades the exact property the incident bought.** A reporter carries none of that risk because it removes nothing.
+
+> **SHAPE THAT WOULD BE SAFE:** extend the existing decision table to *evaluate* every registered worktree, and for the excluded classes emit `REPORT-ONLY` rows plus a copy-pasteable command block -- never an `-Apply` path, no `-Name` override, no force. The dirty check, the branch-keeping rule, the orphan ledger and the fence receipt all already exist and would be reused unchanged. **The human stays the actuator for the dangerous population; only the discovery is automated.**
+
+> **A SECOND, SMALLER FINDING FROM THE SAME PASS.** `git worktree remove` is refused to an agent by `scripts/hooks/worktree_gate.ps1` for every tree but its own, and that refusal names the user as the only actor. That is consistent with the above and should NOT be relaxed to close this item -- the reporter makes the refusal cheap to live with, which is the correct order of operations.
+
+**Cluster:** Worktree lifecycle / developer tooling. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). The cost is unbounded worktree accumulation, a manual audit nobody schedules, and disk. **Explicitly NOT a licence to widen the prune fence** -- the item is closed by adding reporting, and would be mis-implemented by adding reach.
