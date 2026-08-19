@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Pure (vscode-free) view-model behind the read-only Steps view (ADR 0076 §2 phase 2b / #222).
 //
 // It consumes the `messagefoundry lens parse --json` contract (ADR 0076 §3) — the engine owns the
@@ -1082,11 +1084,14 @@ export const ADD_MENU_CATALOG: readonly AddMenuItem[] = [
   },
   {
     id: "fhir_lookup", label: "FHIR Lookup", group: "Translate & lookup", op: "insert_row", action: "fhir_lookup",
-    assignVar: true,
+    // #1243 removed the flat '?'-query, so structured params= is the ONLY way to express a search and the
+    // row must carry one -- without the seed the Add menu could emit a read-by-id only, and a placeholder
+    // teaching "Patient?identifier=X" generated a Handler the engine refuses on its first run.
+    assignVar: true, seed: { params: { expr: "{}" } },
     prompts: [
       { field: "var", label: "Assign result to", kind: "text", placeholder: "pat" },
       { field: "connection", label: "FHIR connection ([egress].allowed_http)", kind: "text", placeholder: "epic" },
-      { field: "query", label: "FHIR query", kind: "text", placeholder: "Patient?identifier=X" },
+      { field: "query", label: "FHIR path (search fields go in params)", kind: "text", placeholder: "Patient" },
     ],
   },
   // --- Structure & flow ---

@@ -14,12 +14,15 @@ being bounded is the handler's, not the network's.
 
 **Pure ASGI, not** ``BaseHTTPMiddleware``: no task hop, and the response-start signal is visible
 directly. It is registered inside :class:`~messagefoundry.api.client_networks.ClientNetworkMiddleware`
-(a refused address is rejected before it can occupy a deadline) and outside everything else, so the
-deadline covers auth dependencies, the body cap and the route alike.
+(a refused address is rejected before it can occupy a deadline) and outside everything that builds a
+response, so the deadline covers auth dependencies, the body cap and the route alike.
 
 Being outside the app's ``_security_headers`` middleware, the refusal sets the baseline response
 headers itself rather than shipping a 503 with none of them — the same reason
-``ClientNetworkMiddleware`` carries its own ``_DENIAL_HEADERS``.
+``ClientNetworkMiddleware`` carries its own ``_DENIAL_HEADERS``. That hand-copy is now a belt to
+:class:`~messagefoundry.api.header_floor.SecurityHeaderFloorMiddleware`'s braces rather than the only
+thing standing: the floor is registered further out still and ``setdefault``s the same baseline, which
+is also what supplies the ``Strict-Transport-Security`` the static tuple below structurally cannot.
 """
 
 from __future__ import annotations

@@ -1,5 +1,5 @@
 # Copyright (c) MessageFoundry contributors.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """A3 — value-level coverage for the per-PID CPU collector, and for the SUBTREE the values cover.
 
 Before this module the CPU path had **no value-level test at all**: ``test_connscale_smoke`` asserted

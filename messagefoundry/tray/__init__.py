@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """MessageFoundry Windows tray service-manager (ADR 0113).
 
 A tiny, unprivileged Windows notification-area app for the box running the engine as an

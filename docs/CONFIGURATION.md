@@ -13,12 +13,27 @@
 > **`[reference]`**, **`[backup]`** ([ADR 0049](adr/0049-turnkey-dr-backup-restore-verify.md)) and
 > **`[dr]`** ([ADR 0048](adr/0048-third-tier-disaster-recovery-standby.md)).
 >
-> **An unimplemented key is accepted *silently*** — every section model is pydantic `extra="ignore"`, so
-> a forward-looking file still loads rather than failing. The accepted-but-ignored keys, each also
-> flagged where it is documented: the **whole `[engine]` section** (see [`[engine]`](#engine)),
-> `[delivery].outbox_workers`/`dead_letter`, `[logging].file`/`max_bytes`/`backups`,
+> **An unrecognized KEY in `messagefoundry.toml` is REFUSED at load** — a key its section does not
+> define fails the start, naming the section, the key and the nearest real field name. It used to be
+> accepted silently, which left the setting it was meant to apply un-applied with nothing anywhere
+> reporting a problem. An unknown top-level **SECTION** is still tolerated (`[engine]`, see
+> [`[engine]`](#engine)), so a forward-looking file that adds a whole section still loads.
+>
+> **The refusal covers the FILE. It does not cover env or CLI — check those spellings yourself.** A
+> misspelled `MEFOR_*` variable or `serve` flag is still dropped silently — the env layer is where
+> secrets belong, and it already drops a var aimed at one of the five sections that have no env layer
+> ([Mechanism](#mechanism)). The loader also cannot tell such a typo from one of the documented
+> `MEFOR_*` variables its consuming module reads straight from the environment rather than declaring as
+> a field (`MEFOR_STORE_VAULT_ADDR`, `MEFOR_TLS_REVOCATION_ATTESTED` and siblings). **One exception:**
+> an unrecognized `[security]` posture switch is refused from **env as well as the file**, because every
+> shipped `MEFOR_SECURITY_*` name maps to a real field, so there is no out-of-band variable to collide
+> with — and believing a posture control is on when it is not is the worst case of the class.
+>
+> A handful of keys are **declared but not yet read** — they load, they just do nothing yet:
 > `[retention].audit_days` (**reserved/keep-forever by design**), `[reference].max_staleness_seconds`,
-> `[ai].baa_attested`, and `[update_check].index_url`/`index_allowed_hosts`.
+> `[ai].baa_attested`, and `[update_check].index_url`/`index_allowed_hosts`. The former
+> "accepted-but-ignored" keys that were never fields at all — `[delivery].outbox_workers`/`dead_letter`
+> and `[logging].file`/`max_bytes`/`backups` — now **refuse**.
 
 ## Principle — two kinds of configuration
 
@@ -547,7 +562,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `password_min_length` | int | 15 | local-password policy — ASVS 5.0-aligned, length-first |
 | `password_require_uppercase` / `password_require_lowercase` / `password_require_digit` / `password_require_symbol` | bool | `false` | character classes — **opt-in**, each independently (ASVS 5.0 forbids mandatory composition); turn one on only for a legacy standard that still mandates it |
 | `password_check_breached` | bool | `true` | reject known common/breached passwords against a bundled offline top-10k list (no live HIBP call) |
-| `password_check_context` | bool | `true` | reject passwords containing app/vendor/HL7 terms (e.g. `messagefoundry`, `mefor`, `hl7`, `corepoint`) |
+| `password_check_context` | bool | `true` | reject a local password that **contains** any deny-list term — a case-insensitive substring test, anywhere in the value, not a whole-word or prefix match. The **twelve** terms are listed in full in [SECURITY.md](SECURITY.md) "Password policy"; an earlier revision of this row called them "app/vendor/HL7 terms" and gave four examples, which mis-stated the rule (five of the twelve are generic credential words unrelated to this application or to HL7). The list is fixed in code (`CONTEXT_WORDS` in [`auth/policy.py`](../messagefoundry/auth/policy.py)): **this flag turns the whole check on or off, and no setting adds or removes a term**, so a site needing its own vocabulary uses `password_breach_corpus_file` below — which matches the *whole* password, never a substring |
 | `password_check_username` | bool | `true` | reject a password containing the user's **own username** (ASVS 6.2.11) |
 | `password_breach_corpus_file` | path | — | optional path to a **larger offline breach corpus** that augments the bundled top-10k list (ASVS 6.2.12): a plaintext list **or** an HIBP-style SHA-1 hash export (`HASH[:count]` lines, auto-detected). Fully offline — still no live HIBP call. Use a curated subset, not the full ~40 GB HIBP set (it is loaded into memory). A path, not a secret |
 | `lockout_threshold` | int | 5 | failed logins before lock (per account) |
@@ -666,7 +681,7 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 | `ntp_peer` | str | — | NTP/SNTP host to compare the local clock against (**required** when `require_time_sync`) |
 | `time_sync_max_skew_seconds` | float | `2.0` | \|local − peer\| above this is "skewed" (must be > 0) |
 | `time_sync_fail_closed` | bool | `false` | **refuse to start** (instead of warn) on skew or an unreachable peer. Further opt-in; requires `require_time_sync` |
-| `file`, `max_bytes`, `backups` | str/int | — | **accepted-but-ignored** (planned) rotation — none is a `LoggingSettings` field. The engine logs to stdout and NSSM rotates it; `log_dir` above is how you point the engine at where it lands |
+| `file`, `max_bytes`, `backups` | str/int | — | **REFUSED** — none is a `LoggingSettings` field, and an unrecognized key now fails the start rather than loading silently. The engine logs to stdout and NSSM rotates it; `log_dir` above is how you point the engine at where it lands |
 
 > PHI redaction + control-char scrubbing are **always-on handler filters** (not a toggle) applied to
 > **every** sink, including the off-box forwarder ([`logging_setup.py`](../messagefoundry/logging_setup.py),
@@ -701,11 +716,19 @@ disposition, and the audit trail stay intact — the Mirth Data-Pruner pattern);
 `messages` row and never touches a body still in flight. The *row* survives; its PHI *columns* do not
 — `messages.metadata` is nulled in the same statement as the body (ASVS 14.2.7). The raw `[retention]` fields still default to
 `0`/`""` = keep/off, **but `serve` applies a posture gate on top of them, so retention is *not*
-opt-in on a PHI instance**: under `[security].enforcement = enforce` (the default) an unbounded
-`[security].delete_message_bodies_after_days` or `[retention].dead_letter_days` **refuses to start
-(exit 2)**; on a non-enforcing PHI instance each *unset* window is auto-bounded to **30 days**. All
-three built-in environment names (`dev`, `staging`, `prod`) derive PHI. The audited opt-out is
-`[security].allow_keeping_phi_indefinitely = true`. See [PHI.md §8](PHI.md#8-retention--purge).
+opt-in on a PHI instance**: each *unset* window that carries an auto-bound —
+`[security].delete_message_bodies_after_days`, `[retention].dead_letter_days` and
+`[retention].reference_snapshot_days` — is **defaulted to 30 days** at startup, under **both**
+`[security].enforcement` dials, and the defaulted settings are named on stderr. A window set
+**explicitly to `0`** is not defaulted: that **refuses to start (exit 2)** under `enforce`, and warns
+under `warn`. This paragraph used to state the opposite split — refusal under `enforce`, auto-bound
+only on a non-enforcing instance — which the shipped gate in
+[`__main__.py`](../messagefoundry/__main__.py) refutes; an *unset* window has not refused since the
+auto-bound moved to both dials. All three built-in environment names (`dev`, `staging`, `prod`)
+derive PHI. The audited opt-out is `[security].allow_keeping_phi_indefinitely = true`, which
+suppresses the auto-bound as well as the refusal. **Thirty days is the engine's floor against an
+accidentally unbounded window, not your retention policy — set each window to the number your site
+actually requires.** See [PHI.md §8](PHI.md#8-retention--purge).
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `messages_days` | | | **→ moved to `[security].delete_message_bodies_after_days`** (ADR 0118) — set it there; no longer accepted in `[retention]`. |
@@ -765,8 +788,8 @@ Because the local diff is cheap and PHI-safe it is **on by default** (zero phone
 | `stall_max_oldest_seconds` | num | _unset_ | raise a `message_stall` alert (Corepoint "Max Message Stall", [ADR 0014](adr/0014-alerting-rules-engine.md)) when an outbound lane's **oldest undelivered message** has waited this long. **Unset (the default) = the stall alert is OFF** — deny-by-default/opt-in, because it overlaps `buildup_max_oldest_seconds`'s age dimension and would double-page if both fired. Set a threshold to turn it on; a per-outbound `stall=StallThreshold(...)` overrides it. The stall event routes through `[[alerts.rules]]` like any other ([ADR 0014](adr/0014-alerting-rules-engine.md)). |
 | `saturation_sustain_samples` | int | _unset_ | raise a `saturation` alert (BACKLOG #93, [ADR 0014 amendment](adr/0014-alerting-rules-engine.md)) when an outbound lane's pending backlog is **rising sustained** over this many consecutive samples — the queue **derivative** (ingest > drain), distinct from the absolute depth/age ceilings above. A bursty-but-**draining** lane (spike then fall) never fires; only a lane whose depth climbs monotonically does. **Unset (the default) = OFF** — deny-by-default/opt-in (it overlaps `buildup_max_oldest_seconds`'s age dimension). Floor of 2 (fewer can't tell a burst from sustained growth). Global-only for now; a per-outbound override is a documented follow-up (a `[[alerts.rules]]` `connection` glob with `transports = []` can suppress it for a known-bursty feed in the interim). |
 | `priority` | enum | `normal` | **global DR / priority tier default** for every connection (#61, [ADR 0048](adr/0048-third-tier-disaster-recovery-standby.md)). A connection declaring no `priority=` of its own inherits this; resolution order is per-connection override > this global default > the built-in `normal`. The total order is `critical > normal > low`, and the [`[dr]`](#dr--third-tier-disaster-recovery-standby) run-profile starts only connections whose resolved rank is at or above `[dr].priority_threshold`. It governs **when a connection runs**, never what it does. `normal` keeps every connection at the same tier, so a deployment that never enables DR is byte-unchanged. An unknown value fails config load. |
-| `outbox_workers` | int | — | **accepted-but-ignored** (planned): delivery concurrency. Not a `DeliverySettings` field — worker topology is set by `[pipeline].claim_mode` today |
-| `dead_letter` | enum | — | **accepted-but-ignored** (planned): `keep`/`drop`-after-N. Not a `DeliverySettings` field — a finite `retry_max_attempts` is what dead-letters a row today |
+| `outbox_workers` | int | — | **REFUSED** — not a `DeliverySettings` field, and an unrecognized key now fails the start rather than loading silently. Worker topology is set by `[pipeline].claim_mode` today |
+| `dead_letter` | enum | — | **REFUSED** — not a `DeliverySettings` field, and an unrecognized key now fails the start rather than loading silently. A finite `retry_max_attempts` is what dead-letters a row today |
 
 ### `[pipeline]`
 | Key | Type | Default | Notes |
@@ -1486,7 +1509,7 @@ and a PHI weakening under **strict enforcement** (`enforcement = enforce`, the d
 | `require_encryption_for_remote` | bool | `true` | any off-machine access must be over TLS. Setting it `false` is the config-file twin of `--allow-insecure-bind` and rides the **same** clamp: it cannot relax a cleartext bind on a **PHI instance under `enforcement = enforce`** — note that is *enforcing*-PHI, not merely production, so a `dev` or `staging` box on shipped defaults is refused exactly like `prod`. It also does not reach `/ui` (the browser surface refuses an unprotected off-loopback bind under either escape) |
 | `serve_web_console` | bool | `true` | mount the browser ops console at `/ui` — **on by default** ([ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md)); set `false` to shrink to a JSON-only surface. Default-on applies to **local loopback** binds. On an **exposed** instance (a non-loopback bind, a declared TLS terminator, **or** a set `web_console_public_address`) the two cases diverge and it matters which you are in: a **default-on** console — one you never asked for by name — **auto-degrades to JSON-only** with only a stderr warning, so `/ui` 404s on a cleanly-started engine; an **explicit** `serve_web_console = true` stays on and then must satisfy the exposure ladder or `serve` **refuses** (exit 2) — off-loopback `/ui` requires in-process TLS or a declared terminator, and behind a declared terminator it additionally requires `web_console_public_address`. So "explicit" is what stops the silent degrade; TLS and the origin are separate refusals on top |
 | `web_console_public_address` | str | `""` | external origin when the console is exposed off-box (CSRF/CSWSH + WebAuthn RP-id) |
-| `allowed_client_networks` | list[str] | `[]` | **`[BUILT]` ([ADR 0151](adr/0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md)):** source-address allow-list for the **operator API + web console**. **Empty (the default) = no restriction.** Non-empty = a request whose client address is outside every listed network is refused **403 in middleware, before routing and before sign-in** (also covers `/ui`, `/ui/static`, `/ws/stats`). **One route is exempt for *every* source address, not just loopback: `/health`** ([`api/client_networks.py`](../messagefoundry/api/client_networks.py), `_EXEMPT_PATHS = {"/health"}`) — the tokenless liveness probe an off-box monitor or load balancer needs, and the reason this row's own diagnostic below works from a blocked address at all. Do not read the enumerated coverage as "every operator-surface route is address-gated". Entries are CIDR networks or bare hosts (`"10.20.0.0/16"`, `"2001:db8::/48"`, `"10.20.4.7"` → `/32`), IPv4 + IPv6 mixed; malformed entries are **refused at load** and valid ones are stored normalized (`10.1.2.3/24` → `10.1.2.0/24`). **Loopback is always allowed**, with no knob (the tray `/health` poll, an on-box browser, `messagefoundry check` and a container HEALTHCHECK cannot be allow-listed). **Operator surface only** — the ingest listeners keep their own peer restriction, a per-connection `source_ip_allowlist` set on the `inbound(...)` call or in `connections.toml`. Note the spelling: it is **not** a key of the `[inbound]` service-settings section (that section carries only `bind_host`, `ack_after` and `stream_inflight_budget_bytes`), and because every section model is `extra="ignore"`, writing `source_ip_allowlist` into `[inbound]` in `messagefoundry.toml` is accepted silently and does nothing. **It matches the address uvicorn reports, so it is INERT behind an UNDECLARED proxy / NAT / a bridged container** — declare the proxy in `[api].trusted_proxies` or this does nothing; `curl /health` and read `observed_client` to check. Setting it **tightens `[api].trusted_proxies` to single hosts** (a broad range would let every host inside it forge its own source address). Startup-only: a lockout costs a service restart. Defence-in-depth **behind** the host firewall, not the primary network control — read OFF-LOOPBACK-DEPLOYMENT.md first. Env: `MEFOR_SECURITY_ALLOWED_CLIENT_NETWORKS` (**comma**-separated). |
+| `allowed_client_networks` | list[str] | `[]` | **`[BUILT]` ([ADR 0151](adr/0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md)):** source-address allow-list for the **operator API + web console**. **Empty (the default) = no restriction.** Non-empty = a request whose client address is outside every listed network is refused **403 in middleware, before routing and before sign-in** (also covers `/ui`, `/ui/static`, `/ws/stats`). **One route is exempt for *every* source address, not just loopback: `/health`** ([`api/client_networks.py`](../messagefoundry/api/client_networks.py), `_EXEMPT_PATHS = {"/health"}`) — the tokenless liveness probe an off-box monitor or load balancer needs, and the reason this row's own diagnostic below works from a blocked address at all. Do not read the enumerated coverage as "every operator-surface route is address-gated". Entries are CIDR networks or bare hosts (`"10.20.0.0/16"`, `"2001:db8::/48"`, `"10.20.4.7"` → `/32`), IPv4 + IPv6 mixed; malformed entries are **refused at load** and valid ones are stored normalized (`10.1.2.3/24` → `10.1.2.0/24`). **Loopback is always allowed**, with no knob (the tray `/health` poll, an on-box browser, `messagefoundry check` and a container HEALTHCHECK cannot be allow-listed). **Operator surface only** — the ingest listeners keep their own peer restriction, a per-connection `source_ip_allowlist` set on the `inbound(...)` call or in `connections.toml`. Note the spelling: it is **not** a key of the `[inbound]` service-settings section (that section carries only `bind_host`, `ack_after` and `stream_inflight_budget_bytes`), so writing `source_ip_allowlist` into `[inbound]` in `messagefoundry.toml` is **refused at load** — it used to be accepted silently and do nothing. **It matches the address uvicorn reports, so it is INERT behind an UNDECLARED proxy / NAT / a bridged container** — declare the proxy in `[api].trusted_proxies` or this does nothing; `curl /health` and read `observed_client` to check. Setting it **tightens `[api].trusted_proxies` to single hosts** (a broad range would let every host inside it forge its own source address). Startup-only: a lockout costs a service restart. Defence-in-depth **behind** the host firewall, not the primary network control — read OFF-LOOPBACK-DEPLOYMENT.md first. Env: `MEFOR_SECURITY_ALLOWED_CLIENT_NETWORKS` (**comma**-separated). |
 | `encrypt_stored_data` | bool | `true` | PHI encrypted at rest (key from the environment) |
 | `allow_unencrypted_phi` | bool | `false` | audited escape: start a PHI instance with **no** key |
 | `allow_unencrypted_phi_under_strict_enforcement` | bool | `false` | the **second acknowledgment** required to start a PHI instance keyless under strict enforcement ([ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md)). Under `enforcement = enforce`, `allow_unencrypted_phi = true` on its own is **not** enough — `serve` still refuses to start (exit 2) unless this is also set, so the highest-risk posture (real PHI + strict enforcement) is never one flag away from plaintext at rest. Under `enforcement = warn` the single `allow_unencrypted_phi` flag still governs. With both set the instance starts with PHI bodies, summary/metadata and the error columns **unencrypted at rest**, and the startup AUDIT line names **both** flags. A **loosening** — `security_loosenings()` reports it, so it is never silent |
@@ -1503,7 +1526,7 @@ and a PHI weakening under **strict enforcement** (`enforcement = enforce`, the d
 | `sign_out_after_idle_minutes` | int | `30` | session idle timeout |
 | `max_session_hours` | int | `12` | session absolute lifetime |
 | `block_unlisted_outbound` | bool | `true` | deny-by-default egress — only allow-listed destinations send. **Leaving it unset does not apply `true`** — the internal flag stays `false` and the `[egress]` startup gate decides; see the note under this table |
-| `delete_message_bodies_after_days` | int | `30` | bounded PHI-body retention; `0` = keep indefinitely (audited). **Leaving it unset does not apply 30** — the internal window stays `0` and the `[retention]` startup gate decides (refuse under `enforce`, auto-bound to 30 under `warn`); see the note under this table |
+| `delete_message_bodies_after_days` | int | `30` | bounded PHI-body retention; `0` = keep indefinitely (audited). **Leaving it unset does not apply 30 through the desugar** — the internal window stays `0`, and the `[retention]` startup gate then defaults it to 30 days on a PHI instance under **either** enforcement dial. This row used to say the gate refuses under `enforce` and auto-bounds only under `warn`; it does not — only an **explicit** `0` reaches the refusal. See the note under this table |
 | `allow_keeping_phi_indefinitely` | bool | `false` | audited escape: unbounded PHI retention |
 | `audit_all_authorization_decisions` | bool | `false` | ePHI access is **always** audited regardless of this switch; this adds full *authorization-decision* tracing on top (off by default — forcing it on risks flooding the audit log). "Always audited" is about **coverage**, not about how hard those rows are to alter afterwards: the audit chain is only cryptographically tamper-*evident* on a **keyed** store, and its verify does not catch a truncated tail — see [`[integrity]`](#integrity) |
 | `handles_real_patient_data` | bool | *derived* | the master data-class lever (was `[ai].data_class = "phi"`). Unset ⇒ derived from the environment name — **all three built-in names (`dev`/`staging`/`prod`) now derive PHI** ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) GIVEN 1, so the default/CI path exercises the encryption/egress/retention controls rather than first meeting them in production); a genuinely-synthetic dev/CI box must set `false` **explicitly** (a loud, audited opt-out), and a custom-named env must declare it |
@@ -1519,7 +1542,7 @@ and a PHI weakening under **strict enforcement** (`enforcement = enforce`, the d
 > | Row | Reads as | Internal field with `[security]` absent | What an unconfigured PHI instance actually does |
 > |---|---|---|---|
 > | `block_unlisted_outbound` | `true` | `egress.deny_by_default = False` | the [`[egress]`](#egress) gate decides: with none of the six **counted** `allowed_*` lists `serve` **exits 2** (`allowed_smtp`/`allowed_direct` do not count); with ≥1 counted list it **flips deny-by-default on** for the transports you left empty |
-> | `delete_message_bodies_after_days` | `30` | `retention.messages_days = 0` | under `enforcement = enforce` (the default) an unbounded window **refuses to start (exit 2)**; under `warn` each *unset* window is auto-bounded to 30 days; a synthetic instance keeps bodies forever |
+> | `delete_message_bodies_after_days` | `30` | `retention.messages_days = 0` | the [`[retention]`](#retention) gate defaults each *unset* window to 30 days on a PHI instance under **both** enforcement dials; an **explicit** `0` refuses to start (exit 2) under `enforce` and warns under `warn`; a synthetic instance keeps bodies forever. This cell previously had the refuse / auto-bound split backwards |
 >
 > Neither is a silent fail-open — both paths end in a refusal or an audited flip, and `serve`
 > back-fills the `[security]` object from the resolved internal values before serving, so
@@ -1589,13 +1612,19 @@ A **complete, startable** `messagefoundry.toml` for a loopback PHI instance on a
 run as `messagefoundry serve --config <dir> --env prod` (the active environment is required and has
 no default; `--env` is the CLI layer over `[ai].environment`, which is why it is not in the file).
 
-**Three of these blocks exist only because a shipped serve gate refuses without them** — they are not
-optional garnish. An earlier version of this example carried none of the three and would have hit
-`exit 2` three times over. The four gates a stock PHI instance meets, and what satisfies each:
+**Two of these blocks exist only because a shipped serve gate refuses without them** — they are not
+optional garnish. An earlier version of this example carried neither and would have hit `exit 2`
+twice over. `[retention]` is here for a different reason, given on its own line below. This paragraph
+previously said three blocks and four refusing gates; the retention gate stopped refusing over an
+unset window when the 30-day auto-bound moved to both enforcement dials. The gates a stock PHI
+instance meets, and what satisfies each:
 **keyless PHI** → `MEFOR_STORE_ENCRYPTION_KEY` in the environment; **open egress** → at least one
 *counted* `[egress]` list (see the [`[egress]`](#egress) ⚠️ — `allowed_smtp` alone does not count);
-**unbounded retention** → `[security].delete_message_bodies_after_days` **and**
-`[retention].dead_letter_days`; **no security-notification channel** → the `[alerts]` SMTP transport.
+**unbounded retention** → nothing you must configure to boot: `serve` defaults each *unset* PHI
+window to 30 days rather than refusing, and only an **explicit** `0` is refused (see
+[`[retention]`](#retention)) — set `[security].delete_message_bodies_after_days` and
+`[retention].dead_letter_days` anyway, so the windows carry your site's numbers instead of the
+engine's floor; **no security-notification channel** → the `[alerts]` SMTP transport.
 `[logging]` and `[api]` here are illustrative, not gate-required. `backend = "sqlserver"` also needs
 the `sqlserver` extra + ODBC Driver 18 installed (see the note under [`[store]`](#store--message-store--db)).
 
@@ -1647,7 +1676,8 @@ forward_tls_ca_file = "C:/mefor/siem-ca.pem"   # required for tls unless forward
 [retention]
 # The inbound-body window is [security].delete_message_bodies_after_days above — setting
 # messages_days here is REJECTED at load (ADR 0118). Only the plumbing keys stay in this section:
-dead_letter_days = 90   # REQUIRED: an unbounded dead-letter window is its own exit 2 under enforce
+dead_letter_days = 90   # RECOMMENDED: left unset this is auto-bounded to 30 days; an explicit 0 is
+                        # an exit 2 under enforce. Set it so the window is your number, not the engine's
 # NOTE: vacuum_at / wal_checkpoint_seconds are SQLite-only and a documented NO-OP on this
 # backend = "sqlserver" store — space reclamation is a DBA operation there. Deliberately not set.
 ```

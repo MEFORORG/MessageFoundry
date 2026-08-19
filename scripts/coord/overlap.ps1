@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 <#
 .SYNOPSIS
     What every OTHER session in this repo is changing right now -- files and stated work.
@@ -258,7 +260,14 @@ if (-not $Refresh -and (Test-Path -LiteralPath $cacheFile)) {
     } catch { $map = $null }
 }
 if ($null -eq $map) {
-    $map = Build-Map
+    # @() for the SAME reason Write-JsonArray filters nulls, at the other end of the same round trip.
+    # A bare `$map = Build-Map` survives in process -- assignment preserves AutomationNull, so the
+    # zero-rows guard below still fires -- but it serializes into the cache as `"rows": null`, and the
+    # next run reads that back as `@($null)`, a ONE-element array holding $null. Count is then 1, the
+    # guard does not fire, and the table prints a phantom occupant. The hook arms this constantly:
+    # collision_gate.ps1 runs `overlap.ps1 -File ... -Json` on every gated edit and the cache is written
+    # before the -File early exit, so any bare `overlap.ps1` inside $CacheSeconds inherits it.
+    $map = @(Build-Map)
     try {
         New-Item -ItemType Directory -Force -Path (Split-Path $cacheFile) | Out-Null
         # Last-write-wins on purpose: a duplicate walk is the only cost of a race, and a lock on the

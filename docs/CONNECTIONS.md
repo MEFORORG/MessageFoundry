@@ -715,14 +715,23 @@ at the source.
 
 #### File handling & quarantine policy (ASVS 5.1.1)
 
-MessageFoundry's file surface has three parts: the **directory sources** (the local `File(...)` and
-remote `Sftp(...)`/`Ftp(...)` connectors) that ingest drop-directory files into the pipeline; the
+MessageFoundry's file surface has **at least four** parts. This list is maintained by hand, so read it
+as the current inventory and not as a closed set. The **directory sources** (the local `File(...)` and
+remote `Sftp(...)`/`Ftp(...)` connectors) ingest drop-directory files into the pipeline; the
 **opt-in HTTP uploaded-logs upload** (POST `/uploads` + the web-console delegate POST
 `/ui/uploaded-logs/upload`, [ADR 0134](adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md))
-for operator diagnostic logs; and the **attachment download** route (GET
+carries operator diagnostic logs; the **attachment download** route (GET
 `/messages/{message_id}/attachments/{attachment_id}`, [ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md))
-that serves a detached document back out. The **directory source's** handling of an untrusted drop
-directory is fixed policy (the HTTP uploaded-logs surface has its own policy block below):
+serves a detached document back out; and the **DICOM C-STORE SCP** (an inbound `DICOM(...)`,
+[ADR 0025](adr/0025-dicom-codec-store-connectors.md)) receives whole objects **pushed by a remote
+modality** over DIMSE. An earlier revision of this sentence said "three parts" and omitted the SCP;
+that enumeration was wrong — the SCP is a receiver of remote-pushed content on the same footing as the
+two HTTP routes. None of the drop-directory policy below applies to it: its size ceilings, peer
+controls and transport security are connector settings documented under
+[DICOM](#dicom--dicom-inbound-c-store-scp--outbound-c-store-scuc-echo-and-dicomweb-stow-rs-adr-0025),
+and a deploying site must set them there rather than assume this block covers them. The **directory
+source's** handling of an untrusted drop directory is fixed policy (the HTTP uploaded-logs surface has
+its own policy block below):
 
 - **Permitted type — the inbound's declared `content_type` (default `hl7v2`).** Files are selected by
   the `pattern` glob (default `*.hl7`), and every candidate is **content-sniffed against that declared
@@ -739,7 +748,17 @@ directory is fixed policy (the HTTP uploaded-logs surface has its own policy blo
 - **Maximum size.** `max_file_bytes` (default **16 MiB**, matching the MLLP frame cap). An oversize file
   is rejected by a `stat()` **before** it is read into memory (OOM / DoS guard); `None`/`0` disables it.
 - **Decompression is off by default; opt-in single-stream gzip is bomb-guarded** (ADR 0123). With no
-  `decompress=` set the connector reads raw bytes only and there is no unpacked-size surface. When
+  `decompress=` set the connector performs no decompression itself, so it materialises nothing beyond
+  `max_file_bytes` where that cap is set. An earlier revision went further and said there is "no
+  unpacked-size surface"; that was wrong — a file's *payload* can carry its own compressed stream. The
+  shipped case is a **Deflated Explicit VR LE** DICOM object, which the drop's content sniff accepts on
+  the `DICM` magic alone and which therefore reaches the pipeline with its inflated size unexamined.
+  That inflate is bounded where the object is unpacked rather than at ingest: at **16 MiB**, with no
+  per-connection knob, when a Router or Handler parses it (`guard_part10_deflate` in
+  `parsing/dicom/_inflate.py`, called from `DicomPeek.parse` and `DicomDataset.parse`), and at
+  `max_object_bytes` when an outbound C-STORE SCU forwards it. A site dropping DICOM into a watch
+  directory should size those two ceilings deliberately rather than read this bullet as saying no
+  unpacking happens. When
   `decompress="gzip"` is enabled it gunzips each drop **before** the content sniff, the AV scan, and the
   batch split (so all three see the real bytes), and `max_decompressed_bytes` (default 64 MiB) caps the
   *decompressed* size — a decompression-bomb guard the compressed-only `max_file_bytes` cap cannot
@@ -1602,7 +1621,7 @@ MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 | `presentation_contexts` | `None` → SR + common image storage + Verification | the SOP classes the SCP negotiates (transfer syntaxes default to the standard set) |
 | `calling_ae_allowlist` | `None` → any (subject to the IP gate) | only these calling AE titles may associate (fail-closed when set) |
 | `require_called_ae_title` | `True` | a peer must address this engine's `ae_title` as the called AE |
-| `max_object_bytes` | `134217728` (128 MiB) | reject a single C-STORE object larger than this **before** the durable commit (OOM/DoS guard) |
+| `max_object_bytes` | `134217728` (128 MiB) | reject a single C-STORE object larger than this **before** the durable commit (OOM/DoS guard). It is **also** the ceiling for the pre-decode **inflate** of a *Deflated Explicit VR LE* object: the SCP bound-inflates the raw received Data Set before pydicom touches it, so an over-cap deflate bomb is a DIMSE failure and is never decoded or committed. Note that `0`/`None` does not simply widen this — it removes the object-size check entirely **and tightens** the inflate ceiling to the codec default of **16 MiB**, which is what the guard falls back to when no object cap is configured |
 | `max_associations` | `10` | cap on concurrent inbound associations (connection-flood guard) |
 | `max_pdu_size` | `16384` | cap one PDU's bytes (`0` = unbounded); DoS guard |
 | `timeout_seconds` | `30.0` | ACSE/DIMSE/network timeout |
@@ -1611,7 +1630,7 @@ MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 | `tls_key_password` | `None` → unencrypted key | passphrase for a PKCS#8-encrypted `tls_key_file` (`env()`-sourced, mirroring MLLP's `MEFOR_*_TLS_KEY_PASSWORD`). An encrypted key supplied with **no/wrong** passphrase **fails fast** at startup/`check` rather than hanging on an interactive TTY prompt (there is no TTY under an NSSM service account / in a container). |
 | `tls_ca_file` | — | opt-in **mTLS**: require + verify a calling peer's client certificate |
 
-The **bind interface** is the service-level `[inbound].bind_host` (or a per-connection `bind_address`) and the **peer-IP gate** is the per-connection **`source_ip_allowlist`** — both are set on the `inbound(...)` call, not as `DICOM()` arguments. ⚠️ **`source_ip_allowlist` is *not* a key of the `[inbound]` section in `messagefoundry.toml`.** That section carries only `bind_host`, `ack_after` and `stream_inflight_budget_bytes`, and every settings section is pydantic `extra="ignore"` — so writing `source_ip_allowlist` under `[inbound]` in the service TOML is **accepted silently and does nothing**. (Verified: `InboundSettings.model_fields` is exactly those three; a loaded `[inbound].source_ip_allowlist` leaves no attribute behind, while a sibling `bind_host` survives.) `bind_address` is the same story — a per-connection keyword, not a `[inbound]` key. The reachable forms are `inbound("IB_…", DICOM(...), source_ip_allowlist=["10.20.0.0/16"])` and, for the transports available as data, the **top-level** `source_ip_allowlist` key in `connections.toml` (shown in the [`connections.toml` example](#connections-as-data--connectionstoml-adr-0007) above) — `DICOM()` is code-first only, so for a SCP it is the `inbound(...)` keyword. A non-loopback cleartext SCP is **refused at startup** unless `tls=true` (the generalized [cleartext] bind-guard — `check_dimse_tls_exposure`). `serve --allow-insecure-bind` downgrades that refusal to a warning, but the flag is **clamped** exactly as it is for the MLLP/HTTP/TCP listeners: on a PHI-classified instance under the default `[security].enforcement = enforce` the bind is refused *even with it*, so on a stock instance `tls=true` is the only way to bind off-loopback. (`host` / `called_ae_title` / `connect_timeout` on `DICOM()` are for the **Phase-2 outbound SCU** and are unused by the inbound SCP.)
+The **bind interface** is the service-level `[inbound].bind_host` (or a per-connection `bind_address`) and the **peer-IP gate** is the per-connection **`source_ip_allowlist`** — both are set on the `inbound(...)` call, not as `DICOM()` arguments. ⚠️ **`source_ip_allowlist` is *not* a key of the `[inbound]` section in `messagefoundry.toml`.** That section carries only `bind_host`, `ack_after` and `stream_inflight_budget_bytes`, and an unrecognized key in a known section is **refused at load** — so writing `source_ip_allowlist` under `[inbound]` in the service TOML **fails the start** (`serve` exit 2), naming the section and the key. It used to be accepted silently and do nothing, which is the failure mode the refusal exists to remove. (Verified: `InboundSettings.model_fields` is exactly those three; `[inbound].source_ip_allowlist` raises `unrecognized config key(s)`, while a sibling `bind_host` loads.) `bind_address` is the same story — a per-connection keyword, not a `[inbound]` key. The reachable forms are `inbound("IB_…", DICOM(...), source_ip_allowlist=["10.20.0.0/16"])` and, for the transports available as data, the **top-level** `source_ip_allowlist` key in `connections.toml` (shown in the [`connections.toml` example](#connections-as-data--connectionstoml-adr-0007) above) — `DICOM()` is code-first only, so for a SCP it is the `inbound(...)` keyword. A non-loopback cleartext SCP is **refused at startup** unless `tls=true` (the generalized [cleartext] bind-guard — `check_dimse_tls_exposure`). `serve --allow-insecure-bind` downgrades that refusal to a warning, but the flag is **clamped** exactly as it is for the MLLP/HTTP/TCP listeners: on a PHI-classified instance under the default `[security].enforcement = enforce` the bind is refused *even with it*, so on a stock instance `tls=true` is the only way to bind off-loopback. (`host` / `called_ae_title` / `connect_timeout` on `DICOM()` are for the **Phase-2 outbound SCU** and are unused by the inbound SCP.)
 
 > **Fail-closed peer controls (deny-by-default).** DICOM has no transport authentication on its own, so a **non-loopback** SCP **MUST** set a **verifiable** peer control — either a per-connection `source_ip_allowlist` (an `inbound(...)` keyword — **not** a `[inbound]` service-TOML key, see the ⚠️ above), or **mTLS** (`tls=true` **and** `tls_ca_file`, which makes the SCP require + verify a client cert). With **neither** set, a non-loopback SCP is **refused at construction** (the connection degrades per ADR 0031 startup fault isolation; surfaced under `check`/dry-run). This is the **authentication** analog of the `check_dimse_tls_exposure` cleartext bind-guard above (which is the orthogonal **confidentiality** guard): TLS-without-mTLS encrypts the channel but does **not** authenticate the peer. A **loopback** bind (`127.0.0.1`/`localhost`/`::1`, the common dev/single-box case) is exempt.
 >

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 import * as assert from "assert";
 
 import { diffMessages, parseEncoding, parseMessage, type DiffCell } from "../../hl7diff";

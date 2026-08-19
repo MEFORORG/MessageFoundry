@@ -58,6 +58,53 @@ Ambiguity is resolved by taking the **first** rule that matches, not by judgemen
 6. **If two assessors following 1–5 disagree** → **`needs-review`**, with the disagreement recorded.
    Forcing a premature verdict is what produces flip-flop; parking it is cheaper and honest.
 
+### 1.1a An off-by-default control cannot reach a `pass` — owner ruling, 2026-08-16
+
+**Rule 4 stands exactly as written, and it is strict.** Asked directly whether the rubric should be
+relaxed, the project owner ruled on **2026-08-16** that it should not: *"it can be configured" is never
+a pass*, and an off-by-default control can **never** be graded `pass`. The §1.3 tie-breaker stands with
+it. The ruling was applied to the record on the same date, and the owner accepted the consequence in
+advance — that applying it moves at least one cell **down**, which is a §2.2 cause-4 movement and not a
+regression.
+
+This subsection exists because rule 4 was being read correctly and then argued around. Three arguments
+recur; all three are now settled.
+
+1. **"The feature ships off, but every control inside it is unconditional."** That is **rule 5**, not
+   rule 4 — first ruled on 2026-08-05 and re-affirmed by the 2026-08-16 ruling. A control whose internal
+   quality is beyond reproach still does not run on a shipped default, and rule 4 asks about the
+   default. The implementation's quality belongs in the residual; it does not move the verdict.
+2. **"On the default there is no exposure, because the risk and the control appear and disappear
+   together — so a `partial` grades a harm that cannot occur."** Rejected. This is the **vacuity
+   argument**, and accepting it would make rule 4's first limb unfalsifiable: *every* off-by-default
+   control removes its own trigger, so the argument is available to all of them and discriminates
+   between none of them. A property predicated of an object the shipped default never creates is not
+   *satisfied*.
+3. **"No code change could improve the cell, so a `partial` manufactures a phantom remediation item."**
+   Rejected as a ground, and usually **false on the facts** as well. Before offering it, name the change
+   that would make the verb hold on a stock install and say why it is impossible. Flipping a default,
+   moving an optional dependency into the base dependency set, and adding a gate that refuses to start
+   are all bounded, ordinary product work — and where such a change exists the remediation is real, so
+   the item filed against it is not phantom.
+
+**What rule 4's second limb actually requires.** It is *"a gate that refuses to start when the
+precondition is absent"* — a **startup** refusal, of the whole instance. Two near-misses do not qualify,
+and both have been argued here:
+
+- **A warning is not a refusal.** Logging loudly at startup and then continuing is rule 5's second limb
+  *verbatim* ("warns rather than refusing"), so a cell whose only startup-time response to the missing
+  precondition is a log line lands **on** rule 5 rather than merely failing to earn rule 4.
+- **A request-time error on a registered route is not a startup gate.** A route that exists and answers
+  `400` or `503` because a component is missing describes a **feature being absent**, which is precisely
+  the state rule 5 grades. Rule 4's limb is about an instance declining to run at all.
+
+**Two consequences for how this is written down.** First, the owner also directed that the
+off-by-default defaults themselves be changed, filed as ordinary product work in the ledger and
+described as product changes rather than as assessment findings. Second, **this document records the
+rule and deliberately not a list of the cells it moves**: an enumeration of affected requirements over a
+closed, published requirement set hands out the complement by subtraction, so the rule is public and the
+per-requirement verdicts stay in the record of record.
+
 ### 1.2 Worked examples — the ones that actually broke
 
 These are the real disputes. They are here so the next assessor reaches the same answer.
@@ -67,7 +114,7 @@ These are the real disputes. They are here so the next assessor reaches the same
 | **5.4.3** | `na` | **Rule 1, and it moved for the same reason 11.7.1 did.** Antivirus scanning of inbound content is an **enterprise-provided** control — the deploying organisation's AV/EDR/ICAP stack over the drop directory, the SFTP landing zone and the upload path — so the verb's subject is outside the declared scope of §2. ⚠️ Previously scored `fail` under rule 3 and cited here as the worked example of one, on the reasoning that *a scan hook exists but its only shipped implementation is `_no_scan` and there is no configuration key at all, so an operator must author the scanner*. **That reasoning is still true of the code** — it simply answers rule 3's question, and rule 1 runs first. ⛔ **This `na` is WEAKER than 11.7.1's and its rationale says so on the cell:** the engine *does* ship a scan seam, so this is a control the product **could** implement, which makes the verdict conditional on the enterprise actually covering those paths. It therefore carries a **deployment requirement**, and a consult to test that premise on outbound-initiated SFTP pulls is filed in the ledger. **CLOSED by owner decision (2026-08-02); do not re-derive it.** |
 | **15.2.5** | `partial` | Rule 5, **not** rule 3. `[sandbox].mode` ships `off`, but `subprocess` mode is real and was verified by executing it. A working control that ships off. |
 | **11.7.1** | `na` | **Rule 1 — the hardest call in this table, and it moved.** The verb is *"full memory encryption is in use"*: a property of the **CPU, firmware and hypervisor**, not of the three software artifacts in §2. Outside the declared scope, so rule 1 fires before rule 3 is ever reached. **The objection this has to answer, because it is a good one:** ADR 0152's rungs 1–2 *do* ship in-engine, so the engine is not silent on this cell. But that code **reports on and gates against** the platform property — it never provides it. Reporting is not implementing (§2's first guard). ⚠️ Previously scored `fail` under rule 3 and cited here as the worked example of one. That reading was not wrong on its own terms; it answered *"does code implement the verb"* without first asking *"is the verb's subject in scope"*, and rule 1 runs first. **This cell has moved four times in eighteen days — it is CLOSED by owner decision (2026-08-02); do not re-derive it.** ⛔ It buys **no** Level 3 claim: see §2.1. |
-| **3.7.3** | `fail` | Rule 3. One off-site navigation, a bare 303, no interstitial and no cancel. `oidc_enabled=False` removes the **trigger**, not a control. |
+| **3.7.3** | `pass` | **Rule 4 — and this row is CORRECTED 2026-08-16.** It stood here as the table's worked example of a rule-3 `fail`, on the reasoning that there was *one off-site navigation, a bare 303, no interstitial and no cancel*. That described the code accurately when it was written. The interstitial was then **built**, and the record has carried this cell as `pass` since 2026-08-03 while this row went on saying `fail` — a worked example teaching the wrong answer for thirteen days. `[security].external_link_interstitial` ships `True` and `[security].organization_domains` ships **empty**, which is the strict position, so every absolute off-site destination is interstitialed out of the box and the verb is satisfied by a shipped default (`messagefoundry/config/settings.py:3743,3746`). **No live worked example of rule 3 remains in this table** — 5.4.3 and 11.7.1 both left it under rule 1 — and that is said plainly rather than patched with a substitute, because a stale example is worse than a missing one. |
 | **10.5.5** | `na` | Rule 1. The requirement is conditional — *"**when using** OIDC back-channel logout"* — and the precondition is false and unreachable by configuration. **Building it would create applicability.** |
 | **12.2.2** | `na` | Rule 1. No external-facing services on the declared scope. *Also a scoping error worth remembering: this row spent months scoring 12.3.1's verb.* |
 | **12.3.1** | `partial` | Rule 5. Raw TCP and X12 cannot speak TLS in any configuration — but a substantial control exists elsewhere (TLS-by-default store hop with a refusing gate), so partial coverage, not rule 3. |
@@ -222,6 +269,14 @@ verdicts not yet re-verified against it."*
 under one frame and carried into another, leaving at least one cell's bucket **unrecoverable from the
 record**. Where a verdict would differ under a documented opt-in, the default is scored and the delta
 is recorded in the cell's residual — never as a second column.
+
+**What that posture says about OPTIONAL COMPONENTS, written down because it was being left to
+inference.** The posture names components that a default install does **not** carry — *"SQL Server
+store"* needs the `sqlserver` packaging extra, so the assessed configuration is demonstrably not a bare
+`pip install messagefoundry`. Read the posture as exhaustive **in both directions**: an optional
+component the posture **names** is present, and one it does **not** name is at its default, which for a
+packaging extra means **absent**. Without that rule an assessor may silently assume whichever install
+set makes a cell easier to grade, and the two readings disagree about exactly the cells §1.1a governs.
 
 ---
 

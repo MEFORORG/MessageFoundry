@@ -271,6 +271,31 @@ diverge enough to warrant it; keep this root file general.
 - `/compact` before long sessions hit the limit; focus the summary on API shape and decisions
   (e.g. "preserve the connector registry and the inbound/outbound/@router/@handler interface").
 
+### Declare what your seat is for
+- **Declare at the start of a session, before the work.** A SessionStart hook asks; answering takes
+  one command, and it is what every fleet view reads:
+
+  ```
+  pwsh -NoProfile -File scripts\coord\seat.ps1 -Declare -Seat <role> -Goal "<one line>"
+  ```
+
+  Optional on the same call: `-Done "<what finished looks like>"`, `-OutOfScope "<what you will not
+  touch>"`, `-Handoff <path>`.
+- **Why this is a rule and not a nicety.** The mechanical half of the episode record has always
+  worked — a Stop hook fires `seat.ps1 -Record` and every episode carries `writes`, `touchedPaths`,
+  `dirty`, `unpushed` and `tip`. The declared half did not. Measured 2026-08-18 across the live
+  seats directory: **22 records, 1 with a goal, 1 with a seat.** So the fleet could always answer
+  *"is this seat alive and writing"* and never *"what is it trying to do"* — which is the question a
+  person actually asks. The schema was never missing; nothing fed it.
+- **The hook cannot do it for you, by design.** It stamps `goalPromptedAt`, and where the payload
+  names the session it writes a `seat` label marked `seatSource: derived:caller`. It will never
+  write a `goal`: a goal is intent, and a machine that invents one produces a record that looks
+  declared and says nothing — the hollow-record failure this repo refuses elsewhere. A derived label
+  never overwrites a declared one, and `declaredAt` stays null until somebody actually says
+  something.
+- **An undeclared seat is now visible rather than silent.** `goalPromptedAt` separates *asked and
+  ignored* from *never asked* — two states with opposite fixes that used to render identically.
+
 ### Git discipline
 - Work on a **feature branch and open a PR**; commit at logical stops, **one coherent layer per
   commit**, with clear messages. (Direct pushes to `main` are blocked by the harness, so
@@ -279,6 +304,16 @@ diverge enough to warrant it; keep this root file general.
   one-layer-per-commit changes and narrate each (respect the ledger gate — never `--no-verify` or a
   rename workaround). **Pushes, PRs, and merges need the owner's approval**: they are outward-facing
   and, with auto-merge on, a PR effectively merges to `main`.
+- **Whoever executes a push or merge announces it** — one `mail.ps1 -Send -To all` line, before
+  (heads-up: `"pushing #N now, touches X"`) and/or after (`"landed #N at <sha>, touches X, rebase if
+  BEHIND"`). Worded around the *action*, not a fixed identity — no gate enforces *who* may push a
+  branch or merge a PR, only *which* refs (`push_guard.py` blocks direct pushes to protected refs; it
+  cannot see `gh pr merge` at all), so hard-coding this to a role would leave the exact lapse case
+  silently uncovered. **Never a hold/freeze/wait request or a promise about future state** — a
+  2026-08-01 rehearsal of exactly that shape stayed "in force" for hours after the condition it named
+  had already resolved, while `main` moved four times underneath it (`docs/WORKTREES.md`, "Announcing
+  yourself"). This is an **unenforced courtesy norm, not a substitute** for `gh pr view <N> --json
+  mergeStateStatus`, which stays the only authoritative merge-state check.
 - **Never grep for the next free ADR / BACKLOG number.** Two sessions that both grep pick the *same*
   number, create differently-named files, **merge clean**, and silently corrupt the ledger (it has fired
   three times). Allocate it atomically — `pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -Title
@@ -505,6 +540,18 @@ harness process only.)
   and until it lands those five glyphs stay. **No NEW glyph vocabulary may be introduced anywhere**,
   and nothing outside those two files may adopt one.
 
+  **THE WARNING SIGN (U+26A0) IS NOT A SIXTH HOLDOUT — owner-ruled 2026-08-14, "not sanctioned".** It
+  is in neither `_CLOSED` nor `_OPEN`, so `parse_items` ignores it and it carries no status semantics
+  anywhere; it is decoration, which the rule above forbids outright. **The measured population is
+  recorded here so nobody re-derives the false zero that stalled this question once already: 496
+  occurrences across 80 files** at `ae76b9f9` — 447 under `docs/` (121 in `BACKLOG.md`, 93 in
+  `BACKLOG-CLOSED.md`, 35 in `docs/adr/`), 10 in `tests/`, 4 in `ide/`, 3 in engine source, and **zero
+  in `scripts/`, in the web console, and in this file**. Retiring them is **BACKLOG #1265**, a filed
+  migration — *not* a licence to start editing those 496 lines, and not a cp1252 hazard (the cp1252
+  gate covers `scripts/**/*.py`, which contains none of them). **Census this population only with the
+  ledger counts as a positive control** — the first attempt returned a false zero off a broken shell
+  escape, and a pattern that finds nothing anywhere is indistinguishable from a clean repo.
+
   **When you must read that alphabet, import `parse_items` from `backlog_status_check.py`. Never
   re-derive it.** It *defines* item status — the banner block ends at the first line that is neither
   blank nor a blockquote — and a hand-rolled scan is a second, silently different definition. That is
@@ -552,6 +599,24 @@ harness process only.)
   When a cell's anchor points at code that has moved or gone, say **"the cell has a stale anchor"**:
   the engine is not insecure and the vault is not broken, the *evidence* went stale — usually
   **because the code got better and the fix deleted the line the anchor quoted**.
+  - **"Elsewhere" is where, and reading it is one command.** The record is
+    `docs/security/asvs-scorecard.toml` in the separate `MessageFoundry-vault` clone, checked out
+    **beside this repository** (the same clone [`docs/LEDGER-GATE.md`](docs/LEDGER-GATE.md) describes).
+    `docs/security/` is gitignored here, so from an engine checkout `git ls-files docs/security`
+    returns **zero** — the record does not look misplaced, it looks like it does not exist, which is
+    why sessions conclude there is nothing to read. The current score, with **no** engine tree, corpus
+    or network needed, in well under a second:
+
+    ```
+    python scripts/asvs/scorecard.py --scorecard <vault>/docs/security/asvs-scorecard.toml --status
+    ```
+
+    A full verify additionally needs `--corpus` and an **explicit `--root`** naming the engine tree.
+    `--root` is REQUIRED in verify mode and `verify` refuses a root that CONTAINS the scorecard:
+    resolving anchors against the repository that stores the record produces a self-consistent, wrong
+    answer, and the vault carries its own tracked copy of `messagefoundry/` for exactly that trap to
+    fall into. **No number this tool prints is a fact without the ref pair it prints beside it** — the
+    `# asvs-verify scorecard=X engine=Y` header is part of the measurement, not decoration.
   - **Never say "vault cell", "gate cell", or "vault gate cell".** All three name the filing cabinet
     instead of the subject, and the third also fuses the checker with the checked — a cell exists
     whether or not any job is running. Measured 2026-08-12: that phrasing sent a reader looking at the

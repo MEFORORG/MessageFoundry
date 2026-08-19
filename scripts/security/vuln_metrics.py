@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Dependency-vulnerability program metrics — NIST SSDF **RV.2** evidence.
 
 Computes the dependency fast-response KPIs from REAL repo data + public feeds, so "is the program

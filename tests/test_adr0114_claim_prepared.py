@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """ADR 0114 sub-lever B (``fifo_claim_prepared``): stable claim text + retained prepared cursor
 on store-owned dedicated connections.
 

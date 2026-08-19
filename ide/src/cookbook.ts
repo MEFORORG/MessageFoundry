@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Organization and contributors
 // Cookbook — a searchable "solved problems" gallery webview (BACKLOG #104). Mirrors Corepoint's
 // cookbook of pre-built integration patterns: browse/search a recipe by name, then INSERT its real,
 // editable Python via `editor.insertSnippet` — the same insertion primitive as Insert Element
@@ -10,15 +12,7 @@
 // around it (follows home.ts's pattern: CSP, nonce, message passing, styling).
 import * as vscode from "vscode";
 import { RECIPES, searchBlob } from "./cookbookRecipes";
-
-function nonce(): string {
-  let s = "";
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 24; i++) {
-    s += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return s;
-}
+import { nonce } from "./cspNonce";
 
 function esc(s: string): string {
   // Escape quotes too, not just &<>: these values land inside double-quoted HTML attributes
