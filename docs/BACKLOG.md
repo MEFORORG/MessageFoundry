@@ -10347,6 +10347,17 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 >
 > Corroborating, same run: `test_connscale_cpu_probe.py`'s walk-timeout (#1290) failed **in the same job**, with no apt failure and 10,488 tests passing. **Two independent connscale probes failing together, both of them timing/measurement-shaped, is the signature of a loaded runner** rather than of two unrelated defects.
 
+> **A FOURTH SIGHTING QUALIFIES THE THIRD: THE SHORTFALL REPRODUCES, AND THAT CUTS THE OTHER WAY.** PR #394 run `32290943152`, `test (windows-2022, py3.14)`, **the same sweep configuration**:
+>
+>     #431   fixed_aggregate  count=12  offered=24.0  sent=36  acked=13
+>     #394   fixed_aggregate  count=12  offered=24.0  sent=36  acked=14
+>
+> **Different PRs, different runner images, same config, and the ack count lands within one of itself.** The entry above argued from MAGNITUDE that a 64 percent shortfall looks like starvation rather than an invariant failure. **That argument is weakened by this: starvation is load-dependent and should scatter. A shortfall that reproduces to within one ack across independent runs looks SYSTEMATIC** -- a limit being hit at a particular offered rate, not a runner having a bad minute.
+>
+> **Neither reading is established, and the item's severity is unchanged.** What has changed is that the cheap explanation is no longer the comfortable one: **"it is just a loaded runner" now has to explain the reproducibility**, and it does not. The store-side discriminator below remains the only thing that settles it, and this makes running it more urgent rather than less.
+>
+> **Recorded against my own earlier entry deliberately.** The magnitude argument was written the same day and is not retracted -- it is bounded by this. Leaving it unqualified would let a reader take "probably starvation" as the current state of the evidence, which it no longer is.
+
 > **IT IS ON `main`, AND IT IS CROSS-PLATFORM -- so it is not one runner's bad day.**
 >
 >     main    run 32255231838  head de896e0f  test (windows-2022, py3.14)   FAILED
