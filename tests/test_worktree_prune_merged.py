@@ -2052,3 +2052,42 @@ def test_a_detached_tree_held_by_no_other_ref_is_withheld_not_reported(
         "a detached worktree whose commits exist in no other ref was suggested for removal"
     )
     assert res["counts"]["reportOnlyHeld"] >= 1
+
+
+def test_a_worktree_holding_a_coordination_claim_is_never_reported(
+    fx: Fixture, sleeper: int
+) -> None:
+    """The commands the report emits are plain `git worktree remove`, which does NOT release claims.
+
+    This script's own -Apply path releases them (``Remove-ClaimsHeldBy``, BACKLOG #345). The reported
+    commands do not, so a reported row whose tree holds a claim hands the operator a command that
+    strands it -- and a stranded claim is worse than an orphaned worktree, because ``claim.ps1
+    -Release`` is worktree-scoped and nobody can release it once the holder is gone. Measured
+    2026-08-19: 19 of 28 live claims were already orphaned exactly that way.
+    """
+    live_record(fx, sleeper, fx.primary)
+    nested = fx.primary / ".claude" / "worktrees" / "nested"
+
+    before = run(fx, "-IdleHours", "0")
+    assert "nested" in {r["leaf"] for r in before["reportOnly"]}, (
+        "fixture regression: 'nested' must be reported BEFORE the claim, or this proves nothing"
+    )
+
+    # Derive the common dir, never type `.git/...`: in a worktree `.git` is a FILE, so the bare form
+    # resolves against the wrong place and the claim would be written where nothing reads it -- which
+    # looks exactly like the feature working.
+    common = Path(
+        _git(fx.primary, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    )
+    claims = common / "mefor-coord" / "claims"
+    claims.mkdir(parents=True, exist_ok=True)
+    (claims / "9999.json").write_text(
+        json.dumps({"key": "9999", "worktree": str(nested).replace("\\", "/"), "note": "held"}),
+        encoding="utf-8",
+    )
+
+    after = run(fx, "-IdleHours", "0")
+    assert "nested" not in {r["leaf"] for r in after["reportOnly"]}, (
+        "a worktree holding a coordination claim was suggested for removal"
+    )
+    assert after["counts"]["reportOnlyHeld"] > before["counts"]["reportOnlyHeld"]

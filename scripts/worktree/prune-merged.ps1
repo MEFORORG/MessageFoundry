@@ -918,6 +918,42 @@ function Read-OrphanLedger {
 # merely quiet is never touched by this.
 $claimsDir = if ($gitCommonDir) { Join-Path $gitCommonDir 'mefor-coord/claims' } else { '' }
 
+# --- REPORT-ONLY, second pass: a tree holding a COORDINATION CLAIM is never suggested --------------
+# This runs here rather than with the rest of the report-only computation only because $claimsDir is
+# not resolved until this point.
+#
+# WHY IT IS NEEDED AT ALL, and it is a defect the first cut of the report shipped with. The commands
+# the report emits are plain `git worktree remove`, which -- unlike this script's own -Apply path
+# (Remove-ClaimsHeldBy, BACKLOG #345) -- does NOT release the claims that worktree holds. So a
+# reported row whose tree holds a claim hands the operator a command that strands it, and a stranded
+# claim is worse than an orphaned worktree: `claim.ps1 -Release` is worktree-scoped, so once the
+# holder is gone NOBODY can release it normally, and the key reads as actively-being-built forever.
+# Measured 2026-08-19: 19 of 28 live claims were already orphaned exactly this way.
+#
+# A claim is also positive evidence the tree is NOT finished -- somebody registered work in it -- so
+# withholding is the right answer rather than emitting a release command beside the removal.
+#
+# UNREADABLE IS NOT ABSENT, same rule as Remove-ClaimsHeldBy: a claim file we cannot parse might name
+# this worktree, so it withholds. Fails closed.
+if ($reportOnly.Count -gt 0) {
+    $claimed = @{}
+    $claimUnreadable = $false
+    if ($claimsDir -and (Test-Path -LiteralPath $claimsDir)) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA SilentlyContinue)) {
+            try { $c = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop }
+            catch { $claimUnreadable = $true; continue }
+            $n = ConvertTo-Norm ([string]$c.worktree)
+            if ($n) { $claimed[$n] = $true }
+        }
+    }
+    $kept = @()
+    foreach ($r in $reportOnly) {
+        if ($claimUnreadable -or $claimed.ContainsKey((ConvertTo-Norm $r.Path))) { $reportHeld++; continue }
+        $kept += $r
+    }
+    $reportOnly = @($kept)
+}
+
 # An UNREADABLE claim belongs to the REGISTRY, not to any one worktree -- by definition we could not read
 # whose it is. So it is surveyed ONCE, here, rather than discovered inside the removal loop. Two bugs
 # came out of doing it the other way, and both are the same mistake in different clothes:
