@@ -243,8 +243,16 @@ if ($Status) {
             Write-Host "  interp   : $pinnedPy (primary checkout -- not removable)"
         }
     }
-    # A worktree whose ruff drifts off constraints.lock lints with a DIFFERENT linter than CI, and its
-    # `ruff check --fix` hook rewrites files accordingly. Compare rather than assume.
+    # A worktree whose ruff drifts off constraints.lock lints with a DIFFERENT linter than CI, so the
+    # `ruff check .` / `ruff format --check .` pass CONTRIBUTING.md asks for before a push answers a
+    # question CI will answer differently. Compare rather than assume.
+    #
+    # NARROWED 2026-08-18. This used to add "and its `ruff check --fix` hook rewrites files
+    # accordingly", which held while the ruff hooks were `language: system` and ran whatever ruff was
+    # on PATH. They now come from the pre-commit-managed astral-sh/ruff-pre-commit repo at a pinned
+    # rev, so the commit-time hook runs its OWN ruff and a divergent .venv can no longer edit source
+    # on commit. What survives is the read-only half -- a local verdict CI does not share -- plus a
+    # hand-run `ruff check --fix`, which still rewrites files. That is why this check stays.
     $wantRuff = (Select-String -Path (Join-Path $RepoRoot "constraints.lock") -Pattern '^ruff==(\S+)' -EA SilentlyContinue)
     if ($wantRuff) {
         $want = $wantRuff.Matches[0].Groups[1].Value
@@ -407,8 +415,9 @@ Copy-Item (Join-Path $RepoRoot "scripts\hooks\durability_push.sh") $postCommit -
 # header). A patch here would also be futile: `pre-commit install` rewrites the file from its template,
 # so anything spliced in is erased the next time anyone runs it.
 #
-# There are two real problems with the generated shim in a multi-worktree checkout. Both are REPORTED
-# by -Status and both have a supported remedy that needs no patching:
+# Two real problems with the generated shim in a multi-worktree checkout. The first is LIVE and is
+# reported by -Status; the second is FIXED, and is kept here because the fix is undone by writing one
+# new hook, and because this is the text somebody reads while a hook is red at them:
 #
 #   1. INSTALL_PYTHON is hardcoded to whichever checkout last ran `pre-commit install` -- here it was
 #      MessageFoundry-ledger's .venv, a DISPOSABLE worktree. Delete that worktree and the fallback
@@ -417,16 +426,29 @@ Copy-Item (Join-Path $RepoRoot "scripts\hooks\durability_push.sh") $postCommit -
 #      REMEDY: run `pre-commit install` from the PRIMARY checkout, whose .venv is not disposable. That
 #      is pre-commit's own mechanism for repointing it -- no third-party edit to its file.
 #
-#   2. ruff/bandit/ledger-gate/forbidden-content are `language: system` -- deliberately, so pre-commit
-#      cannot disagree with the CI/dev ruff on a version. But `language: system` resolves from PATH, so
-#      the hooks need a venv on PATH. Measured from a bare PATH: `ruff` not found.
-#      REMEDY: commit from a shell with the worktree's .venv activated (the documented workflow).
+#   2. RETIRED 2026-08-18 -- recorded so it is not rewritten under a new hook id. The two ruff hooks
+#      were `language: system`, on the reasoning that sharing one installed ruff with CI made a
+#      version disagreement impossible. The reasoning was sound and the mechanism was not:
+#      `language: system` resolves `entry:` as a bare program name on PATH, `ruff` is on no ambient
+#      PATH here, and this shim execs a venv's python.exe DIRECTLY -- which does not put that venv's
+#      Scripts on PATH. Measured from a bare PATH: `ruff` not found, in the primary checkout too.
+#      The remedy this file used to print was "commit from a shell with the worktree's .venv
+#      activated", which is not available to an agent session at all -- shell state does not survive
+#      between tool calls -- so the apparent remedy was `--no-verify`, and that drops the ledger gate
+#      and the leak gate along with ruff. The ruff hooks now come from the pre-commit-managed
+#      astral-sh/ruff-pre-commit repo at a pinned rev and need no venv; the hooks still on
+#      `language: system` name only `python`, which the Windows Python Manager shim puts on the
+#      ambient PATH, and tests/test_lint_scope_parity.py reds on a `language: system` entry naming
+#      anything else. Note bandit was never in this set -- it is a hosted PyCQA/bandit hook.
 #
-# The sharper half of (2) is version drift, not absence, and -Status checks it: a worktree whose ruff
-# disagrees with constraints.lock lints with a DIFFERENT linter than CI *and* its `ruff check --fix`
-# hook rewrites files to match. Measured 2026-07-29: one worktree carried ruff 0.16.0 against
-# pyproject's `<0.16` cap (installed standalone, so nothing capped it), producing ~829 findings CI does
-# not have, and stripping `# noqa` directives the pinned 0.15.22 still wants.
+# VERSION DRIFT IS A DIFFERENT PROBLEM FROM (2) AND IS STILL LIVE, which is what -Status checks: a
+# worktree whose ruff disagrees with constraints.lock lints with a DIFFERENT linter than CI. Measured
+# 2026-07-29: one worktree carried ruff 0.16.0 against pyproject's `<0.16` cap (installed standalone,
+# so nothing capped it), producing ~829 findings CI does not have, and stripping `# noqa` directives
+# the pinned 0.15.22 still wants -- through `ruff check --fix`, which at that time was ALSO the commit
+# hook, so a divergent venv rewrote source on commit. That commit-time half died with the move above.
+# The read-only half did not: CONTRIBUTING.md tells a developer to run ruff by hand before pushing,
+# and that run is the venv's.
 
 # Git for Windows does not need the exec bit, but a WSL/Linux checkout of the same repo would.
 if ($IsLinux -or $IsMacOS) { & chmod +x $commitMsg; & chmod +x $prePush; & chmod +x $postCommit }
