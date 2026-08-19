@@ -10203,3 +10203,108 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Documentation / adopter-facing. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0). The cost today is that someone evaluating the project cannot see how its authors think about the threat surface, or what responsibility their own Handler code would carry.
+
+## 1290. connscale CPU-probe process-table walk times out on hosted Windows runners, reddening a required context on main
+
+> 🔢 **Filed 2026-08-19 -- not started. A REQUIRED STATUS CHECK IS INTERMITTENTLY RED ON `main`, AND THE TEST THAT FAILS CANNOT ASSESS THE REGRESSION IT EXISTS TO CATCH WHEN IT DOES.** `tests/test_connscale_cpu_probe.py::test_subtree_re_resolution_picks_up_a_late_spawned_child` fails on the `walked_ok` assertion ([`test_connscale_cpu_probe.py:309`](../tests/test_connscale_cpu_probe.py)): the process-table walk returned `None` on **every one of 6 attempts in 30s**, the Windows path allowing 5s per walk. **THE CHANGE: make the walk's deadline survive a loaded hosted runner, or degrade a walk-level timeout to a skip rather than a failure.**
+
+> **IT IS ON `main`, NOT ON A BRANCH -- that is what makes it a queue problem rather than one PR's problem.** CI run `32255231838`, head `de896e0f`, event `push`, failing job **`test (windows-2022, py3.14)`** -- which is one of the 13 REQUIRED contexts. Every PR that follows inherits the same exposure.
+
+> **IT IS NONDETERMINISTIC, AND THAT IS MEASURED RATHER THAN ASSUMED.** The identical leg on PR #448 (`test (windows-2022, py3.14)`, same runner image, same hour) returned **SUCCESS**. Same test, same required leg, opposite outcomes, and neither branch touches this subsystem -- #448 changes `scripts/coord/overlap.ps1`. **Do not read this as "flaky, ignore it":** this repository's two famous flakes turned out to be a livelock and a test that was right, so the label is earned here only by the cross-branch pair above.
+
+> **CONFIRMED ON THE SAME HEAD, which is stronger than the cross-branch pair.** Re-running the failed job alone (`gh run rerun 32255523152 --failed`, PR #447 head `4ccbf816`, no code change) returned **`completed/success`**. Identical commit, identical leg, opposite outcome -- so the failure cannot be a property of the tree under test. **Note what this does and does not establish:** it settles nondeterminism, and it says nothing about how often the walk fails or under what runner load, which is what an actual fix has to be sized against.
+
+> **THE FAILING ASSERTION IS THE ONE THE TEST'S OWN AUTHOR SEPARATED OUT AS AN ENVIRONMENT PROBLEM.** The test deliberately splits *"the probe could not enumerate at all"* from *"it enumerated and missed a live child"*, so the two cannot be confused. It fails on the **first**; the re-resolution regression assertion below it **never runs**. So while this is red, the test is not merely failing -- it is **silent on the defect it was written to detect**, which is the worse half.
+
+> **THIS IS NOT NEW, AND THE RECORD IS IN THE TEST.** Its own comment records the same class on 2026-07-30: *failed twice in one job on windows-2025, while windows-2022 and ubuntu passed the identical commit.* The runner that fails has since changed; the class has not.
+
+> **DO NOT MERGE THIS INTO EITHER NEIGHBOURING ITEM -- different causes, same file family.** #1014 is a **fixed 24-port block collision** in `test_connscale_smoke_end_to_end`, whose `flaky(reruns=2)` marker hides a determinate resource contention. #1210 arm 2 is **FD/RSS provenance** in the same probe -- the sum carries no record of the PID set it covered. Neither is a walk that never completes. `docs/BACKLOG.md` carried **zero** items on the walk timing out when this was filed; the search that returned that zero returns hits for the same tokens in the test file, so the null is a real null.
+
+**Cluster:** CI reliability / load-harness probe. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- `harness/load/` is test infrastructure and ships in no engine path. The cost is a required context that randomly blocks the merge queue, and a regression assertion that is inert exactly when the probe is under stress.
+
+## 1291. Get-HandledTools returns NULL on its zero-tool and missing-file paths, correct only by its caller's grace
+
+> 🔢 **Filed 2026-08-19 -- not started. THIS IS A LATENT TRAP, NOT A LIVE DEFECT, AND THE DISTINCTION IS THE ITEM.** `Get-HandledTools` in [`scripts/worktree/install-gate.ps1`](../scripts/worktree/install-gate.ps1) returns `$null` rather than an empty array on two of its paths. **Shipped behaviour is correct today** because its single caller (around line 294) wraps the result in `@(...)`. **A commit message or item claiming a present-tense bug here would be false.** The honest claim: the function is correct only by its caller's grace, and the guarantee belongs in the function. **THE CHANGE: make both exit paths return an array unconditionally.**
+
+> **MEASURED, in pwsh 7, by extracting the function through the PowerShell AST rather than running it:**
+>
+>     missing file   ->  NULL
+>     zero tools     ->  NULL
+>     one tool       ->  type=String    count=1
+>     two tools      ->  type=Object[]  count=2
+>
+> The one-tool arm is the sharp edge: a bare `String` answers `.Contains('Edi')` with **True**, so a membership test against a single handled tool silently succeeds on a substring of it.
+
+> **BOTH EXIT PATHS UNROLL -- a tail-only fix leaves the worse one broken.** The early `if (-not (Test-Path ...)) { return @() }` returns NULL exactly as the closing `@($tools)` does, and **that early path is the normal one on a box where the gate was never installed** -- which is every fresh checkout. Fixing only the tail repairs the case that is already hardest to reach and leaves the common one.
+
+> **A TEST THROUGH `-Status` CANNOT DISTINGUISH FIXED FROM UNFIXED**, because that caller re-wraps. The discriminating test must call `Get-HandledTools` **directly** and assert **type and count** on the zero-element, one-element and missing-file arms.
+
+> **AND IT CANNOT BE REACHED BY DOT-SOURCING: loading `install-gate.ps1` PERFORMS A MACHINE-GLOBAL INSTALL.** The sanctioned route is AST extraction -- `ParseFile` plus `FunctionDefinitionAst` -- which is about five lines and was confirmed working while measuring the table above. Any test written for this item must use it; a dot-source in a test would install the gate on whatever machine ran the suite.
+
+> **Fix, and it should match the one spelling its sibling introduces:** `return ,@($tools)` at the tail and `return ,@()` at the early return. PR #447 fixes the adjacent `-Status` unroll in the same file with `return ,$wired`; this is the same class, found while measuring that one, and left unfixed there because that branch was already pushed and its author stopped writing code.
+
+**Cluster:** Worktree gate / PowerShell correctness. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0), and no live defect axis either -- `scripts/worktree/` is developer tooling and the caller currently compensates. The cost is that the next caller written against this function inherits a NULL its signature does not advertise.
+
+## 1292. connscale smoke reports a message acked but not observed at intake, and nothing discriminates harness race from real intake loss
+
+> 🔢 **Filed 2026-08-19 -- not started. THE ASSERTION THAT FIRES NAMES AN ACKED-BUT-UNREAD MESSAGE, AND THAT IS EITHER A HARNESS RECONCILIATION RACE OR A COUNT-AND-LOG VIOLATION. NOBODY HAS SEPARATED THE TWO, AND THEY HAVE VERY DIFFERENT SEVERITIES.** `tests/test_connscale_smoke.py::test_connscale_smoke_end_to_end` trips `assert r.no_loss.ok` with:
+>
+>     ('fixed_aggregate', 24, 'engine_read 34 < confirmed sent 35 (lost 1 on intake);
+>      1 unconfirmed send(s) (no ACK before connection close) not observed at intake
+>      -- not counted as loss')
+>
+> **Read the parenthetical carefully -- it is what makes this item worth filing.** The harness already excludes the benign case: a send with no ACK before close is explicitly *not counted as loss*. The one it is complaining about is a **confirmed** send. **THE CHANGE: discriminate the two causes before treating this as a flake.**
+
+> **WHY THE DISTINCTION IS THE WHOLE ITEM.** `CLAUDE.md` section 2's count-and-log invariant is that every received message is persisted **before** the ACK, so nothing is accepted-and-dropped. A message that was **acked** and then **not observed at intake** is, on its face, that invariant failing. **It is at least as likely that the harness reconciles a counter across a window that can close mid-flight** -- which is a test defect and nothing more. **Neither has been demonstrated.** Filing it as "flaky" picks the comfortable branch without evidence, and that is precisely the named-cause-retires-a-finding trap.
+
+> **SEVERITY, STATED IN THE CONDITIONAL PER SECTION 0.** If it is the harness, cost is CI noise. If it is real, it **would** mean a deploying site could lose an acked message at intake -- the one thing the staged pipeline's ACK-on-receipt design exists to prevent. **No live instance is affected, because there are none.** The item is P1 on the strength of the branch that has not been ruled out, not on a demonstrated defect.
+
+> **IT IS ON `main`, AND IT IS CROSS-PLATFORM -- so it is not one runner's bad day.**
+>
+>     main    run 32255231838  head de896e0f  test (windows-2022, py3.14)   FAILED
+>     PR #448 run 32259244062  rebased head   test (ubuntu-latest, py3.14)  FAILED
+>
+> Two operating systems, two branches. On `main` the record read `count=12, sent=36, acked=36`; on #448 `count=24, engine_read=34, sent=35`. **Same assertion, different shapes** -- which is itself evidence against a single fixed off-by-one.
+
+> **IT ALREADY HAS `@pytest.mark.flaky(reruns=2)` AND FAILED ANYWAY.** So it did not merely lose a coin toss; **it exhausted its retries.** A retry budget that is already being spent is not a mitigation, it is a mask -- and it is the same masking #1014 records for this file's port allocation.
+
+> **DO NOT FOLD THIS INTO ITS NEIGHBOURS.** #1014 is a **fixed 24-port block collision** in this same test -- a bind failure, not a delivery count. #1290 is the **CPU-probe process-table walk timing out**, a different test in the same suite. This is a **reconciliation** assertion. All three are live at once, which is the actual reason the merge queue keeps stalling: two of them sit inside the REQUIRED `test (...)` contexts, so any PR can inherit either.
+
+> **FIRST STEP THAT IS NOT A GUESS:** make the harness record, for the specific message it counts as lost, whether an ingress row exists in the store. That answers "acked but not persisted" versus "persisted but not counted" directly, and it is the discriminator neither the current assertion nor a re-run can supply.
+
+**Cluster:** CI reliability / intake accounting. **Priority:** P1. **Verdict:** build.
+**Severity:** no deployment axis today (sec. 0 -- zero instances). Rated P1 because the unexcluded branch is a count-and-log invariant failure, and because it is currently red on `main` inside a required context.
+
+## 1293. removing a worktree orphans every unlanded ledger number it allocated, permanently stranding those PRs
+
+> 🔢 **Filed 2026-08-19 -- not started. LEDGER OWNERSHIP IS A PATH-STRING COMPARISON AGAINST A DIRECTORY THAT CAN CEASE TO EXIST, AND WHEN IT DOES, `owns()` RETURNS FALSE FOR EVERY SESSION FOREVER.** `Checker.owns` ([`scripts/hooks/ledger_check.py:219-231`](../scripts/hooks/ledger_check.py)) reads `<git-common-dir>/mefor-coord/alloc/<kind>/<number>.json` and compares `self.repo` to the recorded `worktree`, casefolded. **There is no fallback for a recorded worktree that is gone.** Ownership is documented as non-transferable, so nothing can re-key it. **THE CHANGE: give an orphaned allocation a defined recovery path.**
+
+> **THIS IS NOT HYPOTHETICAL -- PR #397 IS STRANDED BY IT RIGHT NOW, AND IT IS SITTING IN THE MERGE QUEUE.** Measured:
+>
+>     BACKLOG #1264 allocated by   a session worktree, recorded in its alloc claim
+>     that directory                does not exist, and is not in `git worktree list`
+>     #1264 on origin/main          NO  (0 occurrences of its heading)
+>     PR #397                       DIRTY, and its only conflict is docs/BACKLOG.md
+>
+> **The combination is what strands it.** The conflict needs a resolution commit; the resolution re-introduces a heading that is not yet on `main`, which the gate treats as an **addition**, so ownership is consulted; and ownership can never again be satisfied. **A one-file, purely mechanical ledger conflict is therefore unresolvable by anybody.**
+
+> **THE FAILURE IS SILENT UNTIL THE COMMIT, WHICH IS THE EXPENSIVE MOMENT.** Nothing warns at worktree-removal time, nothing warns when the PR goes DIRTY, and the refusal arrives only when someone has already done the resolution work. The gate is **failing closed and is behaving correctly** -- the defect is that there is no route back, not that it refuses.
+
+> **THREE CANDIDATE ROUTES, none obviously right, which is why this needs a decision rather than a patch:**
+>
+>     recreate a worktree at the recorded PATH   restores the comparison's referent; the gate keys on
+>                                                the string, so this works -- but it is uncomfortably
+>                                                close to the rename-workaround CLAUDE.md sec. 5 forbids
+>     an explicit `alloc.ps1 -Reassign <n>`      honest and auditable, but it puts a hole in the
+>                                                non-transferable rule the gate rests on
+>     let a MISSING owner directory fall through  narrowest, and it fails OPEN exactly once per number --
+>       to the CI behaviour (ownership skipped)   needs care that "missing" cannot be forged
+>
+> **Whichever is chosen, it must not be "widen the gate".** The `--ci` leg already skips ownership by design (`not self.ci and not self.owns(...)`, `ledger_check.py:266` and `:355`), so a green CI is **not** evidence a number was properly allocated -- that hole should not be made bigger.
+
+> **THE OPERATIONAL RULE THAT FALLS OUT, AND IT IS WORTH ADOPTING EVEN IF THE FIX IS DEFERRED:** before removing a worktree, check whether it owns any allocation whose item is not yet on `main`. That sweep is cheap -- read each `alloc/*/<n>.json`, match `worktree` against the removal list, and grep `origin/main`'s ledger for the heading. **It was run against the 16 worktrees proposed for removal on 2026-08-19 and returned zero**, with #1264 used as the positive control to prove the sweep can actually detect the class.
+
+**Cluster:** Ledger gate / worktree lifecycle. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- this is developer tooling. The cost is a PR that cannot be landed by anyone and a ledger number burned with no way to reuse it, plus the sweep above being folk knowledge until it is written into the removal path.
