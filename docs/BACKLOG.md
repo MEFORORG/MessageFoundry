@@ -10246,3 +10246,33 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Worktree gate / PowerShell correctness. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0), and no live defect axis either -- `scripts/worktree/` is developer tooling and the caller currently compensates. The cost is that the next caller written against this function inherits a NULL its signature does not advertise.
+
+## 1292. connscale smoke reports a message acked but not observed at intake, and nothing discriminates harness race from real intake loss
+
+> 🔢 **Filed 2026-08-19 -- not started. THE ASSERTION THAT FIRES NAMES AN ACKED-BUT-UNREAD MESSAGE, AND THAT IS EITHER A HARNESS RECONCILIATION RACE OR A COUNT-AND-LOG VIOLATION. NOBODY HAS SEPARATED THE TWO, AND THEY HAVE VERY DIFFERENT SEVERITIES.** `tests/test_connscale_smoke.py::test_connscale_smoke_end_to_end` trips `assert r.no_loss.ok` with:
+>
+>     ('fixed_aggregate', 24, 'engine_read 34 < confirmed sent 35 (lost 1 on intake);
+>      1 unconfirmed send(s) (no ACK before connection close) not observed at intake
+>      -- not counted as loss')
+>
+> **Read the parenthetical carefully -- it is what makes this item worth filing.** The harness already excludes the benign case: a send with no ACK before close is explicitly *not counted as loss*. The one it is complaining about is a **confirmed** send. **THE CHANGE: discriminate the two causes before treating this as a flake.**
+
+> **WHY THE DISTINCTION IS THE WHOLE ITEM.** `CLAUDE.md` section 2's count-and-log invariant is that every received message is persisted **before** the ACK, so nothing is accepted-and-dropped. A message that was **acked** and then **not observed at intake** is, on its face, that invariant failing. **It is at least as likely that the harness reconciles a counter across a window that can close mid-flight** -- which is a test defect and nothing more. **Neither has been demonstrated.** Filing it as "flaky" picks the comfortable branch without evidence, and that is precisely the named-cause-retires-a-finding trap.
+
+> **SEVERITY, STATED IN THE CONDITIONAL PER SECTION 0.** If it is the harness, cost is CI noise. If it is real, it **would** mean a deploying site could lose an acked message at intake -- the one thing the staged pipeline's ACK-on-receipt design exists to prevent. **No live instance is affected, because there are none.** The item is P1 on the strength of the branch that has not been ruled out, not on a demonstrated defect.
+
+> **IT IS ON `main`, AND IT IS CROSS-PLATFORM -- so it is not one runner's bad day.**
+>
+>     main    run 32255231838  head de896e0f  test (windows-2022, py3.14)   FAILED
+>     PR #448 run 32259244062  rebased head   test (ubuntu-latest, py3.14)  FAILED
+>
+> Two operating systems, two branches. On `main` the record read `count=12, sent=36, acked=36`; on #448 `count=24, engine_read=34, sent=35`. **Same assertion, different shapes** -- which is itself evidence against a single fixed off-by-one.
+
+> **IT ALREADY HAS `@pytest.mark.flaky(reruns=2)` AND FAILED ANYWAY.** So it did not merely lose a coin toss; **it exhausted its retries.** A retry budget that is already being spent is not a mitigation, it is a mask -- and it is the same masking #1014 records for this file's port allocation.
+
+> **DO NOT FOLD THIS INTO ITS NEIGHBOURS.** #1014 is a **fixed 24-port block collision** in this same test -- a bind failure, not a delivery count. #1290 is the **CPU-probe process-table walk timing out**, a different test in the same suite. This is a **reconciliation** assertion. All three are live at once, which is the actual reason the merge queue keeps stalling: two of them sit inside the REQUIRED `test (...)` contexts, so any PR can inherit either.
+
+> **FIRST STEP THAT IS NOT A GUESS:** make the harness record, for the specific message it counts as lost, whether an ingress row exists in the store. That answers "acked but not persisted" versus "persisted but not counted" directly, and it is the discriminator neither the current assertion nor a re-run can supply.
+
+**Cluster:** CI reliability / intake accounting. **Priority:** P1. **Verdict:** build.
+**Severity:** no deployment axis today (sec. 0 -- zero instances). Rated P1 because the unexcluded branch is a count-and-log invariant failure, and because it is currently red on `main` inside a required context.
