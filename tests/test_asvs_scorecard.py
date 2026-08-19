@@ -3264,24 +3264,32 @@ def test_the_base_line_reports_the_spread_not_one_commit(tmp_path: Path) -> None
     assert "**Anchor commit:**" not in doc
 
 
-def test_an_unmeasured_distance_says_so_and_is_never_rendered_as_zero(tmp_path: Path) -> None:
-    """An absent distance and a distance of ZERO are different claims.
+def test_the_rendered_line_never_carries_a_commit_distance(tmp_path: Path) -> None:
+    """A COMMITTED artifact may only carry facts derived from the RECORD.
 
-    Silently omitting the span would restore exactly the one-number impression this line exists to
-    remove -- the reader would take the remaining figures as complete.
+    The first version of this line printed "spanning N to M commit(s) behind the checked tree", where
+    the checked tree is engine `main` -- which moves. Measured against one real `verified_at`:
+    459 commits behind `origin/main`, 458 behind `main~1`, 457 behind `main~2`. So every engine commit
+    changed a committed file, and `render-drift` would have gone red on every unrelated engine merge:
+    a gate whose resting state is red, which is the antipattern filed as BACKLOG #320 the same day.
 
-    Falsified by dropping the `else` branch in `_base_line`: NOT MEASURED disappears and the line
-    renders as though distance were simply not relevant.
+    The distance is not discarded -- it prints to stderr in the verify summary. It just cannot live in
+    a file.
+
+    Falsified by restoring the `spanning ... behind the checked tree` clause in `_base_line`.
     """
     cells = [
-        Cell(id="1.1.1", level=1, verdict="pass", last_verified="2026-08-01", verified_at="a" * 40)
+        Cell(id="1.1.1", level=1, verdict="pass", last_verified="2026-08-01", verified_at="a" * 40),
     ]
     spread = base_spread(cells, "a" * 40)
-    assert spread.behind == {}  # base_spread is pure: it never measures distance
-    assert "NOT MEASURED" in _base_line("a" * 40, spread)
-    # And when it IS measured, the span renders as a range.
-    measured = replace(spread, behind={"a" * 40: 7})
-    assert "spanning 7 commit(s) behind" in _base_line("a" * 40, measured)
+    # Even when distances ARE supplied, the rendered line must not mention them.
+    line = _base_line("a" * 40, replace(spread, behind={"a" * 40: 459}))
+    assert "459" not in line
+    assert "behind" not in line
+    assert "spanning" not in line
+    # The record-derived facts are still there, and they move only when the record moves.
+    assert "1 distinct engine tree(s) across 1 of 1 cell(s)" in line
+    assert "where 1 of 1 cell(s) sit" in line
 
 
 def test_at_anchor_compares_on_the_prefix_because_the_two_fields_have_different_widths(

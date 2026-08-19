@@ -31,7 +31,7 @@ import time
 import tokenize
 import tomllib
 from collections import Counter
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, Literal, get_args
 
@@ -1910,15 +1910,21 @@ def _base_line(anchor_sha: str, spread: BaseSpread | None) -> str:
         f"**Verdict bases:** {spread.refs} distinct engine tree(s) across "
         f"{spread.with_ref} of {spread.total} cell(s)"
     ]
-    if spread.behind:
-        lo, hi = min(spread.behind.values()), max(spread.behind.values())
-        # ONE number when they coincide. "spanning 6 to 6 commits" reads as a measurement error.
-        span = f"{lo}" if lo == hi else f"{lo} to {hi}"
-        bits.append(f"spanning {span} commit(s) behind the checked tree")
-    else:
-        # NEVER silently omit this. An absent distance and a distance of zero are different claims,
-        # and the whole defect being fixed here is a number presented without what bounds it.
-        bits.append("distance to the checked tree NOT MEASURED")
+    # NO COMMIT DISTANCE IN THE RENDERED LINE, and leaving it out is the correction rather than an
+    # omission. The first version printed "spanning N to M commit(s) behind the checked tree", where
+    # the checked tree is engine `main` -- which MOVES. Measured against one real `verified_at`:
+    #
+    #     distance to origin/main      459
+    #     distance to origin/main~1    458
+    #     distance to origin/main~2    457
+    #
+    # So EVERY engine commit changes this line, and this line is COMMITTED. The render-drift gate
+    # would then be red on every unrelated engine merge -- a gate whose resting state is red, which is
+    # the exact antipattern filed as BACKLOG #320 the same day, reintroduced by its own author.
+    #
+    # A committed artifact may only carry facts derived from the RECORD, which change when the record
+    # changes. The distance is genuinely useful and is not discarded: it prints to stderr in the verify
+    # summary, where it is read by a human and committed by nobody.
     if spread.without_ref:
         bits.append(f"{spread.without_ref} cell(s) record no base at all")
     # The anchor stays, demoted to what it actually is: where the EVIDENCE was last re-read, with the
@@ -2566,16 +2572,39 @@ def main(argv: list[str] | None = None) -> int:
         # function of the cells. Keeping it pure is what lets the renderer be unit-tested against a
         # fixture with no repository at all.
         spread = base_spread(cells, anchor)
-        distances = ref_distances(args.root, {c.verified_at for c in cells if c.verified_at})
+        # The PURE spread goes into the file. `base_spread` reads only the record, so this line moves
+        # when the record moves and at no other time -- which is the property a committed artifact
+        # needs. See `_base_line` for what happens when a moving number gets committed.
         args.render.write_text(
-            render_current(
-                cells,
-                anchor_sha=anchor,
-                spread=replace(spread, behind=distances),
-            ),
+            render_current(cells, anchor_sha=anchor, spread=spread),
             encoding="utf-8",
         )
         print(f"rendered {args.render}")
+
+    # The distance to the checked tree, on STDERR and committed by nobody. It is real information --
+    # it is how you see that the widest cohort was verified 500 commits ago -- it simply cannot live
+    # in a file, because it changes on every engine commit rather than on every record change.
+    if args.root is not None and (refs := {c.verified_at for c in cells if c.verified_at}):
+        behind = ref_distances(args.root, refs)
+        if behind:
+            lo, hi = min(behind.values()), max(behind.values())
+            # ONE number when they coincide: "spanning 6 to 6" reads as a measurement error.
+            span = f"{lo}" if lo == hi else f"{lo} to {hi}"
+            print(
+                f"  {len(behind)} of {len(refs)} verdict base(s) resolve in the checked tree, "
+                f"spanning {span} commit(s) behind its HEAD. NOT rendered into the entry point: this "
+                "number moves on every engine commit, so committing it would red the drift gate on "
+                "merges that changed nothing about the record.",
+                file=sys.stderr,
+            )
+        else:
+            # Absent is not zero. Say which, for the same reason every other count here names its base.
+            print(
+                f"  0 of {len(refs)} verdict base(s) resolve in the checked tree, so no distance "
+                "could be measured. That is NOT a distance of zero -- the refs may predate this "
+                "checkout's history, or the tree may be shallow.",
+                file=sys.stderr,
+            )
 
     return 0 if findings.ok else 1
 
