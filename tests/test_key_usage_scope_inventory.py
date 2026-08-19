@@ -50,6 +50,10 @@ _KEY_MATERIAL = frozenset(
         "OIDC IdP JWKS verification keys",
         "OIDC IdP TLS trust anchor",
         "Cert tooling",
+        "Outbound SMTP transport TLS",
+        "Inbound XML-DSig verification",
+        "SFTP transport",
+        "SMART Backend Services client assertion",
     }
 )
 

@@ -216,10 +216,12 @@ trail.
 - **When acceptable:** a documented retention requirement that genuinely needs keep-forever, accepted in
   writing.
 - **Compensating controls:** a bounded window (e.g. 30 days); a startup **AUDIT** line records the override.
-- **Still refused:** a **PHI** instance with an unbounded PHI-body window refuses under **strict enforcement**
-  (`enforcement = enforce`, the default) unless `allow_keeping_phi_indefinitely = true` (which downgrades the
-  refusal to a loud audited warning); at `enforcement = warn` a PHI instance auto-bounds each unset window to
-  30 days.
+- **Still refused:** a **PHI** instance whose PHI-body window is set **explicitly to `0`** refuses under
+  **strict enforcement** (`enforcement = enforce`, the default) unless `allow_keeping_phi_indefinitely = true`
+  (which downgrades the refusal to a loud audited warning). This bullet used to say the 30-day auto-bound of
+  an *unset* window happened only at `enforcement = warn`. It happens on **both** dials, so the refusal above
+  is reached only by an explicit `0` — or by the opt-out itself, which suppresses the auto-bound and therefore
+  leaves an unset window unbounded.
 
 ### `allow_single_factor_admin_when_exposed = true` — lift the strict-enforcement single-factor-admin refusal
 - **What you lose:** on a **PHI** instance under **strict enforcement** (`enforcement = enforce`, the default)
@@ -295,7 +297,8 @@ trail.
   (`--allow-insecure-bind` / `MEFOR_ALLOW_INSECURE_TLS`) are **honoured** again. This reproduces the
   historical **non-production** PHI behaviour on a box that is otherwise strict-by-default: the cleartext
   off-box bind, open-egress, and single-factor-admin-at-exposure refusals downgrade to loud audited warnings,
-  and an unset PHI retention window auto-bounds to 30 days rather than refusing. Named once by
+  and an explicitly-zeroed PHI retention window warns rather than refusing. (The 30-day auto-bound of an
+  **unset** window is not part of this dial — it applies under `enforce` too.) Named once by
   `security_loosenings()` and in `GET /security/posture`.
 - **When acceptable:** a PHI **staging / pre-prod** box that must mirror production's *config* (so the
   encryption / egress / retention paths are exercised, not first met in production) but is deliberately run at
