@@ -10261,10 +10261,15 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **SEVERITY, STATED IN THE CONDITIONAL PER SECTION 0.** If it is the harness, cost is CI noise. If it is real, it **would** mean a deploying site could lose an acked message at intake -- the one thing the staged pipeline's ACK-on-receipt design exists to prevent. **No live instance is affected, because there are none.** The item is P1 on the strength of the branch that has not been ruled out, not on a demonstrated defect.
 
+> **A THIRD SIGHTING, 2026-08-19, AND ITS MAGNITUDE ARGUES AGAINST THE ALARMING BRANCH.** PR #431 run `32278742105`, `test (windows-2025, py3.14)`: `sweep_mode='fixed_aggregate', count=12, sent=36, acked=13`. **Twenty-three of thirty-six sends unacked** -- against `lost 1 of 35` in the first sighting. **A count-and-log invariant failure does not plausibly scale like that**; an engine that persists-then-acks either does so or does not, and a 64 percent shortfall looks like the harness measuring an engine that could not keep up, not one silently dropping. **It is EVIDENCE, not a verdict:** the item stays open and the discriminator below is still the thing that settles it. Recorded because the magnitude is the first data that distinguishes the two branches at all.
+>
+> Corroborating, same run: `test_connscale_cpu_probe.py`'s walk-timeout (#1290) failed **in the same job**, with no apt failure and 10,488 tests passing. **Two independent connscale probes failing together, both of them timing/measurement-shaped, is the signature of a loaded runner** rather than of two unrelated defects.
+
 > **IT IS ON `main`, AND IT IS CROSS-PLATFORM -- so it is not one runner's bad day.**
 >
 >     main    run 32255231838  head de896e0f  test (windows-2022, py3.14)   FAILED
 >     PR #448 run 32259244062  rebased head   test (ubuntu-latest, py3.14)  FAILED
+>     PR #431 run 32278742105  rebased head   test (windows-2025, py3.14)   FAILED  (sent=36 acked=13)
 >
 > Two operating systems, two branches. On `main` the record read `count=12, sent=36, acked=36`; on #448 `count=24, engine_read=34, sent=35`. **Same assertion, different shapes** -- which is itself evidence against a single fixed off-by-one.
 
@@ -10340,3 +10345,26 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Worktree lifecycle / developer tooling. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0). The cost is unbounded worktree accumulation, a manual audit nobody schedules, and disk. **Explicitly NOT a licence to widen the prune fence** -- the item is closed by adding reporting, and would be mis-implemented by adding reach.
+
+## 1295. the manual worktree-removal path strands coordination claims, and 19 of 30 are already orphaned
+
+> 🔢 **Filed 2026-08-19 -- not started. A STRANDED CLAIM IS UNRELEASABLE BY ANYONE, AND IT READS AS ACTIVELY-BEING-BUILT FOREVER.** `claim.ps1 -Release` is **worktree-scoped** -- deliberately, so no session can free a key another is mid-build on. The consequence nobody designed for: once the holding worktree is gone, **the normal release path can never be satisfied again**, and the item looks claimed to every future session. `CLAUDE.md` section 5 already records the cost -- *"a held claim on finished work looks exactly like someone actively building, and stalls the next session for days."* **THE CHANGE: release claims on the removal path that is actually used, and provide a sweep for the ones already stranded.**
+
+> **MEASURED 2026-08-19, from the claim files on disk rather than from `-List` prose:**
+>
+>     holder gone    19
+>     holder alive   11
+>     unreadable      0
+>
+> Positive control: 11 resolved **alive** in the same pass, so the directory test is not returning a blanket "gone". The 19 trace to just **six** long-dead worktrees, one of which holds eight of them.
+
+> **THE GAP IS THE PATH, NOT THE TOOL.** `prune-merged.ps1` **already** releases claims when it removes a worktree (`Remove-ClaimsHeldBy`, BACKLOG #345). But it reaches only `<repo>-<name>` siblings -- 11 of 36 registered worktrees on this clone (#1294) -- and `worktree_gate.ps1` directs everything else to a plain **`git worktree remove`**, which releases nothing. **So the sanctioned path for the majority of worktrees is precisely the one that strands claims**, and the covered path is the minority case.
+
+> **THIS ALREADY BIT THE FEATURE FILED BESIDE IT.** #1294's report-only rows emit exactly that plain `git worktree remove`, so as first written they handed the operator a command that would strand any claim the reported tree held. Fixed by withholding a claim-holding tree from the report -- but that fix protects **one** consumer of the command, not the command itself, which is why this item is separate and is about the path.
+
+> **A SWEEP IS NOT THE WHOLE FIX, AND SHOULD NOT BE CONFUSED FOR ONE.** `claim.ps1 -Release <key> -Force` clears a stranded claim today, so the 19 are recoverable by hand. That restores the registry; it does nothing to stop the twentieth. **Both halves are needed, and the ordering matters: fix the path first**, or the sweep is repeated work with a known expiry.
+
+> **DO NOT AUTO-RELEASE ON A "HOLDER GONE" TEST ALONE.** A worktree directory can be momentarily absent -- mid-move, on a disconnected drive, during a failed removal that left it deregistered (the orphan case this script already tracks). Releasing on that reading hands a live session's key away, which is the failure `Remove-ClaimsHeldBy`'s own comment calls **strictly worse than the orphan being fixed**. Whatever lands must fold the same full-path normalisation and refuse anything it cannot read.
+
+**Cluster:** Coordination registry / worktree lifecycle. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- developer coordination only. The cost is 19 backlog items currently presenting as claimed-and-in-progress when nobody is working them, which is the exact signal the registry exists to make trustworthy.
