@@ -258,13 +258,35 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"{hit.path}:{hit.lineno}: #{hit.number} resolves to no filed item{note}")
         print(f"    {hit.line}")
-        state = (
-            f"BELOW THE FLOOR ({floor}) -- the allocator only ever issues above its high-water "
-            "mark, so this number can NEVER be issued and the citation is permanently harmless."
-            if hit.number <= floor
-            else f"ABOVE THE FLOOR ({floor}) -- this number CAN still be issued to unrelated work. "
-            "This is the live shape."
-        )
+        # BACKLOG #1235: THE ANNOTATION ASKS `is_live_shape`, THE SAME PREDICATE THE EXIT CODE ASKS.
+        #
+        # It used to branch on `hit.number <= floor` ALONE and never consult `pr_shaped` -- a THIRD
+        # definition of the live-shape rule, beside the exit list and the test's copy, and it
+        # DISAGREED IN PRODUCTION rather than in principle. MEASURED at 4c28badd: six hits printed
+        # BOTH `[PR/issue/foreign-repo shaped -- very likely NOT a backlog citation]` AND `This is
+        # the live shape.` -- two contradictory annotations on the SAME hit, two lines apart -- while
+        # the process exited 0. A reader saw six live-shape citations above a green gate.
+        #
+        # It survived the single-definition refactor that is this item's own subject, which is the
+        # part worth keeping: `is_live_shape` was extracted and the exit list and the test were both
+        # repointed at it, while the branch that PRINTS the verdict to a human was left behind. The
+        # definitions a tool COMPUTES with get unified; the one it NARRATES with is easy to miss
+        # precisely because no assertion reads it.
+        if hit.number <= floor:
+            state = (
+                f"BELOW THE FLOOR ({floor}) -- the allocator only ever issues above its high-water "
+                "mark, so this number can NEVER be issued and the citation is permanently harmless."
+            )
+        elif not is_live_shape(hit, floor):
+            state = (
+                f"ABOVE THE FLOOR ({floor}), but NOT the live shape -- see the annotation above. "
+                "The exit code passes over this hit deliberately."
+            )
+        else:
+            state = (
+                f"ABOVE THE FLOOR ({floor}) -- this number CAN still be issued to unrelated work. "
+                "This is the live shape."
+            )
         print(f"    -> {state}")
 
     distinct = sorted({hit.number for hit in hits})
