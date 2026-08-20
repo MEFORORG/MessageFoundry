@@ -190,6 +190,14 @@ def test_an_ordinary_command_is_still_allowed(primary: Path, repos_file: Path) -
 # not have claimed without measuring both gates:
 #
 #     one-level escaped interpreter arg   main ALLOW -> DENY      inherited, now closed
+#
+#         bash -c "echo \\"x\\"; git -C <governed> reset --hard"
+#
+#     NAMED HERE DELIBERATELY, under the owner's ruling that a construct is published only ALONGSIDE
+#     THE FIX THAT MAKES IT INERT. This one is inert in this commit and travels in the same change,
+#     so it cannot be lifted from here and used against this tree. It is named because an unnamed
+#     improvement claim is not checkable: 'main ALLOW -> DENY' asks a reader to take the author's
+#     word for what was measured, and the whole point of the left column is that it can be re-run.
 #     two-level escaped interpreter arg   main DENY  -> DENY      my regression, repaired
 #
 # THE LEFT COLUMN IS THE POINT. A fix is not only judged against the branch it repairs; measuring
