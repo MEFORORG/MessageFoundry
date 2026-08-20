@@ -47,8 +47,12 @@ runs for the same four titles; only the last run's numbers (#248–#251) were fi
 a worktree that no longer exists, and `alloc.ps1` has no release verb by design ("holes are free,
 collisions are not"), so those claims stand permanently and the ledger gate will refuse a commit that
 files there. **#315** and **#317** are deliberate probe allocations used to verify the floor fix below;
-they are holes too. Always allocate with `scripts/coord/alloc.ps1`; never pick a number by reading this
-file.
+they are holes too. **#1297** is a hole for a different and instructive reason: it was allocated from the
+**primary checkout** because the allocating shell's working directory was the primary rather than the
+session's own worktree, so the ledger gate correctly refused the commit ("#1297 was not allocated to this
+worktree") and the item was re-filed at **#1298**. The gate did its job; the lesson is that `alloc.ps1`
+records the claim against **whatever tree it runs in**, so run it from the worktree that will commit.
+Always allocate with `scripts/coord/alloc.ps1`; never pick a number by reading this file.
 
 **If you allocated a backlog number before 2026-07-31T00:31Z, re-check it — the trigger is the
 timestamp, not the value.** That is when the floor fix landed. Any number issued before it came from a
@@ -9429,7 +9433,7 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 ## 1261. the cutover ratchet's prose pattern matches ordinary English, and the ratchet has zero slack
 
-> 🔢 **Filed 2026-08-14 - not started. THE GATE HAS FIRED ON INNOCENT PROSE AT LEAST THREE TIMES AND HAS BEEN FIXED BY EDITING THE PROSE EVERY TIME.** Value **6/10** · Difficulty **3/10** · _quick win_. The pattern in `tests/test_cutover_slug_rot.py` carries, as its **first alternative**, a bare two-word phrase whose second word is `mirror` and whose first is the definite article. It therefore matches that ordinary English noun phrase with no regard for whether the sentence concerns repository topology at all.
+> ✅ **SHIPPED 2026-08-20 -- the ratchet's fifth prose alternative now requires a topology qualifier, and the ceiling was re-baselined 52 to 41 in the same change.** Landed on `main` at `1df0c074` via PR #461 (cherry-pick of `9d781edf`). **Verified by CONTENT, not by PR state:** the `tests/test_cutover_slug_rot.py` blob is `13a711b7` on `origin/main`, on the PR head and on `9d781edf` -- all three identical. **The cumulative patch-id test does NOT match here (branch `43f5a21a` against squash `148226e6`) and that proves nothing** -- a cherry-pick onto a different base plus an update-branch breaks the equality without the work being absent. On a squash-merging repo a patch-id MATCH proves landed and a NO-MATCH proves nothing; blob identity settled it in one command. **Both ratchet assertions were rewired through the new predicate and the both-directions test the item demanded is present; two mutants each red it, so it is not one-polarity.** `main` no longer carries the bare pattern at zero slack.
 
 > **THE PATTERN HAS FIVE ALTERNATIVES AND IS DELIBERATELY NOT REPRODUCED HERE -- see the self-reference note below for why.** Read it at `tests/test_cutover_slug_rot.py`, in the `_PROSE` constant. **Four of the five are unambiguous topology terms.** The fifth is the definite article followed by the noun `mirror`, and **that is an ordinary English phrase** -- it appears naturally in sentences about a reflected assertion, or an inverted case, with no repository anywhere in view. The regex cannot tell those apart from a claim about this repository, **because nothing in it looks at the surrounding sentence.**
 
@@ -10464,3 +10468,33 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Coordination registry / worktree lifecycle. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0) -- developer coordination only. The cost is 19 backlog items currently presenting as claimed-and-in-progress when nobody is working them, which is the exact signal the registry exists to make trustworthy.
+
+## 1298. The archive dialog's permanently-discarded warning is not a loss test: a worktree behind main sees landed files as untracked
+
+> 🔢 **Filed 2026-08-20 -- not started. THE WARNING REASONS FROM "NOT IN THIS WORKTREE'S INDEX" STRAIGHT TO "WILL BE PERMANENTLY DISCARDED", SKIPPING THE ONLY QUESTION THAT DECIDES IT -- DOES THIS CONTENT EXIST ANYWHERE ELSE.** The session-archive dialog lists the worktree's dirty set and states the files "will be permanently discarded". For a `??` entry that is a statement about **this worktree's index**, not about the content. A worktree whose HEAD predates a commit sees every file that landed since as untracked, because they are absent from **its** index while being tracked on `main`. **THE CHANGE: document the three-command recoverability check as the thing a seat runs before believing the warning, and provide it as a helper so the answer is not re-derived by hand under time pressure.**
+
+> **MEASURED 2026-08-20, on a live instance of the dialog.** It warned that two files would be permanently discarded:
+>
+>     ?? tests/test_notifiable_admin.py
+>     ?? docs/adr/0167-phi-security-notification-readiness-gates-on-a-deliverable-address-...md
+>
+> Both are **tracked on `origin/main`**. `test_notifiable_admin.py` was added at `4c28badd` (PR #428), which merged **that same session**. Every local copy was **byte-identical** to main's blob in **all six** worktrees holding them -- `39e240c604393124a635107ba2dd8d8ac8c1805e` for the test, `af21f40e1fb9273183855b3a4d1da5da9fbd897f` for the ADR. Archiving would have discarded **nothing**; a checkout restores both.
+
+> **REPRODUCED ON THIS SEAT'S OWN TREE, which is what establishes the mechanism rather than the coincidence.** The cleaner worktree sat at `dd655da2`, two commits behind `origin/main`, and `git status --porcelain` showed **the identical `??` pair**. Fast-forwarding to `1df0c074` converted both to tracked with no edit and no conflict. The files never changed; the base did.
+
+> **THE FAILURE IS SYSTEMATIC AND ITS TIMING IS ADVERSARIAL.** Every session whose base is behind `main` is warned about every file that landed since it branched, on every archive, for as long as it stays behind -- so the warning is loudest exactly when the fleet is landing fastest, and wrong in precisely those cases. **Both ways of responding to it are damaging:** a seat that believes it refuses a safe archive and stalls, and a seat that learns to dismiss it will one day dismiss a warning that was real. A signal that is usually a false alarm trains the response that defeats it.
+
+> **SCOPE, STATED PLAINLY SO THE ITEM IS NOT MIS-BUILT: the dialog is the Claude Code harness and is NOT this repository's code.** Nothing here can change its wording, and an item that implies otherwise would be unbuildable. What IS in scope: a `docs/WORKTREES.md` subsection recording that the warning is an index test rather than a loss test, plus a helper under `scripts/coord/` that answers the recoverability question for a whole dirty set and prints what it examined. **A helper is worth more than the prose alone** -- the check is three commands and entirely mechanical, and it is needed at the moment a modal is open and the seat is deciding.
+
+> **THE CHECK, and its asymmetry.**
+>
+>     git fetch origin -q
+>     git cat-file -e "origin/main:<path>"          # is it on main at all?
+>     git hash-object <worktree>/<path>             # vs: git rev-parse origin/main:<path>
+>
+> An identical hash means archive freely. **Absent from main, or a differing hash, is the ONLY case the dialog's wording actually describes** -- and that case is real, so the helper must not answer "safe" by default. Anything it cannot read must count as unrecoverable, not as clean: the same rule `occupancy.ps1` states for its own fence, that a cannot-tell must never read as an all-clear.
+
+> **RELATED BUT DISTINCT, so they are not merged.** [#1293](#1293) is unlanded ledger numbers orphaned by worktree removal and [#1295](#1295) is coordination claims stranded by it; both concern what removal **destroys**. This item concerns a warning that **misreports** what removal would destroy, in the direction of a false alarm. A correct answer here does not fix either of those, and fixing those does not quiet this.
+
+**Cluster:** Worktree lifecycle / session tooling. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- developer coordination only. The cost is a routine, high-frequency prompt that is wrong in the common case, teaching seats to dismiss the one class of prompt that must not become routine.
