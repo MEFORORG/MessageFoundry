@@ -261,3 +261,40 @@ def test_an_unknown_host_gets_the_CONSERVATIVE_reading() -> None:
     assert '($tool -eq "Bash")' in gate, (
         "the opt-in must be keyed on the host, not left unconditional"
     )
+
+
+def test_an_escaped_quote_in_an_interpreter_ARGUMENT_still_reaches_the_inner_code() -> None:
+    """BACKLOG #1229 residual, THIRD round -- and the host flag alone could not close it.
+
+    THE EXTRACTION AND THE BLANKING MUST AGREE ABOUT WHERE THE ARGUMENT ENDS. The interpreter-argument
+    regex was ``[^"]*``, which is escape-BLIND and stops at the first quote INCLUDING an escaped one.
+    Once the span blanking became escape-AWARE the two disagreed::
+
+        bash -c "bash -c \\"git -C <governed> reset --hard\\""
+        extraction got  `bash -c \`   -- truncated at the escaped quote, no verb in it
+        blanking removed the whole span
+        so nothing reached any rule -> ALLOW
+
+    MEASURED: origin/main DENY x3, the escape-aware fix ALLOW x3, and the control below DENY on both.
+    The inner command really runs -- ``bash -c "bash -c \\"expr 111 \* 3\\""`` prints 333.
+
+    ON MAIN THE TWO AGREED BY ACCIDENT, both being escape-blind, which left the verb visible OUTSIDE
+    the span. Making one side escape-aware removed the accident without replacing it. **A host flag
+    cannot fix this**: the failing host is Bash, where the escape is real and honouring it is correct.
+    """
+    import tempfile
+
+    d = Path(tempfile.mkdtemp())
+    primary = d / "Repo"
+    rf = d / "repos.txt"
+    rf.write_text(f"{primary}\n", encoding="utf-8")
+    gated = f"git -C {primary} reset --hard"
+
+    escaped = f"bash -c {DQ}bash -c {ESC_DQ}{gated}{ESC_DQ}{DQ}"
+    assert_denied(run_gate(shell(escaped, d), rf))
+
+    # THE DISCRIMINATING CONTROL: identical nesting, no escape. It denies on main and on the fix, so
+    # the trigger is the ESCAPE and not the nesting -- without this row the test above would pass
+    # against a gate that simply denied anything containing `bash -c`.
+    plain = f"bash -c {SQ}bash -c {DQ}{gated}{DQ}{SQ}"
+    assert_denied(run_gate(shell(plain, d), rf))

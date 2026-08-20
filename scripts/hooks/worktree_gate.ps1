@@ -700,8 +700,29 @@ function Get-ScannableSegments([string]$Cmd, [bool]$PosixEscapes = $false) {
     # now that $sigil contributes a named group of its own.
     $inner = @()
     foreach ($ln in $lines) {
+        # THE EXTRACTION MUST AGREE WITH THE BLANKING ABOUT WHERE THE ARGUMENT ENDS
+        # (BACKLOG #1229 residual, third round). `[^"]*` is escape-BLIND: it stops at the first
+        # quote, INCLUDING an escaped one. Once Remove-QuotedSpans became escape-AWARE, the two
+        # disagreed -- and the inner code was never re-scanned:
+        #
+        #     bash -c "bash -c \\"git -C <governed> reset --hard\\""
+        #     extraction got:  `bash -c \\`   -- truncated at the escaped quote, no verb
+        #     blanking removed: the whole span     -- so nothing reached any rule  -> ALLOW
+        #
+        # MEASURED: main DENY x3, the escape-aware fix ALLOW x3, and the control (same nesting,
+        # NO escape) DENY on both -- so the trigger is the ESCAPE, not the nesting. The inner
+        # command really runs: `bash -c "bash -c \\"expr 111 \\* 3\\""` prints 333.
+        #
+        # ON MAIN THE TWO AGREED BY ACCIDENT, both being escape-blind, which left the verb visible
+        # OUTSIDE the span. Making one side escape-aware removed the accident without replacing it.
+        # This is why a host flag alone cannot close it: the failing host is BASH, where the escape
+        # is real and honouring it is correct.
+        #
+        # The SINGLE-quoted arm stays escape-blind on purpose: sh gives the backslash no special
+        # meaning inside a single-quoted word, which is the same asymmetry Remove-QuotedSpans keeps.
+        $dqCode = if ($PosixEscapes) { "(?<code>(?:\\.|[^`"\\])*)" } else { "(?<code>[^`"]*)" }
         foreach ($pat in @(
-            "(?i)(?:^|\s)$flagThenSep`"(?<code>[^`"]*)`""
+            "(?i)(?:^|\s)$flagThenSep`"$dqCode`""
             "(?i)(?:^|\s)$flagThenSep'(?<code>[^']*)'"
         )) {
             foreach ($m in [regex]::Matches($ln, $pat)) { $inner += $m.Groups['code'].Value }
