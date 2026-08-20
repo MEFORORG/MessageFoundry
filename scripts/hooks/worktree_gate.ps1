@@ -375,12 +375,51 @@ function Remove-QuotedSpans([string]$s) {
     for ($i = 0; $i -lt $s.Length; $i++) {
         $ch = $s[$i]
         if ($quote -eq [char]0) {
-            if ($ch -eq '"' -or $ch -eq "'") { $quote = $ch; $openAt = $i }
+            # A BACKSLASH ESCAPE OUTSIDE A SPAN IS A LITERAL AND OPENS NOTHING (BACKLOG #1229
+            # residual). `\"` is an ordinary character to the shell, so the command around it RUNS --
+            # but this scan treated it as an opener, paired it with the next escaped quote, and blanked
+            # the live command between them. Same straddle as the two-regex defect above, one character
+            # class over, and RULE-AGNOSTIC: it disarms whatever rule sits behind it, so it hid
+            # `reset --hard` and `worktree add` and not only `checkout`.
+            if ($ch -eq '\' -and $i + 1 -lt $s.Length) {
+                [void]$out.Append($ch); [void]$out.Append($s[$i + 1]); $i++
+            }
+            elseif ($ch -eq '"' -or $ch -eq "'") { $quote = $ch; $openAt = $i }
             else { [void]$out.Append($ch) }
         }
+        elseif ($quote -eq '"' -and $ch -eq '\' -and $i + 1 -lt $s.Length) {
+            # Inside a DOUBLE-quoted span a backslash escapes the next character, so `\"` does not
+            # close it. DELIBERATELY NOT APPLIED INSIDE A SINGLE-QUOTED SPAN: sh gives the backslash no
+            # special meaning there, so `'a\'` really does close at that quote. Treating the two alike
+            # would swallow the rest of the line from a trailing backslash -- fail-open, which is the
+            # direction this whole function exists to avoid.
+            $i++
+        }
         elseif ($ch -eq $quote) {
-            # Emit the blanked pair only on a CLOSED span, matching what the regexes produced.
-            [void]$out.Append($quote); [void]$out.Append($quote)
+            # A QUOTED PROGRAM PATH KEEPS ITS GIT TOKEN, DECIDED HERE RATHER THAN IN A PRE-PASS
+            # (BACKLOG #1229 residual). This used to be two regexes run BEFORE this scan, double quotes
+            # first -- which is the same ordered-pair shape the scan replaced, so it straddled the same
+            # way: `"` ... `/git"` paired ACROSS a live command and collapsed it to a bare `git`,
+            # stripping the verb and its arguments so no rule matched. Deciding it on a span this scan
+            # already OWNS means it cannot pair across anything.
+            #
+            # Case-insensitive on purpose, and EMITTED LOWERCASE, which is a separate decision from
+            # matching. `GIT.EXE` is a real spelling on Windows and `-match` accepts it -- but the rules
+            # downstream compare case-SENSITIVELY, so echoing the original case handed them a token they
+            # did not recognise. MEASURED with no escape involved, on the pre-fix hook:
+            #     "C:\Program Files\Git\bin\git.exe" -C <governed> reset --hard   -> DENY
+            #     "C:\Program Files\Git\bin\GIT.EXE" -C <governed> reset --hard   -> ALLOW
+            # A pre-existing gap, independent of the straddle, and invisible while the only spellings
+            # anyone tested were lowercase. Canonicalising here is the fail-CLOSED direction: it
+            # preserves a verb for the rules to judge instead of a token they will skip.
+            $span = $s.Substring($openAt + 1, $i - $openAt - 1)
+            if ($span -match '[\\/](git(?:\.exe)?)$') {
+                [void]$out.Append($Matches[1].ToLowerInvariant())
+            }
+            else {
+                # Emit the blanked pair only on a CLOSED span, matching what the regexes produced.
+                [void]$out.Append($quote); [void]$out.Append($quote)
+            }
             $quote = [char]0; $openAt = -1
         }
     }
@@ -647,11 +686,16 @@ function Get-ScannableSegments([string]$Cmd) {
 
     foreach ($line in @($lines + $inner)) {
         # A quoted PROGRAM path must keep its git token -- `"C:\Program Files\Git\bin\git.exe" checkout
-        # main` is a real spelling and blanking it wholesale would be a false NEGATIVE. Collapse that form
-        # to a bare token first, then blank every remaining quoted span.
-        $s = $line -replace '"[^"]*[\\/](git(?:\.exe)?)"', '$1'
-        $s = $s -replace "'[^']*[\\/](git(?:\.exe)?)'", '$1'
-        $s = Remove-QuotedSpans $s
+        # main` is a real spelling and blanking it wholesale would be a false NEGATIVE. That collapse now
+        # happens INSIDE Remove-QuotedSpans, on a span the scan already owns.
+        #
+        # IT USED TO BE TWO ORDERED REGEXES RIGHT HERE, DOUBLE QUOTES FIRST, AND THAT WAS A SECOND LIVE
+        # FAIL-OPEN OF THE EXACT SHAPE THE SCAN BELOW EXISTS TO CLOSE. Running before the scan, they
+        # could pair a quote with a distant `/git"` ACROSS a gated command and replace the whole middle
+        # with a bare token -- verb and arguments gone, nothing left for any rule to match. Ownership
+        # cannot be decided by a regex that has no idea which quote opened first, which is the same
+        # sentence this file already wrote about the blanking order.
+        $s = Remove-QuotedSpans $line
         [pscustomobject]@{ Raw = $line; Scan = $s }
     }
 }
