@@ -2908,6 +2908,37 @@ class AuthService:
                 admins.add(user.id)
         return admins == {user_id}
 
+    async def has_notifiable_admin(self) -> bool:
+        """True iff at least one ENABLED administrator has an email address on file.
+
+        BACKLOG #1020. The PHI startup gate computes notification readiness from the SMTP transport
+        alone (``notify_security_events`` + ``email_smtp_host`` + ``email_from``), which answers
+        *"is a transport configured"* and never *"can the account that matters actually receive"*.
+        Those come apart on a first run: ``_ensure_bootstrap_admin`` creates the account holding
+        ``frozenset(Permission)`` with no ``email=``, and ``SecurityEventNotifier.notify`` starts
+        ``if not event.email: return`` -- so every notice about the most privileged account on the
+        instance no-ops while the gate reports a healthy channel.
+
+        Deliberately scoped to the ROLE, not to the bootstrap account: ``email`` is optional in
+        ``UserCreateRequest`` and is not required for the Administrator role, so a hand-created
+        privileged account has the identical hole. Keying on the bootstrap user alone would close
+        the instance this was found on and leave the class open.
+
+        Enumerates as :meth:`is_last_enabled_admin` and :meth:`_other_enabled_admin_exists` do --
+        same store calls, same disabled-skip, same role test. **That agreement is a convention, not
+        a mechanism, and this docstring must not claim otherwise:** these are now THREE independent
+        copies of "who is an enabled administrator", and nothing binds them. If one gains a
+        condition -- a lockout check, an auth_provider filter -- the others keep the old answer
+        silently. Extracting a shared enumeration is worth its own item; it is deliberately not done
+        here, because it would rewrite two guards this change has no business touching.
+        """
+        for user in await self._store.list_users():
+            if user.disabled or not user.email:
+                continue
+            if Role.ADMINISTRATOR.value in await self._store.get_user_role_ids(user.id):
+                return True
+        return False
+
     async def set_ad_group_map(self, entries: Sequence[tuple[str, str]], *, actor: str) -> None:
         await self._store.set_ad_group_role_map(entries)
         await self._audit(
