@@ -23,6 +23,7 @@ from collections.abc import Sequence
 
 import pytest
 
+from harness.load.connscale.intake_audit import MOMENT_POST_MORTEM
 from harness.load.connscale.probe import ProbeDegraded
 from harness.load.connscale.profile import load_connscale_profile_text
 from harness.load.connscale.report import ConnScaleRecord
@@ -173,6 +174,44 @@ def _assert_fd_probe(records: Sequence[ConnScaleRecord]) -> None:
     )
 
 
+def _assert_intake_audit(records: Sequence[ConnScaleRecord]) -> None:
+    """Assert the BACKLOG #1292 discriminator on every step, in the order its verdicts matter.
+
+    Four properties, each pinning a different way this could go quietly wrong:
+
+    1. NO step is ``engine_suspect``. This is the finding the item is about: the engine framed an
+       accept-ACK for a message and its own stopped, committed store has no row for it.
+    2. EVERY step's audit is CONCLUSIVE. A PROBE_UNUSABLE result is not a pass -- it means the
+       instrument could not answer, and an instrument that silently stops answering leaves the
+       original unattributable failure in place while looking green.
+    3. EVERY step's sweep read rows (``store_total > 0``) against a step that sent messages. This is
+       the positive control: a set comparison against an empty set is clean for the wrong reason.
+    4. The authoritative audit is the POST-MORTEM one. A live read could be explained away as early
+       sampling; a read of a stopped engine's store cannot, and mislabelling one as the other would
+       destroy the only distinction the second moment exists to make.
+    """
+    for r in records:
+        audit = r.intake_audit
+        assert not audit.engine_suspect, (
+            f"COUNT-AND-LOG INVARIANT -- {r.sweep_mode}@N={r.count}: {audit.summary()}. The engine "
+            f"accept-ACKed those sends and its own stopped, committed store has no messages row for "
+            f"them, so a deploying site would be able to lose an acknowledged message at intake. "
+            f"The sequence numbers above name them; this is reproducible, not statistical."
+        )
+        assert audit.conclusive, (
+            f"INTAKE AUDIT COULD NOT ANSWER -- {r.sweep_mode}@N={r.count}: {audit.summary()}. The "
+            f"discriminator is the whole point of this step's no-loss coverage, so a probe that did "
+            f"not run or could not read is reported as a failure rather than tolerated: tolerating "
+            f"it restores exactly the unattributable red this check exists to replace."
+        )
+        assert audit.moment == MOMENT_POST_MORTEM, audit
+        assert audit.store_total > 0, (
+            f"INTAKE AUDIT POSITIVE CONTROL -- {r.sweep_mode}@N={r.count} sent {r.sent} message(s) "
+            f"and the store sweep read {audit.store_total} row(s): {audit.summary()}. A clean set "
+            f"comparison over an empty read says nothing about intake."
+        )
+
+
 async def test_connscale_smoke_end_to_end() -> None:
     # Reserve a contiguous inbound-port block (BACKLOG #1014). The sweep's max connection count
     # needs that many contiguous inbound ports, and the engine binds base_port + i for each. A
@@ -213,9 +252,27 @@ async def test_connscale_smoke_end_to_end() -> None:
     }
 
     # (2) No-loss at each N (sent == engine_read, engine_written == sink_received, backlog drained).
+    # UNCHANGED, deliberately. This is the COUNT check, and (2b) below does not replace it: a step
+    # whose counts do not reconcile still fails here exactly as before. What changed is that its
+    # failure message now carries the per-message attribution appended by `_build_record`, so a CI
+    # reader gets a verdict instead of a number they cannot act on.
     for r in report.records:
         assert r.sent > 0, r
         assert r.no_loss.ok, (r.sweep_mode, r.count, r.no_loss.detail)
+
+    # (2b) BACKLOG #1292 -- the PER-MESSAGE intake audit, asserted INDEPENDENTLY of (2).
+    #
+    # It is strictly ADDITIONAL, not a restatement: (2) compares counts and forgives an unconfirmed
+    # send, so a message the engine ACCEPT-ACKed and then has no row for passes (2) whenever it also
+    # happened to be excused as a timeout. This asserts the thing (2) cannot: that no accept-ACKed
+    # message is absent from the engine's own committed store.
+    #
+    # PROBE_UNUSABLE is required to be ABSENT rather than tolerated. Unlike wall #4's OS probe there
+    # is no known legitimate degrade path here -- the read is a paged query against a quiesced,
+    # step-exclusive store -- so a probe that could not answer is a defect to classify deliberately,
+    # not a gap to excuse. `store_total > 0` is the sweep's positive control: a query returning
+    # nothing would otherwise score a clean set comparison over an empty set.
+    _assert_intake_audit(report.records)
 
     # (3) Curve monotonicity smoke (a LOOSE >= per mode; CI runners are noisy): FD count + empty-claims
     # at N=24 >= N=12. Asserted via the report's monotonicity SLOs.
