@@ -1171,7 +1171,7 @@ class _HostileListingClient(_FakeClient):
     [
         "../../etc/passwd.hl7",  # traversal, and the default *.hl7 pattern MATCHES it
         "/etc/passwd.hl7",  # absolute
-        "..\..\etc\passwd.hl7",  # Windows separators -- posixpath.basename is a NO-OP on this
+        r"..\..\etc\passwd.hl7",  # Windows separators -- posixpath.basename is a NO-OP on this
         "sub/dir.hl7",  # a subdirectory component
         ".",
         "..",
@@ -1218,9 +1218,9 @@ async def test_a_safe_entry_beside_a_hostile_one_still_flows(
     # Refusing one entry must not abort the poll -- the legitimate file beside it is still delivered.
     # Without this, a hostile server could suppress a real feed by planting one bad name.
     client = _HostileListingClient(["../../etc/passwd.hl7", "good.hl7"])
-    client.files["/in/good.hl7"] = b"MSH|^~\&|A"
+    client.files["/in/good.hl7"] = rb"MSH|^~\&|A"
     src = _src(monkeypatch, client)
     h = _RecordingHandler()
     src._handler = h
     await src._poll_once()
-    assert h.bodies == [b"MSH|^~\&|A"]
+    assert h.bodies == [rb"MSH|^~\&|A"]

@@ -19,10 +19,13 @@ A small N (12 → 24) keeps it inside the pytest-timeout budget; the shipped ``c
 from __future__ import annotations
 
 import sys
+from collections.abc import Sequence
 
 import pytest
 
+from harness.load.connscale.probe import ProbeDegraded
 from harness.load.connscale.profile import load_connscale_profile_text
+from harness.load.connscale.report import ConnScaleRecord
 from harness.load.connscale.runner import run_connscale
 from tests._connscale_ports import (
     INBOUND_PORT_HI,
@@ -67,6 +70,107 @@ zero_loss = true
 fd_monotonic = true
 empty_claims_monotonic = true
 """)
+
+
+def _is_budget_exhausted(cause: str) -> bool:
+    """Is this recorded cause one where the probe SPENT its whole timeout budget?
+
+    Delegates to the probe's own :class:`ProbeDegraded` rather than listing members here, so the
+    tolerable set cannot drift member-by-member away from the definition. An UNRECOGNISED cause is
+    treated as not-tolerable: a new degrade path must be classified deliberately, and defaulting the
+    unknown to "tolerate" is how a fresh probe defect would arrive already excused."""
+    try:
+        return ProbeDegraded(cause).is_budget_exhausted
+    except ValueError:
+        return False
+
+
+def _assert_fd_probe(records: Sequence[ConnScaleRecord]) -> None:
+    """Assert wall #4 to the strength the OS probe's contract actually supports — no more, no less.
+
+    This used to be a bare ``assert r.fd_count_peak is not None and r.fd_count_peak > 0, r`` inside the
+    loop above, with no tolerance for a probe that honestly could not measure. ``fd_count_peak`` is
+    ``None`` on every one of the probe's degrade paths, and only some of them implicate anything under
+    test — so a starved runner whose process-table walk timed out reddened a REQUIRED context as though
+    the ENGINE were at fault, and did it with a message that named no mechanism. The record now carries
+    the cause, so this can state a verdict instead of a value check.
+
+    The tolerable/not line is the probe's own (``ProbeDegraded.is_budget_exhausted``), NOT a second
+    vocabulary invented here. It is the same line ``tests/test_connscale_cpu_probe.py`` draws from the
+    seconds a failed walk actually spent: budget exhausted is COULD NOT MEASURE, anything faster is
+    MEASURED AND BROKEN.
+
+    Four properties, and none is weaker than the old assertion wherever the probe worked:
+
+    1. Where the probe READ, the count must be positive — the wall exists. Unchanged.
+    2. Where it did not, the record must NAME a cause. An unattributable gap FAILS. A tolerance that
+       swallowed it would buy a green by destroying the only evidence of what went wrong, which is the
+       failure mode this whole change exists to remove.
+    3. A cause that is not budget-exhausted FAILS — a walk that returned zero rows, a failed
+       enumeration, a snapshot with no root row, a per-PID read that ran and parsed nothing. A broken
+       probe must not hide behind the tolerance written for a slow one.
+    4. A budget-exhausted cause is tolerated PER RECORD but not for the run: at least one step must have
+       measured, so a probe that never works anywhere still cannot pass. That is the same bound
+       assertion (5) below already places on the reload probe."""
+    for r in records:
+        if r.fd_count_peak is not None:
+            assert r.fd_count_peak > 0, r
+            continue
+        causes = tuple(r.fd_probe_degraded)
+        scope = f"{r.fd_probe_degraded_ticks} of {r.fd_probe_ticks} probe tick(s) degraded"
+        assert causes, (
+            f"UNATTRIBUTED GAP -- wall #4 read nothing at {r.sweep_mode}@N={r.count} and the record "
+            f"names no cause ({scope}). A gap that cannot say which probe path produced it is not "
+            f"evidence about the engine in either direction, and is deliberately NOT tolerated: "
+            f"tolerating it is what made one starved runner and one broken enumerator the same "
+            f"artifact. Record: {r}"
+        )
+        broken = tuple(c for c in causes if not _is_budget_exhausted(c))
+        assert not broken, (
+            f"PROBE DEFECT -- wall #4 read nothing at {r.sweep_mode}@N={r.count} because {broken} "
+            f"({scope}; all causes {causes}). None of those is an exhausted timeout budget: the probe "
+            f"RAN and produced nothing usable, which is a defect in the probe itself and is reported "
+            f"as a failure rather than downgraded to a tolerated gap. Record: {r}"
+        )
+    # Every step degraded, and (given the loop above) every cause was an exhausted budget. Each such
+    # step alone measures the RUNNER rather than this tree, but a run in which the FD probe never once
+    # read is not evidence that wall #4 exists -- so the tolerance stops here instead of buying a green
+    # over zero measurements.
+    detail = "; ".join(
+        f"{r.sweep_mode}@N={r.count} {r.fd_probe_degraded_ticks}/{r.fd_probe_ticks} "
+        f"{tuple(r.fd_probe_degraded)}"
+        for r in records
+    )
+    # THE BOUND IS AT THE SLO'S GRANULARITY, NOT THE RUN'S, AND THE DIFFERENCE IS A REAL DEFECT THAT
+    # SHIPPED HERE FIRST. The obvious form -- "at least one record measured" -- is not enough, because
+    # the per-record assertion this replaced was doing DOUBLE DUTY: it was also the only thing
+    # guaranteeing `fd_count_monotonic` had two readings in a group to COMPARE. `_monotonic_slo`
+    # SKIPS None readings (runner.py, "Missing readings (None) are skipped, not failed"), so with a
+    # run-wide bound it can return ok=True observed='monotonic' having compared NOTHING -- and a real
+    # FD collapse then passes. Measured on this smoke: forcing every step after the first to
+    # WALK_TIMEOUT left one group with a single reading, PAIRS ACTUALLY COMPARED=0, and the SLO still
+    # reported monotonic; a 1000-handle collapse at N=12 with both N=24 steps degraded passed the same
+    # way, while the unforced control compared 2 pairs and a genuine 1000->100 drop correctly failed.
+    #
+    # So require that some (sweep_mode, claim_mode) group -- the SAME key `_monotonic_slo` groups on
+    # (BACKLOG #1101) -- actually has a pair. Grouping on sweep_mode alone would re-introduce the bug
+    # one level up: two readings split across claim modes are never compared with each other.
+    #
+    # NOT MIRRORED FROM assertion (5). An earlier version of this justified the run-wide bound as "the
+    # same bound the reload probe already has". Same SHAPE, wrong ANALOGY: `reload_seconds` feeds no
+    # monotonicity SLO, so a single reading there costs nothing. `fd_count_peak` feeds one.
+    measured_per_group: dict[tuple[str, str], int] = {}
+    for r in records:
+        if r.fd_count_peak is not None:
+            key = (r.sweep_mode, r.claim_mode)
+            measured_per_group[key] = measured_per_group.get(key, 0) + 1
+    assert any(n >= 2 for n in measured_per_group.values()), (
+        f"WALL #4 NEVER COMPARED -- no (sweep_mode, claim_mode) group has two measured readings, so "
+        f"`fd_count_monotonic` compared zero pairs and its green says nothing. Measured readings per "
+        f"group: {measured_per_group or '{}'} [{detail}]. A single step timing out is tolerated; a run "
+        f"in which the FD wall is never compared against itself is not, because the SLO that is "
+        f"supposed to cover it silently passes over an empty set."
+    )
 
 
 async def test_connscale_smoke_end_to_end() -> None:
@@ -125,9 +229,11 @@ async def test_connscale_smoke_end_to_end() -> None:
     for r in report.records:
         assert r.executor_queue_depth_peak is not None, r  # the shim installed the default executor
         assert r.executor_busy_peak is not None, r
-        assert r.fd_count_peak is not None and r.fd_count_peak > 0, r
         # Wall #3 is separated, never summed into one number; both halves are non-negative.
         assert r.idle_poll_per_s >= 0.0 and r.wake_fanout_per_s >= 0.0
+
+    # (4b) Wall #4 (FD), asserted only as far as this test is ENTITLED to. See _assert_fd_probe.
+    _assert_fd_probe(report.records)
 
     # (5) The reload-latency probe (wall #5) times an O(connections) quiesce-and-swap. Like the other
     # OS-side probes it is best-effort and gap-tolerant BY DESIGN: a reload fired mid-hold at the highest
