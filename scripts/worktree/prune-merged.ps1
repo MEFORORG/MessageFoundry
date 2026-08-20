@@ -48,11 +48,15 @@
          fences it on pid + process start time. Only LIVE / UNVERIFIED / UNREADABLE veto, for the
          veto-only reason above. A session in a NESTED worktree vetoes its ancestor too.
       2. RECENT ACTIVITY (-IdleHours, default 36). Newest mtime of the worktree's PRIVATE git metadata
-         (index, HEAD, logs/HEAD, ...). This is the signal that does NOT depend on a recorded cwd, and
-         it is what covers the fence's biggest blind spot -- so it is not a nicety, it is the load-
-         bearing one for the class of worktree this tool actually prunes. If it cannot be read, that is
-         a veto too. Confirm a specific worktree past this veto with -Name <slug>; -Name never
-         overrides signal 1, a nested worktree, or a lock.
+         (index, HEAD, ORIG_HEAD, FETCH_HEAD, COMMIT_EDITMSG, MERGE_MSG) crossed with the timestamp of
+         the LAST ENTRY IN logs/HEAD -- the reflog is read by CONTENT, never by mtime, because a
+         `git gc` rewrites every reflog in place and moved all 48 of them to one identical mtime on
+         2026-08-18, vetoing the whole repository at once (Get-ReflogLastEntry has the measurement).
+         This is the signal that does NOT depend on a recorded cwd, and it is what covers the fence's
+         biggest blind spot -- so it is not a nicety, it is the load-bearing one for the class of
+         worktree this tool actually prunes. If it cannot be read, that is a veto too. Confirm a
+         specific worktree past this veto with -Name <slug>; -Name never overrides signal 1, a nested
+         worktree, or a lock.
 
     WHAT THE FENCE CANNOT SEE (printed on every run, because a fence believed to be wider than it is
     is worse than no fence):
@@ -65,8 +69,13 @@
       * a cwd recorded as a UNC (\\host\C$\...) or 8.3 short path -- the match is a normalised string
         compare, and neither spelling normalises to the worktree's own path;
       * a session that never registered;
-      * a session that only Writes/Edits files and runs no git command: it touches none of the seven
-        metadata files, so signal 2 goes quiet on it as well.
+      * a session that only Writes/Edits files and runs no git command: it touches none of the metadata
+        signal 2 reads, so signal 2 goes quiet on it as well;
+      * a session whose ONLY git command rewrites the reflog without appending to it -- in practice
+        `git gc` or `git reflog expire`. Signal 2 stopped counting that on 2026-08-18 and this is the
+        price: the same write that used to veto the entire repository for 36 hours now vetoes nothing.
+        It is a deliberate trade and the cheap half of it, because a session doing real work runs
+        commands that DO append, and every one of those is still seen.
     It DOES see VS Code sessions: the file registry carries every surface, and the match is purely
     path-based (the Desktop app's own session tooling only lists what it spawned).
 
@@ -409,6 +418,47 @@ function Test-Merged {
 }
 
 # --- Occupancy signal 2: recent activity, which does not depend on a recorded cwd ----------------
+
+#: Metadata whose MTIME is the activity reading. `logs/HEAD` is deliberately NOT in this list; it is
+#: read by content instead, for the reason written out over Get-ReflogLastEntry.
+$ACTIVITY_MTIME_FILES = @('index', 'HEAD', 'ORIG_HEAD', 'FETCH_HEAD', 'COMMIT_EDITMSG', 'MERGE_MSG')
+
+function Get-ReflogLastEntry {
+    param([string]$LogPath)
+    # THE REFLOG IS READ BY CONTENT, NOT BY MTIME, AND THAT IS THE WHOLE POINT.
+    #
+    # A reflog line is:  <old-oid> <new-oid> <name> <<email>> <epoch> <tz>\t<message>
+    # The epoch is stamped by the operation that APPENDED the entry. Nothing which rewrites the file
+    # without appending to it can move that number. The file's mtime is exactly the opposite: it
+    # moves for any write at all, including one that changes nothing.
+    #
+    # MEASURED 2026-08-18 on this repository. A `git gc` ran at 08:15:34-08:16:05 -- packed-refs
+    # rewritten at 08:15:34, the packs at 08:16:02-08:16:05 -- and its reflog expiry rewrote every
+    # reflog in place. **48 of 50** worktree `logs/HEAD` files came out carrying the IDENTICAL mtime
+    # `2026-08-18 08:15:42`, to the second, while their contents were days older: one worktree's last
+    # entry is `2026-08-14 12:55:35`, four days before its own mtime.
+    #
+    # Signal 2 took the newest mtime, so that single gc made EVERY worktree in the repository read
+    # "recently active -- someone may be working here" for the next -IdleHours. On the run that found
+    # it, 11 of 14 candidates were vetoed on that basis alone and the tool removed nothing. With 50
+    # worktrees and 9 live sessions producing loose objects, gc is frequent enough that the veto can
+    # sit permanently on -- and a veto that always fires carries no more information than one that
+    # never fires, which is the failure class docs/adr/0158 names.
+    #
+    # Returns $null when there is no entry to read. The CALLER decides what that means, because "the
+    # file is empty" and "the file would not parse" are not the same fact and must not act alike.
+    try { $last = Get-Content -LiteralPath $LogPath -Tail 1 -ErrorAction Stop } catch { return $null }
+    if (-not $last) { return $null }
+    # Split at the tab FIRST, so a committer name containing '>' cannot be mistaken for the closing
+    # bracket of the email. What remains ends with "<epoch> <tz>", and anchoring the match on that end
+    # is what makes it exact rather than merely plausible.
+    $head = ([string]$last -split "`t", 2)[0]
+    $m = [regex]::Match($head, '(\d{9,11})\s+[+-]\d{4}\s*$')
+    if (-not $m.Success) { return $null }
+    try { return [DateTimeOffset]::FromUnixTimeSeconds([long]$m.Groups[1].Value).LocalDateTime }
+    catch { return $null }
+}
+
 function Get-WorktreeActivity {
     param([string]$Path)
     # The worktree's PRIVATE git metadata only. Deliberately NOT the working files: a venv install or a
@@ -421,12 +471,29 @@ function Get-WorktreeActivity {
     $gitdir = ([string]$gitdir).Trim()
     if (-not (Test-Path -LiteralPath $gitdir)) { return $null }
     $newest = $null
-    foreach ($rel in @('index', 'HEAD', 'ORIG_HEAD', 'FETCH_HEAD', 'COMMIT_EDITMSG', 'MERGE_MSG', 'logs/HEAD')) {
+    foreach ($rel in $ACTIVITY_MTIME_FILES) {
         $f = Join-Path $gitdir $rel
         if (Test-Path -LiteralPath $f) {
             $t = (Get-Item -LiteralPath $f -Force).LastWriteTime
             if ($null -eq $newest -or $t -gt $newest) { $newest = $t }
         }
+    }
+    $log = Join-Path $gitdir 'logs/HEAD'
+    if (Test-Path -LiteralPath $log) {
+        $item = Get-Item -LiteralPath $log -Force
+        $t = Get-ReflogLastEntry -LogPath $log
+        if ($null -eq $t -and $item.Length -gt 0) {
+            # Non-empty, and it would not parse. FALL BACK TO THE MTIME, which is the reading this
+            # had before. A parse failure must never be the thing that makes a worktree look idle,
+            # because idle is the direction that REMOVES one: a reflog shape this does not recognise
+            # is a reason to keep vetoing, not a reason to stop.
+            $t = $item.LastWriteTime
+        }
+        # A zero-length logs/HEAD contributes NOTHING, and that is not an error: every entry has
+        # expired, so the reflog holds no evidence in either direction and the six mtimes above still
+        # speak. Reading its mtime here would reinstate the exact bug this function exists to remove,
+        # on the oldest worktrees in the repository -- which are the ones most likely to be prunable.
+        if ($null -ne $t -and ($null -eq $newest -or $t -gt $newest)) { $newest = $t }
     }
     return $newest
 }
@@ -651,6 +718,98 @@ foreach ($s in $siblings) {
 }
 $prunable = @($decisions | Where-Object { $_.Decision -eq 'PRUNE' })
 
+# --- REPORT-ONLY: the population this script must never remove (BACKLOG #1294) --------------------
+# Everything REGISTERED that is not a prunable sibling: the Claude-managed trees under
+# .claude/worktrees, nested trees, detached ones, Temp scratchpads, and trees whose path is not a
+# `<repo>-<name>` sibling at all -- those never even reach $prefixed, so before this they were
+# invisible to every line of this report.
+#
+# THIS REMOVES NOTHING, AND THAT IS THE DESIGN, NOT A LIMITATION. The exclusions above are deliberate
+# and were paid for: .claude/worktrees is where EnterWorktree relocates a LIVE session, and this tool
+# once removed an occupied worktree, deregistering it and then failing to delete the directory, after
+# which every git command in the working session failed. The bias stays exactly as the header states
+# it -- a false SKIP is a minor annoyance, a false PRUNE destroys a session. Widening -Apply to reach
+# these would trade the property that incident bought, and the fence is not strong enough to carry it:
+# its own receipt records that signal 1 cannot see a session writing by absolute path from elsewhere,
+# 29% of the writes by primary-seated sessions on this repo.
+#
+# So the gap being closed is DISCOVERY, not reach. Before this a tree here was either removed by
+# nothing or unknown, and an operator had to assemble the list by hand -- measured 2026-08-19, twelve
+# were removed exactly that way off a hand-built list, which is the work this section exists to spare.
+#
+# ONLY TREES THAT LOOK FINISHED ARE LISTED. A dirty or occupied one is not actionable, and a report
+# that lists everything trains the eye to skip it -- the same reason the claims line is conditional.
+# The counts of what was withheld are printed so the omission is visible rather than silent.
+$reportOnly = @()
+$reportHeld = 0
+$siblingPaths = @($siblings | ForEach-Object { ($_.Path -replace '\\', '/').TrimEnd('/') })
+foreach ($w in $occ.Worktrees) {
+    $fwd = ($w.Path -replace '\\', '/').TrimEnd('/')
+    if ($fwd -ieq $RepoRootFwd.TrimEnd('/')) { continue }         # the primary checkout, never
+    if ($siblingPaths -contains $fwd) { continue }                # already in the decision table
+    # Signal 1: a registered live session sitting in it or in a worktree nested inside it. Fails
+    # closed -- an unavailable fence withholds the row rather than suggesting a removal we could not
+    # check. USE THE SHARED HELPER, do not re-implement the match: the session field is
+    # `WorktreePath`, and a hand-rolled filter against a guessed field name matches nothing and
+    # reports every tree as unoccupied -- which is the failure direction that suggests removals.
+    if (-not $occ.Available) { $reportHeld++; continue }
+    if (@(Get-WorktreeOccupants -Occupancy $occ -Path $w.Path -IncludeNested).Count -gt 0) { $reportHeld++; continue }
+    # A tree containing another registered worktree is structural, not finished.
+    if (@(Get-NestedWorktrees -Occupancy $occ -Path $w.Path).Count -gt 0) { $reportHeld++; continue }
+    $clean = Test-WorktreeClean -Path $w.Path
+    if (-not $clean.Clean) { $reportHeld++; continue }
+    # Signal 2: the same idle proxy the decision pass uses. Unknown activity withholds the row.
+    $act = Get-WorktreeActivity -Path $w.Path
+    if ($null -eq $act -or $act -gt $idleCut) { $reportHeld++; continue }
+    $idleH = [math]::Round(((Get-Date) - $act).TotalHours, 1)
+
+    # WHAT REMOVAL ACTUALLY RISKS -- and the first two cuts of this both got it wrong.
+    #
+    # Cut 1 listed every idle clean tree under a "look finished" banner, printing a removal command
+    # beside rows reading "37 commit(s) not on origin/main". The content column contradicted the
+    # banner, and the banner is what gets read.
+    #
+    # Cut 2 over-corrected: it withheld anything whose touched paths still differed from main. That
+    # FAILED ITS OWN POSITIVE CONTROL -- a branch whose content had genuinely landed (as a squash) was
+    # withheld, because main's copy of a shared file had moved on for unrelated reasons. In a repo
+    # where docs/BACKLOG.md changes hourly that predicate withholds everything, and a report that is
+    # always empty is not a safe report, it is an ignored one.
+    #
+    # THE QUESTION IS NOT "DID THE CONTENT LAND". IT IS "WOULD REMOVAL LOSE ANYTHING", and
+    # `git worktree remove` DOES NOT DELETE BRANCHES. So:
+    #   * a tree ON A BRANCH  -> its commits stay reachable through that ref after removal. Rung 2 of
+    #                            the recoverability ladder. No content test is needed or meaningful.
+    #   * a DETACHED tree     -> its commits are reachable through NOTHING once the tree is gone.
+    #                            Rung 3, a race against gc. This is the only case that must prove its
+    #                            content is elsewhere before it can be suggested.
+    if ($w.Detached -or -not $w.Branch) {
+        $tip = (& git -C $w.Path rev-parse HEAD 2>$null)
+        if ($LASTEXITCODE -ne 0 -or -not $tip) { $reportHeld++; continue }
+        $tip = ([string]$tip).Trim()
+        # Reachable from some OTHER ref? Then removal strands nothing and it is rung 2 after all.
+        $holders = @(& git -C $RepoRoot for-each-ref --contains $tip --format='%(refname)' 2>$null)
+        if ($LASTEXITCODE -ne 0) { $reportHeld++; continue }
+        if ($holders.Count -eq 0) {
+            # Nothing else points at it. Withheld -- and this is exactly the state that looks finished
+            # and is not, so it is never listed however clean and idle it is.
+            $reportHeld++
+            continue
+        }
+        $landed = "detached, but $($holders.Count) other ref(s) hold $($tip.Substring(0,8))"
+    }
+    else {
+        $landed = "on branch -- commits survive removal via the ref"
+    }
+
+    $reportOnly += [pscustomobject]@{
+        Path   = $w.Path
+        Leaf   = (Split-Path $w.Path -Leaf)
+        Branch = $(if ($w.Branch) { $w.Branch } else { '(detached)' })
+        IdleH  = $idleH
+        Landed = $landed
+    }
+}
+
 # -Name is the loudest thing an operator can do to the fence: it is -IdleHours 0 scoped to one tree,
 # and signal 1 has been measured vetoing 0 of 4 real siblings. It used to produce only a grey `note:`
 # line, while the flag it is equivalent to got a red banner.
@@ -758,6 +917,42 @@ function Read-OrphanLedger {
 # gone AND deregistered, so there is no session left in there to collide with. A claim whose holder is
 # merely quiet is never touched by this.
 $claimsDir = if ($gitCommonDir) { Join-Path $gitCommonDir 'mefor-coord/claims' } else { '' }
+
+# --- REPORT-ONLY, second pass: a tree holding a COORDINATION CLAIM is never suggested --------------
+# This runs here rather than with the rest of the report-only computation only because $claimsDir is
+# not resolved until this point.
+#
+# WHY IT IS NEEDED AT ALL, and it is a defect the first cut of the report shipped with. The commands
+# the report emits are plain `git worktree remove`, which -- unlike this script's own -Apply path
+# (Remove-ClaimsHeldBy, BACKLOG #345) -- does NOT release the claims that worktree holds. So a
+# reported row whose tree holds a claim hands the operator a command that strands it, and a stranded
+# claim is worse than an orphaned worktree: `claim.ps1 -Release` is worktree-scoped, so once the
+# holder is gone NOBODY can release it normally, and the key reads as actively-being-built forever.
+# Measured 2026-08-19: 19 of 28 live claims were already orphaned exactly this way.
+#
+# A claim is also positive evidence the tree is NOT finished -- somebody registered work in it -- so
+# withholding is the right answer rather than emitting a release command beside the removal.
+#
+# UNREADABLE IS NOT ABSENT, same rule as Remove-ClaimsHeldBy: a claim file we cannot parse might name
+# this worktree, so it withholds. Fails closed.
+if ($reportOnly.Count -gt 0) {
+    $claimed = @{}
+    $claimUnreadable = $false
+    if ($claimsDir -and (Test-Path -LiteralPath $claimsDir)) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA SilentlyContinue)) {
+            try { $c = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop }
+            catch { $claimUnreadable = $true; continue }
+            $n = ConvertTo-Norm ([string]$c.worktree)
+            if ($n) { $claimed[$n] = $true }
+        }
+    }
+    $kept = @()
+    foreach ($r in $reportOnly) {
+        if ($claimUnreadable -or $claimed.ContainsKey((ConvertTo-Norm $r.Path))) { $reportHeld++; continue }
+        $kept += $r
+    }
+    $reportOnly = @($kept)
+}
 
 # An UNREADABLE claim belongs to the REGISTRY, not to any one worktree -- by definition we could not read
 # whose it is. So it is surveyed ONCE, here, rather than discovered inside the removal loop. Two bugs
@@ -1157,6 +1352,11 @@ if ($Json) {
         gh       = $ghDetail
         ghProbes = [pscustomobject]@{ attempted = $ghAttempts; failed = $ghFailures; firstError = $ghFirstError }
         candidates = @($decisions)
+        # REPORT-ONLY rows travel in the JSON too, so a consumer can tell "this tool considered the
+        # tree and will not touch it" from "this tool never saw it" -- and so the rows are testable.
+        # `reportOnlyHeld` is a COUNT of what was withheld, not a list: naming the withheld trees
+        # would re-create the suggestion the withholding exists to avoid.
+        reportOnly = @($reportOnly | ForEach-Object { [pscustomobject]@{ leaf = $_.Leaf; path = $_.Path; branch = $_.Branch; idleHours = $_.IdleH; safety = $_.Landed } })
         excluded = @($excluded | ForEach-Object { [pscustomobject]@{ leaf = (Split-Path $_.Wt.Path -Leaf); reason = $_.Why } })
         namedMisses = @($namedMisses)
         orphansFromEarlierRuns = @($priorOrphans | ForEach-Object { [pscustomobject]@{ leaf = $_.Leaf; path = $_.Path; branch = $_.Branch; why = $_.Why } })
@@ -1173,6 +1373,8 @@ if ($Json) {
             orphaned        = $orphaned
             orphansFromEarlierRuns = $priorOrphans.Count
             skipped         = $skipped
+            reportOnly      = $reportOnly.Count
+            reportOnlyHeld  = $reportHeld
             branchesDeleted = $branchesDeleted
             branchesKept    = $branchesKept
             # Coordination claims cleared because their holder was removed (BACKLOG #345).
@@ -1194,6 +1396,37 @@ if ($Json) {
         exitCode = $exit
     } | ConvertTo-Json -Depth 6 | Write-Output
     exit $exit
+}
+
+# --- REPORT-ONLY rows: discovery for the population this script must never remove ----------------
+# Printed on BOTH a dry run and an -Apply, because the whole point is that -Apply never reaches these
+# and an operator who only ever runs -Apply would otherwise never see them.
+if ($reportOnly.Count -gt 0 -or $reportHeld -gt 0) {
+    Write-Host ""
+    Write-Host "REPORT-ONLY -- worktrees this script will NEVER remove ($($reportOnly.Count) look finished, $reportHeld withheld)" -ForegroundColor Cyan
+    Write-Host "  These are outside the candidate set BY DESIGN: .claude/worktrees is where a live session" -ForegroundColor DarkGray
+    Write-Host "  gets relocated, and this tool once removed an occupied worktree. Nothing below is acted on." -ForegroundColor DarkGray
+    if ($reportOnly.Count -gt 0) {
+        Write-Host ""
+        Write-Host ("  {0,-46} {1,-28} {2,7}  {3}" -f 'WORKTREE', 'BRANCH', 'IDLE', 'CONTENT') -ForegroundColor DarkGray
+        foreach ($r in $reportOnly) {
+            Write-Host ("  {0,-46} {1,-28} {2,6}h  {3}" -f $r.Leaf, $r.Branch, $r.IdleH, $r.Landed)
+        }
+        Write-Host ""
+        Write-Host "  If you want them gone, these are the commands. They are yours to run, not this script's:" -ForegroundColor DarkGray
+        foreach ($r in $reportOnly) {
+            Write-Host "      git -C `"$RepoRoot`" worktree remove `"$($r.Path)`""
+        }
+        # The removal is only safe while the row is; say so rather than letting a scrolled-back list
+        # get pasted tomorrow. This is the same reason -Apply re-evaluates instead of trusting a table.
+        Write-Host "  Re-run this first if the list is more than a few minutes old -- a tree can go dirty" -ForegroundColor DarkGray
+        Write-Host "  or become occupied between the report and the paste, and neither is visible in it." -ForegroundColor DarkGray
+    }
+    # NO SILENT CAPS. A withheld row is a row the operator would otherwise assume does not exist.
+    if ($reportHeld -gt 0) {
+        Write-Host "  $reportHeld withheld as not-finished or not-checkable: occupied, dirty, containing another" -ForegroundColor DarkGray
+        Write-Host "  worktree, active within -IdleHours, or with unreadable activity. Withholding fails closed." -ForegroundColor DarkGray
+    }
 }
 
 Write-Host ""

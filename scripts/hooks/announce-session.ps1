@@ -48,8 +48,14 @@
           records on this host read kind=interactive, entrypoint=claude-desktop, including a
           workflow-driven session. Do not read it as protection it has never provided.
 
-    OUTCOME CODES: ANNOUNCED, NO_PEERS, NO_SESSION_ID, LOOKUP_FAILED, LOOKUP_KILLED, UNATTENDED,
-    DISABLED, BUDGET_EXHAUSTED, SETTLED, RECENT_CWD, ERROR. There is deliberately NO code for the
+    NO SHIPPED CALLER REACHES THE OUTSIDE-A-REPO PATH. The shim scripts/coord/install-coordination.ps1
+    writes is gated on the same git probe this hook would use and invokes it with no arguments, so
+    outside a repo the hook is never STARTED rather than standing down inside itself. -CommonDir and
+    the presence scoping below therefore serve a caller the OPERATOR wires. Do not read their existence
+    as the container gap being closed.
+
+    OUTCOME CODES: ANNOUNCED, NO_PEERS, NO_SESSION_ID, NO_LOGIN, LOOKUP_FAILED, LOOKUP_KILLED,
+    UNATTENDED, DISABLED, BUDGET_EXHAUSTED, SETTLED, RECENT_CWD, ERROR. There is deliberately NO code for the
     suppressed path: that is the hot path and it must stay free. The log records DECISIONS, not
     heartbeats -- a log that counted every quiet prompt would measure traffic, not coordination.
 
@@ -195,12 +201,28 @@ try {
     # another repo, but a manual or test invocation could, and creating state in someone else's .git
     # plus a visible line in their prompts once a minute is not acceptable. Same discriminator the
     # shim's missing-script notice uses.
+    # $repoRoot is the base that SATISFIED the guard, kept rather than recomputed: it is the only repo
+    # this invocation has proven it may touch, and the presence call needs exactly that to scope itself
+    # when the cwd cannot. Recomputing it there would be a second answer to a settled question.
     $bases = @((Split-Path $cd -Parent), $top) | Where-Object { $_ }
     $isMf = $false
+    $repoRoot = ''
     foreach ($b in $bases) {
-        if (Test-Path -LiteralPath (Join-Path $b 'scripts/coord/presence.ps1')) { $isMf = $true; break }
+        if (Test-Path -LiteralPath (Join-Path $b 'scripts/coord/presence.ps1')) { $isMf = $true; $repoRoot = $b; break }
     }
+
     if (-not $isMf) { exit 0 }
+
+    # The login lookup lives in the shared registry library, one definition with the liveness fence.
+    #
+    # RESOLVED FROM $PSScriptRoot, NOT FROM $repoRoot, for the same reason -PresenceScript defaults
+    # that way: the library that ships BESIDE this hook is the one whose contract it was written
+    # against. $repoRoot is derived from -CommonDir, which a caller can point at a different checkout
+    # of this repo -- and then the hook would load a sibling's copy of the library, whose functions can
+    # predate or postdate its own. Measured while building this: pointing -CommonDir at another
+    # checkout loaded a library without the lookup, and the hook went silent with no error, because a
+    # missing command is non-terminating under this file's SilentlyContinue preference.
+    . (Join-Path $PSScriptRoot '..\coord\session-registry.ps1')
 
     # --- 3. STATE DIR (resolved BEFORE the off-switch and the payload parse) ------------------------
     # The draft resolved this AFTER those branches, which made the DISABLED and NO_SESSION_ID receipts
@@ -383,11 +405,25 @@ try {
         # DO NOT pass -SelfPid. It saves a measured ~0.4 s by skipping presence's ancestry walk, but that
         # walk is our SECOND self-identification net, and a roster that lists you as your own peer makes
         # the session message ITSELF -- the most damaging failure this class of code has.
+        # SCOPE PRESENCE EXPLICITLY ONLY WHERE THE CWD CANNOT. presence defaults to the current
+        # worktree's repo family; outside a repo it has nothing to scope to and returns an empty
+        # roster, which this hook then reads as 'nothing usable' and stands down -- right when there is
+        # no repo to find, wrong when the caller already named one. $top is empty exactly when git could
+        # not resolve a toplevel, so it is the discriminator and costs no extra git call. Passed ONLY
+        # then: in a repo the default is measured and working.
+        #
+        # A HASHTABLE SPLAT, NEVER AN ARRAY ONE, and this is measured. @('-Json','-Repo',$path) binds
+        # POSITIONALLY: the path landed on presence's [int] -SelfPid, the transformation error was
+        # swallowed by the catch below, and it surfaced as the same generic 'nothing usable' --
+        # indistinguishable from the empty roster this hook exists to report.
+        $presenceArgs = @{ Json = $true }
+        if (-not $top -and $repoRoot) { $presenceArgs['Repo'] = $repoRoot }
+
         $peers = @()
         $ok = $false
         if (Test-Path -LiteralPath $PresenceScript) {
             try {
-                $out = & $PresenceScript -Json
+                $out = & $PresenceScript @presenceArgs
                 if ($out) {
                     $parsed = @($out | ConvertFrom-Json)
                     if ($parsed.Count -gt 0 -and $parsed[0].PSObject.Properties.Name -contains 'SessionId') {
@@ -437,14 +473,100 @@ try {
 
         # BOTH self-identification nets.
         $others = @($peers | Where-Object { (-not $_.IsSelf) -and -not ($_.SessionId -ieq $selfId) })
-        $myLogin = if ($me) { [string]$me.Login } else { 'default' }
+
+        # THIS SESSION'S LOGIN IS A FACT, LOOKED UP, NOT INFERRED FROM THE ROSTER.
+        #
+        # It used to read $me.Login and fall back to the literal 'default' when $me was absent. $me is
+        # absent whenever this session is not in the roster, and a roster is built from the WORKTREES of
+        # one repo -- so a session rooted anywhere else is missing from it by construction, and the
+        # fallback fired every time. A guessed login does not degrade the comparison below, it INVERTS
+        # it: on a non-default root every default-login peer is judged unreachable and every peer
+        # sharing this session's root is judged reachable.
+        #
+        # Registry records are enumerated across every config root, so the lookup answers for a session
+        # the roster cannot see. Prefer the roster row when there is one -- it is already loaded and
+        # costs nothing -- and fall back to the registry, never to a literal.
+        $lookup = if ($me -and $me.Login) { $null } else { Get-LoginForSession -SessionId $selfId }
+        $myLogin = if ($me -and $me.Login) { [string]$me.Login } else { [string]$lookup.Login }
+
+        # NO LOGIN, NO ANNOUNCEMENT. Standing down is the only safe branch, and both alternatives were
+        # measured to be worse:
+        #   - Guessing inverts the filter, as above.
+        #   - Skipping the filter looks like it fails safe and does not. Peers are offered as targets,
+        #     which DEBITS the lifetime send budget at print time and adds them to 'known', and nothing
+        #     refunds either when the model finds no session row and silently skips them. Six wasted
+        #     offers reach the terminal 'exhausted' state, after which this session never announces
+        #     again -- so a filter that cannot be computed would end in permanent silence, which is the
+        #     exact failure this hook exists to prevent.
+        # A receipt makes the stand-down visible, and the next prompt retries: a record that is missing
+        # because it is being written right now resolves on its own.
+        # -SelfTest is EXEMPT, and not as a convenience. It is a hand-run diagnostic with no payload and
+        # therefore no session id, so the lookup cannot succeed BY CONSTRUCTION there -- standing down
+        # would make the diagnostic report nothing on every invocation, including on the healthy repo
+        # path it exists to inspect. It sends nothing and debits no budget, so the reason for standing
+        # down does not apply. It prints the login, and says so when it is unknown, in the block below --
+        # which also states that the login filter is OFF for that run, because an empty login makes the
+        # filter's branch unreachable and every cross-login peer therefore renders as MESSAGE. A
+        # diagnostic that quietly disables a filter would misreport reachability as good news.
+        if (-not $myLogin -and -not $SelfTest) {
+            # RESET THE MARKER, exactly as every other stand-down here does. Section 14 already wrote
+            # state='checking' with attempts+1 BEFORE this lookup, so returning without clearing it
+            # leaves the session one prompt from the kill ladder above -- which fires on
+            # state='checking' AND attempts >= 2, injects a LOOKUP_KILLED line whose note ("previous
+            # lookup did not return") is false, and installs an hour-long floor. Measured: three
+            # consecutive stand-downs produced that cycle, and because `checks` never advanced past 0
+            # the SETTLED cap could not end it either, so it repeated for the life of the session.
+            # Standing down must be RECOVERABLE; the next prompt has to be able to try again.
+            $upd = if ($m) { $m } else { [pscustomobject]@{ schema = 2; sessionId = $selfId } }
+            $upd | Add-Member -NotePropertyName state -NotePropertyValue 'pending' -Force
+            $upd | Add-Member -NotePropertyName attempts -NotePropertyValue 0 -Force
+            $upd | Add-Member -NotePropertyName checks -NotePropertyValue ([int]$upd.checks + 1) -Force
+            $upd | Add-Member -NotePropertyName lastCheck -NotePropertyValue (Get-Date).ToString('o') -Force
+            $upd.PSObject.Properties.Remove('floorSeconds')
+            try { $upd | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $marker -Encoding ascii } catch { }
+
+            # THE NOTE CLAIMS ONLY WHAT WAS ESTABLISHED. An unreadable record and an absent one are
+            # indistinguishable here by construction: a record that fails to parse has no sessionId to
+            # attribute it by, so this cannot say WHOSE record it was. Reporting "no record" outright
+            # would send an operator looking for a missing file that may be present and corrupt --
+            # which is the launch-moment case this registry library is built around. Count them
+            # instead, on this rare path only, and let the number speak.
+            #
+            # THE AMBIGUOUS CASE IS NAMED SEPARATELY BECAUSE IT DOES NOT SELF-RESOLVE. Two roots each
+            # claiming this id is a configuration, not a race: it will still be true next prompt, and
+            # every prompt after that. Reporting it as "no record matched" -- which this did until the
+            # lookup started returning its match count -- sent an operator hunting for a missing file
+            # that was in fact present TWICE, which is the one place the cause was visible.
+            $matched = if ($lookup) { [int]$lookup.Matched } else { 0 }
+            $unreadable = if ($matched -gt 1) { 0 } else {
+                @(Get-SessionRecords -IncludeUnreadable | Where-Object { $_.Unreadable }).Count
+            }
+            # LEAD WITH THE DISCRIMINATOR. Write-Receipt folds this through Get-Clean with an 80-char
+            # cap, so anything past that is gone from the only durable record of the decision. The
+            # first version buried the word that told the three cases apart at the end of a sentence
+            # and it was truncated away -- the receipt then read identically for a missing record and
+            # a duplicated one, which is the failure this note exists to prevent.
+            $why = if ($matched -gt 1) {
+                "AMBIGUOUS: $matched config roots hold a record for this id; will not self-resolve"
+            } elseif ($unreadable -gt 0) {
+                "UNREADABLE: $unreadable registry record(s) unparsed, maybe still being written"
+            } else {
+                "MISSING: no registry record matched this session id"
+            }
+            Write-Receipt 'NO_LOGIN' @{ peers = $peers.Count; checks = [int]$upd.checks; note = $why }
+            exit 0
+        }
 
         $ranked = @()
         foreach ($p in $others) {
             $reason = ''
             if ([string]$p.Surface -ne 'desktop') {
                 $reason = 'the MCP cannot enumerate this surface'
-            } elseif (([string]$p.Login) -and -not ([string]$p.Login -ieq $myLogin)) {
+            # The $myLogin guard is reachable ONLY under -SelfTest: the real path exits at NO_LOGIN
+            # above rather than continuing with an uncomputable filter. Without it an empty login would
+            # compare unequal to every peer and mark the whole roster unreachable, which would make the
+            # diagnostic report a fleet-wide outage that does not exist.
+            } elseif ($myLogin -and ([string]$p.Login) -and -not ([string]$p.Login -ieq $myLogin)) {
                 # presence spans every config root, and a peer under another login is unreachable by
                 # THIS session's tools.
                 $reason = 'different login -- invisible to this session''s MCP'
@@ -469,6 +591,15 @@ try {
             Write-Output "  state dir  : $StateDir"
             Write-Output "  MessageFoundry guard: passed"
             Write-Output "  marker state found  : $st"
+            if ($myLogin) {
+                Write-Output "  this session's login: $myLogin"
+            } else {
+                Write-Output "  this session's login: UNKNOWN (a hand-run carries no session id, so the"
+                Write-Output "        registry lookup has nothing to match). THE LOGIN FILTER IS OFF for"
+                Write-Output "        this run, so a peer on another login shows as MESSAGE here and"
+                Write-Output "        would be SKIPped on the real path. Reachability below is therefore"
+                Write-Output "        an UPPER BOUND, not what a real session would send."
+            }
             if ($st -eq 'settled' -or $st -eq 'exhausted') { Write-Output "  would exit silently: already $st" }
             if (-not $me) {
                 # Say so rather than quietly listing this session as its own peer. Run by hand there is

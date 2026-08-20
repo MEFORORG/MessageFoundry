@@ -9575,6 +9575,88 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Ledger tooling / evidence integrity. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) -- documentation accuracy. The cost is that the ledger's own evidence decays invisibly, and the decay is fastest after exactly the kind of broad, correct, well-reviewed change nobody would think to re-check it against.
+## 1264. The seat clock fires on cadence but its fanout skips seats, and the tick's own rubric sends every seat to look at the clock
+
+> 🔢 **Filed 2026-08-14 - not started. Found by three seats independently, each holding one face of it, and none able to see it alone.** Value **7/10** - Difficulty **4/10**. The coordination clock wakes seats on a timer. **Its cadence is healthy and its fanout is not**, and the two are indistinguishable from inside any single seat.
+
+> **THE CLOCK IS NOT THE DEFECT. MEASURED: 112 firings, cadence ~10.0 minutes.** No firing was late.
+
+> **THE FANOUT IS. Recipients per firing ranged 1 to 11 with a MEDIAN OF 2, and AT LEAST 53 of 112 firings reached EXACTLY ONE SEAT.** One seat received 33 of 112 - 29 percent.
+
+> **THE COUNTS ARE ROBUST TO THE COUNTING RULE, WHICH IS THE FIRST THING A READER SHOULD TRY TO BREAK.** A fan-out stamps its recipients seconds apart, so grouping firings **by minute** could split one broadcast straddling a boundary into two with divided recipients - manufacturing exactly this defect's signature. Re-measured by **clustering** instead (consecutive sends within 30s = one firing, which is what a fan-out is):
+
+> ```
+> rule            firings   reached exactly ONE seat   median recipients
+> minute-key        112              53                      2
+> 30s cluster       113              53                      2
+> ```
+
+> **Two independent grouping rules, the same answer.** The artifact is worth at most one boundary firing, and the floor wording already covers it. Prefer **"at least 53 of ~113 firings reached exactly one seat"** - 113 is the better-grounded denominator.
+
+> **AND THE CENSUS IS KEYED ON SEND TIME, NOT DELIVERY TIME.** Every figure comes from the message's sender-stamped `createdUtc`. That closes the other obvious attack - *"was this measured at the receiver, where a queue can manufacture raggedness?"* - and it matters because the same clock read **broken on delivery time and 10.0 minutes on send time**. Corroborating seats measured their own gaps on the same axis.
+
+> **WHAT WOULD OVERTURN THE MIXED-MODE READING, stated so it is falsifiable:** it assumes firings **did** occur at ~20:11 and ~20:21. That is taken from the clock-owner's own "last good tick 20:21" and **has not been verified against the clock's heartbeat by anyone who read the source.** If those two firings never fired, that seat's gap is a pure outage and its two skips come off this count.
+
+> **EVERY COUNT HERE IS A FLOOR, NOT A CENSUS, AND THE BIAS RUNS THE WRONG WAY.** They are derived from **delivered mail files**, so a firing that was written but never enqueued - or enqueued to a box the instrument cannot read - is **invisible to it**. The defect is UNDER-DELIVERY and the instrument can only UNDER-COUNT, so it is biased in the **same direction as the defect**. The true fanout could be worse than these numbers; it cannot be established as better from them.
+
+**Both innocent explanations were tested and both fail.**
+
+- **Not roster growth.** If only one or two seats were genuinely live, a 2-recipient broadcast would be correct - and the count would climb as seats joined. **It collapses and recovers instead:** `10,10,10,10,9,11,11` over 13:51-14:51, then `2,5,3,3,6,2,2,2` over 15:01-16:11, then back to `10,...,11` by 16:21. Eleven seats do not all die at 15:01 and all return at 16:21.
+- **Not seat death.** One seat sent **28 messages inside its own 60.1-minute gap**, one of them **28 seconds before** a firing that skipped it. For "not live" to explain that, it would have to be invisible to the roster while demonstrably sending mail on either side of the skip.
+
+> **CORRECTION TO THIS ITEM'S OWN CENTRAL CLAIM: QUANTISED DOES NOT MEAN "FANOUT SKIP". IT MEANS "EVERY FIRING HAPPENED AND NONE REACHED YOU" -- A DELIVERY FAULT WHOSE CAUSE THE TEST CANNOT NAME.** A **fanout skip** (the seat was not on the list) and a **failed send** (the seat was on the list and the send errored) are **indistinguishable from the receiver**. The 36-minute outage proves the second case exists here: the **scheduler ran perfectly and every send returned failure**. Had that outage ended on-grid instead of on a manual recovery fire, it would have presented as **quantised** and been counted as fanout evidence.
+
+> **SO THE COUNTS ABOVE BOUND A DELIVERY FAULT, NOT SPECIFICALLY A ROSTER FAULT.** The roster/fanout hypothesis remains the best lead - it explains the collapse-and-recover shape and the stable core of always-reached seats, which a send failure does not - **but the measurement does not on its own exclude send-side failure, and this item should not be read as having done so.** Separating them needs the SENDER's own per-firing result, which nobody has read.
+
+> **THE DISCRIMINATOR, AND IT IS ONE DIVISION.** A gap that is an **exact multiple of the cadence** means the clock fired and you were skipped. A **ragged** gap is a real gap. Measured: 50.0, 40.0 and 60.1 minutes all quantised to within 0.01 of a 10-minute multiple; 42.3 minutes was ragged. **It took three seats a full day to find that division, because from inside one seat "the clock is slow" and "the broadcast skipped me" are the same observation.**
+
+> **A FOURTH SEAT, AND IT IS THE SMALLEST SKIP MEASURED - ONE FIRING, NOT A RUN.** Ticks at 20:01:11Z then 20:21:13Z: a **20.0 minute gap, exactly 2x the cadence**, so the ~20:11 firing fired and skipped them. **They sent mail 60 seconds later**, at 20:12:09Z, and ran commands continuously either side (20:03:28Z, 20:12:09Z, 20:14:20Z, 20:20:17Z). **This is the datapoint a reader cannot dismiss:** a long gap can be argued away as an outage or a dead seat, but a *single isolated skip bracketed by demonstrated activity 60 seconds out* cannot.
+
+> **THE DOC HALF IS ALREADY DEMONSTRATED TO WORK, ON THAT SAME SEAT.** Their 20.0 minute gap **exceeds the rubric's ~15 minute threshold**, so by the rubric they should have reported a broken chain. They did not - only because the quantised-versus-ragged discriminator had reached them minutes earlier. **The rubric would have produced one more false clock report; the discriminator prevented it.**
+
+> **A RAGGED CONTROL CASE, 2026-08-14 ~20:58Z, AND IT IS WHAT KEEPS THIS ITEM HONEST.** Every gap above is **quantised**. Two seats then recorded **ragged** ones in the same window - **46.8 min (residual 0.32)** and **36.8 min (residual 0.68)** - and by the discriminator those are **real gaps in the chain, NOT fanout skips**. Both seats were demonstrably sending mail across their own gaps, so idleness explains neither.
+
+> **CAUSE CONFIRMED BY ITS AUTHOR, SO THIS BLOCK IS NO LONGER A HYPOTHESIS: THE CLOCK WAS DOWN, AND IT WAS AN EDIT THAT OVERRAN A LENGTH CAP.** The seat maintaining the tick edited its body to fix the rubric, taking it to **3395 characters against `mail.ps1`'s hard 2000-char cap**, so every send returned `FAILED(queued=0, exit=1)` and **no seat received anything** between ~20:28Z and 20:57Z. **Firings were attempted and nothing was enqueued** - a real break in the chain, which is exactly what RAGGED means. **The discriminator classified it correctly without knowing the cause.**
+
+> **AND THEIR VERIFICATION COULD NOT HAVE CAUGHT IT.** They checked the file **parsed** and carried **no glyphs**; both passed. **Neither check can see a runtime length limit enforced by a different script.** Their first fix also failed - trimmed to 2314, still over - and they only knew because they **fired the clock and read the heartbeat** instead of trusting the edit.
+
+> **THE TWO GAPS HAVE DIFFERENT LENGTHS AND THE SAME END, WHICH IS THE DIAGNOSTIC PART.** 46.8 and 36.8 minutes both terminate at ~20:58, and the tick **phase moved** with them - every firing that day landed 9-16 seconds past the minute, that one landed at 02. **Different durations converging on one resume instant is the signature of the SCHEDULE RESTARTING**, not of a selection skipping people: a skip leaves each seat's gap an exact multiple of the cadence, a restart does not.
+
+> **THE RULE ASSUMES EVERY FIRING SITS ON THE CADENCE GRID, AND AN OFF-GRID FIRE BREAKS IT IN BOTH DIRECTIONS.** A manual live-fire or recovery test lands off the `:x1` grid, so the gap **before** it reads ragged and the gap **after** it -- to the next scheduled firing -- can fall under the ~6 minute floor and read as **OVER-FIRING, the fault the rubric calls the expensive one.** Neither is true; the clock is on cadence and one endpoint simply is not on the grid.
+
+> **This is the second-order form of the same defect: a rule answering exactly the question it was given, on data violating an assumption nobody wrote down.** The recovery fire at ~20:58 was sent to nine seats, so up to nine could each hold a short gap the rubric tells them to escalate.
+
+> **Before classifying, check whether EITHER endpoint is off the grid; if so, the gap is unclassifiable by this rule.** *(Raised by the seat that supplied the divide-by-ten rule, against their own rule. Not corroborated here -- this seat's next tick had not arrived at the time of writing, so the claim rests on the arithmetic rather than on a second observation.)*
+
+> **A LIMIT ON THE DISCRIMINATOR ITSELF, AND IT BITES HARDEST ON THE WORST-AFFECTED SEAT.** Dividing a gap by the cadence requires **the cadence as an INDEPENDENT input**, and **a skipped seat cannot derive it from its own ticks** - its samples are precisely the firings that survived selection. A heavily-skipped seat computing a "cadence" from its surviving gaps will classify real skips as ragged and conclude the chain is broken. **Take the cadence from the fleet-wide census, never from the reader's own gaps.** One seat's 36.80 min fits no 10-minute grid anchored at either of its own prior ticks, which is what surfaced this.
+
+> **THE TWO CLASSES CONCATENATE, SO RAGGED IS WEAKER THAN IT LOOKS: IT MEANS *NOT PURELY QUANTISED*, NOT *A PURE CHAIN BREAK*.** One seat's 56.75 min gap is a **mixture** - the ~20:11 and ~20:21 firings happened **while the clock was healthy** and it received neither (two fanout skips), then the outage accounted for the rest. **Neither class alone produces 56.75.**
+
+> **THEREFORE: CLIP EACH SEAT'S GAP TO THE OUTAGE WINDOW AND CLASSIFY THE REMAINDER - DO NOT DISCARD A GAP THAT MERELY STRADDLES IT.** *"20:21-20:57 is the outage"* is correct as a **window** and wrong as a **filter**: applied to any gap touching it, it absorbs genuine skips into the outage and **drives this item's count DOWN. The count is already a floor, so every such absorption makes an under-measurement worse.**
+
+> **MEASURE CADENCE ON SEND TIME, NOT DELIVERY TIME.** The same clock measured on delivery looked broken and on send showed **10.0 minutes almost exactly**. **A capped, queued channel turns a regular sender into a ragged-looking one at the receiver**, so a cadence audited from a recipient's transcript inherits the channel's backlog as if it were the clock's behaviour.
+
+> **THE DISCRIMINATOR WAS VALIDATED BLIND, WHICH IS THE STRONGEST THING SAID FOR IT HERE.** Three seats classified their own gaps *before* the outage was disclosed; each sorted its ragged gap to *chain break* and its quantised gaps to *skip*, and the chain break turned out to be a real one. **A rule that sorts correctly for a reader who does not know what they are looking at is worth more than one confirmed by the seat that proposed it.**
+
+> **SO THIS ITEM COVERS THE QUANTISED CASE ONLY, AND THE RAGGED ONE IS A DIFFERENT MECHANISM.** Recorded here so that a later reader with one ragged gap does not attach it to this item and conclude the fanout defect is broader than measured - and so that a fix for the fanout is not credited with curing a restart. **Nobody has confirmed what restarted; a hook was edited around 20:15 and that coincidence is named, not claimed.**
+
+> **UNEXPLAINED, AND THE BEST LEAD: three seats received ALL SIX firings across 18:41-19:21 while others flickered.** Whatever varies does not vary for them. **Nobody has read the roster source** - this item is filed on behaviour alone.
+
+**TWO FIXES WITH DIFFERENT OWNERS. State both, because one absorbs the other if you do not.**
+
+1. **CODE - STILL OPEN, AND NOBODY HAS READ THE ROSTER SOURCE.** The roster/fanout selection itself. No mechanism is claimed here.
+2. **DOC - ALREADY FIXED, 2026-08-14, in `scripts/coord/seat-tick.ps1`.** The rubric used to tell every seat that a gap over ~15 minutes means *the chain is broken* - so every seat looked at **the clock** and nobody looked at **the roster**. **An instruction that names the wrong subject converts one fleet-wide defect into eleven private ones.** It now says a long gap means something is wrong but **divide by the cadence before saying what**: quantised means every firing happened and you were not on the list (report a SKIP, not a slow clock); ragged means a real gap. Verified with a positive control - a deliberately broken file returned 2 errors, so the clean parse means something.
+
+> **A FIFTH SEAT WAS SKIPPED AND IT IS THE ONE THAT OWNS THE CLOCK.** Census of its own transcript, 106 tick records: **15:11 -> 15:41, 30.0 min quantised (2 firings never received); 15:41 -> 16:21, 40.0 min quantised (3 firings never received)** - inside the same collapse, but measured from a **receiver's transcript** rather than from delivery files, so it is an independent instrument rather than a second look at the same one.
+
+> **AND THAT SEAT TOLD THE FLEET AT 19:35 THAT THE CLOCK "DID NOT MISS A BEAT"** - true of the six consecutive 10.0-minute gaps it was standing in, false as a claim about the clock. **The seat that owns an instrument is not automatically the one who notices it is broken**, and the disproving census was in its own transcript all day, unrun.
+
+> **THE QUALIFICATION ON THESE NUMBERS WAS ONCE DESTROYED IN TRANSIT, WHICH IS WHY IT IS RESTATED HERE RATHER THAN CITED.** A broadcast carrying them was truncated by the mail length cap **mid-word, exactly on the caveat** - `"...so they are a F"` - so the headline survived and the bound did not. Two seats then relayed the figures flat. **A cap bites at the END of a message, which is precisely where a caveat sits.** If a number reaches you from a truncated message, treat it as unqualified until you read the whole message on disk.
+
+**Cluster:** Coordination / session clock. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (§0) - this is fleet tooling. The cost is silent under-delivery of wake-ups, which is indistinguishable from a healthy quiet clock and therefore self-concealing.
+
+**Provenance.** Measured independently by three seats on 2026-08-14; counts come from delivered mail files, so every figure here is a **floor**. Numbers are inlined deliberately: the working lived under `mefor-coord/handoffs/`, which is never committed, and an item citing an uncommitted path resolves to nothing.
 
 ## 1265. the warning sign is unsanctioned decoration in 496 places across 80 files
 
@@ -10203,3 +10285,179 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Documentation / adopter-facing. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0). The cost today is that someone evaluating the project cannot see how its authors think about the threat surface, or what responsibility their own Handler code would carry.
+
+## 1290. connscale CPU-probe process-table walk times out on hosted Windows runners, reddening a required context on main
+
+> 🔢 **Filed 2026-08-19 -- not started. A REQUIRED STATUS CHECK IS INTERMITTENTLY RED ON `main`, AND THE TEST THAT FAILS CANNOT ASSESS THE REGRESSION IT EXISTS TO CATCH WHEN IT DOES.** `tests/test_connscale_cpu_probe.py::test_subtree_re_resolution_picks_up_a_late_spawned_child` fails on the `walked_ok` assertion ([`test_connscale_cpu_probe.py:309`](../tests/test_connscale_cpu_probe.py)): the process-table walk returned `None` on **every one of 6 attempts in 30s**, the Windows path allowing 5s per walk. **THE CHANGE: make the walk's deadline survive a loaded hosted runner, or degrade a walk-level timeout to a skip rather than a failure.**
+
+> **IT IS ON `main`, NOT ON A BRANCH -- that is what makes it a queue problem rather than one PR's problem.** CI run `32255231838`, head `de896e0f`, event `push`, failing job **`test (windows-2022, py3.14)`** -- which is one of the 13 REQUIRED contexts. Every PR that follows inherits the same exposure.
+
+> **IT IS NONDETERMINISTIC, AND THAT IS MEASURED RATHER THAN ASSUMED.** The identical leg on PR #448 (`test (windows-2022, py3.14)`, same runner image, same hour) returned **SUCCESS**. Same test, same required leg, opposite outcomes, and neither branch touches this subsystem -- #448 changes `scripts/coord/overlap.ps1`. **Do not read this as "flaky, ignore it":** this repository's two famous flakes turned out to be a livelock and a test that was right, so the label is earned here only by the cross-branch pair above.
+
+> **CONFIRMED ON THE SAME HEAD, which is stronger than the cross-branch pair.** Re-running the failed job alone (`gh run rerun 32255523152 --failed`, PR #447 head `4ccbf816`, no code change) returned **`completed/success`**. Identical commit, identical leg, opposite outcome -- so the failure cannot be a property of the tree under test. **Note what this does and does not establish:** it settles nondeterminism, and it says nothing about how often the walk fails or under what runner load, which is what an actual fix has to be sized against.
+
+> **THE FAILING ASSERTION IS THE ONE THE TEST'S OWN AUTHOR SEPARATED OUT AS AN ENVIRONMENT PROBLEM.** The test deliberately splits *"the probe could not enumerate at all"* from *"it enumerated and missed a live child"*, so the two cannot be confused. It fails on the **first**; the re-resolution regression assertion below it **never runs**. So while this is red, the test is not merely failing -- it is **silent on the defect it was written to detect**, which is the worse half.
+
+> **THIS IS NOT NEW, AND THE RECORD IS IN THE TEST.** Its own comment records the same class on 2026-07-30: *failed twice in one job on windows-2025, while windows-2022 and ubuntu passed the identical commit.* The runner that fails has since changed; the class has not.
+
+> **DO NOT MERGE THIS INTO EITHER NEIGHBOURING ITEM -- different causes, same file family.** #1014 is a **fixed 24-port block collision** in `test_connscale_smoke_end_to_end`, whose `flaky(reruns=2)` marker hides a determinate resource contention. #1210 arm 2 is **FD/RSS provenance** in the same probe -- the sum carries no record of the PID set it covered. Neither is a walk that never completes. `docs/BACKLOG.md` carried **zero** items on the walk timing out when this was filed; the search that returned that zero returns hits for the same tokens in the test file, so the null is a real null.
+
+**Cluster:** CI reliability / load-harness probe. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- `harness/load/` is test infrastructure and ships in no engine path. The cost is a required context that randomly blocks the merge queue, and a regression assertion that is inert exactly when the probe is under stress.
+
+## 1291. Get-HandledTools returns NULL on its zero-tool and missing-file paths, correct only by its caller's grace
+
+> 🔢 **Filed 2026-08-19 -- not started. THIS IS A LATENT TRAP, NOT A LIVE DEFECT, AND THE DISTINCTION IS THE ITEM.** `Get-HandledTools` in [`scripts/worktree/install-gate.ps1`](../scripts/worktree/install-gate.ps1) returns `$null` rather than an empty array on two of its paths. **Shipped behaviour is correct today** because its single caller (around line 294) wraps the result in `@(...)`. **A commit message or item claiming a present-tense bug here would be false.** The honest claim: the function is correct only by its caller's grace, and the guarantee belongs in the function. **THE CHANGE: make both exit paths return an array unconditionally.**
+
+> **MEASURED, in pwsh 7, by extracting the function through the PowerShell AST rather than running it:**
+>
+>     missing file   ->  NULL
+>     zero tools     ->  NULL
+>     one tool       ->  type=String    count=1
+>     two tools      ->  type=Object[]  count=2
+>
+> The one-tool arm is the sharp edge: a bare `String` answers `.Contains('Edi')` with **True**, so a membership test against a single handled tool silently succeeds on a substring of it.
+
+> **BOTH EXIT PATHS UNROLL -- a tail-only fix leaves the worse one broken.** The early `if (-not (Test-Path ...)) { return @() }` returns NULL exactly as the closing `@($tools)` does, and **that early path is the normal one on a box where the gate was never installed** -- which is every fresh checkout. Fixing only the tail repairs the case that is already hardest to reach and leaves the common one.
+
+> **A TEST THROUGH `-Status` CANNOT DISTINGUISH FIXED FROM UNFIXED**, because that caller re-wraps. The discriminating test must call `Get-HandledTools` **directly** and assert **type and count** on the zero-element, one-element and missing-file arms.
+
+> **AND IT CANNOT BE REACHED BY DOT-SOURCING: loading `install-gate.ps1` PERFORMS A MACHINE-GLOBAL INSTALL.** The sanctioned route is AST extraction -- `ParseFile` plus `FunctionDefinitionAst` -- which is about five lines and was confirmed working while measuring the table above. Any test written for this item must use it; a dot-source in a test would install the gate on whatever machine ran the suite.
+
+> **Fix, and it should match the one spelling its sibling introduces:** `return ,@($tools)` at the tail and `return ,@()` at the early return. PR #447 fixes the adjacent `-Status` unroll in the same file with `return ,$wired`; this is the same class, found while measuring that one, and left unfixed there because that branch was already pushed and its author stopped writing code.
+
+**Cluster:** Worktree gate / PowerShell correctness. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0), and no live defect axis either -- `scripts/worktree/` is developer tooling and the caller currently compensates. The cost is that the next caller written against this function inherits a NULL its signature does not advertise.
+
+## 1292. connscale smoke reports a message acked but not observed at intake, and nothing discriminates harness race from real intake loss
+
+> 🔢 **Filed 2026-08-19 -- not started. THE ASSERTION THAT FIRES NAMES AN ACKED-BUT-UNREAD MESSAGE, AND THAT IS EITHER A HARNESS RECONCILIATION RACE OR A COUNT-AND-LOG VIOLATION. NOBODY HAS SEPARATED THE TWO, AND THEY HAVE VERY DIFFERENT SEVERITIES.** `tests/test_connscale_smoke.py::test_connscale_smoke_end_to_end` trips `assert r.no_loss.ok` with:
+>
+>     ('fixed_aggregate', 24, 'engine_read 34 < confirmed sent 35 (lost 1 on intake);
+>      1 unconfirmed send(s) (no ACK before connection close) not observed at intake
+>      -- not counted as loss')
+>
+> **Read the parenthetical carefully -- it is what makes this item worth filing.** The harness already excludes the benign case: a send with no ACK before close is explicitly *not counted as loss*. The one it is complaining about is a **confirmed** send. **THE CHANGE: discriminate the two causes before treating this as a flake.**
+
+> **WHY THE DISTINCTION IS THE WHOLE ITEM.** `CLAUDE.md` section 2's count-and-log invariant is that every received message is persisted **before** the ACK, so nothing is accepted-and-dropped. A message that was **acked** and then **not observed at intake** is, on its face, that invariant failing. **It is at least as likely that the harness reconciles a counter across a window that can close mid-flight** -- which is a test defect and nothing more. **Neither has been demonstrated.** Filing it as "flaky" picks the comfortable branch without evidence, and that is precisely the named-cause-retires-a-finding trap.
+
+> **SEVERITY, STATED IN THE CONDITIONAL PER SECTION 0.** If it is the harness, cost is CI noise. If it is real, it **would** mean a deploying site could lose an acked message at intake -- the one thing the staged pipeline's ACK-on-receipt design exists to prevent. **No live instance is affected, because there are none.** The item is P1 on the strength of the branch that has not been ruled out, not on a demonstrated defect.
+
+> **A THIRD SIGHTING, 2026-08-19, AND ITS MAGNITUDE ARGUES AGAINST THE ALARMING BRANCH.** PR #431 run `32278742105`, `test (windows-2025, py3.14)`: `sweep_mode='fixed_aggregate', count=12, sent=36, acked=13`. **Twenty-three of thirty-six sends unacked** -- against `lost 1 of 35` in the first sighting. **A count-and-log invariant failure does not plausibly scale like that**; an engine that persists-then-acks either does so or does not, and a 64 percent shortfall looks like the harness measuring an engine that could not keep up, not one silently dropping. **It is EVIDENCE, not a verdict:** the item stays open and the discriminator below is still the thing that settles it. Recorded because the magnitude is the first data that distinguishes the two branches at all.
+>
+> Corroborating, same run: `test_connscale_cpu_probe.py`'s walk-timeout (#1290) failed **in the same job**, with no apt failure and 10,488 tests passing. **Two independent connscale probes failing together, both of them timing/measurement-shaped, is the signature of a loaded runner** rather than of two unrelated defects.
+
+> **A FOURTH SIGHTING QUALIFIES THE THIRD: THE SHORTFALL REPRODUCES, AND THAT CUTS THE OTHER WAY.** PR #394 run `32290943152`, `test (windows-2022, py3.14)`, **the same sweep configuration**:
+>
+>     #431   fixed_aggregate  count=12  offered=24.0  sent=36  acked=13
+>     #394   fixed_aggregate  count=12  offered=24.0  sent=36  acked=14
+>
+> **Different PRs, different runner images, same config, and the ack count lands within one of itself.** The entry above argued from MAGNITUDE that a 64 percent shortfall looks like starvation rather than an invariant failure. **That argument is weakened by this: starvation is load-dependent and should scatter. A shortfall that reproduces to within one ack across independent runs looks SYSTEMATIC** -- a limit being hit at a particular offered rate, not a runner having a bad minute.
+>
+> **Neither reading is established, and the item's severity is unchanged.** What has changed is that the cheap explanation is no longer the comfortable one: **"it is just a loaded runner" now has to explain the reproducibility**, and it does not. The store-side discriminator below remains the only thing that settles it, and this makes running it more urgent rather than less.
+>
+> **Recorded against my own earlier entry deliberately.** The magnitude argument was written the same day and is not retracted -- it is bounded by this. Leaving it unqualified would let a reader take "probably starvation" as the current state of the evidence, which it no longer is.
+
+> **IT IS ON `main`, AND IT IS CROSS-PLATFORM -- so it is not one runner's bad day.**
+>
+>     main    run 32255231838  head de896e0f  test (windows-2022, py3.14)   FAILED
+>     PR #448 run 32259244062  rebased head   test (ubuntu-latest, py3.14)  FAILED
+>     PR #431 run 32278742105  rebased head   test (windows-2025, py3.14)   FAILED  (sent=36 acked=13)
+>
+> Two operating systems, two branches. On `main` the record read `count=12, sent=36, acked=36`; on #448 `count=24, engine_read=34, sent=35`. **Same assertion, different shapes** -- which is itself evidence against a single fixed off-by-one.
+
+> **IT ALREADY HAS `@pytest.mark.flaky(reruns=2)` AND FAILED ANYWAY.** So it did not merely lose a coin toss; **it exhausted its retries.** A retry budget that is already being spent is not a mitigation, it is a mask -- and it is the same masking #1014 records for this file's port allocation.
+
+> **DO NOT FOLD THIS INTO ITS NEIGHBOURS.** #1014 is a **fixed 24-port block collision** in this same test -- a bind failure, not a delivery count. #1290 is the **CPU-probe process-table walk timing out**, a different test in the same suite. This is a **reconciliation** assertion. All three are live at once, which is the actual reason the merge queue keeps stalling: two of them sit inside the REQUIRED `test (...)` contexts, so any PR can inherit either.
+
+> **FIRST STEP THAT IS NOT A GUESS:** make the harness record, for the specific message it counts as lost, whether an ingress row exists in the store. That answers "acked but not persisted" versus "persisted but not counted" directly, and it is the discriminator neither the current assertion nor a re-run can supply.
+
+**Cluster:** CI reliability / intake accounting. **Priority:** P1. **Verdict:** build.
+**Severity:** no deployment axis today (sec. 0 -- zero instances). Rated P1 because the unexcluded branch is a count-and-log invariant failure, and because it is currently red on `main` inside a required context.
+
+## 1293. removing a worktree orphans every unlanded ledger number it allocated, permanently stranding those PRs
+
+> 🔢 **Filed 2026-08-19 -- not started. LEDGER OWNERSHIP IS A PATH-STRING COMPARISON AGAINST A DIRECTORY THAT CAN CEASE TO EXIST, AND WHEN IT DOES, `owns()` RETURNS FALSE FOR EVERY SESSION FOREVER.** `Checker.owns` ([`scripts/hooks/ledger_check.py:219-231`](../scripts/hooks/ledger_check.py)) reads `<git-common-dir>/mefor-coord/alloc/<kind>/<number>.json` and compares `self.repo` to the recorded `worktree`, casefolded. **There is no fallback for a recorded worktree that is gone.** Ownership is documented as non-transferable, so nothing can re-key it. **THE CHANGE: give an orphaned allocation a defined recovery path.**
+
+> **THIS IS NOT HYPOTHETICAL -- PR #397 IS STRANDED BY IT RIGHT NOW, AND IT IS SITTING IN THE MERGE QUEUE.** Measured:
+>
+>     BACKLOG #1264 allocated by   a session worktree, recorded in its alloc claim
+>     that directory                does not exist, and is not in `git worktree list`
+>     #1264 on origin/main          NO  (0 occurrences of its heading)
+>     PR #397                       DIRTY, and its only conflict is docs/BACKLOG.md
+>
+> **The combination is what strands it.** The conflict needs a resolution commit; the resolution re-introduces a heading that is not yet on `main`, which the gate treats as an **addition**, so ownership is consulted; and ownership can never again be satisfied. **A one-file, purely mechanical ledger conflict is therefore unresolvable by anybody.**
+
+> **THE FAILURE IS SILENT UNTIL THE COMMIT, WHICH IS THE EXPENSIVE MOMENT.** Nothing warns at worktree-removal time, nothing warns when the PR goes DIRTY, and the refusal arrives only when someone has already done the resolution work. The gate is **failing closed and is behaving correctly** -- the defect is that there is no route back, not that it refuses.
+
+> **THREE CANDIDATE ROUTES, none obviously right, which is why this needs a decision rather than a patch:**
+>
+>     recreate a worktree at the recorded PATH   restores the comparison's referent; the gate keys on
+>                                                the string, so this works -- but it is uncomfortably
+>                                                close to the rename-workaround CLAUDE.md sec. 5 forbids
+>     an explicit `alloc.ps1 -Reassign <n>`      honest and auditable, but it puts a hole in the
+>                                                non-transferable rule the gate rests on
+>     let a MISSING owner directory fall through  narrowest, and it fails OPEN exactly once per number --
+>       to the CI behaviour (ownership skipped)   needs care that "missing" cannot be forged
+>
+> **Whichever is chosen, it must not be "widen the gate".** The `--ci` leg already skips ownership by design (`not self.ci and not self.owns(...)`, `ledger_check.py:266` and `:355`), so a green CI is **not** evidence a number was properly allocated -- that hole should not be made bigger.
+
+> **ROUTE 1 WAS TESTED ON THE LIVE INSTANCE, 2026-08-19, AND IT WORKS.** Owner-directed. `git worktree add` at the exact recorded path, on the stranded PR's own branch; resolve there; commit there. **The ledger gate reported `Passed`** on a commit that could not have been made from anywhere else, and PR #397 went `DIRTY` to `MERGEABLE`. **Note what this does and does not settle:** it confirms the mechanism -- `owns()` compares a path string, so restoring the path restores the referent -- and it settles nothing about whether this should be the *documented* remedy, because it is still uncomfortably adjacent to the rename-workaround CLAUDE.md sec. 5 forbids. **The distinction worth preserving: this RESTORES the condition the gate tests rather than bypassing the test.** A reassign flag would be the honest version of the same intent.
+>
+> Two details a repeat of this must not skip. **`git worktree add -B` resets the local branch**, and here it moved one from `91a24061` -- verify what that ref held before accepting the reset (it was an old `main` commit, reachable from many refs, so nothing was stranded; that was checked, not assumed). And **resolve the ledger conflict against a computed target, never by eye**: merge-base `292/212`, branch `293/213`, `origin/main` `310/230`, so the only correct result was `311/231`, and `parse_items` returning exactly that is what made "keep both sides" a verified claim instead of a hopeful one.
+
+> **THE OPERATIONAL RULE THAT FALLS OUT, AND IT IS WORTH ADOPTING EVEN IF THE FIX IS DEFERRED:** before removing a worktree, check whether it owns any allocation whose item is not yet on `main`. That sweep is cheap -- read each `alloc/*/<n>.json`, match `worktree` against the removal list, and grep `origin/main`'s ledger for the heading. **It was run against the 16 worktrees proposed for removal on 2026-08-19 and returned zero**, with #1264 used as the positive control to prove the sweep can actually detect the class.
+
+**Cluster:** Ledger gate / worktree lifecycle. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- this is developer tooling. The cost is a PR that cannot be landed by anyone and a ledger number burned with no way to reuse it, plus the sweep above being folk knowledge until it is written into the removal path.
+
+## 1294. no cleanup path exists for the 70 percent of worktrees the prune tool must never touch, so they accumulate until a human removes them by hand
+
+> ✅ **SHIPPED 2026-08-19 -- `prune-merged.ps1` now evaluates EVERY registered worktree and emits `REPORT-ONLY` rows plus a copy-pasteable command block for the ones it must not touch. No `-Apply` path for them, no `-Name` override, and `worktree_gate.ps1` unchanged: only DISCOVERY was automated, the human stays the actuator.** The risk model took three cuts and the controls caught each. Cut 1 listed every idle clean tree under a *"look finished"* banner beside rows reading *"37 commit(s) not on origin/main"*. Cut 2 withheld anything whose touched paths still differed from `main`, and **failed its own positive control** -- a branch whose content had landed as a squash was withheld because `main`'s copy of a shared file had moved on, which in this repo withholds everything. Cut 3 asks the right question: **`git worktree remove` does not delete branches**, so a tree on a branch keeps its commits through the ref and no content test is meaningful; a **detached** tree is the only one removal can strand, and is listed only when another ref already contains its tip -- rung 2 versus rung 3 of the recoverability ladder, not a merge test. Withholding fails closed throughout (unavailable fence, unreadable activity, unreadable ref list), and the withheld **count** is printed while the withheld **trees are not named** -- naming them would re-create the suggestion the withholding exists to avoid. Three tests, negative control run on all three; one originally passed with the feature fully broken because it asserted a tree was ABSENT from an empty list, and now asserts the list is populated first. 78 passed.
+>
+> **Original finding, kept because the measurement is the reason the shape is a reporter:**
+>
+> **THIS IS NOT "THE PRUNE TOOL HAS A COVERAGE BUG". ITS EXCLUSIONS ARE DELIBERATE, WERE PAID FOR BY AN INCIDENT, AND MUST STAY.** `scripts/worktree/prune-merged.ps1` refuses anything with a `.claude/worktrees/` path segment, anything nested inside another registered worktree, detached trees, Temp scratchpad trees, and the primary. Its header states why: that directory is **"the exact place EnterWorktree relocates a live session to"**, the tool **once removed an occupied worktree** -- deregistering it and then failing to delete the directory, after which every git command in the working session failed -- and the resulting bias is recorded as **"a false SKIP is a minor annoyance, a false PRUNE destroys a session"**. **THE CHANGE: give the excluded population a REPORTING path, not a removal path.**
+
+> **MEASURED 2026-08-19 on this clone:**
+>
+>     total registered worktrees        36
+>     reachable by prune-merged.ps1     11   (<repo>-<name> siblings)
+>     .claude/worktrees/*               12   excluded BY DESIGN -- live sessions live here
+>     other (C:/mfw*, Temp, detached)   13   excluded
+>
+> So **30 percent** is reachable. On the same day the owner removed **12** of the excluded ones by hand, from a list assembled manually, because nothing produces that list.
+
+> **THE ACTUAL DEFECT IS THE ABSENCE OF A SAFE MIDDLE.** Today there are two states: the tool removes it, or nobody knows it exists. There is no artifact that says *"these excluded trees look finished -- here are the commands, you decide"*. That gap is what turns routine hygiene into a manual audit, and a manual audit is what gets skipped until 53 worktrees accumulate.
+
+> **WHY A REPORTER AND NOT A WIDER FENCE.** The occupancy fence's own receipt states it cannot see **"a session writing into a worktree by absolute path from elsewhere (29% of the writes by primary-seated sessions, measured on this repo)"**, a cwd recorded as UNC or 8.3, a session that never registered, or one that only edits files. The 36h git-metadata veto exists to cover that hole and is a proxy, not a fact. **Automating deletion of the directory where live sessions live, behind a fence with a measured 29 percent blind spot in one of its two signals, trades the exact property the incident bought.** A reporter carries none of that risk because it removes nothing.
+
+> **SHAPE THAT WOULD BE SAFE:** extend the existing decision table to *evaluate* every registered worktree, and for the excluded classes emit `REPORT-ONLY` rows plus a copy-pasteable command block -- never an `-Apply` path, no `-Name` override, no force. The dirty check, the branch-keeping rule, the orphan ledger and the fence receipt all already exist and would be reused unchanged. **The human stays the actuator for the dangerous population; only the discovery is automated.**
+
+> **A SECOND, SMALLER FINDING FROM THE SAME PASS.** `git worktree remove` is refused to an agent by `scripts/hooks/worktree_gate.ps1` for every tree but its own, and that refusal names the user as the only actor. That is consistent with the above and should NOT be relaxed to close this item -- the reporter makes the refusal cheap to live with, which is the correct order of operations.
+
+**Cluster:** Worktree lifecycle / developer tooling. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0). The cost is unbounded worktree accumulation, a manual audit nobody schedules, and disk. **Explicitly NOT a licence to widen the prune fence** -- the item is closed by adding reporting, and would be mis-implemented by adding reach.
+
+## 1295. the manual worktree-removal path strands coordination claims, and 19 of 30 are already orphaned
+
+> 🔢 **Filed 2026-08-19 -- not started. A STRANDED CLAIM IS UNRELEASABLE BY ANYONE, AND IT READS AS ACTIVELY-BEING-BUILT FOREVER.** `claim.ps1 -Release` is **worktree-scoped** -- deliberately, so no session can free a key another is mid-build on. The consequence nobody designed for: once the holding worktree is gone, **the normal release path can never be satisfied again**, and the item looks claimed to every future session. `CLAUDE.md` section 5 already records the cost -- *"a held claim on finished work looks exactly like someone actively building, and stalls the next session for days."* **THE CHANGE: release claims on the removal path that is actually used, and provide a sweep for the ones already stranded.**
+
+> **MEASURED 2026-08-19, from the claim files on disk rather than from `-List` prose:**
+>
+>     holder gone    19
+>     holder alive   11
+>     unreadable      0
+>
+> Positive control: 11 resolved **alive** in the same pass, so the directory test is not returning a blanket "gone". The 19 trace to just **six** long-dead worktrees, one of which holds eight of them.
+
+> **THE GAP IS THE PATH, NOT THE TOOL.** `prune-merged.ps1` **already** releases claims when it removes a worktree (`Remove-ClaimsHeldBy`, BACKLOG #345). But it reaches only `<repo>-<name>` siblings -- 11 of 36 registered worktrees on this clone (#1294) -- and `worktree_gate.ps1` directs everything else to a plain **`git worktree remove`**, which releases nothing. **So the sanctioned path for the majority of worktrees is precisely the one that strands claims**, and the covered path is the minority case.
+
+> **THIS ALREADY BIT THE FEATURE FILED BESIDE IT.** #1294's report-only rows emit exactly that plain `git worktree remove`, so as first written they handed the operator a command that would strand any claim the reported tree held. Fixed by withholding a claim-holding tree from the report -- but that fix protects **one** consumer of the command, not the command itself, which is why this item is separate and is about the path.
+
+> **A SWEEP IS NOT THE WHOLE FIX, AND SHOULD NOT BE CONFUSED FOR ONE.** `claim.ps1 -Release <key> -Force` clears a stranded claim today, so the 19 are recoverable by hand. That restores the registry; it does nothing to stop the twentieth. **Both halves are needed, and the ordering matters: fix the path first**, or the sweep is repeated work with a known expiry.
+
+> **DO NOT AUTO-RELEASE ON A "HOLDER GONE" TEST ALONE.** A worktree directory can be momentarily absent -- mid-move, on a disconnected drive, during a failed removal that left it deregistered (the orphan case this script already tracks). Releasing on that reading hands a live session's key away, which is the failure `Remove-ClaimsHeldBy`'s own comment calls **strictly worse than the orphan being fixed**. Whatever lands must fold the same full-path normalisation and refuse anything it cannot read.
+
+**Cluster:** Coordination registry / worktree lifecycle. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- developer coordination only. The cost is 19 backlog items currently presenting as claimed-and-in-progress when nobody is working them, which is the exact signal the registry exists to make trustworthy.

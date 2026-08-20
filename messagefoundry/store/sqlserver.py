@@ -129,6 +129,7 @@ from messagefoundry.store.store import (
     delivery_key,
     not_deployed_detail,
     owned_lane_scope,
+    password_claim_set,
     should_record_event,
 )
 
@@ -1354,7 +1355,8 @@ _SCHEMA: list[str] = [
         channel_scope NVARCHAR(MAX) NULL, totp_secret NVARCHAR(MAX) NULL,
         totp_enabled BIT NOT NULL DEFAULT 0, totp_enrolled_at FLOAT NULL,
         totp_recovery_codes NVARCHAR(MAX) NULL, last_totp_step INT NULL,
-        oidc_issuer NVARCHAR(MAX) NULL, oidc_subject NVARCHAR(MAX) NULL)""",
+        oidc_issuer NVARCHAR(MAX) NULL, oidc_subject NVARCHAR(MAX) NULL,
+        password_claimed_at FLOAT NULL)""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
     # MFA (WP-14): TOTP columns ALTER-ed in for a pre-existing users table (idempotent).
@@ -1375,6 +1377,22 @@ _SCHEMA: list[str] = [
         ALTER TABLE users ADD oidc_issuer NVARCHAR(MAX) NULL""",
     """IF COL_LENGTH('users','oidc_subject') IS NULL
         ALTER TABLE users ADD oidc_subject NVARCHAR(MAX) NULL""",
+    # Claimed-ness of the bootstrap admin (BACKLOG #1245): NULL on an existing row would read as
+    # "never claimed", which is what would retire an account whose holder claimed it long ago — this
+    # defect, re-introduced by its own fix. So the ADD is paired with a one-time backfill: a local
+    # account not flagged must_change_password already rotated its own credential, and
+    # password_changed_at is when. The backfill MUST stay inside this COL_LENGTH guard. Split out into
+    # its own _SCHEMA entry it becomes a permanent SECOND WRITER of the column (every schema re-apply
+    # would re-run it), and single-writer monotonicity is the entire point — a second writer is
+    # exactly the defect #1245 documents. The backfill goes through EXEC so its parse is DEFERRED:
+    # a statement naming a column added earlier in the SAME batch fails to compile, which would fail
+    # the must-succeed _ensure_schema transaction on every upgrading open.
+    """IF COL_LENGTH('users','password_claimed_at') IS NULL
+    BEGIN
+        ALTER TABLE users ADD password_claimed_at FLOAT NULL;
+        EXEC(N'UPDATE users SET password_claimed_at = password_changed_at
+               WHERE must_change_password = 0 AND password_hash IS NOT NULL');
+    END""",
     """IF OBJECT_ID('roles','U') IS NULL CREATE TABLE roles (
         id NVARCHAR(64) NOT NULL PRIMARY KEY, display_name NVARCHAR(128) NOT NULL,
         description NVARCHAR(512) NULL, builtin BIT NOT NULL DEFAULT 1,
@@ -9080,6 +9098,18 @@ class SqlServerStore:
         d = await self._fetchone("SELECT * FROM users WHERE username=?", (username,))
         return UserRecord.from_mapping(d) if d else None
 
+    async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
+        # BACKLOG #1256. Both columns, never `subject` alone -- a subject is unique only within its
+        # issuer. NOTE the comparison is the DATABASE's, and these columns carry no explicit COLLATE:
+        # under a case-insensitive server default two subjects differing only in case would match
+        # here, which is SAFE for this predicate (it can only refuse MORE) but is the opposite of the
+        # byte-exact comparison SQLite and Postgres perform. The BIN2 remedy this file applies to
+        # `reference_sets.[key]` is the fix if that divergence ever needs closing.
+        d = await self._fetchone(
+            "SELECT * FROM users WHERE oidc_issuer=? AND oidc_subject=?", (issuer, subject)
+        )
+        return UserRecord.from_mapping(d) if d else None
+
     async def list_users(self) -> list[UserRecord]:
         rows = await self._fetchall("SELECT * FROM users ORDER BY username")
         return [UserRecord.from_mapping(d) for d in rows]
@@ -9092,14 +9122,17 @@ class SqlServerStore:
         user_id: str,
         *,
         password_hash: str,
-        must_change_password: bool = False,
+        must_change_password: bool = True,
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
+        claim_set = password_claim_set(must_change_password, "?")
+        claim_args: tuple[float, ...] = () if must_change_password else (now,)
         await self._execute(
             "UPDATE users SET password_hash=?, password_changed_at=?, must_change_password=?,"
+            f"{claim_set}"
             " failed_attempts=0, locked_until=NULL, updated_at=? WHERE id=?",
-            (password_hash, now, 1 if must_change_password else 0, now, user_id),
+            (password_hash, now, 1 if must_change_password else 0, *claim_args, now, user_id),
         )
 
     # --- MFA: native TOTP second factor (local accounts, WP-14) --------------
@@ -9360,6 +9393,12 @@ class SqlServerStore:
                 await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
                 await cur.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
                 await cur.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
+                # BACKLOG #1233, verbatim with the SQLite and Postgres bodies: presets are
+                # owner-scoped by Identity.user_id (#1225) with no FK cascade, so without this the
+                # rows outlive the account carrying PHI-shaped `criteria` (ADR 0136) that no owner can
+                # reach or purge. This leg is CI-only, so an asymmetry between the three backends
+                # surfaces first in CI rather than here.
+                await cur.execute("DELETE FROM search_presets WHERE owner=?", (user_id,))
                 await cur.execute("DELETE FROM users WHERE id=?", (user_id,))
                 await self._commit(conn)
             except Exception:
