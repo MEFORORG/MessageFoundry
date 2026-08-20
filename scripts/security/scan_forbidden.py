@@ -132,12 +132,14 @@ _SLUG_LEAD_IN = r"\b(?:session|worktree|branch|lane|slug|agent|seat)(?:es|s)?\b"
 _SLUG_PLACEHOLDER_HEX = r"(?:a1b2c3|abc123|abcdef|123456|000000)"
 
 # TWO words minimum, where arm 1 accepts one, and the asymmetry was measured the hard way. Over the
-# tracked corpus a one-word bare head cost nothing, which is a NULL produced by luck rather than by a
-# mechanism: no such token happened to be backticked anywhere in the tree. Writing this very comment
-# supplied the missing positive control -- three backticked two-part tokens in the paragraphs above
-# tripped the detector describing them. A one-word head plus a six-letter tail is a hyphenated
-# English word; the generated slugs this guard exists for are adjective-noun-hex. The cost is a real
-# and accepted gap: a genuine one-word bare slug is missed unless it carries a path prefix.
+# tracked corpus a one-word bare head cost nothing -- a NULL produced by luck rather than by a
+# mechanism, since no such token happened to be backticked anywhere in the tree. The missing positive
+# control arrived from writing this comment block: an earlier draft named three of the colliding
+# tokens in backticks, and the detector fired on the paragraph describing it. They were reworded to
+# the prose form used above, which is why no example here is spelled out. A one-word head plus a
+# six-letter tail is a hyphenated English word; the generated slugs this guard exists for are
+# adjective-noun-hex. The cost is a real and accepted gap: a genuine one-word bare slug is missed
+# unless it carries a path prefix.
 #
 # The TRAILING guard is load-bearing in a way the prefixed arm's is not: `[0-9a-f]{6}` would
 # otherwise match the first six characters of a longer hex run, so a full-length blob id after a
