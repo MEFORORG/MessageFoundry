@@ -95,6 +95,13 @@ class Verdict:
 
     * ``OK`` -- a success-concluded step with margin at or above the floor.
     * ``LOW`` -- a success-concluded step whose margin is under the floor. THE GATE. Exit 1.
+      **Its headline leads with the step's SUCCESS, then with the timing (BACKLOG #1254).** The
+      required contexts are named for WHERE they ran -- ``test (windows-2025, py3.14)`` -- so this
+      exit reds a check whose label reads *the tests failed on Windows*, and a confident wrong label
+      closes the question instead of inviting a look at the log. LOW is reachable only from
+      ``outcome == "success"``, so that claim is READ from the step's own conclusion rather than
+      inferred. The job name is deliberately not the lever: those strings are required contexts and
+      a required-but-absent context blocks every PR.
     * ``CENSORED`` -- the step did not conclude success, so its elapsed is a lower bound and NO
       margin is claimed. Exit 0: the step's own failure already reds the job, and printing a healthy
       ratio here would be a compensating control resting on a false premise.
@@ -241,7 +248,13 @@ def decide(
         return Verdict(
             code="LOW",
             exit_code=1,
-            headline=f"MARGIN LOW: {shape}",
+            # The success clause comes FIRST, and it is a reading rather than an inference: this
+            # branch is unreachable unless `outcome` was the step's own `success`. See the Verdict
+            # docstring for why the check's output is the lever here and the job name is not.
+            headline=(
+                f"the {baseline.step!r} step CONCLUDED SUCCESS -- nothing it runs failed. This "
+                f"check is a TIMING gate, and it is what reddened this leg: {shape}"
+            ),
             notes=[
                 "Raising the cap is NOT the fix and this check must not be read as asking for one. "
                 "A cap sized against the work is the fix; the underlying runner slowness is its own "
