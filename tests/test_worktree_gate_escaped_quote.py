@@ -173,6 +173,35 @@ def test_an_ordinary_command_is_still_allowed(primary: Path, repos_file: Path) -
     assert run_gate(shell("echo hello ; ls -la", primary.parent), repos_file) is None
 
 
+# VERIFIED STATE OF THIS FAMILY, recorded because TWO OF MY OWN COMMIT MESSAGES SAY OTHERWISE AND
+# A COMMIT MESSAGE CANNOT BE AMENDED ONCE PUSHED (BACKLOG #1229 residual).
+#
+# `4d46a2a0` and `c308cc34` both state that rules 3c and 3d are UNADDRESSED and that I could not
+# reproduce them. **THEY ARE CLOSED.** Verified COLD by the seat that found them, on a rig that
+# predates my fix and which I did not write: all four PowerShell shapes now DENY where the previous
+# fix ALLOWed, including 3c (shared core.hooksPath) and 3d (another session's worktree).
+#
+# MY NON-REPRODUCTION WAS MY HARNESS, NOT THE GATE. My control allowed on origin/main too, which
+# means my shapes never exercised rule 3c at all -- evidence about my construction. Gating the
+# escape AT THE SCANNER closed all three rules at once, which is what rule-agnostic cuts both ways
+# means: one character disarmed three rules, and one flag re-armed them.
+#
+# AND THE EXTRACTION FIX CLOSED AN INHERITED DEFECT TOO, which I did not set out to fix and would
+# not have claimed without measuring both gates:
+#
+#     one-level escaped interpreter arg   main ALLOW -> DENY      inherited, now closed
+#     two-level escaped interpreter arg   main DENY  -> DENY      my regression, repaired
+#
+# THE LEFT COLUMN IS THE POINT. A fix is not only judged against the branch it repairs; measuring
+# against main is what distinguishes 'restored' from 'improved', and I would have reported the
+# weaker claim.
+#
+# LEFT OPEN AND NOT CLAIMED: twelve further shapes the same lens reports as INHERITED from main --
+# command substitution, backticks, ANSI-C quoting, concatenated quoting, heredocs, bare program
+# names, and the per-line split. None is introduced here and none is fixed here. They are with the
+# Dispatcher as a disclosure question.
+
+
 # COVERAGE NOTE, deliberately a comment rather than an assertion, because what it names is a CLASS and
 # a class cannot be enumerated by a test (BACKLOG #1229 residual).
 #
