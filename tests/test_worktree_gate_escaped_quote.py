@@ -185,3 +185,79 @@ def test_an_ordinary_command_is_still_allowed(primary: Path, repos_file: Path) -
 # would quote always is. Anything that decides span boundaries WITHOUT that ownership rule -- a regex
 # pair, a pre-pass, a lookahead -- has been wrong here three times now. If you add one, it belongs
 # inside Remove-QuotedSpans' single pass, and it needs a case in this file.
+
+
+# --- BACKLOG #1229 residual, SECOND ROUND: the escape rule is HOST-SPECIFIC ----------------------
+#
+# THE FIRST VERSION OF THIS FIX RE-CREATED #1229'S OWN DEFECT ON THE OTHER HOST, and it did so through
+# the decision this file argued FOR. Honouring a backslash escape inside a double-quoted span is
+# correct POSIX -- but `scripts/hooks/worktree_gate.ps1:999` scans BOTH tool names through ONE matcher
+# (`$tool -in @("Bash", "PowerShell")`), and **PowerShell has no backslash escape**; its escape is the
+# backtick. So on a PowerShell payload the scan held a span open that PowerShell had already CLOSED,
+# straddled the live command, and blanked it.
+#
+# Found by the seat whose own design row asserted exactly this property -- a row I argued should be
+# dropped, and which they dropped agreeing with me. Their commit called it "a deny no shell requires".
+# That sentence is true of sh and FALSE OF POWERSHELL, and neither of us checked the second half.
+#
+# EVERY ROW BELOW IS PINNED TO WHETHER THE COMMAND ACTUALLY EXECUTES ON THAT HOST, measured with an
+# inert payload that COMPUTES (`111*3` -> 333) rather than echoes, so an echo-back cannot be mistaken
+# for a run. That is the only ground truth here: "should this deny" is a question about the shell, not
+# about the gate.
+_ODD_BS = 'Write-Output "C:\Temp\\" ; {gated} ; Write-Output "x"'
+_STRADDLE = 'echo \\" ; {gated} ; echo \\"'
+
+
+@pytest.mark.parametrize(
+    "tool,template,expect_deny,measured",
+    [
+        # pwsh -NoProfile -Command '...(111*3)...' printed 333 -> the middle statement RAN.
+        ("PowerShell", _ODD_BS, True, "333 printed: middle RAN"),
+        # bash -c '...' -> "unexpected EOF while looking for matching \"" -> nothing parses, nothing runs.
+        ("Bash", _ODD_BS, False, "syntax error: nothing executes"),
+        # pwsh printed the line as a literal string, no 333 -> the middle did NOT run.
+        ("PowerShell", _STRADDLE, False, "no 333: middle did NOT run"),
+        # bash printed 333 -> the middle RAN.
+        ("Bash", _STRADDLE, True, "333 printed: middle RAN"),
+    ],
+)
+def test_the_verdict_matches_whether_the_command_RUNS_on_that_host(
+    primary: Path, repos_file: Path, tool: str, template: str, expect_deny: bool, measured: str
+) -> None:
+    """The gate must model each shell's real quoting, not one shell's.
+
+    ``measured`` is not decoration -- it records the observation each row is pinned to, so a future
+    reader can tell an assertion grounded in shell behaviour from one grounded in a previous verdict.
+    A row that only asserted "deny" would be satisfied by a gate that denies everything.
+    """
+    command = template.format(gated=f"git -C {primary} reset --hard")
+    result = run_gate(
+        {"tool_name": tool, "tool_input": {"command": command}, "cwd": str(primary.parent)},
+        repos_file,
+    )
+    if expect_deny:
+        assert_denied(result), f"{tool}: {measured} -- the gate must see it"
+    else:
+        assert result is None, f"{tool}: {measured} -- denying it would be a FALSE DENY"
+
+
+def test_an_unknown_host_gets_the_CONSERVATIVE_reading() -> None:
+    """The default is fail-CLOSED, and the direction is the whole reason it is a default.
+
+    Honouring the escape makes spans LONGER, so it blanks MORE and can hide a command -- fail OPEN.
+    Refusing it leaves more text visible to the rules -- fail CLOSED. So `$PosixEscapes` defaults to
+    false and only a host known to use backslash escapes opts in.
+
+    Asserted on the SOURCE because the parameter default is the guarantee; a behavioural probe would
+    need a third tool name the gate does not currently accept.
+    """
+    gate = (
+        Path(__file__).resolve().parents[1] / "scripts" / "hooks" / "worktree_gate.ps1"
+    ).read_text(encoding="utf-8")
+    assert "[bool]$PosixEscapes = $false" in gate, (
+        "the escape rule must default to OFF: an unrecognised host has to get the reading that blanks "
+        "less, or a future tool name silently inherits sh semantics (BACKLOG #1229 residual)"
+    )
+    assert '($tool -eq "Bash")' in gate, (
+        "the opt-in must be keyed on the host, not left unconditional"
+    )
