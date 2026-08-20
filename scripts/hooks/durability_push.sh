@@ -74,13 +74,27 @@ case "$URL" in
     ;;
 esac
 
+# NAMESPACE BY REPOSITORY. Two repositories push rescue tags to ONE remote -- the engine's `private`
+# and the vault's `origin` are the same GitHub repo -- so a tag keyed by branch name ALONE collides on
+# any name both use. `main` is the obvious one, and the push is --force, so the second repo to commit
+# silently overwrites the first's coverage. Measured 2026-08-19: refs/tags/rescue/auto/main held a sha
+# belonging to NEITHER repo's main.
+#
+# Discriminate by the git COMMON DIR, never by the remote URL -- the URL is the thing that makes these
+# two indistinguishable in the first place. The common dir is shared by every worktree of a repo and
+# differs between repos, which is exactly the grouping wanted here.
+REPO=$(basename "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)")" 2>/dev/null)
+# A tag path component must not carry spaces or shell-special characters.
+REPO=$(printf '%s' "$REPO" | tr -c 'A-Za-z0-9._-' '-')
+[ -n "$REPO" ] || REPO=unknown
+
 BRANCH=$(git symbolic-ref --quiet --short HEAD 2>/dev/null)
 if [ -n "$BRANCH" ]; then
-  TAG="refs/tags/rescue/auto/$BRANCH"
+  TAG="refs/tags/rescue/auto/$REPO/$BRANCH"
 else
   # Detached HEAD is the state most likely to lose work -- no branch ref keeps the commit alive, so
   # the reflog is the only thing holding it. Tag by sha rather than skipping.
-  TAG="refs/tags/rescue/auto/detached/$(git rev-parse --short HEAD 2>/dev/null)"
+  TAG="refs/tags/rescue/auto/$REPO/detached/$(git rev-parse --short HEAD 2>/dev/null)"
 fi
 
 # Backgrounded and detached so the commit returns immediately. --force because the tag tracks a
