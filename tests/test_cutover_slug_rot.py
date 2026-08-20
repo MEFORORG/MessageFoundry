@@ -86,6 +86,54 @@ _HISTORICAL = (
 #: ratchet over its ceiling and failed CI on a documentation-only branch. Verified before changing:
 #: the boundary suppresses exactly those two lines and keeps every genuine "private repo" hit
 #: (~20 of them, across workflows, INSTALL-GUIDE, VERSION-CONTROL, SECURITY and the ADRs).
+#: BACKLOG #1261: THE BARE DEFINITE-ARTICLE FORM IS SPLIT OUT, because it is the only alternative that
+#: is also ORDINARY ENGLISH. The other four name repository topology and cannot mean anything else, so
+#: they still count bare. The bare form counts only when a TOPOLOGY QUALIFIER shares its line.
+#:
+#: WHY THIS IS A CLASS FIX AND THE PREVIOUS THREE WERE NOT. This alternative had fired on innocent prose
+#: at least three times and was answered each time by editing the PROSE -- most recently `e6d25d1d`,
+#: which reworded two sentences to "counterpart" and left the pattern untouched, so the next author
+#: writing the same ordinary sentence reproduced the outage. A defect fixed three times at the instance
+#: level is a class nobody has priced.
+#:
+#: MEASURED BEFORE CHANGING, over 1619 tracked files: 52 hits, of which **20 matched ONLY via the bare
+#: form**. Reading all 20 splits them three ways -- and the split is why the qualifier list is SHORT:
+#:   * 5 are figurative English with no repository in view: "the mirror image" of a lever, "the mirror
+#:     passes", "The mirror image of the case above", "the mirror line for a remote-tracking ref",
+#:     "The mirror of the blocking assertion". These are what the gate must stop counting.
+#:   * 9 carry an unambiguous topology term on the same line and still count.
+#:   * 6 are HISTORICAL narration the retrospective filter never covered -- "what it did on the
+#:     mirror", "failed outright on the mirror", "the mirror-gated" flip. They drop, and dropping them
+#:     is correct: this gate's subject is a PRESENT-TENSE claim that this repo is a copy, which none of
+#:     them makes.
+#:
+#: `remote` and `branch` are DELIBERATELY ABSENT from the qualifier set, and that is not fastidiousness:
+#: with either of them in, "the mirror line for a remote-tracking ref" and "The mirror image of the case
+#: above, and it broke every open branch" both survive -- 2 of the 5 false positives kept by two words.
+#: Every term here means repository topology and nothing else.
+_TOPOLOGY = r"(?i)\b(repo|repos|repository|repositories|slug|github|MEFORORG|cutover|publish|published|publishing|upstream|fork)\b"
+_PROSE_UNAMBIGUOUS = re.compile(
+    r"(?i)(public mirror|OSS mirror|private repo\b|the published mirror)"
+)
+_PROSE_BARE = re.compile(r"(?i)the mirror")
+_TOPOLOGY_QUALIFIER = re.compile(_TOPOLOGY)
+
+
+def _is_mirror_prose(line: str) -> bool:
+    """Whether ``line`` claims, in the present tense, that this repository is a copy of another.
+
+    Structure, not vocabulary. The bare definite-article form is a claim about topology ONLY when the
+    line also names topology; on its own it is ordinary English and this gate has no business counting
+    it. Both directions are pinned by tests below -- a one-directional test passes just as well against
+    deleting the alternative outright, which would silently retire the check the ratchet enforces.
+    """
+    if _PROSE_UNAMBIGUOUS.search(line):
+        return True
+    return bool(_PROSE_BARE.search(line) and _TOPOLOGY_QUALIFIER.search(line))
+
+
+#: Retained under its old name so the two assertions below read unchanged. It answers "does this line
+#: contain any candidate phrase at all", and is NEVER the whole test -- `_is_mirror_prose` is.
 _PROSE = re.compile(
     r"(?i)(the mirror|public mirror|OSS mirror|private repo\b|the published mirror)"
 )
@@ -108,7 +156,19 @@ _RETROSPECTIVE = re.compile(
 #: fell to 52 across 1533 tracked files and the ceiling follows it DOWN. **The ceiling is NOT left at
 #: 54 to bank the two.** Slack is what turns a ratchet into a rubber stamp: real rot would have to
 #: exceed the slack before anything reds, and nothing would report that the gate had gone quiet.
-_PROSE_CEILING = 52
+#:
+#: 2026-08-17: 52 -> 41 (BACKLOG #1261), and this is the largest fall so far because it is the first one
+#: that fixed the CLASSIFIER rather than an instance. Measured at 41 across 1619 tracked files, by the
+#: same scan the assertion runs. **The eleven are enumerated by kind beside ``_TOPOLOGY`` above** -- 5
+#: figurative English the gate was never meant to police, and 6 historical narrations that make no
+#: present-tense claim. Not one of them was edited: the prose is untouched and the pattern moved, which
+#: is the inversion of every previous fix here.
+#:
+#: **THE SLACK THAT MATTERED WAS ZERO, and that is why this was a tripwire rather than a nuisance.** At
+#: 52 actual against a 52 ceiling, the next innocent sentence containing an ordinary-English phrase red
+#: `main` on a documentation-only branch, and the sanctioned remedies were to reword it or to delete an
+#: unrelated genuine hit to buy room. The rule is unchanged and this number may fall again, never rise.
+_PROSE_CEILING = 41
 
 
 #: This module, excluded from its own scan. Its taxonomy above necessarily SPELLS every phrase it
@@ -193,7 +253,7 @@ def test_present_tense_mirror_prose_does_not_grow() -> None:
         f"{f}:{i}"
         for f in files
         for i, line in enumerate(_read(f).splitlines(), 1)
-        if _PROSE.search(line) and not _RETROSPECTIVE.search(line)
+        if _is_mirror_prose(line) and not _RETROSPECTIVE.search(line)
     ]
     scanned = len(files)
     assert scanned > 100, (
@@ -205,6 +265,48 @@ def test_present_tense_mirror_prose_does_not_grow() -> None:
         f"module's triage taxonomy before allowlisting.\nNew or changed:\n  "
         + "\n  ".join(hits[-12:])
     )
+
+
+def test_ordinary_english_is_not_counted_and_a_real_claim_still_is() -> None:
+    """BOTH DIRECTIONS, and neither alone is worth anything (BACKLOG #1261).
+
+    A one-directional test -- "the figurative sentence is not counted" -- passes just as well against
+    deleting the alternative entirely, which would silently retire the very check the ratchet exists to
+    enforce. So the second half is not symmetry for its own sake: it is what makes the first half mean
+    the classifier got NARROWER rather than ABSENT.
+
+    The fixtures are the REAL lines, quoted from the tree as it stood when this was measured, because a
+    fixture invented to fit the regex tests the regex against itself. This module is excluded from its
+    own scan (``_SELF``), so quoting them here cannot move the ratchet -- which is the only reason the
+    defect can be documented in the repository it polices at all.
+
+    Falsified by reverting ``_is_mirror_prose`` to the bare pattern: every NOT-counted assertion goes
+    red. Falsified in the other direction by deleting the bare form instead of qualifying it: the last
+    three assertions go red. Restored, and the suite is back at its recorded node ids.
+    """
+    # ORDINARY ENGLISH -- no repository anywhere in view. Each of these was a live counted hit.
+    for line in (
+        "**This lever is the mirror image -- it MUST move it, by",
+        "# The SAME custom env with the posture set via [security] resolves -- the mirror passes.",
+        '"""The mirror image of the case above, and it broke every open branch the hour it landed.',
+        "Nothing here touches refs/heads/main: this is the mirror line for a remote-tracking ref alone.",
+        '"""The mirror of the blocking assertion: an accidental promotion must also be a deliberate edit."""',
+    ):
+        assert not _is_mirror_prose(line), (
+            "ordinary English is being counted as a topology claim, which is the defect #1261 records: "
+            f"{line!r}"
+        )
+
+    # A GENUINE PRESENT-TENSE CLAIM that this repository is a copy. These MUST still count, in each of
+    # the two shapes the classifier admits -- an unambiguous phrase alone, and the bare form qualified.
+    for line in (
+        "MessageFoundry is the public mirror of a private source repository.",
+        "this repo is the source, not the mirror. Left inverted, the job skips on the ONLY repo that can",
+        "the mirror with the repo-slug `if: github.repository == 'MEFORORG/MessageFoundry'`",
+    ):
+        assert _is_mirror_prose(line), (
+            f"a real topology claim stopped being counted -- the gate has been retired, not fixed: {line!r}"
+        )
 
 
 def test_the_ratchet_is_not_slack() -> None:
@@ -219,7 +321,7 @@ def test_the_ratchet_is_not_slack() -> None:
         1
         for f in files
         for line in _read(f).splitlines()
-        if _PROSE.search(line) and not _RETROSPECTIVE.search(line)
+        if _is_mirror_prose(line) and not _RETROSPECTIVE.search(line)
     )
     slack = _PROSE_CEILING - actual
     assert slack <= 8, (
