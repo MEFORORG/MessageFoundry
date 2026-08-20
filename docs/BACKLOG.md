@@ -3145,6 +3145,14 @@ So the registered control for a context should record **what it does not break**
 
 **Cluster:** Testing & CI. **Priority:** P2. **Verdict:** build when the trigger fires. **Severity:** medium (four items are parked on a blocker that is about to stop existing, and their own text will keep saying otherwise).
 
+**THE TRIGGER WILL NOT FIRE. OWNER RULED 2026-08-20: THERE IS NO MULTI-VM LAB.** Asked directly whether one was available, the answer was no. **So this item's own framing is now FALSE and it is the sentence that misleads every planning pass:** the body above says the four residuals are *"parked on a blocker that is about to stop existing"*. **That blocker is not about to stop existing.** It is indefinite, and the four are blocked on HARDWARE rather than on a decision -- which is not a thing any amount of triage, scoring or re-reading can move.
+
+**WHAT THAT CHANGES FOR EACH RESIDUAL.** #99, #98, #320 and #351 stay open and stay blocked, but they stop being *imminent*. **Do not price any of them as capacity in a wave plan, and do not re-triage them hoping for a different answer** -- a hardware precondition does not yield to analysis. #98 is the one partial exception and only in one limb: its trigger reads *"a deployment that wants EPA, OR the first domain-joined lab box"*, and **the first disjunct survives this ruling** -- a real deployment wanting EPA would still fire it. The lab half is dead; the deployment half is not.
+
+**AND THE TRAP THIS ITEM SHOULD CARRY FOR WHENEVER A RIG DOES EXIST, because it will be reached for then and not before:** a green rig result must NOT be recorded as retiring the `db_lookup` workaround. Different question. `docs/AOAG-DEPLOYMENT.md` section 4.5's planned-outage mandate stands until the RECONNECT ITSELF is proven -- **"the setting exists" is not the same claim as "the reconnect works"**, and the first is what a rig standing up would demonstrate.
+
+*Amended by the Dispatcher on the owner's ruling. No hardware was required for this amendment and none is implied by it; the ruling closed a question, it did not unblock any work.*
+
 **Trigger:** the lab is **available for validation** — reachable, with VMs provisionable. **Not** "lab validated": proving the lab does what these items need is this item's own first deliverable, so gating on validation would mean the trigger can never fire.
 
 **Scope.** Two halves, in order.
