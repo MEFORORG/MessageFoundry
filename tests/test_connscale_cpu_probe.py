@@ -33,6 +33,7 @@ import time
 
 import pytest
 
+from harness.load.connscale import probe
 from harness.load.connscale.probe import (
     _CREATION_SKEW_TOLERANCE_S,
     _PROBE_TIMEOUT_S,
@@ -52,6 +53,41 @@ from harness.load.enginepoll import EngineSample
 #: couple of enumerations can time out entirely and the test still reaches a verdict, which is exactly
 #: the transient-failure tolerance `_resolve_pids` is written to provide.
 _RESOLUTION_DEADLINE_S = max(30.0, 6 * _PROBE_TIMEOUT_S)
+
+#: Per-walk timeout granted during the bounded extension below, in place of the probe's production
+#: ``_PROBE_TIMEOUT_S``, for the duration of THIS test only (BACKLOG #1290).
+#:
+#: The measured cause of the #1290 red is ONE walk failing to complete within 5 s on a starved hosted
+#: runner. More 5 s attempts do not attack that: each is cut off at the same point, so six of them buy
+#: six identical timeouts and no measurement. A LONGER walk does attack it. The 5 s bound exists to stop
+#: a hung shell-out wedging the RUNNER's poll tick; this test is not on that cadence, and no test in this
+#: file asserts the bound's value, so raising it here removes no coverage.
+_STALLED_WALK_TIMEOUT_S = 3.0 * _PROBE_TIMEOUT_S
+
+#: Hard ceiling on how many long walks the extension may make. BOUNDED on purpose: it is entered only
+#: on a runner that has already spent ``_RESOLUTION_DEADLINE_S`` without one usable enumeration, and an
+#: unbounded retry there would trade a red required context for a hung job. The healthy path is
+#: untouched by any of this — it resolves in one or two walks and costs well under a second.
+_STALL_EXTENSION_WALKS = 2
+
+#: Share of this test's own pytest-timeout watchdog that the whole poll may spend before it must reach
+#: a verdict. The extension is trimmed to fit, so the walks it is granted DERIVE from the watchdog.
+#:
+#: This bound is not optional. Being killed by the watchdog fails the test with a thread dump and NO
+#: verdict at all — strictly worse than the failure #1290 is fixing, and it would arrive on exactly the
+#: stalled runner the extension exists to serve. Reading the watchdog rather than hardcoding it matters
+#: because the value is per leg: ci.yml's matrix passes 60 s on ubuntu and 120 s on the Windows legs
+#: (`pytest_timeout`), and the Windows legs are the ones where the walk stalls. On a 60 s watchdog the
+#: extension trims to ZERO walks and the test degrades to a 30 s poll then a skip, which is the correct
+#: answer there; on the 120 s Windows legs both extension walks fit inside 60 s of an 84 s share.
+_WATCHDOG_SHARE = 0.7
+
+#: A failed walk counts as BUDGET-EXHAUSTED (the runner was too slow to enumerate) rather than a FAST
+#: error (the enumeration itself is broken) when it spent at least this fraction of the timeout it was
+#: given. The two get OPPOSITE verdicts -- skip and fail -- so the discriminator is stated once, here.
+#: The slack absorbs clock granularity only: ``subprocess.run`` cannot raise ``TimeoutExpired`` before
+#: its timeout, so a genuine timeout always lands above this line and an immediate error far below it.
+_BUDGET_CONSUMED_FRACTION = 0.9
 
 
 def _sample(elapsed: float) -> EngineSample:
@@ -260,15 +296,89 @@ def test_sampler_measures_a_descendant_that_actually_burns_cpu() -> None:
     assert after.cpu_seconds - first.cpu_seconds > 0.5
 
 
+def _granted_extension_walks(config: pytest.Config) -> int:
+    """How many long walks the bounded extension may make here, trimmed to fit the per-test watchdog.
+
+    The watchdog is READ (``--timeout``, which ci.yml passes per leg) rather than hardcoded: a copy of
+    the number in this file would drift from the matrix, and the direction it drifts in is the bad one —
+    an extension that outgrows the watchdog converts a clean skip into a timeout kill with no verdict.
+    Returns 0 when there is no room, which is a correct outcome, not a degraded one: the poll still runs
+    for ``_RESOLUTION_DEADLINE_S`` and still reports which of the two failures occurred."""
+    watchdog = config.getoption("timeout", default=None)
+    if not isinstance(watchdog, int | float) or watchdog <= 0:
+        return _STALL_EXTENSION_WALKS  # no watchdog to fit inside; the hard ceiling still applies
+    spare_s = watchdog * _WATCHDOG_SHARE - _RESOLUTION_DEADLINE_S
+    return max(0, min(_STALL_EXTENSION_WALKS, int(spare_s // _STALLED_WALK_TIMEOUT_S)))
+
+
+def _spend_summary(failed: list[tuple[float, float]]) -> str:
+    """Group failed walks by the per-walk budget they were given: how many got it, and the range they
+    actually spent.
+
+    SUMMARISED rather than enumerated. A stalled runner makes on the order of a hundred attempts inside
+    ``_RESOLUTION_DEADLINE_S``, and a per-walk list that long is unreadable in a CI log — which is the
+    same "message nobody can act on" failure #1290 is fixing at the verdict level, so it must not be
+    reintroduced in the text of the verdict."""
+    by_budget: dict[float, list[float]] = {}
+    for spent, budget in failed:
+        by_budget.setdefault(budget, []).append(spent)
+    return "; ".join(
+        f"{len(spent)} walk(s) at a {budget:.0f}s budget, spending {min(spent):.1f}-{max(spent):.1f}s"
+        for budget, spent in sorted(by_budget.items())
+    )
+
+
+def _walk_succeeded(sampler: FdSampler) -> bool:
+    """Run ONE subtree re-resolution and report whether THAT walk enumerated successfully.
+
+    Reads ``_resolve_errored`` rather than ``sampler._pids is not None``, which is what the caller used
+    to read. ``_pids`` retains the last GOOD resolution across a subsequent FAILED walk (that is the
+    point of the cache), so ``_pids is not None`` scores every later walk a success once any earlier one
+    has succeeded, and then reports the stale cache as that walk's result. ``_resolve_errored`` is set
+    per walk, so it answers the question actually being asked. With ``resolve_every=1`` the cached-serve
+    branch of ``_resolve_pids`` (which clears the flag without walking) is never taken, so the flag here
+    is exactly this walk's outcome."""
+    sampler.sample_proc()
+    return not sampler._resolve_errored
+
+
 @pytest.mark.skipif(sys.platform not in ("win32", "linux"), reason="OS FD probe path")
-def test_subtree_re_resolution_picks_up_a_late_spawned_child() -> None:
+def test_subtree_re_resolution_picks_up_a_late_spawned_child(
+    monkeypatch: pytest.MonkeyPatch,
+    pytestconfig: pytest.Config,
+) -> None:
     # A3: the subtree used to be resolved exactly ONCE. A sharded engine's `serve --shard` workers appear
     # AFTER the supervisor, so a one-shot walk pins the sampler to an idle parent for the whole run.
     sampler = FdSampler(os.getpid(), resolve_every=1)
     sampler.sample_proc()  # walk 1 — before the child exists
     resolved_before = list(sampler._pids or [])
 
+    walks = 0
+    walked_ok = False  # did ANY enumeration succeed? separates "cannot measure" from "wrong answer"
+    resolved_after: list[int] = []
+    failed: list[tuple[float, float]] = []  # (seconds spent, seconds allowed) per FAILED walk
+    extension_walks = _granted_extension_walks(pytestconfig)
+
     child = subprocess.Popen([sys.executable, "-c", _BURN])  # noqa: S603 - fixed argv, no shell
+
+    def _attempt(budget_s: float) -> bool:
+        """One walk. True once the late-spawned child appears in a FRESH successful resolution.
+
+        A failed walk is recorded with what it SPENT against what it was ALLOWED, because that pair is
+        the only thing that separates "this runner is too slow to enumerate" from "this enumeration is
+        broken" — and those two get opposite verdicts below."""
+        nonlocal walks, walked_ok, resolved_after
+        started = time.monotonic()
+        ok = _walk_succeeded(sampler)
+        spent = time.monotonic() - started
+        walks += 1
+        if not ok:
+            failed.append((spent, budget_s))
+            return False
+        walked_ok = True
+        resolved_after = list(sampler._pids or [])
+        return child.pid in resolved_after
+
     try:
         # POLL, don't sleep-and-hope. This used to be `time.sleep(1.0)` then ONE `sample_proc()`, which
         # contradicted the contract under test: `_resolve_pids` treats an ERRORED enumeration as
@@ -281,22 +391,26 @@ def test_subtree_re_resolution_picks_up_a_late_spawned_child() -> None:
         # property. Measured on windows-2025 (2026-07-30): failed twice in one job, while windows-2022
         # and ubuntu passed the identical commit.
         deadline = time.monotonic() + _RESOLUTION_DEADLINE_S
-        walks = 0
-        walked_ok = (
-            False  # did ANY enumeration succeed? separates "cannot measure" from "wrong answer"
-        )
-        resolved_after: list[int] = []
-        while True:
-            sampler.sample_proc()
-            walks += 1
-            if sampler._pids is not None:
-                walked_ok = True
-                resolved_after = list(sampler._pids)
-                if child.pid in resolved_after:
-                    break
-            if time.monotonic() >= deadline:
+        found = False
+        while not found:
+            found = _attempt(_PROBE_TIMEOUT_S)
+            if found or time.monotonic() >= deadline:
                 break
             time.sleep(0.25)
+
+        # BOUNDED EXTENSION (BACKLOG #1290). Entered only when the loop above produced NO usable
+        # enumeration at all — never when a walk succeeded, so it cannot be used to grind a genuine
+        # missing-child result into a pass. Each extension walk gets a LONGER budget, because the
+        # failure being extended past is a walk that ran out of budget; repeating it at the same 5 s
+        # bound reproduces the same cut-off. This is the only place the probe's production timeout is
+        # raised, it is undone at teardown, and the walk count is trimmed to fit the watchdog.
+        # (`found` is not tested here: it can only be True via a successful walk, so it implies
+        # `walked_ok` and would add a condition a reader could mistake for an independent one.)
+        if not walked_ok and extension_walks:
+            monkeypatch.setattr(probe, "_PROBE_TIMEOUT_S", _STALLED_WALK_TIMEOUT_S)
+            for _ in range(extension_walks):
+                if _attempt(_STALLED_WALK_TIMEOUT_S):
+                    break
     finally:
         child.kill()
         child.wait(timeout=10)
@@ -306,14 +420,39 @@ def test_subtree_re_resolution_picks_up_a_late_spawned_child() -> None:
     # Two distinct failures, reported distinctly. Collapsing them is what made the original message
     # useless: "the probe could not enumerate at all" is an environment/probe problem, while "it
     # enumerated and missed a live child" is the re-resolution regression this test exists to catch.
-    assert walked_ok, (
-        f"the process-table walk never succeeded in {_RESOLUTION_DEADLINE_S:.0f}s ({walks} attempts) — "
-        f"every one returned None (enumeration errored or timed out; the Windows path allows "
-        f"{_PROBE_TIMEOUT_S:.0f}s per walk). The probe could not measure at all, so this test could not "
-        f"assess re-resolution. Not the same as missing the child."
-    )
+    # #1290 keeps that separation and adds the verdict it was missing: the first is not a defect in the
+    # tree under test, so it must stop reddening a required context — but only when the walk actually
+    # ran out of budget. A walk that returns None WITHOUT spending its budget is a broken enumerator,
+    # and downgrading that to a skip is how a skip-on-load hides a probe regression forever.
+    if not walked_ok:
+        assert failed, "the loop made no attempt at all, so neither failure can be reported"
+        fast = [(s, b) for s, b in failed if s < b * _BUDGET_CONSUMED_FRACTION]
+        spend = _spend_summary(failed)
+        if fast:
+            pytest.fail(
+                f"ENUMERATION FAILURE -- failure ONE of the two this test keeps apart, NOT the "
+                f"re-resolution regression. The process-table walk never succeeded in {walks} "
+                f"attempts, and {len(fast)} of them returned None WITHOUT spending the timeout they "
+                f"were given [{spend}]. A walk that fails FAST did not run out of budget -- the "
+                f"enumeration errored or returned zero rows -- so this is a probe defect, reported as a "
+                f"failure and deliberately NOT downgraded to a skip. Re-resolution could not be "
+                f"assessed either way."
+            )
+        pytest.skip(
+            f"ENUMERATION TIMEOUT -- failure ONE of the two this test keeps apart, NOT the "
+            f"re-resolution regression. The process-table walk never succeeded in {walks} attempts "
+            f"[{spend}], every one of them spending its whole timeout; the bounded extension was "
+            f"granted {extension_walks} walk(s) of {_STALLED_WALK_TIMEOUT_S:.0f}s against a per-test "
+            f"watchdog of {pytestconfig.getoption('timeout', default=None)}s. The probe could not "
+            f"enumerate AT ALL, so this test could not assess re-resolution: it is reporting COULD NOT "
+            f"MEASURE, not measured-and-wrong. Skipped rather than failed because an exhausted walk "
+            f"budget measures the runner, not this tree (BACKLOG #1290); a walk that fails WITHOUT "
+            f"spending its budget still FAILS, so a broken enumerator cannot hide behind this skip."
+        )
+
     assert child.pid in resolved_after, (
-        f"the walk SUCCEEDED but did not include the late-spawned child {child.pid} after {walks} "
+        f"RE-RESOLUTION REGRESSION -- failure TWO of the two this test keeps apart. The walk SUCCEEDED "
+        f"but did not include the late-spawned child {child.pid} after {walks} "
         f"attempts over {_RESOLUTION_DEADLINE_S:.0f}s; last resolution was {resolved_after}. This is "
         f"the A3 regression: a subtree resolved once pins the sampler to an idle parent, so a sharded "
         f"engine's `serve --shard` workers are never counted."
