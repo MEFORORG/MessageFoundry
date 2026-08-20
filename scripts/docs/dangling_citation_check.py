@@ -115,6 +115,16 @@ def _load_backlog_module() -> object:
     return module
 
 
+#: The scan's coverage bound, stated ONCE and printed on EVERY exit path (BACKLOG #1235).
+#: It used to be a literal inside the hits branch, so a CLEAN run never showed it -- the bound was
+#: absent at exactly the moment a reader concludes "clean", which is the population it qualifies.
+#: Naming it is not tidiness: two copies of a caveat drift, and the copy that goes stale is the one
+#: nobody reads because it only prints on the path they are not on.
+_COVERAGE_BOUND = (
+    "Not scanned: the private companion repository, where a citation is invisible to this repo."
+)
+
+
 def allocation_floor(sources: list[Path] | None = None) -> int:
     """The highest item number the ledgers know about. Nothing at or below it can ever be issued.
 
@@ -241,11 +251,49 @@ def main(argv: list[str] | None = None) -> int:
 
     paths = args.paths or sorted(Path("docs").rglob("*.md"))
     allocated = allocated_numbers()
+
+    # BACKLOG #1235: REFUSE AN EMPTY POPULATION INSTEAD OF REPORTING IT CLEAN.
+    #
+    # The default path list is `Path("docs").rglob(...)` -- relative to the CURRENT WORKING DIRECTORY,
+    # not the repo root. MEASURED from a directory with no `docs/`: this printed
+    #     No unresolved backlog citation in 0 file(s).
+    #     Resolved against 0 allocated item numbers (open and closed).
+    # and exited 0. **Both counts were zero and nothing objected.** A green that is a statement about
+    # the ENVIRONMENT rather than the SUBJECT, which is worse than an untested gate because it closes
+    # the question instead of inviting it.
+    #
+    # THIS IS THE TRAP UNDER THE ITEM'S FIRST DISJUNCT, not a hypothetical: the >200-file population
+    # floor lives ONLY in `test_the_docs_scan_actually_covers_something`, so it guards the PYTEST arm
+    # and nothing else. Anyone who satisfies the item by wiring this CLI into `.github/` or
+    # `.pre-commit-config.yaml` -- the documented way to close it -- inherits a gate that reports clean
+    # when it scanned nothing, and inherits it precisely BECAUSE they closed the item.
+    #
+    # Refusing on an empty ALLOCATION as well as an empty PATH list is deliberate: an unreadable ledger
+    # resolves every citation to "no filed item", which fails the other way and would bury a real run
+    # in false positives. Both zeros mean the same thing -- the tool is not looking at this repository.
+    if not paths or not allocated:
+        print(
+            f"ERROR: refusing to report on an empty population -- {len(paths)} file(s) scanned, "
+            f"{len(allocated)} allocated item number(s) resolved.\n"
+            f"       scanned from: {Path.cwd()}\n"
+            "       The default path list is CWD-relative, so this is what running outside the repo "
+            "root looks like.\n"
+            "       A clean result over nothing is not a clean result. Pass paths explicitly, or run "
+            "from the repo root.",
+            file=sys.stderr,
+        )
+        return 1
+
     hits = unresolved_citations(list(paths), allocated)
 
     if not hits:
         print(f"No unresolved backlog citation in {len(paths)} file(s).")
         print(f"Resolved against {len(allocated)} allocated item numbers (open and closed).")
+        # BACKLOG #1235: THE COVERAGE BOUND PRINTS ON A CLEAN RUN TOO. It used to sit only after the
+        # hits loop, so this early return skipped it -- absent at exactly the moment a reader concludes
+        # "clean", which is the whole population the bound exists to qualify. It is in the docstring,
+        # and a docstring is not what a CI log shows.
+        print(_COVERAGE_BOUND)
         return 0
 
     floor = allocation_floor()
@@ -305,9 +353,7 @@ def main(argv: list[str] | None = None) -> int:
         "This is an UPPER BOUND ON CITATIONS, NOT A COUNT OF DEFECTS -- some hits are very likely"
     )
     print("not backlog references at all. Each is printed above with its source line; judge them.")
-    print(
-        "Not scanned: the private companion repository, where a citation is invisible to this repo."
-    )
+    print(_COVERAGE_BOUND)
     # FAIL CLOSED, ON THE LIVE SHAPE ONLY (BACKLOG #1235). The first version of this took `--fail`
     # as opt-in and nothing passed it, so a planted dangling citation was reported correctly AND the
     # process still exited 0 -- a checker that cannot fail is not a check, which is the defect this
