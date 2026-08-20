@@ -355,6 +355,7 @@ def test_subtree_re_resolution_picks_up_a_late_spawned_child(
 
     walks = 0
     walked_ok = False  # did ANY enumeration succeed? separates "cannot measure" from "wrong answer"
+    child_alive_at_success = False  # was the target still running when a walk finally succeeded?
     resolved_after: list[int] = []
     failed: list[tuple[float, float]] = []  # (seconds spent, seconds allowed) per FAILED walk
     extension_walks = _granted_extension_walks(pytestconfig)
@@ -367,7 +368,7 @@ def test_subtree_re_resolution_picks_up_a_late_spawned_child(
         A failed walk is recorded with what it SPENT against what it was ALLOWED, because that pair is
         the only thing that separates "this runner is too slow to enumerate" from "this enumeration is
         broken" — and those two get opposite verdicts below."""
-        nonlocal walks, walked_ok, resolved_after
+        nonlocal walks, walked_ok, resolved_after, child_alive_at_success
         started = time.monotonic()
         ok = _walk_succeeded(sampler)
         spent = time.monotonic() - started
@@ -376,6 +377,17 @@ def test_subtree_re_resolution_picks_up_a_late_spawned_child(
             failed.append((spent, budget_s))
             return False
         walked_ok = True
+        # A LATCH, NOT A SAMPLE, AND THE DISTINCTION IS LOAD-BEARING. `_BURN` is a BOUNDED loop --
+        # roughly 12 s, then it exits on its own -- so a walk succeeding late enough is enumerating a
+        # table the child has already left, and its absence there proves nothing about re-resolution.
+        # But the poll runs to `_RESOLUTION_DEADLINE_S` (30 s) whenever the child is never found, so
+        # the LAST successful walk is post-exit even in runs where EARLY walks succeeded while the
+        # child was alive and legitimately showed it missing. Sampling at the end therefore suppresses
+        # the real A3 regression; latching on ANY in-lifetime success preserves it. Measured: with a
+        # probe that enumerates instantly but never reports descendants -- the genuine defect -- the
+        # sampled form skipped and this form fails, which is the whole point of the assertion.
+        if child.poll() is None:
+            child_alive_at_success = True
         resolved_after = list(sampler._pids or [])
         return child.pid in resolved_after
 
@@ -450,12 +462,35 @@ def test_subtree_re_resolution_picks_up_a_late_spawned_child(
             f"spending its budget still FAILS, so a broken enumerator cannot hide behind this skip."
         )
 
+    # THE TARGET MUST HAVE BEEN ALIVE WHEN THE WALK SUCCEEDED, OR ITS ABSENCE PROVES NOTHING. This
+    # guard is failure ONE's third form, and it is the one a bounded burner makes reachable: `_BURN`
+    # completes in roughly 12 s on its own, while a walk can succeed later than that -- always, once
+    # the bounded extension has spent `_RESOLUTION_DEADLINE_S` first. A child absent because it EXITED
+    # is not a child the re-resolution missed, so reporting it as the A3 regression would be a
+    # confident false accusation of a product defect that is not there. Skipped rather than failed for
+    # the same reason as the enumeration timeout above: the test could not MEASURE, and a green that
+    # rests on an unmeasurable run is what this whole item is about.
+    #
+    # A NARROW FORM OF THIS WAS REACHABLE BEFORE #1290 TOO -- a walk failing past roughly 14 s and then
+    # succeeding inside the 30 s deadline hits it identically. The bounded extension widened the window
+    # and made post-exit success the DESIGNED path, which is what turned a latent edge into the normal
+    # one. This guard closes both.
+    if walked_ok and child.pid not in resolved_after and not child_alive_at_success:
+        pytest.skip(
+            f"COULD NOT MEASURE -- the walk succeeded only AFTER the target exited, so the child's "
+            f"absence from the process table proves nothing about re-resolution. `_BURN` is a bounded "
+            f"loop (about 12 s); the successful walk landed after it had already completed, following "
+            f"{walks} attempt(s) over {_RESOLUTION_DEADLINE_S:.0f}s. This is failure ONE, not the A3 "
+            f"regression: reporting it as a regression would accuse the product of a defect the run "
+            f"never tested for."
+        )
+
     assert child.pid in resolved_after, (
         f"RE-RESOLUTION REGRESSION -- failure TWO of the two this test keeps apart. The walk SUCCEEDED "
-        f"but did not include the late-spawned child {child.pid} after {walks} "
-        f"attempts over {_RESOLUTION_DEADLINE_S:.0f}s; last resolution was {resolved_after}. This is "
-        f"the A3 regression: a subtree resolved once pins the sampler to an idle parent, so a sharded "
-        f"engine's `serve --shard` workers are never counted."
+        f"WHILE THE CHILD WAS STILL RUNNING and still did not include the late-spawned child "
+        f"{child.pid}, after {walks} attempts over {_RESOLUTION_DEADLINE_S:.0f}s; last resolution was "
+        f"{resolved_after}. This is the A3 regression: a subtree resolved once pins the sampler to an "
+        f"idle parent, so a sharded engine's `serve --shard` workers are never counted."
     )
 
 
