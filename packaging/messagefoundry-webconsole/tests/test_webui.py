@@ -3260,6 +3260,33 @@ async def test_disable_mfa_enforces_full_stepup_when_stale(engine: Engine) -> No
         assert user is not None and user.totp_enabled  # still on — the gate held
 
 
+async def test_disabling_the_LAST_factor_renders_the_page_not_raw_json(engine: Engine) -> None:
+    """BACKLOG #1022: this route DELEGATES to the JSON handler, so its refusal arrives as an
+    HTTPException -- and without a translation here FastAPI renders that as a bare ``{"detail": ...}``
+    into a browser form navigation. Every sibling refusal in this module answers with the account page
+    carrying the message; this one did not, so adding the guard to the service made the console worse
+    at exactly the moment it started refusing. The remedy is the operator's to act on (enroll another
+    factor first), so it has to reach somewhere they can read it.
+    """
+    service = AuthService(engine.store, AuthSettings())  # default posture: require_mfa=True
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        await _enroll_mfa(c, service, "op")
+        uid = await _uid(service, "op")
+        await _mint_action(c, "/ui/account/mfa/disable")
+        r = await c.post("/ui/account/mfa/disable", headers={"Sec-Fetch-Site": "same-origin"})
+
+        assert r.status_code == 400, r.text
+        # THE ASSERTION THAT DISCRIMINATES: a raw JSON refusal is also a 400, so the status code
+        # alone would pass against the defect. What distinguishes them is the body being a page.
+        assert "<html" in r.text.lower(), f"refusal did not render as HTML:\n{r.text[:300]}"
+        assert "enroll another factor first" in r.text
+        user = await service.store.get_user(uid)
+        assert user is not None and user.totp_enabled  # refused, and nothing was stripped
+
+
 async def test_mfa_posts_reject_cross_site(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)

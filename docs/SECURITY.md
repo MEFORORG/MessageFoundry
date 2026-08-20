@@ -53,12 +53,16 @@ immediately (enforced — the account is flagged `must_change_password`), and de
 user exists, no further bootstrap occurs.
 
 **Auto-retirement (WP-3).** The bootstrap account exists only to seed the first real admin, so it
-self-retires while still **unclaimed** (never password-changed): it is **disabled once a second
-administrator exists**, and — if left unclaimed — **disabled `[auth].bootstrap_expiry_hours` after
-creation** (default 72 h; `0` disables the timer). Once you change its password it becomes a normal
-admin account and auto-retirement stops touching it: both the expiry timer and the supersession check
-fire only while the bootstrap is still **unclaimed**, which is carried by the `must_change_password`
-flag — so an administrative password reset, which re-sets that flag, **re-arms them**. And
+self-retires while still **unclaimed** — while its holder has never rotated the password themselves:
+it is **disabled once a second administrator exists**, and — if left unclaimed — **disabled
+`[auth].bootstrap_expiry_hours` after creation** (default 72 h; `0` disables the timer). Rotate its
+password through self-service change-password and the account is **claimed**: it becomes a normal
+admin account and is never auto-disabled, so a single-admin deployment can't be locked out. The claim
+is **recorded** — `users.password_claimed_at`, stamped by that rotation and never cleared — rather
+than inferred from the credential state the account currently carries
+([ADR 0164](adr/0164-record-bootstrap-claimed-ness-never-infer-a-monotonic-lifecycle-fact-from-mutable-credential-state.md)),
+so an [admin password reset](#admin-password-reset-wp-l3-12-asvs-646) of a claimed bootstrap account
+does not un-claim it: the temp it issues must still be rotated, but retirement stays off. And
 auto-retirement is not the only way to lose an administrator: the failed-attempt lockout is a
 **separate mechanism** and it does reach a claimed sole administrator (see
 [Brute-force & abuse protection](#brute-force--abuse-protection)). A retired
@@ -880,14 +884,23 @@ allow-listed provider values only, one session per form POST (the AD role-resync
 effect fires once at login, never per navigation), MFA stays delegated to the directory.
 
 `require_mfa` defaults **on** (BACKLOG #187 — secure-by-default, including the loopback bind; the
-documented org opt-out is `[auth].require_mfa = false`). The exposure gate now guards the **explicit
+documented org opt-out is `[security].require_mfa = false` — the `[auth]` spelling of this key is
+**rejected at load** and `serve` exits 2 naming the replacement). The exposure gate now guards the **explicit
 opt-out**: when the API is bound **off-loopback** with `require_mfa` *turned off*, `serve` makes the
 posture explicit at startup — it **refuses to start** on a **production PHI** instance and **warns** on a
 non-production PHI instance (a synthetic instance stays quiet), mirroring the keyless-store and
 open-egress startup gates. So an exposed PHI deployment can't silently run the Administrator interface
-single-factor. `require_mfa` is safe to keep on even on an **AD-only** deployment — it gates only
-**local** Administrator accounts (AD/Kerberos MFA stays delegated to the directory), so an operator who
-opts out at exposure simply re-enables `[auth].require_mfa=true` (or keeps the bind on loopback).
+single-factor. `require_mfa` is safe to keep on for an **AD-only** deployment's *directory* users:
+AD/Kerberos identities are exempt under either `require_mfa_scope` value, their factor delegated to the
+directory. An earlier revision of this sentence said it "gates only **local** Administrator accounts";
+that was wrong. Under the shipped `require_mfa_scope = "every_local_account"` it covers **every** local
+account, which on an AD-only deployment still means the local bootstrap admin and any local service
+accounts — a non-interactive local bearer-token account becomes MFA-pending and cannot enrol
+unattended. **That is a decision a deploying site must make before first start:** either such an
+account becomes an AD principal, or the scope is set to `administrators`. An operator who opts out at
+exposure re-enables `[security].require_mfa = true` (or keeps the bind on loopback).
+[CONFIGURATION.md](CONFIGURATION.md) `[security].require_mfa_scope` is the authority on the two
+remedies and on why mTLS is not a third.
 
 ### Administrative-interface defense-in-depth (WP-L3-13, ASVS 8.4.2)
 
@@ -1144,7 +1157,7 @@ one-to-one — that is why the bind/exposure posture occupies two rows and the A
 | New client IP during a session | this request's address vs `session.client` | knob on **and** a session exists, is unrevoked, has an anchor, and the two are not the same host (both-loopback counts as one host) | **CHALLENGE** — force a fresh step-up; first sighting also writes `auth.admin_action_new_ip` + an out-of-band notice; repeats WARNING-log only. **Never** an RBAC deny | **off** | `[auth].admin_new_ip_step_up` |
 | Credential recency | age of `session.reauth_at` | `now − reauth_at > step_up_max_age_seconds`, or `reauth_at is None` | **DENY** 403 + `X-Step-Up-Required: 1` (console: 303 → `/ui/reauth`) | 300 s | `[auth].step_up_max_age_seconds` |
 | Action-bound step-up grant | a single-use grant minted only by `reauth(purpose=…)`, on the **monotonic** clock | no unconsumed grant for this route's action | **DENY** 403 + `X-Step-Up-Required` + `X-Step-Up-Action: <action>`; opting out falls back to the session window | on | `[auth].require_action_step_up` |
-| MFA state | `session.mfa_verified_at` × factor enrollment × account roles | non-LOCAL account → never required; LOCAL + enrolled → always; LOCAL + un-enrolled → required when the knob is on **and** the account holds Administrator | **DENY** 403 + `X-MFA-Required: 1` at the step-up boundary | on | `[auth].require_mfa` |
+| MFA state | `session.mfa_verified_at` × factor enrollment × account roles | AD account → never required here (directory MFA is delegated); LOCAL + enrolled → always, whatever the scope says; LOCAL + un-enrolled → required when the knob is on **and** the scope covers the account — **`every_local_account` by default**, i.e. every local account, or the Administrator role only under `administrators` | **DENY** 403 + `X-MFA-Required: 1` on **every** authorized route — an **access gate**, not only a step-up gate; the console twin is a 303 to `/ui/mfa`, with the account and factor-enrolment routes exempt so an un-enrolled user is not stranded. An earlier revision of this row said Administrator-only and step-up-boundary-only; both were wrong | on; scope `every_local_account` | `[security].require_mfa`, `[security].require_mfa_scope` (the `[auth]` spellings are rejected at load) |
 | Identity provider — local credential rotation | `identity.auth_provider` | the provider is AD (the credential is the directory's, not the engine's) | **DENY** `POST /me/password` with **400**; the step-up re-proof for that identity becomes a **live directory re-bind** instead of a local hash compare, so a disabled AD account cannot refresh its window, and the engine MFA gate never fires for it | n/a | `[auth].ad_enabled` |
 | Authentication ambience | how the session was minted | browser Kerberos SSO and the OIDC callback mint with `seed_reauth=False` | **CHALLENGE** — the session is born **without** step-up freshness, so its first sensitive action forces an explicit credential step-up (the *second* signal in this table whose action is a challenge rather than a hard decision) | n/a | (by design) |
 | Session age | `created_at` / `last_used_at` / `expires_at` vs wall clock, on **every** request | idle > 30 min; past the absolute expiry (12 h, or a tighter signature-verified federated `id_token.exp` cap); or a **backward** wall-clock step (NTP step-back, VM snapshot revert) | **DENY** — the session is revoked in the store, then 401. The idle clock is refreshed only by user-driven requests, so a background poll cannot keep a session alive | 30 min / 12 h | `[security].sign_out_after_idle_minutes`, `max_session_hours` (the ADR 0118 homes; `[auth].session_idle_timeout_minutes` / `session_absolute_hours` are the retired aliases), plus `[auth].oidc_session_max_hours` for a tighter federated cap |
@@ -1168,7 +1181,7 @@ one-to-one — that is why the bind/exposure posture occupies two rows and the A
 | Declared token class of a federated assertion | the `typ` JOSE header, and the presence of an `events` claim, on a **signature-verified** JWS | `typ` present and — normalised `.strip().lower()` then `application/`-stripped — not `jwt`, so `at+jwt` (RFC 9068 access token), `logout+jwt` and `secevent+jwt` are refused while an **absent** `typ` is allowed (RFC 7519 §5.1 makes the header advisory); or the claim set carries `events`, i.e. an RFC 8417 security event token. Every such token is minted by the **same issuer under the same key**, so no signature or key rung distinguishes it | **DENY** the sign-in — `ClaimsError("wrong_token_type")` at the key-selection rung, `ClaimsError("unexpected_events_claim")` ahead of the nonce compare (a logout token carries no nonce, so a later check would misreport it as a browser-binding failure) | on | (no knob) |
 | Federated authentication-context claims (`amr` / `acr`) | the `amr` list / `acr` string of a **signature-verified** `id_token` | `oidc_require_mfa_claim` on **and** neither an `amr` value in `[auth].oidc_mfa_amr_values` (default `["mfa"]`) nor an `acr` in `oidc_required_acr_values` (default `[]`, so the `amr` arm alone decides) | **DENY** the sign-in — `ClaimsError("mfa_claim_missing")`. An IdP **assertion**, never a proof | on, `["mfa"]` / `[]` | `[auth].oidc_require_mfa_claim`, `oidc_mfa_amr_values`, `oidc_required_acr_values` |
 | UPN suffix of the federated username claim | the suffix after the FIRST `@` of the username claim | `oidc_username_strip_domain` on (default) **and** the suffix is not in `oidc_allowed_username_domains` (or `[auth].ad_domain`). With stripping **off** the claim is used verbatim and no suffix check runs | **DENY** the sign-in — `ClaimsError("username_domain_not_allowed")` | on | `[auth].oidc_allowed_username_domains`, `oidc_username_strip_domain` |
-| Bootstrap-admin age × admin population | `users.created_at` for the built-in bootstrap account × whether a second enabled Administrator exists | still unclaimed (`must_change_password` set) **and** (`now ≥ created_at + bootstrap_expiry_hours × 3600` **or** another enabled admin exists); `0` = no time expiry | **DENY** — the account is disabled, **all** its sessions revoked, `auth.bootstrap_admin_retired` audited. A *claimed* (password-changed) bootstrap account is never touched | 72 h | `[auth].bootstrap_expiry_hours` |
+| Bootstrap-admin claim state × age × admin population | `users.password_claimed_at` and `users.created_at` for the built-in bootstrap account × whether a second enabled Administrator exists | still unclaimed (`password_claimed_at` unset — only the holder's own self-service rotation stamps it, and nothing clears it) **and** (`now ≥ created_at + bootstrap_expiry_hours × 3600` **or** another enabled admin exists); `0` = no time expiry | **DENY** — the account is disabled, **all** its sessions revoked, `auth.bootstrap_admin_retired` audited. A *claimed* bootstrap account is never touched, and an admin password reset does not un-claim it (ADR 0164) | 72 h | `[auth].bootstrap_expiry_hours` |
 | Browser `Origin` at the WebSocket handshake | the `Origin` header on the upgrade | absent (a native client) → allowed; present → must be an exact member of the list, whose default `[]` rejects **every** browser Origin | **DENY** before `accept()`, so the route never runs | `[]` | `[api].ws_allowed_origins` |
 | Cross-site request signal on a `/ui` state change | `Sec-Fetch-Site` (preferred) else `Origin` vs our own origin (`[api].public_origin` is authoritative when set; `Host` is the fallback) | `Sec-Fetch-Site` ∈ {cross-site, same-site}, or a non-matching `Origin` | **DENY** 403 — defence-in-depth over the `SameSite=Strict` cookie, deliberately token-free | on | `[api].public_origin` |
 
@@ -1445,9 +1458,32 @@ MFA step-up is now built (WP-14 native TOTP); a web console banner for the feed 
 Local passwords follow an **ASVS 5.0-aligned** policy (WP-3): **min length 15**, **no mandatory
 character-class composition** (the `require_*` class flags are opt-in, default off — ASVS forbids
 mandatory composition), plus **offline breached/common-password screening** (a bundled top-10k list,
-no live HIBP call) and a small **context-word deny-list** (app/vendor/HL7 terms like `messagefoundry`,
-`mefor`, `hl7`, `corepoint`). Enforced identically on create-user and change-password; tune via
-`[auth]` (see [CONFIGURATION.md](CONFIGURATION.md)). AD passwords are governed by Active Directory.
+no live HIBP call) and a fixed **context-word deny-list**, enumerated in full below. Enforced
+identically on create-user and change-password; tune via `[auth]` (see
+[CONFIGURATION.md](CONFIGURATION.md)). AD passwords are governed by Active Directory.
+
+**The context-word deny-list, in full.** A local password is refused if it *contains* any of these
+twelve terms as a case-insensitive substring, anywhere in the value — not only as a prefix, and not
+only as a whole word:
+
+`messagefoundry`, `mefor`, `mllp`, `hl7`, `corepoint`, `mirth`, `rhapsody`, `changeme`, `bootstrap`,
+`admin`, `administrator`, `password`
+
+An earlier revision of this page described the list as "app/vendor/HL7 terms" and showed four of the
+twelve as examples. That description was wrong in a way a reader could act on: five members —
+`changeme`, `bootstrap`, `admin`, `administrator`, `password` — are generic credential words with no
+connection to this application, to a vendor, or to HL7, so a passphrase chosen on the strength of the
+old sentence could still be refused with no indication of which rule fired. The list above is the
+whole of it, mirrored from `CONTEXT_WORDS` in
+[`auth/policy.py`](../messagefoundry/auth/policy.py); the code is the authority if the two diverge.
+
+**What a deploying site can and cannot tune here.** `password_check_context` is a whole-list on/off
+switch, on by default. There is **no** setting that adds a site's own terms — its hospital
+abbreviation, a partner or product name, the local domain — and none that removes a member whose
+substring collides with a legitimate local word. A site that wants wider coverage supplies it through
+`password_breach_corpus_file` below, which answers a different question: that corpus is matched
+against the **whole** password, so a term added there is refused only when it *is* the password, never
+when it appears inside a longer passphrase.
 
 Two further screens (ASVS 6.2.11 / 6.2.12), both on by default and fully offline:
 
@@ -1467,7 +1503,7 @@ service-identity plane.
 
 | Pathway | Factor | Brute-force defense | Notes |
 |---|---|---|---|
-| **Local** (argon2id) | **password** (argon2id) **plus an engine second factor** — RFC 6238 TOTP, single-use recovery codes, or a WebAuthn/FIDO2 passkey. Since ASVS 6.3.3 that factor is an **access gate, not merely a step-up boundary**: an MFA-pending session is refused on *every* authorized route with `X-MFA-Required: 1` (browser sessions are confined to `/ui/mfa`). It binds any local account that has enrolled a factor, plus every account `[auth].require_mfa_scope` covers — **`every_local_account` by default** (`[auth].require_mfa` defaults **on**). Set the scope to `administrators` for the pre-6.3.3 posture, in which a non-admin, un-enrolled local session is **password-only end to end**. Caveat: a passkey is asserted at `user_verification=preferred`, so for a passkey-only account the second factor may be **device possession alone** | **per-account lockout** (5/15 min), fed by **both** the password and the TOTP/recovery leg + breach/context policy + the per-IP **and** global sign-in window | the only pathway the engine itself can lock out; the only one with a phishing-resistant factor |
+| **Local** (argon2id) | **password** (argon2id) **plus an engine second factor** — RFC 6238 TOTP, single-use recovery codes, or a WebAuthn/FIDO2 passkey. That factor is an **access gate, not merely a step-up boundary**: an MFA-pending session is refused on *every* authorized route with `X-MFA-Required: 1`, and a browser session is **redirected** to `/ui/mfa` — *not* confined to it, as an earlier revision of this cell said, because the account and factor-enrolment routes are declared MFA-pending-exempt, so a user with no factor yet enrols at `/ui/account`. It binds any local account that has enrolled a factor, plus every account `[security].require_mfa_scope` covers — **`every_local_account` by default** (`[security].require_mfa` defaults **on**; both keys are rejected under `[auth]` and fail the start). Set the scope to `administrators` for the earlier, narrower posture, in which a non-admin, un-enrolled local session is **password-only end to end**. Caveat: a passkey is asserted at `user_verification=preferred`, so for a passkey-only account the second factor may be **device possession alone** | **per-account lockout** (5/15 min), fed by **both** the password and the TOTP/recovery leg + breach/context policy + the per-IP **and** global sign-in window | the only pathway the engine itself can lock out; the only one with a phishing-resistant factor |
 | **AD** (LDAP simple-bind, LDAPS by default) | password, verified by a bind **as the user** against the DC; MFA is **delegated and unverifiable at the engine** — the simple-bind call site issues the session MFA-satisfied under the owner-signed delegated-directory relaxation, regardless of what the directory enforced, and no `amr`-equivalent evidence is received. The grant is now a per-mechanism argument rather than a blanket literal, so the federated leg can differ (see OIDC) | the **directory's** lockout/complexity policy; engine-side, the per-IP **and** global sign-in window (`[auth].login_rate_limit_enabled`, default on — **off leaves this pathway with no engine-side control at all**) — and **no** engine per-account lockout | password strength + lockout are the AD domain's responsibility. LDAPS is the default, not a structural guarantee: `[auth].ad_allow_insecure_ldap` opts into a plain bind, and `ad_tls_verify=false` is refused at startup unless the `MEFOR_ALLOW_INSECURE_TLS` dev escape is set |
 | **Kerberos / SPNEGO** | domain ticket; MFA is **delegated and unverifiable at the engine** — the session is issued MFA-satisfied and no `amr`-equivalent evidence is received | the **domain's** controls; engine-side, the sign-in window on the token-bearing leg (`[auth].login_rate_limit_enabled`, default on — **off leaves this pathway with no engine-side control at all**; the RFC 4559 challenge leg is deliberately unthrottled either way) | experimental, off by default, **single-leg — no mutual authentication**, channel binding deliberately un-enforced. The browser leg (`GET /ui/sso`) mints with no step-up window, so the first sensitive action forces a step-up; the JSON `POST /auth/negotiate` seeds it |
 | **OIDC federation** (browser only, hybrid AD-backed) | IdP-asserted, gated on a **signature-verified** `amr`/`acr` claim (`[auth].oidc_require_mfa_claim` defaults **on**) — an assertion, not a proof | no engine credential to guess, so no per-account lockout; both legs (`/ui/oidc/start`, `/ui/oidc/callback`) charge the sign-in window (`[auth].login_rate_limit_enabled`, default on — **off leaves this pathway with no engine-side control at all**, though the bounded pending-flow cache still caps concurrent start legs), plus the IdP's own lockout | hybrid-only: a federated principal with no on-prem AD object is refused. Roles come from LDAP, never from a token claim. When `[auth].oidc_username_strip_domain` is on (default), the claim's UPN suffix must match `oidc_allowed_username_domains` (or `[auth].ad_domain`); with stripping **off** the claim is used verbatim and no suffix check applies. The session's absolute lifetime is capped at the verified `id_token.exp`; minted with no step-up window |
@@ -1528,15 +1564,28 @@ delegated pathways rather than narrowing it, and an operator turning it off must
 lockout policy carrying the whole load. OIDC has no engine credential to lock out; the mTLS plane has
 no guessable secret at all, so no rate limit or lockout applies to it. **A genuine second factor is built
 for local accounts only** — TOTP (WP-14) *and* WebAuthn passkeys (WP-14b), the latter being the only
-phishing-resistant factor shipped; `[auth].require_mfa` defaults on but scopes to local Administrator
-accounts, and it is enforced at the **step-up boundary, not as an access gate** (see
-[Multi-factor authentication](#multi-factor-authentication-totp-wp-14) and the separate 6.3.3 scoring).
+phishing-resistant factor shipped; `[security].require_mfa` defaults **on** and its shipped scope is
+**`every_local_account`** rather than the Administrator role, and it is enforced as an **access gate, not
+only at the step-up boundary** — an MFA-pending session is refused on every authorized route. An earlier
+revision of this sentence asserted the opposite on both counts and named the `[auth]` keys the loader
+rejects; it also contradicted the Local row of the table above, which was right (see
+[Multi-factor authentication](#multi-factor-authentication-totp-wp-14)).
 AD/Kerberos MFA is delegated to the directory; OIDC's is asserted by the IdP and gated on a
-signature-verified claim. **The consequence, stated plainly:** every directory pathway satisfies the
-engine's MFA gates without an engine-verified factor — `_complete_ad_login` mints AD, Kerberos and OIDC
-sessions `mfa_verified=True` unconditionally — so a *password* on the AD pathway reaches the same PHI
-surface as a passkey-backed local Administrator. OIDC is the only delegated pathway that carries any
-engine-side evidence at all (the signature-verified `amr`/`acr` gate); AD and Kerberos carry none.
+signature-verified claim. **The consequence, stated plainly:** the AD and Kerberos pathways satisfy the
+engine's MFA gates without an engine-verified factor, so a *password* on the AD pathway reaches the same
+PHI surface as a passkey-backed local Administrator. The mechanism is a **per-mechanism argument**, not a
+blanket literal: `mfa_verified` is a keyword parameter of `_complete_ad_login`, and the simple-bind and
+Kerberos legs pass `True` under the signed delegated-directory relaxation while the federated leg passes
+`[auth].oidc_require_mfa_claim` itself — on by default, and reached only after the claim gate has already
+refused any token carrying no configured `amr`/`acr`, so the grant there is engine-verified rather than
+assumed. Turn that setting off and the federated session mints **un**verified, and `mfa_satisfied`
+refuses it while `[security].require_mfa` is on (the default). An earlier revision of this sentence said
+`_complete_ad_login` mints all three `mfa_verified=True` unconditionally; that was wrong about the
+mechanism and contradicted the OIDC row of the table above. OIDC therefore remains the only delegated
+pathway carrying engine-side evidence at all; AD and Kerberos carry none, and **closing that gap is the
+deploying site's job, in the directory** — the engine accepts whatever the directory asserts, so the
+domain's own MFA policy (Entra Conditional Access or an MFA proxy) is the only control over those two
+pathways.
 
 ## Brute-force & abuse protection
 
@@ -1871,8 +1920,12 @@ runs bulk AES-256-GCM. #198 closes the **application-code-feasible** half and ac
 - **Person/entity authentication** (required) — local argon2id and/or AD bind; lockout on brute force.
 - **Audit controls** (required) — durable, user-attributed audit trail (append-only via the store API).
 - **Automatic logoff** (addressable) — idle + absolute session timeouts.
-- **Emergency access** (required) — the bootstrap admin provides break-glass; treat its credential as
-  a sealed secret.
+- **Emergency access** (required) — **not applicable to this component.** Break-glass exists so a
+  clinician can reach a *patient's record* when normal authorisation would refuse it. This engine
+  holds no point-of-care record: it routes and transforms messages in transit, and the record of
+  authority lives in the systems on either side, which is where an emergency-access path belongs.
+  The bootstrap admin is **not** a break-glass mechanism and is not a compliance control — it seeds
+  the first real administrator and then self-retires (see *Auto-retirement (WP-3)* above).
 
 ---
 

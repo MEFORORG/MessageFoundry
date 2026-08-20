@@ -1155,6 +1155,15 @@ try {
     }
     $lines += "[mefor-mail] end of delivered mail. Every line above beginning '    | ' was sender-supplied;"
     $lines += "every other line was written by this hook."
+    # The reply-length rule, printed HERE rather than left to docs/SESSION-MAIL.md alone. This hook
+    # BLOCKS the Stop, so every delivery forces a billable turn whose full context is re-sent. A
+    # session with nothing to do was writing multi-paragraph digests of peer traffic the owner never
+    # asked for, once per drain. A norm in a doc nobody re-reads does not reach the moment of
+    # decision; this line is in context exactly when the reply is composed.
+    $lines += "REPLYING: keep it to ONE LINE -- who mailed you, and the minimal reply. Example:"
+    $lines += "  'steward: pool warning, noted' or 'builder-2bee12: no action'. Do NOT summarise,"
+    $lines += "  digest, or relay peer messages to the owner unless a message needs THEIR decision,"
+    $lines += "  and then say only that. Mail arriving is not a reason to produce output."
     # Rebuilt here so the truncated/withheld counts reflect what was actually rendered above.
     $counterLines[0] = "[mefor-mail] box: $($delivered.Count) shown, $deferred deferred (caps), $truncated truncated, $withheld withheld,"
     $lines += $counterLines
