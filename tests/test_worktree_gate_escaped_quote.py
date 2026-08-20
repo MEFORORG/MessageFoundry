@@ -233,7 +233,14 @@ def test_an_ordinary_command_is_still_allowed(primary: Path, repos_file: Path) -
 # inert payload that COMPUTES (`111*3` -> 333) rather than echoes, so an echo-back cannot be mistaken
 # for a run. That is the only ground truth here: "should this deny" is a question about the shell, not
 # about the gate.
-_ODD_BS = 'Write-Output "C:\Temp\\" ; {gated} ; Write-Output "x"'
+_ODD_BS = 'Write-Output "C:\\Temp\\" ; {gated} ; Write-Output "x"'
+# NOT MADE RAW, WHICH IS THE ESCAPE-SEQUENCE GATE'S OWN PRESCRIBED REMEDY (BACKLOG #1229 residual).
+# `r'...'` would preserve the `\\\` as TWO backslashes, turning this line's ODD trailing count
+# into an EVEN one -- and per the measured table ODD is the ALLOW case under test while EVEN DENIES.
+# The remedy would have yielded a GREEN test of the non-regressing case: the regression row neutered,
+# with nothing reporting it. Escaping only the INVALID sequence preserves the value exactly (verified
+# by comparing ast.literal_eval before and after, not by reading the line).
+# Generally: that remedy is unsafe for any literal that ALSO contains a valid backslash escape.
 _STRADDLE = 'echo \\" ; {gated} ; echo \\"'
 
 
@@ -300,12 +307,12 @@ def test_an_escaped_quote_in_an_interpreter_ARGUMENT_still_reaches_the_inner_cod
     Once the span blanking became escape-AWARE the two disagreed::
 
         bash -c "bash -c \\"git -C <governed> reset --hard\\""
-        extraction got  `bash -c \`   -- truncated at the escaped quote, no verb in it
+        extraction got  `bash -c \\`   -- truncated at the escaped quote, no verb in it
         blanking removed the whole span
         so nothing reached any rule -> ALLOW
 
     MEASURED: origin/main DENY x3, the escape-aware fix ALLOW x3, and the control below DENY on both.
-    The inner command really runs -- ``bash -c "bash -c \\"expr 111 \* 3\\""`` prints 333.
+    The inner command really runs -- ``bash -c "bash -c \\"expr 111 \\* 3\\""`` prints 333.
 
     ON MAIN THE TWO AGREED BY ACCIDENT, both being escape-blind, which left the verb visible OUTSIDE
     the span. Making one side escape-aware removed the accident without replacing it. **A host flag
