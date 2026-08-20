@@ -203,7 +203,7 @@ def test_a_missing_tlsversion_enum_raises_rather_than_skipping(
     """The `harden_kex_groups` failure mode, refused on purpose.
 
     That helper pins nothing on this interpreter because `SSLContext.set_groups` does not exist and it
-    returns silently — six call sites, zero effect, green tests. A probe that skipped when a
+    returns silently — every call site, zero effect, green tests. A probe that skipped when a
     deprecated `TLSVersion` disappeared would become a gate that cannot fail, and would report success
     forever afterwards.
 
