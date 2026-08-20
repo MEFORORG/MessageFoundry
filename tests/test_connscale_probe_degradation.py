@@ -516,20 +516,44 @@ def test_the_console_names_the_mechanism_beside_the_n_a() -> None:
 def test_a_measured_record_is_asserted_exactly_as_strictly_as_before() -> None:
     # The pre-existing strength is preserved where the probe worked: a positive count passes, and a
     # non-positive one still fails. The change adds a verdict for gaps; it does not relax readings.
-    _assert_fd_probe([_record(fd=100, ticks=6)])
+    # TWO measured readings, because the run-level bound requires a comparable PAIR -- see
+    # test_one_measured_reading_in_a_group_is_not_a_comparison for why one is not enough.
+    _assert_fd_probe([_record(count=12, fd=100, ticks=6), _record(count=24, fd=110, ticks=6)])
     with pytest.raises(AssertionError):
-        _assert_fd_probe([_record(fd=0, ticks=6)])
+        _assert_fd_probe([_record(count=12, fd=0, ticks=6), _record(count=24, fd=110, ticks=6)])
 
 
-def test_a_spent_budget_gap_is_tolerated_when_another_step_measured() -> None:
-    # The starved-runner case that was reddening a required context. Tolerated -- but only alongside a
-    # step that actually measured, which is what stops the tolerance becoming a blanket green.
+def test_a_spent_budget_gap_is_tolerated_beside_a_comparable_pair() -> None:
+    # The starved-runner case that was reddening a required context. Tolerated -- but only where the
+    # SLO that covers wall #4 still had a pair to compare. Renamed from "when another step measured":
+    # one other measuring step is NOT the condition, because two readings split so that no group holds
+    # two are never compared with each other.
     _assert_fd_probe(
         [
             _record(count=12, fd=None, ticks=6, degraded_ticks=6, degraded=("walk_timeout",)),
             _record(count=24, fd=140, ticks=6),
+            _record(count=48, fd=150, ticks=6),
         ]
     )
+
+
+def test_one_measured_reading_in_a_group_is_not_a_comparison() -> None:
+    # THE REGRESSION TEST FOR A DEFECT THAT SHIPPED HERE. The first version of the run-level bound was
+    # `any(fd_count_peak is not None)`, which passes on a run where exactly one step measured -- and
+    # `_monotonic_slo` SKIPS None readings, so `fd_count_monotonic` then reports ok=True having
+    # compared ZERO pairs. Measured on the real smoke at the time: forcing every step after the first
+    # to WALK_TIMEOUT gave PAIRS ACTUALLY COMPARED=0 and the SLO still said "monotonic", and a genuine
+    # 1000-handle collapse passed the same way. A green that rests on an empty comparison is exactly
+    # what this file exists to prevent.
+    with pytest.raises(AssertionError, match="WALL #4 NEVER COMPARED") as e:
+        _assert_fd_probe(
+            [
+                _record(count=12, fd=1000, ticks=6),
+                _record(count=24, fd=None, ticks=6, degraded_ticks=6, degraded=("walk_timeout",)),
+            ]
+        )
+    # The verdict must show WHY it is not a comparison, not merely that it failed.
+    assert "per group" in str(e.value)
 
 
 def test_a_broken_probe_still_fails_and_the_message_names_the_cause() -> None:
@@ -585,7 +609,7 @@ def test_a_run_that_never_measured_wall_four_fails_despite_every_cause_being_tol
     # The bound on the tolerance, and the reason this is not "a tolerance alone". Each step in
     # isolation is excusable; a whole run that measured wall #4 zero times proves nothing about wall
     # #4, so it fails rather than passing on the strength of four excuses.
-    with pytest.raises(AssertionError, match="WALL #4 UNMEASURED") as e:
+    with pytest.raises(AssertionError, match="WALL #4 NEVER COMPARED") as e:
         _assert_fd_probe(
             [
                 _record(count=12, fd=None, ticks=6, degraded_ticks=6, degraded=("walk_timeout",)),

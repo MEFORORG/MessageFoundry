@@ -961,8 +961,20 @@ def _pid_running(pid: int) -> bool | None:
     except PermissionError:
         return True  # exists but owned by someone else — still "running" as far as we can see
     state = _proc_state(pid)
-    if state is None:  # POSIX without /proc (e.g. macOS): a zombie and a runner look identical
-        return None
+    if state is None:
+        # `_proc_state` returns None for TWO situations that must not be collapsed, and collapsing
+        # them turns a SUCCESS into a red on Linux. `os.kill(pid, 0)` above and the `/proc` read here
+        # are two syscalls with a gap between them, and a reaper can retire the pid inside that gap --
+        # so a MISSING `/proc/<pid>` on a kernel that HAS `/proc` is a definite answer, "gone", not an
+        # inability to answer. Only a platform with no `/proc` at all (macOS) genuinely cannot tell a
+        # zombie from a runner, and that is the case `None` is reserved for.
+        #
+        # Reading the directory rather than the platform string: `sys.platform` says which OS, and the
+        # question here is whether THIS kernel exposes the interface. They agree today and the second
+        # is what the code actually depends on.
+        if os.path.isdir("/proc"):
+            return False  # /proc exists and this pid is not in it: retired between the two calls
+        return None  # no /proc at all: a zombie and a runner are indistinguishable here
     return state != "Z"
 
 
