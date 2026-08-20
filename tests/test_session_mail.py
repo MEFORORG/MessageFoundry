@@ -425,6 +425,55 @@ def test_a_plain_message_is_delivered_end_to_end(repo: Path, tmp_path: Path) -> 
     assert len(box_files(repo, key, "seen")) == 1
 
 
+def _send(repo: Path, body: str) -> subprocess.CompletedProcess[str]:
+    """Drive the REAL sender. The seeder deliberately bypasses these arms, so they need this route."""
+    return subprocess.run(
+        [
+            "pwsh", "-NoProfile", "-NonInteractive", "-File", str(MAIL),
+            "-Send", "-MailRoot", str(mail_root(repo)), "-To", str(repo), "-Body", body,
+        ],
+        cwd=str(repo), capture_output=True, text=True, timeout=TIMEOUT, check=False,
+    )  # fmt: skip
+
+
+def test_the_send_line_arm_refuses_at_the_boundary_and_passes_one_below(repo: Path) -> None:
+    """The adjacent pair, not a 300-char probe.
+
+    A single long probe proves the arm fires on SOMETHING; it cannot distinguish a threshold of 240
+    from one of 250. Only the adjacent pair pins the number, and an arm off by ten at the boundary is
+    exactly the failure that ships a body cut by one line. Measured 2026-08-18: of four independent
+    implementations that pinned this boundary, one sat one character low and its author found it only
+    by running this pair.
+    """
+    at_cap = _send(repo, "x" * MAX_LINE_CHARS)
+    assert at_cap.returncode == 0, f"a line AT the cap must send: {at_cap.stdout}\n{at_cap.stderr}"
+
+    one_over = _send(repo, "x" * (MAX_LINE_CHARS + 1))
+    assert one_over.returncode != 0, "a line ONE over the cap must be refused"
+    assert str(MAX_LINE_CHARS) in one_over.stderr, one_over.stderr
+
+
+def test_the_send_line_arm_is_disjoint_from_the_byte_arm(repo: Path) -> None:
+    """The reason a second arm exists at all: the byte arm cannot see this body.
+
+    A long line inside a SHORT body is under the byte cap by a wide margin and is still cut at render.
+    Measured across five senders on 2026-08-18, a rendered-cost check alone missed 55 of 69 real
+    truncations, so the arms are not redundant and neither test stands in for the other.
+    """
+    body = "\n".join(["short line", "y" * (MAX_LINE_CHARS + 1), "short line"])
+    assert len(body) < MAX_BODY_BYTES, "the point of this case is that the BYTE arm would pass it"
+
+    proc = _send(repo, body)
+    assert proc.returncode != 0, "a long line in a short body must be refused by the line arm"
+    assert str(MAX_LINE_CHARS) in proc.stderr, proc.stderr
+
+    # The buried-line case: the arm must read every line, not the first or the longest-looking one.
+    buried = "\n".join(["a", "b", "z" * (MAX_LINE_CHARS + 40), "c"])
+    assert _send(repo, buried).returncode != 0, (
+        "a long line BURIED among short ones must be refused"
+    )
+
+
 def test_a_second_drain_shows_nothing_and_says_so(repo: Path, tmp_path: Path) -> None:
     """THE DISCRIMINATOR for the delivery test above: the same fixture, drained twice.
 
@@ -1570,3 +1619,69 @@ def test_the_injection_is_ascii_even_with_a_hostile_message(repo: Path, tmp_path
     # Newlines survive -- the last-net scrub must not collapse the injection onto one line.
     assert "\n" in text
     assert re.fullmatch(r"[\x20-\x7E\n]*", text), "a non-printable byte reached the injection"
+
+
+def test_an_expired_message_is_named_and_receipted_so_the_sender_can_see_it(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Expiry must be observable in BOTH directions, which is the whole of BACKLOG #1228.
+
+    Before this, a swept message was reported to the recipient as a bare ``1 expired`` -- no id, no
+    sender, no subject -- and to the SENDER as nothing at all. The send call had already returned
+    success and no receipt was ever written, so ``mail.ps1`` could only say "delivery UNPROVEN (no
+    receipt)", which is indistinguishable from a message sitting in an inbox nobody has drained.
+    Every observable on both sides said the message had been delivered.
+
+    A test asserting only the recipient half leaves the sender blind, which is the direction that
+    made this invisible in the first place, so both are asserted here against ONE drain run.
+
+    The fresh message is a NEGATIVE CONTROL and is load-bearing: without it a drain that swept
+    everything, or one that rendered nothing at all, would satisfy the expiry assertions.
+    """
+    info = seed(
+        repo,
+        tmp_path,
+        [
+            # Unambiguously past, so there is no timing race to lose.
+            {
+                "body": "SWEPT-BODY: must never be rendered",
+                "expiresUtc": "2020-01-01T00:00:00.0000000Z",
+            },
+            {"body": "FRESH-CONTROL: must be shown instead"},
+        ],
+    )
+    swept_stem = str(info["rows"][0]["stem"])
+    out = injection(run_drain(repo, event="Stop"))
+
+    # --- recipient half: told WHICH, not merely how many ---------------------------------------
+    assert "1 expired" in out, out
+    assert "EXPIRED AND NEVER SHOWN" in out, out
+    assert swept_stem in out, f"the swept id was not named: {out!r}"
+    assert "SWEPT-BODY" not in out, "an expired message's body was rendered"
+    assert "FRESH-CONTROL" in out, "the negative control was not shown, so the run proves nothing"
+
+    # --- sender half: a receipt exists, and it says the message was never observed ---------------
+    receipt = mail_root(repo) / "receipts" / f"{swept_stem}.json"
+    assert receipt.exists(), (
+        "no receipt for a swept message leaves the sender with no signal at all"
+    )
+    data = json.loads(receipt.read_text(encoding="utf-8"))
+    assert data["disposition"] == "expired-unshown", data
+    # The assertion, not an omission: this text was never emitted to anyone.
+    assert data["observedUtc"] == "", data
+    # It did leave the inbox, and that did happen.
+    assert data["consumedUtc"], data
+
+
+def test_the_fresh_control_alone_produces_no_expiry_line(repo: Path, tmp_path: Path) -> None:
+    """The other direction: a drain with nothing expired must not emit the naming line.
+
+    Guards the common path. The naming line is appended conditionally, and a false ``if`` inside the
+    counter array literal was measured to contribute a ``$null`` element -- which would have emitted
+    a blank line into every drain that swept nothing.
+    """
+    seed(repo, tmp_path, [{"body": "FRESH-ONLY: nothing here has expired"}])
+    out = injection(run_drain(repo, event="Stop"))
+    assert "FRESH-ONLY" in out
+    assert "0 expired" in out, out
+    assert "EXPIRED AND NEVER SHOWN" not in out, out
