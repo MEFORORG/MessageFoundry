@@ -73,6 +73,23 @@ def shell(command: str, cwd: Path) -> dict[str, object]:
 # in the SCANNER, so it disarms every rule equally; pinning one verb would leave the suite green while
 # the destructive arm stayed open.
 #
+# ***BUT THIS SUITE DOES NOT ACTUALLY COVER MORE THAN ONE RULE, AND AN EARLIER VERSION OF THIS COMMENT
+# CLAIMED IT DID. MEASURED, WHICH IS THE ONLY REASON I KNOW:*** both verbs are denied by the SAME rule
+# -- each returns "would change the working tree of the SHARED PRIMARY checkout". Two verbs, one rule.
+# The defect is rule-AGNOSTIC, so the coverage that would actually pin that property has to exercise
+# DIFFERENT RULES, and this file exercises one.
+#
+# **AND "DENIED" IS A WEAKER CLAIM THAN "DENIED BY THE RULE WE THINK."** A suite that asserts only that
+# a deny happened cannot tell a rule-agnostic scanner fix from a lucky overlap in one rule's matching.
+# The stronger form -- reading back the rule ids the gate RECORDS and asserting they are distinct --
+# was built independently on another lane and is the right home for that coverage; this file should
+# not grow a second, thinner version of it. Cross-checked there: 10 of its 11 rows pass against this
+# gate unchanged.
+#
+# Left as-is deliberately rather than widened here, and the over-claim corrected in place rather than
+# deleted, because the gap is real and a reader who saw only the fixed comment could not tell this
+# suite had ever asserted coverage it does not have.
+#
 # `worktree add` WAS IN THIS LIST AND WAS REMOVED, WHICH IS WORTH RECORDING RATHER THAN TIDYING AWAY.
 # A report reached me claiming the escape hid it, so it went in as a third case and FAILED. The
 # discriminating probe is the one that settles it -- run the same command WITH and WITHOUT the escape:
