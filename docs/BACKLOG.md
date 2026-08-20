@@ -47,8 +47,12 @@ runs for the same four titles; only the last run's numbers (#248–#251) were fi
 a worktree that no longer exists, and `alloc.ps1` has no release verb by design ("holes are free,
 collisions are not"), so those claims stand permanently and the ledger gate will refuse a commit that
 files there. **#315** and **#317** are deliberate probe allocations used to verify the floor fix below;
-they are holes too. Always allocate with `scripts/coord/alloc.ps1`; never pick a number by reading this
-file.
+they are holes too. **#1297** is a hole for a different and instructive reason: it was allocated from the
+**primary checkout** because the allocating shell's working directory was the primary rather than the
+session's own worktree, so the ledger gate correctly refused the commit ("#1297 was not allocated to this
+worktree") and the item was re-filed at **#1298**. The gate did its job; the lesson is that `alloc.ps1`
+records the claim against **whatever tree it runs in**, so run it from the worktree that will commit.
+Always allocate with `scripts/coord/alloc.ps1`; never pick a number by reading this file.
 
 **If you allocated a backlog number before 2026-07-31T00:31Z, re-check it — the trigger is the
 timestamp, not the value.** That is when the floor fix landed. Any number issued before it came from a
@@ -4204,6 +4208,7 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 ## 1020. The first-run bootstrap Administrator is created with no email address, and the PHI notification gate cannot see it
 
+> **AMENDED 2026-08-20 -- THE HOLD CONDITION THIS ITEM NAMES HAS BEEN SATISFIED, AND THE ITEM STILL DOES NOT CLOSE. THE REASON CHANGED; THE VERDICT DID NOT.** The rulings below say *"do not close this before `#1257` lands"*. **`#1257` HAS LANDED** -- `tests/test_lifespan_startup_unwinds.py` is present on `origin/main` and `api/app.py` carries the unwind around `engine.start()`. Content-tested against `origin/main`, not read from `#1257`'s banner, which still reads open. **So anyone watching that banner flip would close this item for a reason that was never the real one.** **THE LIVE REASON, measured on `origin/main` the same day:** `__main__.py:2350-2354` still computes `security_channel_ready` as `notify_security_events AND email_smtp_host AND email_from` -- **SMTP wiring alone.** It asks *"is a transport configured"*, never *"can the account holding `frozenset(Permission)` receive"*, which is this item's second sentence verbatim. The landing branch adds the deliverable-address predicate in `auth/service.py` and **never wires it in**: `__main__.py` is not in its changed-file list and the whole file hashes identically on both refs. **A reason that can expire silently is a worse reason even while it is still true** -- this one is checkable in one command. Recorded by the lander under ADR 0165.
 > 🔢 **Filed 2026-08-04 — not started.** Value **5/10** · Difficulty **3/10** · _fill-in_. `_ensure_bootstrap_admin` calls `create_user` with no `email=`, so the account holding `frozenset(Permission)` has a NULL email and `SecurityEventNotifier.notify`'s `if not event.email: return` makes all ten notice types no-op for it. The PHI startup gate that refuses to serve without a notification channel computes readiness from the SMTP transport alone, so it would report a healthy channel while no notice about the all-permission account could be delivered.
 > ⚠️ **AMENDED 2026-08-11 — the bootstrap half shipped on a branch; THE PART WITH TEETH IS UNTOUCHED, so this stays OPEN.** `w3-l2-auth-policy` (`a46f7a83`, pushed, **unlanded**) retires the emailless bootstrap admin. But the item's second sentence — the PHI startup gate reporting a healthy channel while no notice about the all-permission account could be delivered — **is not addressed**. Re-read on `main` rather than relayed: `messagefoundry/__main__.py:2292-2296` still computes `security_channel_ready` as `notify_security_events and email_smtp_host and email_from`, which is **SMTP wiring alone**. It asks *"is a transport configured"*, never *"can the account that matters actually receive"* — SDS-3.8, the instrument answering the adjacent question. A deploying site would get a green readiness signal for a channel that cannot reach the one account holding `frozenset(Permission)`.
 
@@ -6003,7 +6008,8 @@ rules out the family `#1014` already fixed and points at the one it did not.
 
 ## 1105. `harden_kex_groups`' docstring undercounts its own call sites, in the paragraph written to warn about exactly that
 
-> 🔢 **Filed 2026-08-08 - not started. Measured on `main` at 166634c9, not hypothesised.** Value **3/10** · Difficulty **1/10**. `messagefoundry/config/tls_policy.py:125` says `APPROVED_KEX_GROUPS` reaches "zero of this function's **six** call sites"; `:136` repeats "a call at **six** sites with zero effect". Scanning `messagefoundry/`, `tests/`, `harness/`, `packaging/` and `ide/` for `harden_kex_groups(` finds **seven** sites that build and harden a real TLS context, plus an eighth reference added by `#338`. Nothing checks the number - the tests derive their site list instead - so the docstring is the only place it is asserted, and it is wrong.
+> ✅ **SHIPPED 2026-08-20 -- the count was DELETED, not corrected, and that is the fix.** The docstring no longer states a number: `APPROVED_KEX_GROUPS` reaches **none** of the call sites, and the paragraph now says why no count is stated -- the site list is *derived* by `tests/test_tls_policy.py`, so a number written into prose is a second definition that nothing checks. **A cited number carrying no conclusion is a liability; delete it rather than correct it.** Correcting "six" to "seven" would have produced a true sentence measuring the wrong thing, and it would have read as freshly checked forever. **No behaviour change of any kind** -- the separately-recorded fact that `harden_kex_groups` pins nothing on any interpreter this project runs on (`SSLContext.set_groups` is a 3.15 API) is untouched. Fix authored by the builder lane; this banner by the lander under ADR 0165. Original filing follows.
+> **Filed 2026-08-08 - not started. Measured on `main` at 166634c9, not hypothesised.** Value **3/10** · Difficulty **1/10**. `messagefoundry/config/tls_policy.py:125` says `APPROVED_KEX_GROUPS` reaches "zero of this function's **six** call sites"; `:136` repeats "a call at **six** sites with zero effect". Scanning `messagefoundry/`, `tests/`, `harness/`, `packaging/` and `ide/` for `harden_kex_groups(` finds **seven** sites that build and harden a real TLS context, plus an eighth reference added by `#338`. Nothing checks the number - the tests derive their site list instead - so the docstring is the only place it is asserted, and it is wrong.
 
 **Cluster:** Documentation accuracy / security-comment drift. **Priority:** P3. **Verdict:** build.
 **Severity:** no product effect and no PHI effect, and **no behaviour change of any kind** - the separate,
@@ -10136,6 +10142,7 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **Severity:** no deployment axis (§0) -- dev-box test tooling; **CI (Linux) is unaffected and reports nothing**. The cost is that every seat running a full suite on this box may or may not hit a 160-failure wall depending on its own `PATH`, and while it is hit the module cannot detect the defect it exists to catch.
 ## 1273. the module that exists to write the C0/DEL test once writes it twice, and logging_setup re-derives it a third time
 
+> **PARTIAL 2026-08-20 -- ONE OF THE TWO SPELLINGS INSIDE THE MODULE IS GONE; THE THIRD, IN ANOTHER MODULE, IS NOT. THIS ITEM STAYS OPEN.** `controlchars.py` now states the set once, in `_is_control_char` at `:67`, and both `has_control_char` and `strip_control_chars` read it -- so the module's own interior no longer contradicts its docstring. **But `logging_setup.py:66-70` still re-derives the same set independently** (`for _i in range(0x20)` plus `[0x7F]`), and the landing branch does not touch that file at all. The item names **three** spellings and asks for **one definition of the SET**; two of three now share one. **The leverage the module exists to provide is still absent across the module boundary:** widen `_is_control_char` and it reaches neither `_CTRL_TRANSLATION` nor anything reading it, and nothing reports the omission. Measured on the landing branch, not inferred. Recorded by the lander under ADR 0165, because a closing banner that lists what a change fixed and not what it left is half a record.
 > 🔢 **Filed 2026-08-15 - not started. THE CONSOLIDATION DOES NOT CONSOLIDATE ITS OWN TWO FUNCTIONS.** [`controlchars.py`](../messagefoundry/controlchars.py) was created by [#1253](BACKLOG.md) to write the C0/DEL test **once**; its docstring is titled *"The C0/DEL control-character test, written once"* and ends *"THE POINT IS THE COPYING PRACTICE, not the seven known lines. If you need this test, import it."* **It then spells the predicate out twice inside itself**, and a third statement of the same set lives in `logging_setup`.
 
 > **MEASURED, three independent spellings of one set:**
@@ -10483,3 +10490,33 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Coordination registry / worktree lifecycle. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0) -- developer coordination only. The cost is 19 backlog items currently presenting as claimed-and-in-progress when nobody is working them, which is the exact signal the registry exists to make trustworthy.
+
+## 1298. The archive dialog's permanently-discarded warning is not a loss test: a worktree behind main sees landed files as untracked
+
+> 🔢 **Filed 2026-08-20 -- not started. THE WARNING REASONS FROM "NOT IN THIS WORKTREE'S INDEX" STRAIGHT TO "WILL BE PERMANENTLY DISCARDED", SKIPPING THE ONLY QUESTION THAT DECIDES IT -- DOES THIS CONTENT EXIST ANYWHERE ELSE.** The session-archive dialog lists the worktree's dirty set and states the files "will be permanently discarded". For a `??` entry that is a statement about **this worktree's index**, not about the content. A worktree whose HEAD predates a commit sees every file that landed since as untracked, because they are absent from **its** index while being tracked on `main`. **THE CHANGE: document the three-command recoverability check as the thing a seat runs before believing the warning, and provide it as a helper so the answer is not re-derived by hand under time pressure.**
+
+> **MEASURED 2026-08-20, on a live instance of the dialog.** It warned that two files would be permanently discarded:
+>
+>     ?? tests/test_notifiable_admin.py
+>     ?? docs/adr/0167-phi-security-notification-readiness-gates-on-a-deliverable-address-...md
+>
+> Both are **tracked on `origin/main`**. `test_notifiable_admin.py` was added at `4c28badd` (PR #428), which merged **that same session**. Every local copy was **byte-identical** to main's blob in **all six** worktrees holding them -- `39e240c604393124a635107ba2dd8d8ac8c1805e` for the test, `af21f40e1fb9273183855b3a4d1da5da9fbd897f` for the ADR. Archiving would have discarded **nothing**; a checkout restores both.
+
+> **REPRODUCED ON THIS SEAT'S OWN TREE, which is what establishes the mechanism rather than the coincidence.** The cleaner worktree sat at `dd655da2`, two commits behind `origin/main`, and `git status --porcelain` showed **the identical `??` pair**. Fast-forwarding to `1df0c074` converted both to tracked with no edit and no conflict. The files never changed; the base did.
+
+> **THE FAILURE IS SYSTEMATIC AND ITS TIMING IS ADVERSARIAL.** Every session whose base is behind `main` is warned about every file that landed since it branched, on every archive, for as long as it stays behind -- so the warning is loudest exactly when the fleet is landing fastest, and wrong in precisely those cases. **Both ways of responding to it are damaging:** a seat that believes it refuses a safe archive and stalls, and a seat that learns to dismiss it will one day dismiss a warning that was real. A signal that is usually a false alarm trains the response that defeats it.
+
+> **SCOPE, STATED PLAINLY SO THE ITEM IS NOT MIS-BUILT: the dialog is the Claude Code harness and is NOT this repository's code.** Nothing here can change its wording, and an item that implies otherwise would be unbuildable. What IS in scope: a `docs/WORKTREES.md` subsection recording that the warning is an index test rather than a loss test, plus a helper under `scripts/coord/` that answers the recoverability question for a whole dirty set and prints what it examined. **A helper is worth more than the prose alone** -- the check is three commands and entirely mechanical, and it is needed at the moment a modal is open and the seat is deciding.
+
+> **THE CHECK, and its asymmetry.**
+>
+>     git fetch origin -q
+>     git cat-file -e "origin/main:<path>"          # is it on main at all?
+>     git hash-object <worktree>/<path>             # vs: git rev-parse origin/main:<path>
+>
+> An identical hash means archive freely. **Absent from main, or a differing hash, is the ONLY case the dialog's wording actually describes** -- and that case is real, so the helper must not answer "safe" by default. Anything it cannot read must count as unrecoverable, not as clean: the same rule `occupancy.ps1` states for its own fence, that a cannot-tell must never read as an all-clear.
+
+> **RELATED BUT DISTINCT, so they are not merged.** [#1293](#1293) is unlanded ledger numbers orphaned by worktree removal and [#1295](#1295) is coordination claims stranded by it; both concern what removal **destroys**. This item concerns a warning that **misreports** what removal would destroy, in the direction of a false alarm. A correct answer here does not fix either of those, and fixing those does not quiet this.
+
+**Cluster:** Worktree lifecycle / session tooling. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- developer coordination only. The cost is a routine, high-frequency prompt that is wrong in the common case, teaching seats to dismiss the one class of prompt that must not become routine.

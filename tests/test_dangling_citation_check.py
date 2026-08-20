@@ -188,25 +188,26 @@ def _repo_root() -> Path:
 
 
 def _live_shape_citations() -> list[tuple[str, int, int]]:
-    """Citations naming a number ABOVE the floor that are not PR/foreign-repo shaped.
+    """Citations naming a number that can still be issued -- the shape that can arm.
 
-    Below the floor is unreachable forever, and a foreign reference is not a backlog citation at
-    all; both are reported by the tool for a human to read and neither is a defect.
+    CALLS THE SHIPPED PREDICATES RATHER THAN RE-DERIVING THEM (BACKLOG #1235 residual 2). This
+    helper previously re-implemented both halves inline -- `number in filed` duplicating
+    `unresolved_citations`, and `number <= floor or pr_shaped` duplicating what `main` filters on.
+    Two of the three agreed with the script by convention, with nothing binding them: a rule with
+    two definitions is the exact defect this tool exists to catch in other people's gates.
+
+    The consequence is checkable and is the point: a single mutation to `cc.is_live_shape` now reds
+    BOTH this real-tree gate and the exit-code arms below. Before, mutating one left the other
+    green, which is what "agreeing by convention" buys you.
     """
     root = _repo_root()
     floor = cc.allocation_floor()
-    filed = cc.allocated_numbers()
-    out: list[tuple[str, int, int]] = []
-    for path in sorted((root / "docs").rglob("*.md")):
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        for lineno, number, _line, pr_shaped in cc.citations_in(text):
-            if number in filed or number <= floor or pr_shaped:
-                continue
-            out.append((str(path.relative_to(root)), lineno, number))
-    return out
+    hits = cc.unresolved_citations(sorted((root / "docs").rglob("*.md")), cc.allocated_numbers())
+    return [
+        (str(hit.path.relative_to(root)), hit.lineno, hit.number)
+        for hit in hits
+        if cc.is_live_shape(hit, floor)
+    ]
 
 
 def test_the_docs_scan_actually_covers_something() -> None:
@@ -224,3 +225,84 @@ def test_no_docs_citation_names_a_number_that_can_still_be_issued() -> None:
     assert not live, "citations naming a still-issuable number:\n  " + "\n  ".join(
         f"{p}:{n} #{num}" for p, n, num in live
     )
+
+
+# --- main()'s EXIT CODE, which nothing above asserts (BACKLOG #1235, residual) ---------------------
+#
+# HOW THE GAP WAS FOUND, because the method transfers: a SET DIFFERENCE over the module's public
+# surface, not a grep for something missing. The module defines six top-level names --
+# _load_backlog_module, allocation_floor, allocated_numbers, citations_in, unresolved_citations,
+# main -- and the suite above exercises four. `main` was the SOLE untouched public entry point.
+# That is a positive enumeration on both sides, so it does not depend on anyone's choice of pattern.
+#
+# WHY IT MATTERS HERE SPECIFICALLY: main()'s last line IS the fail-closed contract --
+#     return 1 if (live and not args.advisory) else 0
+# -- and it had ZERO coverage. Invert the `not`, or return 0 unconditionally, and every test above
+# still passes. This file's own header calls a detector that cannot fail "not a gate"; its exit code
+# was in exactly that state.
+#
+# THE LAST TWO ARMS ARE THE POINT. Both produce HITS and both must exit 0, because the contract keys
+# on the LIVE SHAPE rather than on the hit count. Without them, a mutation to `return 1 if hits
+# else 0` passes everything -- and that mutation reds the tree today on 26 permanently-harmless
+# citations, which is how a gate gets switched off.
+
+
+def _unissued_above_floor() -> int:
+    """A number the allocator CAN still issue -- the only shape that can ever arm."""
+    # int() is load-bearing for mypy, not decoration: `cc` is loaded via importlib at runtime, so
+    # every attribute on it is Any and the arithmetic silently widens the return type.
+    number = int(cc.allocation_floor()) + 100
+    assert number < 9000, "citations_in only scans [1000,9000); pick differently"
+    return number
+
+
+def _unissued_below_floor() -> int:
+    """A permanent hole: at or below the high-water mark, so never issuable.
+
+    Derived rather than hardcoded. A literal would silently become a RESOLVING number the day it is
+    filed, at which point this stops testing the below-floor branch and nothing would say so.
+    """
+    allocated = cc.allocated_numbers()
+    floor = cc.allocation_floor()
+    for number in range(1000, floor + 1):
+        if number not in allocated:
+            return number
+    raise AssertionError("no hole below the floor; this arm needs a different construction")
+
+
+def _doc(tmp_path: pathlib.Path, body: str) -> str:
+    path = tmp_path / "doc.md"
+    path.write_text(body, encoding="utf-8")
+    return str(path)
+
+
+def test_a_live_shape_citation_makes_main_exit_1(tmp_path: pathlib.Path) -> None:
+    """FAIL CLOSED BY DEFAULT. The whole point of the flip from opt-in `--fail`."""
+    doc = _doc(tmp_path, f"see #{_unissued_above_floor()} for the rationale\n")
+    assert cc.main([doc]) == 1
+
+
+def test_advisory_reports_the_same_hit_and_exits_0(tmp_path: pathlib.Path) -> None:
+    """The documented escape. Untested, an opt-out is indistinguishable from a broken gate."""
+    doc = _doc(tmp_path, f"see #{_unissued_above_floor()} for the rationale\n")
+    assert cc.main([doc]) == 1  # same corpus, so the arms differ ONLY by the flag
+    assert cc.main([doc, "--advisory"]) == 0
+
+
+def test_a_file_with_no_citation_exits_0(tmp_path: pathlib.Path) -> None:
+    assert cc.main([_doc(tmp_path, "no citation here at all\n")]) == 0
+
+
+def test_a_citation_BELOW_the_floor_is_reported_but_does_not_fail(tmp_path: pathlib.Path) -> None:
+    """ASYMMETRIC ARM 1: a hit that must NOT fail. Below the high-water mark the allocator can never
+    issue that number, so the citation is permanently harmless -- reported for a human, not a defect.
+    """
+    doc = _doc(tmp_path, f"see #{_unissued_below_floor()} for the rationale\n")
+    assert cc.main([doc]) == 0
+
+
+def test_a_PR_SHAPED_reference_is_reported_but_does_not_fail(tmp_path: pathlib.Path) -> None:
+    """ASYMMETRIC ARM 2, on the other axis: a foreign reference is not a backlog citation at all,
+    even when its number is above the floor."""
+    doc = _doc(tmp_path, f"shipped in PR #{_unissued_above_floor()}\n")
+    assert cc.main([doc]) == 0
