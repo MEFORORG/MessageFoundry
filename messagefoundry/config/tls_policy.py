@@ -122,8 +122,10 @@ def harden_kex_groups(ctx: ssl.SSLContext) -> str | None:
     *assertable*. This docstring previously said "Python 3.13+"; that was wrong, and it was repeated
     into `docs/PHI.md`, `docs/ASVS-L2-PHASE0-CHANGES.md`, ADR 0092 §4(b) and the ASVS scorecard.
     Measured on this tree: Python 3.14.6 / OpenSSL 3.5.7, ``hasattr(ctx, "set_groups")`` is ``False``,
-    so :data:`APPROVED_KEX_GROUPS` reaches **zero** of this function's six call sites and every built
-    context falls back to OpenSSL's default group list.
+    so :data:`APPROVED_KEX_GROUPS` reaches **none** of this function's call sites and every built
+    context falls back to OpenSSL's default group list. **No count is stated here on purpose** — the
+    site list is *derived* by ``tests/test_tls_policy.py``, so a number written out here is a second
+    definition that nothing checks. The "six" this sentence used to carry was wrong (BACKLOG #1105).
 
     That default *is* forward-secret — which is the property the TLS 1.2+ floor guarantees and the one
     ASVS 11.6.2's first clause is about — but it is **wider than the approved list**. Measured against
@@ -133,8 +135,8 @@ def harden_kex_groups(ctx: ssl.SSLContext) -> str | None:
     the engine's key-exchange groups as "pinned" anywhere — they are **inherited**.
 
     The **return value is the point.** A security control that cannot report whether it did anything
-    reports success forever; that is how a call at six sites with zero effect survived three
-    assessments. ``tests/test_tls_policy.py`` asserts the ``None`` *unconditionally*, so the first
+    reports success forever; that is how a call at every one of those sites with zero effect
+    survived three assessments. ``tests/test_tls_policy.py`` asserts the ``None`` *unconditionally*, so the first
     interpreter that grows the API turns that test red — which is the signal to re-derive this
     docstring, `docs/PHI.md` §4 and the 11.6.2 row, and to switch the test to ``get_groups()``.
 
