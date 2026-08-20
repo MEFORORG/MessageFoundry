@@ -9577,6 +9577,88 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Ledger tooling / evidence integrity. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) -- documentation accuracy. The cost is that the ledger's own evidence decays invisibly, and the decay is fastest after exactly the kind of broad, correct, well-reviewed change nobody would think to re-check it against.
+## 1264. The seat clock fires on cadence but its fanout skips seats, and the tick's own rubric sends every seat to look at the clock
+
+> 🔢 **Filed 2026-08-14 - not started. Found by three seats independently, each holding one face of it, and none able to see it alone.** Value **7/10** - Difficulty **4/10**. The coordination clock wakes seats on a timer. **Its cadence is healthy and its fanout is not**, and the two are indistinguishable from inside any single seat.
+
+> **THE CLOCK IS NOT THE DEFECT. MEASURED: 112 firings, cadence ~10.0 minutes.** No firing was late.
+
+> **THE FANOUT IS. Recipients per firing ranged 1 to 11 with a MEDIAN OF 2, and AT LEAST 53 of 112 firings reached EXACTLY ONE SEAT.** One seat received 33 of 112 - 29 percent.
+
+> **THE COUNTS ARE ROBUST TO THE COUNTING RULE, WHICH IS THE FIRST THING A READER SHOULD TRY TO BREAK.** A fan-out stamps its recipients seconds apart, so grouping firings **by minute** could split one broadcast straddling a boundary into two with divided recipients - manufacturing exactly this defect's signature. Re-measured by **clustering** instead (consecutive sends within 30s = one firing, which is what a fan-out is):
+
+> ```
+> rule            firings   reached exactly ONE seat   median recipients
+> minute-key        112              53                      2
+> 30s cluster       113              53                      2
+> ```
+
+> **Two independent grouping rules, the same answer.** The artifact is worth at most one boundary firing, and the floor wording already covers it. Prefer **"at least 53 of ~113 firings reached exactly one seat"** - 113 is the better-grounded denominator.
+
+> **AND THE CENSUS IS KEYED ON SEND TIME, NOT DELIVERY TIME.** Every figure comes from the message's sender-stamped `createdUtc`. That closes the other obvious attack - *"was this measured at the receiver, where a queue can manufacture raggedness?"* - and it matters because the same clock read **broken on delivery time and 10.0 minutes on send time**. Corroborating seats measured their own gaps on the same axis.
+
+> **WHAT WOULD OVERTURN THE MIXED-MODE READING, stated so it is falsifiable:** it assumes firings **did** occur at ~20:11 and ~20:21. That is taken from the clock-owner's own "last good tick 20:21" and **has not been verified against the clock's heartbeat by anyone who read the source.** If those two firings never fired, that seat's gap is a pure outage and its two skips come off this count.
+
+> **EVERY COUNT HERE IS A FLOOR, NOT A CENSUS, AND THE BIAS RUNS THE WRONG WAY.** They are derived from **delivered mail files**, so a firing that was written but never enqueued - or enqueued to a box the instrument cannot read - is **invisible to it**. The defect is UNDER-DELIVERY and the instrument can only UNDER-COUNT, so it is biased in the **same direction as the defect**. The true fanout could be worse than these numbers; it cannot be established as better from them.
+
+**Both innocent explanations were tested and both fail.**
+
+- **Not roster growth.** If only one or two seats were genuinely live, a 2-recipient broadcast would be correct - and the count would climb as seats joined. **It collapses and recovers instead:** `10,10,10,10,9,11,11` over 13:51-14:51, then `2,5,3,3,6,2,2,2` over 15:01-16:11, then back to `10,...,11` by 16:21. Eleven seats do not all die at 15:01 and all return at 16:21.
+- **Not seat death.** One seat sent **28 messages inside its own 60.1-minute gap**, one of them **28 seconds before** a firing that skipped it. For "not live" to explain that, it would have to be invisible to the roster while demonstrably sending mail on either side of the skip.
+
+> **CORRECTION TO THIS ITEM'S OWN CENTRAL CLAIM: QUANTISED DOES NOT MEAN "FANOUT SKIP". IT MEANS "EVERY FIRING HAPPENED AND NONE REACHED YOU" -- A DELIVERY FAULT WHOSE CAUSE THE TEST CANNOT NAME.** A **fanout skip** (the seat was not on the list) and a **failed send** (the seat was on the list and the send errored) are **indistinguishable from the receiver**. The 36-minute outage proves the second case exists here: the **scheduler ran perfectly and every send returned failure**. Had that outage ended on-grid instead of on a manual recovery fire, it would have presented as **quantised** and been counted as fanout evidence.
+
+> **SO THE COUNTS ABOVE BOUND A DELIVERY FAULT, NOT SPECIFICALLY A ROSTER FAULT.** The roster/fanout hypothesis remains the best lead - it explains the collapse-and-recover shape and the stable core of always-reached seats, which a send failure does not - **but the measurement does not on its own exclude send-side failure, and this item should not be read as having done so.** Separating them needs the SENDER's own per-firing result, which nobody has read.
+
+> **THE DISCRIMINATOR, AND IT IS ONE DIVISION.** A gap that is an **exact multiple of the cadence** means the clock fired and you were skipped. A **ragged** gap is a real gap. Measured: 50.0, 40.0 and 60.1 minutes all quantised to within 0.01 of a 10-minute multiple; 42.3 minutes was ragged. **It took three seats a full day to find that division, because from inside one seat "the clock is slow" and "the broadcast skipped me" are the same observation.**
+
+> **A FOURTH SEAT, AND IT IS THE SMALLEST SKIP MEASURED - ONE FIRING, NOT A RUN.** Ticks at 20:01:11Z then 20:21:13Z: a **20.0 minute gap, exactly 2x the cadence**, so the ~20:11 firing fired and skipped them. **They sent mail 60 seconds later**, at 20:12:09Z, and ran commands continuously either side (20:03:28Z, 20:12:09Z, 20:14:20Z, 20:20:17Z). **This is the datapoint a reader cannot dismiss:** a long gap can be argued away as an outage or a dead seat, but a *single isolated skip bracketed by demonstrated activity 60 seconds out* cannot.
+
+> **THE DOC HALF IS ALREADY DEMONSTRATED TO WORK, ON THAT SAME SEAT.** Their 20.0 minute gap **exceeds the rubric's ~15 minute threshold**, so by the rubric they should have reported a broken chain. They did not - only because the quantised-versus-ragged discriminator had reached them minutes earlier. **The rubric would have produced one more false clock report; the discriminator prevented it.**
+
+> **A RAGGED CONTROL CASE, 2026-08-14 ~20:58Z, AND IT IS WHAT KEEPS THIS ITEM HONEST.** Every gap above is **quantised**. Two seats then recorded **ragged** ones in the same window - **46.8 min (residual 0.32)** and **36.8 min (residual 0.68)** - and by the discriminator those are **real gaps in the chain, NOT fanout skips**. Both seats were demonstrably sending mail across their own gaps, so idleness explains neither.
+
+> **CAUSE CONFIRMED BY ITS AUTHOR, SO THIS BLOCK IS NO LONGER A HYPOTHESIS: THE CLOCK WAS DOWN, AND IT WAS AN EDIT THAT OVERRAN A LENGTH CAP.** The seat maintaining the tick edited its body to fix the rubric, taking it to **3395 characters against `mail.ps1`'s hard 2000-char cap**, so every send returned `FAILED(queued=0, exit=1)` and **no seat received anything** between ~20:28Z and 20:57Z. **Firings were attempted and nothing was enqueued** - a real break in the chain, which is exactly what RAGGED means. **The discriminator classified it correctly without knowing the cause.**
+
+> **AND THEIR VERIFICATION COULD NOT HAVE CAUGHT IT.** They checked the file **parsed** and carried **no glyphs**; both passed. **Neither check can see a runtime length limit enforced by a different script.** Their first fix also failed - trimmed to 2314, still over - and they only knew because they **fired the clock and read the heartbeat** instead of trusting the edit.
+
+> **THE TWO GAPS HAVE DIFFERENT LENGTHS AND THE SAME END, WHICH IS THE DIAGNOSTIC PART.** 46.8 and 36.8 minutes both terminate at ~20:58, and the tick **phase moved** with them - every firing that day landed 9-16 seconds past the minute, that one landed at 02. **Different durations converging on one resume instant is the signature of the SCHEDULE RESTARTING**, not of a selection skipping people: a skip leaves each seat's gap an exact multiple of the cadence, a restart does not.
+
+> **THE RULE ASSUMES EVERY FIRING SITS ON THE CADENCE GRID, AND AN OFF-GRID FIRE BREAKS IT IN BOTH DIRECTIONS.** A manual live-fire or recovery test lands off the `:x1` grid, so the gap **before** it reads ragged and the gap **after** it -- to the next scheduled firing -- can fall under the ~6 minute floor and read as **OVER-FIRING, the fault the rubric calls the expensive one.** Neither is true; the clock is on cadence and one endpoint simply is not on the grid.
+
+> **This is the second-order form of the same defect: a rule answering exactly the question it was given, on data violating an assumption nobody wrote down.** The recovery fire at ~20:58 was sent to nine seats, so up to nine could each hold a short gap the rubric tells them to escalate.
+
+> **Before classifying, check whether EITHER endpoint is off the grid; if so, the gap is unclassifiable by this rule.** *(Raised by the seat that supplied the divide-by-ten rule, against their own rule. Not corroborated here -- this seat's next tick had not arrived at the time of writing, so the claim rests on the arithmetic rather than on a second observation.)*
+
+> **A LIMIT ON THE DISCRIMINATOR ITSELF, AND IT BITES HARDEST ON THE WORST-AFFECTED SEAT.** Dividing a gap by the cadence requires **the cadence as an INDEPENDENT input**, and **a skipped seat cannot derive it from its own ticks** - its samples are precisely the firings that survived selection. A heavily-skipped seat computing a "cadence" from its surviving gaps will classify real skips as ragged and conclude the chain is broken. **Take the cadence from the fleet-wide census, never from the reader's own gaps.** One seat's 36.80 min fits no 10-minute grid anchored at either of its own prior ticks, which is what surfaced this.
+
+> **THE TWO CLASSES CONCATENATE, SO RAGGED IS WEAKER THAN IT LOOKS: IT MEANS *NOT PURELY QUANTISED*, NOT *A PURE CHAIN BREAK*.** One seat's 56.75 min gap is a **mixture** - the ~20:11 and ~20:21 firings happened **while the clock was healthy** and it received neither (two fanout skips), then the outage accounted for the rest. **Neither class alone produces 56.75.**
+
+> **THEREFORE: CLIP EACH SEAT'S GAP TO THE OUTAGE WINDOW AND CLASSIFY THE REMAINDER - DO NOT DISCARD A GAP THAT MERELY STRADDLES IT.** *"20:21-20:57 is the outage"* is correct as a **window** and wrong as a **filter**: applied to any gap touching it, it absorbs genuine skips into the outage and **drives this item's count DOWN. The count is already a floor, so every such absorption makes an under-measurement worse.**
+
+> **MEASURE CADENCE ON SEND TIME, NOT DELIVERY TIME.** The same clock measured on delivery looked broken and on send showed **10.0 minutes almost exactly**. **A capped, queued channel turns a regular sender into a ragged-looking one at the receiver**, so a cadence audited from a recipient's transcript inherits the channel's backlog as if it were the clock's behaviour.
+
+> **THE DISCRIMINATOR WAS VALIDATED BLIND, WHICH IS THE STRONGEST THING SAID FOR IT HERE.** Three seats classified their own gaps *before* the outage was disclosed; each sorted its ragged gap to *chain break* and its quantised gaps to *skip*, and the chain break turned out to be a real one. **A rule that sorts correctly for a reader who does not know what they are looking at is worth more than one confirmed by the seat that proposed it.**
+
+> **SO THIS ITEM COVERS THE QUANTISED CASE ONLY, AND THE RAGGED ONE IS A DIFFERENT MECHANISM.** Recorded here so that a later reader with one ragged gap does not attach it to this item and conclude the fanout defect is broader than measured - and so that a fix for the fanout is not credited with curing a restart. **Nobody has confirmed what restarted; a hook was edited around 20:15 and that coincidence is named, not claimed.**
+
+> **UNEXPLAINED, AND THE BEST LEAD: three seats received ALL SIX firings across 18:41-19:21 while others flickered.** Whatever varies does not vary for them. **Nobody has read the roster source** - this item is filed on behaviour alone.
+
+**TWO FIXES WITH DIFFERENT OWNERS. State both, because one absorbs the other if you do not.**
+
+1. **CODE - STILL OPEN, AND NOBODY HAS READ THE ROSTER SOURCE.** The roster/fanout selection itself. No mechanism is claimed here.
+2. **DOC - ALREADY FIXED, 2026-08-14, in `scripts/coord/seat-tick.ps1`.** The rubric used to tell every seat that a gap over ~15 minutes means *the chain is broken* - so every seat looked at **the clock** and nobody looked at **the roster**. **An instruction that names the wrong subject converts one fleet-wide defect into eleven private ones.** It now says a long gap means something is wrong but **divide by the cadence before saying what**: quantised means every firing happened and you were not on the list (report a SKIP, not a slow clock); ragged means a real gap. Verified with a positive control - a deliberately broken file returned 2 errors, so the clean parse means something.
+
+> **A FIFTH SEAT WAS SKIPPED AND IT IS THE ONE THAT OWNS THE CLOCK.** Census of its own transcript, 106 tick records: **15:11 -> 15:41, 30.0 min quantised (2 firings never received); 15:41 -> 16:21, 40.0 min quantised (3 firings never received)** - inside the same collapse, but measured from a **receiver's transcript** rather than from delivery files, so it is an independent instrument rather than a second look at the same one.
+
+> **AND THAT SEAT TOLD THE FLEET AT 19:35 THAT THE CLOCK "DID NOT MISS A BEAT"** - true of the six consecutive 10.0-minute gaps it was standing in, false as a claim about the clock. **The seat that owns an instrument is not automatically the one who notices it is broken**, and the disproving census was in its own transcript all day, unrun.
+
+> **THE QUALIFICATION ON THESE NUMBERS WAS ONCE DESTROYED IN TRANSIT, WHICH IS WHY IT IS RESTATED HERE RATHER THAN CITED.** A broadcast carrying them was truncated by the mail length cap **mid-word, exactly on the caveat** - `"...so they are a F"` - so the headline survived and the bound did not. Two seats then relayed the figures flat. **A cap bites at the END of a message, which is precisely where a caveat sits.** If a number reaches you from a truncated message, treat it as unqualified until you read the whole message on disk.
+
+**Cluster:** Coordination / session clock. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (§0) - this is fleet tooling. The cost is silent under-delivery of wake-ups, which is indistinguishable from a healthy quiet clock and therefore self-concealing.
+
+**Provenance.** Measured independently by three seats on 2026-08-14; counts come from delivered mail files, so every figure here is a **floor**. Numbers are inlined deliberately: the working lived under `mefor-coord/handoffs/`, which is never committed, and an item citing an uncommitted path resolves to nothing.
 
 ## 1265. the warning sign is unsanctioned decoration in 496 places across 80 files
 
@@ -10267,6 +10349,17 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > **A THIRD SIGHTING, 2026-08-19, AND ITS MAGNITUDE ARGUES AGAINST THE ALARMING BRANCH.** PR #431 run `32278742105`, `test (windows-2025, py3.14)`: `sweep_mode='fixed_aggregate', count=12, sent=36, acked=13`. **Twenty-three of thirty-six sends unacked** -- against `lost 1 of 35` in the first sighting. **A count-and-log invariant failure does not plausibly scale like that**; an engine that persists-then-acks either does so or does not, and a 64 percent shortfall looks like the harness measuring an engine that could not keep up, not one silently dropping. **It is EVIDENCE, not a verdict:** the item stays open and the discriminator below is still the thing that settles it. Recorded because the magnitude is the first data that distinguishes the two branches at all.
 >
 > Corroborating, same run: `test_connscale_cpu_probe.py`'s walk-timeout (#1290) failed **in the same job**, with no apt failure and 10,488 tests passing. **Two independent connscale probes failing together, both of them timing/measurement-shaped, is the signature of a loaded runner** rather than of two unrelated defects.
+
+> **A FOURTH SIGHTING QUALIFIES THE THIRD: THE SHORTFALL REPRODUCES, AND THAT CUTS THE OTHER WAY.** PR #394 run `32290943152`, `test (windows-2022, py3.14)`, **the same sweep configuration**:
+>
+>     #431   fixed_aggregate  count=12  offered=24.0  sent=36  acked=13
+>     #394   fixed_aggregate  count=12  offered=24.0  sent=36  acked=14
+>
+> **Different PRs, different runner images, same config, and the ack count lands within one of itself.** The entry above argued from MAGNITUDE that a 64 percent shortfall looks like starvation rather than an invariant failure. **That argument is weakened by this: starvation is load-dependent and should scatter. A shortfall that reproduces to within one ack across independent runs looks SYSTEMATIC** -- a limit being hit at a particular offered rate, not a runner having a bad minute.
+>
+> **Neither reading is established, and the item's severity is unchanged.** What has changed is that the cheap explanation is no longer the comfortable one: **"it is just a loaded runner" now has to explain the reproducibility**, and it does not. The store-side discriminator below remains the only thing that settles it, and this makes running it more urgent rather than less.
+>
+> **Recorded against my own earlier entry deliberately.** The magnitude argument was written the same day and is not retracted -- it is bounded by this. Leaving it unqualified would let a reader take "probably starvation" as the current state of the evidence, which it no longer is.
 
 > **IT IS ON `main`, AND IT IS CROSS-PLATFORM -- so it is not one runner's bad day.**
 >

@@ -781,6 +781,14 @@ class UserRecord:
     # subsequent one, so a reassigned username cannot hand the account to a new subject.
     oidc_issuer: str | None = None
     oidc_subject: str | None = None
+    # Credential claim (BACKLOG #1245): when the holder set their OWN credential through authenticated
+    # self-service rotation. NULL = never claimed. It records a claim, NOT continuing control — an admin
+    # reset legitimately takes control away and deliberately leaves this stamp alone. Monotonic by
+    # construction: the only writer is a set_password call carrying must_change_password False, and that
+    # write COALESCEs, so the first claim stands for the life of the account. ``must_change_password``
+    # cannot stand in for it: a rotation clears that flag and an admin reset re-sets it, so no reader can
+    # tell "never claimed" from "claimed, then reset".
+    password_claimed_at: float | None = None
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> UserRecord:
@@ -804,6 +812,11 @@ class UserRecord:
             totp_enrolled_at=_opt_float(d.get("totp_enrolled_at")),
             oidc_issuer=d.get("oidc_issuer"),
             oidc_subject=d.get("oidc_subject"),
+            # Hard subscript, deliberately unlike its .get() neighbours (BACKLOG #1245): a missing key
+            # would decode as None, None means "never claimed", and an account read that way would be
+            # retired. Failing loudly on a mapping that lacks the column beats silently retiring a
+            # claimed account. Every reader is a SELECT *, so the column is present once migrated.
+            password_claimed_at=_opt_float(d["password_claimed_at"]),
         )
 
 
@@ -1214,6 +1227,38 @@ def _opt_float(value: Any) -> float | None:
     return None if value is None else float(value)
 
 
+def password_claim_set(must_change_password: bool, placeholder: str) -> str:
+    """The ``users.password_claimed_at`` term of a ``set_password`` UPDATE — shared by all three
+    backends so the single-writer rule is stated once (BACKLOG #1245).
+
+    A caller passing ``must_change_password`` False is issuing a credential the holder chose, so that
+    call records the claim. A caller passing True is issuing a provisional credential (the bootstrap
+    mint, an admin-created account, an admin reset): it gets an EMPTY term, so the column is absent
+    from the SET list and the statement can neither stamp nor clear it.
+
+    **AT LEAST TWO callers pass False, not one** -- stated as a floor rather than an enumeration
+    because a closed list here is a liability (SDS-3.6), and an earlier draft of this docstring said
+    "and only that call" and was wrong. Self-service rotation is the intended one. The argon2
+    rehash-on-login path passes the record's EXISTING flag straight through, which is False for any
+    already-rotated account, so it reaches this branch too. That is safe for a reason worth writing
+    down rather than rediscovering: reaching it requires a verified password, and on any row where
+    the flag is False with a password set the stamp is already present (a fresh database because
+    only rotation clears the flag, and it stamps; a migrated one because the upgrade backfill covers
+    exactly ``must_change_password = 0 AND password_hash IS NOT NULL``), so the COALESCE no-ops.
+    **The invariant to preserve is therefore not "one caller" but "every caller passing False has
+    just authenticated the holder".**
+
+    ``COALESCE`` makes the claim WRITE-ONCE: a later rotation re-runs this term against a non-NULL
+    column and changes nothing, so the stamp is monotonic once set. That monotonicity is the whole
+    point — the flag it replaces as a claimed-ness test is non-monotonic (rotation clears it, an
+    admin reset re-sets it), which is why no reader could tell "never claimed" from "claimed, then
+    reset". Do not add a second writer of this column, and never assign it NULL after creation.
+    """
+    if must_change_password:
+        return ""
+    return f" password_claimed_at=COALESCE(password_claimed_at, {placeholder}),"
+
+
 def _append_channel_scope(
     clauses: list[str],
     params: list[object],
@@ -1610,7 +1655,8 @@ CREATE TABLE IF NOT EXISTS users (
     totp_recovery_codes  TEXT,                 -- JSON list of argon2id hashes of single-use recovery codes
     last_totp_step       INTEGER,              -- highest TOTP time-step already consumed (single-use within window, ASVS 6.5.1); NULL = none yet
     oidc_issuer          TEXT,                 -- federated identity (BACKLOG #1015): verified OIDC issuer; NULL = not federated / never federated-logged-in
-    oidc_subject         TEXT                  -- federated identity (BACKLOG #1015): verified OIDC sub; the account's federated login is pinned to (issuer, sub), refusing a reassigned username
+    oidc_subject         TEXT,                 -- federated identity (BACKLOG #1015): verified OIDC sub; the account's federated login is pinned to (issuer, sub), refusing a reassigned username
+    password_claimed_at  REAL                  -- BACKLOG #1245: when the holder set their OWN credential via authenticated self-service rotation; NULL = never claimed. Write-once (COALESCE in set_password); an admin reset must neither set nor clear it
 );
 
 CREATE TABLE IF NOT EXISTS roles (
@@ -3072,6 +3118,19 @@ class MessageStore:
         ):
             if column not in user_cols:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
+        # Claimed-ness of the bootstrap admin (BACKLOG #1245): NULL on an existing row would read as
+        # "never claimed", which is what would retire an account whose holder claimed it long ago —
+        # this defect, re-introduced by its own fix. So the ADD is paired with a one-time backfill:
+        # a local account not flagged must_change_password already rotated its own credential, and
+        # password_changed_at is when. The backfill MUST stay inside this creation guard. Hoisted out
+        # it becomes a permanent SECOND WRITER of the column, and single-writer monotonicity is the
+        # entire point — a second writer is exactly the defect #1245 documents.
+        if "password_claimed_at" not in user_cols:
+            await db.execute("ALTER TABLE users ADD COLUMN password_claimed_at REAL")
+            await db.execute(
+                "UPDATE users SET password_claimed_at = password_changed_at"
+                " WHERE must_change_password = 0 AND password_hash IS NOT NULL"
+            )
         # Step B adds the routed stage, which carries the handler to run in queue.handler_name. A
         # Step-A DB's queue table predates the column — ALTER it in (NULL on existing ingress/outbound
         # rows is correct). The queue table always exists here (CREATE IF NOT EXISTS ran in _SCHEMA).
@@ -7696,6 +7755,17 @@ class MessageStore:
             row = await cur.fetchone()
         return UserRecord.from_mapping(dict(row)) if row else None
 
+    async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
+        # BACKLOG #1256. Both columns are compared, never `subject` alone: a subject is unique only
+        # WITHIN its issuer, so matching on it across issuers would refuse two unrelated people who
+        # happen to share an opaque identifier at different IdPs.
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT * FROM users WHERE oidc_issuer=? AND oidc_subject=?", (issuer, subject)
+            )
+            row = await cur.fetchone()
+        return UserRecord.from_mapping(dict(row)) if row else None
+
     async def get_user_by_username(self, username: str) -> UserRecord | None:
         async with self._read() as db:
             cur = await db.execute("SELECT * FROM users WHERE username=?", (username,))
@@ -7716,15 +7786,18 @@ class MessageStore:
         user_id: str,
         *,
         password_hash: str,
-        must_change_password: bool = False,
+        must_change_password: bool = True,
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
+        claim_set = password_claim_set(must_change_password, "?")
+        claim_args: tuple[float, ...] = () if must_change_password else (now,)
         async with self._lock:
             await self._db.execute(
                 "UPDATE users SET password_hash=?, password_changed_at=?, must_change_password=?,"
+                f"{claim_set}"
                 " failed_attempts=0, locked_until=NULL, updated_at=? WHERE id=?",
-                (password_hash, now, 1 if must_change_password else 0, now, user_id),
+                (password_hash, now, 1 if must_change_password else 0, *claim_args, now, user_id),
             )
             await self._commit()
 
@@ -7972,6 +8045,12 @@ class MessageStore:
                 await self._db.execute(
                     "DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,)
                 )
+                # BACKLOG #1233: presets are owner-scoped by Identity.user_id (#1225) and there is no
+                # FK cascade on this table, so without this DELETE the rows outlive the account —
+                # PHI-shaped `criteria` (ADR 0136) persisting with no owner able to reach or purge it,
+                # and counted by nothing. `owner` holds the user_id, not the username, which is what
+                # makes this a single keyed DELETE rather than a name lookup.
+                await self._db.execute("DELETE FROM search_presets WHERE owner=?", (user_id,))
                 await self._db.execute("DELETE FROM users WHERE id=?", (user_id,))
                 await self._commit()
             except Exception:
