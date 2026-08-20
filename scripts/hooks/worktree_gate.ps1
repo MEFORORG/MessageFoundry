@@ -344,7 +344,31 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
 #
 # Three false positives came from scanning the raw string: a two-line command whose second line read
 # `echo about to merge stuff` denied with verb=merge; `echo "git checkout main"` denied; and
-function Remove-QuotedSpans([string]$s) {
+function Remove-QuotedSpans([string]$s, [bool]$PosixEscapes = $false) {
+    <#
+    ``$PosixEscapes`` -- DOES THIS HOST TREAT A BACKSLASH AS AN ESCAPE? (BACKLOG #1229 residual, second
+    round.) `sh` does; **PowerShell does NOT** -- its escape is the BACKTICK, so `"C:\Temp\"` is a
+    COMPLETE string there and whatever follows it RUNS.
+
+    THIS PARAMETER EXISTS BECAUSE ITS ABSENCE RE-CREATED #1229's OWN DEFECT ON THE OTHER HOST. The
+    first version of this fix honoured the escape unconditionally, which is correct POSIX -- but line
+    999 scans BOTH tool names through ONE matcher, so on a PowerShell payload the scan held a span open
+    that PowerShell had already closed, straddled the live command between it and a later quote, and
+    blanked it. MEASURED on the shipped fix, both tool names:
+
+        Write-Output "C:\Temp\" ; git -C <governed> reset --hard ; Write-Output "x"     ALLOW
+        ... same line with ONE FEWER backslash (control)                                DENY
+        ... same line with TWO backslashes (even count)                                 DENY
+
+    An ODD count before the closer was the trigger. Verified the middle statement really executes with
+    an inert payload that COMPUTES rather than echoes, so an echo-back could not be mistaken for a run.
+
+    DEFAULT IS $false, AND THE DIRECTION IS THE WHOLE POINT. Honouring the escape makes spans LONGER,
+    so it BLANKS MORE and can hide a command -- fail OPEN. Refusing it makes spans shorter, leaving more
+    text visible to the rules -- fail CLOSED. An unknown or unrecognised host therefore gets the
+    conservative reading, and only a host known to use backslash escapes opts in.
+    #>
+
     <#
     Blank every quoted span in ONE LEFT-TO-RIGHT PASS, so the quote that OPENS FIRST owns the span and
     the other quote character is an ordinary literal inside it -- which is what a POSIX shell does.
@@ -381,13 +405,13 @@ function Remove-QuotedSpans([string]$s) {
             # the live command between them. Same straddle as the two-regex defect above, one character
             # class over, and RULE-AGNOSTIC: it disarms whatever rule sits behind it, so it hid
             # `reset --hard` and `worktree add` and not only `checkout`.
-            if ($ch -eq '\' -and $i + 1 -lt $s.Length) {
+            if ($PosixEscapes -and $ch -eq '\' -and $i + 1 -lt $s.Length) {
                 [void]$out.Append($ch); [void]$out.Append($s[$i + 1]); $i++
             }
             elseif ($ch -eq '"' -or $ch -eq "'") { $quote = $ch; $openAt = $i }
             else { [void]$out.Append($ch) }
         }
-        elseif ($quote -eq '"' -and $ch -eq '\' -and $i + 1 -lt $s.Length) {
+        elseif ($PosixEscapes -and $quote -eq '"' -and $ch -eq '\' -and $i + 1 -lt $s.Length) {
             # Inside a DOUBLE-quoted span a backslash escapes the next character, so `\"` does not
             # close it. DELIBERATELY NOT APPLIED INSIDE A SINGLE-QUOTED SPAN: sh gives the backslash no
             # special meaning there, so `'a\'` really does close at that quote. Treating the two alike
@@ -439,7 +463,7 @@ function Remove-QuotedSpans([string]$s) {
 # Each entry carries BOTH forms. Scan is for deciding whether a git verb is present; Raw is for parsing
 # PATHS out of the same line, since the blanking that stops a commit message supplying a verb would also
 # erase the path.
-function Get-ScannableSegments([string]$Cmd) {
+function Get-ScannableSegments([string]$Cmd, [bool]$PosixEscapes = $false) {
     # Fold line continuations FIRST, or the per-line split below separates `git \` from its verb and the
     # rule stops seeing the command at all. Prose does not end a line with a continuation character, so
     # this does not resurrect the `echo about to merge stuff` false positive.
@@ -695,7 +719,7 @@ function Get-ScannableSegments([string]$Cmd) {
         # with a bare token -- verb and arguments gone, nothing left for any rule to match. Ownership
         # cannot be decided by a regex that has no idea which quote opened first, which is the same
         # sentence this file already wrote about the blanking order.
-        $s = Remove-QuotedSpans $line
+        $s = Remove-QuotedSpans $line $PosixEscapes
         [pscustomobject]@{ Raw = $line; Scan = $s }
     }
 }
@@ -1017,7 +1041,7 @@ if ($tool -in @("Bash", "PowerShell")) {
     # sibling worktrees and the primary alike. Any git failure falls through to ALLOW.
     # -----------------------------------------------------------------------------------------------
     $dangerKeys = 'core\.hookspath|core\.worktree|alias\.[\w.-]+|include\.path|includeif\.'
-    foreach ($seg in (Get-ScannableSegments $cmd)) {
+    foreach ($seg in (Get-ScannableSegments $cmd ($tool -eq "Bash"))) {
         if ($seg.Scan -cnotmatch '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)') { continue }
         if ($seg.Scan -notmatch "(?:\bconfig\b[^|;&]*?\s|-c\s+)(?<key>$dangerKeys)") { continue }
         $badKey = $Matches['key']
@@ -1145,7 +1169,7 @@ What to do instead:
     # entirely. Ask git whether the path is a registered worktree of a governed repo instead. Any git
     # failure -- a path that is not a worktree, or does not exist -- falls through to ALLOW.
     # -----------------------------------------------------------------------------------------------
-    foreach ($seg in (Get-ScannableSegments $cmd)) {
+    foreach ($seg in (Get-ScannableSegments $cmd ($tool -eq "Bash"))) {
         if ($seg.Scan -cnotmatch '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)') { continue }
         if ($seg.Scan -cnotmatch '\bworktree\s+(?<wtverb>remove|move)(?=\s|$)') { continue }
         $wtVerb = $Matches['wtverb']
@@ -1408,7 +1432,7 @@ $cleanupBullet
     # denying it because the primary's path appears in the `cd` is a false positive.
     $anyInferredTarget = $false
     $gitToken = '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)'
-    foreach ($seg in (Get-ScannableSegments $cmd)) {
+    foreach ($seg in (Get-ScannableSegments $cmd ($tool -eq "Bash"))) {
         # Match a git invocation however it is spelled: git, git.exe, or an absolute path to either.
         if ($seg.Scan -cnotmatch $gitToken) { continue }
         if ($seg.Scan -cnotmatch "\bgit(\.exe)?\b[^|;&]*?\s(?<verb>$verbs)(?=\s|$)") { continue }
