@@ -10,6 +10,20 @@ An item that exists in either ledger is invisible here and is that gate's busine
 exists in neither is invisible there and is this one's. Neither subsumes the other, and the near-
 identical names are the reason this paragraph is the first thing in the file.
 
+AND THE NAMES DIVERGE ON WIRING TOO, WHICH IS THE HALF THAT MISLEADS. That sibling IS run in CI
+(`.github/workflows/backlog-hygiene.yml`, and its test is named in `ci.yml`'s docs-lane list). THIS
+SCRIPT IS RUN BY NO WORKFLOW AND NO PRE-COMMIT HOOK -- it reaches CI only through
+`tests/test_dangling_citation_check.py`, which is manifest-classified and therefore runs on the
+tooling leg. Measured, with a positive control in the same pass: `dangling_citation_check` returns
+ZERO hits across `.github/` and `.pre-commit-config.yaml`, while `backlog_status_check`, `ledger_check`
+and `scan_forbidden` return 3, 2 and 3 -- so the probe finds wiring where wiring exists.
+
+WHY THAT IS WORTH A PARAGRAPH RATHER THAN LEFT TO BE LOOKED UP: a grep for `citation_check` HITS A
+WORKFLOW, and the hit belongs to the sibling. The answer is confident, well-formed, and wrong in the
+direction of believing a change here is CI-covered when it is not. Anyone reasoning about whether a
+behaviour change in this file can red a build must grep the FULL name, and should treat a bare
+`citation_check` match as evidence about the other script until they have checked which one it named.
+
 WHAT THE DEFECT IS. While a number names nothing, a citation to it resolves to NOTHING -- honest and
 harmless, and it advertises its own brokenness. If that number is later issued, the citation starts
 resolving to unrelated work and NOTHING anywhere reports a problem. The ledger's own erratum names
