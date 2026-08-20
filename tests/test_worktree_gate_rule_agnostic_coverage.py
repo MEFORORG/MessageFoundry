@@ -183,6 +183,49 @@ def test_the_escape_arms_cover_more_than_one_rule(repo: SimpleNamespace) -> None
     )
 
 
+def counterpart_command(rule: str, repo: SimpleNamespace) -> tuple[str, Path]:
+    """An ORDINARY use of the same rule's subject, which must be allowed. Returns (command, cwd).
+
+    One per rule, deliberately close to that rule's offender: the same verb family or the same
+    subject, differing only in being legitimate.
+    """
+    if rule == "3":
+        return f'git -C {repo.primary} commit -m "chore: clean up dead code"', repo.primary
+    if rule == "3b":
+        # Creating a NEW branch is not a hijack -- rule 3b denies only a switch onto an EXISTING one.
+        return "git checkout -b claude/brand-new-branch", repo.wt
+    if rule == "3c":
+        return f"git -C {repo.primary} config user.name someone", repo.primary
+    if rule == "3d":
+        return f"git -C {repo.primary} worktree list", repo.primary
+    raise AssertionError(f"unknown arm {rule!r}")
+
+
+@pytest.mark.parametrize("rule,what", ARMS, ids=[r for r, _ in ARMS])
+def test_the_counterpart_for_each_rule_must_not_fire(
+    repo: SimpleNamespace, rule: str, what: str
+) -> None:
+    """THE HARDENED COUNTERPART, one per rule. Without it this file cannot fail in one direction.
+
+    MEASURED, AGAINST THIS FILE, WHICH IS WHY IT IS HERE AND NOT DELEGATED. An earlier draft dropped
+    its must-ALLOW rows on the grounds that equivalents live in the sibling suites, reasoning that a
+    load-bearing fact should be stated once. That is right for PROSE and wrong for a TEST: a suite
+    only discriminates through the assertions it actually runs. Mutation-tested standalone, the
+    draft stayed 7-of-7 GREEN against a gate mutated to deny every verb against a governed tree --
+    it could see a gate that had stopped denying and not one that had started denying everything.
+
+    The offender rows above and these rows together are what make a verdict here mean something. A
+    fix that widened the gate until the offenders passed would redden these instead.
+    """
+    command, cwd = counterpart_command(rule, repo)
+    result = run_gate(shell(command, cwd=cwd), repo.repos)
+    assert result is None, (
+        f"an ORDINARY {what} command was denied. The gate has been widened rather than corrected, "
+        f"which passes the offender rows above for the wrong reason.\nCommand: {command}\n"
+        f"Deny object:\n{result}"
+    )
+
+
 def test_an_ungoverned_repo_is_untouched(tmp_path: Path) -> None:
     """Anti-vacuity on the other axis: the deny must come from GOVERNANCE, not from the backslash.
 
