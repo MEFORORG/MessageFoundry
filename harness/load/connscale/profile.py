@@ -78,6 +78,7 @@ _CONNSCALE_KEYS = frozenset(
         "base_port",
         "transform",
         "reload_probe",
+        "intake_audit",
         "store_backend",
         "corpus_count_per_trigger",
         "correlator_capacity",
@@ -157,6 +158,12 @@ class ConnScaleProfile:
     # variance from a single run: the runner loops each (claim_mode, fuse, sweep_mode, count) cell
     # ``trials`` times as distinct steps, and build_fuse_comparison aggregates the repeats by key.
     trials: int = 1
+    # BACKLOG #1292: run the PER-MESSAGE intake audit alongside the count-based no-loss reconcile.
+    # Default ON, because the whole point of the item is that a shortfall in CI cannot be attributed
+    # after the fact -- an audit an operator has to remember to enable would be absent on exactly the
+    # run that needed it. It costs one paged sweep of the step's own store per step, so the heavy
+    # operator sweeps (N=1500, long holds) can turn it off.
+    intake_audit: bool = True
 
     def modes(self) -> tuple[str, ...]:
         """The sweep modes to run (``both`` expands to both, in a stable order)."""
@@ -308,6 +315,7 @@ def _profile_from_data(data: dict[str, Any], *, where: str) -> ConnScaleProfile:
         ),
         transform=transform,
         reload_probe=_opt_bool(cs, "reload_probe", f"{where} [connscale]", default=False),
+        intake_audit=_opt_bool(cs, "intake_audit", f"{where} [connscale]", default=True),
         store_backend=store_backend,
         corpus_count_per_trigger=_opt_int(
             cs, "corpus_count_per_trigger", f"{where} [connscale]", default=20, minimum=1

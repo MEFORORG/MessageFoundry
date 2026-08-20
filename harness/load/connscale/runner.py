@@ -30,10 +30,11 @@ import os
 import tempfile
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from harness.load.connscale import intake_audit
 from harness.load.connscale.compare import (
     ClaimModeComparison,
     FuseModeComparison,
@@ -42,6 +43,7 @@ from harness.load.connscale.compare import (
     build_fuse_comparison,
 )
 from harness.load.connscale.driver import ConnScaleDriver
+from harness.load.connscale.intake_audit import IntakeAudit, IntakeLedger, StoreReader
 from harness.load.connscale.probe import FdSampler, ProcSample, time_reload
 from harness.load.connscale.profile import ConnScaleProfile
 from harness.load.connscale.report import (
@@ -333,33 +335,35 @@ async def _run_one_step(
     if profile.store_backend is None:
         db_dir = tempfile.mkdtemp(prefix="mefor-connscale-")
         db_path = str(Path(db_dir) / f"{tag}.db")
-    node = EngineNode(
-        tag,
-        api_port,
-        env=_node_env(
-            base_env,
-            claim_mode=claim_mode,
-            fuse_mode=fuse_mode,
-            batch_mode=batch_mode,
-            count=count,
-            base_port=profile.base_port,
-            transform=profile.transform,
-            sink_host=sink_host,
-            sink_port=sink_port,
-            sink_ports=sink_ports,
-            install_executor_shim=install_executor_shim,
-            db_path=db_path,
-        ),
-        config_dir=_CONFIG_DIR,
-        cwd=cwd,
+    # Captured rather than inlined into EngineNode: the BACKLOG #1292 intake audit opens THIS step's
+    # store afterwards, and it must resolve the same MEFOR_STORE_* the engine itself was given (the
+    # per-step SQLite file, or the shared server connection) instead of re-deriving them.
+    node_env = _node_env(
+        base_env,
+        claim_mode=claim_mode,
+        fuse_mode=fuse_mode,
+        batch_mode=batch_mode,
+        count=count,
+        base_port=profile.base_port,
+        transform=profile.transform,
+        sink_host=sink_host,
+        sink_port=sink_port,
+        sink_ports=sink_ports,
+        install_executor_shim=install_executor_shim,
+        db_path=db_path,
     )
+    node = EngineNode(tag, api_port, env=node_env, config_dir=_CONFIG_DIR, cwd=cwd)
     poller = EnginePoller(node.url, token=None, origin=time.perf_counter())
+    # BACKLOG #1292: the per-message send ledger the intake audit reads. None disables the audit
+    # wholesale (the sender's write path is then byte-identical to pre-#1292).
+    ledger = IntakeLedger() if profile.intake_audit else None
     driver = ConnScaleDriver(
         host=sink_host,
         base_port=profile.base_port,
         count=count,
         correlator=correlator,
         metrics=metrics,
+        ledger=ledger,
     )
     fd_sampler: FdSampler | None = None
     samples: list[EngineSample] = []
@@ -462,6 +466,53 @@ async def _run_one_step(
             final = await poller.sample_once()
         if final is not None:
             samples.append(final)
+
+        # --- BACKLOG #1292: the intake audit, at its TWO moments -------------------------------
+        # MOMENT 1, LIVE (engine still up), and only on a shortfall: does every message the harness
+        # read a response frame for actually HAVE a row right now? If it does, nothing was lost and
+        # the shortfall is in the `engine_read` gauge. Gated on the shortfall because on a clean step
+        # it would only re-confirm what MOMENT 2 confirms anyway, at a page sweep per step.
+        # `poller.baseline`/`poller.final`, NOT the local `final`: those are the exact two samples
+        # `_build_record` hands `_reconcile`, and the audit has to be triggered by the shortfall the
+        # step will actually REPORT. The two diverge on the drain-timeout path, where the local
+        # `final` can be None while the poller still holds an earlier sample.
+        read_short = _read_shortfall(
+            metrics.counters, poller.baseline, poller.final, unconfirmed_budget=count
+        )
+        audit_live = intake_audit.not_run(
+            "no intake shortfall to attribute at this moment", moment=intake_audit.MOMENT_LIVE
+        )
+        if ledger is not None and read_short > 0:
+            audit_live = await intake_audit.run_intake_audit(
+                ledger,
+                _store_reader(node_env, metrics.counters.sent),
+                moment=intake_audit.MOMENT_LIVE,
+                sent=metrics.counters.sent,
+                read_short=read_short,
+            )
+        # MOMENT 2, POST-MORTEM. Stop the engine FIRST, so the store is committed and quiesced: with
+        # no process running, "we sampled too early" is no longer available as an explanation, which
+        # is what separates outcome 1 (sample lag) from outcome 2 (sum coverage). `stop()` is
+        # idempotent, so the `finally` below still runs it on every other path.
+        audit_final = intake_audit.not_run("intake audit disabled for this profile")
+        if ledger is not None:
+            with contextlib.suppress(Exception):
+                await node.stop()
+            if node.alive:
+                # Refuse to CALL it a post-mortem when it would not be one. A read taken while the
+                # engine is still running answers the LIVE question, and labelling it post_mortem
+                # would destroy the one distinction the second moment exists to make.
+                audit_final = intake_audit.not_run(
+                    "the engine did not stop, so a post-mortem read would not be post-mortem"
+                )
+            else:
+                audit_final = await intake_audit.run_intake_audit(
+                    ledger,
+                    _store_reader(node_env, metrics.counters.sent),
+                    moment=intake_audit.MOMENT_POST_MORTEM,
+                    sent=metrics.counters.sent,
+                    read_short=read_short,
+                )
         return _build_record(
             claim_mode=claim_mode,
             fuse_mode=fuse_mode,
@@ -475,6 +526,8 @@ async def _run_one_step(
             samples=samples,
             drain_seconds=drain_seconds,
             reload_seconds=reload_seconds,
+            audit_live=audit_live,
+            audit_final=audit_final,
         )
     finally:
         with contextlib.suppress(Exception):
@@ -561,6 +614,37 @@ def _node_env(
     if install_executor_shim:
         env[SHIM_ENV] = "1"  # harness-only: install the default-sized instrumented executor
     return env
+
+
+def _store_reader(node_env: Mapping[str, str], sent: int) -> StoreReader:
+    """A one-shot reader over THIS step's own store, for the BACKLOG #1292 intake audit.
+
+    Goes through the ``Store`` protocol (``open_store`` -> ``count_messages``/``list_messages``) so
+    SQLite and the two server backends take one path, and resolves its settings from the SAME env the
+    engine subprocess was given. It deliberately does NOT go through ``GET /messages``: that route is
+    ``require_phi_read`` and charges a per-actor anti-automation budget, so a per-message sweep would
+    be 429'd -- and it would also read the numbers through the very API layer under suspicion.
+
+    The engine-package import sits INSIDE the call, mirroring ``_reset_server_store`` directly above:
+    this rig OWNS the engine subprocess and inspects its store, which is why it is the one part of
+    ``harness/load`` that reaches past the HTTP API at all.
+    """
+    # 4x the sends plus a floor: `messages` holds one row per RECEIVED message and this store is
+    # exclusive to the step, so a table meaningfully larger than the run means the assumption is
+    # wrong -- report TRUNCATED rather than sweep an unbounded table.
+    row_cap = max(4 * sent + 1000, 10_000)
+
+    async def _read() -> intake_audit.StoreSnapshot:
+        from messagefoundry.config.settings import load_settings
+        from messagefoundry.store.base import open_store
+
+        store = await open_store(load_settings(environ=node_env).store)
+        try:
+            return await intake_audit.sweep_store(store, row_cap=row_cap)
+        finally:
+            await store.close()
+
+    return _read
 
 
 async def _reset_server_store(backend: str, env: Mapping[str, str]) -> tuple[int, int]:
@@ -754,6 +838,8 @@ def _build_record(
     samples: list[EngineSample],
     drain_seconds: float | None,
     reload_seconds: float | None,
+    audit_live: IntakeAudit | None = None,
+    audit_final: IntakeAudit | None = None,
 ) -> ConnScaleRecord:
     c = metrics_counters.snapshot()
     base, final = poller.baseline, poller.final
@@ -763,6 +849,14 @@ def _build_record(
     # half-the-run fraction, and its separate intake floor keeps `read >= sent // 2` required here
     # even when `count` exceeds half the step's sends (the short-hold smoke cells).
     no_loss = _reconcile(c, base, final, unconfirmed_budget=count)
+    live = audit_live if audit_live is not None else intake_audit.not_run("audit not wired")
+    post = audit_final if audit_final is not None else intake_audit.not_run("audit not wired")
+    # BACKLOG #1292: ATTRIBUTE the reconcile's own failure text, never soften it. `ok` is untouched --
+    # a genuine invariant failure still fails the step on the count check exactly as before -- and the
+    # audit verdict is APPENDED so a CI reader gets the attribution in the same message that
+    # currently gives them only a number they cannot act on.
+    if not no_loss.ok and post.verdict != intake_audit.VERDICT_NOT_RUN:
+        no_loss = replace(no_loss, detail=f"{no_loss.detail}; {post.summary()}")
     in_pipeline_peak = max((s.in_pipeline for s in samples), default=0)
 
     # Wall #1: executor saturation (None when the shim isn't installed → all-None samples).
@@ -841,6 +935,57 @@ def _build_record(
         working_set_peak_bytes=proc.working_set_peak_bytes,
         fuse_thread_hops=fuse_mode,
         batch_handoff_statements=batch_mode,
+        intake_audit=post,
+        intake_audit_live=live,
+    )
+
+
+@dataclass(frozen=True)
+class _Excusal:
+    """How many unconfirmed sends the intake bound forgives this step, and whether that broke."""
+
+    unconfirmed: int
+    budget: int
+    excused: int
+    over_budget: bool
+
+
+def _excusal(c: Counters, *, unconfirmed_budget: int) -> _Excusal:
+    """THE definition of the unconfirmed-send excusal, extracted so ``_reconcile`` and the BACKLOG
+    #1292 intake audit compute the SAME ``sent - excused``.
+
+    The audit exists to explain the ``engine_read {read} < confirmed sent {sent - excused}`` message,
+    so it has to be triggered by that exact quantity. A second copy of this arithmetic beside it
+    would let the audit fire on a shortfall the reconcile does not report, or stay silent on one it
+    does -- either way attributing the wrong failure. Behaviour is verbatim what ``_reconcile``
+    computed inline before the extraction.
+    """
+    unconfirmed = c.timeouts
+    # Three quarters, not half — half was sized against a 16% worst-observed and windows-2025 has
+    # since produced 51% on a lossless run, failing `main` at 9b03057f by ONE message. `excused` is
+    # clamped rather than zeroed so an over-budget failure stops claiming intake loss it cannot show.
+    # `ok` still requires `not over_budget`, so the verdict is unchanged. Full rationale: report.py.
+    budget = max(unconfirmed_budget, 3 * c.sent // 4)
+    over_budget = unconfirmed > budget
+    return _Excusal(unconfirmed, budget, 0 if over_budget else unconfirmed, over_budget)
+
+
+def _read_shortfall(
+    c: Counters,
+    base: EngineSample | None,
+    final: EngineSample | None,
+    *,
+    unconfirmed_budget: int,
+) -> int:
+    """``confirmed sent - engine_read`` -- the shortfall ``_reconcile`` reports as intake loss, and
+    the trigger for the LIVE intake audit. 0 when the engine gauges are unavailable (there is then no
+    shortfall to attribute; ``_reconcile`` fails the step on its own for that)."""
+    if base is None or final is None:
+        return 0
+    return (
+        c.sent
+        - _excusal(c, unconfirmed_budget=unconfirmed_budget).excused
+        - (final.read - base.read)
     )
 
 
@@ -889,14 +1034,13 @@ def _reconcile(
     # guarantee is enforced SEPARATELY below as an intake floor the excusal cannot lower. See
     # harness/load/report.py's copy for the full rationale; the three copies are kept in step
     # deliberately.
-    unconfirmed = c.timeouts
-    # Three quarters, not half — half was sized against a 16% worst-observed and windows-2025 has
-    # since produced 51% on a lossless run, failing `main` at 9b03057f by ONE message. `excused` is
-    # clamped rather than zeroed so an over-budget failure stops claiming intake loss it cannot show.
-    # `ok` still requires `not over_budget`, so the verdict is unchanged. Full rationale: report.py.
-    budget = max(unconfirmed_budget, 3 * sent // 4)
-    over_budget = unconfirmed > budget
-    excused = 0 if over_budget else unconfirmed
+    ex = _excusal(c, unconfirmed_budget=unconfirmed_budget)
+    unconfirmed, budget, excused, over_budget = (
+        ex.unconfirmed,
+        ex.budget,
+        ex.excused,
+        ex.over_budget,
+    )
     read_short = sent - excused - read
     # The anti-vacuity guarantee, independent of the excusal: at least half the sends must be
     # observed at intake whatever the budget forgives (nothing clamps `excused` to `sent`, so without
@@ -1167,6 +1311,37 @@ def _evaluate_slos(profile: ConnScaleProfile, records: list[ConnScaleRecord]) ->
     if slo.zero_loss:
         all_ok = all(r.no_loss.ok for r in records)
         out.append(SloCheck("zero_loss", True, all_ok, all_ok))
+    if profile.intake_audit:
+        # BACKLOG #1292, and DELIBERATELY NOT folded into zero_loss: this is a per-MESSAGE check and
+        # zero_loss is a per-COUNT one, so they can disagree, and each disagreement is informative.
+        # It is strictly ADDITIONAL -- it can fail a step whose counts reconciled, because a
+        # confirmed-then-absent message that happened to be excused as a timeout passes the count
+        # check today. PROBE_UNUSABLE does NOT fail here: an unanswerable instrument is not evidence
+        # of a defect in either direction, and it is reported as its own observation instead.
+        suspect = [r for r in records if r.intake_audit.engine_suspect]
+        # THE SCOPE TRAVELS WITH THE VERDICT, and that is not decoration here. `_evaluate_slos` is
+        # SHARED with the batch-box aggregate (batchbox.py), whose records are folded from
+        # remote-driver reports and carry a NOT_RUN audit by construction -- those driver processes
+        # poll a REMOTE engine and have no store to read. A bare "clean" there would be a green
+        # earned by nothing at all. So the observation always names how many steps were actually
+        # audited, and zero-audited says so in those words instead of passing itself off as a finding
+        # of no defect. The per-step guarantee is asserted in tests/test_connscale_smoke.py, where
+        # the audit genuinely runs; this line is the operator-facing summary of it.
+        audited = sum(1 for r in records if r.intake_audit.conclusive)
+        if suspect:
+            observed = "; ".join(
+                f"{r.sweep_mode}@N={r.count} {r.intake_audit.summary()}" for r in suspect
+            )
+        elif audited == 0:
+            observed = (
+                f"NOT AUDITED -- 0 of {len(records)} step(s) carry an intake audit, so this says "
+                f"nothing about per-message intake"
+            )
+        else:
+            observed = f"clean ({audited} of {len(records)} step(s) audited)"
+        out.append(
+            SloCheck("intake_audit", "no accept-ACKed message absent", observed, not suspect)
+        )
     if slo.max_drain_seconds is not None:
         worst = max(
             (r.drain_seconds for r in records if r.drain_seconds is not None),
