@@ -347,3 +347,76 @@ def test_a_genuinely_live_hit_is_still_narrated_as_the_live_shape(
     doc.write_text(f"resolves to BACKLOG #{floor + 500} which was never filed\n", encoding="utf-8")
     assert cc.main([str(doc)]) == 1, "a genuinely live citation must fail the gate"
     assert "This is the live shape." in capsys.readouterr().out
+
+
+# --- BACKLOG #1235: a clean result over an EMPTY population is not a clean result -----------------
+
+
+def test_an_empty_population_is_REFUSED_not_reported_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The trap under the item's first disjunct, and it arms by CLOSING the item.
+
+    The default path list is ``Path("docs").rglob(...)`` -- CWD-relative, not repo-relative.
+    MEASURED before this fix, from a directory with no ``docs/``::
+
+        No unresolved backlog citation in 0 file(s).
+        Resolved against 0 allocated item numbers (open and closed).
+        exit 0
+
+    Both counts zero, nothing objecting. The >200-file population floor lives only in
+    ``test_the_docs_scan_actually_covers_something``, so it guards the PYTEST arm and nothing else --
+    anyone who satisfies the item by wiring this CLI into CI, which is the documented way to close it,
+    inherits a gate that reports clean when it scanned nothing.
+    """
+    monkeypatch.chdir(tmp_path)
+    assert cc.main([]) == 1
+    err = capsys.readouterr().err
+    assert "empty population" in err
+    assert "0 file(s) scanned" in err, "the refusal must print WHAT it scanned, not just refuse"
+    assert str(tmp_path) in err, "and WHERE from -- the defect is a CWD-relative default"
+
+
+def test_a_real_population_is_still_reported_normally(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The negative control, and without it the fix above could be 'always refuse'.
+
+    Run against the real docs/ from the repo root: a populated scan must still reach a verdict rather
+    than trip the emptiness guard. This is the arm that makes the refusal a guard instead of a wall.
+    """
+    assert cc.main([]) in (0, 1)  # a verdict, whichever way -- NOT the emptiness refusal
+    assert "empty population" not in capsys.readouterr().err
+
+
+def test_the_coverage_bound_prints_on_a_CLEAN_run_too(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """It used to print only after the hits loop, so the early clean return skipped it.
+
+    The bound was therefore absent at exactly the moment a reader concludes "clean" -- which is the
+    whole population it exists to qualify. It is in the module docstring, and a docstring is not what
+    a CI log shows.
+    """
+    doc = tmp_path / "clean.md"
+    doc.write_text("no citations here at all\n", encoding="utf-8")
+    assert cc.main([str(doc)]) == 0
+    out = capsys.readouterr().out
+    assert "No unresolved backlog citation" in out, "control: this must be the CLEAN path"
+    assert cc._COVERAGE_BOUND in out, (
+        "the coverage bound is absent from the clean run, which is the one a reader acts on"
+    )
+
+
+def test_the_coverage_bound_has_ONE_definition() -> None:
+    """Both exit paths print the same text because there is only one string to print.
+
+    Two copies of a caveat drift, and the copy that goes stale is the one nobody reads -- it only
+    prints on the path they are not on. This is the same single-definition rule the item is about,
+    applied to prose rather than to a predicate.
+    """
+    # Read the module's OWN file, via the loaded object, so this cannot drift from what was
+    # imported. Naming the path again here would be a second definition inside a test whose
+    # subject is second definitions.
+    source = Path(cc.__file__).read_text(encoding="utf-8")
+    assert source.count("Not scanned: the private companion repository") == 1
