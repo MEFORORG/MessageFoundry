@@ -4315,7 +4315,7 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 ## 1022. disable_mfa has no last-factor guard where delete_webauthn_credential does, so the two removal paths can be ordered to reach zero factors
 
-> **DO NOT BUILD -- ALREADY BUILT AND UNLANDED ON PR #394. Flagged 2026-08-15.** This item reads OPEN and UNCLAIMED on `origin/main`, so the pool offers it as fresh work; **the next lane to pull it rebuilds what exists.** That PR carries `b680ee0d fix(auth): refuse to strip the LAST second factor via disable_mfa (#1022)` and `261ae1c9 fix(webconsole): render the last-factor refusal as a page, not raw JSON (#1022)`. Re-checked at `origin/main` `2b64170a`: **still unlanded.** **Clear this banner when #394 lands; until then treat the item as taken.**
+> **THE 2026-08-15 DO-NOT-BUILD BANNER IS RETIRED, AND IT HAD INVERTED. Corrected 2026-08-20 against `origin/main` `dd655da2`.** PR #394 LANDED, so the condition that banner named as its own expiry was met and the banner then read *do not build* over work that was **only half done** -- the direction that removes an item from the queue so nobody looks again. **The first scope option SHIPPED:** `parse_items` refuses a source carrying conflict markers (`scripts/docs/backlog_status_check.py`, defined `:94`, called `:132`, reached before any parsing, both-polarity tested). **The second did NOT, and the item's own failure sentence stayed true:** no pre-commit hook called `parse_items`, so a conflicted `docs/BACKLOG.md` could still be COMMITTED with every ledger gate passing. That half is built at `03d4494a` and landing now; it is not yet on `origin/main`.
 
 > 🔢 **Filed 2026-08-04 — not started.** Value **5/10** · Difficulty **4/10** · _fill-in_. `delete_webauthn_credential` computes `last_second_factor` and refuses when MFA is required; `disable_mfa` has no equivalent test at all. A user with TOTP plus one passkey can delete the passkey (permitted, because `totp_enabled` is still True) and then disable TOTP (permitted, no guard), arriving at zero enrolled factors — the state ADR 0068 AC-10 says the system shall refuse.
 > ⚠️ **AMENDED 2026-08-11 — the guard is SOUND but the item is PARTIAL, and ADR 0068 now contradicts itself. Stays OPEN.** `w3-l2-auth-policy` (`a46f7a83`, pushed, **unlanded**) adds the missing `disable_mfa` last-factor test. Adversarially re-resolved and it survived: `has_webauthn_credentials` exists on **all four** store backends, so it is not silently `AttributeError`-ing off SQLite, and the identity is rebuilt per request, so roles are not stale.
@@ -9404,6 +9404,8 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Scope.** Make the condition impossible to miss rather than relying on ordering discipline. Options to price: have `parse_items` (or its CLI) **refuse** a source containing conflict markers rather than parse it; and/or add the standard `check-merge-conflict` pre-commit hook, which is the cheap general fix and covers every file rather than this one. **The first is the one that protects programmatic callers**, which is where this bit -- a hook does not help a gate that is handed a tree in memory.
 
+**THE SHAPE OF THE CONFLICT DECIDES WHETHER ANYTHING CATCHES IT, and this is not in the text above.** Measured 2026-08-20 at `dd655da2`, by varying the injection rather than re-reading one result. A conflict that **ADDS HEADINGS** is caught incidentally: the ledger gate fails on **OWNERSHIP**, because both sides' numbers read as unallocated -- which renders as *already covered* and is why this looked like a non-defect on the first attempt. **A real ledger conflict is two sides editing PROSE.** It adds no heading, so the ownership guard has nothing to fire on. With a prose-only conflict, restored byte-identical afterwards: ledger gate **Passed**, forbidden-content **Passed**, control chars **Passed**, gitleaks **Passed**, overall **rc 0 -- the conflicted ledger COMMITS** -- while `backlog_status_check.py` on the same file exits **1**. **The capability existed and was simply not wired.**
+
 **How to prove a fix.** Poison a copy of the real ledger with markers and assert the reader **fails**. Asserting it parses a clean file proves nothing: it already does that, and did so throughout the incident.
 
 **Provenance.** Reported by the seat whose own gate nearly certified the broken tree, against its own process, with the near-miss stated plainly rather than after quietly reordering its checks.
@@ -10377,6 +10379,18 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** CI reliability / intake accounting. **Priority:** P1. **Verdict:** build.
 **Severity:** no deployment axis today (sec. 0 -- zero instances). Rated P1 because the unexcluded branch is a count-and-log invariant failure, and because it is currently red on `main` inside a required context.
+
+**A FIFTH SIGHTING, ON `main`'s OWN TIP, AND IT WEAKENS THE ARGUMENT THE FOURTH ENTRY MADE.** CI run `32365754844`, `origin/main` `dd655da2`, `test (windows-2025, py3.14)`: `count=12`, `offered_aggregate_rate=24.0`, `sent=36`, `acked=24`, `nak=0`. The ack series is now:
+
+    #431   fixed_aggregate  count=12  sent=36  acked=13
+    #394   fixed_aggregate  count=12  sent=36  acked=14
+    tip    fixed_aggregate  count=12  sent=36  acked=24
+
+**The fourth entry argued that the shortfall REPRODUCES to within one ack across independent runs and different runner images, and concluded that a reproducible shortfall looks SYSTEMATIC rather than like a runner having a bad minute. 24 does not fit that.** Thirteen, fourteen and twenty-four is a SPREAD, and the reproducibility that made the systematic reading persuasive does not survive its own next datapoint.
+
+**This does NOT flip the verdict to starvation.** Two clustered points and one outlier is not a distribution, and the entry above is bounded rather than retracted -- exactly as it bounded the magnitude argument before it. What has changed is that neither reading now has an argument from reproducibility, so **the store-side discriminator is the only thing that settles this**, and nothing in these five sightings substitutes for running it.
+
+**AND THIS SIGHTING IS NOT WHAT WAS REDDING `main`.** The same run's failing assertion is `tests/test_connscale_smoke.py:128`, `assert r.fd_count_peak is not None` -- the FD probe, not the intake accounting. `no_loss` PASSED in that run, it is computed as `agg_sent - engine_read` so `acked` is not in it at all, and this item's own detail string (`lost N on intake`) appears zero times in the log against a working positive control. The `sent`/`acked` figures above are real and are INCIDENTAL: pytest prints the record's full `repr` on any assertion failure. **Three sessions attributed that red to this item because the numbers pattern-matched it.** When a sighting names an item, quote the line with the caret, never the values in the dump.
 
 ## 1293. removing a worktree orphans every unlanded ledger number it allocated, permanently stranding those PRs
 
