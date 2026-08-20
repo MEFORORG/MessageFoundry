@@ -102,6 +102,7 @@ tests/test_worktree_gate_command_parsing.py
 tests/test_worktree_gate_control_plane.py
 tests/test_worktree_gate_default_reposfile.py
 tests/test_worktree_gate_emitter.py
+tests/test_worktree_gate_escaped_quote.py
 tests/test_worktree_gate_git.py
 tests/test_worktree_gate_hijack.py
 tests/test_worktree_gate_interpreter_flags.py
