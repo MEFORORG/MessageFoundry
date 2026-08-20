@@ -306,3 +306,44 @@ def test_a_PR_SHAPED_reference_is_reported_but_does_not_fail(tmp_path: pathlib.P
     even when its number is above the floor."""
     doc = _doc(tmp_path, f"shipped in PR #{_unissued_above_floor()}\n")
     assert cc.main([doc]) == 0
+
+
+# --- BACKLOG #1235: the ANNOTATION must ask the same predicate the EXIT CODE asks ----------------
+
+
+def test_a_pr_shaped_hit_is_not_narrated_as_the_live_shape(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The third definition of the live-shape rule, and the only one that talks to a human.
+
+    MEASURED at 4c28badd before this fix: six hits printed BOTH
+    ``[PR/issue/foreign-repo shaped -- very likely NOT a backlog citation]`` AND
+    ``This is the live shape.`` -- two contradictory annotations on the SAME hit, two lines apart --
+    while the process exited 0.
+
+    Asserted on the CONTRADICTION rather than on either sentence alone, because either one in
+    isolation is correct: the hit IS above the floor, and it IS pr-shaped. Only their co-occurrence
+    on one hit is the defect, so only that co-occurrence can pin it.
+    """
+    doc = tmp_path / "d.md"
+    floor = cc.allocation_floor()
+    doc.write_text(f"see upstream `someproject#{floor + 500}` for context\n", encoding="utf-8")
+    assert cc.main([str(doc)]) == 0, "a pr-shaped hit must not fail the gate"
+    out = capsys.readouterr().out
+    assert "PR/issue/foreign-repo shaped" in out, "control failed: the hit was not annotated at all"
+    assert "This is the live shape." not in out, (
+        "the annotation called a pr-shaped hit the live shape while the exit code passed over it "
+        "-- a third definition of the rule, disagreeing with the other two (BACKLOG #1235)"
+    )
+
+
+def test_a_genuinely_live_hit_is_still_narrated_as_the_live_shape(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The negative control. Suppressing the sentence everywhere would pass the test above and
+    destroy the tool's only human-readable verdict -- a fix that trades a wrong answer for none."""
+    doc = tmp_path / "d.md"
+    floor = cc.allocation_floor()
+    doc.write_text(f"resolves to BACKLOG #{floor + 500} which was never filed\n", encoding="utf-8")
+    assert cc.main([str(doc)]) == 1, "a genuinely live citation must fail the gate"
+    assert "This is the live shape." in capsys.readouterr().out
