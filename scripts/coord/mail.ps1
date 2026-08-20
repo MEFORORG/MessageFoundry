@@ -345,7 +345,7 @@ if ($Send) {
         $me = (Get-Location).Path.TrimEnd('\', '/').ToLowerInvariant()
         foreach ($r in $roster) {
             # Cwd, NOT Worktree. `Worktree` is the roster's DISPLAY LABEL -- a bare leaf name like
-            # `builder-1-session-d229ce` -- while `Cwd` carries the addressable absolute path. The two
+            # `builder-<n>-session-<hex>` -- while `Cwd` carries the addressable absolute path. The two
             # fields answer neighbouring questions and only one of them is an address.
             #
             # MEASURED 2026-08-13, AND IT HAD EATEN EVERY BROADCAST THIS REPO EVER SENT.

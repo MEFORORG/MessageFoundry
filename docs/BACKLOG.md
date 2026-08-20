@@ -4576,7 +4576,7 @@ Resolved against both ledger files with `parse_items`: **`#3` is an OPEN item to
 
 **Related:** PR #209 (the four-digit half, and the source of the `PR #NNNN` convention), \#1029 (the same document), \#1032 (same class: a census that counted without printing context).
 
-**Source:** raised by session `sleepy-villani-df328d` while sweeping the four-digit citations, and correctly kept out of that PR's scope. Owner ruled on it 2026-08-05. Counts here were re-measured against 780ee1d9 with a self-tested pattern after an unverified one reported zero.
+**Source:** raised by a session while sweeping the four-digit citations, and correctly kept out of that PR's scope. Owner ruled on it 2026-08-05. Counts here were re-measured against 780ee1d9 with a self-tested pattern after an unverified one reported zero.
 
 ## 1035. Gate remediations interpolate an unquoted `-File` path into a command the reader is told to run
 
@@ -4653,6 +4653,14 @@ This repo sets `core.hooksPath` at **worktree** scope, which beats global — so
 ## 1083. The forbidden-content guard requires a path prefix on a worktree slug, so a bare slug in prose reaches the public repo
 
 > 🔢 **Filed 2026-08-07 — not started.** Value **6/10** · Difficulty **1/10** · _quick win_. `scripts/security/scan_forbidden.py:96` is `_WORKTREE_SLUG = re.compile(r"(?i:(?:claude/|worktrees/)[a-z0-9]+(?:-[a-z0-9]+)*-[0-9a-f]{6})")`. **The `claude/` or `worktrees/` prefix is MANDATORY**, so a bare slug in prose matches the shape and not the pattern, and ships. ⛔ **A live instance has been on `origin` since 2026-08-05** and the guard passed it on every commit since.
+
+**BUILT AND AWAITING MERGE as of 2026-08-20. VERIFY AGAINST THE CODE BEFORE BUILDING THIS -- do not trust this paragraph.** The widened guard is on PR #462 (`d428ebb0`, plus `f189a0b8` correcting a stale self-reference in the guard's own explanation), together with the ledger redaction this item's fix requires (`435da132`). **The check that settles whether it is still open is one command and it is not this note:** read `_WORKTREE_SLUG` in `scripts/security/scan_forbidden.py` on `origin/main` and see whether the `claude/` or `worktrees/` prefix is still mandatory. If it is, the defect is live and this item is real work. If it is not, the fix landed and this paragraph is spent.
+
+*This is worded to point at the CODE rather than at a PR's state, deliberately.* A banner that says *do not build, it is on PR #N* INVERTS the moment #N lands -- it then reads do-not-build over finished or half-finished work, and nothing in the document can tell. **That is not hypothetical: #1259 carried exactly that banner, its named PR landed, and the banner then steered lanes away from an item whose second half was still genuinely undone.** A pointer to a symbol re-answers itself on every read; a pointer to a merge state answers correctly once and then lies.
+
+**THE FIX CANNOT LAND ALONE, and this is a hard ordering constraint rather than a preference.** With the widened guard on `main` and the four pre-existing ledger instances unredacted, the forbidden-content pre-commit hook REFUSES ANY COMMIT TOUCHING `docs/BACKLOG.md` or `docs/archive/backlog/BACKLOG-CLOSED.md` -- the two most-edited files in the repo. Established on the combined tree by the guard itself, in a 2x2 with an asymmetric control: the widened guard exits **1** on the unredacted ledger and **0** on the redacted one, while the current guard exits **0** on both. **The exit 1 is the load-bearing cell** -- without it the green would be indistinguishable from a guard that cannot see the class at all.
+
+**A SECOND-ORDER EFFECT, MEASURED THREE TIMES ON 2026-08-20, that anyone working this item inherits.** Once the widened guard exists in a working tree, any agent that RUNS it sees live hits in the ledger and helpfully edits the ledger -- which a builder may not author. Three occurrences, three different agents, **the last two under an explicit prohibition naming both files**. The prohibition is nought for three; checking `git status --porcelain` for what is actually STAGED is three for three. **A rule addressed to the agent lost; a check performed before committing won.** Allowlisting the ledger lines is not an alternative -- the guard's own failure text forbids it.
 
 **Cluster:** Repo hygiene / public-repo content control. **Priority:** P2. **Verdict:** build. **Severity:** no product effect and no PHI effect. It leaks an internal task name into a **public** repository — low individual harm, but the guard exists precisely because the project decided these should not ship, and it is failing silently at that job.
 
@@ -4887,7 +4895,7 @@ against the gate **as it will ship**, not as it is.
 
 **Related:** #1032 and #1035 (the same output surface, viewed as runnability rather than injection), #1039.
 
-**Source:** the two instances were found independently on 2026-08-05 by sessions `trusting-wu-c2e6d5` (refname, in Rule 3b) and `sharp-chatelet-f33072` (file path, in Rule 1b), the second after the first asked whether the new rule interpolated an attacker-influenceable value into a command form. Filed separately from the five deferrals it was grouped with, because the general form is a different and larger item than any of them.
+**Source:** the two instances were found independently on 2026-08-05 by one session (refname, in Rule 3b) and a second session (file path, in Rule 1b), the second after the first asked whether the new rule interpolated an attacker-influenceable value into a command form. Filed separately from the five deferrals it was grouped with, because the general form is a different and larger item than any of them.
 
 ## 1042. The `[vault]` key/secret/transit providers build a redirect-following HTTP client, so a diverted 3xx could carry `X-Vault-Token` off-path
 
