@@ -695,6 +695,24 @@ def test_a_session_reusing_a_phantoms_id_cannot_consume_mail_it_never_saw(
     assert len(box_files(repo, key, "seen")) == 1
 
 
+#: 300 is DERIVED, not chosen: `_race` gives each racer subprocess `timeout=240`, so a run that is
+#: slow but still legitimate can consume nearly 240 s before the test itself would call it. A per-test
+#: deadline at or below that can only ever fire FIRST, which means the outer cap decides the outcome
+#: and the inner one can never be reached. 300 clears it, and matches the three sibling race arms
+#: above, which are the same shape.
+#:
+#: WITHOUT THIS MARKER THE TOOLING LEG'S `--timeout=120` APPLIED (`.github/workflows/ci.yml`, the
+#: `-m tooling` step), i.e. HALF the inner subprocess deadline -- and this arm does `VERDICT_ROUNDS`
+#: (600) rounds against the siblings' `ROUNDS` (60), so it is the one arm that most needed the
+#: headroom and the only one of the four that was missing it. On a loaded hosted Windows runner it
+#: crossed 120 s and pytest-timeout killed the xdist worker; locally it completes in about 17 s,
+#: which is why this reproduced as an intermittent red rather than a permanent one.
+#:
+#: The kill is SILENT BY CONSTRUCTION, which is why the CI logs carry no stack: pytest-timeout dumps
+#: the stacks and then calls `os._exit(1)`, killing the worker before execnet can relay the dump. CI
+#: therefore shows only `worker 'gwN' crashed while running '<nodeid>'` with no traceback, which
+#: reads like a native crash and is not one.
+@pytest.mark.timeout(300)
 def test_the_claim_verdict_agrees_with_the_filesystem(tmp_path: Path) -> None:
     """DEFECT 4, the verdict half -- and the half that was nearly shipped broken.
 
