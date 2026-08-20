@@ -121,7 +121,7 @@ def test_the_group_pin_is_inert_on_this_runtime_and_says_so() -> None:
     """A liveness receipt for ASVS 11.6.2 — written to FAIL on the interpreter upgrade.
 
     ``SSLContext.set_groups`` is a **Python 3.15** addition, so ``harden_kex_groups`` pins nothing on
-    any interpreter this project runs on and ``APPROVED_KEX_GROUPS`` reaches zero of its six call
+    any interpreter this project runs on and ``APPROVED_KEX_GROUPS`` reaches none of its call
     sites. That was already true; what was missing was any way to NOTICE. The tests that stood here
     asserted (a) that the call does not raise, (b) that it no-ops on an object without the API, and (c)
     the contents of a string constant — all three pass identically whether or not a single group is

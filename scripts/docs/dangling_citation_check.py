@@ -198,6 +198,27 @@ def unresolved_citations(paths: list[Path], allocated: set[int]) -> list[Hit]:
     return hits
 
 
+def is_live_shape(hit: Hit, floor: int) -> bool:
+    """True iff this unresolved citation can EVER arm -- the shape the exit code keys on.
+
+    THE ONE DEFINITION (BACKLOG #1235 residual 2). This predicate previously existed twice: once
+    inline in :func:`main` and once re-derived inside the gate test, agreeing by convention with
+    nothing binding them. Two definitions of the rule a gate fires on is the defect this whole tool
+    exists to catch in other people's gates, reproduced inside it.
+
+    Both conditions exclude a citation that is REPORTED but is not a defect:
+
+    * ``number > floor`` -- at or below the allocator's high-water mark a number can never be
+      issued (``alloc.ps1`` starts at ``$observed + 1`` and only ever scans upward), so the
+      citation resolves to nothing permanently rather than by luck.
+    * ``not pr_shaped`` -- a PR, issue or foreign-repo reference is not a backlog citation at all.
+
+    Keeping them here rather than at the call site is what makes a single mutation red BOTH the
+    exit-code arms and the real-tree gate. Before this, mutating one left the other green.
+    """
+    return hit.number > floor and not hit.pr_shaped
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -275,7 +296,7 @@ def main(argv: list[str] | None = None) -> int:
     # never be issued, and a PR/issue/foreign-repo reference is not a backlog citation at all; both
     # are reported for a human to read and neither is a defect. Failing on them would red the tree
     # today for hits that are correct, and a gate that cries wolf gets switched off.
-    live = [h for h in hits if h.number > floor and not h.pr_shaped]
+    live = [h for h in hits if is_live_shape(h, floor)]
     if live:
         print()
         print(f"LIVE SHAPE: {len(live)} citation(s) name a number that can still be issued.")
