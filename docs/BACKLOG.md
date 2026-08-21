@@ -10560,3 +10560,32 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Worktree lifecycle / session tooling. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0) -- developer coordination only. The cost is a routine, high-frequency prompt that is wrong in the common case, teaching seats to dismiss the one class of prompt that must not become routine.
+
+## 1299. unbacked_check reports commits whose CONTENT is fully landed as unbacked work, because a squash-merge and a local merge over a backed parent both leave an orphan commit object
+
+> 🔢 **Filed 2026-08-21 -- not started. Every alarm on the measured run was content-durable, and the remedy it prints would push rescue tags for work already on `main`.** Value **5/10** · Difficulty **3/10**. `scripts/coord/unbacked_check.ps1` answers *"does this COMMIT OBJECT exist on a remote"*. A reader runs it to ask *"is any WORK at risk of being lost"*. Those two questions diverge on exactly two routine mechanisms, and both were live on this machine.
+
+> **MEASURED 2026-08-21, and the rate is the finding: 7 of 7 alarms were false.** The run reported `7 commits on 7 branches exist on no remote`, over a coverage line of `541 refs and 33 worktree checkouts (incl. primary) across 1 repository, 2 of 2 configured remote(s) answered`. Every one is durable:
+>
+> | branch(es) | commit | why it is not at risk |
+> | --- | --- | --- |
+> | `pr-439`, `claude/mail-reply-one-line` | `20a14af1` | PR #439 **MERGED** 2026-08-19; content verified live on `origin/main` in `docs/SESSION-MAIL.md` and `scripts/hooks/mail-drain.ps1` |
+> | `pr-394`, `pr394` | `db80c064` | merge commit; PR #394 **MERGED**; substantive parent `312ffbb9` backed at `private/rescuetags/auto/detached/7b38e2c9` |
+> | `pr-436` | `9a79934c` | merge commit; PR #436 **MERGED**; parent `93b63188` backed at `private/rescuetags/auto/adr-0156-amendment` |
+> | `pr-437` | `ccf467b7` | merge commit; PR #437 **MERGED**; parent `7e8dab37` backed at `private/rescuetags/auto/MessageFoundry/lander/apt-guard` |
+> | a live session's feature branch | `92537c51` | merge commit; parent `dfc52076` backed at that branch's auto rescue tag on the private durability remote |
+
+> **THE TWO MECHANISMS, both of which are normal operation rather than an edge case.** **(1) Squash-merge orphans the original.** `main` receives a NEW commit with a different sha, so the branch a session still holds points at an object that now exists on no remote -- while its content is fully landed. Every merged PR left behind by `gh pr checkout` is in this class, and the local branch outlives the PR. **(2) A local `merge main into <branch>` over a rescue-tagged parent.** The parent carrying the authored work IS backed; only the merge commit created locally is not. Re-running the merge reproduces it, so nothing authored is at stake.
+
+> **THE COUNT DOUBLE-COUNTS, which matters because the headline number is what gets relayed.** The tool measures per REF, so two local checkout names for one commit are two alarms: the 7 branch-alarms cover **5 distinct commit objects**. Measuring per ref is correct and is the script's own hard-won lesson -- the finding is only that the printed noun is "commits" where the unit is branches.
+
+> **THE DIRECTION IS A FALSE ALARM, AND THE PRINTED REMEDY ACTS ON IT.** The script closes with `git push --force <private-remote> <branch>:refs/tags/rescue/branch/<branch>`. Followed here, that would create seven rescue tags for content already on `main`. A false clean is merely believed; a false alarm is **acted on**, and this one comes with the command to act on it already formatted.
+
+> **WHY THIS DEFECT WAS STRUCTURALLY EASY TO MISS, and the script says so itself.** Its docstring records **three** shipped defects -- per HEAD instead of per ref, per local ref instead of per reachable remote, per branch instead of per checkout -- and names the pattern: *"each earlier version answered a question adjacent to the one a reader would ask."* All three were false **negatives**, and the stated fix each time was *"to widen what everything means"*. Widening is monotonic: it can only add alarms, never retire one. So a discipline built entirely from missed-detection defects has no step at which a **false positive** would surface, which is why the fourth instance of the script's own documented class arrives in the direction its remedy cannot reach.
+
+> **RELATED BUT DISTINCT, so they are not merged.** [#1298](#1298) is the archive dialog's discard warning misreporting landed files as unrecoverable. Same family -- a false alarm about loss -- and its severity note states this item's cost exactly: a routine prompt that is wrong in the common case teaches seats to dismiss the one class of prompt that must not become routine. It is a different instrument with a different mechanism, so a fix to either leaves the other intact.
+
+> **DIRECTION, not a prescription.** Do **not** suppress by dropping orphan objects from the report -- an object existing nowhere is precisely what this tool protects, and the squash case is indistinguishable from genuine loss without asking a second question. Prefer to **classify rather than filter**: report a commit whose tree is reachable on `origin/main`, or whose non-`main` parent is backed, as a separate, non-actionable class, leaving the actionable set to genuinely unpublished authored work. **Pair any change with a must-not-trip arm alongside the must-trip one**, per this ledger's standing rule: a genuinely unpushed authored commit must still alarm, and the seven above must not. Note the prior-art census for this item was taken with a positive control -- the same predicate returns 223 hits for an unrelated common term -- so the zero existing items on this tool is a measured absence, not a blind scan.
+
+**Cluster:** Session tooling / instrument scope. **Priority:** P3. **Verdict:** build.
+**Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- developer coordination tooling only. The cost is the credibility of the one instrument that measures single-copy work: at a 7-of-7 false-alarm rate a seat learns to skim it, and the run that finally carries a real unbacked commit reads identically to the six before it.
