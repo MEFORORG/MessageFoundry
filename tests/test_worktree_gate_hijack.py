@@ -465,20 +465,21 @@ def test_a_worktree_of_an_UNGOVERNED_repo_is_untouched(tmp_path: Path) -> None:
 #
 # BACKLOG #1229 residual, fourth round. Rule 3 records the FIRST verb-bearing segment it sees and
 # revises that record only when a later segment resolves a GOVERNED target. Inside a linked worktree no
-# segment ever does, so whatever line one carries is what rule 3b is handed -- and while
-# Remove-QuotedSpans kept the git token of EVERY quoted span whose leaf was `git`, an ordinary
-# `cp -r "/c/backups/Git" switch` looked exactly like a git command carrying a gated verb.
+# segment ever does, so whatever line one carries is what rule 3b is handed -- so any line that LOOKS
+# like a git command carrying a gated verb eats the hijack behind it.
 #
-# The effect is the opposite of the false denies that motivated the position predicate, which is why it
-# is pinned in this file and not beside them: the shadowing line ATE the hijack, and a real
-# `git switch <free branch>` in somebody else's worktree came back ALLOW.
+# WHAT THIS GUARDS IS THE CASE-SENSITIVITY OF THE EMIT IN Remove-QuotedSpans, and that is why it lives
+# here rather than beside the false-deny rows in tests/test_worktree_gate_escaped_quote.py. A
+# case-INSENSITIVE emit -- tried, and reverted on 2026-08-21 -- gave `cp -r "/c/backups/Git" switch` a
+# git token, and a real `git switch <free branch>` in somebody else's worktree then came back ALLOW.
+# So the case rule is not only a false-deny question: relaxing it opens a fail-OPEN on rule 3b.
 
 
 @pytest.mark.parametrize(
     "leaf",
     [
-        "Git",  # the case-folded spelling the unconditional emit added
-        "Git.exe",  # and the `.exe` spelling, which a predicate that short-circuits on it still leaks
+        "Git",  # the Title-cased spelling a case-insensitive emit would have kept
+        "Git.exe",  # and the `.exe` spelling, which a fix that special-cased `.exe` would still leak
     ],
 )
 @pytest.mark.parametrize(
@@ -491,12 +492,12 @@ def test_a_worktree_of_an_UNGOVERNED_repo_is_untouched(tmp_path: Path) -> None:
 def test_a_quoted_git_path_on_an_earlier_line_does_not_shadow_a_hijack(
     repo: SimpleNamespace, leaf: str, shadow_verb: str
 ) -> None:
-    """MEASURED main=DENY, unconditional-emit=ALLOW, this build=DENY, over the real hook.
+    """MEASURED main=DENY, case-insensitive-emit=ALLOW, this build=DENY, over the real hook.
 
-    The two parametrised axes are not thoroughness. ``leaf`` separates a position predicate that governs
-    every spelling from one that short-circuits on ``.exe`` -- the latter closes the first row and
-    leaves the second ALLOWing, which is exactly the shape a reader would call fixed. ``shadow_verb``
-    proves the capture is of the RECORD and not of a matching verb pair.
+    The two parametrised axes are not thoroughness. ``leaf`` separates a fix that governs every
+    spelling from one that special-cases ``.exe`` -- the latter closes the first row and leaves the
+    second ALLOWing, which is exactly the shape a reader would call fixed. ``shadow_verb`` proves the
+    capture is of the RECORD and not of a matching verb pair.
     """
     command = f'cp -r "/c/backups/{leaf}" {shadow_verb}\ngit switch {repo.other}'
     reason = assert_denied(run_gate(shell(command, cwd=repo.wt), repo.repos))
@@ -515,7 +516,7 @@ def test_the_shadow_probe_is_discriminating(repo: SimpleNamespace) -> None:
     # ONE: the hijack alone denies, so the ALLOW the shadow produced came from the ADDED line.
     assert_denied(run_gate(shell(f"git switch {repo.other}", cwd=repo.wt), repo.repos))
     # TWO: a leaf that does not end in a git token never emitted one, so it never shadowed -- and this
-    # row denies under the unconditional emit too. It separates "the emit" from "an extra line".
+    # row denies under a case-INSENSITIVE emit too. It separates "the emit" from "an extra line".
     assert_denied(
         run_gate(
             shell(f'cp -r "/c/backups/GitHub" switch\ngit switch {repo.other}', cwd=repo.wt),
@@ -539,8 +540,8 @@ def test_a_SAME_LINE_semicolon_compound_still_shadows_and_is_NOT_fixed_here(
         cp -r "/c/backups/Git" switch ; git switch <free branch>     ALLOW
         git -C <ungoverned> clean -fd  NEWLINE  git switch <branch>  ALLOW  (no quoting at all)
 
-    Both ALLOW on origin/main as well, so neither is introduced by the position predicate and neither
-    is closed by it. This row exists because a shadow test written on ONE LINE would pass vacuously --
+    Both ALLOW on origin/main as well, so neither is introduced by anything in the emit and neither is
+    closed by it. This row exists because a shadow test written on ONE LINE would pass vacuously --
     it would be measuring the segment splitter, not the emit -- and the next person to write one needs
     to see that stated rather than rediscover it.
 
