@@ -12,7 +12,9 @@ check produce three DIFFERENT verdicts here.
 The three planted worlds mirror the three ways this can go, and they are deliberately not variations
 of one:
 
-* the rows ARE all there while a shortfall is reported  -> SAMPLING_LAG      (harness/instrument)
+* the rows ARE all there, a shortfall is reported, and
+  part of it survives setting the never-confirmed
+  sends aside                                          -> SAMPLING_LAG      (harness/instrument)
 * an ACCEPT-ACKed row is genuinely absent               -> INVARIANT_SUSPECT (the engine branch)
 * the probe's own read comes back empty                 -> PROBE_UNUSABLE    (the null guard)
 
@@ -37,6 +39,7 @@ from harness.load.connscale.intake_audit import (
     VERDICT_NOT_RUN,
     VERDICT_PROBE_UNUSABLE,
     VERDICT_SAMPLING_LAG,
+    VERDICT_UNCONFIRMED_SHORTFALL,
     IntakeAudit,
     IntakeLedger,
     StoreSnapshot,
@@ -199,6 +202,189 @@ def test_absent_rejected_message_is_correlation_suspect_not_loss() -> None:
     assert audit.missing_codes == ("AE",)
 
 
+def test_a_rejected_send_that_IS_stored_is_not_a_correlation_finding() -> None:
+    """The negative control for the branch above, and it is the one that pins the MEMBERSHIP test.
+
+    The NULL-control-id NAK limbs are only SOME of them: a limb that rejects AFTER parsing MSH-10
+    writes a row that DOES carry the id, and the sweep finds it. Without this, dropping the
+    ``cid not in store_ids`` half of the predicate -- leaving a bare ``not rec.accepted`` -- kept the
+    whole suite green while turning every ordinary NAK into a standing CORRELATION_SUSPECT that
+    ``report.py`` prints on each clean step, and which the smoke assertion cannot catch because that
+    verdict is conclusive and not engine_suspect. This is the false-alarm direction.
+    """
+    led = _ledger(accepted=3, rejected=1)
+    audit = judge(
+        led, StoreSnapshot(_all_ids(led), total=4), moment=MOMENT_POST_MORTEM, sent=4, read_short=0
+    )
+
+    assert audit.verdict == VERDICT_INTAKE_COMPLETE
+    assert audit.missing_rejected_total == 0 and audit.missing_accepted_total == 0
+
+
+# --- the LEDGER-side positive control, and the shortfall it must not misattribute ----------------
+
+
+def test_a_ledger_with_nothing_confirmed_is_unusable_not_clean() -> None:
+    """THE BLIND-BUT-GREEN CASE, and the one the store-side control could not see.
+
+    ``confirmed`` is the only set compared; ``unconfirmed`` is read as a count and never searched.
+    So a step where no send was ever ACKed compares an EMPTY set, and every guard keyed on
+    ``ledger.total`` -- which counts both -- waves it through. It is reachable on the harness's own
+    headline fault: the runner's excusal clamps ``excused`` to 0 once the unconfirmed count exceeds
+    its budget, so such a step arrives here with a large ``read_short``.
+
+    Before the ledger-side control this returned a CONCLUSIVE verdict stating the shortfall was
+    "not in intake" -- computed over zero elements, rendering a green SLO row, and passing all four
+    smoke assertions -- on precisely the step the reconcile calls a possible accepted-and-dropped.
+    """
+    led = _ledger(accepted=0, unconfirmed=5)
+    snap = StoreSnapshot(frozenset({"OTHER0", "OTHER1", "OTHER2"}), total=3)
+
+    audit = judge(led, snap, moment=MOMENT_POST_MORTEM, sent=5, read_short=2)
+
+    assert audit.verdict == VERDICT_PROBE_UNUSABLE
+    assert "NO send was ever confirmed" in audit.detail
+    # The properties that actually protect the run: an empty comparison must not be readable as an
+    # answer, and must never clear the engine.
+    assert not audit.conclusive
+    assert not audit.engine_suspect
+
+
+def test_a_shortfall_inside_the_unconfirmed_set_does_not_accuse_the_gauge() -> None:
+    """A shortfall made ENTIRELY of never-confirmed sends implicates neither intake nor the gauge.
+
+    ``_excusal`` clamps ``excused`` to 0 when the unconfirmed count exceeds its budget, so
+    ``read_short`` then carries sends the engine may never have received. Calling that SAMPLING_LAG
+    accused an ``engine_read`` gauge that matched the store exactly, and the sentence was appended
+    verbatim to the reconcile's own "systemic no-ACK fault" line -- one failure message contradicting
+    itself and pointing at an enginepoll bug that does not exist.
+    """
+    led = _ledger(accepted=2, unconfirmed=8)
+    stored = frozenset(led.confirmed)
+    # The OVER-BUDGET world: excusal clamped to 0, so read_short = sent - read = 8, and once the 8
+    # never-confirmed sends are set aside nothing is unexplained (10 - 8 - 2 = 0).
+    audit = judge(
+        led,
+        StoreSnapshot(stored, total=2),
+        moment=MOMENT_POST_MORTEM,
+        sent=10,
+        read_short=8,
+        unexplained_short=0,
+    )
+
+    assert audit.verdict == VERDICT_UNCONFIRMED_SHORTFALL
+    assert audit.conclusive and not audit.engine_suspect
+    # The regression guard keys on the ACCUSATION, not on the words "engine_read gauge" -- this
+    # detail names the gauge inside a NEGATION ("implicates NEITHER intake NOR the engine_read
+    # gauge"), so a bare substring test would answer a different question than the one asked.
+    # "sample attribution" is the diagnosis unique to SAMPLING_LAG, and is what must be absent.
+    assert "sample attribution" not in audit.detail
+    assert "never-confirmed" in audit.detail
+
+
+def test_a_shortfall_larger_than_the_unconfirmed_set_still_names_the_gauge() -> None:
+    """The complement, so the split above cannot be satisfied by never returning SAMPLING_LAG.
+
+    One more missing than the never-confirmed sends can account for, with every confirmed send
+    present, leaves a remainder nothing else explains -- and THAT is a real gauge finding.
+    """
+    led = _ledger(accepted=2, unconfirmed=8)
+    audit = judge(
+        led,
+        StoreSnapshot(frozenset(led.confirmed), total=2),
+        moment=MOMENT_POST_MORTEM,
+        sent=10,
+        read_short=9,
+        unexplained_short=1,
+    )
+
+    assert audit.verdict == VERDICT_SAMPLING_LAG
+    assert "sample attribution" in audit.detail
+
+
+def test_an_IN_BUDGET_shortfall_is_a_gauge_finding_even_though_sends_went_unconfirmed() -> None:
+    """THE REGRESSION THAT AN INFERRED PREDICATE GETS BACKWARDS, and it is the COMMON path.
+
+    A first cut at the split above asked ``read_short <= len(ledger.unconfirmed)`` and read a True as
+    "the excusal was clamped". That inference only holds OVER budget. In budget ``excused ==
+    unconfirmed``, so the never-confirmed sends are ALREADY subtracted out of ``read_short`` and any
+    residue is confirmed sends the gauge did not count -- a genuine SAMPLING_LAG. Because
+    over-budget needs ``timeouts > 3/4 sent``, the in-budget world here is the ordinary one, so the
+    inferred predicate silenced a real gauge finding on the path most runs take.
+
+    Numbers are the real arithmetic: sent=100, timeouts=5, engine_read=93. ``_excusal`` is in budget
+    (5 <= max(24, 75)) so ``excused``=5 and ``read_short`` = 100-5-93 = 2, while the unconfirmed
+    count is 5 -- and 2 <= 5, which is exactly the shape the bad predicate accepted. The producer's
+    ``unexplained`` = 100-5-93 = 2 is positive, so the gauge is correctly named.
+    """
+    led = _ledger(accepted=95, unconfirmed=5)
+    audit = judge(
+        led,
+        StoreSnapshot(frozenset(led.confirmed), total=95),
+        moment=MOMENT_POST_MORTEM,
+        sent=100,
+        read_short=2,
+        unexplained_short=2,
+    )
+
+    assert audit.verdict == VERDICT_SAMPLING_LAG
+    assert "sample attribution" in audit.detail
+
+
+def test_the_unexplained_remainder_comes_from_the_producer_not_the_ledger() -> None:
+    """The two worlds are INDISTINGUISHABLE from inside judge(), which is why it must not guess.
+
+    Identical ledger, identical store, identical ``read_short`` -- only the producer's
+    ``unexplained_short`` differs, and the verdict flips. That is the whole argument for passing it:
+    no function of the ledger alone could separate these two.
+    """
+
+    def _verdict(unexplained: int) -> str:
+        led = _ledger(accepted=2, unconfirmed=8)
+        return judge(
+            led,
+            StoreSnapshot(frozenset(led.confirmed), total=2),
+            moment=MOMENT_POST_MORTEM,
+            sent=10,
+            read_short=8,
+            unexplained_short=unexplained,
+        ).verdict
+
+    assert _verdict(0) == VERDICT_UNCONFIRMED_SHORTFALL
+    assert _verdict(3) == VERDICT_SAMPLING_LAG
+
+
+def test_only_the_post_mortem_moment_states_the_engine_conclusion() -> None:
+    """The same absent row concludes DIFFERENT things at the two moments, and the text must say so.
+
+    ``sweep_store`` pages ``ORDER BY received_at DESC`` + OFFSET, so a row committed while a LIVE
+    sweep walks shifts the window and a genuinely present row can go unread -- documented as known
+    and deliberate, and it manufactures exactly this verdict. The machine gates already read only the
+    post-mortem, but the live detail is printed to the console and stored in the JSON artifact, where
+    an unhedged "the count-and-log invariant would not hold" is quotable as an engine finding that
+    the post-mortem beside it may not support.
+    """
+    led = _ledger(accepted=3)
+    snap = StoreSnapshot(frozenset(list(led.confirmed)[1:]), total=2)
+
+    live = judge(led, snap, moment=MOMENT_LIVE, sent=3, read_short=1)
+    post = judge(led, snap, moment=MOMENT_POST_MORTEM, sent=3, read_short=1)
+
+    # Both SEE it -- the hedge must not suppress the finding, only its conclusion.
+    assert live.verdict == post.verdict == VERDICT_INVARIANT_SUSPECT
+    assert live.missing_accepted_total == post.missing_accepted_total == 1
+
+    assert "count-and-log invariant would not hold" in post.detail
+    assert "STOPPED" in post.detail
+    assert "count-and-log invariant would not hold" not in live.detail
+    assert "post-mortem reproduces it" in live.detail
+
+    # The MACHINE surface must agree with the prose by construction, not because the SLO gate
+    # happens to read the post-mortem field. A live sweep can manufacture this verdict; only the
+    # post-mortem may carry it into `engine_suspect`, which is what fails the run.
+    assert post.engine_suspect and not live.engine_suspect
+
+
 # --- the positive controls ------------------------------------------------------------------------
 
 
@@ -261,12 +447,16 @@ def test_ledger_overflow_and_duplicates_are_unusable() -> None:
     for i in range(4):
         small.record_confirmed(f"C{i}", i, "AA", accepted=True)
     assert small.overflow == 2
-    assert (
-        judge(
-            small, StoreSnapshot(frozenset(), 0), moment=MOMENT_LIVE, sent=4, read_short=0
-        ).verdict
-        == VERDICT_PROBE_UNUSABLE
-    )
+    # The snapshot trips NO OTHER GUARD -- rows present, nothing truncated, no error, and every id
+    # the ledger did manage to record IS in the store -- and the DETAIL is asserted, not just the
+    # verdict. Both matter: with the overflow guard deleted this world still reaches
+    # PROBE_UNUSABLE via the partial-ledger guard ("accounted 2 of 4"), so a verdict-only assertion
+    # passed with the guard under test entirely removed. Overflow is step 1 of the blindness
+    # ordering, and a step whose test cannot fail is not covering it.
+    snap = StoreSnapshot(frozenset(small.confirmed), total=len(small.confirmed))
+    overflowed = judge(small, snap, moment=MOMENT_LIVE, sent=4, read_short=0)
+    assert overflowed.verdict == VERDICT_PROBE_UNUSABLE
+    assert "overflowed" in overflowed.detail
 
     dup = IntakeLedger()
     dup.record_confirmed("SAME", 0, "AA", accepted=True)

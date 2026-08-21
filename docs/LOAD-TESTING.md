@@ -306,17 +306,28 @@ headroom denominator (in + out events, not messages). Exit codes match `--load`.
   own store, per message, whether that row is there. Its verdict is on the console, in the JSON
   artifact under `records[].intake_audit`, and appended to a failing `no_loss` detail:
   - `INTAKE_COMPLETE` — every confirmed send has a row.
-  - `SAMPLING_LAG` — a shortfall was reported and every confirmed send has a row anyway, so the
-    shortfall is in the gauge (sample attribution or per-inbound sum coverage). A harness defect.
+  - `SAMPLING_LAG` — a shortfall was reported, every confirmed send has a row anyway, **and the
+    shortfall is larger than the never-confirmed sends can account for**, so the unexplained
+    remainder is in the gauge (sample attribution or per-inbound sum coverage). A harness defect.
+  - `UNCONFIRMED_SHORTFALL` — the shortfall is no larger than the set of sends the harness never got
+    a response frame for, so it implicates **neither** intake **nor** the gauge. Split out from
+    `SAMPLING_LAG` because the excusal clamps its allowance to zero once the unconfirmed count
+    exceeds its budget, and the shortfall then consists of sends the engine may never have received;
+    blaming the gauge for those accused an instrument that was exactly right, and contradicted the
+    `no_loss` line this verdict is appended to, which already calls that step a systemic no-ACK fault.
   - `INVARIANT_SUSPECT` — a send the engine accept-ACKed has no row in its own stopped, committed
     store. The engine branch: on a deployment an acknowledged message would be lost at intake. The
     verdict names the sequence numbers, so it is reproducible rather than statistical.
   - `CORRELATION_SUSPECT` — only *rejected* sends are unmatched. Not an engine finding: several NAK
     paths record their row with a NULL control id, so a rejected message is expected to be
     unmatchable by control id.
-  - `PROBE_UNUSABLE` — the audit could not answer (its own read came back empty, was truncated, or
-    the send ledger was incomplete). Deliberately **not** rendered as "everything is missing", and
-    deliberately **not** a pass either.
+  - `PROBE_UNUSABLE` — the audit could not answer. At least: its own read came back empty or
+    truncated, the send ledger was incomplete, or **nothing was ever confirmed**, which leaves the
+    compared set empty. That last one is the ledger-side positive control and it is not redundant
+    with the store-side one — a ledger holding only unconfirmed sends is non-empty by total and
+    still compares nothing, so without it the audit returned a conclusive "not in intake" computed
+    over zero elements. Deliberately **not** rendered as "everything is missing", and deliberately
+    **not** a pass either.
 
   It runs at two moments: LIVE (engine still up, only on a shortfall) and POST-MORTEM (engine
   stopped, always). The post-mortem one is authoritative — a live read can be explained away as

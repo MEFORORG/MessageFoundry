@@ -38,7 +38,12 @@ invariant.
 PHI. ``report.py`` states the rule for this artifact family: metrics and metadata only, never message
 bodies and never control-id lists. So the audit reports SEQUENCE NUMBERS (dense integers minted by
 the harness's own counter, meaningless outside the run) and the DISTINCT MSA-1 codes involved -- both
-sufficient to act on, neither a control-id list. Full control ids stay in the harness log line.
+sufficient to act on, neither a control-id list. **Control ids are not emitted ANYWHERE -- not to the
+artifact, not to the log.** Said explicitly because the earlier wording here promised they "stay in
+the harness log line", which was false in both directions: a reader who went looking for them found
+none, and a maintainer reconciling the prose against the code would have made it true by logging
+them, which is precisely what the rule above forbids. A run is reproduced from the seqs and the
+profile, never from an identifier list.
 """
 
 from __future__ import annotations
@@ -65,6 +70,13 @@ VERDICT_INTAKE_COMPLETE: Final = "INTAKE_COMPLETE"
 #: A shortfall was reported, yet every confirmed send HAS a row -> the ``engine_read`` gauge, not the
 #: engine, is short. A harness/instrument defect (sample attribution or sum coverage).
 VERDICT_SAMPLING_LAG: Final = "SAMPLING_LAG"
+#: A shortfall was reported and it is wholly accounted for by sends that were NEVER CONFIRMED, so it
+#: implicates neither intake nor the gauge. Split out from :data:`VERDICT_SAMPLING_LAG` because the
+#: runner's excusal clamps ``excused`` to 0 once the unconfirmed count exceeds its budget, and the
+#: shortfall handed here then consists of sends the engine may never have seen. Blaming the gauge for
+#: those named an instrument that was exactly right, and CONTRADICTED the reconcile text this verdict
+#: is appended to -- which already calls that step a systemic no-ACK fault.
+VERDICT_UNCONFIRMED_SHORTFALL: Final = "UNCONFIRMED_SHORTFALL"
 #: A send the engine ACCEPT-ACKed has no ``messages`` row -> the count-and-log invariant would be
 #: broken. The engine branch, and the only one that justifies the P1.
 VERDICT_INVARIANT_SUSPECT: Final = "INVARIANT_SUSPECT"
@@ -203,14 +215,23 @@ class IntakeAudit:
         return self.verdict in (
             VERDICT_INTAKE_COMPLETE,
             VERDICT_SAMPLING_LAG,
+            VERDICT_UNCONFIRMED_SHORTFALL,
             VERDICT_INVARIANT_SUSPECT,
             VERDICT_CORRELATION_SUSPECT,
         )
 
     @property
     def engine_suspect(self) -> bool:
-        """Is this the branch that implicates the ENGINE (vs the harness or the probe)?"""
-        return self.verdict == VERDICT_INVARIANT_SUSPECT
+        """Is this the branch that implicates the ENGINE (vs the harness or the probe)?
+
+        THE MOMENT IS PART OF THE CLAIM, not a caveat on it. A LIVE sweep pages over a store still
+        being written and can miss a row that is present, so a live INVARIANT_SUSPECT is not by
+        itself an engine finding -- ``_conclusion`` already says so in the prose. Requiring the
+        post-mortem here makes the machine surface agree with that text BY CONSTRUCTION rather than
+        by the SLO gate happening to read the post-mortem field, which is an invariant maintained by
+        a distant call site and would break silently if another reader picked the live one.
+        """
+        return self.verdict == VERDICT_INVARIANT_SUSPECT and self.moment == MOMENT_POST_MORTEM
 
     def summary(self) -> str:
         """One line a CI reader can act on without re-running anything."""
@@ -261,6 +282,27 @@ def not_run(reason: str, *, moment: str = MOMENT_POST_MORTEM) -> IntakeAudit:
     )
 
 
+def _conclusion(moment: str) -> str:
+    """What an accept-ACKed-but-absent row is ALLOWED to conclude, which depends on the moment.
+
+    Only the post-mortem may state the engine finding. ``sweep_store`` pages with ``ORDER BY
+    received_at DESC`` + OFFSET, so a row committed while a LIVE sweep is walking shifts the window
+    and a genuinely present row can go unread -- the module docstring records this as known and
+    deliberate, and it manufactures exactly this verdict. The live text therefore reports the same
+    observation without the conclusion, so a console line or a JSON artifact cannot be quoted as an
+    invariant violation the post-mortem beside it does not support.
+    """
+    if moment == MOMENT_POST_MORTEM:
+        return (
+            "the engine was STOPPED and its store committed when this was read, so on a deployment "
+            "the count-and-log invariant would not hold for those messages"
+        )
+    return (
+        "NOT an engine finding on its own: this LIVE read pages over a store still being written "
+        "and can miss a row that is present, so it stands only if the post-mortem reproduces it"
+    )
+
+
 def judge(
     ledger: IntakeLedger,
     snapshot: StoreSnapshot,
@@ -268,6 +310,7 @@ def judge(
     moment: str,
     sent: int,
     read_short: int,
+    unexplained_short: int | None = None,
 ) -> IntakeAudit:
     """Turn a ledger + one store read into a verdict. Pure -- the whole decision table, unit-testable.
 
@@ -276,22 +319,33 @@ def judge(
     blind is ruled out BEFORE a null is allowed to mean anything:
 
     1. the sender-side ledger is overflowed / non-unique / empty -> PROBE_UNUSABLE.
-    2. the store sweep failed or was truncated -> PROBE_UNUSABLE.
-    3. the store sweep read ZERO rows against a non-empty ledger -> PROBE_UNUSABLE. This is the
-       positive control, and it is checked HERE so a broken query renders as "unusable" and never as
-       "every message is missing" -- the worst possible false positive to hang a P1 on.
-    4. an ACCEPT-ACKed send with no row -> INVARIANT_SUSPECT. Checked BEFORE the partial-ledger guard
+    2. NOTHING was ever confirmed -> PROBE_UNUSABLE. The ledger-side positive control, and separate
+       from step 1 on purpose: the compared set is ``confirmed``, so a ledger holding only
+       unconfirmed sends is non-empty by ``total`` and still compares NOTHING.
+    3. the store sweep failed or was truncated -> PROBE_UNUSABLE.
+    4. the store sweep read ZERO rows against a non-empty ledger -> PROBE_UNUSABLE. The store-side
+       positive control, checked HERE so a broken query renders as "unusable" and never as "every
+       message is missing" -- the worst possible false positive to hang a P1 on.
+    5. an ACCEPT-ACKed send with no row -> INVARIANT_SUSPECT. Checked BEFORE the partial-ledger guard
        below: a short ledger under-reports, so a finding inside it is still a real finding.
-    5. only REJECT-ACKed sends unmatched -> CORRELATION_SUSPECT (see the module docstring).
-    6. the ledger did not account for every send -> PROBE_UNUSABLE, because a null over a partial
-       ledger proves nothing. This is step 4's mirror image, and why the two are split rather than
+    6. only REJECT-ACKed sends unmatched -> CORRELATION_SUSPECT (see the module docstring).
+    7. the ledger did not account for every send -> PROBE_UNUSABLE, because a null over a partial
+       ledger proves nothing. This is step 5's mirror image, and why the two are split rather than
        both being checked up front.
-    7. a shortfall with every confirmed send present -> SAMPLING_LAG: the gauge is short, not intake.
-    8. otherwise INTAKE_COMPLETE.
+    8. a shortfall with NOTHING left unexplained once the never-confirmed sends are set aside ->
+       UNCONFIRMED_SHORTFALL. ``unexplained_short`` is supplied by the PRODUCER, which alone knows
+       whether its excusal was clamped; this step must not infer it from the unconfirmed count,
+       because in-budget those sends are already subtracted out of ``read_short`` and the guess
+       silences a real gauge finding on the common path.
+    9. a shortfall with an unexplained remainder, every confirmed send present -> SAMPLING_LAG: that
+       remainder is in the gauge, not intake.
+    10. otherwise INTAKE_COMPLETE.
     """
     confirmed = ledger.confirmed
+    unconfirmed_count = len(ledger.unconfirmed)
     ledger_total = ledger.total
     store_ids = snapshot.control_ids
+    unexplained = read_short if unexplained_short is None else unexplained_short
 
     def _unusable(detail: str) -> IntakeAudit:
         return _build(
@@ -321,6 +375,22 @@ def judge(
         return _unusable(
             f"the send ledger recorded NOTHING against {sent} counted send(s) -- the sender-side "
             f"instrument did not run, so a clean set comparison here would be vacuous"
+        )
+    if not confirmed and sent > 0:
+        # THE POSITIVE CONTROL FOR THE LEDGER SIDE, and it must test `confirmed` rather than
+        # `ledger_total`: every finding branch below iterates `confirmed` and NOTHING reads
+        # `unconfirmed` except as a count, so a ledger holding only unconfirmed sends compares an
+        # EMPTY set and every verdict it could reach would be true of nothing. The guard above does
+        # not cover this -- it fires only when the ledger is empty outright. Reachable on the
+        # harness's own headline fault: when the runner's excusal goes over budget it clamps
+        # `excused` to 0, so a step where no send was ever ACKed arrives here with a large
+        # `read_short`, and without this it returned a CONCLUSIVE "not in intake" over zero
+        # elements -- clearing intake on exactly the step the reconcile calls a possible
+        # accepted-and-dropped.
+        return _unusable(
+            f"NO send was ever confirmed against {sent} counted send(s) ({len(ledger.unconfirmed)} "
+            f"unconfirmed) -- the compared set is empty, so no verdict here could distinguish a "
+            f"clean intake from a lost one"
         )
     if snapshot.error is not None:
         return _unusable(f"the store sweep failed: {snapshot.error}")
@@ -352,6 +422,25 @@ def judge(
     )
     late_unconfirmed = sum(1 for cid in ledger.unconfirmed if cid in store_ids)
 
+    def _matched(verdict: str, detail: str) -> IntakeAudit:
+        """The three MATCHED outcomes -- every confirmed send accounted for -- differ only in verdict
+        and prose. Collapsed for the same reason ``_unusable`` above is: three adjacent hand-rolled
+        blocks differing in one constant make a divergence in a copied argument read as normal, and
+        that divergence is not hypothetical here (``_unusable`` deliberately passes
+        ``late_unconfirmed=0`` while these pass the computed value)."""
+        return _build(
+            moment=moment,
+            verdict=verdict,
+            read_short=read_short,
+            sent=sent,
+            ledger=ledger,
+            snapshot=snapshot,
+            missing_accepted=(),
+            missing_rejected=(),
+            late_unconfirmed=late_unconfirmed,
+            detail=detail,
+        )
+
     if missing_accepted:
         partial = (
             ""
@@ -370,8 +459,7 @@ def judge(
             late_unconfirmed=late_unconfirmed,
             detail=(
                 f"{len(missing_accepted)} send(s) the engine ACCEPT-ACKed have no messages row in "
-                f"its own store ({snapshot.total} row(s) present){partial} -- on a deployment the "
-                f"count-and-log invariant would not hold for those messages"
+                f"its own store ({snapshot.total} row(s) present){partial} -- {_conclusion(moment)}"
             ),
         )
     if missing_rejected:
@@ -397,37 +485,37 @@ def judge(
             f"comparison over a partial ledger cannot exclude a loss among the "
             f"{sent - ledger_total} it never saw"
         )
-    if read_short > 0:
-        return _build(
-            moment=moment,
-            verdict=VERDICT_SAMPLING_LAG,
-            read_short=read_short,
-            sent=sent,
-            ledger=ledger,
-            snapshot=snapshot,
-            missing_accepted=(),
-            missing_rejected=(),
-            late_unconfirmed=late_unconfirmed,
-            detail=(
-                f"engine_read is short by {read_short} yet all {len(confirmed)} confirmed send(s) "
-                f"HAVE a messages row ({snapshot.total} row(s) present) -- the shortfall is in the "
-                f"engine_read gauge (sample attribution or per-inbound sum coverage), not in intake"
-            ),
+    # NAMING THE GAUGE IS A POSITIVE CLAIM, so it is made only for the part of the shortfall no
+    # excusal can forgive -- and that part is COMPUTED BY THE PRODUCER, never inferred here. The
+    # runner's excusal clamps `excused` to 0 over budget and then hands on a bare int, so
+    # `read_short` alone cannot say which world it describes: in-budget the unconfirmed sends are
+    # already subtracted out of it, over-budget they are still inside it. Guessing from the
+    # unconfirmed COUNT gets the common in-budget case backwards and silences a real gauge finding.
+    # `None` means the producer did not say; then every missing message is the gauge's to answer
+    # for, which is the pre-existing behaviour and errs toward a HARNESS finding rather than
+    # toward silence.
+    if read_short > 0 and unexplained <= 0:
+        return _matched(
+            VERDICT_UNCONFIRMED_SHORTFALL,
+            f"engine_read is short by {read_short}, and once the {unconfirmed_count} never-"
+            f"confirmed send(s) are set aside NOTHING is left unaccounted for -- so the shortfall "
+            f"implicates NEITHER intake NOR the engine_read gauge. All {len(confirmed)} confirmed "
+            f"send(s) have a messages row ({snapshot.total} row(s) present, {late_unconfirmed} "
+            f"unconfirmed send(s) arrived anyway)",
         )
-    return _build(
-        moment=moment,
-        verdict=VERDICT_INTAKE_COMPLETE,
-        read_short=read_short,
-        sent=sent,
-        ledger=ledger,
-        snapshot=snapshot,
-        missing_accepted=(),
-        missing_rejected=(),
-        late_unconfirmed=late_unconfirmed,
-        detail=(
-            f"all {len(confirmed)} confirmed send(s) have a messages row; {snapshot.total} row(s) "
-            f"present, {late_unconfirmed} excused send(s) arrived anyway"
-        ),
+    if read_short > 0:
+        return _matched(
+            VERDICT_SAMPLING_LAG,
+            f"engine_read is short by {read_short}, of which {unexplained} remain(s) unaccounted "
+            f"for after the {unconfirmed_count} never-confirmed send(s) are set aside, yet all "
+            f"{len(confirmed)} confirmed send(s) HAVE a messages row ({snapshot.total} row(s) "
+            f"present) -- that remainder is in the engine_read gauge (sample attribution or "
+            f"per-inbound sum coverage), not in intake",
+        )
+    return _matched(
+        VERDICT_INTAKE_COMPLETE,
+        f"all {len(confirmed)} confirmed send(s) have a messages row; {snapshot.total} row(s) "
+        f"present, {late_unconfirmed} excused send(s) arrived anyway",
     )
 
 
@@ -472,6 +560,7 @@ async def run_intake_audit(
     moment: str,
     sent: int,
     read_short: int,
+    unexplained_short: int | None = None,
 ) -> IntakeAudit:
     """Read the store once through ``reader`` and judge.
 
@@ -482,7 +571,14 @@ async def run_intake_audit(
         snapshot = await reader()
     except Exception as exc:  # noqa: BLE001 - any reader failure is a probe outcome, not a run failure
         snapshot = StoreSnapshot(frozenset(), 0, error=f"{type(exc).__name__}: {exc}")
-    audit = judge(ledger, snapshot, moment=moment, sent=sent, read_short=read_short)
+    audit = judge(
+        ledger,
+        snapshot,
+        moment=moment,
+        sent=sent,
+        read_short=read_short,
+        unexplained_short=unexplained_short,
+    )
     if audit.verdict != VERDICT_INTAKE_COMPLETE:
         log.warning("%s", audit.summary())
     return audit
