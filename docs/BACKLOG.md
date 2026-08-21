@@ -8820,7 +8820,7 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 ## 1241. operator-config values reach URL and header sinks with no construction-time screen
 
-> 🔢 **Filed 2026-08-13. PARTIALLY FIXED on PR #379 and DELIBERATELY STILL OPEN -- see the amendment below. DO NOT CLOSE THIS ON #379.** Value **5/10** · Difficulty **3/10**. Several operator-configured values are interpolated into URL paths, query strings and an HTTP header with weaker treatment than the message-derived values beside them -- in one case with no screen at all. Found during #1107 (ASVS 1.2.2). **The subject is the asymmetry**, so fixing one site without the others misses the point.
+> ✅ **Filed 2026-08-13. CLOSED 2026-08-21 (dispatcher) -- all five limbs landed; see the closing amendment at the end of this item. The original "DO NOT CLOSE THIS ON #379" stood and was honoured: #379 was never the closure, and four further limbs landed after it.** Value **5/10** · Difficulty **3/10**. Several operator-configured values are interpolated into URL paths, query strings and an HTTP header with weaker treatment than the message-derived values beside them -- in one case with no screen at all. Found during #1107 (ASVS 1.2.2). **The subject is the asymmetry**, so fixing one site without the others misses the point.
 >
 > ⚠️ **AMENDED 2026-08-13 (dispatcher) -- PARTIAL PROGRESS RECORDED, ITEM STAYS OPEN.** Banner authored by the dispatcher rather than the builder, per the owner's 2026-08-13 ruling that a builder may resolve conflicts but may not author ledger content. **The builder flagged the partiality in its own commit body; this records it in the ledger so a reader of `main` cannot mistake #379 for a closure.**
 >
@@ -8886,6 +8886,16 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > **`fhir.py:231` INVERTS rather than drifts, and this item already contains its own refutation.** The prose below says `conditional_query` reaches the URL with "no screen and no encoding at all". The `WHAT #379 FIXED` paragraph above says #379 added construction-time screening of exactly that value, and `:261-263` confirms it shipped. Both sentences are in this one item, and the stale one sits in the section a builder reads last.
 >
 > **The `tests/test_fhir_transport.py` anchor has now drifted twice.** This item already corrected `:220` to `:221`; it is `:222` today. **Do not correct it a third time -- pin it by content.** Three sequential off-by-ones on one assertion is the measurement that a line number is the wrong instrument for this reference, not a run of bad luck.
+
+> ✅ **CLOSED 2026-08-21 (dispatcher) -- taking the completeness judgement the lander deliberately left, because I am the seat that can.**
+>
+> The 2026-08-14 lander amendment declined closure on explicitly seat-shaped grounds: all five limbs appeared complete and two seats had independently verified four of them, so closing was *defensible*, but it remained "a judgement about COMPLETENESS, and the seat that supplied a paired commit to unblock a gate is the wrong one to make it." **That reasoning was right, and it names a conflict I do not have.** Banner repair on a landed item is dispatcher maintenance.
+>
+> **VERIFIED MYSELF at `origin/main` `eea87845`, by content and not by any reachability predicate.** One screen is DEFINED at `fhir.py:188` and applied at THREE construction sites: `:233` (destination `url`), `:263` (`conditional_query`), `:797` (lookup `url`, its comment naming this item).
+>
+> **BOTH SINKS CHECKED SEPARATELY rather than the second inferred from the first**, because this item's whole subject is the ASYMMETRY and checking site one is exactly how a partial reads as complete. The URL sink at `:464` and the `If-None-Exist` HEADER sink at `:469` both read the screened attribute `self.conditional_query`, so the single construction-time screen covers both. The fifth limb -- `dicomweb.py`'s `study_uid` grammar gate -- landed per the lander's amendment with a negative control of 12 of 12 grammar cases failing against reverted source while 7 positive controls still passed.
+>
+> **WHAT DOES NOT CLOSE WITH IT, stated so it is not lost:** the citation damage this item documents in its own prose survives the code being fixed. At least seven anchors no longer point at what they claim, and `fhir.py:428` is the one that matters because it resolves to a real, plausibly adjacent line -- an outbound header build in this same file -- so it reads as a working citation forever rather than announcing its own brokenness. **That is #1263's subject, not this item's**, and it is filed there. Closing here does not bury it.
 
 **Cluster:** Security / input validation. **Priority:** P2. **Verdict:** build.
 **Severity:** Conditional and lower than the message-derived sites, because these values come from operator config rather than from an inbound message -- an operator can already choose the endpoint. It is filed because the treatment is *inconsistent within the same file*, which is how the weaker one survives review.
@@ -10162,7 +10172,7 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 ## 1271. invalid escape sequences in test_remotefile_transport.py become a SyntaxError and take the whole module at collection
 
-> 🔢 **Filed 2026-08-14 - not started. THE BLAST RADIUS IS THE MODULE, NOT THE LINE.** Python has announced that invalid escape sequences become a **`SyntaxError`**; this project targets **3.14+** and will meet that upgrade. A `SyntaxError` fails at **COLLECTION**, so the whole of `tests/test_remotefile_transport.py` disappears in one step rather than one test failing. **A test file that vanishes at collection does not report as a failure -- it reports as fewer tests**, which is the quietest possible way to lose coverage.
+> ✅ **Filed 2026-08-14. CLOSED 2026-08-21 (dispatcher) -- fixed on main by content, verified with the item's own instrument.** THE BLAST RADIUS IS THE MODULE, NOT THE LINE.** Python has announced that invalid escape sequences become a **`SyntaxError`**; this project targets **3.14+** and will meet that upgrade. A `SyntaxError` fails at **COLLECTION**, so the whole of `tests/test_remotefile_transport.py` disappears in one step rather than one test failing. **A test file that vanishes at collection does not report as a failure -- it reports as fewer tests**, which is the quietest possible way to lose coverage.
 
 > **THREE SITES, ONE FILE, reproduced here by compiling the module with `SyntaxWarning` captured:**
 >
@@ -10181,6 +10191,12 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > **THE VARIANT THIS EXPOSED IS WORTH MORE THAN THE DEFECT, AND IT IS NOT AN INSTRUMENT FAULT.** The compiler is **right about LOCATION and silent about MAGNITUDE** -- one warning per line, by design -- and it **stays honest on re-run**: fix one escape on 1174 and it warns again. **The lossy step was the SUMMARY.** *"3 sites, 1 file"* was passed between seats and **"sites" silently became "defects" in transit**, because the two words coincide whenever a line carries exactly one escape -- which is true of two of the three lines here. **The exposed party is a patch author who acts on a relayed count and does not re-run the compiler.** Every other instrument failure recorded around this item was a tool answering an adjacent question; **here the tool answered exactly the right question and the sentence carrying its answer lost the distinction.** *A count relayed without its unit is a different claim from the one measured.*
 
 > **THE METHOD IS THE TRANSFERABLE PART, and a grep is the wrong instrument here by a factor of a hundred.** These were found by **compiling all 1,046 `.py` files with `SyntaxWarning` captured**, not by searching for backslashes. **A grep for the pattern returns 325 files, because `|^~\&` is the HL7 encoding-characters field** -- so it counts the **domain** rather than the **defect**. In a repo whose subject matter is a format built out of escape-like punctuation, **the compiler is the only instrument that answers the question being asked.** Any sweep for this class must compile, not match.
+
+> ✅ **CLOSED 2026-08-21 (dispatcher). All three cited sites are fixed on `origin/main` `eea87845`, checked individually rather than site-one-and-inferred.**
+>
+> `tests/test_remotefile_transport.py:1174` is `r"..\..\etc\passwd.hl7"` -- a raw string, covering all three of the escape sequences the item names. `:1221` and `:1226` are both `rb"MSH|^~\&|A"` -- raw BYTE literals, which is the second of the item's two corrections and the one a reader checking only the first site would miss.
+>
+> **Confirmed with the item's OWN instrument rather than a substitute for it:** compiling all 1147 `.py` blobs on `origin/main` with warnings captured returns **0 SyntaxWarnings and 0 SyntaxErrors**. That is the measurement the item asks for, and it covers the whole corpus rather than the one module -- so it also answers whether the class recurred elsewhere while this sat open. It has not.
 
 **Cluster:** Test-suite durability / Python version readiness. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) -- test-only. The cost is deferred and sharp: on a future Python the module stops being collected, and the loss shows up as a **smaller test count** rather than as a failure, which is the shape least likely to be noticed.
