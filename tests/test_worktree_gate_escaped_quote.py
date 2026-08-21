@@ -502,8 +502,16 @@ def test_an_UNLISTED_wrapper_word_is_a_known_open_residual(primary: Path, repos_
     ``Test-GitProgramPosition``'s own docstring: a name listed in error costs only a fail-CLOSED deny,
     so the list may be generously long -- but a name MISSING from it is a fail-OPEN.
 
-    WHEN THIS TEST REDS, that is the success signal: somebody added the word, or replaced the
-    allowlist with something that does not need one. Delete the row; do not restore the ALLOW.
+    THE TWO ROWS ALLOW FOR DIFFERENT REASONS, and the second was nearly written up as the first.
+    ``myrunner`` is genuinely absent from the vocabulary. ``setarch`` is PRESENT -- what ends the chain
+    there is its OPERAND, ``x86_64``, which is a bare word and therefore not transparent. So the
+    allowlist has two ways to lose: a name it does not carry, and a listed name whose operand is
+    neither an option nor numeric. Adding a generic "a wrapper may be followed by one bare word" element
+    would close the second and cost ``watch ls "/c/backups/Git" clean``, which is a real shape; the row
+    is disclosed instead. Both are fail-open, both are narrow, and neither is claimed as closed.
+
+    WHEN THIS TEST REDS, that is the success signal: somebody added the word, or widened the chain, or
+    replaced the allowlist with something that needs neither. Delete the row; do not restore the ALLOW.
 
     ``ssh box "/usr/bin/git" ...`` is deliberately NOT in this list even though it allows for the same
     mechanical reason. ``ssh`` runs the program on the REMOTE host, so it cannot reach this machine's
