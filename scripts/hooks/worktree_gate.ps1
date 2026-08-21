@@ -339,100 +339,6 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     $out | Where-Object { $_ }
 }
 
-function Test-GitProgramPosition([string]$Left) {
-    <#
-    IS THE SPAN THAT ENDS HERE A PROGRAM, OR AN ARGUMENT? (BACKLOG #1229 residual, fourth round.)
-
-    Remove-QuotedSpans keeps the git token of a quoted span so a quoted PROGRAM path stays visible to
-    the rules. It used to keep it UNCONDITIONALLY, and position is the whole difference between the two
-    shapes that spelling covers:
-
-        "C:\Program Files\Git\bin\GIT.EXE" -C <governed> reset --hard   a program. MUST deny.
-        cp -r "/c/backups/Git" restore                                   a path. Must NOT deny.
-
-    The second is an ordinary directory whose leaf happens to be `Git` followed by an ordinary word that
-    happens to be a git verb, and at least 15 such shapes were measured DENY on the unconditional emit
-    and ALLOW on the gate before it. This function is the discriminator.
-
-    WHAT IS IN SCOPE AT THE CALL SITE, and why the check belongs there rather than in a rule: the scan
-    holds $openAt, so the text left of the opening quote is already computed WITH EVERY EARLIER SPAN
-    BLANKED. That blanked form is the correct input and the raw line is not -- a `;` that lived inside
-    an earlier quoted word must not then be read as a command separator.
-
-    THE RULE. The span is in program position iff, reading right to left from its opening quote, a
-    COMMAND BOUNDARY is reachable across tokens that are transparent to command dispatch. A bare word
-    that is not one of those is NOT transparent, and that single decision is what makes `cp`, `mv`,
-    `ls`, `echo`, `python`, `docker` and `Copy-Item` stop denying.
-
-    BOTH ENDS OF THE TRADE, because the owner ruled on it (2026-08-20) and a one-sided write-up would
-    read as a pure win:
-      GAINED -- every argument-position false deny above allows, including the lowercase spellings
-        `cp -r "/c/backups/git" restore` and `cp -r "./git" restore`. Those two DENIED on the gate
-        before the unconditional emit as well, so this is a DELIBERATE, RECORDED WEAKENING against that
-        gate and not merely a repair of a fresh regression. They were false denies of the same family;
-        keeping them would have meant keeping a wrong answer because it was old.
-      PAID -- a program invoked through a WRAPPER WORD THIS FUNCTION DOES NOT KNOW allows where the
-        unconditional emit denied: `myrunner "/usr/bin/git" -C <governed> reset --hard` (measured).
-        The mitigation is that the wrapper list may be generously long -- a name listed in error only
-        ever costs a fail-CLOSED deny -- but the list is an allowlist and a miss is a fail-OPEN.
-    #>
-    # A COMMAND BOUNDARY: the character after which the next word is dispatched as a program. `&` covers
-    # `&&`, POSIX backgrounding and PowerShell's call operator; `|` covers `||` and an ordinary pipeline;
-    # `(` covers a subshell and `$(`; `{` covers a brace group and a PowerShell script block; the
-    # backtick covers a backtick command substitution.
-    #
-    # CLOSING BRACKETS ARE DELIBERATELY ABSENT. Neither shell dispatches a command straight after `)` or
-    # `}` -- a separator has to intervene -- so admitting them buys no deny and costs the false deny
-    # `cp -r $(pwd) "/c/backups/Git" clean`. The two shapes that look like they need them do not:
-    # `X=$(ls) "...GIT.EXE"` is carried by the assignment element below, which runs to the first
-    # whitespace, and `( "...GIT.EXE" ... )` is carried by the OPENING paren.
-    $sep = '(?:^|[\r\n;|&({`])'
-    # TRANSPARENT TOKENS. Each must be followed by whitespace, which is why a GLUED assignment
-    # (`--src="/c/repos/Git"`) never enters the chain and that shape keeps allowing.
-    $elem = @(
-        # A pair this same left-to-right scan already blanked, so `sudo "-u" "root" "...GIT.EXE"` still
-        # reaches the boundary.
-        '(?:""|'''')'
-        # A POSIX assignment prefix: FOO=1, PATH=/x, X=$(ls).
-        '[A-Za-z_][A-Za-z0-9_]*=\S*'
-        # A WRAPPER: a program that runs the program named after it. Optionally path-qualified and
-        # optionally .exe-suffixed. Read as "AT LEAST these" (CLAUDE.md section 11) -- a missing name is
-        # the fail-open this function's docstring prices, so add to it freely.
-        ('(?:\S*[\\/])?(?:' + (@(
-            'sudo', 'doas', 'su', 'runuser', 'env', 'command', 'exec', 'builtin', 'eval',
-            'nohup', 'setsid', 'nice', 'ionice', 'chrt', 'taskset', 'stdbuf', 'unbuffer',
-            'timeout', 'time', 'xargs', 'watch', 'parallel', 'strace', 'ltrace', 'valgrind',
-            'chroot', 'proot', 'winpty', 'busybox', 'setarch', 'flock', 'script',
-            'Start-Process', 'saps', 'start'
-        ) -join '|') + ')(?:\.exe)?')
-        # An option of one of those wrappers TOGETHER WITH ITS OPERAND, and this pair must be tried
-        # BEFORE the bare option below or the chain is atomic over the shorter reading and cannot back
-        # up. MEASURED: without it `sudo -u root "<path>\GIT.EXE" -C <governed> reset --hard` ALLOWs,
-        # because `root` is a bare word and a bare word ends the chain. The operand may not itself start
-        # with a dash -- that is another option and the next element takes it.
-        '-{1,2}\S*[ \t]+[^-\s][^\s]*'
-        # An option of one of those wrappers: -u, --rm, -I{}.
-        '-{1,2}\S*'
-        # A numeric operand of one of those wrappers: `timeout 5`, `nice -n 10`.
-        '[0-9]\S*'
-        # A COMPLETED redirection. An INCOMPLETE one is deliberately not here: in `echo hi > "/c/Git"`
-        # the quoted word IS the redirect target, i.e. an argument, and `echo` blocks the chain anyway.
-        '[0-9]*(?:>>|>&|>|<&|<)[ \t]*\S+'
-        # A shell keyword, so `if "...GIT.EXE" ...` and `! "...GIT.EXE" ...` are still program position.
-        '(?:if|then|else|elif|do|while|until|!)'
-    ) -join '|'
-    # ATOMIC on purpose. Every element ends at whitespace and the chain must reach end-of-string, so a
-    # SHORTER chain can never succeed where the greedy one failed -- atomicity therefore costs no match
-    # and removes the exponential alternation backtracking a long transparent prefix would invite.
-    $chain = "(?>(?:(?:$elem)[ \t]+)*)"
-    if ($Left -match "(?i)$sep[ \t]*$chain[ \t]*$") { return $true }
-    # SECOND ENTRY POINT: `find . -type f -exec "<prog>" {} \;` really runs the word after -exec, and no
-    # chain can reach a boundary across `find .` because `find` is not a wrapper -- it dispatches only
-    # here, behind this flag.
-    if ($Left -match "(?i)(?:^|[\s;|&({])-{1,2}exec(?:dir)?[ \t]+$chain[ \t]*$") { return $true }
-    $false
-}
-
 # Decide from the COMMAND, never from prose inside it -- but "prose" and "code" are not the same as
 # "quoted" and "unquoted", and conflating them was a measured regression.
 #
@@ -521,38 +427,34 @@ function Remove-QuotedSpans([string]$s, [bool]$PosixEscapes = $false) {
             # stripping the verb and its arguments so no rule matched. Deciding it on a span this scan
             # already OWNS means it cannot pair across anything.
             #
-            # Case-insensitive on purpose, and EMITTED LOWERCASE, which is a separate decision from
-            # matching. `GIT.EXE` is a real spelling on Windows and `-match` accepts it -- but the rules
-            # downstream compare case-SENSITIVELY, so echoing the original case handed them a token they
-            # did not recognise. MEASURED with no escape involved, on the pre-fix hook:
-            #     "C:\Program Files\Git\bin\git.exe" -C <governed> reset --hard   -> DENY
-            #     "C:\Program Files\Git\bin\GIT.EXE" -C <governed> reset --hard   -> ALLOW
-            # A pre-existing gap, independent of the straddle, and invisible while the only spellings
-            # anyone tested were lowercase. Canonicalising here is the fail-CLOSED direction: it
-            # preserves a verb for the rules to judge instead of a token they will skip.
+            # CASE-SENSITIVE, AND THE CASE-INSENSITIVE VERSION IS A RETRACTION RATHER THAN AN
+            # OVERSIGHT (owner ruling 2026-08-21). This site briefly used `-match` plus
+            # `.ToLowerInvariant()`, on the reasoning that `GIT.EXE` is a real Windows spelling the
+            # case-SENSITIVE rules downstream would otherwise skip, so canonicalising was the
+            # fail-CLOSED direction. That reasoning is sound in isolation and was withdrawn on
+            # measurement, because this emit does not only ever see programs:
             #
-            # BUT ONLY IN PROGRAM POSITION, and that condition is the fourth round of this residual.
-            # Keeping the token unconditionally read `cp -r "/c/backups/Git" restore` as a git command:
-            # a backup directory whose leaf is `Git`, followed by an ordinary word that happens to be a
-            # git verb. At least 15 such shapes were measured DENY here and ALLOW on the gate before the
-            # emit landed. Test-GitProgramPosition is the discriminator and its docstring prices BOTH
-            # ENDS of the trade -- including the two lowercase shapes that now allow where the OLDER
-            # gate denied, which is a weakening the owner ruled for on 2026-08-20 and which is recorded
-            # rather than taken quietly.
+            #     "<...>\Git\bin\GIT.EXE" -C <governed> reset --hard    a PROGRAM. Should deny.
+            #     cp -r "/c/backups/Git" restore                        a PATH. Must not deny.
             #
-            # AND THE FALSE DENY WAS NOT THE WORST OF IT. An argument-position emit does not merely deny
-            # the line it sits on: it makes that line look like a git command carrying a gated verb, and
-            # rule 3 hands the FIRST such line it finds to Test-WorktreeHijack. Measured from inside a
-            # linked worktree, two lines, `cp -r "/c/backups/Git" switch` then `git switch free1`: the
-            # real hijack on line two goes ALLOW, because line one captured the verb. So the position
-            # test closes a fail-OPEN as well as a false deny, and that is why it governs the `.exe`
-            # spelling too rather than short-circuiting it -- the shadow works just as well through a
-            # file named `Git.exe`.
+            # A case-insensitive match cannot tell those apart -- both end in separator-then-`Git` --
+            # so canonicalising minted a `git` token for the second and the next ordinary word became
+            # its verb. MEASURED: 12 shapes DENY here and ALLOW on `origin/main` (`cp`, `mv`, `ls`,
+            # `rsync`, `find -exec`, `7z`, `echo`, `python --src`, `Copy-Item`, `Move-Item`), against
+            # ZERO fail-opens gained. Twelve daily false denies on the guard itself is what buys a
+            # gate disabled wholesale, which is the failure this file's own preamble names.
+            #
+            # WHAT THIS DELIBERATELY DOES NOT FIX, stated because a one-sided note reads as a clean
+            # win: the quoted `GIT.EXE`-as-PROGRAM spelling stays ALLOW. That is NOT a regression --
+            # `origin/main` allows it today, measured -- it is a pre-existing hole this change
+            # declines to close, because the only remedy tried costs the twelve above. Closing it
+            # needs a POSITION test (is this span a program or an argument). That was built, and
+            # measured to open `cmd /c "<git.exe>"` and PowerShell dot-source as NEW fail-opens that
+            # main denies, so it was reverted. Do NOT re-add the lowercase emit without that
+            # discriminator, and do not add the discriminator without re-measuring those two.
             $span = $s.Substring($openAt + 1, $i - $openAt - 1)
-            # Captured BEFORE the position test, whose own -match would otherwise clobber $Matches.
-            $tok = if ($span -match '[\\/](git(?:\.exe)?)$') { $Matches[1] } else { '' }
-            if ($tok -and (Test-GitProgramPosition $out.ToString())) {
-                [void]$out.Append($tok.ToLowerInvariant())
+            if ($span -cmatch '[\\/](git(?:\.exe)?)$') {
+                [void]$out.Append($Matches[1])
             }
             else {
                 # Emit the blanked pair only on a CLOSED span, matching what the regexes produced.

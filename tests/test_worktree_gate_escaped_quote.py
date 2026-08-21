@@ -154,15 +154,25 @@ def test_a_quoted_program_path_still_keeps_its_git_token(primary: Path, repos_fi
     assert_denied(run_gate(shell(command, primary.parent), repos_file))
 
 
-@pytest.mark.parametrize("spelling", ["git", "git.exe", "GIT.EXE", "Git"])
-def test_the_program_path_token_survives_every_spelling(
+@pytest.mark.parametrize("spelling", ["git", "git.exe"])
+def test_the_program_path_token_survives_the_backslash_separated_spelling(
     primary: Path, repos_file: Path, spelling: str
 ) -> None:
-    """Case-folded and backslash-separated spellings, which the naive form of this fix misses.
+    """The backslash-separated program path, which the naive form of this fix misses.
 
-    PowerShell `-replace` is case-insensitive by DEFAULT, so the old regexes accepted `GIT.EXE` by
-    accident rather than by decision. Keeping the token is the fail-CLOSED direction -- it preserves a
-    verb for the rules to judge -- so the case-insensitivity is now deliberate and pinned.
+    ``GIT.EXE`` AND ``Git`` WERE ROWS HERE AND ARE NOT ANY MORE, on a measurement rather than a
+    tidy-up. The emit is deliberately case-SENSITIVE (``-cmatch``), so those spellings blank wholesale
+    and ALLOW -- and that is NOT a regression, because ``origin/main`` ALLOWs them too. Main's collapse
+    regex is case-INSENSITIVE but substitutes ``$1``, preserving the original case, and every rule
+    downstream compares case-sensitively; main therefore mints a token nothing recognises and lands on
+    the same verdict by a different route. Measured on both blobs::
+
+        "<...>\\Git\\bin\\git.exe" -C <governed> reset --hard   main=DENY   this build=DENY
+        "<...>\\Git\\bin\\GIT.EXE" -C <governed> reset --hard   main=ALLOW  this build=ALLOW
+        "<...>\\Git\\bin\\Git"     -C <governed> reset --hard   main=ALLOW  this build=ALLOW
+
+    The uppercase hole is disclosed as a tripwire further down this file rather than dropped silently:
+    see ``test_the_UPPERCASE_quoted_PROGRAM_spelling_is_a_known_open_residual``.
     """
     command = f"{DQ}C:\\Program Files\\Git\\bin\\{spelling}{DQ} -C {primary} reset --hard"
     assert_denied(run_gate(shell(command, primary.parent), repos_file))
@@ -344,28 +354,51 @@ def test_an_escaped_quote_in_an_interpreter_ARGUMENT_still_reaches_the_inner_cod
     assert_denied(run_gate(shell(plain, d), rf))
 
 
-# --- BACKLOG #1229 residual, FOURTH ROUND: the token survives only in PROGRAM position -----------
+# --- BACKLOG #1229 residual, FOURTH ROUND: the emit is CASE-SENSITIVE, and the PROGRAM-POSITION
+# --- experiment that briefly stood here was REVERTED (owner ruling, 2026-08-21) -------------------
 #
-# Keeping the git token of a closed span is the false-NEGATIVE guard the three tests above pin. It was
-# UNCONDITIONAL, and position is the whole difference between the two shapes that spelling covers:
+# Keeping the git token of a closed span is the false-NEGATIVE guard the three tests above pin. Two
+# further changes were layered on top of it and BOTH ARE GONE. The tests that pinned them went with
+# them; this block records the dead end so the next reader does not walk back into it.
 #
-#     "C:\Program Files\Git\bin\GIT.EXE" -C <governed> reset --hard   a PROGRAM. Must deny.
-#     cp -r "/c/backups/Git" restore                                  a PATH. Must not deny.
+# WHAT WAS TRIED.
+#   (a) The emit was made case-INSENSITIVE and canonicalised to lowercase, so that `GIT.EXE` -- a real
+#       Windows spelling the case-SENSITIVE rules downstream otherwise skip -- would still present a
+#       verb for those rules to judge. Fail-closed in direction, and sound in isolation.
+#   (b) (a) then read `cp -r "/c/backups/Git" restore` as a git command, so a `Test-GitProgramPosition`
+#       predicate was added to keep the token only where the span is dispatched as a PROGRAM -- a
+#       command boundary reachable leftward across an allowlist of wrapper words.
 #
-# The second is a backup directory whose leaf happens to be `Git`, followed by an ordinary word that
-# happens to be a git verb. Measured across two gate blobs driven over the real hook: at least 15 such
-# shapes DENY under the unconditional emit and ALLOW under the blob before it.
+# WHY IT WAS REVERTED, and it is not the false denies. The predicate bought those back at the price of
+# two fail-OPENS on shapes `origin/main` DENIES:
 #
-# AND THE FALSE DENY WAS NOT THE WORST OF IT -- see
-# tests/test_worktree_gate_hijack.py::test_a_quoted_git_path_on_an_earlier_line_does_not_shadow_a_hijack,
-# where the same emit made rule 3b hand back an ALLOW on a real worktree hijack. A test file that saw
-# only the false denies would have scored this change as a pure relaxation of a security control. It is
-# not: it closes a fail-OPEN and a fail-CLOSED defect with the same predicate.
+#     cmd /c "<...>\Git\bin\git.exe" -C <governed> reset --hard      main=DENY   experiment=ALLOW
+#     . "<...>\Git\bin\git.exe" -C <governed> reset --hard           main=DENY   experiment=ALLOW
+#         (the second is a PowerShell dot-source, on a PowerShell tool call)
+#
+# Spending a security gate's DENY to buy a tidier false-deny profile is the wrong direction, so (a) and
+# (b) were both withdrawn. RE-MEASURED after the revert, on the same rig and the real hook: both rows
+# are DENY again, matching main.
+#
+# WHAT IS TRUE NOW. Every row below measured over the real hook against `origin/main` and against this
+# tree, and IDENTICAL on the two blobs -- so none of it is introduced here and none of it is repaired
+# here:
+#
+#     "<...>\Git\bin\git.exe" -C <governed> reset --hard          DENY   the guard the emit exists for
+#     "<...>\Git\bin\GIT.EXE" -C <governed> reset --hard          ALLOW  a residual, pinned below
+#     cp -r "/c/backups/Git" restore   (cwd = the governed repo)   ALLOW  the leaf case is what saves it
+#     cp -r "/c/backups/git" restore   (cwd = the governed repo)   DENY   a false deny, pinned below
+#
+# So the case-sensitivity is not a tie-break between two right answers. It is the ONLY thing standing
+# between the argument-position family and a daily false deny, and it leaks the uppercase PROGRAM
+# spelling in exchange. BOTH ends are pinned as tripwires below rather than left to a comment, because
+# a residual that lives only in prose is one nobody notices closing.
 
 
-# Both ends of every row, so neither arm can pass vacuously: the ARGUMENT spelling must ALLOW and the
-# PROGRAM spelling of a quoted git path must DENY. A gate that denied everything reddens the first
-# assertion; a gate that blanked every span reddens the second.
+# The must-ALLOW half: the case-sensitivity is what keeps this family out of the deny path. Every row
+# is the same span in ARGUMENT position, and each carries its own discriminating control that varies
+# THE LEAF CASE ALONE -- so no row can pass against a gate that has simply stopped keeping the token,
+# and none can pass against one that denies everything.
 @pytest.mark.parametrize(
     "argument_shape",
     [
@@ -379,161 +412,124 @@ def test_an_escaped_quote_in_an_interpreter_ARGUMENT_still_reaches_the_inner_cod
         "du -sh {q} restore",
         "head -n 5 {q} clean",
         "docker run --rm -v {q} restore",
-        # A REDIRECT TARGET is an argument too, and it is the row that keeps the redirection element in
-        # Test-GitProgramPosition honest: `> out.txt "<prog>"` IS program position, `echo hi > "<dir>"`
-        # is not, and only the COMPLETED form is transparent.
+        # A REDIRECT TARGET, a command substitution and a brace expansion left of the span, and an
+        # earlier span this same scan already blanked. All four were shapes the reverted predicate had
+        # to reason about explicitly; under a case-sensitive emit they need no special handling at all,
+        # which is most of the argument for the simpler rule.
         "echo hi > {q} clean",
-        # Command substitution and a brace expansion left of the span. Both were measured to keep
-        # DENYING under a draft predicate whose boundary set admitted the CLOSING bracket; neither
-        # shell dispatches a command straight after one, so it is not in the set.
         "cp -r $(pwd) {q} clean",
         "cp -r ${BACKUP} {q} clean",
-        # An earlier span this same scan already blanked must not turn the next one into a program.
         'cp -r "/a/Git" {q} clean',
     ],
 )
-def test_a_quoted_git_path_in_ARGUMENT_position_does_not_deny(
+def test_a_TITLE_CASED_quoted_git_leaf_cannot_supply_a_verb(
     primary: Path, repos_file: Path, argument_shape: str
 ) -> None:
-    """The false-deny half of the position predicate, with its own discriminating control per row."""
+    """A quoted PATH whose leaf is `Git` is not a git command, and the CWD here is load-bearing.
+
+    THE EARLIER VERSION OF THIS TEST RAN FROM ``primary.parent`` AND COULD NOT FAIL. From there a bare
+    ``git restore`` names no governed target, so the row ALLOWs whatever the scanner emitted -- it was
+    measuring the target resolver, not the emit. Moving the cwd INTO the governed repo makes the emit
+    the only variable, and the leaf case then separates cleanly. Measured, all 14 rows, both blobs::
+
+        cp -r "/c/backups/Git" restore    ALLOW
+        cp -r "/c/backups/git" restore    DENY
+    """
     quoted = f"{DQ}/c/backups/Git{DQ}"
     # `.replace` rather than `.format`: one row carries a literal `${BACKUP}` and str.format would
     # read those braces as a field name and raise -- turning a probe into a collection error.
     shaped = argument_shape.replace("{q}", quoted)
-    assert run_gate(shell(shaped, primary.parent), repos_file) is None, (
+    assert run_gate(shell(shaped, primary), repos_file) is None, (
         "a quoted PATH whose leaf is `Git` is not a git command, and denying it stops legitimate "
         "work over a directory name (BACKLOG #1229 residual, fourth round)"
     )
-    # THE DISCRIMINATING CONTROL, and it varies POSITION alone: the identical span at the head of the
-    # line is a program and must still deny. Without this row the test above would pass against a
-    # scanner that had simply stopped keeping the token -- which is the remedy this fix rejected,
-    # because it re-opens the whole GIT.EXE-as-program family.
-    program = f"{DQ}C:\\Program Files\\Git\\bin\\GIT.EXE{DQ} -C {primary} reset --hard"
-    assert_denied(run_gate(shell(program, primary.parent), repos_file))
-
-
-# A WRAPPER RUNS THE PROGRAM NAMED AFTER IT, so the span behind one is still in program position. This
-# is the half a naive "is the span first on the line" test gets wrong, and it is where a draft
-# predicate measured on the same rig leaked 30 of 36 program-position shapes.
-@pytest.mark.parametrize(
-    "prefix",
-    [
-        "sudo ",
-        "sudo -u root ",  # an option WITH AN OPERAND -- measured to leak without its own element
-        'sudo "-u" "root" ',  # the operands pre-blanked by this same scan
-        "env FOO=1 ",
-        "FOO=1 ",
-        "FOO=1 BAR=2 ",
-        "X=$(ls) ",
-        "time ",
-        "nohup ",
-        "timeout 5 ",
-        "nice -n 10 ",
-        "xargs ",
-        "/usr/bin/sudo ",
-        "> out.txt ",
-        "2>&1 ",
-        "echo hi ; ",
-        "echo hi && ",
-        "echo hi | ",
-        "echo hi ;",  # no space after the separator
-        "& ",
-        "( ",
-        "if true ; then ",
-        "! ",
-        "echo x | xargs -I{} ",
-        "find . -type f -exec ",
-    ],
-)
-def test_a_wrapper_prefix_does_not_move_a_quoted_git_program_out_of_program_position(
-    primary: Path, repos_file: Path, prefix: str
-) -> None:
-    """The fail-OPEN half. Each prefix really dispatches the word after it."""
-    program = f"{DQ}C:\\Program Files\\Git\\bin\\GIT.EXE{DQ} -C {primary} reset --hard"
-    assert_denied(run_gate(shell(prefix + program, primary.parent), repos_file))
-    # THE DISCRIMINATING CONTROL: a NON-wrapper word in the same slot is not transparent, so the same
-    # span becomes an argument and allows. Without it, a predicate that returned true unconditionally
-    # -- i.e. the unconditional emit this change replaces -- would pass every row above.
-    assert (
-        run_gate(shell(f"cp -r {DQ}/c/backups/Git{DQ} restore", primary.parent), repos_file) is None
-    )
-
-
-def test_the_argument_position_ALLOW_is_a_RECORDED_WEAKENING_for_the_lowercase_spelling(
-    primary: Path, repos_file: Path
-) -> None:
-    """OWNER-RULED 2026-08-20, and pinned here so the losing end cannot be quietly dropped.
-
-    ``cp -r "/c/backups/git" restore`` and ``cp -r "./git" restore`` DENIED on origin/main as well as
-    under the unconditional emit -- the pre-fix collapse kept a lowercase token whatever its position,
-    so these two were false denies of the same family that simply predate the case-folding. Position
-    is now the only question asked, so they ALLOW.
-
-    BOTH ENDS, because a one-sided note reads as a pure win:
-      GAINED -- the whole argument-position family stops denying, in every case spelling.
-      PAID -- this is a deliberate DENY-to-ALLOW move against origin/main, not merely the repair of a
-      fresh regression, and it is recorded as such rather than absorbed into the repair.
-
-    The control below is what makes this a test rather than a restatement of current behaviour: the
-    SAME lowercase spelling in PROGRAM position must still deny.
-    """
-    for shape in (f"cp -r {DQ}/c/backups/git{DQ} restore", f"cp -r {DQ}./git{DQ} restore"):
-        assert run_gate(shell(shape, primary.parent), repos_file) is None, (
-            f"{shape} must allow -- owner ruling of 2026-08-20, recorded in Remove-QuotedSpans"
-        )
+    # THE DISCRIMINATING CONTROL, and it varies THE LEAF CASE alone: the identical line with a
+    # lowercase leaf really does emit a token and really does deny. This is a FALSE DENY and it is
+    # pinned as such below -- it is used here because it is the sharpest available control, not
+    # because it is the right answer.
     assert_denied(
         run_gate(
-            shell(f"{DQ}/usr/bin/git{DQ} -C {primary} reset --hard", primary.parent), repos_file
-        )
-    )
-
-
-def test_an_UNLISTED_wrapper_word_is_a_known_open_residual(primary: Path, repos_file: Path) -> None:
-    """A TRIPWIRE OVER THE COST OF THIS CHANGE. It asserts ALLOW and that is NOT an endorsement.
-
-    ``Test-GitProgramPosition`` reaches a command boundary across an ALLOWLIST of wrapper words. A
-    wrapper it does not know is an ordinary bare word, which ends the chain, so the span behind it
-    reads as an argument::
-
-        myrunner "/usr/bin/git" -C <governed> reset --hard        ALLOW   (origin/main: DENY)
-        setarch x86_64 "/usr/bin/git" -C <governed> reset --hard  ALLOW   (origin/main: DENY)
-
-    Measured on the real hook, both blobs. This is the price of the predicate and it is stated in
-    ``Test-GitProgramPosition``'s own docstring: a name listed in error costs only a fail-CLOSED deny,
-    so the list may be generously long -- but a name MISSING from it is a fail-OPEN.
-
-    THE TWO ROWS ALLOW FOR DIFFERENT REASONS, and the second was nearly written up as the first.
-    ``myrunner`` is genuinely absent from the vocabulary. ``setarch`` is PRESENT -- what ends the chain
-    there is its OPERAND, ``x86_64``, which is a bare word and therefore not transparent. So the
-    allowlist has two ways to lose: a name it does not carry, and a listed name whose operand is
-    neither an option nor numeric. Adding a generic "a wrapper may be followed by one bare word" element
-    would close the second and cost ``watch ls "/c/backups/Git" clean``, which is a real shape; the row
-    is disclosed instead. Both are fail-open, both are narrow, and neither is claimed as closed.
-
-    WHEN THIS TEST REDS, that is the success signal: somebody added the word, or widened the chain, or
-    replaced the allowlist with something that needs neither. Delete the row; do not restore the ALLOW.
-
-    ``ssh box "/usr/bin/git" ...`` is deliberately NOT in this list even though it allows for the same
-    mechanical reason. ``ssh`` runs the program on the REMOTE host, so it cannot reach this machine's
-    primary, and the gate's own must-allow set already carries ``ssh box "git checkout main"``.
-    """
-    for shape in (
-        f"myrunner {DQ}/usr/bin/git{DQ} -C {primary} reset --hard",
-        f"setarch x86_64 {DQ}/usr/bin/git{DQ} -C {primary} reset --hard",
-    ):
-        assert run_gate(shell(shape, primary.parent), repos_file) is None, (
-            f"{shape} now DENIES. If you widened the wrapper vocabulary deliberately, that is the "
-            "intended outcome -- delete this test and the residual note in Test-GitProgramPosition. "
-            "Do NOT restore the ALLOW to make this pass."
-        )
-    # THE CONTROL that keeps the tripwire attached to the wrapper vocabulary rather than to the whole
-    # predicate: a LISTED wrapper in the identical slot must still deny.
-    assert_denied(
-        run_gate(
-            shell(f"nohup {DQ}/usr/bin/git{DQ} -C {primary} reset --hard", primary.parent),
+            shell(shaped.replace(f"{DQ}/c/backups/Git{DQ}", f"{DQ}/c/backups/git{DQ}"), primary),
             repos_file,
         )
     )
+
+
+def test_the_UPPERCASE_quoted_PROGRAM_spelling_is_a_known_open_residual(
+    primary: Path, repos_file: Path
+) -> None:
+    """A TRIPWIRE OVER THE COST OF THE CASE-SENSITIVE EMIT. It asserts ALLOW and that is NOT an
+    endorsement -- read this before acting on it.
+
+    ``GIT.EXE`` is a real spelling on Windows and the emit is case-SENSITIVE, so the span blanks
+    wholesale and no verb reaches any rule::
+
+        "<...>\\Git\\bin\\GIT.EXE" -C <governed> reset --hard      ALLOW   (origin/main: ALLOW)
+        "<...>\\Git\\bin\\Git"     -C <governed> reset --hard      ALLOW   (origin/main: ALLOW)
+
+    PRE-EXISTING, NOT INTRODUCED HERE, and the mechanism on main is worth stating because it looks
+    like it should differ: main's collapse regex IS case-insensitive, but it substitutes ``$1``, which
+    preserves the original case, and every rule downstream compares case-sensitively. Main therefore
+    mints a token nothing recognises and lands on the same verdict by a different route.
+
+    THE ONLY REMEDY TRIED COST MORE THAN IT BOUGHT. Making the emit case-insensitive closes these two
+    and re-opens the whole argument-position family above; adding a program-position discriminator to
+    hold both ends opened `cmd /c` and PowerShell dot-source as fail-opens that main denies. Do NOT
+    re-add the lowercase emit without a discriminator, and do not add a discriminator without
+    re-measuring those two.
+
+    WHEN THIS TEST REDS, that is the success signal: somebody closed the hole. Delete the row; do not
+    restore the ALLOW.
+    """
+    for leaf in ("GIT.EXE", "Git", "Git.exe"):
+        shape = f"{DQ}C:\\Program Files\\Git\\bin\\{leaf}{DQ} -C {primary} reset --hard"
+        assert run_gate(shell(shape, primary.parent), repos_file) is None, (
+            f"{shape} now DENIES. If you closed the uppercase program spelling deliberately, that is "
+            "the intended outcome -- delete this test. Do NOT restore the ALLOW, and check that "
+            "`cmd /c` and PowerShell dot-source still DENY."
+        )
+    # THE CONTROL that keeps the tripwire attached to the CASE and not to the whole emit: the
+    # lowercase spelling in the identical slot must still deny.
+    assert_denied(
+        run_gate(
+            shell(
+                f"{DQ}C:\\Program Files\\Git\\bin\\git.exe{DQ} -C {primary} reset --hard",
+                primary.parent,
+            ),
+            repos_file,
+        )
+    )
+
+
+def test_a_LOWERCASE_quoted_git_LEAF_in_argument_position_is_a_known_open_FALSE_DENY(
+    primary: Path, repos_file: Path
+) -> None:
+    """THE OTHER END OF THE SAME TRADE, and it asserts the WRONG answer on purpose.
+
+    The emit is unconditional in position, so an ordinary backup directory whose leaf really is
+    lowercase ``git`` reads as a git command and its next word becomes a verb::
+
+        cp -r "/c/backups/git" restore    DENY   (origin/main: DENY)
+        cp -r "./git" restore             DENY   (origin/main: DENY)
+
+    Both measured from INSIDE the governed repo, on both blobs. This is a FALSE DENY: nothing here is
+    a git invocation. It is pinned rather than described because the previous occupant of this slot --
+    a test asserting these ALLOW -- passed only because it ran from ``primary.parent``, where no
+    governed target resolves and the verdict is decided somewhere else entirely.
+
+    NOT A WEAKENING AND NOT A REGRESSION EITHER WAY: main denies these too, and the reverted predicate
+    is what briefly allowed them.
+
+    WHEN THIS TEST REDS, somebody taught the emit to tell a program from an argument without the two
+    fail-opens the last attempt cost. Delete the row; do not restore the DENY.
+    """
+    for shape in (f"cp -r {DQ}/c/backups/git{DQ} restore", f"cp -r {DQ}./git{DQ} restore"):
+        # If this reds, the shape now ALLOWs. Delete the row; do not restore the DENY, and re-check
+        # that `cmd /c` and PowerShell dot-source of a quoted `git.exe` still DENY.
+        assert_denied(run_gate(shell(shape, primary), repos_file))
+    # THE CONTROL: a leaf that is not a git token at all never emitted one, so it never denied. It
+    # separates "the emit fired" from "this gate denies any `cp`".
+    assert run_gate(shell(f"cp -r {DQ}/c/backups/GitHub{DQ} restore", primary), repos_file) is None
 
 
 # --- BACKLOG #1229 residual, FOURTH ROUND: the convention belongs to the INTERPRETER --------------
