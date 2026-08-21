@@ -10761,3 +10761,29 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** CI gate accuracy / instrument scope. **Priority:** P2. **Verdict:** build.
 **Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- developer tooling. The cost is that the repository's designated single source of truth for merge-blocking behaviour is wrong about the two legs a contributor is most likely to hit, in the direction that under-reports what blocks -- so a red leg reads as ignorable, and with `required_approving_review_count: 0` the only thing between an armed PR and `main` is exactly this set.
+
+## 1302. mail.ps1 accepts an MCP-namespace session id in -ToSessionId and the message becomes silently undeliverable, expiring with neither sender nor recipient told
+
+> 🔢 **Filed 2026-08-21 -- not started. The one place in this transport where a message is genuinely LOST rather than late, and both ends read it as delivered.** Value **7/10** · Difficulty **2/10** · _quick win_. `scripts/coord/mail.ps1:106` declares `-ToSessionId` as a bare `[string]` with **no validation**, and `:240` writes it into the message as `sessionId`. The drain then compares that value against the **harness** session id -- `scripts/hooks/mail-drain.ps1:852`, against `$sessionId` sourced at `:490` from `$hook.session_id`. **Three id namespaces exist for one session -- registry, MCP and harness -- and only one of them can ever match.**
+
+> **THE MECHANISM, verified in code rather than inferred from the symptom.** An MCP id is `local_`-prefixed; a harness id is a bare UUID. The comparison at `:852` is a string inequality, so a `local_` id can never equal the value it is tested against, on any drain, ever. The message is skipped every pass, stays in `inbox/`, and expires. **Nothing errors at send time, nothing errors at drain time, and nothing reports the expiry to either party.** `docs/WORKTREES.md` already records that a registry id and an MCP id for one session **shared no characters** -- so the namespaces are known to be disjoint, and nothing acts on that knowledge at the point where it matters.
+
+> **MEASURED, one box, as a natural experiment.** Reported by the dispatcher seat 2026-08-21:
+>
+> | box partition | count | with NO sessionId | with a `local_` id |
+> | --- | --- | --- | --- |
+> | delivered (`seen/`) | 81 | 81 | **0** |
+> | stranded (`inbox/`) | 5 | 0 | **5** |
+>
+> **No message carrying a `local_` id has ever been delivered in that box: 0 for 5.** A second box was checked as a control and showed 270 delivered, all with no `sessionId` and none `local_`-prefixed -- consistent, and it confirms the failure needs the field to be *set wrongly*, not merely set.
+
+> **THE IMPACT IS MEASURED, NOT HYPOTHETICAL, AND IT IS THE ARGUMENT FOR THE VALUE SCORE.** The five stranded messages were one seat's entire session output: a level report, a completed CI mechanism diagnosis, two unprompted self-retractions, and an explicit request to pull two never-started items. **The recipient read that lane as silent for the whole session and wrote "level unreported" three times.** The messages were due to expire three days later with neither end told. A transport that loses a message is recoverable if somebody knows; this one is not, because the sender's `Queued 1 message(s)` line is indistinguishable from a successful send.
+
+> **WHY THIS IS WORSE THAN AN ORDINARY DELIVERY FAILURE.** The send path reports success, the drain reports a clean empty box, and the expiry is silent in both directions. **Every instrument on the path agrees that nothing is wrong.** Compare the deliberate design elsewhere in this transport: the send path already prints *"Queued is not delivered"*, and the drain already distinguishes deferred, truncated, withheld, expired and unreadable in its own summary. The vocabulary for reporting this exists; it is simply never reached, because the message is filtered by a comparison that silently declines to match.
+
+> **DIRECTION, not a prescription.** Validate at **send** time -- reject, or warn loudly, on a `-ToSessionId` that does not have the harness id shape. Cheap and mechanical, and it fails the sender rather than the recipient, which is the party able to fix it.
+
+> **BOUND, and file the residual with it rather than discovering it later.** This catches a **wrong-namespace** id. It does **not** catch a correctly-shaped but **stale** id -- one belonging to a session that has ended -- which fails identically and just as silently. So the fix is a **partial control**, and the item must say so; the same partial-control shape this ledger keeps re-filing -- name that residual in the item's own words rather than citing a number, since the sibling item is unallocated. **Pair any change with a must-not-trip arm**: a message with no `sessionId` at all is the normal broadcast case and must keep delivering.
+
+**Cluster:** Session coordination / silent-loss transport. **Priority:** P2. **Verdict:** build.
+**Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- developer coordination only. The cost is that a seat's entire output can vanish while every instrument on the path reports success, and the recipient then reasons from a silence it has no way to distinguish from an idle lane.
