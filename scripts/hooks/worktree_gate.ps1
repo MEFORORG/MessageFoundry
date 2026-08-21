@@ -608,11 +608,15 @@ function Get-FlagOwner([string]$Left) {
     THE SCAN IS BOUNDED AND IT CONTINUES LEFT. Bounding it at the last command separator is what stops
     a program named before a `;` or a pipe from voting on this flag, and continuing left past bare
     words is what keeps `su someone -c`, `docker run --rm img sh -c` and `cmd /d /Q/C` classified --
-    each has a non-interpreter word between the interpreter and its flag. Those three, plus
-    `echo hi;cmd /k` and `(cmd /mnt/c`, are the counterexamples that defeated five earlier
-    program-token candidates, and they defeated them because each of those candidates required the
-    program to be ADJACENT to the switch run. A bounded leftward scan is a different instrument and
-    all five were measured to survive it.
+    each has a non-interpreter word between the interpreter and its flag.
+
+    THAT IS WHY THE $cmdExeFlag NOTE ABOVE IS CORRECTED RATHER THAN CITED. It listed five shapes that
+    defeated five earlier program-token candidates: `echo hi;cmd /k`, `(cmd /mnt/c`, `cmd /d /Q/C`, an
+    ALIAS, and a RENAMED copy of cmd.exe. The first three break ADJACENCY -- every one of those
+    candidates asked whether the token IMMEDIATELY LEFT of the switch run was a cmd spelling -- and all
+    three were measured to DENY under this scan, which is a different instrument. The last two break
+    IDENTITY, and this function does not close them: an unknown name gets no recursion, which is the
+    disclosed cost recorded at the caller. Four of five, not five of five.
     #>
     # Both hosts take their code under `/c` as well as `-Command`, so a cmd-family match is theirs.
     $winSet = @('pwsh', 'powershell', 'cmd', 'wsl')
