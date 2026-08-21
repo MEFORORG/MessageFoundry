@@ -436,6 +436,57 @@ def _send(repo: Path, body: str) -> subprocess.CompletedProcess[str]:
     )  # fmt: skip
 
 
+def _send_addressed(repo: Path, session_id: str | None) -> subprocess.CompletedProcess[str]:
+    """Send with an optional ``-ToSessionId``. ``None`` omits the flag entirely (the ordinary case)."""
+    args = [
+        "pwsh", "-NoProfile", "-NonInteractive", "-File", str(MAIL),
+        "-Send", "-MailRoot", str(mail_root(repo)), "-To", str(repo), "-Body", "probe",
+    ]  # fmt: skip
+    if session_id is not None:
+        args += ["-ToSessionId", session_id]
+    return subprocess.run(
+        args, cwd=str(repo), capture_output=True, text=True, timeout=TIMEOUT, check=False
+    )
+
+
+def test_a_wrong_namespace_session_id_is_refused_at_SEND(repo: Path) -> None:
+    """BACKLOG #1302 -- the sender is the only party who can fix the id, so the sender is told.
+
+    An id from the wrong namespace is compared literally against the reading session's harness id
+    (`mail-drain.ps1`), never matches, and the message sits in the inbox until it is swept to
+    `expired/`. MEASURED: six messages from one seat stranded for a whole session while the send path
+    printed `Queued 1 message(s)` for every one of them, and the recipient read that lane as silent.
+
+    The drain already reports ITS side. This asserts the half that was missing.
+    """
+    bad = _send_addressed(repo, "local_2b3b416c-1d0c-4e81-987c-bb19e590045d")
+
+    assert bad.returncode != 0, f"a wrong-namespace id must be refused at send: {bad.stdout}"
+    # The refusal has to name the REMEDY, not merely the rejection -- the sender's next move is to drop
+    # the flag, and a message that only says "invalid" leaves them guessing at which id to hunt for.
+    assert "-ToSessionId" in bad.stderr
+    assert "omit -ToSessionId" in bad.stderr
+
+
+def test_the_ordinary_broadcast_and_a_real_harness_id_both_still_send(repo: Path) -> None:
+    """THE MUST-NOT-TRIP ARM, and the reason the guard is scoped to a supplied value.
+
+    Two ways this fix could have been worse than the defect. Refusing a message with NO
+    ``-ToSessionId`` would break the ORDINARY broadcast, which is most traffic on this channel. And
+    refusing a genuine harness id would make the flag unusable for the case it exists to serve -- mail
+    that is only meaningful to one session, where a worktree outliving its occupant would otherwise
+    hand a note to a stranger.
+
+    Asserted in the SAME test as a pair, so a guard that accidentally rejected everything cannot pass
+    by satisfying one half.
+    """
+    broadcast = _send_addressed(repo, None)
+    assert broadcast.returncode == 0, f"no -ToSessionId is the ordinary case: {broadcast.stderr}"
+
+    real = _send_addressed(repo, "177a513c-60f4-49af-8cd4-465ff4f9118d")
+    assert real.returncode == 0, f"a bare-UUID harness id must send: {real.stderr}"
+
+
 def test_the_send_line_arm_refuses_at_the_boundary_and_passes_one_below(repo: Path) -> None:
     """The adjacent pair, not a 300-char probe.
 
