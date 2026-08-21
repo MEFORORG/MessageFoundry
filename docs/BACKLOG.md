@@ -16262,3 +16262,40 @@ apart correctly.
 declared serialised write order on that file. Building this alongside those without agreeing an order
 first risks the exact same-file collision this project's own collision-detection conventions exist to
 catch.
+
+---
+
+## 1360. three test files pick a free pid and rely on it staying free, so a loaded runner reuses it and a DEAD record reads as a veto
+
+> ✅ **SHIPPED 2026-08-26 (lander, authored per ADR 0165 -- the underlying fix is the builder's own
+> verified work, landed unmodified; this banner is mine).** Three copies of a `_find_free_pid` helper
+> (`test_worktree_prune_merged.py`, `test_coord_presence.py`, `test_session_registry.py`) each spawned
+> `cmd /c exit`, waited for it to exit, slept, and returned its pid as "free" -- free at the moment it
+> returns, and nothing keeps it free afterward. Replaced by one `tests/_dead_pid.py`, returning
+> `2147483647` (`Int32.MaxValue`): within the `[int]` cast `Test-RecordLiveness` performs, non-zero so
+> it takes the liveness path rather than the `UNREADABLE` shortcut, and structurally unassignable on
+> either platform (Linux caps pids at ~2^22, Windows pids are multiples of 4 far below 2^31) -- dead by
+> construction rather than by timing. Verified independently against the landed diff before writing
+> this banner: `tests/_dead_pid.py` exists, defines `NEVER_LIVE_PID: Final = 2147483647`, and all
+> three test files import it.
+>
+> **Diagnosed from a real failure**, not from inspection alone: `windows-2025` run `32268545492`,
+> `tests/test_worktree_prune_merged.py:753`, `assert d["Occupants"] == []`, an ordinary exit-1
+> assertion beside an unrelated crash in the same run. The comment on the original helper --
+> `time.sleep(0.3)  # let the OS reap it before we claim the pid is gone` -- states the intended
+> guard and the mechanism does the opposite: reaping RELEASES a pid for reuse rather than reserving
+> it, so the sleep widens the window it appears to close.
+>
+> **The fix does not stub, mock, or force the liveness verdict** -- the real `Get-Process` call still
+> runs and still returns "not running" on its own; only the pid handed to it is now unassignable. The
+> constraint that shaped this over the obvious alternative: the tests assert both `Occupants == []`
+> and `Decision == "SKIP"`, so any remedy that short-circuited the verdict would pass while testing
+> nothing.
+
+**Cluster:** CI reliability / test determinism. **Priority:** P2. **Verdict:** build.
+**Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- test-suite determinism
+only. The cost was a required context redding on a race whose failure looked like a real occupancy
+veto.
+
+---
+
