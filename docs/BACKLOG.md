@@ -10499,6 +10499,38 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **Cluster:** Coordination registry / worktree lifecycle. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0) -- developer coordination only. The cost is 19 backlog items currently presenting as claimed-and-in-progress when nobody is working them, which is the exact signal the registry exists to make trustworthy.
 
+## 1296. backlog-hygiene's claim extraction reads a backticked MENTION of BACKLOG #N as a CLAIM, so a PR explaining the gate is enforced by it
+
+> 🔢 **Filed 2026-08-20 -- not started. A REQUIRED status check enforces against a PR that made no claim, and the two tempting fixes both destroy something.** Value **5/10** · Difficulty **2/10** · _quick win_. `.github/workflows/backlog-hygiene.yml:66` extracts the claim with a raw grep over the pull request's title and body:
+>
+>     claim="$(printf '%s
+%s
+' "$PR_TITLE" "$PR_BODY" | grep -oiE 'BACKLOG #[0-9]+' | head -1 || true)"
+>
+> **No inline code span is stripped**, so a token written in backticks to *discuss* the gate is indistinguishable from one written to *claim* an item. A backticked span is a **mention, not a use** -- the same rule root `CLAUDE.md` section 11 already states when it permits quoting a glyph as a token.
+
+> **LIVE INSTANCE, measured 2026-08-20 on PR #428.** That PR deliberately writes its item numbers bare (`#1020`, `#1105`) precisely so as not to claim them. It then carries an author's correction explaining the gate, containing the sentence *"a reviewer adding `BACKLOG #1020` to the title or body is what makes the gate ask."* The gate matched that backticked token and failed the PR:
+>
+>     ERROR: this PR says it implements 'BACKLOG #1020' and changes engine/IDE code, but it does not
+>     touch docs/BACKLOG.md or any file under docs/archive/backlog/.
+>
+> **The paragraph explaining the gate is what tripped the gate.** The PR never claimed #1020; on the merits #1020 must stay open, because its own banner reads *"do not close this before #1257 lands"* and #1257 is open.
+
+> **THE DIRECTION IS A FALSE DENY, WHICH IS THE ONE THAT GETS ACTED ON.** A false clean is merely believed; a false failure is acted on immediately. Both obvious remedies are destructive: **edit the quoted evidence** (deleting the explanation that made the gate's behaviour checkable), or **write a banner asserting a completion that did not happen** (which is precisely the lie this gate exists to prevent -- see #60, its founding case). A third, worse, is to grandfather the hit.
+
+> **THE ARGUMENT THIS FILING RESTS ON: THE SECOND STEP OF THE SAME JOB ALREADY SOLVED THIS CLASS, AND THE FIRST NEVER DID.** `backlog_citation_check.py` -- the citation gate added by #1095, running as a later step of this same required job -- binds a number to a ledger path **by construct** and scopes findings to lines the PR **added**. Its own record states that *"a same-line rule was tried first and measured, and it read generic ledger prose as a citation."* That step was designed against exactly this false positive. The claim-extraction step above it was not, and nothing carried the lesson upward inside one file.
+
+> **AND THE CLASS IS THE MOST-FILED ONE IN THIS LEDGER, WHICH IS WHY ITS ABSENCE HERE IS THE FINDING.** The worktree gate has **at least eight** items for quoted spans defeating a matcher (#1066, #1069, #1082, #1085, #1086, #1097, #1040, #1229). `backlog-hygiene.yml` has **none**. The census was taken with a positive control -- the same predicate returns those eight -- so the zero is a real absence and not a blind scan.
+
+> **A SECOND, SMALLER DEFECT IN THE SAME LINE, recorded so a fix does not close only the visible half.** `head -1` takes the **first** match in title-then-body order. The pass condition is *"did the PR touch any ledger file"*, so this cannot produce a false green on the wrong item -- but the **error message** names whichever number appeared first, which on a PR discussing several is not necessarily the one it implements. A reader debugging the red is sent to the wrong item.
+
+> **THE FIX HAS A WRINKLE WORTH STATING BEFORE SOMEONE HITS IT.** The pull request that fixes this must describe the defect, and describing it means writing the literal token -- so the fixing PR is itself subject to the bug it removes. Expect to need the banner edit, or a spelling that avoids the token, on the PR that lands the fix.
+
+> **DIRECTION, not a prescription.** Blank inline code spans before extraction, the way `Get-ScannableSegments` blanks quoted spans for the worktree gate -- **and note that file's measured lesson, which is the trap on this fix**: blanking indiscriminately created false denies there and needed its own items. So pair any change with a **must-not-trip** arm alongside the must-trip one: a PR body that genuinely claims an item must still be enforced, and a PR body that merely quotes the token must not. **Do not loosen the pattern until it passes** -- that buys a green by discarding the invariant.
+
+**Cluster:** CI gate accuracy / instrument scope. **Priority:** P3. **Verdict:** build.
+**Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- this is developer tooling. The cost is a required check that can block a compliant PR, and whose two obvious remedies each damage the record: one deletes evidence, the other files a false completion.
+
 ## 1298. The archive dialog's permanently-discarded warning is not a loss test: a worktree behind main sees landed files as untracked
 
 > 🔢 **Filed 2026-08-20 -- not started. THE WARNING REASONS FROM "NOT IN THIS WORKTREE'S INDEX" STRAIGHT TO "WILL BE PERMANENTLY DISCARDED", SKIPPING THE ONLY QUESTION THAT DECIDES IT -- DOES THIS CONTENT EXIST ANYWHERE ELSE.** The session-archive dialog lists the worktree's dirty set and states the files "will be permanently discarded". For a `??` entry that is a statement about **this worktree's index**, not about the content. A worktree whose HEAD predates a commit sees every file that landed since as untracked, because they are absent from **its** index while being tracked on `main`. **THE CHANGE: document the three-command recoverability check as the thing a seat runs before believing the warning, and provide it as a helper so the answer is not re-derived by hand under time pressure.**
@@ -10528,3 +10560,32 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Worktree lifecycle / session tooling. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0) -- developer coordination only. The cost is a routine, high-frequency prompt that is wrong in the common case, teaching seats to dismiss the one class of prompt that must not become routine.
+
+## 1299. unbacked_check reports commits whose CONTENT is fully landed as unbacked work, because a squash-merge and a local merge over a backed parent both leave an orphan commit object
+
+> 🔢 **Filed 2026-08-21 -- not started. Every alarm on the measured run was content-durable, and the remedy it prints would push rescue tags for work already on `main`.** Value **5/10** · Difficulty **3/10**. `scripts/coord/unbacked_check.ps1` answers *"does this COMMIT OBJECT exist on a remote"*. A reader runs it to ask *"is any WORK at risk of being lost"*. Those two questions diverge on exactly two routine mechanisms, and both were live on this machine.
+
+> **MEASURED 2026-08-21, and the rate is the finding: 7 of 7 alarms were false.** The run reported `7 commits on 7 branches exist on no remote`, over a coverage line of `541 refs and 33 worktree checkouts (incl. primary) across 1 repository, 2 of 2 configured remote(s) answered`. Every one is durable:
+>
+> | branch(es) | commit | why it is not at risk |
+> | --- | --- | --- |
+> | `pr-439`, `claude/mail-reply-one-line` | `20a14af1` | PR #439 **MERGED** 2026-08-19; content verified live on `origin/main` in `docs/SESSION-MAIL.md` and `scripts/hooks/mail-drain.ps1` |
+> | `pr-394`, `pr394` | `db80c064` | merge commit; PR #394 **MERGED**; substantive parent `312ffbb9` backed at `private/rescuetags/auto/detached/7b38e2c9` |
+> | `pr-436` | `9a79934c` | merge commit; PR #436 **MERGED**; parent `93b63188` backed at `private/rescuetags/auto/adr-0156-amendment` |
+> | `pr-437` | `ccf467b7` | merge commit; PR #437 **MERGED**; parent `7e8dab37` backed at `private/rescuetags/auto/MessageFoundry/lander/apt-guard` |
+> | a live session's feature branch | `92537c51` | merge commit; parent `dfc52076` backed at that branch's auto rescue tag on the private durability remote |
+
+> **THE TWO MECHANISMS, both of which are normal operation rather than an edge case.** **(1) Squash-merge orphans the original.** `main` receives a NEW commit with a different sha, so the branch a session still holds points at an object that now exists on no remote -- while its content is fully landed. Every merged PR left behind by `gh pr checkout` is in this class, and the local branch outlives the PR. **(2) A local `merge main into <branch>` over a rescue-tagged parent.** The parent carrying the authored work IS backed; only the merge commit created locally is not. Re-running the merge reproduces it, so nothing authored is at stake.
+
+> **THE COUNT DOUBLE-COUNTS, which matters because the headline number is what gets relayed.** The tool measures per REF, so two local checkout names for one commit are two alarms: the 7 branch-alarms cover **5 distinct commit objects**. Measuring per ref is correct and is the script's own hard-won lesson -- the finding is only that the printed noun is "commits" where the unit is branches.
+
+> **THE DIRECTION IS A FALSE ALARM, AND THE PRINTED REMEDY ACTS ON IT.** The script closes with `git push --force <private-remote> <branch>:refs/tags/rescue/branch/<branch>`. Followed here, that would create seven rescue tags for content already on `main`. A false clean is merely believed; a false alarm is **acted on**, and this one comes with the command to act on it already formatted.
+
+> **WHY THIS DEFECT WAS STRUCTURALLY EASY TO MISS, and the script says so itself.** Its docstring records **three** shipped defects -- per HEAD instead of per ref, per local ref instead of per reachable remote, per branch instead of per checkout -- and names the pattern: *"each earlier version answered a question adjacent to the one a reader would ask."* All three were false **negatives**, and the stated fix each time was *"to widen what everything means"*. Widening is monotonic: it can only add alarms, never retire one. So a discipline built entirely from missed-detection defects has no step at which a **false positive** would surface, which is why the fourth instance of the script's own documented class arrives in the direction its remedy cannot reach.
+
+> **RELATED BUT DISTINCT, so they are not merged.** [#1298](#1298) is the archive dialog's discard warning misreporting landed files as unrecoverable. Same family -- a false alarm about loss -- and its severity note states this item's cost exactly: a routine prompt that is wrong in the common case teaches seats to dismiss the one class of prompt that must not become routine. It is a different instrument with a different mechanism, so a fix to either leaves the other intact.
+
+> **DIRECTION, not a prescription.** Do **not** suppress by dropping orphan objects from the report -- an object existing nowhere is precisely what this tool protects, and the squash case is indistinguishable from genuine loss without asking a second question. Prefer to **classify rather than filter**: report a commit whose tree is reachable on `origin/main`, or whose non-`main` parent is backed, as a separate, non-actionable class, leaving the actionable set to genuinely unpublished authored work. **Pair any change with a must-not-trip arm alongside the must-trip one**, per this ledger's standing rule: a genuinely unpushed authored commit must still alarm, and the seven above must not. Note the prior-art census for this item was taken with a positive control -- the same predicate returns 223 hits for an unrelated common term -- so the zero existing items on this tool is a measured absence, not a blind scan.
+
+**Cluster:** Session tooling / instrument scope. **Priority:** P3. **Verdict:** build.
+**Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- developer coordination tooling only. The cost is the credibility of the one instrument that measures single-copy work: at a 7-of-7 false-alarm rate a seat learns to skim it, and the run that finally carries a real unbacked commit reads identically to the six before it.
