@@ -10515,3 +10515,33 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Worktree lifecycle / session tooling. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0) -- developer coordination only. The cost is a routine, high-frequency prompt that is wrong in the common case, teaching seats to dismiss the one class of prompt that must not become routine.
+
+## 1305. the worktree gate matches git by SPELLING, so a case variant of the program name bypasses every rule
+
+> 🔢 **Filed 2026-08-21 -- not started. `Git -C <governed> reset --hard` IS ALLOWED WHERE `git -C <governed> reset --hard` IS DENIED, AND THE ONLY DIFFERENCE IS THE CAPITAL LETTER.** Measured against `origin/main` driving the real hook as a subprocess, with the lowercase spelling as a discriminating control and a benign command as a negative control. The same holds for `GIT`, and it is not confined to one rule -- `Git ... checkout` allows too. No quoting, no wrapper, no escape sequence: the bypass is typing the program name differently.
+
+> **WHY IT WORKS.** Windows resolves `Git`, `GIT` and `git` to the same `git.exe`, so all three RUN. The gate's token comparison is case-SENSITIVE, so only one of them MATCHES. The gate is therefore matching a **spelling** and calling it a program, while the operating system matches an **executable**. Everything downstream of that comparison inherits the gap, which is why it is not a single-rule defect.
+
+> **THE CLASS, and it is the transferable half.** This is a LEXICAL check standing in for a SEMANTIC one -- the same shape this repository has now hit repeatedly on unrelated surfaces: an absence claim keyed on a symbol NAME, a tier predicate keyed on a body SPLIT that discarded a table, a ledger row detector keyed on a fixed digit WIDTH. Each was a string test where the real question was about a referent. **The fix direction is to compare the RESOLVED EXECUTABLE, not a spelling** -- otherwise the next bypass is a trailing dot, a short path, a quoted absolute path, or an alias, and each one closes as its own item forever.
+
+> **NOT INTRODUCED BY ANY UNLANDED WORK, and that is measured rather than assumed.** It reproduces identically on `origin/main` and on the unlanded lane branch carrying that work. [#1229](#1229)'s residual work neither opened nor closed it. A case-INSENSITIVE emit was briefly built as part of that work and reverted -- it addressed only the quoted-program-path corner of this gap and cost 12 measured false denies plus two new fail-opens, so it is **not** the remedy here and should not be re-derived. See the gate's own comment at the emit site, which records that retraction.
+
+> **BOUND, stated because a clean-looking finding invites over-reading.** What is measured is: bare `Git`/`GIT` for `reset --hard` and `checkout`, on the Bash tool, with the cwd inside the governed primary. Rule 3b, the linked-worktree path, is unsampled entirely, as are the target-path attack shapes. The exhaustive spelling-by-rule matrix is kept out of this file deliberately; it is in the builder-1 episode note under the gate sections.
+
+**Cluster:** Worktree gate / developer guardrail. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- this guard is coordination tooling and is not shipped in the wheel. The cost is that a guard believed to be governing every session is bypassed by an ordinary typo-shaped variation, which is worse than a guard known to be absent.
+
+## 1301. a ledger banner citing a commit sha must cite a commit whose subject names the item it sits under
+
+> 🔢 **Filed 2026-08-21 -- not started. ONE EDIT CORRUPTED TWO ITEMS IN OPPOSITE DIRECTIONS AND NO GATE COULD SEE IT, BUT A SHA-TO-ITEM AGREEMENT CHECK WOULD HAVE.** A retirement banner intended for one item was written onto another. The Markdown stayed valid, the item count did not move, the status glyph was untouched, and the misplaced paragraph carried no glyph of its own -- so `parse_items` had no second banner to object to and every ledger gate passed.
+
+> **THE SIGNAL THAT WAS THERE ALL ALONG.** The overwritten banner cited two commit shas whose subjects both ended in that item's own number. The paragraph that replaced it cited a sha whose subject named a DIFFERENT item. So the rule is mechanical and needs no judgement: **a banner citing a commit sha must cite a commit whose subject names the item the banner sits under.**
+
+> **WHY THIS IS STRONGER THAN THE OBVIOUS RULE.** The natural response to a transposed edit is "key the edit on the item NUMBER, not on a same-shaped sentence". That is correct and it only helps an author who remembers to follow it. A sha-to-item check catches the edit that was **already keyed wrong**, which is the case that actually happened -- twice, silently, in the same file.
+
+> **BOUND, and it makes this a PARTIAL control that must be described as one.** It fires only on banners that cite shas. Retirement and SHIPPED banners nearly always do; a `Filed -- not started` banner carries none and is outside the check entirely. It reduces the blast radius of a class of ledger corruption; it does not eliminate it.
+
+> **A KNOWN WAY TO MIS-VERIFY THIS, recorded so the next reader does not repeat it.** A first attempt at the "has anyone already fixed this" screen used a needle that omitted the backticks around the symbol and returned False everywhere, reading as **already fixed**. The re-run normalised and carried a positive control per item. Any implementation of this check needs the same discipline: a screen that finds nothing is indistinguishable from a clean corpus until a positive control says otherwise.
+
+**Cluster:** Ledger integrity / commit gates. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- ledger hygiene. The cost is that a wrongly-transposed banner reads as a working cross-reference forever, and the two items it corrupts fail in opposite directions: one over-reports its status and one under-reports it.
