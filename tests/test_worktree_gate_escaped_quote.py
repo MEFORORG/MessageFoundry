@@ -532,6 +532,66 @@ def test_a_LOWERCASE_quoted_git_LEAF_in_argument_position_is_a_known_open_FALSE_
     assert run_gate(shell(f"cp -r {DQ}/c/backups/GitHub{DQ} restore", primary), repos_file) is None
 
 
+@pytest.mark.parametrize(
+    "tool,template,why",
+    [
+        # cmd.exe /c runs the quoted program; the default Git install path contains a space and MUST
+        # be quoted, so this is the ordinary spelling and not an exotic one. Executed here:
+        # cmd.exe /c '"C:\Program Files\Git\bin\git.exe" --version' printed a git version.
+        ("Bash", "cmd /c {prog} -C {gated} reset --hard", "cmd /c dispatches the quoted program"),
+        # PowerShell dot-source. Verified on pwsh 7.6.4 that `.` runs the executable, same as `&`.
+        ("PowerShell", ". {prog} -C {gated} reset --hard", "dot-source dispatches it too"),
+    ],
+)
+def test_the_two_fail_OPENS_the_reverted_PREDICATE_INTRODUCED_are_DENIED_again(
+    primary: Path, repos_file: Path, tool: str, template: str, why: str
+) -> None:
+    """THE REVERT'S OWN JUSTIFICATION, AS AN ASSERTION RATHER THAN A COMMENT.
+
+    The `Test-GitProgramPosition` predicate was withdrawn because it moved exactly these two shapes
+    from DENY to ALLOW while `origin/main` denies both. That reason lived only in prose -- in the
+    narrative block above and inside two failure strings -- so nothing would have reported it if the
+    predicate came back. Every test that DOES red on the predicate reds on a FALSE-DENY row whose own
+    text says to delete it, which means the suite's stated remedy, followed literally, lands both
+    fail-opens green. These two rows are the missing half.
+
+    Measured over the real hook, cwd = the governed repo, on `origin/main` and on this tree::
+
+        cmd /c "<...>\\Git\\bin\\git.exe" -C <governed> reset --hard   DENY / DENY
+        . "<...>\\Git\\bin\\git.exe" -C <governed> reset --hard        DENY / DENY
+
+    and on the withdrawn predicate blob (`fb93c9ca`), ALLOW for both.
+
+    WHEN THIS TEST REDS, a change has re-opened a hole `origin/main` closes. Do NOT delete the row.
+    """
+    prog = f"{DQ}C:\\Program Files\\Git\\bin\\git.exe{DQ}"
+    gated = template.format(prog=prog, gated=primary)
+    (
+        assert_denied(
+            run_gate(
+                {"tool_name": tool, "tool_input": {"command": gated}, "cwd": str(primary)},
+                repos_file,
+            )
+        ),
+        f"{tool}: {why} -- this is the fail-open the revert exists to keep shut",
+    )
+    # THE CONTROL, and it is what stops the row degenerating into "the gate denies any `cmd /c`":
+    # the identical line aimed at a path no repos file governs must ALLOW. Measured ALLOW on both
+    # blobs, so a gate that denied unconditionally would fail here.
+    ungoverned = template.format(prog=prog, gated=primary.parent / "NotGoverned")
+    assert (
+        run_gate(
+            {
+                "tool_name": tool,
+                "tool_input": {"command": ungoverned},
+                "cwd": str(primary.parent),
+            },
+            repos_file,
+        )
+        is None
+    ), f"{tool}: an UNGOVERNED target must allow, or the deny above proves nothing"
+
+
 # --- BACKLOG #1229 residual, FOURTH ROUND: the convention belongs to the INTERPRETER --------------
 #
 # The parametrised test above pins the OUTER host: a Bash tool call gets POSIX escape rules and a
