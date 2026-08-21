@@ -671,7 +671,7 @@ jobs:
             # the env var first, so that file would never be read -- it would only drop the full real
             # token list into the job workspace for every later step to see.
             export MEFOR_REQUIRE_TOKENS=1
-            export MEFOR_MIN_DETECTORS=names=7,estate=13,site_prefixes=1
+            export MEFOR_MIN_DETECTORS=names=8,estate=14,site_prefixes=2
             echo "token list loaded from the MEFOR_FORBIDDEN_TOKENS secret (fail-closed, per-section floor)."
           elif [ "$IS_FORK_PR" = "true" ]; then
             echo "fork PR -- the secret is unavailable BY DESIGN; structural-only scan."

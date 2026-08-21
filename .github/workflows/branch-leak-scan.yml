@@ -85,7 +85,7 @@ jobs:
         run: |
           if [ -n "$MEFOR_FORBIDDEN_TOKENS" ]; then
             export MEFOR_REQUIRE_TOKENS=1
-            export MEFOR_MIN_DETECTORS=names=7,estate=13,site_prefixes=1
+            export MEFOR_MIN_DETECTORS=names=8,estate=14,site_prefixes=2
             echo "token list loaded from the MEFOR_FORBIDDEN_TOKENS secret (fail-closed, per-section floor)."
           else
             # A push event cannot come from a fork, so unlike security.yml there is no legitimate
