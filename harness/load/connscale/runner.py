@@ -89,6 +89,10 @@ _CONFIG_DIR = "harness/config/connscale"
 _STOP_GRACE = 5.0
 _SETTLE = 0.5  # let final ACKs/arrivals settle before the truly-final engine sample
 _HEALTH_TIMEOUT = 30.0
+# One spelling, because both audit moments report it and they must not drift into disagreeing about
+# why nothing ran -- a reader comparing the two moments of a disabled step reads the difference as
+# meaningful.
+_AUDIT_DISABLED = "intake audit disabled for this profile"
 _PORTS_READY_TIMEOUT = 60.0  # waiting for the engine to report all N inbound rows (N can be large)
 # A single trivial ADT type — the connscale graph routes every message identically, so the mix only
 # needs to drive ONE generated type (the wall is per-connection machinery, not message-type spread).
@@ -479,22 +483,35 @@ async def _run_one_step(
         read_short = _read_shortfall(
             metrics.counters, poller.baseline, poller.final, unconfirmed_budget=count
         )
-        audit_live = intake_audit.not_run(
-            "no intake shortfall to attribute at this moment", moment=intake_audit.MOMENT_LIVE
-        )
-        if ledger is not None and read_short > 0:
+        # The part no excusal forgives, computed HERE because only this side knows whether the
+        # excusal was clamped. The audit must not re-derive it -- see `_unexplained_shortfall`.
+        unexplained_short = _unexplained_shortfall(metrics.counters, poller.baseline, poller.final)
+        # The two NOT_RUN reasons answer different questions, and each is stated at the branch it
+        # describes. The disabled one has to be reachable on a step that DID have a shortfall: "no
+        # shortfall to attribute" printed on a failing step is a false statement about the run, in
+        # the one field whose entire job is attribution, on exactly the step someone opens the
+        # artifact to read.
+        if ledger is None:
+            audit_live = intake_audit.not_run(_AUDIT_DISABLED, moment=intake_audit.MOMENT_LIVE)
+        elif read_short > 0:
             audit_live = await intake_audit.run_intake_audit(
                 ledger,
                 _store_reader(node_env, metrics.counters.sent),
                 moment=intake_audit.MOMENT_LIVE,
                 sent=metrics.counters.sent,
                 read_short=read_short,
+                unexplained_short=unexplained_short,
+            )
+        else:
+            audit_live = intake_audit.not_run(
+                "no intake shortfall to attribute at this moment",
+                moment=intake_audit.MOMENT_LIVE,
             )
         # MOMENT 2, POST-MORTEM. Stop the engine FIRST, so the store is committed and quiesced: with
         # no process running, "we sampled too early" is no longer available as an explanation, which
         # is what separates outcome 1 (sample lag) from outcome 2 (sum coverage). `stop()` is
         # idempotent, so the `finally` below still runs it on every other path.
-        audit_final = intake_audit.not_run("intake audit disabled for this profile")
+        audit_final = intake_audit.not_run(_AUDIT_DISABLED)
         if ledger is not None:
             with contextlib.suppress(Exception):
                 await node.stop()
@@ -512,6 +529,7 @@ async def _run_one_step(
                     moment=intake_audit.MOMENT_POST_MORTEM,
                     sent=metrics.counters.sent,
                     read_short=read_short,
+                    unexplained_short=unexplained_short,
                 )
         return _build_record(
             claim_mode=claim_mode,
@@ -987,6 +1005,29 @@ def _read_shortfall(
         - _excusal(c, unconfirmed_budget=unconfirmed_budget).excused
         - (final.read - base.read)
     )
+
+
+def _unexplained_shortfall(
+    c: Counters, base: EngineSample | None, final: EngineSample | None
+) -> int:
+    """The part of the shortfall NO excusal can forgive -- ``sent - unconfirmed - engine_read``.
+
+    THE PRODUCER OWNS THIS BECAUSE ONLY THE PRODUCER CAN COMPUTE IT. ``_read_shortfall`` subtracts
+    ``excused``, which ``_excusal`` CLAMPS TO 0 over budget, and it then returns a bare int -- so the
+    clamp state is destroyed one line after being computed. A consumer handed only that int cannot
+    tell the two worlds apart: in-budget the unconfirmed sends are ALREADY subtracted out, so a
+    residual shortfall is a genuine gauge finding, while over-budget the same number silently
+    contains them. Comparing the shortfall against the unconfirmed COUNT to guess which world it is
+    gets the common (in-budget) case backwards and would silence a real gauge finding.
+
+    Subtracting the UNCLAMPED ``c.timeouts`` makes the quantity mean the same thing in both worlds,
+    so the audit never has to reconstruct budget arithmetic it does not own. Uses ``c.timeouts`` --
+    the same input ``_excusal`` calls ``unconfirmed`` -- rather than the ledger, keeping one
+    definition of the population.
+    """
+    if base is None or final is None:
+        return 0
+    return c.sent - c.timeouts - (final.read - base.read)
 
 
 def _reconcile(

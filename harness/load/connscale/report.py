@@ -10,7 +10,9 @@ reconcile, plus an SLO verdict. **Metrics + metadata only** — never message bo
 That rule is why the BACKLOG #1292 intake audit reports **sequence numbers**, not the control ids it
 actually matched on: a seq is a dense integer minted by the harness's own counter and meaningless
 outside the run, so it identifies the message for a follow-up without putting a list of message
-identifiers into a shared artifact. The control ids stay in the harness log line.
+identifiers into a shared artifact. The control ids are emitted NOWHERE -- not here and not to the
+log; the previous wording sent readers to a log line that never carried them, and invited a
+maintainer to make the sentence true by logging exactly what this rule exists to keep out.
 
 The thundering-herd measurement is reported **explicitly and separated** (critic must-change #3): the
 ``fixed_aggregate`` sweep (constant R across N) IS the herd measurement, so the report carries the
