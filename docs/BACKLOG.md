@@ -10759,6 +10759,9 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > **THE DEFECT IS NOT "THE CONTROL SHIPS OFF" -- IT IS THAT THE DOCUMENTATION ASSERTS AN AFFORDANCE THAT DOES NOT EXIST.** That is **SDS-3.7**, a compensating control resting on a false premise, sitting in the one document where the rule bites hardest. An operator doing diligence reads row 1633, concludes the ingest plane can be rate-limited, sets out to enable it, and cannot.
 > ⭐ **"off" is worse than absent.** An absent control prompts a question; a control documented as *present but disabled* prompts a configuration edit that cannot succeed, and the operator's most likely conclusion is that they have mis-typed the key.
 > **TWO OPPOSITE FIXES, AND THE CHOICE IS AN OWNER CALL -- deliberately not pre-decided here.**
+> **STATUS OF THAT OWNER CALL, RECORDED 2026-08-21 SO THE ITEM STOPS LOOKING LIKE IT IS WAITING ON A DECISION THAT MAY ALREADY EXIST.** A ratification of **option (a)** -- expose the two keys on the `MLLP()` factory -- **dated approximately 04:55Z on 2026-08-21, is claimed by three separate sessions and was witnessed by none of them here.** The banner above is therefore **deliberately NOT flipped**, and this note is not a closure.
+> **WHY THIS IS WRITTEN DOWN RATHER THAN ACTED ON, AND IT IS NOT PROCESS THEATRE.** An item that has been ruled but not written is **indistinguishable, from the owner's side, from one still awaiting them** -- so they get asked again, and the asking is what makes it look unresolved. Recording the claim WITH its unwitnessed status collapses that ambiguity without anybody having to forge the ruling. **The opposite failure is on this project's record:** a constraint entered the durable record without its provenance, was cited back as owner authority twice, and had never been issued at all. A relayed ratification written as a banner is that same shape, and three sessions reporting it does not make it witnessed -- the freeze was believed by everyone who repeated it too.
+> **WHAT CLOSES THIS:** the owner confirming the ratification directly, after which the banner flips to option (a) and this note is deleted rather than kept. **Two things must NOT ride along with that closure:** the `SECURITY.md:1728` claim that the off-default ingest posture is *ruled rather than accidental* is **separately unratified** and must not be asserted by a closure summary; and per the paragraph below, exposing the keys without correcting the row's "off" wording reproduces the defect in a new place.
 > **(a) Expose the two keys** on the `MLLP()` factory, making the documentation true and the control reachable. **(b) Delete the `SECURITY.md` row**, making the documentation true and the control honestly absent. They are opposite in every respect except that both end the false premise, and picking between them is a product decision about whether ingest-plane rate limiting is wanted at all.
 > **Whichever is chosen, the other must not be done by halves** -- exposing the keys without correcting the row's "off" wording, or deleting the row while leaving `_MessagePacer` reading settings nothing can supply, reproduces the defect in a new place.
 > **SCOPE, and it is wider than MLLP.** A pacing-vocabulary sweep over all **25** modules in `transports/` found **14 hits in `mllp.py`** (live positive control) and **ZERO in the other 24**. Eleven modules call `register_source`; **ten have no rate or volume control in any configuration**, including raw TCP, X12 and the DICOM C-STORE SCP. So a rate bound is not merely unreachable on MLLP -- it does not exist anywhere else on the ingest plane.
@@ -11974,3 +11977,40 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Session coordination / silent-loss transport. **Priority:** P2. **Verdict:** build.
 **Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- developer coordination only. The cost is that a seat's entire output can vanish while every instrument on the path reports success, and the recipient then reasons from a silence it has no way to distinguish from an idle lane.
+
+## 1304. the windows-2025 harness leg intermittently times out launching pwsh, redding the required CI gate roll-up on unrelated changes
+
+> 🔢 **Filed 2026-08-21 by the lander, after it blocked an eight-line prose PR twice.** Value **5/10** -- Difficulty **3/10** -- _fill-in_. `repo harness tests (windows-2025)` intermittently fails with `subprocess.TimeoutExpired` on a **`pwsh` process launch**, not on any assertion. It is **not itself a required context** -- it reds the required **`CI gate`** roll-up, and that distinction decides how a blocked PR reads (measured: `CI gate` failed carrying a `tooling` result of `failure`).
+
+> **TWO DISTINCT TESTS, ONE FAILURE MODE, DIFFERENT XDIST WORKERS.** Neither failure is an assertion; both are a launch that never returns.
+> ```
+> tests/test_worktree_gate_control_plane.py::test_a_victim_path_containing_a_space_is_still_governed
+>     pwsh -File scripts/hooks/worktree_gate.ps1      timed out after 60s   worker gw2
+> tests/test_coord_claim_reconcile.py::test_a_gone_holder_whose_work_is_unmerged_is_held
+>     pwsh -File scripts/coord/claim-reconcile.ps1    timed out after 45s   workers gw2 and gw1
+> ```
+> Every observed run reported **`1 failed, 1976 passed`** -- the suite is otherwise entirely green, which is why this reads as a blocked PR rather than as a broken tree.
+
+> **THE CHRONOLOGY IS THE EVIDENCE, because no change can account for it.** The `windows-2025` harness leg on 2026-08-21:
+> ```
+> 11:26  main                        success
+> 11:29  lander/1071-mechanism-...   success
+> 11:45  main                        success
+> 12:27  lander/close-four-verified  success
+> 12:43  main                        FAILURE   test_a_gone_holder...
+> 12:44  lander/1004-ordering        FAILURE   test_a_victim_path...
+> 13:16  lander/1004-ordering rerun  FAILURE   test_a_gone_holder...
+> ~13:30 lander/1004-ordering rerun  success   -- merged as 78beee9e
+> ```
+> **Four clean, three consecutive failures, then clean again, with NO code change across the whole window.** All four merges that day (#475, #476, #477, #478) touched **only `docs/BACKLOG.md`** -- verified per-commit diffstat. The failing test and the script it drives both last changed in `2d17e726` (PR #420), days earlier. **One of the three failures was on `main` itself**, with no PR involved, which is what rules out the branch as the cause.
+
+> **WHY THE STREAK MATTERS MORE THAN THE RATE.** Three in a row looks like something broke; the fourth run passed with no intervention. **Reruns do get through** -- #478 landed at 12:51, in the middle of the failing window. So the leg is flaky rather than broken, and the honest sample is small: **4 clean / 3 failed / 1 clean, in one afternoon.** That is enough to file and **not** enough to quote a rate.
+
+> **THE OPERATIONAL COST, and it is why this is not merely annoying.** A lander who hits this has two bad options: rerun until green, which is **manufacturing a green rather than earning one**, or report the queue blocked. Nothing distinguishes this from a real regression at the moment it fires -- both render as `CI gate` red on a required roll-up. **Whoever picks this up should also decide what a rerun budget is**, because "rerun until it passes" is currently an unwritten norm rather than a policy.
+
+> **NOT MEASURED, DO NOT INFER:** the cause. The correlation is with **time**, not with repository content, and a CI log does not say what changed at 12:43. Runner contention, xdist worker pressure and a pwsh startup regression are all consistent with what was observed and **none of them is evidenced**. Also not measured: whether `windows-2022` or `ubuntu-latest` show the same mode, whether the two scripts share a slow path, and whether the 45s/60s bounds were ever calibrated against real launch times.
+
+> **RELATED, and NOT the same finding:** a `pwsh` SIGSEGV on **Linux** in `tests/test_worktree_gate_interpreter_sigils.py` is being worked separately. Same interpreter, different platform, different signature -- a hang to timeout is not a crash. Do not merge the two without evidence they share a cause.
+
+**Cluster:** CI reliability / required-gate stability. **Priority:** P2. **Verdict:** build.
+**Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- CI only. The cost is that a required roll-up reds on changes that cannot have caused it, which both blocks unrelated work and trains reviewers to discount a red that will sometimes be real.
