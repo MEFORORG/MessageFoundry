@@ -11364,3 +11364,22 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Session coordination / silent-loss transport. **Priority:** P2. **Verdict:** build.
 **Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- developer coordination only. The cost is that a seat's entire output can vanish while every instrument on the path reports success, and the recipient then reasons from a silence it has no way to distinguish from an idle lane.
+
+## 1303. three test files pick a free pid and rely on it staying free, so a loaded runner reuses it and a DEAD record reads as a veto
+
+> ✅ **SHIPPED 2026-08-21 -- three copies of a `_find_free_pid` helper replaced by one `tests/_dead_pid.py` returning a pid that CANNOT be assigned, so deadness holds by construction instead of by timing. The fix was constrained to keep the test able to FAIL, and that was proven rather than asserted.** Diagnosed from run `32268545492`'s sibling failure on `windows-2025`: `tests/test_worktree_prune_merged.py:753`, `assert d["Occupants"] == []`, an ordinary exit-1 assertion sitting beside an unrelated crash in the same run.
+
+> **THE RACE IS VISIBLE IN THE CONSTRUCTION, WHICH IS WHY THIS IS NOT A FLAKE RULING.** The helper spawned `cmd /c exit`, waited for it to EXIT, slept, and returned its pid as "free". The pid is free at the moment it returns and **nothing keeps it free** -- between that return and the moment the tool reads the record, the OS may hand it to a new process. Intermittency was never the evidence; the acquire-release-then-rely sequence is.
+
+> **THE COMMENT IS THE BEST EVIDENCE IN THE ITEM.** One copy carried `time.sleep(0.3)  # let the OS reap it before we claim the pid is gone`. That states the intent exactly and the mechanism does the opposite: **reaping does not RESERVE a pid, it RELEASES it for reuse**, so the sleep WIDENS the window it appears to guard. The hazard was reasoned about and the direction inverted.
+
+> **THE PATH TO THE FAILURE, traced through the real fence.** `Test-RecordLiveness` ([`scripts/coord/session-registry.ps1:181`](../scripts/coord/session-registry.ps1)) reports **DEAD** when `Get-Process -Id` finds nothing -- and DEAD vetoes nothing. A REUSED pid **is** running, and a test record carries no `startedAt` for the reuse fence to consult, so the verdict becomes **UNVERIFIED** -- which **does** veto (`occupancy.ps1:75`). The occupant list then comes back non-empty and an assertion that a dead record is "not a veto" fires. `cmd /c exit` is Windows-only, matching where it was seen; pid reuse needs pid churn, and that tier spawns pwsh/git children constantly on a runner whose pid space recycles far faster than a developer box.
+
+> **WHY `2147483647`.** `Int32.MaxValue`: inside the `[int]` cast the fence performs, **non-zero** so it takes the liveness path rather than the `UNREADABLE` shortcut a falsy pid triggers, and **structurally unassignable** -- Linux caps pids at `pid_max` (ceiling ~2^22) and Windows pids are multiples of 4 far below 2^31.
+
+> **THE CONSTRAINT THAT SHAPED THE FIX, and it is the reason to prefer this over the obvious remedy.** The test asserts BOTH `Occupants == []` AND `Decision == "SKIP"` -- a dead record is *neither* a veto *nor* a permission. **Any remedy that stubbed, mocked or forced the liveness verdict would make the test pass while exercising nothing**, converting a loud false-failure into a quiet always-pass. The real `Get-Process` call still runs and still returns "not running" on its own. **PROVEN, not asserted:** adding `DEAD` to `occupancy.ps1`'s veto states turns the test RED, and removing it turns it green again -- so the veto path is still covered.
+
+> **SIZE, corrected against an earlier miscount.** THREE definitions and FOUR call sites, across `test_worktree_prune_merged.py`, `test_coord_presence.py` and `test_session_registry.py`. An initial count said six call sites; that used `grep -c '_find_free_pid()'`, which also matches the DEFINITION line (`def _find_free_pid() -> int:`) and so inflated every file by one.
+
+**Cluster:** CI reliability / test determinism. **Priority:** P2. **Verdict:** build.
+**Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- test-suite determinism only. The cost is a required context redding on a race whose failure looks like a real occupancy veto, and a duplicated shape that would have been fixed one site at a time.

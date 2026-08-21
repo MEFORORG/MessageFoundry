@@ -30,6 +30,8 @@ from typing import Any
 
 import pytest
 
+from tests._dead_pid import never_live_pid
+
 REGISTRY = Path(__file__).resolve().parents[1] / "scripts" / "coord" / "session-registry.ps1"
 
 pytestmark = pytest.mark.skipif(
@@ -108,7 +110,7 @@ def test_recycled_pid_is_not_live(config_root: Path) -> None:
 
 
 def test_dead_pid_is_dead(config_root: Path) -> None:
-    write_session(config_root, pid=_find_free_pid(), session_id="cccccccc-3333")
+    write_session(config_root, pid=never_live_pid(), session_id="cccccccc-3333")
     assert liveness(config_root, "cccccccc")["State"] == "DEAD"
 
 
@@ -154,15 +156,6 @@ def test_malformed_record_does_not_break_the_lookup(config_root: Path) -> None:
 def test_prefix_match_reports_the_most_alive_candidate(config_root: Path) -> None:
     """Deciding whether it is safe to disturb something: an ambiguous prefix must not resolve to the
     dead one and green-light the move."""
-    write_session(config_root, pid=_find_free_pid(), session_id="7777abcd-8888")
+    write_session(config_root, pid=never_live_pid(), session_id="7777abcd-8888")
     write_session(config_root, pid=os.getpid(), session_id="7777efgh-9999")
     assert liveness(config_root, "7777")["State"] == "LIVE"
-
-
-def _find_free_pid() -> int:
-    proc = subprocess.Popen(
-        ["cmd", "/c", "exit"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    proc.wait(timeout=30)
-    time.sleep(0.3)
-    return proc.pid
