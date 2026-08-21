@@ -526,3 +526,86 @@ def test_an_UNLISTED_wrapper_word_is_a_known_open_residual(primary: Path, repos_
             repos_file,
         )
     )
+
+
+# --- BACKLOG #1229 residual, FOURTH ROUND: the convention belongs to the INTERPRETER --------------
+#
+# The parametrised test above pins the OUTER host: a Bash tool call gets POSIX escape rules and a
+# PowerShell tool call does not. That is right about the line the tool typed, and it was applied to
+# something else as well -- the payload EXTRACTED from an interpreter flag on that line. A Bash tool
+# call invoking pwsh therefore read a PowerShell payload under POSIX backslash rules, held open a span
+# PowerShell had already closed, and blanked the gated command between it and a later quote.
+#
+# THE PROOF THAT ONE FLAG PER LINE CANNOT EXPRESS THIS is that the SAME CHARACTERS have opposite
+# correct answers. Measured on this box with a payload that COMPUTES rather than echoes:
+#
+#     pwsh -NoProfile -Command '$d = "C:\Temp\" ; 111*3 ; Write-Output "x"'   -> printed 333: it RAN
+#     bash -c            '$d = "C:\Temp\" ; expr 111 \* 3 ; echo "x"'        -> unexpected EOF: INERT
+#     sh -c              (same)                                              -> unexpected EOF: INERT
+#
+# So the pwsh row must deny and the bash row must not, from one line, under one tool name. The
+# convention now comes from Get-FlagOwner -- the program that owns the matched flag -- and the outer
+# line keeps the outer host's rules, because the outer line really is the outer host's.
+
+_INNER_STRADDLE = '$d = "C:\\Temp\\" ; {gated} ; Write-Output "x"'
+
+
+@pytest.mark.parametrize(
+    "tool,invocation,expect_deny,measured",
+    [
+        # The fail-open. All three read a PowerShell payload under the OUTER host's POSIX rules.
+        ("Bash", "pwsh -Command", True, "333 printed: the middle statement RAN"),
+        ("Bash", "pwsh -c", True, "333 printed: the middle statement RAN"),
+        ("Bash", "powershell -Command", True, "333 printed: the middle statement RAN"),
+        # The same characters where POSIX rules are CORRECT. Denying these would be a false deny, and
+        # they are what stops the rows above from being satisfied by "always fail closed".
+        ("Bash", "bash -c", False, "unexpected EOF: nothing parses, nothing runs"),
+        ("Bash", "sh -c", False, "unexpected EOF: nothing parses, nothing runs"),
+        # THE CONVERSE DIRECTION, and it is the half that proves the convention is not simply pinned
+        # to the payload's own tool name either: a PowerShell tool call invoking bash used to apply
+        # PowerShell rules to a POSIX payload, which denied a shape that cannot run.
+        ("PowerShell", "bash -c", False, "unexpected EOF: nothing parses, nothing runs"),
+        ("PowerShell", "sh -c", False, "unexpected EOF: nothing parses, nothing runs"),
+        ("PowerShell", "pwsh -Command", True, "333 printed: the middle statement RAN"),
+    ],
+)
+def test_the_escape_convention_of_an_EXTRACTED_payload_comes_from_its_interpreter(
+    primary: Path, repos_file: Path, tool: str, invocation: str, expect_deny: bool, measured: str
+) -> None:
+    """Every row is pinned to whether the payload RUNS on the interpreter that receives it.
+
+    ``measured`` records the observation rather than a previous verdict, for the reason the sibling
+    matrix above gives: a row that asserted only "deny" would be satisfied by a gate that denies
+    everything, and a row that asserted only "allow" by one that recurses into nothing.
+    """
+    payload = _INNER_STRADDLE.format(gated=f"git -C {primary} reset --hard")
+    command = f"{invocation} {SQ}{payload}{SQ}"
+    result = run_gate(
+        {"tool_name": tool, "tool_input": {"command": command}, "cwd": str(primary.parent)},
+        repos_file,
+    )
+    if expect_deny:
+        assert_denied(result), f"{tool}/{invocation}: {measured} -- the gate must see it"
+    else:
+        assert result is None, (
+            f"{tool}/{invocation}: {measured} -- denying it would be a FALSE DENY"
+        )
+
+
+def test_the_escape_count_and_not_the_nesting_is_what_triggers_the_straddle(
+    primary: Path, repos_file: Path
+) -> None:
+    """CONTROL for the matrix above: the same nesting with an EVEN backslash run, and with none.
+
+    Both denied before this change and both deny after it, on either reading of the escape -- so a
+    row from the matrix that moved has moved because of the ODD trailing run, not because the gate
+    started or stopped objecting to ``pwsh -Command`` in general.
+    """
+    gated = f"git -C {primary} reset --hard"
+    for payload in (
+        '$d = "C:\\Temp\\\\" ; ' + gated + ' ; Write-Output "x"',  # EVEN run
+        '$d = "C:/Temp" ; ' + gated + ' ; Write-Output "x"',  # no backslash at all
+    ):
+        assert_denied(
+            run_gate(shell(f"pwsh -Command {SQ}{payload}{SQ}", primary.parent), repos_file)
+        )
