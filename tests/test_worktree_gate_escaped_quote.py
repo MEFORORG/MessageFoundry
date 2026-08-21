@@ -342,3 +342,187 @@ def test_an_escaped_quote_in_an_interpreter_ARGUMENT_still_reaches_the_inner_cod
     # against a gate that simply denied anything containing `bash -c`.
     plain = f"bash -c {SQ}bash -c {DQ}{gated}{DQ}{SQ}"
     assert_denied(run_gate(shell(plain, d), rf))
+
+
+# --- BACKLOG #1229 residual, FOURTH ROUND: the token survives only in PROGRAM position -----------
+#
+# Keeping the git token of a closed span is the false-NEGATIVE guard the three tests above pin. It was
+# UNCONDITIONAL, and position is the whole difference between the two shapes that spelling covers:
+#
+#     "C:\Program Files\Git\bin\GIT.EXE" -C <governed> reset --hard   a PROGRAM. Must deny.
+#     cp -r "/c/backups/Git" restore                                  a PATH. Must not deny.
+#
+# The second is a backup directory whose leaf happens to be `Git`, followed by an ordinary word that
+# happens to be a git verb. Measured across two gate blobs driven over the real hook: at least 15 such
+# shapes DENY under the unconditional emit and ALLOW under the blob before it.
+#
+# AND THE FALSE DENY WAS NOT THE WORST OF IT -- see
+# tests/test_worktree_gate_hijack.py::test_a_quoted_git_path_on_an_earlier_line_does_not_shadow_a_hijack,
+# where the same emit made rule 3b hand back an ALLOW on a real worktree hijack. A test file that saw
+# only the false denies would have scored this change as a pure relaxation of a security control. It is
+# not: it closes a fail-OPEN and a fail-CLOSED defect with the same predicate.
+
+
+# Both ends of every row, so neither arm can pass vacuously: the ARGUMENT spelling must ALLOW and the
+# PROGRAM spelling of a quoted git path must DENY. A gate that denied everything reddens the first
+# assertion; a gate that blanked every span reddens the second.
+@pytest.mark.parametrize(
+    "argument_shape",
+    [
+        "cp -r {q} restore",
+        "rsync -a {q} restore",
+        "mv {q} clean",
+        "ls {q} clean",
+        "echo {q} merge",
+        "7z a out.7z {q} am",
+        "cp -r {q} switch",
+        "du -sh {q} restore",
+        "head -n 5 {q} clean",
+        "docker run --rm -v {q} restore",
+        # A REDIRECT TARGET is an argument too, and it is the row that keeps the redirection element in
+        # Test-GitProgramPosition honest: `> out.txt "<prog>"` IS program position, `echo hi > "<dir>"`
+        # is not, and only the COMPLETED form is transparent.
+        "echo hi > {q} clean",
+        # Command substitution and a brace expansion left of the span. Both were measured to keep
+        # DENYING under a draft predicate whose boundary set admitted the CLOSING bracket; neither
+        # shell dispatches a command straight after one, so it is not in the set.
+        "cp -r $(pwd) {q} clean",
+        "cp -r ${BACKUP} {q} clean",
+        # An earlier span this same scan already blanked must not turn the next one into a program.
+        'cp -r "/a/Git" {q} clean',
+    ],
+)
+def test_a_quoted_git_path_in_ARGUMENT_position_does_not_deny(
+    primary: Path, repos_file: Path, argument_shape: str
+) -> None:
+    """The false-deny half of the position predicate, with its own discriminating control per row."""
+    quoted = f"{DQ}/c/backups/Git{DQ}"
+    # `.replace` rather than `.format`: one row carries a literal `${BACKUP}` and str.format would
+    # read those braces as a field name and raise -- turning a probe into a collection error.
+    shaped = argument_shape.replace("{q}", quoted)
+    assert run_gate(shell(shaped, primary.parent), repos_file) is None, (
+        "a quoted PATH whose leaf is `Git` is not a git command, and denying it stops legitimate "
+        "work over a directory name (BACKLOG #1229 residual, fourth round)"
+    )
+    # THE DISCRIMINATING CONTROL, and it varies POSITION alone: the identical span at the head of the
+    # line is a program and must still deny. Without this row the test above would pass against a
+    # scanner that had simply stopped keeping the token -- which is the remedy this fix rejected,
+    # because it re-opens the whole GIT.EXE-as-program family.
+    program = f"{DQ}C:\\Program Files\\Git\\bin\\GIT.EXE{DQ} -C {primary} reset --hard"
+    assert_denied(run_gate(shell(program, primary.parent), repos_file))
+
+
+# A WRAPPER RUNS THE PROGRAM NAMED AFTER IT, so the span behind one is still in program position. This
+# is the half a naive "is the span first on the line" test gets wrong, and it is where a draft
+# predicate measured on the same rig leaked 30 of 36 program-position shapes.
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "sudo ",
+        "sudo -u root ",  # an option WITH AN OPERAND -- measured to leak without its own element
+        'sudo "-u" "root" ',  # the operands pre-blanked by this same scan
+        "env FOO=1 ",
+        "FOO=1 ",
+        "FOO=1 BAR=2 ",
+        "X=$(ls) ",
+        "time ",
+        "nohup ",
+        "timeout 5 ",
+        "nice -n 10 ",
+        "xargs ",
+        "/usr/bin/sudo ",
+        "> out.txt ",
+        "2>&1 ",
+        "echo hi ; ",
+        "echo hi && ",
+        "echo hi | ",
+        "echo hi ;",  # no space after the separator
+        "& ",
+        "( ",
+        "if true ; then ",
+        "! ",
+        "echo x | xargs -I{} ",
+        "find . -type f -exec ",
+    ],
+)
+def test_a_wrapper_prefix_does_not_move_a_quoted_git_program_out_of_program_position(
+    primary: Path, repos_file: Path, prefix: str
+) -> None:
+    """The fail-OPEN half. Each prefix really dispatches the word after it."""
+    program = f"{DQ}C:\\Program Files\\Git\\bin\\GIT.EXE{DQ} -C {primary} reset --hard"
+    assert_denied(run_gate(shell(prefix + program, primary.parent), repos_file))
+    # THE DISCRIMINATING CONTROL: a NON-wrapper word in the same slot is not transparent, so the same
+    # span becomes an argument and allows. Without it, a predicate that returned true unconditionally
+    # -- i.e. the unconditional emit this change replaces -- would pass every row above.
+    assert (
+        run_gate(shell(f"cp -r {DQ}/c/backups/Git{DQ} restore", primary.parent), repos_file) is None
+    )
+
+
+def test_the_argument_position_ALLOW_is_a_RECORDED_WEAKENING_for_the_lowercase_spelling(
+    primary: Path, repos_file: Path
+) -> None:
+    """OWNER-RULED 2026-08-20, and pinned here so the losing end cannot be quietly dropped.
+
+    ``cp -r "/c/backups/git" restore`` and ``cp -r "./git" restore`` DENIED on origin/main as well as
+    under the unconditional emit -- the pre-fix collapse kept a lowercase token whatever its position,
+    so these two were false denies of the same family that simply predate the case-folding. Position
+    is now the only question asked, so they ALLOW.
+
+    BOTH ENDS, because a one-sided note reads as a pure win:
+      GAINED -- the whole argument-position family stops denying, in every case spelling.
+      PAID -- this is a deliberate DENY-to-ALLOW move against origin/main, not merely the repair of a
+      fresh regression, and it is recorded as such rather than absorbed into the repair.
+
+    The control below is what makes this a test rather than a restatement of current behaviour: the
+    SAME lowercase spelling in PROGRAM position must still deny.
+    """
+    for shape in (f"cp -r {DQ}/c/backups/git{DQ} restore", f"cp -r {DQ}./git{DQ} restore"):
+        assert run_gate(shell(shape, primary.parent), repos_file) is None, (
+            f"{shape} must allow -- owner ruling of 2026-08-20, recorded in Remove-QuotedSpans"
+        )
+    assert_denied(
+        run_gate(
+            shell(f"{DQ}/usr/bin/git{DQ} -C {primary} reset --hard", primary.parent), repos_file
+        )
+    )
+
+
+def test_an_UNLISTED_wrapper_word_is_a_known_open_residual(primary: Path, repos_file: Path) -> None:
+    """A TRIPWIRE OVER THE COST OF THIS CHANGE. It asserts ALLOW and that is NOT an endorsement.
+
+    ``Test-GitProgramPosition`` reaches a command boundary across an ALLOWLIST of wrapper words. A
+    wrapper it does not know is an ordinary bare word, which ends the chain, so the span behind it
+    reads as an argument::
+
+        myrunner "/usr/bin/git" -C <governed> reset --hard        ALLOW   (origin/main: DENY)
+        setarch x86_64 "/usr/bin/git" -C <governed> reset --hard  ALLOW   (origin/main: DENY)
+
+    Measured on the real hook, both blobs. This is the price of the predicate and it is stated in
+    ``Test-GitProgramPosition``'s own docstring: a name listed in error costs only a fail-CLOSED deny,
+    so the list may be generously long -- but a name MISSING from it is a fail-OPEN.
+
+    WHEN THIS TEST REDS, that is the success signal: somebody added the word, or replaced the
+    allowlist with something that does not need one. Delete the row; do not restore the ALLOW.
+
+    ``ssh box "/usr/bin/git" ...`` is deliberately NOT in this list even though it allows for the same
+    mechanical reason. ``ssh`` runs the program on the REMOTE host, so it cannot reach this machine's
+    primary, and the gate's own must-allow set already carries ``ssh box "git checkout main"``.
+    """
+    for shape in (
+        f"myrunner {DQ}/usr/bin/git{DQ} -C {primary} reset --hard",
+        f"setarch x86_64 {DQ}/usr/bin/git{DQ} -C {primary} reset --hard",
+    ):
+        assert run_gate(shell(shape, primary.parent), repos_file) is None, (
+            f"{shape} now DENIES. If you widened the wrapper vocabulary deliberately, that is the "
+            "intended outcome -- delete this test and the residual note in Test-GitProgramPosition. "
+            "Do NOT restore the ALLOW to make this pass."
+        )
+    # THE CONTROL that keeps the tripwire attached to the wrapper vocabulary rather than to the whole
+    # predicate: a LISTED wrapper in the identical slot must still deny.
+    assert_denied(
+        run_gate(
+            shell(f"nohup {DQ}/usr/bin/git{DQ} -C {primary} reset --hard", primary.parent),
+            repos_file,
+        )
+    )
