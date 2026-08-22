@@ -54,7 +54,12 @@ from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     weakened_tls_escape_permitted_here,
 )
-from messagefoundry.config.tls_policy import RevocationHopGuard, build_smtp_tls_context
+from messagefoundry.config.tls_policy import (
+    InsecureHopRefused,
+    RevocationHopGuard,
+    build_smtp_tls_context,
+    smtp_login_approved,
+)
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -282,8 +287,37 @@ class EmailDestination(DestinationConnector):
         try:
             with self._connect() as smtp:
                 if self.username is not None:
-                    smtp.login(self.username, self.password or "")
+                    # NOT smtp.login(): its preference order is internal and tries CRAM-MD5 FIRST, an
+                    # HMAC over MD5 (BACKLOG #1171, ASVS 11.4.1 — Appendix C marks MD5 disallowed with
+                    # no default-off escape). smtp_login_approved drives auth() against the server's
+                    # advertised list restricted to PLAIN/LOGIN.
+                    #
+                    # escape_permitted=False DELIBERATELY. The helper's escape arm exists for callers
+                    # whose cleartext-credential decision is escapable; this cell's is NOT — the
+                    # construction gate above refuses username+use_tls=false outright, even with the
+                    # escape. Passing True would make the send-time check weaker than the
+                    # construction-time one it backs up, which is how a backstop becomes a hole.
+                    smtp_login_approved(
+                        smtp,
+                        self.username,
+                        self.password or "",
+                        channel_encrypted=self.use_tls,
+                        escape_permitted=False,
+                        cell="EMAIL outbound",
+                    )
                 smtp.send_message(msg)
+        except InsecureHopRefused as exc:
+            # A POLICY refusal is not an internal code error. Unconverted it is a ValueError,
+            # which escapes the arms below and lands in the delivery worker's catch-all --
+            # labelled "internal error (our bug, not the partner)" and dead-lettered. That
+            # sends an operator to read our source over a partner that offers no approved AUTH
+            # mechanism, or a connection configured without TLS. Same misdirection as mapping a
+            # rejected credential to a refusal, one layer down (BACKLOG #1171).
+            #
+            # The refusal text is config and capability only -- host, cell, mechanism names --
+            # so it is carried whole rather than reduced to a type name: it is the one thing an
+            # operator needs and it contains no message content.
+            raise DeliveryError(f"Email {self.host}:{self.port} refused: {exc}") from exc
         except smtplib.SMTPException as exc:
             raise DeliveryError(
                 f"Email {self.host}:{self.port} SMTP send failed: {type(exc).__name__}"
@@ -304,8 +338,30 @@ class EmailDestination(DestinationConnector):
             with self._connect() as smtp:
                 smtp.ehlo_or_helo_if_needed()
                 if self.username is not None:
-                    smtp.login(self.username, self.password or "")
+                    # Same restriction as _send: a connection TEST that authenticated via CRAM-MD5
+                    # would report a hop healthy that the real send path refuses, which is worse than
+                    # either behaviour alone.
+                    smtp_login_approved(
+                        smtp,
+                        self.username,
+                        self.password or "",
+                        channel_encrypted=self.use_tls,
+                        escape_permitted=False,
+                        cell="EMAIL outbound probe",
+                    )
                 smtp.noop()
+        except InsecureHopRefused as exc:
+            # A POLICY refusal is not an internal code error. Unconverted it is a ValueError,
+            # which escapes the arms below and lands in the delivery worker's catch-all --
+            # labelled "internal error (our bug, not the partner)" and dead-lettered. That
+            # sends an operator to read our source over a partner that offers no approved AUTH
+            # mechanism, or a connection configured without TLS. Same misdirection as mapping a
+            # rejected credential to a refusal, one layer down (BACKLOG #1171).
+            #
+            # The refusal text is config and capability only -- host, cell, mechanism names --
+            # so it is carried whole rather than reduced to a type name: it is the one thing an
+            # operator needs and it contains no message content.
+            raise DeliveryError(f"Email {self.host}:{self.port} refused: {exc}") from exc
         except smtplib.SMTPException as exc:
             raise DeliveryError(
                 f"Email {self.host}:{self.port} probe failed: {type(exc).__name__}"

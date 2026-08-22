@@ -28,12 +28,12 @@ to prevent was purely syntactic.
 from __future__ import annotations
 
 import re
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _bash_resolver import explain_returncode, require_bash
 
 yaml = pytest.importorskip("yaml")
 
@@ -107,11 +107,20 @@ def test_there_are_shell_blocks_to_check() -> None:
     )
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available to syntax-check with")
 def test_every_shell_run_block_parses(tmp_path: Path) -> None:
-    """``bash -n`` every block. Reports ALL offenders, not just the first, so one run fixes them all."""
-    bash = shutil.which("bash")
-    assert bash is not None  # narrowed by the skipif; keeps mypy honest
+    """``bash -n`` every block. Reports ALL offenders, not just the first, so one run fixes them all.
+
+    NO ``skipif`` ON ``shutil.which`` (BACKLOG #1216). That guard asked whether A bash EXISTS, not
+    whether the one it found CAN DO THE JOB -- and on Windows, PATH order decides which operating
+    system answers. The WSL launcher is FOUND rather than absent, so the skip never fired and every
+    block failed for a reason unrelated to its content.
+
+    ``require_bash`` probes git-derived candidates with a live read-back and fails LOUDLY when none
+    can see this process's files. Loud is right here: ci.yml sets ``defaults.run.shell: bash`` on
+    every OS, so a leg without a usable bash cannot run this gate at all, and a skip there would be
+    a green that proves nothing.
+    """
+    bash = require_bash(tmp_path)
     blocks = _shell_blocks()
     failures: list[str] = []
     for i, (wf, job, step, script) in enumerate(blocks):
@@ -134,6 +143,20 @@ def test_every_shell_run_block_parses(tmp_path: Path) -> None:
             )
             continue
         if proc.returncode != 0:
-            failures.append(f"{wf} :: job {job} :: {step}\n    {proc.stderr.strip()}")
-    print(f"syntax-checked {len(blocks)} shell blocks; {len(failures)} failed")
+            # 127 is "command not found" -- a HARNESS fault -- and 2 is a real syntax error. Naming
+            # which one keeps a broken harness from impersonating a finding about the content.
+            detail = explain_returncode(proc.returncode, f"{wf} :: {step}")
+            failures.append(f"{wf} :: job {job} :: {step}\n    {detail}\n    {proc.stderr.strip()}")
+    print(f"syntax-checked {len(blocks)} shell blocks with {bash}; {len(failures)} failed")
+    # A 100 PERCENT FAILURE RATE IS AN INSTRUMENT FAULT, NOT N CONTENT FAULTS (BACKLOG #1216). This
+    # exact signature printed on every run for a full day and was read as N real defects: "154 shell
+    # blocks; 154 failed". Every block in the repository being independently wrong is not a
+    # hypothesis worth entertaining before the harness is ruled out, so say it HERE rather than
+    # leaving a reader to notice the ratio.
+    if blocks and len(failures) == len(blocks):
+        raise AssertionError(
+            f"ALL {len(blocks)} shell blocks failed, using {bash}. That is an INSTRUMENT fault, not "
+            f"{len(blocks)} content faults -- rule the harness out before editing any workflow "
+            "(BACKLOG #1216). First few:\n\n" + "\n\n".join(failures[:3])
+        )
     assert not failures, "shell `run:` blocks that do not parse:\n\n" + "\n\n".join(failures)
