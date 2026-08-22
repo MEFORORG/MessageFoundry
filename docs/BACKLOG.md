@@ -13106,7 +13106,7 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 ## 1317. the TLS cipher allowlist tests a name prefix, so NULL-encryption and anonymous suites pass every gate
 
-> ✅ **Filed 2026-08-22. CLOSED 2026-08-22 (lander) -- fixed on main by PR 519 and PR 525; verified by RUNNING the shipped code, not by reading it.** Value **8/10** · Difficulty **3/10**. Owner-ruled the
+> 🚧 **Filed 2026-08-22. PARTIAL 2026-08-22 (lander) -- the NAMED defect is fixed on main by PR 519 and PR 525, verified by running the shipped code; the item's own library half stays OPEN.** Value **8/10** · Difficulty **3/10**. Owner-ruled the
 > same day: **a strict positive allowlist**, admitting only suites that appear on every current
 > candidate list, anything unnamed rejected. At zero deployments the compatibility cost of being
 > strict is zero.
@@ -13119,6 +13119,15 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > everything would read identically. The missing PAIR of predicates this item names now exists as
 > `_is_encrypting` and `_is_peer_authenticated` and is called from both paths, and `_is_forward_secret`
 > was left alone exactly as the item instructs.
+>
+> **WHY PARTIAL AND NOT CLOSED, recorded because I first wrote CLOSED and corrected it before the
+> commit landed.** The heading defect is fixed and the founding claim is now false in the code. But
+> this item says of itself, further down, that **the library half is unchanged and still open** --
+> `ldap3`, `hvac` and ODBC Driver 18 pick their own suites and no engine object exists to assert on.
+> An item that declares part of itself open must not be closed, and closing it would delete the only
+> open record of that half. **The first pass verified the two functions the HEADING names and read a
+> quarter of the body.** A code re-read is necessary and is not sufficient; the item's own scope
+> statement outranks it.
 > Verdict: build
 > Closing-act: code
 
