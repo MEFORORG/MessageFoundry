@@ -392,26 +392,75 @@ class _FtpClient(_RemoteClient):
 #: installed paramiko offers. A deny list would have to be edited every time the library adds an
 #: algorithm, and the failure mode of forgetting is that the new algorithm is PROPOSED. Here the
 #: failure mode of forgetting is that it is excluded -- wrong in the safe direction, by construction.
+#:
+#: ENCRYPT-THEN-MAC ONLY. Encrypt-then-MAC is the composition order ASVS 11.3.5 asks about, and the
+#: plain ``hmac-sha2-256`` / ``hmac-sha2-512`` names are SSH's original Encrypt-and-MAC: the tag is
+#: computed over the PLAINTEXT, so a receiver has to decrypt attacker-chosen ciphertext before it can
+#: authenticate it. The ``-etm@openssh.com`` names authenticate the ciphertext instead, so a forgery
+#: is rejected without ever being decrypted. The hash is the same SHA-2 either way; the ORDER is the
+#: control, which is why the two Encrypt-and-MAC names are not approved despite a sound hash.
 _APPROVED_SFTP_MACS = frozenset(
     {
-        "hmac-sha2-256",
-        "hmac-sha2-512",
         "hmac-sha2-256-etm@openssh.com",
         "hmac-sha2-512-etm@openssh.com",
     }
 )
 
+#: SSH ciphers this connector will PROPOSE. Same shape and same reasoning as :data:`_APPROVED_SFTP_MACS`
+#: above: an allow-list, subtracted by :func:`_disabled_sftp_ciphers` from whatever the installed
+#: paramiko offers, so forgetting to add a newly-shipped algorithm EXCLUDES it rather than proposing it.
+#:
+#: MEASURED against paramiko 5.0.0 (the version ``constraints.lock`` pins), whose ``_preferred_ciphers``
+#: offers nine names. Five are approved here. The four left out, and why each:
+#:   - ``aes128-cbc``, ``aes192-cbc``, ``aes256-cbc`` -- CBC. SSH's CBC mode is what the
+#:     chosen-ciphertext plaintext-recovery attack of CVE-2008-5161 targets, and CBC is also the half
+#:     of the composition that makes a plaintext MAC (above) dangerous. AES-CTR and AES-GCM carry the
+#:     same key sizes with neither problem, so dropping these gives up no strength.
+#:   - ``3des-cbc`` -- CBC as above, and under the 128-bit floor twice over: a 64-bit block (the
+#:     Sweet32 birthday attack, CVE-2016-2183) and roughly 112 bits of effective key strength.
+#: Of the approved five, the two ``-gcm@openssh.com`` names are AEAD -- the cipher authenticates its
+#: own ciphertext -- and the three ``-ctr`` names are the modern non-AEAD floor every SSH server
+#: speaks, paired by the allow-list above with an encrypt-then-MAC tag.
+#:
+#: EXCLUDING AN ALGORITHM THE LIBRARY DOES NOT OFFER IS HARMLESS. The subtraction only ever names
+#: something paramiko actually proposed, so an algorithm a future release drops simply stops
+#: appearing in the deny list, and one it adds -- ``chacha20-poly1305@openssh.com``, say -- stays out
+#: until someone approves it here. That second case costs a good cipher, never proposes a weak one.
+_APPROVED_SFTP_CIPHERS = frozenset(
+    {
+        "aes128-gcm@openssh.com",
+        "aes256-gcm@openssh.com",
+        "aes128-ctr",
+        "aes192-ctr",
+        "aes256-ctr",
+    }
+)
 
-def _disabled_sftp_macs(paramiko: Any) -> list[str]:
-    """Every MAC the installed paramiko would offer that is NOT in :data:`_APPROVED_SFTP_MACS`.
+
+def _not_approved(paramiko: Any, attribute: str, approved: frozenset[str]) -> list[str]:
+    """Every algorithm the installed paramiko offers under ``attribute`` that is NOT in ``approved``.
 
     Reads the library's own preferred list rather than a hardcoded one, so the subtraction stays
     correct across paramiko versions. If that attribute ever disappears the result is an EMPTY deny
-    list, which would silently restore the weak proposals -- so the caller asserts non-emptiness
+    list, which would silently restore the weak proposals -- so the negotiation tests in
+    ``tests/test_remotefile_transport.py`` assert the derived deny list is NON-EMPTY, for each arm,
     rather than trusting this to have found something.
+
+    One body serves both arms (MAC and cipher) deliberately: a second copy would drift, and the copy
+    that drifted would be the one asserting safety.
     """
-    offered = getattr(paramiko.Transport, "_preferred_macs", None)
-    return [m for m in (offered or ()) if m not in _APPROVED_SFTP_MACS]
+    offered = getattr(paramiko.Transport, attribute, None)
+    return [name for name in (offered or ()) if name not in approved]
+
+
+def _disabled_sftp_macs(paramiko: Any) -> list[str]:
+    """Every MAC the installed paramiko would offer that is NOT in :data:`_APPROVED_SFTP_MACS`."""
+    return _not_approved(paramiko, "_preferred_macs", _APPROVED_SFTP_MACS)
+
+
+def _disabled_sftp_ciphers(paramiko: Any) -> list[str]:
+    """Every cipher the installed paramiko would offer that is NOT in :data:`_APPROVED_SFTP_CIPHERS`."""
+    return _not_approved(paramiko, "_preferred_ciphers", _APPROVED_SFTP_CIPHERS)
 
 
 def _import_paramiko() -> Any:
@@ -468,9 +517,21 @@ class _SftpClient(_RemoteClient):
             paramiko.AutoAddPolicy() if self._accept_unknown else paramiko.RejectPolicy()
         )
         pkey = self._load_key(paramiko)
-        # Constrain the MAC proposal to the approved set (BACKLOG #1171). Passed on every connect, not
-        # behind a setting: a control an operator has to switch on is not a control.
-        disabled = {"mac": _disabled_sftp_macs(paramiko)}
+        # Constrain the MAC proposal to the approved set (BACKLOG #1171), and the cipher proposal to
+        # its own approved set. Both are passed on every connect, not behind a setting: a control an
+        # operator has to switch on is not a control.
+        # THE KEYS ARE PLURAL AND THAT IS THE WHOLE CONTROL. paramiko's
+        # ``Transport._filter_algorithm`` does ``self.disabled_algorithms.get(type_, [])`` and is
+        # called with "ciphers", "macs", "keys", "pubkeys", "kex" and "compression". A SINGULAR key
+        # matches nothing, ``.get`` returns the empty default, and every weak algorithm stays on the
+        # wire -- silently, because paramiko neither validates the keys nor warns about an unknown
+        # one. This shipped as ``{"mac": ...}`` and was therefore INERT from the day it landed: a
+        # real handshake against a server pinned to 3des-cbc and hmac-md5 COMPLETED through it.
+        # Do not "tidy" these to the singular names that read more naturally beside the helpers.
+        disabled = {
+            "macs": _disabled_sftp_macs(paramiko),
+            "ciphers": _disabled_sftp_ciphers(paramiko),
+        }
         client.connect(
             disabled_algorithms=disabled,
             hostname=self._host,
