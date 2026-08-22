@@ -12102,8 +12102,14 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > ```
 > scripts/coord/occupancy.ps1:251   Short = $sid.Substring(0, [Math]::Min(8, $sid.Length))
 > scripts/coord/overlap.ps1:234     Short = ([string]$sess.sessionId).Substring(0, 8)
-> scripts/hooks/collision_gate.ps1  $lines += "  $(Get-SafeForMessage $r.Short) (...)"
+> scripts/hooks/collision_gate.ps1:230  "$(Get-SafeForMessage $_.Short) [$(...Branch)]"
+> scripts/hooks/collision_gate.ps1:243  "  $(Get-SafeForMessage $r.Short) ($(...Surface)) in "
 > ```
+> **TWO PRINT SITES, NOT ONE, and I recorded only `:243` when I filed this.** The Dispatcher and the
+> Builder 1 seat both found `:230` independently. `grep -c 'session=' ` on that file returns **0**, so
+> neither site labels the value. **My own error is the defect this item is about, one level up: I
+> found one instance and wrote "the gate prints", which states a conclusion at a wider scope than the
+> query that produced it.** Whoever fixes this should label BOTH and re-run that grep as the check.
 > **THE COST IS NOT CONFUSION, IT IS A FALSE DISMISSAL, and that is why this is worth a number.** The gate's message is read at exactly one moment: somebody is blocked and is trying to identify the other session. It hands them an identifier that **looks resolvable, is not, and whose failure to resolve reads as evidence the WARNING is stale.** The finder came within one step of treating a **true file claim** as a false alarm on that basis. A control that argues against itself when consulted is worse than a silent one.
 > **NOT #1040, and the distinction is the interesting part.** #1040 is about hook deny text being attacker-influenceable, and its fix -- `Get-SafeForMessage` folding a value entering prose -- **is already applied to this exact line.** The value is correctly ESCAPED and incorrectly LABELLED. Escaping asks *"can this string do something"*; labelling asks *"will a reader know what this string IS"*. The first is closed here and the second was never posed.
 > **FIX, one word, and it is why difficulty is 1:** print `session=89933aa2` instead of `89933aa2`. A label turns an apparent sha into what it is. Whoever takes it should check the two `Short` producers as well -- a caller that formats the value correctly does not help a second caller that does not.
