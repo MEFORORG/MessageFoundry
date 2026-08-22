@@ -6880,6 +6880,18 @@ filing.
 
 **What actually stands, and it is narrower than what was written:** the per-actor non-GET floor cannot reach the sign-in ceremony. **Both seats agree on that.** They differ only on whether *any* build reaches the cell, and the item body already answers that with a path. **The sign-in floor must be client-keyed and method-agnostic**, and seven of 57 console non-GET routes carry no `require_ui` gate at all, so charging inside those factories cannot reach them.
 
+**THE BUILDING LANE WITHDREW ITS OWN VERDICT AND BROADCAST THE WITHDRAWAL. Verified independently against this item's body on `main` before recording.**
+
+**The verdict contradicted an owner ruling nobody had read.** This item rests on **Owner Ruling 4 of 2026-08-17**, which splits the two 2026-08-11 scope-outs and returns **this** cell to work by name, on the grounds that the console simply never calls the limiter -- *"wiring, not engineering, and its absence is a real hole"*.
+
+***AND THE ITEM NAMES THE BUILD THAT WAS DONE AS THE WRONG MOVE, IN ADVANCE.*** Under **"What would NOT be an honest pass"** it lists *"wiring `allow_admin_write` into the `/ui` dependency for the coverage, without deciding what a realistic floor is and what evidence sets it"*, and warns that doing so **"would make the scorecard's own absence-claim mutation land verbatim."** The console pacing work built under `#287` is that shape, and it inherited a per-actor number this item already describes as calibrated from a claim asserted **without a source**.
+
+**What survives, and it is not nothing:** `#287` closes a hole the owner ruling itself calls real, and its commit message says only that it does not reach this cell on its own strength -- which matches the ruling. **It was the mail verdict that was wrong, not the code.**
+
+**HOW BOTH SEATS GOT HERE IS ONE FAILURE WITH ONE FIX.** The lane read the item's first 2000 characters, formed a verdict, and stopped; the reachability analysis begins at character **3829**, and the "what would not be a pass" passage at **3139**. This seat then recorded that verdict without opening the item at all. *The same lane had made the identical error on `#1152` an hour earlier -- concluding from a one-liner that a surface was unexamined, and recommending a duplicate allocation.*
+
+> **Both seats reached the same self-diagnosis independently: code gets measured carefully, ledger items get read carelessly.** The mechanical fix is to search an item for its conclusion before ruling on it, not to read more attentively.
+
 ## The original note, kept as written and now known wrong
 
 **VERDICT 2026-08-22 FROM THE BUILDING LANE: CANNOT HONESTLY REACH `pass`, AND CLOSING THE RATE-BUDGET HOLE DOES NOT CHANGE THAT.** The verdict was recorded as `partial`.
