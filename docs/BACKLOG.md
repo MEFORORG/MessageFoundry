@@ -13424,3 +13424,44 @@ blind window is about a day rather than open-ended.
 
 **Source:** found by a builder while sizing #1164, who declined to build it because the 26-importer noise budget is the item, and routed here by the liaison carrying the owner's ruling that the gate widening be filed as its own work.
 
+## 1327. settings models use extra=ignore, so a since-deleted setting passes silently and the test named after it establishes nothing
+
+> 🔢 **Filed 2026-08-22 - not started.** Pydantic settings models accept and drop an unknown keyword. Deleting a setting therefore leaves every call site that passes it green, and the test most likely to pass it is the one NAMED after the setting.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Testing / silent-failure class. **Priority:** P2. **Verdict:** build.
+**Severity:** test-integrity gap, not a runtime defect. **Conditional, per section 0:** zero deployments; what would be wrong is a suite reporting a condition it never established.
+
+**What, measured by two seats.** `model_config` carries `extra="ignore"` on **35 of 38** settings models, so this is the models' configuration and not a property of any one field. A negative control settles the mechanism: constructing a settings model with a deliberately bogus keyword is **accepted**, `hasattr` is False and `model_extra` is None. **`AlertRule` already uses `extra="forbid"` and proves the fix works in this codebase.**
+
+***STATE THE HAZARD, NOT A POPULATION -- AND THIS IS THE POINT OF THE ROW.*** One seat wrote that every test passing a since-removed setting is green and establishing nothing. **That is a population claim and it was not measured.** The other seat swept `tests/` and `messagefoundry/` for a keyword absent from the target model's `model_fields` and found **zero** live instances beyond the single one already fixed: the only direct hit is `tests/test_alert_rules.py:343`, a deliberate `pytest.raises` control proving `AlertRule` forbids extras, and all five kwargs-helper candidates were false positives. **The honest form is "the NEXT deletion will do this silently", not "the suite is full of these"** -- the second gets quoted back later as a measured fact (SDS-3.6).
+
+**The zero carries its own limits, which is what makes it a measurement.** The sweeping seat named them: the direct scan sees only `Name(...)` call shapes, so it misses `mod.Model(...)`, dict-splat and helper indirection -- **it would not have found their own bug** -- and the helper scan follows one hop.
+
+**Proposed work, unallocated.** Set `extra="forbid"` on the settings models as `AlertRule` does, and expect the change to surface live call sites rather than to be inert.
+
+**Source:** found by a builder whose own commit contained the only instance, then broadened and controlled by a second builder. Both declined to file it and named it the Dispatcher's to number.
+
+## 1328. no cell-to-item map exists, so an ASVS re-score cannot be handed to the seat that must flip the banner
+
+> 🔢 **Filed 2026-08-22 - not started.** A research-verdict item closes by TWO acts in different seats: a vault scorecard re-score, then a ledger banner flip. Nothing maps a cell to the item it governs, so the first act cannot be handed to the seat that performs the second.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Coordination tooling / ledger integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** process-integrity gap. **Conditional, per section 0:** zero deployments; the cost is a ledger that misreports which work is finished.
+
+**What, measured 2026-08-22.** A research-verdict item needs a **re-score** (the tracker's, in the vault scorecard) and then a **banner flip** (a ledger edit the tracker may not perform -- `BUILDER.md:253` forbids the filer, `:148` assigns it). ***STEP ONE WITHOUT STEP TWO LEAVES AN ITEM OPEN WHILE THE WORK IS GENUINELY DONE, AND NOTHING ANYWHERE REPORTS THE DISAGREEMENT.*** Measured that day: **three re-scores, zero banner flips, and no flip was ever requested.**
+
+**Why the handoff cannot simply be mailed.** The tracker was asked for item numbers and **correctly refused**: cell ids and item numbers live in different records, `docs/security/` is gitignored from every engine checkout, and no measured map exists. **Guessing the link would fabricate exactly the connection the handoff exists to make reliable.** They also measured that **none of their five scorecard commits carries an item ref** -- the refs in that commit range come from MERGE commits pulling other seats' work, a wrong population they caught before reporting.
+
+***AND THE FLOW IS NOT ONE-DIRECTIONAL, WHICH IS THE HAZARD NOBODY HAD PRICED.*** One re-score that day moved a cell **pass to PARTIAL**, reverting an earlier pass whose measurement had been scoped too narrowly. **If an item was closed on the strength of that pass, it must RE-OPEN.** So the map is needed for correctness in both directions: without it a closed banner can rest on a withdrawn premise, which is a compensating control on a false premise (SDS-3.7).
+
+**Consequence for any closed-item counter.** `CLOSED SINCE <ref>` measures **banner state**, not whether work finished. Without this map it is neither a floor nor a ceiling. **The discriminator, recorded so nobody re-derives it: for each item whose closing act is a re-score, compare the cell `last_verified` against the banner last touch. A cell re-scored after the banner was last touched is step one done and step two missing.**
+
+**Proposed work, unallocated.** A map from ASVS cell id to the backlog items it governs, readable from an engine checkout without the vault, plus the reverse lookup the handoff needs.
+
+**Source:** the two-act structure was named by the ASVS Tracker seat; this row is the Dispatcher's, whose handoff rule assumed a map that does not exist.
+
+
