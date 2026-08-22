@@ -8672,7 +8672,13 @@ filing.
 
 **And the "fix" would cost something real:** forcing all candidates tag-checks every row against every retired key on every read, multiplying store read cost through a rotation, to conceal a value the ciphertext already prints.
 
-***SO THE HONEST STATE IS ONE GROUND CLOSED AND ONE ARGUED, NOT ONE CLOSED AND ONE OPEN.*** The verdict still holds -- an argument is not an assessor's acceptance of it -- but the distinction decides who acts next: an open ground waits on a builder, an argued one waits on a reader who either accepts the reasoning or says which limb fails. **The building lane names reason 2 as the one it would attack first.**
+***CORRECTED AGAIN, AND THIS IS THE THIRD VERSION OF THIS PARAGRAPH.*** It first said the second ground was **open and unexamined** -- wrong, the reasoning ships in the code. It then said **argued, not open**, on the building lane's own framing. **That lane has since withdrawn the word "contested" and the withdrawal is right.**
+
+**THE DISTINCTION THAT SETTLES IT: the three reasons answer IMPACT. The requirement measures CONFORMANCE to an absolute verb.** A short-circuit return inside a cryptographic loop **is** a short-circuit return, whether or not the value it leaks is secret. *Both things are true at once* -- the reasoning about impact is sound and correctly stopped a costly change, **and** the cell correctly stays down, because it is not asking whether the leak matters.
+
+**So this ground is neither open nor contested. It is EXAMINED, ARGUED ON IMPACT, AND NON-CONFORMING ON THE VERB** -- and the code comment has been amended so it no longer reads as closing the requirement question.
+
+*The lane also records that reason 2 had already been conceded verbatim before its commit, and that the loop was never unexamined.* **The cost of the "fix" remains real and is why nobody should build it on the strength of the verdict alone: an assessor's verb and an engineer's threat model are answering different questions, and only one of them is about whether the change is worth making.**
 
 *The comment exists because an unreported non-defect gets "fixed" by the next reader. The next reader arrived, and it worked.*
 
