@@ -830,6 +830,15 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             }
         )
 
+    def crl_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
+        """BACKLOG #1005. Routed exactly like :meth:`cert_expiry` -- same fan-out, same redaction --
+        because a CRL path is config metadata and carries no PHI. Kept a SEPARATE method because an
+        expired CRL refuses every client rather than degrading one identity, so an operator filtering
+        on it is asking a different question."""
+        self.cert_expiry(
+            f"{name} (CRL)", path=path, not_after=not_after, days_remaining=days_remaining
+        )
+
     def secret_rotation_due(
         self,
         name: str,
