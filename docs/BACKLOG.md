@@ -13191,3 +13191,30 @@ twice in one hour.
 
 **Source:** found by a builder while sizing #1318's fix, and it corrected the framing of its own earlier report -- they had repeated a peer's "the tests never load the file" finding without running it, then ran it and found one does, through `check`. **The correction made the finding sharper, not smaller: not a missing gate, a gate that downgrades.** Symbols above; base engine `origin/main` a530d4ea.
 
+## 1321. main is green while carrying a break: both DB legs are skipped on main and only run on a PR
+
+> 🔢 **Filed 2026-08-22 - not started.** `main` can merge a change that breaks the Postgres and SQL Server suites and still report green, because neither leg runs on a push. The first pull request afterwards inherits the red and its author debugs someone else's change.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** CI / test-gate coverage. **Priority:** P2. **Verdict:** build.
+**Severity:** gate-coverage gap, not a runtime defect. Nothing would ship broken to a deploying site; what is at stake is that the gate protecting two of three store backends is not armed on the branch it is supposed to protect.
+
+**What, measured at `origin/main`.** The Postgres and SQL Server jobs carry
+`if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.serverdb == 'true'`
+(`.github/workflows/ci.yml:1855`), and the guard above it at `:1319` states the intent outright: *"push must no longer fire them"*. So on a push to `main` they do not run, and `main` cannot go red on anything only those legs test.
+
+**It has already happened once, and that is how it was found.** [#1187](#1187) merged as `fdd89b49` and added a `masked` key to the summary-access coalescer (`messagefoundry/api/app.py:1025-1029`). Both database twins assert dict **equality** and therefore break on an added key:
+
+| test | assertion | sees a new key? |
+|---|---|---|
+| `tests/test_postgres_store.py:3409` | `json.loads(rows[0]["detail"]) == {"count": 5, "window_start": 0}` | yes, and it breaks |
+| `tests/test_sqlserver_store.py:3435` | identical | yes, and it breaks |
+| `tests/test_api.py:587` | `'"count": 5' in detail` | **no** |
+
+***THE PART THAT GENERALISES IS THE ASSERTION STRENGTH, NOT THE SKIP.*** The SQLite twin uses **substring containment**, which cannot observe an added key, so the leg that DID run passed honestly. **The weaker assertion survived exactly the change the two stronger ones caught, and the two stronger ones were the ones not being run.** A skipped strong check and a running weak check produce the same green, and only one of them is evidence.
+
+**Proposed work, unallocated.** Arm the two legs on pushes to `main`, or accept the cost deliberately and record it. Separately, whether `test_api.py:587` should assert equality rather than containment belongs to [#1187](#1187)'s author, not here.
+
+**Source:** found by another seat when their pull request took three red legs for a change they did not make. Their two-line fix is on their own branch; this item is the gate gap, not that fix.
+
