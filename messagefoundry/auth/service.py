@@ -122,6 +122,22 @@ STEP_UP_ACTION_MFA_DISABLE = "mfa_disable"
 STEP_UP_ACTION_WEBAUTHN_ENROLL = "webauthn_enroll"
 STEP_UP_ACTION_WEBAUTHN_DELETE = "webauthn_delete"
 STEP_UP_ACTION_ADMIN_USER_UPDATE = "admin_user_update"
+# BACKLOG #1149 (ASVS 7.5.2). Terminating a session is bound to an ACTION rather than to the shared
+# session window, because 7.5.2's verb is "having authenticated AGAIN" — an authentication event
+# SUBSEQUENT to the one that established the session. A window seeded by the login ceremony satisfies
+# a recency test the moment a session exists, so `require_reauth_only` alone let a caller mass-revoke
+# every other session of the account with no proof beyond the sign-in they already had.
+STEP_UP_ACTION_SESSION_TERMINATE = "session_terminate"
+# BACKLOG #1148 (ASVS 7.5.1). The verb asks for full re-authentication before modifications to
+# attributes that affect authentication, naming MFA configuration verbatim and NOT qualifying whose.
+# The self-service half already satisfies it; the ADMIN half did not -- both reset lanes rode the
+# plain login-seeded window, so an administrator who signed in under step_up_max_age_seconds ago
+# could act with ZERO fresh proof. What that gate protects is the most complete modification
+# available to the named attribute: admin_reset_mfa disables TOTP and deletes every passkey, and
+# disable_totp NULLs the recovery codes alongside the secret -- one call clears the second factor,
+# every recovery code and every passkey, on someone else's account.
+STEP_UP_ACTION_ADMIN_RESET_MFA = "admin_reset_mfa"
+STEP_UP_ACTION_ADMIN_RESET_PASSWORD = "admin_reset_password"  # nosec B105 — step-up action id, not a credential; echoed publicly in X-Step-Up-Action
 
 _T = TypeVar("_T")
 
@@ -1349,6 +1365,31 @@ class AuthService:
         return bool(self._settings.ad_session_recheck_seconds) and self._ldap is not None
 
     @property
+    def bootstrap_deadline_configured(self) -> bool:
+        """Whether ANY bound can end the unclaimed bootstrap credential -- so whether the ASVS 6.4.5
+        reminder task has anything to warn about. Drives whether the API lifespan creates it at all.
+
+        BACKLOG #1141. This exists because the lifespan gate open-coded
+        ``bootstrap_expiry_hours > 0`` while :meth:`bootstrap_expiry_warning` warns on the EARLIER of
+        **two** bounds -- WP-3 account retirement and the ASVS 6.4.1 credential expiry. Those are
+        different questions, and BACKLOG #1245 corrected the two computations in this file without
+        reaching the gate that decides whether they ever run.
+
+        THE CONSEQUENCE WAS A SILENTLY DEAD WARNING ARM, not a style defect: at
+        ``bootstrap_expiry_hours = 0`` with ``initial_password_expiry_hours`` set, the warning method
+        correctly computes a deadline and **nothing ever calls it**, because the reminder task is its
+        only consumer and was never created. The operator gets no notice before the credential dies.
+
+        Same lesson :meth:`_unclaimed_bootstrap` records one level over: two open-coded copies of one
+        lifecycle question is how the warn path inherited #1245. This is the third copy, in another
+        module, and it inherited it too.
+        """
+        return (
+            self._settings.bootstrap_expiry_hours > 0
+            or self._settings.initial_password_expiry_hours > 0
+        )
+
+    @property
     def directory_reconcile_alert(self) -> str | None:
         """The last mass-revoke circuit-breaker trip, or ``None``. Latches until a pass completes
         without tripping, so an operator who missed the log line still sees the standing condition."""
@@ -2242,13 +2283,32 @@ class AuthService:
                 # legitimate code.
                 return await self._store.consume_totp_step(user.id, matched_step)
         normalized = code.upper()  # recovery codes are minted uppercase
-        hashes = await self._store.get_recovery_code_hashes(user.id)
-        for h in hashes:
-            if await self._argon2(verify_password, h, normalized):
-                # Atomic compare-and-delete: only the caller that actually removes the hash wins, so a
-                # concurrent verify of the same single-use code can't double-spend it (WP-14).
-                return await self._store.consume_recovery_code_hash(user.id, h)
-        return False
+        real = list(await self._store.get_recovery_code_hashes(user.id))
+        # ASVS 11.2.4 (BACKLOG #1149's sibling, #1167; ADR 0170). This walk used to `return` on the
+        # first argon2id match, so the NUMBER of ~64 MiB verifications was a function of which code
+        # was presented -- and, on the failure path, of how many codes REMAINED. Timing a single
+        # failed attempt therefore leaked the user's remaining recovery-code count.
+        #
+        # Constant WORK, not a short-circuit: always run exactly the configured slot count, padding
+        # with the same fixed dummy hash the local login leg uses, and pick the winner afterwards.
+        #
+        # THIS ADDS NO AMPLIFICATION CEILING, WHICH IS THE OBJECTION THE OBVIOUS FIX DESERVES AND
+        # THIS ONE DOES NOT. The failure path ALREADY verified every remaining hash, so the cost here
+        # is today's WORST CASE made unconditional -- bounded by `mfa_recovery_code_count` (default
+        # 10, validator-capped at 50), which is the same bound that already shipped. `_argon2` also
+        # holds a semaphore, so this cannot widen the concurrent-argon2 footprint either.
+        slots = max(self._settings.mfa_recovery_code_count, len(real))
+        matched = -1
+        for i in range(slots):
+            h = real[i] if i < len(real) else _DUMMY_PASSWORD_HASH
+            ok = await self._argon2(verify_password, h, normalized)
+            if ok and i < len(real) and matched < 0:
+                matched = i  # recorded, NOT returned -- returning here restores the leak
+        if matched < 0:
+            return False
+        # Atomic compare-and-delete: only the caller that actually removes the hash wins, so a
+        # concurrent verify of the same single-use code can't double-spend it (WP-14).
+        return await self._store.consume_recovery_code_hash(user.id, real[matched])
 
     async def disable_mfa(self, identity: Identity, *, client: str | None = None) -> None:
         """Self-service: turn off the caller's TOTP MFA (the API gates this behind step-up). Audited +
