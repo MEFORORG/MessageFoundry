@@ -1113,6 +1113,12 @@ def create_app(
             max_files_per_user=store_settings.max_upload_files_per_user,
             max_total_bytes_per_user=store_settings.max_upload_total_bytes_per_user,
             retention_days=store_settings.uploads_retention_days,
+            # ASVS 2.3.4: the quota's cross-PROCESS half. The per-uploader lock inside UploadStore is
+            # an asyncio.Lock and so is per-event-loop; N engine shards over one uploads_dir hold N
+            # of them. Every shard shares this ONE unified store (ADR 0063), so it is the decision
+            # point that spans them. None here is the genuinely store-LESS path (embedding / tests) —
+            # the same path that falls back to build_store_cipher above.
+            store=engine.store if engine is not None else None,
         )
     # ADR 0118: the EFFECTIVE [security] switch values (serve syncs the gate-flipped egress/retention back
     # in) back the read-only GET /security/posture view. None → the secure defaults for the test/embedding
@@ -5654,6 +5660,9 @@ def create_managed_app(
                 max_files_per_user=resolved.max_upload_files_per_user,
                 max_total_bytes_per_user=resolved.max_upload_total_bytes_per_user,
                 retention_days=resolved.uploads_retention_days,
+                # ASVS 2.3.4: bind the cross-shard quota ledger to the SAME store this lifespan just
+                # opened — this is the serve path, so it is the one that actually runs sharded.
+                store=store,
             )
         # Operational alert notifier (webhook/email). None when no transport is configured → the
         # engine falls back to the logging sink. Its background dispatch task is owned by this
