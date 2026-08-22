@@ -8517,6 +8517,8 @@ filing.
 
 ## 1163. research an honest pass for ASVS 11.1.2 -- how a cryptographic inventory can claim ALL without an unmeasured completeness claim
 
+> 🚧 **IN PROGRESS 2026-08-22 -- builder-1 lane**, banner written by the dispatcher, same reason. Claimed via `claim.ps1`; the coord ledger and this banner are different artifacts with different writers. **Not a closure.**
+>
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The four uninventoried surfaces are inventoried and the unmeasured completeness claim has been replaced with at-least language, so the residual is the missing per-row usage sentences (13 of 65 section-4 table lines carry one) plus the research question about deriving the inventory mechanically. That research is cheaper than filed because crypto_inventory_check.py already walks five stated first-party roots and fails the build on undocumented usage, so a stated-corpus instrument partly exists. _(was 6/10 · 6/10.)_
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.1.2** (L2) currently scores **partial**. The pinned verb asks for a maintained inventory of ALL keys, algorithms and certificates, documenting where each key can and cannot be used. The 23-row inventory at `docs/ASVS-L2-PHASE0-CHANGES.md:73` is real, cadenced and CI-guarded, and four shipped crypto surfaces have no row in it.
@@ -8777,6 +8779,8 @@ filing.
 
 ## 1171. research an honest pass for ASVS 11.4.1 -- SHA-1 TOTP and a keyed BLAKE2b de-identification seed
 
+> 🚧 **IN PROGRESS 2026-08-22 -- builder-2 lane**, banner written by the dispatcher: `BUILDER.md:253` puts banner flips outside a builder's lane and the lane-vs-broadcast expiry at `:257` is ambiguous enough that two builders read it differently, so this seat wrote it rather than leave the double-build hazard uncovered. The alerts cleartext-credential refusal is committed; the AUTH-mechanism restriction is not yet landed. **Not a closure.**
+>
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. Half the item is gone -- totp.py:84-85 confirms the SHA-256 cutover with the algorithm string derived so the two cannot drift -- and the cell's own last_verified of 2026-08-16 postdates that cutover while still reading partial, which independently confirms the remainder is the non-TOTP limb. Value 6 on that remainder: an L1 requirement short of pass on shipped code, one site rather than two, with the user-facing authenticator-interop question retired. Difficulty 4 because the worst case is a two-file swap plus the inventory registration at crypto_inventory_check.py:104 and :348, ahead of which sits the cheap prior question of whether a de-identification seed is a cryptographic use the verb reaches. _(was 7/10 · 5/10.)_
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.4.1** (L1) currently scores **partial**. The pinned verb allows only approved hash functions for general cryptographic use, naming HMAC and KDF explicitly. Two independent sites miss it: `messagefoundry/auth/totp.py:71` hard-codes `hashlib.sha1`, and `messagefoundry/anon/keying.py:60` uses a keyed BLAKE2b -- both re-read at 166634c9.
@@ -12515,3 +12519,31 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** CI reliability / supply chain. **Priority:** P1. **Verdict:** build.
 **Severity:** no engine-runtime effect and no deployment axis (sec. 0) -- but this is the **disclosure** path, not the deployment one, and publishing to PyPI is real and current. A silent pass here would let a regression in the `only-include` allowlist republish private documentation to a public index, which is what releases 0.1.0..0.2.15 already did once.
+## 1314. tls_check_hostname=false bypasses both SMTP credential gates, so a credentialed hop trusts any peer chaining to the anchor
+
+> 🔢 **Filed 2026-08-22 - not started.** Value **8/10** · Difficulty **3/10** · _quick win_. **A third TLS weakening axis reaches `smtp.login()` with no refusal, no attestation and no warning**, while the two axes beside it are gated absolutely. Value 8 because a deploying site would put SMTP AUTH credentials on a connection authenticated only to the anchor, not to the name; difficulty 3 because the fix is a third arm matching two that already exist in the same constructors.
+
+**Cluster:** Security / transport posture. **Priority:** P1. **Verdict:** build.
+**Severity:** no exposure today ([§0](../CLAUDE.md) - zero deployments). **On first deployment**, a site that set `tls_check_hostname=false` would send SMTP AUTH credentials to any peer presenting a certificate that chains to the configured anchor, **regardless of the name on it**.
+
+**The gap.** `EmailDestination.__init__` (`transports/email.py`) and `DirectDestination.__init__` (`transports/direct.py`) branch three ways on TLS posture. The `not use_tls` arm and the `not tls_verify` arm each carry a body gate **and** a separate credential gate -- `if self.username is not None: raise` -- placed **outside** the escape conditional, so passing the escape does not skip it. The verified arm carries **no credential gate at all**, and `tls_check_hostname` is read there.
+
+**So the absoluteness is real and partial.** Verified by execution: `use_tls=false` + username and `tls_verify=false` + username are refused **with** the escape env var, **with** `tls_hop_attested`, and **with** `cleartext_accepted`, in all four arms across both connectors. *Those two axes need no change.* With `use_tls=true`, `tls_verify=true`, `tls_check_hostname=false` and a username set, **both connectors construct silently.**
+
+**Operator-reachable, not theoretical.** `Email()` and `Direct()` in `config/wiring.py` expose `tls_check_hostname` as a public keyword **beside `username` and `password`**; the connectors read it via `s.get("tls_check_hostname", True)`. The plausible route is a relay whose certificate carries the wrong SAN.
+
+**Measured with a live TLS handshake** -- throwaway RFC5280-conformant CA, synthetic material, no PHI. Connector host `smtp.partner.org`; peer presenting a certificate for `attacker.example` issued by the trusted anchor:
+
+| `check_hostname` | result |
+|---|---|
+| `True` | refused, `SSLCertVerificationError` |
+| `False` | **handshake succeeded**, peer CN `attacker.example` |
+
+`_send` and `_probe` then reach `smtp.login(self.username, self.password or "")`.
+
+**The shape of the fix, and it must not widen the existing arms.** A credential gate on the verified arm keyed on `tls_check_hostname`, matching the wording and the absolute placement of the two that exist. The escape belongs to the *body* posture in both existing arms and never to the *credential*; a third arm should keep that split.
+
+**Related but NOT the same item.** [#333](#333) is closed and concerns the loosening **registry**'s visibility. Its argument that `tls_allow_expired` is not a MITM primitive rests explicitly on hostname matching *still applying* -- which is the check this item shows an operator can disable. A reader who takes #333's reasoning as covering this case would be wrong.
+
+**Source:** found by adversarial verification of an unrelated claim, 2026-08-22. **Two seats had independently asserted the gates were absolute** -- both had verified the two covered arms and generalised. Recorded because agreement between two readers of the same two arms is not coverage of a third.
+
