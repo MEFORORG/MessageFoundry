@@ -8662,7 +8662,19 @@ filing.
 
 ***AND THE MECHANICAL REPAIR WOULD HAVE BEEN A REAL DEFECT.*** Re-pointing that anchor at the nearest surviving argon2 call -- the obvious move, and the one a tool would suggest -- **would have produced a GREEN anchor certifying a defect that no longer exists, on a Level 3 cell, permanently.** The correct action is **retirement**, not re-anchor: there is no equivalent line, because the thing it pointed at is gone.
 
-**The verdict holds because the downgrade rested on TWO data-dependent early returns, and only one is closed.** The other -- the AES-GCM keyring candidate loop -- still returns inside its loop, unchanged. **One ground closing does not lift a verdict that two grounds held down.**
+**The downgrade rested on TWO data-dependent early returns. One is CLOSED. The second is not open -- it is ARGUED, and the argument is shipped in the code.** *Corrected here within the hour: this entry first recorded the second ground as unchanged and unexamined, which is wrong.*
+
+**`store/crypto.py:773-789` on `main` carries the reasoning in a comment naming this item and the requirement**, verified present. It gives three independent grounds, any one sufficient:
+
+1. **The input is not attacker-supplied** -- `stored` comes from the store, not a request, so chosen ciphertext there already requires database write access.
+2. **What the timing reveals is already in plaintext** -- candidate count varies with which key encrypted the row, and `key_id` is parsed out of `stored` two lines above because the marker publishes it.
+3. **The per-candidate cost is a GMAC tag check** -- microseconds, constant-time inside `cryptography`. The recovery-code walk mattered because each step was a ~64 MiB argon2id, which is precisely why *that* one was fixed.
+
+**And the "fix" would cost something real:** forcing all candidates tag-checks every row against every retired key on every read, multiplying store read cost through a rotation, to conceal a value the ciphertext already prints.
+
+***SO THE HONEST STATE IS ONE GROUND CLOSED AND ONE ARGUED, NOT ONE CLOSED AND ONE OPEN.*** The verdict still holds -- an argument is not an assessor's acceptance of it -- but the distinction decides who acts next: an open ground waits on a builder, an argued one waits on a reader who either accepts the reasoning or says which limb fails. **The building lane names reason 2 as the one it would attack first.**
+
+*The comment exists because an unreported non-defect gets "fixed" by the next reader. The next reader arrived, and it worked.*
 
 *Recorded here so nobody reads this item's landing as a re-score.* The record is what is behind; the engine is ahead.
 ## 1168. research an honest pass for ASVS 11.3.1 -- retiring PKCS#1 v1.5 when the DIRECT key-transport half has no padding parameter to set
