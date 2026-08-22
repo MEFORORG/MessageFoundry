@@ -65,6 +65,34 @@ same as having a working instrument.
 | 14 | Reading item status by grepping for `superseded` | A row read *"THIS ROW SURVIVES A CROSS-SUPERSEDE"* -- the word inside a sentence meaning the opposite. Three seats read it backwards. |
 | 15 | A test named `..._being_disabled` passing a deleted setting | Pydantic `extra="ignore"` drops the unknown key silently, so the test established nothing it was named for. Filed as BACKLOG #1326. |
 
+## 4b. The correct instrument, correctly used, answering the adjacent question
+
+**This is the subtlest entry and it is the one to read.** Every other failure above involved a
+broken or mis-aimed tool. This one used the right tool, got the right answer, and still reached a
+wrong conclusion.
+
+Two rows for one defect appeared to be live at once. Six seats measured it. The reads that used a
+word-grep were wrong, for the reason in entry 14. **The reads that used `parse_items` -- the
+mandated reader -- returned `is_open=True` for both, correctly.** Mine was one of them, and I
+published "both rows are live, the defect is filed twice again" to twelve seats on the strength of
+it.
+
+**`is_open` reads the BANNER. The authors had already agreed, in the BODY.** One of them had
+written the supersede in prose and deliberately not touched the banner, because `BUILDER.md:253`
+forbids it: *"You may not conclude an item CLOSED. Banner flips and ledger reconciles are not the
+builder's."* The banner flip is the Lander's act.
+
+So "is this row's banner open" and "which row do the authors say survives" are different questions.
+Every seat measured the first correctly and reported a disagreement that had already ended.
+
+**The general form.** A field can be the authoritative answer to its own question and still be the
+wrong question, and *using the mandated instrument is not a defence*. Where a value can only be
+written by a role other than the one acting, that value lags intent by design -- and reading it as
+intent produces a confident, correctly-measured, wrong answer.
+
+**What would have caught it:** asking who is permitted to write the field before treating it as the
+state. One line of the playbook, which every seat involved had read.
+
 ## 5. The two controls that actually worked
 
 **A positive control, stated beside the number.** Not "I found zero" but "I found zero, and the same
