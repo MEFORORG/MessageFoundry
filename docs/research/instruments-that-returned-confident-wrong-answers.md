@@ -51,11 +51,17 @@ withdrawn. The honest form is "the next one will do this silently", not "these a
 
 ## Two shapes that are not instrument failures
 
-**A marker that reverses its own meaning in context is worse than no marker.** A row containing
+**A STATUS MARKER MUST NOT BE A WORD THAT ALSO APPEARS IN NARRATION.** A row containing
 "THIS ROW SURVIVES A CROSS-SUPERSEDE" was read as superseded by three separate readers grepping for
-that word. This is the positional-meaning defect CLAUDE.md section 11 gives as the reason not to use
-status glyphs -- reproduced exactly, in prose. The rule is not about pictographs; it is about tokens
-whose meaning depends on the sentence around them.
+that word; a fourth read "SUPERSEDED BY #1326" in a body paragraph and took it for the row's status.
+Both misreadings are presence-equals-meaning -- the positional-meaning defect CLAUDE.md section 11
+gives as the reason not to use status glyphs, reproduced exactly, in prose.
+
+The rule is not about pictographs. It is about tokens whose meaning depends on the sentence around
+them, and PROSE IS NOT IMMUNE: a word carries its scope in the sentence, which is precisely why the
+same word used as BOTH a status and a narration cannot. In this repo the banner alphabet is the status
+channel and `parse_items` is its only correct reader; anything written in the body is narration, no
+matter how emphatic. **Four seats grepped the body for a status word. None of them was careless.**
 
 **Mutual deference has no fixed point, and neither does mutual assertion.** Two seats deferring to a
 third produced two records of one defect; both then yielding to each other produced zero; both then
