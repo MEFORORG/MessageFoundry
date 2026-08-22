@@ -144,6 +144,40 @@ def test_dead_letter_summary_and_last_error_gated() -> None:
     assert redacted.summary is None and redacted.last_error is None
 
 
+def test_a_masked_value_is_not_counted_as_a_phi_exposure() -> None:
+    """The exposure audit must count what the caller could READ, not what the field was called.
+
+    Masking (ASVS 14.2.6) made every list row carry a non-empty ``summary`` again -- ``MRN ****0001``
+    is truthy -- so a counter keyed on "is this property non-empty" reports a PHI exposure for a row
+    whose identifiers were never shown. At list scale that is a false positive per row, and it
+    drowns the signal the audit exists for: the single record someone actually opened.
+    """
+    holder = _identity(Permission.MESSAGES_VIEW_SUMMARY)
+    # Only the masked property is populated, so nothing else can account for a count.
+    masked = redact_unauthorized(_summary(error=None, metadata=None), holder)
+    assert masked.summary == "****"  # populated, and unreadable
+    assert count_exposed([masked]) == 0
+
+    revealed = redact_unauthorized(
+        _summary(error=None, metadata=None), holder, revealed=frozenset({"summary"})
+    )
+    assert revealed.summary == "DOE^JOHN"
+    assert count_exposed([revealed]) == 1  # the control: the same row, actually exposed
+
+
+def test_a_masked_row_still_counts_when_another_phi_property_is_complete() -> None:
+    """Masking one property must not suppress the count for a different one that IS readable.
+
+    ``error`` is not in ``MASKED_UNTIL_REVEALED``, so a row whose summary is masked and whose error
+    is complete is still an exposure -- and a fix that keyed on "this model has any masked property"
+    rather than on the individual values would have hidden it.
+    """
+    holder = _identity(Permission.MESSAGES_VIEW_SUMMARY)
+    row = redact_unauthorized(_summary(metadata=None), holder)
+    assert row.summary == "****" and row.error == "boom in PID-5"
+    assert count_exposed([row]) == 1
+
+
 def test_count_exposed_reflects_what_is_returned() -> None:
     holder, nonholder = _identity(Permission.MESSAGES_VIEW_SUMMARY), _identity()
     rows = [_summary(), _summary(summary=None, error=None)]  # one carries PHI, one already blank

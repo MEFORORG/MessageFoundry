@@ -525,7 +525,44 @@ async def test_summary_access_audited_server_side_and_coalesced(engine: Engine) 
         assert not [a for a in await engine.store.list_audit() if a["action"] == "summary_access"]
         await app.state.summary_auditor.flush(engine.store)  # e.g. shutdown flush
     rows = [a for a in await engine.store.list_audit() if a["action"] == "summary_access"]
-    assert len(rows) == 1 and '"count": 2' in (rows[0]["detail"] or "")  # both calls coalesced
+    assert len(rows) == 1  # both calls coalesced into one window
+    detail = rows[0]["detail"] or ""
+    # The LIST surface masks, so these two accesses disclosed nothing -- but a bulk fetch must still
+    # be visible in the audit, or a 5,000-row scrape would look like no request at all (ASVS 14.2.6,
+    # BACKLOG #1187). The two counts are kept apart so one can never be read as the other.
+    assert '"masked": 2' in detail  # accumulated across both calls
+    assert '"count": 0' in detail  # and nothing was actually readable
+
+
+async def test_the_audit_separates_a_masked_list_from_a_real_disclosure(engine: Engine) -> None:
+    """Listing and opening the SAME message must land in different counters (BACKLOG #1187).
+
+    Before this split every list row counted as a PHI exposure, so the audit could not tell a
+    console poll from someone reading a patient's identifiers -- the false positives buried the one
+    event the record exists for.
+    """
+    await engine.store.enqueue_message(
+        channel_id="ch1", raw=ADT, deliveries=[("archive", ADT)], summary="MRN 100001 · DOE, JANE"
+    )
+    app = create_app(engine, allow_no_auth=True)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        listed = (await c.get("/messages")).json()["messages"][0]
+        await c.get(f"/messages/{listed['id']}")  # the open IS the reveal act
+        await app.state.summary_auditor.flush(engine.store)
+
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "summary_access"]
+    details = [r["detail"] or "" for r in rows]
+
+    # The LIST: one row returned, nothing readable.
+    assert any('"count": 0' in d and '"masked": 1' in d for d in details)
+
+    # The OPEN: a real disclosure, and nothing masked. The count is 3 rather than 1 because the
+    # detail route audits [detail, *outbox, *events] together -- the nested delivery and event rows
+    # carry their own `last_error` / `detail` PHI, which is NOT in MASKED_UNTIL_REVEALED and so was
+    # readable all along. Asserted exactly, because a looser "> 0" would pass if the summary reveal
+    # silently stopped counting and only the nested rows carried it.
+    assert any('"count": 3' in d and '"masked": 0' in d for d in details)
 
 
 async def test_summary_audit_coalescer_rolls_over_with_count() -> None:

@@ -187,19 +187,52 @@ def redact_unauthorized(  # noqa: UP047
     # Still null the values, so `count_exposed` and any server-side read of the returned model agree
     # with what is actually serialized. The serializer alone would leave the attribute populated.
     withheld: dict[str, object | None] = {prop: None for prop in gated if prop not in allowed}
+    masked: set[str] = set()
     for prop in allowed & MASKED_UNTIL_REVEALED - revealed:
         value = getattr(model, prop, None)
         if isinstance(value, str) and value:
             withheld[prop] = mask_for_display(value)
+            masked.add(prop)
     out = model.model_copy(update=withheld)
     if isinstance(out, PhiGatedModel):
         out.release_phi(allowed)
+        # Only properties actually replaced with a mask -- an empty value is not masked, it is
+        # empty, and marking it would make `count_exposed` skip a property that later becomes real.
+        out.mark_phi_masked(masked)
     return out
 
 
 def count_exposed(models: Sequence[BaseModel]) -> int:
-    """How many ``models`` still carry a non-empty PHI property — call **after** redaction, so the
-    count reflects what is actually returned. Fed to the server-side PHI-exposure audit."""
+    """How many ``models`` still carry a READABLE PHI property — call **after** redaction, so the
+    count reflects what is actually returned. Fed to the server-side PHI-exposure audit.
+
+    A **display-masked** property is not an exposure and is not counted (ASVS 14.2.6). It is
+    non-empty, so counting on emptiness alone would report a PHI exposure for every masked list row
+    and bury the record someone actually opened. The mask is read from the model's own record of
+    what it masked, never inferred from the value -- a real summary may contain the mask characters.
+    """
+
+    return sum(1 for m in models if _has_readable_phi(m))
+
+
+def count_masked(models: Sequence[BaseModel]) -> int:
+    """How many ``models`` carry a display-masked PHI property and nothing readable.
+
+    The other half of the exposure audit. A masked row is not a disclosure, but it is still a row
+    someone asked for -- so a bulk list fetch has to stay visible in the audit even though it
+    harvested no identifiers. Counting only :func:`count_exposed` would make a 5,000-row scrape
+    indistinguishable from no request at all, which is the harvest signal the audit exists to keep.
+    """
     return sum(
-        1 for m in models if any(getattr(m, prop, None) for prop in gated_properties(type(m)))
+        1
+        for m in models
+        if not _has_readable_phi(m)
+        and isinstance(m, PhiGatedModel)
+        and any(getattr(m, p, None) for p in m._phi_masked)
     )
+
+
+def _has_readable_phi(m: BaseModel) -> bool:
+    """True when any gated property is non-empty AND not display-masked."""
+    masked = m._phi_masked if isinstance(m, PhiGatedModel) else frozenset()
+    return any(getattr(m, p, None) for p in gated_properties(type(m)) if p not in masked)
