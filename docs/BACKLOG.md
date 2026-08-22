@@ -8517,6 +8517,8 @@ filing.
 
 ## 1163. research an honest pass for ASVS 11.1.2 -- how a cryptographic inventory can claim ALL without an unmeasured completeness claim
 
+> 🚧 **IN PROGRESS 2026-08-22 -- builder-1 lane**, banner written by the dispatcher, same reason. Claimed via `claim.ps1`; the coord ledger and this banner are different artifacts with different writers. **Not a closure.**
+>
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The four uninventoried surfaces are inventoried and the unmeasured completeness claim has been replaced with at-least language, so the residual is the missing per-row usage sentences (13 of 65 section-4 table lines carry one) plus the research question about deriving the inventory mechanically. That research is cheaper than filed because crypto_inventory_check.py already walks five stated first-party roots and fails the build on undocumented usage, so a stated-corpus instrument partly exists. _(was 6/10 · 6/10.)_
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.1.2** (L2) currently scores **partial**. The pinned verb asks for a maintained inventory of ALL keys, algorithms and certificates, documenting where each key can and cannot be used. The 23-row inventory at `docs/ASVS-L2-PHASE0-CHANGES.md:73` is real, cadenced and CI-guarded, and four shipped crypto surfaces have no row in it.
@@ -8777,6 +8779,8 @@ filing.
 
 ## 1171. research an honest pass for ASVS 11.4.1 -- SHA-1 TOTP and a keyed BLAKE2b de-identification seed
 
+> 🚧 **IN PROGRESS 2026-08-22 -- builder-2 lane**, banner written by the dispatcher: `BUILDER.md:253` puts banner flips outside a builder's lane and the lane-vs-broadcast expiry at `:257` is ambiguous enough that two builders read it differently, so this seat wrote it rather than leave the double-build hazard uncovered. The alerts cleartext-credential refusal is committed; the AUTH-mechanism restriction is not yet landed. **Not a closure.**
+>
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. Half the item is gone -- totp.py:84-85 confirms the SHA-256 cutover with the algorithm string derived so the two cannot drift -- and the cell's own last_verified of 2026-08-16 postdates that cutover while still reading partial, which independently confirms the remainder is the non-TOTP limb. Value 6 on that remainder: an L1 requirement short of pass on shipped code, one site rather than two, with the user-facing authenticator-interop question retired. Difficulty 4 because the worst case is a two-file swap plus the inventory registration at crypto_inventory_check.py:104 and :348, ahead of which sits the cheap prior question of whether a de-identification seed is a cryptographic use the verb reaches. _(was 7/10 · 5/10.)_
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.4.1** (L1) currently scores **partial**. The pinned verb allows only approved hash functions for general cryptographic use, naming HMAC and KDF explicitly. Two independent sites miss it: `messagefoundry/auth/totp.py:71` hard-codes `hashlib.sha1`, and `messagefoundry/anon/keying.py:60` uses a keyed BLAKE2b -- both re-read at 166634c9.
