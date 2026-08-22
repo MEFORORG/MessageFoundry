@@ -21,7 +21,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from messagefoundry.api._ui_seam import UiDeps
-from messagefoundry.api.models import UploadResendRequest
+from messagefoundry.api.models import UploadedMessageSearchRequest, UploadResendRequest
 from messagefoundry.auth import Identity, Permission
 
 from .. import pages
@@ -34,9 +34,10 @@ from .._auth import (
 from ._common import _form_pairs
 
 # The browse GET decrypts PHI (step-up), so register it as an UNLOCK form — a stale step-up 303s to
-# /ui/reauth and GET-redirects back to the browse page (the PHI-shaped filter is a GET query, so it is
-# deliberately NOT carried across the redirect). The delete POST is body-less + step-up, so it may be
-# auto-retried after re-auth. Upload/resend are same-origin require_ui POSTs (not registered).
+# /ui/reauth and GET-redirects back to the browse page. The PHI-shaped filter now travels in the POST
+# body of .../filter (BACKLOG #1184) and so cannot cross the redirect at all. The delete POST is
+# body-less + step-up, so it may be auto-retried after re-auth. Upload/resend/filter are same-origin
+# POSTs (not registered).
 register_ui_action(
     r"^/ui/uploaded-logs/file/[^/?#]+$", Permission.FILES_BROWSE, auto_retry=False, unlock=True
 )
@@ -164,19 +165,23 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             )
         return RedirectResponse("/ui/uploaded-logs", status_code=303)
 
-    @app.get("/ui/uploaded-logs/file/{file_id}", response_class=HTMLResponse)
-    async def ui_uploaded_log_browse(
+    async def _render_browse(
         file_id: str,
         request: Request,
-        engine: Any = Depends(deps.get_engine),
-        identity: Identity = Depends(require_ui_step_up(Permission.FILES_BROWSE)),
-        content: str | None = Query(None, max_length=512),
-        field_path: str | None = Query(None, max_length=32),
-        field_value: str | None = Query(None, max_length=512),
-        message_type: str | None = Query(None, max_length=64),
-        control_id: str | None = Query(None, max_length=256),
-        limit: int = Query(200, ge=1, le=500),
+        engine: Any,
+        identity: Identity,
+        *,
+        content: str | None,
+        field_path: str | None,
+        field_value: str | None,
+        message_type: str | None,
+        control_id: str | None,
+        limit: int,
+        error: str = "",
+        status_code: int = 200,
     ) -> Response:
+        """Render one uploaded file's browse page for a given filter — shared by the GET page render
+        and by the POST that filters on a needle (BACKLOG #1184)."""
         # No outcome banner here: this page is step-up-gated, so a flag aimed at it is dropped whenever
         # the window is stale (see :data:`_FAILED_TARGET`). Every refused mutation reports on the list.
         shared = dict(  # noqa: C408
@@ -203,8 +208,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 offset=0,
             )
 
+        # `error` means the criteria never validated, so there is nothing to search ON. Browse
+        # metadata-only, but keep the typed values in `shared` so the form is not silently
+        # blanked -- the same shape the HTTPException 400 arm below already uses.
         try:
-            result = await _browse(content, field_path, field_value)
+            result = await _browse(
+                *((None, None, None) if error else (content, field_path, field_value))
+            )
         except HTTPException as exc:
             if exc.status_code == 404:  # bad/absent id (incl. path-traversal) → back to the list
                 return RedirectResponse("/ui/uploaded-logs", status_code=303)
@@ -225,7 +235,103 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     status_code=400,
                 )
             raise
-        return HTMLResponse(pages.uploaded_log_detail(result, **shared))
+        return HTMLResponse(
+            pages.uploaded_log_detail(result, error=error, **shared), status_code=status_code
+        )
+
+    @app.get("/ui/uploaded-logs/file/{file_id}", response_class=HTMLResponse)
+    async def ui_uploaded_log_browse(
+        file_id: str,
+        request: Request,
+        engine: Any = Depends(deps.get_engine),
+        identity: Identity = Depends(require_ui_step_up(Permission.FILES_BROWSE)),
+        field_path: str | None = Query(None, max_length=32),
+        message_type: str | None = Query(None, max_length=64),
+        control_id: str | None = Query(None, max_length=256),
+        limit: int = Query(200, ge=1, le=500),
+    ) -> Response:
+        """The file's message list, filtered by the criteria that are safe on a URL (BACKLOG #1184).
+
+        ``content`` and ``field_value`` are gone from this signature for the reason the content-search
+        page states: a GET form writes the typed term into the address bar, browser history and every
+        access log on the way. The filter form now POSTs to ``.../filter``, so a link still carrying
+        ``?content=`` lists the whole file rather than filtering — the term is ignored, not honoured."""
+        return await _render_browse(
+            file_id,
+            request,
+            engine,
+            identity,
+            content=None,
+            field_path=field_path,
+            field_value=None,
+            message_type=message_type,
+            control_id=control_id,
+            limit=limit,
+        )
+
+    @app.post("/ui/uploaded-logs/file/{file_id}/filter", response_class=HTMLResponse)
+    async def ui_uploaded_log_filter(
+        file_id: str,
+        request: Request,
+        engine: Any = Depends(deps.get_engine),
+        identity: Identity = Depends(
+            require_ui_step_up(
+                Permission.FILES_BROWSE,
+                reauth_next=lambda r: r.url.path.removesuffix("/filter"),
+            )
+        ),
+    ) -> Response:
+        """Filter the browse listing on criteria carried in the request BODY (BACKLOG #1184).
+
+        A path of its own because the browse page is a registered ``unlock`` action, which the console
+        refuses to serve as a POST; ``reauth_next`` sends a stale-step-up bounce back to that page, the
+        documented continuation for a body-carrying POST."""
+        assert_same_origin(request)
+        form = dict(await _form_pairs(request))
+        try:
+            # The engine's own body model for this route, so a posted form is bounded exactly as the
+            # JSON API bounds it — no second, drifting copy of the field lengths.
+            criteria = UploadedMessageSearchRequest(
+                content=form.get("content") or None,
+                field_path=form.get("field_path") or None,
+                field_value=form.get("field_value") or None,
+                message_type=form.get("message_type") or None,
+                control_id=form.get("control_id") or None,
+                limit=200,  # the form carries no page-size control; same default the GET declares
+                offset=0,
+            )
+        except ValueError:  # pydantic: a criterion is longer than its bound
+            # REFUSE, do not answer with the whole file. Returning 200 with every criterion dropped
+            # and the inputs blanked reads to an operator as "your filter matched everything", which
+            # is the opposite of what happened -- and it silently discarded their valid criteria too.
+            # The sibling POST /ui/messages/search/run answers 400 with a banner, and the GET this
+            # replaced answered 422; this arm was the only one that swallowed it (BACKLOG #1184).
+            return await _render_browse(
+                file_id,
+                request,
+                engine,
+                identity,
+                content=form.get("content") or None,
+                field_path=form.get("field_path") or None,
+                field_value=form.get("field_value") or None,
+                message_type=form.get("message_type") or None,
+                control_id=form.get("control_id") or None,
+                limit=200,
+                error="a filter criterion is longer than that field allows",
+                status_code=400,
+            )
+        return await _render_browse(
+            file_id,
+            request,
+            engine,
+            identity,
+            content=criteria.content,
+            field_path=criteria.field_path,
+            field_value=criteria.field_value,
+            message_type=criteria.message_type,
+            control_id=criteria.control_id,
+            limit=criteria.limit,
+        )
 
     @app.post("/ui/uploaded-logs/file/{file_id}/resend")
     async def ui_uploaded_log_resend(

@@ -73,6 +73,7 @@ POST /ui/login
 POST /ui/logout
 POST /ui/messages/search/presets
 POST /ui/messages/search/presets/{preset_id}/delete
+POST /ui/messages/search/run
 POST /ui/messages/{message_id}/edit-resend
 POST /ui/messages/{message_id}/replay
 POST /ui/mfa
@@ -86,6 +87,7 @@ POST /ui/statistics/reset-many
 POST /ui/statistics/reset-one
 POST /ui/status/integrity-check
 POST /ui/uploaded-logs/file/{file_id}/delete
+POST /ui/uploaded-logs/file/{file_id}/filter
 POST /ui/uploaded-logs/file/{file_id}/resend
 POST /ui/uploaded-logs/upload
 POST /ui/users
