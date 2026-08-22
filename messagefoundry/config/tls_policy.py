@@ -1066,6 +1066,12 @@ def smtp_login_approved(
             f"({', '.join(APPROVED_SMTP_AUTH_MECHANISMS)}). CRAM-MD5 is an HMAC over MD5 and is "
             "refused (ASVS 11.4.1; Appendix C marks MD5 disallowed)."
         )
+    # THE AUTH OBJECTS READ THESE OFF THE CONNECTION, and omitting them fails only against a real
+    # server. ``auth_plain``'s own docstring is "Requires self.user and self.password to be set";
+    # ``auth_login`` says the same. ``login()`` assigns them before its loop, so driving ``auth()``
+    # directly means doing the same job by hand -- and this function shipped WITHOUT it, unwired, so
+    # nothing exercised the path. A fake that models ``login()`` cannot catch it either.
+    smtp.user, smtp.password = username, password
     last: Exception | None = None
     for mech in usable:
         try:
@@ -1073,4 +1079,11 @@ def smtp_login_approved(
             return
         except Exception as exc:  # noqa: BLE001 - try the next approved mechanism, report the last
             last = exc
-    raise InsecureHopRefused(f"{cell}: every approved SMTP AUTH mechanism failed: {last}") from last
+    # A REJECTED CREDENTIAL IS NOT A POLICY REFUSAL, and conflating them sends an operator with a
+    # wrong password to go reading TLS policy. Re-raise the server's own exception so the caller's
+    # existing ``except smtplib.SMTPException`` maps it to DeliveryError exactly as it did when this
+    # was ``smtp.login()``. InsecureHopRefused stays reserved for the two decisions THIS function
+    # makes: an unencrypted channel, and a server offering no approved mechanism.
+    if last is not None:
+        raise last
+    raise InsecureHopRefused(f"{cell}: no approved SMTP AUTH mechanism was attempted")

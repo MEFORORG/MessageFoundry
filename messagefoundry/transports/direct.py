@@ -62,7 +62,10 @@ from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     weakened_tls_escape_permitted_here,
 )
-from messagefoundry.config.tls_policy import build_smtp_tls_context
+from messagefoundry.config.tls_policy import (
+    build_smtp_tls_context,
+    smtp_login_approved,
+)
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -400,7 +403,18 @@ class DirectDestination(DestinationConnector):
         try:
             with self._connect() as smtp:
                 if self.username is not None:
-                    smtp.login(self.username, self.password or "")
+                    # NOT smtp.login(): it tries CRAM-MD5 FIRST, an HMAC over MD5 (BACKLOG
+                    # #1171, ASVS 11.4.1). escape_permitted=False because this cell's
+                    # cleartext-credential refusal at construction is absolute -- a send-time
+                    # backstop that is weaker than the gate it backs up is a hole.
+                    smtp_login_approved(
+                        smtp,
+                        self.username,
+                        self.password or "",
+                        channel_encrypted=self.use_tls,
+                        escape_permitted=False,
+                        cell="DIRECT outbound",
+                    )
                 smtp.send_message(msg)
         except smtplib.SMTPException as exc:
             raise DeliveryError(
@@ -422,7 +436,16 @@ class DirectDestination(DestinationConnector):
             with self._connect() as smtp:
                 smtp.ehlo_or_helo_if_needed()
                 if self.username is not None:
-                    smtp.login(self.username, self.password or "")
+                    # Same restriction as _send: a probe that authenticated via CRAM-MD5
+                    # would report a hop healthy that the real send path refuses.
+                    smtp_login_approved(
+                        smtp,
+                        self.username,
+                        self.password or "",
+                        channel_encrypted=self.use_tls,
+                        escape_permitted=False,
+                        cell="DIRECT outbound probe",
+                    )
                 smtp.noop()
         except smtplib.SMTPException as exc:
             raise DeliveryError(

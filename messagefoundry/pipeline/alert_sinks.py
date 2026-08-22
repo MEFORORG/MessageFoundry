@@ -45,7 +45,12 @@ from messagefoundry.config.settings import (
     EscalationTier,
     weakened_tls_escape_permitted,
 )
-from messagefoundry.config.tls_policy import HopPosture, TrustAnchorPolicy, build_smtp_tls_context
+from messagefoundry.config.tls_policy import (
+    HopPosture,
+    TrustAnchorPolicy,
+    build_smtp_tls_context,
+    smtp_login_approved,
+)
 
 __all__ = [
     "AlertTransport",
@@ -406,7 +411,7 @@ def send_plain_email(
     if allowed and host.lower() not in allowed:
         raise ValueError(f"SMTP host {host!r} is not in the configured allowlist")
     # SMTP AUTH over an un-encrypted channel puts the password on the wire (BACKLOG #1171, ASVS
-    # 11.4.1). Line ~433 below logs in whenever a username is set, while STARTTLS runs only when
+    # 11.4.1). The AUTH call below runs whenever a username is set, while STARTTLS runs only when
     # `use_tls` — so `[alerts].email_use_tls=false` beside `email_username` sent the credential in
     # cleartext, with no refusal at the function, at EmailTransport, or at the serve gate.
     #
@@ -451,7 +456,19 @@ def send_plain_email(
             # context= is REQUIRED (#323): starttls()'s own default verifies NOTHING.
             smtp.starttls(context=tls_context)
         if username is not None:
-            smtp.login(username, password or "")
+            # NOT smtp.login(): it tries CRAM-MD5 FIRST, an HMAC over MD5 (BACKLOG #1171,
+            # ASVS 11.4.1). The refusal above already guarantees use_tls here, so
+            # channel_encrypted is not merely asserted -- it is the same value that gate read.
+            # escape_permitted=False: this cell's cleartext-credential refusal has no escape,
+            # matching the two connectors rather than introducing a third posture.
+            smtp_login_approved(
+                smtp,
+                username,
+                password or "",
+                channel_encrypted=use_tls,
+                escape_permitted=False,
+                cell="alerts SMTP transport",
+            )
         smtp.send_message(msg)
 
 

@@ -55,8 +55,28 @@ class _RecordingSMTP:
         _RecordingSMTP.captured["tls"] = True
         _RecordingSMTP.captured["context"] = context
 
-    def login(self, user: str, password: str) -> None:
-        _RecordingSMTP.captured["login"] = (user, password)
+    # BACKLOG #1171: production drives auth() directly, never login(). CRAM-MD5 is advertised
+    # DELIBERATELY -- it is what a regression to login() would select, so a fake offering only
+    # PLAIN/LOGIN could not tell a fixed cell from a broken one.
+    esmtp_features = {"auth": "CRAM-MD5 PLAIN LOGIN"}
+    user = ""
+    password = ""
+
+    def ehlo_or_helo_if_needed(self) -> None:
+        return None
+
+    def has_extn(self, name: str) -> bool:
+        return name.lower() == "auth"
+
+    def auth(self, mechanism: str, authobject: Any, *, initial_response_ok: bool = True) -> None:
+        _RecordingSMTP.captured["auth_mechanism"] = mechanism
+        _RecordingSMTP.captured["login"] = (self.user, self.password)
+
+    def auth_plain(self, challenge: bytes | None = None) -> str:
+        return ""
+
+    def auth_login(self, challenge: bytes | None = None) -> str:
+        return ""
 
     def send_message(self, msg: Any) -> None:
         _RecordingSMTP.captured["subject"] = msg["Subject"]
@@ -510,3 +530,29 @@ def test_the_security_event_hop_refuses_a_cleartext_credential(smtp: type[_Recor
     with pytest.raises(ValueError, match="credentials"):
         n._send(SecurityEvent(event_type=ACCOUNT_LOCKED, username="dr.who", email="dr.who@x"))
     assert "login" not in smtp.captured
+
+
+def test_cram_md5_is_never_selected_even_when_the_server_offers_it(
+    smtp: type[_RecordingSMTP],
+) -> None:
+    """THE CONFORMANCE ASSERTION. ASVS 11.4.1 disallows MD5 for any cryptographic purpose.
+
+    The fake advertises ``CRAM-MD5 PLAIN LOGIN``. smtplib's own ``login()`` builds its preference
+    list as ``['CRAM-MD5', 'PLAIN', 'LOGIN']`` and picks the first the server advertises — so the
+    unfixed code selects an HMAC over MD5 here. Restoring ``smtp.login()`` in place of
+    ``smtp_login_approved`` turns this red.
+    """
+    t = EmailTransport(
+        host="smtp.example",
+        port=587,
+        sender="mf@example",
+        recipients=["ops@x"],
+        username="svc",
+        password="pw",
+    )
+    asyncio.run(t.send({"type": "connection_stopped", "connection": "OB_X", "detail": "b"}))
+    assert smtp.captured["auth_mechanism"] == "PLAIN"
+    assert "MD5" not in smtp.captured["auth_mechanism"].upper()
+    # POSITIVE CONTROL on the fake itself: it really did offer the disallowed mechanism, so the
+    # assertion above is a choice the code made and not an option it never had.
+    assert "CRAM-MD5" in _RecordingSMTP.esmtp_features["auth"]
