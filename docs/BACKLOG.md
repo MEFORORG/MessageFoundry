@@ -13445,18 +13445,18 @@ blind window is about a day rather than open-ended.
 > Verdict: build
 > Closing-act: code
 > 
-> ***SUPERSEDED BY #1326 -- A SECOND DUPLICATE FROM THIS SEAT, IN ONE EVENING. IT SHOULD BE CLOSED.***
-> *A builder and I filed the same defect within minutes, from opposite directions: they had deferred it
-> to me to number, then filed it themselves as the seat whose own commit contained the instance.* **Both
-> numbers came from `alloc.ps1`, so atomic allocation prevented a COLLISION and cannot prevent a
-> DUPLICATE -- it guarantees two seats never take the same number, not that one defect takes only one.**
+> ***THIS ROW SURVIVES A CROSS-SUPERSEDE, AND THE NEAR-MISS IS WORTH THE LINE.*** *A builder filed the
+> same defect as #1326 fourteen seconds after handing it to this seat. Then **each of us marked our own
+> row superseded by the other's** -- they withdrew #1326 to a stub pointing here, I wrote a supersede
+> note pointing there.* **For a few minutes both rows pointed at each other and neither survived; a
+> reader following either went in a circle.** *Mutual deference produced the duplicate AND then nearly
+> destroyed both records of it.* **#1326 lands WITHDRAWN; this row is the survivor.**
 > 
-> **#1326 IS THE BETTER ROW AND CARRIES SOMETHING THIS ONE DOES NOT:** *these settings models also load
-> from TOML and `MEFOR_` environment variables, so `extra="forbid"` turns an unknown config key into a
-> **load refusal**.* **That makes it a posture change rather than test hygiene** -- plausibly better, and
-> a decision rather than a one-line edit. *Read #1326, not this row.*
-> 
-> ⚠️ **BANNER NOT FLIPPED -- closing is the Lander's act** (`BUILDER.md:253` forbids the filer, `:148`
+> **LIFTED FROM #1326 BEFORE IT WENT TO A STUB -- the design question that makes this more than a
+> one-liner:** *these settings models also load from **TOML** and **`MEFOR_` environment variables**, so
+> setting `extra="forbid"` turns an unknown **config** key into a **LOAD REFUSAL**, not merely a test
+> failure.* ***That is a posture change rather than test hygiene, and it is a decision rather than an
+> edit*** -- plausibly the better posture, but it must be taken deliberately.
 > assigns it). *Until it is flipped this is an open duplicate.*
 
 **Cluster:** Testing / silent-failure class. **Priority:** P2. **Verdict:** build.
