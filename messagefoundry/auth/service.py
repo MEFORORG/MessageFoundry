@@ -122,6 +122,12 @@ STEP_UP_ACTION_MFA_DISABLE = "mfa_disable"
 STEP_UP_ACTION_WEBAUTHN_ENROLL = "webauthn_enroll"
 STEP_UP_ACTION_WEBAUTHN_DELETE = "webauthn_delete"
 STEP_UP_ACTION_ADMIN_USER_UPDATE = "admin_user_update"
+# BACKLOG #1149 (ASVS 7.5.2). Terminating a session is bound to an ACTION rather than to the shared
+# session window, because 7.5.2's verb is "having authenticated AGAIN" — an authentication event
+# SUBSEQUENT to the one that established the session. A window seeded by the login ceremony satisfies
+# a recency test the moment a session exists, so `require_reauth_only` alone let a caller mass-revoke
+# every other session of the account with no proof beyond the sign-in they already had.
+STEP_UP_ACTION_SESSION_TERMINATE = "session_terminate"
 
 _T = TypeVar("_T")
 

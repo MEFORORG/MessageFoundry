@@ -971,6 +971,15 @@ async def test_list_and_revoke_own_session(engine: Engine) -> None:
         sessions = (await c.get("/me/sessions", headers=h2)).json()["sessions"]
         assert len(sessions) == 2 and sum(s["current"] for s in sessions) == 1  # one marked current
         other = next(s for s in sessions if not s["current"])  # the t1 session
+        # BACKLOG #1149 (ASVS 7.5.2). This assertion is INVERTED from its original form, and the
+        # inversion is the point: it used to log in and terminate with NO intervening authentication,
+        # which is precisely the state 7.5.2 forbids ("having authenticated AGAIN"). A login-seeded
+        # window is not an authentication event subsequent to the login.
+        fresh = await c.delete(f"/me/sessions/{other['id']}", headers=h2)
+        assert fresh.status_code == 403
+        assert fresh.headers.get("X-Step-Up-Action") == "session_terminate"
+        assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 200  # nothing revoked
+        assert (await _reauth(c, t2, purpose="session_terminate")).status_code == 200
         assert (await c.delete(f"/me/sessions/{other['id']}", headers=h2)).status_code == 200
         assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 401  # revoked
         assert (await c.get("/auth/me", headers=h2)).status_code == 200  # current still valid
@@ -983,6 +992,14 @@ async def test_revoke_other_sessions_keeps_current(engine: Engine) -> None:
     async with _client(engine, service) as c:
         t1 = (await _login(c, "u")).json()["token"]
         t2 = (await _login(c, "u")).json()["token"]
+        # BACKLOG #1149 (ASVS 7.5.2). Also inverted, and this is the route the cell turns on: a
+        # freshly-logged-in caller could sign every other session of the account out with no proof
+        # beyond the sign-in they already held.
+        fresh = await c.delete("/me/sessions", headers=_auth(t2))
+        assert fresh.status_code == 403
+        assert fresh.headers.get("X-Step-Up-Action") == "session_terminate"
+        assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 200  # untouched
+        assert (await _reauth(c, t2, purpose="session_terminate")).status_code == 200
         resp = await c.delete("/me/sessions", headers=_auth(t2))  # sign out everywhere else
         assert resp.status_code == 200 and "1" in resp.json()["detail"]
         assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 401
@@ -997,6 +1014,12 @@ async def test_cannot_revoke_another_users_session(engine: Engine) -> None:
         ta = (await _login(c, "a")).json()["token"]
         tb = (await _login(c, "b")).json()["token"]
         b_sid = (await c.get("/me/sessions", headers=_auth(tb))).json()["sessions"][0]["id"]
+        # BACKLOG #1149: the action-bound gate now runs BEFORE the body, so a caller with no grant is
+        # 403 whether the id is theirs or not — which is the property that keeps ownership from
+        # leaking. Clear the gate first, so the 404 below still measures OWNERSHIP rather than the
+        # step-up. Without this reauth the test would pass on the gate and prove nothing about it.
+        assert (await c.delete(f"/me/sessions/{b_sid}", headers=_auth(ta))).status_code == 403
+        assert (await _reauth(c, ta, purpose="session_terminate")).status_code == 200
         # a tries to revoke b's session → 404 (ownership-checked, doesn't confirm/touch it)
         assert (await c.delete(f"/me/sessions/{b_sid}", headers=_auth(ta))).status_code == 404
         assert (await c.get("/auth/me", headers=_auth(tb))).status_code == 200  # b still signed in
@@ -1022,7 +1045,7 @@ async def test_revoke_session_requires_reauth_when_stale(engine: Engine) -> None
         assert (
             await c.get("/auth/me", headers=_auth(t1))
         ).status_code == 200  # nothing revoked yet
-        assert (await _reauth(c, t2)).status_code == 200
+        assert (await _reauth(c, t2, purpose="session_terminate")).status_code == 200
         assert (await c.delete(f"/me/sessions/{t1_sid}", headers=_auth(t2))).status_code == 200
         assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 401  # now revoked
 
@@ -1037,7 +1060,7 @@ async def test_revoke_other_sessions_requires_reauth_when_stale(engine: Engine) 
         stale = await c.delete("/me/sessions", headers=_auth(t2))
         assert stale.status_code == 403 and stale.headers.get("X-Step-Up-Required") == "1"
         assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 200  # t1 untouched
-        assert (await _reauth(c, t2)).status_code == 200
+        assert (await _reauth(c, t2, purpose="session_terminate")).status_code == 200
         assert (await c.delete("/me/sessions", headers=_auth(t2))).status_code == 200
         assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 401  # t1 signed out
         assert (await c.get("/auth/me", headers=_auth(t2))).status_code == 200  # current kept
@@ -1055,7 +1078,7 @@ async def test_revoke_no_mfa_user_gate_is_password_only(engine: Engine) -> None:
         assert stale.status_code == 403
         assert stale.headers.get("X-Step-Up-Required") == "1"
         assert stale.headers.get("X-MFA-Required") is None  # NOT the MFA gate
-        assert (await _reauth(c, t)).status_code == 200
+        assert (await _reauth(c, t, purpose="session_terminate")).status_code == 200
         assert (await c.delete("/me/sessions", headers=_auth(t))).status_code == 200
 
 
@@ -1073,7 +1096,7 @@ async def test_revoke_ownership_404_survives_reauth(engine: Engine) -> None:
         assert (
             await c.delete(f"/me/sessions/{b_sid}", headers=_auth(ta))
         ).status_code == 403  # stale
-        assert (await _reauth(c, ta)).status_code == 200
+        assert (await _reauth(c, ta, purpose="session_terminate")).status_code == 200
         assert (
             await c.delete(f"/me/sessions/{b_sid}", headers=_auth(ta))
         ).status_code == 404  # own

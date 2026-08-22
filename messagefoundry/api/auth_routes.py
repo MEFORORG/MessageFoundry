@@ -63,7 +63,6 @@ from messagefoundry.api.security import (
     client_ip,
     get_auth,
     require,
-    require_reauth_only,
     require_reauth_only_action,
     require_step_up,
     require_step_up_action,
@@ -82,6 +81,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_MFA_CONFIRM,
     STEP_UP_ACTION_MFA_DISABLE,
     STEP_UP_ACTION_MFA_ENROLL,
+    STEP_UP_ACTION_SESSION_TERMINATE,
     AuthService,
 )
 from messagefoundry.auth.tokens import hash_token
@@ -475,10 +475,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def revoke_my_session(
         session_id: str,
         service: AuthService = Depends(_service),
-        # 7.5.2 (ASVS): terminating a session needs a fresh PASSWORD re-proof (require_reauth_only —
-        # NOT the MFA gate: a no-factor user must still be able to revoke). The gate runs before the
-        # body and 403s identically for owned AND foreign ids, so it leaks no ownership.
-        identity: Identity = Depends(require_reauth_only()),
+        # 7.5.2 (ASVS): terminating a session needs a fresh PASSWORD re-proof BOUND TO THIS ACTION
+        # (BACKLOG #1149) — single-use, so the login-seeded window no longer satisfies it. Still the
+        # reauth-only family and NOT the MFA gate: a no-factor user must remain able to revoke. The
+        # gate runs before the body and 403s identically for owned AND foreign ids, so it leaks no
+        # ownership.
+        identity: Identity = Depends(require_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)),
     ) -> SimpleMessage:
         # Ownership-checked in the service: a 404 (not 403) avoids confirming another user's session id.
         if not await service.revoke_own_session(identity, session_id, actor=identity.username):
@@ -489,8 +491,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def revoke_my_other_sessions(
         request: Request,
         service: AuthService = Depends(_service),
-        # 7.5.2 (ASVS): password re-proof before mass-terminating the user's other sessions.
-        identity: Identity = Depends(require_reauth_only()),
+        # 7.5.2 (ASVS): action-bound password re-proof before mass-terminating the user's other
+        # sessions (BACKLOG #1149). This is the route the cell turns on — a login-seeded window let a
+        # caller sign every other session out with no proof beyond the sign-in they already held.
+        identity: Identity = Depends(require_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)),
     ) -> SimpleMessage:
         current = hash_token(bearer_token(request) or "")
         revoked = await service.revoke_other_sessions(identity, current, actor=identity.username)
