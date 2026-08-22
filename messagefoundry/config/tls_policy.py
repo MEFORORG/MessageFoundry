@@ -234,9 +234,17 @@ def harden_crl_check(ctx: ssl.SSLContext, crl_file: str) -> None:
     * A missing file must not degrade to "no revocation checking". A configured control that
       silently does nothing is worse than an absent one.
 
-    ``capath=`` -- OpenSSL's hashed directory, the natural shape for a refreshable CRL drop -- is
-    deliberately NOT used here and is NOT ruled out: it has never been measured. Do not add it on
-    the strength of this docstring."""
+    **``capath=`` IS MEASURED AND IT WORKS -- and the guard above would REFUSE it.** OpenSSL's
+    hashed directory (``c_rehash`` producing ``<hash>.0`` + ``<hash>.r0``) is the natural shape for
+    a refreshable CRL drop, and measured on this worktree it enforces revocation identically:
+    revoked client REFUSED ``certificate revoked``, good client ACCEPTED, against a ``cafile=``
+    positive control and a CA-only baseline that accepts the revoked client.
+
+    **But ``cert_store_stats()["crl"]`` reports ZERO for it**, because a hashed directory is read
+    LAZILY during verification rather than at load time. So the ``>= 1`` assertion above -- which is
+    exactly right for ``cafile=`` -- is not a valid liveness check for ``capath=`` and would reject
+    a working configuration. Anyone adding ``capath=`` support needs a different proof that the
+    directory is real, not this one. That is why this loader stays ``cafile=``-only for now."""
     from pathlib import Path
 
     path = Path(crl_file)
