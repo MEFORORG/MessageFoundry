@@ -111,7 +111,13 @@ class UploadQuotaError(UploadError):
       most **N-1 files** over, one per shard mid-write, each bounded by ``max_upload_bytes``.
     * **A leaked reservation.** A process killed between reserve and release never pays back, and its
       slot narrows that uploader's budget until the row goes idle for
-      ``UPLOAD_RESERVATION_STALE_AFTER``. It errs toward refusing, not allowing, and it self-heals.
+      ``UPLOAD_RESERVATION_STALE_AFTER``. It errs toward refusing, not allowing.
+      **IT DOES NOT SELF-HEAL UNCONDITIONALLY, and an earlier version of this line said it did.**
+      The release statement sets ``since = <now>`` **unconditionally** (its own comment: "Never
+      conditional: refusing a release would strand the reservation it is paying back"), so every
+      *subsequent* release by the same uploader pushes the staleness clock forward. **It self-heals
+      only while that uploader is otherwise IDLE.** A uploader who keeps uploading successfully can
+      hold a leaked slot indefinitely, and the reserve path's own staleness reset never fires for it.
     * **A reclaimed live reservation.** If one uploader keeps reservations continuously outstanding
       for longer than that window, the staleness reset zeroes a row that was legitimately non-zero,
       which restores the N-1 bound above for that window. Never worse than the pre-#1112 behaviour.
@@ -618,7 +624,11 @@ class UploadStore:
     async def _release_across_shards(self, *, uploader_id: str, size: int) -> None:
         """Pay the reservation back. Never raises: the file is already written (or already failed) by
         the time this runs, so turning a ledger blip into a failed upload would be strictly worse.
-        A reservation that is never released is reclaimed once it goes stale — see
+
+        A reservation that is never released is reclaimed once the row goes stale — **but only while
+        that uploader is otherwise IDLE.** This statement sets ``since = <now>`` unconditionally, so
+        each later release by the same uploader restarts the staleness clock and a leaked slot can
+        survive indefinitely under continued activity. See
         :meth:`messagefoundry.store.base.Store.reserve_upload_quota`."""
         if self._ledger is None:
             return
