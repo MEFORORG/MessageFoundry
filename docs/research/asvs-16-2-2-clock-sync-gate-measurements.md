@@ -89,8 +89,16 @@ virtualizes monotonic and boottime offsets only, but one kernel is what was meas
 
 ## 3. The Windows surface, which nobody had measured
 
-[`docs/SERVICE.md`](../SERVICE.md) and CLAUDE.md section 2 make a Windows service under NSSM the
-deployment path. `ntp_adjtime` is Linux-only, and the pass's eight subjects name no Windows probe.
+[`docs/SYSTEM-REQUIREMENTS.md`](../SYSTEM-REQUIREMENTS.md) grades Windows Server 2022/2025 the
+**"Primary supported & serviced platform (Windows-service deployment via NSSM)"**; the mechanics are
+[`docs/SERVICE.md`](../SERVICE.md) and CLAUDE.md section 2. `ntp_adjtime` is Linux-only, and the
+pass's eight subjects name no Windows probe.
+
+*Primary and the only serviced path, not the only documented one.
+[`docs/DEPLOYMENT.md`](../DEPLOYMENT.md) presents the container image as "a complement" rather than a
+replacement, and Linux is a supported engine platform that the operator services themselves. The
+distinction does not rescue the control -- section 4's finding holds on the serviced Windows path
+and the supported Linux path alike -- but the exclusive reading overstates the doc set.*
 
 Measured on a developer and test box, read-only:
 
@@ -134,6 +142,12 @@ strength of this memo. Flipping `require_time_sync` remains a load failure witho
 (`config/settings.py`, the `require_time_sync`/`ntp_peer` validator); shipping a default peer was
 ruled out on 2026-08-10; and declaring the cell operator-substrate remains wrong because the engine
 built the mechanism.
+
+**That 2026-08-10 ruling did not cover the gate measured here, and the distinction is why measuring
+it was legitimate work rather than re-litigation.** The item records that the same ruling
+*explicitly did not rule on the refusing-gate alternative, sending it back for re-specification*.
+Read without that qualifier, the sentence above would suggest the refusing gate had already been
+declined; it had not. It was open, it was re-specified by the pass, and section 3 is what closes it.
 
 **The item's filing says "cannot honestly reach pass" is a valid finding.** This memo does not assert
 that conclusion -- it removes the one control that had been offered against it, and the gap between
