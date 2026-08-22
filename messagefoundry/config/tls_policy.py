@@ -34,6 +34,7 @@ import ipaddress
 import logging
 import os
 import ssl
+import time
 import urllib.request
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -209,6 +210,70 @@ def harden_verify_flags(ctx: ssl.SSLContext) -> None:
     if strict is None:  # pragma: no cover - depends on the linked OpenSSL build
         return
     ctx.verify_flags |= strict
+
+
+def harden_crl_check(ctx: ssl.SSLContext, crl_file: str) -> None:
+    """Load a CRL onto a *verifying* ``ctx`` and turn on leaf revocation checking (BACKLOG #1005).
+
+    The opt-in revocation half of :func:`harden_verify_flags`, which does strict RFC 5280 path
+    validation and explicitly NOT revocation. Call it only on a context that already verifies the
+    peer, after the CA is loaded.
+
+    **Three refusals, and each one is a measured failure mode rather than defensive habit.**
+    Re-measured on this worktree, CPython 3.14.6 / OpenSSL 3.5.7, TLS 1.2 pinned so client auth is
+    in-handshake:
+
+    * ``cadata=`` loads **zero** CRLs from the same PEM bytes that ``cafile=`` loads one from, while
+      still setting the check flag -- and the observable is not a skipped check, it is EVERY client
+      refused with ``unable to get certificate CRL``. No error and no warning at load time. So this
+      loads through ``cafile=`` only, and asserts ``cert_store_stats()["crl"] >= 1`` afterwards:
+      that count is the only thing that distinguishes "loaded" from "silently ignored".
+    * A CRL past ``nextUpdate`` refuses every client, not just revoked ones (verify error 12).
+      Checked here at construction so an unrefreshed CRL fails loudly at startup instead of at the
+      first partner handshake, where the operator's only symptom is every partner dropping at once.
+    * A missing file must not degrade to "no revocation checking". A configured control that
+      silently does nothing is worse than an absent one.
+
+    **``capath=`` IS MEASURED AND IT WORKS -- and the guard above would REFUSE it.** OpenSSL's
+    hashed directory (``c_rehash`` producing ``<hash>.0`` + ``<hash>.r0``) is the natural shape for
+    a refreshable CRL drop, and measured on this worktree it enforces revocation identically:
+    revoked client REFUSED ``certificate revoked``, good client ACCEPTED, against a ``cafile=``
+    positive control and a CA-only baseline that accepts the revoked client.
+
+    **But ``cert_store_stats()["crl"]`` reports ZERO for it**, because a hashed directory is read
+    LAZILY during verification rather than at load time. So the ``>= 1`` assertion above -- which is
+    exactly right for ``cafile=`` -- is not a valid liveness check for ``capath=`` and would reject
+    a working configuration. Anyone adding ``capath=`` support needs a different proof that the
+    directory is real, not this one. That is why this loader stays ``cafile=``-only for now."""
+    from pathlib import Path
+
+    path = Path(crl_file)
+    if not path.is_file():
+        raise ValueError(
+            f"[tls] crl file {crl_file!r} does not exist; refusing to build a context that would "
+            "advertise revocation checking and perform none"
+        )
+
+    # Freshness BEFORE loading: an expired CRL refuses every client, so say so at startup.
+    from messagefoundry.pki import read_crl_facts
+
+    facts = read_crl_facts(path.read_bytes(), now=time.time())
+    if facts.expired:
+        raise ValueError(
+            f"[tls] crl file {crl_file!r} expired at {facts.next_update_iso} "
+            f"({-facts.days_remaining} day(s) ago); an expired CRL refuses EVERY client, not only "
+            "revoked ones, so this would take the listener down at the first partner handshake"
+        )
+
+    ctx.load_verify_locations(cafile=str(path))  # cafile= ONLY -- cadata= loads zero CRLs
+    loaded = ctx.cert_store_stats().get("crl", 0)
+    if loaded < 1:
+        raise ValueError(
+            f"[tls] crl file {crl_file!r} loaded no CRL into the trust store "
+            f"(cert_store_stats crl={loaded}); the check flag would be set with nothing to check "
+            "against, which refuses every client rather than skipping the check"
+        )
+    ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
 
 
 #: OpenSSL ``X509_V_FLAG_NO_CHECK_TIME`` (``openssl/x509_vfy.h``) — a **stable public constant**

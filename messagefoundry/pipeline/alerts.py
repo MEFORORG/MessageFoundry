@@ -98,6 +98,19 @@ class AlertSink(Protocol):
         Emitted by the :class:`~messagefoundry.pipeline.cert_expiry.CertExpiryRunner`."""
         ...
 
+    def crl_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
+        """A configured CRL is expired or within the warn window (BACKLOG #1005). ``name`` labels the
+        connection; ``path`` is the PEM; ``not_after`` is the ISO ``nextUpdate``; ``days_remaining``
+        is negative once expired.
+
+        **SEPARATE FROM :meth:`cert_expiry` BECAUSE THE REMEDY AND THE BLAST RADIUS DIFFER.** An
+        expiring server certificate degrades one identity and is fixed by reissuing it. An expired
+        CRL makes OpenSSL refuse EVERY client presenting a certificate under that issuer -- not
+        merely revoked ones -- so an unrefreshed CRL is a total interface outage, and the fix is a
+        PKI refresh rather than a reissue. Emitting both down one method would give an operator one
+        string for two causes with opposite remedies."""
+        ...
+
     def secret_rotation_due(
         self,
         name: str,
@@ -299,6 +312,28 @@ class LoggingAlertSink:
                 path,
                 days_remaining,
                 not_after,
+            )
+
+    def crl_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
+        # An EXPIRED crl refuses every client, so it is an ERROR rather than a warning: the listener
+        # is effectively down, not merely approaching a deadline (BACKLOG #1005).
+        if days_remaining < 0:
+            log.error(
+                "crl_expiry: %r CRL EXPIRED at %s (%d day(s) ago) — this listener refuses EVERY "
+                "client until it is refreshed: %s",
+                name,
+                not_after,
+                -days_remaining,
+                path,
+            )
+        else:
+            log.warning(
+                "crl_expiry: %r CRL expires at %s (%d day(s) left); refresh it before then or the "
+                "listener will refuse every client: %s",
+                name,
+                not_after,
+                days_remaining,
+                path,
             )
 
     def secret_rotation_due(
