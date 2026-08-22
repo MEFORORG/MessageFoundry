@@ -132,6 +132,41 @@ def test_the_run_this_item_was_filed_for_would_have_been_flagged() -> None:
     assert any("Raising the cap is NOT the fix" in n for n in verdict.notes)
 
 
+def test_a_LOW_verdict_leads_with_the_STEPS_SUCCESS_and_names_a_TIMING_gate() -> None:
+    """BACKLOG #1254. The required contexts render as `test (<os>, py3.14)` -- named for WHERE they
+    ran, never for WHAT they assert -- so a LOW margin reds a check whose label reads *the tests
+    failed on Windows*. Measured 2026-08-13: a seat read that label, formed the wrong hypothesis, and
+    corrected itself only by opening the log. A vague label invites a look at the log; a confident
+    wrong one closes the question.
+
+    Renaming the job is the dangerous lever -- those three strings are required contexts, and a
+    required-but-absent context blocks every PR -- so the fix is the one that cannot wedge anything:
+    this gate's own first line states what did NOT fail before it states what did.
+
+    THE CLAIM IS ONE THE INSTRUMENT HOLDS, not one it infers. `LOW` is reachable only from
+    `outcome == "success"` (anything else is CENSORED), and that outcome is the measured step's own
+    conclusion -- so "the step concluded success" is read, not assumed.
+
+    Falsified by restoring the old `MARGIN LOW: {shape}` headline: the success claim is absent from
+    the string entirely, so the membership assertions AND the ordering assertion go RED. Restored.
+    """
+    verdict = decide(
+        elapsed_seconds=parse_clock("25:51"),
+        cap_seconds=parse_clock("26:00"),
+        outcome="success",
+        baseline=_uncensored(parse_clock("25:51")),
+    )
+    head = verdict.headline
+    assert (verdict.code, verdict.exit_code) == ("LOW", 1)
+    assert "Tests (pytest)" in head  # the step whose outcome it actually read, named
+    assert "CONCLUDED SUCCESS" in head
+    assert "TIMING" in head
+    assert "1.006x" in head  # the measurement survives the rewording rather than being replaced
+    # The claim LEADS. A sentence saying so after the ratio is the same information in the position
+    # where the misreading has already happened.
+    assert head.index("CONCLUDED SUCCESS") < head.index("1.006x")
+
+
 def test_a_skipped_step_reports_NO_OBSERVATION_and_never_a_ratio() -> None:
     """THE NEGATIVE CONTROL. A docs-only PR skips the gated steps, and a check that then printed a
     healthy margin would be reporting on a step that did not run -- the exact "green signal that means
@@ -157,6 +192,11 @@ def test_a_step_that_did_not_conclude_success_is_CENSORED_not_scored(outcome: st
     Keying on the STEP's own conclusion is what makes this reachable at all -- the job conclusion
     cannot distinguish a step killed at its cap from a step that passed inside a job that was
     cancelled later.
+
+    ALSO THE NEGATIVE CONTROL for the LOW headline above (BACKLOG #1254), and this is the arm where
+    the `test (<os>, py3.14)` label is RIGHT. A step that was killed or cancelled did not conclude
+    success, so carrying the success clause here would be that defect inverted -- a gate telling a
+    reader nothing failed while the thing it measured is exactly what failed.
     """
     verdict = decide(
         elapsed_seconds=3300, cap_seconds=3300, outcome=outcome, baseline=_uncensored()
@@ -165,6 +205,7 @@ def test_a_step_that_did_not_conclude_success_is_CENSORED_not_scored(outcome: st
     assert "LOWER BOUND" in verdict.headline
     assert "1.000x" not in verdict.headline
     assert any("false premise" in n for n in verdict.notes)
+    assert "CONCLUDED SUCCESS" not in verdict.headline
 
 
 def test_a_zero_duration_refuses_rather_than_reporting_an_infinite_margin() -> None:
