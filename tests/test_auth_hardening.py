@@ -478,6 +478,98 @@ async def test_unknown_user_login_runs_password_verify(
     assert calls["n"] >= 1  # the dummy verify ran for the unknown user
 
 
+# --- #1141 (ASVS 6.4.5): the reminder gate must ask about BOTH bounds, not one -------------------
+
+
+@pytest.mark.parametrize(
+    ("bootstrap_hours", "credential_hours", "expected", "why"),
+    [
+        (
+            0,
+            0,
+            False,
+            "neither bound configured -- nothing can end the credential, so nothing to warn",
+        ),
+        (72, 0, True, "WP-3 account retirement only"),
+        (0, 72, True, "ASVS 6.4.1 CREDENTIAL expiry only -- THE ROW THAT WAS SILENTLY DEAD"),
+        (72, 72, True, "both bounds, the shipped default"),
+    ],
+)
+async def test_bootstrap_deadline_configured_covers_both_bounds(
+    engine: Engine, bootstrap_hours: int, credential_hours: int, expected: bool, why: str
+) -> None:
+    """The API lifespan gates the ASVS 6.4.5 reminder task on this, and the task is the ONLY consumer
+    of ``bootstrap_expiry_warning``. That method warns on the EARLIER of two bounds, so a gate asking
+    about one of them silently deletes the warning arm for the configuration where only the other is
+    set -- the third row. BACKLOG #1245 corrected the two deadline computations in auth/service.py
+    and never reached the gate deciding whether they ever run.
+
+    ASYMMETRIC BY CONSTRUCTION: a gate that simply returned True would pass three rows and fail the
+    first, and one that kept the old single-bound test passes three and fails the third. No single
+    wrong answer satisfies the table.
+    """
+    service = await _service(
+        engine,
+        AuthSettings(
+            require_mfa=False,
+            bootstrap_expiry_hours=bootstrap_hours,
+            initial_password_expiry_hours=credential_hours,
+        ),
+    )
+    assert service.bootstrap_deadline_configured is expected, why
+
+
+# --- #1167 (ASVS 11.2.4): the recovery-code walk must cost the same whatever is presented --------
+
+
+@pytest.mark.parametrize(
+    ("present", "why"),
+    [("first", "matches slot 0"), ("last", "matches the final slot"), ("wrong", "matches nothing")],
+)
+async def test_recovery_code_verify_cost_does_not_vary_with_the_code(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, present: str, why: str
+) -> None:
+    """The argon2 verify COUNT must be the configured slot count in every case.
+
+    It used to `return` on the first match, so the number of ~64 MiB verifications was a function of
+    which code was presented -- and on the failure path, of how many codes REMAINED, so timing one
+    failed attempt leaked the user's remaining recovery-code count.
+
+    THIS IS A CONSTANT-WORK CLAIM, NOT A CONSTANT-TIME ONE. The argon2 verifies dominate by orders
+    of magnitude and are what this pins; the store round trip on a match is not equalized and is not
+    claimed to be. See ADR 0170.
+    """
+    import messagefoundry.auth.service as svc
+
+    calls = {"n": 0}
+    real = svc.verify_password
+    monkeypatch.setattr(
+        svc,
+        "verify_password",
+        lambda stored, pw: (calls.__setitem__("n", calls["n"] + 1), real(stored, pw))[1],
+    )
+
+    slots = 10
+    service = await _service(engine, AuthSettings(require_mfa=False, mfa_recovery_code_count=slots))
+    await _add(service, "rec", Role.VIEWER)
+    user = await engine.store.get_user_by_username("rec")
+    assert user is not None
+    # Deliberately fewer live codes than slots: the padding is what makes a FAILED attempt stop
+    # leaking how many remain, which is the half an attacker with only the password can measure.
+    codes = ["AAAA-1111", "BBBB-2222", "CCCC-3333"]
+    await engine.store.enable_totp(user.id, recovery_code_hashes=[hash_password(c) for c in codes])
+
+    presented = {"first": codes[0], "last": codes[-1], "wrong": "ZZZZ-9999"}[present]
+    calls["n"] = 0
+    ok = await service._verify_second_factor(user, presented)
+
+    assert ok is (present != "wrong"), why
+    assert calls["n"] == slots, (
+        f"{why}: {calls['n']} argon2 verifies against {slots} slots -- the count varies with the "
+        "code presented, so it still leaks. 3 would mean it short-circuits on the live codes only"
+    )
+
+
 # --- L13: a secret in the config file is warned about ------------------------
 
 

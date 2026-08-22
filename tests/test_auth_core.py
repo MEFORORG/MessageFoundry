@@ -151,3 +151,45 @@ def test_tokens_are_unique_and_only_the_hash_is_storable() -> None:
     assert hash_token(t1) == hash_token(t1)  # deterministic lookup
     assert hash_token(t1) != t1  # only the hash is ever persisted
     assert len(hash_token(t1)) == 64  # sha256 hex digest
+
+
+# --- BACKLOG #1134 (ASVS 6.2.4): the corpus must clear the POLICY, not merely be large -----------
+
+
+def test_breach_corpus_meets_the_asvs_6_2_4_policy_matching_bar() -> None:
+    """ASVS 6.2.4 asks for at least the top 3000 passwords WHICH MATCH THE APPLICATION'S POLICY.
+
+    A big corpus is not the requirement: at the shipped `password_min_length = 15`, only **18** of the
+    original 10,000 entries reached that length -- an entry shorter than the minimum can only reject
+    what the length clause already rejects, so it added nothing. The bar is on the POLICY-CLEARING
+    subset, and this pins it so a future corpus swap cannot quietly drop back under it.
+
+    `check_breached` is off HERE FOR THE SAME REASON IT WAS OFF WHEN THE CORPUS WAS BUILT: with it on,
+    every entry rejects itself against the corpus it belongs to, and this would measure nothing.
+    """
+    from messagefoundry.auth.policy import _common_passwords
+
+    matches_policy = PasswordPolicy(check_breached=False, check_username=False)
+    clearing = [e for e in _common_passwords() if not matches_policy.violations(e)]
+    assert len(clearing) >= 3000, (
+        f"only {len(clearing)} corpus entries clear the shipped policy; ASVS 6.2.4 wants at least "
+        "3000. A corpus can grow and still fail this -- the entries must MATCH THE POLICY"
+    )
+
+
+def test_breach_corpus_growth_did_not_over_block_or_regress() -> None:
+    """The two directions a corpus change can break, asserted together.
+
+    Growing a screen is only safe if it still rejects what it did before AND has not started
+    rejecting things it should accept. A test for either alone would pass a corpus that swallowed
+    every password, or one that had quietly emptied.
+    """
+    policy = PasswordPolicy()
+    # REGRESSION arm: a short known-common value is still screened (isolated from the length clause).
+    assert "not be a common or breached password" in PasswordPolicy(min_length=6).violations(
+        "letmein"
+    )
+    # COVERAGE arm: a long breached value is now screened, which is what #1134 bought.
+    assert "not be a common or breached password" in policy.violations("1234567891234567")
+    # OVER-BLOCK arm: a strong passphrase that is not in the corpus is still accepted.
+    assert policy.violations("correct-horse-battery-staple-xyz") == []

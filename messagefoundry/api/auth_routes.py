@@ -63,7 +63,6 @@ from messagefoundry.api.security import (
     client_ip,
     get_auth,
     require,
-    require_reauth_only,
     require_reauth_only_action,
     require_step_up,
     require_step_up_action,
@@ -78,10 +77,13 @@ from messagefoundry.auth import (
 )
 from messagefoundry.auth.permissions import CustomRoleError
 from messagefoundry.auth.service import (
+    STEP_UP_ACTION_ADMIN_RESET_MFA,
+    STEP_UP_ACTION_ADMIN_RESET_PASSWORD,
     STEP_UP_ACTION_ADMIN_USER_UPDATE,
     STEP_UP_ACTION_MFA_CONFIRM,
     STEP_UP_ACTION_MFA_DISABLE,
     STEP_UP_ACTION_MFA_ENROLL,
+    STEP_UP_ACTION_SESSION_TERMINATE,
     AuthService,
 )
 from messagefoundry.auth.tokens import hash_token
@@ -475,10 +477,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def revoke_my_session(
         session_id: str,
         service: AuthService = Depends(_service),
-        # 7.5.2 (ASVS): terminating a session needs a fresh PASSWORD re-proof (require_reauth_only —
-        # NOT the MFA gate: a no-factor user must still be able to revoke). The gate runs before the
-        # body and 403s identically for owned AND foreign ids, so it leaks no ownership.
-        identity: Identity = Depends(require_reauth_only()),
+        # 7.5.2 (ASVS): terminating a session needs a fresh PASSWORD re-proof BOUND TO THIS ACTION
+        # (BACKLOG #1149) — single-use, so the login-seeded window no longer satisfies it. Still the
+        # reauth-only family and NOT the MFA gate: a no-factor user must remain able to revoke. The
+        # gate runs before the body and 403s identically for owned AND foreign ids, so it leaks no
+        # ownership.
+        identity: Identity = Depends(require_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)),
     ) -> SimpleMessage:
         # Ownership-checked in the service: a 404 (not 403) avoids confirming another user's session id.
         if not await service.revoke_own_session(identity, session_id, actor=identity.username):
@@ -489,8 +493,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def revoke_my_other_sessions(
         request: Request,
         service: AuthService = Depends(_service),
-        # 7.5.2 (ASVS): password re-proof before mass-terminating the user's other sessions.
-        identity: Identity = Depends(require_reauth_only()),
+        # 7.5.2 (ASVS): action-bound password re-proof before mass-terminating the user's other
+        # sessions (BACKLOG #1149). This is the route the cell turns on — a login-seeded window let a
+        # caller sign every other session out with no proof beyond the sign-in they already held.
+        identity: Identity = Depends(require_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)),
     ) -> SimpleMessage:
         current = hash_token(bearer_token(request) or "")
         revoked = await service.revoke_other_sessions(identity, current, actor=identity.username)
@@ -762,7 +768,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def reset_user_password(
         user_id: str,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
+        # BACKLOG #1148 (ASVS 7.5.1): the proof must be BOUND TO THIS ACTION and single-use, not
+        # the login-seeded window. require_step_up_ACTION, never the reauth_only variant -- that
+        # one carries mfa_gate=False and would DROP the second factor from an admin resetting
+        # someone else's credential. The enrolment deadlock that justifies mfa_gate=False does
+        # not exist here: the operator's own enrolment has nothing to do with the target's.
+        identity: Identity = Depends(
+            require_step_up_action(STEP_UP_ACTION_ADMIN_RESET_PASSWORD, Permission.USERS_MANAGE)
+        ),
     ) -> PasswordResetResponse:
         """Admin password reset (ASVS 6.4.6 / WP-L3-12): issue a one-time, must-change credential the
         administrator never keeps. Returned **once** for out-of-band delivery; the affected user is also
@@ -787,7 +800,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def reset_user_mfa(
         user_id: str,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
+        # BACKLOG #1148 (ASVS 7.5.1). This is the sharper of the two: one call clears the TOTP
+        # secret, every recovery code and every passkey on the target account.
+        identity: Identity = Depends(
+            require_step_up_action(STEP_UP_ACTION_ADMIN_RESET_MFA, Permission.USERS_MANAGE)
+        ),
     ) -> SimpleMessage:
         """Admin MFA reset (lost authenticator + no recovery codes): clear the user's TOTP enrollment
         and revoke their sessions so they re-enroll. The acting admin is itself step-up + MFA gated."""
