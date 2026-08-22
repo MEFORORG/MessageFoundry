@@ -9158,6 +9158,20 @@ filing.
 **AND A COMPENSATING CONTROL SILENTLY BECOMES TRUE, WHICH IS ITS OWN HAZARD.** The item lists repairing the claim at `_security.py:154-155` -- that `/ui` URLs carry opaque ids only and never PHI, which the item calls *"true of the path, false of the query string while the search route exists"*. This change removes the falsifying condition, so **the claim becomes true by construction rather than by repair**.
 
 *A compensating control that starts being true because something else changed should say why it is true.* Otherwise the record cannot distinguish a control that was verified from one that drifted into correctness, and the next change that reintroduces a query-string needle silently falsifies it again with nothing pointing at the dependency.
+
+**AN EIGHTH TEST FAILURE IS OPEN AND DELIBERATELY LEFT THAT WAY. The eliminations are recorded here so nobody buys them twice.** `test_route_map_parser_detects_a_planted_permission_mutation` **passes alone, passes with its sibling doc suite, and passes after the whole scorecard suite in ONE process (159 passed). It fails only in the full run.**
+
+**Three candidate mechanisms are RULED OUT with evidence, not with reasoning:**
+
+- **No test writes the real `docs/SECURITY.md`.** Every `write_text` / `write_bytes` / open-for-write / `shutil.copy` against a `SECURITY.md` path was grepped across `tests/` and the console suite. **Exactly two writers exist**, both in `tests/test_asvs_scorecard.py`, both targeting `(tmp_path / "docs" / "SECURITY.md")`.
+- **`chdir` cannot repoint the read.** Both doc suites resolve absolutely -- `_ROOT = Path(__file__).resolve().parent.parent`, then `_ROOT/docs/SECURITY.md`. **46 test files call `chdir` and none of them can affect this.**
+- **The scorecard suite is not the contaminator** -- run in a single process with the failing test, everything passes.
+
+**So a stale document on disk is not the mechanism, and the surviving shape is in-process state:** a module-level cache, import order, or a planting helper that does not unwind. **The failing assertion is the test's BASELINE check** -- a route's permission or gate differing between the live app and the doc *before* anything is planted -- which points at something altering `create_app()` output globally.
+
+***THE LANE STOPPED HERE ON PURPOSE, AND THAT IS THE RIGHT CALL RATHER THAN AN ABANDONMENT.*** The discriminator is a full-suite run on a tree without the change -- roughly 36 minutes -- and **it blocks nothing**. No ownership is claimed in either direction.
+
+> **Leaving a red accurately open beats spending half an hour to decorate one nobody is waiting on** -- provided the eliminations are written down, which is the whole reason this note exists.
 ## 1185. research an honest pass for ASVS 14.2.2 -- cache control for PL-2 responses the coverage guard is structurally unable to see
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. The tuple at api/app.py:346 still carries the same five prefixes, the middleware at :1296-1305 has exactly two arms, and none of the three monitoring routes at :2321, :2348 and :2391 falls under either, so on a first deployment those PL-2-bearing responses would carry no cache directive. Value 7 is rung 7 -- no operator-side remedy exists in the default posture, and the second disjunct's process-lifetime decrypted caches have none at all. Difficulty 6 because the fix is structural rather than additive: the guard in tests/test_no_store_phi_coverage.py selects routes by permission gate and so can never see a monitoring-gated PL-2 route, and the item also requires rulings on whether sensitivity tracks permission or classification and on the docstring-versus-PHI.md conflict. _(was 7/10 · 6/10.)_
