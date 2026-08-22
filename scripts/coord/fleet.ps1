@@ -52,6 +52,13 @@ param(
     [switch]$Text,
     [switch]$Json,
     [switch]$All,
+    # Bring back every SUPERSEDED record -- the older episodes of a box, one row each. Off by
+    # default because one busy worktree otherwise occupies a third of the roster; never DELETED,
+    # because a superseded record is evidence and the count is always printed. -All implies this.
+    # AFFECTS THE TEXT ROSTER ONLY. -Json emits every row regardless and always did: a machine
+    # consumer should receive the full set and apply its own rule, and silently shrinking its input
+    # to suit a human's screen is how a downstream tool starts reporting a smaller fleet.
+    [switch]$History,
     [switch]$Chip,
     [string]$BoxKey,
     [string]$SessionKey,
@@ -191,7 +198,9 @@ $now = [DateTime]::UtcNow
 # result treats it as LOCAL, silently adding the UTC offset, and this box reported ages five hours in
 # the FUTURE. The pattern was correct throughout; the TYPE was not what the code assumed, which is
 # why re-reading the parse call finds nothing and dumping the type finds it immediately.
-function Get-AgeHours($iso) {
+function Get-AgeHoursExact($iso) {
+    # UNROUNDED, and it exists because ordering and display need different resolutions. Anything
+    # that COMPARES two records must call this; anything that PRINTS an age wants the rounded one.
     if (-not $iso) { return $null }
     try {
         $utc = if ($iso -is [DateTime]) {
@@ -199,8 +208,15 @@ function Get-AgeHours($iso) {
         } else {
             [DateTimeOffset]::Parse([string]$iso, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal).UtcDateTime
         }
-        return [Math]::Round(($now - $utc).TotalHours, 1)
+        return ($now - $utc).TotalHours
     } catch { return $null }
+}
+
+function Get-AgeHours($iso) {
+    # The DISPLAY age. One decimal is a 6-minute bucket, which is fine to read and wrong to sort on.
+    $e = Get-AgeHoursExact $iso
+    if ($null -eq $e) { return $null }
+    return [Math]::Round($e, 1)
 }
 
 $rows = @()
@@ -220,12 +236,23 @@ foreach ($r in $records) {
     $ageH = Get-AgeHours $rec.asOf
 
     # SUPERSEDED: a newer record in the same box, or a later record naming this one as predecessor.
+    #
+    # ORDER ON THE EXACT AGE, NEVER THE DISPLAYED ONE. This compared the ROUNDED age until
+    # 2026-08-22, and one decimal is a 6-minute bucket -- so two records written inside the same
+    # bucket tied, no strict `-lt` could order them, and BOTH survived as live roster rows.
+    # Measured in messagefoundry-096b5d29 the day it was found: 21:17:32Z and 21:16:52Z, forty
+    # seconds and two distinct records apart, both rounding to 0.1, both rendered.
+    #
+    # It is the defect this whole roster keeps producing in new places -- an instrument whose
+    # resolution does not match the question. A 6-minute bucket is the right precision to READ and
+    # the wrong precision to SORT, and the two uses had been sharing one function.
+    $exactAge = Get-AgeHoursExact $rec.asOf
     $superseded = $false
     foreach ($o in $records) {
         if ($o.File -eq $r.File) { continue }
         if ($o.Box -ne $r.Box) { continue }
-        $oAge = Get-AgeHours $o.Rec.asOf
-        if ($null -ne $oAge -and $null -ne $ageH -and $oAge -lt $ageH) { $superseded = $true }
+        $oAge = Get-AgeHoursExact $o.Rec.asOf
+        if ($null -ne $oAge -and $null -ne $exactAge -and $oAge -lt $exactAge) { $superseded = $true }
     }
 
     $state = switch ($true) {
@@ -255,6 +282,16 @@ foreach ($r in $records) {
         State       = $state
         Fence       = $fence
         AgeHours    = $ageH
+        # THE FACT, kept apart from the STATE LABEL that sometimes hides it. The state switch tests
+        # lifecycle first, so a CLOSED or HANDED record is never LABELLED 'SUPERSEDED' even when a
+        # newer record exists in its box -- and both labels are worth keeping, because "somebody
+        # closed this" and "a newer episode exists" are different things a reader wants.
+        #
+        # Folding has to key on this boolean rather than on the label, or exactly the records a
+        # remediating seat just closed stay on the roster forever. Measured 2026-08-22: four boxes
+        # rendered two rows each for that reason, every one of them an orphan its seat had just
+        # closed on purpose.
+        Superseded  = $superseded
         WriterStale = $writerStale
         Branch      = if ($rec.PSObject.Properties.Name -contains 'branch') { [string]$rec.branch } else { $null }
         Worktree    = $wt
@@ -473,7 +510,27 @@ if ($stops.Count -gt 0) {
     ""
 }
 
-$shown = if ($All) { $rows } else { $rows | Where-Object { $_.State -ne 'ORPHANED-STALE' } }
+# TWO FOLDS, COUNTED SEPARATELY, because they answer different questions and a reader who is
+# surprised by a missing row needs to know WHICH rule took it.
+#
+# WHY SUPERSEDED IS FOLDED AT ALL. The state has been computed correctly since it was written --
+# measured 2026-08-22 on the busiest box, messagefoundry-096b5d29: 104 records, 102 SUPERSEDED, 1
+# INTERRUPTED, 1 CLOSED. Every one of those 102 was rendered as its own roster line, so ONE
+# worktree occupied 104 of the roster's 279 rows. Nothing was wrong with the classification; it
+# just was not used. A reader asking "who holds this worktree and what are they doing" cannot
+# answer it from 104 lines, and that is the only question this roster exists to answer.
+#
+# FOLDED, NOT DROPPED, AND THAT IS THE WHOLE DESIGN. A superseded record is evidence -- a seat is
+# deliberately holding a nosid record tonight BECAUSE it evidences a defect, and a roster that
+# silently discarded superseded rows would erase exactly that class of proof. So the count is
+# always printed and -History always brings them back.
+$showHistory = $History -or $All
+$shown = $rows
+if (-not $All) { $shown = $shown | Where-Object { $_.State -ne 'ORPHANED-STALE' } }
+if (-not $showHistory) { $shown = $shown | Where-Object { -not $_.Superseded } }
+$shown = @($shown)
+$foldedStale = @($rows | Where-Object { $_.State -eq 'ORPHANED-STALE' }).Count
+$foldedSuperseded = @($rows | Where-Object { $_.Superseded }).Count
 $folded = @($rows).Count - @($shown).Count
 
 if (@($rows).Count -eq 0) {
@@ -486,7 +543,17 @@ if (@($rows).Count -eq 0) {
         "{0,-30} {1,-14} {2,-18} {3,-7} {4}{5}" -f $row.Box, $seat, $row.State, $row.AgeHours, $row.Branch, $mark
     }
 }
-if ($folded -gt 0) { ""; "$folded row(s) folded as ORPHANED-STALE (older than $FoldDays days). Show with -All." }
+if ($folded -gt 0) {
+    ""
+    # Named separately on purpose. "12 rows folded" tells a reader something is missing and not
+    # which rule removed it, and the two rules have different remedies.
+    if (-not $All -and $foldedStale -gt 0) {
+        "$foldedStale row(s) folded as ORPHANED-STALE (older than $FoldDays days). Show with -All."
+    }
+    if (-not $showHistory -and $foldedSuperseded -gt 0) {
+        "$foldedSuperseded row(s) folded as SUPERSEDED (an older episode of a box that has a newer record). Show with -History."
+    }
+}
 
 ""
 "RESPAWN POPULATION (INTERRUPTED, HANDED): " + @($rows | Where-Object { $_.State -in @('INTERRUPTED', 'HANDED') }).Count

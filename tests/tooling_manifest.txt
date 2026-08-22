@@ -50,6 +50,7 @@ tests/test_coord_claim_liveness.py
 tests/test_coord_claim_reconcile.py
 tests/test_coord_claim_refresh.py
 tests/test_coord_claim_release_history.py
+tests/test_coord_fleet_roster_fold.py
 tests/test_coord_handoff_pointer.py
 tests/test_coord_handoff_report.py
 tests/test_coord_lock.py
