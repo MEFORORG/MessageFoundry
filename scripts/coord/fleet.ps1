@@ -279,17 +279,27 @@ if ($null -ne $originMainAgeMinutes -and $originMainAgeMinutes -gt 60) { $stops 
 # 2026-08-22 the ratio was 2 broken of 3 recorded against 262 records -- the denominator is the part
 # that says the mechanism is unused, and the numerator is the part that says the few uses are wrong.
 $ptrTotal = 0; $ptrDangling = 0; $ptrDrifted = 0; $ptrUnreadable = 0
+$ptrBoxes = @{}
 foreach ($o in $records) {
     $h = $o.Rec.handoff
     if (-not ($h -and $h.path)) { continue }
     $ptrTotal++
+    # BOXES AS WELL AS RECORDS, because ONE SEAT CAN HOLD SEVERAL RECORDS AND THE COUNTS DIVERGE.
+    # A seat whose declaration landed in nosid.json and then re-declared under its session id leaves
+    # BOTH records in place, each carrying the same pointer -- measured 2026-08-22, 5 pointers across
+    # 4 boxes, with one box holding two records naming one file. Counting records answers "how many
+    # rows carry a pointer", which is right for the per-row render below. It is the WRONG denominator
+    # for "how many seats would be sent somewhere broken", and it inflates the moment anyone
+    # remediates. Both are printed so a reader can see 5-across-4 rather than inferring 5 seats.
+    $ptrBoxes[$o.Box] = $true
     try {
         if (-not (Test-Path -LiteralPath ([string]$h.path) -PathType Leaf)) { $ptrDangling++ }
         elseif ($null -ne $h.bytes -and [long]$h.bytes -ne (Get-Item -LiteralPath ([string]$h.path) -EA Stop).Length) { $ptrDrifted++ }
     } catch { $ptrUnreadable++ }
 }
 if ($ptrDangling -gt 0 -or $ptrDrifted -gt 0) {
-    $stops += "handoffPointersBroken=$($ptrDangling + $ptrDrifted) of $ptrTotal -- a seat told to READ THE HANDOFF would be sent to a file that is missing or is no longer the one that was pointed at"
+    $spread = if ($ptrBoxes.Count -ne $ptrTotal) { " across $($ptrBoxes.Count) seat(s) -- records exceed seats, so at least one seat holds duplicate records" } else { " across $($ptrBoxes.Count) seat(s)" }
+    $stops += "handoffPointersBroken=$($ptrDangling + $ptrDrifted) of $ptrTotal$spread -- a seat told to READ THE HANDOFF would be sent to a file that is missing or is no longer the one that was pointed at"
 }
 
 $receipt = [ordered]@{
@@ -307,6 +317,7 @@ $receipt = [ordered]@{
     originMainSha             = $originMainSha
     originMainAgeMinutes      = $originMainAgeMinutes
     handoffPointers           = $ptrTotal
+    handoffPointerSeats       = $ptrBoxes.Count
     handoffPointersDangling   = $ptrDangling
     handoffPointersDrifted    = $ptrDrifted
     handoffPointersUnreadable = $ptrUnreadable

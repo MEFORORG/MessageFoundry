@@ -253,6 +253,42 @@ class TestFleetRecomputesRatherThanTrustingTheRecord:
         rows = [r for r in out["rows"] if r.get("HandoffState")]
         assert rows and rows[0]["HandoffState"] == "dangling", rows
 
+    def test_two_records_in_one_box_report_records_and_seats_separately(self, repo: Path) -> None:
+        """A remediated seat leaves TWO records naming one handoff, and the counts must diverge.
+
+        Measured 2026-08-22 on the live registry: 5 pointers across 4 boxes, because a seat whose
+        declaration landed in nosid.json re-declared under its session id and neither record was
+        pruned. Counting records answers "how many rows carry a pointer". It is the wrong
+        denominator for "how many seats would be sent somewhere broken", and it inflates the moment
+        anybody fixes their own record -- so remediation would read as the problem getting worse.
+        """
+        doc = repo / "h.md"
+        doc.write_text("body", encoding="utf-8")
+        seat(repo, "-Declare", "-Seat", "lander", "-Goal", "g", "-Handoff", str(doc))
+        rec_path = next(iter(seats_dir(repo).rglob("sess-ptr.json")))
+        # The shape the live registry is in: same box, second record, same pointer.
+        (rec_path.parent / "nosid.json").write_text(
+            rec_path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        doc.unlink()
+
+        out = self._fleet_json(repo)
+        assert out["receipt"]["handoffPointers"] == 2, "two records carry a pointer"
+        assert out["receipt"]["handoffPointerSeats"] == 1, "but they are ONE seat"
+        stops = " ".join(out["receipt"]["stopConditions"])
+        assert "across 1 seat(s)" in stops, stops
+        assert "duplicate records" in stops, "the divergence must be named, not left to arithmetic"
+
+    def test_one_record_per_seat_does_not_claim_duplicates(self, repo: Path) -> None:
+        """NEGATIVE CONTROL. The duplicate warning must not fire when records and seats agree."""
+        doc = repo / "h.md"
+        doc.write_text("body", encoding="utf-8")
+        seat(repo, "-Declare", "-Seat", "lander", "-Goal", "g", "-Handoff", str(doc))
+        doc.unlink()
+        out = self._fleet_json(repo)
+        assert out["receipt"]["handoffPointers"] == out["receipt"]["handoffPointerSeats"] == 1
+        assert "duplicate records" not in " ".join(out["receipt"]["stopConditions"])
+
     def test_the_receipt_reports_a_ratio_not_a_bare_count(self, repo: Path) -> None:
         """A numerator alone cannot be read: 1 dangling is a crisis at 2 pointers and noise at 200."""
         doc = repo / "h.md"
