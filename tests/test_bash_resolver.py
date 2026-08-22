@@ -153,7 +153,18 @@ def test_the_mingw_wrapper_passes_the_namespace_probe_and_fails_the_path_probe(
         (
             c
             for c in bash_candidates()
-            if c.is_file() and c.parent.name == "bin" and c.parent.parent.name != "usr"
+            # `.exe` IS THE PLATFORM TEST, deliberately not sys.platform. The wrapper is
+            # `bin/bash.exe` by construction, so the suffix identifies it without a second
+            # condition the docstring does not name. MEASURED: without the suffix this matches
+            # /bin/bash AND /usr/local/bin/bash on Linux -- parent `bin`, grandparent not
+            # `usr` -- so the skip never fired and the test asserted that an ordinary Linux
+            # bash rewrites PATH. The assertion was right and the SUBJECT was wrong.
+            if (
+                c.is_file()
+                and c.suffix == ".exe"
+                and c.parent.name == "bin"
+                and c.parent.parent.name != "usr"
+            )
         ),
         None,
     )
