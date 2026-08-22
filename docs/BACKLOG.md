@@ -6585,6 +6585,12 @@ filing.
 
 **Proposed work, by subject, all unallocated:** the apiclient path-segment encoding work; the web console structural URL builder and its context partition; the FHIR conditional-write structured parameters replacing the flat query string; the apiclient positive scheme allow-list. One thing to confirm before the third lands: that percent-encoding with `safe=''` leaves FHIR's `|`, `,` and `:` separators expressible. That is reasoned from HTTP layering and NOT measured, and the engine's own suite pins `%7C` as correct so it cannot disagree -- settle it against a real FHIR server first.
 
+
+**SHIPPED IN `#488` AT `cf38e16a`, AND STILL OPEN ON PURPOSE. DO NOT REBUILD IT.** The build landed; the banner has not moved because closing it is a judgement this seat cannot make alone -- the building lane witnessed the code, and this seat did not.
+
+**The merge commit touched ZERO ledger lines,** so nothing in this entry would otherwise say the work exists. That is the gap this note closes: a lane arriving here reads an open item with no marker and rebuilds shipped code, which is the double-build this project already pays for elsewhere.
+
+**Before working this item, read it as: code on `main`, banner open, closure pending.** The remaining question is whether anything is left, not whether to start.
 ## 1108. research an honest pass for ASVS 2.1.1 -- what the operator API's input validation rules would have to be before any documentation could define them
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Counted at HEAD, api/models.py carries 21 max_length bounds against 206 str annotations, reproducing the item's 21-of-205, expose_docs still ships False at settings.py:726, and no per-field validation reference exists under docs/ (HL7-VALIDATION.md and CODESETS.md are both data-plane). Value 7 for a real L1 gap with no workaround where the coverage half is not merely documentary; difficulty 6 because the item forbids restating field types as the honest pass, so an expected structure must first be decided for ids, connection names, globs, time ranges and free-text search and then made real across the API models under mypy strict, with the console, harness, IDE extension and apiclient all consuming those bounds. _(was 7/10 · 6/10.)_
@@ -7336,6 +7342,12 @@ filing.
 
 **Work, by subject, all unallocated:** the Corepoint-import module-name sanitization work, with a test asserting an export naming `../../../evil` writes inside the output directory and nowhere else; the codeset-rename source-name validation work plus the mirroring traversal test; the file-path-construction census over the verifier's roots, with the command and its positive control recorded, as the precondition for any residual sentence containing "every"; the absence-claim re-key with a mutation that bites; the IDE surface row correction; the harness file-drop filename sanitization work and the eight sibling joins beside it, contingent on scope; and the record correction that router and destination names from a Corepoint export are **not** sanitized (`corepoint_import.py:445`, `:432`), contrary to the contrast clause offered for the module-name omission. One owner ruling is needed and it is broader than this cell: are `harness/` and `scripts/` inside the assessed scope? The method doc names three artifacts while the verifier scans four roots, and that mismatch affects every requirement that writes an absence bound.
 
+
+**SHIPPED IN `#488` AT `cf38e16a`, AND STILL OPEN ON PURPOSE. DO NOT REBUILD IT.** The build landed; the banner has not moved because closing it is a judgement this seat cannot make alone -- the building lane witnessed the code, and this seat did not.
+
+**The merge commit touched ZERO ledger lines,** so nothing in this entry would otherwise say the work exists. That is the gap this note closes: a lane arriving here reads an open item with no marker and rebuilds shipped code, which is the double-build this project already pays for elsewhere.
+
+**Before working this item, read it as: code on `main`, banner open, closure pending.** The remaining question is whether anything is left, not whether to start.
 ## 1131. research an honest pass for ASVS 6.1.1 -- what the anti-automation documentation must say about malicious account lockout
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. The documentation half this item was filed against has landed, including the contradiction the item said a fix editing one parenthetical would leave standing, and the unbounded re-lock plus the step-up-gated forced-rotation remedy are both disclosed. The scored remainder is the adjudication the item re-scoped to, whether the verb grades the document alone or names a property the control must hold, plus a scorecard re-read, which is reading and writing rather than code. _(was 7/10 · 5/10.)_
