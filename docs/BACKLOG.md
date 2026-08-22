@@ -13191,7 +13191,7 @@ twice in one hour.
 
 **Source:** found by a builder while sizing #1318's fix, and it corrected the framing of its own earlier report -- they had repeated a peer's "the tests never load the file" finding without running it, then ran it and found one does, through `check`. **The correction made the finding sharper, not smaller: not a missing gate, a gate that downgrades.** Symbols above; base engine `origin/main` a530d4ea.
 
-## 1321. main is green while carrying a break: both DB legs are skipped on main and only run on a PR
+## 1321. the server-DB path gate does not list `messagefoundry/api/`, so an api change selects those legs on neither a PR nor a push
 
 > 🔢 **Filed 2026-08-22 - not started.** `main` can merge a change that breaks the Postgres and SQL Server suites and still report green, because neither leg runs on a push. The first pull request afterwards inherits the red and its author debugs someone else's change.
 > Verdict: build
@@ -13199,6 +13199,29 @@ twice in one hour.
 
 **Cluster:** CI / test-gate coverage. **Priority:** P2. **Verdict:** build.
 **Severity:** gate-coverage gap, not a runtime defect. Nothing would ship broken to a deploying site; what is at stake is that the gate protecting two of three store backends is not armed on the branch it is supposed to protect.
+
+***AMENDED 2026-08-22, WITHIN THE HOUR: MY HEADLINE NAMED A DESIGNED TRADEOFF, NOT THE DEFECT.***
+*A peer refuted it and I re-measured at `origin/main` rather than relaying.* **That the container legs
+do not fire on a push is INTENDED and stated** -- `ci.yml:1317-1319` says they *"run nightly + on
+dispatch + via the PR path-gates, so a push must no longer fire them"*, a billed-minutes decision.
+**Filing that would have been filing a decision as a bug.**
+
+**THE ACTUAL HOLE IS THE PATH GATE'S PRODUCER SET.** The `serverdb` alternation (`ci.yml:1358`) lists
+`messagefoundry/store/`, three pipeline modules, `config/(settings|wiring)`, a transports list, a
+`tests/test_(...)` list and `ci.yml` itself. **It does not list `messagefoundry/api/`.** Measured by
+counting occurrences in that single line, with a positive control: `messagefoundry/api` appears **0**
+times, `messagefoundry/store` appears **1**. *So a change confined to `api/` selects the server-DB legs
+on NEITHER a pull request NOR a push.* **The break did not slip past those legs. They were never
+selected.**
+
+***AND THE INVARIANT IS ALREADY WRITTEN, ONE LEVEL TOO NARROW.*** `ci.yml:1348` requires that the
+alternation *"MUST list every file the sqlserver-store / postgres-store pytest steps below run"* --
+which covers the **test** files and not the **source** files those tests assert against.
+`tests/test_postgres_store.py:3409` asserts on a dict produced by `messagefoundry/api/app.py::_emit`.
+**Widening the stated invariant from the tests to their producers is the fix.**
+
+**Severity is bounded and the row should say so:** the nightly leg runs these unconditionally, so the
+blind window is about a day rather than open-ended.
 
 **What, measured at `origin/main`.** The Postgres and SQL Server jobs carry
 `if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.serverdb == 'true'`
