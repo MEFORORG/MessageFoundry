@@ -28,7 +28,7 @@ from messagefoundry.api.security import (
     require_service_cert,
     resolve_client_cert_identity,
 )
-from messagefoundry.api.tls import build_api_ssl_context
+from messagefoundry.api.tls import build_api_ssl_context, ensure_api_tls_material
 from messagefoundry.api.tls_client_cert import (
     MF_CLIENT_PEERCERT_STATE_KEY,
     client_cert_http_protocol_class,
@@ -222,7 +222,7 @@ def test_serve_mtls_without_cert_map_keeps_stock_protocol(
     assert "http" not in captured  # stock protocol — the shim is never wired without a map
 
 
-def test_serve_loopback_without_tls_passes_no_ssl_factory(
+def test_serve_loopback_without_a_certificate_now_mints_and_serves_tls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from messagefoundry.store.crypto import generate_key
@@ -236,7 +236,16 @@ def test_serve_loopback_without_tls_passes_no_ssl_factory(
         encoding="utf-8",
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
-    assert "ssl_context_factory" not in captured  # plaintext loopback: no TLS wiring
+    # BACKLOG #1276, owner ruling 2026-08-22 (option 3): THIS ASSERTION IS DELIBERATELY INVERTED.
+    # It previously read `"ssl_context_factory" not in captured  # plaintext loopback: no TLS
+    # wiring`, which pinned the very behaviour the ruling removes -- an unconfigured engine opening
+    # a cleartext socket. The engine now mints a self-signed placeholder and serves HTTPS.
+    #
+    # This is also what SUPERSEDES ADR 0143, whose browser hardening was premised on a "cleartext
+    # loopback secure-context WITHOUT auto-TLS". Loopback is exactly the case it named.
+    assert "ssl_context_factory" in captured
+    assert (tmp_path / "api-generated-cert.pem").exists()
+    assert (tmp_path / "api-generated-key.pem").exists()
 
 
 # --- WP-15: reverse-proxy / upstream TLS termination -------------------------
@@ -1466,3 +1475,66 @@ def test_a_non_phi_instance_is_not_refused(
     _posture_probe_toml(tmp_path, public_origin=None, serve_ui=False, synthetic=True)
     rc = _run_posture_b(tmp_path, monkeypatch, env="prod")
     assert rc != 2 or "public_origin" not in capsys.readouterr().err
+
+
+# --- BACKLOG #1276: the engine always serves TLS -----------------------------------------------
+#
+# Owner ruling 2026-08-22 (option 3), superseding ADR 0143's cleartext-loopback premise. An
+# operator certificate always wins; with none configured the engine mints a self-signed
+# PLACEHOLDER rather than opening a cleartext socket.
+
+
+def test_an_operator_certificate_always_wins_and_nothing_is_minted(tmp_path: Path) -> None:
+    # POSITIVE CONTROL for every test below: the generated pair is a fallback BENEATH
+    # [api].tls_cert_file, never a replacement. A site that configures its own chain must see no
+    # behaviour change at all -- and must not find engine-minted files appearing in its state dir.
+    api = ApiSettings(tls_cert_file="operator-cert.pem", tls_key_file="operator-key.pem")
+    cert, key = ensure_api_tls_material(api, state_dir=tmp_path)
+    assert (cert, key) == ("operator-cert.pem", "operator-key.pem")
+    assert list(tmp_path.iterdir()) == []  # nothing minted
+
+
+def test_a_first_run_mints_a_usable_self_signed_pair(tmp_path: Path) -> None:
+    api = ApiSettings()
+    assert not api.tls_enabled  # the state this fallback exists for
+    cert, key = ensure_api_tls_material(api, state_dir=tmp_path)
+    assert Path(cert).exists() and Path(key).exists()
+    # It must be loadable as a real chain, not merely present: a file that exists but cannot be
+    # loaded would fail at uvicorn's socket rather than here.
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+
+
+def test_the_minted_certificate_names_the_bind_host(tmp_path: Path) -> None:
+    # The CN/SAN must match what a client dials, or every verifying first-party client fails the
+    # hostname check against the very certificate the engine just minted for them.
+    api = ApiSettings()
+    cert, _ = ensure_api_tls_material(api, state_dir=tmp_path)
+    loaded = x509.load_pem_x509_certificate(Path(cert).read_bytes())
+    common_names = [a.value for a in loaded.subject.get_attributes_for_oid(NameOID.COMMON_NAME)]
+    assert api.host in common_names
+
+
+def test_a_second_start_reuses_the_pair_and_never_re_mints(tmp_path: Path) -> None:
+    # MINT-ONCE. _write_private_key uses O_EXCL and REFUSES to overwrite, so a re-mint attempt
+    # would not silently rotate the key -- it would raise. Asserting the bytes are unchanged proves
+    # the reuse branch is taken rather than the write being attempted and swallowed.
+    api = ApiSettings()
+    first_cert, first_key = ensure_api_tls_material(api, state_dir=tmp_path)
+    cert_bytes = Path(first_cert).read_bytes()
+    key_bytes = Path(first_key).read_bytes()
+    second_cert, second_key = ensure_api_tls_material(api, state_dir=tmp_path)
+    assert (second_cert, second_key) == (first_cert, first_key)
+    assert Path(second_cert).read_bytes() == cert_bytes
+    assert Path(second_key).read_bytes() == key_bytes
+
+
+def test_the_minted_pair_builds_a_serving_context(tmp_path: Path) -> None:
+    # END TO END for this half: the paths the helper returns must survive build_api_ssl_context,
+    # which is what the serve path actually calls. A pair that mints but cannot build a context
+    # would move the failure to startup instead of removing it.
+    api = ApiSettings()
+    cert, key = ensure_api_tls_material(api, state_dir=tmp_path)
+    serving = api.model_copy(update={"tls_cert_file": cert, "tls_key_file": key})
+    ctx = build_api_ssl_context(serving)
+    assert ctx.minimum_version is ssl.TLSVersion.TLSv1_2
