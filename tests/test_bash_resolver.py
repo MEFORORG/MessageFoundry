@@ -10,6 +10,7 @@ CONSTRUCTS the failing condition rather than waiting to encounter it.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -28,11 +29,32 @@ def test_a_real_bash_is_found_and_can_read_this_process_files(tmp_path: Path) ->
     """POSITIVE CONTROL for every negative below: on this box the resolver succeeds.
 
     Without this, a resolver that rejected EVERYTHING would satisfy the negative tests perfectly.
+
+    THE SECOND ASSERTION IS DELIBERATELY NOT ``bash_sees(resolved)``, and that is the whole point.
+    ``require_bash`` returns only a candidate ``bash_sees`` has already approved, so re-asserting it
+    is an IDENTITY -- true by construction, incapable of failing. MEASURED: with ``bash_sees``
+    mutated to ``return True``, the two negative tests below both went red and this one stayed
+    GREEN, certifying a resolver whose probe was broken wide open. A live first assertion masked a
+    dead second one.
+
+    So the check below is INDEPENDENT of the selection predicate: it runs the resolved interpreter
+    directly, with a different token, a different file name and a shell builtin rather than ``cat``.
+    If the probe is broken open this fails, because a WSL bash genuinely cannot read the file.
     """
     resolved = require_bash(tmp_path)
     assert resolved, "no bash resolved"
-    assert bash_sees(Path(resolved), tmp_path), (
-        "the resolved bash cannot read the probe it just wrote"
+    marker = tmp_path / "independent_check.txt"
+    marker.write_text("INDEPENDENT-OK\n", encoding="utf-8")
+    proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
+        [resolved, "-c", 'read -r line < independent_check.txt; printf "%s" "$line"'],
+        cwd=str(tmp_path),
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0 and b"INDEPENDENT-OK" in proc.stdout, (
+        f"the resolved bash ({resolved}) could not read a file this process wrote: "
+        f"rc={proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr!r}"
     )
 
 
