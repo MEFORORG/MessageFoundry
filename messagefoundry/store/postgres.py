@@ -80,6 +80,7 @@ from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
+    UPLOAD_RESERVATION_STALE_AFTER,
     Row,
     acquire_pooled,
     warm_pool_connections,
@@ -494,6 +495,16 @@ _SCHEMA: list[str] = [
         key_id      TEXT PRIMARY KEY,
         invocations BIGINT NOT NULL DEFAULT 0,
         updated_at  DOUBLE PRECISION NOT NULL
+    )""",
+    # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112) — see the SQLite `_SCHEMA`
+    # for the in-flight-only rationale. This is the backend a real sharded deployment runs:
+    # `require_unified_store` makes a server DB mandatory past one shard. No PHI (an account id and
+    # two counters).
+    """CREATE TABLE IF NOT EXISTS upload_quota (
+        uploader_id    TEXT PRIMARY KEY,
+        inflight_files BIGINT NOT NULL DEFAULT 0,
+        inflight_bytes BIGINT NOT NULL DEFAULT 0,
+        since          DOUBLE PRECISION NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS pending_approvals (
         id           TEXT PRIMARY KEY,
@@ -6056,6 +6067,67 @@ class PostgresStore:
             time.time(),
         )
         return int(row["invocations"]) if row is not None else int(count)
+
+    async def reserve_upload_quota(
+        self,
+        uploader_id: str,
+        *,
+        files: int,
+        size_bytes: int,
+        max_files: int = 0,
+        max_total_bytes: int = 0,
+        stale_after: float = UPLOAD_RESERVATION_STALE_AFTER,
+    ) -> bool:
+        """Atomically reserve (or release) an uploader's in-flight upload budget — see
+        :meth:`messagefoundry.store.base.Store.reserve_upload_quota` for the contract, and the SQLite
+        twin for the statement shape.
+
+        One statement carries the budget predicate into the ``DO UPDATE``, so no other connection can
+        land between the read and the write. ``RETURNING`` (absent on a refusal) discriminates applied
+        from refused."""
+        now = time.time()
+        if files <= 0:
+            # RELEASE — unconditional, clamped at zero (a double release cannot mint budget).
+            await self._execute(
+                "UPDATE upload_quota SET"
+                " inflight_files = GREATEST(0, inflight_files + $2),"
+                " inflight_bytes = GREATEST(0, inflight_bytes + $3),"
+                " since = $4"
+                " WHERE uploader_id = $1",
+                uploader_id,
+                int(files),
+                int(size_bytes),
+                now,
+            )
+            return True
+        if files > max_files or size_bytes > max_total_bytes:
+            # Fail closed before touching the row: the insert branch applies unconditionally.
+            return False
+        stale = now - max(0.0, stale_after)
+        row = await self._fetchone(
+            "INSERT INTO upload_quota (uploader_id, inflight_files, inflight_bytes, since)"
+            " VALUES ($1,$2,$3,$4)"
+            " ON CONFLICT (uploader_id) DO UPDATE SET"
+            " inflight_files ="
+            " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_files END + $2,"
+            " inflight_bytes ="
+            " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_bytes END + $3,"
+            " since = CASE WHEN upload_quota.since <= $5 OR upload_quota.inflight_files <= 0"
+            " THEN $4 ELSE upload_quota.since END"
+            " WHERE (CASE WHEN upload_quota.since <= $5 THEN 0"
+            " ELSE upload_quota.inflight_files END) + $2 <= $6"
+            " AND (CASE WHEN upload_quota.since <= $5 THEN 0"
+            " ELSE upload_quota.inflight_bytes END) + $3 <= $7"
+            " RETURNING 1 AS applied",
+            uploader_id,
+            int(files),
+            int(size_bytes),
+            now,
+            stale,
+            int(max_files),
+            int(max_total_bytes),
+        )
+        return row is not None
 
     async def cipher_invocations(self, key_id: str) -> int:
         """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""

@@ -419,7 +419,16 @@ def _parse_channel(ch: dict[str, Any], index: int) -> Channel:
         raise CorepointImportError(f"channel {name!r} requires an 'inbound' object")
     in_connector, in_call = _render_connector(inbound, name, inbound=True)
 
-    module_name = _opt_str(inbound, "name") or f"IB_{ident.upper()}"
+    # The export chooses this string, and it becomes BOTH the emitted ``inbound()`` connection name
+    # and the module's filename stem (``import_corepoint`` writes ``out / f"{module_name}.py"``), so
+    # it is untrusted text that reaches a filesystem write: fold it to a bare identifier, exactly as
+    # the channel name above and the handler names below are folded. Mutation is right here rather
+    # than a refusal, because the importer WRITES into a directory it created (it is not selecting an
+    # existing file, so there is no basename-aliasing target to hand an attacker), and a fold that
+    # collides with another channel's stem is already de-duplicated and reported by the writer's
+    # ``assigned`` set. Sanitize at the source, not at the filename, so the stem and the connection
+    # name it registers cannot desync.
+    module_name = _sanitize(_opt_str(inbound, "name") or f"IB_{ident.upper()}")
 
     dests_raw = ch.get("destinations", [])
     if not isinstance(dests_raw, list):

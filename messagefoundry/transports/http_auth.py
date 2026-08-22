@@ -52,6 +52,7 @@ from messagefoundry.transports.rest import (
     _no_redirect_opener,
     _redact_url,
     cleartext_acceptance_from_settings,
+    ech_readdressed_request,
     enforce_outbound_length_limits,
     proxy_auth_handler_from_settings,
     refuse_cleartext_credential_hop,
@@ -131,6 +132,13 @@ class OAuth2ClientCredentialsProvider:
         cleartext_reason: str | None = None,
         connection: str | None = None,
         proxy: ProxyConfig | None = None,
+        # #1176 (ADR 0139): this connection's loopback ECH sidecar, when it has one. The token-endpoint
+        # POST follows the connection's egress route exactly as ADR 0126 rules it must for a forward
+        # proxy; for ECH that means the request is RE-ADDRESSED to the sidecar with the real
+        # authorization-server host in ``Host``, so the AS hostname is never in a cleartext outer
+        # ClientHello. Mutually exclusive with ``proxy`` (refused at connector construction). None
+        # (default) -> byte-identical.
+        ech_sidecar: str | None = None,
     ) -> None:
         if not token_url:
             raise HttpAuthError("OAuth2 client-credentials requires an 'oauth2_token_url' setting")
@@ -199,9 +207,24 @@ class OAuth2ClientCredentialsProvider:
         self._proxy_auth: dict[str, str] = (
             token_proxy.auth_headers() if token_proxy is not None else {}
         )
+        self._ech_sidecar = ech_sidecar
         self._lock = threading.Lock()
         self._cached_token: str | None = None
         self._cached_expiry_monotonic = 0.0
+
+    def _token_request(self, data: bytes, headers: dict[str, str]) -> urllib.request.Request:
+        """The token-endpoint POST, on this connection's egress route. With an ECH sidecar the request
+        is re-addressed to it (#1176); without one it goes straight to the configured ``token_url``,
+        byte-identical. The cleartext-credential refusal above keys on the DECLARED ``token_url``
+        scheme, which is what the sidecar re-originates — the engine->sidecar leg is same-host loopback
+        (ADR 0092), exactly as the delivery hop's is."""
+        if self._ech_sidecar is not None:
+            return ech_readdressed_request(
+                self._ech_sidecar, self.token_url, data=data, headers=headers, method="POST"
+            )
+        return urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) above
+            self.token_url, data=data, headers=headers, method="POST"
+        )
 
     def access_token(self) -> str:
         """A valid bearer token — cached until it nears expiry, else freshly acquired. Blocking (a token
@@ -248,9 +271,7 @@ class OAuth2ClientCredentialsProvider:
         # env(), so an env value that resolved to an unexpected blob would otherwise surface as an
         # opaque IdP-side failure on the first mint rather than as a clear config error.
         enforce_outbound_length_limits(self.token_url, dict(headers))
-        req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) above
-            self.token_url, data=data, headers=headers, method="POST"
-        )
+        req = self._token_request(data, headers)
         try:
             with self._opener.open(req, timeout=self.timeout_seconds) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
@@ -287,12 +308,14 @@ class OAuth2ClientCredentialsProvider:
 
 
 def oauth2_cc_provider_from_settings(
-    s: Mapping[str, Any], *, proxy: ProxyConfig | None = None
+    s: Mapping[str, Any], *, proxy: ProxyConfig | None = None, ech_sidecar: str | None = None
 ) -> OAuth2ClientCredentialsProvider | None:
     """The :class:`OAuth2ClientCredentialsProvider` for an ``env()``-resolved settings mapping, or ``None``
     when symmetric OAuth2-CC auth is off (``oauth2_token_url`` absent, or ``oauth2_enabled`` is False) — so
     any connection that didn't configure it is byte-identical. ``proxy`` (ADR 0126) routes the
-    token-endpoint POST through the connection's forward proxy."""
+    token-endpoint POST through the connection's forward proxy; ``ech_sidecar`` (#1176, ADR 0139)
+    re-addresses it to the connection's loopback ECH sidecar instead. The two are mutually exclusive by
+    construction."""
     if not s.get("oauth2_token_url"):
         return None
     if not s.get("oauth2_enabled", True):
@@ -318,18 +341,21 @@ def oauth2_cc_provider_from_settings(
         cleartext_reason=_accepted[1],
         connection=_accepted[2],
         proxy=proxy,  # ADR 0126: forward-proxy the token-endpoint POST
+        ech_sidecar=ech_sidecar,  # #1176: ...or re-address it to the ECH sidecar (ADR 0139)
     )
 
 
 def bearer_provider_from_settings(
-    s: Mapping[str, Any], *, proxy: ProxyConfig | None = None
+    s: Mapping[str, Any], *, proxy: ProxyConfig | None = None, ech_sidecar: str | None = None
 ) -> BearerTokenProvider | None:
     """The active bearer-token provider for an HTTP destination, or ``None`` when none is configured
     (byte-identical). Unifies the SMART Backend Services provider (ADR 0024, asymmetric JWT) and the
     OAuth2 client-credentials provider (#65, symmetric secret) behind the one bearer seam the connector
     drives. The two are **mutually exclusive** on one connection — configuring both is a loud
     :class:`HttpAuthError` (a connection has exactly one identity). ``proxy`` (ADR 0126) routes whichever
-    provider's token-endpoint call through the connection's forward proxy."""
+    provider's token-endpoint call through the connection's forward proxy; ``ech_sidecar`` (#1176,
+    ADR 0139) re-addresses it to the connection's loopback ECH sidecar instead, so the ECH connection's
+    token hop stops leaking the authorization server's SNI while its payload hop is routed."""
     # Detect the conflict from settings PRESENCE before constructing either provider, so a "both
     # configured" mistake reports the mutual-exclusion error rather than whichever provider's own
     # validation happens to fire first on partial config.
@@ -340,9 +366,9 @@ def bearer_provider_from_settings(
             "a connection cannot use BOTH SMART Backend Services and OAuth2 client-credentials auth "
             "(mutually exclusive — configure exactly one)"
         )
-    return token_provider_from_settings(s, proxy=proxy) or oauth2_cc_provider_from_settings(
-        s, proxy=proxy
-    )
+    return token_provider_from_settings(
+        s, proxy=proxy, ech_sidecar=ech_sidecar
+    ) or oauth2_cc_provider_from_settings(s, proxy=proxy, ech_sidecar=ech_sidecar)
 
 
 def digest_handler_from_settings(

@@ -110,9 +110,20 @@ validation, cannot be authored as data, and are invisible to the connection edit
 factory parameter (and therefore a `connections.toml` form) is tracked as **BACKLOG #NNN**.
 
 `ech_sidecar` must be a loopback address and is **mutually exclusive** with the `proxy_url` settings key
-(the sidecar *is* that connection's egress proxy) — refused at construction,
-[`transports/rest.py:1192-1196`](../../messagefoundry/transports/rest.py). It composes with the
-connection's TLS verify/allowlist/signing posture.
+(the sidecar *is* that connection's egress proxy) — refused in `RestDestination.__init__`
+([`transports/rest.py`](../../messagefoundry/transports/rest.py); named by symbol rather than by line,
+because a line number goes stale silently and a wrong one reads as a working reference forever). It
+composes with the connection's TLS verify/allowlist/signing posture.
+
+**Both of the connection's outbound hops take the sidecar.** The delivery request and — when the
+connection uses OAuth2 client-credentials or SMART Backend Services — the **token-endpoint POST** are
+each re-addressed to it, so the authorization server's hostname is not left in a cleartext outer
+ClientHello while the payload hop is routed (BACKLOG #1176).
+
+**Every other connector REFUSES the key rather than ignoring it.** `ech_egress` is honoured only by the
+REST destination; on any other outbound, and on any inbound, construction fails loudly
+(`transports/base.py`, `build_destination` / `build_source`). Read that refusal as what it is: it
+conceals no SNI, it just stops a silent no-op from looking like a working control.
 
 ## Verify before trusting a partner
 
