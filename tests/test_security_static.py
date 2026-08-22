@@ -96,8 +96,12 @@ import pytest
 #   that keeps ``scripts/`` out of the ReDoS clause has no bearing on it and there is no reason to
 #   leave a root unwalked for XML.
 #
-# ``ide/`` is in none of them because it is TypeScript — it contains zero ``.py`` files, so the
-# exclusion is a fact about the tree rather than a filter.
+# ``ide/`` is in none of them because it is TypeScript — it contains zero ``.py`` files, so these
+# Python-AST clauses have nothing to read there. That is a fact about the LANGUAGE, not a finding that
+# ``ide/`` is free of the things these clauses look for: it ships first-party crypto in TypeScript
+# (``ide/src/cspNonce.ts`` draws CSPRNG bytes from ``node:crypto``; ``ide/src/engineClient.ts`` pins a
+# TLS floor), none of which any Python walker can see. BACKLOG #1164 owns the TypeScript arm; this
+# comment previously stated the exclusion as a property of the tree and that was the wrong fact.
 #
 # ``scripts/`` is walked by neither the ReDoS nor the single-JSON/URL-parser clause: it is
 # build/release tooling not reachable from untrusted input, and the retired release-sync checker

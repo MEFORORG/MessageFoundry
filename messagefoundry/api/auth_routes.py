@@ -233,7 +233,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # so a native client can hide its SSO affordance when the acceptor is degraded.
         return ProvidersInfo(
             local=True,
-            ad=service.ad_enabled,
+            ad=service.ad_password_login_enabled,
             kerberos=service.kerberos_available,
             oidc=service.oidc_available,
         )

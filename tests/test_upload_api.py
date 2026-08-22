@@ -164,7 +164,8 @@ async def test_upload_list_browse_roundtrip(engine: Engine, tmp_path: Path) -> N
         assert "PID" not in br.text and "MRN123" not in br.text  # no decrypted body leaks
 
         # content-search filter on a PHI-shaped needle → the audit records the SHAPE, never the value.
-        f = await c.get(f"/uploads/{fid}/messages", params={"content": "MRN123"}, headers=h)
+        # The needle rides the body (BACKLOG #1184), so this is the POST sibling of the browse above.
+        f = await c.post(f"/uploads/{fid}/messages/search", json={"content": "MRN123"}, headers=h)
         assert f.status_code == 200 and f.json()["matched"] == 1
 
     audits = await engine.store.list_audit()
@@ -487,14 +488,17 @@ async def test_browse_requires_step_up_and_audits_shape(engine: Engine, tmp_path
             await c.post("/uploads", files={"file": ("b.hl7", BATCH, "text/plain")}, headers=h)
         ).json()["file_id"]
 
-        # Fresh login is within the step-up window → browse works, with a PHI-shaped needle.
-        ok = await c.get(f"/uploads/{fid}/messages", params={"content": "MRN123"}, headers=h)
+        # Fresh login is within the step-up window → browse works, with a PHI-shaped needle. The
+        # needle-bearing shape is the POST (BACKLOG #1184); the step-up gate is identical on both.
+        ok = await c.post(f"/uploads/{fid}/messages/search", json={"content": "MRN123"}, headers=h)
         assert ok.status_code == 200, ok.text
         assert ok.json()["matched"] == 1
 
         # Back-date the step-up window → the next browse is refused BEFORE any decrypt/scan.
         await service.store.mark_session_reauthed(hash_token(token), now=0.0)
-        blocked = await c.get(f"/uploads/{fid}/messages", params={"content": "MRN123"}, headers=h)
+        blocked = await c.post(
+            f"/uploads/{fid}/messages/search", json={"content": "MRN123"}, headers=h
+        )
         assert blocked.status_code == 403
         assert blocked.headers.get("X-Step-Up-Required") == "1"
 
@@ -813,3 +817,56 @@ async def test_the_prune_audit_row_names_the_system_not_the_pruned_files_owner(
     assert detail["uploader_id"] and detail["uploader_id"] != "op", (
         "the prune row must carry the immutable owner key, not only the reassignable username"
     )
+
+
+# --- BACKLOG #1184 (ASVS 14.2.1): the PHI needle is off the query string --------------------------
+
+
+async def test_uploaded_browse_moves_the_needle_into_a_post_body(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """The uploaded-log browse filter may no longer take the needle on the URL.
+
+    Three assertions, in one run so they share a fixture: a needle on the GET query string no longer
+    filters (it selects nothing, so the whole file comes back); ``field_path`` on the SAME GET still
+    filters (the positive control -- without it, an unreachable route would look identical); and the
+    POST variant filters with the needle in the request BODY, absent from the resolved URL."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        fid = (
+            await c.post("/uploads", files={"file": ("b.hl7", BATCH, "text/plain")}, headers=h)
+        ).json()["file_id"]
+
+        stale = await c.get(f"/uploads/{fid}/messages", params={"content": "MRN123"}, headers=h)
+        assert stale.status_code == 200, stale.text
+        assert stale.json()["matched"] == 2, (
+            "a query-string needle still filtered the browse: "
+            f"matched={stale.json()['matched']} of {stale.json()['total_messages']}"
+        )
+
+        # PID-5, not PID-3: BOTH fixtures carry PID-3, so "matched == 2" is exactly what an
+        # UNFILTERED browse returns and the assertion could not tell a working field_path from
+        # a dropped one. ADT2 has no PID-5, so this discriminates at 1 -- deleting the
+        # field_path forward in app.py now reds here instead of passing silently.
+        control = await c.get(f"/uploads/{fid}/messages", params={"field_path": "PID-5"}, headers=h)
+        assert control.status_code == 200, control.text
+        assert control.json()["matched"] == 1, (
+            "field_path must still filter on the URL-safe GET; 2 means it was dropped and the "
+            f"browse returned everything: {control.json()}"
+        )
+
+        r = await c.post(f"/uploads/{fid}/messages/search", headers=h, json={"content": "MRN123"})
+        assert r.status_code == 200, r.text
+        assert r.json()["matched"] == 1
+        assert "MRN123" not in str(r.request.url), f"the needle rode the URL: {r.request.url}"
+        assert b"MRN123" in r.request.content  # control: it really was sent, in the body
+
+    browse = [a for a in await engine.store.list_audit() if a["action"] == "upload.browse"]
+    joined = " ".join(str(a["detail"] or "") for a in browse)
+    assert "MRN123" not in joined  # the needle value is still never audited

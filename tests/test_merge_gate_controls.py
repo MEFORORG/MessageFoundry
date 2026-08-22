@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tomllib
@@ -40,6 +39,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _bash_resolver import bash_sees, require_bash
 
 from tests._workflow_contexts import ROOT, jobs_of, load_workflow
 
@@ -276,64 +276,33 @@ def _hygiene_script() -> str:
     return script
 
 
-def _bash_candidates() -> list[Path]:
-    """Every plausible bash, GIT-DERIVED FIRST.
-
-    ``shutil.which("bash")`` alone is a fact about PATH, and on Windows PATH order decides WHICH
-    OPERATING SYSTEM answers: ``C:\\Windows\\System32\\bash.exe`` is the WSL launcher, whose filesystem
-    namespace is not the one this process just wrote a fixture into. Git for Windows always ships bash
-    beside git, so git -- which every test here already requires -- is the deterministic anchor.
-    """
-    found: list[Path] = []
-    git = shutil.which("git")
-    if git:
-        # `<root>/cmd/git.exe`, `<root>/bin/git.exe` and `<root>/mingw64/bin/git.exe` are all shipped
-        # layouts, so walk up and try both bash homes from each level.
-        for parent in Path(git).resolve().parents:
-            for rel in ("bin/bash.exe", "usr/bin/bash.exe", "bin/bash"):
-                found.append(parent / rel)
-    on_path = shutil.which("bash")
-    if on_path:
-        found.append(Path(on_path))
-    return found
-
-
 def _bash_sees(bash: Path, tmp_path: Path) -> bool:
-    """LIVE POSITIVE CONTROL for the namespace, not a guess from the path string.
+    """Delegates to the shared probe, under THIS module's explicit child environment.
 
-    Rejecting ``system32`` by name would be a pattern match on a spelling. This writes a token into
-    the directory the fixture will live in and requires the candidate to read it back -- if it cannot,
-    it is looking at a different filesystem and every verdict it returns would be about nothing.
+    The logic moved to ``tests/_bash_resolver.py`` (BACKLOG #1216): it was proven here on 2026-08-10
+    and then three other modules kept their own ``shutil.which`` guards, so the defect survived
+    everywhere it had not been fixed. Two copies of a resolver are free to disagree, and the copy that
+    disagrees is the one still manufacturing failures. The ``env`` is passed rather than inlined
+    because ``_child_env`` carries this module's git-config overrides, which the shared helper has no
+    business knowing about.
     """
-    probe = tmp_path / "mf_bash_probe.txt"
-    probe.write_text("MFPROBE-OK\n", encoding="utf-8")
-    try:
-        out = _run([str(bash), "-c", "cat mf_bash_probe.txt"], tmp_path, _child_env())
-    except OSError:
-        return False
-    return out.returncode == 0 and b"MFPROBE-OK" in out.stdout
+    return bash_sees(bash, tmp_path, _child_env())
 
 
 def _require_bash(tmp_path: Path) -> str:
     """A bash that can see this process's files, or a loud failure -- never a skip.
 
     ci.yml sets ``defaults.run.shell: bash`` on every OS, so a leg without a usable bash could not run
-    the gate this control exercises, and a skip there would be a green that proves nothing.
+    the gate this control exercises, and a skip there would be a green that proves nothing. The shared
+    helper raises ``RuntimeError``; it is converted to ``pytest.fail`` here so the report reads as a
+    test failure rather than an error, which is how this module already reported it.
     """
-    tried: list[str] = []
-    for candidate in _bash_candidates():
-        if not candidate.is_file():
-            continue
-        tried.append(str(candidate))
-        if _bash_sees(candidate, tmp_path):
-            print(f"[#1000] bash resolved to {candidate} (namespace probe passed)")
-            return str(candidate)
-    pytest.fail(
-        "no bash on this machine can read a file this process just wrote. Tried: "
-        f"{tried or '(none found)'}. On Windows, `bash` on PATH is often "
-        "C:\\Windows\\System32\\bash.exe -- the WSL launcher, which runs in a different filesystem "
-        "namespace, and a control that ran there would be measuring nothing."
-    )
+    try:
+        resolved = require_bash(tmp_path, _child_env())
+    except RuntimeError as exc:
+        pytest.fail(str(exc))
+    print(f"[#1000] bash resolved to {resolved} (namespace probe passed)")
+    return resolved
 
 
 def _fixture_repo(tmp_path: Path, env: dict[str, str]) -> tuple[Path, str, str, str]:
