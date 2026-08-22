@@ -790,6 +790,15 @@ class AesGcmCipher:
         #
         # NOT a licence to reuse this argument elsewhere: #1167 names extending it to the recovery-code
         # walk as the one move that would NOT be an honest pass. It is scoped to this loop.
+        #
+        # AND IT ANSWERS IMPACT, NOT CONFORMANCE — do not read the three reasons above as closing the
+        # ASVS question. 11.2.4's verb is ABSOLUTE: no short-circuit operations in comparisons,
+        # calculations or returns. This is a short-circuit return whether or not the value it leaks is
+        # secret, so the cell stays PARTIAL on this loop by design, and its record named closing BOTH
+        # this and the recovery-code walk as what would earn the pass — before either was written, so
+        # the arithmetic is not after-the-fact. Both statements are true at once: no vulnerability
+        # here, and no conformance either. Whether the read-cost trade above is worth paying to reach
+        # the absolute verb is an OWNER call, not an assessor's and not this comment's.
         candidates = [self._keyring[key_id]] if key_id in self._keyring else []
         candidates += [aes for kid, aes in self._keyring.items() if kid != key_id]
         for aes in candidates:

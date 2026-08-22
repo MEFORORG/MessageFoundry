@@ -251,7 +251,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         request: Request, e: str | None = Query(None, max_length=32)
     ) -> HTMLResponse:
         auth = get_auth(request)
-        ad_enabled = auth is not None and auth.ad_enabled
+        # The AD password FORM follows the login pathway, not the directory bind: an operator who
+        # turned the pathway off keeps the bind up for SSO/OIDC, and offering a form that will be
+        # refused is just a worse error (BACKLOG #1137). getattr degrades against an older engine
+        # carrying only the fused flag, the same precedent as oidc_available below.
+        ad_enabled = auth is not None and bool(
+            getattr(auth, "ad_password_login_enabled", auth.ad_enabled)
+        )
         sso_enabled = auth is not None and auth.kerberos_available
         # getattr: an older engine (seam < 10) has no oidc_available property at all, and a bare
         # attribute read would AttributeError rather than degrade (the exposure_protected
@@ -328,6 +334,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # affordance ASVS 7.4.4 makes visible), which means the origin check is the only
         # request-provenance control it will ever have: without it a cross-site POST the browser
         # attaches the cookie to would forcibly terminate the operator's session.
+        #
+        # IT ALSO CHARGES NO WRITE BUDGET, AND THAT IS DELIBERATE (BACKLOG #287). Having no Depends
+        # gate, it never reaches `require_ui`, where every other non-GET /ui route now spends
+        # `allow_admin_write`. Do not "correct" that: a throttled logout is a signed-in operator who
+        # cannot sign out, which is the 7.4.4 affordance failing exactly when someone is trying to
+        # end a session they no longer trust. Signing out is also not the operation a write budget
+        # exists to bound — it REMOVES authority rather than exercising it. Written down because an
+        # unwritten right answer is indistinguishable from an oversight, and this one now sits
+        # conspicuously alone.
         assert_same_origin(request)
         auth = get_auth(request)
         token = session_token(request)
