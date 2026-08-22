@@ -83,8 +83,21 @@ def _build_body(event: SecurityEvent) -> str:
     failed = event.detail.get("failed_attempts")
     if event.event_type in (ACCOUNT_LOCKED, LOGIN_AFTER_FAILURES) and failed:
         lines.append(f"Failed attempts: {failed}")
-    if event.event_type == EMAIL_CHANGED and event.detail.get("new_email"):
-        lines.append(f"New email on file: {event.detail['new_email']}")
+    if event.event_type == EMAIL_CHANGED:
+        # BACKLOG #1139: an EMAIL_CHANGED carrying no ``new_email`` is a REMOVAL, not a repoint, and
+        # it must not render as the repoint wording minus a line. Two reasons this arm is worth its
+        # own sentence: "was changed" with the new value silently omitted reads as a truncated
+        # notice, and this really is the last message this address will get — :meth:`notify` returns
+        # early the moment the account has no address, so every later notice about the account is
+        # dropped. Saying so is what lets the holder act while they still can.
+        new_email = event.detail.get("new_email")
+        if new_email:
+            lines.append(f"New email on file: {new_email}")
+        else:
+            lines.append(
+                "The address was removed from the account, so this is the last security "
+                "notice this address will receive."
+            )
     if event.client_ip:
         lines.append(f"Source IP: {event.client_ip}")
     lines += [
