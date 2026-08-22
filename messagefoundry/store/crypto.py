@@ -769,6 +769,27 @@ class AesGcmCipher:
         nonce, ct = raw[:_NONCE_BYTES], raw[_NONCE_BYTES:]
         # Try the named key first (the fast path for current-format rows), then every other key — this
         # transparently decrypts legacy key_id='0' rows and rows written under a retired key mid-rotation.
+        #
+        # BACKLOG #1167 (ASVS 11.2.4) EXAMINED THIS SHORT-CIRCUIT AND IS DELIBERATELY LEAVING IT.
+        # It is a literal short-circuit return inside a cryptographic loop, so it looks like the verb's
+        # target, and the sibling one in `_verify_second_factor` WAS a real leak and was fixed (ADR
+        # 0170). This one is not, for three independent reasons — any one of which is sufficient:
+        #
+        #   1. THE INPUT IS NOT ATTACKER-SUPPLIED. `stored` comes from the store, not from a request.
+        #      Submitting chosen ciphertext here already requires database write access.
+        #   2. WHAT THE TIMING REVEALS IS ALREADY IN PLAINTEXT. The candidate count varies with which
+        #      key encrypted the row — and `key_id` is parsed out of `stored` two lines above, because
+        #      the marker publishes it. The "leak" is a value the same string hands over for free.
+        #   3. THE PER-CANDIDATE COST IS A GMAC TAG CHECK. Microseconds, and constant-time inside
+        #      `cryptography`. The recovery-code walk mattered because each step was a ~64 MiB argon2id.
+        #
+        # AND THE "FIX" WOULD COST SOMETHING REAL: forcing all candidates would tag-check every row
+        # against every retired key on every read, multiplying store read cost through a rotation, to
+        # conceal a value the ciphertext already prints. Recorded here rather than left to be
+        # rediscovered — an unreported non-defect gets "fixed" by the next reader.
+        #
+        # NOT a licence to reuse this argument elsewhere: #1167 names extending it to the recovery-code
+        # walk as the one move that would NOT be an honest pass. It is scoped to this loop.
         candidates = [self._keyring[key_id]] if key_id in self._keyring else []
         candidates += [aes for kid, aes in self._keyring.items() if kid != key_id]
         for aes in candidates:
