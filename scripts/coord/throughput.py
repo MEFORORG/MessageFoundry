@@ -151,8 +151,14 @@ def _self_test() -> int:
     Builds a synthetic before/after pair in memory and asserts the movement is seen. A gauge that has
     never been shown to fire is indistinguishable from one that cannot.
     """
+    # Both banner glyphs are written as ESCAPES, never as literals. A literal here carries a
+    # non-cp1252 character into a file under scripts/, which tests/test_cp1252_console_safety.py
+    # rejects: printing one aborts a stock Windows console. The open banner was escaped from the
+    # start and the closed one was not, so the gate caught exactly one of the two.
     before = "## 1. alpha\n> \U0001f522 prioritized\n\nbody\n\n## 2. beta\n> \U0001f522 prioritized\n\nbody\n"
-    after = "## 1. alpha\n> ✅ shipped\n\nbody\n\n## 2. beta\n> \U0001f522 prioritized\n\nbody\n"
+    after = (
+        "## 1. alpha\n> \u2705 shipped\n\nbody\n\n## 2. beta\n> \U0001f522 prioritized\n\nbody\n"
+    )
 
     a, b = RefRead("synthetic-before"), RefRead("synthetic-after")
     for item in parse_items(before):
