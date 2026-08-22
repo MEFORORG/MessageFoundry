@@ -398,10 +398,28 @@ function Get-ScriptCurrency {
     $originSha = Invoke-Git -Dir $Wt -GitArgs @('rev-parse', 'origin/main')
 
     $state = if ($runSha -eq $mainSha) { 'current' } else {
-        # Distinguish "an older committed version" from "somebody is editing it right now". Both
-        # differ from main and they want opposite responses: one is a pull, one is your own work.
+        # THREE WAYS TO DIFFER FROM MAIN, and they want three different responses. Collapsing any
+        # pair produces a confident wrong instruction, which is worse than saying nothing.
+        #
+        # AHEAD is here because this check got it wrong about ITSELF. Measured 2026-08-22, on the
+        # first run after the feature was built: this worktree was 8 commits AHEAD of origin/main,
+        # carrying the very change being described, and the check reported OUT-OF-DATE and told it
+        # to run `merge --ff-only origin/main`. That is not the remedy for a branch that is ahead;
+        # it is a no-op at best. Any seat on a feature branch touching this file would have been
+        # told the same thing -- and with the stale population measured at zero the same evening,
+        # a false OUT-OF-DATE was the only thing this check had left to say to anybody.
+        #
+        # ANCESTRY IS THE RIGHT QUESTION HERE, unlike the landed-content probe fleet.ps1 warns
+        # about. That one asks "is my WORK in main", which squash-merge makes ancestry answer
+        # wrongly. This asks "does my HEAD already CONTAIN main", where ancestry IS the definition.
         $headSha = Invoke-Git -Dir $Wt -GitArgs @('rev-parse', 'HEAD:scripts/coord/seat.ps1')
-        if ($headSha -and $runSha -eq $headSha) { 'out-of-date' } else { 'modified' }
+        if ($headSha -and $runSha -eq $headSha) {
+            # --is-ancestor answers by EXIT CODE and prints nothing, so this reads Invoke-Git's own
+            # contract -- '' when git succeeded, $null when it did not -- rather than reaching for
+            # $LASTEXITCODE after the call and hoping nothing in between reset it.
+            $contains = Invoke-Git -Dir $Wt -GitArgs @('merge-base', '--is-ancestor', 'origin/main', 'HEAD')
+            if ($null -ne $contains) { 'ahead' } else { 'out-of-date' }
+        } else { 'modified' }
     }
 
     return [ordered]@{
@@ -769,7 +787,12 @@ try {
     # THE REPORT. Same audience rule as the line above: the two hook paths stay silent, a person or
     # agent at the CLI gets told. It is a warning and never a refusal -- the record is already
     # written by the time this runs, on purpose, so nothing here can cost a seat its record.
-    if (-not $Record -and -not $Prompt -and $ws.state -ne 'current' -and $ws.state -ne 'unknown') {
+    # 'ahead' and 'unknown' are silent alongside 'current'. A branch that already contains main and
+    # changed this file on purpose has nothing to fix, and telling it to pull would be the wrong
+    # instruction attached to a wrong label -- which is how this check first described its own
+    # author. A warning that fires on the ordinary case is the permanent-warning failure: it stops
+    # carrying information and readers correctly learn to skip it.
+    if (-not $Record -and -not $Prompt -and $ws.state -in @('out-of-date', 'modified')) {
         $short = { param($s) if ($s) { $s.Substring(0, [Math]::Min(12, $s.Length)) } else { '(none)' } }
         if ($ws.state -eq 'out-of-date') {
             Write-Host ''

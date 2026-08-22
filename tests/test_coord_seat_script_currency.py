@@ -248,3 +248,43 @@ class TestTheVerdictCarriesItsReferencePoint:
         seat(repo, "-Declare", "-Seat", "s", "-Goal", "g")
         on_disk = git(repo, "hash-object", str(target)).strip()
         assert currency(repo)["runningSha"] == on_disk
+
+
+class TestABranchThatIsAheadIsNotCalledBehind:
+    """The check got this wrong about ITSELF, on its own first run.
+
+    This worktree was 8 commits AHEAD of origin/main, carrying the very change being described,
+    and the check reported OUT-OF-DATE and told it to run ``merge --ff-only origin/main`` -- not a
+    remedy for a branch that is ahead. With the stale population measured at zero the same evening,
+    a false OUT-OF-DATE was the only thing this check had left to say to anyone.
+    """
+
+    def test_a_branch_containing_main_reports_ahead(self, repo: Path) -> None:
+        set_origin_main(repo, git(repo, "rev-parse", "HEAD").strip())
+        target = repo / "scripts" / "coord" / "seat.ps1"
+        target.write_text(
+            target.read_text(encoding="utf-8") + "\n# my own work\n", encoding="utf-8"
+        )
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "my own change to seat.ps1")
+        seat(repo, "-Declare", "-Seat", "s", "-Goal", "g")
+        assert currency(repo)["state"] == "ahead"
+
+    def test_ahead_is_not_warned_about(self, repo: Path) -> None:
+        """Silent alongside 'current'. A warning on the ordinary case teaches readers to skip it."""
+        set_origin_main(repo, git(repo, "rev-parse", "HEAD").strip())
+        target = repo / "scripts" / "coord" / "seat.ps1"
+        target.write_text(
+            target.read_text(encoding="utf-8") + "\n# my own work\n", encoding="utf-8"
+        )
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "my own change to seat.ps1")
+        out = seat(repo, "-Declare", "-Seat", "s", "-Goal", "g").stdout
+        assert "OUT-OF-DATE" not in out
+        assert "merge --ff-only" not in out
+
+    def test_a_branch_NOT_containing_main_still_reports_out_of_date(self, repo: Path) -> None:
+        """THE CONTROL. Without it, 'ahead' could swallow the real defect the check exists for."""
+        make_origin_main_differ(repo)
+        seat(repo, "-Declare", "-Seat", "s", "-Goal", "g")
+        assert currency(repo)["state"] == "out-of-date"
