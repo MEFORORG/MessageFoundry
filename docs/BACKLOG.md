@@ -10762,6 +10762,21 @@ gate is the wrong shape, validation of the walk is the right one.
 > **How to prove a fix:** drive the console resend POST with a deliberately stale step-up window (`AuthSettings(step_up_max_age_seconds=-1)`, the idiom the console suite already uses) and assert it does **not** inject. A test that only checks a fresh operator can resend passes on the defective code.
 > Verdict: build
 > Closing-act: code
+> 
+> ***DESIGN IS DECIDED AND WRITTEN DOWN -- START FROM IT, DO NOT RE-DERIVE IT.***
+> `.git/mefor-coord/handoffs/2026-08-22-builder2-EPISODE-1122-1107-partition.md` section 9 carries the
+> chosen shape, both refused alternatives with their reasons, the three concrete edits, and this item's
+> own proof method. *It was written instead of half-building the change under a live stop rung.*
+> 
+> **THE SHAPE: make the POST body-less and put the selection in the query, so `reauth_next` rebuilds the
+> confirm URL from `r.url.query`. THE CONFIRM PAGE'S OWN URL IS THE STASH** -- nothing is held
+> server-side, so no message body gains a new lifetime. *That is why it beats stash-and-replay rather
+> than merely differing from it: stashing a body across a re-auth is PHI at rest in a new place, with a
+> new deletion question, bought to save one click (section 9).*
+> 
+> ⚠️ **The bounded-exception option was REFUSED, and the reason is on the record so it is not re-proposed:**
+> *the item's own premise shows nothing enforces the arrival path, so a form left open past the window
+> still posts.* **Documenting that harder does not make it true (SDS-3.7).**
 
 **Cluster:** Security / Access control. **Priority:** P3. **Verdict:** build. **Severity:** minor -- reaches only the operator's OWN files since #1152, needs an authenticated session with `files:browse`, and same-origin still holds; the value is closing the seam-bypass class rather than this instance.
 
