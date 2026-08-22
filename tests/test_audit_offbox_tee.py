@@ -195,3 +195,42 @@ def test_emit_audit_tee_is_best_effort_on_logging_failure(audit_capture, monkeyp
     monkeypatch.setattr(audit_tee.audit_logger, "info", boom)
     # Must swallow the logging failure — the caller's audit row is already durable.
     emit_audit_tee(action="auth.login", actor="z", channel_id=None, detail=None, ts=1.0)
+
+
+def test_tee_docstring_and_cipher_registry_agree_about_audit_log() -> None:
+    """The tee's docstring makes a claim about ``audit_log.detail`` at rest; pin it to the registry.
+
+    Until 2026-08-22 the docstring said ``detail`` "is a cipher column at rest", which was FALSE --
+    ``audit_log`` appears nowhere in ``_CIPHER_COLUMNS``, while that tuple's own comment block names
+    ``message_events.detail``, ``connection_event.reason`` and ``alert_instance.reason`` as covered.
+    The error mattered because it made the redaction in :func:`emit_audit_tee` read as defence in
+    depth over an already-sealed column, when it is the only thing standing between an HL7 fragment
+    and the off-box copy.
+
+    This guard fails in BOTH directions, which is the point: revert the docstring and it goes red;
+    add ``audit_log`` to ``_CIPHER_COLUMNS`` without updating the prose and it goes red too. Coverage
+    is not a one-line change -- ``audit_row_hash`` hashes the PLAINTEXT ``detail`` into the
+    tamper-evident chain and key rotation rewrites every cipher column, so naive coverage breaks
+    verification on the first rekey (BACKLOG #1198).
+    """
+    from messagefoundry.store.store import MessageStore
+
+    covered = {table for table, _column in MessageStore._CIPHER_COLUMNS}
+    doc = audit_tee.emit_audit_tee.__doc__ or ""
+
+    # POSITIVE CONTROL: the registry must be readable and non-trivial, or an empty `covered` would
+    # make the branch below pass vacuously.
+    assert "messages" in covered, (
+        "cipher registry unreadable or empty -- the assertion below is void"
+    )
+
+    if "audit_log" in covered:  # pragma: no cover - fires only once someone adds coverage
+        assert "NOT a cipher column at rest" not in doc, (
+            "audit_log is now cipher-covered but audit_tee's docstring still says it is not. "
+            "Update the prose, and check audit_row_hash/rekey against the chain (BACKLOG #1198)."
+        )
+    else:
+        assert "NOT a cipher column at rest" in doc, (
+            "audit_log is NOT cipher-covered and the docstring no longer says so. It previously "
+            "claimed the opposite, which hid an at-rest gap (BACKLOG #1198)."
+        )
