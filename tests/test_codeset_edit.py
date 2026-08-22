@@ -528,6 +528,49 @@ def test_rename_rejects_traversal_source_without_moving_a_file_into_the_dir(tmp_
     assert not (_codesets(tmp_path) / "stolen.csv").exists()
 
 
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("a/b", "must not contain a path separator"),
+        ("a\\b", "must not contain a path separator"),
+        ("..", "must not contain '..'"),
+        ("x..y", "must not contain '..'"),
+        ("/etc/passwd", "must not contain a path separator"),
+        ("lab.results", "must be a bare stem"),
+        ("bad\x01name", "must not contain control characters"),
+        ("   ", "must be a non-empty string"),
+    ],
+    ids=[
+        "slash",
+        "backslash",
+        "dotdot",
+        "embedded-dotdot",
+        "absolute",
+        "suffix",
+        "control",
+        "blank",
+    ],
+)
+def test_rename_source_clears_every_refusal_branch_not_just_the_separator(
+    tmp_path: Path, source: str, expected: str
+) -> None:
+    """Each refusal branch of ``_validate_name``, exercised on the rename SOURCE.
+
+    The traversal test above matches only ``must not contain a path separator``, so a deliberately
+    weaker guard -- ``if "/" in old or "\\\\" in old: raise`` -- would satisfy it while leaving the
+    ``..``, control-character, suffix and empty branches unguarded on ``old``. Found by the
+    adversarial pass on BACKLOG #1130, which named the test as pinning one branch of seven.
+
+    Mutation: narrow the ``_validate_name(codesets_dir, old)`` call at :182 to a separator-only
+    check. Red: every id except ``slash``, ``backslash`` and ``absolute``.
+    """
+    _codesets(tmp_path).mkdir()
+    with pytest.raises(WiringError, match=expected):
+        codeset_edit.rename_code_set(tmp_path, source, "target", validate=_validate)
+    assert not (_codesets(tmp_path) / "target.csv").exists()
+    assert not (_codesets(tmp_path) / "target.toml").exists()
+
+
 def test_rename_collision_raises(tmp_path: Path) -> None:
     codeset_edit.upsert_code_set(
         tmp_path, "diets", ["code", "value"], [["A", "Apple"]], validate=_validate
