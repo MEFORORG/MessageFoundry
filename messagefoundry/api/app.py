@@ -6016,11 +6016,19 @@ def create_managed_app(
                         auth_settings.oidc_redirect_path,
                     )
                 reaper = asyncio.create_task(_session_reaper(store))
-                if auth_settings.bootstrap_expiry_hours > 0:
+                if auth.bootstrap_deadline_configured:
                     # ASVS 6.4.5 arm 2: nudge an operator BEFORE an unclaimed first-run bootstrap admin is
                     # auto-disabled. API-lifespan-owned (like the session reaper), NOT engine-owned — it
                     # reaches the AuthService directly. The warn method latches once-per-window; the sink logs
-                    # (LoggingAlertSink fallback) or notifies. No task when time-expiry is off (byte-identical).
+                    # (LoggingAlertSink fallback) or notifies. No task when NEITHER bound is configured.
+                    #
+                    # BACKLOG #1141: this open-coded `auth_settings.bootstrap_expiry_hours > 0`, a THIRD copy
+                    # of a question `bootstrap_expiry_warning` answers over TWO bounds — WP-3 account
+                    # retirement AND the ASVS 6.4.1 credential expiry. At bootstrap_expiry_hours=0 with
+                    # initial_password_expiry_hours set, that method computed a correct deadline and this
+                    # task — ITS ONLY CONSUMER — was never created, so the warning arm was SILENTLY DEAD.
+                    # BACKLOG #1245 corrected the two computations in auth/service.py and never reached the
+                    # gate deciding whether they run. Ask the AuthService, which owns the predicate now.
                     bootstrap_reminder = asyncio.create_task(
                         _bootstrap_expiry_reminder(auth, notifier or LoggingAlertSink())
                     )
