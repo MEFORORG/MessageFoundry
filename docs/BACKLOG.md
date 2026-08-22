@@ -8644,6 +8644,30 @@ filing.
 
 **OWNER RULING 2026-08-22 -- validate the key type and fail closed.** The re-scoping found **26 site entries, 9 of them open omissions**, and one that disposes of the cell: under the shipped-supported `[store].cipher_provider = "vault_transit"`, the store data key, the key-encryption key and the audit-chain MAC key are all operator-chosen Vault Transit keys **whose type the product reads and then discards**. An operator can back the audit MAC with an unsuitable key type and nothing objects. That falsifies the verb's configuration limb behind a setting, **with no counterparty on the other end**, so the counterparty-interop trade the packet argued cannot dispose of this cell in either direction. The ruling: check the type the product already fetches against what each of the three uses requires, and refuse to start on a mismatch. The round trip is already being paid for; only the answer is being thrown away.
 
+**ONE LIMB BUILT 2026-08-22: the signing-key strength floor. The Vault key-type limb this item's
+ruling is about is NOT built and is untouched by it.** This item's own prose named the defect --
+the JWS and SMART signing-key check at `transports/signing.py` "is a type check only and accepted
+RSA-1024 when executed" -- and that is now closed. `_load_private_key` calls a new
+`_require_key_strength`, which refuses an RSA modulus below `_MIN_RSA_BITS` (2048; NIST SP 800-131A
+disallowed RSA-1024 for signature generation in 2013).
+
+Re-measured before building, by execution rather than by reading: the loader ACCEPTED a 1024-bit key
+and reported `key_size=1024`, while rejecting unparseable material in the same run -- so it was live
+and simply never asked. Two mutations were run afterwards and each turned the suite red: removing the
+size comparison, and removing the call. 177 tests pass across the signing-adjacent suites.
+
+EC takes no floor here and that is deliberate rather than an omission: `_require_key_for_alg` already
+pins the curve per algorithm, and both supported curves (P-256, P-384) clear any current floor. A
+test pins that reasoning so a future weak curve has to confront it.
+
+**THE VERIFY PATH IS DELIBERATELY NOT INCLUDED, and the reason is the one this item cares about.**
+`require_public_key_for_alg` admits an identity provider's key fetched from its JWKS
+(`auth/oidc/claims.py`). A floor there would refuse an IdP advertising a weak key -- an availability
+decision about **somebody else's infrastructure**, with a real counterparty on the other end. The
+private-key floor has the opposite profile: the operator generates that key and registers only its
+public half, so raising it can break no handshake with anybody. Folding the two together would have
+smuggled a counterparty-facing refusal into a change whose entire justification is that it has none.
+The JWKS floor is real, is unfiled, and is named here by subject rather than by a number.
 ## 1167. research an honest pass for ASVS 11.2.4 -- constant-time recovery-code verification without turning ten argon2id slots into an amplification target
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **7/10** · _money pit_. The data-dependent early return survives on the shipped MFA path: _verify_second_factor walks the argon2id recovery hashes and returns on the first match, so the number of ~64 MiB verifications is a function of which code was presented. Value 4 because the leak is a wall-clock signal on an already-authenticated second factor rather than a bypass; difficulty 7 because the obvious constant-time loop multiplies a 64 MiB argon2id verification by the slot count on every attempt, converting a timing leak into a memory and CPU amplification target, and the evidentiary half has no precedent in this tree. _(was 4/10 · 7/10.)_

@@ -32,6 +32,7 @@ from messagefoundry.pipeline.wiring_runner import _dest_config
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.rest import RestDestination
 from messagefoundry.transports.signing import (
+    _MIN_RSA_BITS,
     MessageSigner,
     SigningError,
     signer_from_destination,
@@ -385,3 +386,41 @@ async def test_with_signing_end_to_end_through_the_connector(ec_pem: str) -> Non
     jws = _header(opener.requests[0], "X-JWS-Signature")
     assert jws is not None
     verify_detached_jws(jws, opener.requests[0].data, dest._signer.public_key)  # type: ignore[union-attr]
+
+
+# --- the RSA signing floor (BACKLOG #1317 sibling; NIST SP 800-131A, ASVS 11.4.1) ---------------
+#
+# Before this floor, _load_private_key was a TYPE check only: measured, it loaded an RSA-1024 key
+# without complaint while rejecting unparseable material in the same run, so the loader was live and
+# simply never asked how big the modulus was.
+
+
+def test_rsa_1024_signing_key_is_refused() -> None:
+    weak = _pem(rsa.generate_private_key(public_exponent=65537, key_size=1024))
+    with pytest.raises(SigningError, match="RSA-1024"):
+        MessageSigner(OutboundSigning(algorithm="RS256", private_key=weak))
+
+
+def test_rsa_2048_signing_key_is_accepted(rsa_pem: str) -> None:
+    """POSITIVE CONTROL. Without it the refusal above is indistinguishable from a loader that rejects
+    every RSA key, which would pass that test for entirely the wrong reason."""
+    signer = MessageSigner(OutboundSigning(algorithm="RS256", private_key=rsa_pem))
+    assert signer is not None
+
+
+def test_an_ec_key_needs_no_size_floor(ec_pem: str) -> None:
+    """EC is exempt BY CONSTRUCTION, not by omission: _require_key_for_alg pins the curve per
+    algorithm and both supported curves are above any current floor. Pinned so that a future change
+    adding a weak curve has to confront this test rather than slip past an untested gap."""
+    signer = MessageSigner(OutboundSigning(algorithm="ES256", private_key=ec_pem))
+    assert signer is not None
+
+
+def test_the_floor_is_stated_once_and_read_from_the_constant() -> None:
+    """The refusal must derive from _MIN_RSA_BITS rather than a second hardcoded 2048, so raising the
+    floor later cannot leave a stale number in the message an operator actually reads."""
+    assert _MIN_RSA_BITS >= 2048
+    weak = _pem(rsa.generate_private_key(public_exponent=65537, key_size=1024))
+    with pytest.raises(SigningError) as excinfo:
+        MessageSigner(OutboundSigning(algorithm="RS256", private_key=weak))
+    assert str(_MIN_RSA_BITS) in str(excinfo.value)
