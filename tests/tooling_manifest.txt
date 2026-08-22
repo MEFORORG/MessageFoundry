@@ -57,6 +57,7 @@ tests/test_coord_overlap_attribution.py
 tests/test_coord_overlap_cache.py
 tests/test_coord_overlap_signals.py
 tests/test_coord_presence.py
+tests/test_coord_throughput.py
 tests/test_coord_seat_prompt.py
 tests/test_coord_seat_session_key.py
 tests/test_coord_unbacked_check.py
