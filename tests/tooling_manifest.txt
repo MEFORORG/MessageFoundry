@@ -44,11 +44,14 @@ tests/test_claim_check.py
 tests/test_claude_section_citations.py
 tests/test_claude_settings_contract.py
 tests/test_collision_gate.py
+tests/test_coord_box_activity.py
 tests/test_coord_claim_adjudicate.py
 tests/test_coord_claim_liveness.py
 tests/test_coord_claim_reconcile.py
 tests/test_coord_claim_refresh.py
 tests/test_coord_claim_release_history.py
+tests/test_coord_handoff_pointer.py
+tests/test_coord_handoff_report.py
 tests/test_coord_lock.py
 tests/test_coord_overlap_attribution.py
 tests/test_coord_overlap_cache.py
