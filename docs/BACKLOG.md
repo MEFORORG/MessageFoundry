@@ -11778,7 +11778,14 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **Source:** routed 2026-08-14 by the role-playbooks seat alongside #1266, with an explicit request that the two be kept apart.
 ## 1268. SQL Server `users.username` lacks the binary collation its sibling identifier columns carry, and the bootstrap-retirement gate compares case-sensitively against it
 
-> 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **4/10** · _quick win_. Both limbs survive at HEAD: sqlserver.py:1349 is the one identifier column in that file without a COLLATE clause against six BIN2 siblings, the bootstrap guard at auth/service.py:724 is a case-sensitive Python compare against BOOTSTRAP_USERNAME (:71), postgres.py:513 and store.py:1638 are both plain TEXT, and no username case normalisation exists on either path. Value 8 -- on a SQL Server store the bootstrap expiry and supersession control would be walked past by a different capitalisation while the login itself succeeds, and nothing reports that the control did not run. Difficulty 4: the COLLATE clause matches the file's own convention and the comparison normalisation is small, with the cost being the design ruling on case-sensitivity plus the three-backend test that must be shown failing on SQL Server only. _(previously unscored.)_
+> ✅ **SHIPPED 2026-08-20 -- BOTH LIMBS FIXED, and the second does not depend on the first.** [ADR 0169](adr/0169-username-identity-is-case-sensitive-and-must-not-depend-on-store-collation.md). Limb 1: `users.username` now pins `COLLATE Latin1_General_100_BIN2`, the collation its five sibling identifier columns in the same file already carried. Limb 2: the bootstrap-retirement gate compares the value **the store returned**, never the caller's input, then re-reads by id since retirement may have disabled the row. **Measured before the fix, with 6.4.1 disarmed so it could not mask the result: `login("admin")` refused and retired; `login("Admin")` returned `ok=True` with a session issued.** Conditional per `CLAUDE.md` section 0 -- **zero deployments**, so that is what a first deployment against a SQL Server store would have hit, not a live exposure.
+> **RESIDUAL, stated because a closing banner that lists only what it fixed is half a record:** the `users` DDL is **creation-guarded**, so an EXISTING SQL Server database keeps its original column collation -- no re-type is attempted. Nothing to migrate (zero deployments), and **limb 2 is correct on such a database anyway**, which is why limb 2 was built to not depend on limb 1. The schema-hash bump is that guard, not a column alteration.
+> **Fix and ADR authored by the builder lane; this banner authored by the lander** under [ADR 0165](adr/0165-a-builder-pr-satisfies-the-ledger-gate-with-a-paired-commit-authored-by-the-dispatcher-or-lander.md). Original filing follows.
+> **Filed 2026-08-14 - not started. THE USERNAME COLUMN IS THE ONE IDENTIFIER COLUMN IN THIS FILE WITHOUT AN EXPLICIT COLLATION, AND IT IS THE ONE AUTHENTICATION DEPENDS ON.** Filed as ONE item with two limbs, not two items: they are the same root cause -- *what counts as "the same username" is defined in two places that do not agree* -- and fixing either limb alone leaves the other a live trap.
+
+> **LIMB 1: THE COLUMN.** [`store/sqlserver.py:1348`](messagefoundry/store/sqlserver.py:1348) declares `username NVARCHAR(256) NOT NULL UNIQUE` **with no `COLLATE` clause**, so it inherits the database default -- on a stock SQL Server install a **case-INsensitive** collation (`SQL_Latin1_General_CP1_CI_AS`). The same file already pins **`COLLATE Latin1_General_100_BIN2`** on its other identifier columns at `:1305`, `:1306`, `:1307`, `:1313`, `:1314` and `:1338`. **The pattern is established in this very file and the auth column is the omission.** The other backends disagree with SQL Server and with each other's defaults: Postgres declares `username TEXT NOT NULL UNIQUE` ([`store/postgres.py:512`](messagefoundry/store/postgres.py:512)), which is case-SENSITIVE, as is SQLite's default `BINARY`. So `Admin` and `admin` are **two accounts on Postgres/SQLite and one account on SQL Server** -- a store-dependent identity model under a `UNIQUE` constraint that reads as if it settled the question.
+
+> **LIMB 2: THE GATE, AND THIS IS THE SHARP END.** [`auth/service.py:650`](messagefoundry/auth/service.py:650) runs the bootstrap expiry/supersession enforcement behind a **Python** comparison:
 >
 > **Filed 2026-08-14 - not started. THE USERNAME COLUMN IS THE ONE IDENTIFIER COLUMN IN THIS FILE WITHOUT AN EXPLICIT COLLATION, AND IT IS THE ONE AUTHENTICATION DEPENDS ON.** Filed as ONE item with two limbs, not two items: they are the same root cause -- *what counts as "the same username" is defined in two places that do not agree* -- and fixing either limb alone leaves the other a live trap.
 > **LIMB 1: THE COLUMN.** [`store/sqlserver.py:1348`](messagefoundry/store/sqlserver.py:1348) declares `username NVARCHAR(256) NOT NULL UNIQUE` **with no `COLLATE` clause**, so it inherits the database default -- on a stock SQL Server install a **case-INsensitive** collation (`SQL_Latin1_General_CP1_CI_AS`). The same file already pins **`COLLATE Latin1_General_100_BIN2`** on its other identifier columns at `:1305`, `:1306`, `:1307`, `:1313`, `:1314` and `:1338`. **The pattern is established in this very file and the auth column is the omission.** The other backends disagree with SQL Server and with each other's defaults: Postgres declares `username TEXT NOT NULL UNIQUE` ([`store/postgres.py:512`](messagefoundry/store/postgres.py:512)), which is case-SENSITIVE, as is SQLite's default `BINARY`. So `Admin` and `admin` are **two accounts on Postgres/SQLite and one account on SQL Server** -- a store-dependent identity model under a `UNIQUE` constraint that reads as if it settled the question.
@@ -12665,32 +12672,7 @@ than by a number, since none is allocated.
 
 **Source:** surfaced 2026-08-22 by the eight-cell ASVS re-scoping pass while completing the
 enumeration for cell 12.1.2, then verified independently against the shipped validator before
-filing.
-
-**BUILT 2026-08-22, same day.** `_is_encrypting` and `_is_peer_authenticated` were added beside the
-untouched `_is_forward_secret`, together with `_APPROVED_TLS_SUITES`, the strict positive allow-list
-the owner ruled for. Both measured suites are now refused, with the good suite still accepted as a
-control. Three mutations were run and each turned the suite red -- forcing either predicate to
-`True`, and removing the allow-list check -- so none of the new tests is vacuous.
-
-**TWO SCOPING DECISIONS THE ITEM DID NOT ANTICIPATE, both recorded because a later reader would
-otherwise take the allow-list as universal.** First, the list governs the operator KNOB and is never
-applied to an inherited default context: it is AEAD-only, the shipped default carries six CBC-SHA2
-suites, and asserting it against an inherited context would refuse every current configuration --
-the exact interop regression `harden_cipher_suites`' own docstring already records. Leaving
-`tls_ciphers` unset keeps those six available; setting it does not. Second, `[api].proxy_tls_ciphers`
-passes `require_approved_suites=False`, because that field DECLARES what an external proxy speaks
-rather than configuring one of ours; refusing an unlisted-but-sound suite there would not harden
-anything, it would stop an operator describing their proxy accurately. The three property checks
-still bind on that field.
-
-**The residual above is unchanged and still open:** this covered the operator-facing knob and the
-shipped context builder. It did not enumerate every `SSLContext` construction, and it does not reach
-suite sets chosen inside `ldap3`, `hvac` or ODBC Driver 18. One instrument note worth carrying: the
-startup TLS probe's `ALL:@SECLEVEL=0` context (140 suites, 12 anonymous) was examined and
-DELIBERATELY LEFT ALONE -- the security level is load-bearing there, because without it the probe
-would measure the engine's own refusal to offer rather than a peer's refusal to accept, turning a
-real finding into a false pass. That cell's own ruling is a separate question about allowlist width; this item is the build
+filing. That cell's own ruling is a separate question about allowlist width; this item is the build
 which both readings of the cell now require.
 
 ## 1315. prose path:line citations carry no token, so nothing can verify them
@@ -12707,3 +12689,33 @@ which both readings of the cell now require.
 
 **Cluster:** Security record integrity / evidence hygiene. **Priority:** P3. **Verdict:** build.
 **Severity:** no engine-runtime effect and no deployment axis (sec. 0). This is evidence quality in the security record: more than half its citation surface has never been read by any gate, so a reader cannot distinguish a citation that still points at its subject from one that merely points at a line that still exists.
+
+## 1305. the worktree gate matches git by SPELLING, so a case variant of the program name bypasses every rule
+
+> 🔢 **Filed 2026-08-21 -- not started. `Git -C <governed> reset --hard` IS ALLOWED WHERE `git -C <governed> reset --hard` IS DENIED, AND THE ONLY DIFFERENCE IS THE CAPITAL LETTER.** Measured against `origin/main` driving the real hook as a subprocess, with the lowercase spelling as a discriminating control and a benign command as a negative control. The same holds for `GIT`, and it is not confined to one rule -- `Git ... checkout` allows too. No quoting, no wrapper, no escape sequence: the bypass is typing the program name differently.
+
+> **WHY IT WORKS.** Windows resolves `Git`, `GIT` and `git` to the same `git.exe`, so all three RUN. The gate's token comparison is case-SENSITIVE, so only one of them MATCHES. The gate is therefore matching a **spelling** and calling it a program, while the operating system matches an **executable**. Everything downstream of that comparison inherits the gap, which is why it is not a single-rule defect.
+
+> **THE CLASS, and it is the transferable half.** This is a LEXICAL check standing in for a SEMANTIC one -- the same shape this repository has now hit repeatedly on unrelated surfaces: an absence claim keyed on a symbol NAME, a tier predicate keyed on a body SPLIT that discarded a table, a ledger row detector keyed on a fixed digit WIDTH. Each was a string test where the real question was about a referent. **The fix direction is to compare the RESOLVED EXECUTABLE, not a spelling** -- otherwise the next bypass is a trailing dot, a short path, a quoted absolute path, or an alias, and each one closes as its own item forever.
+
+> **NOT INTRODUCED BY ANY UNLANDED WORK, and that is measured rather than assumed.** It reproduces identically on `origin/main` and on the unlanded lane branch carrying that work. [#1229](#1229)'s residual work neither opened nor closed it. A case-INSENSITIVE emit was briefly built as part of that work and reverted -- it addressed only the quoted-program-path corner of this gap and cost 12 measured false denies plus two new fail-opens, so it is **not** the remedy here and should not be re-derived. See the gate's own comment at the emit site, which records that retraction.
+
+> **BOUND, stated because a clean-looking finding invites over-reading.** What is measured is: bare `Git`/`GIT` for `reset --hard` and `checkout`, on the Bash tool, with the cwd inside the governed primary. Rule 3b, the linked-worktree path, is unsampled entirely, as are the target-path attack shapes. The exhaustive spelling-by-rule matrix is kept out of this file deliberately; it is in the builder-1 episode note under the gate sections.
+
+**Cluster:** Worktree gate / developer guardrail. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- this guard is coordination tooling and is not shipped in the wheel. The cost is that a guard believed to be governing every session is bypassed by an ordinary typo-shaped variation, which is worse than a guard known to be absent.
+
+## 1301. a ledger banner citing a commit sha must cite a commit whose subject names the item it sits under
+
+> 🔢 **Filed 2026-08-21 -- not started. ONE EDIT CORRUPTED TWO ITEMS IN OPPOSITE DIRECTIONS AND NO GATE COULD SEE IT, BUT A SHA-TO-ITEM AGREEMENT CHECK WOULD HAVE.** A retirement banner intended for one item was written onto another. The Markdown stayed valid, the item count did not move, the status glyph was untouched, and the misplaced paragraph carried no glyph of its own -- so `parse_items` had no second banner to object to and every ledger gate passed.
+
+> **THE SIGNAL THAT WAS THERE ALL ALONG.** The overwritten banner cited two commit shas whose subjects both ended in that item's own number. The paragraph that replaced it cited a sha whose subject named a DIFFERENT item. So the rule is mechanical and needs no judgement: **a banner citing a commit sha must cite a commit whose subject names the item the banner sits under.**
+
+> **WHY THIS IS STRONGER THAN THE OBVIOUS RULE.** The natural response to a transposed edit is "key the edit on the item NUMBER, not on a same-shaped sentence". That is correct and it only helps an author who remembers to follow it. A sha-to-item check catches the edit that was **already keyed wrong**, which is the case that actually happened -- twice, silently, in the same file.
+
+> **BOUND, and it makes this a PARTIAL control that must be described as one.** It fires only on banners that cite shas. Retirement and SHIPPED banners nearly always do; a `Filed -- not started` banner carries none and is outside the check entirely. It reduces the blast radius of a class of ledger corruption; it does not eliminate it.
+
+> **A KNOWN WAY TO MIS-VERIFY THIS, recorded so the next reader does not repeat it.** A first attempt at the "has anyone already fixed this" screen used a needle that omitted the backticks around the symbol and returned False everywhere, reading as **already fixed**. The re-run normalised and carried a positive control per item. Any implementation of this check needs the same discipline: a screen that finds nothing is indistinguishable from a clean corpus until a positive control says otherwise.
+
+**Cluster:** Ledger integrity / commit gates. **Priority:** P3. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- ledger hygiene. The cost is that a wrongly-transposed banner reads as a working cross-reference forever, and the two items it corrupts fail in opposite directions: one over-reports its status and one under-reports it.
