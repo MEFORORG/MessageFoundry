@@ -1279,11 +1279,13 @@ Both kinds of user share one identity model (`users.auth_provider` is `local` or
 
 - **Local users** authenticate with an argon2id-hashed password and are assigned roles explicitly
   (`PUT /users/{id}/roles` or the web console Users page).
-- **AD users** authenticate by LDAP simple-bind over **LDAPS**. The engine binds with a service
-  account to find the user, binds as the user to verify the password, then resolves group membership
-  (including **nested** groups via `LDAP_MATCHING_RULE_IN_CHAIN`). Their roles are **re-synced from
-  AD groups on every login** through the **AD-group→role map**, so manual role assignment doesn't
-  apply to AD users.
+- **AD users** sign in through **Windows SSO or OIDC**, not with a directory password: the LDAP
+  simple-bind sign-in is **retired**, and `POST /auth/login` with `provider=ad` is refused and
+  audited. The engine still binds with a service account to find the user and resolve group
+  membership (including **nested** groups via `LDAP_MATCHING_RULE_IN_CHAIN`), and their roles are
+  still **re-synced from AD groups on every login** through the **AD-group→role map**, so manual
+  role assignment doesn't apply to AD users. Binding **as the user** survives in one place only
+  — step-up re-authentication at `POST /me/reauth`.
 - **Windows SSO (Kerberos)** — optional, experimental. `POST /auth/negotiate` completes a SPNEGO
   exchange (`pyspnego`) for passwordless login on a domain-joined client; the resulting principal's
   groups are resolved the same way. Requires a server keytab/SPN. **Single-leg only:** the negotiate
@@ -1506,13 +1508,14 @@ Two further screens (ASVS 6.2.11 / 6.2.12), both on by default and fully offline
 
 ### Authentication pathways — comparative strength
 
-**Five** authentication pathways ship: four interactive sign-ins, plus the non-interactive mTLS
-service-identity plane.
+**Five** authentication pathways ship: **three** interactive sign-ins (Local, Kerberos/SPNEGO,
+OIDC), the **AD directory bind** — retained for step-up re-authentication after its sign-in was
+retired — and the non-interactive mTLS service-identity plane.
 
 | Pathway | Factor | Brute-force defense | Notes |
 |---|---|---|---|
 | **Local** (argon2id) | **password** (argon2id) **plus an engine second factor** — RFC 6238 TOTP, single-use recovery codes, or a WebAuthn/FIDO2 passkey. That factor is an **access gate, not merely a step-up boundary**: an MFA-pending session is refused on *every* authorized route with `X-MFA-Required: 1`, and a browser session is **redirected** to `/ui/mfa` — *not* confined to it, as an earlier revision of this cell said, because the account and factor-enrolment routes are declared MFA-pending-exempt, so a user with no factor yet enrols at `/ui/account`. It binds any local account that has enrolled a factor, plus every account `[security].require_mfa_scope` covers — **`every_local_account` by default** (`[security].require_mfa` defaults **on**; both keys are rejected under `[auth]` and fail the start). Set the scope to `administrators` for the earlier, narrower posture, in which a non-admin, un-enrolled local session is **password-only end to end**. Caveat: a passkey is asserted at `user_verification=preferred`, so for a passkey-only account the second factor may be **device possession alone** | **per-account lockout** (5/15 min), fed by **both** the password and the TOTP/recovery leg + breach/context policy + the per-IP **and** global sign-in window | the only pathway the engine itself can lock out; the only one with a phishing-resistant factor |
-| **AD** (LDAP simple-bind, LDAPS by default) | password, verified by a bind **as the user** against the DC; MFA is **delegated and unverifiable at the engine** — the simple-bind call site issues the session MFA-satisfied under the owner-signed delegated-directory relaxation, regardless of what the directory enforced, and no `amr`-equivalent evidence is received. The grant is now a per-mechanism argument rather than a blanket literal, so the federated leg can differ (see OIDC) | the **directory's** lockout/complexity policy; engine-side, the per-IP **and** global sign-in window (`[auth].login_rate_limit_enabled`, default on — **off leaves this pathway with no engine-side control at all**) — and **no** engine per-account lockout | password strength + lockout are the AD domain's responsibility. LDAPS is the default, not a structural guarantee: `[auth].ad_allow_insecure_ldap` opts into a plain bind, and `ad_tls_verify=false` is refused at startup unless the `MEFOR_ALLOW_INSECURE_TLS` dev escape is set |
+| **AD** (LDAP simple-bind, LDAPS by default) — **step-up re-authentication only; the sign-in was retired** | password, verified by a bind **as the user** against the DC. It no longer mints a session: `POST /auth/login` with `provider=ad` is refused and audited, and the bind survives only at `POST /me/reauth`, where it re-proves a session **another** pathway minted. So this row carries no MFA grant of its own — the session's MFA state was decided at sign-in by Kerberos or OIDC, and the delegated-directory relaxation now sits on the Kerberos row that still exercises it | the **directory's** lockout/complexity policy; engine-side, a **per-actor** step-up budget, **not** the sign-in limiter — the bind is post-session, so an unauthenticated flood cannot reach it, and `[auth].login_rate_limit_enabled=false` no longer strips this pathway bare — and **no** engine per-account lockout | password strength + lockout are the AD domain's responsibility. LDAPS is the default, not a structural guarantee: `[auth].ad_allow_insecure_ldap` opts into a plain bind, and `ad_tls_verify=false` is refused at startup unless the `MEFOR_ALLOW_INSECURE_TLS` dev escape is set |
 | **Kerberos / SPNEGO** | domain ticket; MFA is **delegated and unverifiable at the engine** — the session is issued MFA-satisfied and no `amr`-equivalent evidence is received | the **domain's** controls; engine-side, the sign-in window on the token-bearing leg (`[auth].login_rate_limit_enabled`, default on — **off leaves this pathway with no engine-side control at all**; the RFC 4559 challenge leg is deliberately unthrottled either way) | experimental, off by default, **single-leg — no mutual authentication**, channel binding deliberately un-enforced. The browser leg (`GET /ui/sso`) mints with no step-up window, so the first sensitive action forces a step-up; the JSON `POST /auth/negotiate` seeds it |
 | **OIDC federation** (browser only, hybrid AD-backed) | IdP-asserted, gated on a **signature-verified** `amr`/`acr` claim (`[auth].oidc_require_mfa_claim` defaults **on**) — an assertion, not a proof | no engine credential to guess, so no per-account lockout; both legs (`/ui/oidc/start`, `/ui/oidc/callback`) charge the sign-in window (`[auth].login_rate_limit_enabled`, default on — **off leaves this pathway with no engine-side control at all**, though the bounded pending-flow cache still caps concurrent start legs), plus the IdP's own lockout | hybrid-only: a federated principal with no on-prem AD object is refused. Roles come from LDAP, never from a token claim. When `[auth].oidc_username_strip_domain` is on (default), the claim's UPN suffix must match `oidc_allowed_username_domains` (or `[auth].ad_domain`); with stripping **off** the claim is used verbatim and no suffix check applies. The session's absolute lifetime is capped at the verified `id_token.exp`; minted with no step-up window |
 | **mTLS service identity** (non-interactive, ADR 0083) | a **verified** client certificate mapped through a deny-by-default, name-space-qualified allow-list (`CN:` / `SAN:<type>:`) | **not applicable** — no guessable secret and no lockout; admission requires a chain verifying to the pinned client CA plus a listed qualified name | no session, no MFA, no step-up — which is why it is **PHI-fenced**: `require_service_cert` raises at **app construction** if asked to gate a PHI-view permission. One route only (`GET /service/identity`); every success is audited `service_cert_auth` |
@@ -1522,7 +1525,7 @@ Comparative properties on the dimensions the table's four columns cannot carry:
 | Pathway | Phishing resistance | Replay resistance | Credential stored by the engine | MFA support | Revocation |
 |---|---|---|---|---|---|
 | **Local** | passkeys only (WebAuthn origin-bound, `attestation=none`, `user_verification=preferred`); password/TOTP are phishable | TOTP is single-use per 30 s step (`totp_skew_steps` default `0`); recovery codes single-use; passkey challenges are 64-byte CSPRNG, single-use, 120 s TTL, with a strict sign-counter compare-and-set | argon2id password hash (t=3, m=64 MiB, p=4); TOTP secret **cipher-encrypted**; recovery codes argon2id-hashed; COSE public keys **plaintext by design** | built (TOTP + passkeys) | disable the account or revoke sessions — immediate |
-| **AD** | none | none beyond TLS | **none** — only the service-account bind password (env or a `[secrets]` reference, fail-closed) | delegated and **unverifiable** — the simple-bind leg issues MFA-satisfied under a signed relaxation; the engine receives no evidence (contrast OIDC's signature-verified `amr`/`acr`, which is enforced) | disabling in AD does **not** end a live session on its own; `[auth].ad_session_recheck_seconds` (default **300 s**) closes it, bounded by interval × strikes |
+| **AD** | none | none beyond TLS | **none** — only the service-account bind password (env or a `[secrets]` reference, fail-closed) | **not asserted here** — the bind re-proves an existing session and grants nothing; the delegated, **unverifiable** MFA grant belongs to the Kerberos row | disabling in AD does **not** end a live session on its own; `[auth].ad_session_recheck_seconds` (default **300 s**) closes it, bounded by interval — strikes |
 | **Kerberos** | none (single-leg, no channel binding) | ticket lifetime is the domain's | **none** — the acceptor keytab/SPN is OS-owned | delegated, unverifiable | as AD |
 | **OIDC** | the IdP's, not the engine's | strongest of the four: server-side PKCE verifier + `state` (constant-time compare) + `nonce`, single-use flow, a `__Host-`-prefixed browser-binding cookie the callback requires, and a `typ`/kid/alg/signature/`events`/`iss`/`aud`/`exp`/`iat`/`nbf`/`nonce`/`sub` ladder under a bounded clock skew — `typ` and `events` assert the token **class** (an access token or a logout token carries the same issuer and key), and `sub`/`iat` are required rather than optional | **none** — only the confidential-client secret (env-only or a `[secrets]` reference, resolved eagerly at startup) | asserted via `amr`/`acr` **and enforced** — with `[auth].oidc_require_mfa_claim` on (default) a token carrying no configured `amr`/`acr` is refused at claims validation, and only then is the session minted MFA-verified; switch it off and the federated session is minted **un**verified, which `mfa_satisfied` refuses. This is the one directory leg whose factor the engine actually verifies | as AD, plus the `id_token.exp` cap; no refresh tokens and no RP-initiated logout |
 | **mTLS** | n/a (no interactive ceremony) | n/a | **none** — the engine holds only the pinned client CA and the name map | none, structurally | **no revocation checking** — `VERIFY_X509_STRICT` is strict path validation, not OCSP/CRL; live revocation is the org's PKI. Engine-side: remove the allow-list entry (config change → restart) or disable the mapped account |
@@ -1560,13 +1563,15 @@ must not lock an account) — **but an already-locked account IS refused at the 
 verification** (`finish_webauthn_assertion` checks `locked_until` first and audits
 `auth.webauthn_failed` with `reason=locked`), so the lock is *enforced* across every local factor even
 though only two legs feed it. Neither fed nor enforced on `POST /me/reauth` or
-`POST /me/password`. AD and Kerberos brute-force resistance is the
-directory's job, so set the domain lockout/complexity policy accordingly. The engine-side throttle that
-*does* cover AD, Kerberos and OIDC is the sliding-window sign-in limiter — **per client IP and
+`POST /me/password` — which now matters more, because since the AD sign-in was retired the step-up
+re-auth route is the **only** place an AD password is still bound, and it is covered by a per-actor
+budget rather than by either the lockout or the sign-in limiter. AD and Kerberos brute-force resistance
+is the directory's job, so set the domain lockout/complexity policy accordingly. The engine-side
+throttle that *does* cover Kerberos and OIDC is the sliding-window sign-in limiter — **per client IP and
 globally**, not merely globally. **And it has one switch.** With
-`[auth].login_rate_limit_enabled = false` the limiter is never constructed, so the AD, Kerberos and
+`[auth].login_rate_limit_enabled = false` the limiter is never constructed, so the Kerberos and
 OIDC pathways retain only the directory's / IdP's own defenses and **no engine-side anti-automation at
-all**, while Local keeps its per-account lockout — which the 6.1.1 table records as having *no
+all**, while Local keeps its per-account lockout and the AD step-up bind keeps its per-actor budget — which the 6.1.1 table records as having *no
 dedicated off switch*. That one flag therefore **widens** the strength gap between the local and the
 delegated pathways rather than narrowing it, and an operator turning it off must have the directory's
 lockout policy carrying the whole load. OIDC has no engine credential to lock out; the mTLS plane has
@@ -1580,10 +1585,10 @@ rejects; it also contradicted the Local row of the table above, which was right 
 [Multi-factor authentication](#multi-factor-authentication-totp-wp-14)).
 AD/Kerberos MFA is delegated to the directory; OIDC's is asserted by the IdP and gated on a
 signature-verified claim. **The consequence, stated plainly:** the AD and Kerberos pathways satisfy the
-engine's MFA gates without an engine-verified factor, so a *password* on the AD pathway reaches the same
-PHI surface as a passkey-backed local Administrator. The mechanism is a **per-mechanism argument**, not a
-blanket literal: `mfa_verified` is a keyword parameter of `_complete_ad_login`, and the simple-bind and
-Kerberos legs pass `True` under the signed delegated-directory relaxation while the federated leg passes
+engine's MFA gates without an engine-verified factor, so a *domain ticket* on the Kerberos pathway
+reaches the same PHI surface as a passkey-backed local Administrator. The mechanism is a **per-mechanism argument**, not a
+blanket literal: `mfa_verified` is a keyword parameter of `_complete_ad_login`, and the Kerberos leg
+passes `True` under the signed delegated-directory relaxation while the federated leg passes
 `[auth].oidc_require_mfa_claim` itself — on by default, and reached only after the claim gate has already
 refused any token carrying no configured `amr`/`acr`, so the grant there is engine-verified rather than
 assumed. Turn that setting off and the federated session mints **un**verified, and `mfa_satisfied`
