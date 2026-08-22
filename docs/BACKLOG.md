@@ -8550,6 +8550,7 @@ filing.
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.1.3** (L3) currently scores **partial**, and its own residual marks the verdict CONTESTED and asks for a full re-read. The pinned verb asks for discovery mechanisms that identify all instances of cryptography. The shipped gate is real and merge-blocking, but discovery is a hand-maintained import allow-list.
 
+> **SHIPPED-BUT-OPEN 2026-08-22 -- builder-2 round 3, same [ADR 0165](adr/0165-a-builder-pr-satisfies-the-ledger-gate-with-a-paired-commit-authored-by-the-dispatcher-or-lander.md) pairing.** The crypto-gate's `ide/` exclusion is now recorded as a fact about the LANGUAGE rather than as a finding that `ide/` is crypto-free -- an absence of scan is not an absence of crypto, and the comment said the second while meaning the first.
 **Cluster:** Security / ASVS remediation research. **Priority:** P3. **Verdict:** research.
 **Severity:** tooling-coverage gap, not a runtime defect. A first deployment is unaffected; what is at stake is whether a green gate is evidence of coverage.
 
@@ -8781,6 +8782,8 @@ filing.
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.4.1** (L1) currently scores **partial**. The pinned verb allows only approved hash functions for general cryptographic use, naming HMAC and KDF explicitly. Two independent sites miss it: `messagefoundry/auth/totp.py:71` hard-codes `hashlib.sha1`, and `messagefoundry/anon/keying.py:60` uses a keyed BLAKE2b -- both re-read at 166634c9.
 
+> **SHIPPED-BUT-OPEN 2026-08-22 -- builder-2 round 3, ledger pairing authored by the LANDER per [ADR 0165](adr/0165-a-builder-pr-satisfies-the-ledger-gate-with-a-paired-commit-authored-by-the-dispatcher-or-lander.md); the builder did not author this.** Four limbs land, each refusing a weak algorithm at the point it is proposed rather than after: the SFTP connector no longer proposes an HMAC over a disallowed hash; SMTP AUTH requires an approved mechanism AND an encrypted channel; an HTTP Digest challenge naming a disallowed hash is refused; and the XML-DSig path passes an explicit accept-set instead of letting `signxml`'s default choose.
+> **NOT A CLOSURE.** The author records the SMTP call-site wiring as UNBUILT -- it is a posture-threading design step they hold no assignment for. Whoever closes this must account for that limb rather than reading the four above as the whole.
 **Cluster:** Security / ASVS remediation research. **Priority:** P2. **Verdict:** research.
 **Severity:** no present exploitability is claimed for either site -- SHA-1 in HMAC has no practical break and BLAKE2b is sound. The gap is conformance to the named list, which is what an L1 requirement measures.
 
@@ -9539,6 +9542,7 @@ filing.
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **15.2.4** (L3) currently scores **partial**. The pinned verb asks that third-party components and all transitive dependencies come from the expected repository and that there is no risk of a dependency confusion attack. What holds it short is the in-scope web console: shipped docs instruct a bare-name index install (`README.md:110`) and the engine loads whatever occupies that import name by presence, not provenance (`messagefoundry/__main__.py:1769`).
 
+> **SHIPPED-BUT-OPEN 2026-08-22 -- builder-2 round 3, same [ADR 0165](adr/0165-a-builder-pr-satisfies-the-ledger-gate-with-a-paired-commit-authored-by-the-dispatcher-or-lander.md) pairing.** The README's supply-chain note claimed signing coverage that two of three releases do not have; the claim is corrected and a derived guard added so the prose cannot drift from the artefacts again.
 **Cluster:** Security / ASVS remediation research. **Priority:** P1. **Verdict:** research.
 **Severity:** if `release.yml` is the correct artifact, `README.md:110` would be a live dependency-confusion primitive on first deployment -- a first-registered squatter's code executing in the engine process -- and the compensating guard would be green-but-blind to it.
 
@@ -10147,6 +10151,8 @@ gate is the wrong shape, validation of the walk is the right one.
 > **COUNT DRIFT, recorded so it is not read as a discrepancy:** this item says *"154 shell blocks; 154 failed"*; the same instrument reported **160 of 160** on 2026-08-14. **The corpus grew; the 100-percent signature -- which is the actual finding -- held at both sizes.**
 > **`#1272` IS THIS ITEM'S DUPLICATE and closes with a pointer here.** It was filed onto an unpushed branch and named the 160 where this one names the 154 -- **two symptoms of one PATH-order defect, filed twice because neither author could see the other's tree.** This number survives on a mechanical asymmetry, not on merit: **a landed item is amendable from any worktree; an unpushed one is editable only by the branch holder.**
 
+> **SHIPPED-BUT-OPEN 2026-08-22 -- builder-2 round 3, same [ADR 0165](adr/0165-a-builder-pr-satisfies-the-ledger-gate-with-a-paired-commit-authored-by-the-dispatcher-or-lander.md) pairing.** A shared resolver now finds a bash that can SEE this process's files, adopted in all four modules that resolve one.
+> **THE SECOND COMMIT IS THE ONE TO READ, AND IT IS AN ADMISSION.** The author's own positive control was an identity -- `assert bash_sees(require_bash(...))`, where `require_bash` returns only a candidate `bash_sees` has already approved, so it was true by construction and incapable of failing. Mutating the probe to `return True` left it GREEN while two sibling tests went red. It certified a resolver with no working namespace check: **the #1216 defect itself, one level up**, in a test written an hour earlier by someone who had spent the night on exactly that class. Kept as a separate commit deliberately, so folding it in cannot erase that it happened.
 **Cluster:** Testing and instruments. **Priority:** P2. **Verdict:** build. **Severity:** conditional -- no product effect; it manufactures failures that mask real ones.
 
 ---
