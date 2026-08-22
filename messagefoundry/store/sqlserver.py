@@ -65,7 +65,12 @@ from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
-from messagefoundry.store.base import acquire_pooled, warm_pool_connections, warm_pool_target
+from messagefoundry.store.base import (
+    UPLOAD_RESERVATION_STALE_AFTER,
+    acquire_pooled,
+    warm_pool_connections,
+    warm_pool_target,
+)
 from messagefoundry.store.content_search import SearchSpec, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
@@ -1338,6 +1343,14 @@ _SCHEMA: list[str] = [
     """IF OBJECT_ID('cipher_meta','U') IS NULL CREATE TABLE cipher_meta (
         key_id NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY,
         invocations BIGINT NOT NULL DEFAULT 0, updated_at FLOAT NOT NULL)""",
+    # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112) — see the SQLite `_SCHEMA`
+    # for the in-flight-only rationale. One of the two backends a real sharded deployment runs
+    # (`require_unified_store` makes a server DB mandatory past one shard). No PHI (an account id and
+    # two counters). BIN2 collation matches the other id-keyed tables.
+    """IF OBJECT_ID('upload_quota','U') IS NULL CREATE TABLE upload_quota (
+        uploader_id NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY,
+        inflight_files BIGINT NOT NULL DEFAULT 0, inflight_bytes BIGINT NOT NULL DEFAULT 0,
+        since FLOAT NOT NULL)""",
     """IF OBJECT_ID('pending_approvals','U') IS NULL CREATE TABLE pending_approvals (
         id NVARCHAR(64) NOT NULL PRIMARY KEY, operation NVARCHAR(128) NOT NULL,
         params NVARCHAR(MAX) NOT NULL, requester NVARCHAR(256) NOT NULL,
@@ -8856,6 +8869,88 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
         return total
+
+    async def reserve_upload_quota(
+        self,
+        uploader_id: str,
+        *,
+        files: int,
+        size_bytes: int,
+        max_files: int = 0,
+        max_total_bytes: int = 0,
+        stale_after: float = UPLOAD_RESERVATION_STALE_AFTER,
+    ) -> bool:
+        """Atomically reserve (or release) an uploader's in-flight upload budget — see
+        :meth:`messagefoundry.store.base.Store.reserve_upload_quota` for the contract, and the SQLite
+        twin for the statement shape.
+
+        MERGE with HOLDLOCK is the SQL Server upsert that is safe under the concurrent opens of an
+        engine-shard fleet (a bare IF EXISTS/INSERT races) — the same pattern
+        :meth:`add_cipher_invocations` uses. The budget predicate rides ``WHEN MATCHED AND``, so a
+        refusal matches no rows and ``OUTPUT`` returns nothing."""
+        now = time.time()
+        if files <= 0:
+            # RELEASE — unconditional, clamped at zero (a double release cannot mint budget).
+            await self._execute(
+                "UPDATE upload_quota SET"
+                " inflight_files = CASE WHEN inflight_files + ? < 0 THEN 0 ELSE inflight_files + ? END,"
+                " inflight_bytes = CASE WHEN inflight_bytes + ? < 0 THEN 0 ELSE inflight_bytes + ? END,"
+                " since = ?"
+                " WHERE uploader_id = ?",
+                (
+                    int(files),
+                    int(files),
+                    int(size_bytes),
+                    int(size_bytes),
+                    now,
+                    uploader_id,
+                ),
+            )
+            return True
+        if files > max_files or size_bytes > max_total_bytes:
+            # Fail closed before touching the row: WHEN NOT MATCHED inserts unconditionally.
+            return False
+        stale = now - max(0.0, stale_after)
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "MERGE upload_quota WITH (HOLDLOCK) AS t"
+                    " USING (SELECT ? AS uploader_id, ? AS files, ? AS size_bytes, ? AS now_ts,"
+                    " ? AS stale_ts, ? AS max_files, ? AS max_total_bytes) AS s"
+                    " ON t.uploader_id = s.uploader_id"
+                    " WHEN MATCHED AND"
+                    " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_files END)"
+                    " + s.files <= s.max_files"
+                    " AND (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_bytes END)"
+                    " + s.size_bytes <= s.max_total_bytes"
+                    " THEN UPDATE SET"
+                    " t.inflight_files ="
+                    " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_files END) + s.files,"
+                    " t.inflight_bytes ="
+                    " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_bytes END)"
+                    " + s.size_bytes,"
+                    " t.since = CASE WHEN t.since <= s.stale_ts OR t.inflight_files <= 0"
+                    " THEN s.now_ts ELSE t.since END"
+                    " WHEN NOT MATCHED THEN"
+                    " INSERT (uploader_id, inflight_files, inflight_bytes, since)"
+                    " VALUES (s.uploader_id, s.files, s.size_bytes, s.now_ts)"
+                    " OUTPUT INSERTED.inflight_files;",
+                    (
+                        uploader_id,
+                        int(files),
+                        int(size_bytes),
+                        now,
+                        stale,
+                        int(max_files),
+                        int(max_total_bytes),
+                    ),
+                )
+                row = await cur.fetchone()
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return row is not None
 
     async def cipher_invocations(self, key_id: str) -> int:
         """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""

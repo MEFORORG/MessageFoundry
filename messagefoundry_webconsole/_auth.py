@@ -263,6 +263,25 @@ def require_ui(
                 "too many requests; please slow down",
                 headers={"Retry-After": "10"},
             )
+        # BACKLOG #287: the console reaches the handlers IN-PROCESS -- it holds no HTTP client -- so
+        # a /ui write never passes through the engine's `_enforce_admin_write_pacing`. Without this
+        # the product's only pacing floor was absent on the one surface a human actually uses. Same
+        # NON-GET rule as the engine: a GET must stay free because the console's nav polls on a timer,
+        # and charging those would throttle an idle operator. This is a separate budget from the PHI
+        # one above by design -- that quota measures PHI reads, and administration must not spend it.
+        if request.method != "GET":
+            # PROVENANCE BEFORE SPEND, and the order is the security property. The routes call
+            # assert_same_origin inline, which runs AFTER this dependency -- so charging first would
+            # let an attacker's page spend a victim's budget using the victim's SameSite cookie, and
+            # throttle their console from off-origin. Re-asserting here is idempotent (the inline
+            # call still stands) and makes a cross-site write cost the attacker nothing.
+            assert_same_origin(request)
+            if not auth.allow_admin_write(identity.user_id):
+                raise HTTPException(
+                    status.HTTP_429_TOO_MANY_REQUESTS,
+                    "too many requests; please slow down",
+                    headers={"Retry-After": "10"},
+                )
         return identity
 
     return dependency

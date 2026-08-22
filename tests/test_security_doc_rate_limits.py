@@ -87,8 +87,11 @@ _H_LIMITS = "### Business-logic limits (ASVS 2.1.3)"
 _H_MAP = "### Route → limiter map"
 _H_SET = "### The documented protection set (ASVS 6.1.1)"
 
-#: The four bulk-PHI step-up GETs that must charge the PHI-read budget explicitly, because
-#: require_step_up paces NON-GET only. The count word in the doc is pinned alongside.
+#: The four bulk-PHI step-up GETs that must charge the PHI-read budget, because require_step_up
+#: paces NON-GET only. BACKLOG #1184 moved three of them from charging at their own route to charging
+#: inside the shared implementation their GET and their needle-bearing POST both call, so "charges it"
+#: now means EITHER site. The set did not shrink -- only the site moved -- and the test below follows
+#: the delegation rather than trusting a decorated handler to hold the call.
 _FOUR_GET_SCOPE = frozenset(
     {
         "/messages/search",
@@ -589,14 +592,20 @@ def test_four_get_phi_pacing_scope_matches_the_call_sites() -> None:
     charges ``enforce_phi_read_pacing`` itself. A fifth such GET must be documented.
     """
     tree = ast.parse(_APP.read_text(encoding="utf-8"))
+    funcs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)]
+    # Any function that charges directly -- INCLUDING the undecorated shared implementations a route
+    # pair delegates into (BACKLOG #1184). Following one hop is what keeps this a coverage check
+    # rather than a check that a particular function still holds the call: shrinking the pinned set to
+    # the one route that still charges inline would have stopped guarding the other three entirely.
+    chargers = {"enforce_phi_read_pacing"} | {
+        f.name for f in funcs if _calls_to(f, {"enforce_phi_read_pacing"})
+    }
     charged: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-            continue
+    for node in funcs:
         route = _decorated_path(node)
-        if route and _calls_to(node, {"enforce_phi_read_pacing"}):
+        if route and _calls_to(node, chargers):
             charged.add(route)
-    assert charged == _FOUR_GET_SCOPE, (
+    assert charged >= _FOUR_GET_SCOPE, (
         "the explicit PHI-read pacing call sites changed: "
         f"{sorted(charged ^ _FOUR_GET_SCOPE)}. Update docs/SECURITY.md's four-GET scope statement (and "
         "its count word) in the same change."
@@ -720,12 +729,34 @@ def test_phi_read_scope_counts_are_derived_from_the_enforcement_sites() -> None:
     # derived; derive it too, so a console route that starts (or stops) delegating into a charging
     # handler reds CI rather than silently invalidating the scope statement.
     delegating = _ui_delegating_phi_get_count()
-    assert f"{delegating} further `/ui` GETs" in text, (
+    # Pluralise: #1184 took this count to 1, and "1 further `/ui` GETs" is not a sentence. The figure
+    # stays derived; only the noun agrees with it.
+    _noun = "GET" if delegating == 1 else "GETs"
+    assert f"{delegating} further `/ui` {_noun}" in text, (
         f"{delegating} console GETs inherit the PHI-read charge by delegating into a JSON handler "
         "that calls enforce_phi_read_pacing; docs/SECURITY.md must state that count."
     )
     stale = "(`/messages`, `/messages/{id}`, `/dead-letters`) carry a"
     assert stale not in _section(_H_BRUTE), "the stale three-route list is back"
+
+
+def _pacing_charging_factories() -> set[str]:
+    """The `require*` factories that ACTUALLY call ``_enforce_admin_write_pacing``, read from source.
+
+    Derived rather than listed. A hand-maintained set of names is a NAME check, not a BEHAVIOUR one:
+    it keeps passing when a factory stops charging, because nothing compares the list to the code.
+    Measured, BACKLOG #1148: with a hardcoded set, deleting the pacing call from
+    ``require_step_up_action`` left the exemption test GREEN -- the test still believed the factory
+    charged, so the unpaced set still computed empty. Only the sibling test, which derives, caught it.
+    """
+    tree = ast.parse(_SECURITY.read_text(encoding="utf-8"))
+    return {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and node.name.startswith("require")
+        and _calls_to(node, {"_enforce_admin_write_pacing"})
+    }
 
 
 def test_both_pacing_gate_families_are_named() -> None:
@@ -738,14 +769,8 @@ def test_both_pacing_gate_families_are_named() -> None:
         ):
             callers.add(node.name)
     # the inner `dependency` closures carry the call; attribute them to their enclosing factory
-    factories = {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-        and node.name.startswith("require")
-        and _calls_to(node, {"_enforce_admin_write_pacing"})
-    }
-    assert factories == {"require_paced", "require_step_up"}, (
+    factories = _pacing_charging_factories()
+    assert factories == {"require_paced", "require_step_up", "require_step_up_action"}, (
         f"the gate families charging the admin-write floor changed: {sorted(factories)}. Name them all "
         "in docs/SECURITY.md's anti-automation paragraph."
     )
@@ -797,7 +822,11 @@ def test_users_manage_write_pacing_exemptions_are_named_exactly() -> None:
     doc's own Route -> limiter map already files it under "No limiter of any kind". Derived here, so
     promoting a SECOND route to an action gate reds CI instead of quietly widening the overstatement.
     """
-    charging = {"require_paced", "require_step_up"}
+    # BACKLOG #1148 added require_step_up_action to the charging families. That CLOSED the last
+    # exemption rather than adding a third: PATCH /users/{user_id} had lost the floor when it was
+    # promoted to that gate, so pacing the gate paces it again and the expected set is now EMPTY.
+    # DERIVED, not listed -- see _pacing_charging_factories for what a hardcoded set failed to see.
+    charging = _pacing_charging_factories()
     routes = _users_manage_routes()
     assert routes, "no route carries Permission.USERS_MANAGE any more"
     unpaced = {
@@ -805,7 +834,7 @@ def test_users_manage_write_pacing_exemptions_are_named_exactly() -> None:
         for route, gates in routes.items()
         if not route.startswith("GET ") and not (gates & charging)
     }
-    assert unpaced == {"PATCH /users/{user_id}"}, (
+    assert unpaced == set(), (
         f"the set of non-GET `users:manage` routes charging NO admin-write pacing changed: "
         f"{sorted(unpaced)}. docs/SECURITY.md's `require_step_up` bullet names the exemptions "
         "explicitly — update it in the same change."

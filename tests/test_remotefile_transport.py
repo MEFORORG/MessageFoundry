@@ -35,6 +35,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
 )
 from messagefoundry.transports.remotefile import (
+    _APPROVED_SFTP_MACS,
     RemoteFileDestination,
     RemoteFileSource,
     _FtpClient,
@@ -798,8 +799,30 @@ class _AuthException(Exception):
     pass
 
 
+class _FakeTransport:
+    """Stands in for ``paramiko.Transport``, carrying the real preferred-MAC list.
+
+    The connector reads this to derive its ``disabled_algorithms`` (BACKLOG #1171), so the fake has
+    to HAVE it. Production deliberately does not tolerate its absence: a missing attribute there
+    would yield an empty deny list, which silently restores the weak proposals -- the unsafe
+    direction. A fake that omitted it would push the code toward that tolerance.
+    """
+
+    _preferred_macs = (
+        "hmac-sha2-256-etm@openssh.com",
+        "hmac-sha2-512-etm@openssh.com",
+        "hmac-sha2-256",
+        "hmac-sha2-512",
+        "hmac-sha1",
+        "hmac-md5",
+        "hmac-sha1-96",
+        "hmac-md5-96",
+    )
+
+
 class _FakeParamiko:
     SSHClient = _FakeSSHClient
+    Transport = _FakeTransport
     RejectPolicy = _RejectPolicy
     AutoAddPolicy = _AutoAddPolicy
     SSHException = _SSHException
@@ -826,6 +849,54 @@ def test_sftp_unknown_host_key_accepted_with_escape(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(remotefile, "_import_paramiko", lambda: _FakeParamiko)
     client = _SftpClient({"host": "h", "port": 22, "remote_dir": "/in"})
     assert client._accept_unknown is True  # AutoAddPolicy will be selected (logged loudly)
+
+
+def test_sftp_proposes_no_weak_mac_and_the_check_cannot_pass_vacuously(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SFTP connector must not OFFER an HMAC over a disallowed hash (BACKLOG #1171, ASVS 11.4.1).
+
+    paramiko's preferred MAC list carries ``hmac-md5``, ``hmac-sha1`` and their -96 truncations.
+    Appendix C marks HMAC-MD5 **D** and SHA-1 **L** ("not suitable for HMAC"), and with no
+    restriction a server that selects one gets it. The connector now subtracts an approved allow-list
+    from whatever the installed library offers and disables the remainder.
+
+    TWO ASSERTIONS, AND THE SECOND IS WHY THE FIRST MEANS ANYTHING. "No weak member survives" passes
+    trivially against an EMPTY effective set -- which is exactly what a broken subtraction (or a
+    paramiko that renamed ``_preferred_macs``) would produce. So the surviving set is asserted
+    NON-EMPTY first. A connector that proposes nothing is a different defect, not a pass.
+    """
+    captured: dict[str, Any] = {}
+    # _FakeTransport carries the real paramiko preferred list, weak members INCLUDED -- that fixture
+    # is the thing under test, so the subtraction has to remove them rather than the fixture omitting
+    # them. Referenced rather than re-declared here: two copies of the list would drift, and the copy
+    # that drifted would be the one asserting safety.
+    offered = _FakeTransport._preferred_macs
+
+    class _CapturingClient(_FakeSSHClient):
+        def connect(self, **kw: Any) -> None:
+            captured.update(kw)
+
+    class _Paramiko(_FakeParamiko):
+        SSHClient = _CapturingClient
+
+    monkeypatch.setattr(remotefile, "_import_paramiko", lambda: _Paramiko)
+    client = _SftpClient({"host": "h", "port": 22, "remote_dir": "/in"})
+    client._connect()
+
+    disabled = captured["disabled_algorithms"]["mac"]
+    effective = [m for m in offered if m not in disabled]
+
+    # POSITIVE CONTROL FIRST: the connector still proposes something.
+    assert effective, (
+        "every MAC was disabled -- the connector would propose none and negotiation would fail. "
+        "A 'no weak MAC' assertion passes vacuously against this state, which is why it is checked "
+        f"first. disabled={disabled}"
+    )
+    weak = [m for m in effective if "md5" in m.lower() or "sha1" in m.lower()]
+    assert not weak, f"the SFTP connector still proposes a disallowed-hash MAC: {weak}"
+    # And the allow-list itself cannot acquire one without this reddening.
+    assert not [m for m in _APPROVED_SFTP_MACS if "md5" in m.lower() or "sha1" in m.lower()]
 
 
 # === egress allowlist ([egress].allowed_remote) ==============================
@@ -1171,7 +1242,7 @@ class _HostileListingClient(_FakeClient):
     [
         "../../etc/passwd.hl7",  # traversal, and the default *.hl7 pattern MATCHES it
         "/etc/passwd.hl7",  # absolute
-        "..\..\etc\passwd.hl7",  # Windows separators -- posixpath.basename is a NO-OP on this
+        r"..\..\etc\passwd.hl7",  # Windows separators -- posixpath.basename is a NO-OP on this
         "sub/dir.hl7",  # a subdirectory component
         ".",
         "..",
@@ -1218,9 +1289,9 @@ async def test_a_safe_entry_beside_a_hostile_one_still_flows(
     # Refusing one entry must not abort the poll -- the legitimate file beside it is still delivered.
     # Without this, a hostile server could suppress a real feed by planting one bad name.
     client = _HostileListingClient(["../../etc/passwd.hl7", "good.hl7"])
-    client.files["/in/good.hl7"] = b"MSH|^~\&|A"
+    client.files["/in/good.hl7"] = rb"MSH|^~\&|A"
     src = _src(monkeypatch, client)
     h = _RecordingHandler()
     src._handler = h
     await src._poll_once()
-    assert h.bodies == [b"MSH|^~\&|A"]
+    assert h.bodies == [rb"MSH|^~\&|A"]

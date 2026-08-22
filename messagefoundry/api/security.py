@@ -635,6 +635,15 @@ def require_step_up_action(
         auth = get_auth(request)
         if auth is not None and auth.enabled:
             token = bearer_token(request)
+            # BACKLOG #1148 (ASVS 2.4.2): charge the SAME per-actor anti-automation bucket
+            # require_step_up charges, in the SAME position — first, so a throttled write is refused
+            # before any further work. Without this, promoting a route from require_step_up to this
+            # factory SILENTLY STRIPS the pacing floor while reading as a hardening change, because
+            # the action binding is visible in the diff and the lost pacing is not. That already
+            # happened once: PATCH /users/{user_id} was promoted and lost it, and
+            # docs/SECURITY.md files it under "No limiter of any kind" to this day. Adding it here
+            # closes that too rather than only sparing the routes #1148 promotes.
+            _enforce_admin_write_pacing(request, auth, identity)
             # NOT redundant with the ASVS 6.3.3 gate in require(), despite covering the same sessions
             # for every non-exempt path. DELETE /me/mfa shares its path with the MFA-exempt
             # GET /me/mfa, so if _MFA_EXEMPT_ROUTES is ever flattened to bare paths this check is the

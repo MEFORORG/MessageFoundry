@@ -469,7 +469,14 @@ Write-Host ""
 $armedRemote = (& git -C $RepoRoot config --get mefor.durabilityRemote)
 if ($armedRemote) {
     Write-Host "Durability : ARMED -> $armedRemote" -ForegroundColor Green
-    Write-Host "             Every commit now also lands as refs/tags/rescue/auto/<branch> there."
+    # The <repo> segment is load-bearing and MUST stay in this message. It was added because
+    # refs/tags/rescue/auto/main collided between the engine and the vault, which push to one
+    # remote; the bare shape this line used to print still resolves, to that contested fossil. So
+    # an operator who built a query from the old wording got a CONFIDENT HIT at a commit belonging
+    # to neither repository and concluded their work was backed up. Keep this in step with
+    # scripts/hooks/durability_push.sh:93 and :97.
+    Write-Host "             Every commit now also lands as refs/tags/rescue/auto/<repo>/<branch>"
+    Write-Host "             there, or refs/tags/rescue/auto/<repo>/detached/<sha> off a branch."
 } else {
     Write-Host "!! DURABILITY HOOK IS INSTALLED BUT NOT ARMED." -ForegroundColor Yellow
     Write-Host "   mefor.durabilityRemote is unset, so it exits 0 without pushing and nothing is" -ForegroundColor Yellow

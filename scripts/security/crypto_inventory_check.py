@@ -61,9 +61,22 @@ from pathlib import Path
 # The five first-party roots the gate walks — byte-identical (as basenames) to
 # ``tests/test_security_static.py``'s ``_CRYPTO_ROOTS`` (#283 owns that pin; this gate consumes it).
 # ``ide/`` is deliberately absent: it is the TypeScript VS Code extension and contains ZERO ``.py``
-# files, so there is no crypto call site for the AST scanner to find there — the exclusion is a fact
-# about the tree, not a filter (``_assert_ide_is_typescript`` below turns that fact into an enforced
-# invariant, so a future ``.py`` under ``ide/`` reds the gate instead of silently escaping the walk).
+# files, so THIS scanner — which rglobs ``*.py`` and walks the Python AST — has nothing to read there.
+# ``_assert_ide_is_typescript`` below turns that into an enforced invariant, so a future ``.py`` under
+# ``ide/`` reds the gate instead of silently escaping the walk.
+#
+# WHAT THAT EXCLUSION DOES **NOT** MEAN, and this comment used to say otherwise (BACKLOG #1164): it is
+# NOT a finding that ``ide/`` is crypto-free. Zero ``.py`` files is a fact about the LANGUAGE, and the
+# question this gate exists to answer is whether a tree contains cryptography. ``ide/`` does:
+# ``ide/src/cspNonce.ts`` imports ``randomBytes`` from ``node:crypto`` and draws CSPRNG bytes consumed
+# across the extension, and ``ide/src/engineClient.ts`` pins a TLS floor it applies to every https
+# request. Both are first-party crypto in a shipped artifact and NEITHER is discoverable from here.
+#
+# ADDING ``ide/`` TO WALK_ROOTS WOULD BE A NO-OP THAT LOOKS LIKE A FIX: the Python AST scanner would
+# find zero ``.py`` there, report clean, and the TypeScript sites would stay invisible while the tree
+# gained a green whose greenness is evidence of nothing. Covering them needs a TypeScript arm on a
+# merge-gating context, which is unbuilt. Until it exists this gate's green means "no undocumented
+# crypto in the PYTHON of five roots", and that is the only claim it supports.
 # ``samples/`` is absent by design too, on the SAME rationale as the ``ide/`` exclusion (ASVS 11.1.3):
 # it is author-space EXAMPLE config, not shipped engine code, so its crypto (e.g. a content-fingerprint
 # ``hashlib.sha256`` in a sample Handler) is out of the deployed-system inventory scope — the gate

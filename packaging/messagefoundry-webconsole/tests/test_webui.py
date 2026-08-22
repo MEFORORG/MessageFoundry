@@ -2418,9 +2418,13 @@ async def test_reset_password_shows_temp_once(engine: Engine) -> None:
     await _add(service, "u2", Role.VIEWER)
     async with _boss_client(engine, service) as c:
         uid = await _uid(service, "u2")
-        r = await c.post(
-            f"/ui/users/{uid}/reset-password", headers={"Sec-Fetch-Site": "same-origin"}
-        )
+        # BACKLOG #1148 (ASVS 7.5.1): the login window no longer unlocks an admin reset. The bounce
+        # is asserted first, so this still shows the gate EXISTS rather than only that a grant works.
+        path = f"/ui/users/{uid}/reset-password"
+        bounced = await c.post(path, headers={"Sec-Fetch-Site": "same-origin"})
+        assert bounced.status_code == 303 and "/ui/reauth" in bounced.headers["location"]
+        await _mint_action(c, path)
+        r = await c.post(path, headers={"Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 200
         assert "Temporary password issued" in r.text and "<code>" in r.text
         user = await service.store.get_user(uid)
@@ -2433,6 +2437,20 @@ async def test_reset_mfa_and_revoke_sessions_roundtrip(engine: Engine) -> None:
     async with _boss_client(engine, service) as c:
         uid = await _uid(service, "u2")
         for action in ("reset-mfa", "revoke-sessions"):
+            # BACKLOG #1148: reset-mfa is action-bound and needs a fresh grant; revoke-sessions is
+            # deliberately NOT -- it sits outside 7.5.1, which names attributes affecting
+            # AUTHENTICATION. Minting only for the tagged one keeps that boundary under test.
+            if action == "reset-mfa":
+                # ASSERT THE BOUNCE, not just the success. Minting and then succeeding proves the
+                # flow works and NOT that the gate exists -- measured: reverting the route to the
+                # window-scoped gate left this test GREEN until this assertion was added, so the
+                # sharper of the two lanes had no console coverage of its own binding.
+                bounced = await c.post(
+                    f"/ui/users/{uid}/{action}", headers={"Sec-Fetch-Site": "same-origin"}
+                )
+                assert bounced.status_code == 303, action
+                assert "/ui/reauth" in bounced.headers["location"], action
+                await _mint_action(c, f"/ui/users/{uid}/{action}")
             r = await c.post(f"/ui/users/{uid}/{action}", headers={"Sec-Fetch-Site": "same-origin"})
             assert r.status_code == 303, action
             assert r.headers["location"] == f"/ui/users/{uid}", action
@@ -2683,6 +2701,9 @@ async def test_all_admin_posts_reject_cross_site(engine: Engine) -> None:
         # missing assert_same_origin on those routes must fail loudly, not hide behind a no-grant 303).
         await _mint_action(c, "/ui/account/webauthn/enroll")
         await _mint_action(c, "/ui/account/webauthn/abc123/delete")
+        # BACKLOG #1148 puts the two admin reset lanes into that same shape.
+        await _mint_action(c, f"/ui/users/{boss_id}/reset-password")
+        await _mint_action(c, f"/ui/users/{boss_id}/reset-mfa")
         posts = [
             "/ui/users",
             f"/ui/users/{boss_id}/update",
@@ -2752,6 +2773,10 @@ async def test_ad_user_carveouts_on_ui_surface(engine: Engine) -> None:
         r = await _post_pairs(c, "/ui/users/ad-user-1/roles", [("roles", "viewer")])
         assert r.status_code == 400 and "AD-group map" in r.text
         assert await service.store.get_user_role_ids("ad-user-1") == []
+        # BACKLOG #1148: mint the grant FIRST, or the 400 below is never reached -- the action gate
+        # runs before the body and would 303 to reauth, so this would silently stop measuring the
+        # AD carve-out it is named for and start measuring the step-up.
+        await _mint_action(c, "/ui/users/ad-user-1/reset-password")
         r = await c.post(
             "/ui/users/ad-user-1/reset-password", headers={"Sec-Fetch-Site": "same-origin"}
         )
@@ -3393,7 +3418,8 @@ async def test_search_page_renders_bare_form(engine: Engine) -> None:
         await _cookie_login(c, "op")
         r = await c.get("/ui/messages/search")
         assert r.status_code == 200
-        assert 'action="/ui/messages/search"' in r.text
+        # The form POSTs its criteria (BACKLOG #1184) — the page path renders it, /run executes it.
+        assert 'action="/ui/messages/search/run"' in r.text
         assert 'name="field_path"' in r.text and 'name="field_value"' in r.text
         assert "Content search" in r.text
         # No criteria → no results section (no decrypt/audit ran).
@@ -3467,9 +3493,11 @@ async def test_search_hostile_field_value_is_escaped(engine: Engine) -> None:
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
-        r = await c.get(
-            "/ui/messages/search",
-            params={"content": '"><script>alert(1)</script>'},
+        # The term now arrives in the POST body (BACKLOG #1184); it is still reflected into the
+        # form input on the way back, which is what must render escaped.
+        r = await c.post(
+            "/ui/messages/search/run",
+            data={"content": '"><script>alert(1)</script>'},
         )
         assert r.status_code == 200
         assert "<script>alert(1)</script>" not in r.text
@@ -4292,6 +4320,16 @@ async def test_sessions_revoke_others(engine: Engine) -> None:
         await _cookie_login(c, "op")
         op_id = await _uid(service, "op")
         assert len(await service.store.list_sessions(op_id)) == 2
+        # BACKLOG #1149 (ASVS 7.5.2): the login window no longer unlocks a terminate, so the
+        # freshly-logged-in POST bounces to /ui/reauth and revokes NOTHING. That bounce is the
+        # console half of the defect this item closes -- it used to succeed here.
+        bounced = await c.post(
+            "/ui/account/sessions/revoke-others", headers={"Sec-Fetch-Site": "same-origin"}
+        )
+        assert bounced.status_code == 303
+        assert bounced.headers["location"] == "/ui/reauth?next=/ui/account/sessions/revoke-others"
+        assert len(await service.store.list_sessions(op_id)) == 2  # nothing signed out yet
+        await _mint_action(c, "/ui/account/sessions/revoke-others")
         r = await c.post(
             "/ui/account/sessions/revoke-others", headers={"Sec-Fetch-Site": "same-origin"}
         )
@@ -4311,9 +4349,15 @@ async def test_sessions_revoke_one(engine: Engine) -> None:
         await _cookie_login(c, "op")
         op_id = await _uid(service, "op")
         other_id = hash_token(other.token or "")
-        r = await c.post(
-            f"/ui/account/sessions/{other_id}/revoke", headers={"Sec-Fetch-Site": "same-origin"}
-        )
+        # BACKLOG #1149: same inversion as revoke-others -- a fresh login is no longer a terminate
+        # grant, so this bounces first and the target session survives it.
+        path = f"/ui/account/sessions/{other_id}/revoke"
+        bounced = await c.post(path, headers={"Sec-Fetch-Site": "same-origin"})
+        assert bounced.status_code == 303
+        assert bounced.headers["location"] == f"/ui/reauth?next={path}"
+        assert other_id in {s.token_hash for s in await service.store.list_sessions(op_id)}
+        await _mint_action(c, path)
+        r = await c.post(path, headers={"Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 303 and r.headers["location"] == "/ui/account/sessions?m=revoked"
         remaining = {s.token_hash for s in await service.store.list_sessions(op_id)}
         assert other_id not in remaining and len(remaining) == 1
@@ -4323,6 +4367,12 @@ async def test_sessions_posts_reject_cross_site(engine: Engine) -> None:
     service = await _service(engine)
     async with _boss_client(engine, service) as c:
         for path in ("/ui/account/sessions/x/revoke", "/ui/account/sessions/revoke-others"):
+            # BACKLOG #1149: the action gate now runs BEFORE assert_same_origin, so without a grant
+            # this would 303 to reauth and the assertion below would be measuring the STEP-UP rather
+            # than the CSRF defence it is named for. Mint the grant first so the origin guard is the
+            # thing actually under test -- the same shadowing the JSON ownership-404 test had to
+            # avoid. A cross-site POST must be refused outright, never bounced to a login form.
+            await _mint_action(c, path)
             r = await c.post(path, headers={"Sec-Fetch-Site": "cross-site"})
             assert r.status_code == 403, path
 
@@ -5530,3 +5580,58 @@ async def test_console_action_audits_the_browser_address(engine: Engine) -> None
     assert logins and logins[0]["client"] == "10.7.7.7"
     ok, message = await engine.store.verify_audit_chain()
     assert ok, message
+
+
+# --- BACKLOG #1184 (ASVS 14.2.1): the console search form posts the needle -------------------------
+
+
+async def test_search_form_posts_the_needle_instead_of_putting_it_on_the_url(
+    engine: Engine,
+) -> None:
+    """A GET form puts whatever the operator typed into the browser's address bar, its history and
+    every log between them. The content-search form must therefore submit as a POST.
+
+    Asserted on the rendered HTML (the form's own method) and then on behaviour: the POST returns
+    results for a term that never appears in the request URL."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine)  # ADT with PID-3 = 100
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        form = await c.get("/ui/messages/search")
+        assert form.status_code == 200
+        # The page carries several forms (the preset controls are POSTs already), so pin the SEARCH
+        # form's own opening tag rather than the page's method vocabulary.
+        assert 'method="get" action="/ui/messages/search"' not in form.text, (
+            "the content-search form still submits on the URL"
+        )
+        assert 'method="post" action="/ui/messages/search/run"' in form.text
+        assert 'name="field_value"' in form.text  # control: it is still the search form
+
+        r = await c.post(
+            "/ui/messages/search/run",
+            data={"field_path": "PID-3", "field_value": "100"},
+        )
+        assert r.status_code == 200, r.text
+        assert "match(es)" in r.text
+        assert f"/ui/messages/{mid}" in r.text
+        assert "100" not in str(r.request.url), f"the needle rode the URL: {r.request.url}"
+
+
+async def test_search_get_ignores_a_needle_left_on_the_query_string(engine: Engine) -> None:
+    """An old bookmark carrying ``?content=`` renders the bare form rather than running a search, so
+    a URL-borne needle cannot select PHI.
+
+    Positive control in the same run: ``?field_path=`` on the SAME route still runs a search, which
+    is what distinguishes "the needle is gone" from "the route stopped searching"."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _seed(engine)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        stale = await c.get("/ui/messages/search", params={"content": "MSH"})
+        assert stale.status_code == 200, stale.text
+        assert "match(es)" not in stale.text, "a query-string needle still ran a search"
+        control = await c.get("/ui/messages/search", params={"field_path": "PID-3"})
+        assert control.status_code == 200
+        assert "match(es)" in control.text  # control: field_path is kept and still searches

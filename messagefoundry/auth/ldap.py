@@ -171,6 +171,44 @@ class LdapAuthenticator:
             receive_timeout=self._s.ad_receive_timeout,
         )
 
+    def _equalizing_bind(self, password: str) -> None:
+        """Do the password-verifying bind's work for a principal that does not exist, and discard it.
+
+        ASVS 6.3.8 (BACKLOG #1140). Builds the same second ``Server`` and ``Connection`` with the
+        same finite ``receive_timeout``, binds against a DN that cannot exist under the configured
+        search base, and unbinds — so the absent/disabled branch costs the same Server build, TCP
+        connect and bind round trip as the present-and-enabled one.
+
+        **Swallows every LDAP error, and that is load-bearing rather than lazy.** The caller wraps
+        this in a handler that turns ``LDAPException`` into :class:`LdapError`, so letting a bind
+        against a deliberately-bogus DN raise would turn a plain failed login into a *connectivity
+        error* — a louder oracle than the timing one this exists to close, and a behaviour change on
+        the ordinary wrong-username path.
+
+        **What this does NOT claim:** that wall-clock is now provably equal. It equalizes the code
+        PATH, which is what the item measured; a directory may still answer ``invalidCredentials``
+        and a no-such-object in different times, and the group-resolution search on the success path
+        remains unmatched. No timing measurement has been run here either.
+        """
+        import ldap3
+
+        try:
+            conn = ldap3.Connection(
+                self._server(),
+                # Cannot collide with a real principal: `mf-` prefixed, and a CN this shape is not
+                # issued by the account provisioning any deployment of this engine would use.
+                user=f"CN=mf-nonexistent-timing-equalizer,{self._s.ad_user_search_base}",
+                password=password,
+                authentication=ldap3.SIMPLE,
+                receive_timeout=self._s.ad_receive_timeout,
+            )
+            try:
+                conn.bind()  # result deliberately ignored — this branch always fails the login
+            finally:
+                conn.unbind()
+        except ldap3.core.exceptions.LDAPException:
+            return
+
     def _find_user(self, conn: Any, username: str) -> dict[str, Any] | None:
         import ldap3
 
@@ -242,6 +280,17 @@ class LdapAuthenticator:
             with self._service_conn() as svc:
                 info = self._find_user(svc, username)
                 if info is None:
+                    # ASVS 6.3.8 (BACKLOG #1140): an absent or disabled principal used to return
+                    # HERE, skipping the whole second Server build, TCP connect and bind round trip
+                    # below — so a valid username was deducible from response TIME behind an
+                    # identical response. Do that work anyway and discard it. This is the AD leg's
+                    # analogue of _DUMMY_PASSWORD_HASH on the local leg (auth/service.py).
+                    #
+                    # DELIBERATELY NOT THE OBVIOUS FIX: the disabled-bit check stays inside
+                    # _find_user. It has TWO callers — this one binds, the Kerberos/SSO one below
+                    # does not — so relocating it into the bind path alone would let a DISABLED
+                    # ACCOUNT AUTHENTICATE OVER SSO. Equalize the CALLER, never move the check.
+                    self._equalizing_bind(password)
                     return None
                 user_dn = str(info["dn"])
                 # The password-verifying bind — a SECOND connection (and a second Server, built by
