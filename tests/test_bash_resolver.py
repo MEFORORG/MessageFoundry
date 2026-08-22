@@ -19,6 +19,7 @@ from _bash_resolver import (
     BASH_HARNESS_FAILURE,
     BASH_SYNTAX_ERROR,
     bash_candidates,
+    bash_preserves_path_order,
     bash_sees,
     explain_returncode,
     require_bash,
@@ -118,3 +119,64 @@ def test_a_harness_failure_is_never_reported_as_a_syntax_error() -> None:
     # And an unknown code is described rather than silently classified as either.
     other = explain_returncode(3, "a workflow block")
     assert "HARNESS" not in other and "3" in other
+
+
+def test_the_resolved_bash_keeps_a_prepended_path_entry_first(tmp_path: Path) -> None:
+    """A test that shadows a binary with a stub gets the stub, not the real one.
+
+    Git for Windows' `bin/bash.exe` is the MINGW64 wrapper: it REWRITES the inherited PATH so
+    `/mingw64/bin` leads. Git ships `curl.exe` there, so a prepended curl stub is silently bypassed and
+    the step reaches the live network. MEASURED: that is how a release-age check passed off pypi.org
+    rather than off its fixture, and it broke exactly the rows whose stub Git also ships -- `gh` and
+    `jq` stubs kept winning, which is why it read as flakiness rather than as one defect.
+    """
+    resolved = Path(require_bash(tmp_path))
+    assert bash_preserves_path_order(resolved, tmp_path), (
+        f"the resolved bash ({resolved}) rewrote PATH, so a stub a test prepends is bypassed"
+    )
+
+
+def test_the_mingw_wrapper_passes_the_namespace_probe_and_fails_the_path_probe(
+    tmp_path: Path,
+) -> None:
+    """THE DISCRIMINATING CASE, and the reason two controls exist rather than one.
+
+    `bash_sees` asks whether the interpreter shares this process's FILESYSTEM NAMESPACE. The wrapper
+    does, perfectly. The failure is entirely in PATH ORDER, an orthogonal dimension, so that control
+    could not fail in the direction this was failing -- which is why the defect shipped under a probe
+    written specifically to catch a wrong interpreter.
+
+    Skips only when the wrapper is genuinely absent, and asserts BOTH halves so a wrapper that stopped
+    rewriting PATH would surface here rather than silently weakening the test.
+    """
+    wrapper = next(
+        (
+            c
+            for c in bash_candidates()
+            if c.is_file() and c.parent.name == "bin" and c.parent.parent.name != "usr"
+        ),
+        None,
+    )
+    if wrapper is None:
+        pytest.skip("no Git-for-Windows bin/bash.exe wrapper on this box to discriminate against")
+    assert bash_sees(wrapper, tmp_path), (
+        "the wrapper should pass the NAMESPACE probe -- if it does not, this test is no longer "
+        "demonstrating that the two controls are orthogonal"
+    )
+    assert not bash_preserves_path_order(wrapper, tmp_path), (
+        "the wrapper no longer rewrites PATH; if Git changed this, the ordering fix in "
+        "bash_candidates may be unnecessary -- verify before removing it"
+    )
+
+
+def test_candidates_prefer_usr_bin_over_the_bin_wrapper() -> None:
+    """The ordering IS the fix, pinned so a future edit cannot quietly reverse it."""
+    names = [str(c).replace("\\", "/") for c in bash_candidates()]
+    usr = next((i for i, n in enumerate(names) if n.endswith("usr/bin/bash.exe")), None)
+    wrapper = next(
+        (i for i, n in enumerate(names) if n.endswith("/bin/bash.exe") and "usr/bin" not in n),
+        None,
+    )
+    if usr is None or wrapper is None:
+        pytest.skip("this box does not produce both candidate shapes")
+    assert usr < wrapper, f"usr/bin must be tried before the bin wrapper, got {names}"

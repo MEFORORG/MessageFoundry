@@ -28,6 +28,7 @@ failures.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -55,8 +56,27 @@ def bash_candidates() -> list[Path]:
     if git:
         # `<root>/cmd/git.exe`, `<root>/bin/git.exe` and `<root>/mingw64/bin/git.exe` are all shipped
         # layouts, so walk up and try both bash homes from each level.
+        #
+        # `usr/bin/bash.exe` BEFORE `bin/bash.exe`, AND THE ORDER IS THE WHOLE FIX. Git for Windows'
+        # `<root>/bin/bash.exe` is the MINGW64 WRAPPER: it REWRITES the inherited PATH, putting
+        # `/mingw64/bin` at the head ahead of anything the caller prepended. `<root>/usr/bin/bash.exe`
+        # is the real shell and leaves PATH alone. MEASURED on this box, same command, one variable:
+        #
+        #     Git/bin/bash.exe      PATH head -> /mingw64/bin   (a prepended stub dir is GONE)
+        #     Git/usr/bin/bash.exe  PATH head -> <the prepend>  (preserved)
+        #
+        # It matters because a test that prepends a stub directory to shadow a real binary is silently
+        # bypassed under the wrapper. Git ships `curl.exe` in `mingw64/bin`, so a curl stub loses and
+        # the step reaches the LIVE network -- which is how a release-age check passed off pypi.org
+        # instead of off its fixture. SELECTIVE, and that is why it looked like flakiness: `gh` and
+        # `jq` stubs still win, because Git ships neither there.
+        #
+        # `bash_sees` CANNOT CATCH THIS and it is not a gap in that probe -- it is a different
+        # dimension. It asks whether the interpreter shares this process's FILESYSTEM NAMESPACE, and
+        # both binaries do. PATH ORDER is orthogonal, so the control could not fail in the direction
+        # this was failing. `bash_preserves_path_order` below is the control for that dimension.
         for parent in Path(git).resolve().parents:
-            for rel in ("bin/bash.exe", "usr/bin/bash.exe", "bin/bash"):
+            for rel in ("usr/bin/bash.exe", "bin/bash.exe", "bin/bash"):
                 found.append(parent / rel)
     on_path = shutil.which("bash")
     if on_path:
@@ -89,6 +109,44 @@ def bash_sees(bash: Path, tmp_path: Path, env: dict[str, str] | None = None) -> 
     return out.returncode == 0 and _PROBE_TOKEN.encode() in out.stdout
 
 
+def bash_preserves_path_order(
+    bash: Path, tmp_path: Path, env: dict[str, str] | None = None
+) -> bool:
+    """LIVE CONTROL for the dimension :func:`bash_sees` cannot see: does a PREPENDED PATH entry stay
+    first?
+
+    Git for Windows' `bin/bash.exe` wrapper rewrites PATH so `/mingw64/bin` leads, which silently
+    un-shadows any stub a test prepended -- and Git ships `curl.exe` there. `bash_sees` passes on that
+    binary because the filesystem namespace is fine; the failure is entirely in PATH order.
+
+    Asserted on the RESOLVED PATH the child reports, not on the string handed in: the wrapper's whole
+    behaviour is to rewrite it between here and there, so reading back what the caller set would be
+    asking the question in a place where the answer cannot be wrong.
+    """
+    marker = tmp_path / "mf_path_probe"
+    marker.mkdir(exist_ok=True)
+    child_env = dict(env) if env is not None else dict(os.environ)
+    child_env["PATH"] = str(marker) + os.pathsep + child_env.get("PATH", "")
+    try:
+        out = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
+            [str(bash), "-c", "echo $PATH"],
+            cwd=str(tmp_path),
+            env=child_env,
+            capture_output=True,
+            timeout=_TIMEOUT,
+            check=False,
+        )
+    except OSError:
+        return False
+    if out.returncode != 0:
+        return False
+    head = out.stdout.decode("utf-8", "replace").strip().split(":", 1)[0]
+    # The child reports a POSIX-style path, so compare on the leaf rather than the spelling: a
+    # tmp_path basename is unique per test, and matching the whole translated path would be an
+    # assertion about the translator rather than about ordering.
+    return head.rstrip("/").endswith(marker.name)
+
+
 def require_bash(tmp_path: Path, env: dict[str, str] | None = None) -> str:
     """A bash that can see this process's files, or a loud failure -- NEVER a skip.
 
@@ -101,7 +159,12 @@ def require_bash(tmp_path: Path, env: dict[str, str] | None = None) -> str:
         if not candidate.is_file():
             continue
         tried.append(str(candidate))
-        if bash_sees(candidate, tmp_path, env):
+        # BOTH controls, because they answer different questions and a candidate can pass one
+        # while failing the other. The MINGW64 wrapper sees the filesystem perfectly and
+        # rewrites PATH; a WSL bash preserves PATH order and cannot open the file.
+        if bash_sees(candidate, tmp_path, env) and bash_preserves_path_order(
+            candidate, tmp_path, env
+        ):
             return str(candidate)
     raise RuntimeError(
         "no bash on this machine can read a file this process just wrote. Tried: "
