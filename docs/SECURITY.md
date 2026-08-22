@@ -628,8 +628,8 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `GET` | `/ui/users/{user_id}` | `users:manage` | `require_ui_step_up` |
 | `POST` | `/ui/users/{user_id}/channel-scope` | `users:manage` | `require_ui_step_up` |
 | `POST` | `/ui/users/{user_id}/delete` | `users:manage` | `require_ui_step_up` |
-| `POST` | `/ui/users/{user_id}/reset-mfa` | `users:manage` | `require_ui_step_up` |
-| `POST` | `/ui/users/{user_id}/reset-password` | `users:manage` | `require_ui_step_up` |
+| `POST` | `/ui/users/{user_id}/reset-mfa` | `users:manage` | `require_ui_step_up_action` (action `admin_reset_mfa`) |
+| `POST` | `/ui/users/{user_id}/reset-password` | `users:manage` | `require_ui_step_up_action` (action `admin_reset_password`) |
 | `POST` | `/ui/users/{user_id}/revoke-sessions` | `users:manage` | `require_ui_step_up` |
 | `POST` | `/ui/users/{user_id}/roles` | `users:manage` | `require_ui_step_up` |
 | `POST` | `/ui/users/{user_id}/update` | `users:manage` | `require_ui_step_up` |
