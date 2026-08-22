@@ -362,8 +362,12 @@ def main(argv: list[str] | None = None) -> int:
         # scoping -- with the writer's dict branch disabled, a payload OMITTING the key was refused
         # while a payload CARRYING it exited 0 and wrote a Python repr into a TOML string. So the
         # guard stopped looking at the exact moment a cell is rewritten. That is not a corner: of
-        # 345 cells in the record exactly ONE holds a top-level non-scalar, and the natural payload
+        # the whole record exactly ONE cell holds a top-level non-scalar, and the natural payload
         # for rewriting that cell ECHOES the key -- the guard covered every cell that cannot be hurt.
+        # (The record's cell TOTAL is deliberately not stated here. It is vault-derived, this file
+        # ships to PyPI, and a coverage count over a closed public requirement set discloses the
+        # uncovered set by subtraction. `main` already words it this way; the figure is the only
+        # thing that differs, and it must not come back through a merge.)
         #
         # The payload IS the record of the type the author asked for, so it can be compared against.
         # An intentional retype agrees with its own payload and still passes; a writer corruption
