@@ -3113,6 +3113,9 @@ This is **wider than the disclosure describes.** [`CONFIGURATION.md:718`](CONFIG
 > **Filed 2026-08-01 — not started.** Arbitrary code from any of ~30 floating transitives at `.github/workflows/release.yml:255` runs with the OIDC identity that then signs the wheel, writes the SLSA attestation and publishes to PyPI — a backdoored artifact carrying a *valid* Sigstore bundle and valid provenance — and no Dependabot ecosystem parses an inline `pip install X==Y`, so the pin rots with no trigger and no owner (the two siblings at `:104` and `:207`, the latter a `~=` range, float identically); the ADR 0034 hashed-lock mechanism is proven and running for `ci-scanners`/`ci-quality`, but `sigstore` is absent from every lock (`grep -c sigstore uv.lock` → 0), adding a seventh is a six-place lockstep edit, the resolve contamination may force the same excluded-by-decision call semgrep got, and no PR leg ever executes this path.
 > Verdict: build
 > Closing-act: code
+> **OWNER RULING 2026-08-22: pin `sigstore==4.4.0` and hash-lock it. NOT 4.5.0.**
+> *The ruling was made today and lived only in the owner queue record; this row is the surface that
+> governs `release.yml:255`, so it belongs here.*
 
 **Cluster:** Security / Supply chain. **Priority:** P2. **Verdict:** build. **Severity:** medium.
 
@@ -11118,7 +11121,16 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > **The carve-out this item makes IS sound, and I verified it:** `_encode_search_params` has exactly three references in the file (def `:697`, docstring `:721`, call `:756`) and is reached only from `_resolve_read_url`, so `conditional_query` travels a different path and the two tests this item promises to keep green are untouched by any change here.
 > **THE TAIL IS VAULTED AND NO BUILDER IN A PUBLIC CHECKOUT CAN PERFORM IT.** This item's title is to close ASVS 1.2.2 on the merits, and its re-score note makes the cell the terminal state -- but that cell lives in the separate vault clone, and `git ls-files docs/security` returns **0** here. A second vaulted artifact sits on the same tail: the 15.1.5 `fhir_lookup` row in the threat model. **A builder can finish every line of Limb B and still not close 1.2.2.**
 > Verdict: build
-> Closing-act: code
+> Closing-act: blocked
+> **BLOCKED 2026-08-22 BY OWNER RULING -- pending a real FHIR server. This is 1107 clause 3.**
+> *Recorded here because a reader cannot see it from anywhere else: the encoding question cannot be
+> settled against our own suite, which pins `%7C` in five places and therefore cannot disagree with
+> itself.* **`Closing-act` is `blocked`, not `code`, so a dispatch gate refuses this to a builder.**
+>
+> ⚠️ **DO NOT READ THIS ITEM's `OWNER-RULED` BANNER AS COVERING IT.** *That marks a DIFFERENT ruling,
+> of 2026-08-13, on the two limbs.* **A grep for "owner rul" hits that one and returns a reader who
+> then stops looking** -- which is how a builder was nearly handed this item twice in one hour, once
+> by this seat. A second ruling on the same item has no home unless someone writes it in.
 
 **Cluster:** Transports / FHIR egress. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- zero instances; on first deployment a Handler passing an unsanitised value into a FHIR search **would** be able to alter the query's meaning.
 
