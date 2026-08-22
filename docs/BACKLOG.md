@@ -1377,6 +1377,8 @@ parity analysis.
 >
 > **Re-scored 2026-08-03 → DEMAND-GATE.** Corepoint-parity persisted-definition model plus a report-only validator and an additive NCPDP codec, all cleanly worked around today by a code-first Handler, so useful breadth rather than a blocker; the whole scope is still remainder — NCPDP appears nowhere in `messagefoundry/` and `profile` is merely "reserved for a conformance-profile" (`messagefoundry/parsing/validate.py:56`) — spanning a new stored model the code reads, a validator, and a new codec class. **SPLIT 2026-08-10:** the NCPDP codec moves to #1213 (clean, additive, precedented by X12 ADR 0012 and DICOM ADR 0025). What stays here is the PERSISTED-DEFINITION MODEL, and its #26 adjacency is now stated: visual/template-driven authoring is declined-by-design, and this threads that needle only as DATA THE CODE READS, NEVER A GUI MODELER. Trigger restated as **a migration a code-first Handler genuinely cannot express** -- the 75-feed estate port completed USING code-first Handlers, so "modeling-heavy" must not be read as having fired it.
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** Declarative HL7 modeling. **Priority:** P3. **Verdict:** demand-gate.
 
@@ -1398,6 +1400,8 @@ parity analysis.
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
 > **AMENDED 2026-07-28 — two of the three named sub-capabilities are BUILT; do not rebuild them.** Adversarial verification (2 lenses) refuted a full close, so this stays open — but narrowed. **BUILT and persisted across all three backends:** escalation tiers and schedule-aware thresholds ([ADR 0133](adr/0133-alert-escalation-tiers-schedule-aware-thresholds-and-content-triggered-alerts-the-56-remainder.md)), including the per-key escalation state the notifier drops on resolve (`messagefoundry/api/app.py:2367`, `:2541`) and the occurrence-driven tier count surfaced on the rules API (`:4316`).
 > ⚠️ **The REMAINDER is the third sub-capability — content (Action-Point) alerting — and it is plumbing with no reachable trigger.** `content_match` exists on the concrete notifier (`messagefoundry/pipeline/alert_sinks.py:669`, event shape at `:677`, label routing at `:553`) but is **not on the `AlertSink` Protocol** (`messagefoundry/pipeline/alerts.py:27`), and the engine holds its sink as `self._alert_sink: AlertSink` (`messagefoundry/pipeline/wiring_runner.py:731`) — which is also `LoggingAlertSink` whenever no `[alerts]` transport is configured. A Handler is passed only the payload and no alert emitter is exported, so **nothing outside the tests can ever fire it**. Second, smaller gap: the persisted `escalation_tier` is never surfaced on `AlertInstanceInfo` / `GET /alerts/active`, which does not match ADR 0133 D1's stated outcome. Build **only** those two things.
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** Operational/monitoring (alert remainder). **Priority:** P2. **Verdict:** demand-gate.
 
@@ -1417,6 +1421,8 @@ parity analysis.
 >
 > **Re-scored 2026-08-03 → DEMAND-GATE.** Niche file/FTP interop knobs most partners never need, and the ones that bite are transport-side where no Handler can substitute; all of it is per-driver additive on two connectors — `FileDestination` still has no append, dated-subfolder archive or header/trailer framing knob, and `remotefile` is explicit-`FTP_TLS` only with no implicit/passive toggle or keyboard-interactive auth (`messagefoundry/transports/remotefile.py:13`, `:256-262`). **Reviewed 2026-08-10 at the G26 demand-gate triage: trigger re-read against the code and NOT fired -- deferral stands.**
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** Minor gaps. **Priority:** P3. **Verdict:** demand-gate.
 
@@ -1456,6 +1462,8 @@ parity analysis.
 >
 > **Re-scored 2026-08-03 → DEMAND-GATE.** Corepoint-parity transport breadth with a clean workaround — the pluggable destination registry lets an adopter write the connector code-first — and nothing exists today (`transports/` carries no object-store or bus driver; `pyproject.toml` names no boto3/azure/google-cloud/kafka dependency). But the scored remainder is the whole scope: four-plus drivers, four vetted dependencies through the hash-locked lock file, plus credential sourcing and egress allow-listing on each, which exceeds the single-connector band 5. Quadrant becomes money pit. _(was 5/10 · 5/10.)_ **Reviewed 2026-08-10 at the G26 demand-gate triage: trigger re-read against the code and NOT fired -- deferral stands.**
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** Minor gaps. **Priority:** P3. **Verdict:** demand-gate.
 
@@ -1974,6 +1982,8 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 > **Build constraints:** Build at the connector, not in a Router/Handler. (1) Honor count-and-log: suppressed duplicate instances (the 2..N objects per Study/Series UID) must still be persisted with an explicit disposition such as FILTERED — never silently dropped, since each C-STORE object is a received-and-ACKed message. (2) The de-dup "seen-UID" state lives on the connector (analogous to FileSource's processed-file tracking); it must survive connector/engine restart, or a bounded reset window on restart must be explicitly documented…
 > 🔢 **Re-scored 2026-08-03 → DEMAND-GATE.** Niche DICOM-only study collapse most partners never need, and the SR→HL7 case can already filter to SR objects code-first because `DicomPeek` exposes both UIDs (`messagefoundry/parsing/dicom/peek.py:105-106`), though no pure Router can hold the cross-message state; the remainder is a connector-side seen-UID ledger modelled on the existing durable `processed_files` precedent (`messagefoundry/store/base.py:844`, `prune_processed_files` at `:857`) plus an explicit FILTERED disposition on the suppressed 2..N objects at `_on_c_store`/`_commit` (`messagefoundry/transports/dicom.py:273`, `:368`), tested on all three backends. **Reviewed 2026-08-10 at the G26 demand-gate triage: trigger re-read against the code and NOT fired -- deferral stands.**
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** Connections & Transports. **Priority:** P2. **Verdict:** demand-gate. **Severity (vs Corepoint):** moderate.
 
@@ -2061,6 +2071,8 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 > **The 2/10 was arrived at by conflating VISIBILITY with ENFORCEMENT.** stdout, NSSM rotation, the TLS syslog forwarder and #50's disk metering make the log *visible*; none of them makes processing *stop* when the log cannot be written. The item is the enforcement, and that is what the owner ruled in. **A guard that logs a warning and lets processing continue does not satisfy this item** — that is the specific defect to check for at review.
 > **Work exists and is UNVERIFIED.** `w3-log-write-failure` (`d26d66a6`, pushed and anchored) carries five commits whose subjects claim: the halt let the backlog keep routing so the internal stages are stopped too; a reload-recovery claim that *"was a guess"* was measured and three docs corrected; two PHI-inventory anti-rot gates found red on the branch; and a console-contract seam bump. **The lane died mid-flight on a usage limit, so none of it is verified.** It carries **ADR 0162**, whose number was independently confirmed to come from `alloc.ps1` — a real allocation record exists and `main`'s highest is 0161 — so the number is sound, but the index row should be re-checked before landing since a rebase can drop it.
 > **The claim most worth verifying by execution is the partial halt:** a halt that stops intake while routed and outbound rows keep draining would still violate the invariant this item exists to protect.
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** Logging & Audit. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -2084,6 +2096,8 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 > **Promoted out of demand-gate at the G26 triage.** It is ordinary scheduled work now; no trigger needs to fire first.
 > **AMENDED 2026-07-28 — the API half is BUILT; the console half is DEAD CODE.** Adversarial verification refuted a full close. **BUILT:** `GET /messages/export` (`messagefoundry/api/app.py:3001`) behind a dedicated `MESSAGES_EXPORT` permission with step-up + audit ([ADR 0131](adr/0131-bulk-raw-message-body-export-from-a-search-result-step-up-audited-phi-egress.md)), with 11 tests. A scripted operator can export today.
 > ⚠️ **The REMAINDER is the console affordance, and it is worse than missing — it is wired to nothing.** The console JS registers a handler on `[data-mf-msg-export]`, but **no page builder emits that attribute** (`pages/messages.py` contains zero `data-mf-*` attributes and no per-row checkboxes), and the URL the JS fetches, `/ui/messages/export`, **has no route** — it would be swallowed by `/ui/messages/{message_id}`. So the progress bar and stop control the Scope names by name are unreachable. ⚠️ **ADR 0131 and its index row at `docs/adr/README.md:157` overstate this** and should be amended when the console half lands.
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** Logging & Audit. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -2203,6 +2217,8 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 >
 > **Re-tiered 2026-08-10: NO LONGER DEMAND-GATE -- schedulable.** Its trigger has FIRED against this repo's OWN shipped sample, no deployment required: `samples/config/IB_PDF_TO_MDM.py` calls `current_ingest_time()`, which lands in MSH-7, EVN-2 AND TXA-4, while the Test Bench body comparator ignores only MSH-7 and MSH-10.
 > **Promoted out of demand-gate at the G26 triage.** It is ordinary scheduled work now; no trigger needs to fire first.
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** IDE / Test tooling. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -2248,6 +2264,8 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 >
 > **Re-scored 2026-08-03 → DEMAND-GATE.** Marginal tuning knob with no interop dimension — the fixed cadence serves live monitoring fine and no deployment has reported console bandwidth as material; the build is a validated settings field read by the push loop, where the cadence is a single `await asyncio.sleep(1.0)` at `messagefoundry/api/app.py:4945` and `config/settings.py:701` already carries the sibling `ws_allowed_origins`. **Reviewed 2026-08-10 at the G26 demand-gate triage: trigger re-read against the code and NOT fired -- deferral stands.**
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** Monitoring. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -2289,6 +2307,8 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 >
 > **Re-scored 2026-08-03 → DEMAND-GATE.** Real firewall role-inversion gap that an external relay (socat/stunnel) works around awkwardly but genuinely, which is why it stays at moderate severity and P2; the outbound half is not a knob — `DestinationConnector` (`transports/base.py:459`) exposes only `send` (`:480`) and every destination dials (`tcp.py:189`, `mllp.py:849`, `x12.py:158`), so a listening outbound needs an accept loop handing a peer socket to the per-outbound delivery worker and reconciled with retry/backoff and the connection-lifecycle status vocabulary. _(was 6/10 · 5/10.)_ **Reviewed 2026-08-10 -- POLICY, not demand; deferral stands.** The socat/stunnel relay does work, and what it costs was not previously written down: it places a hop OUTSIDE the engine's supervision -- outside count-and-log, and outside the forward-secrecy floor `harden_cipher_suites` asserts at 12 call sites across 5 files. The trigger is therefore a POLICY question (is an out-of-engine relay acceptable), not a demand one.
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** Connections & Transports. **Priority:** P2. **Verdict:** demand-gate. **Severity (vs Corepoint):** moderate.
 
@@ -2330,6 +2350,8 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 >
 > **Re-scored 2026-08-03 → DEMAND-GATE.** Niche X12 knob most partners never need — the pyx12 walk yields a conforming 997/999 free (`parsing/x12/validate.py:18`, `:69`), covering the common ack, and only a contract that specifically mandates interchange-level accept/reject reaches for TA1; the build is a pure codec addition beside the existing splitter and delimiters in `messagefoundry/parsing/x12/`, which today contains no TA1 generator at all — only the outbound classifies a partner's returned TA1 (`transports/x12.py:73-74`). **Reviewed 2026-08-10 at the G26 demand-gate triage: trigger re-read against the code and NOT fired -- deferral stands.**
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** HL7 / Messaging. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** moderate.
 
@@ -2349,6 +2371,8 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 >
 > **Re-scored 2026-08-03 → DEMAND-GATE.** Every constituent step already ships documented — install, backup/restore/DR, decommission at `docs/EARLY-ADOPTER-GUIDE.md` §4/§10/§16 — so the gap is prose stitching, not capability; one new doc that orders them end-to-end, no code. **Reviewed 2026-08-10 -- deferred by owner ruling: build after more testing.** Pure prose stitching over steps that all ship and are documented separately; no capability gap, 1/10 difficulty. Whoever writes it must write the quiesce/drain ordering against the actual drain semantics rather than assembling section titles -- getting that order wrong loses messages.
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** Admin & Deployment. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -2368,6 +2392,8 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 >
 > **Re-scored 2026-08-03 → DEMAND-GATE.** Anti-flap refinement the shipped `realert_seconds` / per-rule `cooldown_seconds` throttle already damps (`messagefoundry/config/settings.py:2678`, `:2823`), with single-sided `min_depth`/`min_oldest_seconds` matching confirmed at `messagefoundry/pipeline/alert_sinks.py:617-623`; two new AlertRule fields plus clear-edge state in the sink, no store or migration. **Reviewed 2026-08-10 -- deferral stands, and this is the cleanest deferral in the set.** Its trigger names an observation nobody can make yet: *operators reporting flapping the flat realert/cooldown throttle does not damp*. That cannot fire from analysis, only from watching real alerts misbehave. The covering mechanism (`realert_seconds` + per-rule `cooldown_seconds`) is genuine rather than a fig leaf, and building a deadband now means choosing two threshold constants with no traffic to choose them from -- the shape of change that gets tuned once in anger and never revisited.
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** Alerting. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -2407,6 +2433,8 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 >
 > **Re-scored 2026-08-03 → DEMAND-GATE.** Niche close-framed TCP interop knob: `codec_for` requires both delimiter bytes and `FrameCodec` rejects `start == end` (`messagefoundry/transports/framing.py:62-63`, `:167-170`), so connection-close framing is inexpressible today; a `framing=none` path bypasses the shared codec on the Tcp read loop (`messagefoundry/transports/tcp.py:508-515`) and the destination's write-then-close. **Reviewed 2026-08-10 at the G26 demand-gate triage: trigger re-read against the code and NOT fired -- deferral stands.**
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** Connections & Transports. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -2487,6 +2515,8 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 >
 > **Re-scored 2026-08-03 → DEMAND-GATE.** IDE Test Bench DX input to seed the per-message metadata bag for transform tests; nobody is blocked, and the seam is small — a `--meta` flag threaded through `dry_run`/`route_message` (`messagefoundry/pipeline/dryrun.py:512-521`, `:702-709`) into the Test Bench's CLI-only channel (`ide/src/testBench.ts:240`). The bag itself already shipped (#150/ADR 0081, `messagefoundry/config/wiring.py:2604`) but write-only — no `meta_get` on `Message` — which is a clause of this item's OWN trigger, so it holds the tier at DEMAND-GATE without discounting worth-if-built. **Reviewed 2026-08-10 at the G26 demand-gate triage: trigger re-read against the code and NOT fired -- deferral stands.** Its trigger describes a condition that CANNOT arise as the engine is built.
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** IDE / DX. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -2526,6 +2556,8 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
 > **AMENDED 2026-07-30 — the API half is BUILT; the console half is DEAD CODE.** Adversarial verification refuted a full close. **BUILT** ([ADR 0130](adr/0130-runtime-ephemeral-log-verbosity-control-and-phi-redacted-log-tail-viewer.md)): the restart-free runtime verbosity control — `set_runtime_level` / `current_log_level` (`messagefoundry/logging_setup.py:417`, `:440`; root + uvicorn, ephemeral, survives `/config/reload`) behind `GET`/`PATCH /logging/level` (`messagefoundry/api/app.py:4527`, `:4541`), gated by `monitoring:diagnose` and audited as `logging_level_change` — plus the paginated **redacted** tail `GET /logs/tail` (`:4570`) behind the new `logs:view` PHI-read permission (`messagefoundry/auth/permissions.py:57`), reusing the #49 redactor, hop-guarded and audited as `logs_view`. 11 tests in `tests/test_logging_surfaces.py`.
 > ⚠️ **The REMAINDER is the in-console viewer the Scope names, and it is worse than missing — it is wired to nothing.** `messagefoundry_webconsole/static/app.js` registers both features, `[data-mf-log-level]` (`:1252`) and `[data-mf-log-viewer]` (`:1294`), but **no page builder emits either attribute** (`data-mf-log` occurs nowhere outside `app.js`), and the URLs the JS fetches — `/ui/logging/level` (`:1259`) and `/ui/logs/tail` (`:1308`) — **have no route**: neither appears in the golden `/ui` surface (`packaging/messagefoundry-webconsole/tests/golden/ui_routes.txt`). During an incident an operator still reaches both only through the JSON API. ⚠️ ADR 0130's **Built:** block correctly lists routes + DTOs only, but its Related line calls [ADR 0065](adr/0065-web-ops-dashboard.md) "the console that renders it" (`0130:13-14`) — nothing renders it today; amend that when the console half lands. Per-logger/per-area targeting is an ADR-recorded MVP scope-out (`0130:97-98`), not a gap.
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** Logging & Audit. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -2570,6 +2602,8 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 >
 > **Re-scored 2026-08-03 → DEMAND-GATE.** One-call sugar over an API that already does the hard part — `groups()` hands back the span view (`messagefoundry/parsing/message.py:470`) and `add_segment` grafts lines (`:377`), so the 'find the group boundary' boilerplate the item cites is mostly already solved; a small additive helper whose only subtlety is re-encoding across two messages' MSH separators. **Reviewed 2026-08-10 at the G26 demand-gate triage: trigger re-read against the code and NOT fired -- deferral stands.**
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** Modeling & Codecs. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -2609,6 +2643,8 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 > **Promoted out of demand-gate at the G26 triage.** It is ordinary scheduled work now; no trigger needs to fire first.
 > **AMENDED 2026-07-28 — the API half is BUILT; the console view is the remainder. ⚠️ This item was nearly closed in error.** A first pass read the merged endpoint as the whole item; two independent adversarial lenses **both refuted** that, and they were right. **BUILT:** `GET /users/{user_id}/permissions` (`messagefoundry/api/auth_routes.py:610`, docstring citing BACKLOG #177 at `:615`) resolving the flattened effective set via `AuthService.identity_for_user_id` (`:622`) — the same `Identity.build` path `/auth/me` uses — with tests and `docs/SECURITY.md` coverage.
 > ⚠️ **The REMAINDER: the Scope says "An admin endpoint … PLUS console view", and the re-score explicitly prices in "a console pane".** `user_detail_page` returns only Profile / Roles / Channel-scope / Account-actions cards, `_user_detail` never calls the inspector, the golden `/ui` route surface contains **no** permission-inspector route, and `apiclient/` has **no wrapper** for the endpoint — so the console cannot even reach it. An admin still cross-references `/users` × `/roles` by hand, which is the exact workaround the item exists to remove. Build the pane; do not rebuild the endpoint.
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** Security. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -2633,6 +2669,8 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 > **AND NOTHING WOULD HAVE CAUGHT IT, which is the part that outlives this item.** The `[sftp]` extra is installed on **ZERO CI legs** — verified independently on `main`: `grep -rn sftp .github/` returns nothing, `paramiko` is in neither `[dev]` nor `[harness]`, and CI's broadest install (`ci.yml:252`) is `.[dev,harness,fhir,dicom,x12,xml,webauthn]`. **So an SFTP enforcement test cannot run in CI at all, and a green CI is not evidence about this connector.** A local green was real but is not standing evidence. **Whatever lands here must add the extra to a CI leg in the same change, or it ships an untestable control.**
 > **A separate engine-wide hazard found in the same pass.** `hmac-sha2-384` rates **UNKNOWN** and **HARD-REFUSES every SFTP connection**, while the module's own mapping table names `Mac=SHA384` as part of the measured TLS set — and `pyproject.toml:114` pins `paramiko>=5.0` **unbounded**. A routine Dependabot bump that changes paramiko's preferred MAC list would break SFTP everywhere, with **no operator escape** until this item's deferred knob half exists. That is an argument for the knob, not against it.
 > **The honest shape for whoever picks this up: floor SHIPPED (on a branch), knob DEFERRED, kex screen has a KNOWN POSITION BUG.** The ranked-table rows and the scoring line below still say `client.connect` passes no `disabled_algorithms`. **That remains TRUE of `main`** — `ssh_policy.py` is not on `58220c2a` — and it is left standing deliberately rather than "corrected" into describing an unlanded branch. **It must be rewritten in the same commit that lands the floor, not before.**
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** Security. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -2736,6 +2774,8 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 >
 > **Re-scored 2026-08-03 → DEMAND-GATE.** Niche IHE packaging format that base64-inline already serves for any accepting partner; XOP framing is spec-fiddly but confined to one connector's string-concatenated envelope (messagefoundry/transports/soap.py:643-702), with no body signature to disturb and the DICOMweb boundary generator to borrow. **Reviewed 2026-08-10 at the G26 demand-gate triage: trigger re-read against the code and NOT fired -- deferral stands.**
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** Web Services & HTTP. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -10418,6 +10458,8 @@ gate is the wrong shape, validation of the walk is the right one.
 > **Filed 2026-08-10 -- split out of #78 at the demand-gate triage.** #78 bolted two unrelated conditions to one trigger: a persisted custom-definition model AND an NCPDP codec. They have very different risk, so they are now separate rows. **This one is the clean half.**
 > **Why it is clean:** it is the shape this project has already shipped twice -- X12 ([ADR 0012](adr/0012-x12-edi-codec.md)) and DICOM ([ADR 0025](adr/0025-dicom-codec-store-connectors.md)). A pure tolerant codec under `parsing/`, riding payload-agnostic ingress ([ADR 0004](adr/0004-payload-agnostic-ingress.md)) behind its own `content_type`, called ON DEMAND by a Router or Handler against a `RawMessage`, and NEVER pushed through the pipeline. It carries no declarative-authoring risk, which is what makes it separable from #78's remaining half.
 > **On-trigger / demand-gate.** Trigger: **a real NCPDP feed appears.** Pharmacy claims are outside the HL7/FHIR/X12/DICOM scope the project has taken on, so this waits for a genuine feed rather than being built on parity grounds.
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Cluster:** Codecs & Parsing. **Priority:** P3. **Verdict:** demand-gate. **Severity:** minor.
 
