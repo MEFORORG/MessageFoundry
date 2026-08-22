@@ -334,6 +334,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # affordance ASVS 7.4.4 makes visible), which means the origin check is the only
         # request-provenance control it will ever have: without it a cross-site POST the browser
         # attaches the cookie to would forcibly terminate the operator's session.
+        #
+        # IT ALSO CHARGES NO WRITE BUDGET, AND THAT IS DELIBERATE (BACKLOG #287). Having no Depends
+        # gate, it never reaches `require_ui`, where every other non-GET /ui route now spends
+        # `allow_admin_write`. Do not "correct" that: a throttled logout is a signed-in operator who
+        # cannot sign out, which is the 7.4.4 affordance failing exactly when someone is trying to
+        # end a session they no longer trust. Signing out is also not the operation a write budget
+        # exists to bound — it REMOVES authority rather than exercising it. Written down because an
+        # unwritten right answer is indistinguishable from an oversight, and this one now sits
+        # conspicuously alone.
         assert_same_origin(request)
         auth = get_auth(request)
         token = session_token(request)
