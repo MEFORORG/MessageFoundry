@@ -12242,3 +12242,20 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **NOT BLOCKED, and the correction matters more than the conclusion.** An earlier ruling from this seat deferred the work behind another lane's uncommitted `api/app.py`. That was measured at **file** granularity and is wrong at **hunk** granularity: **21 uncommitted hunks in that file, none touching either `render_metrics` occurrence**, the nearest ending well above it. The holding lane volunteered the finer measurement against its own interest, and this seat re-derived it before reversing rather than accepting the account.
 
 *The general form, which is the reusable part: "the file is dirty" and "the change is contested" are different questions, and a file-level check answers the first while appearing to answer the second.*
+## 1311. The collision gate prints a truncated session UUID where readers expect a commit sha
+
+> 🔢 OPEN -- filed 2026-08-22 by the Dispatcher. Mechanism supplied by a lane that hit it twice; every coordinate re-verified here before filing.
+
+**`scripts/hooks/collision_gate.ps1` prints an 8-character truncated session UUID BARE and UNLABELLED, at `:230` and `:243`, inside a git-centric block message.** The value comes from a `Short` field built by truncating `sessionId` (`scripts/coord/occupancy.ps1:251`, `scripts/coord/overlap.ps1:234`). The file contains **zero** `session=` labels.
+
+**An 8-hex token in a git tool reads as a short commit sha to every reader.** Two seats independently tried to resolve `89933aa2` in the object store; it is the first segment of `89933aa2-bcb4-4993-9019-6ba8a18f576e`.
+
+***THE SEVERITY IS NOT THE CONFUSION, IT IS THE DIRECTION THE CONFUSION POINTS.*** This message is read at exactly one moment: when someone is **blocked** and looking for the other session. It hands them an identifier that **looks** resolvable, **is not**, and **whose failure to resolve reads as evidence the warning itself is stale.** The lane that hit it reports coming *within one step of treating a true file claim as a false alarm on that basis*.
+
+**A gate that makes its own true warnings look false is worse than one that says nothing**, because it trains the reader to dismiss it -- and the dismissal feels like diligence, since they went and checked.
+
+**THE FIX IS ONE WORD PER SITE:** print `session=89933aa2` rather than the bare token. That turns an apparent sha into what it is, at both call sites.
+
+**Not a defect in the claim.** The file-level collision the gate reports was **true** on both occasions. Only the identifier's presentation is wrong.
+
+**Two filing hazards worth recording, because both nearly stopped this being filed at all.** The reporting lane cited `scripts/coord/collision_gate.ps1`, which **does not exist** -- the file is under `scripts/hooks/`. And this seat first concluded the emitter was outside the checkout entirely, having listed `scripts/hooks/*.py` and reasoned about *all* hooks; **the gate is a `.ps1`.** *A glob narrower than the claim it supports produces a confident negative, and neither of us noticed the narrowing.*
