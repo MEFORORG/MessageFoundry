@@ -81,7 +81,7 @@ jobs:
       # uv via the SHA-pinned action (ci.yml's pin), not an unpinned `pip install uv`: a version pin
       # does not satisfy Scorecard PinnedDependenciesID and this repo already carries two such findings.
       - name: Set up uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           # NO CACHE, unlike every other setup-uv use in this repo. Left at the default this would be
           # the only workflow here that BOTH restores a dependency cache AND is reachable from a
