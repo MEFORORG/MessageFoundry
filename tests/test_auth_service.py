@@ -202,7 +202,33 @@ async def test_admin_reset_does_not_re_arm_retirement_of_a_claimed_bootstrap() -
         # The reset re-raises must_change_password — that write is correct and must stay; what must
         # not follow from it is a retirement.
         after_reset = await store.get_user_by_username("admin")
-        assert after_reset is not None and after_reset.must_change_password
+        # BACKLOG #1245 DIAGNOSTIC LIMB. This assertion has failed INTERMITTENTLY, and the recorded
+        # failure is `must_change_password` FALSE here -- NOT the retirement assertion below. One
+        # investigation pass was already spent on the wrong assertion; the item says so explicitly.
+        #
+        # A bare `assert after_reset.must_change_password` CANNOT DISTINGUISH THREE CAUSES, and all
+        # three produce an identical red:
+        #   (a) the write never landed
+        #   (b) it landed and something reset it
+        #   (c) the read path is wrong
+        # A PAIRED READ AT THE SAME INSTANT -- the store record AND the raw row -- splits them on the
+        # next occurrence. Same `store._db` seam four other tests in this file already use.
+        #
+        # This costs two lines and DOES NOT REQUIRE REPRODUCING THE FAILURE FIRST, which is what
+        # makes it worth adding before anyone tries to. Six candidate mechanisms are already REFUTED
+        # BY READING in the item; a seventh is deliberately not offered as a story.
+        cursor = await store._db.execute(
+            "SELECT must_change_password FROM users WHERE id=?", (admin.id,)
+        )
+        raw_row = await cursor.fetchone()
+        raw_flag = None if raw_row is None else raw_row[0]
+        assert after_reset is not None and after_reset.must_change_password, (
+            f"#1245 intermittent: store record must_change_password="
+            f"{after_reset.must_change_password if after_reset else None!r}, "
+            f"raw row must_change_password={raw_flag!r}. "
+            "DISAGREE -> the read path is wrong (c). BOTH falsey -> the write never landed or was "
+            "reset (a/b), and the raw value tells you which by whether the row exists at all."
+        )
         out = await service.login("admin", temp)  # this login is itself a retirement trigger
         assert out.ok and out.must_change_password
         still = await store.get_user_by_username("admin")
