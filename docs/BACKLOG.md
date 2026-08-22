@@ -12665,7 +12665,32 @@ than by a number, since none is allocated.
 
 **Source:** surfaced 2026-08-22 by the eight-cell ASVS re-scoping pass while completing the
 enumeration for cell 12.1.2, then verified independently against the shipped validator before
-filing. That cell's own ruling is a separate question about allowlist width; this item is the build
+filing.
+
+**BUILT 2026-08-22, same day.** `_is_encrypting` and `_is_peer_authenticated` were added beside the
+untouched `_is_forward_secret`, together with `_APPROVED_TLS_SUITES`, the strict positive allow-list
+the owner ruled for. Both measured suites are now refused, with the good suite still accepted as a
+control. Three mutations were run and each turned the suite red -- forcing either predicate to
+`True`, and removing the allow-list check -- so none of the new tests is vacuous.
+
+**TWO SCOPING DECISIONS THE ITEM DID NOT ANTICIPATE, both recorded because a later reader would
+otherwise take the allow-list as universal.** First, the list governs the operator KNOB and is never
+applied to an inherited default context: it is AEAD-only, the shipped default carries six CBC-SHA2
+suites, and asserting it against an inherited context would refuse every current configuration --
+the exact interop regression `harden_cipher_suites`' own docstring already records. Leaving
+`tls_ciphers` unset keeps those six available; setting it does not. Second, `[api].proxy_tls_ciphers`
+passes `require_approved_suites=False`, because that field DECLARES what an external proxy speaks
+rather than configuring one of ours; refusing an unlisted-but-sound suite there would not harden
+anything, it would stop an operator describing their proxy accurately. The three property checks
+still bind on that field.
+
+**The residual above is unchanged and still open:** this covered the operator-facing knob and the
+shipped context builder. It did not enumerate every `SSLContext` construction, and it does not reach
+suite sets chosen inside `ldap3`, `hvac` or ODBC Driver 18. One instrument note worth carrying: the
+startup TLS probe's `ALL:@SECLEVEL=0` context (140 suites, 12 anonymous) was examined and
+DELIBERATELY LEFT ALONE -- the security level is load-bearing there, because without it the probe
+would measure the engine's own refusal to offer rather than a peer's refusal to accept, turning a
+real finding into a false pass. That cell's own ruling is a separate question about allowlist width; this item is the build
 which both readings of the cell now require.
 
 ## 1315. prose path:line citations carry no token, so nothing can verify them
