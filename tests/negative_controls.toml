@@ -376,7 +376,7 @@ block every pull request in the repository.
 """
 green = [
   "tests/test_merge_gate_controls.py::test_the_backlog_hygiene_gate_leaves_the_benign_shapes_alone",
-  "tests/test_merge_gate_controls.py::test_the_bash_namespace_probe_rejects_an_interpreter_that_cannot_see_the_fixture",
+  "tests/test_bash_support.py::test_the_bash_namespace_probe_rejects_an_interpreter_that_cannot_see_the_fixture",
 ]
 observed = """
 RUN AGAINST THE PRE-FIX GATE, which is what makes this evidence rather than a claim. The identical
