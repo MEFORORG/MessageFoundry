@@ -478,6 +478,47 @@ async def test_unknown_user_login_runs_password_verify(
     assert calls["n"] >= 1  # the dummy verify ran for the unknown user
 
 
+# --- #1141 (ASVS 6.4.5): the reminder gate must ask about BOTH bounds, not one -------------------
+
+
+@pytest.mark.parametrize(
+    ("bootstrap_hours", "credential_hours", "expected", "why"),
+    [
+        (
+            0,
+            0,
+            False,
+            "neither bound configured -- nothing can end the credential, so nothing to warn",
+        ),
+        (72, 0, True, "WP-3 account retirement only"),
+        (0, 72, True, "ASVS 6.4.1 CREDENTIAL expiry only -- THE ROW THAT WAS SILENTLY DEAD"),
+        (72, 72, True, "both bounds, the shipped default"),
+    ],
+)
+async def test_bootstrap_deadline_configured_covers_both_bounds(
+    engine: Engine, bootstrap_hours: int, credential_hours: int, expected: bool, why: str
+) -> None:
+    """The API lifespan gates the ASVS 6.4.5 reminder task on this, and the task is the ONLY consumer
+    of ``bootstrap_expiry_warning``. That method warns on the EARLIER of two bounds, so a gate asking
+    about one of them silently deletes the warning arm for the configuration where only the other is
+    set -- the third row. BACKLOG #1245 corrected the two deadline computations in auth/service.py
+    and never reached the gate deciding whether they ever run.
+
+    ASYMMETRIC BY CONSTRUCTION: a gate that simply returned True would pass three rows and fail the
+    first, and one that kept the old single-bound test passes three and fails the third. No single
+    wrong answer satisfies the table.
+    """
+    service = await _service(
+        engine,
+        AuthSettings(
+            require_mfa=False,
+            bootstrap_expiry_hours=bootstrap_hours,
+            initial_password_expiry_hours=credential_hours,
+        ),
+    )
+    assert service.bootstrap_deadline_configured is expected, why
+
+
 # --- #1167 (ASVS 11.2.4): the recovery-code walk must cost the same whatever is presented --------
 
 

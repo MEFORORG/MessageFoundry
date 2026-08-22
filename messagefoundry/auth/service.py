@@ -1355,6 +1355,31 @@ class AuthService:
         return bool(self._settings.ad_session_recheck_seconds) and self._ldap is not None
 
     @property
+    def bootstrap_deadline_configured(self) -> bool:
+        """Whether ANY bound can end the unclaimed bootstrap credential -- so whether the ASVS 6.4.5
+        reminder task has anything to warn about. Drives whether the API lifespan creates it at all.
+
+        BACKLOG #1141. This exists because the lifespan gate open-coded
+        ``bootstrap_expiry_hours > 0`` while :meth:`bootstrap_expiry_warning` warns on the EARLIER of
+        **two** bounds -- WP-3 account retirement and the ASVS 6.4.1 credential expiry. Those are
+        different questions, and BACKLOG #1245 corrected the two computations in this file without
+        reaching the gate that decides whether they ever run.
+
+        THE CONSEQUENCE WAS A SILENTLY DEAD WARNING ARM, not a style defect: at
+        ``bootstrap_expiry_hours = 0`` with ``initial_password_expiry_hours`` set, the warning method
+        correctly computes a deadline and **nothing ever calls it**, because the reminder task is its
+        only consumer and was never created. The operator gets no notice before the credential dies.
+
+        Same lesson :meth:`_unclaimed_bootstrap` records one level over: two open-coded copies of one
+        lifecycle question is how the warn path inherited #1245. This is the third copy, in another
+        module, and it inherited it too.
+        """
+        return (
+            self._settings.bootstrap_expiry_hours > 0
+            or self._settings.initial_password_expiry_hours > 0
+        )
+
+    @property
     def directory_reconcile_alert(self) -> str | None:
         """The last mass-revoke circuit-breaker trip, or ``None``. Latches until a pass completes
         without tripping, so an operator who missed the log line still sees the standing condition."""
