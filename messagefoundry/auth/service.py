@@ -128,6 +128,16 @@ STEP_UP_ACTION_ADMIN_USER_UPDATE = "admin_user_update"
 # a recency test the moment a session exists, so `require_reauth_only` alone let a caller mass-revoke
 # every other session of the account with no proof beyond the sign-in they already had.
 STEP_UP_ACTION_SESSION_TERMINATE = "session_terminate"
+# BACKLOG #1148 (ASVS 7.5.1). The verb asks for full re-authentication before modifications to
+# attributes that affect authentication, naming MFA configuration verbatim and NOT qualifying whose.
+# The self-service half already satisfies it; the ADMIN half did not -- both reset lanes rode the
+# plain login-seeded window, so an administrator who signed in under step_up_max_age_seconds ago
+# could act with ZERO fresh proof. What that gate protects is the most complete modification
+# available to the named attribute: admin_reset_mfa disables TOTP and deletes every passkey, and
+# disable_totp NULLs the recovery codes alongside the secret -- one call clears the second factor,
+# every recovery code and every passkey, on someone else's account.
+STEP_UP_ACTION_ADMIN_RESET_MFA = "admin_reset_mfa"
+STEP_UP_ACTION_ADMIN_RESET_PASSWORD = "admin_reset_password"  # nosec B105 — step-up action id, not a credential; echoed publicly in X-Step-Up-Action
 
 _T = TypeVar("_T")
 

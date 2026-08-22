@@ -77,6 +77,8 @@ from messagefoundry.auth import (
 )
 from messagefoundry.auth.permissions import CustomRoleError
 from messagefoundry.auth.service import (
+    STEP_UP_ACTION_ADMIN_RESET_MFA,
+    STEP_UP_ACTION_ADMIN_RESET_PASSWORD,
     STEP_UP_ACTION_ADMIN_USER_UPDATE,
     STEP_UP_ACTION_MFA_CONFIRM,
     STEP_UP_ACTION_MFA_DISABLE,
@@ -766,7 +768,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def reset_user_password(
         user_id: str,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
+        # BACKLOG #1148 (ASVS 7.5.1): the proof must be BOUND TO THIS ACTION and single-use, not
+        # the login-seeded window. require_step_up_ACTION, never the reauth_only variant -- that
+        # one carries mfa_gate=False and would DROP the second factor from an admin resetting
+        # someone else's credential. The enrolment deadlock that justifies mfa_gate=False does
+        # not exist here: the operator's own enrolment has nothing to do with the target's.
+        identity: Identity = Depends(
+            require_step_up_action(STEP_UP_ACTION_ADMIN_RESET_PASSWORD, Permission.USERS_MANAGE)
+        ),
     ) -> PasswordResetResponse:
         """Admin password reset (ASVS 6.4.6 / WP-L3-12): issue a one-time, must-change credential the
         administrator never keeps. Returned **once** for out-of-band delivery; the affected user is also
@@ -791,7 +800,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def reset_user_mfa(
         user_id: str,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
+        # BACKLOG #1148 (ASVS 7.5.1). This is the sharper of the two: one call clears the TOTP
+        # secret, every recovery code and every passkey on the target account.
+        identity: Identity = Depends(
+            require_step_up_action(STEP_UP_ACTION_ADMIN_RESET_MFA, Permission.USERS_MANAGE)
+        ),
     ) -> SimpleMessage:
         """Admin MFA reset (lost authenticator + no recovery codes): clear the user's TOTP enrollment
         and revoke their sessions so they re-enroll. The acting admin is itself step-up + MFA gated."""
