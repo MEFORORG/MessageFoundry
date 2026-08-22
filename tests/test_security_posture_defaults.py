@@ -771,11 +771,6 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         "require_action_step_up",
         "admin_new_ip_step_up",
         "ad_enabled",
-        # BACKLOG #1137: this one is exempt for the INVERSE of the usual reason. The floor treats a
-        # bool's insecure value as the negation of its default, and here that is backwards -- turning
-        # the AD password pathway OFF removes a credential-accepting surface while the directory bind
-        # stays up for SSO/OIDC, so False is the hardened value, not the loosened one.
-        "ad_password_login_enabled",
         "ad_use_nested_groups",
         "kerberos_enabled",
         "oidc_enabled",

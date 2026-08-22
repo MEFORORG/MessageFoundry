@@ -179,8 +179,8 @@ async def test_the_refusal_is_the_retirement_and_not_a_broken_fixture() -> None:
 # --- the hazard --------------------------------------------------------------
 
 
-async def test_step_up_re_bind_survives_the_login_pathway_being_disabled() -> None:
-    """DO NOT "FINISH THE JOB" BY GATING ``_reauth_ad`` ON THIS FLAG.
+async def test_step_up_re_bind_survives_the_login_pathway_being_retired() -> None:
+    """DO NOT "FINISH THE JOB" BY CLOSING ``_reauth_ad``.
 
     ``AuthProvider`` has two members, so ``_complete_ad_login`` stamps Kerberos and OIDC logins
     ``AD`` exactly as it stamps a password login, and ``reauth`` dispatches to ``_reauth_ad`` on that
@@ -188,8 +188,14 @@ async def test_step_up_re_bind_survives_the_login_pathway_being_disabled() -> No
     Gating it here would look like a one-pathway change and would in fact remove step-up from three,
     which is the kind of total loss nobody would accept if it were stated out loud.
 
-    The re-bind is a decision for layer 2, which must first say what a Kerberos identity re-proves
-    WITH. Until then it stays reachable, and this test fails if someone closes it.
+    The re-bind is a decision that must first say what a Kerberos identity re-proves WITH; the
+    precondition is written up in docs/research/ad-step-up-after-simple-bind-retirement.md. Until
+    that is answered the re-bind stays reachable, and this test fails if someone closes it.
+
+    NAME CHANGE (from ``..._being_disabled``): there is no flag any more. Two tests in this file
+    passed ``ad_password_login_enabled=False`` to ``AuthSettings`` AFTER the field was deleted, and
+    pydantic silently dropped it -- so they named a flag state they never established while staying
+    green. The condition is now unconditional, which is stronger, and the tests say so.
     """
     store = await MessageStore.open(":memory:")
     try:
@@ -208,7 +214,7 @@ async def test_step_up_re_bind_still_rejects_a_bad_credential() -> None:
     try:
         service = AuthService(
             store,
-            _ad_settings(ad_password_login_enabled=False),
+            _ad_settings(),
             ldap=_FakeLdap(),  # type: ignore[arg-type]
         )
         await service.initialize()
@@ -228,7 +234,7 @@ async def test_step_up_re_bind_treats_a_directory_outage_as_a_refusal() -> None:
     try:
         service = AuthService(
             store,
-            _ad_settings(ad_password_login_enabled=False),
+            _ad_settings(),
             ldap=_Down(),  # type: ignore[arg-type]
         )
         await service.initialize()

@@ -924,8 +924,10 @@ class AuthService:
         if principal is None:
             await self._directory_reject_audit(username, "kerberos", "not_in_directory")
             return LoginOutcome(ok=False, error="user not found in directory")
-        # Same signed relaxation as the simple-bind leg (ASVS 6.3.4): a Kerberos service ticket carries
-        # no factor-strength assertion that pyspnego surfaces, so directory delegation stands.
+        # The signed delegated-directory relaxation (ASVS 6.3.4): a Kerberos service ticket carries no
+        # factor-strength assertion that pyspnego surfaces, so directory delegation stands. Since the
+        # AD password sign-in was retired (BACKLOG #1137) this is the ONLY leg passing a hard True --
+        # docs/SECURITY.md's Kerberos rows are where that grant is now disclosed.
         return await self._complete_ad_login(
             principal, client, mfa_verified=True, seed_reauth=seed_reauth
         )
@@ -1197,8 +1199,8 @@ class AuthService:
         federated_subject: tuple[str, str] | None = None,
     ) -> LoginOutcome:
         # ``federated_subject`` is the verified OIDC ``(issuer, sub)`` and is passed ONLY by the
-        # federated path (BACKLOG #1015). It defaults to None, so the AD-simple-bind and Kerberos
-        # callers stay byte-identical — no extra store write, no changed audit row. The federated
+        # federated path (BACKLOG #1015). It defaults to None, so the Kerberos caller stays
+        # byte-identical — no extra store write, no changed audit row. The federated
         # caller has already enforced the subject-continuity guard before reaching here.
         existing = await self._store.get_user_by_username(principal.username)
         if existing is not None and existing.auth_provider != AuthProvider.AD.value:
