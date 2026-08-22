@@ -34,7 +34,18 @@ class Identity:
     permissions: frozenset[Permission]
     must_change_password: bool = False
     #: Per-channel RBAC scope: connections this user's *operational* permissions apply to. ``None``
-    #: = all channels (the default / Administrators). See docs/security/PHASE-8C-RBAC.md.
+    #: = all channels (the default / Administrators).
+    #:
+    #: BACKLOG #1151 (ASVS 8.1.1): this used to end "See docs/security/PHASE-8C-RBAC.md", which a
+    #: reader of the public repository CANNOT REACH -- `docs/security/` is gitignored here, so
+    #: `git ls-files docs/security` returns zero and the directory is absent from a fresh checkout.
+    #: That is a standing decision, not an oversight, which is exactly why the pointer had to go: a
+    #: dangling reference to a security document is worse than no reference, because it tells the
+    #: reader the rule is written down somewhere they can look. THE RULE ITSELF IS STATED ABOVE
+    #: INSTEAD: ``None`` is every channel; a frozenset restricts to exactly those connection ids.
+    #: Note ``None`` and an EMPTY frozenset are not the same value -- None is unrestricted, and an
+    #: empty set would restrict to nothing. The first draft of this comment said "empty frozenset
+    #: means every channel", which is the inverse; it was caught by re-reading the annotation.
     allowed_channels: frozenset[str] | None = None
 
     @classmethod

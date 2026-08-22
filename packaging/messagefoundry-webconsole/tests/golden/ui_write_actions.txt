@@ -21,5 +21,7 @@
 ^/ui/uploaded-logs/file/[^/?#]+$
 ^/ui/uploaded-logs/file/[^/?#]+/delete$
 ^/ui/users/[^/?#]+$
-^/ui/users/[^/?#]+/(reset-password|reset-mfa|revoke-sessions|delete)$
+^/ui/users/[^/?#]+/(revoke-sessions|delete)$
+^/ui/users/[^/?#]+/reset-mfa$
+^/ui/users/[^/?#]+/reset-password$
 ^/ui/users/new$
