@@ -20,8 +20,13 @@ in section 4 rather than left to be inferred.
 gate refuses to start the engine on the documented primary deployment surface, today, in the shipped
 enforcing posture.** That is a measurement, not an argument, and it is the reason this memo exists.
 
-Everything below was measured on 2026-08-22. Every negative carries the positive control that makes
-it mean something; where a control failed, the failure is written down rather than the finding.
+Everything below was measured on 2026-08-22 against engine tree `00cfbc86`. Every negative carries
+the positive control that makes it mean something; where a control failed, the failure is written
+down rather than the finding.
+
+*The commit is given because a date is not checkable and a commit is. Code citations here name a
+symbol rather than a line for the same reason: a line number rots silently, a symbol does not, and a
+commit fails loudly when wrong.*
 
 ## 1. The container question, which was the smaller one
 
