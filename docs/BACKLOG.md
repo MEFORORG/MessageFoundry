@@ -12776,8 +12776,17 @@ them.* **Measured by reading every catch of the identical tuple and what it retu
 ***THE FIFTH IS A DIFFERENT AND WORSE DEFECT.*** The four `CheckResult` sites at least say *"settings
 did not load"*; **`:1116` silently substitutes a shipped default for a config that was REFUSED** -- no
 `CheckResult`, no detail, nothing printed, no skip recorded. *A reader cannot tell that site fired at
-all.* **Fix all five, and that one does not merely need a better exit code -- it needs to stop
-answering.**
+all.* ***CORRECTED AGAIN, SAME HOUR: FIX THE FOUR. THE FIFTH IS A DIFFERENT CONTRACT AND IS SCOPED OUT
+DELIBERATELY.*** *Two seats reached this independently and this ledger was the outlier -- the builder
+fixing it classified `:1116` as a **value resolver, not a check**, and a second seat measuring the same
+file agreed unprompted.* **A check owes a `CheckResult`; a resolver owes a value.** *Widening the
+resolver's contract to "refuse" is a different change with a different blast radius, and with the four
+checks now failing on an unloadable config **the gate fails anyway** -- so the defect this item exists
+to fix is closed by the four.*
+
+⚠️ **IT STILL SWALLOWS SILENTLY AND IS DELIBERATELY LEFT DOING SO -- recorded here so nobody reads
+"four" as the whole surface.** *That is a separate small item if anyone wants it, not a gap in this
+one.*
 
 ***AND THE COUNT ITSELF IS THE LESSON:*** three seats reported three, then four, then five, each
 measuring honestly and each stopping at the first population their instrument could see. **Prefer "at
