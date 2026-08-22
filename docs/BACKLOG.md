@@ -13472,7 +13472,6 @@ blind window is about a day rather than open-ended.
 > took it for a status.** *That is presence-equals-meaning -- the exact misreading `CLAUDE.md` section 11
 > forbids for banner glyphs, reproduced with a phrase instead of a pictograph.* **A status marker must
 > not be a word that also appears in narration.**
-> assigns it). *Until it is flipped this is an open duplicate.*
 
 **Cluster:** Testing / silent-failure class. **Priority:** P2. **Verdict:** build.
 **Severity:** test-integrity gap, not a runtime defect. **Conditional, per section 0:** zero deployments; what would be wrong is a suite reporting a condition it never established.
