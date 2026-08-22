@@ -1129,7 +1129,7 @@ async def test_session_cap_evicts_oldest_on_login(engine: Engine) -> None:
         assert len((await c.get("/me/sessions", headers=_auth(t3))).json()["sessions"]) == 2
 
 
-async def test_ad_login_maps_groups_and_grants_permission(engine: Engine) -> None:
+async def test_ad_session_maps_groups_and_grants_permission(engine: Engine) -> None:
     principal = AdPrincipal(
         username="jdoe",
         display_name="J Doe",
@@ -1156,13 +1156,20 @@ async def test_ad_login_maps_groups_and_grants_permission(engine: Engine) -> Non
     await service.initialize()
     await service.set_ad_group_map([("CN=MF-Ops,DC=x", "operator")], actor="admin")
     async with _client(engine, service) as c:
-        r = await _login(c, "jdoe", "pw", provider="ad")
-        assert r.status_code == 200 and r.json()["user"]["roles"] == ["operator"]
-        assert r.json()["user"]["auth_provider"] == "ad"
-        h = _auth(r.json()["token"])
+        # AD PASSWORD LOGIN is retired (BACKLOG #1137), so the session is minted through the tail
+        # Kerberos and OIDC both end at. The subject is unchanged: an AD-provider session carries the
+        # group-mapped role, and that role's permission is honoured at a real API route.
+        out = await service._complete_ad_login(principal, None, mfa_verified=True)
+        assert out.ok and out.token is not None
+        h = _auth(out.token)
+        # Read the role back over HTTP rather than off the outcome object: this is an API test, and
+        # /auth/me is the serialising path a console actually calls.
+        me = (await c.get("/auth/me", headers=h)).json()
+        assert me["roles"] == ["operator"] and me["auth_provider"] == "ad"
         # operator has connections:control — a missing connection yields 404 (not 403)
         assert (await c.post("/connections/none/start", headers=h)).status_code == 404
-        assert (await c.get("/auth/providers", headers=h)).json()["ad"] is True
+        # The API advertises the retired form as GONE, so a client stops rendering it.
+        assert (await c.get("/auth/providers", headers=h)).json()["ad"] is False
 
 
 async def test_disabled_auth_fails_closed_unless_opted_in(engine: Engine) -> None:
