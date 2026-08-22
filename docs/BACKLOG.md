@@ -12266,26 +12266,18 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **NOT BLOCKED, and the correction matters more than the conclusion.** An earlier ruling from this seat deferred the work behind another lane's uncommitted `api/app.py`. That was measured at **file** granularity and is wrong at **hunk** granularity: **21 uncommitted hunks in that file, none touching either `render_metrics` occurrence**, the nearest ending well above it. The holding lane volunteered the finer measurement against its own interest, and this seat re-derived it before reversing rather than accepting the account.
 
 *The general form, which is the reusable part: "the file is dirty" and "the change is contested" are different questions, and a file-level check answers the first while appearing to answer the second.*
-## 1311. The collision gate prints a truncated session UUID where readers expect a commit sha
+## 1311. WITHDRAWN -- duplicate of #1310, same defect, same sites, same fix
 
-> 🔢 OPEN -- filed 2026-08-22 by the Dispatcher. Mechanism supplied by a lane that hit it twice; every coordinate re-verified here before filing.
+> 🔢 OPEN -- filed and withdrawn 2026-08-22, both by the Dispatcher, within four minutes. The number is kept and cannot be reclaimed; this body exists so it is not left dangling.
 
-**`scripts/hooks/collision_gate.ps1` prints an 8-character truncated session UUID BARE and UNLABELLED, at `:230` and `:243`, inside a git-centric block message.** The value comes from a `Short` field built by truncating `sessionId` (`scripts/coord/occupancy.ps1:251`, `scripts/coord/overlap.ps1:234`). The file contains **zero** `session=` labels.
+**READ `#1310` INSTEAD.** It carries the same finding, was written first, is committed at `997e673b`, and is in an open pull request. Nothing here is unique to it except the second call site named below, which has been handed over.
 
-**An 8-hex token in a git tool reads as a short commit sha to every reader.** Two seats independently tried to resolve `89933aa2` in the object store; it is the first segment of `89933aa2-bcb4-4993-9019-6ba8a18f576e`.
+**ONE ADDITION THIS ITEM HAD AND `#1310` DID NOT: the bare print occurs at BOTH `scripts/hooks/collision_gate.ps1:230` AND `:243`, not one site.** Confirmed independently by the reporting lane after this seat raised it.
 
-***THE SEVERITY IS NOT THE CONFUSION, IT IS THE DIRECTION THE CONFUSION POINTS.*** This message is read at exactly one moment: when someone is **blocked** and looking for the other session. It hands them an identifier that **looks** resolvable, **is not**, and **whose failure to resolve reads as evidence the warning itself is stale.** The lane that hit it reports coming *within one step of treating a true file claim as a false alarm on that basis*.
+***THE ALLOCATION GATE CANNOT CATCH THIS, AND THAT IS THE POINT WORTH KEEPING.*** `alloc.ps1` prevents two seats taking the same **number**. It is silent on two seats filing the same **finding** under different numbers. Neither seat collided on anything, which is precisely why nothing objected -- **the gate reported success while the ledger acquired a duplicate.**
 
-**A gate that makes its own true warnings look false is worse than one that says nothing**, because it trains the reader to dismiss it -- and the dismissal feels like diligence, since they went and checked.
+**How two careful seats got here.** The mechanism was mailed by a lane that ended with *"not my item and I have no number -- mechanism is above for whoever owns the hook."* That is an open invitation with no addressee. Two seats each read it, each verified it independently, and each filed. *An unassigned "someone should file this" is a duplicate-filing generator, and the more diligent the readers, the more reliably it fires.*
 
-**THE FIX IS ONE WORD PER SITE:** print `session=89933aa2` rather than the bare token. That turns an apparent sha into what it is, at both call sites.
+**The other seat named its own half exactly:** it acted on a message addressed to others without checking whether an addressee was already acting. *"Routes to me" answers who commits, not whether someone else already is.*
 
-**Not a defect in the claim.** The file-level collision the gate reports was **true** on both occasions. Only the identifier's presentation is wrong.
-
-**TWO FILING HAZARDS, BOTH THIS SEAT'S, RECORDED BECAUSE THEY NEARLY STOPPED THIS BEING FILED AT ALL.**
-
-**First, and corrected here after the reporting lane objected: this seat concluded the emitter was outside the checkout entirely.** It listed `scripts/hooks/*.py` and stated a conclusion about **all** hooks. The gate is a `.ps1` and was present the whole time. *The defect is not the glob -- it is stating the conclusion at a wider scope than the query.*
-
-**Second, an attribution this item originally got wrong about the reporting lane, now withdrawn.** It recorded that they had cited a path under `scripts/coord/` that does not exist. **They did not.** They gave `scripts/coord/occupancy.ps1:251` and `scripts/coord/overlap.ps1:234` with directories, both correct, and wrote `collision_gate.ps1:243` with **no directory at all**. This seat supplied `scripts/coord/` from the surrounding context and then recorded its own inference as their claim.
-
-*An unqualified filename in a list of qualified ones invites exactly that completion, so the ambiguity was real -- but the wrong path was this seat's, and a record that misattributes it would outlive everyone who remembers.*
+**This seat's half is worse, because it had just recorded the same lesson.** `#1309` was retired an hour earlier for being a duplicate filed off an incomplete read, and the rule taken from it -- check whether a finding is already recorded before allocating -- was applied to the **ledger** and not to **peer sessions**. *The check was narrowed to the artifact this seat owns, which is the same too-narrow-instrument failure recorded three times tonight, in its most avoidable form.*
