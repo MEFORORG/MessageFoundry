@@ -42,6 +42,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from _bash_resolver import require_bash
 
 _ROOT = Path(__file__).resolve().parent.parent
 _WORKFLOW = _ROOT / ".github" / "workflows" / "dependabot-auto-merge.yml"
@@ -142,8 +143,11 @@ def _run_step_body(
     tuning constant like ``MIN_RELEASE_AGE_HOURS`` is exercised at its SHIPPED value rather than at
     one this test invented. The caller's ``env`` then overlays the PR-derived inputs.
     """
-    bash = shutil.which("bash")
-    assert bash is not None  # narrowed by the caller's skipif; keeps mypy honest
+    # NOT ``shutil.which("bash")`` (BACKLOG #1216): that answers whether A bash exists, not whether
+    # the one found can read this process's files. On Windows it resolves the WSL launcher, which runs
+    # in a different filesystem namespace -- so the callers' skipif never fired and every row failed
+    # for a reason unrelated to the shipped body it was checking.
+    bash = require_bash(tmp_path)
     step = _step(step_id)
     body = str(step["run"])
     assert "${{" not in body, (
@@ -377,7 +381,8 @@ def test_ci_executing_ecosystem_is_aged_at_least_five_days() -> None:
 # --------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash to execute the run: body")
+# No bash skipif (BACKLOG #1216): _run_step_body resolves via require_bash, which fails LOUDLY
+# when no bash can see this process's files rather than skipping on a which() miss.
 @pytest.mark.parametrize(
     ("ecosystem", "names", "expected"),
     [
@@ -417,7 +422,8 @@ def test_allowset_holds_everything_not_named(
     )
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash to execute the run: body")
+# No bash skipif (BACKLOG #1216): _run_step_body resolves via require_bash, which fails LOUDLY
+# when no bash can see this process's files rather than skipping on a which() miss.
 @pytest.mark.parametrize(
     ("security_track", "ecosystem"),
     [
@@ -482,7 +488,7 @@ def _gh_stub(tmp_path: Path, count: str | None) -> Path:
 
 
 @pytest.mark.skipif(
-    shutil.which("bash") is None or shutil.which("jq") is None,
+    shutil.which("jq") is None,  # bash via require_bash (BACKLOG #1216)
     reason="needs bash + jq, same runner matrix as the release-age rows below",
 )
 @pytest.mark.parametrize(
@@ -549,7 +555,7 @@ def _iso(hours_ago: float) -> str:
 
 
 @pytest.mark.skipif(
-    shutil.which("bash") is None or shutil.which("jq") is None,
+    shutil.which("jq") is None,  # bash via require_bash (BACKLOG #1216)
     reason="needs bash + jq. It runs WHEREVER both exist — the ubuntu leg AND the two REQUIRED "
     "windows-2022/windows-2025 legs, whose runner images ship jq and Git Bash — and skips on the "
     "maintainer's box, where Git Bash carries no jq. A red here is therefore not necessarily a "
