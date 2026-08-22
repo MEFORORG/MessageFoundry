@@ -12760,5 +12760,29 @@ this fix is larger than this item and independently true.***
 
 **Relationship to [#1318](#1318):** #1318 is the instance -- `init` writes a config the loader rejects. **This is the class**, and it is independently true: fix the scaffold template and `check` still cannot fail on any other unloadable config.
 
+***AMENDED 2026-08-22, POPULATION CORRECTED TWICE: it is FIVE catch sites, not three.*** *The count
+moved 3 -> 4 -> 5 in twenty minutes, each step by a different seat, and the file is
+`messagefoundry/checks.py` (1761 lines) -- NOT `verify/checks.py`, which is 251 lines and holds none of
+them.* **Measured by reading every catch of the identical tuple and what it returns:**
+
+| site | returns | keeps the reason? |
+|---|---|---|
+| `:1269` posture | `CheckResult(ok=True, skipped=True, detail="settings did not load: ...")` | yes |
+| `:1357` | same shape | yes |
+| `:1457` | same shape | yes |
+| `:1704` | same shape | yes |
+| ***`:1116`*** | ***`PipelineSettings().snapshot_on_send`*** -- a **DEFAULT VALUE** | ***NO*** |
+
+***THE FIFTH IS A DIFFERENT AND WORSE DEFECT.*** The four `CheckResult` sites at least say *"settings
+did not load"*; **`:1116` silently substitutes a shipped default for a config that was REFUSED** -- no
+`CheckResult`, no detail, nothing printed, no skip recorded. *A reader cannot tell that site fired at
+all.* **Fix all five, and that one does not merely need a better exit code -- it needs to stop
+answering.**
+
+***AND THE COUNT ITSELF IS THE LESSON:*** three seats reported three, then four, then five, each
+measuring honestly and each stopping at the first population their instrument could see. **Prefer "at
+least" until you have enumerated by reading, not by recall** -- SDS-3.6, arrived at the expensive way,
+twice in one hour.
+
 **Source:** found by a builder while sizing #1318's fix, and it corrected the framing of its own earlier report -- they had repeated a peer's "the tests never load the file" finding without running it, then ran it and found one does, through `check`. **The correction made the finding sharper, not smaller: not a missing gate, a gate that downgrades.** Symbols above; base engine `origin/main` a530d4ea.
 
