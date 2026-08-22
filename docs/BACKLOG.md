@@ -12332,6 +12332,27 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 > **THE PROCESS POINT, worth more than the correction, and it is NOT the obvious one.** The tempting lesson is "a false not-measured entry is worse than a short one". **This entry was not false -- it was BUNDLED**, and bundling is the sharper failure: `45s/60s` asserted one status over two bounds with different answers, so a reader chasing it could not know which half was already closed. **That is what sent a lane down an already-closed thread** -- it was passed on as "the cheapest thread" precisely because the item said it was open, and half of it was. **A not-measured list is a promise those things are genuinely unchecked. Make each entry name exactly ONE thing, or the promise is unverifiable per-item even when it is partly true.**
 > **RELATED, and NOT the same finding:** a `pwsh` SIGSEGV on **Linux** in `tests/test_worktree_gate_interpreter_sigils.py` is being worked separately. Same interpreter, different platform, different signature -- a hang to timeout is not a crash. Do not merge the two without evidence they share a cause.
+> **AMENDMENT 2026-08-22: THE ENUMERATION ABOVE IS UNDERSTATED. THERE IS A THIRD TEST AND A SECOND FAILURE MODE.** The line reading *"TWO DISTINCT TESTS, ONE FAILURE MODE"* was true when written and is not now, which is exactly the shape SDS-3.6 warns about -- an enumeration in prose that nothing re-checks. Found by sweeping main's own CI history rather than by hitting it.
+> ```
+> tests/test_worktree_prune_merged.py::test_fence_contribution_is_reported_not_implied
+>     worker 'gw3' CRASHED while running it        run 32497283563, main @ 48be4c22
+>     1 failed, 1977 passed, 14 skipped in 911.49s     2026-08-21T15:39:25Z
+> ```
+> **A CRASHED XDIST WORKER IS NOT A `subprocess.TimeoutExpired`,** and this item's TITLE says *"times out launching pwsh"* -- a title that cannot cover a crash. **OPEN, NOT RESOLVED:** xdist reports a worker killed mid-test as "crashed", so a timeout that takes the worker down with it would present exactly this way. Same cause with a different face, or a second cause, is **not established here** and must not be assumed in either direction. What IS established: the observable signature the next reader will grep for is broader than the two lines above it.
+> **SAME-ARM SIGHTING ON MAIN, 2026-08-22, AND IT LANDS ON A LEDGER-ONLY COMMIT.** The paragraph above is careful to say the earlier main sighting was a *different* arm of this test (intake loss, #1292's subject) and therefore corroboration rather than proof. That gap is now closed by a direct observation:
+> ```
+> main @ aed856b3   run 32551574030   windows-2022   04:37:25Z
+>   FAILED tests/test_connscale_smoke.py::test_connscale_smoke_end_to_end
+>   AssertionError: fixed_aggregate@N=24: 26.7 < prior 36 * 0.75
+>
+> PR #496 @ e849acf1  run 32551603741  windows-2022   04:30Z (re-run: PASSED)
+>   same test, same assertion, same leg
+>   AssertionError: fixed_aggregate@N=24: 22.2 < prior 35.1 * 0.75
+> ```
+> **`aed856b3` IS A LEDGER-ONLY MERGE -- it filed one backlog item and touched no code whatsoever.** A commit that changes no engine source cannot move a connection-scale polling metric, so the `empty_claims_monotonic` arm is environmental on this leg, not a property of any tree it reddens. The PR-side instance re-ran green on the identical head, which is the second half of the same conclusion.
+> **THIS ALSO PUTS A SECOND ARM INTO THIS ITEM'S SIGNATURE, alongside the crash above.** The observable set is now: `subprocess.TimeoutExpired` on a pwsh launch, a crashed xdist worker, and a monotonicity SLO on `test_connscale_smoke`. Whether they share one cause is **still not established** and must not be inferred from their sharing a leg -- the note above says so about the crash and it applies identically here.
+> **AND THE BASE RATE, WITH ITS DENOMINATOR, because the item argues from a streak and never states one.** Over **100 CI runs on `main`** (2026-08-14T19:25Z to 2026-08-22T04:23Z, the full window the Actions API returns in one page): **68 success, 24 failure, 8 cancelled.** Of the 24 failures, `repo harness tests (windows-2025)` is named in **7**, and in **all 7** `CI gate` -- a REQUIRED context -- fails with it: runs 32549032927, 32497283563, 32483211076, 32378103644, 32293477690, 32268545492, 32206563674.
+> **THAT IS THE SEVERITY SENTENCE THIS ITEM WAS MISSING.** Not "it blocked an eight-line prose PR twice" but: this leg is the **single largest contributor to a red default branch**, and every one of its failures reddens the roll-up that gates every merge. **DELIBERATELY NOT CLAIMED:** that the other 17 failures share a cause. Four other jobs appear in that list -- `test (windows-2025)` 7 times, `test (windows-2022)` 4, `test (ubuntu-latest)` 3, plus web-console and SQL Server legs -- and **none of them was investigated here**. The 7 is a floor for this item's subject, not a partition of the 24.
 
 **Cluster:** CI reliability / required-gate stability. **Priority:** P2. **Verdict:** build.
 **Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- CI only. The cost is that a required roll-up reds on changes that cannot have caused it, which both blocks unrelated work and trains reviewers to discount a red that will sometimes be real.
