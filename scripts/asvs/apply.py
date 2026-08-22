@@ -352,38 +352,38 @@ def main(argv: list[str] | None = None) -> int:
         # above; it was written to catch DROPPED KEYS and it does. It is simply blind to this, and a
         # rewrite that corrupts every value while preserving every key would report green.
         #
-        # SCOPED TO KEYS THE PAYLOAD DID NOT TOUCH, deliberately: the corruption is the WRITER
-        # changing a type nobody asked it to change. A payload that INTENTIONALLY retypes a field --
-        # schema evolution, a scalar becoming a table -- is an edit, not damage, and an unscoped
-        # check would refuse it. A guard that refuses legitimate edits is a guard someone disables.
+        # COMPARE AGAINST THE TYPE THE PAYLOAD STATED, rather than declining to look at keys it
+        # carries. The intent behind the original scoping is right and is preserved: a payload that
+        # INTENTIONALLY retypes a field -- schema evolution, a scalar becoming a table -- is an EDIT,
+        # not damage, and a guard that refuses legitimate edits is a guard someone disables.
         #
-        # THE INTENT ABOVE IS RIGHT AND THIS IMPLEMENTATION OF IT IS KNOWN-INCOMPLETE -- see the open
-        # BACKLOG #1242. `k not in c` scopes by "the payload did not MENTION this key", which is not
-        # the same question as "the payload asked for this type". A payload that CARRIES the key is
-        # skipped entirely, so this guard cannot see a corruption arriving through a mentioned key,
-        # while the same corruption through an omitted key is refused. That asymmetry is the defect:
-        # of the whole record exactly one cell holds a top-level non-scalar, and the natural payload
-        # for rewriting that cell ECHOES the key -- so the guard covers every cell that cannot be
-        # hurt and stops looking at the one that can.
+        # RETRACTED AND WHY (#1242): the first version expressed that as `k not in c`, which skipped
+        # every key the payload carries. Measured by the ASVS Tracker against this author's own
+        # scoping -- with the writer's dict branch disabled, a payload OMITTING the key was refused
+        # while a payload CARRYING it exited 0 and wrote a Python repr into a TOML string. So the
+        # guard stopped looking at the exact moment a cell is rewritten. That is not a corner: of
+        # the whole record exactly ONE cell holds a top-level non-scalar, and the natural payload
+        # for rewriting that cell ECHOES the key -- the guard covered every cell that cannot be hurt.
+        # (The record's cell TOTAL is deliberately not stated here. It is vault-derived, this file
+        # ships to PyPI, and a coverage count over a closed public requirement set discloses the
+        # uncovered set by subtraction. `main` already words it this way; the figure is the only
+        # thing that differs, and it must not come back through a merge.)
         #
-        # THE EXPOSURE IS LATENT, NOT LIVE, AND THE DISTINCTION IS LOAD-BEARING. Measured on this
-        # writer by a seat other than its author: the table is PRESERVED whether the payload carries
-        # the key or omits it. Corruption requires a BROKEN writer -- and then only when the payload
-        # carries the key, which is exactly the case this guard does not inspect. So the correct
-        # sentence is "WOULD fail to catch a regression here", not "corrupts today"; the second reads
-        # as 12.1.5 being at risk now, and it is not. Written conditionally on purpose: a false
-        # present-tense claim propagates into severity language and security records, which is the
-        # defect this comment exists to prevent, one level up.
+        # The payload IS the record of the type the author asked for, so it can be compared against.
+        # An intentional retype agrees with its own payload and still passes; a writer corruption
+        # disagrees whether or not the payload happened to mention the key.
         #
-        # This note exists because the paragraph above ARGUES for the boundary and argues well. An
-        # unguarded gap invites the question; a well-reasoned wrong boundary suppresses it, and an
-        # auditor reading this function would otherwise find a guard, find a persuasive rationale,
-        # and stop. Do not read the presence of this check as "the writer's type corruption is
-        # guarded". Read #1242's open row first.
+        # _ORDERED is excluded because render() deliberately COERCES those -- `int(cell['level'])`
+        # and the quoted emissions -- so a payload stating another type there is NORMALISED BY
+        # DESIGN, and refusing it would be the false-refusal this scoping exists to prevent.
+        # _SUBTABLES are excluded because they have their own key comparison below.
         retyped = sorted(
             k
             for k in was
-            if k in now and k not in c and type(was[k]) is not type(now[k])  # noqa: E721
+            if k in now
+            and k not in _ORDERED
+            and k not in _SUBTABLES
+            and type(c[k] if k in c else was[k]) is not type(now[k])  # noqa: E721
         )
         if retyped:
             print(
