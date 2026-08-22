@@ -2418,9 +2418,13 @@ async def test_reset_password_shows_temp_once(engine: Engine) -> None:
     await _add(service, "u2", Role.VIEWER)
     async with _boss_client(engine, service) as c:
         uid = await _uid(service, "u2")
-        r = await c.post(
-            f"/ui/users/{uid}/reset-password", headers={"Sec-Fetch-Site": "same-origin"}
-        )
+        # BACKLOG #1148 (ASVS 7.5.1): the login window no longer unlocks an admin reset. The bounce
+        # is asserted first, so this still shows the gate EXISTS rather than only that a grant works.
+        path = f"/ui/users/{uid}/reset-password"
+        bounced = await c.post(path, headers={"Sec-Fetch-Site": "same-origin"})
+        assert bounced.status_code == 303 and "/ui/reauth" in bounced.headers["location"]
+        await _mint_action(c, path)
+        r = await c.post(path, headers={"Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 200
         assert "Temporary password issued" in r.text and "<code>" in r.text
         user = await service.store.get_user(uid)
@@ -2433,6 +2437,20 @@ async def test_reset_mfa_and_revoke_sessions_roundtrip(engine: Engine) -> None:
     async with _boss_client(engine, service) as c:
         uid = await _uid(service, "u2")
         for action in ("reset-mfa", "revoke-sessions"):
+            # BACKLOG #1148: reset-mfa is action-bound and needs a fresh grant; revoke-sessions is
+            # deliberately NOT -- it sits outside 7.5.1, which names attributes affecting
+            # AUTHENTICATION. Minting only for the tagged one keeps that boundary under test.
+            if action == "reset-mfa":
+                # ASSERT THE BOUNCE, not just the success. Minting and then succeeding proves the
+                # flow works and NOT that the gate exists -- measured: reverting the route to the
+                # window-scoped gate left this test GREEN until this assertion was added, so the
+                # sharper of the two lanes had no console coverage of its own binding.
+                bounced = await c.post(
+                    f"/ui/users/{uid}/{action}", headers={"Sec-Fetch-Site": "same-origin"}
+                )
+                assert bounced.status_code == 303, action
+                assert "/ui/reauth" in bounced.headers["location"], action
+                await _mint_action(c, f"/ui/users/{uid}/{action}")
             r = await c.post(f"/ui/users/{uid}/{action}", headers={"Sec-Fetch-Site": "same-origin"})
             assert r.status_code == 303, action
             assert r.headers["location"] == f"/ui/users/{uid}", action
@@ -2683,6 +2701,9 @@ async def test_all_admin_posts_reject_cross_site(engine: Engine) -> None:
         # missing assert_same_origin on those routes must fail loudly, not hide behind a no-grant 303).
         await _mint_action(c, "/ui/account/webauthn/enroll")
         await _mint_action(c, "/ui/account/webauthn/abc123/delete")
+        # BACKLOG #1148 puts the two admin reset lanes into that same shape.
+        await _mint_action(c, f"/ui/users/{boss_id}/reset-password")
+        await _mint_action(c, f"/ui/users/{boss_id}/reset-mfa")
         posts = [
             "/ui/users",
             f"/ui/users/{boss_id}/update",
@@ -2752,6 +2773,10 @@ async def test_ad_user_carveouts_on_ui_surface(engine: Engine) -> None:
         r = await _post_pairs(c, "/ui/users/ad-user-1/roles", [("roles", "viewer")])
         assert r.status_code == 400 and "AD-group map" in r.text
         assert await service.store.get_user_role_ids("ad-user-1") == []
+        # BACKLOG #1148: mint the grant FIRST, or the 400 below is never reached -- the action gate
+        # runs before the body and would 303 to reauth, so this would silently stop measuring the
+        # AD carve-out it is named for and start measuring the step-up.
+        await _mint_action(c, "/ui/users/ad-user-1/reset-password")
         r = await c.post(
             "/ui/users/ad-user-1/reset-password", headers={"Sec-Fetch-Site": "same-origin"}
         )
