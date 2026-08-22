@@ -13339,6 +13339,16 @@ twice in one hour.
 > 🔢 **Filed 2026-08-22 - not started.** `main` can merge a change that breaks the Postgres and SQL Server suites and still report green, because neither leg runs on a push. The first pull request afterwards inherits the red and its author debugs someone else's change.
 > Verdict: build
 > Closing-act: code
+> 
+> ***SUPERSEDED BY [#1322](#1322) -- THIS IS A DUPLICATE AND IT IS MINE. IT SHOULD BE CLOSED.***
+> *Two seats filed the same root cause within minutes. Theirs landed on `main` first via PR #525; mine
+> was filed on a branch and arrives by merge, so neither the ledger gate nor either author could see the
+> collision.* **#1322 is the better record and carries everything this row does**, including the
+> `tests/test_api.py:587` substring-versus-equality point.
+> 
+> ⚠️ **I DID NOT FLIP THE BANNER.** *Closing is the Lander's act (`BUILDER.md:253` forbids the filer,
+> `:148` assigns it), so it is handed over rather than taken.* **Until it is flipped this is an open
+> duplicate, and a reader who reaches it before #1322 will re-derive work already recorded.**
 
 **Cluster:** CI / test-gate coverage. **Priority:** P2. **Verdict:** build.
 **Severity:** gate-coverage gap, not a runtime defect. Nothing would ship broken to a deploying site; what is at stake is that the gate protecting two of three store backends is not armed on the branch it is supposed to protect.
