@@ -9044,6 +9044,8 @@ filing.
 
 ## 1179. research an honest pass for ASVS 12.3.3 -- internal-hop transport encryption when a certificate cannot be a shipped default
 
+> 🚧 **IN PROGRESS 2026-08-22 -- builder-1 lane**, banner written by the dispatcher: `BUILDER.md` puts banner flips outside a builder's lane and the lane-versus-broadcast expiry is ambiguous enough that two builders read it differently, so this seat writes it. Claimed via `claim.ps1`; the coord ledger and this banner are different artifacts with different writers. The 2026-08-20 pass is being applied in its own order -- scope correction first, then the shipped-surface refusal case, then the build. **Not a closure.**
+>
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **5/10** · _quick win_. On a first deployment the internal hops would carry session bearer tokens and, on the assessed proxy topology, PHI reads in cleartext with no gate refusing to start, and the vendor cannot ship the certificate the control needs. Difficulty 5: a scoping ruling, a one-line Dockerfile change and a bounded startup check that can sit on the existing exposure_protected property without colliding with the revocation refusal. _(was 7/10 · 7/10.)_
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **12.3.3** (L2) currently scores **partial**. The pinned verb asks that transport encryption cover all connectivity between internal HTTP-based services, with no fallback to unencrypted communication. Every first-party internal hop defaults to `http://127.0.0.1:8765` because `tls_cert_file: str | None = None` at `messagefoundry/config/settings.py:712`, and the shipped image carries a genuine downgrade at `docker/Dockerfile:91` (both re-read at 166634c9).
@@ -9720,6 +9722,8 @@ filing.
 **Researched 2026-08-20. The ruling this cell needs is filed and unruled, and the prevention work is owed under either answer rather than gated on it.** The item's core sentence holds and was re-measured: modification prevention is absent by design in every configuration -- zero hits anywhere under `messagefoundry/` for ledger, system-versioning, append-only, WORM, trigger-creation or grant and revoke tokens, against positive controls of thirty-one table creations in `store/sqlserver.py` and twenty-two index creations in `store/store.py` in the same run. Both scorecard anchors are stale by line. The residual's second half is FALSE at HEAD in all three backends: `_backfill_audit_chain` fills only rows whose `row_hash` is NULL and skips any row that has one (`store/store.py:2263-2264`, `store/postgres.py:1571-1573`, `store/sqlserver.py:2383-2385`), and `rekey_audit_chain` sets a watermark and never rewrites a hash.
 
 **A first-class access finding neither record carries: the security log's `detail` column would be plaintext at rest on every backend.** `messagefoundry/store/store.py:7415-7418` inserts it unwrapped, and reading the cipher-column registry at `store/store.py:2365` in full shows `audit_log` absent while its own comment block explicitly names `message_events.detail`, `connection_event.reason` and `alert_instance.reason` as cipher-covered. So on an encrypted store the security log's free-text column is the one plaintext outlier while three lesser operational event logs are sealed -- and `messagefoundry/store/audit_tee.py:53` states in a shipped docstring that this column "is a cipher column at rest for exactly that reason", which is false at HEAD. Separately, the item's own severity framing (no exposure on the access limb) does not hold: `audit_tee.py:29-30` pins the tee logger above the deployment level and it is called unconditionally after commit in all three backends, so a full copy of every security-log record would land in the general application log at any log level, with no read permission and no chain. An executed probe with the deployment level raised showed the audit record reaching the root handler while an ordinary record at the same level was correctly suppressed in the same run.
+
+**CORRECTED 2026-08-22: the TEE half of the access finding above is WITHDRAWN. The cipher-column half stands.** That paragraph reads the tee as putting "a full copy of every security-log record" into the general application log, and that mischaracterises a deliberate, documented control. `emit_audit_tee` in `messagefoundry/store/audit_tee.py` builds a fixed **seven**-field record -- `event`, `ts`, `action`, `actor`, `channel_id`, `client`, `detail` -- and runs the only free-text member through `safe_text()`, which the shipped comment on that line calls a "PHI chokepoint" and the function docstring states as "**Never emits a raw message body**". So what forwards is redacted metadata, not the row, and it is not a copy of it. The INFO pin is deliberate for the same reason and says so in its own comment: audit evidence must forward regardless of the deployment's general log level, because attribution has to survive a host or database compromise -- which is the `sec-offbox-log` control working, not a leak. **What survives is narrower and has to be argued on its own ground:** actor, action, channel and client address do reach the general application log at any level, with no read permission and no chain. That is a metadata-disclosure question about an intentional off-box copy, not the unredacted exposure the withdrawn sentence described, and it does not by itself overturn the item's "no exposure on the access limb" severity framing. The plaintext-`detail`-at-rest finding in the same paragraph is untouched and re-verified: `audit_log` is absent from the cipher-column registry on every backend.
 
 **What must be built regardless of the ruling.** Make `row_hash` non-nullable, delete `_backfill_audit_chain` in all three backends (it exists only for rows written before chaining, and at zero deployments there are none), and add update and delete deny rules in each backend's schema -- with two constraints. Report it PER BACKEND and never as immutability: on the embedded backend the actor who can issue the update can drop the rule or edit the file, and the no-application-path limb is already verified without it, so the real prevention value is on the server backends against a login holding data rights but not schema rights, demonstrated by executing a real update against a low-privilege login rather than the elevated CI one. And specify it so it does not block the remedy for the plaintext column, because adding that column to the cipher registry creates legitimate update traffic through `store/store.py:2396-2430` and the key-rotation re-encrypt pass at `:2724-2760`. Also: the "only the backfill ever updates an audit row" precondition was measured with a literal grep that cannot see a statement whose table name is interpolated (eleven such sites exist); reading them shows the conclusion holds, which is not the same as having measured it.
 
@@ -12559,3 +12563,77 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Source:** found by adversarial verification of an unrelated claim, 2026-08-22. **Two seats had independently asserted the gates were absolute** -- both had verified the two covered arms and generalised. Recorded because agreement between two readers of the same two arms is not coverage of a third.
 
+
+## 1317. the TLS cipher allowlist tests a name prefix, so NULL-encryption and anonymous suites pass every gate
+
+> 🔢 **Filed 2026-08-22 - not started.** Value **8/10** · Difficulty **3/10**. Owner-ruled the
+> same day: **a strict positive allowlist**, admitting only suites that appear on every current
+> candidate list, anything unnamed rejected. At zero deployments the compatibility cost of being
+> strict is zero.
+
+**Cluster:** Security / transport. **Priority:** P1. **Verdict:** build.
+**Severity:** no live exposure -- there are zero deployments (sec. 0). On a **first** deployment an
+operator following the documented `[api].tls_ciphers` knob could install a suite offering no
+confidentiality, or no peer authentication, on the browser-facing operator console listener.
+
+**The defect, stated so the fix lands in the right place.** `validate_tls_ciphers` and
+`harden_cipher_suites` (`messagefoundry/config/tls_policy.py`) admit or refuse a configured cipher
+string on **exactly one property: forward secrecy**, via `_is_forward_secret`. Nothing in that path
+asks whether a suite **encrypts** or whether it **authenticates the peer**.
+
+**`_is_forward_secret` is NOT the bug and must not be "fixed".** It answers its own question
+correctly, and both suites below genuinely ARE forward-secret: `ECDHE-RSA-NULL-SHA` negotiates an
+ephemeral ECDH key exchange, and `ADH` is anonymous *ephemeral* DH. A reader who takes this item's
+own heading as "the predicate matches on a name prefix" will tighten the prefix matching and leave
+the hole exactly where it is. **The gap is a missing pair of predicates, not a defective one.**
+
+**Measured by RUNNING the shipped validator rather than reading it.** Four inputs, controls firing
+both ways:
+
+| input | result | property it lacks |
+|---|---|---|
+| `ECDHE-RSA-NULL-SHA` | **ACCEPTED** | no confidentiality -- `NULL` is a real, negotiable cipher |
+| `ADH-AES256-GCM-SHA384` | **ACCEPTED** | no peer authentication -- trivially machine-in-the-middle |
+| `ECDHE-RSA-AES256-GCM-SHA384` | accepted | control: a suite that should pass, and does |
+| `RC4-MD5` | rejected (`ValueError`) | control: the validator is not accepting everything |
+
+The `RC4-MD5` control is load-bearing. Without it, the acceptances above are indistinguishable from
+a validator that returns success for every string it is handed.
+
+**What to build, per the 2026-08-22 owner ruling.** Replace the single forward-secrecy test with a
+**strict positive allowlist**: an explicit set of suite names present on every current candidate
+list, everything unnamed refused. Keep the forward-secrecy check as one member of the resulting
+property set rather than deleting it. Refuse at **config load**, so a bad value cannot reach a
+listener at all.
+
+**The proof it must carry.** The mutation that matters is not "does a good suite still pass" -- it
+is **does removing the new predicate turn the table above red**. A test that pins only the good
+control cannot fail when the fix is reverted, which is the shape that has already shipped elsewhere
+in this repository. Pin all four rows, and pin the refusal as a load-time error rather than a
+runtime one.
+
+**Honest residual, and what was NOT searched.** This item covers the operator-facing knob and the
+shipped context builder reached from it. It does **not** enumerate every `SSLContext` construction
+in the engine, and it does not reach the suite sets chosen inside third-party libraries (`ldap3`,
+`hvac`, ODBC Driver 18) -- a different surface with a different owner, named here by subject rather
+than by a number, since none is allocated.
+
+**Source:** surfaced 2026-08-22 by the eight-cell ASVS re-scoping pass while completing the
+enumeration for cell 12.1.2, then verified independently against the shipped validator before
+filing. That cell's own ruling is a separate question about allowlist width; this item is the build
+which both readings of the cell now require.
+
+## 1315. prose path:line citations carry no token, so nothing can verify them
+
+> 🔢 **Filed 2026-08-22 by the researcher, contributed jointly with the ASVS Tracker.** Value **6/10** -- Difficulty **5/10**. The security record and the #1107-#1199 research items together carry **3,543 bare `path:line` citations** (occurrences; 2,871 distinct) that assert nothing an independent reference could check. Against them the scorecard holds **2,090 evidence anchors** carrying an `expect` token the tree confirms -- roughly **1.7 uncheckable prose citations for every checkable anchor**. Ownership splits cleanly: the Tracker owns the security-record half, this seat wrote all 1,313 occurrences in #1107-#1199. One item, because both halves share one cause and one fix.
+> **THIS IS NOT ROT, AND THE DISTINCTION DECIDES HOW IT IS SCOPED.** Measured decay in the #1107-#1199 half is **16 of 1,196 distinct pairs** -- 15 citing files outside this tree (uvicorn internals, `sspilib`, the ASVS corpus) and one genuinely gone (`messagefoundry_webconsole/routes/connections.py`, confirmed against sibling route files as a control). The problem is not that these citations are going stale. It is that **nothing can tell whether one has**, because a bare line number makes no claim to check. An anchor locates BY CONTENT and survives drift -- the verifier reported 975 line drifts at its last run, every one an advisory rather than a fault. A prose citation names a referent and asserts nothing about it.
+> **UNVERIFIABILITY DOES NOT DECAY AND DOES NOT ANNOUNCE ITSELF.** A detector built for rot returns zero and the zero means nothing; the Tracker built one and watched it pass a citation already known to be 42 lines stale.
+> **FIX DIRECTION, not prescribed:** a locating token beside each prose citation, retrofitted, so the instrument that already resolves anchors can resolve prose. The form that survived four seats' review is **symbol for WHERE plus a resolvable commit for WHEN** -- a symbol survives a line moving and does NOT survive the code changing under it, and the commit is what makes a stale citation fail loudly rather than resolve to something that merely still exists. In a commit message pin the **base you read against**, never the commit you are creating: the latter is circular, and writing the base is what exposes a stale address at write time.
+> **THE CRITERION IS NOT "IS THERE A LINE NUMBER", IT IS "CAN SOMETHING ELSE IN THE SENTENCE FIND THE LINE AGAIN".** That grades a citation rather than failing it: `settings.py:1520 requires require_time_sync` locates itself and survives the line moving; `durability_push.sh:80 also carries the bare form` does not. Applied across five seats it turned raw counts of 68, 8 and 3 into naked counts of 24, 1 and 1 -- the same corpora, a criterion instead of a pattern. One seat measured **zero of seven commit messages token-bearing against mostly-compliant prose**, and diagnosed it exactly: in prose they were quoting the token to make an argument, so the convention was a side effect; in a message they were reporting a change and a bare address felt sufficient. **A convention that holds only where it is incidental has not been adopted.**
+> **MEASURING CITATIONS HAS ITS OWN THREE RULES, each bought by a measured failure while this item was being prepared.** A **ZERO needs a POSITIVE control** and a nonzero rarely does -- a negative control proves a pattern does not match everything, which catches over-matching, and every failure here was under-matching. The control must sit in the **SAME CORPUS as the test** -- three seats controlled a commit-message test against a file and proved only that the pattern fires on files. And **state the UNIT with the number**: `grep -c` counts matching LINES, a regex `findall` counts OCCURRENCES, and on this file the two differ ~2x because rows are enormous single lines.
+> **MEASUREMENT NOTE, AND IT COST TWO SEATS A PUBLISHED FIGURE.** Count with a pattern carrying **no path-prefix anchor** -- three conventions are in use (full-prefix, package-relative, bare filename) and a prefix-requiring pattern under-reports by ~6x; that produced a first figure of 389 against a true 2,230 in the security record alone. **State the unit.** `grep -c` counts matching LINES, a regex `findall` counts OCCURRENCES, and on this file the two differ ~2x because rows are enormous single lines; three seats published 1,340 / 1,355 / 2,903 for one corpus and all three agreed within 2% once the unit was named. Never add an occurrence count to a distinct count -- doing so produces a figure that is neither, and it happened twice while this item was being prepared.
+> **AN UNDER-REPORT IS THE FAILURE THAT SURVIVES REVIEW.** An overstated decay figure raises an alarm somebody disproves; an understated one makes an unmanaged surface look managed and nothing about it looks wrong. A naive rot-measure over the #1107-#1199 half overstated decay ~600x across four passes -- 635, 396, 245, then 16 -- each intermediate publishable-looking, each caused by guessing a path prefix instead of indexing the tree.
+> **ALREADY ADOPTED, NEEDING NOBODY'S PERMISSION AND NOT WAITING ON THIS ITEM:** no new bare `path:line` in anything the adopting seats author, covering source, memos, dispatch briefs and **commit messages** -- the last binding hardest, because a message is the one artifact nobody can correct in place.
+
+**Cluster:** Security record integrity / evidence hygiene. **Priority:** P3. **Verdict:** build.
+**Severity:** no engine-runtime effect and no deployment axis (sec. 0). This is evidence quality in the security record: more than half its citation surface has never been read by any gate, so a reader cannot distinguish a citation that still points at its subject from one that merely points at a line that still exists.
