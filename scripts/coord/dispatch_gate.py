@@ -27,14 +27,26 @@ that defines item status (``backlog_status_check.parse_items``), never a second 
     > Research: none | done <date>
     > Closing-act: code | scorecard-rescore | owner-ruling | banner-only
 
-An item passes only when its ``Closing-act`` is one a builder can perform. **A MISSING field is a
-refusal, not a pass** -- fail closed. Almost no item carries these fields yet, so this gate is
-expected to refuse most of the ledger today; that is the correct behaviour and the migration is the
-work, not a reason to soften the gate. Use ``--explain`` to see what each item needs.
+**IT NAMES THE CLOSING ACT. IT DOES NOT REFUSE THE ITEM.** That is a correction to this tool's first
+version, and the correction matters more than the tool. That version refused any closing act a
+builder could not perform. Measured against the very range it was built for, it would have blocked
+#1112, #1171 and #1187 -- all three of which reached ``main``, #1171 being the SMTP
+credential-exposure fix.
 
-**It is a DISPATCH gate, not a CI gate, on purpose.** Making missing fields a CI error would red the
-build for all 328 items at once and be disabled within a day. Dispatch is where the decision is
-actually made, the set is small, and a refusal there costs one edit.
+**CANNOT CLOSE IS NOT CANNOT BE WORKED.** A seat that ships the code and leaves the item open has
+produced a complete outcome. A gate that calls that a failure suppresses real work to protect a
+counter, which is the same error as the wave it was built to prevent, pointing the other way: the
+wave picked unclosable items believing they would close, and the first gate proposed refusing
+workable items because they would not. Both fuse *can a builder do it* with *can anyone here close
+it*.
+
+So each item comes back as one of three levels. ``ok`` closes by the builder's own act. ``advise``
+is workable, with the closing act and its owning seat named. ``refuse`` is reserved for an item
+whose state nobody has declared, because there the dispatch can name nothing at all -- and even that
+blocks only under ``--refuse``.
+
+**It is a DISPATCH aid, not a CI gate, on purpose.** Making missing fields a CI error would red the
+build for all 330 items at once and be disabled within a day.
 
 Usage::
 
@@ -54,7 +66,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "docs"))
 
 from backlog_status_check import (  # type: ignore[import-not-found]  # noqa: E402
-    BUILDABLE_CLOSING_ACTS,
+    BUILDER_CLOSABLE_ACTS,
+    CLOSING_SEAT,
     DEFAULT_SOURCES,
     Item,
     parse_items,
@@ -76,29 +89,45 @@ def load_items(root: Path) -> dict[int, Item]:
     return out
 
 
-def judge(item: Item) -> tuple[bool, str]:
-    """Return (dispatchable, reason). Fail closed: an undeclared item is refused."""
+def judge(item: Item) -> tuple[str, str]:
+    """Return (level, note). Levels: ``ok``, ``advise``, ``refuse``.
+
+    **This ADVISES by default and refuses almost nothing, which is a correction.** The first version
+    returned a boolean and refused any closing act a builder could not perform. Measured against the
+    range it was built for, that would have blocked #1112, #1171 and #1187 -- all of which reached
+    main, #1171 being the SMTP credential-exposure fix. Cannot close is not cannot be worked: a seat
+    that ships the code and leaves the item open has produced a complete outcome, and a gate that
+    calls that a failure suppresses real work to protect a counter.
+
+    So the rule is NAME THE CLOSING ACT, NEVER REFUSE IT. The only ``refuse`` left is an item whose
+    state nobody has declared, because there the dispatch cannot name anything at all.
+    """
     act = item.fields.get("closing-act", "").strip().lower()
     verdict = item.fields.get("verdict", "").strip().lower()
     research = item.fields.get("research", "").strip().lower()
 
     if not act:
         missing = [k for k in ("verdict", "research", "closing-act") if k not in item.fields]
-        return False, (
-            f"declares no Closing-act (missing: {', '.join(missing)}). A builder cannot be told "
-            f"what would close this. Add the three lines to the banner blockquote."
+        return "refuse", (
+            f"declares no Closing-act (missing: {', '.join(missing)}). The dispatch cannot tell the "
+            f"seat what would close this, or who closes it. Add the three lines to the banner."
         )
-    if act not in BUILDABLE_CLOSING_ACTS:
-        return False, (
-            f"Closing-act is {act!r}, which no builder can perform. Dispatching it produces code "
-            f"and no closure -- the exact shape of the 2026-08-21 wave."
+
+    notes: list[str] = []
+    if act not in BUILDER_CLOSABLE_ACTS:
+        who = CLOSING_SEAT.get(act, "a seat this tool does not know")
+        notes.append(
+            f"closes by {act!r}, performed by {who} -- NOT by the builder. Expect shipped code and "
+            f"an open item. That is a complete outcome, not a failure."
         )
     if verdict == "research" and research in ("", "none"):
-        return False, (
-            "Verdict is 'research' with no completed research pass. Route it to research first; a "
-            "builder cannot close an open research question by building."
+        notes.append(
+            "Verdict is 'research' with no completed pass recorded, so the question may still be "
+            "open. Read the item's CURRENT body before briefing it."
         )
-    return True, "dispatchable"
+    if notes:
+        return "advise", " ".join(notes)
+    return "ok", f"closes by {act!r}, performed by {CLOSING_SEAT.get(act, 'the builder')}"
 
 
 def _self_test() -> int:
@@ -110,12 +139,12 @@ def _self_test() -> int:
         it.fields.update(fields)
         return it
 
-    cases: list[tuple[dict[str, str], bool, str]] = [
-        ({}, False, "an item declaring nothing must be refused (fail closed)"),
+    cases: list[tuple[dict[str, str], str, str]] = [
+        ({}, "refuse", "an item declaring nothing has nothing to name"),
         (
             {"closing-act": "code", "verdict": "build", "research": "none"},
-            True,
-            "a build item passes",
+            "ok",
+            "a build item the seat can close itself",
         ),
         (
             {
@@ -123,30 +152,31 @@ def _self_test() -> int:
                 "verdict": "research",
                 "research": "done 2026-08-20",
             },
-            False,
-            "the exact shape of the wave that closed zero must be refused",
+            "advise",
+            "THE WAVE SHAPE IS WORKABLE AND MUST BE ADVISED, NEVER REFUSED -- refusing it would "
+            "have blocked #1112, #1171 and #1187, all of which reached main",
         ),
         (
             {"closing-act": "code", "verdict": "research", "research": "none"},
-            False,
-            "an open research question must not be dispatched as a build",
+            "advise",
+            "an open research question is a warning to read the body, not a bar to working it",
         ),
         (
             {"closing-act": "code", "verdict": "research", "research": "done 2026-08-20"},
-            True,
-            "research already done, closing act is code -- buildable",
+            "ok",
+            "research done, closing act is code",
         ),
     ]
     for fields, want, why in cases:
         got, reason = judge(mk(fields))
         if got != want:
-            failures.append(f"{why}: wanted {want}, got {got} ({reason})")
+            failures.append(f"{why}: wanted {want!r}, got {got!r} ({reason})")
 
     for line in failures:
         print(f"SELF-TEST FAIL: {line}", file=sys.stderr)
     if failures:
         return 1
-    print(f"self-test PASS: {len(cases)} cases, including the wave shape that closed zero")
+    print(f"self-test PASS: {len(cases)} cases; the wave shape is ADVISED, not refused")
     return 0
 
 
@@ -165,6 +195,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--range", action="append", default=[], help="inclusive range, e.g. 1107-1199")
     ap.add_argument("--root", type=Path, default=Path.cwd())
     ap.add_argument("--explain", action="store_true", help="show every item, not only refusals")
+    ap.add_argument(
+        "--refuse",
+        action="store_true",
+        help="exit 1 when any item is UNDECLARED or unknown. OFF by default: a dispatch names "
+        "closing acts, it does not block work.",
+    )
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args(argv)
 
@@ -186,7 +222,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    ok: list[int] = []
+    ok: list[tuple[int, str]] = []
+    advise: list[tuple[int, str]] = []
     refused: list[tuple[int, str]] = []
     unknown: list[int] = []
     for num in sorted(set(wanted)):
@@ -194,27 +231,35 @@ def main(argv: list[str] | None = None) -> int:
         if item is None:
             unknown.append(num)
             continue
-        good, reason = judge(item)
-        (ok.append(num) if good else refused.append((num, reason)))
+        level, note = judge(item)
+        # Explicit dispatch on the level. The first version did `if good` on judge()'s return, and
+        # when judge started returning a LEVEL STRING every level became truthy -- an undeclared
+        # item reported as dispatchable. A truthiness test over a widened return type is exactly the
+        # silent-wrong-answer shape this tool exists to catch.
+        {"ok": ok, "advise": advise, "refuse": refused}[level].append((num, note))
 
-    print(f"dispatchable: {len(ok)} of {len(set(wanted))}   refused: {len(refused)}")
+    print(f"items closing by the builder's own act: {len(ok)} of {len(set(wanted))}")
     print(f"  ledger parsed: {len(items)} items from {args.root}")
     print()
 
     for num in unknown:
         print(f"  #{num}: NOT IN THE LEDGER")
-    for num, reason in refused:
-        print(f"  #{num}: REFUSED -- {reason}")
+    for num, note in refused:
+        print(f"  #{num}: UNDECLARED -- {note}")
+    for num, note in advise:
+        print(f"  #{num}: workable -- {note}")
     if args.explain:
-        for num in ok:
-            print(f"  #{num}: dispatchable")
+        for num, note in ok:
+            print(f"  #{num}: {note}")
 
-    if refused or unknown:
-        print()
-        print(
-            "Refusing the wave. An item a builder cannot close produces code and no closure, which\n"
-            "is what a 30-item overnight wave did on 2026-08-21 while every gauge read healthy."
-        )
+    print()
+    print(
+        "NAMING, NOT REFUSING. An item the builder cannot close is still worth building: the seat\n"
+        "ships the code and the item stays open until its named seat closes it. What the 2026-08-21\n"
+        "wave lacked was the NAME, not permission -- nobody was told the closing act was elsewhere."
+    )
+    if args.refuse and (refused or unknown):
+        print("--refuse given: the wave contains undeclared or unknown items.")
         return 1
     return 0
 

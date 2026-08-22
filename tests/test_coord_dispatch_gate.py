@@ -2,10 +2,14 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """Tests for the dispatch gate and the banner fields it reads.
 
-**The behaviour that matters most here is the refusal, so that is what these weight.** A gate that
-passes an item a builder cannot close reproduces the 2026-08-21 wave: thirty items dispatched, nine
-product-code commits landed, zero items closed. Fail-closed on a missing field is therefore pinned
-as hard as the happy path.
+**These pin that the gate NAMES rather than REFUSES, which is a correction to its first version.**
+That version refused any closing act a builder could not perform. Measured against the very range it
+was built for, it would have blocked #1112, #1171 and #1187 -- all of which reached main, #1171
+being the SMTP credential-exposure fix. Cannot close is not cannot be worked, and a gate that calls
+shipped-code-plus-open-item a failure suppresses real work to protect a counter.
+
+So the weight here is on the ADVISE path, and on the one thing still refused: an item whose state
+nobody has declared, because there the dispatch can name nothing at all.
 
 The field parsing is tested against the SHARED parser, because putting a second field scanner beside
 `parse_items` would be exactly the two-definitions defect the ledger rules forbid.
@@ -65,16 +69,19 @@ def test_an_item_declaring_nothing_is_refused(gate: ModuleType) -> None:
     so a test that only checked `ok is False` passed with the branch gone, and a mutation caught
     that. What is lost without it is the only message that tells the reader what to add.
     """
-    ok, reason = gate.judge(_item(gate))
-    assert ok is False
+    level, reason = gate.judge(_item(gate))
+    assert level == "refuse"
     assert "missing:" in reason, f"the refusal must enumerate what to add; got {reason!r}"
     for key in ("verdict", "research", "closing-act"):
         assert key in reason
 
 
-def test_the_wave_shape_is_refused(gate: ModuleType) -> None:
-    """Research verdict, research done, closing act a scorecard re-score. All 93 items looked so."""
-    ok, reason = gate.judge(
+def test_the_wave_shape_is_advised_never_refused(gate: ModuleType) -> None:
+    """Research verdict, research done, closing act a scorecard re-score. All 93 items looked so.
+
+    REFUSING THIS SHAPE WAS THE BUG. #1112, #1171 and #1187 carry it and all three reached main.
+    """
+    level, reason = gate.judge(
         _item(
             gate,
             **{
@@ -84,31 +91,35 @@ def test_the_wave_shape_is_refused(gate: ModuleType) -> None:
             },
         )
     )
-    assert ok is False
-    assert "no builder can perform" in reason
+    assert level == "advise", (
+        "the wave shape is workable; refusing it blocked shipped security work"
+    )
+    assert "NOT by the builder" in reason
+    assert "ASVS Tracker" in reason, "the advice must NAME who closes it"
 
 
 def test_a_build_item_passes(gate: ModuleType) -> None:
-    ok, _ = gate.judge(
+    level, _ = gate.judge(
         _item(gate, **{"closing-act": "code", "verdict": "build", "research": "none"})
     )
-    assert ok is True
+    assert level == "ok"
 
 
-def test_an_unfinished_research_question_is_not_dispatchable_as_a_build(gate: ModuleType) -> None:
-    ok, reason = gate.judge(
+def test_an_unfinished_research_question_is_advised_not_barred(gate: ModuleType) -> None:
+    """A warning to read the item's current body, not a bar to working it."""
+    level, reason = gate.judge(
         _item(gate, **{"closing-act": "code", "verdict": "research", "research": "none"})
     )
-    assert ok is False
-    assert "research first" in reason
+    assert level == "advise"
+    assert "CURRENT body" in reason
 
 
 def test_completed_research_with_a_code_closing_act_passes(gate: ModuleType) -> None:
     """This is the state the 93 items SHOULD have been rewritten into before dispatch."""
-    ok, _ = gate.judge(
+    level, _ = gate.judge(
         _item(gate, **{"closing-act": "code", "verdict": "research", "research": "done 2026-08-20"})
     )
-    assert ok is True
+    assert level == "ok"
 
 
 def test_fields_are_read_only_from_the_banner_block(parser: ModuleType) -> None:
@@ -142,6 +153,21 @@ def test_field_parsing_did_not_break_status_parsing(parser: ModuleType) -> None:
     assert item.fields["closing-act"] == "code"
 
 
+def test_an_undeclared_item_does_not_block_by_default(
+    gate: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Exit 0 without --refuse. A dispatch names closing acts; it does not withhold permission."""
+    assert gate.main(["1108", "--root", str(_ROOT)]) == 0
+    assert "NAMING, NOT REFUSING" in capsys.readouterr().out
+
+
+def test_refuse_flag_makes_an_undeclared_item_blocking(
+    gate: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The strict behaviour survives, opt-in, for a wave planned specifically to close items."""
+    assert gate.main(["1108", "--root", str(_ROOT), "--refuse"]) == 1
+
+
 def test_a_ledger_that_did_not_parse_refuses_to_report(
     gate: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -151,7 +177,10 @@ def test_a_ledger_that_did_not_parse_refuses_to_report(
     assert "INSTRUMENT ERROR" in capsys.readouterr().err
 
 
-def test_an_item_absent_from_the_ledger_is_refused(gate: ModuleType) -> None:
-    """A number nobody filed must not dispatch as though it were fine."""
-    rc = gate.main(["999999", "--root", str(_ROOT)])
-    assert rc == 1
+def test_an_item_absent_from_the_ledger_is_reported(
+    gate: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A number nobody filed is named, and blocks only under --refuse."""
+    assert gate.main(["999999", "--root", str(_ROOT)]) == 0
+    assert "NOT IN THE LEDGER" in capsys.readouterr().out
+    assert gate.main(["999999", "--root", str(_ROOT), "--refuse"]) == 1
