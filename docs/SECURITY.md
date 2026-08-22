@@ -198,7 +198,7 @@ apply. What each **adds** over plain `require()`:
 | `require_phi_read` | 7 | the ADR 0092 PHI-read hop refusal (`enforce_phi_read_hop`) **before** any identity work, then the per-actor PHI-read budget, 429 + `Retry-After: 10` |
 | `require_step_up` | 26 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
 | `require_step_up_action` | 2 | a **single-use, action-bound** step-up grant minted only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`) |
-| `require_reauth_only` / `require_reauth_only_action` | 2 / 2 | password step-up **without** the MFA gate — deadlock avoidance on the MFA-enrollment lanes |
+| `require_reauth_only_action` | 4 | password step-up **without** the MFA gate — deadlock avoidance on the MFA-enrollment lanes, and on session terminate (ASVS 7.5.2), where the grant is action-bound so a login-seeded window does not unlock it. `require_reauth_only` still exists and still backs the `/ui` twin, but BACKLOG #1149 moved the last JSON route off it, so it no longer appears in this walk |
 | `require_service_cert` | 1 | cert-only authentication (a bearer token gets 401), and a **PHI fence** that raises at *app construction* if asked to gate `messages:view_summary` / `messages:view_raw` |
 
 `optional_identity` (2 routes) never raises, so a tokenless client is answered; `authorize_ws` (1 route)
@@ -341,8 +341,8 @@ tuple: they act only on the caller's own account.
 | `DELETE` | `/me/mfa` | `require_step_up_action` (action `mfa_disable`) | step-up bound to the disable action (current factor + a fresh password). ⚠️ **No last-factor guard** — this is the TOTP path (`disable_mfa`), and it does **not** refuse when it would leave the account with zero enrolled factors. The passkey removal path does refuse; see BACKLOG #1022 for the asymmetry |
 | `GET` | `/me/sessions` | `require` | |
 | `GET` | `/me/security-events` | `require` | |
-| `DELETE` | `/me/sessions/{session_id}` | `require_reauth_only` | password-only step-up |
-| `DELETE` | `/me/sessions` | `require_reauth_only` | password-only step-up |
+| `DELETE` | `/me/sessions/{session_id}` | `require_reauth_only_action` (action `session_terminate`) | password-only step-up, bound to the action (ASVS 7.5.2): a login-seeded window does not unlock a terminate |
+| `DELETE` | `/me/sessions` | `require_reauth_only_action` (action `session_terminate`) | password-only step-up, bound to the action (ASVS 7.5.2) |
 
 #### Users, roles & directory maps
 
@@ -555,8 +555,8 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `GET` | `/ui/account/password` | *(authenticated session only)* | `require_ui` |
 | `POST` | `/ui/account/password` | *(authenticated session only)* | `require_ui` |
 | `GET` | `/ui/account/sessions` | *(authenticated session only)* | `require_ui` |
-| `POST` | `/ui/account/sessions/revoke-others` | *(authenticated session only)* | `require_ui_reauth_only` |
-| `POST` | `/ui/account/sessions/{session_id}/revoke` | *(authenticated session only)* | `require_ui_reauth_only` |
+| `POST` | `/ui/account/sessions/revoke-others` | *(authenticated session only)* | `require_ui_reauth_only_action` |
+| `POST` | `/ui/account/sessions/{session_id}/revoke` | *(authenticated session only)* | `require_ui_reauth_only_action` |
 | `POST` | `/ui/account/webauthn/enroll` | *(authenticated session only)* | `require_ui_reauth_only_action` |
 | `POST` | `/ui/account/webauthn/verify` | *(authenticated session only)* | `require_ui_reauth_only` |
 | `POST` | `/ui/account/webauthn/{credential_id_hash}/delete` | *(authenticated session only)* | `require_ui_step_up_action` |
