@@ -12474,3 +12474,32 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **The affected-cell count and the cell ids are deliberately NOT recorded here.** Coverage stays vaulted, and a count of affected cells over a closed domain discloses the rest by subtraction. The population goes to whoever holds the vault record, directly.
 
 **Source:** found by the ASVS Tracker while performing cleared work, not built by it. Content handed to this seat; number allocated and filed here.
+
+## 1314. tls_check_hostname=false bypasses both SMTP credential gates, so a credentialed hop trusts any peer chaining to the anchor
+
+> 🔢 **Filed 2026-08-22 - not started.** Value **8/10** · Difficulty **3/10** · _quick win_. **A third TLS weakening axis reaches `smtp.login()` with no refusal, no attestation and no warning**, while the two axes beside it are gated absolutely. Value 8 because a deploying site would put SMTP AUTH credentials on a connection authenticated only to the anchor, not to the name; difficulty 3 because the fix is a third arm matching two that already exist in the same constructors.
+
+**Cluster:** Security / transport posture. **Priority:** P1. **Verdict:** build.
+**Severity:** no exposure today ([§0](../CLAUDE.md) - zero deployments). **On first deployment**, a site that set `tls_check_hostname=false` would send SMTP AUTH credentials to any peer presenting a certificate that chains to the configured anchor, **regardless of the name on it**.
+
+**The gap.** `EmailDestination.__init__` (`transports/email.py`) and `DirectDestination.__init__` (`transports/direct.py`) branch three ways on TLS posture. The `not use_tls` arm and the `not tls_verify` arm each carry a body gate **and** a separate credential gate -- `if self.username is not None: raise` -- placed **outside** the escape conditional, so passing the escape does not skip it. The verified arm carries **no credential gate at all**, and `tls_check_hostname` is read there.
+
+**So the absoluteness is real and partial.** Verified by execution: `use_tls=false` + username and `tls_verify=false` + username are refused **with** the escape env var, **with** `tls_hop_attested`, and **with** `cleartext_accepted`, in all four arms across both connectors. *Those two axes need no change.* With `use_tls=true`, `tls_verify=true`, `tls_check_hostname=false` and a username set, **both connectors construct silently.**
+
+**Operator-reachable, not theoretical.** `Email()` and `Direct()` in `config/wiring.py` expose `tls_check_hostname` as a public keyword **beside `username` and `password`**; the connectors read it via `s.get("tls_check_hostname", True)`. The plausible route is a relay whose certificate carries the wrong SAN.
+
+**Measured with a live TLS handshake** -- throwaway RFC5280-conformant CA, synthetic material, no PHI. Connector host `smtp.partner.org`; peer presenting a certificate for `attacker.example` issued by the trusted anchor:
+
+| `check_hostname` | result |
+|---|---|
+| `True` | refused, `SSLCertVerificationError` |
+| `False` | **handshake succeeded**, peer CN `attacker.example` |
+
+`_send` and `_probe` then reach `smtp.login(self.username, self.password or "")`.
+
+**The shape of the fix, and it must not widen the existing arms.** A credential gate on the verified arm keyed on `tls_check_hostname`, matching the wording and the absolute placement of the two that exist. The escape belongs to the *body* posture in both existing arms and never to the *credential*; a third arm should keep that split.
+
+**Related but NOT the same item.** [#333](#333) is closed and concerns the loosening **registry**'s visibility. Its argument that `tls_allow_expired` is not a MITM primitive rests explicitly on hostname matching *still applying* -- which is the check this item shows an operator can disable. A reader who takes #333's reasoning as covering this case would be wrong.
+
+**Source:** found by adversarial verification of an unrelated claim, 2026-08-22. **Two seats had independently asserted the gates were absolute** -- both had verified the two covered arms and generalised. Recorded because agreement between two readers of the same two arms is not coverage of a third.
+
