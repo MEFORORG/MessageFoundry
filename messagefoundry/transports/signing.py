@@ -141,7 +141,41 @@ def _load_private_key(private_key: str, password: str | None) -> _PrivateKey:
         raise SigningError(
             f"signing key must be an RSA or EC (ECDSA) private key, got {type(key).__name__}"
         )
+    _require_key_strength(key)
     return key
+
+
+#: Smallest RSA modulus this engine will SIGN with. NIST SP 800-131A disallowed RSA-1024 for
+#: signature generation in 2013; ASVS 11.4.1 and every current candidate list agree on 2048 as the
+#: floor. Measured before this floor existed: :func:`_load_private_key` was a TYPE check only and
+#: loaded a 1024-bit key without complaint, against a control in the same run showing it does reject
+#: unparseable material -- so the loader was live and simply never asked how big the modulus was.
+_MIN_RSA_BITS = 2048
+
+
+def _require_key_strength(key: _PrivateKey) -> None:
+    """Refuse a signing key that is the right TYPE but too weak to sign with.
+
+    Scoped to the key this engine signs with, deliberately. The operator generates it and registers
+    only its public half, so raising the floor costs no counterparty anything -- it cannot break a
+    handshake with anybody, because nobody else chose this key.
+
+    **The verification path is a different question and is NOT changed here.**
+    :func:`require_public_key_for_alg` admits an identity provider's JWKS key, where a floor WOULD be
+    counterparty-facing: it would refuse an IdP advertising a weak key, which is an availability
+    decision about somebody else's infrastructure rather than a tightening of our own. That belongs
+    in its own change with its own reasoning, and folding it in here would smuggle a counterparty
+    refusal into a change whose whole justification is that it has no counterparty.
+
+    EC needs no floor here: :func:`_require_key_for_alg` already pins the curve per algorithm, and
+    both supported curves (P-256, P-384) are above any current floor.
+    """
+    if isinstance(key, rsa.RSAPrivateKey) and key.key_size < _MIN_RSA_BITS:
+        raise SigningError(
+            f"signing key is RSA-{key.key_size}, below the {_MIN_RSA_BITS}-bit floor for signature "
+            f"generation (NIST SP 800-131A, ASVS 11.4.1). Generate a new key of at least "
+            f"{_MIN_RSA_BITS} bits and register its public half with the counterparty."
+        )
 
 
 # The ECDSA algorithms and their (curve name, friendly name, JOSE coordinate width, hash) — keeps
