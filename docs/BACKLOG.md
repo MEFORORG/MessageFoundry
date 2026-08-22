@@ -12350,3 +12350,37 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **The other seat named its own half exactly:** it acted on a message addressed to others without checking whether an addressee was already acting. *"Routes to me" answers who commits, not whether someone else already is.*
 
 **This seat's half is worse, because it had just recorded the same lesson.** `#1309` was retired an hour earlier for being a duplicate filed off an incomplete read, and the rule taken from it -- check whether a finding is already recorded before allocating -- was applied to the **ledger** and not to **peer sessions**. *The check was narrowed to the artifact this seat owns, which is the same too-narrow-instrument failure recorded three times tonight, in its most avoidable form.*
+
+## 1307. the safe ASVS writer has no path to retire an anchor
+
+> 🔢 **Filed 2026-08-22 - not started.** Value **5/10** · Difficulty **2/10** · _fill-in_. **Retirement is a SANCTIONED outcome the only safe writer cannot express**, so one live tracking item is blocked indefinitely with no workaround that keeps the guard intact. Difficulty 2 because the fix mirrors an override that already exists in the same tool.
+
+**Cluster:** ASVS tooling. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect and no verdict moves. The cost is that a maintainer with a legitimate retirement must either leave a stale anchor in place or reach for the unsafe path.
+
+**The gap.** `scripts/asvs/apply.py` refuses any payload where an evidence or absence list SHRINKS, with `REFUSING: cell <id> evidence count would DROP 7 -> 6`. **The condition takes no flag.** `--allow-verdict-change` is the only override and does not cover cardinality.
+
+**Why that is a hole rather than a strict setting.** The tracking loop names four causes for an anchor that no longer resolves, and one of them is **the gap the anchor certified was CLOSED, so retire the anchor** -- the case where the engine got BETTER and the fix deleted the line the anchor quoted. That outcome is sanctioned, expected, and unreachable through the only writer that is safe to use.
+
+**The guard is CORRECT and must not be widened.** It exists because a truncating repair once cut one cell from 15 anchors to 10 and another from 17 to 1 **with the verifier green throughout**. A count that drops silently is exactly what it is there to stop.
+
+**Proposed shape, mirroring `--allow-verdict-change` rather than inventing one:** an explicit declaration that a retirement is intended, refused by default, with the payload naming WHICH anchors are being retired so the refusal stays answerable rather than becoming a blanket bypass. Dangerous thing explicit, safe thing default.
+
+**Source:** found by the ASVS Tracker while performing cleared work, not built by it. Content handed to this seat; number allocated and filed here.
+
+## 1308. vault scorecard records are unwritable by the safe writer when their pre-existing prose trips its character ban
+
+> 🔢 **Filed 2026-08-22 - not started.** Value **5/10** · Difficulty **3/10** · _fill-in_. **A population of records cannot be edited by the safe writer at all** -- a sanctioned edit is refused before it starts, for a character the writer did not author. Difficulty 3 because the correct scope (author versus pre-existing text) is a design call, not a regex change.
+
+**Cluster:** ASVS tooling. **Priority:** P2. **Verdict:** build.
+**Severity:** no engine effect. The cost is that affected records are frozen against the only safe writer, so a maintainer must either skip a legitimate edit or leave the record stale.
+
+**LEAD WITH THE UNWRITABILITY, NOT WITH THE CHARACTERS.** Read as a tidiness item this gets deferred forever; the actual defect is **records that cannot be edited by the safe writer**.
+
+**The mechanism.** `scripts/asvs/apply.py` bans a character class in residual text. **When that text is PRE-EXISTING, a sanctioned edit to the cell is refused before it starts** -- the writer refuses the whole field over a character it did not put there. The ban on NEW text is right; applying it to text the writer is not authoring is what makes the record unwritable.
+
+**THIS IS A DIFFERENT POPULATION FROM THE ENGINE-REPO CHARACTER CENSUS, and the two must not be folded together.** That one lives in the ENGINE repository and already has its own filed migration. This one is in the **vault scorecard** -- a different artifact in a different repository. **One number must never appear to cover both**, which is precisely how a later reader would merge them.
+
+**The affected-cell count and the cell ids are deliberately NOT recorded here.** Coverage stays vaulted, and a count of affected cells over a closed domain discloses the rest by subtraction. The population goes to whoever holds the vault record, directly.
+
+**Source:** found by the ASVS Tracker while performing cleared work, not built by it. Content handed to this seat; number allocated and filed here.
