@@ -627,7 +627,8 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `POST` | `/ui/uploaded-logs/file/{file_id}/filter` | `files:browse` | `require_ui_step_up` |
 | `POST` | `/ui/uploaded-logs/file/{file_id}/delete` | `files:delete` | `require_ui_step_up` |
 | `GET` | `/ui/uploaded-logs/file/{file_id}/delete-confirm` | `files:delete` | `require_ui` |
-| `POST` | `/ui/uploaded-logs/file/{file_id}/resend` | `files:browse` | `require_ui` |
+| `POST` | `/ui/uploaded-logs/file/{file_id}/resend` | `files:browse` | `require_ui_step_up` |
+| `GET` | `/ui/uploaded-logs/file/{file_id}/resend-confirm` | `files:browse` | `require_ui` |
 | `GET` | `/ui/uploaded-logs/upload` | `files:upload` | `require_ui` |
 | `POST` | `/ui/uploaded-logs/upload` | `files:upload` | `require_ui` |
 | `GET` | `/ui/users` | `users:read` | `require_ui` |
@@ -680,11 +681,20 @@ else would need its own authorization rule stated here.
    browser cannot act on.
 2. **No `/ui` route charges the per-actor admin-write pacing floor** (see the interim note under
    [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
-3. **Two console routes lose a step-up their JSON counterparts have**:
-   `POST /ui/uploaded-logs/upload` and `POST /ui/uploaded-logs/file/{file_id}/resend` are plain
-   `require_ui`, while `POST /uploads` and `POST /uploads/{file_id}/resend` are `require_step_up` —
-   a multipart body cannot survive the re-auth redirect. So a PHI-at-rest write and a PHI
-   re-injection are gated on `files:upload` / `files:browse` alone on this plane.
+3. **One console route loses a step-up its JSON counterpart has**: `POST /ui/uploaded-logs/upload`
+   is plain `require_ui`, while `POST /uploads` is `require_step_up` — a multipart body cannot
+   survive the re-auth redirect. So a PHI-at-rest write is gated on `files:upload` alone on this
+   plane. **The resend half of this divergence is CLOSED (BACKLOG #1227):**
+   `POST /ui/uploaded-logs/file/{file_id}/resend` is now `require_ui_step_up`, reached through a
+   body-less confirm step that carries its two parameters in the query, so it survives the re-auth
+   redirect the way `delete` does. The premise that used to stand in for the gate — that the POST
+   arrives from an already-stepped-up browse page — was never enforced by anything.
+   That step introduces one *new*, narrower divergence, disclosed here rather than left to be
+   discovered: `GET /ui/uploaded-logs/file/{file_id}/resend-confirm` is plain `require_ui` while the
+   permission-equivalent JSON browse route carries a step-up. It **cannot** carry one, because it is
+   the re-auth continuation itself — gating it would bounce the operator back to `/ui/reauth`
+   indefinitely. It is accepted because the page renders **no message body**: a filename, an ordinal
+   and a connection name, all three of which the operator supplied on the previous screen.
 4. **The ADR 0092 PHI-read hop refusal does not apply on the `/ui` browse routes.**
    `enforce_phi_read_hop` appears nowhere in `messagefoundry_webconsole/`; the console's own gates —
    `require_ui(..., phi=True)` and `require_ui_step_up(..., phi=True)` — apply only the per-actor
