@@ -9744,6 +9744,8 @@ filing.
 
 **A first-class access finding neither record carries: the security log's `detail` column would be plaintext at rest on every backend.** `messagefoundry/store/store.py:7415-7418` inserts it unwrapped, and reading the cipher-column registry at `store/store.py:2365` in full shows `audit_log` absent while its own comment block explicitly names `message_events.detail`, `connection_event.reason` and `alert_instance.reason` as cipher-covered. So on an encrypted store the security log's free-text column is the one plaintext outlier while three lesser operational event logs are sealed -- and `messagefoundry/store/audit_tee.py:53` states in a shipped docstring that this column "is a cipher column at rest for exactly that reason", which is false at HEAD. Separately, the item's own severity framing (no exposure on the access limb) does not hold: `audit_tee.py:29-30` pins the tee logger above the deployment level and it is called unconditionally after commit in all three backends, so a full copy of every security-log record would land in the general application log at any log level, with no read permission and no chain. An executed probe with the deployment level raised showed the audit record reaching the root handler while an ordinary record at the same level was correctly suppressed in the same run.
 
+**CORRECTED 2026-08-22: the TEE half of the access finding above is WITHDRAWN. The cipher-column half stands.** That paragraph reads the tee as putting "a full copy of every security-log record" into the general application log, and that mischaracterises a deliberate, documented control. `emit_audit_tee` in `messagefoundry/store/audit_tee.py` builds a fixed **seven**-field record -- `event`, `ts`, `action`, `actor`, `channel_id`, `client`, `detail` -- and runs the only free-text member through `safe_text()`, which the shipped comment on that line calls a "PHI chokepoint" and the function docstring states as "**Never emits a raw message body**". So what forwards is redacted metadata, not the row, and it is not a copy of it. The INFO pin is deliberate for the same reason and says so in its own comment: audit evidence must forward regardless of the deployment's general log level, because attribution has to survive a host or database compromise -- which is the `sec-offbox-log` control working, not a leak. **What survives is narrower and has to be argued on its own ground:** actor, action, channel and client address do reach the general application log at any level, with no read permission and no chain. That is a metadata-disclosure question about an intentional off-box copy, not the unredacted exposure the withdrawn sentence described, and it does not by itself overturn the item's "no exposure on the access limb" severity framing. The plaintext-`detail`-at-rest finding in the same paragraph is untouched and re-verified: `audit_log` is absent from the cipher-column registry on every backend.
+
 **What must be built regardless of the ruling.** Make `row_hash` non-nullable, delete `_backfill_audit_chain` in all three backends (it exists only for rows written before chaining, and at zero deployments there are none), and add update and delete deny rules in each backend's schema -- with two constraints. Report it PER BACKEND and never as immutability: on the embedded backend the actor who can issue the update can drop the rule or edit the file, and the no-application-path limb is already verified without it, so the real prevention value is on the server backends against a login holding data rights but not schema rights, demonstrated by executing a real update against a low-privilege login rather than the elevated CI one. And specify it so it does not block the remedy for the plaintext column, because adding that column to the cipher registry creates legitimate update traffic through `store/store.py:2396-2430` and the key-rotation re-encrypt pass at `:2724-2760`. Also: the "only the backfill ever updates an audit row" precondition was measured with a literal grep that cannot see a statement whose table name is interpolated (eleven such sites exist); reading them shows the conclusion holds, which is not the same as having measured it.
 
 **The anchor-stream idea is right and its transport is not.** Adding the row id and hash to the off-box tee record (`audit_tee.py:63-73`) costs nothing -- the head hash carries no PHI and no secret -- but it closes tail truncation only over an AUTHENTICATED, gap-detecting hop. `messagefoundry/logging_setup.py` documents the forwarder as lossy in its own words: datagram sends are fire-and-forget, an unreachable collector at startup is SKIPPED for the process lifetime, and a stalled one drops records after a bounded wait. Over the default transport a gap in the collector's copy is ambiguous and a forged anchor line is injectable.
@@ -12582,6 +12584,65 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Source:** found by adversarial verification of an unrelated claim, 2026-08-22. **Two seats had independently asserted the gates were absolute** -- both had verified the two covered arms and generalised. Recorded because agreement between two readers of the same two arms is not coverage of a third.
 
+
+## 1317. the TLS cipher allowlist tests a name prefix, so NULL-encryption and anonymous suites pass every gate
+
+> 🔢 **Filed 2026-08-22 - not started.** Value **8/10** · Difficulty **3/10**. Owner-ruled the
+> same day: **a strict positive allowlist**, admitting only suites that appear on every current
+> candidate list, anything unnamed rejected. At zero deployments the compatibility cost of being
+> strict is zero.
+
+**Cluster:** Security / transport. **Priority:** P1. **Verdict:** build.
+**Severity:** no live exposure -- there are zero deployments (sec. 0). On a **first** deployment an
+operator following the documented `[api].tls_ciphers` knob could install a suite offering no
+confidentiality, or no peer authentication, on the browser-facing operator console listener.
+
+**The defect, stated so the fix lands in the right place.** `validate_tls_ciphers` and
+`harden_cipher_suites` (`messagefoundry/config/tls_policy.py`) admit or refuse a configured cipher
+string on **exactly one property: forward secrecy**, via `_is_forward_secret`. Nothing in that path
+asks whether a suite **encrypts** or whether it **authenticates the peer**.
+
+**`_is_forward_secret` is NOT the bug and must not be "fixed".** It answers its own question
+correctly, and both suites below genuinely ARE forward-secret: `ECDHE-RSA-NULL-SHA` negotiates an
+ephemeral ECDH key exchange, and `ADH` is anonymous *ephemeral* DH. A reader who takes this item's
+own heading as "the predicate matches on a name prefix" will tighten the prefix matching and leave
+the hole exactly where it is. **The gap is a missing pair of predicates, not a defective one.**
+
+**Measured by RUNNING the shipped validator rather than reading it.** Four inputs, controls firing
+both ways:
+
+| input | result | property it lacks |
+|---|---|---|
+| `ECDHE-RSA-NULL-SHA` | **ACCEPTED** | no confidentiality -- `NULL` is a real, negotiable cipher |
+| `ADH-AES256-GCM-SHA384` | **ACCEPTED** | no peer authentication -- trivially machine-in-the-middle |
+| `ECDHE-RSA-AES256-GCM-SHA384` | accepted | control: a suite that should pass, and does |
+| `RC4-MD5` | rejected (`ValueError`) | control: the validator is not accepting everything |
+
+The `RC4-MD5` control is load-bearing. Without it, the acceptances above are indistinguishable from
+a validator that returns success for every string it is handed.
+
+**What to build, per the 2026-08-22 owner ruling.** Replace the single forward-secrecy test with a
+**strict positive allowlist**: an explicit set of suite names present on every current candidate
+list, everything unnamed refused. Keep the forward-secrecy check as one member of the resulting
+property set rather than deleting it. Refuse at **config load**, so a bad value cannot reach a
+listener at all.
+
+**The proof it must carry.** The mutation that matters is not "does a good suite still pass" -- it
+is **does removing the new predicate turn the table above red**. A test that pins only the good
+control cannot fail when the fix is reverted, which is the shape that has already shipped elsewhere
+in this repository. Pin all four rows, and pin the refusal as a load-time error rather than a
+runtime one.
+
+**Honest residual, and what was NOT searched.** This item covers the operator-facing knob and the
+shipped context builder reached from it. It does **not** enumerate every `SSLContext` construction
+in the engine, and it does not reach the suite sets chosen inside third-party libraries (`ldap3`,
+`hvac`, ODBC Driver 18) -- a different surface with a different owner, named here by subject rather
+than by a number, since none is allocated.
+
+**Source:** surfaced 2026-08-22 by the eight-cell ASVS re-scoping pass while completing the
+enumeration for cell 12.1.2, then verified independently against the shipped validator before
+filing. That cell's own ruling is a separate question about allowlist width; this item is the build
+which both readings of the cell now require.
 
 ## 1315. prose path:line citations carry no token, so nothing can verify them
 
