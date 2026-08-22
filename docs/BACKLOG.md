@@ -13444,6 +13444,20 @@ blind window is about a day rather than open-ended.
 > 🔢 **Filed 2026-08-22 - not started.** Pydantic settings models accept and drop an unknown keyword. Deleting a setting therefore leaves every call site that passes it green, and the test most likely to pass it is the one NAMED after the setting.
 > Verdict: build
 > Closing-act: code
+> 
+> ***SUPERSEDED BY #1326 -- A SECOND DUPLICATE FROM THIS SEAT, IN ONE EVENING. IT SHOULD BE CLOSED.***
+> *A builder and I filed the same defect within minutes, from opposite directions: they had deferred it
+> to me to number, then filed it themselves as the seat whose own commit contained the instance.* **Both
+> numbers came from `alloc.ps1`, so atomic allocation prevented a COLLISION and cannot prevent a
+> DUPLICATE -- it guarantees two seats never take the same number, not that one defect takes only one.**
+> 
+> **#1326 IS THE BETTER ROW AND CARRIES SOMETHING THIS ONE DOES NOT:** *these settings models also load
+> from TOML and `MEFOR_` environment variables, so `extra="forbid"` turns an unknown config key into a
+> **load refusal**.* **That makes it a posture change rather than test hygiene** -- plausibly better, and
+> a decision rather than a one-line edit. *Read #1326, not this row.*
+> 
+> ⚠️ **BANNER NOT FLIPPED -- closing is the Lander's act** (`BUILDER.md:253` forbids the filer, `:148`
+> assigns it). *Until it is flipped this is an open duplicate.*
 
 **Cluster:** Testing / silent-failure class. **Priority:** P2. **Verdict:** build.
 **Severity:** test-integrity gap, not a runtime defect. **Conditional, per section 0:** zero deployments; what would be wrong is a suite reporting a condition it never established.
