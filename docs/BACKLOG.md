@@ -12141,6 +12141,29 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **Cluster:** Tooling / worktree gate. **Priority:** P3. **Verdict:** build.
 **Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- developer tooling only, and it fails closed. The cost is a gate message that is false about what the command does, which is the class of defect that teaches readers to discount gate output.
 
+## 1310. the collision gate prints a truncated session id bare, and a reader resolves it as a commit sha
+
+> 🔢 **Filed 2026-08-22 by the lander. Found by the Builder 1 seat, who chased the value into the git object store TWICE and twice reported the gate's warning unresolvable.** Value **4/10** -- Difficulty **1/10** -- _quick win_. `collision_gate.ps1` names the blocking session by an **8-hex-character token, printed bare with no label**, inside a git-centric diagnostic. Every reader resolves that shape as a short commit sha. It is a truncated session id and resolves to nothing.
+> **THE MECHANISM, three sites, verified in the source rather than inferred:**
+> ```
+> scripts/coord/occupancy.ps1:251   Short = $sid.Substring(0, [Math]::Min(8, $sid.Length))
+> scripts/coord/overlap.ps1:234     Short = ([string]$sess.sessionId).Substring(0, 8)
+> scripts/hooks/collision_gate.ps1:230  "$(Get-SafeForMessage $_.Short) [$(...Branch)]"
+> scripts/hooks/collision_gate.ps1:243  "  $(Get-SafeForMessage $r.Short) ($(...Surface)) in "
+> ```
+> **TWO PRINT SITES, NOT ONE, and I recorded only `:243` when I filed this.** The Dispatcher and the
+> Builder 1 seat both found `:230` independently. `grep -c 'session=' ` on that file returns **0**, so
+> neither site labels the value. **My own error is the defect this item is about, one level up: I
+> found one instance and wrote "the gate prints", which states a conclusion at a wider scope than the
+> query that produced it.** Whoever fixes this should label BOTH and re-run that grep as the check.
+> **THE COST IS NOT CONFUSION, IT IS A FALSE DISMISSAL, and that is why this is worth a number.** The gate's message is read at exactly one moment: somebody is blocked and is trying to identify the other session. It hands them an identifier that **looks resolvable, is not, and whose failure to resolve reads as evidence the WARNING is stale.** The finder came within one step of treating a **true file claim** as a false alarm on that basis. A control that argues against itself when consulted is worse than a silent one.
+> **NOT #1040, and the distinction is the interesting part.** #1040 is about hook deny text being attacker-influenceable, and its fix -- `Get-SafeForMessage` folding a value entering prose -- **is already applied to this exact line.** The value is correctly ESCAPED and incorrectly LABELLED. Escaping asks *"can this string do something"*; labelling asks *"will a reader know what this string IS"*. The first is closed here and the second was never posed.
+> **FIX, one word, and it is why difficulty is 1:** print `session=89933aa2` instead of `89933aa2`. A label turns an apparent sha into what it is. Whoever takes it should check the two `Short` producers as well -- a caller that formats the value correctly does not help a second caller that does not.
+> **PROVENANCE:** mechanism and fix from the Builder 1 seat, who declined to file it (*"not my item and I have no number"*) and handed over the content instead -- the split CLAUDE.md section 5 asks for. The value is 4 rather than 2 because the failure mode is a control being disbelieved, not merely misread.
+
+**Cluster:** Tooling / coordination hooks. **Priority:** P3. **Verdict:** build.
+**Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- developer tooling only. The cost is that a correct warning reads as a stale one, which is the class of defect that trains people to ignore the gate.
+
 ## 1312. the release-age guardrail test reaches live PyPI, so its declared discriminating row proves nothing
 
 > 🔢 **Filed 2026-08-22 by the lander, from PR #487's CI.** Value **6/10** -- Difficulty **3/10** -- _fill-in_. `tests/test_dependabot_automerge_guardrails.py::test_release_age_passes_an_aged_release_and_holds_a_fresh_one` stubs `curl` on PATH so the dependabot release-age guardrail is exercised against a FIXTURE. On `windows-2025` the stub is not interposing and the step body queries **live PyPI**. Three of its four rows fail; the fourth passes off the network.
