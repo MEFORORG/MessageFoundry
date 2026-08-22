@@ -6892,6 +6892,19 @@ filing.
 
 > **Both seats reached the same self-diagnosis independently: code gets measured carefully, ledger items get read carelessly.** The mechanical fix is to search an item for its conclusion before ruling on it, not to read more attentively.
 
+**THE BUILDABLE PATH, SUPPLIED BY THE RESEARCHING SEAT AFTER THE RETRACTION. Anchors re-verified against `origin/main` by this seat before recording -- the step whose absence caused everything above.**
+
+**Piece 3 closes the burst and is genuinely new code.** A **minimum inter-submission interval**. `min_interval` returns **zero** across `messagefoundry/auth/` and `api/security.py`, against a live control of the same token elsewhere in the tree -- so the zero is a property of the code, not of the pattern.
+
+**Piece 4 is a flow timer on paired ceremonies, and the proposal's inventory was short.** It enumerated four pairs; **at least seven** exist. Two of the dropped ones matter:
+
+- **login then MFA-verify** -- *the pair this item names FIRST* (`auth/service.py:814`, the session-minting call).
+- **the federated pair** -- `POST /ui/oidc/start` (`webconsole/routes/oidc.py:144`) then `GET /ui/oidc/callback` (`:209`). It is bounded **above** by a flow TTL and has **no lower bound at all** -- the ceiling-without-floor shape the flow timer exists to fix.
+
+**Two structural corrections the path needs before it is buildable.** A floor keyed on *(authenticated actor, non-GET)* **cannot reach the pre-authentication half**: at login there is no actor, and two session-minting legs are GETs, so the sign-in floor must be **client-keyed and method-agnostic**. And **seven of 57 console non-GET routes carry no `require_ui` gate at all**, so charging inside those factories cannot reach them -- `POST /ui/logout` charges nothing with no stated exemption, and that needs deciding explicitly rather than by omission.
+
+***THE LIMB THAT DECIDES HONESTY IS THE FLOOR DERIVATION, AND IT IS THE ONE THE EARLIER ATTEMPT SKIPPED.*** The floor must sit just **below the fastest observed human**. Set above it, it throttles real operators and **gets reversed on the first complaint** -- which is how a control becomes a number nobody can defend. This is the limb that makes the difference between a pass and a coverage claim, and it is why "wire the existing budget in for the coverage" is listed above as what would **not** be an honest pass.
+
 ## The original note, kept as written and now known wrong
 
 **VERDICT 2026-08-22 FROM THE BUILDING LANE: CANNOT HONESTLY REACH `pass`, AND CLOSING THE RATE-BUDGET HOLE DOES NOT CHANGE THAT.** The verdict was recorded as `partial`.
