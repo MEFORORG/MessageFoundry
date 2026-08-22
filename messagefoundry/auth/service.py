@@ -458,7 +458,16 @@ class AuthService:
 
     @property
     def ad_enabled(self) -> bool:
+        """Whether this engine can BIND to the directory -- what Kerberos SSO, federated OIDC and the
+        session reconciler each need. Not the same question as whether we accept an AD password; see
+        :attr:`ad_password_login_enabled` (BACKLOG #1137)."""
         return self._ldap is not None
+
+    @property
+    def ad_password_login_enabled(self) -> bool:
+        """Whether a user may present an AD password to our login form. Requires the bind (there is
+        nothing to verify against otherwise) AND the operator leaving the pathway on."""
+        return self._ldap is not None and self._settings.ad_password_login_enabled
 
     @property
     def action_step_up_required(self) -> bool:
@@ -875,7 +884,11 @@ class AuthService:
         return attempts, locked_until is not None
 
     async def _login_ad(self, username: str, password: str, *, client: str | None) -> LoginOutcome:
-        if self._ldap is None:
+        # Refuse BEFORE the bind, not after: binding first would still probe the directory for a
+        # pathway the operator turned off, and the bind's own outcome distinguishes a real account
+        # from an absent one. Spelled out rather than via `ad_password_login_enabled` because a
+        # property call does not narrow `self._ldap` for the type checker; the two are equivalent.
+        if not self._settings.ad_password_login_enabled or self._ldap is None:
             return LoginOutcome(ok=False, error="AD authentication is not configured")
         try:
             principal = await asyncio.to_thread(self._ldap.authenticate, username, password)

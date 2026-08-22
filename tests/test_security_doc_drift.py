@@ -417,6 +417,12 @@ _CONTEXTUAL_NAME_MARKERS = (
 #: request is allowed, so it belongs in the settings reference rather than the 8.1.3/8.1.4 tables.
 _CONTEXTUAL_REVIEWED_NON_INPUTS = frozenset(
     {
+        # BACKLOG #1137: whether the AD password pathway is OFFERED at all. Same shape as
+        # `oidc_enabled` below -- it decides which login pathway exists, not whether a given request
+        # is allowed, and it is never read as a consumer or environment attribute on a request path.
+        # A user refused here is refused because the pathway is closed to everyone, not because
+        # anything about THEM was evaluated.
+        "ad_password_login_enabled",
         # OIDC wiring: endpoints, client identity, secrets, discovery and claim-mapping shape.
         "oidc_enabled",
         "oidc_issuer",
