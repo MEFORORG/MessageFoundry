@@ -12177,3 +12177,23 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Tooling / CI gates. **Priority:** P2. **Verdict:** build.
 **Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- CI tooling only. The cost is that a supply-chain auto-merge control's discriminating test passes for a reason unrelated to the control.
+
+## 1313. the sdist leak gate passes silently when tar fails, so the guard on a public PyPI publish can report clean having listed nothing
+
+> 🔢 **Filed 2026-08-22 by the lander.** Value **8/10** -- Difficulty **2/10** -- _quick win_. `.github/workflows/release.yml:118-119`, the *"Leak gate -- sdist MUST be package-only (private-doc/PHI publish guard)"* step, decides on the CONTENT of a pipeline and never on whether the pipeline RAN. When `tar tzf` fails, `leak` is empty, the gate prints `sdist is package-only` and the release proceeds to the PyPI publish step.
+> **THIS GATE EXISTS BECAUSE THE LEAK ALREADY HAPPENED ONCE.** Its own comment: hatchling without `only-include` *"sweeps the whole repo into the sdist and this workflow uploads it to PUBLIC PyPI -- which leaked `docs/security/*` and other deny-listed private docs on releases 0.1.0..0.2.15."* So the failure mode is not hypothetical and the blast radius is a public index, where a withdrawn file stays mirrored.
+> **THREE TRIGGERS, EACH MEASURED against the step's own body, not reasoned about:**
+> ```
+> corrupt or truncated tarball    tar tzf fails    leak=""   -> "sdist is package-only", rc 0
+> TWO .tar.gz in dist/            sd is multiline  leak=""   -> PASSED, while one of the two
+>                                                              CONTAINED docs/security/PRIVATE.md
+> dist/ empty (build made none)   sd is ""         leak=""   -> "sdist is package-only", rc 0
+> ```
+> **POSITIVE CONTROL, run first so the greens above mean something:** a well-formed sdist containing `docs/security/PRIVATE.md` **trips** the gate and exits 1, naming the three offending paths. The gate is correct on the class it was written for. It cannot tell that class from *"I never got a listing"*.
+> **`set -o pipefail` DOES NOT FIX THIS, and that is the part most likely to be got wrong.** Measured: the same body under `set -o pipefail` still prints `sdist is package-only` and returns 0, because the trailing **`|| true`** swallows the status regardless of which element failed. A fix that adds `pipefail` and stops will produce a green that is exactly as blind, in a step whose whole purpose is to be believed.
+> **FIX DIRECTION, not prescribed:** decide on evidence of a LISTING rather than on the absence of matches -- assert `tar tzf` succeeded, and assert the listing is non-empty and contains the package tree, before asking what is outside the allowlist. Resolve `sd` so that zero or multiple matches is a hard error rather than a silently malformed argument. Whatever is built, plant a corrupt tarball and a second `.tar.gz` and confirm the step goes RED on each before believing it.
+> **NOT #1000 AND NOT ALREADY OWNED, checked before filing.** #1000 (closed) is this class stated as a rule for the **13 required merge contexts**; `release.yml` is not one of them and its scope note says so. `tests/test_release_pipeline.py` covers allowlist-regex **drift** between `pyproject`'s `only-include` and the workflow's `grep -vE` -- it never executes this step, so a gate that cannot fire is invisible to it. [ADR 0158](adr/0158-silent-controls-green-signals-that-mean-nothing-and-shape-over-detection.md) is the taxonomy and names this Class 2; this is an unowned instance of it on the publish path, not a restatement.
+> **PROVENANCE:** surfaced by an adversarial verification pass that was convened to REFUTE a different, broader claim and did so unanimously (3 of 3 -- the class is filed as #1000 and partly guarded already). This survived as the one instance-level gap two verifiers independently confirmed by reading the file. Re-measured here from scratch before filing.
+
+**Cluster:** CI reliability / supply chain. **Priority:** P1. **Verdict:** build.
+**Severity:** no engine-runtime effect and no deployment axis (sec. 0) -- but this is the **disclosure** path, not the deployment one, and publishing to PyPI is real and current. A silent pass here would let a regression in the `only-include` allowlist republish private documentation to a public index, which is what releases 0.1.0..0.2.15 already did once.
