@@ -8635,6 +8635,31 @@ filing.
 
 **Still not an honest pass:** raising the one floor that already exists (`auth/oidc/jwks.py:34`, set AT the failing value of 2048), which is the least exposed surface; declaring operator-supplied key material out of assessment scope, which deletes the finding rather than fixing it and which the verb's section prose now gives a foothold it did not appear to have; and citing the standard's own appendix clauses or the federal transition schedule as grounds for scoring a pass -- those are inputs to a ruling about what to build and cannot make a 112-bit floor satisfy a verb that says 128. One instrument note: the JWS floor is marked unblocked and is therefore likely to be built first and alone, and the line it introduces MATCHES this requirement's recorded absence pattern -- so landing it by itself would take the machine guard from firing to silent while a dozen surfaces stay at 112 bits. Re-cut the pattern in the same commit. Proposed work, unallocated and by subject: the cipher-string strength gate; the JWS and SMART modulus floor; the XML signature-verification algorithm policy; the WebAuthn advertised-algorithm restriction; the Transit key-type check on both the data-key and key-encryption-key paths; a checked-not-inherited TLS key-strength assertion recorded as drift protection that moves no verdict; the list-preserving security-level raise, contingent on the ruling; the anonymizer strength fixes; rows for the PKCS#12 import and the inbound mTLS paths; and an amended decision packet carrying the measured trust-anchor cost and the fact that its own middle option cannot reach pass.
 
+
+**ONE LIMB BUILT 2026-08-22: the signing-key strength floor. The Vault key-type limb this item's
+ruling is about is NOT built and is untouched by it.** This item's own prose named the defect --
+the JWS and SMART signing-key check at `transports/signing.py` "is a type check only and accepted
+RSA-1024 when executed" -- and that is now closed. `_load_private_key` calls a new
+`_require_key_strength`, which refuses an RSA modulus below `_MIN_RSA_BITS` (2048; NIST SP 800-131A
+disallowed RSA-1024 for signature generation in 2013).
+
+Re-measured before building, by execution rather than by reading: the loader ACCEPTED a 1024-bit key
+and reported `key_size=1024`, while rejecting unparseable material in the same run -- so it was live
+and simply never asked. Two mutations were run afterwards and each turned the suite red: removing the
+size comparison, and removing the call. 177 tests pass across the signing-adjacent suites.
+
+EC takes no floor here and that is deliberate rather than an omission: `_require_key_for_alg` already
+pins the curve per algorithm, and both supported curves (P-256, P-384) clear any current floor. A
+test pins that reasoning so a future weak curve has to confront it.
+
+**THE VERIFY PATH IS DELIBERATELY NOT INCLUDED, and the reason is the one this item cares about.**
+`require_public_key_for_alg` admits an identity provider's key fetched from its JWKS
+(`auth/oidc/claims.py`). A floor there would refuse an IdP advertising a weak key -- an availability
+decision about **somebody else's infrastructure**, with a real counterparty on the other end. The
+private-key floor has the opposite profile: the operator generates that key and registers only its
+public half, so raising it can break no handshake with anybody. Folding the two together would have
+smuggled a counterparty-facing refusal into a change whose entire justification is that it has none.
+The JWKS floor is real, is unfiled, and is named here by subject rather than by a number.
 ## 1167. research an honest pass for ASVS 11.2.4 -- constant-time recovery-code verification without turning ten argon2id slots into an amplification target
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **7/10** · _money pit_. The data-dependent early return survives on the shipped MFA path: _verify_second_factor walks the argon2id recovery hashes and returns on the first match, so the number of ~64 MiB verifications is a function of which code was presented. Value 4 because the leak is a wall-clock signal on an already-authenticated second factor rather than a bypass; difficulty 7 because the obvious constant-time loop multiplies a 64 MiB argon2id verification by the slot count on every attempt, converting a timing leak into a memory and CPU amplification target, and the evidentiary half has no precedent in this tree. _(was 4/10 · 7/10.)_
