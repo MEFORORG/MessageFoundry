@@ -728,6 +728,25 @@ def test_phi_read_scope_counts_are_derived_from_the_enforcement_sites() -> None:
     assert stale not in _section(_H_BRUTE), "the stale three-route list is back"
 
 
+def _pacing_charging_factories() -> set[str]:
+    """The `require*` factories that ACTUALLY call ``_enforce_admin_write_pacing``, read from source.
+
+    Derived rather than listed. A hand-maintained set of names is a NAME check, not a BEHAVIOUR one:
+    it keeps passing when a factory stops charging, because nothing compares the list to the code.
+    Measured, BACKLOG #1148: with a hardcoded set, deleting the pacing call from
+    ``require_step_up_action`` left the exemption test GREEN -- the test still believed the factory
+    charged, so the unpaced set still computed empty. Only the sibling test, which derives, caught it.
+    """
+    tree = ast.parse(_SECURITY.read_text(encoding="utf-8"))
+    return {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and node.name.startswith("require")
+        and _calls_to(node, {"_enforce_admin_write_pacing"})
+    }
+
+
 def test_both_pacing_gate_families_are_named() -> None:
     """``_enforce_admin_write_pacing`` has exactly two callers; naming only one understates coverage."""
     tree = ast.parse(_SECURITY.read_text(encoding="utf-8"))
@@ -738,14 +757,8 @@ def test_both_pacing_gate_families_are_named() -> None:
         ):
             callers.add(node.name)
     # the inner `dependency` closures carry the call; attribute them to their enclosing factory
-    factories = {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-        and node.name.startswith("require")
-        and _calls_to(node, {"_enforce_admin_write_pacing"})
-    }
-    assert factories == {"require_paced", "require_step_up"}, (
+    factories = _pacing_charging_factories()
+    assert factories == {"require_paced", "require_step_up", "require_step_up_action"}, (
         f"the gate families charging the admin-write floor changed: {sorted(factories)}. Name them all "
         "in docs/SECURITY.md's anti-automation paragraph."
     )
@@ -797,7 +810,11 @@ def test_users_manage_write_pacing_exemptions_are_named_exactly() -> None:
     doc's own Route -> limiter map already files it under "No limiter of any kind". Derived here, so
     promoting a SECOND route to an action gate reds CI instead of quietly widening the overstatement.
     """
-    charging = {"require_paced", "require_step_up"}
+    # BACKLOG #1148 added require_step_up_action to the charging families. That CLOSED the last
+    # exemption rather than adding a third: PATCH /users/{user_id} had lost the floor when it was
+    # promoted to that gate, so pacing the gate paces it again and the expected set is now EMPTY.
+    # DERIVED, not listed -- see _pacing_charging_factories for what a hardcoded set failed to see.
+    charging = _pacing_charging_factories()
     routes = _users_manage_routes()
     assert routes, "no route carries Permission.USERS_MANAGE any more"
     unpaced = {
@@ -805,7 +822,7 @@ def test_users_manage_write_pacing_exemptions_are_named_exactly() -> None:
         for route, gates in routes.items()
         if not route.startswith("GET ") and not (gates & charging)
     }
-    assert unpaced == {"PATCH /users/{user_id}"}, (
+    assert unpaced == set(), (
         f"the set of non-GET `users:manage` routes charging NO admin-write pacing changed: "
         f"{sorted(unpaced)}. docs/SECURITY.md's `require_step_up` bullet names the exemptions "
         "explicitly — update it in the same change."
