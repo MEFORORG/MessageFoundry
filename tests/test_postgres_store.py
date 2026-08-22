@@ -3406,7 +3406,7 @@ async def test_summary_access_census_survives_and_coalesces_pg(store) -> None:
     await c.note(store, "alice", "ch1", 1, 3600.0)  # hour 1 -> flush hour-0 window (count 5)
     rows = [r for r in await store.list_audit() if r["action"] == "summary_access"]
     assert len(rows) == 1
-    assert json.loads(rows[0]["detail"]) == {"count": 5, "window_start": 0}
+    assert json.loads(rows[0]["detail"]) == {"count": 5, "masked": 0, "window_start": 0}
     assert rows[0]["actor"] == "alice" and rows[0]["channel_id"] == "ch1"
 
     await c.note(store, "bob", "", 4, 3600.0)  # hour 1, scope "" -> channel_id NULL
