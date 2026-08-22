@@ -12687,9 +12687,28 @@ rather than configuring one of ours; refusing an unlisted-but-sound suite there 
 anything, it would stop an operator describing their proxy accurately. The three property checks
 still bind on that field.
 
-**The residual above is unchanged and still open:** this covered the operator-facing knob and the
-shipped context builder. It did not enumerate every `SSLContext` construction, and it does not reach
-suite sets chosen inside `ldap3`, `hvac` or ODBC Driver 18. One instrument note worth carrying: the
+**The residual above is NOW CLOSED for first-party constructions, 2026-08-22.** It read: this covered
+the operator-facing knob and the shipped context builder, did not enumerate every `SSLContext`
+construction, and does not reach suite sets chosen inside `ldap3`, `hvac` or ODBC Driver 18. **The
+enumeration half is now done and every first-party site asserts** -- the OIDC identity-provider
+opener, the syslog TLS forwarder (both arms, including `tls_verify=False`), the Postgres store
+(pinned-CA and verification-disabled arms), the SOAP mutual-TLS opener, the alert webhook, and the
+shared REST/FHIR/DICOMweb opener family. **The library half is unchanged and still open:** `ldap3`,
+`hvac` and ODBC Driver 18 choose their own suites and no engine object exists to assert on.
+**TWO FIRST-PARTY SITES ARE DELIBERATELY NOT ASSERTED, each with its reason in the code**, so a later
+reader does not "fix" them: the TLS floor probe below, and the Postgres `ssl=True` default arm, where
+asyncpg builds the context and asserting a look-alike here would grade an object the connection never
+uses. Closing that arm changes what asyncpg receives on the DEFAULT store path and is a separate
+decision, not a rider.
+**THE INSTRUMENT THAT GUARDED THIS RESIDUAL COULD NOT SEE IT.** `tests/test_tls_policy.py` derives its
+call-site list from the presence of `harden_kex_groups(` in a file, so it can only find a HALF-hardened
+site -- one that pins key-exchange groups but skips the cipher assertion. Every site listed above called
+neither helper, so the scan passed over all of them in silence. `tests/test_tls_cipher_assertion_sites.py`
+is the other half: one test per site, each proving the call is REACHED rather than merely present.
+**THE WORK WAS RECOVERED, NOT REDONE.** It was built by a workflow whose parent session's Claude account
+was cancelled on 2026-08-22 at 16:56Z while its full-suite run was in flight; the tree was stranded
+uncommitted in a locked worktree. It has been replayed onto current `main` (which had moved two commits,
+including this item's own build) and re-verified there. One instrument note worth carrying: the
 startup TLS probe's `ALL:@SECLEVEL=0` context (140 suites, 12 anonymous) was examined and
 DELIBERATELY LEFT ALONE -- the security level is load-bearing there, because without it the probe
 would measure the engine's own refusal to offer rather than a peer's refusal to accept, turning a
@@ -12710,3 +12729,38 @@ which both readings of the cell now require.
 
 **Cluster:** Security record integrity / evidence hygiene. **Priority:** P3. **Verdict:** build.
 **Severity:** no engine-runtime effect and no deployment axis (sec. 0). This is evidence quality in the security record: more than half its citation surface has never been read by any gate, so a reader cannot distinguish a citation that still points at its subject from one that merely points at a line that still exists.
+
+## 1319. the demote-teardown source-phase timing assertion is wall-clock and fails on a loaded ubuntu runner
+
+> 🔢 **Filed 2026-08-22, recovered from a session cut off mid-measurement when its account was cancelled.** Value **5/10** -- Difficulty **2/10** -- _quick win_. [`tests/test_adr0157_demote_teardown.py:106`](../tests/test_adr0157_demote_teardown.py) asserts `elapsed < 1.5` on a wall clock. It failed on `main` at `2d1c89e6` -- CI run `32580332076`, leg `test (ubuntu-latest, py3.14)` -- reporting `source phase took 1.92s`. **That commit was docs-only (#515), so nothing in the tree under test could have moved the number.** **THE CHANGE: assert the CONCURRENCY WIDTH the test is actually about, not the elapsed time it currently infers it from.**
+> **THE THRESHOLD IS NOT MERELY TIGHT -- IT SITS 0.13s BELOW THE MUTATION IT EXISTS TO CATCH.** Four implementations, 200 sources at 0.4s under a 3.0s budget, measured rather than reasoned about:
+>
+> | implementation | elapsed | finished | started at 50ms | `elapsed < 1.5` | `all(stop_finished)` |
+> | --- | --- | --- | --- | --- | --- |
+> | shipped, max-shaped | 0.40s | 200/200 | 200/200 | PASS | PASS |
+> | MUTANT sequential loop | 3.01s | 7/200 | 1/200 | FAIL | FAIL |
+> | MUTANT semaphore(8) | 3.00s | 56/200 | 8/200 | FAIL | FAIL |
+> | MUTANT semaphore(64) | **1.63s** | 200/200 | 64/200 | FAIL | **PASS** |
+>
+> **THE SEMAPHORE(64) ROW IS THE ITEM.** Every source finishes, so `all(stop_finished)` passes and `_pending_source_stops` is empty. The wall-clock bound is the ONLY assertion that catches it -- which is why this cannot be fixed by raising the threshold. The discriminating band is `(0.40, 1.63)` and the bound sits at `1.50`.
+> **SO ON THE FAILING RUN THE TEST WAS NOT MERELY RED, IT WAS INCAPABLE.** CI measured **1.92s for the shipped implementation** -- above the 1.63s the semaphore(64) mutant produces. For the duration of that load the correct code was SLOWER than the defect the assertion is written to detect, so no threshold in the band could have separated them. A flake that reddens is a nuisance; an instrument that cannot discriminate while it is loaded is the same class as #1290's walk failing before its regression assertion runs.
+> **LOCAL CONTROL, and it isolates the cause to the runner rather than the tree.** Seven consecutive runs on a Windows box **while the full suite ran concurrently**: `0.40 0.41 0.40 0.41 0.41 0.41 0.41`. So the floor is the 0.4s sleep plus roughly 10ms of scheduling, and CI's 1.92s is about 1.5s of runner latency spread across 200 tasks -- a 4.7x inflation of the overhead term, not a property of the code.
+> **THE FIX IS ALREADY AVAILABLE IN THE TEST DOUBLE AND NEEDS NO NEW TIMING.** `_Source` records `stop_started`. Sampling how many sources have started before any completes separates all four rows above -- 200 / 1 / 8 / 64 -- with no dependence on how fast the runner is. It is also the stronger assertion on its own terms: `_stop_sources_demote` creates every task eagerly before its first `await`, and [`wiring_runner.py:2645`](../messagefoundry/pipeline/wiring_runner.py) says so in its own docstring (*"Tasks are created eagerly, outside any gate"*), so *all N started* is a property of the shipped design rather than of the box. Keep a generous wall-clock bound underneath if a second signal is wanted, but it must stop being the discriminator.
+> **WHAT IS NOT ESTABLISHED, stated so nobody reads more into it.** This is **at least one** observed failure. The rate under runner load was never measured, no re-run of the same head was recorded before the session ended, and no cross-branch pair like #1290's was collected. The mutation table above is the strong evidence here; the frequency is not.
+> **DO NOT MERGE THIS INTO #1290 -- same cluster, different failure.** #1290 is a process-table walk on hosted **Windows** that never completes, so its regression assertion never runs. This is a **ubuntu** bound that a fully completed, correct run exceeds. Neither fix touches the other's file.
+
+**Cluster:** CI reliability / teardown tests. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- `tests/` ships in no engine path. The cost is that a required context can redden on `main` from runner load alone, and that while it is loaded the test cannot perform the discrimination it was written for.
+
+## 1322. the serverdb path gate lists the tests but not the sources they assert against, so an api/ change strands the DB legs
+
+> 🔢 **Filed 2026-08-22 -- not started. Found by the liaison, verified independently against `origin/main` by the filing seat.** Value **6/10** -- Difficulty **3/10** -- _quick win_. `.github/workflows/ci.yml:1358` computes `serverdb` from a path alternation that decides whether the SQL Server and Postgres legs run on a pull request. **It lists `messagefoundry/store/`, three `pipeline/` modules, `config/(settings|wiring)`, a `transports/` list, a `tests/test_(...)` list and `ci.yml` itself. It does not list `messagefoundry/api/`.** **THE CHANGE: widen the alternation, and widen the stated invariant above it, to the SOURCES those suites assert against -- not only the test files they run.**
+> **THIS IS NOT "MAIN SKIPS THE LEGS", AND THE DISTINCTION IS THE ITEM.** Skipping on push is DELIBERATE and must not be filed as a defect: `ci.yml:1521` reads `if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.serverdb == 'true'`, and its own comment names the *"no-per-merge-run guard"*. Filing that would be filing a billed-minutes decision. The defect is one level down -- the PR arm, which is the only arm that can catch a change before it lands, is selected by a producer set with a hole in it.
+> **THE INVARIANT IS ALREADY WRITTEN AND IS ONE LEVEL TOO NARROW.** `ci.yml:1348`: the alternation *"MUST list every file the sqlserver-store / postgres-store pytest steps below run"*. That binds the TEST files. It does not bind the SOURCE those tests assert against, and `tests/test_postgres_store.py` asserts on a dict built by `messagefoundry/api/app.py::_emit`. A rule that covers the asserting file but not the asserted-on file cannot see this class.
+> **IT HAS ALREADY FIRED, WHICH IS WHY THIS IS A MEASUREMENT AND NOT A HYPOTHETICAL.** #514 (BACKLOG #1187, merged `fdd89b49`) added a `masked` key to the `summary_access` audit detail. It touched `api/app.py`, so `serverdb` evaluated **false**, so the DB legs never ran on its PR; and push never runs them. It merged green leaving `tests/test_postgres_store.py:3409` and `tests/test_sqlserver_store.py:3435` asserting the old two-key shape. The next PR to select those legs inherited three red ones it did not cause -- PR #525, fixed there at `2b6dc1be`.
+> **AND THE ONE LEG THAT DID RUN COULD NOT SEE IT, which is a second, separable weakness worth naming on this row.** The SQLite twin at `tests/test_api.py:587` asserts `'"count": 5' in detail` -- SUBSTRING containment, blind to an added key. The two server-DB twins assert DICT EQUALITY and would have caught it. So the assertion strong enough to catch the change was the one not being run, and the one being run was too weak to notice. Tightening `test_api.py:587` to equality belongs to #1187's owner, not to this row, but a gate widening alone leaves that half standing.
+> **SEVERITY IS BOUNDED AND THE BOUND IS IN THE SAME LINE.** The `schedule` arm of `ci.yml:1521` runs these legs nightly and unconditionally, so the blind window is about a day, not open-ended. What the nightly does not do is stop the merge -- it reports after the fact, on `main`, to whoever reads it.
+> **CONDITIONAL, per section 0:** zero deployments, so nothing shipped is affected. The cost is a merge gate that cannot fail on a class of regression it has tests for, and a red PR handed to whichever unrelated branch selects the legs next.
+
+**Cluster:** CI reliability / path gating. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- this is CI configuration and ships in no engine path. The cost is that server-DB store tests do not run on the pull request that breaks them, and the failure surfaces on an unrelated branch a day later.
