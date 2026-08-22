@@ -110,6 +110,7 @@ tests/test_worktree_gate_interpreter_sigils.py
 tests/test_worktree_gate_quote_straddle.py
 tests/test_worktree_gate_receipts.py
 tests/test_worktree_gate_remedy_families.py
+tests/test_worktree_gate_rule_agnostic_coverage.py
 tests/test_worktree_gate_shell_semantics.py
 tests/test_worktree_gate.py
 tests/test_worktree_new_cleanup_advice.py
