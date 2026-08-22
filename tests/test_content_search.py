@@ -325,7 +325,11 @@ async def test_search_gated_and_redacted(enc_engine: Engine) -> None:
         )
         assert r.status_code == 200, r.text
         msgs = r.json()["messages"]
-        assert msgs and msgs[0]["summary"] == "MRN9001 DOE JANE"  # admin sees summary
+        # The search MATCHED on content ("JANE" in raw) and returned the row -- that is the
+        # assertion. Its summary comes back display-masked, because search results are a census
+        # surface (ASVS 14.2.6); matching happens inside the store BEFORE redaction, so masking the
+        # projection cannot degrade the search. Opening the message is what reveals it.
+        assert msgs and msgs[0]["summary"] == "****"
 
 
 async def test_search_audited_without_phi_needle(enc_engine: Engine) -> None:

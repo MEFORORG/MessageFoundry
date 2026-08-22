@@ -104,6 +104,11 @@ def _offer_context(version: ssl.TLSVersion | None) -> ssl.SSLContext:
         # TLS 1.0 ClientHello at the default security level, so without this the probe would measure
         # OUR refusal to ask rather than THEIR refusal to answer — a false pass.
         ctx.set_ciphers("ALL:@SECLEVEL=0")
+    # DELIBERATELY NOT hardened: harden_cipher_suites would RAISE here, and that is the point. The
+    # ALL:@SECLEVEL=0 offer above resolves to a wide suite list including non-forward-secret suites,
+    # by design, because the probe must be able to ASK. Asserting forward secrecy would empty the
+    # offer and turn a floor probe that can fail into one that cannot. This context carries no
+    # application data and never leaves this module. Do not "fix" it.
     return ctx
 
 

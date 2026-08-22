@@ -84,7 +84,70 @@ PHI_FIELDS: dict[type[BaseModel], dict[str, Permission]] = {
     },
 }
 
+#: Properties whose *authorized* value is still display-masked until a reveal act (ASVS 14.2.6).
+#: Authorization and reveal are two different decisions: permission says the caller MAY see the
+#: value, a reveal says they asked for THIS one. Only ``summary`` today, which is the subject that
+#: was allocated.
+#:
+#: **``metadata`` carries the same ingest-derived MRN/patient-name PHI** (see ``PHI_FIELDS`` above)
+#: and is the obvious next candidate — named here rather than silently included or silently left
+#: out, because masking one field while the same identifiers return complete one field over is a
+#: partial control that reads as a whole one.
+MASKED_UNTIL_REVEALED: frozenset[str] = frozenset({"summary"})
+
+#: What a masked run is replaced with. ASCII on purpose (the no-glyph rule), and a fixed width so
+#: the mask never leaks the length of what it hides.
+_MASK = "****"
+
+#: How many trailing characters of an identifier survive the mask. Four is enough to confirm a
+#: record you already identified and not enough to read a census off a screen opened for another
+#: reason — which is precisely the exposure 14.2.6 describes, and the one the triage objection was
+#: measured against (search matches inside the store, before redaction, so finding a known patient
+#: is unaffected).
+_KEEP_TAIL = 4
+
 M = TypeVar("M", bound=BaseModel)
+
+
+def mask_for_display(summary: str) -> str:
+    """Mask the identifiers in a composed summary, keeping it recognizable but not enumerable.
+
+    ``MRN 100001 · DOE, JANE`` becomes ``MRN ****0001 · D**, J**``. The separator, the labels and
+    the shape survive so the row still reads as a row; the values do not.
+
+    Structure comes from :func:`messagefoundry.parsing.summary.summarize` — parts joined by
+    ``" · "``, each either ``<label> <value>`` for an identifier or a bare ``FAMILY, GIVEN``
+    name. An unrecognized part is masked whole rather than passed through: an unknown shape is the
+    case where guessing wrong leaks, so the default is to hide it.
+    """
+    if not summary:
+        return summary
+    return " · ".join(_mask_part(p) for p in summary.split(" · "))
+
+
+def _mask_part(part: str) -> str:
+    label, sep, value = part.partition(" ")
+    if sep and label in _IDENTIFIER_LABELS:
+        return f"{label} {_mask_tail(value)}"
+    if "," in part:  # FAMILY, GIVEN -- keep each initial so the row stays scannable
+        return ", ".join(_mask_name(n.strip()) for n in part.split(","))
+    return _MASK
+
+
+def _mask_tail(value: str) -> str:
+    """Keep the last :data:`_KEEP_TAIL` characters; mask the rest at fixed width."""
+    return f"{_MASK}{value[-_KEEP_TAIL:]}" if len(value) > _KEEP_TAIL else _MASK
+
+
+def _mask_name(name: str) -> str:
+    """Keep one initial. An empty component stays empty rather than becoming a bare mask."""
+    return f"{name[0]}{_MASK[:2]}" if name else name
+
+
+#: Labels :func:`~messagefoundry.parsing.summary.summarize` puts in front of an identifier value.
+#: Kept beside the masker so the two move together; a label added there and not here degrades to
+#: the whole-part mask, which is the safe direction.
+_IDENTIFIER_LABELS = frozenset({"MRN", "Order", "Acc"})
 
 
 def gated_properties(model_cls: type[BaseModel]) -> dict[str, Permission]:
@@ -92,7 +155,12 @@ def gated_properties(model_cls: type[BaseModel]) -> dict[str, Permission]:
     return PHI_FIELDS.get(model_cls, {})
 
 
-def redact_unauthorized(model: M, identity: Identity) -> M:  # noqa: UP047
+def redact_unauthorized(  # noqa: UP047
+    model: M,
+    identity: Identity,
+    *,
+    revealed: frozenset[str] = frozenset(),
+) -> M:
     """Return ``model`` with each PHI property the caller may **not** see set to ``None``, and the
     rest **released** for serialization. The single per-property read gate (ASVS 8.2.3).
 
@@ -100,6 +168,17 @@ def redact_unauthorized(model: M, identity: Identity) -> M:  # noqa: UP047
     every gated property from JSON until an authorization decision is recorded on the instance, so
     this call is what turns a permitted property back on rather than what turns a forbidden one off.
     A route that never calls it returns ``null`` for all of them.
+
+    **Authorization is not reveal (ASVS 14.2.6).** A permitted property in
+    :data:`MASKED_UNTIL_REVEALED` is display-masked unless this call names it in ``revealed``. That
+    is two decisions, not one: the permission says the caller MAY see such values, the reveal says
+    they asked for THIS record's.
+
+    ``revealed`` is a **per-call argument with no stored counterpart anywhere** — deliberately, and
+    it is the whole design. A reveal held on the session, the identity or the module would be a
+    *status* rather than an *act*, which renders every row on screen for as long as it is set. Being
+    a parameter, it cannot outlive the call that passed it, so the leak is impossible by
+    construction rather than prevented by review.
     """
     gated = gated_properties(type(model))
     if not gated:
@@ -107,16 +186,53 @@ def redact_unauthorized(model: M, identity: Identity) -> M:  # noqa: UP047
     allowed = {prop for prop, perm in gated.items() if identity.has(perm)}
     # Still null the values, so `count_exposed` and any server-side read of the returned model agree
     # with what is actually serialized. The serializer alone would leave the attribute populated.
-    withheld: dict[str, None] = {prop: None for prop in gated if prop not in allowed}
+    withheld: dict[str, object | None] = {prop: None for prop in gated if prop not in allowed}
+    masked: set[str] = set()
+    for prop in allowed & MASKED_UNTIL_REVEALED - revealed:
+        value = getattr(model, prop, None)
+        if isinstance(value, str) and value:
+            withheld[prop] = mask_for_display(value)
+            masked.add(prop)
     out = model.model_copy(update=withheld)
     if isinstance(out, PhiGatedModel):
         out.release_phi(allowed)
+        # Only properties actually replaced with a mask -- an empty value is not masked, it is
+        # empty, and marking it would make `count_exposed` skip a property that later becomes real.
+        out.mark_phi_masked(masked)
     return out
 
 
 def count_exposed(models: Sequence[BaseModel]) -> int:
-    """How many ``models`` still carry a non-empty PHI property — call **after** redaction, so the
-    count reflects what is actually returned. Fed to the server-side PHI-exposure audit."""
+    """How many ``models`` still carry a READABLE PHI property — call **after** redaction, so the
+    count reflects what is actually returned. Fed to the server-side PHI-exposure audit.
+
+    A **display-masked** property is not an exposure and is not counted (ASVS 14.2.6). It is
+    non-empty, so counting on emptiness alone would report a PHI exposure for every masked list row
+    and bury the record someone actually opened. The mask is read from the model's own record of
+    what it masked, never inferred from the value -- a real summary may contain the mask characters.
+    """
+
+    return sum(1 for m in models if _has_readable_phi(m))
+
+
+def count_masked(models: Sequence[BaseModel]) -> int:
+    """How many ``models`` carry a display-masked PHI property and nothing readable.
+
+    The other half of the exposure audit. A masked row is not a disclosure, but it is still a row
+    someone asked for -- so a bulk list fetch has to stay visible in the audit even though it
+    harvested no identifiers. Counting only :func:`count_exposed` would make a 5,000-row scrape
+    indistinguishable from no request at all, which is the harvest signal the audit exists to keep.
+    """
     return sum(
-        1 for m in models if any(getattr(m, prop, None) for prop in gated_properties(type(m)))
+        1
+        for m in models
+        if not _has_readable_phi(m)
+        and isinstance(m, PhiGatedModel)
+        and any(getattr(m, p, None) for p in m._phi_masked)
     )
+
+
+def _has_readable_phi(m: BaseModel) -> bool:
+    """True when any gated property is non-empty AND not display-masked."""
+    masked = m._phi_masked if isinstance(m, PhiGatedModel) else frozenset()
+    return any(getattr(m, p, None) for p in gated_properties(type(m)) if p not in masked)
