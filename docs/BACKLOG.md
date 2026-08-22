@@ -8815,6 +8815,48 @@ The JWKS floor is real, is unfiled, and is named here by subject rather than by 
 
 **OWNER RULING 2026-08-22 -- split three ways; only one third needs a ruling at all.** The packet framed one hospital-peer interop judgement. The re-scoping found **33 distinct composition sites spanning the 45 hop rows of the CI-enforced communications inventory**, across four protocol families, and the interop rationale reaches only TLS on MLLP and DICOM. (1) **SSH is ordinary in-house work, not a ruling:** drop two non-EtM MAC names from a frozenset the product already maintains, and pass a `"cipher"` key beside the `"mac"` key it already passes. Take it. (2) The **MLLP and DICOM** interop question stands on its own merits as the packet intended. (3) **LDAPS, Vault and the SQL Server TDS hop** choose their suites inside `ldap3`, `hvac` or ODBC Driver 18, where the engine has no reach -- those rows get a terminal state. A single uniform policy was rejected because it would commit the engine to a guarantee it cannot keep on nine of the rows.
 
+
+**BUILT 2026-08-22 -- and the build found that the CONTROL ALREADY ON MAIN WAS INERT.** That second
+part matters more than the first and is why this note leads with it.
+
+**The inert control.** `_SftpClient._connect` passed `disabled_algorithms = {"mac": ...}`. paramiko
+reads **`"macs"`**. Its `Transport._filter_algorithm` does `self.disabled_algorithms.get(type_, [])`
+and is called with `"ciphers"`, `"macs"`, `"keys"`, `"pubkeys"`, `"kex"` and `"compression"` -- so a
+singular key matched nothing, `.get` returned the empty default, and every weak algorithm stayed on
+the wire. paramiko neither validates the keys nor warns about an unknown one, so nothing reported a
+problem. **The MAC restriction shipped as decoration from the day it landed, and any ASVS 11.4.1
+claim resting on it was unsupported.**
+
+Proved by a REAL handshake, not by reading: both ends real paramiko 5.0.0 over a socketpair, driving
+the shipped `_connect` with only `SSHClient` replaced by a recorder, against a server pinned to
+`3des-cbc` and `hmac-md5`. The handshake **COMPLETED** and negotiated exactly those. Positive control
+in the same run, the same derived deny-lists under the plural keys: negotiation **REFUSED**
+(`IncompatiblePeer`). Good-input control, plural keys against a default server: completed on
+`aes128-ctr` and `hmac-sha2-256-etm@openssh.com`.
+
+**Why no test caught it, which is the reusable part.** The tests read `["disabled_algorithms"]["mac"]`
+-- the same wrong key production wrote -- then recomputed the subtraction by hand against a fake.
+Test and code agreed on a fiction. Their "cannot pass vacuously" guard was built for the wrong
+failure mode: it fires on an EMPTY deny list, the renamed-attribute case, while a WRONG KEY produces
+a fully populated deny list that paramiko silently ignores. **A test that models a library's
+semantics instead of invoking them cannot see a disagreement about the interface.**
+
+**What now ships.** The keys are plural. `_APPROVED_SFTP_MACS` drops the two Encrypt-and-MAC names,
+keeping only the two `-etm@openssh.com` entries, because composition order rather than hash strength
+is what this cell asks about. A new `_APPROVED_SFTP_CIPHERS` allow-list admits the two AES-GCM and
+three AES-CTR names and excludes the four CBC and 3DES ones paramiko 5.0.0 would otherwise propose
+(CVE-2008-5161 for CBC; Sweet32 and roughly 112-bit strength for 3DES). Allow-list, not deny-list, so
+forgetting to approve a future algorithm EXCLUDES it -- wrong in the safe direction.
+
+**The regression guard runs everywhere, including where paramiko is absent**, which is what this
+repository's CI test legs actually use. It pins the exact key set the connector passes and asserts
+each key is one paramiko consults. Restoring the shipped singular keys turns four tests RED; three
+further mutations (single key reverted, cipher arm deleted, a CBC name approved) each turn it red
+too, with zero vacuous.
+
+**Residual.** The live fixture-fidelity check still skips where the `[sftp]` extra is absent, so the
+literal key set is pinned locally but compared against the real library only where it is installed.
+Nothing here touches the TLS/FTPS context in the same module, which was already hardened.
 ## 1171. research an honest pass for ASVS 11.4.1 -- SHA-1 TOTP and a keyed BLAKE2b de-identification seed
 
 > 🚧 **IN PROGRESS 2026-08-22 -- builder-2 lane**, banner written by the dispatcher: `BUILDER.md:253` puts banner flips outside a builder's lane and the lane-vs-broadcast expiry at `:257` is ambiguous enough that two builders read it differently, so this seat wrote it rather than leave the double-build hazard uncovered. The alerts cleartext-credential refusal is committed; the AUTH-mechanism restriction is not yet landed. **Not a closure.**
