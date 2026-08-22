@@ -21,7 +21,6 @@ import pytest
 from pydantic import ValidationError
 
 from messagefoundry.auth import reconcile
-from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.ldap import AdPrincipal, LdapError
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
@@ -83,8 +82,23 @@ class _FakeLdap:
 async def _signed_in_ad_user(
     service: AuthService, store: MessageStore, username: str
 ) -> str | None:
-    """Log ``username`` in over the AD path and return the minted token."""
-    return (await service.login(username, "pw", provider=AuthProvider.AD)).token
+    """Mint an AD-stamped session for ``username`` and return the token.
+
+    These tests need an AD SESSION, never the simple-bind pathway that used to produce one -- that
+    pathway is retired (BACKLOG #1137) and ``login(provider=AD)`` now refuses. They go through
+    ``_complete_ad_login``, which is the shared tail of the surviving paths: Kerberos and OIDC both
+    end here, and it is what stamps the session ``AuthProvider.AD``. Calling it directly avoids
+    faking a SPNEGO token for a test whose subject is the reconciler, not the login mechanism.
+    """
+    ldap = service._ldap
+    principal = ldap.resolve_principal(username)  # type: ignore[union-attr]
+    assert principal is not None, f"the fake directory holds no principal for {username!r}"
+    token = (await service._complete_ad_login(principal, None, mfa_verified=True)).token
+    # Forget the SETUP probe. Several tests assert on `probes` to prove the reconciler did or did
+    # not reach the directory, and a fixture that leaves its own round trip in that list makes the
+    # instrument read the fixture instead of the subject.
+    ldap.probes.clear()  # type: ignore[union-attr]
+    return token
 
 
 # --- the pure decision layer -------------------------------------------------
