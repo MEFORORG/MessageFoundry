@@ -12721,9 +12721,44 @@ which both readings of the cell now require.
 
 ***THE GATE CANNOT CATCH IT, AND THAT IS THE SHARPER HALF.*** `tests/test_scaffold.py` and `tests/test_scaffold_requirements.py` call `load_settings` **ZERO** times -- **positive control: 58 test files in the suite DO call it**, so the query fires and the absence is real. Those tests assert **string presence** in the generated TOML. ***A test asserting the presence of a string the loader rejects CERTIFIES the defect rather than catching it.***
 
+***AMENDED 2026-08-22: the writer set is THREE files, not one.*** `scaffold.py` writes
+`messagefoundry.toml`, `environments/dev.toml` and `environments/prod.toml`. *This item was filed as
+though there were a single template; a builder's census over the complete writer set corrected it.*
+**The other two carry ZERO relocated keys for a STRUCTURAL reason rather than a lucky one** -- they are
+flat `env()` VALUE files, not settings sections, so no `(section, key)` pair CAN match. *A zero with a
+reason cannot silently become nonzero when someone adds a key; a zero without one can.* **Population:
+1 active, 3 armed, measured over all three writers.**
+
+***AND THE ONE-LINE DIAGNOSIS IS THE BUILDER'S: "the scaffold did not change -- the LOADER did."*** The
+ADR 0118 relocation swept the docs and the settings and never swept the one place that WRITES a config.
+**That is why the test gate matters more than the template line:** the gate is what makes the NEXT
+relocation fail loudly instead of shipping. ***See [#1320](#1320) -- the gate defect found while sizing
+this fix is larger than this item and independently true.***
+
 **Three more are latent in the same template**, commented out with instructions to uncomment: `[egress].deny_by_default`, `[ai].data_class`, `[ai].production`. **Each becomes this same failure the moment an operator follows the line printed beside it.**
 
 **The fix has two shapes and the item does not choose between them:** emit the replacement key (`local_access_only` / `listen_address`) instead of the relocated one, or comment the emission as the other three are. **Whichever is chosen, the test gap is the part that must not survive** -- a scaffold test that never loads what the scaffold wrote can only ever assert that the generator did what the generator does.
 
 **Source:** measured by the ASVS Tracker, independently verified by the Liaison, and re-verified here before filing. **One citation was corrected in that chain:** the emitting file is `messagefoundry/scaffold.py`, not `messagefoundry/config/scaffold.py`. Symbols above; base engine `origin/main` at the tip carrying #1317.
+
+## 1320. messagefoundry check cannot fail on an unloadable service config -- it catches the refusal and reports skipped
+
+> 🔢 **Filed 2026-08-22 - not started.** Value **9/10** · Difficulty **3/10** · _quick win_. **The commit and CI gate LOADS a refused config, RECEIVES the exact refusal, PRINTS it, and returns rc=0 as a SKIP.** Value 9 because it is not one bug -- no config error of this class has ever been failable; difficulty 3 because the fix is to distinguish two states the `except` clause currently merges.
+
+**Cluster:** Tooling / gates. **Priority:** P1. **Verdict:** build.
+**Severity:** no exposure. **On first deployment**, and in CI today, a service config that cannot load would pass `messagefoundry check` rather than failing it.
+
+***THE GATE IS NOT BLIND. IT SEES THE DEFECT AND DOWNGRADES IT.*** `checks.py` wraps `load_settings` in `except (FileNotFoundError, ValueError, ValidationError, OSError)` and returns `ok=True, skipped=True` at **three** sites -- posture, build-check, and alert-smtp-tls. `_reject_relocated_keys` raises `ValueError`, so all three catch it. Captured output: `skip posture: settings did not load: [api].host moved to [security].local_access_only ...` with **rc = 0**.
+
+**So the existing test CERTIFIES the defect.** `tests/test_scaffold.py::test_scaffolded_config_passes_check` runs `messagefoundry check` over a freshly scaffolded repo and asserts `rc == 0`. It passes on a config the loader refuses.
+
+***THE FIX IS A DISTINCTION, NOT A CATCH LIST: ABSENT is a legitimate skip. PRESENT-BUT-REFUSED is not.*** The `except` renders two states identically, and they have opposite remedies -- **the same two-states-one-signal shape this repo already records for `goalPromptedAt`**, where *asked and ignored* versus *never asked* rendered the same and had opposite fixes.
+
+**Scope.** A config file that is **missing** should still skip. A config file that **exists and fails to load** should **fail**, at all three sites. **And the skip must PRINT what it skipped and why** -- the capture above proves the cause is already in hand and only the exit code discards it. *A reader seeing "posture: skipped" learns nothing; "posture skipped BECAUSE the config was refused" is the whole difference.*
+
+**The test must redden first.** `test_scaffolded_config_passes_check` asserts `rc == 0` today and passes on a broken config. **A change that does not fail that exact test before fixing it has not moved the gate from certifying to checking.**
+
+**Relationship to [#1318](#1318):** #1318 is the instance -- `init` writes a config the loader rejects. **This is the class**, and it is independently true: fix the scaffold template and `check` still cannot fail on any other unloadable config.
+
+**Source:** found by a builder while sizing #1318's fix, and it corrected the framing of its own earlier report -- they had repeated a peer's "the tests never load the file" finding without running it, then ran it and found one does, through `check`. **The correction made the finding sharper, not smaller: not a missing gate, a gate that downgrades.** Symbols above; base engine `origin/main` a530d4ea.
 
