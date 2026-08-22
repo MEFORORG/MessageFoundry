@@ -1027,16 +1027,59 @@ def _crl_material(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
         )
         return builder.sign(key, hashes.SHA256()).public_bytes(serialization.Encoding.PEM)
 
+    def leaf(cn: str, serial: int, *, server: bool) -> tuple[bytes, bytes]:
+        """A CA-issued leaf. `serial` 4000 is the one the CRL above revokes."""
+        lk = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        oid = (
+            x509.oid.ExtendedKeyUsageOID.SERVER_AUTH
+            if server
+            else x509.oid.ExtendedKeyUsageOID.CLIENT_AUTH
+        )
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)]))
+            .issuer_name(ca.subject)
+            .public_key(lk.public_key())
+            .serial_number(serial)
+            .not_valid_before(now - day)
+            .not_valid_after(now + 90 * day)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.ExtendedKeyUsage([oid]), critical=False)
+        )
+        if server:
+            builder = builder.add_extension(
+                x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False
+            )
+        cert = builder.sign(key, hashes.SHA256())
+        return (
+            cert.public_bytes(serialization.Encoding.PEM),
+            lk.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            ),
+        )
+
     ca_pem = ca.public_bytes(serialization.Encoding.PEM)
-    paths = {
-        "ca_only": tmp / "ca_only.pem",
-        "ca_and_fresh": tmp / "ca_and_fresh.pem",
-        "ca_and_expired": tmp / "ca_and_expired.pem",
-    }
-    paths["ca_only"].write_bytes(ca_pem)
-    paths["ca_and_fresh"].write_bytes(ca_pem + crl(now + 30 * day))
-    paths["ca_and_expired"].write_bytes(ca_pem + crl(now - day))
-    return {k: str(v) for k, v in paths.items()}
+    out: dict[str, str] = {}
+
+    def put(name: str, data: bytes) -> None:
+        p = tmp / name
+        p.write_bytes(data)
+        out[name.split(".")[0]] = str(p)
+
+    put("ca_only.pem", ca_pem)
+    put("ca_and_fresh.pem", ca_pem + crl(now + 30 * day))
+    put("ca_and_expired.pem", ca_pem + crl(now - day))
+    for cn, serial, is_server, stem in (
+        ("localhost", 2000, True, "server"),
+        ("good-client", 3000, False, "good"),
+        ("revoked-client", 4000, False, "revoked"),
+    ):
+        cert_pem, key_pem = leaf(cn, serial, server=is_server)
+        put(f"{stem}.pem", cert_pem)
+        put(f"{stem}_key.pem", key_pem)
+    return out
 
 
 def _verifying_ctx() -> ssl.SSLContext:
@@ -1075,3 +1118,82 @@ def test_harden_crl_check_refuses_a_missing_file(tmp_path: Path) -> None:
     # construction is the whole reason this item is sized 5 rather than 3.
     with pytest.raises(ValueError, match="does not exist"):
         harden_crl_check(_verifying_ctx(), str(tmp_path / "nope.pem"))
+
+
+def _crl_handshake(crl_bundle: str | None, client_stem: str, mat: dict[str, str]) -> str:
+    """Complete one real mTLS handshake. Returns "ACCEPTED" or the OpenSSL refusal reason.
+
+    TLS 1.2 is pinned so client authentication happens IN the handshake and the server-side
+    outcome is unambiguous -- under 1.3 the client cert arrives after the server has finished and
+    the failure surfaces on a later read instead.
+    """
+    import socket
+    import threading
+
+    srv_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    srv_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    srv_ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    srv_ctx.load_cert_chain(mat["server"], mat["server_key"])
+    srv_ctx.verify_mode = ssl.CERT_REQUIRED
+    srv_ctx.load_verify_locations(cafile=mat["ca_only"])
+    if crl_bundle is not None:
+        harden_crl_check(srv_ctx, crl_bundle)
+
+    cli_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    cli_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    cli_ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    cli_ctx.load_verify_locations(cafile=mat["ca_only"])
+    cli_ctx.load_cert_chain(mat[client_stem], mat[f"{client_stem}_key"])
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    box: dict[str, str] = {}
+
+    def accept() -> None:
+        try:
+            conn, _ = listener.accept()
+            with srv_ctx.wrap_socket(conn, server_side=True):
+                box["result"] = "ACCEPTED"
+        except ssl.SSLError as exc:
+            box["result"] = str(exc)
+        except OSError as exc:  # pragma: no cover - transport teardown race
+            box["result"] = f"OSError: {exc}"
+
+    thread = threading.Thread(target=accept)
+    thread.start()
+    with (
+        contextlib.suppress(OSError, ssl.SSLError),
+        socket.create_connection(("127.0.0.1", port), timeout=10) as sock,
+        cli_ctx.wrap_socket(sock, server_hostname="localhost"),
+    ):
+        pass
+    thread.join(timeout=10)
+    listener.close()
+    return box.get("result", "NO SERVER RESULT")
+
+
+def test_a_revoked_client_is_refused_by_a_crl_checked_context(
+    _crl_material: dict[str, str],
+) -> None:
+    # THE CLAIM THAT MATTERS. Every other test in this block asserts that a flag is set or that a
+    # bad input is refused; none of them establishes that revocation actually happens. This drives
+    # a real mTLS handshake with a certificate the CRL names.
+    result = _crl_handshake(_crl_material["ca_and_fresh"], "revoked", _crl_material)
+    assert "revoked" in result.lower(), result
+
+
+def test_a_good_client_is_accepted_by_the_same_context(_crl_material: dict[str, str]) -> None:
+    # POSITIVE CONTROL, and it is what separates a working revocation check from a context that
+    # refuses everyone -- which is exactly what trap 1 produces and what a flag assertion cannot
+    # tell apart.
+    assert _crl_handshake(_crl_material["ca_and_fresh"], "good", _crl_material) == "ACCEPTED"
+
+
+def test_without_the_crl_the_revoked_client_gets_in(_crl_material: dict[str, str]) -> None:
+    # THE GAP ITSELF, pinned as a NEGATIVE CONTROL. This is the shipped posture the item is filed
+    # against: CA loaded, CERT_REQUIRED set, no CRL -- and a certificate revoked this morning
+    # authenticates until its notAfter. If this ever starts failing, revocation arrived by some
+    # other route and the item's premise needs re-deriving rather than the test relaxing.
+    assert _crl_handshake(None, "revoked", _crl_material) == "ACCEPTED"
