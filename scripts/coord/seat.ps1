@@ -95,6 +95,9 @@ param(
     [Parameter(ParameterSetName = 'Prompt')][string]$DerivedSeat,
     # Only for tests and for -Declare from a different cwd. Normally derived.
     [string]$Worktree,
+    # Precedence for the record's session key, highest first: this parameter, then the hook's stdin
+    # payload session_id, then $env:CLAUDE_CODE_SESSION_ID, then the literal 'nosid'. See
+    # Get-SessionKey -- the env rung is what keeps a CLI -Declare on the same record as the hooks.
     [string]$SessionId
 )
 
@@ -180,8 +183,35 @@ function Read-HookPayload {
 function Get-SessionKey {
     param($Payload, [string]$Override)
     $sid = $null
-    if ($Override) { $sid = $Override }
-    elseif ($Payload -and ($Payload.PSObject.Properties.Name -contains 'session_id')) { $sid = [string]$Payload.session_id }
+    $src = $null
+    if ($Override) { $sid = $Override; $src = 'param' }
+    elseif ($Payload -and ($Payload.PSObject.Properties.Name -contains 'session_id')) {
+        $sid = [string]$Payload.session_id; $src = 'payload'
+    }
+    elseif ($env:CLAUDE_CODE_SESSION_ID) {
+        # THE CLI PATH, AND IT IS THE ONE THE BANNER TELLS EVERY SEAT TO RUN. The two hooks read
+        # session_id off their stdin payload and pass it as -SessionId; a person or agent typing
+        # `-Declare -Seat x -Goal "..."` has no payload and no id to type, so before this fell to
+        # 'nosid' -- and the DECLARATION, which is the whole point of the CLI path, landed in a
+        # record attributable to no session.
+        #
+        # Measured 2026-08-21 across the live seats directory: 18 of 21 declarations sat in
+        # nosid.json while the session-keyed record written by the hooks in the SAME BOX read
+        # seat=null, goal=null. fleet.ps1 rendered each of those boxes twice -- once declared and
+        # once NOT-DECLARED -- and nothing reported a problem, because both records were valid.
+        # That is the hollow-record failure CLAUDE.md section 5 exists to prevent, arriving one
+        # layer further in: the schema was fed, and what fed it could not be joined to a session.
+        #
+        # The variable is authoritative rather than a guess: on this session the SessionStart hook
+        # wrote its record with sessionIdSource='param' carrying the id from its payload, and
+        # $env:CLAUDE_CODE_SESSION_ID held THE SAME VALUE. Env is deliberately ranked BELOW the
+        # payload so a hook holding the real thing always wins.
+        #
+        # NOT CLAUDE_CODE_HOST_SESSION_ID, which is a different namespace -- it carries the
+        # `local_`-prefixed id the session-management MCP addresses, and keying records on it
+        # would silently split every box in two all over again.
+        $sid = [string]$env:CLAUDE_CODE_SESSION_ID; $src = 'env'
+    }
 
     if (-not $sid) {
         # THE LITERAL STRING, NOT nosid-<pid>. A hook runs as a pwsh CHILD whose pid changes every
@@ -192,7 +222,7 @@ function Get-SessionKey {
     }
     $clean = $sid -replace '[^A-Za-z0-9._-]', '-'
     if ($clean.Length -gt 80) { $clean = $clean.Substring(0, 80) }
-    return @{ Key = $clean; Id = $sid; Source = if ($Override) { 'param' } else { 'payload' } }
+    return @{ Key = $clean; Id = $sid; Source = $src }
 }
 
 function Get-ConfigRootLabel {
