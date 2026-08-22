@@ -65,7 +65,7 @@ from xml.sax.saxutils import escape as _xml_escape  # nosec B406 — pure string
 from xml.sax.xmlreader import InputSource  # nosec B406 — fed only the hardened, no-DTD parser
 
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.tls_policy import relax_verify_expiry
+from messagefoundry.config.tls_policy import harden_cipher_suites, relax_verify_expiry
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -206,6 +206,10 @@ def _client_cert_opener(
         relax_verify_expiry(
             ctx, host=host
         )  # server chain + hostname still verified; expiry relaxed
+    # Assert forward secrecy LAST, so it sees the final suite list (ASVS 12.1.2). The docstring above
+    # already claimed parity with mllp.py / api/tls.py on the TLS floor; this makes the claim true of
+    # the cipher assertion those siblings also carry.
+    harden_cipher_suites(ctx, connector="SOAP destination (mutual TLS)")
     return urllib.request.build_opener(
         _NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx), *extra_handlers
     )
@@ -466,7 +470,10 @@ class SoapDestination(DestinationConnector):
                     "(mutually exclusive — configure exactly one)"
                 )
             if self._opener is _NO_REDIRECT_OPENER:
-                self._opener = urllib.request.build_opener(_NoRedirectHandler)
+                # _no_redirect_opener, not a bare build_opener: the bare form lets urllib fill in an
+                # HTTPSHandler whose context the engine never names, so the forward-secrecy assertion
+                # cannot reach this hop (ASVS 12.1.2).
+                self._opener = _no_redirect_opener()
             self._opener.add_handler(digest)
 
         # ADR 0015 amendment (#236): body-secret substitution. Parsed last so the credential validation

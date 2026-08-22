@@ -48,6 +48,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.config.tls_policy import (
     HopPosture,
     TrustAnchorPolicy,
+    build_asserted_https_handler,
     build_smtp_tls_context,
     smtp_login_approved,
 )
@@ -274,8 +275,30 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-# A shared opener that never follows redirects; reused for every webhook POST.
-_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+def _build_no_redirect_opener() -> urllib.request.OpenerDirector:
+    """Build the shared webhook opener: verifying https, never follows a redirect.
+
+    The ``HTTPSHandler`` is NAMED rather than left for ``build_opener`` to fill in. urllib's default
+    handler builds its own TLS context, which the engine never held a reference to — so this hop's
+    suite list was inherited and unchecked. :func:`~messagefoundry.config.tls_policy.
+    build_asserted_https_handler` returns that same default handler with its context asserted forward-
+    secret (ASVS 12.1.2). It substitutes nothing: see that function for why replacing the context
+    would have changed the handshake. Handler-for-handler identical to the previous
+    ``build_opener(_NoRedirectHandler)``.
+
+    A named function, not an inline module-level expression, so a test can call the exact construction
+    the shared opener is built from instead of reloading this module.
+
+    Built through the ``tls_policy`` factory so this module still never names ``ssl`` itself, matching
+    the plain-data TLS settings :class:`EmailTransport` carries for the same reason."""
+    return urllib.request.build_opener(
+        _NoRedirectHandler,
+        build_asserted_https_handler(connector="alert webhook destination"),
+    )
+
+
+# The shared opener, reused for every webhook POST.
+_NO_REDIRECT_OPENER = _build_no_redirect_opener()
 
 
 class WebhookTransport:
