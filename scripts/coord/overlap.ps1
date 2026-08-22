@@ -93,6 +93,17 @@ $common = $common.Trim()
 $myRoot = (& git @gitArgs rev-parse --path-format=absolute --show-toplevel 2>$null)
 $myRootNorm = ConvertTo-Norm $myRoot
 
+# THE QUERYING WORKTREE'S OWN HEAD, used below to stop crediting a peer with a commit the caller wrote.
+# Empty when it cannot be resolved, and every use is guarded on that -- see the note at the third
+# intersect term for why the failure direction has to be "report more", not "report less".
+#
+# `-q --verify` and NOT a bare `rev-parse HEAD`. On an unborn branch the bare form prints the literal
+# string "HEAD" on stdout while exiting 128, so a caller that tested the output instead of the exit code
+# would anchor a diff on the word HEAD. Measured: `-q --verify` exits 1 and prints nothing.
+$myHead = ""
+$headOut = (& git @gitArgs rev-parse -q --verify HEAD 2>$null)
+if ($LASTEXITCODE -eq 0 -and $headOut) { $myHead = ([string]$headOut).Trim() }
+
 $cacheFile = Join-Path $common "mefor-coord/overlap-cache.json"
 
 function Get-WorktreeList {
@@ -210,6 +221,40 @@ function Build-Map {
                 $files += @($authored | Where-Object { $still.Contains($_) })
             }
             else { $files += $authored }
+
+            # AND A THIRD TERM: what the peer changed BEYOND WHAT I ALREADY HAVE.
+            #
+            # Both anchors above are origin/main, evaluated inside the peer's worktree, so neither knows
+            # anything about the session asking. A commit the CALLER authored, which the peer inherited
+            # by being cut from the caller's branch, is credited to the peer -- indistinguishable from
+            # work the peer did. Measured 2026-08-22: the gate told a session that handoff.ps1 had been
+            # "CHANGED AND COMMITTED" on a peer's branch and to check its commits. The peer had never
+            # touched the file in a commit it owned; the blob was identical across its whole branch, and
+            # the one commit that authored it was the reader's. So the reader went looking for a peer's
+            # conflicting commit, found only their own, and could only read that as the gate being
+            # broken -- which is how a gate stops being read, and then gets uninstalled.
+            #
+            # Three-dot, so it resolves the merge base and asks the ANCESTRY question. A tree diff
+            # (`<myHEAD> <peerHEAD>`, two arguments) is a different sentence and fails BOTH ways here:
+            # it still flags the inherited file, because our trees genuinely differ in it once I commit
+            # again, AND it credits the peer with files only I have ever touched.
+            #
+            # ADDED, never substituted. Re-anchoring either term above on $myHead would suppress this
+            # false positive and silently restore the squash-merge one: the two-dot term only self-clears
+            # a landed branch because it is measured against origin/main, where the squashed commit
+            # actually is. tests/test_coord_overlap_signals.py pins both directions.
+            #
+            # DEGRADES BY OVER-REPORTING. No $myHead, or a diff that fails, drops the term entirely and
+            # leaves today's wider set -- the same choice the two-dot fallback above makes, for the same
+            # reason: an over-report is loud and annoying, an under-report is a silent collision.
+            if ($myHead) {
+                $beyondMine = @(& git -C $w.Path diff --name-only "$myHead...HEAD" 2>$null)
+                if ($LASTEXITCODE -eq 0) {
+                    $theirs = [System.Collections.Generic.HashSet[string]]::new(
+                        [string[]]$beyondMine, [System.StringComparer]::Ordinal)
+                    $files = @($files | Where-Object { $theirs.Contains($_) })
+                }
+            }
         }
         # --no-optional-locks: a plain `git status` REWRITES the index of the repo it inspects, and this
         # walks every peer worktree -- so merely asking "what is in flight" would mutate other sessions'
@@ -256,7 +301,18 @@ if (-not $Refresh -and (Test-Path -LiteralPath $cacheFile)) {
         $age = ((Get-Date) - [datetime]::Parse($c.at)).TotalSeconds
         # Bound BOTH ways: a cache stamped in the future (clock skew, or a file copied between boxes)
         # would otherwise look eternally fresh and pin a stale map forever.
-        if ($age -ge 0 -and $age -lt $CacheSeconds -and $c.root -eq $myRootNorm) { $map = @($c.rows) }
+        #
+        # KEYED ON $myHead AS WELL AS $myRootNorm, because Files now depends on it. Root alone was NOT
+        # already sufficient, which is worth stating because it looks like it should be: the root is
+        # what identifies the querying worktree, but the third intersect term above is a function of
+        # that worktree's HEAD, and HEAD moves under a fixed root every time the caller commits. Left
+        # out, the map would be answered from a walk computed at the previous HEAD for the rest of the
+        # window. That errs toward over-reporting (an older HEAD yields a merge base no newer, so the
+        # term is no smaller), so it is not a collision risk -- but a cache whose value depends on an
+        # input its key does not name is a cache that lies, and the fix is one field. A cache written
+        # before this field existed reads back as $null, misses, and re-walks once.
+        if ($age -ge 0 -and $age -lt $CacheSeconds -and $c.root -eq $myRootNorm -and
+            [string]$c.head -eq $myHead) { $map = @($c.rows) }
     } catch { $map = $null }
 }
 if ($null -eq $map) {
@@ -272,7 +328,7 @@ if ($null -eq $map) {
         New-Item -ItemType Directory -Force -Path (Split-Path $cacheFile) | Out-Null
         # Last-write-wins on purpose: a duplicate walk is the only cost of a race, and a lock on the
         # hot path of every edit would be worse than the thing it protects.
-        @{ at = (Get-Date).ToString("o"); root = $myRootNorm; rows = $map } |
+        @{ at = (Get-Date).ToString("o"); root = $myRootNorm; head = $myHead; rows = $map } |
             ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cacheFile -Encoding UTF8
     } catch { }   # a cache we cannot write is a slow hook, not a broken one
 }

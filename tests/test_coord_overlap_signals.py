@@ -12,6 +12,11 @@ If ``MatchedDirty`` were computed from the committed diff rather than the workin
 false there, the gate would allow the edit, and two sessions would write the same file with nothing
 reported. An over-block is loud and annoying; this would be quiet and cost someone their work.
 
+The second half of this file asks a different question about the same field: not *which* signal a file
+matched, but whether the peer is the one who put it there at all. ``Files``' committed half is a set
+difference against ``origin/main``, which credits a peer with every commit on its branch -- including
+the ones it inherited from the worktree asking the question.
+
 Driven against a REAL git fixture, because the question is entirely about what git reports: a test
 using stub rows would only assert that the plumbing carries a value someone else computed.
 """
@@ -160,6 +165,167 @@ def test_an_untouched_file_is_not_reported(
     primary, peer = peer_worktree
     (peer / "alpha.txt").write_text("base\nunsaved only\n", encoding="utf-8")
     assert query(primary, tmp_path, "beta.txt") == []
+
+
+# --------------------------------------------- whose commit is it? (attribution of the committed half)
+#
+# Measured 2026-08-22. The gate told a session that ``scripts/coord/handoff.ps1`` had been "CHANGED AND
+# COMMITTED" on a peer's branch and to "check its commits before you duplicate or revert it". The peer
+# had never touched the file in any commit it owned: the blob was byte-identical across the peer's whole
+# branch, and the single commit that authored it was one the READER had written and the peer had merely
+# inherited by being cut from the reader's own work.
+#
+# So the reader went looking for a peer's conflicting commit, found only their own, and had no way to
+# read that except as the gate being broken. That is how a gate stops being read, and then gets
+# uninstalled -- collision_gate.ps1's own docstring names that as its failure mode.
+#
+# The committed half is intersect(origin/main...HEAD, origin/main..HEAD), both evaluated inside the PEER
+# worktree. Neither term knows anything about the querying session, so a commit the querier authored is
+# indistinguishable from one the peer authored. The remedy is a THIRD intersect term anchored on the
+# querying worktree's own HEAD; the two origin/main anchors must stay, because they are what makes the
+# set self-clear when a branch lands by squash-merge (pinned below).
+
+
+@pytest.fixture
+def shared_history(tmp_path: Path) -> tuple[Path, Path]:
+    """A peer cut FROM the querying worktree's HEAD, so the two share a commit that authored a file.
+
+    Three files with three different provenances, which is what makes the fixture discriminating:
+    ``shared.txt`` comes from a commit BOTH have, ``peer_only.txt`` from a commit only the peer has,
+    and ``alpha.txt`` is uncommitted in the peer's tree. A fixture that branched at ``origin/main``
+    (as ``peer_worktree`` above does) cannot separate them at all.
+    """
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True, capture_output=True
+    )
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(primary)], check=True, capture_output=True
+    )
+    git(primary, "config", "user.email", "t@example.invalid")
+    git(primary, "config", "user.name", "t")
+    for name in ("alpha.txt", "beta.txt"):
+        (primary / name).write_text("base\n", encoding="utf-8")
+    git(primary, "add", "-A")
+    git(primary, "commit", "-qm", "base")
+    git(primary, "remote", "add", "origin", str(origin))
+    git(primary, "push", "-q", "origin", "main")
+
+    # THE SHARED COMMIT: authored here, ahead of origin/main, and inherited by the peer below.
+    (primary / "shared.txt").write_text("mine\n", encoding="utf-8")
+    git(primary, "add", "shared.txt")
+    git(primary, "commit", "-qm", "work the querying session authored")
+
+    peer = tmp_path / "peer-wt"
+    git(primary, "worktree", "add", "-q", "-b", "peer-branch", str(peer))  # from the primary's HEAD
+    (peer / "peer_only.txt").write_text("theirs\n", encoding="utf-8")
+    git(peer, "add", "peer_only.txt")
+    git(peer, "commit", "-qm", "work only the peer authored")
+    (peer / "alpha.txt").write_text("base\nunsaved\n", encoding="utf-8")
+    return primary, peer
+
+
+def test_a_commit_the_querying_worktree_already_has_is_not_credited_to_the_peer(
+    shared_history: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """THE FALSE POSITIVE. Sending a reader to audit their own commit is worse than saying nothing."""
+    primary, _peer = shared_history
+    assert query(primary, tmp_path, "shared.txt") == [], (
+        "the peer was credited with a file whose only commit is one the querying worktree already "
+        "has, so 'check its commits' sends the reader to their own work"
+    )
+
+
+def test_a_commit_only_the_peer_has_is_still_reported(
+    shared_history: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """NEGATIVE CONTROL. Without it, "stop reporting committed files" passes the test above."""
+    primary, _peer = shared_history
+    rows = query(primary, tmp_path, "peer_only.txt")
+    assert rows, "a file the peer committed on its OWN commit is real, actionable overlap"
+    assert "peer_only.txt" in rows[0]["Files"]
+
+
+def test_an_uncommitted_peer_edit_is_never_filtered(
+    shared_history: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """The dirty half must not be narrowed by ANY ancestry rule: somebody is typing in it now.
+
+    ``alpha.txt`` is untouched by every commit in this fixture, so it survives only if the working-tree
+    signal is unioned in after the committed half is filtered -- which is also why the filter has to go
+    before that union and not after. Applied after, it would drop the whole ROW and take the gate's
+    deny path down with it, turning a false-positive fix into a silent missed collision.
+    """
+    primary, _peer = shared_history
+    rows = query(primary, tmp_path, "alpha.txt")
+    assert rows, "an uncommitted peer edit is always a collision"
+    assert rows[0]["MatchedDirty"] is True
+    assert "alpha.txt" in rows[0]["Files"]
+
+
+def test_a_branch_that_landed_by_squash_merge_still_self_clears(tmp_path: Path) -> None:
+    """REGRESSION PIN on the property the narrowing above must not cost.
+
+    This repo squash-merges, so a landed branch's commit never becomes an ancestor of anything: the
+    merge base never advances and ``origin/main...HEAD`` keeps crediting it with its files forever,
+    blocking that file set until someone prunes the worktree. Only the two-dot term clears it, and only
+    because it is anchored on ``origin/main``. Re-anchoring either existing term on the querying HEAD
+    would suppress the reported false positive too -- and silently restore this one. Measured
+    2026-07-30 and never pinned by a test until now.
+    """
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True, capture_output=True
+    )
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(primary)], check=True, capture_output=True
+    )
+    git(primary, "config", "user.email", "t@example.invalid")
+    git(primary, "config", "user.name", "t")
+    (primary / "alpha.txt").write_text("base\n", encoding="utf-8")
+    git(primary, "add", "-A")
+    git(primary, "commit", "-qm", "base")
+    git(primary, "remote", "add", "origin", str(origin))
+    git(primary, "push", "-q", "origin", "main")
+
+    peer = tmp_path / "peer-wt"
+    git(primary, "worktree", "add", "-q", "-b", "peer-branch", str(peer))
+    (peer / "gamma.txt").write_text("landed work\n", encoding="utf-8")
+    git(peer, "add", "gamma.txt")
+    git(peer, "commit", "-qm", "work that is about to land")
+
+    # LAND IT THE WAY THIS REPO LANDS THINGS: squashed, so the peer's commit is not an ancestor.
+    git(primary, "merge", "--squash", "peer-branch")
+    git(primary, "commit", "-qm", "work that is about to land (#1)")
+    git(primary, "push", "-q", "origin", "main")
+    assert (
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(primary),
+                "merge-base",
+                "--is-ancestor",
+                "peer-branch",
+                "origin/main",
+            ],
+            capture_output=True,
+            timeout=TIMEOUT,
+            check=False,
+        ).returncode
+        != 0
+    ), (
+        "the fixture did not actually squash -- the peer's commit IS an ancestor, so nothing is pinned"
+    )
+
+    assert query(primary, tmp_path, "gamma.txt") == [], (
+        "a branch whose work has landed is still credited with its files, so its session blocks that "
+        "file set indefinitely"
+    )
 
 
 def raw_query(primary: Path, tmp_path: Path, path: str) -> str:
