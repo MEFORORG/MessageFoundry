@@ -1851,7 +1851,18 @@ class AuthSettings(_Section):
     initial_password_expiry_hours: int = 72
 
     # Active Directory / LDAP. The bind password is a secret: MEFOR_AUTH_AD_BIND_PASSWORD.
+    #
+    # `ad_enabled` means DIRECTORY BIND CAPABILITY -- this engine can reach AD and resolve principals.
+    # It is what Kerberos SSO, federated OIDC and the session reconciler each depend on, and it is why
+    # they all validate against it rather than against the login pathway below (BACKLOG #1137).
     ad_enabled: bool = False
+    # Whether a user may present an AD password to OUR login form, which we verify by SIMPLE-binding as
+    # them. Split out of `ad_enabled` because the two are different decisions that happened to share a
+    # switch: wanting federated login (which needs the bind) forced you to also expose this
+    # credential-accepting surface, since `oidc_enabled` refuses to validate without `ad_enabled`.
+    # Defaults True so the split alone changes nothing; whether this pathway should survive at all is a
+    # separate question and deliberately not decided here.
+    ad_password_login_enabled: bool = True
     ad_server: str | None = None  # e.g. ldaps://dc1.example.com:636
     ad_domain: str | None = None  # e.g. example.com (UPN suffix)
     ad_user_search_base: str | None = None

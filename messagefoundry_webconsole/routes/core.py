@@ -251,7 +251,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         request: Request, e: str | None = Query(None, max_length=32)
     ) -> HTMLResponse:
         auth = get_auth(request)
-        ad_enabled = auth is not None and auth.ad_enabled
+        # The AD password FORM follows the login pathway, not the directory bind: an operator who
+        # turned the pathway off keeps the bind up for SSO/OIDC, and offering a form that will be
+        # refused is just a worse error (BACKLOG #1137). getattr degrades against an older engine
+        # carrying only the fused flag, the same precedent as oidc_available below.
+        ad_enabled = auth is not None and bool(
+            getattr(auth, "ad_password_login_enabled", auth.ad_enabled)
+        )
         sso_enabled = auth is not None and auth.kerberos_available
         # getattr: an older engine (seam < 10) has no oidc_available property at all, and a bare
         # attribute read would AttributeError rather than degrade (the exposure_protected
