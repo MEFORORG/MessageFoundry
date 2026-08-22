@@ -6870,7 +6870,17 @@ filing.
 **Proposed work, by subject, all unallocated:** console anti-automation pacing parity and its AST parity gate -- the shipped tree already cites a filed item for this subject in three places, so name that citation rather than minting a number; JSON pacing parity for the three non-charging authenticated factories; the minimum inter-submission interval primitive; the flow timer over a CODE-ENUMERATED ceremony inventory including the sign-in and federated pairs, stating where the floor lands given that console handlers skip the JSON handlers' dependencies; an unauthenticated sign-in interval floor that is client-keyed and method-agnostic; the human-interaction timing measurement, published with its sample size and task list, retiring the unsourced order-of-magnitude sentence; and applying the 2026-08-17 ruling to this cell while re-pointing its four drifted anchors. Note when the parity work lands that the shipped doc-drift test requires the wording flip in both `docs/SECURITY.md` (two sites) and `docs/CONFIGURATION.md` in the same change.
 
 
-**VERDICT 2026-08-22 FROM THE BUILDING LANE: CANNOT HONESTLY REACH `pass`, AND CLOSING THE RATE-BUDGET HOLE DOES NOT CHANGE THAT.** The verdict stays `partial`.
+**RETRACTED WITHIN THE HOUR IT WAS WRITTEN. THE NOTE BELOW RECORDED A `cannot reach pass` VERDICT, AND THIS ITEM'S OWN RESEARCH ON `main` OPENS BY SAYING AN HONEST PASS IS REACHABLE.** Kept in place, because how it went wrong is the useful part.
+
+**The building lane's argument is CORRECT and is ALREADY IN THIS ITEM -- as a premise, not as the conclusion.** The body records that a floor keyed on *(authenticated actor, non-GET)* cannot reach the pre-authentication half of the human surface: at login there is no actor, and two session-minting legs are GETs. That appears under **"two structural corrections the path needs before it is buildable"**, alongside a **five-piece** build path. So the lane re-derived one of the item's own stated obstacles and read it as the terminus.
+
+***A PERMANENT `partial` RESTING ON AN UNEXAMINED ALTERNATIVE IS THE FAILURE THIS RETRACTION EXISTS TO PREVENT.*** The researching seat raised it before the note could settle, and named the discriminator exactly: *was the recorded path seen and rejected, or not seen?* It was not seen.
+
+**What actually stands, and it is narrower than what was written:** the per-actor non-GET floor cannot reach the sign-in ceremony. **Both seats agree on that.** They differ only on whether *any* build reaches the cell, and the item body already answers that with a path. **The sign-in floor must be client-keyed and method-agnostic**, and seven of 57 console non-GET routes carry no `require_ui` gate at all, so charging inside those factories cannot reach them.
+
+## The original note, kept as written and now known wrong
+
+**VERDICT 2026-08-22 FROM THE BUILDING LANE: CANNOT HONESTLY REACH `pass`, AND CLOSING THE RATE-BUDGET HOLE DOES NOT CHANGE THAT.** The verdict was recorded as `partial`.
 
 **The two mechanisms are not the same mechanism, which is the whole finding.** The pinned requirement asks about realistic human **timing** across a business flow. What the engine has is a per-request **rate** budget. A rate budget bounds requests per second; it says nothing about whether login, then MFA, then approve completed in 200 milliseconds. **The second mechanism is not built**, so no amount of work on the first can satisfy the verb.
 
@@ -12185,6 +12195,16 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 ## 1309. Scope GET /metrics and /stats labels to the caller's allowed_channels
 
 > 🔢 OPEN -- allocated 2026-08-22 by the Dispatcher at a builder's request, under the standing rule that this seat allocates and the building lane does not file.
+
+**RETIRED THE HOUR IT WAS FILED -- THIS IS A DUPLICATE OF `#1152` AND SHOULD NOT BE BUILT. The number is kept, retired in place, because commits and mail already cite it.**
+
+**Why it was filed and why that was wrong.** A lane measured the `/metrics` gap in code, read `#1152` for its one-liner and residual, hit a retracted paragraph, and concluded the surface was unexamined. It then recommended an allocation, and this seat allocated. **`#1152`'s body names the surface directly** -- `render_metrics`, `gather_snapshot` and `topology` all appear in it on `main`. The lane verified this itself and **withdrew its own recommendation**.
+
+**The measurement was never in doubt; only its home was.** Zero identity references in `api/metrics.py` against 127 in `api/app.py`, and all six builtin roles holding `monitoring:read`, all stand -- as `#1152` work.
+
+*The shape worth keeping: the code was measured carefully and the ledger carelessly, and the recommendation came off the careless half.* Two items for one finding is exactly the ledger corruption the allocation rule exists to prevent, and it was avoided by the finding lane checking its own claim rather than by any gate.
+
+**Everything below is superseded. Read `#1152`.**
 
 **THIS ITEM IS A BUILD, NOT A FINDING. THE FINDING IS ALREADY RECORDED IN `#1152`'s BODY AND IS NOT RESTATED HERE.** Read it there. Two seats measured the same gap independently and a third established it was already on record, so filing it again would create two descriptions of one defect with no drift signal between them.
 
