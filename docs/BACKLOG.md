@@ -13553,3 +13553,31 @@ blind window is about a day rather than open-ended.
 
 **Cluster:** Ledger integrity / commit gates. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0) -- ledger hygiene. The cost is that a wrongly-transposed banner reads as a working cross-reference forever, and the two items it corrupts fail in opposite directions: one over-reports its status and one under-reports it.
+## 1331. test_connscale_smoke_end_to_end wears six assertions under one name, so a merge-blocking flake reads as six unrelated bugs
+
+> 🔢 **Filed 2026-08-22 - not started.** One test name covers at least six separate properties, so two seats hitting it twice see two unrelated bugs rather than one recurring problem. It sits on three of the thirteen required contexts, so every occurrence is merge-blocking.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** CI integrity / test design. **Priority:** P2. **Verdict:** build.
+**Severity:** queue tax, not a product defect. **Conditional, per section 0:** zero deployments; the cost is merge latency and a standing invitation to re-run until green, which manufactures a green rather than earning one.
+
+**What it cost, measured 2026-08-22 by the LANDER seat.** `tests/test_connscale_smoke.py::test_connscale_smoke_end_to_end` blocked **three PRs in one evening** -- #516, #530 and #529 -- on `test (ubuntu-latest, py3.14)` and the Windows legs. Read the required set from `.github/required-contexts.txt`, never from this row: it was recorded moving six times in one day.
+
+***WHY IT DOES NOT READ AS ONE PROBLEM, AND THIS IS THE ROW.*** It wears **two different assertions**:
+
+```
+throughput SLO   fixed_aggregate at N=24: 25.1 against a prior 34.5 * 0.75
+intake loss      engine_read 35 below confirmed sent 36 -- one message lost on intake
+```
+
+**Measured by the DISPATCHER seat on `origin/main`:** the test is **273 lines** and the end-to-end case asserts **at least six** separate properties -- record count, sweep modes, per-record `no_loss.ok`, two monotonicity SLOs, and the additive engine fields. **A single name over six assertions is why nobody has owned it.**
+
+**THE FIX DIRECTION IS TO MAKE THE FAILURE NAME ITSELF** -- split the assertions, or carry the failing property into the message, so the next reader knows which of the six broke without reading 273 lines. **Do not let this row become "re-run it".**
+
+**THE ATTRIBUTION RULE THAT MAKES A RE-RUN EARNED**, and it is what cleared both PRs this seat re-ran: *attribute by FILE SCOPE first.* #529 and #530 each touch **zero** files under `pipeline/`, `store/` or `transports/`, and neither touches the test, so neither can reach the intake path. That is a measurement rather than a shrug.
+
+**NOT MEASURED, DO NOT INFER:** whether the two assertions share a root cause -- nothing here shows it either way. Neither failure was reproduced locally; both figures are read off CI. The three-PR count is the lander's observation across one evening and is not a rate.
+
+**Source:** surfaced by the LANDER while attributing reds on #529 and #530; the six-assertion count and the required-context arithmetic are the DISPATCHER's, whose handoff routed the content here for filing.
+
