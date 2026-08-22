@@ -371,6 +371,42 @@ def bearer_provider_from_settings(
     ) or oauth2_cc_provider_from_settings(s, proxy=proxy, ech_sidecar=ech_sidecar)
 
 
+#: Digest algorithms this engine will answer a challenge with (BACKLOG #1171, ASVS 11.4.1). The
+#: ``-sess`` variants are the same hash and are accepted by stripping the suffix.
+#:
+#: **The SERVER chooses, not us.** ``urllib``'s handler reads ``chal.get('algorithm', 'MD5')`` -- so an
+#: endpoint that simply OMITS the parameter, which is the common RFC 2617 case, gets answered with MD5.
+#: Appendix C marks MD5 **D**: disallowed for any cryptographic purpose, in a clause with no default-off
+#: escape. There is no way to dictate the algorithm to the peer, so the only honest options are refuse
+#: or remove, and refusing keeps the feature for endpoints that offer an approved hash.
+_APPROVED_DIGEST_ALGORITHMS = frozenset({"SHA-256", "SHA-512-256"})
+
+
+class _ApprovedDigestAuthHandler(urllib.request.HTTPDigestAuthHandler):
+    """Refuses a Digest challenge that names a disallowed hash, instead of silently answering it.
+
+    LOUD, not ``return None``. Returning ``None`` makes urllib skip the auth and the request fails as a
+    bare 401 -- an operator would read that as bad credentials and go looking in the wrong place. This
+    raises with the algorithm named, in the same ``HttpAuthError`` contract the rest of this seam uses
+    for a refused hop.
+    """
+
+    def get_authorization(self, req: Any, chal: Mapping[str, str]) -> Any:
+        # Mirrors urllib's own default EXACTLY: an absent parameter means MD5, which is the case that
+        # makes this reachable without a hostile server -- a plain RFC 2617 endpoint.
+        named = str(chal.get("algorithm", "MD5")).strip()
+        base = named.upper().removesuffix("-SESS")
+        if base not in _APPROVED_DIGEST_ALGORITHMS:
+            raise HttpAuthError(
+                f"the endpoint's HTTP Digest challenge names algorithm {named!r}, which is not an "
+                f"approved hash (ASVS 11.4.1; approved here: {sorted(_APPROVED_DIGEST_ALGORITHMS)}). "
+                "urllib defaults to MD5 when the challenge omits the parameter, so an endpoint that "
+                "names nothing lands here too. Use an endpoint offering SHA-256 Digest, or a different "
+                "http_auth mode (BACKLOG #1171)."
+            )
+        return super().get_authorization(req, chal)
+
+
 def digest_handler_from_settings(
     s: Mapping[str, Any], *, url: str
 ) -> urllib.request.HTTPDigestAuthHandler | None:
@@ -424,7 +460,7 @@ def digest_handler_from_settings(
     # A default-realm entry keyed on the endpoint URL: urllib matches by URL prefix, so the same
     # credential answers whatever realm the server names in its 401 challenge.
     pwmgr.add_password(None, url, user, password)
-    return urllib.request.HTTPDigestAuthHandler(pwmgr)
+    return _ApprovedDigestAuthHandler(pwmgr)
 
 
 def _require_http_spec(spec: ConnectionSpec, mode: str) -> None:

@@ -370,3 +370,53 @@ def test_oauth2_cc_on_soap_injects_bearer() -> None:
     )
     assert isinstance(d, SoapDestination)
     assert isinstance(d._token_provider, OAuth2ClientCredentialsProvider)
+
+
+# --- BACKLOG #1171 (ASVS 11.4.1): the server picks the digest hash, so refuse a disallowed one ------
+
+
+def _digest_handler() -> urllib.request.HTTPDigestAuthHandler:
+    handler = digest_handler_from_settings(
+        {"http_auth": "digest", "http_auth_user": "u", "http_auth_password": "p"},
+        url=URL,
+    )
+    assert handler is not None, "the factory returned no handler; the cases below would be vacuous"
+    return handler
+
+
+@pytest.mark.parametrize(
+    ("chal", "why"),
+    [
+        ({"algorithm": "MD5"}, "an endpoint that names MD5 outright"),
+        ({}, "an endpoint that names NOTHING -- urllib defaults the parameter to MD5"),
+        ({"algorithm": "md5-sess"}, "the -sess variant is the same hash, and case must not matter"),
+    ],
+)
+def test_a_disallowed_digest_algorithm_is_refused_loudly(chal: dict[str, str], why: str) -> None:
+    """Appendix C marks MD5 **D** -- disallowed for any cryptographic purpose, no default-off escape.
+
+    THE ABSENT CASE IS THE ONE THAT MATTERS. It needs no hostile server: a plain RFC 2617 endpoint
+    omits ``algorithm``, and ``urllib`` reads ``chal.get('algorithm', 'MD5')``, so the engine answered
+    with MD5 by default. The exposure was reachable through ordinary interoperability.
+
+    LOUD, not ``return None``. Skipping the auth silently would surface as a bare 401, which an
+    operator reads as bad credentials -- sending them to look in the wrong place entirely.
+    """
+    handler = _digest_handler()
+    full = {"realm": "r", "nonce": "n", **chal}
+    with pytest.raises(HttpAuthError) as ei:
+        handler.get_authorization(urllib.request.Request(URL), full)
+    assert "not an approved hash" in str(ei.value), why
+
+
+def test_an_approved_digest_algorithm_is_still_answered() -> None:
+    """POSITIVE CONTROL: the refusal above must not be "refuse everything".
+
+    Without this, deleting the whole feature would satisfy every case above perfectly, and the tests
+    would be reporting a working gate over a connector that can no longer authenticate at all.
+    """
+    handler = _digest_handler()
+    chal = {"realm": "r", "nonce": "n", "algorithm": "SHA-256"}
+    # Returns a header string rather than raising; the value itself is urllib's business, not ours.
+    result = handler.get_authorization(urllib.request.Request(URL), chal)
+    assert result, "an approved algorithm produced no authorization header"

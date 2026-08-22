@@ -32,6 +32,7 @@ from messagefoundry.config.tls_policy import (
     insecure_hop_disposition,
     is_loopback_hop_host,
     kex_groups_report,
+    smtp_login_approved,
     tls_revocation_attested,
     validate_tls_ciphers,
 )
@@ -767,3 +768,86 @@ def test_smtp_context_verify_false_accepts_anything(_tls_peer: tuple[int, str]) 
     port, _ = _tls_peer
     ctx = build_smtp_tls_context(host="localhost", cell="Email destination", verify=False)
     assert _handshake_result(ctx, port, "localhost") == "ok"
+
+
+# --- BACKLOG #1171 (ASVS 11.4.1): SMTP AUTH mechanism + the channel it may run on -----------------
+
+
+class _FakeSmtp:
+    """Records which AUTH mechanism was driven. Mirrors only what smtp_login_approved touches."""
+
+    def __init__(self, offers: str) -> None:
+        self.esmtp_features = {"auth": offers}
+        self.used: str | None = None
+
+    def ehlo_or_helo_if_needed(self) -> None:
+        pass
+
+    def has_extn(self, name: str) -> bool:
+        return name in self.esmtp_features
+
+    def auth(self, mechanism: str, authobject: object, *, initial_response_ok: bool = True) -> None:
+        self.used = mechanism
+
+    def auth_plain(self, challenge: object = None) -> str:
+        return ""
+
+    def auth_login(self, challenge: object = None) -> str:
+        return ""
+
+    def auth_cram_md5(self, challenge: object = None) -> str:
+        return ""
+
+
+def test_cram_md5_is_never_chosen_even_when_the_server_offers_it() -> None:
+    """smtplib's own order is ['CRAM-MD5','PLAIN','LOGIN'] -- CRAM-MD5 FIRST.
+
+    CRAM-MD5 is an HMAC over MD5, which Appendix C marks D: disallowed for any cryptographic purpose.
+    So every unrestricted smtp.login() tried a disallowed hash before anything else. With both on
+    offer the approved one must win.
+    """
+    smtp = _FakeSmtp("CRAM-MD5 PLAIN")
+    smtp_login_approved(
+        smtp, "u", "p", channel_encrypted=True, escape_permitted=False, cell="EMAIL"
+    )
+    assert smtp.used == "PLAIN", f"a disallowed mechanism was chosen: {smtp.used}"
+
+
+def test_a_server_offering_only_a_disallowed_mechanism_is_refused() -> None:
+    smtp = _FakeSmtp("CRAM-MD5")
+    with pytest.raises(InsecureHopRefused) as ei:
+        smtp_login_approved(
+            smtp, "u", "p", channel_encrypted=True, escape_permitted=False, cell="EMAIL"
+        )
+    assert "none of which is approved" in str(ei.value)
+    assert smtp.used is None, "it authenticated anyway"
+
+
+def test_auth_over_an_unencrypted_channel_is_refused() -> None:
+    """THE HALF THAT MAKES THE OTHER HALF SAFE.
+
+    PLAIN and LOGIN SEND THE PASSWORD; CRAM-MD5 does not. Restricting the mechanism without also
+    requiring encryption would close a conformance gap by putting a cleartext password on the wire --
+    strictly worse than the gap. Ruled build-both-or-neither for that reason.
+    """
+    smtp = _FakeSmtp("PLAIN LOGIN")
+    with pytest.raises(InsecureHopRefused) as ei:
+        smtp_login_approved(
+            smtp, "u", "p", channel_encrypted=False, escape_permitted=False, cell="ALERT"
+        )
+    assert "SEND THE PASSWORD" in str(ei.value)
+    assert smtp.used is None, "the password went out over an unencrypted channel"
+
+
+def test_the_clamped_escape_still_crosses_an_unencrypted_hop() -> None:
+    """POSITIVE CONTROL for the refusal above: it must not be "refuse everything".
+
+    Without this, a helper that raised unconditionally would satisfy both refusal tests and the suite
+    would report a working gate over a connector that can never authenticate. The escape is the same
+    clamped one governing the LDAPS bind, the MLLP/FTPS contexts and the webhook sink.
+    """
+    smtp = _FakeSmtp("PLAIN LOGIN")
+    smtp_login_approved(
+        smtp, "u", "p", channel_encrypted=False, escape_permitted=True, cell="ALERT"
+    )
+    assert smtp.used == "PLAIN"

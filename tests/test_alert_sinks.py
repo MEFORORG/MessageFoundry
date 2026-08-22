@@ -252,8 +252,30 @@ def test_email_transport_sends_via_smtp(monkeypatch: pytest.MonkeyPatch) -> None
             # was accepting any certificate. "STARTTLS was issued" is not a security assertion.
             sent["context"] = context
 
-        def login(self, user: str, password: str) -> None:
-            sent["login"] = (user, password)
+        # BACKLOG #1171: production drives auth() directly, never login() -- login() tries
+        # CRAM-MD5 first, an HMAC over MD5. CRAM-MD5 IS ADVERTISED HERE ON PURPOSE so a
+        # regression back to login() would pick it and be visible.
+        esmtp_features = {"auth": "CRAM-MD5 PLAIN LOGIN"}
+        user = ""
+        password = ""
+
+        def ehlo_or_helo_if_needed(self) -> None:
+            return None
+
+        def has_extn(self, name: str) -> bool:
+            return name.lower() == "auth"
+
+        def auth(
+            self, mechanism: str, authobject: Any, *, initial_response_ok: bool = True
+        ) -> None:
+            sent["auth_mechanism"] = mechanism
+            sent["login"] = (self.user, self.password)
+
+        def auth_plain(self, challenge: bytes | None = None) -> str:
+            return ""
+
+        def auth_login(self, challenge: bytes | None = None) -> str:
+            return ""
 
         def send_message(self, msg: Any) -> None:
             sent["subject"] = msg["Subject"]
