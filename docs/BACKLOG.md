@@ -13106,10 +13106,28 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 ## 1317. the TLS cipher allowlist tests a name prefix, so NULL-encryption and anonymous suites pass every gate
 
-> 🔢 **Filed 2026-08-22 - not started.** Value **8/10** · Difficulty **3/10**. Owner-ruled the
+> 🚧 **Filed 2026-08-22. PARTIAL 2026-08-22 (lander) -- the NAMED defect is fixed on main by PR 519 and PR 525, verified by running the shipped code; the item's own library half stays OPEN.** Value **8/10** · Difficulty **3/10**. Owner-ruled the
 > same day: **a strict positive allowlist**, admitting only suites that appear on every current
 > candidate list, anything unnamed rejected. At zero deployments the compatibility cost of being
 > strict is zero.
+>
+> **VERIFIED AT CLOSURE -- both functions the item names, controls firing both ways.** Run against
+> `main` at `76ee9a7b`, using the item's own method of exercising the shipped validator rather than
+> reading it. `validate_tls_ciphers` and `harden_cipher_suites` each REFUSE `ECDHE-RSA-NULL-SHA` for
+> not encrypting and `ADH-AES256-GCM-SHA384` for not authenticating the peer, and each ACCEPT
+> `ECDHE-RSA-AES256-GCM-SHA384` -- the positive control, without which a validator that refused
+> everything would read identically. The missing PAIR of predicates this item names now exists as
+> `_is_encrypting` and `_is_peer_authenticated` and is called from both paths, and `_is_forward_secret`
+> was left alone exactly as the item instructs.
+>
+> **WHY PARTIAL AND NOT CLOSED, recorded because I first wrote CLOSED and corrected it before the
+> commit landed.** The heading defect is fixed and the founding claim is now false in the code. But
+> this item says of itself, further down, that **the library half is unchanged and still open** --
+> `ldap3`, `hvac` and ODBC Driver 18 pick their own suites and no engine object exists to assert on.
+> An item that declares part of itself open must not be closed, and closing it would delete the only
+> open record of that half. **The first pass verified the two functions the HEADING names and read a
+> quarter of the body.** A code re-read is necessary and is not sufficient; the item's own scope
+> statement outranks it.
 > Verdict: build
 > Closing-act: code
 
@@ -13463,7 +13481,6 @@ blind window is about a day rather than open-ended.
 > took it for a status.** *That is presence-equals-meaning -- the exact misreading `CLAUDE.md` section 11
 > forbids for banner glyphs, reproduced with a phrase instead of a pictograph.* **A status marker must
 > not be a word that also appears in narration.**
-> assigns it). *Until it is flipped this is an open duplicate.*
 
 **Cluster:** Testing / silent-failure class. **Priority:** P2. **Verdict:** build.
 **Severity:** test-integrity gap, not a runtime defect. **Conditional, per section 0:** zero deployments; what would be wrong is a suite reporting a condition it never established.
