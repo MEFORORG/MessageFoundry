@@ -13394,3 +13394,33 @@ blind window is about a day rather than open-ended.
 
 **Source:** found by another seat when their pull request took three red legs for a change they did not make. Their two-line fix is on their own branch; this item is the gate gap, not that fix.
 
+
+## 1323. the crypto-inventory gate enumerates a store-only seam set, so first-party TLS seams outside it are invisible to it
+
+> 🔢 **Filed 2026-08-22 - not started.** The required crypto-inventory gate is green while structurally unable to see a real first-party TLS seam. `pipeline/alert_sinks.py` imports `smtplib` and `config.tls_policy`, and the gate's seam set names store modules only, so no import it makes can trigger a review.
+> Verdict: build
+> Closing-act: code
+
+**Cluster:** Security / gate coverage. **Priority:** P2. **Verdict:** build.
+**Severity:** gate-coverage gap, not a runtime defect. **Conditional, per section 0:** zero deployments, so nothing shipped is exposed. What would be wrong on a first deployment is a merge gate that cannot fail on a class of change it exists to catch.
+
+**What, measured at `HEAD`.** `scripts/security/crypto_inventory_check.py:100-108` defines the first-party delegated-crypto seam set:
+
+| entry | package |
+|---|---|
+| `messagefoundry.store.crypto` | store |
+| `messagefoundry.store.keyprovider` | store |
+| `messagefoundry.store.keyprovider_vault` | store |
+| `messagefoundry.store.crypto_transit` | store |
+| `messagefoundry.store.backup_codec` | store |
+
+***ALL FIVE ARE `messagefoundry.store.*`. THE SET IS STORE-ONLY BY CONSTRUCTION.*** Meanwhile `messagefoundry/pipeline/alert_sinks.py` imports `smtplib` at `:29` and `from messagefoundry.config.tls_policy import (...)` at `:48` -- a first-party TLS seam in a different package, which no entry in that set can match.
+
+***THE FAILURE IS THE ONE A GREEN GATE CANNOT REPORT.*** The file **is** correctly inventoried in the doc, so a reader checking the record finds it present. **The gate is what cannot see it**, and a required merge-blocking context that is structurally blind to a surface reports the same green whether that surface is sound or not.
+
+**The fix, and its real cost.** Adding `messagefoundry.config.tls_policy` to the seam set is one line. It then newly implicates **at least 26 importers** (measured 26 by a seat reading import statements, 28 by a broader pattern here; stated as a floor per SDS-3.6), each of which needs an inventory row or the gate reds the build. **That inventory backlog is the actual work, not the one-line edit**, and it is why this is filed rather than fixed in passing.
+
+**Scope note, so it does not absorb its neighbour.** Correcting the *prose* on the two ASVS cells that overclaim coverage is a separate, already-authorised act belonging to the tracker seat. **This row is the gate widening only.** A cell whose text says the gate covers first-party TLS seams while the gate enumerates store modules is a completeness claim the standards already refuse (SDS-3.6, SDS-3.7); fixing the words does not widen the gate, and widening the gate does not fix the words.
+
+**Source:** found by a builder while sizing #1164, who declined to build it because the 26-importer noise budget is the item, and routed here by the liaison carrying the owner's ruling that the gate widening be filed as its own work.
+
