@@ -15,17 +15,21 @@ import pytest
 
 from messagefoundry.config import tls_policy
 from messagefoundry.config.tls_policy import (
+    _APPROVED_TLS_SUITES,
     APPROVED_KEX_GROUPS,
     TLS_REVOCATION_ATTESTED_ENV,
     HopDisposition,
     HopPosture,
     InsecureHopRefused,
+    _is_encrypting,
     _is_forward_secret,
+    _is_peer_authenticated,
     active_hop_posture,
     build_smtp_tls_context,
     current_hop_posture,
     enforce_insecure_hop,
     fips_attestation,
+    harden_cipher_suites,
     harden_kex_groups,
     harden_verify_flags,
     in_process_tls_revocation_refused,
@@ -851,3 +855,108 @@ def test_the_clamped_escape_still_crosses_an_unencrypted_hop() -> None:
         smtp, "u", "p", channel_encrypted=False, escape_permitted=True, cell="ALERT"
     )
     assert smtp.used == "PLAIN"
+
+
+# --- BACKLOG #1317: forward secrecy is not sufficient -------------------------------------------
+#
+# Both suites below are FORWARD-SECRET and passed every gate before this item. ECDHE-RSA-NULL-SHA is
+# authenticated and encrypts NOTHING; ADH-AES256-GCM-SHA384 is strongly encrypted and authenticates
+# NOBODY. The four rows pinned here are the exact measurement that filed the item.
+
+_NULL_CIPHER = "ECDHE-RSA-NULL-SHA"
+_ANON_CIPHER = "ADH-AES256-GCM-SHA384"
+_GOOD_CIPHER = "ECDHE-RSA-AES256-GCM-SHA384"
+
+
+def _ciphers_available(spec: str) -> bool:
+    """Whether this OpenSSL build can resolve ``spec`` at all, so a skip is honest rather than a pass."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    try:
+        ctx.set_ciphers(spec)
+    except ssl.SSLError:
+        return False
+    return any(c.get("name") == spec for c in ctx.get_ciphers())
+
+
+@pytest.mark.parametrize(
+    ("spec", "why"),
+    [
+        (_NULL_CIPHER, "NULL cipher: forward-secret, authenticated, transmits plaintext"),
+        (_ANON_CIPHER, "anonymous: forward-secret, encrypted, authenticates no peer"),
+    ],
+)
+def test_validate_tls_ciphers_rejects_what_forward_secrecy_cannot_see(spec: str, why: str) -> None:
+    if not _ciphers_available(spec):
+        pytest.skip(f"this OpenSSL build cannot resolve {spec}")
+    with pytest.raises(ValueError):
+        validate_tls_ciphers(spec)
+
+
+def test_validate_tls_ciphers_still_accepts_a_good_suite() -> None:
+    """POSITIVE CONTROL. Without it the rejections above are indistinguishable from a validator that
+    refuses everything, which would pass the two tests above for entirely the wrong reason."""
+    assert validate_tls_ciphers(_GOOD_CIPHER) == _GOOD_CIPHER
+
+
+def test_validate_tls_ciphers_rejects_an_unlisted_suite_that_passes_every_property() -> None:
+    """The allow-list earns its place here. ECDHE-RSA-AES256-SHA384 is forward-secret, encrypting and
+    authenticated -- it satisfies all three predicates and is still refused, because it is not named.
+    This is the row that distinguishes a strict positive allow-list from a pile of property checks."""
+    unlisted = "ECDHE-RSA-AES256-SHA384"
+    if not _ciphers_available(unlisted):
+        pytest.skip(f"this OpenSSL build cannot resolve {unlisted}")
+    probe = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    probe.set_ciphers(unlisted)
+    entry = next(c for c in probe.get_ciphers() if c.get("name") == unlisted)
+    assert _is_forward_secret(entry) and _is_encrypting(entry) and _is_peer_authenticated(entry)
+    assert unlisted not in _APPROVED_TLS_SUITES
+    with pytest.raises(ValueError, match="approved list"):
+        validate_tls_ciphers(unlisted)
+
+
+def test_the_two_new_predicates_read_the_openssl_description() -> None:
+    assert not _is_encrypting(
+        {"name": "x", "description": "x TLSv1 Kx=ECDH Au=RSA Enc=None Mac=SHA1"}
+    )
+    assert _is_encrypting({"name": "x", "description": "x TLSv1.2 Enc=AESGCM(256) Mac=AEAD"})
+    assert not _is_peer_authenticated(
+        {"name": "x", "description": "x Kx=DH Au=None Enc=AESGCM(256)"}
+    )
+    assert _is_peer_authenticated({"name": "x", "description": "x Kx=ECDH Au=RSA Enc=AESGCM(256)"})
+    # Au=any is NOT anonymous -- TLS 1.3 reports it because authentication is negotiated separately.
+    assert _is_peer_authenticated(
+        {"name": "x", "description": "x TLSv1.3 Kx=any Au=any Enc=AESGCM(256)"}
+    )
+
+
+def test_harden_cipher_suites_asserts_on_no_shipped_default() -> None:
+    """The safety property the whole change rests on. If any default context shape carried a NULL or
+    anonymous suite, the new assertions in harden_cipher_suites would refuse every deployment. Ships
+    as a test rather than a measurement in a commit message so a future OpenSSL cannot break it
+    silently."""
+    for make in (
+        lambda: ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER),
+        lambda: ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+        ssl.create_default_context,
+    ):
+        harden_cipher_suites(make(), connector="test-default-shape")
+
+
+def test_harden_cipher_suites_does_not_apply_the_operator_allow_list() -> None:
+    """The allow-list is AEAD-only and the shipped default carries six CBC-SHA2 suites. Applying it to
+    an INHERITED context would refuse every current configuration, so this pins that it is not. The
+    assertion is on the SIX being present and tolerated, not merely on the call succeeding."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    cbc = [c["name"] for c in ctx.get_ciphers() if "Mac=AEAD" not in str(c.get("description", ""))]
+    assert cbc, "control: the default is expected to carry non-AEAD suites on this build"
+    assert any(n not in _APPROVED_TLS_SUITES for n in cbc)
+    harden_cipher_suites(ctx, connector="test-inherited-default")
+
+
+def test_harden_cipher_suites_raises_on_a_null_cipher_context() -> None:
+    if not _ciphers_available(_NULL_CIPHER):
+        pytest.skip("this OpenSSL build cannot resolve a NULL cipher")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.set_ciphers(_NULL_CIPHER)
+    with pytest.raises(ValueError, match="NULL-cipher"):
+        harden_cipher_suites(ctx, connector="test-null")
