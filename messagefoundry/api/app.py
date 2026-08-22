@@ -3441,9 +3441,15 @@ def create_app(
         # EXACT type (no MRO walk), so the MessageDetail wrapper and each nested OutboxInfo/EventInfo are
         # redacted individually. The raw body stays on this route's view_raw gate. Exposure is audited
         # server-side, mirroring the list endpoints (count after redaction = what's actually returned).
+        # OPENING ONE MESSAGE IS THE REVEAL ACT (ASVS 14.2.6). The list and search surfaces mask the
+        # summary, because those are where complete identifiers could be read off a screen opened for
+        # another reason. This route is a deliberate, per-message, already-audited open — record_view
+        # above plus the tamper-evident audit chain — so it is the specific act that lifts the mask,
+        # and it lifts it for THIS message only. The reveal is a call argument with nowhere to live
+        # between calls, so it cannot become a session-wide toggle by accident.
         outbox = [redact_unauthorized(o, identity) for o in detail.outbox]
         events = [redact_unauthorized(e, identity) for e in detail.events]
-        detail = redact_unauthorized(detail, identity).model_copy(
+        detail = redact_unauthorized(detail, identity, revealed=frozenset({"summary"})).model_copy(
             update={"outbox": outbox, "events": events}
         )
         exposed = count_exposed([detail, *outbox, *events])

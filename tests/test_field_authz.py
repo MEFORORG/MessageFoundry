@@ -72,9 +72,59 @@ def _dead(**over: Any) -> DeadLetterRow:
     return DeadLetterRow(**base)
 
 
-def test_holder_sees_phi_fields_unchanged() -> None:
+def test_holder_sees_summary_masked_until_revealed() -> None:
+    """Permission is not reveal (ASVS 14.2.6): a holder gets the summary MASKED by default.
+
+    ``error`` is not in ``MASKED_UNTIL_REVEALED``, so it is unchanged in the same call — which is
+    what makes this a test of the mask rather than of redaction.
+    """
     m = redact_unauthorized(_summary(), _identity(Permission.MESSAGES_VIEW_SUMMARY))
-    assert m.summary == "DOE^JOHN" and m.error == "boom in PID-5"
+    assert m.summary == "****" and m.error == "boom in PID-5"
+
+
+def test_holder_sees_complete_summary_only_on_a_reveal() -> None:
+    m = redact_unauthorized(
+        _summary(), _identity(Permission.MESSAGES_VIEW_SUMMARY), revealed=frozenset({"summary"})
+    )
+    assert m.summary == "DOE^JOHN"
+
+
+def test_reveal_without_permission_still_denies() -> None:
+    """Reveal is not a second route to the value -- it only lifts the mask on what permission allows.
+
+    Asking for a reveal you have no permission for must return ``None``, not the complete value and
+    not a mask of it. Masking a value the caller may not see at all would leak its shape.
+    """
+    m = redact_unauthorized(
+        _summary(), _identity(Permission.MESSAGES_READ), revealed=frozenset({"summary"})
+    )
+    assert m.summary is None
+
+
+def test_a_reveal_does_not_persist_to_the_next_message() -> None:
+    """The reveal is an ACT on one record, never a STATUS that renders the next one.
+
+    This is the sticky anti-pattern arriving by accident, and it passes any test that checks a
+    single message. Revealing message one and then redacting message two with the SAME identity
+    must leave message two masked.
+    """
+    holder = _identity(Permission.MESSAGES_VIEW_SUMMARY)
+    first = redact_unauthorized(_summary(id="m1"), holder, revealed=frozenset({"summary"}))
+    second = redact_unauthorized(_summary(id="m2"), holder)  # no reveal for this one
+
+    assert first.summary == "DOE^JOHN"  # positive control: the reveal did work on m1
+    assert second.summary == "****"  # and did not survive into m2
+
+
+def test_reveal_cannot_be_held_anywhere_but_the_call() -> None:
+    """Structural, not behavioural: ``revealed`` is a keyword-only parameter with no stored
+    counterpart, so a reveal cannot outlive the call. A future refactor that parks it on the
+    identity, the module or a default would break this signature check first."""
+    import inspect
+
+    param = inspect.signature(redact_unauthorized).parameters["revealed"]
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY
+    assert param.default == frozenset()  # the default is "nothing revealed", not "remember"
 
 
 def test_non_holder_has_phi_fields_nulled_others_untouched() -> None:
@@ -88,7 +138,8 @@ def test_non_holder_has_phi_fields_nulled_others_untouched() -> None:
 
 def test_dead_letter_summary_and_last_error_gated() -> None:
     holder = redact_unauthorized(_dead(), _identity(Permission.MESSAGES_VIEW_SUMMARY))
-    assert holder.summary == "DOE^JOHN" and holder.last_error == "delivery failed: 9f3c"
+    # summary is masked until revealed; last_error is not a masked property, so it is unchanged.
+    assert holder.summary == "****" and holder.last_error == "delivery failed: 9f3c"
     redacted = redact_unauthorized(_dead(), _identity())
     assert redacted.summary is None and redacted.last_error is None
 
