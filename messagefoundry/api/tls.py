@@ -10,7 +10,9 @@ isolation. The ``tls_min_version`` floor (NIST SP 800-52r2: 1.2+) is enforced vi
 
 from __future__ import annotations
 
+import logging
 import ssl
+from pathlib import Path
 
 from messagefoundry.auth.trust_anchors import api_client_anchor_spec, enforce_anchor
 from messagefoundry.config.settings import ApiSettings
@@ -21,7 +23,9 @@ from messagefoundry.config.tls_policy import (
     harden_verify_flags,
 )
 
-__all__ = ["build_api_ssl_context"]
+__all__ = ["build_api_ssl_context", "ensure_api_tls_material"]
+
+log = logging.getLogger(__name__)
 
 # Map the validated tls_min_version floor to the SSLContext minimum (TLS < 1.2 is never allowed).
 _MIN_VERSION = {"1.2": ssl.TLSVersion.TLSv1_2, "1.3": ssl.TLSVersion.TLSv1_3}
@@ -68,3 +72,72 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
         if api.tls_client_crl_file:
             harden_crl_check(ctx, api.tls_client_crl_file)
     return ctx
+
+
+#: Filenames for the first-run generated pair, written beside the store database (BACKLOG #1276).
+#: **Why there, and the alternative rejected.** That directory is already the engine's own writable
+#: state (the database and its WAL live there), it is already operator-controlled via ``--db`` /
+#: ``[store].path``, and it is NOT operator-authored configuration -- which is what keeps the engine
+#: out of the business of editing an operator's TOML. The rejected alternative was a new
+#: ``[api].tls_generated_dir`` setting: a knob for a question with one sensible answer.
+_GENERATED_CERT_NAME = "api-generated-cert.pem"
+_GENERATED_KEY_NAME = "api-generated-key.pem"
+
+
+def ensure_api_tls_material(api: ApiSettings, *, state_dir: Path) -> tuple[str, str] | None:
+    """Return the ``(cert_path, key_path)`` the API should serve with, minting on first run.
+
+    **The engine always serves TLS (owner ruling 2026-08-22, superseding ADR 0143's cleartext
+    loopback premise).** An operator-supplied ``[api].tls_cert_file`` always wins -- this is a
+    fallback BENEATH it, never a replacement -- so a site that configures its own chain sees no
+    behaviour change and this function is not even consulted.
+
+    **Returns ``None`` when a reverse proxy terminates TLS upstream** -- see the guard below.
+
+    **Mint-once, then reuse.** The pair is written with :func:`_write_private_key`'s ``O_EXCL`` +
+    ``0o600`` + Windows-DACL sequence, which REFUSES to overwrite. So a second start finds the
+    files and loads them; it does not re-mint, and it cannot clobber a key.
+
+    **The generated certificate is a PLACEHOLDER TO BE REPLACED, not an endorsed production
+    terminator.** It is self-signed, so it carries no chain of trust: strictly better than
+    cleartext, strictly worse than an operator-supplied chain. A browser reaching the console gets
+    a trust interstitial until it is imported (``docs/TRAY.md`` documents that import).
+
+    **NOT HANDLED HERE, and it is filed rather than forgotten:** nothing re-mints an EXPIRED
+    generated pair. ``build_api_ssl_context`` performs no expiry check, so on day 366 the engine
+    would serve an expired certificate every client rejects. The rotation shape is an open decision
+    on #1276; until it lands, ``CertExpiryRunner`` alarms on this path like any other served cert.
+    """
+    if api.tls_cert_file:  # operator-supplied material always wins
+        return api.tls_cert_file, api.tls_key_file or ""
+
+    # A DECLARED UPSTREAM TERMINATOR IS NOT AN UNPROTECTED HOP, AND MINTING HERE WOULD BREAK IT.
+    # `tls_terminated_upstream` (+ trusted_proxies) says a reverse proxy terminates TLS in FRONT of
+    # the engine and speaks plaintext to it. Serving HTTPS underneath that proxy does not harden the
+    # deployment -- it breaks the proxy's own hop. "Always serves TLS" means the engine never leaves
+    # a hop unprotected, NOT that it terminates TLS in every topology.
+    if api.tls_terminated_upstream:
+        return None
+
+    cert_path = state_dir / _GENERATED_CERT_NAME
+    key_path = state_dir / _GENERATED_KEY_NAME
+    if cert_path.exists() and key_path.exists():
+        return str(cert_path), str(key_path)
+
+    from messagefoundry import pki
+    from messagefoundry.__main__ import _write_private_key
+
+    state_dir.mkdir(parents=True, exist_ok=True)
+    # 365 days, inheriting the `cert self-signed` CLI default rather than inventing a second
+    # lifetime for the same primitive.
+    cert_pem, key_pem = pki.make_self_signed(api.host, [], 365)
+    _write_private_key(key_path, key_pem)
+    cert_path.write_bytes(cert_pem)
+    log.warning(
+        "no [api].tls_cert_file configured — minted a SELF-SIGNED certificate for %s at %s. It has "
+        "no chain of trust and is a PLACEHOLDER: browsers will show a trust interstitial until it "
+        "is imported, and it should be replaced with an operator-supplied chain.",
+        api.host,
+        cert_path,
+    )
+    return str(cert_path), str(key_path)
