@@ -441,3 +441,107 @@ def test_overlap_does_not_rewrite_a_peers_git_index(
     before = index.stat().st_mtime_ns
     query(primary, tmp_path, "alpha.txt")
     assert index.stat().st_mtime_ns == before, "overlap rewrote a peer worktree's git index"
+
+
+# ------------------------------------------------ the walk has a budget, and blowing it is not silent
+#
+# THE COST IS PROCESS COUNT. This walk spawns one git per diff term per worktree, so it scales with how
+# many worktrees exist rather than with how much work is in them. Measured 2026-08-22 at 73 worktrees:
+# 11.4s for the two origin/main terms, 14.6s once a third term was evaluated per peer, 12.0s with that
+# term gated on one up-front `for-each-ref`. collision_gate.ps1 runs this on every Edit and Write under
+# a harness timeout of 20s, and when that timeout fires the HOOK is killed -- so it emits nothing, and
+# empty stdout from a PreToolUse hook is byte-identical to "checked, nobody else is touching this file".
+# That is the one failure the gate cannot narrate, because it is no longer running when it happens.
+#
+# -TimeBudgetSeconds moves the bail INSIDE the walk, where it can still be reported. The property under
+# test is not the timing -- it is that an overrun yields NO map, NO cache and a non-zero exit, never a
+# partial map. A partial map is an under-report, and an under-report from this script is a silent
+# collision.
+
+
+def _budgeted(primary: Path, tmp_path: Path, budget: str) -> subprocess.CompletedProcess[str]:
+    """The whole-map query with a walk budget, WITHOUT asserting the exit code -- that is the subject."""
+    return subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(OVERLAP),
+            "-Repo",
+            str(primary),
+            "-Json",
+            "-Refresh",
+            "-TimeBudgetSeconds",
+            budget,
+            "-ConfigRoot",
+            str(tmp_path / "no-such-config"),
+            "-TasksDir",
+            str(tmp_path / "no-such-tasks"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+
+
+@pytest.fixture
+def three_peers(tmp_path: Path) -> Path:
+    """A primary with three peer worktrees, each carrying a commit -- enough git spawns to overrun."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True, capture_output=True
+    )
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(primary)], check=True, capture_output=True
+    )
+    git(primary, "config", "user.email", "t@example.invalid")
+    git(primary, "config", "user.name", "t")
+    (primary / "alpha.txt").write_text("base\n", encoding="utf-8")
+    git(primary, "add", "-A")
+    git(primary, "commit", "-qm", "base")
+    git(primary, "remote", "add", "origin", str(origin))
+    git(primary, "push", "-q", "origin", "main")
+    for n in range(3):
+        peer = tmp_path / f"peer-{n}"
+        git(primary, "worktree", "add", "-q", "-b", f"peer-{n}", str(peer))
+        (peer / f"file-{n}.txt").write_text("theirs\n", encoding="utf-8")
+        git(peer, "add", "-A")
+        git(peer, "commit", "-qm", f"peer {n} work")
+    return primary
+
+
+def test_a_generous_budget_still_returns_the_whole_map(three_peers: Path, tmp_path: Path) -> None:
+    """CONTROL. Without it, a bail on every run would satisfy the test below."""
+    proc = _budgeted(three_peers, tmp_path, "60")
+    assert proc.returncode == 0, f"exited {proc.returncode}: {proc.stderr}"
+    rows = json.loads(proc.stdout.strip())
+    assert len(rows) == 3, f"expected all three peers, got {[r['Worktree'] for r in rows]}"
+
+
+def test_a_walk_that_blows_its_budget_returns_no_map_at_all(
+    three_peers: Path, tmp_path: Path
+) -> None:
+    """AND SAYS SO WITH AN EXIT CODE. Silence here is indistinguishable from an all-clear.
+
+    ``[]`` would be the literal all-clear, and a partial array would be a quieter version of the same
+    lie. The only honest answer is no answer plus a non-zero exit, which is the channel the gate
+    already treats as "this check did not happen".
+    """
+    cache = (
+        Path(git(three_peers, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+        / "mefor-coord"
+        / "overlap-cache.json"
+    )
+    assert not cache.exists(), (
+        "the fixture must start with no cache, or the assertion below is blind"
+    )
+    proc = _budgeted(three_peers, tmp_path, "0.01")
+    assert proc.returncode == 3, f"expected the budget exit, got {proc.returncode}: {proc.stderr}"
+    assert proc.stdout.strip() == "", f"a partial or empty map was printed anyway:\n{proc.stdout}"
+    assert not cache.exists(), (
+        "an abandoned walk was cached, pinning the under-report for the window"
+    )
