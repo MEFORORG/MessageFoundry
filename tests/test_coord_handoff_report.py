@@ -242,7 +242,7 @@ class TestTheFourHolds:
         proc = run(sandbox, "-Retire", "RESUME-HERE.md", "-Force")
         assert proc.returncode == 0, proc.stdout + proc.stderr
         dest = retired_dir(sandbox) / "handoffs"
-        assert (dest / "RESUME-HERE.md.tar.gz").is_file()
+        assert (dest / "RESUME-HERE.md.zip").is_file()
         assert not (dest / "RESUME-HERE.md").exists()
 
 

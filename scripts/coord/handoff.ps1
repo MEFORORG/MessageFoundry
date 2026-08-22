@@ -317,9 +317,25 @@ if ($PSCmdlet.ParameterSetName -eq 'Retire') {
         # precedent proves it: COORDINATOR-HANDOFF-LIVE.md, the file its own retirement README singles
         # out as the worst offender, is sitting uncompressed in _retired-2026-08-22/ right now, where
         # it still reads exactly as it did before.
-        $dest = Join-Path $destDir "$($target.Name).tar.gz"
-        tar -czf $dest -C (Split-Path $target.Path -Parent) $target.Name
-        if ($LASTEXITCODE -ne 0) { throw "tar failed for $($target.Name); nothing was moved." }
+        # Compress-Archive, NOT `tar`, and the reason is a measured portability failure rather than
+        # a preference. The first version shelled out to tar. On Windows that resolves to whichever
+        # tar is first on PATH, and the two behave differently on the SAME arguments:
+        #
+        #   GNU tar 1.35 (Git Bash, /usr/bin/tar)     "Cannot connect to C: resolve failed"
+        #   bsdtar       (Windows, System32\tar.exe)  succeeds
+        #
+        # GNU tar reads a leading `C:` as a REMOTE HOST spec. `--force-local` fixes it there and is
+        # rejected by bsdtar, so there is no flag that works on both. It passed every local run
+        # because pytest was invoked from PowerShell, where System32 wins the PATH -- a peer running
+        # the same test from a bash-rooted shell hit it immediately. The bug was in the code and the
+        # test could not see it, because the test inherits the shell that launched it.
+        #
+        # Compress-Archive is in-process: no PATH lookup, no argument parsed as a host, and no second
+        # implementation to disagree with. Nothing consumes the archive format -- this code writes
+        # the restore command itself -- so the format was free to change and the failure class is
+        # gone rather than worked around.
+        $dest = Join-Path $destDir "$($target.Name).zip"
+        Compress-Archive -LiteralPath $target.Path -DestinationPath $dest -Force
         if (-not (Test-Path -LiteralPath $dest)) { throw "archive not created for $($target.Name); nothing was moved." }
         Remove-Item -LiteralPath $target.Path -Force
     } else {
@@ -364,7 +380,7 @@ is why a dangling seat pointer could not be resolved against it.
 "@
     }
     $restore = if ($compress) {
-        "tar -xzf `"$dest`" -C `"$handoffs`""
+        "Expand-Archive -LiteralPath `"$dest`" -DestinationPath `"$handoffs`""
     } else {
         "Move-Item -LiteralPath `"$dest`" -Destination `"$handoffs`""
     }
