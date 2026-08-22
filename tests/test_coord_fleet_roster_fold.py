@@ -208,9 +208,13 @@ class TestClosedRecords:
         A CLOSED record is never LABELLED superseded -- lifecycle wins the state switch -- so a
         fold keyed on the label leaves exactly the rows a remediating seat tried to retire.
         """
-        seat(repo, "-Declare", "-Seat", "old", "-Goal", "g", session="sess-old")
-        seat(repo, "-Close", session="sess-old")
-        seat(repo, "-Declare", "-Seat", "new", "-Goal", "g", session="sess-new")
+        # Session keys sort in WRITE order on purpose. asOf is stamped to the second, so two runs
+        # can land in one second and tie; the tie is broken on the file name, and naming these out
+        # of order would make the test assert the tiebreak rather than the fold. Measured: it
+        # passed alone and failed under load before the names were ordered.
+        seat(repo, "-Declare", "-Seat", "old", "-Goal", "g", session="sess-a-old")
+        seat(repo, "-Close", session="sess-a-old")
+        seat(repo, "-Declare", "-Seat", "new", "-Goal", "g", session="sess-b-new")
         rows = roster_rows(fleet(repo, "-Text"))
         assert len(rows) == 1
         assert "new" in rows[0], rows
@@ -228,3 +232,32 @@ class TestClosedRecords:
         rows = roster_rows(fleet(repo, "-Text"))
         assert len(rows) == 1
         assert "CLOSED" in rows[0], rows
+
+
+class TestTheRosterSurfacesTheWritersCurrency:
+    """Recording the fact in seat.ps1 surfaces nothing until the roster shows it."""
+
+    def test_an_out_of_date_writer_is_marked_on_its_row(self, repo: Path) -> None:
+        head = git(repo, "rev-parse", "HEAD").strip()
+        target = repo / "scripts" / "coord" / "seat.ps1"
+        target.write_text(
+            target.read_text(encoding="utf-8") + "\n# newer, on origin/main only\n",
+            encoding="utf-8",
+        )
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "newer seat.ps1")
+        git(repo, "update-ref", "refs/remotes/origin/main", git(repo, "rev-parse", "HEAD").strip())
+        git(repo, "reset", "-q", "--hard", head)
+        seat(repo, "-Declare", "-Seat", "s", "-Goal", "g", session="sess-old-script")
+        assert "[SCRIPT-OUT-OF-DATE]" in fleet(repo, "-Text")
+
+    def test_a_current_writer_is_not_marked(self, repo: Path) -> None:
+        """The negative control. A mark that always prints is not a signal."""
+        git(repo, "update-ref", "refs/remotes/origin/main", git(repo, "rev-parse", "HEAD").strip())
+        seat(repo, "-Declare", "-Seat", "s", "-Goal", "g", session="sess-current")
+        assert "[SCRIPT-OUT-OF-DATE]" not in fleet(repo, "-Text")
+
+    def test_it_is_not_confused_with_the_record_age_marker(self, repo: Path) -> None:
+        """WRITER-STALE means the RECORD is old; this means the SCRIPT is. Different objects."""
+        text = (COORD / "fleet.ps1").read_text(encoding="utf-8")
+        assert "[WRITER-STALE]" in text and "[SCRIPT-OUT-OF-DATE]" in text

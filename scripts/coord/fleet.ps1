@@ -246,13 +246,24 @@ foreach ($r in $records) {
     # It is the defect this whole roster keeps producing in new places -- an instrument whose
     # resolution does not match the question. A 6-minute bucket is the right precision to READ and
     # the wrong precision to SORT, and the two uses had been sharing one function.
+    # AND THE ORDER MUST BE TOTAL, not merely finer. asOf is stamped to the SECOND, so moving the
+    # comparison off the rounded age shrank the tie window from 6 minutes to 1 second without
+    # closing it -- two records written inside one second still tie, and a tie means NEITHER
+    # supersedes the other, so both survive. That is the original defect at a smaller scale, and it
+    # showed up as a test that passed alone and failed under load, which is the worst way to find it.
+    #
+    # The file name breaks the tie. It is arbitrary and it is DETERMINISTIC, which is the property
+    # that matters: exactly one record in a tied pair survives, the same one on every render. It
+    # does not claim to know which was written first -- at equal timestamps nothing here can.
     $exactAge = Get-AgeHoursExact $rec.asOf
     $superseded = $false
     foreach ($o in $records) {
         if ($o.File -eq $r.File) { continue }
         if ($o.Box -ne $r.Box) { continue }
         $oAge = Get-AgeHoursExact $o.Rec.asOf
-        if ($null -ne $oAge -and $null -ne $exactAge -and $oAge -lt $exactAge) { $superseded = $true }
+        if ($null -eq $oAge -or $null -eq $exactAge) { continue }
+        if ($oAge -lt $exactAge) { $superseded = $true }
+        elseif ($oAge -eq $exactAge -and [string]::CompareOrdinal([string]$o.File, [string]$r.File) -gt 0) { $superseded = $true }
     }
 
     $state = switch ($true) {
@@ -292,6 +303,16 @@ foreach ($r in $records) {
         # rendered two rows each for that reason, every one of them an orphan its seat had just
         # closed on purpose.
         Superseded  = $superseded
+        # WHICH seat.ps1 wrote this record, as that writer measured itself. Read, never recomputed:
+        # the question is what the writer was running AT THE TIME, and re-deriving it here would
+        # answer today's question about a past write -- which is the exact substitution that
+        # invented a phantom cause on 2026-08-22 and cost three sessions an evening.
+        #
+        # Absent on every record written before the field existed, and rendered as nothing rather
+        # than as 'current'. A missing measurement is not a passing one.
+        WriterScript = if (($rec.PSObject.Properties.Name -contains 'writerScript') -and $rec.writerScript) {
+            [string]$rec.writerScript.state
+        } else { $null }
         WriterStale = $writerStale
         Branch      = if ($rec.PSObject.Properties.Name -contains 'branch') { [string]$rec.branch } else { $null }
         Worktree    = $wt
@@ -474,7 +495,7 @@ if ($Json) {
         # Handoff* are computed here, not read from the record: -Json is what another tool consumes,
         # and a consumer that got the recorded flag would inherit the same never-re-checked value the
         # human render stopped trusting above.
-        rows    = @($rows | Select-Object Box, SessionKey, Seat, State, Fence, AgeHours, WriterStale, Branch, Worktree, Epoch,
+        rows    = @($rows | Select-Object Box, SessionKey, Seat, State, Fence, AgeHours, Superseded, WriterScript, WriterStale, Branch, Worktree, Epoch,
             @{n = 'HandoffPath'; e = { if ($_.Rec.handoff) { [string]$_.Rec.handoff.path } else { $null } } },
             @{n = 'HandoffState'; e = {
                     $h = $_.Rec.handoff
@@ -540,6 +561,11 @@ if (@($rows).Count -eq 0) {
     foreach ($row in ($shown | Sort-Object State, Box)) {
         $seat = if ($row.Seat) { $row.Seat } else { 'NOT-DECLARED' }
         $mark = if ($row.WriterStale) { ' [WRITER-STALE]' } else { '' }
+        # A DIFFERENT WORD ON PURPOSE. WRITER-STALE above means THE RECORD IS OLD; this means THE
+        # SCRIPT IS OLD. Two facts about two objects, and one token carrying both is the failure
+        # CLAUDE.md section 11 describes. Only out-of-date is marked -- 'modified' is the ordinary
+        # state of a maintainer's own checkout and flagging it would train readers to ignore this.
+        if ($row.WriterScript -eq 'out-of-date') { $mark += ' [SCRIPT-OUT-OF-DATE]' }
         "{0,-30} {1,-14} {2,-18} {3,-7} {4}{5}" -f $row.Box, $seat, $row.State, $row.AgeHours, $row.Branch, $mark
     }
 }
