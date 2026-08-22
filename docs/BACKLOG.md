@@ -1152,6 +1152,8 @@ deliberate owner pass rather than bundled into this harness change.
 >
 > 🛠 **Decline overturned (2026-07-09).** A prioritization pass recommended DECLINE; the stated reason was **invalid**. Purity binds `@router` / `@handler` — **not connectors** (CLAUDE.md §8: “side effects (DB, network) belong in connections/transports”). This is an unfired **demand-gate**, not an architectural impossibility.
 > 🔢 **Re-scored 2026-08-03 → DEMAND-GATE.** The only order-preserving way to push one ordered feed past the ~60 msg/s one-lane-one-core bound; the engine-shard "workaround" is void (shards partition by connection) and the in-engine router-fanout substitute leaves transform serialized, so a real gap with only an awkward workaround. Nothing keyed exists (`partition_key`/`sequence_key`: zero hits in `messagefoundry/`), and keyed lane assignment with single-writer-per-lane over the durable outbox plus the A40 cross-key hazard is multi-week work sitting directly on the strict-FIFO invariant. Quadrant becomes big bet. _(was 5/10 · 9/10.)_ **Reviewed 2026-08-10 -- deferral stands, with the arithmetic recorded.** The 45M/day capability target DOES NOT IMPLY this item: 45M/day across 1,500 connections is ~0.35 ev/s per connection, roughly 170x below the ~60 msg/s one-lane bound, so the target is met by CONCENTRATION rather than per-lane speed. The trigger is specifically ONE ORDERED INTERFACE EXCEEDING ~60 msg/s. Note also that the 2026-07-09 decline was OVERTURNED and must not be re-declined on the purity argument: purity binds `@router`/`@handler`, not connectors.
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Type:** feature — throughput/ordering enhancement. Deferred by design: the near-term model is
 **FIFO per outbound connection** (simple, safe). Per-key ordering is the leading-edge refinement to
@@ -1590,6 +1592,8 @@ that into the corresponding OBX segment." Reconciled against the in-store siblin
 > **Re-scored 2026-08-03 → DEMAND-GATE.** A customer's own Azure OpenAI / Bedrock / in-house endpoint is precisely this item's ask and today fails as an opaque 502 rather than a config error, with BYO the only workaround and one that forfeits the central audit the customer wanted; the broker, audit and egress allow-list already ship, so the remainder is per-provider wire shapes behind `chat()`, a validator that refuses an unserviced `provider`, and the stale `docs/AI.md:22` line. _(was 5/10 · 6/10.)_
 > **AMENDED 2026-07-28 — the engine broker IS built; the remainder is narrower than this item reads.** Adversarial verification refuted a full close. **BUILT:** the engine-side broker (`messagefoundry/transports/ai_broker.py`), its per-use AI-egress audit, and the IDE flip — [ADR 0135](adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md), `code_only` + non-streaming MVP.
 > ⚠️ **The REMAINDER is the generic customer-endpoint mode, and it is half-merged in a way that fails confusingly.** `provider` is **accepted but never read** — stored at `ai_broker.py:143` and used nowhere — and `chat()` unconditionally sends the **Anthropic Messages** wire body with `anthropic-version` / `x-api-key` headers regardless of it (the shape is documented as the MVP provider at `ai_broker.py:62`). So every backend this item names — Azure OpenAI, Bedrock, an internal gateway, vLLM, Ollama — rejects that body as an **opaque 502 rather than a config error**, and no validator refuses a non-`claude` provider. Also `docs/AI.md` still declares *"No model-provider or engine broker integration exists yet"* and omits `api_key`/`allowed_endpoints` — stale, since the broker shipped.
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Type:** feature — AI governance + customer-infrastructure integration. Turns the **reserved-but-unused**
 `[ai]` broker config keys into a real integration: let the **engine broker** the IDE assistant's model calls to a
@@ -1677,6 +1681,8 @@ reconciled the same day.
 > (isolated-store refusal, synthetic-only, backend-aware *negative* rule, sink-cap **with an `INCONCLUSIVE`
 > outcome**). **Do not build the measurement layer** until the owner re-ratifies the sustain gate + estimand —
 > the required changes are listed in the ADR's 2026-07-14 Amendment.
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Type:** feature — an operator/adopter-facing **capacity self-test** shipped *with the engine*. It runs the
 same style of measurement we do for throughput testing, but as a first-class, on-demand command an adopter
@@ -1818,6 +1824,8 @@ filed against this item.
 >
 > **Re-scored 2026-08-03 → DEMAND-GATE.** Narrow EPA hardening on an opt-in in-process-TLS SSO mode nobody is blocked on, and structurally void behind a TLS-terminating proxy, so a niche interop knob at best; the acceptors are still constructed with no bindings at all (`spnego.server(service=…)` / `spnego.server()` at `messagefoundry/auth/ldap.py:300-302`, `:360-362`, with no `channel_bindings` argument or CBT knob anywhere), so the work is a spike plus one conditional per-mode flag — but the answer needs the same domain lab #99(e) is blocked on. **Reviewed 2026-08-10 at the G26 demand-gate triage: trigger re-read against the code and NOT fired -- deferral stands.**
 > **On-trigger / demand-gate.** Recorded from the ADR 0068 open items (browser Kerberos SSO, L5c).
+> Verdict: demand-gate
+> Closing-act: blocked
 
 **Type:** security hardening spike + (conditionally) a per-mode opt-in knob.
 
@@ -1851,6 +1859,8 @@ that first domain-joined box — run this spike alongside it.
 > * **(b)** was closed separately via **#224**. **(c)** remains a documented stdlib scope-out (OpenSSL, not SChannel) — a decision, not a task.
 > * **(e) — the live domain-lab gMSA/SSO/reverse-proxy smoke — is the ONLY residual**, and it needs a real DC + AD CS + gMSA. That is **rig/provisioning the project does not own** (same gate as [#98](#98-kerberos-sso-channel-binding-epa-opt-in--acceptor-enforcement-spike-p3-on-trigger)); it is gated behind **#275**. No engineering capacity closes it.
 > ⚠️ **Two cross-references above resolve to paths that no longer exist from this baseline** (`docs/security/OFF-LOOPBACK-DEPLOYMENT.md`): `docs/security/` is **gitignored post-cutover**. The deployment content is intact for operators with the working tree; the links simply do not resolve in the public repo. See [`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md).
+> Verdict: demand-gate
+> Closing-act: blocked
 
 **Type:** deployment hardening — close the last-mile gaps between "the identity primitives exist" and a
 turnkey, documented, validated enterprise Windows/AD install.
@@ -1909,6 +1919,8 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 >
 > **Re-scored 2026-08-03 → DEMAND-GATE.** The adopter already hand-ported and the AI `/migrate` covers the rest, with no named demand, so it ships little worth even if finished; the mapper and CLI are built, leaving reconciliation of the emitted mapping against a real Corepoint export and the deferred `ide/` wrapper — behind #313's multi-message Handler model, which this item cannot buy. _(was 2/10 · 6/10.)_ **Reviewed 2026-08-10 -- deferral stands; two corrections to the record.** (1) Its gate #313 sits ABOVE the published #231 baseline BY DESIGN and is sound evidence a public reader cannot open -- per this repo's own convention, do not disclaim it, do not call it unverifiable, do not strip it. (2) The Corepoint ROLE LAYER IS WIRED, so SPEC-105's "Vocabulary Action objects produced: 0" is a PRE-WIRING measurement and must not be quoted as current state.
 > **AMENDED 2026-07-28 — the stated blocker is discharged; the real gate is a different item.** This item has been carried as blocked on an *"input schema SYNTHETIC-until-validated"* premise. That premise no longer holds: [ADR 0086](adr/0086-deterministic-corepoint-import.md) **Amendment 2026-07-24 §2(a′)** supersedes the old JSON model (`:46-49` marks the synthetic format *SUPERSEDED*) — the input is now a **validated XML** format, parsed through `defusedxml` (`messagefoundry/corepoint_import.py:81`, with the security rationale at `0086:124`). ⚠️ **This does NOT make the item schedulable.** The real gate is **#313** (the multi-message Handler model — the import refuses ~2,000 statements without it), and #313 is **invisible from this published baseline**, which ends at #231. Do not read the discharged blocker as a green light; the item stays P3 and demand-gated behind #313.
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **Type:** migration / DX (large). The deterministic sibling for the AI `/migrate` — the **one open gap** in the AI-off completeness matrix ([`docs/AI-OFF-MATRIX.md`](AI-OFF-MATRIX.md)).
 
@@ -2857,6 +2869,8 @@ def route_demo_oru(msg):
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. Remainder is a UX latency fix on an authoring surface, which is the DX and console polish band, not a functional gap. The debounced channel and the deferral machinery already ship and the false stale-disk premise is already corrected in the code comment at :924-930, so the change is one subscription plus tests; the cost that keeps it above a trivial edit is the ADR 0076 section 5 amendment re-arguing a wholesale-adopted guardrail. _(was 4/10 · 3/10.)_
 >
 > **Filed 2026-07-30. PARTLY LANDED 2026-08-04 — the race half is fixed; the save-gate relaxation this item was filed for is STILL OPEN. Re-framed 2026-07-30 to match the instruction that filed it.** This was originally recorded as "revisit — do not treat as a bug", which contradicted the owner's actual words: *"Put that fix on the backlog too."* It is a **fix**, gated on an ADR amendment — not a question about whether to act. **Landed:** a user save arriving while a `lens rewrite` held the single edit slot was **discarded**, leaving the view on a pre-save projection with no signal until the next save; it is now deferred to slot release and re-projected exactly once ([ADR 0076](adr/0076-typed-action-vocabulary-action-list-lens.md) Amendment C — **ACCEPTED**; owner-ratified and landed with integration-c 2026-08-11). **Still open:** whether a *bounded relaxation* of the save gate is safe. Argue it against the corrected premise, not the old one: `render()` pipes `document.getText()` to `lens parse -` over stdin, so rows are projected from the **live buffer**, not from disk — the "stale disk content" justification the gate's own comment carried was false. The surviving reasons are re-shelling Python per keystroke and the fact that a re-projection replaces the entire webview HTML. `RERENDER_DEBOUNCE_MS` is at `stepsView.ts:93`; the stale `:89`/`:91` anchors below were corrected in this same commit, so the two no longer disagree. The engineering caveat that motivated the softer framing is preserved below and is unchanged.
+> Verdict: build
+> Closing-act: code
 
 **Cluster:** IDE & Authoring. **Priority:** P3. **Verdict:** **build (ADR-first)** — owner asked for the fix; the save-gate it touches is a deliberate ADR 0076 §5 guardrail, so the amendment lands before the change. **Severity:** low (UX latency).
 
@@ -2963,6 +2977,8 @@ The existing test is too weak to catch any of it: `test_insert_comment_reads_bac
 > 🚧 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Increment 1 is on disk and wired into the required pytest legs; the remainder is increment 2, whose highest-value piece is fuzzing the unauthenticated MLLP/raw-TCP/X12 ingress plane, and no mutator exists in the tree to extend. Value 7 for a real gap with no workaround (every other security test here is static or in-process); difficulty 6 for a mutator the project does not have plus an OpenAPI security overlay with a fifth DEP-1 lock, a TLS black-box target and the console plane, with only the nightly-notice widening cheap. _(was 7/10 · 6/10.)_
 >
 > **In progress 2026-07-31.** Increment 1 built: an authenticated authorization sweep against a live loopback listener in front of a real engine (negative / authorized-reach / viewer BFLA), with fail-closed floors and two canaries. Increment 2 — schema-driven breadth, the unauthenticated MLLP/TCP/X12 ingress plane, the /ui console plane and a TLS black-box target — is not built.
+> Verdict: build
+> Closing-act: code
 
 **Type:** security testing — dynamic (DAST) tier of [`Secure_Development_Standards`](Secure_Development_Standards.md) §6.1.
 
@@ -2985,6 +3001,13 @@ The existing test is too weak to catch any of it: `test_insert_comment_reads_bac
 > 🚧 **Re-scored 2026-08-20 -> P3.** Value **3/10** · Difficulty **3/10** · _fill-in_. Diagnosis only: the CI symptom was absorbed by #115's widened stranding budget, nothing was lost, and the record-correction half is in the tree at report.py:596-606. What is left is a single measurement under concurrent load driven from an existing dispatch-only workflow, so both worth and cost stay small. _(was 3/10 · 3/10.)_
 >
 > **Status: OPEN INVESTIGATION (filed 2026-08-01, not started).** Diagnosis only — the CI symptom is already fixed (#115, `06fd327d`) by widening the reconcile's stranding budget. This item is the **underlying capacity fact**, which that fix does not address and deliberately did not try to. Tooling to measure it landed in #118 (`harness/load/ingress_probe.py` + a dispatch-only sweep across ubuntu / windows-2022 / windows-2025). The decisive experiment — the same sweep on the **self-hosted WS2025 rig** — is blocked: that runner is unregistered (`actions/runners` → `total_count: 0`) and `selfhosted-win2025-sql.yml` has never run.
+> Verdict: build
+> **NO `Closing-act` DELIBERATELY -- THE CLASSIFICATION IS CONTESTED AND A GATE SHOULD REFUSE THIS.**
+> *An adversarial pass moved this from `research` to `build` on a real argument (the item mentions
+> ASVS and scorecard ZERO times, against 112 items that mention both, so there is no cell to re-score)
+> but returned **low** confidence, and the direction of the change is toward `code`.* **A wrong `code`
+> hands an unfinishable item to a builder with a machine-readable blessing on it, which is exactly what
+> a derivation did to [#1243](#1243) earlier the same day.** *Needs one human read; until then, absent.*
 
 **Type:** CI/runner capacity — not a correctness defect. No message was ever lost in any observed instance.
 
@@ -5307,6 +5330,8 @@ against the gate **as it will ship**, not as it is.
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. A developer-guardrail wording question with no product, engine or PHI effect: the printed command works, it is just not the mechanism that made the reader's own worktree. Difficulty 2 because the code half is one hint string feeding the existing emitters plus a test, with the owner decision being the slow part rather than the edit. _(was 4/10 · 4/10.)_
 >
 > **Filed 2026-08-05 — not started.** Two mechanisms create worktrees here and they use different layouts. `new.ps1` makes siblings at `<repo-parent>/<repo-name>-<Name>`; the Claude Code harness makes nested ones under `<primary>/.claude/worktrees/<slug>`. Rule 3b fires for both and its remediation only ever names the first.
+> Verdict: build
+> Closing-act: blocked
 
 **What.** A session blocked by Rule 3b is told to run `new.ps1`, which produces a sibling worktree. If that session is itself harness-created and nested, the remediation hands it a worktree in a different layout from the one it lives in — functional, but not what the reader expects, and not made by the mechanism that made theirs.
 
@@ -5323,6 +5348,8 @@ against the gate **as it will ship**, not as it is.
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. The gate's own site is already written as conditional (worktree_gate.ps1:865-879 spells out the three bypass flags and the allowlist reason), so the remainder is one measurement plus the sweep for other deferring sites, and at least two unconditional ones survive (prune-merged.ps1:1271, BACKLOG-CLOSED.md:6675). It ships nothing runnable to an adopter, which caps it at internal-tooling hygiene, and the work is one command plus doc edits. _(was 5/10 · 2/10.)_
 >
 > **Filed 2026-08-05 — not started.** At least three git flags defeat the guard that stops a branch being checked out in two worktrees. Any code or comment reasoning that "git already refuses this" is making a claim about a **configuration**, not about git, and must say so.
+> Verdict: build
+> Closing-act: code
 
 **Measured 2026-08-05**, against a branch live in another worktree:
 
@@ -5349,6 +5376,8 @@ against the gate **as it will ship**, not as it is.
 > 🚧 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. The two proven-exploitable surfaces are closed and one helper per class exists in PowerShell, so the residual is applying the same treatment to the Python hooks, of which claim_check.py:134-140 is a confirmed untreated prose interpolation of a newline-capable value. Value drops from 8 because the highest-influence values (a refname into a command, a Write file_path into prose) are now folded, and difficulty drops from 5 because the audit is done and the Python hooks need one small helper rather than the PowerShell one. _(was 8/10 · 5/10.)_
 >
 > **IN PROGRESS 2026-08-10 — the audit is complete and two surfaces are closed; branch `w2-l3-gate-emitter` (`f911ebe5`, `608738e6`, `590b68f6`).** `worktree_gate.ps1` now has exactly one helper per class -- `Get-SafeForMessage` folds a value entering PROSE, `Get-SafeForCommand` single-quotes one entering a COMMAND -- plus `Protect-CommandLines`, a sweep at `Write-Deny` (the one funnel every rule already passes through) that drops shell metacharacters sitting OUTSIDE a quoted span on an indented `pwsh`/`git` line. A helper-produced value is inside quotes and is untouched, so the sweep cannot make a correct line wrong; it only defangs a line whose author did not use the helper, which is the failure that actually recurs. Shape for the guarantee, names for the message -- the same split rule 1b already makes. `collision_gate.ps1` got the prose fold, as a LOCAL copy: `worktree_gate.ps1` is installed outside every working tree and can dot-source nothing, so a shared module would be importable by one hook and not the other. Closes #1035, #1076 and #1036 as instances. At least one hook surface and one design question remain -- see the session report; neither is described here.
+> Verdict: build
+> Closing-act: code
 
 **Instance one — a refname into a command.** `git check-ref-format` accepts `;`, `$`, `|`, `"` and `'` in a refname. A legal, creatable branch carrying a quote and a comment marker made Rule 3b emit a line that parses as **two statements**, the second arbitrary, with the comment marker hiding the remainder. A branch with a bare interior quote emitted an unparseable line. Fixed by doubling the quotes in the single-quoted emission.
 
@@ -5525,6 +5554,8 @@ against the gate **as it will ship**, not as it is.
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **6/10** · Difficulty **2/10** · _quick win_. Prevention for the private security corpus on a public remote is still a client hook that push --no-verify skips and a fresh clone lacks, and the shipped security document says nothing about that posture. Value drops to the awkward-workaround band because the posture IS now written down accurately, just in a workflow header rather than in docs/SECURITY.md, so a diligent reader can reach it; the remainder is an owner decision plus recording it, since detection landed and the item forbids answering by hardening the hook. _(was 7/10 · 6/10.)_
 >
 > **Filed 2026-08-05 — not started.** Successor to #1034, which is closed on its title. That item's stated remedy — "the durable answer is server-side" — is **unavailable**, measured rather than inferred. So the only thing preventing `docs/security` from reaching the public remote is a client-side hook that `git push --no-verify` skips and a fresh clone does not have until an installer is run by hand. That is the posture; the question is whether it is acceptable.
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **The measurement, stated once here so nobody re-derives it.** Both halves of #1034's server-side answer are dead:
 
@@ -5848,6 +5879,8 @@ The same `[^"\s]+` class truncated at a SPACE, so any governed root whose path c
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **4/10** · _fill-in_. Rule 3c still decides governance by an equality-or-slash-prefix test over the resolved git common dir, so an independent clone under a governed root inherits governance, and the deny text still asserts a shared .git that a vendored clone does not have. Value 4 because it is a false deny in developer tooling with no product surface; difficulty 4 because any fix must pin both directions at once -- allow the vendored clone while keeping the nested .claude/worktrees case denied -- and it forces the git-submodule question the item deliberately deferred. _(was 4/10 · 4/10.)_
 >
 > **Filed 2026-08-06 — not started, deliberately.** Rule 3c decides "is this a governed repository" with an equality-or-slash-prefix test against each governed root. Any repository living anywhere UNDER a governed root therefore inherits its governance, including one that shares nothing with it.
+> Verdict: build
+> Closing-act: code
 
 **Cluster:** Session-drift controls / gate integrity. **Priority:** P3. **Severity:** a FALSE DENY, not a fail-open, and not reachable on this box today -- no independent repo currently lives under the primary. It fires the day someone vendors a clone or drops a scratch repo there.
 
@@ -5866,6 +5899,8 @@ The same `[^"\s]+` class truncated at a SPACE, so any governed root whose path c
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **4/10** · _quick win_. Rule 3c still decides on $seg.Scan at worktree_gate.ps1:976-978 while Remove-QuotedSpans at :347-388 blanks every closed quoted span, so a quoted danger key is erased before the disarm regex runs; grep finds no length-preserving mask, no bare-word unmask, and the pinned ALLOW test the item names is absent from tests/. Value 7 because the fail-open needs no unusual spelling and disarms the ledger, claim and leak commit gates for every worktree at once with no compensating detection, but its blast radius is the developer harness rather than a deployment; difficulty 4 because the one written fix was rejected on verification after acquiring five new fail-opens, so the remainder is a scanner rewrite plus an adversarial test round. _(was 8/10 · 3/10.)_
 >
 > **Filed 2026-08-06 — a fix was WRITTEN and then REJECTED BY VERIFICATION, and ONE SPELLING OF THIS DEFECT REMAINS OPEN BY DESIGN. ⛔ DO NOT SHIP THE BANKED PATCH.** The round that closed this also introduced at least five new fail-opens; see #1061's banner. ⛔ The gate governing this machine is unchanged — still commit `a67838d2`, blob `3e7db362`.
+> Verdict: build
+> Closing-act: code
 
 **Cluster:** Session-drift controls / gate integrity. **Priority:** P1. **Severity:** a FAIL-OPEN on `core.hooksPath` needing no unusual spelling — quoting an argument is ordinary.
 
@@ -5895,6 +5930,8 @@ git -c 'alias.ci=commit --no-verify' ci -m x
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **5/10** · _quick win_. The fail-open is unaddressed in the shipped gate: rule 3c decides from argv at worktree_gate.ps1:960 and the whole file contains no GIT_CONFIG reference, so all four measured channels remain ALLOW. The remainder is a new rule with its own danger match plus a file-identity target resolution inside a 1911-line Windows gate that has regressed before, which is bounded but intricate work with no store, ADR or migration axis. _(was 8/10 · 6/10.)_
 >
 > **Filed 2026-08-06 — not started. ⛔ OPEN ON EVERY GATE MEASURED: the committed one, the rejected round-2 patch, and the round-3 fix (banked as a patch, not committed).**
+> Verdict: build
+> Closing-act: code
 
 **Cluster:** Session-drift controls / gate integrity. **Priority:** P1. **Severity:** a FAIL-OPEN that disarms the commit gates end to end — confirmed by putting a blocked commit through it, not inferred.
 
@@ -5915,6 +5952,8 @@ git -c 'alias.ci=commit --no-verify' ci -m x
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The hole is open and the gate file records it: scripts/hooks/worktree_gate.ps1:1607-1614 states that an extended-length or UNC admin-share spelling normalises to //?/c:/... or //localhost/c$/..., matches no governed root, was verified live on this box, and that closing it means folding both prefixes into Get-ComparablePath, moving rules 3, 3b, 3c and 3d with it. Difficulty 4 because the change itself is a lexical fold inside a five-line function (:164-168) and the cost is the cross-rule test matrix plus a negative control, not a new mechanism. _(was 5/10 · 5/10.)_
 >
 > **Filed 2026-08-06 — not started. ⛔ OPEN ON EVERY GATE MEASURED.**
+> Verdict: build
+> Closing-act: code
 
 **Cluster:** Session-drift controls / gate integrity. **Priority:** P2. **Severity:** a FAIL-OPEN on `core.hooksPath`, requiring the admin-share spelling of a local path.
 
@@ -5943,6 +5982,8 @@ git -c 'alias.ci=commit --no-verify' ci -m x
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **5/10** · _fill-in_. Two fail-opens on a shared disarm-write rule plus two over-denies, all four reproducible from the shipped source, on a maintainer guardrail rather than a product control. Difficulty 5 because the target-token half must be shell-aware per tool payload rather than one regex, with red-first tests for each shape. _(was 5/10 · 5/10.)_
 >
 > **Filed 2026-08-06 — not started. ⛔ OPEN ON EVERY GATE MEASURED.**
+> Verdict: build
+> Closing-act: code
 
 **Cluster:** Session-drift controls / gate integrity. **Priority:** P2. **Severity:** MIXED, and the mix is the point — two fail-opens and two over-denies in one predicate's blind spot. Each is an assertion in `tests/test_worktree_gate_control_plane.py` rather than prose, because a deleted case is indistinguishable from one that never existed.
 
@@ -12901,6 +12942,8 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 ## 1309. Scope GET /metrics and /stats labels to the caller's allowed_channels
 
 > 🔢 OPEN -- allocated 2026-08-22 by the Dispatcher at a builder's request, under the standing rule that this seat allocates and the building lane does not file.
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **RETIRED THE HOUR IT WAS FILED -- THIS IS A DUPLICATE OF `#1152` AND SHOULD NOT BE BUILT. The number is kept, retired in place, because commits and mail already cite it.**
 
@@ -12928,6 +12971,8 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 ## 1311. WITHDRAWN -- duplicate of #1310, same defect, same sites, same fix
 
 > 🔢 OPEN -- filed and withdrawn 2026-08-22, both by the Dispatcher, within four minutes. The number is kept and cannot be reclaimed; this body exists so it is not left dangling.
+> Verdict: demand-gate
+> Closing-act: owner-ruling
 
 **READ `#1310` INSTEAD.** It carries the same finding, was written first, is committed at `997e673b`, and is in an open pull request. Nothing here is unique to it except the second call site named below, which has been handed over.
 
