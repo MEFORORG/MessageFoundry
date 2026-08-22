@@ -8655,6 +8655,16 @@ filing.
 
 **Still not an honest pass, and the trap has a fresh twin.** Extending the "it only leaks what the marker already publishes" defence to the recovery-code walk remains disqualified, because that branch is taken on the secret itself. The twin is the published-count fact above: it is true and load-bearing, and it is one step from "the walk only leaks a count the API already publishes, therefore nothing needs building". That inference is FALSE -- the published count discharges the count limb and nothing else. The half-fix is also disqualified: closing the recovery-code loop while leaving `:2234-2243` produces a cell that reads fixed and measures worse, because the surviving fast path becomes the only variation left and is therefore easier to isolate. One instrument note: the proposed keyed-MAC fix would introduce a line matching this requirement's own recorded absence pattern, so it must re-anchor the pattern onto the still-open sites in the same commit; and the drift-protection assertion must never become an evidence anchor, because an anchor reads as coverage whatever the prose beside it says. Proposed work, unallocated and by subject: the constant-time recovery-code verification; the TOTP-branch work equalization, which must land with it; the keyed-MAC comparison hardening first among the one-liners; the bare-comparison sweep extended by the five sites above; the keyring full-walk change; the archive-frame discharge; a delegation-and-index clause naming all four caches; a second discovery instrument for comprehension and short-circuiting-builtin exits, scanning the full first-party tree with the denominator reported; and the anchor and item-text correction.
 
+
+**LANDED IN `#490`, AND IT CLOSED A RECORDED GAP -- BUT THE CELL IT MAPS TO DOES NOT MOVE. Both halves said together, because a closed gap beside a landed item reads like a re-score and this is not one.**
+
+**What the landing did:** the dead anchor the post-merge verify surfaced **is** the early-return line the cell was downgraded for. The recovery-code walk returned on the first argon2id match, so wall-clock leaked which code was presented. The constant-work loop closes exactly that, and the shipped code cites the requirement, this item and the ADR by number.
+
+***AND THE MECHANICAL REPAIR WOULD HAVE BEEN A REAL DEFECT.*** Re-pointing that anchor at the nearest surviving argon2 call -- the obvious move, and the one a tool would suggest -- **would have produced a GREEN anchor certifying a defect that no longer exists, on a Level 3 cell, permanently.** The correct action is **retirement**, not re-anchor: there is no equivalent line, because the thing it pointed at is gone.
+
+**The verdict holds because the downgrade rested on TWO data-dependent early returns, and only one is closed.** The other -- the AES-GCM keyring candidate loop -- still returns inside its loop, unchanged. **One ground closing does not lift a verdict that two grounds held down.**
+
+*Recorded here so nobody reads this item's landing as a re-score.* The record is what is behind; the engine is ahead.
 ## 1168. research an honest pass for ASVS 11.3.1 -- retiring PKCS#1 v1.5 when the DIRECT key-transport half has no padding parameter to set
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **7/10** · _big bet_. All four anchors are exact at HEAD: PKCS1v15 is the unconditional RSA signing padding (signing.py:212, :239), direct.py:344 calls add_signer with no rsa_padding keyword, and direct.py:359's add_recipient takes no padding argument at all. Value 8 for a weak-padding default on every RSA signature the shipped engine produces plus RSAES-PKCS1-v1_5 key transport, holding the cell at partial with no configuration an operator can choose to avoid it. Difficulty 7 because the honest-pass question turns on partner PSS/ECDSA field data nobody has gathered and on whether the CMS EnvelopedData surface can reach RSA-OAEP without leaving the pinned cryptography, which needs a version disagreement settled before it can even be introspected. _(was 8/10 · 7/10.)_
@@ -12400,6 +12410,14 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Source:** found by the ASVS Tracker while performing cleared work, not built by it. Content handed to this seat; number allocated and filed here.
 
+
+**MEASURED OCCURRENCE COUNT: THIS HAS NOW BLOCKED REAL WORK FIVE TIMES IN ONE NIGHT.** Filed as a gap; it is behaving as an active obstruction.
+
+**The fifth instance is the sharpest, because the blocked seat had already established that retirement was the CORRECT action** -- an anchor pointing at a line a fix deleted, where re-pointing would certify a defect that no longer exists. **The writer refuses cardinality drops unconditionally and offers no retirement path, so a correct, reasoned retirement cannot be written even once it is agreed.**
+
+*A tool that cannot express "this evidence should no longer exist" forces the alternatives: leave a dead anchor, or re-point it at something that does not support the claim.* **Both are worse than the retirement it will not accept**, and the second is worse than the first because it looks resolved.
+
+**Not urgent, and the direction matters:** in the blocked instance the stale residual **overstates** the case against the engine, which is the safe direction to be wrong in. The residual rewrite is assessor work and routes to the owner.
 ## 1308. vault scorecard records are unwritable by the safe writer when their pre-existing prose trips its character ban
 
 > 🔢 **Filed 2026-08-22 - not started.** Value **5/10** · Difficulty **3/10** · _fill-in_. **A population of records cannot be edited by the safe writer at all** -- a sanctioned edit is refused before it starts, for a character the writer did not author. Difficulty 3 because the correct scope (author versus pre-existing text) is a design call, not a regex change.
