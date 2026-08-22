@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -179,6 +180,109 @@ def test_an_editing_peer_still_denies_when_another_peer_merely_committed(tmp_pat
 
 def test_allows_a_payload_with_no_file_path(tmp_path: Path) -> None:
     assert run_gate(make_overlap_stub(tmp_path, [LIVE_ROW]), file_path=None) is None
+
+
+# ------------------------------------------------- an id that READS as a revision must say what it is
+#
+# Measured 2026-08-22. The committed-and-clean notice named a peer as ``80c88a83
+# [claude/<peer-branch>]`` inside a sentence whose verb was "CHANGED AND COMMITTED" and whose
+# remediation was "check its commits". Its reader took the token for an abbreviated commit hash,
+# looked for it in three separate object stores, found it in none of them, and concluded the gate had
+# invented a SHA. It had not: the value is ``Short`` from ``overlap.ps1``, the first eight characters
+# of a registry session UUID -- correct, useful, and resolving to no git object anywhere. There is no
+# revision in this code path at all.
+#
+# So the scan below is on the SHAPE OF THE SENTENCE rather than on the value. A UUID prefix is hex, so
+# it is indistinguishable from a short SHA by inspection, and this repo prints both: ``prune-merged.ps1``
+# and ``rescue.ps1`` emit REAL abbreviated hashes in the same ``<hex> [<branch>]`` form. The only thing
+# that can separate them is the word in front, which is why ``session-context.ps1`` puts it on the ROW
+# and not in a legend -- a column cannot mean one thing in one row and something else in the next.
+#
+# NOT a `git cat-file -e` check on the value. That instrument answers "is this string a git object"
+# when the question is "what KIND of identifier is this" -- and it answers WRONG for every real session
+# id, which would suppress the peer's identity entirely and restore the silence. Worse, a prefix that
+# happened to collide with one of this repo's ~66,000 objects would then be printed as a VALIDATED
+# revision.
+
+_HEXISH = re.compile(r"(?<![0-9A-Za-z])([0-9a-f]{7,40})(?![0-9A-Za-z])")
+
+
+def _unlabelled_hexish(text: str) -> list[str]:
+    """Every token a reader could mistake for an abbreviated commit hash, minus the labelled ones.
+
+    Seven is git's own floor for an abbreviated hash, so it is the shortest token that reads as one.
+    "Labelled" means the word ``session`` immediately precedes it -- the idiom already shipped at
+    ``overlap.ps1``'s single-file printer and at ``session-context.ps1``'s roster.
+    """
+    out = []
+    for m in _HEXISH.finditer(text):
+        if text[: m.start()].rstrip().lower().endswith("session"):
+            continue
+        out.append(m.group(1))
+    return out
+
+
+def test_the_hexish_scanner_sees_a_bare_token() -> None:
+    """LIVE POSITIVE CONTROL. An absence claim without one is a blind grep.
+
+    Both strings are hand-written from the MEASURED output rather than taken from the gate, so they
+    keep testing the scanner after the gate is fixed -- an input derived from the current output can
+    only ever agree with it.
+    """
+    reported = (
+        "[collision] handoff.ps1 was already CHANGED AND COMMITTED on another live session's branch "
+        "(80c88a83 [claude/peer-work]), whose tree is now clean."
+    )
+    assert _unlabelled_hexish(reported) == ["80c88a83"], (
+        "the scanner cannot see the token that was actually mistaken for a SHA, so every assertion "
+        "below is blind"
+    )
+    assert _unlabelled_hexish("committed by session 80c88a83 on branch claude/x") == []
+    assert _unlabelled_hexish("nothing hex-shaped in this sentence at all") == []
+
+
+@pytest.mark.parametrize("short", ["deadbeef", "80c88a83"])
+def test_the_committed_and_clean_notice_labels_the_session_id(tmp_path: Path, short: str) -> None:
+    """The reported defect, driven through the real gate.
+
+    ``80c88a83`` is the id from the 2026-08-22 report; ``deadbeef`` is the fixture value used
+    everywhere else in this file and is itself SHA-shaped, which is how the ambiguity stayed invisible
+    to the suite for as long as it did.
+    """
+    row = {**COMMITTED_ROW, "Short": short}
+    got = run_gate(make_overlap_stub(tmp_path, [row]))
+    assert got is not None, "expected context, not silence"
+    ctx = got["hookSpecificOutput"]["additionalContext"]
+    assert short in ctx, "the peer's identity must still be SHOWN, not suppressed"
+    assert _unlabelled_hexish(ctx) == [], (
+        "the notice carries a bare hex-shaped token in a sentence about commits. A reader will try to "
+        f"resolve it as a revision and find nothing:\n{ctx}"
+    )
+
+
+def test_the_denial_labels_the_session_id(tmp_path: Path) -> None:
+    """The deny path prints the same value in the same shape and needs the same word."""
+    got = run_gate(make_overlap_stub(tmp_path, [EDITING_ROW]))
+    assert got is not None
+    reason = got["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "deadbeef" in reason
+    assert _unlabelled_hexish(reason) == [], (
+        f"the refusal carries a bare hex-shaped token:\n{reason}"
+    )
+
+
+def test_the_committed_and_clean_notice_points_at_something_runnable(tmp_path: Path) -> None:
+    """NON-VACUITY on the remediation half.
+
+    Labelling the id fixes what the reader misreads; it does not tell them what to do instead. The
+    branch is the actionable half -- ``git log`` takes a branch and takes no session id -- so the
+    notice has to name it and hand over a command shaped around it.
+    """
+    got = run_gate(make_overlap_stub(tmp_path, [COMMITTED_ROW]))
+    assert got is not None
+    ctx = got["hookSpecificOutput"]["additionalContext"]
+    assert "claude/other-work" in ctx, "the branch is the half a reader can act on"
+    assert "git log" in ctx, f"no runnable remediation in:\n{ctx}"
 
 
 # ------------------------------------------- the notice is OUTPUT AN AGENT ACTS ON (BACKLOG #1040)

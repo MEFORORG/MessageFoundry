@@ -226,12 +226,37 @@ $editing = @($live | Where-Object { $null -eq $_.PSObject.Properties['MatchedDir
 if ($editing.Count -eq 0) {
     # Committed-and-clean in every live worktree: report it, do not block. The peer may well have
     # already done what you are about to do, which is worth knowing and not worth refusing over.
+    #
+    # LABEL THE ID, AND HAND OVER THE BRANCH. Measured 2026-08-22: this sentence named a peer as
+    # "80c88a83 [claude/<peer-branch>]" and its reader took the leading token for an abbreviated
+    # commit hash. Reasonably so -- the verb is "CHANGED AND COMMITTED", the noun beside it is
+    # "branch", the remediation said "check its commits", and this repo prints REAL short hashes in
+    # exactly this `<hex> [<branch>]` shape elsewhere (prune-merged.ps1, rescue.ps1). They searched
+    # three separate object stores, found it in none of them, and concluded the gate had invented a
+    # revision. It had not, and it could not have: `Short` is the first eight characters of a registry
+    # session UUID (overlap.ps1), so it is hex by construction and resolves to no git object anywhere.
+    # No git revision is read in this code path at all.
+    #
+    # The word "session" is the whole fix, and it goes on the ROW rather than into a legend -- a column
+    # cannot mean one thing in one row and something else in the next. Same idiom as overlap.ps1's
+    # single-file printer and session-context.ps1's live-peer roster.
+    #
+    # VERIFYING THE VALUE AS A REVISION IS NOT THE FIX. `git cat-file -e` answers "is this string a git
+    # object" when the question is "what KIND of identifier is this", and it answers NO for every real
+    # session id -- so guarding on it would suppress the peer's identity and restore the silence. A
+    # prefix that happened to collide with one of this repo's tens of thousands of objects would then
+    # be printed as a VALIDATED revision, which is worse than the ambiguity it replaced.
+    #
+    # THE BRANCH IS THE ACTIONABLE HALF. `git log` takes a branch and takes no session id, which is
+    # exactly why "check its commits" pointed that reader at the one identifier they could not use.
+    # The command stays a LITERAL with placeholders -- see the note on Get-SafeForMessage above: no
+    # value this gate prints is ever interpolated into a command line.
     $names = (@($live | ForEach-Object {
-                "$(Get-SafeForMessage $_.Short) [$(Get-SafeForMessage $_.Branch)]" }) -join ', ')
+                "session $(Get-SafeForMessage $_.Short) on branch $(Get-SafeForMessage $_.Branch)" }) -join '; ')
     [Console]::Out.Write((@{
                 hookSpecificOutput = @{
                     hookEventName     = "PreToolUse"
-                    additionalContext = "[collision] $(Get-SafeForMessage (Split-Path $target -Leaf)) was already CHANGED AND COMMITTED on another live session's branch ($names), whose tree is now clean. Not blocking -- but that work may overlap yours, so check its commits before you duplicate or revert it."
+                    additionalContext = "[collision] $(Get-SafeForMessage (Split-Path $target -Leaf)) was already CHANGED AND COMMITTED in another LIVE session's worktree ($names), whose tree is now clean. Not blocking -- but that work may overlap yours. The id there is a coordination-registry session id, NOT a commit: it resolves to no git object, so do not try to look it up. Read the BRANCH instead, before you duplicate or revert what is on it:  git log --oneline origin/main..<that branch> -- <this file>"
                 }
             } | ConvertTo-Json -Compress -Depth 6))
     exit 0
@@ -240,7 +265,9 @@ if ($editing.Count -eq 0) {
 $leaf = Get-SafeForMessage (Split-Path $target -Leaf)
 $lines = @("$leaf has UNCOMMITTED changes in another LIVE session's worktree -- editing it now means one of you loses work at merge.", "")
 foreach ($r in $editing) {
-    $lines += "  $(Get-SafeForMessage $r.Short) ($(Get-SafeForMessage $r.Surface)) in " +
+    # "session" for the same reason as the notice above: bare, this row leads with an 8-hex token
+    # immediately before a bracketed branch, which is the shape of an abbreviated commit hash.
+    $lines += "  session $(Get-SafeForMessage $r.Short) ($(Get-SafeForMessage $r.Surface)) in " +
               "$(Get-SafeForMessage $r.Worktree) [$(Get-SafeForMessage $r.Branch)]"
     foreach ($w in @($r.Work | Select-Object -First 2)) {
         $lines += "      building: $(Get-SafeForMessage $w)"

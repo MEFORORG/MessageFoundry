@@ -316,7 +316,12 @@ if ($Json) { (Write-JsonArray $map); exit 0 }
 if (@($map).Count -eq 0) { Write-Host "No other worktree has changes."; exit 0 }
 Write-Host ""
 foreach ($r in $map) {
-    $who = if ($r.Live) { "LIVE $($r.Surface) $($r.Short)" } else { "dormant" }
+    # "session" here too. This table has no header row, so bare the third column is an unexplained
+    # 8-hex token sitting beside a branch name -- the shape of an abbreviated commit hash, and read as
+    # one on 2026-08-22 when the collision gate re-rendered the same value into prose. The word goes on
+    # the ROW, not into a header, so the column cannot mean one thing in one row and something else in
+    # the next; the single-file printer above already does it this way.
+    $who = if ($r.Live) { "LIVE $($r.Surface) session $($r.Short)" } else { "dormant" }
     Write-Host ("{0,-38} {1,-38} {2}" -f $r.Worktree, $r.Branch, $who)
     foreach ($w in @($r.Work | Select-Object -First 3)) { Write-Host "    building: $w" }
     Write-Host ("    {0} changed file(s)" -f @($r.Files).Count)
