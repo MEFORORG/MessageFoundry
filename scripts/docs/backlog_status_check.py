@@ -87,9 +87,22 @@ _HEADING = re.compile(r"^## (?P<num>\d+)\.\s")
 _FIELD_KEYS = ("verdict", "research", "closing-act")
 _FIELD = re.compile(rf"^>\s*(?P<key>{'|'.join(_FIELD_KEYS)})\s*:\s*(?P<value>.+?)\s*$", re.I)
 
-# A closing act a BUILDER can perform. Anything else means the item cannot be closed by the seat it
-# is dispatched to, however much code that seat writes.
-BUILDABLE_CLOSING_ACTS = frozenset({"code"})
+# Closing acts a BUILDER can perform themselves. An item outside this set is still WORKABLE -- the
+# seat writes the code and finishes with an open item, which is a complete outcome, not a failure.
+#
+# CANNOT CLOSE IS NOT CANNOT BE WORKED. Measured 2026-08-22: refusing every non-code closing act
+# would have blocked #1112, #1171 and #1187, all of which reached main -- #1171 being the SMTP
+# credential-exposure fix. The first version of the dispatch gate did exactly that, and this comment
+# exists because the constant's old name (BUILDABLE_) invited the conflation.
+BUILDER_CLOSABLE_ACTS = frozenset({"code"})
+
+# Who performs each closing act. A dispatch NAMES this rather than refusing the item.
+CLOSING_SEAT = {
+    "code": "the builder, on merge",
+    "scorecard-rescore": "the ASVS Tracker, in the vault scorecard",
+    "owner-ruling": "the owner, via the Liaison",
+    "banner-only": "the Dispatcher or Lander, in the ledger",
+}
 
 # BACKLOG #1259: an unresolved git conflict parses CLEANLY here without this check, and the reason is
 # specific -- `>>>>>>> branch` starts with ">", so the banner-block scanner below treats it as a
