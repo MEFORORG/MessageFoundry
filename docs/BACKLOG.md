@@ -13106,10 +13106,19 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 ## 1317. the TLS cipher allowlist tests a name prefix, so NULL-encryption and anonymous suites pass every gate
 
-> 🔢 **Filed 2026-08-22 - not started.** Value **8/10** · Difficulty **3/10**. Owner-ruled the
+> ✅ **Filed 2026-08-22. CLOSED 2026-08-22 (lander) -- fixed on main by PR 519 and PR 525; verified by RUNNING the shipped code, not by reading it.** Value **8/10** · Difficulty **3/10**. Owner-ruled the
 > same day: **a strict positive allowlist**, admitting only suites that appear on every current
 > candidate list, anything unnamed rejected. At zero deployments the compatibility cost of being
 > strict is zero.
+>
+> **VERIFIED AT CLOSURE -- both functions the item names, controls firing both ways.** Run against
+> `main` at `76ee9a7b`, using the item's own method of exercising the shipped validator rather than
+> reading it. `validate_tls_ciphers` and `harden_cipher_suites` each REFUSE `ECDHE-RSA-NULL-SHA` for
+> not encrypting and `ADH-AES256-GCM-SHA384` for not authenticating the peer, and each ACCEPT
+> `ECDHE-RSA-AES256-GCM-SHA384` -- the positive control, without which a validator that refused
+> everything would read identically. The missing PAIR of predicates this item names now exists as
+> `_is_encrypting` and `_is_peer_authenticated` and is called from both paths, and `_is_forward_secret`
+> was left alone exactly as the item instructs.
 > Verdict: build
 > Closing-act: code
 
