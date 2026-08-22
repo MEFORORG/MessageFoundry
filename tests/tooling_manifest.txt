@@ -107,6 +107,7 @@ tests/test_worktree_gate_command_parsing.py
 tests/test_worktree_gate_control_plane.py
 tests/test_worktree_gate_default_reposfile.py
 tests/test_worktree_gate_emitter.py
+tests/test_worktree_gate_escaped_quote.py
 tests/test_worktree_gate_git.py
 tests/test_worktree_gate_hijack.py
 tests/test_worktree_gate_interpreter_flags.py
@@ -114,6 +115,7 @@ tests/test_worktree_gate_interpreter_sigils.py
 tests/test_worktree_gate_quote_straddle.py
 tests/test_worktree_gate_receipts.py
 tests/test_worktree_gate_remedy_families.py
+tests/test_worktree_gate_rule_agnostic_coverage.py
 tests/test_worktree_gate_shell_semantics.py
 tests/test_worktree_gate.py
 tests/test_worktree_new_cleanup_advice.py

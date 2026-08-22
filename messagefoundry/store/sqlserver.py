@@ -1358,8 +1358,16 @@ _SCHEMA: list[str] = [
         approver NVARCHAR(256) NULL, decided_at FLOAT NULL, expires_at FLOAT NULL)""",
     """IF INDEXPROPERTY(OBJECT_ID('pending_approvals'),'ix_pending_approvals_status','IndexID') IS NULL
         CREATE INDEX ix_pending_approvals_status ON pending_approvals(status, requested_at)""",
+    # BACKLOG #1268: `username` carries the same binary collation as every other identifier column in
+    # this schema, and it is the one the engine authenticates against. Without it the column inherits
+    # the DATABASE default -- case-INsensitive on a stock install (SQL_Latin1_General_CP1_CI_AS) --
+    # while SQLite (BINARY) and Postgres (TEXT) are both case-SENSITIVE. That made `Admin` and `admin`
+    # two accounts on two backends and one account on the third, under a UNIQUE constraint that reads
+    # as if it had settled the question. Pinning it here makes account identity a property of the
+    # ENGINE rather than of whichever collation an operator's database happened to be created with.
     """IF OBJECT_ID('users','U') IS NULL CREATE TABLE users (
-        id NVARCHAR(64) NOT NULL PRIMARY KEY, username NVARCHAR(256) NOT NULL UNIQUE,
+        id NVARCHAR(64) NOT NULL PRIMARY KEY,
+        username NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL UNIQUE,
         auth_provider NVARCHAR(16) NOT NULL, display_name NVARCHAR(256) NULL,
         email NVARCHAR(256) NULL, disabled BIT NOT NULL DEFAULT 0, created_at FLOAT NOT NULL,
         updated_at FLOAT NOT NULL, last_login_at FLOAT NULL, password_hash NVARCHAR(512) NULL,

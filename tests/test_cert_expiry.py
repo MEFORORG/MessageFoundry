@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from messagefoundry.config.settings import CertMonitorSettings
+from messagefoundry.config.wiring import MLLP, InboundConnection, Registry
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.cert_expiry import (
@@ -53,6 +54,7 @@ class _RecordingSink:
 
     def __init__(self) -> None:
         self.cert_calls: list[tuple[str, str, str, int]] = []
+        self.crl_calls: list[tuple[str, str, str, int]] = []
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
         pass
@@ -65,6 +67,9 @@ class _RecordingSink:
 
     def cert_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
         self.cert_calls.append((name, path, not_after, days_remaining))
+
+    def crl_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
+        self.crl_calls.append((name, path, not_after, days_remaining))
 
     def secret_rotation_due(
         self, name: str, *, secret: str, last_rotated: str, days_overdue: int
@@ -380,3 +385,116 @@ def test_notifier_sink_emits_cert_expiry_event() -> None:
         )
 
     asyncio.run(_go())
+
+
+# --- BACKLOG #1005 scope 4: the CRL pre-expiry alarm --------------------------------------------
+#
+# A CRL is watched by the same monitor because the operator question is identical -- "is a file I
+# depend on about to expire" -- but it alerts down a SEPARATE sink method, and that separation is
+# the property under test. An expiring CERTIFICATE degrades one identity and is fixed by reissuing
+# it. An EXPIRED CRL makes OpenSSL refuse EVERY client presenting a certificate under that issuer,
+# not merely revoked ones, so it is a total interface outage fixed by a PKI refresh. One method for
+# both would hand an operator one string for two causes with opposite remedies.
+
+
+def _write_crl(path: Path, *, next_update: datetime.datetime) -> None:
+    """A CA bundled with its own CRL, the shape harden_crl_check loads and the monitor reads."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-test-ca")])
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(next_update - datetime.timedelta(days=400))
+        .not_valid_after(next_update + datetime.timedelta(days=400))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(ca.subject)
+        .last_update(next_update - datetime.timedelta(days=30))
+        .next_update(next_update)
+        .sign(key, hashes.SHA256())
+    )
+    path.write_bytes(
+        ca.public_bytes(serialization.Encoding.PEM) + crl.public_bytes(serialization.Encoding.PEM)
+    )
+
+
+def test_a_crl_inside_the_warn_window_alerts_crl_expiry_not_cert_expiry(tmp_path: Path) -> None:
+    # THE SEPARATION IS THE POINT. Asserting crl_calls alone would pass if the runner fired BOTH.
+    crl = tmp_path / "ca_and_crl.pem"
+    _write_crl(crl, next_update=_REF + datetime.timedelta(days=5))
+    sink = _RecordingSink()
+    _runner([MonitoredCert("IB_PARTNER", str(crl), kind="crl")], sink).run_once()
+    assert len(sink.crl_calls) == 1
+    assert sink.cert_calls == []
+    name, path, _, days = sink.crl_calls[0]
+    assert (name, path) == ("IB_PARTNER", str(crl))
+    assert days == 5
+
+
+def test_an_expired_crl_reports_negative_days(tmp_path: Path) -> None:
+    # Negative days_remaining is what tells the sink to escalate: past nextUpdate the listener is
+    # already refusing every client, so this is not an approaching deadline.
+    crl = tmp_path / "stale.pem"
+    _write_crl(crl, next_update=_REF - datetime.timedelta(days=3))
+    sink = _RecordingSink()
+    _runner([MonitoredCert("IB_PARTNER", str(crl), kind="crl")], sink).run_once()
+    assert len(sink.crl_calls) == 1
+    assert sink.crl_calls[0][3] == -3
+
+
+def test_a_fresh_crl_alerts_nothing(tmp_path: Path) -> None:
+    # POSITIVE CONTROL: the alarm can stay SILENT. Without it the two tests above would pass just as
+    # well against a monitor that alerts on every CRL it is handed.
+    crl = tmp_path / "fresh.pem"
+    _write_crl(crl, next_update=_REF + datetime.timedelta(days=365))
+    sink = _RecordingSink()
+    _runner([MonitoredCert("IB_PARTNER", str(crl), kind="crl")], sink).run_once()
+    assert sink.crl_calls == []
+    assert sink.cert_calls == []
+
+
+def test_a_cert_and_a_crl_on_one_connection_route_to_their_own_methods(tmp_path: Path) -> None:
+    # The realistic configuration: one listener presenting a server identity AND checking a CRL.
+    # Both expire, and an operator must be able to tell which one from the alert alone.
+    cert = tmp_path / "server.pem"
+    crl = tmp_path / "ca_and_crl.pem"
+    _write_cert(cert, not_after=_REF + datetime.timedelta(days=7))
+    _write_crl(crl, next_update=_REF + datetime.timedelta(days=2))
+    sink = _RecordingSink()
+    _runner(
+        [
+            MonitoredCert("IB_PARTNER", str(cert)),
+            MonitoredCert("IB_PARTNER", str(crl), kind="crl"),
+        ],
+        sink,
+    ).run_once()
+    assert [c[3] for c in sink.cert_calls] == [7]
+    assert [c[3] for c in sink.crl_calls] == [2]
+
+
+def test_an_inbound_tls_crl_file_is_collected_from_the_registry() -> None:
+    # Scope 1 wired the setting into the three listeners; this is what makes the monitor SEE it.
+    # Outbound is deliberately not collected: a CRL verifies peers we REQUIRE certificates from,
+    # and only an inbound listener does that.
+    registry = Registry()
+    registry.inbound["IB_PARTNER"] = InboundConnection(
+        name="IB_PARTNER",
+        spec=MLLP(
+            port=2575,
+            tls=True,
+            tls_cert_file="c.pem",
+            tls_ca_file="ca.pem",
+            tls_crl_file="ca_and_crl.pem",
+        ),
+        router="r",
+    )
+    collected = certs_from_registry(registry, None)
+    kinds = {(mc.kind, mc.path) for mc in collected}
+    assert ("crl", "ca_and_crl.pem") in kinds
+    assert ("cert", "c.pem") in kinds

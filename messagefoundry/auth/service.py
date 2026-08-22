@@ -744,11 +744,28 @@ class AuthService:
     ) -> LoginOutcome:
         # Enforce bootstrap expiry/supersession before the credential check: an unclaimed bootstrap
         # that lapsed (or was superseded) is disabled here, so the disabled-account path below refuses
-        # it like any other invalid login (WP-3). Scoped to the bootstrap username to keep normal
-        # logins free of the extra lookups.
-        if username == BOOTSTRAP_USERNAME:
-            await self._retire_superseded_bootstrap()
+        # it like any other invalid login (WP-3).
+        #
+        # BACKLOG #1268: THE GATE ASKS THE ROW THE STORE RESOLVED, NEVER THE CALLER'S SPELLING. It
+        # used to read `if username == BOOTSTRAP_USERNAME` -- a PYTHON comparison against the input,
+        # while the lookup below is resolved by the COLUMN'S COLLATION. On a case-insensitive store
+        # those disagree in exactly one direction: `Admin` FAILS the Python guard, so retirement never
+        # runs, and then SUCCEEDS at the lookup, handing back the very row the skipped call would have
+        # disabled. MEASURED before this fix: a lapsed, unclaimed bootstrap credential logged in
+        # successfully as `Admin` while the identical attempt as `admin` was refused and retired.
+        # That is SDS-3.7 exactly -- a compensating control resting on a false premise, the premise
+        # being that the username the gate compared is the username the store matched.
+        #
+        # Comparing the STORED value keeps this correct under any collation, including one the engine
+        # does not control (an operator-supplied database, a restored dump, a column altered
+        # downstream), so it does not depend on the sibling fix in the SQL Server DDL. The `==` is
+        # exact on purpose: `_ensure_bootstrap_admin` writes the canonical spelling, so the stored
+        # value is canonical by construction. The cost is one extra lookup ON THE BOOTSTRAP PATH ONLY
+        # -- an ordinary login still does the single lookup it always did, plus a string compare.
         user = await self._store.get_user_by_username(username)
+        if user is not None and user.username == BOOTSTRAP_USERNAME:
+            await self._retire_superseded_bootstrap()
+            user = await self._store.get_user(user.id)  # re-read: retirement may have disabled it
         if user is None or user.auth_provider != AuthProvider.LOCAL.value or user.disabled:
             # Equalize timing with the real-password path so a missing/disabled/AD account is not
             # distinguishable from a wrong password (defeats username enumeration via latency).

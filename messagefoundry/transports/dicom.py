@@ -61,6 +61,7 @@ from messagefoundry.config.tls_policy import (
     TrustAnchorPolicy,
     build_verifying_client_context,
     harden_cipher_suites,
+    harden_crl_check,
     harden_kex_groups,
     harden_verify_flags,
     relax_verify_expiry,
@@ -142,6 +143,11 @@ def _server_ssl_context(s: dict[str, Any]) -> ssl.SSLContext | None:
     if ca:  # opt-in mTLS: require + verify a calling peer's client cert against this trust anchor
         ctx.load_verify_locations(cafile=str(ca))
         ctx.verify_mode = ssl.CERT_REQUIRED
+        # Opt-in revocation (#1005), after the CA load and inside the mTLS branch -- see mllp.py.
+        # An HTTP proxy can terminate neither DIMSE nor MLLP, so for this listener the documented
+        # out-of-engine delegation does not reach and there is no workaround.
+        if crl := s.get("tls_crl_file"):
+            harden_crl_check(ctx, str(crl))
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
     harden_cipher_suites(ctx, connector="DICOM listener")  # assert forward secrecy (ASVS 12.1.2)
     harden_verify_flags(ctx)  # strict RFC 5280 validation of any mTLS client cert (ASVS 12.1.4)
