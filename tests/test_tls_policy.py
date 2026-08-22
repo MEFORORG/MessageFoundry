@@ -30,6 +30,7 @@ from messagefoundry.config.tls_policy import (
     enforce_insecure_hop,
     fips_attestation,
     harden_cipher_suites,
+    harden_crl_check,
     harden_kex_groups,
     harden_verify_flags,
     in_process_tls_revocation_refused,
@@ -960,3 +961,117 @@ def test_harden_cipher_suites_raises_on_a_null_cipher_context() -> None:
     ctx.set_ciphers(_NULL_CIPHER)
     with pytest.raises(ValueError, match="NULL-cipher"):
         harden_cipher_suites(ctx, connector="test-null")
+
+
+# --- BACKLOG #1005: opt-in CRL checking on the verifying server contexts -----------------------------
+#
+# Both traps from the item are ASSERTIONS here, not comments. Re-measured on this worktree
+# (CPython 3.14.6 / OpenSSL 3.5.7) before any of this was written:
+#
+#   arm                                crls  good client   revoked client
+#   CA only, no CRL flag (shipped)        0  ACCEPTED      ACCEPTED          <- the gap
+#   cafile= CA + FRESH crl, flag ON       1  ACCEPTED      REFUSED: revoked  <- the control works
+#   cadata= CA + FRESH crl, flag ON       0  REFUSED       REFUSED           <- TRAP 1
+#   cafile= CA + STALE crl, flag ON       1  REFUSED       REFUSED           <- TRAP 2
+#
+# TRAP 1 is why the helper asserts cert_store_stats()["crl"] >= 1: a loader that silently loads
+# ZERO CRLs still sets the flag, and then refuses EVERY client with "unable to get certificate
+# CRL". Nothing at load time says so. The count is the only thing that distinguishes "loaded"
+# from "silently ignored".
+#
+# TRAP 2 is why an expired CRL is refused at BUILD time: past nextUpdate, OpenSSL refuses every
+# client rather than just revoked ones, so an unrefreshed CRL is an outage whose first symptom is
+# every partner dropping at once. Failing loudly at startup beats failing at a partner handshake.
+
+
+@pytest.fixture(scope="module")
+def _crl_material(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
+    """A throwaway CA plus a fresh and an expired CRL. Synthetic, no PHI, never leaves tmp."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    tmp = tmp_path_factory.mktemp("crl1005")
+    now = datetime.datetime.now(datetime.UTC)
+    day = datetime.timedelta(days=1)
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "crl-probe-ca")])
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - day)
+        .not_valid_after(now + 365 * day)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+
+    def crl(next_update: datetime.datetime) -> bytes:
+        builder = (
+            x509.CertificateRevocationListBuilder()
+            .issuer_name(ca.subject)
+            .last_update(now - 2 * day)
+            .next_update(next_update)
+            .add_revoked_certificate(
+                x509.RevokedCertificateBuilder()
+                .serial_number(4000)
+                .revocation_date(now - day)
+                .build()
+            )
+        )
+        return builder.sign(key, hashes.SHA256()).public_bytes(serialization.Encoding.PEM)
+
+    ca_pem = ca.public_bytes(serialization.Encoding.PEM)
+    paths = {
+        "ca_only": tmp / "ca_only.pem",
+        "ca_and_fresh": tmp / "ca_and_fresh.pem",
+        "ca_and_expired": tmp / "ca_and_expired.pem",
+    }
+    paths["ca_only"].write_bytes(ca_pem)
+    paths["ca_and_fresh"].write_bytes(ca_pem + crl(now + 30 * day))
+    paths["ca_and_expired"].write_bytes(ca_pem + crl(now - day))
+    return {k: str(v) for k, v in paths.items()}
+
+
+def _verifying_ctx() -> ssl.SSLContext:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    return ctx
+
+
+def test_harden_crl_check_loads_the_crl_and_sets_the_flag(_crl_material: dict[str, str]) -> None:
+    # POSITIVE CONTROL for the two refusals below: the helper CAN succeed, so those tests are not
+    # green merely because it rejects everything handed to it.
+    ctx = _verifying_ctx()
+    harden_crl_check(ctx, _crl_material["ca_and_fresh"])
+    assert ctx.cert_store_stats()["crl"] >= 1
+    assert ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_harden_crl_check_refuses_a_file_carrying_no_crl(_crl_material: dict[str, str]) -> None:
+    # TRAP 1. Without this assertion the context comes back with the flag set and nothing to check
+    # against, and every client -- good or revoked -- is refused "unable to get certificate CRL".
+    # The failure is a total outage that reads, at the call site, like a working control.
+    with pytest.raises(ValueError, match="no CRL"):
+        harden_crl_check(_verifying_ctx(), _crl_material["ca_only"])
+
+
+def test_harden_crl_check_refuses_an_already_expired_crl(_crl_material: dict[str, str]) -> None:
+    # TRAP 2 preflight. Past nextUpdate OpenSSL refuses EVERY client, not just revoked ones, so an
+    # unrefreshed CRL takes a live interface down. Refuse it loudly at construction instead of at
+    # the first partner handshake, where the operator sees only "every partner dropped at once".
+    with pytest.raises(ValueError, match="expired"):
+        harden_crl_check(_verifying_ctx(), _crl_material["ca_and_expired"])
+
+
+def test_harden_crl_check_refuses_a_missing_file(tmp_path: Path) -> None:
+    # A configured-but-absent CRL must not degrade to "no revocation checking". Fail-closed by
+    # construction is the whole reason this item is sized 5 rather than 3.
+    with pytest.raises(ValueError, match="does not exist"):
+        harden_crl_check(_verifying_ctx(), str(tmp_path / "nope.pem"))
