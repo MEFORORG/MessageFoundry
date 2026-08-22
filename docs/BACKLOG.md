@@ -9171,7 +9171,13 @@ filing.
 
 *This is the fourth instance recorded tonight, across three seats, of a test asserting a proxy for the property its name claims.* Together with a refusal test that passed under a plant deleting the refusal, and a redaction pattern green for months because an unrelated sweep caught its token, the common shape is: **the assertion is true, and it would remain true after the defect returned.**
 
-**UNBUILT AND REQUIRED: A ROUTE-TABLE GUARD ASSERTING NO GET OR HEAD ROUTE DECLARES EITHER PARAMETER. THIS IS THE DURABLE HALF OF THE ITEM AND NOTHING LIKE IT EXISTS** -- both suites were grepped. The building lane found this by reading the item's full body after a peer confessed to a truncated read, and is building it.
+**BUILT AT `091a9b7b`, AND THIS NOTE ORIGINALLY SAID IT WAS NOT -- corrected before anyone acted on it.** The guard is `test_no_get_or_head_route_declares_a_phi_needle_parameter` in `tests/test_content_search.py`, verified present in that commit.
+
+**It is the durable half of this item, and it was found by the building lane reading the item's FULL body** after a peer confessed to a truncated read -- the same discipline that had just cost two seats a wrong verdict elsewhere.
+
+**Its construction answers the objection that killed this item's other tests.** It walks **both** planes via `create_app(serve_ui=True)`; it resolves the **wire** name, so a re-add hidden behind `alias="content"` is still caught; it ignores POSTs; and it carries a **positive control** (`seen_query_params > 20`) so an inert walk cannot report a clean repo forever. **Proven by planting a re-declared parameter on `GET /messages/search`: it reds, naming the route and the parameter.** Restored byte-exact.
+
+*Why the original "unbuilt" wording is kept above rather than deleted: a dispatch brief carried it after the completion mail had already been sent, and the building lane caught it before duplicating the work. **A stale "this is unbuilt" note is a duplicate-work generator**, and it is cheaper to correct in place than to leave the reader guessing which of two records is current.*
 
 > **Deleting the parameter earns the verdict once. The guard is what keeps it.**
 
