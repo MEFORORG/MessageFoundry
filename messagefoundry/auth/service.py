@@ -2248,13 +2248,32 @@ class AuthService:
                 # legitimate code.
                 return await self._store.consume_totp_step(user.id, matched_step)
         normalized = code.upper()  # recovery codes are minted uppercase
-        hashes = await self._store.get_recovery_code_hashes(user.id)
-        for h in hashes:
-            if await self._argon2(verify_password, h, normalized):
-                # Atomic compare-and-delete: only the caller that actually removes the hash wins, so a
-                # concurrent verify of the same single-use code can't double-spend it (WP-14).
-                return await self._store.consume_recovery_code_hash(user.id, h)
-        return False
+        real = list(await self._store.get_recovery_code_hashes(user.id))
+        # ASVS 11.2.4 (BACKLOG #1149's sibling, #1167; ADR 0170). This walk used to `return` on the
+        # first argon2id match, so the NUMBER of ~64 MiB verifications was a function of which code
+        # was presented -- and, on the failure path, of how many codes REMAINED. Timing a single
+        # failed attempt therefore leaked the user's remaining recovery-code count.
+        #
+        # Constant WORK, not a short-circuit: always run exactly the configured slot count, padding
+        # with the same fixed dummy hash the local login leg uses, and pick the winner afterwards.
+        #
+        # THIS ADDS NO AMPLIFICATION CEILING, WHICH IS THE OBJECTION THE OBVIOUS FIX DESERVES AND
+        # THIS ONE DOES NOT. The failure path ALREADY verified every remaining hash, so the cost here
+        # is today's WORST CASE made unconditional -- bounded by `mfa_recovery_code_count` (default
+        # 10, validator-capped at 50), which is the same bound that already shipped. `_argon2` also
+        # holds a semaphore, so this cannot widen the concurrent-argon2 footprint either.
+        slots = max(self._settings.mfa_recovery_code_count, len(real))
+        matched = -1
+        for i in range(slots):
+            h = real[i] if i < len(real) else _DUMMY_PASSWORD_HASH
+            ok = await self._argon2(verify_password, h, normalized)
+            if ok and i < len(real) and matched < 0:
+                matched = i  # recorded, NOT returned -- returning here restores the leak
+        if matched < 0:
+            return False
+        # Atomic compare-and-delete: only the caller that actually removes the hash wins, so a
+        # concurrent verify of the same single-use code can't double-spend it (WP-14).
+        return await self._store.consume_recovery_code_hash(user.id, real[matched])
 
     async def disable_mfa(self, identity: Identity, *, client: str | None = None) -> None:
         """Self-service: turn off the caller's TOTP MFA (the API gates this behind step-up). Audited +
