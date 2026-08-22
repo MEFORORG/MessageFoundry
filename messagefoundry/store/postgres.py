@@ -72,6 +72,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.config.tls_policy import (
     HopDisposition,
     HopPosture,
+    harden_cipher_suites,
     is_loopback_hop_host,
     revocation_hop_disposition,
     tls_revocation_attested,
@@ -728,6 +729,9 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
         ctx = _ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = _ssl.CERT_NONE
+        # Verification is off but the store hop is still encrypted, so the suite list still decides
+        # whether recorded PHI traffic survives a future key compromise (ASVS 12.1.2).
+        harden_cipher_suites(ctx, connector="Postgres store (TLS verification disabled)")
         return ctx
     # #201 (ADR 0078 amendment): the engine->store hop below VERIFIES the peer cert (a pinned CA or the
     # system trust store) but asyncpg rides stdlib ssl, which does NO OCSP/CRL revocation — a
@@ -745,7 +749,14 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
         # Pin a private / self-signed CA WITHOUT touching the OS trust store: verify the server cert
         # (+ hostname) against this PEM bundle. create_default_context() already sets CERT_REQUIRED +
         # check_hostname=True, so this stays a fully-verifying posture (a bad path raises at connect).
-        return _ssl.create_default_context(cafile=settings.ssl_root_cert)
+        ctx = _ssl.create_default_context(cafile=settings.ssl_root_cert)
+        harden_cipher_suites(ctx, connector="Postgres store (pinned CA)")
+        return ctx
+    # A RESIDUAL, stated rather than papered over: `True` hands asyncpg the job of building the
+    # context, so no context exists in engine code for harden_cipher_suites to assert on. Asserting a
+    # look-alike built here would grade an object the connection never uses. Closing it means building
+    # the verifying default context here and returning it instead, which changes what asyncpg receives
+    # on the DEFAULT store path — a separate decision, not a rider on this change.
     return True  # verifying TLS against the system trust store (the secure default)
 
 

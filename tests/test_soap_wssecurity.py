@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ssl
 import urllib.request
 from pathlib import Path
 
@@ -69,6 +70,13 @@ class _Opener:
 # --- mutual-TLS opener -------------------------------------------------------
 
 
+#: The interpreter's real default suite list, captured at import — BEFORE any test monkeypatches
+#: ``ssl.create_default_context``. ``_FakeCtx`` hands this back so the forward-secrecy assertion the
+#: opener now runs (``harden_cipher_suites``, ASVS 12.1.2) sees a realistic list rather than a stub
+#: that cannot answer. Capturing it lazily inside the fake would return the fake itself.
+_REAL_DEFAULT_SUITES = ssl.create_default_context().get_ciphers()
+
+
 class _FakeCtx:
     def __init__(self) -> None:
         self.minimum_version: object = None
@@ -79,10 +87,11 @@ class _FakeCtx:
     ) -> None:
         self.cert_args = (certfile, keyfile, password)
 
+    def get_ciphers(self) -> list[dict[str, object]]:
+        return _REAL_DEFAULT_SUITES
+
 
 def test_client_cert_opener_loads_chain_and_floors_tls(monkeypatch: pytest.MonkeyPatch) -> None:
-    import ssl
-
     fake = _FakeCtx()
     monkeypatch.setattr(soap_mod.ssl, "create_default_context", lambda: fake)
     opener = _client_cert_opener("client.pem", "key.pem", "pw")
