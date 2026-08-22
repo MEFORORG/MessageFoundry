@@ -12707,3 +12707,25 @@ which both readings of the cell now require.
 
 **Cluster:** Security record integrity / evidence hygiene. **Priority:** P3. **Verdict:** build.
 **Severity:** no engine-runtime effect and no deployment axis (sec. 0). This is evidence quality in the security record: more than half its citation surface has never been read by any gate, so a reader cannot distinguish a citation that still points at its subject from one that merely points at a line that still exists.
+
+## 1319. the demote-teardown source-phase timing assertion is wall-clock and fails on a loaded ubuntu runner
+
+> 🔢 **Filed 2026-08-22, recovered from a session cut off mid-measurement when its account was cancelled.** Value **5/10** -- Difficulty **2/10** -- _quick win_. [`tests/test_adr0157_demote_teardown.py:106`](../tests/test_adr0157_demote_teardown.py) asserts `elapsed < 1.5` on a wall clock. It failed on `main` at `2d1c89e6` -- CI run `32580332076`, leg `test (ubuntu-latest, py3.14)` -- reporting `source phase took 1.92s`. **That commit was docs-only (#515), so nothing in the tree under test could have moved the number.** **THE CHANGE: assert the CONCURRENCY WIDTH the test is actually about, not the elapsed time it currently infers it from.**
+> **THE THRESHOLD IS NOT MERELY TIGHT -- IT SITS 0.13s BELOW THE MUTATION IT EXISTS TO CATCH.** Four implementations, 200 sources at 0.4s under a 3.0s budget, measured rather than reasoned about:
+>
+> | implementation | elapsed | finished | started at 50ms | `elapsed < 1.5` | `all(stop_finished)` |
+> | --- | --- | --- | --- | --- | --- |
+> | shipped, max-shaped | 0.40s | 200/200 | 200/200 | PASS | PASS |
+> | MUTANT sequential loop | 3.01s | 7/200 | 1/200 | FAIL | FAIL |
+> | MUTANT semaphore(8) | 3.00s | 56/200 | 8/200 | FAIL | FAIL |
+> | MUTANT semaphore(64) | **1.63s** | 200/200 | 64/200 | FAIL | **PASS** |
+>
+> **THE SEMAPHORE(64) ROW IS THE ITEM.** Every source finishes, so `all(stop_finished)` passes and `_pending_source_stops` is empty. The wall-clock bound is the ONLY assertion that catches it -- which is why this cannot be fixed by raising the threshold. The discriminating band is `(0.40, 1.63)` and the bound sits at `1.50`.
+> **SO ON THE FAILING RUN THE TEST WAS NOT MERELY RED, IT WAS INCAPABLE.** CI measured **1.92s for the shipped implementation** -- above the 1.63s the semaphore(64) mutant produces. For the duration of that load the correct code was SLOWER than the defect the assertion is written to detect, so no threshold in the band could have separated them. A flake that reddens is a nuisance; an instrument that cannot discriminate while it is loaded is the same class as #1290's walk failing before its regression assertion runs.
+> **LOCAL CONTROL, and it isolates the cause to the runner rather than the tree.** Seven consecutive runs on a Windows box **while the full suite ran concurrently**: `0.40 0.41 0.40 0.41 0.41 0.41 0.41`. So the floor is the 0.4s sleep plus roughly 10ms of scheduling, and CI's 1.92s is about 1.5s of runner latency spread across 200 tasks -- a 4.7x inflation of the overhead term, not a property of the code.
+> **THE FIX IS ALREADY AVAILABLE IN THE TEST DOUBLE AND NEEDS NO NEW TIMING.** `_Source` records `stop_started`. Sampling how many sources have started before any completes separates all four rows above -- 200 / 1 / 8 / 64 -- with no dependence on how fast the runner is. It is also the stronger assertion on its own terms: `_stop_sources_demote` creates every task eagerly before its first `await`, and [`wiring_runner.py:2645`](../messagefoundry/pipeline/wiring_runner.py) says so in its own docstring (*"Tasks are created eagerly, outside any gate"*), so *all N started* is a property of the shipped design rather than of the box. Keep a generous wall-clock bound underneath if a second signal is wanted, but it must stop being the discriminator.
+> **WHAT IS NOT ESTABLISHED, stated so nobody reads more into it.** This is **at least one** observed failure. The rate under runner load was never measured, no re-run of the same head was recorded before the session ended, and no cross-branch pair like #1290's was collected. The mutation table above is the strong evidence here; the frequency is not.
+> **DO NOT MERGE THIS INTO #1290 -- same cluster, different failure.** #1290 is a process-table walk on hosted **Windows** that never completes, so its regression assertion never runs. This is a **ubuntu** bound that a fully completed, correct run exceeds. Neither fix touches the other's file.
+
+**Cluster:** CI reliability / teardown tests. **Priority:** P2. **Verdict:** build.
+**Severity:** no deployment axis (sec. 0) -- `tests/` ships in no engine path. The cost is that a required context can redden on `main` from runner load alone, and that while it is loaded the test cannot perform the discrimination it was written for.
