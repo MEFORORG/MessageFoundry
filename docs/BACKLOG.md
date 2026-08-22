@@ -4900,6 +4900,23 @@ The comment immediately above says *"Scope is deliberately the posture the requi
 
 **Source:** raised by the `scripts/` glyph sweep on 2026-08-05, then rewritten after an adversarial pass refuted the first draft's "exactly one gate exists" and its `errors='strict'` mechanism. The `--help` crash and the stream-handler values were measured, not inferred.
 
+**AMENDED 2026-08-22 BY THE DISPATCHER -- THIS ITEM'S SCOPE SENTENCE IS FALSE, AND IT IS THE SENTENCE ITS SCORE RESTS ON.** The re-score note says *"the surface is `scripts/` rather than the engine"*. Measured at `origin/main` `4633a295` over `git ls-files`, the opposite holds. Surfaced when an ASVS Tracker census died mid-run on exactly this character.
+
+```
+scripts/**/*.py       (INSIDE the gate's scope)   0 of 39 files contain U+2192
+messagefoundry/**/*.py (OUTSIDE the gate's scope) 134 of 267 files, 1,028 lines
+```
+
+**THE CONTROL IS THE FINDING, AND IT CUTS BOTH WAYS.** A zero inside the gated scope against 134 files outside it is not evidence the gate is broken -- **it is evidence the gate WORKS PERFECTLY and its SCOPE is the entire story.** This is the green-and-blind shape in its purest form: the instrument is doing exactly what it was built to do, reports success, and the population it was built for is a rounding error beside the one nobody gated. The largest single files are `pipeline/wiring_runner.py` (91 lines), `store/store.py` (84), `api/app.py` (53), `config/wiring.py` (50) and `store/postgres.py` (48).
+
+**WHAT THIS DOES NOT ESTABLISH, and the distinction is the whole of any future build.** **1,028 lines is a POPULATION, not a defect count.** `CLAUDE.md` section 11 makes the character a defect because it raises `UnicodeEncodeError` **on a stock cp1252 console** -- so a line only bites **if it reaches a console**. An arrow inside a comment or a docstring never prints and costs nothing. **Nobody has measured the subset that reaches `stdout`/`stderr`, and that subset is the actual defect surface.** Do not let 1,028 travel as a defect count; it is the search space, and quoting it as severity is the same substitution this ledger keeps catching elsewhere.
+
+**Evidence that the narrow class is real rather than theoretical:** the census that produced this measurement **crashed at 23 of 64 rows** on a `U+2192` inside an anchored token, on a stock console, and would otherwise have handed over a partial list presented as complete. **#1221** records the same failure in a doc lint, at the same character, and its fix -- hardening the stream at the print site -- is the shipped in-tree exemplar.
+
+**A punctuation control was run so this is not a false alarm on typography:** 23 anchor tokens in the same corpus carry an **em dash**, which **is** cp1252-safe and correctly did not flag. Only the arrow does.
+
+**Two live items sit on affected files** (`docs/SECURITY.md` for `#1151`, `messagefoundry/__main__.py` for `#1179`), so a build touching them can add to the population without any gate objecting.
+
 ## 1033. The rubric cites its own signals as `#N`, and six of those numbers are real backlog items
 
 > ✅ **Closed 2026-08-10 — PR #NNN.** All ten short `#N` rubric-signal citations in [`Code_Quality_Standards.md`](Code_Quality_Standards.md) converted to the `signal N` form; the L120 anchor fragment left untouched. **Line anchors re-measured, not followed:** the item's L282/L299/L319/L420 (against 780ee1d9) had drifted +2 to **L284/L301/L321/L422** against `origin/main` 516f59ed. Token list printed with line numbers, from a pattern carrying four positive and five negative controls that refuses to report until they pass — it caught its own first-draft blindness to the anchor fragment. Measured after: short `#N` tokens **11 -> 1** (the survivor being the L120 anchor), four-digit citations **40 marked / 0 bare**, and **0 of 57** markdown link targets changed (differ proven live by an injected change). The L422 numbers are pre-0.6 signal IDs and the row now says so. Now pinned by `tests/test_quality_record_scope_claims.py`, whose guards were each verified red-first.
