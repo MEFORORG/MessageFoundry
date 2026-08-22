@@ -23,6 +23,7 @@ from messagefoundry.api.auth_models import (
 )
 
 from .._html import Markup, el, page, register_nav, rows_table
+from ._common import _seg
 
 __all__ = [
     "ad_groups_page",
@@ -360,7 +361,11 @@ def role_form_page(
         description if description is not None else (role.description or "" if role else "")
     )
     perm_checked = checked if checked is not None else (role.permissions if role else ())
-    action = f"/ui/roles/custom/{role.id}/update" if role else "/ui/roles/custom"
+    # _seg, NOT bare interpolation: on a rejected submit `ui_role_update` rebuilds this page from
+    # `CustomRoleInfo(id=role_id, ...)` where role_id is the RAW path param -- a ValidationError on
+    # CustomRoleRequest short-circuits before `update_custom_role` runs, so the 404 lookup that
+    # constrains every OTHER id on this surface never happens (BACKLOG #1107, ASVS 1.2.2).
+    action = f"/ui/roles/custom/{_seg(role.id)}/update" if role else "/ui/roles/custom"
     form = el(
         "form",
         el("label", "Name", el("input", name="display_name", value=name_value, autofocus=True)),
@@ -378,7 +383,7 @@ def role_form_page(
                 "form",
                 el("button", "Delete role", type="submit"),
                 method="post",
-                action=f"/ui/roles/custom/{role.id}/delete",
+                action=f"/ui/roles/custom/{_seg(role.id)}/delete",
                 class_="ctl",
             )
         )

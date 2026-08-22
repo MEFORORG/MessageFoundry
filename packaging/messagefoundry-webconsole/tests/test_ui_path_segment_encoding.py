@@ -10,11 +10,21 @@ interpolated a channel id and a destination name with no encoding at all.
 `quote`'s default is the whole defect: measured, `quote("IB/ACME")` returns it UNCHANGED, because the
 one character it leaves alone is the one a path segment turns on.
 
-**Scoped to CONNECTION NAMES on purpose.** The other /ui interpolations carry ids, where the
-"every interpolated id is a `uuid4().hex`" argument is probably true. It is NOT true of connection
-names: `Registry._add` checks only for a duplicate, so a name is unconstrained free text. Widening
-this to all 54 sites needs each read first -- `_auth`'s reauth `next` is CORRECTLY `safe="/"`, and the
-last test here fails if a blanket sweep breaks it.
+**All 54 interpolation sites were then partitioned by reading each value's PRODUCER**, not its
+interpolation line. That is the only way to answer this: "every interpolated id is a `uuid4().hex`"
+is true of most sites and FALSE for connection names, because `Registry._add` checks only for a
+duplicate, so a name is unconstrained free text.
+
+The partition found the id sites genuinely safe, but NOT for the reason usually given. They are safe
+because every one is read back from the store after a lookup that 404s on a miss -- so a crafted path
+param never reaches a render. **`ui_role_update` is the single exception on the whole surface**, and
+the last two tests cover it: a `ValidationError` short-circuits before that lookup runs.
+
+**A blanket sweep of the remaining sites would be WRONG**, which is why one test exists only to stop
+it: `_auth`'s reauth `next` is CORRECTLY `safe="/"` because it carries a whole path inside a query
+parameter. It is also safe for a DIFFERENT reason than its own comment implies -- adversarial review
+showed attacker-influenceable bytes do reach it, and the `quote()` at the site is what holds. Remove
+that call on a "server-generated anyway" argument and it opens.
 """
 
 from __future__ import annotations
@@ -115,3 +125,43 @@ def test_the_reauth_next_parameter_is_left_alone() -> None:
         "the reauth 'next' encoding changed; if a path-segment builder was applied here it is wrong "
         "-- that value is a path carried in a query parameter"
     )
+
+
+def test_a_rejected_custom_role_submit_cannot_escape_its_path_segment() -> None:
+    """THE ONE SITE ON THIS SURFACE WHERE THE 404 LOOKUP IS BYPASSED.
+
+    Every other id rendered by the console is read back from the store, so a request path param that
+    matched nothing 404s before anything renders. ``ui_role_update`` is the exception: a
+    ``ValidationError`` from ``CustomRoleRequest`` short-circuits BEFORE ``update_custom_role`` runs,
+    and the 400 branch then rebuilds the page from ``CustomRoleInfo(id=role_id, ...)`` using the RAW
+    path param. ``CustomRoleInfo.id`` is a bare ``id: str`` with no ``Field`` constraint.
+
+    So an operator who submits an invalid form to a crafted role path gets that path reflected into
+    the update and delete form actions. Encoded, it stays one segment.
+    """
+    from messagefoundry.api.auth_models import CustomRoleInfo
+    from messagefoundry_webconsole.pages.admin import role_form_page
+
+    role = CustomRoleInfo(id="custom:abc/evil", display_name="x", description=None, permissions=[])
+    html = str(role_form_page(["messages:read"], role=role, error="invalid input"))
+
+    assert "/ui/roles/custom/custom%3Aabc%2Fevil/update" in html
+    assert "/ui/roles/custom/custom%3Aabc%2Fevil/delete" in html
+    assert "/ui/roles/custom/custom:abc/evil/" not in html, (
+        "the reflected role id escaped its path segment; the form now posts to a different route"
+    )
+
+
+def test_a_real_custom_role_id_still_addresses_its_own_route() -> None:
+    """NEGATIVE CONTROL. A genuine id is ``custom:`` + uuid4().hex, so the colon IS encoded -- that is
+    harmless (FastAPI decodes the path param back) but it must still be ONE segment, and the benign
+    case must not be mangled beyond that."""
+    from messagefoundry.api.auth_models import CustomRoleInfo
+    from messagefoundry_webconsole.pages.admin import role_form_page
+
+    role = CustomRoleInfo(
+        id="custom:0123456789abcdef", display_name="ops", description=None, permissions=[]
+    )
+    html = str(role_form_page(["messages:read"], role=role))
+    assert "/ui/roles/custom/custom%3A0123456789abcdef/update" in html
+    assert "%2F" not in html, "a legitimate id contains no slash, so none should be encoded"
