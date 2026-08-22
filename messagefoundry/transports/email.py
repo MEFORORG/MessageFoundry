@@ -55,6 +55,7 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted_here,
 )
 from messagefoundry.config.tls_policy import (
+    InsecureHopRefused,
     RevocationHopGuard,
     build_smtp_tls_context,
     smtp_login_approved,
@@ -305,6 +306,18 @@ class EmailDestination(DestinationConnector):
                         cell="EMAIL outbound",
                     )
                 smtp.send_message(msg)
+        except InsecureHopRefused as exc:
+            # A POLICY refusal is not an internal code error. Unconverted it is a ValueError,
+            # which escapes the arms below and lands in the delivery worker's catch-all --
+            # labelled "internal error (our bug, not the partner)" and dead-lettered. That
+            # sends an operator to read our source over a partner that offers no approved AUTH
+            # mechanism, or a connection configured without TLS. Same misdirection as mapping a
+            # rejected credential to a refusal, one layer down (BACKLOG #1171).
+            #
+            # The refusal text is config and capability only -- host, cell, mechanism names --
+            # so it is carried whole rather than reduced to a type name: it is the one thing an
+            # operator needs and it contains no message content.
+            raise DeliveryError(f"Email {self.host}:{self.port} refused: {exc}") from exc
         except smtplib.SMTPException as exc:
             raise DeliveryError(
                 f"Email {self.host}:{self.port} SMTP send failed: {type(exc).__name__}"
@@ -337,6 +350,18 @@ class EmailDestination(DestinationConnector):
                         cell="EMAIL outbound probe",
                     )
                 smtp.noop()
+        except InsecureHopRefused as exc:
+            # A POLICY refusal is not an internal code error. Unconverted it is a ValueError,
+            # which escapes the arms below and lands in the delivery worker's catch-all --
+            # labelled "internal error (our bug, not the partner)" and dead-lettered. That
+            # sends an operator to read our source over a partner that offers no approved AUTH
+            # mechanism, or a connection configured without TLS. Same misdirection as mapping a
+            # rejected credential to a refusal, one layer down (BACKLOG #1171).
+            #
+            # The refusal text is config and capability only -- host, cell, mechanism names --
+            # so it is carried whole rather than reduced to a type name: it is the one thing an
+            # operator needs and it contains no message content.
+            raise DeliveryError(f"Email {self.host}:{self.port} refused: {exc}") from exc
         except smtplib.SMTPException as exc:
             raise DeliveryError(
                 f"Email {self.host}:{self.port} probe failed: {type(exc).__name__}"

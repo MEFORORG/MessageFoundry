@@ -33,6 +33,11 @@ class _FakeSMTP:
 
     instances: list[_FakeSMTP] = []
 
+    #: What the fake relay advertises for AUTH. A CLASS attribute so a test can vary it --
+    #: __init__ copies it per instance, and patching the instance is impossible from outside
+    #: because the connector constructs the object itself.
+    AUTH_ADVERTISED: dict[str, str] = {"auth": "CRAM-MD5 PLAIN LOGIN"}
+
     def __init__(
         self,
         host: str,
@@ -55,7 +60,7 @@ class _FakeSMTP:
         self.auth_mechanism: str | None = None
         self.user = ""
         self.password = ""
-        self.esmtp_features = {"auth": "CRAM-MD5 PLAIN LOGIN"}
+        self.esmtp_features = dict(type(self).AUTH_ADVERTISED)
         self.sent: list[EmailMessage] = []
         self.did_ehlo = False
         self.did_noop = False
@@ -621,3 +626,45 @@ def test_tls_ca_file_that_does_not_exist_fails_loudly(tmp_path: Any) -> None:
     # operator believes they pinned, and did not.
     with pytest.raises((FileNotFoundError, ssl.SSLError, OSError)):
         EmailDestination(_dest(tls_ca_file=str(tmp_path / "nope.pem")))
+
+
+async def test_a_server_offering_no_approved_mechanism_is_a_delivery_error_not_our_bug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A POLICY refusal must reach the worker as DeliveryError (BACKLOG #1171).
+
+    smtp_login_approved raises InsecureHopRefused, which subclasses ValueError and therefore escapes
+    this connector's ``except smtplib.SMTPException`` arms. Unconverted it lands in the delivery
+    worker's catch-all, which is documented as "Internal/code error (our bug, not the partner)" and
+    dead-letters the row -- sending an operator to read our source over a relay that simply offers no
+    approved AUTH mechanism.
+
+    WITHOUT THE CONVERSION this raises InsecureHopRefused and the test fails on the raises() type.
+    """
+    _install_fake(monkeypatch)
+    # The relay advertises ONLY the disallowed mechanism, which is the reachable real-world case:
+    # an older server offering CRAM-MD5 alone.
+    monkeypatch.setattr(_FakeSMTP, "AUTH_ADVERTISED", {"auth": "CRAM-MD5"})
+    d = EmailDestination(_dest(username="svc", password="s3cret"))
+    with pytest.raises(DeliveryError) as ei:
+        await d.send("body")
+    # The refusal text is carried whole, not reduced to a type name: it names the approved set, which
+    # is the one thing that tells an operator what to change. It is config, never message content.
+    assert "approved" in str(ei.value)
+    [smtp] = _FakeSMTP.instances
+    assert smtp.logged_in is None, (
+        "a credential was sent to a server offering no approved mechanism"
+    )
+
+
+async def test_an_approved_mechanism_still_authenticates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POSITIVE CONTROL for the test above: the refusal is about the OFFERED set, not about auth.
+
+    A guard that refused every authenticated send would satisfy the previous test perfectly.
+    """
+    _install_fake(monkeypatch)
+    monkeypatch.setattr(_FakeSMTP, "AUTH_ADVERTISED", {"auth": "CRAM-MD5 LOGIN"})
+    d = EmailDestination(_dest(username="svc", password="s3cret"))
+    await d.send("body")
+    [smtp] = _FakeSMTP.instances
+    assert smtp.auth_mechanism == "LOGIN", "should fall through CRAM-MD5 to the approved LOGIN"
