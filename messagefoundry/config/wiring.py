@@ -594,7 +594,19 @@ def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any])
                     try:
                         resolved[name] = value.cast(raw)
                     except (ValueError, TypeError) as exc:
-                        bad.append(f"setting {name!r} (env {value.key!r}={raw!r}): {exc}")
+                        # NEVER the raw value: a MEFOR_VALUE_* env() setting carries store passwords
+                        # and connector keys, and this string is raised at startup into the operator
+                        # log, the support bundle and GET /logs/tail (BACKLOG #1183). The value used to
+                        # appear TWICE here -- once from this f-string and once inside the cast's own
+                        # ValueError text ("invalid literal for int() with base 10: '<value>'") -- so
+                        # dropping only the f-string half would still have leaked it. Name the setting,
+                        # the key and the expected TYPE, which is the whole diagnostic an operator
+                        # needs to go fix the value they already hold.
+                        want = getattr(value.cast, "__name__", None) or type(value.cast).__name__
+                        bad.append(
+                            f"setting {name!r} (env {value.key!r}): value is not a valid {want} "
+                            f"({type(exc).__name__}; value withheld)"
+                        )
             elif value.default is not _UNSET:
                 resolved[name] = value.default
             else:

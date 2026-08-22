@@ -58,9 +58,12 @@ _H_FIELDS = "### Field-level (property) authorization (WP-9)"
 _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1.4)"
 
 # --- pinned counting basis (see the doc's "Counting basis" paragraph) --------------------------------
-_ROUTES_DEFAULT = 105
-_ROUTES_WITH_DOCS = 109
-_ROUTES_WITH_UI = 203
+# BACKLOG #1184 (ASVS 14.2.1) added three JSON routes -- POST /messages/search, POST /messages/export
+# and POST /uploads/{file_id}/messages/search -- and two /ui routes, POST /ui/messages/search/run and
+# POST /ui/uploaded-logs/file/{file_id}/filter, so the needle can travel in a body instead of a URL.
+_ROUTES_DEFAULT = 108
+_ROUTES_WITH_DOCS = 112
+_ROUTES_WITH_UI = 208
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -86,6 +89,9 @@ _UI_NO_GATE_ROUTES = frozenset(
 _MULTI_PERMISSION_ROUTES = frozenset(
     {
         ("GET", "/messages/export"),
+        # BACKLOG #1184: the needle-bearing sibling of the export GET. Same two permissions, same
+        # fail-closed-on-either behaviour; only the criteria's carrier differs.
+        ("POST", "/messages/export"),
         ("GET", "/ui/alerts"),
         # BACKLOG #324: the console editor DISPLAYS the body it edits (textarea + `data-original`),
         # and the POST's reject arm re-ships the pristine stored copy — so both verbs require
@@ -923,8 +929,11 @@ def test_multi_permission_routes_are_exactly_the_documented_set() -> None:
         "one needs a row naming BOTH permissions and a note that it fails closed on either."
     )
     text = _doc_text()
-    assert "the only two-permission route **on the JSON plane**" in text, (
-        "the export row's exhaustiveness claim must be scoped to the JSON plane"
+    # BACKLOG #1184 gave export a needle-bearing POST sibling, so "the ONLY two-permission route"
+    # became false the moment that route landed. The set above is the real guard; this pins that the
+    # prose claim stays SCOPED to the JSON plane rather than reading as a whole-app enumeration.
+    assert "the two-permission routes **on the JSON plane**" in text, (
+        "the export rows' exhaustiveness claim must be scoped to the JSON plane"
     )
 
 
@@ -1066,8 +1075,9 @@ def test_ungated_routes_are_exactly_the_reviewed_allowlist() -> None:
     )
     gated = [r for r in rows if r[2]]
     assert len(gated) == len(rows) - len(no_gate) - len(permissionless)
-    assert len(gated) == 87, (
-        f"{len(gated)} permission-gated routes, not 87 — update the doc's totals."
+    # 87 -> 90: BACKLOG #1184's three needle-bearing POSTs, each gated exactly as its GET sibling.
+    assert len(gated) == 90, (
+        f"{len(gated)} permission-gated routes, not 90 — update the doc's totals."
     )
 
 

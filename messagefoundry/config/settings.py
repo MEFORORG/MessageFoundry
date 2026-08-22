@@ -461,9 +461,11 @@ class StoreSettings(_Section):
     # task, each prune audited `upload.prune`). Quotas are enforced per-`uploads_dir`, NOT per-process:
     # the check reads the sidecars off disk with no cache, so engine shards sharing one dir see each
     # other's files and the budget does NOT multiply (measured 2026-08-10 — two UploadStores over one
-    # dir, the second refused the same uploader at quota, against a live positive control). What IS
-    # shared across them is the check-then-write race below, which overshoots by at most one file per
-    # concurrently in-flight upload. Shards given SEPARATE dirs get separate budgets, by construction.
+    # dir, the second refused the same uploader at quota, against a live positive control). The
+    # check-then-write race that used to survive across them — an overshoot of one file per shard
+    # caught between its scan and its write — is closed by an atomic reservation on the unified store
+    # every shard shares (ASVS 2.3.4, BACKLOG #1112); the surviving residuals are stated once in
+    # `uploads.UploadQuotaError`. Shards given SEPARATE dirs get separate budgets, by construction.
     max_upload_files_per_user: int = Field(
         default=100,
         ge=1,

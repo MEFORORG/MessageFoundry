@@ -10,9 +10,13 @@ the harness / any future client can depend on it headlessly.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import pathlib
 import subprocess
 import sys
+from collections.abc import Callable
+from typing import Any
 
 import httpx
 import pytest
@@ -176,3 +180,260 @@ def test_apiclient_still_sends_a_query_that_fits(monkeypatch: pytest.MonkeyPatch
     assert sent == ["http://127.0.0.1:8765/messages?control_id=MSG1"], (
         "the resolved URL (query included) is what the bound measures, so it is what must go out"
     )
+
+
+# --- ASVS 1.2.2 (BACKLOG #1107): contextual encoding + a URL scheme allow-list ----------------
+#
+# Two clauses, and only two. Clause 1 percent-encodes the identifiers this client interpolates into
+# URL PATH SEGMENTS; clause 2 replaces the host-keyed transport check with a positive URL scheme
+# allow-list. The web console URL builder and the FHIR structured-parameter work are clauses 3 and 4
+# of the same item and are NOT in scope here (clause 3 already shipped in transports/fhir.py).
+
+
+def _resolved_raw_path(
+    client: EngineClient, call: Callable[[EngineClient, Any], object], identifier: Any
+) -> str:
+    """Return the path httpx would actually put on the wire for ``call(client, identifier)``.
+
+    The subject is the RESOLVED request, so this asserts against ``httpx.Client.build_request`` --
+    the same resolution step ``_request`` uses -- rather than against the f-string the method typed.
+    ``raw_path`` is read, never ``.path``: httpx DECODES ``.path``, so a correctly encoded ``%2F``
+    reads back there as a bare ``/`` and the assertion would pass on broken code.
+
+    A 2xx with an empty JSON body decodes fine for the methods that return ``None``, and raises
+    ``ApiError`` for the ones that decode a model. Either way the request was already built, which
+    is the only thing under test, so the decode failure is suppressed.
+    """
+    captured: list[httpx.Request] = []
+
+    def _capture(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={}, request=request)
+
+    original_send = client._http.send
+    client._http.send = _capture  # type: ignore[method-assign]
+    try:
+        with contextlib.suppress(ApiError):
+            call(client, identifier)
+    finally:
+        client._http.send = original_send  # type: ignore[method-assign]
+    assert captured, "the call never reached the transport, so nothing was measured"
+    return captured[0].url.raw_path.decode().split("?", 1)[0]
+
+
+# Every path-segment interpolation site in the client, as (label, call, path template). The template
+# holds the LITERAL route around the segment; "{seg}" is where the identifier lands.
+_PATH_SEGMENT_SITES: list[tuple[str, Callable[[EngineClient, Any], object], str]] = [
+    ("reset_user_mfa", lambda c, v: c.reset_user_mfa(v), "/users/{seg}/reset-mfa"),
+    ("start_connection", lambda c, v: c.start_connection(v), "/connections/{seg}/start"),
+    ("stop_connection", lambda c, v: c.stop_connection(v), "/connections/{seg}/stop"),
+    ("restart_connection", lambda c, v: c.restart_connection(v), "/connections/{seg}/restart"),
+    ("purge_connection", lambda c, v: c.purge_connection(v), "/connections/{seg}/purge"),
+    ("get_message", lambda c, v: c.get_message(v), "/messages/{seg}"),
+    ("replay", lambda c, v: c.replay(v), "/messages/{seg}/replay"),
+    ("ack_alert", lambda c, v: c.ack_alert(v), "/alerts/{seg}/ack"),
+    ("resolve_alert", lambda c, v: c.resolve_alert(v), "/alerts/{seg}/resolve"),
+    ("revoke_session", lambda c, v: c.revoke_session(v), "/me/sessions/{seg}"),
+    ("revoke_user_sessions", lambda c, v: c.revoke_user_sessions(v), "/users/{seg}/sessions"),
+    ("update_custom_role", lambda c, v: c.update_custom_role(v, "d", []), "/roles/custom/{seg}"),
+    ("delete_custom_role", lambda c, v: c.delete_custom_role(v), "/roles/custom/{seg}"),
+    ("set_user_roles", lambda c, v: c.set_user_roles(v, []), "/users/{seg}/roles"),
+    ("get_channel_scope", lambda c, v: c.get_channel_scope(v), "/users/{seg}/channel-scope"),
+    ("set_channel_scope", lambda c, v: c.set_channel_scope(v, None), "/users/{seg}/channel-scope"),
+    ("delete_user", lambda c, v: c.delete_user(v), "/users/{seg}"),
+]
+
+
+def test_the_path_segment_site_table_covers_every_interpolation_in_the_client() -> None:
+    """Guard the guard: the table above is only evidence if it is the WHOLE population.
+
+    Counts the interpolated path literals in the client source and requires the table to match. A
+    new endpoint that interpolates an identifier reds this test rather than slipping in unencoded.
+
+    Mutation: delete a row from ``_PATH_SEGMENT_SITES``. Red: the two counts disagree, and the
+    failure prints the literals it found so the difference is readable rather than a bare number."""
+    import re
+
+    from messagefoundry.apiclient import client as client_module
+
+    source = pathlib.Path(client_module.__file__).read_text(encoding="utf-8")
+    interpolated = re.findall(r'f"(/[^"]*\{[^"]*)"', source)
+    assert len(interpolated) == len(_PATH_SEGMENT_SITES), (
+        f"the client has {len(interpolated)} interpolated path literals but the table covers "
+        f"{len(_PATH_SEGMENT_SITES)}; the literals found were {interpolated}"
+    )
+
+
+@pytest.mark.parametrize(("label", "call", "template"), _PATH_SEGMENT_SITES, ids=lambda v: v)
+def test_apiclient_percent_encodes_every_interpolated_path_segment(
+    label: str, call: Callable[[EngineClient, Any], object], template: str
+) -> None:
+    """ASVS 1.2.2 clause 1: an identifier carrying path metacharacters must land in ONE segment.
+
+    ``../..`` is the sharp case. Unencoded it does not merely look wrong -- httpx resolves it and
+    the request RETARGETS, so ``start_connection("../../users/admin")`` leaves ``/connections/``
+    altogether. Four of these sites carry a connection NAME, which is unconstrained free text
+    (``Registry._add`` in config/wiring.py checks only for a duplicate), so the "every id is a
+    uuid4 hex" argument does not cover them.
+
+    Mutation: drop the encode helper at any one site. Red: that site's resolved path is the escaped
+    or split form instead of the single-segment one, and the message names the site."""
+    client = EngineClient("http://127.0.0.1:8765")
+    try:
+        resolved = _resolved_raw_path(client, call, "../../users/admin")
+    finally:
+        client.close()
+    assert resolved == template.format(seg="..%2F..%2Fusers%2Fadmin"), (
+        f"{label}: the identifier escaped its path segment; resolved to {resolved!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("hostile", "encoded"),
+    [
+        ("../../users/admin", "..%2F..%2Fusers%2Fadmin"),
+        ("a/b", "a%2Fb"),
+        ("x?scope=all", "x%3Fscope%3Dall"),
+        ("x#frag", "x%23frag"),
+    ],
+    ids=["dot-dot", "slash", "question", "hash"],
+)
+def test_apiclient_path_metacharacters_cannot_change_the_resolved_path(
+    hostile: str, encoded: str
+) -> None:
+    """The four metacharacters the item names, against one representative site.
+
+    Each breaks the resolved request differently on unencoded code: ``..`` retargets the route,
+    ``/`` splits the segment, ``?`` starts a query, and ``#`` TRUNCATES the path at the fragment --
+    so ``start_connection("x#frag")`` resolves to ``/connections/x`` and the ``/start`` verb is gone.
+
+    Mutation: revert the helper at start_connection. Red: the resolved path is the mangled form."""
+    client = EngineClient("http://127.0.0.1:8765")
+    try:
+        resolved = _resolved_raw_path(client, lambda c, v: c.start_connection(v), hostile)
+    finally:
+        client.close()
+    assert resolved == f"/connections/{encoded}/start", (
+        f"{hostile!r} changed the resolved path to {resolved!r}"
+    )
+
+
+@pytest.mark.parametrize(("label", "call", "template"), _PATH_SEGMENT_SITES, ids=lambda v: v)
+def test_apiclient_leaves_a_plain_identifier_untouched(
+    label: str, call: Callable[[EngineClient, Any], object], template: str
+) -> None:
+    """NEGATIVE CONTROL for the encoding tests above, and it is not optional.
+
+    An encoder that mangled every identifier would satisfy the hostile-input assertions perfectly
+    while breaking every real call. This pins that an ordinary identifier -- the shape the API
+    actually receives -- rides through byte-identical.
+
+    Mutation: encode an already-encoded value a second time (double-encoding). Red: the plain
+    identifier comes back percent-mangled."""
+    client = EngineClient("http://127.0.0.1:8765")
+    try:
+        resolved = _resolved_raw_path(client, call, "IB_ACME_ADT")
+    finally:
+        client.close()
+    assert resolved == template.format(seg="IB_ACME_ADT"), (
+        f"{label}: a plain identifier was altered; resolved to {resolved!r}"
+    )
+
+
+def test_apiclient_still_accepts_an_integer_identifier() -> None:
+    """``ack_alert``/``resolve_alert`` take an ``int``, and ``urllib.parse.quote`` raises
+    ``TypeError`` on a non-str, so the helper has to coerce. This is the test that says so.
+
+    Mutation: drop the ``str()`` coercion in the helper. Red: TypeError, not an assertion."""
+    client = EngineClient("http://127.0.0.1:8765")
+    try:
+        resolved = _resolved_raw_path(client, lambda c, v: c.ack_alert(v), 7)
+    finally:
+        client.close()
+    assert resolved == "/alerts/7/ack", f"an int alert id resolved to {resolved!r}"
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "javascript:alert(1)",
+        "data:text/html,<script>x</script>",
+        "file:///C:/Windows/win.ini",
+        "ms-msdt:/id",
+    ],
+    ids=["javascript", "data", "file", "os-protocol-handler"],
+)
+def test_transport_guard_refuses_a_non_http_url_scheme(base_url: str) -> None:
+    """ASVS 1.2.2 clause 2: only safe URL protocols are permitted, as a POSITIVE allow-list.
+
+    The shipped check is host-keyed -- it returns early when the host is loopback OR empty. None of
+    these four URLs has a hostname, so ``host == ""`` and every one of them builds a client today,
+    including the two schemes the ASVS verb names by name.
+
+    Mutation: move the allow-list below the ``host == ""`` early return. Red: DID NOT RAISE."""
+    with pytest.raises(ApiError, match="scheme"):
+        EngineClient(base_url)
+
+
+def test_transport_guard_refuses_a_base_url_with_no_scheme() -> None:
+    """A schemeless base_url is a typo, and today it builds a client that can never work: urlsplit
+    reads ``127.0.0.1:8765`` as scheme ``""`` and ``localhost:8765`` as scheme ``localhost``, both
+    with no hostname, so both slip through the ``host == ""`` early return.
+
+    This is a DELIBERATE behavior change, pinned here so it stays a decision rather than a side
+    effect: an allow-list admitting only ``http`` and ``https`` refuses both. Failing at
+    construction beats failing on the first request with a transport error. Every in-repo caller
+    passes an explicit scheme, so nothing shipped changes."""
+    with pytest.raises(ApiError, match="scheme"):
+        EngineClient("127.0.0.1:8765")
+    with pytest.raises(ApiError, match="scheme"):
+        EngineClient("localhost:8765")
+
+
+def test_transport_guard_permits_https_and_loopback_http() -> None:
+    """NEGATIVE CONTROL for the allow-list: the two schemes the client exists to speak must pass.
+
+    Without this, an allow-list that refused everything would look identical to a correct one. The
+    plaintext-http refusal for a REMOTE host is a separate control with its own test above --
+    ``http`` has to clear the allow-list and then still meet that check, message intact."""
+    EngineClient("https://engine.example.com:8765").close()
+    EngineClient("http://127.0.0.1:8765").close()
+
+
+# --- ASVS 14.2.1 (BACKLOG #1184): the search needle never rides the query string -------------------
+
+
+def test_apiclient_sends_the_search_needle_in_the_body_not_the_url() -> None:
+    """The needle an operator types is PHI-shaped, and a query string is copied into the engine's
+    access log, the reverse proxy's log and browser history — none of which the redactor can reach.
+
+    The subject is the RESOLVED request, so this reads what ``build_request`` produced rather than
+    what ``search_messages`` typed. Absence from the URL is asserted TOGETHER with presence in the
+    body: on its own, "not in the URL" would also pass for a client that quietly dropped the term.
+
+    Mutation: put ``content=``/``field_value=`` back on the ``_get``. Red: the needle is found in the
+    resolved URL, which the message prints."""
+    client = EngineClient("http://127.0.0.1:8765")
+    captured: list[httpx.Request] = []
+
+    def _capture(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={}, request=request)
+
+    client._http.send = _capture  # type: ignore[method-assign]
+    try:
+        with contextlib.suppress(ApiError):
+            client.search_messages(content="SMITH", field_path="PID-5", field_value="9001")
+    finally:
+        client.close()
+
+    assert captured, "the call never reached the transport, so nothing was measured"
+    sent = captured[0]
+    url = str(sent.url)
+    assert sent.method == "POST", f"search is still a {sent.method}; the needle cannot ride a body"
+    for needle in ("SMITH", "9001"):
+        assert needle not in url, f"the needle {needle!r} rode the resolved URL: {url}"
+        assert needle.encode() in sent.content, (
+            f"the needle {needle!r} reached neither the URL nor the body — it was dropped, not moved"
+        )
+    assert b"PID-5" in sent.content  # the structural locator travels with its value

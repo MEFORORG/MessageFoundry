@@ -514,6 +514,63 @@ def test_rename_to_unsafe_name_raises(tmp_path: Path) -> None:
         codeset_edit.rename_code_set(tmp_path, "diets", "a/b", validate=_validate)
 
 
+def test_rename_rejects_traversal_source_without_moving_a_file_into_the_dir(tmp_path: Path) -> None:
+    # The rename SOURCE is operator-supplied and untrusted exactly like show/upsert/remove's name: it
+    # builds a filesystem path, so it must be rejected BEFORE any filesystem touch. Otherwise a
+    # rename is an arbitrary MOVE of any .csv/.toml on disk into codesets/, contents intact.
+    outside = tmp_path / "outside.csv"
+    outside.write_text("code,value\nA,moved\n", encoding="utf-8")
+    _codesets(tmp_path).mkdir()
+    with pytest.raises(WiringError, match="must not contain a path separator"):
+        codeset_edit.rename_code_set(tmp_path, "../outside", "stolen", validate=_validate)
+    # The out-of-dir file stayed where it was, and nothing landed under codesets/.
+    assert outside.read_text(encoding="utf-8") == "code,value\nA,moved\n"
+    assert not (_codesets(tmp_path) / "stolen.csv").exists()
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("a/b", "must not contain a path separator"),
+        ("a\\b", "must not contain a path separator"),
+        ("..", "must not contain '..'"),
+        ("x..y", "must not contain '..'"),
+        ("/etc/passwd", "must not contain a path separator"),
+        ("lab.results", "must be a bare stem"),
+        ("bad\x01name", "must not contain control characters"),
+        ("   ", "must be a non-empty string"),
+    ],
+    ids=[
+        "slash",
+        "backslash",
+        "dotdot",
+        "embedded-dotdot",
+        "absolute",
+        "suffix",
+        "control",
+        "blank",
+    ],
+)
+def test_rename_source_clears_every_refusal_branch_not_just_the_separator(
+    tmp_path: Path, source: str, expected: str
+) -> None:
+    """Each refusal branch of ``_validate_name``, exercised on the rename SOURCE.
+
+    The traversal test above matches only ``must not contain a path separator``, so a deliberately
+    weaker guard -- ``if "/" in old or "\\\\" in old: raise`` -- would satisfy it while leaving the
+    ``..``, control-character, suffix and empty branches unguarded on ``old``. Found by the
+    adversarial pass on BACKLOG #1130, which named the test as pinning one branch of seven.
+
+    Mutation: narrow the ``_validate_name(codesets_dir, old)`` call at :182 to a separator-only
+    check. Red: every id except ``slash``, ``backslash`` and ``absolute``.
+    """
+    _codesets(tmp_path).mkdir()
+    with pytest.raises(WiringError, match=expected):
+        codeset_edit.rename_code_set(tmp_path, source, "target", validate=_validate)
+    assert not (_codesets(tmp_path) / "target.csv").exists()
+    assert not (_codesets(tmp_path) / "target.toml").exists()
+
+
 def test_rename_collision_raises(tmp_path: Path) -> None:
     codeset_edit.upsert_code_set(
         tmp_path, "diets", ["code", "value"], [["A", "Apple"]], validate=_validate
@@ -788,6 +845,35 @@ def test_cli_rename_missing_to(tmp_path: Path, capsys: pytest.CaptureFixture[str
     )
     assert rc == 1
     assert json.loads(out)["error"] == "--to is required for `codeset rename`"
+
+
+def test_cli_rename_traversal_source_is_a_clean_json_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The CLI adds no name checking of its own, and it is not the only caller: the VS Code grid
+    # shells `codeset rename --name <old>` from a webview message. So the refusal must arrive as
+    # {"error": ...} on stdout with rc 1: never a traceback, and never a completed move.
+    outside = tmp_path / "outside.csv"
+    outside.write_text("code,value\nA,moved\n", encoding="utf-8")
+    _codesets(tmp_path).mkdir()
+    rc, out = _run(
+        [
+            "codeset",
+            "rename",
+            "--config",
+            str(tmp_path),
+            "--name",
+            "../outside",
+            "--to",
+            "stolen",
+            "--json",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert "must not contain a path separator" in json.loads(out)["error"]
+    assert outside.is_file()
+    assert not (_codesets(tmp_path) / "stolen.csv").exists()
 
 
 def test_cli_remove(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

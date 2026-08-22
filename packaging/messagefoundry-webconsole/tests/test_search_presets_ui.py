@@ -140,7 +140,11 @@ async def test_search_message_search_criteria_charges_once(engine: Engine) -> No
     transport = httpx.ASGITransport(app=create_app(engine, auth=service, serve_ui=True))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         await c.post("/ui/login", data={"username": "op", "password": PW})
-        r = await c.get("/ui/messages/search", params={"content": "MRN999"})
+        # POST, not GET (BACKLOG #1184): the needle now travels in the body, and a GET carrying
+        # ?content= would take the BARE-FORM short-circuit instead of reaching core.search_messages
+        # -- which also spends exactly one token, so this test would keep passing while measuring a
+        # different branch. Posting keeps the subject the real, criteria-bearing search.
+        r = await c.post("/ui/messages/search/run", data={"content": "MRN999"})
         # charged once by the handler, not twice by gate+handler
         assert r.status_code == 200, r.text
 

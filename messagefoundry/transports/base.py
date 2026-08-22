@@ -51,6 +51,8 @@ __all__ = [
     "register_destination",
     "build_source",
     "build_destination",
+    "ECH_UNSUPPORTED_DESTINATION_MSG",
+    "ECH_UNSUPPORTED_SOURCE_MSG",
     "peer_ip_allowed",
     "probe_tcp_reachable",
 ]
@@ -538,11 +540,38 @@ def register_destination(kind: ConnectorType, builder: DestinationBuilder) -> No
     _DESTINATIONS[kind] = builder
 
 
+# --- ECH egress: refuse the key where it would be a silent no-op (ADR 0139, ASVS 12.1.5, #1176) ----
+#
+# `ech_egress` routes a connection's egress through a loopback ECH sidecar so the outbound SNI is
+# hidden. Exactly ONE connector implements that send path (the REST destination); every other one
+# would build happily and ignore the key, leaving an ordinary SNI-leaking handshake behind an operator
+# belief that routing was on. The refusal lives HERE, in the seam every connector is constructed
+# through, rather than copied into each connector: a per-connector copy is exactly what left the rest
+# of them silently accepting it, and a copy has to be remembered every time a connector is added.
+# This is a self-contained settings-key check on purpose -- base.py must not import rest.py (the
+# dependency runs the other way), so it cannot call rest.py's resolver.
+
+_ECH_ROUTING_DESTINATIONS: frozenset[ConnectorType] = frozenset({ConnectorType.REST})
+
+ECH_UNSUPPORTED_DESTINATION_MSG = (
+    "ech_egress (ASVS 12.1.5 SNI hiding) is supported only on the REST destination in this "
+    "build; on this connector it would NOT hide the SNI, so it is refused rather than silently "
+    "leaking it (ADR 0139)"
+)
+
+ECH_UNSUPPORTED_SOURCE_MSG = (
+    "ech_egress (ASVS 12.1.5 SNI hiding) is an outbound setting -- no inbound connector originates "
+    "the TLS handshake it would hide, so it is refused rather than silently ignored (ADR 0139)"
+)
+
+
 def build_source(config: Source) -> SourceConnector:
     try:
         builder = _SOURCES[config.type]
     except KeyError:
         raise ValueError(f"no source connector registered for {config.type.value!r}") from None
+    if config.settings.get("ech_egress"):
+        raise ValueError(ECH_UNSUPPORTED_SOURCE_MSG)
     return builder(config)
 
 
@@ -551,6 +580,8 @@ def build_destination(config: Destination) -> DestinationConnector:
         builder = _DESTINATIONS[config.type]
     except KeyError:
         raise ValueError(f"no destination connector registered for {config.type.value!r}") from None
+    if config.settings.get("ech_egress") and config.type not in _ECH_ROUTING_DESTINATIONS:
+        raise ValueError(ECH_UNSUPPORTED_DESTINATION_MSG)
     return builder(config)
 
 
