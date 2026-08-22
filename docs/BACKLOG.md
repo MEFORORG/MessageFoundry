@@ -13445,18 +13445,21 @@ blind window is about a day rather than open-ended.
 > Verdict: build
 > Closing-act: code
 > 
-> ***THIS ROW SURVIVES A CROSS-SUPERSEDE, AND THE NEAR-MISS IS WORTH THE LINE.*** *A builder filed the
-> same defect as #1326 fourteen seconds after handing it to this seat. Then **each of us marked our own
-> row superseded by the other's** -- they withdrew #1326 to a stub pointing here, I wrote a supersede
-> note pointing there.* **For a few minutes both rows pointed at each other and neither survived; a
-> reader following either went in a circle.** *Mutual deference produced the duplicate AND then nearly
-> destroyed both records of it.* **#1326 lands WITHDRAWN; this row is the survivor.**
+> ***SUPERSEDED BY #1326. THIS ROW IS A STUB -- READ #1326 INSTEAD.*** *Ruled by the Lander, who holds
+> the closure call, on the ground that #1326 is the fuller body: it carries the swept population WITH
+> its false positives, the two named BLIND SPOTS in that sweep -- including that the direct scan would
+> not have found the bug that prompted it -- and the config-surface design question.* **This row never
+> carried the blind spots, which is the measurement that settled it.**
 > 
-> **LIFTED FROM #1326 BEFORE IT WENT TO A STUB -- the design question that makes this more than a
-> one-liner:** *these settings models also load from **TOML** and **`MEFOR_` environment variables**, so
-> setting `extra="forbid"` turns an unknown **config** key into a **LOAD REFUSAL**, not merely a test
-> failure.* ***That is a posture change rather than test hygiene, and it is a decision rather than an
-> edit*** -- plausibly the better posture, but it must be taken deliberately.
+> **HOW ONE DEFECT NEARLY ENDED WITH NO LIVE ROW AT ALL, recorded because the near-miss is worse than
+> the duplicate that caused it.** *Two seats filed this defect. Then each of us marked our OWN row
+> superseded by the other's, two seconds apart, and for a while both rows pointed at each other with the
+> finding written down nowhere.* ***MUTUAL DEFERENCE HAS NO FIXED POINT UNLESS SOMEBODY STATES A
+> DIRECTION INSTEAD OF YIELDING ONE*** -- the deferral produced two rows for one defect, and the
+> courtesy that tried to fix it produced zero.
+> 
+> ⚠️ **Banner not flipped -- closing is the Lander's act** (`BUILDER.md:253` forbids the filer, `:148`
+> assigns it).
 > assigns it). *Until it is flipped this is an open duplicate.*
 
 **Cluster:** Testing / silent-failure class. **Priority:** P2. **Verdict:** build.
