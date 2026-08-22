@@ -13445,21 +13445,22 @@ blind window is about a day rather than open-ended.
 > Verdict: build
 > Closing-act: code
 > 
-> ***SUPERSEDED BY #1326. THIS ROW IS A STUB -- READ #1326 INSTEAD.*** *Ruled by the Lander, who holds
-> the closure call, on the ground that #1326 is the fuller body: it carries the swept population WITH
-> its false positives, the two named BLIND SPOTS in that sweep -- including that the direct scan would
-> not have found the bug that prompted it -- and the config-surface design question.* **This row never
-> carried the blind spots, which is the measurement that settled it.**
+> **THIS IS THE LIVE ROW FOR THIS DEFECT. #1326 IS THE SAME FINDING, FILED 22 SECONDS EARLIER BY
+> ANOTHER SEAT, AND IS NOT ROUTED TONIGHT.** *Its body is durable on that seat's branch and 95 lines of
+> it survive for whoever reconciles. Read this row; nothing is lost.*
 > 
-> **HOW ONE DEFECT NEARLY ENDED WITH NO LIVE ROW AT ALL, recorded because the near-miss is worse than
-> the duplicate that caused it.** *Two seats filed this defect. Then each of us marked our OWN row
-> superseded by the other's, two seconds apart, and for a while both rows pointed at each other with the
-> finding written down nowhere.* ***MUTUAL DEFERENCE HAS NO FIXED POINT UNLESS SOMEBODY STATES A
-> DIRECTION INSTEAD OF YIELDING ONE*** -- the deferral produced two rows for one defect, and the
-> courtesy that tried to fix it produced zero.
+> **HOW ONE DEFECT NEARLY ENDED WITH NO ROW AT ALL -- three cycles, all polite, all measured.**
+> *Two seats deferred to a third and it produced **two** rows. Each then withdrew in favour of the other
+> and it produced **zero**. Each then un-withdrew and it produced **two** again.* ***MUTUAL DEFERENCE HAS
+> NO FIXED POINT, AND NEITHER DOES MUTUAL ASSERTION: stating a direction only converges if exactly ONE
+> seat states it, and neither seat can tell whether it is the second.*** **What ended it was not a better
+> argument but an ASYMMETRIC decider -- the seat that merges both branches, deciding by position rather
+> than by merit.**
 > 
-> ⚠️ **Banner not flipped -- closing is the Lander's act** (`BUILDER.md:253` forbids the filer, `:148`
-> assigns it).
+> ⚠️ **THE NEAR-MISS THAT ALMOST SHIPPED: the deciding seat read `SUPERSEDED BY` in this row's PROSE and
+> took it for a status.** *That is presence-equals-meaning -- the exact misreading `CLAUDE.md` section 11
+> forbids for banner glyphs, reproduced with a phrase instead of a pictograph.* **A status marker must
+> not be a word that also appears in narration.**
 > assigns it). *Until it is flipped this is an open duplicate.*
 
 **Cluster:** Testing / silent-failure class. **Priority:** P2. **Verdict:** build.
