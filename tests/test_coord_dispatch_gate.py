@@ -95,7 +95,12 @@ def test_the_wave_shape_is_advised_never_refused(gate: ModuleType) -> None:
         "the wave shape is workable; refusing it blocked shipped security work"
     )
     assert "NOT by the builder" in reason
-    assert "ASVS Tracker" in reason, "the advice must NAME who closes it"
+    assert "ASVS Tracker" in reason, "the advice must NAME who does the work act"
+    # A re-score is TWO acts with different owners, and naming only the first tells the reader the
+    # item finishes elsewhere when what it needs is a handoff message. BUILDER.md:253 forbids a
+    # builder concluding an item CLOSED; :148 gives the banner to the lander.
+    assert "LANDER" in reason, "the advice must also name who flips the banner"
+    assert "Two acts" in reason
 
 
 def test_a_build_item_passes(gate: ModuleType) -> None:
