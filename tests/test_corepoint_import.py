@@ -302,6 +302,65 @@ def test_hostile_values_are_escaped_not_injected() -> None:
     ast.parse(src)
 
 
+def _named_inbound_export(inbound_name: str) -> str:
+    """A minimal one-channel export whose ``inbound.name`` is caller-chosen (the untrusted value)."""
+    return json.dumps(
+        {
+            "channels": [
+                {
+                    "name": "X",
+                    "inbound": {"connector": "mllp", "name": inbound_name, "port": 2615},
+                    "destinations": [{"name": "OB_X", "connector": "mllp", "host": "h", "port": 7}],
+                    "handlers": [
+                        {
+                            "name": "h",
+                            "actions": [{"class": "ItemReplace", "target": "MSH-6", "value": "V"}],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+
+def _import_and_census(inbound_name: str, root: Path) -> tuple[list[Path], list[Path]]:
+    """Import an export naming ``inbound_name``, then census EVERY .py under ``root``.
+
+    Returns ``(inside_out_dir, outside_out_dir)``. The out dir is nested several levels below
+    ``root`` so a traversal escape still lands inside the temp tree and can be seen, rather than
+    escaping the census and reading as containment."""
+    out = root / "a" / "b" / "c" / "out"
+    export = root / "export.json"
+    export.write_text(_named_inbound_export(inbound_name), encoding="utf-8")
+    import_corepoint(export, out)
+    found = sorted(root.rglob("*.py"))
+    return (
+        [p for p in found if p.is_relative_to(out)],
+        [p for p in found if not p.is_relative_to(out)],
+    )
+
+
+def test_a_hostile_inbound_name_cannot_write_outside_the_output_directory(tmp_path: Path) -> None:
+    """``inbound.name`` is the one export value that becomes a filesystem path (the module's filename
+    stem, and the emitted ``inbound()`` connection name with it), so it is untrusted text reaching a
+    write. A traversal name must land inside the output directory and nowhere else."""
+    # POSITIVE CONTROL, same census, benign name: the module IS written and the census DOES see it,
+    # so the empty escape list on the hostile run below is a containment result, not a blind probe.
+    benign_root = tmp_path / "benign"
+    benign_root.mkdir()
+    benign_inside, benign_outside = _import_and_census("IB_ACME_ADT", benign_root)
+    assert benign_inside == [benign_root / "a" / "b" / "c" / "out" / "IB_ACME_ADT.py"]
+    assert benign_outside == []
+
+    hostile_root = tmp_path / "hostile"
+    hostile_root.mkdir()
+    hostile_inside, hostile_outside = _import_and_census("../../../evil", hostile_root)
+    assert hostile_outside == []
+    # The channel is still imported, under a folded stem: the name is sanitized, never dropped. The
+    # exact stem is deliberately not asserted, because that would pin the fold, not the containment.
+    assert len(hostile_inside) == 1
+
+
 def test_malformed_export_raises() -> None:
     with pytest.raises(CorepointImportError):
         parse_export("{ not json ")
