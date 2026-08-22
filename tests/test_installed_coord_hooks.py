@@ -56,6 +56,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _bash_resolver import bash_sees, require_bash
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "coord" / "install-coordination.ps1"
@@ -663,10 +664,15 @@ def test_the_shim_actually_exits_nonzero_with_no_python_on_path(var: str, tmp_pa
     Run against a COPY in tmp_path, never against the installed hook -- that file fires on every push
     in every worktree on this box.
     """
-    sh = shutil.which("sh") or shutil.which("bash")
-    print(f"POSIX shell: {sh or 'NONE FOUND'}")
-    if sh is None:
-        pytest.skip("SKIP (nothing executed): no sh/bash on PATH to run the shim body with")
+    # `sh` is preferred -- the shim is POSIX and running it under a POSIX shell is the faithful
+    # check -- but WHATEVER is found must be PROVED to see this process's files before it is trusted
+    # (BACKLOG #1216). On Windows a PATH lookup can resolve an interpreter in a different filesystem
+    # namespace: it is FOUND rather than absent, so a `which(...) is None` skip never fires and the
+    # body fails for a reason unrelated to the shim. If the found shell is blind, fall back to the
+    # probed resolver, which raises loudly rather than skipping.
+    found = shutil.which("sh") or shutil.which("bash")
+    sh = found if found and bash_sees(Path(found), tmp_path) else require_bash(tmp_path)
+    print(f"POSIX shell: {sh} (namespace probe passed; which() offered {found or 'NONE'})")
 
     script = tmp_path / "shim"
     script.write_text(HERE_STRINGS[var].replace("\r\n", "\n"), encoding="utf-8", newline="")

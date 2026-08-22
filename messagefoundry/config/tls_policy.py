@@ -38,7 +38,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,9 @@ __all__ = [
     "TrustAnchorMode",
     "TrustAnchorPolicy",
     "active_hop_posture",
+    "APPROVED_SMTP_AUTH_MECHANISMS",
     "build_smtp_tls_context",
+    "smtp_login_approved",
     "build_verifying_client_context",
     "cleartext_acceptance_audit_sink",
     "current_hop_posture",
@@ -1005,3 +1007,83 @@ def build_smtp_tls_context(
     if verify:  # nothing to strict-validate on the CERT_NONE path (ASVS 12.1.4)
         harden_verify_flags(ctx)
     return ctx
+
+
+#: SMTP AUTH mechanisms this engine will offer (BACKLOG #1171, ASVS 11.4.1).
+#:
+#: ``smtplib``'s own order is ``['CRAM-MD5', 'PLAIN', 'LOGIN']`` -- CRAM-MD5 FIRST -- and CRAM-MD5 is an
+#: HMAC over MD5, which Appendix C marks **D**: disallowed for any cryptographic purpose, in a clause
+#: with no default-off escape. Every unrestricted ``smtp.login()`` therefore tried a disallowed hash
+#: before anything else.
+#:
+#: **PLAIN AND LOGIN SEND THE PASSWORD; CRAM-MD5 DOES NOT.** Restricting to this set is safe ONLY on an
+#: encrypted channel. Dropping CRAM-MD5 without that condition would close a conformance gap by creating
+#: a credential exposure -- strictly worse than the gap left open. :func:`smtp_login_approved` enforces
+#: both halves together for exactly that reason; neither is correct alone.
+APPROVED_SMTP_AUTH_MECHANISMS = ("PLAIN", "LOGIN")
+
+
+def smtp_login_approved(
+    smtp: Any,
+    username: str,
+    password: str,
+    *,
+    channel_encrypted: bool,
+    escape_permitted: bool,
+    cell: str,
+) -> None:
+    """Authenticate over SMTP with an approved hash, and ONLY over an encrypted channel.
+
+    TWO HALVES, NEITHER CORRECT ALONE. Restricting the mechanism removes the disallowed hash;
+    requiring encryption is what stops that restriction putting a cleartext password on the wire.
+
+    ``escape_permitted`` is the caller's already-clamped
+    ``weakened_tls_escape_permitted`` answer, threaded in rather than read here because this module
+    must not import ``settings`` -- ``settings`` imports THIS one, so the reverse edge is circular.
+    That is the same explicit-posture threading the store hop and the other out-of-gate cells use, and
+    it is the SAME clamped escape governing the LDAPS bind, the MLLP/FTPS contexts, the SFTP host-key
+    acceptance and the webhook sink, so an enforcing-PHI hop is never relaxed by it.
+
+    ``smtplib.SMTP.login`` is deliberately NOT called: its preference order is internal and puts
+    CRAM-MD5 first. ``auth()`` is driven directly against the server's advertised list instead.
+    """
+    if not channel_encrypted and not escape_permitted:
+        raise InsecureHopRefused(
+            f"{cell}: refusing SMTP AUTH over an unencrypted channel. The approved mechanisms "
+            f"({', '.join(APPROVED_SMTP_AUTH_MECHANISMS)}) SEND THE PASSWORD, so authenticating "
+            "without TLS would put it on the wire in clear -- which is why the mechanism restriction "
+            "and this refusal ship together. Enable STARTTLS for this connection, or set "
+            "MEFOR_ALLOW_INSECURE_TLS for a non-PHI hop (BACKLOG #1171, ASVS 11.4.1)."
+        )
+    smtp.ehlo_or_helo_if_needed()
+    if not smtp.has_extn("auth"):
+        raise InsecureHopRefused(f"{cell}: the SMTP server advertises no AUTH extension")
+    advertised = [m.upper() for m in str(smtp.esmtp_features.get("auth", "")).split()]
+    usable = [m for m in APPROVED_SMTP_AUTH_MECHANISMS if m in advertised]
+    if not usable:
+        raise InsecureHopRefused(
+            f"{cell}: the server offers AUTH {advertised or '(none)'}, none of which is approved here "
+            f"({', '.join(APPROVED_SMTP_AUTH_MECHANISMS)}). CRAM-MD5 is an HMAC over MD5 and is "
+            "refused (ASVS 11.4.1; Appendix C marks MD5 disallowed)."
+        )
+    # THE AUTH OBJECTS READ THESE OFF THE CONNECTION, and omitting them fails only against a real
+    # server. ``auth_plain``'s own docstring is "Requires self.user and self.password to be set";
+    # ``auth_login`` says the same. ``login()`` assigns them before its loop, so driving ``auth()``
+    # directly means doing the same job by hand -- and this function shipped WITHOUT it, unwired, so
+    # nothing exercised the path. A fake that models ``login()`` cannot catch it either.
+    smtp.user, smtp.password = username, password
+    last: Exception | None = None
+    for mech in usable:
+        try:
+            smtp.auth(mech, getattr(smtp, "auth_" + mech.lower()), initial_response_ok=True)
+            return
+        except Exception as exc:  # noqa: BLE001 - try the next approved mechanism, report the last
+            last = exc
+    # A REJECTED CREDENTIAL IS NOT A POLICY REFUSAL, and conflating them sends an operator with a
+    # wrong password to go reading TLS policy. Re-raise the server's own exception so the caller's
+    # existing ``except smtplib.SMTPException`` maps it to DeliveryError exactly as it did when this
+    # was ``smtp.login()``. InsecureHopRefused stays reserved for the two decisions THIS function
+    # makes: an unencrypted channel, and a server offering no approved mechanism.
+    if last is not None:
+        raise last
+    raise InsecureHopRefused(f"{cell}: no approved SMTP AUTH mechanism was attempted")

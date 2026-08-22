@@ -26,6 +26,7 @@ import pytest
 
 from messagefoundry.auth.notifications import ACCOUNT_LOCKED, SecurityEvent
 from messagefoundry.config.settings import (
+    INSECURE_TLS_ESCAPE_ENV,
     AlertsSettings,
     AuthSettings,
     SecuritySettings,
@@ -54,8 +55,28 @@ class _RecordingSMTP:
         _RecordingSMTP.captured["tls"] = True
         _RecordingSMTP.captured["context"] = context
 
-    def login(self, user: str, password: str) -> None:
-        _RecordingSMTP.captured["login"] = (user, password)
+    # BACKLOG #1171: production drives auth() directly, never login(). CRAM-MD5 is advertised
+    # DELIBERATELY -- it is what a regression to login() would select, so a fake offering only
+    # PLAIN/LOGIN could not tell a fixed cell from a broken one.
+    esmtp_features = {"auth": "CRAM-MD5 PLAIN LOGIN"}
+    user = ""
+    password = ""
+
+    def ehlo_or_helo_if_needed(self) -> None:
+        return None
+
+    def has_extn(self, name: str) -> bool:
+        return name.lower() == "auth"
+
+    def auth(self, mechanism: str, authobject: Any, *, initial_response_ok: bool = True) -> None:
+        _RecordingSMTP.captured["auth_mechanism"] = mechanism
+        _RecordingSMTP.captured["login"] = (self.user, self.password)
+
+    def auth_plain(self, challenge: bytes | None = None) -> str:
+        return ""
+
+    def auth_login(self, challenge: bytes | None = None) -> str:
+        return ""
 
     def send_message(self, msg: Any) -> None:
         _RecordingSMTP.captured["subject"] = msg["Subject"]
@@ -63,6 +84,13 @@ class _RecordingSMTP:
 
 @pytest.fixture
 def smtp(monkeypatch: pytest.MonkeyPatch) -> type[_RecordingSMTP]:
+    # RESET THE SHARED DICT PER TEST. `captured` is CLASS state and was previously only cleared in
+    # __init__, i.e. only when a connection was actually opened. Every test that asserts something did
+    # NOT happen — a refusal firing before smtplib.SMTP is ever constructed (BACKLOG #1171) — was
+    # therefore reading the PREVIOUS test's dict. MEASURED: the security-event refusal test passed
+    # alone and failed after the one that logs in successfully, because it inherited that login. Three
+    # sibling refusal tests passed only because of the order they happened to run in.
+    _RecordingSMTP.captured = {}
     monkeypatch.setattr("messagefoundry.pipeline.alert_sinks.smtplib.SMTP", _RecordingSMTP)
     return _RecordingSMTP
 
@@ -396,3 +424,135 @@ def test_the_advisory_skips_rather_than_inventing_a_result(tmp_path: Path) -> No
 
     r = _check_alert_smtp_tls(tmp_path)
     assert r.skipped and r.ok
+
+
+# --------------------------------------------------------------------------------------------------
+# BACKLOG #1171 / ASVS 11.4.1 — SMTP AUTH over an un-encrypted channel.
+#
+# The connectors (transports/email.py, transports/direct.py) already refused this at construction,
+# with tests that SET the escape env var and still assert the raise. This cell did not: STARTTLS ran
+# only when use_tls, and the login ran whenever a username was set. So `[alerts].email_use_tls=false`
+# beside `email_username` put the password on the wire.
+#
+# Every test below asserts the fake recorded NO login, not merely that something raised. A refusal
+# that fires after the credential reaches the transport is not a refusal.
+# --------------------------------------------------------------------------------------------------
+
+
+def test_cleartext_alerts_smtp_with_a_credential_is_refused(smtp: type[_RecordingSMTP]) -> None:
+    # WITHOUT THE FIX: no raise, and captured["login"] holds ("svc", "pw") in the clear.
+    t = EmailTransport(
+        host="smtp.example",
+        port=587,
+        sender="mf@example",
+        recipients=["ops@x"],
+        use_tls=False,
+        username="svc",
+        password="pw",
+    )
+    with pytest.raises(ValueError, match="credentials"):
+        asyncio.run(t.send({"type": "connection_stopped", "connection": "OB_X", "detail": "b"}))
+    assert "login" not in smtp.captured, "the credential reached the transport before the refusal"
+
+
+def test_the_escape_does_not_re_permit_a_cleartext_credential(
+    smtp: type[_RecordingSMTP], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The escape buys a cleartext BODY, never a cleartext CREDENTIAL.
+
+    This mirrors tests/test_email_destination.py and tests/test_direct_transport.py, which set the
+    same env var and still assert the raise. Without this test the refusal could be quietly softened
+    into an escapable one and the suite would stay green.
+    """
+    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    t = EmailTransport(
+        host="smtp.example",
+        port=587,
+        sender="mf@example",
+        recipients=["ops@x"],
+        use_tls=False,
+        username="svc",
+        password="pw",
+    )
+    with pytest.raises(ValueError, match="credentials"):
+        asyncio.run(t.send({"type": "connection_stopped", "connection": "OB_X", "detail": "b"}))
+    assert "login" not in smtp.captured
+
+
+def test_cleartext_without_a_credential_still_sends(smtp: type[_RecordingSMTP]) -> None:
+    """POSITIVE CONTROL. A guard that refused every cleartext send would satisfy both tests above.
+
+    Nothing on this path is a credential, so the pre-existing behaviour is unchanged: no TLS, no
+    context, no login, and the message goes.
+    """
+    t = EmailTransport(
+        host="smtp.example", port=587, sender="mf@example", recipients=["ops@x"], use_tls=False
+    )
+    asyncio.run(t.send({"type": "connection_stopped", "connection": "OB_X", "detail": "b"}))
+    assert smtp.captured["tls"] is False
+    assert "login" not in smtp.captured
+
+
+def test_a_credential_over_starttls_still_logs_in(smtp: type[_RecordingSMTP]) -> None:
+    """POSITIVE CONTROL for the other half: the refusal must not break authenticated SMTP.
+
+    A guard keyed on `username is not None` alone — dropping the `not use_tls` half — would refuse
+    this, which is the ordinary production configuration.
+    """
+    t = EmailTransport(
+        host="smtp.example",
+        port=587,
+        sender="mf@example",
+        recipients=["ops@x"],
+        username="svc",
+        password="pw",
+    )
+    asyncio.run(t.send({"type": "connection_stopped", "connection": "OB_X", "detail": "b"}))
+    assert smtp.captured["tls"] is True
+    assert smtp.captured["login"] == ("svc", "pw")
+
+
+def test_the_security_event_hop_refuses_a_cleartext_credential(smtp: type[_RecordingSMTP]) -> None:
+    """A DISTINCT call site, per this file's own rule that one passing does not imply the other.
+
+    security_notify builds its own transport and passes the SAME `[alerts].email_use_tls` knob, so
+    the gap was reachable twice. Both callers funnel through send_plain_email, which is why one
+    refusal covers both — but that is a claim about the code, and this is the measurement of it.
+    """
+    n = SecurityEventNotifier(
+        host="smtp.example",
+        port=587,
+        sender="mf@example",
+        use_tls=False,
+        username="svc",
+        password="pw",
+    )
+    with pytest.raises(ValueError, match="credentials"):
+        n._send(SecurityEvent(event_type=ACCOUNT_LOCKED, username="dr.who", email="dr.who@x"))
+    assert "login" not in smtp.captured
+
+
+def test_cram_md5_is_never_selected_even_when_the_server_offers_it(
+    smtp: type[_RecordingSMTP],
+) -> None:
+    """THE CONFORMANCE ASSERTION. ASVS 11.4.1 disallows MD5 for any cryptographic purpose.
+
+    The fake advertises ``CRAM-MD5 PLAIN LOGIN``. smtplib's own ``login()`` builds its preference
+    list as ``['CRAM-MD5', 'PLAIN', 'LOGIN']`` and picks the first the server advertises — so the
+    unfixed code selects an HMAC over MD5 here. Restoring ``smtp.login()`` in place of
+    ``smtp_login_approved`` turns this red.
+    """
+    t = EmailTransport(
+        host="smtp.example",
+        port=587,
+        sender="mf@example",
+        recipients=["ops@x"],
+        username="svc",
+        password="pw",
+    )
+    asyncio.run(t.send({"type": "connection_stopped", "connection": "OB_X", "detail": "b"}))
+    assert smtp.captured["auth_mechanism"] == "PLAIN"
+    assert "MD5" not in smtp.captured["auth_mechanism"].upper()
+    # POSITIVE CONTROL on the fake itself: it really did offer the disallowed mechanism, so the
+    # assertion above is a choice the code made and not an option it never had.
+    assert "CRAM-MD5" in _RecordingSMTP.esmtp_features["auth"]
