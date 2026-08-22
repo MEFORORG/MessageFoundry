@@ -61,9 +61,9 @@ same as having a working instrument.
 |---|---|---|
 | 11 | "Unpushed: 7" | `git log origin/main..HEAD` answers *what does the PR carry*, not *what have I failed to push*. The real number was 0. Asked while writing the document describing that error. |
 | 12 | "Crossed in flight, fourteen seconds apart" | The allocation records show 22 seconds between filings, and the message blamed as the cause landed **three minutes after both**. Two real timestamps, a real gap, and the wrong events. |
-| 13 | "#1326 is live, #1327 superseded" | Read from a SHA that two newer commits had already replaced. **A SHA is a snapshot; a TIP is a state.** |
+| 13 | "the earlier row is live, the later one superseded" | Read from a SHA that two newer commits had already replaced. **A SHA is a snapshot; a TIP is a state.** |
 | 14 | Reading item status by grepping for `superseded` | A row read *"THIS ROW SURVIVES A CROSS-SUPERSEDE"* -- the word inside a sentence meaning the opposite. Three seats read it backwards. |
-| 15 | A test named `..._being_disabled` passing a deleted setting | Pydantic `extra="ignore"` drops the unknown key silently, so the test established nothing it was named for. Filed as BACKLOG #1326. |
+| 15 | A test named `..._being_disabled` passing a deleted setting | Pydantic `extra="ignore"` drops the unknown key silently, so the test established nothing it was named for. Filed the same night as a settings-model item; the number is not cited here because it was not on main when this was written. |
 
 ## 4b. The correct instrument, correctly used, answering the adjacent question
 
@@ -71,7 +71,7 @@ same as having a working instrument.
 broken or mis-aimed tool. This one used the right tool, got the right answer, and still reached a
 wrong conclusion.
 
-Two rows for one defect appeared to be live at once. Six seats measured it. The reads that used a
+Two rows for one defect appeared to be live at once (a settings-model finding filed twice, minutes apart). Six seats measured it. The reads that used a
 word-grep were wrong, for the reason in entry 14. **The reads that used `parse_items` -- the
 mandated reader -- returned `is_open=True` for both, correctly.** Mine was one of them, and I
 published "both rows are live, the defect is filed twice again" to twelve seats on the strength of
