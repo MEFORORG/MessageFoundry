@@ -333,13 +333,24 @@ def validate_proxy_tls_posture(min_version: str | None, ciphers: str | None) -> 
         # Reuse the forward-secrecy gate; re-raise under the proxy field name so the operator sees which
         # setting is at fault (validate_tls_ciphers's message names the generic "tls_ciphers").
         try:
-            validate_tls_ciphers(ciphers)
+            # require_approved_suites=False: this field DECLARES an external proxy's suite list, it
+            # does not configure one of ours. See validate_tls_ciphers' docstring (BACKLOG #1317).
+            validate_tls_ciphers(ciphers, require_approved_suites=False)
         except ValueError as exc:
             raise ValueError(f"[api].proxy_tls_ciphers rejected: {exc}") from exc
 
 
-def validate_tls_ciphers(value: str) -> str:
+def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) -> str:
     """Validate an operator OpenSSL cipher string, rejecting non-forward-secret key exchange.
+
+    ``require_approved_suites`` gates the :data:`_APPROVED_TLS_SUITES` allow-list only; the three
+    property checks always run. Pass ``False`` where the string DESCRIBES A COMPONENT THE ENGINE DOES
+    NOT OPERATE -- today that is ``[api].proxy_tls_ciphers``, which declares what an external
+    TLS-terminating proxy speaks. A declaration and a configuration are different things: refusing an
+    unlisted-but-sound suite there would not harden anything, it would stop an operator describing
+    their proxy truthfully, and a gate that punishes accurate declarations gets fed inaccurate ones.
+    The properties still bind, because declaring a NULL or anonymous proxy floor is a real defect
+    whoever operates it.
 
     Returns ``value`` unchanged when it parses and every resolved TLS 1.2 suite uses (EC)DHE (TLS 1.3
     suites are inherently ECDHE + AEAD). Raises ``ValueError`` — surfaced as a config-load error — for
@@ -350,13 +361,45 @@ def validate_tls_ciphers(value: str) -> str:
         probe.set_ciphers(value)
     except ssl.SSLError as exc:
         raise ValueError(f"tls_ciphers is not a valid OpenSSL cipher string: {exc}") from exc
-    non_fs = sorted(
-        {str(c.get("name", "?")) for c in probe.get_ciphers() if not _is_forward_secret(c)}
-    )
+    resolved = probe.get_ciphers()
+    non_fs = sorted({str(c.get("name", "?")) for c in resolved if not _is_forward_secret(c)})
     if non_fs:
         raise ValueError(
             "tls_ciphers must resolve to forward-secret (EC)DHE suites only (ASVS 11.6.2); "
             f"these admit a non-forward-secret key exchange: {', '.join(non_fs)}"
+        )
+    # BACKLOG #1317. Forward secrecy was historically the ONLY property checked here, and it is not
+    # sufficient: ECDHE-RSA-NULL-SHA (forward-secret, authenticated, PLAINTEXT) and
+    # ADH-AES256-GCM-SHA384 (forward-secret, strongly encrypted, authenticates NOBODY) both passed.
+    plaintext = sorted({str(c.get("name", "?")) for c in resolved if not _is_encrypting(c)})
+    if plaintext:
+        raise ValueError(
+            "tls_ciphers must resolve to suites that ENCRYPT (ASVS 12.1.2); these are NULL ciphers "
+            f"and would transmit plaintext: {', '.join(plaintext)}"
+        )
+    anonymous = sorted({str(c.get("name", "?")) for c in resolved if not _is_peer_authenticated(c)})
+    if anonymous:
+        raise ValueError(
+            "tls_ciphers must resolve to suites that AUTHENTICATE THE PEER (ASVS 12.1.2); these are "
+            f"anonymous key exchanges and are trivially intercepted: {', '.join(anonymous)}"
+        )
+    if not require_approved_suites:
+        return value
+    # The allow-list is last so an operator hitting a specific property failure above gets the precise
+    # reason rather than a bare "not on the list", which says nothing about what is wrong with it.
+    unlisted = sorted(
+        {
+            str(c.get("name", "?"))
+            for c in resolved
+            if str(c.get("name", "")) not in _APPROVED_TLS_SUITES
+        }
+    )
+    if unlisted:
+        raise ValueError(
+            "tls_ciphers must resolve only to suites on the approved list (ASVS 12.1.2, BACKLOG "
+            f"#1317); these are not on it: {', '.join(unlisted)}. The list is AEAD-only and excludes "
+            "the CBC-SHA2 suites the interpreter default enables; widening it for a legacy peer is a "
+            "deliberate change to _APPROVED_TLS_SUITES, not a configuration override."
         )
     return value
 
@@ -382,9 +425,8 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
     Raises :class:`ValueError` at construction — the same class the surrounding TLS config errors use,
     so it surfaces at ``check`` / dry-run / ``serve`` rather than as a wire-time surprise.
     """
-    non_fs = sorted(
-        {str(c.get("name", "?")) for c in ctx.get_ciphers() if not _is_forward_secret(c)}
-    )
+    resolved = ctx.get_ciphers()
+    non_fs = sorted({str(c.get("name", "?")) for c in resolved if not _is_forward_secret(c)})
     if non_fs:
         raise ValueError(
             f"{connector}: the TLS context would negotiate non-forward-secret suite(s) "
@@ -392,6 +434,85 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
             f"list that admits static RSA/DH key exchange lets a future key compromise decrypt "
             f"recorded PHI traffic."
         )
+    # BACKLOG #1317. The two properties forward secrecy cannot speak to. Measured against the shipped
+    # default on every context shape this module builds: 17 suites, ZERO NULL and ZERO anonymous, so
+    # these assert on no supported configuration today and convert two more inherited properties into
+    # checked ones -- the same move, and the same justification, as the assertion above.
+    #
+    # _APPROVED_TLS_SUITES is deliberately NOT applied here. It is AEAD-only and the shipped default
+    # carries six CBC-SHA2 suites, so applying it to an INHERITED context would refuse every current
+    # configuration. The allow-list governs what an operator may CONFIGURE, not what a default may
+    # contain; conflating the two is how a strict list becomes an outage.
+    plaintext = sorted({str(c.get("name", "?")) for c in resolved if not _is_encrypting(c)})
+    if plaintext:
+        raise ValueError(
+            f"{connector}: the TLS context would negotiate NULL-cipher suite(s) "
+            f"{', '.join(plaintext)} (ASVS 12.1.2), which transmit plaintext. A NULL cipher is "
+            f"forward-secret and authenticated, so the forward-secrecy check above cannot see it."
+        )
+    anonymous = sorted({str(c.get("name", "?")) for c in resolved if not _is_peer_authenticated(c)})
+    if anonymous:
+        raise ValueError(
+            f"{connector}: the TLS context would negotiate anonymous suite(s) "
+            f"{', '.join(anonymous)} (ASVS 12.1.2), which authenticate no peer and are trivially "
+            f"intercepted."
+        )
+
+
+#: Suites an operator-configured ``tls_ciphers`` string may resolve to (BACKLOG #1317, ASVS 12.1.2).
+#:
+#: STRICT POSITIVE ALLOW-LIST, by owner ruling of 2026-08-22, and the strictness is the point: the
+#: three properties below are each necessary and **together still not sufficient**, because a suite
+#: can satisfy all three and remain off every current candidate list. Naming the admitted suites is
+#: the only formulation whose failure mode on an unrecognised name is REFUSAL rather than admission.
+#:
+#: AEAD only, so this deliberately EXCLUDES the six CBC-SHA2 suites the interpreter default enables
+#: (``ECDHE-{ECDSA,RSA}-AES{256,128}-SHA{384,256}`` and the two ``DHE-RSA-AES*-SHA256``). That cost
+#: was ruled on with the exclusion named: an operator needing one for a legacy hospital peer files to
+#: widen this set, which is the direction such a request should travel. **This list governs the
+#: operator KNOB only.** :func:`harden_cipher_suites` must never apply it to an inherited default
+#: context -- the shipped default contains those six, so doing so would refuse every current
+#: configuration.
+_APPROVED_TLS_SUITES = frozenset(
+    {
+        # TLS 1.3 -- always negotiable and not configurable down, so they must be admitted here or
+        # every validation would fail on suites the operator cannot remove.
+        "TLS_AES_256_GCM_SHA384",
+        "TLS_CHACHA20_POLY1305_SHA256",
+        "TLS_AES_128_GCM_SHA256",
+        # TLS 1.2 AEAD, forward-secret, authenticated.
+        "ECDHE-ECDSA-AES256-GCM-SHA384",
+        "ECDHE-RSA-AES256-GCM-SHA384",
+        "ECDHE-ECDSA-AES128-GCM-SHA256",
+        "ECDHE-RSA-AES128-GCM-SHA256",
+        "ECDHE-ECDSA-CHACHA20-POLY1305",
+        "ECDHE-RSA-CHACHA20-POLY1305",
+        "DHE-RSA-AES256-GCM-SHA384",
+        "DHE-RSA-AES128-GCM-SHA256",
+    }
+)
+
+
+def _is_encrypting(cipher: Mapping[str, object]) -> bool:
+    """Whether the suite actually encrypts, i.e. is not a ``NULL`` cipher.
+
+    OpenSSL renders a NULL cipher as ``Enc=None`` in the human description. ``ECDHE-RSA-NULL-SHA`` is
+    a real, negotiable suite that is forward-secret and authenticated and transmits **plaintext**, so
+    forward secrecy alone can never exclude it -- which is exactly how it passed every gate before
+    BACKLOG #1317.
+    """
+    return "Enc=None" not in str(cipher.get("description", ""))
+
+
+def _is_peer_authenticated(cipher: Mapping[str, object]) -> bool:
+    """Whether the suite authenticates the peer, i.e. is not an anonymous key exchange.
+
+    OpenSSL renders anonymous authentication as ``Au=None``. ``ADH-*`` suites are forward-secret and
+    strongly encrypted but authenticate nobody, so they are trivially machine-in-the-middled. Note
+    ``Au=any`` is NOT anonymous: TLS 1.3 suites report it because authentication is negotiated
+    separately from the suite.
+    """
+    return "Au=None" not in str(cipher.get("description", ""))
 
 
 def _is_forward_secret(cipher: Mapping[str, object]) -> bool:
