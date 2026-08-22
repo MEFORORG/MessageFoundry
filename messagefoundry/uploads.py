@@ -11,8 +11,11 @@ at-rest tier as the File-connector spill dirs, documented in ``docs/PHI.md`` §2
 
 This is a **leaf** module: it imports only the pure ``store.crypto`` cipher seam + the pure
 ``parsing.split``/``parsing.peek`` HL7 library. It never imports the store instance, a transport, a
-connection, ``api/``, or ``pipeline/`` — the offline viewer is not wired into the graph. All disk +
-crypto + split work runs **off the event loop** (``asyncio.to_thread``).
+connection, ``api/``, or ``pipeline/`` — the offline viewer is not wired into the graph. The
+cross-process quota ledger (ASVS 2.3.4) does not change that: the store handle arrives as a
+constructor argument typed against the narrow :class:`UploadQuotaLedger` protocol declared HERE, so
+no store module is imported. All disk + crypto + split work runs **off the event loop**
+(``asyncio.to_thread``).
 
 **PHI.** An uploaded file is real HL7 PHI at rest. Bodies are never logged at INFO+; every access is
 gated + audited by the API layer. The on-disk **identity** is a random 32-hex ``file_id`` — the
@@ -35,6 +38,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Protocol
 
 from messagefoundry.parsing.peek import HL7PeekError, Peek
 from messagefoundry.parsing.sniff import _looks_like_hl7, _lstrip_bom_ws
@@ -94,12 +98,32 @@ class UploadQuotaError(UploadError):
     with no cache, so engine shards sharing one dir enforce ONE budget between them (measured
     2026-08-10). Shards pointed at separate dirs get separate budgets, by construction.
 
-    Residual, stated precisely: the critical section is per-process, so N engine shards sharing one
-    dir can still overshoot by at most **N-1 files** — one per shard that is mid-write when another
-    scans, each bounded by ``max_upload_bytes``. On the shipped single-process deployment N is 1 and
-    the overshoot is zero. Closing the multi-shard remainder needs a cross-process mechanism (an
-    advisory lock on the dir, or moving the accounting into the unified store); it is not closed
-    here, and no comment in this module should imply otherwise."""
+    The cross-PROCESS half is the ledger reservation (BACKLOG #1112). The per-process lock is an
+    ``asyncio.Lock``, so N engine shards over one dir used to hold N of them and each could overshoot
+    by one file while another scanned. :meth:`UploadStore._reserve_across_shards` now takes an atomic
+    reservation on the ONE unified store every shard shares before the write and pays it back after,
+    so a shard mid-upload is visible to its siblings and the decision is exclusive across processes.
+
+    Residual, stated precisely, and there are three:
+
+    * **No ledger bound.** ``UploadStore(store=None)`` — the genuinely store-less construction path
+      (embedding / tests) — keeps only the per-process lock, so the pre-#1112 bound applies there: at
+      most **N-1 files** over, one per shard mid-write, each bounded by ``max_upload_bytes``.
+    * **A leaked reservation.** A process killed between reserve and release never pays back, and its
+      slot narrows that uploader's budget until the row goes idle for
+      ``UPLOAD_RESERVATION_STALE_AFTER``. It errs toward refusing, not allowing.
+      **IT DOES NOT SELF-HEAL UNCONDITIONALLY, and an earlier version of this line said it did.**
+      The release statement sets ``since = <now>`` **unconditionally** (its own comment: "Never
+      conditional: refusing a release would strand the reservation it is paying back"), so every
+      *subsequent* release by the same uploader pushes the staleness clock forward. **It self-heals
+      only while that uploader is otherwise IDLE.** A uploader who keeps uploading successfully can
+      hold a leaked slot indefinitely, and the reserve path's own staleness reset never fires for it.
+    * **A reclaimed live reservation.** If one uploader keeps reservations continuously outstanding
+      for longer than that window, the staleness reset zeroes a row that was legitimately non-zero,
+      which restores the N-1 bound above for that window. Never worse than the pre-#1112 behaviour.
+
+    Still open, and out of scope here: the ledger is checked and paid back around the write, not in
+    the same transaction as it, because the body lives on the filesystem rather than in the store."""
 
 
 class UploadNotFoundError(UploadError):
@@ -275,12 +299,37 @@ def browse_messages(
     )
 
 
+class UploadQuotaLedger(Protocol):
+    """The ONE thing :class:`UploadStore` needs from the message store: an atomic, cross-process
+    reservation of an uploader's in-flight upload budget (ASVS 2.3.4).
+
+    Declared here as a structural protocol rather than importing ``store.base.Store``, so this module
+    stays a leaf (see the module docstring). Every backend's ``Store`` satisfies it structurally —
+    see :meth:`messagefoundry.store.base.Store.reserve_upload_quota` for the full contract."""
+
+    async def reserve_upload_quota(
+        self,
+        uploader_id: str,
+        *,
+        files: int,
+        size_bytes: int,
+        max_files: int = 0,
+        max_total_bytes: int = 0,
+    ) -> bool: ...
+
+
 class UploadStore:
     """Filesystem-backed, encrypted-at-rest store for operator-uploaded diagnostic files (ADR 0134).
 
     Constructed with the store's :class:`~messagefoundry.store.crypto.Cipher` so uploaded bodies ride the
     same DEK/keyring/rotation posture as the message store. ``max_bytes`` bounds a single upload (and thus
-    the in-memory whole-file split at browse time)."""
+    the in-memory whole-file split at browse time).
+
+    ``ledger`` is the message store, used ONLY for the cross-process half of the per-uploader quota
+    (ASVS 2.3.4). ``None`` — the genuinely store-less construction path (embedding / tests) — leaves
+    the quota enforced by the per-process lock alone, which is what shipped before and is a real
+    degradation, not a second control: N engine shards over one ``uploads_dir`` would then each be
+    able to overshoot the budget by one file."""
 
     def __init__(
         self,
@@ -291,6 +340,7 @@ class UploadStore:
         max_files_per_user: int = 100,
         max_total_bytes_per_user: int = 250 * 1024 * 1024,
         retention_days: int = 30,
+        store: UploadQuotaLedger | None = None,
     ) -> None:
         self._root = Path(root)
         self._cipher = cipher
@@ -306,7 +356,13 @@ class UploadStore:
         # build-and-write (not just the check) is what makes it atomic — releasing between them is the
         # race. The throughput cost is acceptable here and nowhere near the data plane: this is the
         # operator diagnostic-upload surface, and each pass is bounded by max_bytes.
+        #
+        # This lock is an asyncio.Lock, so it is per-event-loop and therefore PER-PROCESS. Engine
+        # sharding is the built, shipped, default scaling axis and nothing partitions uploads_dir per
+        # shard, so N shards over one directory hold N independent copies of it. `_ledger` is the
+        # cross-process half: one atomic row on the ONE unified store every shard already shares.
         self._quota_lock = asyncio.Lock()
+        self._ledger = store
 
     @property
     def max_bytes(self) -> int:
@@ -445,24 +501,19 @@ class UploadStore:
             # writing when this file would exceed their file-count or aggregate-byte cap. Runs in the same
             # off-loop thread as the write, and the caller holds _quota_lock across BOTH, so no second
             # upload in this process can read this count before the write consumes it (ASVS 2.3.4).
-            # The scan is uncached, so shards sharing a dir enforce one budget rather than one each;
-            # the residual that survives the lock is per-shard, not per-upload. See UploadQuotaError.
-            # The bucket key is the IMMUTABLE uploader_id, the same value the ownership check uses, so
-            # the budget and the ownership rule can never disagree about who a file belongs to: a
-            # recycled username is never billed for files it cannot read. The message text below still
-            # names the human username, because an operator reading a 409 needs a name, not a uuid.
+            # The scan is uncached, so shards sharing a dir enforce one budget rather than one each.
+            # The residual the lock alone cannot cover — a sibling shard between ITS scan and ITS
+            # write, invisible to this one — is covered by the ledger reservation the caller holds
+            # around this whole call. See _reserve_across_shards and _on_disk_refusal.
             mine = [m for m in self._scan_metas_sync() if m.uploader_id == uploader_id]
-            if len(mine) + 1 > self._max_files_per_user:
-                raise UploadQuotaError(
-                    f"uploader {uploader!r} has {len(mine)} uploaded files; the limit is "
-                    f"{self._max_files_per_user}"
-                )
-            projected = sum(m.size for m in mine) + len(data)
-            if projected > self._max_total_bytes_per_user:
-                raise UploadQuotaError(
-                    f"uploader {uploader!r} would hold {projected} bytes; the limit is "
-                    f"{self._max_total_bytes_per_user}"
-                )
+            refusal = self._on_disk_refusal(
+                uploader=uploader,
+                observed_files=len(mine),
+                observed_bytes=sum(m.size for m in mine),
+                size=len(data),
+            )
+            if refusal is not None:
+                raise refusal
             meta = UploadedFileMeta(
                 file_id=file_id,
                 filename=display,
@@ -485,8 +536,119 @@ class UploadStore:
             return meta
 
         # One critical section per process: quota check + write. See _quota_lock in __init__.
+        # Inside it, one cross-PROCESS reservation around the same window (ASVS 2.3.4): the sidecar
+        # scan below already sees every shard's files, so the only thing it CANNOT see is an upload
+        # in flight on another shard — reserved but not yet landed. The reservation is what the other
+        # shards see instead, and it is released the moment the file is on disk (or the write fails),
+        # so a completed upload is counted by the scan and by nothing else.
         async with self._quota_lock:
-            return await asyncio.to_thread(_build_and_write)
+            reserved = await self._reserve_across_shards(
+                uploader_id=uploader_id, uploader=uploader, size=len(data)
+            )
+            try:
+                return await asyncio.to_thread(_build_and_write)
+            finally:
+                if reserved:
+                    await self._release_across_shards(uploader_id=uploader_id, size=len(data))
+
+    async def _reserve_across_shards(self, *, uploader_id: str, uploader: str, size: int) -> bool:
+        """Take this uploader's cross-shard in-flight reservation; return whether one is held.
+
+        ``False`` means there is no ledger bound (the store-less construction path) — not that the
+        reservation was refused. A refusal raises :class:`UploadQuotaError`, the same TYPE the
+        in-process check raises, so the API's 409 + ``upload.reject_quota`` audit is unchanged; the
+        message differs on purpose, so an operator can tell the two causes apart. A ledger error is
+        NOT swallowed: the store being unreachable fails the upload closed.
+
+        The headroom handed to the ledger is the cap minus what the (fleet-visible, uncached) sidecar
+        scan observed, so the ledger only ever holds the in-flight remainder. That is a second scan
+        per save — bounded by the uploader's own file count, off the event loop, and on the operator
+        diagnostic surface rather than the data plane."""
+        if self._ledger is None:
+            return False
+        observed_files, observed_bytes = await asyncio.to_thread(self._observed_sync, uploader_id)
+        # Refuse an already-over-budget uploader HERE, with the on-disk wording, before consulting
+        # the ledger. Otherwise the ledger (handed zero headroom) refuses first and its message
+        # blames in-flight uploads on another shard that do not exist — a 409 that sends an operator
+        # hunting a phantom. Same helper as the under-lock check, so the text is one string.
+        refusal = self._on_disk_refusal(
+            uploader=uploader,
+            observed_files=observed_files,
+            observed_bytes=observed_bytes,
+            size=size,
+        )
+        if refusal is not None:
+            raise refusal
+        ok = await self._ledger.reserve_upload_quota(
+            uploader_id,
+            files=1,
+            size_bytes=size,
+            max_files=self._max_files_per_user - observed_files,
+            max_total_bytes=self._max_total_bytes_per_user - observed_bytes,
+        )
+        if not ok:
+            # Headroom was positive, so the only thing that can have consumed it is an upload in
+            # flight on another shard. That is exactly the double-book this control exists to refuse.
+            raise UploadQuotaError(
+                f"uploader {uploader!r} has {observed_files} uploaded files holding "
+                f"{observed_bytes} bytes, and another engine shard is mid-upload against the same "
+                f"budget; the limits are {self._max_files_per_user} files / "
+                f"{self._max_total_bytes_per_user} bytes"
+            )
+        return True
+
+    def _on_disk_refusal(
+        self, *, uploader: str, observed_files: int, observed_bytes: int, size: int
+    ) -> UploadQuotaError | None:
+        """The per-uploader quota verdict against what is ALREADY on disk, or ``None`` if it fits.
+
+        One string, two callers: the under-lock check inside ``save``'s build-and-write, and the
+        cross-shard reservation's pre-check. The bucket key is the IMMUTABLE ``uploader_id`` (the
+        caller filters on it, the same value the ownership check uses), so the budget and the
+        ownership rule can never disagree about who a file belongs to and a recycled username is
+        never billed for files it cannot read. The message names the human username, because an
+        operator reading a 409 needs a name, not a uuid."""
+        if observed_files + 1 > self._max_files_per_user:
+            return UploadQuotaError(
+                f"uploader {uploader!r} has {observed_files} uploaded files; the limit is "
+                f"{self._max_files_per_user}"
+            )
+        projected = observed_bytes + size
+        if projected > self._max_total_bytes_per_user:
+            return UploadQuotaError(
+                f"uploader {uploader!r} would hold {projected} bytes; the limit is "
+                f"{self._max_total_bytes_per_user}"
+            )
+        return None
+
+    async def _release_across_shards(self, *, uploader_id: str, size: int) -> None:
+        """Pay the reservation back. Never raises: the file is already written (or already failed) by
+        the time this runs, so turning a ledger blip into a failed upload would be strictly worse.
+
+        A reservation that is never released is reclaimed once the row goes stale — **but only while
+        that uploader is otherwise IDLE.** This statement sets ``since = <now>`` unconditionally, so
+        each later release by the same uploader restarts the staleness clock and a leaked slot can
+        survive indefinitely under continued activity. See
+        :meth:`messagefoundry.store.base.Store.reserve_upload_quota`."""
+        if self._ledger is None:
+            return
+        try:
+            await self._ledger.reserve_upload_quota(
+                uploader_id, files=-1, size_bytes=-size, max_files=0, max_total_bytes=0
+            )
+        except Exception:  # noqa: BLE001 — a release failure must not fail an upload that landed
+            _log.warning(
+                "could not release the cross-shard upload reservation for %s; it will be reclaimed "
+                "when it goes stale",
+                uploader_id,
+                exc_info=True,
+            )
+
+    def _observed_sync(self, uploader_id: str) -> tuple[int, int]:
+        """(file count, total bytes) already ON DISK for ``uploader_id`` — the fleet-visible half of
+        the budget. Sync: the caller runs it off the event loop."""
+        mine = [m for m in self._scan_metas_sync() if m.uploader_id == uploader_id]
+        return len(mine), sum(m.size for m in mine)
 
     async def list_files(self) -> list[UploadedFileMeta]:
         """List all uploaded files (newest first). Undecryptable/foreign sidecars are skipped with a

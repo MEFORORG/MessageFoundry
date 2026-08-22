@@ -70,7 +70,7 @@ loader's own wording inline.
 | `messagefoundry codeset list --config DIR` | Summarize every set under `codesets/` (`.csv` **and** `.toml`), sorted by name. |
 | `messagefoundry codeset show --config DIR --name N` | The grid for set `N` (headers + rows); `format:"toml"` ⇒ read-only. |
 | `messagefoundry codeset upsert --config DIR [--data JSON]` | Validate → write `codesets/N.csv` atomically (temp + replace, owner-only perms) → **re-load the written file as the final check**; a bad save rolls back. DETAIL JSON comes from `--data` or stdin. |
-| `messagefoundry codeset rename --config DIR --name N --to M` | Atomic `os.replace` of `codesets/N.<ext>` → `codesets/M.<ext>`; rejects a stem collision. |
+| `messagefoundry codeset rename --config DIR --name N --to M` | Name-safety on **both** `N` and `M` (a bare stem, no separator, `..`, drive or extension) → atomic `os.replace` of `codesets/N.<ext>` → `codesets/M.<ext>`; rejects a stem collision. |
 | `messagefoundry codeset remove --config DIR --name N` | Delete `codesets/N.csv` (else `.toml`). |
 
 Add `--json` to any command for machine-readable output.
@@ -92,13 +92,27 @@ exactly the loader's rule.
 
 ### The operator-supplied name is untrusted
 
-`upsert`'s `name`, `rename`'s `--to`, **and** the `--name` on `show`/`remove` are all treated as
-**untrusted data** (CLAUDE.md §5/§8). The CLI rejects a name that contains a path separator, `..`, an
-absolute / drive-prefixed path, or an embedded `.csv`/`.toml` extension, and applies a final
-`resolve()` check that the target stays inside `codesets/` — so a name can never read or write a file
-outside the code-sets directory.
+`upsert`'s `name`, **both** of `rename`'s `--name` and `--to`, **and** the `--name` on
+`show`/`remove` are all treated as **untrusted data** (CLAUDE.md §5/§8). The CLI rejects a name that
+contains a path separator, `..`, an absolute / drive-prefixed path, or an embedded `.csv`/`.toml`
+extension, and applies a final `resolve()` check that the target stays inside `codesets/` — so a name
+can never read or write a file outside the code-sets directory.
 
-### Validation rules (mirror the loader exactly)
+> **`rename --name` joined that list in BACKLOG #1130 and it is a behaviour change.** It was
+> previously unchecked, so a traversal source resolved outside `codesets/` and the `os.replace` below
+> would have **moved that file in**, contents intact.
+>
+> **The consequence, stated because it is not obvious:** a code set whose file is `lab.results.csv`
+> **loads fine** — `load_code_sets` returns the key `lab.results` and `codeset list` shows it — but
+> its dotted stem fails the no-extension rule, so **no CLI verb can manage it.** `show` and `remove`
+> already refused it; `rename` was the last one that did not, and now it does too. Such a file must
+> be renamed on disk by hand.
+
+### Validation rules (mirror the loader for CONTENT; the NAME rules are stricter)
+
+> **The name rules do NOT mirror the loader, and this heading used to say they did.** The loader
+> accepts a dotted stem such as `lab.results.csv`; the CLI's name rules refuse it. The content rules
+> below do mirror the loader. Measured 2026-08-22 under BACKLOG #1130.
 
 A bad `upsert` is rejected **before** any file is touched: a non-empty key column plus at least one
 value column, unique non-empty headers, all-string cells, no row longer than `columns`, a fully-blank

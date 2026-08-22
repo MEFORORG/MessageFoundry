@@ -12073,3 +12073,24 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** CI reliability / required-gate stability. **Priority:** P2. **Verdict:** build.
 **Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- CI only. The cost is that a required roll-up reds on changes that cannot have caused it, which both blocks unrelated work and trains reviewers to discount a red that will sometimes be real.
+
+## 1306. the worktree gate denies a READ-ONLY git config core.hooksPath query on command shape
+
+> 🔢 **Filed 2026-08-22 by the lander.** Value **4/10** -- Difficulty **2/10** -- _fill-in_. Reported by the Builder 1 seat, relayed by the Dispatcher, and **reproduced here before filing, with a harness whose controls discriminate.** The gate decides on COMMAND SHAPE rather than on whether a value is being assigned, so a bare `git config core.hooksPath` -- which assigns nothing -- is refused with *"setting 'core.hooksPath' would change the SHARED git configuration"*. The message is false about what the command does.
+> **REPRODUCED, and the defect is NARROWER than the report reads.** Driven through the real hook interface: a JSON payload on stdin carrying `cwd`, with `-ReposFile` naming the primary checkout. Five cases, both controls discriminating:
+> ```
+> git config core.hooksPath /dev/null        DENY   <- positive control, correctly denied
+> git config --local core.hooksPath nowhere  DENY   <- positive control, correctly denied
+> git config core.hooksPath                  DENY   <- THE DEFECT: it assigns nothing
+> git config --get core.hooksPath            ALLOW  <- the SAME read, explicit form
+> git config user.name                       ALLOW  <- negative control
+> ```
+> **THERE IS A WORKING SPELLING, and that is most of why this is small.** `--get` is unaffected, so a caller who needs the value has one today.
+> **A SECOND INSTANCE, FOUND WHILE FILING THIS ITEM, AND IT IS THE WORSE HALF.** Writing this entry through a shell heredoc was itself **DENIED** -- because the heredoc *quotes* the command strings above. The gate matched the key inside a documentation payload that assigns nothing and executes nothing. **The same rule that blocks a read also blocks writing the item that describes the read**, and the obvious next move for whoever hits it is to reword the evidence out of the record. That is a documentation-integrity cost rather than an ergonomic one, and it is why the value is 4 and not 2. This entry was written with the file-edit tool instead. **No gate was routed around and none should be** -- the fix belongs in the predicate, not in the caller.
+> **SEVERITY: it FAILS CLOSED and there is no bypass. This is a false positive, not a hole.** Nothing here weakens the control, and the fix must not be read as licence to loosen shape-matching generally: the two positive controls above are exactly what the shape rule exists to catch, and they must keep denying.
+> **WHY THE CONTROLS ARE QUOTED RATHER THAN SUMMARISED.** My first two attempts at this measurement did not discriminate. The first drove the gate with invented `-Tool`/`-Command` parameters it does not have, and returned the identical failure on every case **including the control**. The second sent a payload with no `cwd`, so the gate was OFF and ALLOWED the write case it must deny. **Either would have been reported as "cannot reproduce", and this item would have been closed as unfounded.** A gate probe whose positive control does not deny is measuring nothing, and it is indistinguishable from a clean result.
+> **FIX DIRECTION, not prescribed:** decide on whether a VALUE is present, not on the appearance of the key. The discriminator is already visible in the five rows above, and the heredoc case adds a second requirement -- the test must also survive the key appearing inside quoted text.
+> **PROVENANCE:** found by the Builder 1 seat. **Builder 2 declined it** because the gate cluster is fenced to Builder 1's lane via #1229, which is held by a worktree whose session is gone and that no live session can release. That fence is a separate problem, and this item does not resolve it.
+
+**Cluster:** Tooling / worktree gate. **Priority:** P3. **Verdict:** build.
+**Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- developer tooling only, and it fails closed. The cost is a gate message that is false about what the command does, which is the class of defect that teaches readers to discount gate output.
