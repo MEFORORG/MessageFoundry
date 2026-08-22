@@ -88,9 +88,9 @@ actor** (`allow_admin_write`, keyed on the acting user, `_enforce_admin_write_pa
 `api/security.py` is their only caller):
 
 - **`require_step_up`** — the sensitive surface that also needs a fresh credential re-proof: purge,
-  dead-letter and message replay/resend/edit-resend, `POST /config/reload`, every `users:manage` write
-  **except `PATCH /users/{user_id}`** (promoted to the action-bound `require_step_up_action` gate,
-  which charges **no** pacing — see the Route → limiter map), the `/roles/custom` writes, the
+  dead-letter and message replay/resend/edit-resend, `POST /config/reload`, **every** `users:manage`
+  write — the `PATCH /users/{user_id}` exemption is gone, because BACKLOG #1148 made the action-bound
+  `require_step_up_action` charge the same floor — the `/roles/custom` writes, the
   `/uploads` writes, `POST /search/presets`.
 - **`require_paced`** — state-changing routes that warrant pacing but **not** a step-up re-proof:
   connection start/stop/restart/flag/test/test-credential, `POST /statistics/reset`, the four
@@ -197,7 +197,7 @@ apply. What each **adds** over plain `require()`:
 | `require_paced` | 16 | per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + `Retry-After: 1` |
 | `require_phi_read` | 7 | the ADR 0092 PHI-read hop refusal (`enforce_phi_read_hop`) **before** any identity work, then the per-actor PHI-read budget, 429 + `Retry-After: 10` |
 | `require_step_up` | 26 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
-| `require_step_up_action` | 2 | a **single-use, action-bound** step-up grant minted only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`) |
+| `require_step_up_action` | 2 | the same non-GET pacing (BACKLOG #1148), the **MFA gate**, then a **single-use, action-bound** step-up grant minted only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`). Promoting a route here no longer drops the pacing floor |
 | `require_reauth_only_action` | 4 | password step-up **without** the MFA gate — deadlock avoidance on the MFA-enrollment lanes, and on session terminate (ASVS 7.5.2), where the grant is action-bound so a login-seeded window does not unlock it. `require_reauth_only` still exists and still backs the `/ui` twin, but BACKLOG #1149 moved the last JSON route off it, so it no longer appears in this walk |
 | `require_service_cert` | 1 | cert-only authentication (a bearer token gets 401), and a **PHI fence** that raises at *app construction* if asked to gate `messages:view_summary` / `messages:view_raw` |
 
@@ -1695,7 +1695,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 | `POST /ui/mfa` | per-actor ceremony budget | the ASVS 6.3.3 sign-in gate: it submits the second factor for a session that has already proven its password, so it draws the same budget as `POST /ui/reauth` and carries the same `Retry-After: 30` |
 | `POST /ui/account/mfa/verify` | per-actor ceremony budget | |
 | `POST /ui/account/password` | *(inherits)* | delegates to the JSON handler, which charges once; the 429 is re-raised intact — deliberately not double-charged |
-| **No limiter of any kind** | — | `POST /auth/logout`, `POST /me/mfa/enroll`, `DELETE /me/mfa`, `DELETE /me/sessions[/{id}]`, `PATCH /users/{user_id}`, `POST /ai/chat`, `DELETE /search/presets/{preset_id}`, `PATCH /logging/level`. `PATCH /users/{user_id}` lost the write pacing precisely because it was promoted to an action-bound step-up gate, and the action/reauth-only gates charge no pacing. The console's WebAuthn **ceremony-staging** routes are here too — `POST /ui/account/webauthn/enroll`, `POST /ui/account/webauthn/verify` and `GET /ui/reauth` (which re-stages assertion options on every render) — so the `/ui` ceremony surface is **not** fully paced; only the `POST /ui/reauth/webauthn` finish leg charges limiter 3 |
+| **No limiter of any kind** | — | `POST /auth/logout`, `POST /me/mfa/enroll`, `DELETE /me/mfa`, `DELETE /me/sessions[/{id}]`, `POST /ai/chat`, `DELETE /search/presets/{preset_id}`, `PATCH /logging/level`. `PATCH /users/{user_id}` USED to sit here: it lost the write pacing when it was promoted to an action-bound step-up gate. BACKLOG #1148 made `require_step_up_action` charge the floor, so it is paced again and has left this row. The `reauth_only` action gate still charges none. The console's WebAuthn **ceremony-staging** routes are here too — `POST /ui/account/webauthn/enroll`, `POST /ui/account/webauthn/verify` and `GET /ui/reauth` (which re-stages assertion options on every render) — so the `/ui` ceremony surface is **not** fully paced; only the `POST /ui/reauth/webauthn` finish leg charges limiter 3 |
 
 The console resolves the ceremony gate through a `getattr` shim because it ships as a separately
 versioned wheel: mounted on an engine that predates the method, it falls back to the **sign-in** budget.
