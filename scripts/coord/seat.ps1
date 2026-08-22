@@ -335,6 +335,85 @@ function Get-PoolEpoch {
 # Git-derived facts. Every one is a fact with a time, never a verdict.
 # ---------------------------------------------------------------------------------------------
 
+function Get-ScriptCurrency {
+    <#
+        IS THE SCRIPT THAT IS RUNNING THE ONE THE FLEET AGREED ON?
+
+        WHY THIS EXISTS. Measured 2026-08-22 across the live seats directory: 19 records were keyed
+        to the literal 'nosid' rather than to a session, and every one of the 19 was written by a
+        worktree carrying a seat.ps1 that predated the fix for exactly that defect. Each record
+        carries the tip it was written at; grepped at that tip, all 19 have zero occurrences of the
+        environment fallback, against four on origin/main. Not one was a logic error. The code was
+        correct and was not reaching the seats running it.
+
+        Nothing anywhere reported that. A seat coordinating with a months-old script produced
+        records that were valid, well-formed and wrong, and three sessions spent an evening
+        inventing a second cause for it before someone graded the tree at the record's timestamp.
+
+        SCOPED TO REPORTING, DELIBERATELY. This surfaces the fact and never acts on it. It does not
+        gate -Declare, does not exit non-zero, and does not refuse to write. A coordination script
+        that refuses to record because it is out of date turns a reporting gap into an outage, and
+        the seat that most needs its record written is the one whose checkout nobody has touched.
+
+        WHY THE BLOB AND NOT "COMMITS BEHIND". A branch can sit 57 commits behind origin/main and
+        still carry a byte-identical seat.ps1, and a branch 0 behind can carry a modified one. The
+        question is whether THIS FILE matches, so the measurement is a blob hash of the running
+        file. "Behind by N" answers an adjacent question and would report both of those wrong.
+
+        NOT "STALE", AND THAT IS NOT A STYLE CHOICE. fleet.ps1 already ships WriterStale, meaning
+        THE RECORD IS OLD -- the record's clock against the transcript's. "The script is old" is a
+        different fact about a different object. One token carrying both meanings is the failure
+        CLAUDE.md section 11 describes, so this reports `writerScript.state` and says OUT-OF-DATE.
+
+        NEVER FETCHES. It reads whatever origin/main this checkout already knows, which may itself
+        be old. That is why `comparedToSha` is recorded beside the verdict: a reader who needs to
+        know how fresh the comparison was can see the ref it was taken against, rather than trust
+        a bare word. A verdict without its reference point is the instrument defect this whole
+        episode was made of.
+    #>
+    param([string]$Wt, [string]$ScriptPath)
+
+    $unknown = { param($why) [ordered]@{
+            state = 'unknown'; reason = $why; runningSha = $null
+            mainSha = $null; comparedTo = 'origin/main'; comparedToSha = $null
+        } }
+
+    if (-not $ScriptPath -or -not (Test-Path -LiteralPath $ScriptPath)) {
+        return (& $unknown 'the running script path did not resolve')
+    }
+
+    # hash-object works on any readable path, in or out of the repo, so a sandboxed copy measures
+    # honestly instead of erroring.
+    $runSha = Invoke-Git -Dir $Wt -GitArgs @('hash-object', $ScriptPath)
+    if (-not $runSha) { return (& $unknown 'git could not hash the running script') }
+
+    $mainSha = Invoke-Git -Dir $Wt -GitArgs @('rev-parse', 'origin/main:scripts/coord/seat.ps1')
+    if (-not $mainSha) {
+        # The common case here is a sandbox or a clone with no origin/main. Reporting 'unknown' is
+        # the honest answer; reporting 'current' would manufacture agreement with a ref that is not
+        # there, which is the false-negative direction and the dangerous one.
+        return (& $unknown 'this checkout has no origin/main:scripts/coord/seat.ps1 to compare against')
+    }
+
+    $originSha = Invoke-Git -Dir $Wt -GitArgs @('rev-parse', 'origin/main')
+
+    $state = if ($runSha -eq $mainSha) { 'current' } else {
+        # Distinguish "an older committed version" from "somebody is editing it right now". Both
+        # differ from main and they want opposite responses: one is a pull, one is your own work.
+        $headSha = Invoke-Git -Dir $Wt -GitArgs @('rev-parse', 'HEAD:scripts/coord/seat.ps1')
+        if ($headSha -and $runSha -eq $headSha) { 'out-of-date' } else { 'modified' }
+    }
+
+    return [ordered]@{
+        state         = $state
+        reason        = $null
+        runningSha    = $runSha
+        mainSha       = $mainSha
+        comparedTo    = 'origin/main'
+        comparedToSha = $originSha
+    }
+}
+
 function Get-GitFacts {
     param([string]$Wt)
 
@@ -579,6 +658,10 @@ try {
     $now = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
     $g = Get-GitFacts -Wt $wt
     $cr = Get-ConfigRootLabel
+    # Measured on EVERY write, not only on -Declare. The seat least likely to declare is the one
+    # whose checkout nobody has touched, so recording this only on the declare path would leave the
+    # worst cases unmeasured -- which is how the original defect stayed invisible for 19 records.
+    $ws = Get-ScriptCurrency -Wt $wt -ScriptPath $PSCommandPath
 
     $lifecycle = Prior 'lifecycle' 'open'
     $lifecycleAt = Prior 'lifecycleAt' $now
@@ -637,6 +720,10 @@ try {
         pid              = $PID
         configRootLabel  = $cr.Label
         configRootSource = $cr.Source
+        # Which seat.ps1 produced this record. Sits with pid and configRoot because it describes the
+        # WRITER, not the worktree -- and it is the field that would have named the cause of the 19
+        # nosid records on the first read instead of the third evening.
+        writerScript     = $ws
         poolEpoch        = Get-PoolEpoch -SeatsDir $script:SeatsDir
         # A DERIVED label never overwrites a DECLARED one, and never claims to be one. The order
         # here is the whole rule: declared wins, derived fills only a vacuum, prior survives both.
@@ -678,6 +765,33 @@ try {
     # -Prompt is a hook path like -Record: it must not narrate into a session's context. What the
     # session should SEE is the prompt itself, and that is the hook's line to write, not this one's.
     if (-not $Record -and -not $Prompt) { Write-Host "wrote $recPath" }
+
+    # THE REPORT. Same audience rule as the line above: the two hook paths stay silent, a person or
+    # agent at the CLI gets told. It is a warning and never a refusal -- the record is already
+    # written by the time this runs, on purpose, so nothing here can cost a seat its record.
+    if (-not $Record -and -not $Prompt -and $ws.state -ne 'current' -and $ws.state -ne 'unknown') {
+        $short = { param($s) if ($s) { $s.Substring(0, [Math]::Min(12, $s.Length)) } else { '(none)' } }
+        if ($ws.state -eq 'out-of-date') {
+            Write-Host ''
+            Write-Host 'WARNING: this seat.ps1 is OUT-OF-DATE. Your record was written by an older'
+            Write-Host '         coordination script than the rest of the fleet is running.'
+            Write-Host ("         running  {0}" -f (& $short $ws.runningSha))
+            Write-Host ("         expected {0}  (origin/main, at {1})" -f (& $short $ws.mainSha), (& $short $ws.comparedToSha))
+            Write-Host '         This is REPORTED, not enforced -- your record was written normally.'
+            Write-Host '         Refresh the worktree to fix it for every later write:'
+            Write-Host '             git -C . merge --ff-only origin/main'
+            Write-Host ''
+        }
+        else {
+            # 'modified'. Expected and fine while somebody is editing this file; it is reported so a
+            # reader of the record can tell a work-in-progress writer from a neglected one.
+            Write-Host ''
+            Write-Host 'NOTE: this seat.ps1 is MODIFIED -- it matches neither origin/main nor HEAD.'
+            Write-Host '      Expected if you are editing it. Recorded so the fleet can tell an'
+            Write-Host '      edited writer apart from an out-of-date one.'
+            Write-Host ''
+        }
+    }
 } catch {
     Write-WriterError -Stage 'main' -Message $_.Exception.Message
     Write-Error "seat.ps1: $($_.Exception.Message)" -EA Continue
