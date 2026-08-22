@@ -12181,3 +12181,21 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Tooling / CI gates. **Priority:** P2. **Verdict:** build.
 **Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- CI tooling only. The cost is that a supply-chain auto-merge control's discriminating test passes for a reason unrelated to the control.
+
+## 1309. Scope GET /metrics and /stats labels to the caller's allowed_channels
+
+> 🔢 OPEN -- allocated 2026-08-22 by the Dispatcher at a builder's request, under the standing rule that this seat allocates and the building lane does not file.
+
+**THIS ITEM IS A BUILD, NOT A FINDING. THE FINDING IS ALREADY RECORDED IN `#1152`'s BODY AND IS NOT RESTATED HERE.** Read it there. Two seats measured the same gap independently and a third established it was already on record, so filing it again would create two descriptions of one defect with no drift signal between them.
+
+**What is genuinely new is narrower, and only one record carries it:** the ASVS **cell** for this area never examined the monitoring surface, while the **ledger item** already did. Those are different artifacts, and *"new to the record"* is true of one and false of the other. That distinction is why this is a build item rather than a fresh finding.
+
+**The build.** `GET /metrics` renders labels naming every connection and destination in the estate, and `render_metrics(engine)` takes no identity, so nothing downstream can scope it. `/stats` has the same shape. The fix passes the caller's identity in and filters on `allowed_channels`.
+
+**Why it bites, and the part that is easy to get wrong:** it **is** gated by `monitoring:read`, so this is not an authentication hole. **All six builtin roles hold that permission, VIEWER included** -- enumerated from `BUILTIN_ROLE_PERMISSIONS` rather than assumed. So a channel-restricted viewer enumerates every connection name, and this project names connections `TYPE_PARTNER_MESSAGE`, so those names carry partner identity. **Topology and partner disclosure, not PHI.** The defect is per-object scope, not authn; the finding lane corrected itself on exactly that point mid-way.
+
+**LOCATE THE CALL SITE BY SYMBOL, NEVER BY LINE.** `render_metrics` has exactly two occurrences in `api/app.py` -- the import and the single call -- so a grep is unambiguous. A line number is not: the call measures `4374` on `main`, this seat's first ruling cited `4360` and was **wrong**, and it moves to roughly `4591` once `#1184` lands. *A ruling that names a line goes stale the moment a sibling item merges.*
+
+**NOT BLOCKED, and the correction matters more than the conclusion.** An earlier ruling from this seat deferred the work behind another lane's uncommitted `api/app.py`. That was measured at **file** granularity and is wrong at **hunk** granularity: **21 uncommitted hunks in that file, none touching either `render_metrics` occurrence**, the nearest ending well above it. The holding lane volunteered the finer measurement against its own interest, and this seat re-derived it before reversing rather than accepting the account.
+
+*The general form, which is the reusable part: "the file is dirty" and "the change is contested" are different questions, and a file-level check answers the first while appearing to answer the second.*
