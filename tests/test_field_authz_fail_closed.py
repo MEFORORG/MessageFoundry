@@ -88,8 +88,12 @@ def test_a_freshly_built_phi_model_serializes_its_gated_properties_as_null() -> 
         f"an unreleased MessageSummary serialized PHI: {withheld}"
     )
     # Positive control: the SAME model, released, emits the values — so the assertion above is about
-    # the gate, not about a seed that never carried PHI or a dump that drops every field.
-    released = redact_unauthorized(_summary(), _identity(Permission.MESSAGES_VIEW_SUMMARY))
+    # the gate, not about a seed that never carried PHI or a dump that drops every field. The reveal
+    # is passed so the control observes the COMPLETE value: this test is about the release gate, and
+    # a masked value would leave it unable to tell a working gate from a mask.
+    released = redact_unauthorized(
+        _summary(), _identity(Permission.MESSAGES_VIEW_SUMMARY), revealed=frozenset({"summary"})
+    )
     emitted = released.model_dump(mode="json")
     assert emitted["summary"] == _SUMMARY
     assert emitted["error"] == _ERROR
@@ -113,7 +117,9 @@ def test_redaction_releases_only_what_the_caller_holds() -> None:
     """A caller without the permission gets null; a holder gets the value. Both in one place."""
     nonholder = redact_unauthorized(_summary(), _identity(Permission.MESSAGES_READ))
     assert nonholder.model_dump(mode="json")["summary"] is None
-    holder = redact_unauthorized(_summary(), _identity(Permission.MESSAGES_VIEW_SUMMARY))
+    holder = redact_unauthorized(
+        _summary(), _identity(Permission.MESSAGES_VIEW_SUMMARY), revealed=frozenset({"summary"})
+    )
     assert holder.model_dump(mode="json")["summary"] == _SUMMARY
 
 
@@ -147,7 +153,14 @@ async def test_a_route_that_forgets_redact_unauthorized_denies_rather_than_expos
 
     @app.get("/test-made-the-call", response_model=MessageDetail)
     async def remembered() -> MessageDetail:
-        return redact_unauthorized(_detail(), _identity(Permission.MESSAGES_VIEW_SUMMARY))
+        # Reveals summary so this control observes the COMPLETE value. Without it the control would
+        # still be non-null and would still prove the route released something — but it would no
+        # longer distinguish "the gate works" from "the mask works", and this test is about the gate.
+        return redact_unauthorized(
+            _detail(),
+            _identity(Permission.MESSAGES_VIEW_SUMMARY),
+            revealed=frozenset({"summary"}),
+        )
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
