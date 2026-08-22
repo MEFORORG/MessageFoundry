@@ -4292,6 +4292,16 @@ async def test_sessions_revoke_others(engine: Engine) -> None:
         await _cookie_login(c, "op")
         op_id = await _uid(service, "op")
         assert len(await service.store.list_sessions(op_id)) == 2
+        # BACKLOG #1149 (ASVS 7.5.2): the login window no longer unlocks a terminate, so the
+        # freshly-logged-in POST bounces to /ui/reauth and revokes NOTHING. That bounce is the
+        # console half of the defect this item closes -- it used to succeed here.
+        bounced = await c.post(
+            "/ui/account/sessions/revoke-others", headers={"Sec-Fetch-Site": "same-origin"}
+        )
+        assert bounced.status_code == 303
+        assert bounced.headers["location"] == "/ui/reauth?next=/ui/account/sessions/revoke-others"
+        assert len(await service.store.list_sessions(op_id)) == 2  # nothing signed out yet
+        await _mint_action(c, "/ui/account/sessions/revoke-others")
         r = await c.post(
             "/ui/account/sessions/revoke-others", headers={"Sec-Fetch-Site": "same-origin"}
         )
@@ -4311,9 +4321,15 @@ async def test_sessions_revoke_one(engine: Engine) -> None:
         await _cookie_login(c, "op")
         op_id = await _uid(service, "op")
         other_id = hash_token(other.token or "")
-        r = await c.post(
-            f"/ui/account/sessions/{other_id}/revoke", headers={"Sec-Fetch-Site": "same-origin"}
-        )
+        # BACKLOG #1149: same inversion as revoke-others -- a fresh login is no longer a terminate
+        # grant, so this bounces first and the target session survives it.
+        path = f"/ui/account/sessions/{other_id}/revoke"
+        bounced = await c.post(path, headers={"Sec-Fetch-Site": "same-origin"})
+        assert bounced.status_code == 303
+        assert bounced.headers["location"] == f"/ui/reauth?next={path}"
+        assert other_id in {s.token_hash for s in await service.store.list_sessions(op_id)}
+        await _mint_action(c, path)
+        r = await c.post(path, headers={"Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 303 and r.headers["location"] == "/ui/account/sessions?m=revoked"
         remaining = {s.token_hash for s in await service.store.list_sessions(op_id)}
         assert other_id not in remaining and len(remaining) == 1
@@ -4323,6 +4339,12 @@ async def test_sessions_posts_reject_cross_site(engine: Engine) -> None:
     service = await _service(engine)
     async with _boss_client(engine, service) as c:
         for path in ("/ui/account/sessions/x/revoke", "/ui/account/sessions/revoke-others"):
+            # BACKLOG #1149: the action gate now runs BEFORE assert_same_origin, so without a grant
+            # this would 303 to reauth and the assertion below would be measuring the STEP-UP rather
+            # than the CSRF defence it is named for. Mint the grant first so the origin guard is the
+            # thing actually under test -- the same shadowing the JSON ownership-404 test had to
+            # avoid. A cross-site POST must be refused outright, never bounced to a login form.
+            await _mint_action(c, path)
             r = await c.post(path, headers={"Sec-Fetch-Site": "cross-site"})
             assert r.status_code == 403, path
 

@@ -20,6 +20,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_MFA_CONFIRM,
     STEP_UP_ACTION_MFA_DISABLE,
     STEP_UP_ACTION_MFA_ENROLL,
+    STEP_UP_ACTION_SESSION_TERMINATE,
     STEP_UP_ACTION_WEBAUTHN_DELETE,
     STEP_UP_ACTION_WEBAUTHN_ENROLL,
     AuthService,
@@ -90,8 +91,22 @@ register_ui_action(
 # able to revoke — require_ui_step_up would deadlock it (WP-14). permission=None (self-scoped).
 # The two patterns do not overlap: the per-session pattern requires two more segments after
 # sessions/ (<id>/revoke), so /ui/account/sessions/revoke-others (one segment) matches only itself.
-register_ui_action(r"^/ui/account/sessions/[^/?#]+/revoke$", None, step_up=False)
-register_ui_action(r"^/ui/account/sessions/revoke-others$", None, step_up=False)
+# BACKLOG #1149 (ASVS 7.5.2): both now carry an action= tag, the same treatment the factor lanes got
+# for 7.5.1. Without it these were the LAST /ui write actions whose gate a login-seeded window
+# satisfied, so the browser path -- the one a human actually uses -- stayed open after the JSON API
+# was closed. /ui/reauth mints the matching single-use grant and each terminate consumes one.
+register_ui_action(
+    r"^/ui/account/sessions/[^/?#]+/revoke$",
+    None,
+    step_up=False,
+    action=STEP_UP_ACTION_SESSION_TERMINATE,
+)
+register_ui_action(
+    r"^/ui/account/sessions/revoke-others$",
+    None,
+    step_up=False,
+    action=STEP_UP_ACTION_SESSION_TERMINATE,
+)
 
 
 def register(app: FastAPI, deps: UiDeps) -> None:
@@ -297,9 +312,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # --- L6b: self-service session management (#75 parity — desktop sessions.py twin) ---
     # LISTING one's OWN sessions is plain cookie-authenticated self-service (require_ui). TERMINATING
     # one (revoke one / revoke-others) additionally requires a fresh PASSWORD re-proof
-    # (require_ui_reauth_only — ASVS 7.5.2), NOT the full MFA step-up: a no-factor user must still be
-    # able to revoke, and require_ui_step_up would deadlock them (WP-14). A fresh login seeds the
-    # step-up window, so an immediate post-login revoke is unaffected; a stale window 303s to
+    # (require_ui_reauth_only_action — ASVS 7.5.2), NOT the full MFA step-up: a no-factor user must
+    # still be able to revoke, and require_ui_step_up would deadlock them (WP-14). BACKLOG #1149
+    # CORRECTED THE SENTENCE THAT STOOD HERE: it read "a fresh login seeds the step-up window, so an
+    # immediate post-login revoke is unaffected", which was true of the code and was the defect --
+    # 7.5.2 wants an authentication event AFTER the one that established the session. The proof is
+    # now bound to the action and single-use, so an immediate post-login revoke 303s to
     # /ui/reauth?next=<this action> and auto-retries after re-verification (both terminate POSTs are
     # registered auto_retry, step_up=False, above). The handlers read the HEADER/cookie session token
     # to identify the current session and drive the SERVICE directly (the ui_mfa_verify pattern).
@@ -335,7 +353,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         session_id: str,
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_ui_reauth_only()),
+        identity: Identity = Depends(
+            require_ui_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)
+        ),
     ) -> Response:
         assert_same_origin(request)
         # Ownership-checked in the service; an unknown/foreign id is a silent no-op (never
@@ -348,7 +368,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_revoke_other_sessions(
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_ui_reauth_only()),
+        identity: Identity = Depends(
+            require_ui_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)
+        ),
     ) -> Response:
         assert_same_origin(request)
         current = hash_token(session_token(request) or "")
