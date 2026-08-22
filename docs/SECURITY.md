@@ -449,9 +449,9 @@ tuple: they act only on the caller's own account.
 
 | Method | Path | Permission | Gate | Extra constraints |
 |---|---|---|---|---|
-| `GET` | `/search/presets` | `messages:read` | `require` | |
-| `POST` | `/search/presets` | `messages:read` | `require_step_up` | |
-| `DELETE` | `/search/presets/{preset_id}` | `messages:read` | `require` | **not** paced |
+| `GET` | `/search/presets` | `messages:read` | `require` | **owner-scoped**: a caller sees only their OWN presets. Enforced on the identity's `user_id`, not on any client-supplied field, so the permission grants the FUNCTION and the row's owner grants the DATA (ASVS 8.1.1) |
+| `POST` | `/search/presets` | `messages:read` | `require_step_up` | **owner-scoped**: a caller sees only their OWN presets. Enforced on the identity's `user_id`, not on any client-supplied field, so the permission grants the FUNCTION and the row's owner grants the DATA (ASVS 8.1.1) |
+| `DELETE` | `/search/presets/{preset_id}` | `messages:read` | `require` | **not** paced; **owner-scoped**: a caller sees only their OWN presets. Enforced on the identity's `user_id`, not on any client-supplied field, so the permission grants the FUNCTION and the row's owner grants the DATA (ASVS 8.1.1). A preset id belonging to another user is a miss, not a 403 -- ownership is part of the lookup |
 | `GET` | `/search/layered` | `messages:read` | `require_step_up` | explicit `enforce_phi_read_hop` + `enforce_phi_read_pacing` |
 
 #### Uploaded files (PHI at rest)
