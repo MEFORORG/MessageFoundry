@@ -24,7 +24,7 @@ from fastapi import FastAPI
 from messagefoundry.api._ui_seam import UiDeps
 
 from . import STATIC_DIR, _auth, assert_engine_seam, pages
-from ._security import UiSecurityHeadersMiddleware
+from ._security import UiFetchMetadataMiddleware, UiSecurityHeadersMiddleware
 from ._static import AllowlistedStaticFiles
 from .routes import (
     account,
@@ -101,3 +101,10 @@ def mount_ui(app: FastAPI, deps: UiDeps) -> None:
     # See :mod:`._security`.
     if not any(getattr(m, "cls", None) is UiSecurityHeadersMiddleware for m in app.user_middleware):
         app.add_middleware(UiSecurityHeadersMiddleware)
+
+    # BACKLOG #1122 (ASVS 3.5.3): the cross-site refusal lifted from a route dependency to middleware,
+    # because /ui/static is a Mount rather than an APIRoute -- a dependency never runs for it, so the
+    # asset tier was the one /ui surface the per-route check could not reach. Same re-mount guard as
+    # above, and the same append-by-pattern contract.
+    if not any(getattr(m, "cls", None) is UiFetchMetadataMiddleware for m in app.user_middleware):
+        app.add_middleware(UiFetchMetadataMiddleware)

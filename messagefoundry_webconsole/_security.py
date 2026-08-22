@@ -172,9 +172,10 @@ from __future__ import annotations
 import secrets
 
 from starlette.datastructures import MutableHeaders
+from starlette.responses import PlainTextResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from ._auth import browser_hardening_enabled, security_headers_context
+from ._auth import _CROSS_ORIGIN_FETCH, browser_hardening_enabled, security_headers_context
 from ._html import reset_csp_nonce, set_csp_nonce
 
 #: The route (registered in :mod:`.routes.core`) the browser POSTs CSP violation reports to, and the
@@ -220,6 +221,92 @@ def build_ui_csp(nonce: str) -> str:
 def _is_ui_html_path(path: str) -> bool:
     """The engine's exact /ui-HTML scope: a /ui path that is not a /ui/static asset."""
     return (path == "/ui" or path.startswith("/ui/")) and not path.startswith("/ui/static")
+
+
+def _is_ui_fetch_scope(path: str) -> bool:
+    """Every /ui path INCLUDING the static mount -- deliberately wider than :func:`_is_ui_html_path`.
+
+    The asset tier is exactly what a per-route validator cannot reach: ``/ui/static`` is mounted as a
+    Starlette ``Mount`` in :func:`.mount.mount_ui`, not registered as an ``APIRoute``, so a route
+    dependency never runs for it. That gap is the reason this check is middleware rather than a
+    dependency, so excluding the mount here would remove its only purpose.
+    """
+    return path == "/ui" or path.startswith("/ui/")
+
+
+#: A cross-site request that is a SAFE TOP-LEVEL NAVIGATION is allowed -- intranet links and the OIDC
+#: callback are both cross-site by construction. Anything outside this set arriving cross-site as a
+#: navigation is a CSRF form submission, which :func:`._auth.assert_same_origin` also refuses per-route.
+_SAFE_NAVIGATION_METHODS = frozenset({"GET", "HEAD"})
+#: ``object``/``embed`` pull a subresource into someone else's page while still reporting
+#: ``Sec-Fetch-Mode: navigate``. That is framing, not navigation, so it does not get the carve-out.
+_FRAMING_DESTINATIONS = frozenset({"object", "embed"})
+
+
+class UiFetchMetadataMiddleware:
+    """Refuse a /ui request the BROWSER ITSELF labels cross-site (BACKLOG #1122, ASVS 3.5.3).
+
+    It shares the membership set with :func:`._auth.assert_not_cross_site`, lifted to middleware so it
+    also covers the ``/ui/static`` Mount that route dependencies cannot see -- but it is NOT that check
+    at a wider scope, and building it as one is a defect the suite catches. That helper guards
+    hand-picked routes (a CSP report sink, state-changing POSTs) where nothing legitimate EVER arrives
+    cross-site; its name says FETCH because its callers have already established that. Applying the
+    bare set to every /ui request adds top-level NAVIGATIONS, which those callers never see.
+
+    **A CROSS-SITE TOP-LEVEL NAVIGATION IS LEGITIMATE AND MUST PASS.** An intranet link into the
+    console is one; so is the OIDC callback, where the IdP redirect back is cross-site BY
+    CONSTRUCTION. ``test_oidc_callback_survives_a_cross_site_navigation`` exists to say exactly that,
+    and warns that otherwise *"every real login would 403 while every hermetic test still passed"*.
+    So the refusal must read ``Sec-Fetch-Mode`` too, and fires only when the request is NOT a safe
+    top-level navigation. METHOD is part of safe: a cross-site navigation carrying a POST is a CSRF
+    form submission, and no supported flow makes one (the OIDC leg is a GET; ``response_mode=form_post``
+    is not implemented here). ``object``/``embed`` destinations are refused because they are framing
+    rather than navigation.
+
+    **ABSENT IS ALLOWED, AND THAT IS THE LOAD-BEARING HALF.** ``Sec-Fetch-Site`` is browser-populated:
+    an old browser, a user-agent's out-of-band reporting agent, and every non-browser client omit it
+    entirely. Failing closed on absence would refuse the shipped Windows tray's own ``GET /ui`` probe
+    (``tray/probe.py`` builds its client with no headers at all) and 332 headerless call sites in the
+    /ui test corpus -- MEASURED, both. ``_auth`` already records the same reasoning for the CSP report
+    sink, where a strict check "would 403 every modern report and silently blind the 3.7.5 canary".
+    So this rejects only a header that is PRESENT and says cross-site or same-site.
+
+    **403, NEVER 404.** ``tray/probe.py`` classifies 404 as ``DISABLED`` and every other status as
+    ``ENABLED``, so a 404 here would make the tray report a healthy console as switched off. A later
+    "return 404 rather than disclose the route" hardening pass would look like an improvement and
+    silently break the tray; the tests pin both halves.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not _is_ui_fetch_scope(scope.get("path", "")):
+            await self.app(scope, receive, send)
+            return
+        # Read from the raw scope rather than building a Request: this runs for every /ui asset, and
+        # header names on the wire are lower-cased bytes by ASGI contract.
+        site = mode = dest = None
+        for key, value in scope.get("headers") or ():
+            if key == b"sec-fetch-site":
+                site = value.decode("latin-1")
+            elif key == b"sec-fetch-mode":
+                mode = value.decode("latin-1")
+            elif key == b"sec-fetch-dest":
+                dest = value.decode("latin-1")
+        if site is None or site not in _CROSS_ORIGIN_FETCH:
+            await self.app(scope, receive, send)
+            return
+        if (
+            mode == "navigate"
+            and str(scope.get("method", "")).upper() in _SAFE_NAVIGATION_METHODS
+            and dest not in _FRAMING_DESTINATIONS
+        ):
+            await self.app(scope, receive, send)
+            return
+        await PlainTextResponse("cross-site request rejected", status_code=403)(
+            scope, receive, send
+        )
 
 
 class UiSecurityHeadersMiddleware:
