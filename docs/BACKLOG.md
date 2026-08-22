@@ -12559,6 +12559,65 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **Source:** found by adversarial verification of an unrelated claim, 2026-08-22. **Two seats had independently asserted the gates were absolute** -- both had verified the two covered arms and generalised. Recorded because agreement between two readers of the same two arms is not coverage of a third.
 
 
+## 1317. the TLS cipher allowlist tests a name prefix, so NULL-encryption and anonymous suites pass every gate
+
+> 🔢 **Filed 2026-08-22 - not started.** Value **8/10** · Difficulty **3/10**. Owner-ruled the
+> same day: **a strict positive allowlist**, admitting only suites that appear on every current
+> candidate list, anything unnamed rejected. At zero deployments the compatibility cost of being
+> strict is zero.
+
+**Cluster:** Security / transport. **Priority:** P1. **Verdict:** build.
+**Severity:** no live exposure -- there are zero deployments (sec. 0). On a **first** deployment an
+operator following the documented `[api].tls_ciphers` knob could install a suite offering no
+confidentiality, or no peer authentication, on the browser-facing operator console listener.
+
+**The defect, stated so the fix lands in the right place.** `validate_tls_ciphers` and
+`harden_cipher_suites` (`messagefoundry/config/tls_policy.py`) admit or refuse a configured cipher
+string on **exactly one property: forward secrecy**, via `_is_forward_secret`. Nothing in that path
+asks whether a suite **encrypts** or whether it **authenticates the peer**.
+
+**`_is_forward_secret` is NOT the bug and must not be "fixed".** It answers its own question
+correctly, and both suites below genuinely ARE forward-secret: `ECDHE-RSA-NULL-SHA` negotiates an
+ephemeral ECDH key exchange, and `ADH` is anonymous *ephemeral* DH. A reader who takes this item's
+own heading as "the predicate matches on a name prefix" will tighten the prefix matching and leave
+the hole exactly where it is. **The gap is a missing pair of predicates, not a defective one.**
+
+**Measured by RUNNING the shipped validator rather than reading it.** Four inputs, controls firing
+both ways:
+
+| input | result | property it lacks |
+|---|---|---|
+| `ECDHE-RSA-NULL-SHA` | **ACCEPTED** | no confidentiality -- `NULL` is a real, negotiable cipher |
+| `ADH-AES256-GCM-SHA384` | **ACCEPTED** | no peer authentication -- trivially machine-in-the-middle |
+| `ECDHE-RSA-AES256-GCM-SHA384` | accepted | control: a suite that should pass, and does |
+| `RC4-MD5` | rejected (`ValueError`) | control: the validator is not accepting everything |
+
+The `RC4-MD5` control is load-bearing. Without it, the acceptances above are indistinguishable from
+a validator that returns success for every string it is handed.
+
+**What to build, per the 2026-08-22 owner ruling.** Replace the single forward-secrecy test with a
+**strict positive allowlist**: an explicit set of suite names present on every current candidate
+list, everything unnamed refused. Keep the forward-secrecy check as one member of the resulting
+property set rather than deleting it. Refuse at **config load**, so a bad value cannot reach a
+listener at all.
+
+**The proof it must carry.** The mutation that matters is not "does a good suite still pass" -- it
+is **does removing the new predicate turn the table above red**. A test that pins only the good
+control cannot fail when the fix is reverted, which is the shape that has already shipped elsewhere
+in this repository. Pin all four rows, and pin the refusal as a load-time error rather than a
+runtime one.
+
+**Honest residual, and what was NOT searched.** This item covers the operator-facing knob and the
+shipped context builder reached from it. It does **not** enumerate every `SSLContext` construction
+in the engine, and it does not reach the suite sets chosen inside third-party libraries (`ldap3`,
+`hvac`, ODBC Driver 18) -- a different surface with a different owner, named here by subject rather
+than by a number, since none is allocated.
+
+**Source:** surfaced 2026-08-22 by the eight-cell ASVS re-scoping pass while completing the
+enumeration for cell 12.1.2, then verified independently against the shipped validator before
+filing. That cell's own ruling is a separate question about allowlist width; this item is the build
+which both readings of the cell now require.
+
 ## 1315. prose path:line citations carry no token, so nothing can verify them
 
 > 🔢 **Filed 2026-08-22 by the researcher, contributed jointly with the ASVS Tracker.** Value **6/10** -- Difficulty **5/10**. The security record and the #1107-#1199 research items together carry **3,543 bare `path:line` citations** (occurrences; 2,871 distinct) that assert nothing an independent reference could check. Against them the scorecard holds **2,090 evidence anchors** carrying an `expect` token the tree confirms -- roughly **1.7 uncheckable prose citations for every checkable anchor**. Ownership splits cleanly: the Tracker owns the security-record half, this seat wrote all 1,313 occurrences in #1107-#1199. One item, because both halves share one cause and one fix.
