@@ -209,7 +209,10 @@ async def test_browse_with_bad_criteria_never_answers_json_in_the_html_plane(
         marker = "/ui/uploaded-logs/file/"
         fid = listing.text.split(marker, 1)[1].split('"', 1)[0].split("/")[0]
         # Positive control: the OWNER still gets the rendered 400 page, so the arm is not simply dead.
-        bad = await c.get(f"/ui/uploaded-logs/file/{fid}?content=MSH&field_path=PID-3")
+        # A malformed field_path is the URL-safe way to make the engine refuse the criteria now that
+        # the needle is POST-only (BACKLOG #1184); make_spec rejects it before it authorizes the file,
+        # which is the same arm the old ``?content=...&field_path=...`` pair reached.
+        bad = await c.get(f"/ui/uploaded-logs/file/{fid}?field_path=not+a+path")
         assert bad.status_code == 400
         assert bad.headers["content-type"].startswith("text/html")
 
@@ -217,7 +220,7 @@ async def test_browse_with_bad_criteria_never_answers_json_in_the_html_plane(
         await _login(c2, "op2")
         for target in (fid, "0" * 32):  # not yours, and does not exist
             r = await c2.get(
-                f"/ui/uploaded-logs/file/{target}?content=MSH&field_path=PID-3",
+                f"/ui/uploaded-logs/file/{target}?field_path=not+a+path",
                 follow_redirects=False,
             )
             assert r.status_code == 303, r.text
@@ -626,3 +629,77 @@ async def test_uploaded_log_browse_charges_the_phi_read_budget(
         second = await c.get(f"/ui/uploaded-logs/file/{fid}")
         assert second.status_code == 429
         assert second.headers["Retry-After"]
+
+
+# --- BACKLOG #1184 (ASVS 14.2.1): the browse filter posts the needle ------------------------------
+
+
+async def test_browse_filter_posts_the_needle_instead_of_putting_it_on_the_url(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """The uploaded-log filter form must submit as a POST, and a needle left on the browse GET must
+    no longer filter.
+
+    The control is the un-filtered browse in the same run: it returns BOTH messages, so a POST that
+    returns one is genuinely filtering rather than erroring into an empty page."""
+    service = await _service(engine, ("op", Role.OPERATOR))
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        fid = await _upload(c)
+
+        page = await c.get(f"/ui/uploaded-logs/file/{fid}")
+        assert page.status_code == 200, page.text
+        assert 'name="field_value"' in page.text  # control: it is still the filter form
+        # Pin the FILTER form's own opening tag. The detail page also carries the resend and
+        # delete POSTs, so "a post appears somewhere on this page" witnesses nothing. Without
+        # this pair the test's own opening sentence is unmeasured: flipping method back to
+        # "get" in pages/uploaded_logs.py puts the operator's needle on the query string --
+        # the exact ASVS 14.2.1 exposure #1184 removes -- and every other assertion below
+        # still passes. The sibling search-form test pins it this way already.
+        _filter_action = f'action="/ui/uploaded-logs/file/{fid}/filter"'
+        assert f'method="get" {_filter_action}' not in page.text, (
+            "the uploaded-log filter form still submits on the URL"
+        )
+        assert f'method="post" {_filter_action}' in page.text
+        assert "ADT^A01" in page.text and "ADT^A04" in page.text  # control: both messages listed
+
+        stale = await c.get(f"/ui/uploaded-logs/file/{fid}", params={"content": "MRN123"})
+        assert stale.status_code == 200, stale.text
+        assert "ADT^A04" in stale.text, "a query-string needle still filtered the browse"
+
+        r = await c.post(f"/ui/uploaded-logs/file/{fid}/filter", data={"content": "MRN123"})
+        assert r.status_code == 200, r.text
+        assert "ADT^A01" in r.text and "ADT^A04" not in r.text  # the POST really filtered
+        assert "MRN123" not in str(r.request.url), f"the needle rode the URL: {r.request.url}"
+
+
+async def test_browse_filter_refuses_an_over_long_criterion_instead_of_listing_everything(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """An unparseable filter must REFUSE, not answer 200 with the whole file.
+
+    The arm this covers used to drop all five criteria, re-render the file unfiltered at HTTP 200
+    with the inputs blanked and no banner. To an operator that reads as "your filter matched
+    everything" -- the opposite of what happened -- and it discarded their VALID criteria silently
+    too. The sibling POST /ui/messages/search/run answers 400 with a banner, and the GET this route
+    replaced answered 422; this was the only arm that swallowed it (BACKLOG #1184).
+    """
+    service = await _service(engine, ("op", Role.OPERATOR))
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        fid = await _upload(c)
+
+        # Over the 512 bound on `content`, and a VALID message_type alongside it: the valid one must
+        # survive into the re-render rather than being discarded with the invalid one.
+        r = await c.post(
+            f"/ui/uploaded-logs/file/{fid}/filter",
+            data={"content": "M" * 600, "message_type": "ADT^A01"},
+        )
+        assert r.status_code == 400, f"an unparseable filter must refuse, got {r.status_code}"
+        assert "longer than that field allows" in r.text, "the refusal must say why"
+        # The operator's valid criterion is still in the form -- not silently blanked.
+        assert 'value="ADT^A01"' in r.text, "a valid criterion was discarded with the invalid one"
+        # And the needle never reached the URL even on the refusal path.
+        assert "M" * 600 not in str(r.request.url)

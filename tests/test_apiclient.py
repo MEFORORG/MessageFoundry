@@ -398,3 +398,42 @@ def test_transport_guard_permits_https_and_loopback_http() -> None:
     ``http`` has to clear the allow-list and then still meet that check, message intact."""
     EngineClient("https://engine.example.com:8765").close()
     EngineClient("http://127.0.0.1:8765").close()
+
+
+# --- ASVS 14.2.1 (BACKLOG #1184): the search needle never rides the query string -------------------
+
+
+def test_apiclient_sends_the_search_needle_in_the_body_not_the_url() -> None:
+    """The needle an operator types is PHI-shaped, and a query string is copied into the engine's
+    access log, the reverse proxy's log and browser history — none of which the redactor can reach.
+
+    The subject is the RESOLVED request, so this reads what ``build_request`` produced rather than
+    what ``search_messages`` typed. Absence from the URL is asserted TOGETHER with presence in the
+    body: on its own, "not in the URL" would also pass for a client that quietly dropped the term.
+
+    Mutation: put ``content=``/``field_value=`` back on the ``_get``. Red: the needle is found in the
+    resolved URL, which the message prints."""
+    client = EngineClient("http://127.0.0.1:8765")
+    captured: list[httpx.Request] = []
+
+    def _capture(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={}, request=request)
+
+    client._http.send = _capture  # type: ignore[method-assign]
+    try:
+        with contextlib.suppress(ApiError):
+            client.search_messages(content="SMITH", field_path="PID-5", field_value="9001")
+    finally:
+        client.close()
+
+    assert captured, "the call never reached the transport, so nothing was measured"
+    sent = captured[0]
+    url = str(sent.url)
+    assert sent.method == "POST", f"search is still a {sent.method}; the needle cannot ride a body"
+    for needle in ("SMITH", "9001"):
+        assert needle not in url, f"the needle {needle!r} rode the resolved URL: {url}"
+        assert needle.encode() in sent.content, (
+            f"the needle {needle!r} reached neither the URL nor the body — it was dropped, not moved"
+        )
+    assert b"PID-5" in sent.content  # the structural locator travels with its value

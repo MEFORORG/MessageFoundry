@@ -18,6 +18,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from fastapi.routing import APIRoute
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
@@ -294,13 +295,14 @@ async def test_search_requires_step_up(enc_engine: Engine) -> None:
     await enc_engine.store.enqueue_message(channel_id="IB_A", raw=ADT, deliveries=[])
     async with _client(enc_engine, service) as c:
         token = await _login(c, "boss")
-        # Fresh login is within the step-up window → search works.
-        ok = await c.get("/messages/search", headers=_auth(token), params={"content": "JANE"})
+        # Fresh login is within the step-up window → search works. POST, because the needle now
+        # travels in the body (BACKLOG #1184); the gate is the same on both shapes.
+        ok = await c.post("/messages/search", headers=_auth(token), json={"content": "JANE"})
         assert ok.status_code == 200, ok.text
         assert ok.json()["matched"] == 1
         # Back-date the step-up window → blocked with the step-up signal.
         await service.store.mark_session_reauthed(hash_token(token), now=0.0)
-        blocked = await c.get("/messages/search", headers=_auth(token), params={"content": "JANE"})
+        blocked = await c.post("/messages/search", headers=_auth(token), json={"content": "JANE"})
         assert blocked.status_code == 403
         assert blocked.headers.get("X-Step-Up-Required") == "1"
 
@@ -316,10 +318,10 @@ async def test_search_gated_and_redacted(enc_engine: Engine) -> None:
     )
     async with _client(enc_engine, service) as c:
         token = await _login(c, "boss")
-        r = await c.get(
+        r = await c.post(
             "/messages/search",
             headers=_auth(token),
-            params={"content": "JANE", "target": "raw"},
+            json={"content": "JANE", "target": "raw"},
         )
         assert r.status_code == 200, r.text
         msgs = r.json()["messages"]
@@ -335,10 +337,10 @@ async def test_search_audited_without_phi_needle(enc_engine: Engine) -> None:
     async with _client(enc_engine, service) as c:
         token = await _login(c, "boss")
         # An MRN-shaped digit needle — must NOT appear verbatim in the audit.
-        r = await c.get(
+        r = await c.post(
             "/messages/search",
             headers=_auth(token),
-            params={"content": "9001", "channel_id": "IB_A"},
+            json={"content": "9001", "channel_id": "IB_A"},
         )
         assert r.status_code == 200, r.text
     rows = await enc_engine.store.list_audit(limit=50)
@@ -360,10 +362,10 @@ async def test_search_field_path_audit_records_path_not_value(enc_engine: Engine
     await enc_engine.store.enqueue_message(channel_id="IB_A", raw=ADT, deliveries=[])
     async with _client(enc_engine, service) as c:
         token = await _login(c, "boss")
-        r = await c.get(
+        r = await c.post(
             "/messages/search",
             headers=_auth(token),
-            params={"field_path": "PID-3", "field_value": "MRN9001"},
+            json={"field_path": "PID-3", "field_value": "MRN9001"},
         )
         assert r.status_code == 200, r.text
         assert r.json()["matched"] == 1
@@ -383,3 +385,183 @@ async def test_search_bad_request_returns_400(enc_engine: Engine) -> None:
         # Neither needle supplied.
         r = await c.get("/messages/search", headers=_auth(token))
         assert r.status_code == 400
+
+
+# --- BACKLOG #1184 (ASVS 14.2.1): the PHI needle is off the query string --------------------------
+#
+# uvicorn writes the whole request line — query string included — into the stream NSSM captures, and a
+# reverse proxy logs it again; browser history keeps a third copy. None of those is reachable by the
+# log redactor. So `content` and `field_value` must reach the engine in the BODY, never the URL.
+# `field_path` STAYS on the GET: app.py's own `_search_audit_detail` records it as a structural
+# locator rather than PHI, which is why it is audited by value while the needle never is.
+
+
+def test_get_search_routes_declare_no_phi_needle_query_parameter() -> None:
+    """The three sibling GETs must not INVITE the needle onto the URL.
+
+    Reads the app's own OpenAPI parameter list, so this measures what the route DECLARES rather than
+    what a caller happens to send. ``field_path`` is asserted present on every path as the positive
+    control: without it a scan that simply failed to find the route would read identically to a
+    route that dropped both needle parameters.
+
+    Mutation: put ``content: str | None = Query(...)`` back on any of the three. Red: the assertion
+    prints the offending path and its full parameter list."""
+    schema = create_app().openapi()
+
+    def _names(path: str) -> set[str]:
+        return {p["name"] for p in schema["paths"][path]["get"].get("parameters", [])}
+
+    for path in ("/messages/search", "/messages/export", "/uploads/{file_id}/messages"):
+        names = _names(path)
+        assert "field_path" in names, (
+            f"GET {path} no longer declares field_path — the structural locator must STAY on the "
+            f"query string. Declared: {sorted(names)}"
+        )
+        assert not ({"content", "field_value"} & names), (
+            f"GET {path} still declares the PHI needle on the query string: "
+            f"{sorted({'content', 'field_value'} & names)} (all declared: {sorted(names)})"
+        )
+
+
+async def test_search_get_no_longer_honours_a_needle_on_the_query_string(
+    enc_engine: Engine,
+) -> None:
+    """A needle typed onto the GET URL is not merely undeclared — it selects nothing, so no caller can
+    keep using the old shape and still get results.
+
+    The positive control runs in the same test: ``field_path`` on the SAME route still returns the
+    seeded match, so the 400 below is the needle being gone, not the route being broken."""
+    service = await _service(enc_engine)
+    await _add_user(service, "boss", [Role.ADMINISTRATOR.value])
+    await enc_engine.store.enqueue_message(channel_id="IB_A", raw=ADT, deliveries=[])
+    async with _client(enc_engine, service) as c:
+        token = await _login(c, "boss")
+        stale = await c.get("/messages/search", headers=_auth(token), params={"content": "JANE"})
+        assert stale.status_code == 400, (
+            f"a query-string needle still reached the search: {stale.status_code} {stale.text}"
+        )
+        ok = await c.get("/messages/search", headers=_auth(token), params={"field_path": "PID-3"})
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["matched"] == 1  # control: the route works, field_path is kept
+
+
+async def test_search_takes_the_needle_in_a_post_body(enc_engine: Engine) -> None:
+    """POST /messages/search carries the criteria in the request BODY.
+
+    Asserts on the RESOLVED request, not on the call: the needle must be absent from the URL httpx
+    put on the wire AND present in the bytes it sent. Asserting only the absence would pass a client
+    that silently dropped the term."""
+    service = await _service(enc_engine)
+    await _add_user(service, "boss", [Role.ADMINISTRATOR.value])
+    await enc_engine.store.enqueue_message(channel_id="IB_A", raw=ADT, deliveries=[])
+    async with _client(enc_engine, service) as c:
+        token = await _login(c, "boss")
+        r = await c.post(
+            "/messages/search",
+            headers=_auth(token),
+            json={"content": "JANE", "channel_id": "IB_A"},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["matched"] == 1
+        assert "JANE" not in str(r.request.url), f"the needle rode the URL: {r.request.url}"
+        assert b"JANE" in r.request.content  # control: it really was sent, in the body
+
+
+async def test_post_search_is_still_step_up_gated_and_audited_without_the_needle(
+    enc_engine: Engine,
+) -> None:
+    """The POST variant inherits the GET's controls: step-up, and an audit row that records the
+    needle's SHAPE but never its value."""
+    service = await _service(enc_engine)
+    await _add_user(service, "boss", [Role.ADMINISTRATOR.value])
+    await enc_engine.store.enqueue_message(channel_id="IB_A", raw=ADT, deliveries=[])
+    async with _client(enc_engine, service) as c:
+        token = await _login(c, "boss")
+        ok = await c.post("/messages/search", headers=_auth(token), json={"content": "9001"})
+        assert ok.status_code == 200, ok.text
+        await service.store.mark_session_reauthed(hash_token(token), now=0.0)
+        blocked = await c.post("/messages/search", headers=_auth(token), json={"content": "9001"})
+        assert blocked.status_code == 403
+        assert blocked.headers.get("X-Step-Up-Required") == "1"
+    rows = [dict(r) for r in await enc_engine.store.list_audit(limit=50)]
+    detail = next(r["detail"] for r in rows if r["action"] == "message_search")
+    assert "9001" not in detail
+    assert json.loads(detail)["needle_shape"] == "digits"
+
+
+def test_the_search_body_model_and_the_preset_criteria_stay_in_step() -> None:
+    """``SearchPresetCriteria``'s docstring claims it "Mirrors the ``/messages/search`` typed params
+    exactly". Nothing checked that until BACKLOG #1184 gave the route a body model of its own, so the
+    two are now duplicates and a duplicate that nothing pins is a duplicate that drifts.
+
+    They are deliberately separate types rather than one subclassing the other: the console validates
+    a posted form against the preset model, the JSON route validates a request body against the
+    request model, and neither name should acquire the other's meaning. This is where the copy is kept
+    honest -- the same arrangement ``test_apiclient_length_bounds_match_the_transport_constants``
+    uses for the bounds ADR 0088 forbids importing.
+
+    ``scan_limit`` is the ONE deliberate difference: it is a per-request cost ceiling, not a saved
+    criterion, so it exists on the request and not on the preset.
+
+    Mutation: change ``max_length`` on either model's ``content``. Red: the assertion prints the field
+    and both bounds."""
+    from messagefoundry.api.models import MessageSearchRequest, SearchPresetCriteria
+
+    request_fields = dict(MessageSearchRequest.model_fields)
+    scan_limit = request_fields.pop("scan_limit", None)
+    assert scan_limit is not None, "MessageSearchRequest lost its scan_limit ceiling"
+    preset_fields = dict(SearchPresetCriteria.model_fields)
+    assert set(request_fields) == set(preset_fields), (
+        "the search body model and the preset criteria no longer carry the same fields: "
+        f"only on the request {sorted(set(request_fields) - set(preset_fields))}; "
+        f"only on the preset {sorted(set(preset_fields) - set(request_fields))}"
+    )
+    for name, field in request_fields.items():
+        other = preset_fields[name]
+        assert repr(field.annotation) == repr(other.annotation), (
+            f"{name}: the request declares {field.annotation}, the preset {other.annotation}"
+        )
+        assert [repr(m) for m in field.metadata] == [repr(m) for m in other.metadata], (
+            f"{name}: the request bounds it {field.metadata}, the preset {other.metadata}"
+        )
+
+
+def test_no_get_or_head_route_declares_a_phi_needle_parameter() -> None:
+    """No GET or HEAD route, on either plane, may declare ``content`` or ``field_value``.
+
+    BACKLOG #1184 names this guard directly, and it is the DURABLE half of the item: deleting the
+    parameter from five signatures earns the verdict once, this keeps it. Every other test for
+    #1184 pins ONE route, so a new GET route -- or a well-meaning re-add to an existing one --
+    would put the operator's typed term back into the address bar, browser history and every
+    access log on the way, with nothing red.
+
+    Both planes deliberately: the console reaches the handlers in-process, so a console GET that
+    re-declared the needle would never touch the JSON route this would otherwise check.
+    """
+    app = create_app(serve_ui=True)
+    banned = {"content", "field_value"}
+    offenders: list[str] = []
+    seen_query_params = 0
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        methods = route.methods or set()
+        if not (methods & {"GET", "HEAD"}):
+            continue
+        for param in route.dependant.query_params:
+            seen_query_params += 1
+            name = getattr(param, "alias", None) or param.name
+            if name in banned:
+                offenders.append(f"{sorted(methods)} {route.path} declares {name!r}")
+    # Positive control FIRST: a walk that inspects nothing would report a clean repo forever, which
+    # is indistinguishable from a guard that works. Mirrors the "backstop is inert" check elsewhere
+    # in this suite.
+    assert seen_query_params > 20, (
+        f"the route walk found only {seen_query_params} query parameters -- the guard is inert and "
+        "its clean result means nothing"
+    )
+    assert not offenders, (
+        "a PHI search needle is declared on a GET/HEAD route again (BACKLOG #1184, ASVS 14.2.1). "
+        "The URL, browser history and the access log are outside the redactor's reach; send it in a "
+        f"POST body instead. Offenders: {offenders}"
+    )
