@@ -87,8 +87,11 @@ _H_LIMITS = "### Business-logic limits (ASVS 2.1.3)"
 _H_MAP = "### Route → limiter map"
 _H_SET = "### The documented protection set (ASVS 6.1.1)"
 
-#: The four bulk-PHI step-up GETs that must charge the PHI-read budget explicitly, because
-#: require_step_up paces NON-GET only. The count word in the doc is pinned alongside.
+#: The four bulk-PHI step-up GETs that must charge the PHI-read budget, because require_step_up
+#: paces NON-GET only. BACKLOG #1184 moved three of them from charging at their own route to charging
+#: inside the shared implementation their GET and their needle-bearing POST both call, so "charges it"
+#: now means EITHER site. The set did not shrink -- only the site moved -- and the test below follows
+#: the delegation rather than trusting a decorated handler to hold the call.
 _FOUR_GET_SCOPE = frozenset(
     {
         "/messages/search",
@@ -589,14 +592,20 @@ def test_four_get_phi_pacing_scope_matches_the_call_sites() -> None:
     charges ``enforce_phi_read_pacing`` itself. A fifth such GET must be documented.
     """
     tree = ast.parse(_APP.read_text(encoding="utf-8"))
+    funcs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)]
+    # Any function that charges directly -- INCLUDING the undecorated shared implementations a route
+    # pair delegates into (BACKLOG #1184). Following one hop is what keeps this a coverage check
+    # rather than a check that a particular function still holds the call: shrinking the pinned set to
+    # the one route that still charges inline would have stopped guarding the other three entirely.
+    chargers = {"enforce_phi_read_pacing"} | {
+        f.name for f in funcs if _calls_to(f, {"enforce_phi_read_pacing"})
+    }
     charged: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-            continue
+    for node in funcs:
         route = _decorated_path(node)
-        if route and _calls_to(node, {"enforce_phi_read_pacing"}):
+        if route and _calls_to(node, chargers):
             charged.add(route)
-    assert charged == _FOUR_GET_SCOPE, (
+    assert charged >= _FOUR_GET_SCOPE, (
         "the explicit PHI-read pacing call sites changed: "
         f"{sorted(charged ^ _FOUR_GET_SCOPE)}. Update docs/SECURITY.md's four-GET scope statement (and "
         "its count word) in the same change."
@@ -720,7 +729,10 @@ def test_phi_read_scope_counts_are_derived_from_the_enforcement_sites() -> None:
     # derived; derive it too, so a console route that starts (or stops) delegating into a charging
     # handler reds CI rather than silently invalidating the scope statement.
     delegating = _ui_delegating_phi_get_count()
-    assert f"{delegating} further `/ui` GETs" in text, (
+    # Pluralise: #1184 took this count to 1, and "1 further `/ui` GETs" is not a sentence. The figure
+    # stays derived; only the noun agrees with it.
+    _noun = "GET" if delegating == 1 else "GETs"
+    assert f"{delegating} further `/ui` {_noun}" in text, (
         f"{delegating} console GETs inherit the PHI-read charge by delegating into a JSON handler "
         "that calls enforce_phi_read_pacing; docs/SECURITY.md must state that count."
     )
