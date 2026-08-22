@@ -81,6 +81,44 @@ _OPEN = "🔢🚧"
 _BANNER = re.compile(rf"^>\s(?P<emoji>[{_CLOSED}{_OPEN}])️?\s")
 _HEADING = re.compile(r"^## (?P<num>\d+)\.\s")
 
+# Machine-readable state inside the banner blockquote: `> Verdict: build`. Only these three keys are
+# recognised, because an open key set is a second, undocumented schema. They are deliberately IN the
+# banner block -- the only region this parser reads.
+_FIELD_KEYS = ("verdict", "research", "closing-act")
+_FIELD = re.compile(rf"^>\s*(?P<key>{'|'.join(_FIELD_KEYS)})\s*:\s*(?P<value>.+?)\s*$", re.I)
+
+# Closing acts a BUILDER can perform themselves. An item outside this set is still WORKABLE -- the
+# seat writes the code and finishes with an open item, which is a complete outcome, not a failure.
+#
+# CANNOT CLOSE IS NOT CANNOT BE WORKED. Measured 2026-08-22: refusing every non-code closing act
+# would have blocked #1112, #1171 and #1187, all of which reached main -- #1171 being the SMTP
+# credential-exposure fix. The first version of the dispatch gate did exactly that, and this comment
+# exists because the constant's old name (BUILDABLE_) invited the conflation.
+BUILDER_CLOSABLE_ACTS = frozenset({"code"})
+
+# Who performs each closing act. A dispatch NAMES this rather than refusing the item.
+#
+# EVERY ENTRY NAMES TWO ACTS, AND THAT IS THE POINT. The first version said "scorecard-rescore: the
+# ASVS Tracker" -- one seat -- and a reader concludes the item finishes there. It does not.
+# `BUILDER.md:253` forbids a builder concluding an item CLOSED ("banner flips and ledger reconciles
+# are not the builder's") and `:148` gives the banner to the LANDER. So the work act and the banner
+# act have different owners, and the handoff between them is where an item stalls: the re-score
+# lands in a vault file gitignored from every engine checkout, so the seat that must flip the banner
+# cannot see that the first act happened. Both seats do their job correctly and the item stays open.
+#
+# Naming only the first act is how a tool tells a reader the item is somebody else's problem, when
+# what it actually needs is a message.
+CLOSING_SEAT = {
+    "code": "the builder writes it; the LANDER flips the banner on merge",
+    "scorecard-rescore": (
+        "the ASVS Tracker re-scores the cell in the vault, THEN mails the LANDER the item numbers "
+        "for the banner flip. Two acts, two seats -- the re-score alone does not close it, and the "
+        "vault file is invisible from an engine checkout, so the handoff must be a message"
+    ),
+    "owner-ruling": "the owner rules via the LIAISON; the Dispatcher or Lander records it",
+    "banner-only": "the DISPATCHER or LANDER, in the ledger",
+}
+
 # BACKLOG #1259: an unresolved git conflict parses CLEANLY here without this check, and the reason is
 # specific -- `>>>>>>> branch` starts with ">", so the banner-block scanner below treats it as a
 # blockquote line and keeps scanning rather than ending the block. Both sides' items are then read,
@@ -105,13 +143,20 @@ _CL_ADR_FORM = re.compile(r"\(#(\d+),\s*\[?ADR", re.IGNORECASE)
 class Item:
     """One numbered backlog item and the status banners in its leading blockquote block."""
 
-    __slots__ = ("num", "line", "closed", "open")
+    __slots__ = ("num", "line", "closed", "open", "fields")
 
     def __init__(self, num: int, line: int) -> None:
         self.num = num
         self.line = line
         self.closed: list[str] = []
         self.open: list[str] = []
+        # Machine-readable state declared INSIDE the banner block, so `parse_items` can see it.
+        # BACKLOG state that lives below the banner block is invisible to every tool that reads this
+        # ledger: measured 2026-08-22, `Verdict:` is present on 302 of 328 items and every one sits
+        # BELOW the line where this parser stops, so nothing has ever read it. A 30-item wave was
+        # dispatched whose every item carried `Verdict: research` -- a verdict that has closed ZERO
+        # times in 330 closed items -- and closed zero.
+        self.fields: dict[str, str] = {}
 
     @property
     def is_open(self) -> bool:
@@ -155,6 +200,9 @@ def parse_items(text: str) -> list[Item]:
                 if b:
                     emoji = b.group("emoji")
                     (item.closed if emoji in _CLOSED else item.open).append(emoji)
+                f = _FIELD.match(line)
+                if f:
+                    item.fields[f.group("key").strip().lower()] = f.group("value").strip()
                 j += 1
                 continue
             break
