@@ -81,6 +81,16 @@ _OPEN = "🔢🚧"
 _BANNER = re.compile(rf"^>\s(?P<emoji>[{_CLOSED}{_OPEN}])️?\s")
 _HEADING = re.compile(r"^## (?P<num>\d+)\.\s")
 
+# Machine-readable state inside the banner blockquote: `> Verdict: build`. Only these three keys are
+# recognised, because an open key set is a second, undocumented schema. They are deliberately IN the
+# banner block -- the only region this parser reads.
+_FIELD_KEYS = ("verdict", "research", "closing-act")
+_FIELD = re.compile(rf"^>\s*(?P<key>{'|'.join(_FIELD_KEYS)})\s*:\s*(?P<value>.+?)\s*$", re.I)
+
+# A closing act a BUILDER can perform. Anything else means the item cannot be closed by the seat it
+# is dispatched to, however much code that seat writes.
+BUILDABLE_CLOSING_ACTS = frozenset({"code"})
+
 # BACKLOG #1259: an unresolved git conflict parses CLEANLY here without this check, and the reason is
 # specific -- `>>>>>>> branch` starts with ">", so the banner-block scanner below treats it as a
 # blockquote line and keeps scanning rather than ending the block. Both sides' items are then read,
@@ -105,13 +115,20 @@ _CL_ADR_FORM = re.compile(r"\(#(\d+),\s*\[?ADR", re.IGNORECASE)
 class Item:
     """One numbered backlog item and the status banners in its leading blockquote block."""
 
-    __slots__ = ("num", "line", "closed", "open")
+    __slots__ = ("num", "line", "closed", "open", "fields")
 
     def __init__(self, num: int, line: int) -> None:
         self.num = num
         self.line = line
         self.closed: list[str] = []
         self.open: list[str] = []
+        # Machine-readable state declared INSIDE the banner block, so `parse_items` can see it.
+        # BACKLOG state that lives below the banner block is invisible to every tool that reads this
+        # ledger: measured 2026-08-22, `Verdict:` is present on 302 of 328 items and every one sits
+        # BELOW the line where this parser stops, so nothing has ever read it. A 30-item wave was
+        # dispatched whose every item carried `Verdict: research` -- a verdict that has closed ZERO
+        # times in 330 closed items -- and closed zero.
+        self.fields: dict[str, str] = {}
 
     @property
     def is_open(self) -> bool:
@@ -155,6 +172,9 @@ def parse_items(text: str) -> list[Item]:
                 if b:
                     emoji = b.group("emoji")
                     (item.closed if emoji in _CLOSED else item.open).append(emoji)
+                f = _FIELD.match(line)
+                if f:
+                    item.fields[f.group("key").strip().lower()] = f.group("value").strip()
                 j += 1
                 continue
             break
