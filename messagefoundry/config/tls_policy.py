@@ -34,6 +34,7 @@ import ipaddress
 import logging
 import os
 import ssl
+import urllib.request
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -63,6 +64,7 @@ __all__ = [
     "TrustAnchorPolicy",
     "active_hop_posture",
     "APPROVED_SMTP_AUTH_MECHANISMS",
+    "build_asserted_https_handler",
     "build_smtp_tls_context",
     "smtp_login_approved",
     "build_verifying_client_context",
@@ -513,6 +515,45 @@ def _is_peer_authenticated(cipher: Mapping[str, object]) -> bool:
     separately from the suite.
     """
     return "Au=None" not in str(cipher.get("description", ""))
+
+
+def build_asserted_https_handler(*, connector: str) -> urllib.request.HTTPSHandler:
+    """urllib's OWN default https handler, with the context it built ASSERTED forward-secret.
+
+    For the openers that name no ``HTTPSHandler`` at all. ``urllib.request.build_opener(...)`` fills
+    one in from its default class list, and that handler builds a context in its constructor
+    (``http.client._create_https_context``). So a context always existed on those hops — the ENGINE
+    just never held a reference to it, and :func:`harden_cipher_suites` therefore never ran on it.
+    That, not the absence of a context, is the residual: inheritance without assertion.
+
+    **It asserts on urllib's context rather than substituting one, and that is load-bearing.**
+    Measured on CPython 3.14.6 / OpenSSL 3.5.7: ``ssl.create_default_context()`` is NOT equivalent to
+    what urllib builds. urllib's adds ``set_alpn_protocols(["http/1.1"])`` and
+    ``post_handshake_auth=True``; a hand-built look-alike has neither. Passing such a look-alike as
+    ``context=`` would silently drop the ALPN advertisement and TLS 1.3 post-handshake auth from every
+    default HTTP-family hop — a handshake change, on a control whose whole point is to change nothing
+    about the connection. Handing ``build_opener`` this handler is inert by construction: it is the
+    same class ``build_opener`` would have instantiated itself, built the same way, and supplying an
+    instance only stops urllib adding a second one.
+
+    Reads the handler's private ``_context`` deliberately, and **fails closed** if it is not there. A
+    ``getattr(..., None)`` that shrugged and returned would be a security control reporting success
+    forever — exactly the failure :func:`harden_kex_groups` documents. A CPython that renames the
+    attribute must break loudly at construction, not go quiet.
+
+    ``connector`` is the operator-recognisable label :func:`harden_cipher_suites` names in its error.
+    Lives here rather than beside each opener so the two call sites (the HTTP-family destinations and
+    the alert webhook) cannot drift onto different constructions."""
+    handler = urllib.request.HTTPSHandler()
+    ctx = getattr(handler, "_context", None)
+    if not isinstance(ctx, ssl.SSLContext):
+        raise ValueError(
+            f"{connector}: cannot reach the TLS context urllib's HTTPSHandler built "
+            f"(no `_context` attribute on this runtime), so the forward-secrecy assertion "
+            f"(ASVS 12.1.2) cannot run on this hop. Refusing rather than crossing unchecked."
+        )
+    harden_cipher_suites(ctx, connector=connector)
+    return handler
 
 
 def _is_forward_secret(cipher: Mapping[str, object]) -> bool:

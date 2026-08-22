@@ -12684,9 +12684,28 @@ rather than configuring one of ours; refusing an unlisted-but-sound suite there 
 anything, it would stop an operator describing their proxy accurately. The three property checks
 still bind on that field.
 
-**The residual above is unchanged and still open:** this covered the operator-facing knob and the
-shipped context builder. It did not enumerate every `SSLContext` construction, and it does not reach
-suite sets chosen inside `ldap3`, `hvac` or ODBC Driver 18. One instrument note worth carrying: the
+**The residual above is NOW CLOSED for first-party constructions, 2026-08-22.** It read: this covered
+the operator-facing knob and the shipped context builder, did not enumerate every `SSLContext`
+construction, and does not reach suite sets chosen inside `ldap3`, `hvac` or ODBC Driver 18. **The
+enumeration half is now done and every first-party site asserts** -- the OIDC identity-provider
+opener, the syslog TLS forwarder (both arms, including `tls_verify=False`), the Postgres store
+(pinned-CA and verification-disabled arms), the SOAP mutual-TLS opener, the alert webhook, and the
+shared REST/FHIR/DICOMweb opener family. **The library half is unchanged and still open:** `ldap3`,
+`hvac` and ODBC Driver 18 choose their own suites and no engine object exists to assert on.
+**TWO FIRST-PARTY SITES ARE DELIBERATELY NOT ASSERTED, each with its reason in the code**, so a later
+reader does not "fix" them: the TLS floor probe below, and the Postgres `ssl=True` default arm, where
+asyncpg builds the context and asserting a look-alike here would grade an object the connection never
+uses. Closing that arm changes what asyncpg receives on the DEFAULT store path and is a separate
+decision, not a rider.
+**THE INSTRUMENT THAT GUARDED THIS RESIDUAL COULD NOT SEE IT.** `tests/test_tls_policy.py` derives its
+call-site list from the presence of `harden_kex_groups(` in a file, so it can only find a HALF-hardened
+site -- one that pins key-exchange groups but skips the cipher assertion. Every site listed above called
+neither helper, so the scan passed over all of them in silence. `tests/test_tls_cipher_assertion_sites.py`
+is the other half: one test per site, each proving the call is REACHED rather than merely present.
+**THE WORK WAS RECOVERED, NOT REDONE.** It was built by a workflow whose parent session's Claude account
+was cancelled on 2026-08-22 at 16:56Z while its full-suite run was in flight; the tree was stranded
+uncommitted in a locked worktree. It has been replayed onto current `main` (which had moved two commits,
+including this item's own build) and re-verified there. One instrument note worth carrying: the
 startup TLS probe's `ALL:@SECLEVEL=0` context (140 suites, 12 anonymous) was examined and
 DELIBERATELY LEFT ALONE -- the security level is load-bearing there, because without it the probe
 would measure the engine's own refusal to offer rather than a peer's refusal to accept, turning a
