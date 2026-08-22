@@ -265,8 +265,11 @@ def message_search(
             placeholder="control id (optional)",
         ),
         el("button", "Search", type="submit"),
-        method="get",
-        action="/ui/messages/search",
+        # POST, not GET (BACKLOG #1184, ASVS 14.2.1): the field value and substring an operator types
+        # here are PHI-shaped, and a GET form would write them into the address bar, browser history,
+        # the engine access log and any proxy log in front of it. The body reaches none of those.
+        method="post",
+        action="/ui/messages/search/run",
         class_="filters",
     )
     parts: list[object] = [

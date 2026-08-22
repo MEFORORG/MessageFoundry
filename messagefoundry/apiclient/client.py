@@ -540,20 +540,29 @@ class EngineClient:
     ) -> MessageSearchResults:
         """Content search (ADR 0046 #51): match by an HL7 field path or a raw/summary substring. The
         engine scans-and-decrypts off the event loop, bounded by ``scan_limit`` + ``limit`` (the result
-        reports ``truncated`` when the scan ceiling was hit). Requires a stepped-up session server-side."""
+        reports ``truncated`` when the scan ceiling was hit). Requires a stepped-up session server-side.
+
+        Sent as a POST with the criteria in the BODY (BACKLOG #1184, ASVS 14.2.1). ``content`` and
+        ``field_value`` are whatever an operator typed to find a patient, so they are PHI-shaped, and a
+        query string is copied verbatim into the engine's access log and any proxy log on the way —
+        neither of which the log redactor can reach. The engine's GET no longer accepts them at all.
+        Nothing is created here; POST is the carrier, not the semantics."""
         return _decode(
-            self._get(
+            self._request(
+                "POST",
                 "/messages/search",
-                content=content,
-                field_path=field_path,
-                field_value=field_value,
-                target=target,
-                channel_id=channel_id,
-                status=status,
-                message_type=message_type,
-                control_id=control_id,
-                limit=limit,
-                scan_limit=scan_limit,
+                json={
+                    "content": content,
+                    "field_path": field_path,
+                    "field_value": field_value,
+                    "target": target,
+                    "channel_id": channel_id,
+                    "status": status,
+                    "message_type": message_type,
+                    "control_id": control_id,
+                    "limit": limit,
+                    "scan_limit": scan_limit,
+                },
             ),
             MessageSearchResults,
         )

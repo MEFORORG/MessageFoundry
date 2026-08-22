@@ -116,6 +116,12 @@ from typing import Any
 #: ``pages/uploaded_logs.py`` reads it unconditionally to render the matching sentence. NOT additive
 #: with a default: a console carrying that render against an engine without the field would pass the
 #: handshake and then AttributeError, which is exactly the skew this constant exists to refuse.
+#: ASVS 14.2.1 / BACKLOG #1184 (the PHI search needle off the query string): the console now
+#: constructs ``UploadedMessageSearchRequest`` to validate its posted browse filter, so that model
+#: joins the discovered surface. The handler signatures behind ``CoreHandlers.search_messages`` and
+#: ``.browse_uploaded_file`` also changed shape (each is now the shared implementation the route pair
+#: calls, not the GET route object) — the keyword arguments the console passes are unchanged, but the
+#: contract did move, and a bump is the honest signal for that.
 #:
 #: **v19 WAS DELIBERATELY SKIPPED, and the reason was a defect rather than an accident.** Two unlanded
 #: branches — ``w3-log-write-failure`` (``SystemStatus.log_sinks``, #122) and
@@ -128,7 +134,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "494a51230dce5730"
+ENGINE_UI_SEAM: str = "0beb716d882ba6b5"
 
 
 @dataclass(frozen=True, slots=True)

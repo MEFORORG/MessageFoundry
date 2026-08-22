@@ -79,6 +79,62 @@ class MessageSearchResults(BaseModel):
     scan_limit: int
 
 
+class MessageSearchRequest(BaseModel):
+    """The POST body for content search and for export's search-mode selection (BACKLOG #1184).
+
+    ASVS 14.2.1 asks that sensitive data reach the server in the body or the headers and never in the
+    URL. ``content`` and ``field_value`` are whatever an operator typed to find a patient, so they are
+    PHI-shaped, and a query string is copied verbatim into the engine's access log, the reverse proxy's
+    log and browser history -- none of which the log redactor can reach. They therefore live HERE and
+    nowhere else. The rest of the criteria travel with them: a model split across a body and a query
+    string is the arrangement that lets the next PHI-shaped field land on the URL by default.
+
+    ``field_path`` is the one criterion that also stays on the GET. It is a structural locator
+    (``PID-3``), not a value, which is why the search audit records it verbatim while never recording
+    the needle -- so a presence-test search keeps a plain, bookmarkable URL.
+
+    ``scan_limit`` is ``None`` for "the engine default": the ceiling constants live in
+    :mod:`messagefoundry.store.content_search`, and importing them here would drag the engine into
+    every process that imports these models (ADR 0088 keeps the apiclient engine-free), so the route
+    resolves the default and enforces the ceiling instead of the field doing it.
+    """
+
+    content: str | None = Field(None, max_length=512)
+    field_path: str | None = Field(None, max_length=32)
+    field_value: str | None = Field(None, max_length=512)
+    target: Literal["raw", "summary", "both"] = "both"
+    channel_id: str | None = Field(None, max_length=256)
+    status: str | None = Field(None, max_length=64)
+    message_type: str | None = Field(None, max_length=64)
+    control_id: str | None = Field(None, max_length=256)
+    limit: int = Field(50, ge=1, le=500)
+    scan_limit: int | None = Field(None, ge=1)
+
+
+class MessageExportRequest(MessageSearchRequest):
+    """The POST body for ``/messages/export`` (BACKLOG #1184). Adds the explicit ``ids`` selection (the
+    console's *save-selected*) beside the inherited search criteria (*save-all*), and raises ``limit``
+    to the export route's own ceiling."""
+
+    ids: list[str] = Field(default_factory=list)
+    limit: int = Field(1000, ge=1, le=100_000)
+
+
+class UploadedMessageSearchRequest(BaseModel):
+    """The POST body for browsing an uploaded file's split messages (BACKLOG #1184). The uploaded-log
+    browse takes no channel/status filter and pages with ``offset``, so it is a sibling of
+    :class:`MessageSearchRequest` rather than a subclass of it."""
+
+    content: str | None = Field(None, max_length=512)
+    field_path: str | None = Field(None, max_length=32)
+    field_value: str | None = Field(None, max_length=512)
+    target: Literal["raw", "summary", "both"] = "both"
+    message_type: str | None = Field(None, max_length=64)
+    control_id: str | None = Field(None, max_length=256)
+    limit: int = Field(50, ge=1, le=500)
+    offset: int = Field(0, ge=0)
+
+
 class OutboxInfo(PhiGatedModel):
     phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"last_error"})
 
