@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-0beb716d882ba6b5
+ccb7e71700c38031
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -107,6 +107,7 @@ get_auth: (request: 'Request') -> 'AuthService | None'
 ## AuthService members reached by the console
 action_step_up_required: property -> 'bool'
 ad_enabled: property -> 'bool'
+allow_admin_write: (self, actor: 'str') -> 'bool'
 allow_login_attempt: (self, client: 'str | None') -> 'bool'
 allow_phi_read: (self, actor: 'str') -> 'bool'
 audit_kerberos_reject: (self, reason: 'str') -> 'None'

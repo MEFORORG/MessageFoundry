@@ -33,7 +33,9 @@ undefined; a browser that does not enforce CSP runs it and the nonce'd detect ra
 from __future__ import annotations
 
 import logging
+import os
 import re
+import warnings
 from pathlib import Path
 
 import httpx
@@ -499,17 +501,79 @@ _WINDOW_READ_RE = re.compile(r"window\.([A-Za-z_$][A-Za-z0-9_$]*)")
 _PACKAGE_DIR = Path(messagefoundry_webconsole.__file__).parent
 
 
+class RunbookContractUnenforced(UserWarning):
+    """The runbook is absent from this checkout, so the code-vs-runbook comparisons are inert.
+
+    A warning rather than only a skip reason because a skip is invisible: the CI step runs ``-q``
+    with no ``-rs``, so three skips print as three ``s`` characters among hundreds and the run still
+    reads as clean. This lands in pytest's warnings summary, which prints even under ``-q``.
+
+    Adopted from ``tests/test_threat_model_doc_drift.py`` (BACKLOG #1043), which solved this exact
+    problem for the same reason -- a control that cannot report its own inertness is ADR 0158's
+    class 2.
+    """
+
+
+#: Announce once per session, not once per inert test.
+_RUNBOOK_ABSENCE_ANNOUNCED = False
+
+#: Point this at a copy of the runbook (e.g. the vault working tree) to enforce the comparison half
+#: from a checkout that does not carry it.
+_RUNBOOK_ENV = "MEFOR_WEBCONSOLE_RUNBOOK"
+#: Set truthy where the runbook is EXPECTED to be present. Absence is then a failure, not a notice.
+_REQUIRE_RUNBOOK_ENV = "MEFOR_REQUIRE_WEBCONSOLE_RUNBOOK"
+
+
+def _runbook_path() -> Path:
+    """Where the runbook is read from — the env override, else the in-tree (vault) location."""
+    override = os.environ.get(_RUNBOOK_ENV, "").strip()
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parents[3] / "docs/security/OFF-LOOPBACK-DEPLOYMENT.md"
+
+
+def _announce_runbook_absence(path: Path) -> None:
+    global _RUNBOOK_ABSENCE_ANNOUNCED
+    if _RUNBOOK_ABSENCE_ANNOUNCED:
+        return
+    _RUNBOOK_ABSENCE_ANNOUNCED = True
+    warnings.warn(
+        RunbookContractUnenforced(
+            f"{path} is absent from this checkout (docs/security/** is withheld from public "
+            "checkouts — deny-listed and vaulted), so the code-vs-runbook comparisons in this "
+            "module are INERT in this run: the runbook's header rows, its client-side detect rows "
+            "and its session-cookie attribute row are compared against nothing, and the runbook "
+            "can drift from the _security.py enumeration without anything going red. STILL "
+            "ENFORCED here, and it is the half that guards the artifact shipping in the wheel: "
+            "every emitted header, every client-side detect and every cookie attribute must be "
+            "bucketed in the _security.py degrade contract. Set "
+            f"{_RUNBOOK_ENV}=<path to OFF-LOOPBACK-DEPLOYMENT.md> to enforce the comparison half "
+            f"from this checkout, or {_REQUIRE_RUNBOOK_ENV}=1 to make its absence a hard failure."
+        ),
+        stacklevel=3,
+    )
+
+
 def _runbook_contract() -> str:
-    """The runbook's degrade-contract section (prose + table), or a per-test skip where it is absent.
+    """The runbook's degrade-contract section (prose + table), or an ANNOUNCED per-test skip where it
+    is absent.
 
     ``docs/security/**`` is deny-listed from the OSS mirror (and vaulted after the cutover), so this
     runbook is not there and an assertion about its CONTENT has nothing to say. The skip sits at this
-    single accessor — ``_runbook_contract_table`` funnels through it too — so the ~36 tests in this
-    module that assert about the console's own CODE keep running publicly; only the three that compare
-    code against the runbook table stand down.
+    single accessor — ``_runbook_contract_table`` funnels through it too — so every test in this
+    module that asserts about the console's own CODE keeps running publicly; only the three that
+    compare code against the runbook table stand down (BACKLOG #1124 split those apart: they used to
+    be the SAME three tests, with the code-side assertions downstream of this skip and therefore
+    never executed anywhere).
     """
-    doc = Path(__file__).resolve().parents[3] / "docs/security/OFF-LOOPBACK-DEPLOYMENT.md"
+    doc = _runbook_path()
     if not doc.exists():
+        if os.environ.get(_REQUIRE_RUNBOOK_ENV, "").strip():
+            raise AssertionError(
+                f"{_REQUIRE_RUNBOOK_ENV} is set but {doc} is absent — the runbook comparison was "
+                "expected to be enforced on this leg and would have silently stood down."
+            )
+        _announce_runbook_absence(doc)
         pytest.skip("docs/security/OFF-LOOPBACK-DEPLOYMENT.md is private-only (deny-list / vault)")
     contract = doc.read_text(encoding="utf-8").split(
         "Browser security-feature support and degrade contract", 1
@@ -581,8 +645,6 @@ def test_degrade_contract_enumerates_every_relied_on_feature() -> None:
     docstring = security.__doc__ or ""
     assert "DETECTED and WARNED" in docstring
     assert "DEGRADES SILENTLY" in docstring
-    contract = _runbook_contract()
-    assert "Detected + warned" in contract and "Degrades **silently**" in contract
 
     emitted = _emitted_browser_security_headers()
     # sanity: the set is non-trivial and contains the ones this lane knows ship today
@@ -591,10 +653,6 @@ def test_degrade_contract_enumerates_every_relied_on_feature() -> None:
         assert header in docstring, (
             f"{header} reaches a /ui response but is not bucketed in the _security.py "
             f"degrade contract (detected-and-warned, or degrades-silently + compensating control)"
-        )
-        assert header in contract, (
-            f"{header} reaches a /ui response but has no row in the OFF-LOOPBACK-DEPLOYMENT.md "
-            f"degrade-contract table"
         )
 
     # the non-header features stay pinned by name too
@@ -609,6 +667,32 @@ def test_degrade_contract_enumerates_every_relied_on_feature() -> None:
         assert feature in docstring, feature
     # crossOriginIsolated is named as a NON-detect so nobody "fixes" COOP with a false banner
     assert "crossOriginIsolated" in docstring
+    # no hardcoded feature COUNT may drift away from the list it introduces
+    assert "Four features are relied on" not in docstring
+
+
+def test_runbook_mirrors_the_degrade_contract_enumeration() -> None:
+    """The RUNBOOK half of the enumeration guard, split out of the test above (BACKLOG #1124).
+
+    ``docs/security/OFF-LOOPBACK-DEPLOYMENT.md`` is deny-listed from this repo by design, so this
+    comparison legitimately stands down in every public checkout. It used to stand down carrying the
+    CODE-side assertions with it: ``_runbook_contract()`` was called before the loop, so the whole
+    test reported ``skipped`` and the ``header in docstring`` check -- which needs no runbook at all
+    -- never ran and never showed a result. The contract shipping inside the wheel was unchecked
+    while ``_security.py`` told every reader a CI guard enforced it.
+
+    Splitting them means the code-side half now PASSES visibly and only this one skips.
+    """
+    contract = _runbook_contract()
+    docstring = security.__doc__ or ""
+    assert "Detected + warned" in contract and "Degrades **silently**" in contract
+    assert "DETECTED and WARNED" in docstring and "DEGRADES SILENTLY" in docstring
+
+    for header in sorted(_emitted_browser_security_headers()):
+        assert header in contract, (
+            f"{header} reaches a /ui response but has no row in the OFF-LOOPBACK-DEPLOYMENT.md "
+            f"degrade-contract table"
+        )
     for feature in (
         "window.isSecureContext",
         "/ui/static/csp-probe.js",
@@ -616,8 +700,6 @@ def test_degrade_contract_enumerates_every_relied_on_feature() -> None:
         "nonce-source support",
     ):
         assert feature in contract, feature
-    # no hardcoded feature COUNT may drift away from the list it introduces
-    assert "Four features are relied on" not in docstring
     # the 3.1.1 Pass artifact's named fallback baseline must survive the rewrite (line-wrap agnostic)
     flat = " ".join(contract.split())
     assert (
@@ -646,13 +728,22 @@ def test_degrade_contract_buckets_every_client_side_feature_detect() -> None:
     # nothing would pass vacuously forever)
     assert {"isSecureContext", "PublicKeyCredential"} <= detected, detected
     docstring = security.__doc__ or ""
-    table = _runbook_contract_table()
     for feature in sorted(detected):
         assert feature in docstring, (
             f"window.{feature} is feature-detected by the console but is not bucketed in the "
             f"_security.py degrade contract (detected-and-warned, or degrades-silently + "
             f"compensating control)"
         )
+
+
+def test_runbook_table_buckets_every_client_side_feature_detect() -> None:
+    """The RUNBOOK half of the detect guard, split out of the test above (BACKLOG #1124). Skips in
+    every public checkout because the runbook is deny-listed; the code-side half no longer skips
+    with it."""
+    detected = _detected_browser_security_features()
+    assert {"isSecureContext", "PublicKeyCredential"} <= detected, detected
+    table = _runbook_contract_table()
+    for feature in sorted(detected):
         assert feature in table, (
             f"window.{feature} is feature-detected by the console but has no row in the "
             f"OFF-LOOPBACK-DEPLOYMENT.md degrade-contract table"
@@ -666,18 +757,10 @@ def test_degrade_contract_buckets_every_session_cookie_security_attribute() -> N
     it so), which is a reason to name the compensating control, not to leave it out of an enumeration
     that claims to be exhaustive. Derived from the module that actually writes the cookie."""
     source = Path(webconsole_auth.__file__).read_text(encoding="utf-8")
-    table = _runbook_contract_table()
     docstring = security.__doc__ or ""
-    rows = [
-        line
-        for line in table.splitlines()
-        if line.startswith("|") and COOKIE_ATTRIBUTE_ROW_LABEL in line
-    ]
-    assert len(rows) == 1, rows
     # The attribute must be NAMED by the bucket entry's own label — its "what compensates" prose
     # mentioning it in passing is not a bucket. Without this the guard stayed green when the label was
     # narrowed to a single attribute, because the rationale cell still happened to say the words.
-    runbook_label = [c.strip() for c in rows[0].strip().strip("|").split("|")][0]
     docstring_label = docstring.split(COOKIE_ATTRIBUTE_ROW_LABEL, 1)[1].split("**", 1)[0]
     matched = 0
     for code_token, doc_token in COOKIE_SECURITY_ATTRIBUTES:
@@ -688,12 +771,41 @@ def test_degrade_contract_buckets_every_session_cookie_security_attribute() -> N
         if bare == "SameSite":
             # SameSite is the one attribute with its own dedicated bucket entry (it predates this
             # row), pinned by name in the whole-contract test above.
-            assert bare in docstring and bare in table
+            assert bare in docstring
             continue
         assert bare in docstring_label, (
             f"{bare} is set on the session cookie but the _security.py cookie-attributes bucket "
             f"does not name it"
         )
+    assert matched == len(COOKIE_SECURITY_ATTRIBUTES), matched
+
+
+def test_runbook_table_buckets_every_session_cookie_security_attribute() -> None:
+    """The RUNBOOK half of the cookie-attribute guard, split out of the test above (BACKLOG #1124).
+
+    This is the half that genuinely needs the deny-listed runbook, so it is the half that should
+    skip. Before the split it took the ``_security.py`` side down with it -- and the cookie test was
+    the worst of the three, because ``_runbook_contract_table()`` was its FIRST statement, so not one
+    line of its body ever executed in a public checkout.
+    """
+    source = Path(webconsole_auth.__file__).read_text(encoding="utf-8")
+    table = _runbook_contract_table()
+    rows = [
+        line
+        for line in table.splitlines()
+        if line.startswith("|") and COOKIE_ATTRIBUTE_ROW_LABEL in line
+    ]
+    assert len(rows) == 1, rows
+    runbook_label = [c.strip() for c in rows[0].strip().strip("|").split("|")][0]
+    matched = 0
+    for code_token, doc_token in COOKIE_SECURITY_ATTRIBUTES:
+        if code_token not in source:
+            continue
+        matched += 1
+        bare = doc_token.strip("`")
+        if bare == "SameSite":
+            assert bare in table
+            continue
         assert bare in runbook_label, (
             f"{bare} is set on the session cookie but the OFF-LOOPBACK-DEPLOYMENT.md "
             f"cookie-attributes row does not name it"
