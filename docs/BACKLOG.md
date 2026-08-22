@@ -12707,3 +12707,23 @@ which both readings of the cell now require.
 
 **Cluster:** Security record integrity / evidence hygiene. **Priority:** P3. **Verdict:** build.
 **Severity:** no engine-runtime effect and no deployment axis (sec. 0). This is evidence quality in the security record: more than half its citation surface has never been read by any gate, so a reader cannot distinguish a citation that still points at its subject from one that merely points at a line that still exists.
+
+## 1318. messagefoundry init writes a config the loader rejects, so the first serve after the first init fails
+
+> 🔢 **Filed 2026-08-22 - not started.** Value **8/10** · Difficulty **2/10** · _quick win_. **The product generates a file the loader that reads it refuses**, and the defect is in the PUBLISHED RELEASE. Value 8 because it is the first thing a new adopter does and it fails; difficulty 2 because the fix is to comment the emitted line or emit the replacement key.
+
+**Cluster:** Onboarding / configuration. **Priority:** P1. **Verdict:** build.
+**Severity:** no exposure. **On first deployment**, an adopter running `messagefoundry init` then `messagefoundry serve` would hit a load failure with no working config, on their first two commands.
+
+**The defect.** `messagefoundry/scaffold.py` emits `host = "127.0.0.1"` **UNCOMMENTED** under `[api]`. `messagefoundry/config/settings.py` carries `("api", "host")` in `_RELOCATED_TO_SECURITY`, mapped to `local_access_only / listen_address`, and `_reject_relocated_keys(data)` runs during `load_settings`. So `init` writes a key that `serve` refuses.
+
+**It is in the shipped release**, not only on `main`. At tag `v0.3.2` the uncommented emission and the relocated-key rejection are both present; the scaffold file reads 396 lines at that tag, which is the control confirming the read resolved rather than returning an empty default.
+
+***THE GATE CANNOT CATCH IT, AND THAT IS THE SHARPER HALF.*** `tests/test_scaffold.py` and `tests/test_scaffold_requirements.py` call `load_settings` **ZERO** times -- **positive control: 58 test files in the suite DO call it**, so the query fires and the absence is real. Those tests assert **string presence** in the generated TOML. ***A test asserting the presence of a string the loader rejects CERTIFIES the defect rather than catching it.***
+
+**Three more are latent in the same template**, commented out with instructions to uncomment: `[egress].deny_by_default`, `[ai].data_class`, `[ai].production`. **Each becomes this same failure the moment an operator follows the line printed beside it.**
+
+**The fix has two shapes and the item does not choose between them:** emit the replacement key (`local_access_only` / `listen_address`) instead of the relocated one, or comment the emission as the other three are. **Whichever is chosen, the test gap is the part that must not survive** -- a scaffold test that never loads what the scaffold wrote can only ever assert that the generator did what the generator does.
+
+**Source:** measured by the ASVS Tracker, independently verified by the Liaison, and re-verified here before filing. **One citation was corrected in that chain:** the emitting file is `messagefoundry/scaffold.py`, not `messagefoundry/config/scaffold.py`. Symbols above; base engine `origin/main` at the tip carrying #1317.
+
