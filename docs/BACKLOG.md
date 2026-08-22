@@ -12282,4 +12282,10 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Not a defect in the claim.** The file-level collision the gate reports was **true** on both occasions. Only the identifier's presentation is wrong.
 
-**Two filing hazards worth recording, because both nearly stopped this being filed at all.** The reporting lane cited `scripts/coord/collision_gate.ps1`, which **does not exist** -- the file is under `scripts/hooks/`. And this seat first concluded the emitter was outside the checkout entirely, having listed `scripts/hooks/*.py` and reasoned about *all* hooks; **the gate is a `.ps1`.** *A glob narrower than the claim it supports produces a confident negative, and neither of us noticed the narrowing.*
+**TWO FILING HAZARDS, BOTH THIS SEAT'S, RECORDED BECAUSE THEY NEARLY STOPPED THIS BEING FILED AT ALL.**
+
+**First, and corrected here after the reporting lane objected: this seat concluded the emitter was outside the checkout entirely.** It listed `scripts/hooks/*.py` and stated a conclusion about **all** hooks. The gate is a `.ps1` and was present the whole time. *The defect is not the glob -- it is stating the conclusion at a wider scope than the query.*
+
+**Second, an attribution this item originally got wrong about the reporting lane, now withdrawn.** It recorded that they had cited a path under `scripts/coord/` that does not exist. **They did not.** They gave `scripts/coord/occupancy.ps1:251` and `scripts/coord/overlap.ps1:234` with directories, both correct, and wrote `collision_gate.ps1:243` with **no directory at all**. This seat supplied `scripts/coord/` from the surrounding context and then recorded its own inference as their claim.
+
+*An unqualified filename in a list of qualified ones invites exactly that completion, so the ambiguity was real -- but the wrong path was this seat's, and a record that misattributes it would outlive everyone who remembers.*
