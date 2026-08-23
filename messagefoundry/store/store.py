@@ -1750,7 +1750,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user
 
 CREATE TABLE IF NOT EXISTS search_presets (
     id         TEXT PRIMARY KEY,                 -- uuid4 hex; the cell-AAD pk for the encrypted criteria
-    owner      TEXT NOT NULL,                    -- the owning Identity.user_id (BACKLOG #1225: NOT the
+    owner_user_id TEXT NOT NULL,                 -- the owning Identity.user_id (BACKLOG #1225: NOT the
                                                  -- reassignable username); every read is owner-scoped
     name       TEXT NOT NULL,                    -- operator-chosen label, unique per owner
     criteria   TEXT,                             -- JSON of the typed search params; AES-256-GCM at rest
@@ -1761,9 +1761,9 @@ CREATE TABLE IF NOT EXISTS search_presets (
                                                  -- recalled since the column landed, so the retention
                                                  -- window falls back to updated_at for that row
 );
--- UNIQUE(owner, name) covers both the owner-scoped list (WHERE owner) and the upsert (WHERE owner AND
+-- UNIQUE(owner_user_id, name) covers both the owner-scoped list (WHERE owner) and the upsert (WHERE owner AND
 -- name); get/delete use the id PK — so no separate owner index is needed (ADR 0136, review follow-up).
-CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets(owner, name);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets(owner_user_id, name);
 
 -- Secret-rotation watch state (ASVS 13.3.4, BACKLOG #282). One row per tracked secret CLASS (the store
 -- DEK by its key-id, plus each configured connector/AD/SMTP/Vault/OIDC secret the engine holds). Every
@@ -8148,7 +8148,9 @@ class MessageStore:
                 # PHI-shaped `criteria` (ADR 0136) persisting with no owner able to reach or purge it,
                 # and counted by nothing. `owner` holds the user_id, not the username, which is what
                 # makes this a single keyed DELETE rather than a name lookup.
-                await self._db.execute("DELETE FROM search_presets WHERE owner=?", (user_id,))
+                await self._db.execute(
+                    "DELETE FROM search_presets WHERE owner_user_id=?", (user_id,)
+                )
                 await self._db.execute("DELETE FROM users WHERE id=?", (user_id,))
                 await self._commit()
             except Exception:
@@ -8242,9 +8244,15 @@ class MessageStore:
     # --- saved-search presets (ADR 0136, BACKLOG #151) -----------------------
 
     async def upsert_search_preset(
-        self, *, preset_id: str, owner: str, name: str, criteria: str, now: float | None = None
+        self,
+        *,
+        preset_id: str,
+        owner_user_id: str,
+        name: str,
+        criteria: str,
+        now: float | None = None,
     ) -> tuple[str, bool]:
-        """Create-or-replace a per-user preset by ``(owner, name)``. On a name collision the EXISTING
+        """Create-or-replace a per-user preset by ``(owner_user_id, name)``. On a name collision the EXISTING
         row id is reused (so the encrypted criteria's cell-AAD binding stays stable) and criteria/
         updated_at UPDATE; otherwise a fresh row with ``preset_id`` is inserted. The PHI-shaped criteria
         is encrypted at rest (cell_aad bound to the effective id). Returns ``(effective_id, replaced)``."""
@@ -8253,7 +8261,8 @@ class MessageStore:
             try:
                 await self._db.execute("BEGIN")
                 cur = await self._db.execute(
-                    "SELECT id FROM search_presets WHERE owner=? AND name=?", (owner, name)
+                    "SELECT id FROM search_presets WHERE owner_user_id=? AND name=?",
+                    (owner_user_id, name),
                 )
                 row = await cur.fetchone()
                 effective_id = str(row["id"]) if row is not None else preset_id
@@ -8267,8 +8276,8 @@ class MessageStore:
                 else:
                     await self._db.execute(
                         "INSERT INTO search_presets"
-                        " (id, owner, name, criteria, created_at, updated_at) VALUES (?,?,?,?,?,?)",
-                        (effective_id, owner, name, enc, now, now),
+                        " (id, owner_user_id, name, criteria, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                        (effective_id, owner_user_id, name, enc, now, now),
                     )
                     replaced = False
                 await self._commit()
@@ -8277,18 +8286,18 @@ class MessageStore:
                 await self._db.rollback()
                 raise
 
-    async def list_search_presets(self, owner: str) -> list[dict[str, Any]]:
+    async def list_search_presets(self, owner_user_id: str) -> list[dict[str, Any]]:
         """List a user's presets (id/name/timestamps only — NEVER the criteria), newest name order."""
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT id, name, created_at, updated_at FROM search_presets"
-                " WHERE owner=? ORDER BY name",
-                (owner,),
+                " WHERE owner_user_id=? ORDER BY name",
+                (owner_user_id,),
             )
             return [dict(r) for r in await cur.fetchall()]
 
     async def get_search_preset(
-        self, *, preset_id: str, owner: str, now: float | None = None
+        self, *, preset_id: str, owner_user_id: str, now: float | None = None
     ) -> dict[str, Any] | None:
         """Return one owner-scoped preset with its criteria DECRYPTED, or ``None``.
 
@@ -8301,8 +8310,8 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT id, name, criteria, created_at, updated_at, last_used_at FROM search_presets"
-                " WHERE id=? AND owner=?",
-                (preset_id, owner),
+                " WHERE id=? AND owner_user_id=?",
+                (preset_id, owner_user_id),
             )
             row = await cur.fetchone()
             if row is None:
@@ -8328,11 +8337,12 @@ class MessageStore:
         except Exception:  # noqa: BLE001 — a usage hint must never fail the recall it annotates
             log.warning("failed to stamp search-preset last_used_at", exc_info=True)
 
-    async def delete_search_preset(self, *, preset_id: str, owner: str) -> bool:
-        """Delete an owner-scoped preset. Returns ``True`` if a row was removed. Idempotent."""
+    async def delete_search_preset(self, *, preset_id: str, owner_user_id: str) -> bool:
+        """Delete an owner_user_id-scoped preset. Returns ``True`` if a row was removed. Idempotent."""
         async with self._lock:
             cur = await self._db.execute(
-                "DELETE FROM search_presets WHERE id=? AND owner=?", (preset_id, owner)
+                "DELETE FROM search_presets WHERE id=? AND owner_user_id=?",
+                (preset_id, owner_user_id),
             )
             await self._commit()
             return bool(cur.rowcount)

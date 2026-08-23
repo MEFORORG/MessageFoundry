@@ -41,6 +41,7 @@ tests/test_ci_leg_data_class.py
 tests/test_ci_step_margin.py
 tests/test_ci_tooling_gate.py
 tests/test_ci_venv_pinning.py
+tests/test_citation_line_check.py
 tests/test_claim_check.py
 tests/test_claude_section_citations.py
 tests/test_claude_settings_contract.py
@@ -60,6 +61,7 @@ tests/test_coord_overlap_signals.py
 tests/test_coord_presence.py
 tests/test_coord_dispatch_gate.py
 tests/test_coord_throughput.py
+tests/test_doc_guards_lane.py
 tests/test_quality_expiry_audit.py
 tests/test_coord_seat_prompt.py
 tests/test_coord_seat_session_key.py
@@ -106,6 +108,7 @@ tests/test_session_registry.py
 tests/test_setup_leak_gate_reports_source.py
 tests/test_stalled_prs.py
 tests/test_testpaths_webconsole_coverage.py
+tests/test_verdict_divergence_check.py
 tests/test_workflow_shell_syntax.py
 tests/test_worktree_gate_command_parsing.py
 tests/test_worktree_gate_control_plane.py

@@ -44,7 +44,7 @@ async def list_search_presets(identity, engine):
 async def create_search_preset(identity, engine, body):
     effective_id, replaced = await engine.store.upsert_search_preset(
         preset_id=body.preset_id,
-        owner=identity.username,
+        owner_user_id=identity.username,
         payload=body.payload,
     )
     return effective_id
@@ -52,13 +52,13 @@ async def create_search_preset(identity, engine, body):
 
 async def delete_search_preset(identity, engine, preset_id):
     deleted = await engine.store.delete_search_preset(
-        preset_id=preset_id, owner=identity.username
+        preset_id=preset_id, owner_user_id=identity.username
     )
     return deleted
 
 
 async def get_one(identity, engine, preset_id):
-    row = await engine.store.get_search_preset(preset_id=preset_id, owner=identity.username)
+    row = await engine.store.get_search_preset(preset_id=preset_id, owner_user_id=identity.username)
     return row
 """
 
@@ -92,9 +92,11 @@ def test_it_reports_all_four_preset_sites_including_the_write(tmp_path: Path) ->
     assert proc.returncode == 0, proc.stderr
     out = proc.stdout
 
-    assert "upsert_search_preset(owner=...)" in out, "the WRITE key was missed -- see BACKLOG #1225"
-    assert "delete_search_preset(owner=...)" in out
-    assert "get_search_preset(owner=...)" in out
+    assert "upsert_search_preset(owner_user_id=...)" in out, (
+        "the WRITE key was missed -- see BACKLOG #1225"
+    )
+    assert "delete_search_preset(owner_user_id=...)" in out
+    assert "get_search_preset(owner_user_id=...)" in out
     assert "list_search_presets(arg0=...)" in out, "the positional read scoping was missed"
 
 

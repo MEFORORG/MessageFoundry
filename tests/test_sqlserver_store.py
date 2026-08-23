@@ -932,10 +932,10 @@ async def test_purge_search_presets_ss(store) -> None:
     """
     try:
         await store.upsert_search_preset(
-            preset_id="ss-stale", owner="alice", name="stale", criteria="{}", now=0.0
+            preset_id="ss-stale", owner_user_id="alice", name="stale", criteria="{}", now=0.0
         )
         await store.upsert_search_preset(
-            preset_id="ss-fresh", owner="alice", name="fresh", criteria="{}", now=40 * DAY
+            preset_id="ss-fresh", owner_user_id="alice", name="fresh", criteria="{}", now=40 * DAY
         )
 
         assert await store.purge_search_presets(older_than=30 * DAY) == 1
@@ -958,10 +958,12 @@ async def test_search_preset_retention_keys_on_last_used_ss(store) -> None:
     try:
         for pid, name in (("ss-used", "used"), ("ss-idle", "idle"), ("ss-legacy", "legacy")):
             await store.upsert_search_preset(
-                preset_id=pid, owner="alice", name=name, criteria="{}", now=0.0
+                preset_id=pid, owner_user_id="alice", name=name, criteria="{}", now=0.0
             )
         # The recall stamps last_used_at past the cutoff...
-        got = await store.get_search_preset(preset_id="ss-used", owner="alice", now=40 * DAY)
+        got = await store.get_search_preset(
+            preset_id="ss-used", owner_user_id="alice", now=40 * DAY
+        )
         assert got is not None and got["last_used_at"] is None  # PRE-stamp snapshot
         row = await store._fetchone("SELECT last_used_at FROM search_presets WHERE id='ss-used'")
         assert row is not None and row["last_used_at"] == 40 * DAY

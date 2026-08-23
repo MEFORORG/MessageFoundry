@@ -227,7 +227,7 @@ async def test_a_recreated_username_does_not_inherit_the_departed_operators_pres
         # Capture the row FIRST. BACKLOG #1233 makes delete_user purge it, and this test needs it
         # back afterwards -- see the two-controls note below.
         raw = await engine.store._db.execute(
-            "SELECT * FROM search_presets WHERE owner=?", (alice.id,)
+            "SELECT * FROM search_presets WHERE owner_user_id=?", (alice.id,)
         )
         captured = [dict(r) for r in await raw.fetchall()]
         assert captured, "precondition: alice's preset exists before she is deleted"
