@@ -13910,3 +13910,81 @@ and mechanism only.** The counts size the work without naming which cells are co
 
 **Expiry:** this stops being right if `_BANNED` moves, if the `anchor_repair` skip is removed, or if
 the residual-only scope of that `blob` changes.
+
+## 1334. The dispatch gate green-lights demand-gate and owner-ruling verdicts, the two that mean do not just build it
+
+> 🔢 **Filed 2026-08-23 - not started.** `judge()` in `scripts/coord/dispatch_gate.py` checks exactly one verdict value. `research` gets an advisory; `demand-gate` and `owner-ruling` return **`ok`** -- the same answer a plain `build` gets. The gate names the closing act correctly and says nothing about whether the item should be started at all.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** ledger tooling / dispatch safety. **Priority:** P2. **Verdict:** build.
+**Severity:** no product effect, no deployment axis (sec. 0). The cost is wasted lane slots and, worse,
+**work performed on an item whose whole point is that it must not be worked yet.**
+
+**PROVEN BY CALLING THE FUNCTION, not by reading it.** Each case is a real `judge()` return:
+
+| verdict | closing-act | gate says |
+| --- | --- | --- |
+| `build` | `code` | `ok` |
+| `research` | `code` | `advise` -- "the question may still be open" |
+| **`demand-gate`** | `code` | **`ok`** |
+| **`owner-ruling`** | `code` | **`ok`** |
+| *(no fields at all)* | -- | `refuse` |
+
+**The fail-closed case is already right:** an item declaring nothing is refused, because the dispatch
+cannot name what would close it. **The defect is the opposite end** -- an item that declares its state
+*precisely*, in the sanctioned vocabulary, saying *do not build this yet*, and the gate answers `ok`.
+
+**`demand-gate` and `owner-ruling` are both in the gate's OWN documented vocabulary** (`:26`), so this
+is not an unknown value falling through a default -- **the values are known and simply not acted on.**
+
+**Why this is worth a fix rather than a note.** The gate exists so a dispatch does not have to
+re-derive an item's state. A seat that consults it and gets `ok` has done the right thing and still
+started a gated item. **This ledger already has a worked example: a demand-gate item was dispatched on
+2026-08-22 without its verdict line being read**, and the gate would have said `ok` to it.
+
+**THE FIX IS NOT "REFUSE THEM".** `f3491468` established that refusing what a builder cannot close
+blocks real work -- *cannot close is not cannot be worked* -- and that reasoning applies here too: a
+demand-gate item can legitimately be researched or scoped. **The right shape is the `advise` branch the
+`research` verdict already has**, naming what the gate is and who lifts it.
+
+**Expiry:** this stops being right if `judge()` grows a branch for either value, or if the verdict
+vocabulary in `_FIELD_KEYS`'s documented set changes.
+
+## 1335. Lane virtualenvs install five fewer extras than CI, so a lane can pass locally and fail on the runner
+
+> 🔢 **Filed 2026-08-23 - not started.** `scripts/worktree/new.ps1:234` builds every lane virtualenv with `dev,harness` (plus `sqlserver` on a switch). CI installs `dev,harness,fhir,dicom,x12,xml,webauthn` **and** the web console package. So a lane's green suite is a strictly weaker signal than the runner's, and the gap is silent.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** developer environment / CI parity. **Priority:** P2. **Verdict:** build.
+**Severity:** no product effect, no deployment axis (sec. 0). The cost is **merge latency and a false
+green**, which is the class of defect that teaches a seat to distrust its own local run.
+
+**Measured, both sides:**
+
+```
+scripts/worktree/new.ps1:234
+    $extras = if ($Sqlserver) { "dev,harness,sqlserver" } else { "dev,harness" }
+
+.github/workflows/ci.yml (three legs)
+    uv pip install --system --constraint constraints.lock         -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
+```
+
+**FIVE EXTRAS AND ONE PACKAGE THE LANE NEVER INSTALLS:** `fhir`, `dicom`, `x12`, `xml`, `webauthn`, and
+`packaging/messagefoundry-webconsole`. **`testpaths` now collects the web console suite**, so a lane
+is not merely missing optional-dependency tests -- **it is missing an entire test tree that CI runs.**
+
+***THE FAILURE IS ASYMMETRIC AND THAT IS WHY IT IS WORTH FIXING RATHER THAN DOCUMENTING.*** A missing
+extra makes tests SKIP or COLLECT-ERROR locally, then run on the runner. **A lane sees green, hands
+over, and CI goes red on code the lane never executed.** The lane cannot tell the difference between
+*passed* and *never ran*, which is the same shape as a fixture that stops discriminating.
+
+**Fix direction: make the lane's extras READ FROM THE SAME SOURCE AS CI rather than restating them.**
+Two restatements of one list will drift again -- they already have. If a single source is not practical,
+a test asserting the two lists match is the minimum, so the next divergence goes red instead of quiet.
+
+**Expiry:** this stops being right if the CI legs change their extras, or if `new.ps1` stops building a
+per-lane virtualenv.
