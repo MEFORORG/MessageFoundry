@@ -501,6 +501,13 @@ if ($List) {
                 Inbox    = @(Get-BoxMessages -Root $root -Key $d.Name -Sub 'inbox').Count
                 Seen     = @(Get-BoxMessages -Root $root -Key $d.Name -Sub 'seen').Count
                 Done     = @(Get-BoxMessages -Root $root -Key $d.Name -Sub 'done').Count
+                # EXPIRY IS OTHERWISE VISIBLE FOR ONE TURN AND THEN GONE (BACKLOG #1228). The drain
+                # sweeps a message past its TTL into expired/ and says so once, in the render of the
+                # turn that swept it. After that no surface names it: the sender's receipt says
+                # queued, the recipient was never told, and both counts above stay whole. A message
+                # that expired unshown is the one outcome this channel most needs to be able to
+                # report, so it must be countable after the fact and not only as it happens.
+                Expired  = @(Get-BoxMessages -Root $root -Key $d.Name -Sub 'expired').Count
                 # A claim mid-flight and a claim whose owner died are different facts, and neither is
                 # visible from inbox/seen alone -- a claimed message is in NEITHER.
                 Claiming = @(Get-BoxMessages -Root $root -Key $d.Name -Sub 'claiming').Count
@@ -518,8 +525,8 @@ if ($List) {
     Write-Host "Mail boxes under $root  (as of $([DateTime]::UtcNow.ToString('o')))"
     if ($boxes.Count -eq 0) { Write-Host "  (none)" }
     foreach ($b in $boxes) {
-        Write-Host ("  {0,-52} inbox={1} shown={2} seen={3} done={4} claiming={5} stranded={6}" -f `
-                $b.Key, $b.Inbox, $b.Shown, $b.Seen, $b.Done, $b.Claiming, $b.Stranded)
+        Write-Host ("  {0,-52} inbox={1} shown={2} seen={3} done={4} claiming={5} stranded={6} expired={7}" -f `
+                $b.Key, $b.Inbox, $b.Shown, $b.Seen, $b.Done, $b.Claiming, $b.Stranded, $b.Expired)
     }
     Write-Host ""
     exit 0
@@ -532,6 +539,9 @@ $inbox = @(Get-BoxMessages -Root $root -Key $key -Sub 'inbox')
 $seen = @(Get-BoxMessages -Root $root -Key $key -Sub 'seen')
 $claiming = @(Get-BoxMessages -Root $root -Key $key -Sub 'claiming')
 $stranded = @(Get-BoxMessages -Root $root -Key $key -Sub 'stranded')
+# See the note in the -List block: without this, a swept message is nameable only during the turn that
+# swept it, and silence afterwards is indistinguishable from nothing having expired.
+$expired = @(Get-BoxMessages -Root $root -Key $key -Sub 'expired')
 # SHOWING IS NOT CONSUMING, so "Undelivered: <inbox count>" would be a lie. The drain renders mail at
 # SessionStart and LEAVES IT IN THE INBOX, consuming it only at that session's next turn boundary --
 # see docs/SESSION-MAIL.md, "Showing is not consuming". Counting held mail as undelivered would put the
@@ -562,6 +572,7 @@ if ($Json) {
             Worktree = $here; Key = $key; Inbox = $inbox.Count; Seen = $seen.Count
             ShownHeld = $shownHeld
             Claiming = $claiming.Count; Stranded = $stranded.Count
+            Expired = $expired.Count
             NextDrainShowsAtLeast = $fits
             MailRoot = $root; AsOfUtc = [DateTime]::UtcNow.ToString('o')
         } | ConvertTo-Json -Depth 4) | Write-Output
@@ -582,6 +593,9 @@ Write-Host "               turn boundary after OFF is removed."
 Write-Host ("Next drain shows: at least {0} of {1} (caps: {2} messages / {3} bytes); {4} deferred to later drains." -f `
         $fits, $inbox.Count, $MAIL_CAP_MESSAGES, $MAIL_CAP_TOTAL_BYTES, [Math]::Max(0, $inbox.Count - $fits))
 Write-Host "In flight:     $($claiming.Count) claimed by a drain that has not finished"
+Write-Host "Expired:       $($expired.Count) swept past their TTL. NOBODY WAS TOLD -- expiry is silent to"
+Write-Host "               the sender and to the recipient, so a non-zero count here is the only place"
+Write-Host "               a message that died unread is named after the turn that swept it."
 Write-Host "As of:         $([DateTime]::UtcNow.ToString('o'))"
 
 if ($stranded.Count -gt 0) {
