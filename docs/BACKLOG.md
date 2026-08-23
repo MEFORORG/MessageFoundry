@@ -5297,6 +5297,48 @@ against the gate **as it will ship**, not as it is.
 
 **Source:** identified 2026-08-05 while fixing #1032, and deliberately deferred rather than swept in, so that fix stayed scoped to one rule. Recorded here because a deferral nobody files is a deferral dropped.
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. THIS IS A SCANNER ITEM, NOT A RULE-3C ITEM, AND `#1332` IS
+RETIRED INTO IT.** I filed `#1332` for this defect without finding this row; a building lane caught the
+duplicate by reading `Get-ScannableSegments` before writing to it, where **this row's number is already
+named in the residual list** (`scripts/hooks/worktree_gate.ps1:624`).
+
+**THE SCOPE IS WIDER THAN THIS ROW'S TITLE SAYS. ALL THREE RULE SITES CALL THE SAME FUNCTION** --
+`:1211`, `:1339` and `:1602`, off the definition at `:557`, measured on the ledger base `a92ab10f`. So
+this is not one rule misreading a here-string; **it is the shared segment scanner losing the fact that
+a body was quoted, for every rule that consults it.**
+
+**AND IT IS WHY `#1305` WAS UNFIXABLE IN ITS FILED FORM.** That item's fix extended the same defect to
+the git program token rather than introducing a new one, which is how it added eleven further
+false-deny classes. **One root cause, more than one rule, one half already live on `main`.**
+
+**MEASURED DIFFERENTIALLY, controls discriminating in BOTH directions** -- an all-allow or all-deny
+harness proves nothing:
+
+| case | result |
+| --- | --- |
+| heredoc, key at LINE START | DENY |
+| heredoc, key MID-LINE | DENY |
+| heredoc, key INDENTED | DENY |
+| heredoc, key in BACKTICKS | ALLOW |
+| single-quoted echo, same line | ALLOW |
+| double-quoted echo, same line | ALLOW |
+
+**Position within the line is IRRELEVANT. The discriminator is HEREDOC versus SAME-LINE QUOTING** --
+same-line quoting is handled correctly and a heredoc body is not. A hypothesis that line 2 of a quoted
+body reads as *program position* was tested against this table and **withdrawn**.
+
+**THE BACKTICK ROW IS LUCK AND MUST NOT BE RELIED ON.** The preceding character is simply outside the
+pattern's leading class. A writer who happens to use backticks escapes; one who does not, does not.
+
+***THE OBJECTION IN THE FUNCTION'S OWN NOTE OUTRANKS THE FIX, AND IT IS THE REAL BLOCKER.*** The
+residual says this was left alone because **no test on this gate could tell the two mechanisms apart,
+and a fix whose green nobody could watch fail is not evidence.** Today a multi-line quoted body denies
+**by accident** -- every line reaches the scanner raw. **A fix that blanks those bodies removes the
+accidental deny, so blanking could trade a false DENY for a silent FAIL-OPEN.** Build the discriminator
+first. **If no test can separate *denied because the rule saw a real command* from *denied because the
+raw scan happened to see one*, then this must not be built as specified** -- and that finding is a
+complete result, not a stall.
 ## 1036. A Rule 4 deny names the first allowlisted repo's tooling regardless of which repo fired it
 
 > ✅ **SHIPPED 2026-08-10 — branch `w2-l3-gate-emitter` (`f911ebe5`).** Value **3/10** · Difficulty **2/10** · _quick win_. Rule 4 fires on the TOOL NAME alone, so it had no path to key on and named the first allowlist entry whichever repo the session was in. It now resolves the session's own governed root: by prefix for the primary and its nested `.claude/worktrees/` trees, and via `rev-parse --git-common-dir` for a sibling worktree, which lives outside every root's path. When neither answers it says so and prints NO runnable command -- a path that exists and runs against an unrelated clone is worse than no remedy. Tested with a TWO-entry allowlist across all four governed shapes plus an ungoverned cwd; the two cases the old code got right stay green on both sides.
@@ -5874,6 +5916,17 @@ The same `[^"\s]+` class truncated at a SPACE, so any governed root whose path c
 
 **Source:** recorded in #1065 by the adversarial verification pass on #1061's fix; allocated and fixed 2026-08-06. The quoted-KEY half was found by the design review of the fix for the quoted-PATH half, which is why this is a separate item rather than a line in #1065.
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. A SECOND MEASURED INSTANCE, AND A MECHANISM ITEM NOW HOLDS THE
+FIX DIRECTION.** This row frames the class around a `-C` TARGET. A building lane measured the same
+mechanism in a **MESSAGE flag that executes outright**: `git commit -m "$(...)"` is **ALLOWED on both
+tools**, while the unquoted form is denied -- the control proving the gate can see it when quoting does
+not erase it. **Both shells substitute inside double quotes before git is invoked, so the disarm runs.**
+
+***AND THIS ROW CANNOT BE FIXED ALONE.*** Its remedy pulls toward **less** blanking; `#1086`'s pulls
+toward **more**; they are one design error read from two ends. **#1336** carries the reconciliation --
+the two questions need different strings, and the segment object already provides both. **Do not narrow
+the blanking here without measuring `#1086`'s false-deny rows in the same table.**
 ## 1067. Rule 3c governs by PATH PREFIX, so an independent repo vendored under a governed root inherits its governance
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **4/10** · _fill-in_. Rule 3c still decides governance by an equality-or-slash-prefix test over the resolved git common dir, so an independent clone under a governed root inherits governance, and the deny text still asserts a shared .git that a vendored clone does not have. Value 4 because it is a false deny in developer tooling with no product surface; difficulty 4 because any fix must pin both directions at once -- allow the vendored clone while keeping the nested .claude/worktrees case denied -- and it forces the git-submodule question the item deliberately deferred. _(was 4/10 · 4/10.)_
@@ -12995,6 +13048,39 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **Cluster:** Tooling / worktree gate. **Priority:** P3. **Verdict:** build.
 **Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- developer tooling only, and it fails closed. The cost is a gate message that is false about what the command does, which is the class of defect that teaches readers to discount gate output.
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. THE READ HALF IS BUILT. THE REMAINING HALF IS #1332 AND IS
+OUT OF SCOPE HERE.** Built at `0c176a85`, on a branch cut clean from `a92ab10f`. Rule 3c now decides on
+whether a VALUE IS ASSIGNED rather than on the appearance of the key. Mutation-checked: revert the fix
+and exactly the five read tests fail while all seven write controls still pass.
+
+***THIS ROW'S OWN FIX DIRECTION IS WRONG FOR ONE OF THE TWO SHAPES, AND FOLLOWING IT FAITHFULLY WOULD
+HAVE OPENED A HOLE.*** The direction above says *decide on whether a VALUE is present*. **That is right
+for the `config` subcommand and wrong for `-c`.** Measured against real git: **`git -c <key>` WITHOUT an
+`=` still injects the key for that command, with an empty value.** So absence-of-value there is not a
+read, and an empty `core.hooksPath` is not obviously inert. The narrowing is scoped to the `config`
+subcommand and both `-c` shapes are pinned as tests. **A builder implementing this row as written would
+have loosened `-c` as well.**
+
+**TWO DEFECTS THE BUILDING LANE CAUGHT IN ITS OWN WORK, RECORDED BECAUSE BOTH ARE LIVE TRAPS FOR THE
+NEXT PERSON TOUCHING THIS GATE OR ITS TESTS.**
+
+1. **THE FIRST DRAFT FAILED OPEN ON THE RULE'S OWN POSITIVE CONTROL** -- `git config core.hooksPath
+   /dev/null` was ALLOWED. PowerShell's `-match` **replaces `$Matches` wholesale**, so computing one
+   variable before reading another left the second holding the *first* match's groups; it came back
+   null, satisfied the no-value test, and every real write took the read path. **Caught only because
+   the MUST-DENY rows were kept in the fix's test table** rather than just the row being fixed.
+2. **THE FIRST TESTS WERE VACUOUS.** All five read cases passed against the shared `primary` fixture --
+   **a tmp path that is never created**. Rule 3c asks git for the common dir and **ALLOWS when git
+   fails, by design**, so under that fixture *the rule allows everything*. Rewritten with a git-init'd
+   fixture and every read case paired with the real disarm as a control **in the same repository**, so
+   a fixture that stops discriminating goes red instead of quietly green.
+
+**SCOPE RULING: this item is the READ half only.** The heredoc half -- documentation denied because its
+quoted body is scanned as a command -- is **#1332**, measured pre-existing on `main` and rooted in
+`Get-ScannableSegments`, which all three rule sites call. It is not deferred out of this item for
+convenience: **a load-bearing change to the shared segment scanner must not ship inside a
+difficulty-2 fill-in without its own adversarial pass.** #1306 closes when `0c176a85` lands.
 ## 1310. the collision gate prints a truncated session id bare, and a reader resolves it as a commit sha
 
 > ✅ **SHIPPED 2026-08-23 -- every emitted hex token is labelled, and a TEST now proves it.** *Found by the Builder 1 seat, who chased the value into the git object store TWICE and twice reported the gate's warning unresolvable. Filed 2026-08-22 by the lander.*
@@ -13664,12 +13750,18 @@ would not appear.** The date comparison remains the open work here.
 
 > **BOUND, stated because a clean-looking finding invites over-reading.** What is measured is: bare `Git`/`GIT` for `reset --hard` and `checkout`, on the Bash tool, with the cwd inside the governed primary. Rule 3b, the linked-worktree path, is unsampled entirely, as are the target-path attack shapes. The exhaustive spelling-by-rule matrix is kept out of this file deliberately; it is in the builder-1 episode note under the gate sections.
 
+> ***MEASURED 2026-08-23: THE CASE-INSENSITIVE FIX WAS BUILT AND IT MUST NOT LAND. The verdict is a finding, not a caution.*** *Four snapshots on the building lane's branch are labelled DO NOT LAND by their author and are kept as evidence.* **A false-deny harness against the REAL governed primary -- harness copy md5-matched to the committed gate first, controls firing in BOTH directions (`echo hello world` ALLOW/ALLOW, `git reset --hard` DENY/DENY) -- returned ELEVEN OF ELEVEN CASES FLIPPING ALLOW TO DENY.** *Class A is ordinary writing: a heredoc into a doc, a markdown bullet, a `gh pr` body, a `git commit -m` message, a PowerShell here-string, a mail body. Class B is pipelines and wrappers: `xargs`, `sudo --`, `env -i`, `Start-Process`, `script -c`.* ***THE SHARPEST CASE IS A4: `git commit -m` WITH `Git` IN THE BODY DENIES, SO THE INSTALLED GATE WOULD REFUSE THE COMMIT THAT DOCUMENTS IT.*** **It does NOT weaken the gate -- zero DENY-to-ALLOW across 735 payloads and 35 deny-side rows held. IT OVER-DENIES, which on this gate is the worse direction.**
+> ***THIS ROW'S COST CASE IS WRONG IN BOTH DIRECTIONS.*** **It prices a case-insensitive fix at twelve false denies.** *(1) **Those twelve are ALREADY LIVE IN LOWERCASE** -- 9 of the 10 programs the `:456` comment names DENY on `main` today; `cp -r "/c/backups/git" restore` is denied right now. So the row overstates what a fix must NEWLY cost.* *(2) **The built fix adds ELEVEN MORE CLASSES on top, none of them among the twelve.** So it also understates what THIS fix actually costs.*
+> **ROOT CAUSE, one line, and it is the same for all eleven: QUOTE AND LINE STATE DO NOT SURVIVE `Get-ScannableSegments`, so line 2 of any quoted body is read as PROGRAM POSITION.** ***THE FIX DIRECTION IS A POSITION TEST, NOT A WIDER MATCH.*** `Test-GitProgramPosition` was **built and reverted at `c0d6cef8`** -- **recover it there rather than re-deriving it**, and re-run the false-deny harness BEFORE writing anything. *That is a fresh build, not a continuation of the reverted attempt.*
 **Cluster:** Worktree gate / developer guardrail. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0) -- this guard is coordination tooling and is not shipped in the wheel. The cost is that a guard believed to be governing every session is bypassed by an ordinary typo-shaped variation, which is worse than a guard known to be absent.
 
 ## 1301. a ledger banner citing a commit sha must cite a commit whose subject names the item it sits under
 
 > 🔢 **Filed 2026-08-21 -- not started. ONE EDIT CORRUPTED TWO ITEMS IN OPPOSITE DIRECTIONS AND NO GATE COULD SEE IT, BUT A SHA-TO-ITEM AGREEMENT CHECK WOULD HAVE.** A retirement banner intended for one item was written onto another. The Markdown stayed valid, the item count did not move, the status glyph was untouched, and the misplaced paragraph carried no glyph of its own -- so `parse_items` had no second banner to object to and every ledger gate passed.
+> Verdict: build
+> Research: none
+> Closing-act: code
 
 > **THE SIGNAL THAT WAS THERE ALL ALONG.** The overwritten banner cited two commit shas whose subjects both ended in that item's own number. The paragraph that replaced it cited a sha whose subject named a DIFFERENT item. So the rule is mechanical and needs no judgement: **a banner citing a commit sha must cite a commit whose subject names the item the banner sits under.**
 
@@ -13681,6 +13773,40 @@ would not appear.** The date comparison remains the open work here.
 
 **Cluster:** Ledger integrity / commit gates. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0) -- ledger hygiene. The cost is that a wrongly-transposed banner reads as a working cross-reference forever, and the two items it corrupts fail in opposite directions: one over-reports its status and one under-reports it.
+
+**AMENDMENT 2026-08-23, dispatcher seat. THE RULE AS LITERALLY STATED IS OVER-SCOPED BY ONE LEVEL, AND
+THE MEASUREMENT RESHAPES THE ITEM RATHER THAN SIZING IT.** Measured over this file at `a92ab10f`: 342
+items, **64 carry a sha in the banner block, 123 shas resolve against git.**
+
+| outcome | count | what it is |
+| --- | --- | --- |
+| subject names its own item | **38** | the rule's intended pass -- **and the positive control** |
+| subject names a DIFFERENT item | **53** | ***CORRECT PROSE*** -- a true cross-reference to another item's commit |
+| subject names no item | 26 | ordinary commits, legitimately cited |
+| merge commits | 6 | subject names a PR, not an item |
+
+**`BACKLOG-CLOSED.md` is no better proportionally: 14 resolved, 5 agree, 9 disagree.** So the literal
+check **would ship with 94 violations across the two files, none of them the defect.**
+
+***THE 53 ARE THE FINDING. A CHECK THAT FLAGS THEM IS NOT NOISY, IT IS WRONG*** -- it asserts a defect
+where the ledger is doing exactly what it should. `#320`'s banner truthfully says a CI symptom *"is
+already fixed"* and cites the other item's commit. **That is a useful cross-reference, and the rule as
+written calls it a violation.**
+
+***AND THE SYMMETRY IS WORTH MORE THAN THIS ITEM.*** This row warns that a screen finding **NOTHING**
+reads as a clean corpus. **This screen finds EVERYTHING and reads as a broken ledger. Both are unusable,
+and the row anticipated only one direction.** The next person adding a ledger check will reach for the
+same one-directional caution.
+
+**RULING: NARROW THE TRIGGER TO A CLOSING CLAIM** -- a sha in a CLOSED, retirement or SHIPPED banner, in
+a position asserting it closed **this** item. **The incident stays caught; the prose cross-references
+drop out; nothing rests on a baseline count.** A warn-with-baseline alternative was rejected: it bakes
+in 94 as a number that rots, and the day someone adds a legitimate cross-reference the baseline is
+wrong with nothing reporting it.
+
+**ONE INSTRUMENT NOTE, because it cost a caveat.** A subject grep for this item's target resolves to
+unrelated files, and that is not a defect in the item -- **it asks for a check that does not exist yet**,
+so no grep over the tree can resolve it. **The instrument was being asked an unanswerable question.**
 ## 1331. test_connscale_smoke_end_to_end wears six assertions under one name, so a merge-blocking flake reads as six unrelated bugs
 
 > 🔢 **Filed 2026-08-22 - not started.** One test name covers at least six separate properties, so two seats hitting it twice see two unrelated bugs rather than one recurring problem. It sits on three of the thirteen required contexts, so every occurrence is merge-blocking.
@@ -13769,3 +13895,403 @@ real work -- a wrong closing act is worse than an absent one, because it names t
 **Expiry:** this stops being right if `parse_items` starts reading below the banner block, or if
 the three field names change. Check `_FIELD_KEYS` in `scripts/docs/backlog_status_check.py`.
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. THIS ITEM IS PARTIALLY SHIPPED AND THE DEFECT PARAGRAPH ABOVE
+IS STALE.** Measured by the lane holding the item, and re-measured independently before this was written.
+`parse_items` is the right instrument here: a populated `Item.fields` proves the field is *in the banner
+block*, because that block is the only region the parser reads.
+
+| field | present, open items | missing |
+|---|---|---|
+| `Verdict` | 237 / 246 | 9 |
+| `Closing-act` | 236 / 246 | 10 |
+| `Research` | 1 / 246 | 245 |
+
+The single `Research` is this item's own worked example. So *"304 of 330 open items ... and zero of them are
+inside the banner blockquote"* is no longer true of two fields out of three, and the population moved from
+330 to 246 besides.
+
+- Missing `Verdict` (9): #351, #352, #353, #1008, #1093, #1301, #1305, #1319, #1322.
+- Missing `Closing-act` (10): the same nine, plus #320.
+
+**WHERE THE MIGRATION LANDED, BECAUSE THE OBVIOUS ANSWER IS WRONG.** It is `76ee9a7b` -- 734 lines added to
+this file, **473 of them banner field lines**. `7b6a5b1f` shipped the *reader* (`Item.fields`) and
+`scripts/coord/dispatch_gate.py` and added **two** field lines. Tool and data landed in different pull
+requests, and the commit carrying the data has the subject *"file #1318 -- messagefoundry init writes a
+config the loader refuses"*, which does not mention a schema migration at all. **A 473-line migration is
+invisible in `git log`.** The first seat to check attributed it to the tooling commit -- the reasonable
+place to look, and still the wrong answer.
+
+**THE REMAINING WORK IS NOT A 330-ITEM SCRIPT.** It is two jobs wanting different tools:
+
+1. **Nineteen straggler edits, BY HAND.** Nine items need `Verdict`, ten need `Closing-act`. At this size a
+   script is the wrong instrument; these are surgical and hand-checkable.
+2. **`Research` on 245 items, WHICH IS WHERE THE SCRIPT BELONGS.** This is the field the contention warning
+   above is really about, and the only part still needing a quiet window.
+
+**FIVE OF THE NINE MISSING VERDICTS ARE FREE TEXT AND MUST BE ESCALATED, NOT FLATTENED.** #351, #352, #353,
+#1008 and #1093 carry inline verdicts outside the closed vocabulary -- *"triage"*, *"consult, then decide"*,
+*"triage, then split"*. Two lose something specific under a forced mapping: #1008's ruling of record is
+*"build the runbook fix only; defer the startup preflight"*, and mapping that to `build` drops the clause
+that scopes it; #353 reads *"file now, build on owner green-light"*, a demand-gate written in prose, and
+mapping it to `build` deletes the gate. **A wrong verdict is worse than an absent one** -- this item already
+says so about closing acts, and it holds identically here. The other four (#1301, #1305, #1319, #1322) read
+*"build."* and are mechanical. #320 has no inline verdict at all and already carries a banner `Verdict`; it
+needs only `Closing-act`.
+
+## 1332. Heredoc bodies are scanned as commands, so quoted documentation trips the secret-scanning rules
+
+> 🔢 **Filed 2026-08-23 - not started.** A heredoc body becomes its own line in `Get-ScannableSegments` ([`scripts/hooks/worktree_gate.ps1:557`](../scripts/hooks/worktree_gate.ps1)), and the fact that it is quoted DATA does not survive the newline split. Documentation that QUOTES a config key is scanned as if it SET one. This is the root cause under #1305 and one half of #1306.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**RETIRED THE HOUR IT WAS FILED -- THIS IS A DUPLICATE OF `#1086` AND SHOULD NOT BE BUILT. The number
+is kept, retired in place, because a commit (`143d0d42`) and a building lane's claim note already cite
+it.** Build the scanner fix against **#1086**, which is open, carries the same defect in the same
+function, and holds two things this row does not: **a refuted naive fix and the narrower rule that
+replaces it.**
+
+***HOW THE DUPLICATE SURVIVED THREE DISPATCH SCREENS, RECORDED BECAUSE IT IS A GAP IN THE METHOD AND
+NOT A LAPSE.*** This item was brand new, so it had **no unlanded build commit**; it had **no retirement
+marker**; its verdict was **`build`**. All three screens pass it. **The duplicate was visible only from
+the code's own comment** -- `scripts/hooks/worktree_gate.ps1:624` names `#1086` in the residual list of
+the very function the fix would change. **The building lane found it by reading the function before
+writing to it.**
+
+**SO THERE IS A FOURTH SCREEN AND IT CANNOT BE AUTOMATED FROM THE LEDGER: *does the code being changed
+already cite a different item for this change?*** It needs the file open. **As a dispatch instruction:
+read the function you are about to change, and grep it for a backlog number, before the first line of
+code.**
+
+**Cluster:** commit gates / secret scanning. **Priority:** P2. **Verdict:** build.
+**Severity:** false denies on the commit path. **Conditional, per section 0:** zero deployments; the
+cost is that a seat cannot commit honest documentation, and learns to reach for a bypass.
+
+**Measured by the building lane, differentially against `main`, with controls discriminating in BOTH
+directions.** An all-allow or all-deny harness proves nothing; both arms fired here.
+
+| case | on `main` | with the #1305 fix |
+| --- | --- | --- |
+| CONTROL allow | ALLOW | ALLOW |
+| CONTROL deny (real write) | DENY | DENY |
+| bare read | DENY | DENY |
+| `--get` read | ALLOW | ALLOW |
+| HEREDOC documentation | **DENY** | **DENY** |
+| `commit -m` documentation | ALLOW | ALLOW |
+
+**THE QUOTED-TEXT FALSE DENY IS ALREADY LIVE ON `main`** for the hooks-path rule. The #1305 fix
+neither caused nor worsened it -- it EXTENDED the same defect to the git program token, which is why
+#1305 added eleven further false-deny classes on top. **One root cause, two rules, one half already
+shipped.**
+
+**A HYPOTHESIS TESTED AND WITHDRAWN, recorded because a wrong mechanism is the more expensive
+artifact.** The lane first proposed that *"line 2 of a quoted body reads as PROGRAM POSITION"*, taking
+it from #1305's own "line 2" wording -- then tested it instead of repeating it:
+
+| case | result |
+| --- | --- |
+| heredoc, key at LINE START | DENY |
+| heredoc, key MID-LINE | DENY |
+| heredoc, key INDENTED | DENY |
+| heredoc, key in BACKTICKS | ALLOW |
+| single-quoted echo, same line | ALLOW |
+| double-quoted echo, same line | ALLOW |
+
+**Position within the line is irrelevant. The discriminator is HEREDOC versus SAME-LINE QUOTING** --
+same-line quoting is handled correctly and a heredoc body is not. The gate's own tests already say so
+in prose: `Get-ScannableSegments` *"splits on NEWLINES only"*
+([`tests/test_worktree_gate_hijack.py:536`](../tests/test_worktree_gate_hijack.py)).
+
+**THE BACKTICK ROW IS LUCK AND MUST NOT BE RELIED ON.** The character before the token is a backtick,
+which is simply not in the pattern's leading character class -- the same accident that keeps a dotted
+git reference from tripping the gate constantly. A writer who happens to use backticks escapes; one
+who does not, does not.
+
+**DO NOT BUILD THIS INSIDE #1306.** That item is two fixes: a bare-read case that must decide on
+whether a VALUE is present rather than on the appearance of a key, and this one. Burying a change to
+`Get-ScannableSegments` -- which all three rule sites call (`:1211`, `:1339`, `:1602`) -- inside a
+fill-in item is how a shared scanner changes without an adversarial pass. **Its own item, its own
+pass.**
+
+**Expiry:** this stops being right if `Get-ScannableSegments` stops splitting on newlines, or if
+heredoc bodies gain their own segment kind.
+
+## 1333. Legacy glyphs freeze security-record cells against correction, while the repair path skips the same check
+
+> 🔢 **Filed 2026-08-23 - not started.** Cells carry a banned glyph in prose written BEFORE the gate that now bans it, so each is frozen against every residual correction, by anyone, until the glyphs are removed. The same check is SKIPPED on the repair path, so the record is fully repairable and only partly correctable.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**VERDICT CORRECTED 2026-08-23, from `owner-ruling` to `build`, and the reason is a measurement rather
+than a reconsideration.** This row was filed expecting the glyphs to be spread across prose fields,
+which would have made the strip a migration across a security record and genuinely somebody's decision.
+**Measured afterwards: every occurrence sits in ONE field, none elsewhere**, and the writer reads only that
+field -- so a strip touching it alone unfreezes every affected cell. **One field per affected cell, no
+verdict moves, no anchors touched.**
+
+***AND THE DECIDING ARGUMENT IS THAT NO NEW RULING IS NEEDED: CLAUDE.md section 11 ALREADY BANS THESE
+GLYPHS.*** Stripping them EXECUTES an existing ruling. **The only direction that would need the owner is
+the other one** -- exempting pre-existing glyphs from the check, which asks the owner to carve an
+exception into their own rule. **Option 2 below is therefore the one with an owner cost, and it is no
+longer the cheaper path.**
+
+**Cluster:** record-maintenance tooling. **Priority:** P2. **Verdict:** build -- the strip is mechanical
+maintenance of the record, owned by the seat that owns the record.
+**Severity:** no deployment axis. **Conditional, per section 0:** zero deployments; this blocks
+maintenance of a security record, not any running thing.
+
+**Measured against the live record.** `apply.py` refuses any payload whose prose
+carries one ([`scripts/asvs/apply.py:281`](../scripts/asvs/apply.py)), against a `_BANNED` class
+covering the banner alphabet and the emoji planes. The glyphs predate that gate.
+
+***THE ASYMMETRY IS THE INTERESTING HALF, AND IT IS WHY THIS WENT UNNOTICED.*** The check is skipped
+entirely on a repair pass -- `blob = "" if anchor_repair else ...` -- confirmed empirically by an
+anchor repair landing cleanly on a cell that carries several. **So bookkeeping passes work and
+assessment corrections do not, which is exactly backwards from which one matters.**
+
+**THE PER-FIELD SPLIT IS MEASURED, AND THE GUESS THIS ROW FIRST CARRIED IS REFUTED.** The gate reads
+`residual` and no other prose field: `blob = "" if anchor_repair else " ".join(...)` at
+[`scripts/asvs/apply.py:280`](../scripts/asvs/apply.py), a `" ".join` over a ONE-ELEMENT tuple. This
+row originally guessed the occurrences were spread across fields, so that the freezing subset would
+be smaller than the raw count. **Measured: EVERY OCCURRENCE IS IN `residual`, and NONE is in any other
+string field on any cell.** The freezing subset is every affected cell. **It does not shrink.**
+
+***THE ACTIONABLE HALF SURVIVES, AND IT IS THE HALF THAT SIZES THE WORK: A STRIP TOUCHING `residual`
+ALONE UNFREEZES EVERY CELL.*** No other field needs opening, so this is **one field per affected
+cell** rather than a migration across the record.
+
+**A `" ".join` OVER ONE ELEMENT READS AS EXTENSIBLE AND IS NOT.** Anyone widening the check to further
+prose fields has to notice the tuple, or the widening looks done and changes nothing.
+
+**FIX DIRECTION -- the tension is named here, not resolved:**
+
+1. **Strip the glyphs.** Mechanical, but it edits verdict-bearing assessment prose across 20 records.
+   Not obviously a repair, and not obviously the tracking seat's to make.
+2. **Exempt pre-existing glyphs and enforce only on newly added ones** -- a diff-scoped check rather
+   than a whole-blob one. A tooling change, and it leaves the legacy prose in place.
+
+**A SECOND AND SEPARATE TENSION, in the same area and wanting its own number if anyone takes it.** A
+false absence claim cannot be RETIRED either, because `apply.py` refuses a cardinality shrink by
+design -- correctly, since that guard exists to stop silent truncation. **So a claim whose premise is
+genuinely retired has no clean exit.** Narrowing its pattern would turn a red green by weakening what
+the record asserts, which is a scope change wearing a bookkeeping edit's clothes. The tracking seat
+left it false on purpose, which was the right call.
+
+**At least one correction is blocked on this right now**: built, verified, and refused by the writer.
+
+**Cell identifiers, coverage and gaps stay vaulted (CLAUDE.md section 11), so this row carries counts
+and mechanism only.** The counts size the work without naming which cells are covered.
+
+**Expiry:** this stops being right if `_BANNED` moves, if the `anchor_repair` skip is removed, or if
+the residual-only scope of that `blob` changes.
+
+## 1334. The dispatch gate green-lights demand-gate and owner-ruling verdicts, the two that mean do not just build it
+
+> 🔢 **Filed 2026-08-23 - not started.** `judge()` in `scripts/coord/dispatch_gate.py` checks exactly one verdict value. `research` gets an advisory; `demand-gate` and `owner-ruling` return **`ok`** -- the same answer a plain `build` gets. The gate names the closing act correctly and says nothing about whether the item should be started at all.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** ledger tooling / dispatch safety. **Priority:** P2. **Verdict:** build.
+**Severity:** no product effect, no deployment axis (sec. 0). The cost is wasted lane slots and, worse,
+**work performed on an item whose whole point is that it must not be worked yet.**
+
+**PROVEN BY CALLING THE FUNCTION, not by reading it.** Each case is a real `judge()` return:
+
+| verdict | closing-act | gate says |
+| --- | --- | --- |
+| `build` | `code` | `ok` |
+| `research` | `code` | `advise` -- "the question may still be open" |
+| **`demand-gate`** | `code` | **`ok`** |
+| **`owner-ruling`** | `code` | **`ok`** |
+| *(no fields at all)* | -- | `refuse` |
+
+**The fail-closed case is already right:** an item declaring nothing is refused, because the dispatch
+cannot name what would close it. **The defect is the opposite end** -- an item that declares its state
+*precisely*, in the sanctioned vocabulary, saying *do not build this yet*, and the gate answers `ok`.
+
+**`demand-gate` and `owner-ruling` are both in the gate's OWN documented vocabulary** (`:26`), so this
+is not an unknown value falling through a default -- **the values are known and simply not acted on.**
+
+**Why this is worth a fix rather than a note.** The gate exists so a dispatch does not have to
+re-derive an item's state. A seat that consults it and gets `ok` has done the right thing and still
+started a gated item. **This ledger already has a worked example: a demand-gate item was dispatched on
+2026-08-22 without its verdict line being read**, and the gate would have said `ok` to it.
+
+**THE FIX IS NOT "REFUSE THEM".** `f3491468` established that refusing what a builder cannot close
+blocks real work -- *cannot close is not cannot be worked* -- and that reasoning applies here too: a
+demand-gate item can legitimately be researched or scoped. **The right shape is the `advise` branch the
+`research` verdict already has**, naming what the gate is and who lifts it.
+
+**Expiry:** this stops being right if `judge()` grows a branch for either value, or if the verdict
+vocabulary in `_FIELD_KEYS`'s documented set changes.
+
+
+**A THIRD GAP IN THE SAME FUNCTION, FOUND WHILE FILING THIS ROW AND PROVEN THE SAME WAY: RETIREMENT IS
+INVISIBLE TO THE GATE.** An item retired in place keeps its number, its banner and its fields -- that is
+the established convention, so the ledger is right and the gate is not reading enough:
+
+| item | state | fields | gate says |
+| --- | --- | --- | --- |
+| `#1332` | **retired in place**, duplicate of `#1086` | `build` / `code` | ***`ok`*** |
+| `#1309` | **retired in place**, duplicate of `#1152` | `demand-gate` / `owner-ruling` | `advise` |
+
+**`#1309` gets `advise` for the WRONG REASON** -- its closing act is not one a builder performs, so the
+note is about *who closes it*. **Neither row's retirement is mentioned at all.** A seat consulting the
+gate on `#1332` today is told `ok` about an item whose first body line says it must not be built.
+
+**So the fix has three parts, not one:** advise on `demand-gate` and `owner-ruling`, and **detect a
+retirement marker in the body**. The retirement text is prose rather than a field, so this one needs a
+body read rather than a `fields` lookup -- **or a fourth banner key, which is the cleaner answer if
+anyone is already editing the schema.**
+## 1335. Lane virtualenvs install five fewer extras than CI, so a lane can pass locally and fail on the runner
+
+> 🔢 **Filed 2026-08-23 - not started.** `scripts/worktree/new.ps1:234` builds every lane virtualenv with `dev,harness` (plus `sqlserver` on a switch). CI installs `dev,harness,fhir,dicom,x12,xml,webauthn` **and** the web console package. So a lane's green suite is a strictly weaker signal than the runner's, and the gap is silent.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** developer environment / CI parity. **Priority:** P2. **Verdict:** build.
+**Severity:** no product effect, no deployment axis (sec. 0). The cost is **merge latency and a false
+green**, which is the class of defect that teaches a seat to distrust its own local run.
+
+**Measured, both sides:**
+
+```
+scripts/worktree/new.ps1:234
+    $extras = if ($Sqlserver) { "dev,harness,sqlserver" } else { "dev,harness" }
+
+.github/workflows/ci.yml (three legs)
+    uv pip install --system --constraint constraints.lock         -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
+```
+
+**FIVE EXTRAS AND ONE PACKAGE THE LANE NEVER INSTALLS:** `fhir`, `dicom`, `x12`, `xml`, `webauthn`, and
+`packaging/messagefoundry-webconsole`. **`testpaths` now collects the web console suite**, so a lane
+is not merely missing optional-dependency tests -- **it is missing an entire test tree that CI runs.**
+
+***THE FAILURE IS ASYMMETRIC AND THAT IS WHY IT IS WORTH FIXING RATHER THAN DOCUMENTING.*** A missing
+extra makes tests SKIP or COLLECT-ERROR locally, then run on the runner. **A lane sees green, hands
+over, and CI goes red on code the lane never executed.** The lane cannot tell the difference between
+*passed* and *never ran*, which is the same shape as a fixture that stops discriminating.
+
+**Fix direction: make the lane's extras READ FROM THE SAME SOURCE AS CI rather than restating them.**
+Two restatements of one list will drift again -- they already have. If a single source is not practical,
+a test asserting the two lists match is the minimum, so the next divergence goes red instead of quiet.
+
+**Expiry:** this stops being right if the CI legs change their extras, or if `new.ps1` stops building a
+per-lane virtualenv.
+
+## 1336. Rule 3c asks one string two questions, so every fix for the false deny widens the bypass and back
+
+> 🔢 **Filed 2026-08-23 - not started.** `#1066` (a quoted danger key is invisible, FAIL OPEN) and `#1086` (a quoted body reads as a command, FALSE DENY) are **the same design error pulling in opposite directions**: rule 3c asks both questions of `$seg.Scan`, the quote-blanked text. Blanking more fixes `#1086` and widens `#1066`. Blanking less does the reverse. **Neither row can be fixed alone.**
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** commit gates / secret scanning. **Priority:** P1 -- higher than either row it reconciles,
+because **a fix to either one alone makes the other worse and the last three attempts did exactly
+that.** **Verdict:** build.
+**Severity:** developer tooling, no product or PHI axis (sec. 0). **But one arm is a live FAIL OPEN in
+a security control**, which is why this is P1 rather than P2.
+
+**THE TWO QUESTIONS, AND THEY NEED DIFFERENT STRINGS:**
+
+| question | must read | if it reads the other |
+| --- | --- | --- |
+| *is there a danger KEY here* | **`$seg.Raw`** | quoting erases the key -- **`#1066`, fail open** |
+| *is this text a COMMAND or DATA* | **`$seg.Scan`** | prose becomes a command -- **`#1086`, false deny** |
+
+***THE SEGMENT OBJECT ALREADY CARRIES BOTH, and the rule already uses `Raw` for target resolution a few
+lines later.*** So the change is **not** *blank more* and **not** *blank less* -- it is **stop asking one
+string two questions.** That framing is the item.
+
+**MEASURED, against `origin/main`'s gate, both tools, with the unquoted row as the control proving the
+gate CAN see it:**
+
+| case | PowerShell | Bash |
+| --- | --- | --- |
+| `git config core.hooksPath /dev/null` | DENY | DENY |
+| `git commit -m $(...)` **unquoted** | DENY | DENY |
+| `git commit -m "$(...)"` **quoted** | **ALLOW** | **ALLOW** |
+| `echo` with a backtick-substituted disarm | -- | **ALLOW** |
+
+**Both shells EXECUTE `$(...)` inside double quotes** -- verified separately by substitution, `"a $(1+1)
+b"` becomes `a 2 b`. **So the disarm runs and the gate does not see it.** These rows are an INSTANCE of
+`#1066`, which frames the class around a `-C` TARGET; **this is a substitution in a MESSAGE flag that
+executes outright.**
+
+***THIS RULE HAS EATEN THREE FIXES, TWO OF WHICH SHIPPED GREEN SUITES OVER REAL FAIL-OPENS.***
+`95abca70` was ruled `DO_NOT_LAND` for weakening the gate and pinning the weakening with a test -- and
+its premise, *"a MESSAGE flag's quoted span is DATA"*, is **false for exactly two of the four quoting
+forms**, because **PowerShell substitutes before git is ever invoked**:
+
+| form | after substitution | safe to blank |
+| --- | --- | --- |
+| `"..."` | `a 2 b` | **NO** |
+| `@"..."@` | `a 2 b` | **NO** |
+| `'...'` | `a $(1+1) b` | yes |
+| `@'...'@` | `a $(1+1) b` | yes |
+
+**`95abca70` blanked more, which is `#1066`'s hole widened.** That is the predicted failure of a
+one-directional fix, and it already happened once.
+
+***THE BUILD CONSTRAINT, AND IT IS THE POINT OF FILING THIS SEPARATELY: MEASURE EVERY CANDIDATE AGAINST
+`#1066`'s BYPASS ROWS AND `#1086`'s FALSE-DENY ROWS IN ONE TABLE.*** A fix that only ever sees one of
+those two lists is how this rule has been broken three times. **A green suite is not evidence here
+unless the suite contains both lists.**
+
+**THIS DOES NOT CLOSE `#1066`, `#1069` or `#1086` BY SIDE EFFECT.** They are instances; this is the
+mechanism. Close each on its own rows passing, not on this landing.
+
+**Expiry:** this stops being right if the segment object stops carrying both `Raw` and `Scan`, or if
+rule 3c stops reading `Scan` for key detection.
+
+## 1337. The leak gate has no pattern for a security-record citation, and a bare-identifier screen would be switched off within a day
+
+> 🔢 **Filed 2026-08-23 - not started.** `scripts/security/scan_forbidden.py` screens routable IPs, worktree slugs, home paths, customer and vendor names, and site codes. **It has no pattern for a security-record identifier at all.** The obvious screen -- match the identifier shape -- is **measurably unusable**, and this row carries the working specification instead.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** leak gate / security tooling. **Priority:** P2. **Verdict:** build.
+**Severity:** no product or PHI axis (sec. 0). **The cost is a gate that cannot see one class of content
+it exists to keep out**, and -- if built naively -- **a gate loud enough that somebody disables it.**
+
+***THE NAIVE SCREEN IS UNUSABLE, MEASURED BEFORE ANY OF THIS WAS FILED.*** A shape-only match, filtered
+to real identifiers by corpus membership, over the **2026 tracked files** of this repository:
+
+| screen | files | occurrences | verdict |
+| --- | --- | --- | --- |
+| shape-only, corpus-filtered | 416 | **4582** | ***UNUSABLE*** |
+| context-required | 370 | 2248 | still far too broad |
+| **identifier NEAR a verdict word** | **1** | **tens** | **every hit real** |
+
+***THE ROOT CAUSE IS A GRAMMAR COLLISION: THESE IDENTIFIERS AND SEMANTIC VERSION NUMBERS ARE THE SAME
+SHAPE.*** `uv.lock` scored **229** and `ide/package-lock.json` **200** -- **every one a dependency
+version.** Corpus membership does not save you, because plenty of real identifiers are also plausible
+version numbers. **A gate firing 4582 times is switched off, and a gate that is off is worse than one
+that was never built, because the pipeline still shows a passing step.**
+
+**THE WORKING SPECIFICATION -- SCREEN FOR AN IDENTIFIER WITHIN N CHARACTERS OF A VERDICT WORD, NOT FOR
+IDENTIFIERS.** The distinction is what the identifier is DOING:
+
+- **A bare citation is a FORWARD reference** -- *this code was written with that requirement in mind*.
+  It does not assert coverage, does not assert a result, and does not name a gap. **Not record content.**
+- **An identifier sitting beside a verdict IS record content**, because the pair is the assessment.
+
+**BUILD CONSTRAINT -- TWO CONTROLS, BOTH REQUIRED, OR THE SCREEN IS NOT EVIDENCE:**
+
+1. **A prose citation carrying a verdict, which MUST fire.**
+2. **A lockfile dependency version, which MUST NOT.**
+
+**A screen with only the first is indistinguishable from one that matches everything; a screen with only
+the second is indistinguishable from one that matches nothing.** *Both failures were reached in ten
+minutes while deriving this spec, which is why they are written down as gates rather than advice.*
+
+**The identifier corpus is vendored and lawfully redistributable, so the membership filter needs no
+network and no private file.**
+
+**Expiry:** this stops being right if `scan_forbidden.py` gains a citation pattern, or if the identifier
+grammar stops colliding with semantic versions.
