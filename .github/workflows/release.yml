@@ -112,17 +112,75 @@ jobs:
           # deny-listed private docs on releases 0.1.0..0.2.15. This gate fails the release BEFORE the
           # (last-step) PyPI publish if any sdist member is outside the package + its standard metadata,
           # so a regression in the allowlist can never re-leak. Belt-and-suspenders to the pyproject pin.
-          sd=$(ls dist/*.tar.gz)
+          #
+          # THIS GATE DECIDES ON EVIDENCE OF A LISTING, NEVER ON THE ABSENCE OF MATCHES. The earlier
+          # body asked only the second question, and three inputs measured against it printed
+          # "package-only" and exited 0 having inspected nothing: two tarballs in dist/ (`sd` went
+          # multiline, so the tar argument was malformed, and one of the two carried
+          # docs/security/PRIVATE.md), a corrupt or truncated tarball, and a tarball listing zero
+          # members. Two more were caught only by luck: an empty dist/ died on the bare `ls` under the
+          # runner's `bash -e`, with no ::error:: annotation, and a foreign sdist tripped only because
+          # its own members happened to sit outside the allowlist. A green that inspected nothing is
+          # the worst outcome for the one step whose entire value is that a human believes it, so
+          # steps (1) to (4) below each PROVE something before the allowlist question is asked at all.
+          #
+          # `set -o pipefail` would not have fixed that, and is not what fixes it here. Measured: the
+          # old body under pipefail still printed package-only and returned 0 on all three, because
+          # the trailing `|| true` swallowed the status whichever pipeline element failed. Separating
+          # the listing from the filtering is what fixes it.
+
+          # (1) EXACTLY ONE sdist. Resolved through an array so zero matches and two matches are both
+          # visible as a count, instead of collapsing into one silently malformed `tar` argument.
+          shopt -s nullglob
+          sdists=(dist/*.tar.gz)
+          if [ "${#sdists[@]}" -ne 1 ]; then
+            echo "::error::leak gate needs exactly one sdist in dist/, found ${#sdists[@]}: ${sdists[*]:-none}"
+            exit 1
+          fi
+          sd="${sdists[0]}"
+
+          # (2) THE LISTING MUST SUCCEED. A corrupt or truncated tarball fails right here instead of
+          # handing the filter an empty member list that reads as clean. No pipe on this line on
+          # purpose: the status has to be tar's own, and in `tar ... | sed ...` it is the sed's.
+          if ! raw=$(tar tzf "$sd"); then
+            echo "::error::leak gate could not list $sd (tar failed), so nothing was inspected"
+            exit 1
+          fi
+          # every member carries the `<name>-<version>/` prefix; strip it to compare against the allowlist
+          members=$(sed -E 's#^[^/]+/##' <<<"$raw")
+
+          # (3) A LISTING OF ZERO MEMBERS is not a clean sdist, it is no evidence at all.
+          count=$(grep -c . <<<"$members" || true)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::leak gate listed $sd and got ZERO members, so nothing was inspected"
+            exit 1
+          fi
+
+          # (4) IT MUST BE OUR sdist. An allowlist check over some other project's tarball passes
+          # trivially and says nothing about the artifact this job is about to publish.
+          if ! grep -qE '^messagefoundry/' <<<"$members"; then
+            echo "::error::leak gate found no messagefoundry/ package tree in $sd, so this is not the MessageFoundry sdist"
+            exit 1
+          fi
+
+          # Only now the allowlist question.
           # allowlist = the package tree + the metadata files hatchling force-includes in every sdist
           # (PKG-INFO, pyproject.toml, .gitignore) + README/CHANGELOG + license files (root or licenses/).
-          leak=$(tar tzf "$sd" | sed -E 's#^[^/]+/##' \
-            | grep -vE '^(messagefoundry/|licenses/|README\.md$|CHANGELOG\.md$|LICENSE$|NOTICE$|PKG-INFO$|pyproject\.toml$|\.gitignore$|$)' || true)
+          #
+          # KEEP THE `|| true` ON THIS GREP. grep exits 1 when it matches nothing, and "nothing outside
+          # the allowlist" is the CLEAN case, so a nonzero status here is a pass. The bug was never
+          # `|| true` itself: it was that ONE `|| true` covered BOTH the tar and the grep, so an
+          # upstream listing failure and a clean result became the same empty string. The listing is
+          # proved separately above, which is what makes this `|| true` safe. Do not merge the two
+          # back into a single pipeline.
+          leak=$(grep -vE '^(messagefoundry/|licenses/|README\.md$|CHANGELOG\.md$|LICENSE$|NOTICE$|PKG-INFO$|pyproject\.toml$|\.gitignore$|$)' <<<"$members" || true)
           if [ -n "$leak" ]; then
             echo "::error::sdist contains non-package files — private-doc leak guard tripped:"
             printf '%s\n' "$leak"
             exit 1
           fi
-          echo "sdist is package-only ✓"
+          # Print the COUNT, not just a word: a green log line has to show the gate inspected something.
+          echo "sdist is package-only: inspected $count members in $sd, none outside the allowlist"
 
       - name: Smoke-check the built wheel (clean venv → import + version)
         run: |
