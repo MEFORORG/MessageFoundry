@@ -11394,16 +11394,32 @@ only check that reads the CODE, and it is the one that decides startability.***
 > **The step-up gate on the sole remedy is a CONSTRAINT here, not a mitigation** (`auth_routes.py:757`, `require_step_up(Permission.USERS_MANAGE)`). It is correct on its own axis and it makes this case harder, which is precisely the shape #1131's amendment first got backwards.
 > **How to prove a fix:** lock the sole administrator, then recover **without** editing the database by hand and **without** an already-authenticated second admin -- and assert the recovery path is itself gated, since an unlock affordance is a control an attacker wants. A fix that only lengthens the docs, or that opens an ungated reset, fails on opposite sides.
 
-***CORRECTED 2026-08-23. A DISPATCH BRIEF STATED THAT `admin-unlock` SHIPPED IN `3ab27755`. IT DID NOT.***
-*That commit's **SUBJECT** says sole-admin lockout recovery; its **CONTENT** adds no `locked_until` line to `auth/service.py`, and no account-unlock affordance exists anywhere in `messagefoundry/`.* **Control: `locked_until` appears 7 times in that file, so the search fires.** ***A COMMIT SUBJECT IS NOT A CONTENT CHECK*** -- *the brief was produced by a verification pass whose own instructions forbade deciding from commit messages.*
+***RE-CORRECTED 2026-08-23, SAME HOUR. `admin-unlock` DOES SHIP, AND AN EARLIER CORRECTION IN THIS ROW
+CLAIMING OTHERWISE WAS ITSELF WRONG.*** *Verified repo-wide with both controls firing:* **`__main__.py:603`
+registers the `admin-unlock` subcommand with `--username`, `--db` and `--json`; `:3962` clears the lock via
+`record_login_failure(user.id, failed_attempts=0, locked_until=None)`; `:3964` audits `auth.admin_unlocked`.**
+*`3ab27755` added 92 lines to `__main__.py`.*
 
-**AND THE SCOPE IS THREE SITES, NOT ONE.** *The brief named `service.py:800` alone.* ***The refusal is emitted at `:797` (password), `:2243` (MFA) and `:2608` (WebAuthn), so a duration fix at one leaves two inconsistent*** -- *an error in the narrowing direction, which is the one that yields a half-fix that reads as complete.*
+***SO THE ON-DEMAND AFFORDANCE ALREADY EXISTS AND NEEDS NO BUILD.*** **What remains is narrower:** *a
+**duration-bearing refusal** is absent at all three sites -- `:797` password, `:2243` MFA, `:2608`
+WebAuthn -- and **lock CYCLES are still uncapped**, since `_register_failure` has no counter.*
 
-***THE ENUMERATION TENSION IS ALREADY SPENT AND NEEDS NO OWNER RULING.*** *`"account locked"` at `:797` is **already distinct** from `"invalid credentials"` at `:795`, `:819` and `:856`, so a duration-bearing refusal **refines a signal that already ships** rather than opening a new disclosure class.*
+**THE ENUMERATION TENSION IS SPENT AND NEEDS NO OWNER RULING:** *`"account locked"` is **already
+distinct** from `"invalid credentials"` at `:795`, `:819` and `:856`, so a duration-bearing refusal
+refines a signal that already ships.*
 
-**RECOVERY EXISTS MECHANICALLY AND IS UNREACHABLE.** *`set_password` clears the lock at `store.py:7897`* -- ***but a sole administrator who is locked out cannot authenticate to call it, and 38 argparse subcommands contain no user, passwd or unlock path.*** **The gap is an out-of-band, admin-facing affordance.**
+## ***HOW THE WRONG CORRECTION WAS PRODUCED, BECAUSE THE CONTROL IS THE LESSON***
 
-***SCOPE RULED 2026-08-23: BUILD THE ON-DEMAND RECOVERY, DO NOT RE-SCOPE TO SELF-EXPIRY.*** *Waiting `lockout_minutes` is a workaround, not recovery, for an item whose premise is that **nobody else exists to unlock you**.* **A re-scope to declare self-expiry acceptable routes to the owner; confirming the original scope did not.**
+*Three layers failed in the same direction:* **a `git show <commit> -- auth/service.py` search returned a
+zero that was TRUE FOR THAT FILE and was published as repo-wide** -- *`admin-unlock` lives in
+`__main__.py`;* **the backstop was both FILTERED and TRUNCATED with `head -8`, so it never reached the
+right file;** *and a control WAS printed and DID pass.*
+
+> ***THE CONTROL CONFIRMED THE INSTRUMENT WORKED ON THE FILE THAT WAS SEARCHED, NOT ON THE CLAIM THAT WAS
+> MADE. A CONTROL THAT CERTIFIES YOUR SCOPE INSTEAD OF YOUR CLAIM IS NOT A CONTROL.***
+
+**A scoped search whose scope is wrong produces a true zero and a false conclusion, and a control drawn
+from the same scope cannot see it.** *The claim was repo-wide; every instrument was file-wide.*
 
 > **AMENDED 2026-08-21 -- THE TEST ABOVE PASSES TODAY, BY WAITING, so it cannot discriminate a fixed system from the shipped one.** The lock is time-bounded and clears itself, by default in 15 minutes (`auth/service.py:851-853`, `auth/policy.py:103`), and simply waiting recovers the account **without** hand-editing the database and **without** a second authenticated admin -- satisfying the criterion above exactly as written. **An acceptance test that a defect-free system and the defective system both pass is not an acceptance test.** A usable criterion has to exclude the passage of time: recovery must be reachable **on demand**, gated, and **faster than `lockout_minutes`**, or the item must say plainly that self-expiry is the accepted recovery and re-scope to what is actually owed. **Measured while amending this, and it settles a limb the premise correction had flagged unmeasured:** an ACTIVE lock cannot be extended -- `service.py:739` returns at `:742` before `_register_failure` at `:746` -- but the NUMBER of lock cycles is unbounded, which `docs/SECURITY.md` already words as bounding the lock rather than the campaign. **Amendment only; no status, score or tier changed by this edit.**
 > Verdict: build
