@@ -22,16 +22,36 @@
 # codes below. A genuine test failure exits 1 and is re-raised immediately, never retried.
 # Our own Python cannot cause a native segfault — a real logic regression surfaces as a
 # pytest assertion (exit 1), so this wrapper can never hide one. Each retry emits a visible
-# ::warning:: (grep CI logs for "Native crash" to track the flake frequency against #1459).
+# ::warning:: (grep CI logs for "NATIVE CRASH" to track the flake frequency against #1459).
 #
 # REMOVE THIS WRAPPER once #1459 ships a fix and pyproject's pyodbc floor moves to the fixed
 # release (the throughput-invariant step in .github/workflows/ci.yml calls this).
 #
+# THE ATTRIBUTION IS PER-CALLER, AND THAT IS THE POINT (BACKLOG #1260). The pyodbc class above is
+# ESTABLISHED for the database legs and is NOT established anywhere else. A wrapper that names it
+# unconditionally would print a cause it has not measured onto every leg it is ever added to -- a
+# true observation (a native crash happened) carrying an invented mechanism, which is the harder
+# error to catch because the part a reader checks is true. So callers where the class is NOT known
+# set RETRY_NATIVE_CRASH_CAUSE="" and the message says so in words.
+#
 # Usage: scripts/ci/retry-native-crash.sh <cmd> [args...]
 # Env:   RETRY_NATIVE_CRASH_ATTEMPTS (default 3)
+#        RETRY_NATIVE_CRASH_CAUSE    attribution clause; default names the pyodbc class (correct for
+#                                    the database legs). Set to "" on any leg where it is unproven.
 set -uo pipefail
 
 attempts="${RETRY_NATIVE_CRASH_ATTEMPTS:-3}"
+
+# Defaulting to the pyodbc clause keeps the nine database-leg call sites saying exactly what they
+# say today; only a caller that has NOT established the class has to opt out.
+default_cause=" -- likely the pyodbc py3.14 parameter-binding segfault (mkleehammer/pyodbc#1459)"
+cause="${RETRY_NATIVE_CRASH_CAUSE-$default_cause}"
+if [ -z "$cause" ]; then
+  # DELIBERATELY NAMES NO CLASS, NOT EVEN TO WARN AGAINST ONE. An earlier draft said "do not
+  # assume the pyodbc class" and its own test caught it: that puts the token in the annotation,
+  # so a log grep for pyodbc matches the ONE leg where the class is explicitly not established.
+  cause=" -- CAUSE NOT ESTABLISHED for this leg; do not infer the database-leg crash class"
+fi
 
 # A process killed by signal N exits with 128+N. 139 = 128+SIGSEGV(11) (the observed
 # segfault); 134 = 128+SIGABRT(6) (the param/TVP path can abort() with a core dump instead).
@@ -51,9 +71,9 @@ for n in $(seq 1 "$attempts"); do
     exit "$rc"
   fi
   if [ "$n" -lt "$attempts" ]; then
-    echo "::warning::Native crash (exit ${rc}) on attempt ${n}/${attempts} — likely the pyodbc py3.14 parameter-binding segfault (mkleehammer/pyodbc#1459); retrying."
+      echo "::warning::NATIVE CRASH (exit ${rc}) on attempt ${n}/${attempts}${cause}; retrying."
   fi
 done
 
-echo "::error::Command still crashing after ${attempts} attempts (exit ${rc}); see mkleehammer/pyodbc#1459."
+echo "::error::NATIVE CRASH persisted: still crashing after ${attempts} attempts (exit ${rc})${cause}."
 exit "$rc"

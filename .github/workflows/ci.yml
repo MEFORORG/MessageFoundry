@@ -740,6 +740,9 @@ jobs:
           FAULT_TIMEOUT: ${{ matrix.fault_timeout }}
           PYTEST_TIMEOUT: ${{ matrix.pytest_timeout }}
           PYTEST_WORKERS: ${{ matrix.pytest_workers }}
+          # BACKLOG #1260: empty on purpose -- see the comment above the run line. The wrapper's
+          # default clause names the pyodbc class, which is not established for this leg.
+          RETRY_NATIVE_CRASH_CAUSE: ""
         # `--ignore-glob` subtracts the web console package, which runs as its OWN step below. BACKLOG
         # #1027 added that package to the root `testpaths` so a bare local `pytest` stops silently
         # excluding it; without this subtraction the SAME 356 tests would then run TWICE on every leg.
@@ -777,7 +780,18 @@ jobs:
         # what happens when the selection lives in the run body -- the obvious spelling (`--ignore`) was
         # the one that silently did nothing. One list, read in one place, asserted by
         # tests/test_tooling_partition.py, which also pins the two halves of this wiring.
-        run: pytest -q -n "$PYTEST_WORKERS" --dist loadfile -m 'not tooling' --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
+        # BACKLOG #1260: WRAPPED SO A NATIVE CRASH IS NOT REPORTED AS A TEST FAILURE. A segfault kills
+        # the interpreter, so pytest returns 139/134 with no verdict and THREE layers of naming then
+        # say "tests failed" -- the check name, the step name, and `steps.tests.outcome`, which is what
+        # `step_margin.py` below consumes. None of them is true: the engine was fine and a process died.
+        # The wrapper re-runs ONLY on 139/134 and re-raises exit 1 immediately, so it cannot mask a
+        # regression.
+        #
+        # RETRY_NATIVE_CRASH_CAUSE IS DELIBERATELY EMPTY HERE. The wrapper's default clause names the
+        # pyodbc py3.14 class, which is ESTABLISHED for the database legs and is NOT established for
+        # this one -- the item filing this refuses to conclude it. An empty value makes the annotation
+        # say CAUSE NOT ESTABLISHED rather than assert a mechanism nobody has measured on this leg.
+        run: bash scripts/ci/retry-native-crash.sh pytest -q -n "$PYTEST_WORKERS" --dist loadfile -m 'not tooling' --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
 
       # THE MARGIN CHECK (BACKLOG #344 proposal 1). Last in the job so a LOW margin cannot skip a suite
       # that has not run yet -- a step `if:` with no status function carries an implicit `success()`,
