@@ -11153,6 +11153,37 @@ backends outright** -- worse than an untested migration.
 **THE HONEST RESIDUAL, WHICH THE BUILD MUST STATE:** an existing DEVELOPER server database **will not be
 renamed**, because `CREATE TABLE IF NOT EXISTS` skips a table that already exists. ***It fails at QUERY
 TIME rather than at open.*** **The remedy is to drop and re-create it.**
+
+***FURTHER AMENDMENT 2026-08-23. THERE ARE TWO `owner` COLUMNS IN THESE MODULES, AND A SYMBOL-LEVEL
+RENAME IS THE WRONG INSTRUMENT FOR THIS ITEM.***
+
+| column | where | what it is |
+| --- | --- | --- |
+| `search_presets.owner` | `store.py:1753`, `postgres.py:611`, `sqlserver.py:1534` | **this item's subject** |
+| **`queue.owner`** | `postgres.py:275`, `sqlserver.py:1133` | ***the row-claim LEASE HOLDER*** |
+
+***THE SECOND IS RELIABILITY-CRITICAL AND IT IS DECLARED IMMEDIATELY ABOVE `lease_expires_at`.*** The
+release path nulls the two in a single statement -- `UPDATE queue SET ... owner=NULL,
+lease_expires_at=NULL` at `postgres.py:2932`, `:2971`, `:3071`, `:3196`, `:3226`, `:3313`. **So it is
+the exact mechanism that makes a crashed worker's rows reclaimable**, which is the at-least-once
+invariant section 2 forbids breaking.
+
+***AND IT WOULD BREAK QUIETLY:*** the suites that would catch it are the ones exercising a lease
+**expiring**, not the preset suites a renamer would run.
+
+**THE CODE ALREADY NAMES THE DISTINCTION**, at `store.py:380`: *"Distinct from the row-claim `owner`
+column (a per-store-instance identity, stamped on Postgres only, NOT stable across a restart)"*.
+
+***SO THIS ROW IS COSTED AGAINST AN OPERATION THAT MUST NOT BE PERFORMED.*** A find-and-replace on
+`owner` is not a cheap version of this change; **it is a different and dangerous change.** Two columns
+share one name inside the same three modules, so ***every candidate site must be READ, not matched***.
+**No rename-surface count belongs in this row** -- an earlier figure offered as one was withdrawn by its
+author on measuring what it actually counted, and no correct figure replaces it, because the number is
+not the hazard.
+
+**REQUIRED, AND IT OUTLIVES THIS ITEM: a test asserting `queue` STILL HAS a column named `owner`, so an
+over-broad future rename goes RED.** *Build the guard before the change it guards -- a guard that lands
+afterwards never guarded anything.*
 ## 1233. `delete_user` never removes `search_presets`, so an account deletion strands encrypted PHI-shaped `criteria`
 
 > ✅ **SHIPPED -- verified by content on `origin/main` 2026-08-20, ALL THREE BACKENDS AND THE TEST LIMB, not one of them.** `delete_user` purges `search_presets` in `store/store.py`, `store/postgres.py` and `store/sqlserver.py` -- one keyed purge each, alongside five DELETEs each. **Coverage exists for all three:** `tests/test_postgres_store.py` and `tests/test_sqlserver_store.py` directly, and the SQLite/default path through `tests/test_search_presets_api.py`. **That test is non-vacuous by construction and was checked as such rather than counted:** it asserts a PRECONDITION that the preset exists before deletion, then asserts the purge on both the id and the freed username. **It also carries two independent controls** -- it re-inserts the captured row afterwards, because with the row purged #1225's key assertions would pass TRIVIALLY and stop being evidence about the key at all. **And it records the retraction in place:** the assertion it replaced said the exact opposite, which was true when written and is the defect this item fixes. **Closed on the release condition this project uses -- the fix TEXT on `main` -- not on a merged badge.** The holder's claim can be released; that condition is met.
