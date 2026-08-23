@@ -11807,6 +11807,43 @@ that it is a **cross-repo DESIGN problem touching the vault boundary**, not an i
 while naming no cell id, and that the blocking limb inherits a precondition.* ***The realistic outcome
 in a short window is a half-designed cross-repo control, and a half-built control is the defect this
 whole cluster exists to prevent.***
+
+***AMENDMENT 2026-08-23. THIS ROW SPECIFIES ITS OUTPUT CONSTRAINT PRECISELY AND ITS INPUT NOT AT ALL,
+AND THE DISCLOSURE RISK IS ENTIRELY IN THE INPUT. DO NOT BUILD IT AS FILED.***
+
+**Measured across the whole body: `manifest`, `digest`, `hash`, `token`, `credential`, `fetch` and
+"anchor set" each occur ZERO times.** *The row never says where the check gets its data.*
+
+***WHY THAT IS FATAL RATHER THAN AN OMISSION.*** Its own acceptance test is that an engine pull request
+**goes red BEFORE merge** when a pinned line is deleted. **For engine CI to do that, it must know WHICH
+LINES ARE ANCHORED at check time -- and the engine has none of that data, by deliberate design.**
+
+***AND THE ANCHOR SET IS ITSELF THE VAULTED THING.*** A list of anchored engine lines **IS a coverage
+map**, and section 12's stated harm is exactly this: such a map **hands out what is NOT covered by
+subtraction.** ***IT DISCLOSES WITH ZERO IDENTIFIERS PRESENT.***
+
+***SO THIS ROW'S CONSTRAINT -- report the line, never the identifier -- IS NECESSARY AND NOT SUFFICIENT.
+It governs the FAILURE OUTPUT. The risk lives in the INPUT, which the row does not mention.***
+
+**THE FORK, AND BOTH BRANCHES CARRY A COST THIS ROW DOES NOT STATE:**
+
+| option | buildable | the cost the row omits |
+| --- | --- | --- |
+| **(a)** publish an anchor manifest into the public repo | today, no credentials | ***the manifest AT REST is the coverage map*** -- hashing the CONTENT does not help, because **the paths and lines ARE the coverage** |
+| **(b)** fetch the anchor set at CI time with a vault read credential | yes | ***gives public-repo CI a vault credential***, and a public CI log is one careless trace flag from dumping what it fetched |
+| **(c)** keep it vault-side; make the EXISTING daily run change state observably | yes | does not deliver pre-merge -- **but opens NO new disclosure surface** |
+
+***RECOMMENDED: (c) NOW, WITH (a)-VERSUS-(b) ESCALATED TO THE OWNER.*** This row's own text says the
+third gap bites worst -- *a detector whose output is a count inside an already-failing, non-blocking job
+is indistinguishable from the same job yesterday.* **(c) fixes that and leaves the other gaps HONESTLY
+OPEN rather than answered by a design nobody ratified.**
+
+***(a) VERSUS (b) IS NOT A BUILDER'S CALL AND NOT A DISPATCHER'S.*** Both change what a public
+repository discloses about security coverage. **That is the owner's under section 12.**
+
+**AND A PRECONDITION THIS ROW ALREADY STATES, NOT TO BE LOST IN ANY RE-SCOPE:** making the verify job a
+required context **without first clearing the standing failures** *"converts a silent problem into a
+permanently blocked repository."* **That ordering is not the builder's to clear either.**
 ## 1246. the scorecard's residual prose carries 1,965 ungated file-line citations, and an enumeration in prose can understate a cell's own gap
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **2/10** · _fill-in_. The unchecked half is confirmed in the verifier: scripts/asvs/scorecard.py touches residual only to require non-empty prose on an na verdict (:451-453), to load it (:559) and to render it (:1998), and the retired anchor window is documented at :105-125, so no residual file-line citation is validated. The 7.2.4 evidence re-derives at HEAD, seven mark_session_* sites in messagefoundry/auth/service.py (:1582, :1822, :2160, :2195, :2199, :2464, :2597) against the two the residual enumerates, and _rotate_session_token (:1614) has callers only in tests/test_session_rotation_primitive.py; value 5 and difficulty 2 because SDS-3.6 already carries the general rule and the stated remedy is a filing rule, deliberately not a new gate. _(was 6/10 · 4/10.)_
