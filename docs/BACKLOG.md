@@ -11844,6 +11844,30 @@ repository discloses about security coverage. **That is the owner's under sectio
 **AND A PRECONDITION THIS ROW ALREADY STATES, NOT TO BE LOST IN ANY RE-SCOPE:** making the verify job a
 required context **without first clearing the standing failures** *"converts a silent problem into a
 permanently blocked repository."* **That ordering is not the builder's to clear either.**
+
+***PRECEDENT WARNING 2026-08-23, from the seat that owns this vocabulary: TODAY'S OWNER RULING DOES NOT
+COVER OPTION (a), AND MUST NOT BE CITED AS PERMISSION FOR IT.***
+
+**The ruling sanctioned an individual pairing WHEN IT JUSTIFIES A DECISION** -- its whole basis is that
+a single citation in a design record or a tool comment **explains why something was built.** ***IT SAYS
+NOTHING ABOUT ENUMERATION.***
+
+***AN ANCHOR MANIFEST IS THE COMPLETENESS CASE, WHICH IS THE ONE SECTION 12 ACTUALLY FORBIDS.*** And it
+is **STRONGER than the map that was already declined for exactly this reason**: a map pairs requirements
+with items, whereas ***a manifest pairs them with FILE PATHS AND LINES*** over a closed domain -- so it
+hands out the uncovered surface by subtraction **and** tells a reader precisely where each covered
+control lives. **That is the artifact itself, not a citation about it.**
+
+| option | against today's ruling |
+| --- | --- |
+| **(a)** publish an anchor manifest | ***NOT COVERED. Enumeration over a closed domain -- the forbidden case.*** |
+| **(b)** fetch at CI time with a credential | discloses nothing publicly; the cost is a credential and a dependency |
+
+***SO IF THE OWNER PICKS (a), THAT IS A NEW DECISION AND NOT AN APPLICATION OF THIS MORNING'S.***
+
+**Recorded because the ruling WILL read as broader than it is.** *Two seats reasoned from "identifiers
+appear publicly, so this is fine" today and both were wrong in different directions.* **A narrow ruling
+cited as a general permission is how the next disclosure gets argued into place.**
 ## 1246. the scorecard's residual prose carries 1,965 ungated file-line citations, and an enumeration in prose can understate a cell's own gap
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **2/10** · _fill-in_. The unchecked half is confirmed in the verifier: scripts/asvs/scorecard.py touches residual only to require non-empty prose on an na verdict (:451-453), to load it (:559) and to render it (:1998), and the retired anchor window is documented at :105-125, so no residual file-line citation is validated. The 7.2.4 evidence re-derives at HEAD, seven mark_session_* sites in messagefoundry/auth/service.py (:1582, :1822, :2160, :2195, :2199, :2464, :2597) against the two the residual enumerates, and _rotate_session_token (:1614) has callers only in tests/test_session_rotation_primitive.py; value 5 and difficulty 2 because SDS-3.6 already carries the general rule and the stated remedy is a filing rule, deliberately not a new gate. _(was 6/10 · 4/10.)_
