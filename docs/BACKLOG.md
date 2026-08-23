@@ -13283,8 +13283,13 @@ doubted.**
 **REMAINS OPEN AND UNCLAIMED.** *A second approach is genuinely new work rather than a continuation, so
 it was correctly not started under a rung that holds STARTING.*
 
-**The lane's fuller notes on where to begin live in its own handoff; this row carries the measured
-result, which is the part that must survive the handoff.**
+**WHERE A SECOND ATTEMPT SHOULD BEGIN, from the lane that measured the first:** try the non-enumerating
+output form, **or the comma on the EARLY RETURN ONLY**, leaving the wrapped result alone -- *the comma on
+BOTH fights the caller's own wrap and nests a populated result.* **The two suites that caught it are the
+scan-agreement and wiring tests; 22 pass on the reverted baseline.**
+
+**The lane's fuller notes live in its own handoff; this row carries the measured result and the starting
+point, which are the parts that must survive it.**
 ## 1292. connscale smoke reports a message acked but not observed at intake, and nothing discriminates harness race from real intake loss
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **3/10** · _quick win_. The harness-race branch has been substantially absorbed by the excusal and intake floor at runner.py:869-905, whose comment names this exact flake, but the discriminator the item asks for does not exist -- nothing checks whether an ingress row was written for the message counted lost, so the count-and-log branch is still not ruled out and no other instrument can rule it out. Difficulty is a store lookup wired into the record-building seam plus a test, with both ends of that seam already present (per-send control_id at sender.py:186, per-backend store access at runner.py:373-377). _(previously unscored.)_
