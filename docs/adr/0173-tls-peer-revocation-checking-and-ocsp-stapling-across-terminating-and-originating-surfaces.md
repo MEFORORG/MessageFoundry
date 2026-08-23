@@ -193,7 +193,7 @@ control on a premise that is false for that transport.
 
 ### 1.6 Three hops cross with no signal at all
 
-Three originating hops have **no guard of any kind** — no refusal, no warning, no audit line — and two
+**TWO CONFIRMED originating hops** have **no guard of any kind** — no refusal, no warning, no audit line — **and the true population is larger and UNGRADED; the count and its correction live in §4.3 and nowhere else.** Two
 of the three carry authentication material:
 
 | Hop | Site | Crosses with |
@@ -234,7 +234,7 @@ one build rider that the accept reasoning does not reach.**
 - **Direction 3 (the shipped opt-in client-certificate CRL): unchanged, and it does not count toward
   either graded direction.** It stays opt-in and default-off. The record must not cite it as partial
   12.1.4 coverage.
-- **The three unguarded hops in §1.6 are NOT accepted.** Accepting the *mechanism* is not accepting
+- **The unguarded hops in §1.6 are NOT accepted** (count and scope: §4.3). Accepting the *mechanism* is not accepting
   *silence*. Closing them needs no new dependency, no new control and no stapling, so the reasoning
   that justifies the rest does not apply to them. See §4.3.
 
@@ -357,7 +357,7 @@ The three hops at §1.6 get the same posture-keyed treatment their siblings alre
 exists and the call is one statement: `refuse_unrevoked_verified_hop(scheme, url, connector=,
 revocation_attested=)` at `transports/rest.py:656-679`, called in exactly that shape by five
 siblings (`fhir.py:370`, `dicomweb.py:261`, `rest.py:1347`, `soap.py:403`, and `email.py:239` via
-`RevocationHopGuard.capture`). **All three unguarded hops also lack `harden_verify_flags`** -- measured at HEAD, it occurs zero times in `logging_setup.py`, `auth/oidc_http.py`, `transports/smart.py` and `transports/rest.py` alike, against a positive control of seven files that do carry it. An earlier draft of this ADR presented the omission as peculiar to syslog; it is not, and the corrected reading strengthens the rider rather than weakening it -- the gap spans the group.
+`RevocationHopGuard.capture`). **The unguarded hops also lack `harden_verify_flags`** -- measured at HEAD, it occurs zero times in `logging_setup.py`, `auth/oidc_http.py` and `transports/rest.py` alike, against a positive control of seven files that do carry it. (`transports/smart.py` was in this measured list and is REMOVED: it has no `ssl` usage at all, so it is not a member of the population -- see the withdrawal in §4.3.) An earlier draft of this ADR presented the omission as peculiar to syslog; it is not, and the corrected reading strengthens the rider rather than weakening it -- the gap spans the group.
 
 **Filed by subject, deliberately unallocated** (CLAUDE.md §"Never CITE a `#N` you have not
 allocated"): *revocation-guard parity for the SMART token endpoint, the OIDC token and JWKS legs, and
@@ -370,7 +370,7 @@ record: `transports/direct.py:250-253` shows, in a shipped comment, that DIRECT 
 `RevocationHopGuard` partly because adding it "would make the enumerated count eight and force four
 'seven verifying hops' docs to change". That comment gives a real second reason and records the
 choice honestly, which is the right instinct. But SDS-3.6 says a completeness claim is a liability,
-and an accept-and-document ruling that left three unguarded credential hops outside the count would
+and an accept-and-document ruling that left the unguarded credential hops outside the count would
 write a number a reader treats as coverage.
 
 ## 5. Consequences
@@ -380,7 +380,7 @@ write a number a reader treats as coverage.
 - The 12.1.4 record stops oscillating between "unbuilt" and "impossible" for direction 1. The runtime
   probe in §1.2 is reproducible in under a second, with no engine tree, corpus or network.
 - Direction 3 stops being miscounted as partial coverage of directions 1 or 2.
-- The three unguarded credential hops are named and owned instead of being invisible inside an
+- The unguarded credential hops are named and owned (§4.3) instead of being invisible inside an
   enumeration.
 - Nothing in the tree claims a revocation check it does not perform. The refusals name the missing
   check and the two ways to prove it in front (`tls_policy.py:1033-1037`, `__main__.py:1729-1736`).
