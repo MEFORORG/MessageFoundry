@@ -1351,11 +1351,33 @@ jobs:
           # and run ONLY on the server-DB legs, so a file not matched here edits with NO real SS/PG
           # coverage (it merely skips the gated leg). Keep this in sync with those steps
           # (docs/archive/throughput/throughput-build-plan.md).
+          #
+          # AND THE INVARIANT BINDS THE SOURCES THOSE SUITES ASSERT AGAINST, NOT ONLY THE TEST FILES
+          # THEY RUN (BACKLOG #1322). Binding the asserting file but not the asserted-on file cannot
+          # see this class, and it has already fired: #514 (BACKLOG #1187) added a `masked` key to the
+          # summary_access audit detail built by messagefoundry/api/app.py::_emit. It touched api/ only,
+          # so serverdb evaluated FALSE, the DB legs never ran on its PR, and push never runs them. It
+          # merged green leaving tests/test_postgres_store.py and tests/test_sqlserver_store.py
+          # asserting the old two-key shape, and the NEXT PR to select those legs inherited three reds
+          # it did not cause.
+          #
+          # MEASURED, not reasoned about: of the 36 messagefoundry modules the gated suites import,
+          # EIGHTEEN were unmatched here -- not just api/app, but __main__, parsing/, six pipeline/
+          # modules and config/models. The source arms below now admit all 36, and
+          # tests/test_serverdb_ci_coverage.py::test_serverdb_path_gate_admits_every_source_those_suites_import
+          # DERIVES that set from the suites' own imports and fails if one stops being admitted -- so
+          # this is enforced rather than merely written down here. Import-reachability is a PROXY for
+          # "asserts against": it is what a machine can check, and it is deliberately wider than the
+          # assertion set rather than narrower.
+          #
+          # This does NOT widen the push/schedule arms. Skipping these legs on push is deliberate
+          # (see the no-per-merge-run guard below); the PR arm is the only one that can catch a
+          # change BEFORE it lands, which is why the hole mattered.
           # The transports/ + config/wiring arms are the CAPTURE SURFACE: capture_response / reingress_to
           # are declared there (ADR 0013), and SQL Server / Postgres both declare supports_response_capture
           # + supports_pt_reingress True — so a regression in that surface is a SERVER-DB regression and must
           # pull these legs, not just the SQLite suite.
-          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/pipeline/(cluster|wiring_runner|stage_dispatcher)|messagefoundry/config/(settings|wiring)|messagefoundry/transports/(base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner)|\.github/workflows/ci\.yml)'; then
+          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/api/app|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|sharding|stage_dispatcher|wiring_runner)|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner)|\.github/workflows/ci\.yml)'; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
