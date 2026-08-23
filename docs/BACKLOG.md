@@ -14614,3 +14614,47 @@ network and no private file.**
 
 **Expiry:** this stops being right if `scan_forbidden.py` gains a citation pattern, or if the identifier
 grammar stops colliding with semantic versions.
+
+## 1338. The ledger check is count-preserving, so a duplicated banner field is invisible to it
+
+> 🔢 **Filed 2026-08-23 - not started.** Every seat verifies a ledger edit with `parse_items` totals -- item count and open count. **A duplicated banner field line adds no item, flips no status and moves no count**, so that check reads perfectly clean over a corrupted row. **Reached as a live near-miss on 2026-08-23, caught by a human instruction rather than by any gate.**
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** ledger tooling. **Priority:** P2. **Verdict:** build.
+**Severity:** no product axis (sec. 0). The cost is **a silently corrupted machine-readable ledger** that
+every downstream screen then trusts.
+
+**THE NEAR-MISS, MEASURED.** One migration was built twice -- once on a branch off a dispatcher branch,
+which the ledger gate correctly refused, and once off `main` after a route was found. **Both carried the
+same 93 field lines.** Had both landed, **93 duplicate `> Research: done` lines would have gone in** and
+the check every seat quotes -- *total items and open count unchanged* -- **would have reported success.**
+
+***WHAT SAVED IT WAS THAT ONLY ONE CARRIER REACHED THE REMOTE, PLUS AN EXPLICIT DO-NOT-LAND WRITTEN BY
+HAND. THAT IS LUCK AND A HUMAN INSTRUCTION, NOT A CONTROL.***
+
+**THE BUILD.** A check that counts **occurrences per item per banner key** and fails on more than one.
+`parse_items` already isolates the banner block and `_FIELD_KEYS` already names the three keys, so the
+parsing is done -- **what is missing is that `Item.fields` is a DICT, and a dict cannot represent the
+defect.** The second occurrence silently overwrites the first. *A duplicate-detecting check must read the
+banner lines, not the parsed mapping.*
+
+**Two controls, both required:** a row with a duplicated key that **MUST** fail, and a clean corpus that
+**MUST** pass. *A gate proven only against a clean corpus is indistinguishable from one that matches
+nothing -- which is the defect `a92ab10f` fixed elsewhere in this repo.*
+
+***THE GENERAL SHAPE, RECORDED BECAUSE IT PRODUCED THREE MEASURED INSTANCES IN ONE NIGHT: EVERY CHECK
+THE FLEET RUNS ASKS ABOUT ONE ARTIFACT, AND THESE FAILURES ARE ALL ABOUT PAIRS.***
+
+| instance | the check that passed | what it could not see |
+| --- | --- | --- |
+| this item | two refs verified individually | content present on **both** |
+| a branch mix-up | a commit's content verified | that it sat on the **wrong ref** |
+| `#1332` filed over open `#1086` | three dispatch screens, per item | that **another item already covered it** |
+
+**A PAIR-SHAPED DEFECT IS INVISIBLE TO ANY NUMBER OF CORRECT SINGLE-ARTIFACT CHECKS.** *This item builds
+the control for the first row only; the other two are recorded as motivation, not as scope.*
+
+**Expiry:** this stops being right if `Item.fields` stops being a mapping, or if the ledger gains a
+per-field occurrence check by another route.
