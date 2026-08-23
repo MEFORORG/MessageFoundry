@@ -13652,4 +13652,64 @@ intake loss      engine_read 35 below confirmed sent 36 -- one message lost on i
 **NOT MEASURED, DO NOT INFER:** whether the two assertions share a root cause -- nothing here shows it either way. Neither failure was reproduced locally; both figures are read off CI. The three-PR count is the lander's observation across one evening and is not a rate.
 
 **Source:** surfaced by the LANDER while attributing reds on #529 and #530; the six-assertion count and the required-context arithmetic are the DISPATCHER's, whose handoff routed the content here for filing.
+## 1324. Promote Verdict/Research/Closing-act into the banner block parse_items reads
+
+> 🔢 **Re-scored 2026-08-22.** Filed by the workflow-analysis seat. **Priority:** P2. **Verdict:** build
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** ledger tooling. **This item carries the three fields itself, as the worked example the
+migration should copy.** The inline `**Verdict:** build` above is the OLD form, kept so the script
+that promotes it has a case with both spellings present.
+
+**The defect, measured 2026-08-22.** 304 of 330 open items declare a `**Verdict:**`, and **zero of
+them are inside the banner blockquote**, which is the only region `scripts/docs/backlog_status_check.py`
+`parse_items` reads (it stops at the first line that is neither blank nor a blockquote). So the
+field every item already carries is invisible to every tool that reads this ledger. It is written
+inline beside Priority -- `**Priority:** P2. **Verdict:** build` -- and the distribution is real:
+roughly 158 build, 94 research, 41 demand-gate.
+
+**Why it matters, with the incident.** On 2026-08-21 thirty items were dispatched overnight to two
+builder lanes. Nine product-code commits landed and reached `main`; **zero items closed.** Every
+item in the assigned range carried `Verdict: research`, and across 330 closed items **145 carry
+`Verdict: build` and zero carry `Verdict: research`** -- that verdict has never closed, because its
+closing act is a re-score in the vault scorecard, which is gitignored from every engine checkout.
+`DISPATCHER.md:330` predicted it before the wave: *"a builder can finish the research, the code and
+the tests and still be unable to close the item."* The information needed to see that was already
+on 304 items and no tool could reach it.
+
+**The build.** Promote three lines into each item's banner blockquote:
+
+```
+> Verdict: build | research | demand-gate | owner-ruling
+> Research: none | done <date>
+> Closing-act: code | scorecard-rescore | owner-ruling | banner-only
+```
+
+`parse_items` already reads them (`Item.fields`, shipped in PR #526) and
+`scripts/coord/dispatch_gate.py` already consumes them. **Only the ledger data is missing.**
+
+**Do it with a script, not by hand.** 330 items times three lines is not a hand edit, and the
+existing inline `**Verdict:**` makes the first field mechanical. `Research` is derivable from the
+presence of a dated research pass. `Closing-act` is NOT mechanical for every item and that is the
+real work -- a wrong closing act is worse than an absent one, because it names the wrong seat.
+
+**Two things a builder must not get wrong here.**
+
+1. **A closing act is TWO acts with two owners.** The work act and the banner flip are separate:
+   `BUILDER.md:253` forbids a builder concluding an item closed, `:148` gives the banner to the
+   Lander. The re-score lands in a vault file invisible from an engine checkout, so the seat that
+   must flip the banner cannot see the first act happened. Name both, or the field tells a reader
+   the item finishes somewhere it does not.
+2. **The gate ADVISES, it does not refuse.** An earlier version refused any closing act a builder
+   could not perform, which would have blocked #1112, #1171 and #1187 -- all of which reached
+   `main`, #1171 being the SMTP credential-exposure fix. Cannot close is not cannot be worked.
+   Corrected in `f3491468`; do not reintroduce the refusal.
+
+**Contention warning.** `docs/BACKLOG.md` took 163 commits in 36 hours across seven seats. A
+330-item rewrite needs a quiet window or it will collide. Land the script first, run it second.
+
+**Expiry:** this stops being right if `parse_items` starts reading below the banner block, or if
+the three field names change. Check `_FIELD_KEYS` in `scripts/docs/backlog_status_check.py`.
 
