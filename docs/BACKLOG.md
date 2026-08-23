@@ -3432,6 +3432,10 @@ What is NOT settled is the mechanism. Two independent passes reached different a
 ## 353. Gate the risk-acceptance register against the scorecard: nothing compares its cell lists to the record
 
 > 🚧 **Re-scored 2026-08-20 -> DEMAND-GATE.** Value **6/10** · Difficulty **2/10** · _quick win_. Nothing compares acceptance-list cell ids against the verdict of record, so a signed acceptance could disagree with the scorecard indefinitely and with no alarm. The check is tomllib plus a regex with both-direction fixtures on an existing workflow, but the item's own Verdict reads file now, build on owner green-light and it carries an explicit not-to-be-built-without-the-owner note, so the override applies regardless of the pair. _(was 6/10 · 2/10.)_
+> **NO `Verdict` TOKEN DELIBERATELY -- THE VERDICT IS QUALIFIED AND THE CLOSED VOCABULARY CANNOT HOLD IT.**
+> *Recorded 2026-08-23 (BACKLOG #1324), following the precedent [#320](#320) set for a contested
+> `Closing-act`: the verdict carries an owner gate (**build on owner green-light**) -- flattening to `build` DELETES the gate, which is the opposite of what the row says.* **An absent field makes a token screen REFUSE this item, which is the
+> safe direction; a wrong token blesses it.** *Needs one human read; until then, absent.*
 >
 > **Status OPEN (filed 2026-08-02).** The ASVS risk-acceptance register is **ungated prose**. No CI check has ever compared the cell ids in its signed sign-off blocks against the verdict of record, and a manual cross-check found the lists had drifted substantially with **zero** alarm.
 
@@ -3465,6 +3469,10 @@ What is NOT settled is the mechanism. Two independent passes reached different a
 ## 352. Consult on enterprise AV coverage for SFTP- and file-connector ingest from outside the domain (ASVS 5.4.3 premise check)
 
 > 🚧 **Re-scored 2026-08-20 -> P3.** Value **3/10** · Difficulty **1/10** · _fill-in_. The premise the consult exists to test is unchanged: the scan seam ships and the remote-file poller actually reaches it at remotefile.py:1020, so the na on 5.4.3 rests on the enterprise covering outbound-initiated pulls rather than on the product being unable to screen them. The deliverable is a recorded set of answers rather than code. _(was 1/10 · 1/10.)_
+> **NO `Verdict` TOKEN DELIBERATELY -- THE VERDICT IS QUALIFIED AND THE CLOSED VOCABULARY CANNOT HOLD IT.**
+> *Recorded 2026-08-23 (BACKLOG #1324), following the precedent [#320](#320) set for a contested
+> `Closing-act`: the verdict is `consult, then decide` -- a two-step whose first step has no token, and `research` would name the wrong act.* **An absent field makes a token screen REFUSE this item, which is the
+> safe direction; a wrong token blesses it.** *Needs one human read; until then, absent.*
 >
 > **Status OPEN (filed 2026-08-02).** ASVS **5.4.3** was recorded `na` on 2026-08-02 on the ground that antivirus scanning is an **enterprise-provided** control. This item exists to *test that premise* against the one ingest path most likely to fall outside it, rather than assume it.
 
@@ -3495,6 +3503,10 @@ The distinction matters because these two paths do not look like the case AV cov
 ## 351. SQL Server failover test asserts on a 0.35s wall-clock margin across a real DB round-trip
 
 > 🚧 **Re-scored 2026-08-20 -> DEMAND-GATE.** Value **4/10** · Difficulty **3/10** · _fill-in_. The margin is unchanged in the shipped test and the item's own remedy is parked behind #1003, whose trigger the owner ruled on 2026-08-20 will not fire. Value 4 because the cost is a CI red that misreads as the PR's own defect, with no engine path and no PHI effect; difficulty 3 because the remainder is a one-file test change plus an _acquire latency benchmark that has to run against a real SQL Server rather than the mocked path. _(was 4/10 · 3/10.)_
+> **NO `Verdict` TOKEN DELIBERATELY -- THE VERDICT IS QUALIFIED AND THE CLOSED VOCABULARY CANNOT HOLD IT.**
+> *Recorded 2026-08-23 (BACKLOG #1324), following the precedent [#320](#320) set for a contested
+> `Closing-act`: the verdict is `triage`, qualified by **do not "fix" by widening the margin until the open question is answered** -- a token drops the prohibition, which is the half that prevents the wrong fix.* **An absent field makes a token screen REFUSE this item, which is the
+> safe direction; a wrong token blesses it.** *Needs one human read; until then, absent.*
 >
 > **Status OPEN (filed 2026-08-02).** `tests/test_cluster_failover_sqlserver.py::test_preferred_delay0_wins_expired_lease_race_over_delayed_node` sleeps `_TTL + 0.15` so the lease is expired by ~0.15s, then requires a node carrying a **0.5s** acquire handicap to be rejected. Correctness therefore rests on **less than 0.35s of wall clock** elapsing between the sleep and `dr._maintain_leadership()` — across a real SQL Server round-trip, on a shared CI runner. Observed failing as `assert dr.is_leader() is False → assert True is False`.
 > ⚠️ **AMENDED 2026-08-04 — the hardware blocker has an EXPIRY DATE now.** This item is gated on a
@@ -4206,6 +4218,10 @@ and scoped this sweep out of itself. Every count above was measured against the 
 ## 1008. Startup preflight on the store principal's effective privileges (ASVS 13.2.2)
 
 > 🔢 **Re-scored 2026-08-20 -> DEMAND-GATE.** Value **6/10** · Difficulty **4/10** · _quick win_. Gap stands in shipped code: no privilege probe exists in the four scanned packages beyond the two conditional-DDL guard hits at sqlserver.py:924/:931, and settings.py:514 gates credential kind only, so a sysadmin login would go unobserved on first deployment (value 6). The remainder is a probe across SQL Server plus Postgres with SQLite exempt, a settings plus serve gate, the still-underived Postgres grant set, and a paired out-of-repo scorecard edit, which is the difficulty-4 anchor of a feature across a seam exercised on all three backends. _(was 6/10 · 4/10.)_
+> **NO `Verdict` TOKEN DELIBERATELY -- THE VERDICT IS QUALIFIED AND THE CLOSED VOCABULARY CANNOT HOLD IT.**
+> *Recorded 2026-08-23 (BACKLOG #1324), following the precedent [#320](#320) set for a contested
+> `Closing-act`: the verdict is *build the runbook fix only; defer the startup preflight* -- `build` drops both the scope limit and the deferral, and the body states the runbook half has already LANDED.* **An absent field makes a token screen REFUSE this item, which is the
+> safe direction; a wrong token blesses it.** *Needs one human read; until then, absent.*
 >
 > **Filed 2026-08-04 — not started. Scored 2026-08-04 → DEMAND-GATE.** The engine documents a least-privilege store grant it can
 > **never observe**: there is no fixed-server-role probe and no database-role-membership probe in
@@ -6221,6 +6237,10 @@ Both readings reach the same operational conclusion, which is the whole point of
 ## 1093. ASCQM gap-hunt inventory: the BACKLOG #1073 findings not filed as their own items
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **2/10** · _fill-in_. Ten of the eleven named entries verify open, including the three cheapest: possibly-undefined is absent from the mypy config (pyproject.toml:377-379), RUF006 and filterwarnings appear nowhere in pyproject.toml, and the C901 scan argument is still the literal messagefoundry in at least four places in quality-advisory.yml. Value 5 is the parity/breadth rung with no product effect; difficulty 2 holds because the item's own verdict is triage-then-split and the highest-value entries are single-token config enablements, with the purpose-built checks becoming their own items rather than this one's cost. _(was 5/10 · 2/10.)_
+> **NO `Verdict` TOKEN DELIBERATELY -- THE VERDICT IS QUALIFIED AND THE CLOSED VOCABULARY CANNOT HOLD IT.**
+> *Recorded 2026-08-23 (BACKLOG #1324), following the precedent [#320](#320) set for a contested
+> `Closing-act`: the verdict is `triage-then-split`, whose product is NEW items rather than a change to this one -- no token in the closed set names that act.* **An absent field makes a token screen REFUSE this item, which is the
+> safe direction; a wrong token blesses it.** *Needs one human read; until then, absent.*
 >
 > **Filed 2026-08-07 — not started.** A holding item so the remainder of the #1073 pass is not lost between the four findings that got their own numbers (#1089–#1092) and the ~19 that are correctly **null**. **Nothing here is a new investigation** — each entry names its element, its site and why no current gate reaches it. Triage and split; do not treat this as one unit of work.
 
@@ -13412,6 +13432,8 @@ which both readings of the cell now require.
 ## 1319. the demote-teardown source-phase timing assertion is wall-clock and fails on a loaded ubuntu runner
 
 > 🔢 **Filed 2026-08-22, recovered from a session cut off mid-measurement when its account was cancelled.** Value **5/10** -- Difficulty **2/10** -- _quick win_. [`tests/test_adr0157_demote_teardown.py:106`](../tests/test_adr0157_demote_teardown.py) asserts `elapsed < 1.5` on a wall clock. It failed on `main` at `2d1c89e6` -- CI run `32580332076`, leg `test (ubuntu-latest, py3.14)` -- reporting `source phase took 1.92s`. **That commit was docs-only (#515), so nothing in the tree under test could have moved the number.** **THE CHANGE: assert the CONCURRENCY WIDTH the test is actually about, not the elapsed time it currently infers it from.**
+> Verdict: build
+> Closing-act: code
 > **THE THRESHOLD IS NOT MERELY TIGHT -- IT SITS 0.13s BELOW THE MUTATION IT EXISTS TO CATCH.** Four implementations, 200 sources at 0.4s under a 3.0s budget, measured rather than reasoned about:
 >
 > | implementation | elapsed | finished | started at 50ms | `elapsed < 1.5` | `all(stop_finished)` |
@@ -13434,6 +13456,8 @@ which both readings of the cell now require.
 ## 1322. the serverdb path gate lists the tests but not the sources they assert against, so an api/ change strands the DB legs
 
 > 🔢 **Filed 2026-08-22 -- not started. Found by the liaison, verified independently against `origin/main` by the filing seat.** Value **6/10** -- Difficulty **3/10** -- _quick win_. `.github/workflows/ci.yml:1358` computes `serverdb` from a path alternation that decides whether the SQL Server and Postgres legs run on a pull request. **It lists `messagefoundry/store/`, three `pipeline/` modules, `config/(settings|wiring)`, a `transports/` list, a `tests/test_(...)` list and `ci.yml` itself. It does not list `messagefoundry/api/`.** **THE CHANGE: widen the alternation, and widen the stated invariant above it, to the SOURCES those suites assert against -- not only the test files they run.**
+> Verdict: build
+> Closing-act: code
 > **THIS IS NOT "MAIN SKIPS THE LEGS", AND THE DISTINCTION IS THE ITEM.** Skipping on push is DELIBERATE and must not be filed as a defect: `ci.yml:1521` reads `if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.serverdb == 'true'`, and its own comment names the *"no-per-merge-run guard"*. Filing that would be filing a billed-minutes decision. The defect is one level down -- the PR arm, which is the only arm that can catch a change before it lands, is selected by a producer set with a hole in it.
 > **THE INVARIANT IS ALREADY WRITTEN AND IS ONE LEVEL TOO NARROW.** `ci.yml:1348`: the alternation *"MUST list every file the sqlserver-store / postgres-store pytest steps below run"*. That binds the TEST files. It does not bind the SOURCE those tests assert against, and `tests/test_postgres_store.py` asserts on a dict built by `messagefoundry/api/app.py::_emit`. A rule that covers the asserting file but not the asserted-on file cannot see this class.
 > **IT HAS ALREADY FIRED, WHICH IS WHY THIS IS A MEASUREMENT AND NOT A HYPOTHETICAL.** #514 (BACKLOG #1187, merged `fdd89b49`) added a `masked` key to the `summary_access` audit detail. It touched `api/app.py`, so `serverdb` evaluated **false**, so the DB legs never ran on its PR; and push never runs them. It merged green leaving `tests/test_postgres_store.py:3409` and `tests/test_sqlserver_store.py:3435` asserting the old two-key shape. The next PR to select those legs inherited three red ones it did not cause -- PR #525, fixed there at `2b6dc1be`.
@@ -13741,6 +13765,8 @@ would not appear.** The date comparison remains the open work here.
 ## 1305. the worktree gate matches git by SPELLING, so a case variant of the program name bypasses every rule
 
 > 🔢 **Filed 2026-08-21 -- not started. `Git -C <governed> reset --hard` IS ALLOWED WHERE `git -C <governed> reset --hard` IS DENIED, AND THE ONLY DIFFERENCE IS THE CAPITAL LETTER.** Measured against `origin/main` driving the real hook as a subprocess, with the lowercase spelling as a discriminating control and a benign command as a negative control. The same holds for `GIT`, and it is not confined to one rule -- `Git ... checkout` allows too. No quoting, no wrapper, no escape sequence: the bypass is typing the program name differently.
+> Verdict: build
+> Closing-act: code
 
 > **WHY IT WORKS.** Windows resolves `Git`, `GIT` and `git` to the same `git.exe`, so all three RUN. The gate's token comparison is case-SENSITIVE, so only one of them MATCHES. The gate is therefore matching a **spelling** and calling it a program, while the operating system matches an **executable**. Everything downstream of that comparison inherits the gap, which is why it is not a single-rule defect.
 
