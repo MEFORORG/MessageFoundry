@@ -455,50 +455,18 @@ def test_a_TITLE_CASED_quoted_git_leaf_cannot_supply_a_verb(
     )
 
 
-def test_the_UPPERCASE_quoted_PROGRAM_spelling_is_a_known_open_residual(
-    primary: Path, repos_file: Path
-) -> None:
-    """A TRIPWIRE OVER THE COST OF THE CASE-SENSITIVE EMIT. It asserts ALLOW and that is NOT an
-    endorsement -- read this before acting on it.
-
-    ``GIT.EXE`` is a real spelling on Windows and the emit is case-SENSITIVE, so the span blanks
-    wholesale and no verb reaches any rule::
-
-        "<...>\\Git\\bin\\GIT.EXE" -C <governed> reset --hard      ALLOW   (origin/main: ALLOW)
-        "<...>\\Git\\bin\\Git"     -C <governed> reset --hard      ALLOW   (origin/main: ALLOW)
-
-    PRE-EXISTING, NOT INTRODUCED HERE, and the mechanism on main is worth stating because it looks
-    like it should differ: main's collapse regex IS case-insensitive, but it substitutes ``$1``, which
-    preserves the original case, and every rule downstream compares case-sensitively. Main therefore
-    mints a token nothing recognises and lands on the same verdict by a different route.
-
-    THE ONLY REMEDY TRIED COST MORE THAN IT BOUGHT. Making the emit case-insensitive closes these two
-    and re-opens the whole argument-position family above; adding a program-position discriminator to
-    hold both ends opened `cmd /c` and PowerShell dot-source as fail-opens that main denies. Do NOT
-    re-add the lowercase emit without a discriminator, and do not add a discriminator without
-    re-measuring those two.
-
-    WHEN THIS TEST REDS, that is the success signal: somebody closed the hole. Delete the row; do not
-    restore the ALLOW.
-    """
-    for leaf in ("GIT.EXE", "Git", "Git.exe"):
-        shape = f"{DQ}C:\\Program Files\\Git\\bin\\{leaf}{DQ} -C {primary} reset --hard"
-        assert run_gate(shell(shape, primary.parent), repos_file) is None, (
-            f"{shape} now DENIES. If you closed the uppercase program spelling deliberately, that is "
-            "the intended outcome -- delete this test. Do NOT restore the ALLOW, and check that "
-            "`cmd /c` and PowerShell dot-source still DENY."
-        )
-    # THE CONTROL that keeps the tripwire attached to the CASE and not to the whole emit: the
-    # lowercase spelling in the identical slot must still deny.
-    assert_denied(
-        run_gate(
-            shell(
-                f"{DQ}C:\\Program Files\\Git\\bin\\git.exe{DQ} -C {primary} reset --hard",
-                primary.parent,
-            ),
-            repos_file,
-        )
-    )
+# THE TRIPWIRE THAT USED TO SIT HERE HAS FIRED AND IS GONE (BACKLOG #1305).
+#
+# `test_the_UPPERCASE_quoted_PROGRAM_spelling_is_a_known_open_residual` asserted that
+# `"<...>\Git\bin\GIT.EXE" -C <governed> reset --hard` ALLOWs, and its own docstring named the red as
+# the success signal: "somebody closed the hole. Delete the row; do not restore the ALLOW." It reddened
+# under #1305 and the row is deleted rather than relaxed.
+#
+# WHAT CLOSED IT is upstream of this file's subject and is NOT the remedy that docstring warned off.
+# `ConvertTo-CanonicalGitProgram` lowercases the leaf of a token it has decided is in PROGRAM position,
+# on the line BEFORE `Remove-QuotedSpans` reads it, so the emit here stays case-SENSITIVE and its
+# twelve-false-deny bound is untouched -- the two rows below still hold, measured. The DENY is pinned in
+# tests/test_worktree_gate_program_case.py, not restated here.
 
 
 def test_a_LOWERCASE_quoted_git_LEAF_in_argument_position_is_a_known_open_FALSE_DENY(
@@ -520,8 +488,16 @@ def test_a_LOWERCASE_quoted_git_LEAF_in_argument_position_is_a_known_open_FALSE_
     NOT A WEAKENING AND NOT A REGRESSION EITHER WAY: main denies these too, and the reverted predicate
     is what briefly allowed them.
 
-    WHEN THIS TEST REDS, somebody taught the emit to tell a program from an argument without the two
-    fail-opens the last attempt cost. Delete the row; do not restore the DENY.
+    A PROGRAM-POSITION DISCRIMINATOR HAS SINCE LANDED AND THIS ROW STILL PASSES -- read that as a
+    result, not an oversight (BACKLOG #1305). ``ConvertTo-CanonicalGitProgram`` tells a program from an
+    argument, but it only ever rewrites CASE and never gates this emit, so it cannot remove a deny that
+    exists. Fixing the bypass and fixing this false deny are two changes with opposite risk profiles:
+    the first only adds denies, the second must take one away, and only the first was in scope. So the
+    wrong answer below is still the shipped answer.
+
+    WHEN THIS TEST REDS, somebody took the second half on and let the discriminator gate the emit.
+    Delete the row; do not restore the DENY, and re-measure the two fail-opens pinned below -- gating
+    the emit is exactly what opened them last time.
     """
     for shape in (f"cp -r {DQ}/c/backups/git{DQ} restore", f"cp -r {DQ}./git{DQ} restore"):
         # If this reds, the shape now ALLOWs. Delete the row; do not restore the DENY, and re-check

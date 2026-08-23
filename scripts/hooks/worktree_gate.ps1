@@ -339,6 +339,192 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     $out | Where-Object { $_ }
 }
 
+# ---------------------------------------------------------------------------------------------------
+# THE RULES BELOW MATCH A SPELLING AND CALL IT A PROGRAM; WINDOWS MATCHES AN EXECUTABLE (BACKLOG #1305).
+# `Git`, `GIT`, `gIt` and `GIT.EXE` all resolve to the same git.exe and all RUN -- verified on both the
+# Bash tool (Git Bash 5.2.37) and the PowerShell tool. Every git test in this file compared
+# case-SENSITIVELY, so exactly one of those spellings ever matched. Measured on `origin/main` from
+# inside a governed primary, one capital letter apart:
+#
+#     git -C <governed> reset --hard    DENY        Git -C <governed> reset --hard    ALLOW
+#
+# and identically for rule 3b (linked-worktree hijack), rule 3c (`config core.hooksPath`, which disarms
+# the ledger, claim and leak commit gates for EVERY worktree at once) and rule 3d (`worktree remove`).
+# Four rules, one capital letter.
+#
+# WHY NOT SIMPLY `-imatch` EVERYWHERE, since that is the obvious edit and it is measured, costed and
+# rejected. The git token pattern the rules share leads with `[\s;&|('"\\/]` -- the `\` and `/` are there
+# so an absolute program path matches -- so it also matches any PATH ARGUMENT whose last component is
+# `git`. Widening it by case alone therefore reads `cp -r "/c/backups/Git" restore` as a git command and
+# the next ordinary word as its verb. That was built during BACKLOG #1229 and reverted at a measured cost
+# of twelve false denies (`cp`, `mv`, `ls`, `rsync`, `find -exec`, `7z`, `echo`, `python --src`,
+# `Copy-Item`, `Move-Item`). A false DENY on this gate blocks ordinary developer commands, and that is
+# what buys a gate uninstalled -- the failure this file's own preamble names.
+#
+# SO THE ANSWER NEEDS A POSITION TEST, and this function is it: a forward, quote-aware token scan that
+# finds the PROGRAM token of each command on the line and lowercases ITS git-spelling leaf. Nothing
+# else in the text is touched. `"<...>\Git\bin\GIT.EXE" -C <governed> reset --hard` is canonicalised
+# because that span is dispatched; `cp -r "/c/backups/Git" restore` is not, because `cp` already
+# occupies program position and the quoted span is an argument.
+#
+# THIS IS NOT THE REVERTED PREDICATE, AND THE DIFFERENCE IS THE WHOLE SAFETY ARGUMENT. `Test-GitProgramPosition`
+# (fb93c9ca, reverted in c0d6cef8) used a position test to GATE the existing quoted-program emit, so
+# every shape its wrapper list did not know went from DENY to ALLOW -- two measured fail-opens,
+# `cmd /c "<...>\git.exe"` and a PowerShell dot-source, both of which `origin/main` denies. This
+# function only ever REWRITES CASE, and only on a token whose leaf already spells git. It is therefore
+# THE IDENTITY on every command line that spells git in lowercase, which is every line that denies
+# today: no existing DENY can be reached by this code path, so none can be lost. A position MISS here
+# leaves a pre-existing hole open exactly as `origin/main` leaves it; it cannot convert a deny into an
+# allow. (Both of those fail-open shapes are pinned as tests, and both were re-measured DENY after this
+# change -- the `:456` comment demands exactly that re-measurement.)
+#
+# WHAT THIS DOES NOT COVER -- stated so the next reader infers no stronger claim, and because the item
+# warns that the next bypass "closes as its own item forever" if each is treated as a one-off:
+#   * AN ALIAS OR A SHELL FUNCTION. `Set-Alias g git; g -C <governed> reset --hard` and
+#     `g(){ git "$@"; }; g -C <governed> reset --hard` both run and both ALLOW, here and on main. No
+#     line scanner closes that: the name `g` carries no evidence at all.
+#   * A RENAMED COPY of git.exe, for the same reason.
+#   * A WRAPPER WORD NOT ON THE $transparent LIST BELOW, and any wrapper option that takes a bare-word
+#     operand: `sudo -u root Git ...` stops at `root`, `ssh box Git ...` stops at the host name. Those
+#     keep ALLOWing, as on main.
+#   * A CONCATENATED cmd SWITCH RUN, `cmd /Q/C Git ...` -- the single-component skip below reaches `/c`
+#     and `/d`, not `/Q/C`. Same direction: a miss, not a false deny.
+#   * `-File <script>` and any other route where the command is not in the text at all -- the shell-write
+#     blind spot the file's docstring already names.
+#   * THE LOWERCASE ARGUMENT-POSITION FALSE DENY. `cp -r /c/backups/git restore` DENIES today and still
+#     denies after this change. It is a real false deny and it is deliberately left alone: removing it
+#     means letting a position test GATE the token match, which is precisely the reverted direction
+#     above. Fixing the bypass and fixing that false deny are two different changes with opposite risk
+#     profiles, and only one of them is #1305.
+#   * A TRAILING DOT (`git.`, `git.exe.`) is NOT a live bypass on this box -- measured, neither host
+#     runs it -- so nothing here addresses it. 8.3 short paths and quoted absolute paths in lowercase
+#     already DENY.
+#
+# PLATFORM PREMISE, since it is a fact about the host and not about the characters: this rests on
+# Windows resolving `Git` and `git` to one executable. On a case-sensitive filesystem they are different
+# files and this canonicalisation would name the wrong one -- it is confined to a hook that installs to
+# %USERPROFILE%\.claude\hooks and is measured on Windows only.
+function ConvertTo-CanonicalGitProgram([string]$Text, [bool]$PosixEscapes = $false) {
+    if (-not $Text) { return $Text }
+    # No git spelling in any case means nothing here can change. Cheap, and it is the common line.
+    if ($Text -notmatch 'git') { return $Text }
+
+    # A COMMAND BOUNDARY: the character after which the next word is dispatched as a program. `&` covers
+    # `&&`, POSIX backgrounding and PowerShell's call operator; `|` covers `||` and an ordinary pipeline;
+    # `(` covers a subshell and `$(`; `{` covers a brace group and a PowerShell script block; the
+    # backtick covers a backtick substitution. CLOSING brackets are deliberately absent -- neither shell
+    # dispatches a command straight after `)` or `}`, a separator has to intervene, so admitting them
+    # would only widen what counts as program position.
+    $boundaryChars = [char[]]@(';', '&', '|', '(', '{', '`', "`r", "`n")
+
+    # TRANSPARENT WORDS: a program that dispatches the program named AFTER it, or a shell keyword that
+    # precedes one. Read as "AT LEAST these" (CLAUDE.md section 11). The asymmetry that makes a short
+    # list safe: a name MISSING here costs a MISS -- the capitalised spelling keeps allowing, exactly as
+    # it does on main -- and never a false deny, because the unknown word simply becomes the program and
+    # the scan stops. So this may be extended freely and nothing rests on it being complete.
+    #
+    # `.` is here because a PowerShell dot-source really dispatches, and it is one of the two shapes the
+    # reverted predicate broke. `&` is not a word at all -- it is a boundary character above.
+    $transparent = @(
+        'sudo', 'doas', 'su', 'runuser', 'env', 'command', 'exec', 'builtin', 'eval',
+        'nohup', 'setsid', 'nice', 'ionice', 'chrt', 'taskset', 'stdbuf', 'unbuffer',
+        'timeout', 'time', 'xargs', 'watch', 'parallel', 'strace', 'ltrace', 'valgrind',
+        'chroot', 'proot', 'winpty', 'busybox', 'setarch', 'flock', 'script',
+        'start', 'start-process', 'saps',
+        # The interpreter hosts, so `cmd /c Git ...` and `bash -c` reach the first word of the payload.
+        'cmd', 'pwsh', 'powershell', 'wsl', 'bash', 'sh', 'dash', 'zsh', 'ksh', 'ash', 'mksh', 'fish',
+        '.',
+        # Shell keywords, so `if Git diff ...` and `! Git ...` are still program position.
+        'if', 'then', 'else', 'elif', 'do', 'while', 'until', '!'
+    )
+
+    $len = $Text.Length
+    $i = 0
+    # $seeking: this command's program has not been identified yet. Once it has -- git or anything else
+    # -- every remaining token on the command is an ARGUMENT and is left alone until the next boundary.
+    # That single flag is what keeps `cp -r "/c/backups/Git" restore` untouched.
+    $seeking = $true
+    $hits = @()
+    while ($i -lt $len) {
+        $ch = $Text[$i]
+        if ($ch -eq ' ' -or $ch -eq "`t") { $i++; continue }
+        if ($boundaryChars -contains $ch) { $i++; $seeking = $true; continue }
+
+        # ONE TOKEN, QUOTE-AWARE, and the quote-awareness is load-bearing rather than tidy: a `;` that
+        # lives INSIDE a quoted word is not a command separator, so `echo "hello; Git reset --hard"`
+        # must not hand `Git` a command of its own. Reading quotes here is also what lets a quoted
+        # PROGRAM path -- the ordinary spelling, since the default Git install path has a space in it --
+        # be seen as one token and canonicalised before Remove-QuotedSpans decides what to emit.
+        $start = $i
+        $sb = [System.Text.StringBuilder]::new()
+        while ($i -lt $len) {
+            $c = $Text[$i]
+            if ($c -eq ' ' -or $c -eq "`t" -or ($boundaryChars -contains $c)) { break }
+            if ($c -eq '"' -or $c -eq "'") {
+                $q = $c; $i++
+                while ($i -lt $len -and $Text[$i] -ne $q) {
+                    # The backslash pair is kept WHOLE, not collapsed, because the leaf below splits on
+                    # path separators and a swallowed `\` would hide the leaf. Same asymmetry as
+                    # Remove-QuotedSpans: honoured inside a double-quoted span and outside one, never
+                    # inside a single-quoted one, where sh gives the backslash no special meaning.
+                    if ($PosixEscapes -and $q -eq '"' -and $Text[$i] -eq '\' -and $i + 1 -lt $len) {
+                        [void]$sb.Append($Text[$i]); [void]$sb.Append($Text[$i + 1]); $i += 2; continue
+                    }
+                    [void]$sb.Append($Text[$i]); $i++
+                }
+                if ($i -lt $len) { $i++ }   # consume the closer; an UNTERMINATED quote just ends here
+                continue
+            }
+            if ($PosixEscapes -and $c -eq '\' -and $i + 1 -lt $len) {
+                [void]$sb.Append($c); [void]$sb.Append($Text[$i + 1]); $i += 2; continue
+            }
+            [void]$sb.Append($c); $i++
+        }
+        if (-not $seeking) { continue }
+        $tok = $sb.ToString()
+        if (-not $tok) { continue }     # an empty quoted pair dispatches nothing; keep looking
+
+        # PROGRAM IDENTITY THE WAY Get-FlagOwner ALREADY DOES IT (see below): last path component,
+        # `.exe` stripped, compared lowercased. That is case-insensitive identity done SAFELY, because
+        # by this line the position question is already answered.
+        $name = (($tok -split '[\\/]')[-1] -replace '(?i)\.exe$', '').ToLowerInvariant()
+        if ($name -eq 'git') {
+            $hits += [pscustomobject]@{ Start = $start; Length = $i - $start }
+            $seeking = $false
+            continue
+        }
+        if ($transparent -contains $name) { continue }
+        # An option of a transparent word, tested on the CAPTURED value so a quoted `"-u"` still counts.
+        if ($tok.StartsWith('-')) { continue }
+        # A single-component slash token is a cmd switch (`/c`, `/d`); a MULTI-component one is a POSIX
+        # path and IS a program, so this cannot be a blanket "starts with a slash" skip -- `/usr/bin/GIT`
+        # must still be reached. It is tested after the git leaf above for the same reason.
+        if ($tok -match '^/[^/]*$') { continue }
+        if ($tok -match '^[A-Za-z_][A-Za-z0-9_]*=') { continue }   # FOO=1, an assignment prefix
+        if ($tok -match '^[0-9]+$') { continue }                   # `timeout 5`, `nice -n 10`
+        # An ordinary word. It is this command's program, it is not git, and everything after it is an
+        # argument.
+        $seeking = $false
+    }
+    if ($hits.Count -eq 0) { return $Text }
+
+    $out = [System.Text.StringBuilder]::new()
+    $pos = 0
+    foreach ($h in $hits) {
+        [void]$out.Append($Text.Substring($pos, $h.Start - $pos))
+        # Lowercase the LEAF ONLY, in place. The directory part keeps its spelling because it is a real
+        # path that other code reads, and the anchors mean nothing but the token's tail can move: the
+        # `Git` in `\Git\bin\` is not followed by end-of-token, so it is left exactly as typed.
+        $span = $Text.Substring($h.Start, $h.Length)
+        $span = $span -replace '(?i)git(?=(?:\.exe)?["'']?$)', 'git'
+        $span = $span -replace '(?i)\.exe(?=["'']?$)', '.exe'
+        [void]$out.Append($span)
+        $pos = $h.Start + $h.Length
+    }
+    [void]$out.Append($Text.Substring($pos))
+    $out.ToString()
+}
+
 # Decide from the COMMAND, never from prose inside it -- but "prose" and "code" are not the same as
 # "quoted" and "unquoted", and conflating them was a measured regression.
 #
@@ -444,14 +630,24 @@ function Remove-QuotedSpans([string]$s, [bool]$PosixEscapes = $false) {
             # ZERO fail-opens gained. Twelve daily false denies on the guard itself is what buys a
             # gate disabled wholesale, which is the failure this file's own preamble names.
             #
-            # WHAT THIS DELIBERATELY DOES NOT FIX, stated because a one-sided note reads as a clean
-            # win: the quoted `GIT.EXE`-as-PROGRAM spelling stays ALLOW. That is NOT a regression --
-            # `origin/main` allows it today, measured -- it is a pre-existing hole this change
-            # declines to close, because the only remedy tried costs the twelve above. Closing it
-            # needs a POSITION test (is this span a program or an argument). That was built, and
-            # measured to open `cmd /c "<git.exe>"` and PowerShell dot-source as NEW fail-opens that
-            # main denies, so it was reverted. Do NOT re-add the lowercase emit without that
-            # discriminator, and do not add the discriminator without re-measuring those two.
+            # THE HOLE THAT NOTE LEFT OPEN IS NOW CLOSED UPSTREAM, AND THIS LINE IS DELIBERATELY
+            # UNCHANGED (BACKLOG #1305). It used to end "the quoted `GIT.EXE`-as-PROGRAM spelling stays
+            # ALLOW ... closing it needs a POSITION test", and that is exactly what
+            # ConvertTo-CanonicalGitProgram is. It runs on the line BEFORE this scan sees it and
+            # lowercases the leaf of a token it has decided is in PROGRAM position, so a quoted
+            # `GIT.EXE` program reaches this `-cmatch` already spelled `git.exe` and is kept, while a
+            # quoted `Git` in ARGUMENT position is never rewritten and is still blanked wholesale. The
+            # twelve false denies priced above are therefore still not bought: the discriminator sits
+            # UPSTREAM of this emit rather than gating it.
+            #
+            # THAT DISTINCTION IS THE ONE THE REVERT TURNED ON, so do not collapse it. The withdrawn
+            # `Test-GitProgramPosition` made THIS emit conditional, so a position miss deleted a token
+            # main keeps -- `cmd /c "<...>\git.exe"` and a PowerShell dot-source went DENY to ALLOW.
+            # Upstream canonicalisation cannot do that: it only ever rewrites CASE, and it is the
+            # identity on the lowercase spellings that deny today. Both fail-open shapes were
+            # re-measured DENY after #1305 and both stay pinned in
+            # tests/test_worktree_gate_escaped_quote.py. Keep this match case-SENSITIVE: making it
+            # insensitive here would restore the argument-position family in one step.
             $span = $s.Substring($openAt + 1, $i - $openAt - 1)
             if ($span -cmatch '[\\/](git(?:\.exe)?)$') {
                 [void]$out.Append($Matches[1])
@@ -561,7 +757,17 @@ function Get-ScannableSegments([string]$Cmd, [bool]$PosixEscapes = $false) {
     $folded = $Cmd -replace '\\\r?\n[ \t]*', ' '
     $folded = $folded -replace '`\r?\n[ \t]*', ' '
 
-    $lines = @($folded -split '\r?\n')
+    # CANONICALISE THE CASE OF EACH LINE'S GIT PROGRAM TOKENS BEFORE ANYTHING READS THEM (BACKLOG
+    # #1305). Done here, once, rather than at the four rule sites, because the defect is not any one
+    # rule's: `Git`, `GIT` and `GIT.EXE` all run git.exe, and rules 3, 3b, 3c and 3d each compared a
+    # spelling. Doing it upstream also means the fix reaches a rule nobody has written yet.
+    #
+    # IT RUNS BEFORE Remove-QuotedSpans ON PURPOSE. The blanking below keeps a quoted span's git token
+    # only when the span ENDS in separator-then-lowercase-`git`, so a quoted `GIT.EXE` program arrives
+    # here already lowercased and that emit -- unchanged, still case-sensitive -- keeps it. A quoted
+    # `Git` in ARGUMENT position is untouched by the canonicaliser and is still blanked wholesale. That
+    # split is what lets the case fix and the emit's twelve-false-deny bound hold at the same time.
+    $lines = @($folded -split '\r?\n' | ForEach-Object { ConvertTo-CanonicalGitProgram $_ $PosixEscapes })
 
     # ONE LEVEL of interpreter recursion -- and the flag is recognised by a RULE, never by a list of
     # spellings. What stood here was a fixed list of literals (`-c|-lc|-ec|-Command|-EncodedCommand` plus
@@ -886,8 +1092,13 @@ function Get-ScannableSegments([string]$Cmd, [bool]$PosixEscapes = $false) {
     # Each extracted payload carries ITS OWN convention, taken from the interpreter that was matched
     # rather than from the tool name at the call site. See the note at the extraction above.
     foreach ($item in $inner) {
-        $s = Remove-QuotedSpans $item.Text $item.Posix
-        [pscustomobject]@{ Raw = $item.Text; Scan = $s }
+        # A payload is a FRESH command context -- its first word is dispatched -- so it gets its own
+        # canonicalisation pass rather than inheriting the outer line's. `bash -c 'Git -C <gov> reset
+        # --hard'` is the shape: on the outer line that quoted span is an ARGUMENT of bash and is left
+        # alone; here it is a command line and its `Git` is in program position.
+        $t = ConvertTo-CanonicalGitProgram $item.Text $item.Posix
+        $s = Remove-QuotedSpans $t $item.Posix
+        [pscustomobject]@{ Raw = $t; Scan = $s }
     }
 }
 
