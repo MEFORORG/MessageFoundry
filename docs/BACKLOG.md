@@ -12466,6 +12466,40 @@ done against files that are not tracked in this repository"* is **FALSE**. The f
 `scripts/coord/mail.ps1:352`, the `-To all` branch, in this repository. ***A lane nearly handed this
 item back on that sentence*** -- **a difficulty note that would cause a correct handback is worse than a
 wrong difficulty score.**
+
+***RE-MEASURED 2026-08-23. VERDICT: NOT REPRODUCIBLE -- AND THAT IS NOT THE SAME AS FIXED. DO NOT BUILD
+THE SEND-SIDE INSTRUMENTATION.***
+
+**Post-fix, keyed on send time over `kind=broadcast`: 514 broadcasts across 92 firings.**
+
+| | this row's data | post-fix |
+| --- | --- | --- |
+| median recipients per firing | **2** | **6** |
+| firings reaching exactly one | **~47%** | **24%** |
+
+**Daily medians climb with fleet size -- 1, 1, 3, 3, 1, 7, 6, 8, 7 -- which is CORRECT behaviour.**
+***This row's signature was COLLAPSE-AND-RECOVER*** -- ten and eleven, then a run of twos and threes,
+then back to ten and eleven, **with eleven seats demonstrably live throughout, which is what ruled out
+roster growth.** *Nothing post-fix does that.*
+
+***THE LIMIT MATTERS MORE THAN THE RESULT: THE PRE/POST DIFFERENTIAL IS NOT AVAILABLE.*** By SEND TIME
+only **27 messages** predate `40150e04` and only **8** are broadcasts, against this row's **~113
+firings**. **That population is not in the surviving corpus, so there is no baseline to compare against
+and no differential was ever possible.** *(An earlier mtime-based count suggested a larger pre-fix
+population; it was offered as a lead and it was wrong -- file mtimes shift when files move between
+directories.)*
+
+***SO: the named cause was fixed; this row's signature is absent from 514 post-fix broadcasts; the
+fanout tracks how many seats are live. WHAT CANNOT BE SAID IS THAT THE FIX IS WHY.***
+
+**ONE BLEMISH, FLAGGED RATHER THAN SMOOTHED:** the most recent tail reads 2, 1, 1, 1. *That is
+consistent with seats ENDING -- the innocent explanation this row correctly REJECTED for its own data
+because eleven seats were live.* **It cannot be ruled in or out retrospectively here.**
+
+**RECOMMEND CLOSING AS NOT REPRODUCIBLE**, citing the fix as the plausible cause and recording that the
+comparison corpus was gone. ***The instrumentation was justified only if the defect persisted. Building
+it now would point an instrument at a fault with no evidence of existing -- and a clean result from
+such an instrument is the most misleading artifact available.***
 ## 1265. the warning sign is unsanctioned decoration in 496 places across 80 files
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **4/10** · _fill-in_. Re-censused at HEAD with the ledger counts as the positive control the item demands: 499 occurrences across 81 files, with docs/BACKLOG.md at 121 and BACKLOG-CLOSED.md at 93 both reproducing, so nothing has been swept and the population has drifted up from the filed 496 across 80. Value 4 because nothing is mis-parsed and no behaviour depends on it, leaving a real but consequence-free vocabulary defect; difficulty 4 because each site needs an editorial replacement word rather than a mechanical substitution, the two ledger files must be sliced last to protect the status alphabet backlog_status_check.py genuinely parses, and whether retired ADRs are rewritten at all is still an open decision. _(was 4/10 · 4/10.)_
@@ -12631,6 +12665,25 @@ wrong difficulty score.**
 **Related:** the tick rubric that structurally cannot express this fault is **#1267** -- deliberately a separate item, different owner and different fix.
 **Source:** routed 2026-08-14 by the role-playbooks seat as a code item it could not claim (that seat edits `roles/` only); measurements are that seat's and two corroborating seats', reproduced here rather than re-derived.
 
+
+**AMENDMENT 2026-08-23. TWO THINGS, AND THE FIRST IS A DISPATCH WARNING.**
+
+***THIS ROW'S BANNER SAYS `Verdict: build` AND ITS RE-SCORE PROSE SAYS `DEMAND-GATE`. DO NOT DISPATCH IT
+ON THE BANNER.*** It is one of three such rows in the ledger; the divergence and its measurement are
+`#1342`'s subject. **A dispatcher screening on the field alone passes this row, and was one step from
+doing exactly that.**
+
+**SECOND: WHAT WOULD SETTLE THE FANOUT QUESTION, RECORDED HERE RATHER THAN FILED SEPARATELY BECAUSE THIS
+ROW ALREADY ENUMERATES PRESENCE-BASED ENUMERATION AS A CANDIDATE MECHANISM.**
+
+***A SEAT-COUNT SERIES TO DIVIDE AGAINST.*** Without one, *"this firing reached one recipient"* cannot
+be separated from *"one seat was live"* -- **the correct-behaviour reading and the defect reading are
+the same number.** A sibling re-measure hit exactly this wall: its post-fix daily medians track fleet
+size, and its most recent tail of ones is **unresolvable in either direction** for want of a live-seat
+denominator.
+
+**`presence.ps1` keeps no history**, so the series does not exist retrospectively. *That is a different
+measurement from this row's subject and it is named here rather than performed.*
 ## 1267. the tick rubric asks only about cadence, so it cannot express a fanout fault and its change-test conceals a stoppage
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **3/10** · Difficulty **2/10** · _fill-in_. The artefact is not in the repo at all, so I went to the live file the item names: %USERPROFILE%\.claude\mefor-usage\seat-tick.ps1 (39113 bytes, mtime 2026-08-20 13:25, plain ASCII, verified with `file` + xxd so a null grep is not an encoding artifact). What I found refutes "fully shipped" in both directions. The shipped part is real but incidental: a comment at :277-285 records a 2026-08-20 owner-instructed REWRITE that deleted the entire diagnostic rubric -- "QUANTISED", "FANOUT", "DELIVERY fault", "Act only if something actually changed", "Waking is not a reason to do work" all return 0 hits, and the body is now a 357-char bare wake-up (seat-tick.bodylen reads 357). So the offending sentences are gone. But they were removed for an unrelated reason (do not spend a turn analysing the tick), and the item's actual deliverables did not land. The replacement question is absent; the tick still carries a pending/change test ("Nothing pending -> do nothing") of the same shape the item says is compatible with total stoppage; and the Verdict's explicit second half, a check that the prose cannot silently revert, does not exist -- the three guards at :313, :324 and :347-357 assert the opening marker, the length cap, and length CHANGE, none of which can see a semantic revert. I also checked for relocation rather than assuming deletion: grep -rli "quantised" over the checkout hits only docs/BACKLOG.md, harness/load/connscale/probe.py (unrelated) and a pygments file in .venv, and "FANOUT SKIP" appears in the repo only inside #1267/#1266 prose, so the rubric was not moved into roles/ or docs/. The shared prerequisite is independently disproven from the state files themselves rather than from the item's claim about them. Item is still open in the live ledger (banner is the open numeral at docs/BACKLOG.md:9976) and absent from BACKLOG-CLOSED.md. Value drops from the filed 5 because the two worst sentences are genuinely gone and severity is none with no deployment axis; difficulty stays low and if anything fell -- the near-miss that dominated this item was the 2000-char cap with 40 chars of headroom, and headroom is now 1643, so the fleet-killing edit hazard is much reduced. Not cannot_determine: I could read the evidence, it just lives outside version control. _(was 5/10 · 2/10.)_
