@@ -1210,10 +1210,33 @@ if ($tool -in @("Bash", "PowerShell")) {
     $dangerKeys = 'core\.hookspath|core\.worktree|alias\.[\w.-]+|include\.path|includeif\.'
     foreach ($seg in (Get-ScannableSegments $cmd ($tool -eq "Bash"))) {
         if ($seg.Scan -cnotmatch '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)') { continue }
-        if ($seg.Scan -notmatch "(?:\bconfig\b[^|;&]*?\s|-c\s+)(?<key>$dangerKeys)") { continue }
+        if ($seg.Scan -notmatch "(?<via>\bconfig\b[^|;&]*?\s|-c\s+)(?<key>$dangerKeys)(?<rest>[^|;&]*)") { continue }
+        # READ EVERY GROUP OUT OF $Matches BEFORE RUNNING ANOTHER -match. `-match` REPLACES $Matches
+        # wholesale, so computing $viaConfig first left $rest reading the SECOND match's groups, where
+        # no 'rest' exists -- it came back $null, satisfied the no-value test below, and the rule FAILED
+        # OPEN on its own positive control: `git config core.hooksPath /dev/null` was ALLOWED. Caught by
+        # keeping the must-deny rows in the fix's test table rather than only the row being fixed.
         $badKey = $Matches['key']
-        # A read is not a write.
+        $rest = $Matches['rest']
+        $via = $Matches['via']
+        $viaConfig = $via -match '\bconfig\b'
+        # A read is not a write -- the EXPLICIT read flags.
         if ($seg.Scan -match '(?:^|\s)--(get|get-all|get-regexp|list|show-origin)(\s|$)') { continue }
+        # ...AND THE IMPLICIT ONE (BACKLOG #1306). `git config <key>` with NO VALUE AFTER IT assigns
+        # nothing -- it is the bare read, and `--get` is merely its explicit spelling. Measured against
+        # real git: bare `git config <key>` exits 1 on an unset key and stores nothing, while
+        # `git config <key> <value>` stores. Denying the bare form told the caller "would change the
+        # SHARED git configuration" about a command that changes nothing, and the same false statement
+        # reached anyone documenting the rule.
+        #
+        # SCOPED TO THE `config` SUBCOMMAND ON PURPOSE -- DO NOT EXTEND IT TO `-c`. Measured on the same
+        # git: `-c <key>` WITHOUT an `=` still injects the key for that command (the value arrives
+        # empty), so absence-of-value there is not a read and an empty core.hooksPath is not obviously
+        # inert. The two forms only look alike; `-c` keeps denying whatever follows it.
+        #
+        # `$rest` stops at the next `|;&` because those start a new command, so a trailing separator
+        # cannot be mistaken for a value.
+        if ($viaConfig -and $rest -notmatch '\S') { continue }
 
         $at = [regex]::Match($seg.Raw, '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)')
         $pfx = $(if ($at.Success) { $seg.Raw.Substring(0, $at.Index) } else { "" })

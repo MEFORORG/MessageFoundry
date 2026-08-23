@@ -154,6 +154,64 @@ if (-not $Path -or $Path.Count -eq 0) {
 # rather than failing with "Path does not exist: 'a','b','c'", which is what it did.
 $Path = @($Path | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().Trim("'").Trim('"') } | Where-Object { $_ })
 
+# CONTENT-DURABILITY CLASSIFICATION (BACKLOG #1299).
+#
+# `--not --remotes` answers "does this COMMIT OBJECT exist on a remote". A reader runs this script to
+# ask "is any WORK at risk of being lost". Those two questions diverge on two ROUTINE mechanisms, and
+# measured 2026-08-23 on this machine EVERY alarm was a divergence: 8 of 8 unbacked commits were
+# content-durable. The remedy the script printed would have force-pushed rescue tags for work already
+# on `main`.
+#
+#   (1) SQUASH-MERGE orphans the original. `main` gets a NEW sha, so a branch still pointing at the
+#       pre-squash commit references an object on no remote while its content is fully landed. Every
+#       merged PR left behind by `gh pr checkout` is in this class.
+#   (2) A LOCAL `merge <remote> into <branch>` creates a merge commit that is itself new, while both
+#       its parents are already backed and it contributes no content of its own.
+#
+# WHY THE PARENT TEST ALONE IS NOT SOUND, and this is the half a naive fix gets wrong: a merge whose
+# parents are both backed CAN still carry content that exists nowhere else -- a hand-resolved conflict
+# lives in neither parent. So arm (2) additionally requires the commit's tree to equal the tree an
+# AUTOMATIC merge of those parents produces. Identical means the merge is re-derivable and nothing is
+# lost with it; different means somebody resolved something by hand and that resolution IS the work.
+# Measured on the 6 merge commits live here: all 6 identical, so all 6 are genuinely re-derivable.
+#
+# The classification only ever moves a commit from AT-RISK to DURABLE. A commit that fails both arms
+# is reported exactly as before, so this cannot mask the case the script exists for.
+function Test-CommitContentDurable {
+    param([string]$Repo, [string]$Commit)
+
+    # Arm 1: patch-id already upstream. `git cherry` marks '-' when an equivalent patch exists on the
+    # upstream ref, which is precisely the squash/rebase-landed case a sha comparison cannot see.
+    foreach ($up in @('origin/main', 'origin/master')) {
+        if ((& git -C $Repo rev-parse --verify --quiet "$up") ) {
+            $mark = (& git -C $Repo cherry $up $Commit 2>$null | Select-Object -First 1)
+            if ($mark -and $mark.StartsWith('-')) {
+                return [pscustomobject]@{ Durable = $true; Why = "patch already on $up (squash/rebase-landed)" }
+            }
+            break
+        }
+    }
+
+    # Arm 2: a re-derivable merge over backed parents.
+    $line = (& git -C $Repo rev-list --parents -n1 $Commit 2>$null)
+    if (-not $line) { return [pscustomobject]@{ Durable = $false; Why = $null } }
+    $parents = @(($line -split '\s+') | Select-Object -Skip 1)
+    if ($parents.Count -lt 2) { return [pscustomobject]@{ Durable = $false; Why = $null } }
+
+    foreach ($par in $parents) {
+        $n = (& git -C $Repo rev-list --count $par --not --remotes 2>$null)
+        if (-not $n -or [int]$n -gt 0) {
+            return [pscustomobject]@{ Durable = $false; Why = $null }   # a parent is itself unbacked
+        }
+    }
+    $actual = (& git -C $Repo rev-parse "$Commit^{tree}" 2>$null)
+    $auto = (& git -C $Repo merge-tree --write-tree $parents[0] $parents[1] 2>$null | Select-Object -First 1)
+    if ($actual -and $auto -and $actual -eq $auto) {
+        return [pscustomobject]@{ Durable = $true; Why = 'merge over backed parents, tree identical to the automatic merge' }
+    }
+    return [pscustomobject]@{ Durable = $false; Why = $null }
+}
+
 $repos = @()
 $totalRefs = 0
 $totalWorktrees = 0
@@ -161,6 +219,8 @@ $totalUnbacked = 0
 $totalCommits = 0
 $totalDetached = 0
 $totalDirty = 0
+$totalDurable = 0
+$durableFindings = @()
 
 foreach ($p in $Path) {
     if (-not (Test-Path -LiteralPath $p)) {
@@ -234,6 +294,27 @@ foreach ($p in $Path) {
         # total that would then read as ordinary unpushed work.
         $n = (& git -C $p rev-list --count $ref --not --remotes 2>$null)
         if ($n -and [int]$n -gt 0) {
+            # CLASSIFY BEFORE ALARMING (BACKLOG #1299). Only when EVERY unbacked commit on this ref is
+            # content-durable does the ref stop being a finding -- one commit that fails both arms
+            # keeps the whole ref in the at-risk report, because the point is not to lose that one.
+            $unbacked = @(& git -C $p rev-list $ref --not --remotes 2>$null)
+            $why = $null
+            $allDurable = $unbacked.Count -gt 0
+            foreach ($c in $unbacked) {
+                $v = Test-CommitContentDurable -Repo $p -Commit $c
+                if (-not $v.Durable) { $allDurable = $false; break }
+                if (-not $why) { $why = $v.Why }
+            }
+            if ($allDurable) {
+                $durableFindings += [pscustomobject]@{
+                    Repo    = $p
+                    Ref     = ($ref -replace '^refs/heads/', '')
+                    Commits = [int]$n
+                    Why     = $why
+                }
+                $totalDurable += [int]$n
+                continue
+            }
             $findings += [pscustomobject]@{
                 Ref     = ($ref -replace '^refs/heads/', '')
                 Commits = [int]$n
@@ -350,6 +431,17 @@ if ($totalDirty -gt 0) {
             foreach ($x in $r.DirtyCheckouts) {
                 Write-Host ("             {0,-55} {1} tracked, {2} untracked" -f $x.Worktree, $x.Tracked, $x.Untracked)
             }
+        }
+    }
+}
+# RECLASSIFIED, ALWAYS PRINTED (BACKLOG #1299). Shown on a clean run too: a reader who sees only
+# "0 unbacked" cannot tell whether the classification examined anything, and a silent reclassification
+# is how a real alarm would get suppressed without anyone noticing the mechanism existed.
+if ($totalDurable -gt 0) {
+    Write-Host "durable  : $totalDurable commit$(if ($totalDurable -ne 1) { 's' }) on $($durableFindings.Count) ref$(if ($durableFindings.Count -ne 1) { 's' }) exist on no remote but their CONTENT is not at risk" -ForegroundColor DarkGray
+    if (-not $Quiet) {
+        foreach ($d in $durableFindings) {
+            Write-Host ("             {0,-42} {1}" -f $d.Ref, $d.Why) -ForegroundColor DarkGray
         }
     }
 }

@@ -49,6 +49,40 @@ _DOC_PREFIXES = ("docs/", ".github/")
 _DOC_SUFFIXES = (".md",)
 
 
+def _safe_for_message(value: object, limit: int = 400) -> str:
+    """Fold a value that is about to be INTERPOLATED INTO PROSE AN AGENT IS TOLD TO ACT ON.
+
+    BACKLOG #1040. This gate's deny text is read by a model that then does what it says, so any value
+    carrying a newline can forge a second remedy block -- and a forged block placed FIRST is the one a
+    reader reaching top-down obeys. That is not hypothetical: the same defect was proven on
+    ``worktree_gate.ps1``, where a ``Write`` whose ``file_path`` held embedded newlines produced a
+    reason with two ``Do this instead:`` blocks, the injected one first. It needed nothing on disk --
+    only the JSON field -- so no other gate saw it.
+
+    THE VALUE MOST WORTH FOLDING HERE IS ``note``. It is free text any peer writes with
+    ``claim.ps1 -Take <n> -Note "<what>"``, it is routinely hundreds of characters, and nothing
+    constrains its content. ``worktree`` and ``branch`` are folded too: a refname is not inert either,
+    because ``git check-ref-format`` accepts ``;``, ``$``, ``|``, ``"`` and ``'``.
+
+    A LOCAL HELPER RATHER THAN A SHARED MODULE, and the reason is mechanical rather than stylistic.
+    ``install-git-hooks.ps1`` COPIES this file into the git hooks directory and runs it from there
+    (``exec "$PY" "$HOOK_DIR/claim_check.py"``), so an import of anything under ``scripts/hooks/``
+    resolves at development time and fails at the moment the gate actually runs. ``collision_gate.ps1``
+    took a local copy of its PowerShell equivalent for exactly this reason, recorded on #1040.
+
+    Folds every line break to a space, collapses runs of whitespace, strips control characters, and
+    truncates -- so the value can still be READ, but it can no longer add a line.
+    """
+    text = "" if value is None else str(value)
+    # Control characters, not just \n and \r: a lone \x1b can rewrite a terminal line, and \x08 can
+    # erase what precedes it, so a value that "contains no newline" is not therefore inert.
+    text = "".join(" " if ch < " " or ch == "\x7f" else ch for ch in text)
+    text = " ".join(text.split())
+    if len(text) > limit:
+        text = text[: limit - 3] + "..."
+    return text
+
+
 def _git(*args: str) -> str:
     return subprocess.run(  # nosec B603 B607 - fixed argv, no shell, no caller-supplied executable
         ["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace"
@@ -132,9 +166,10 @@ def main() -> int:
         if _norm(str(claim.get("worktree", ""))) != me:
             problems.append(
                 f"  BACKLOG #{item} is claimed by ANOTHER worktree:\n"
-                f"      held by: {claim.get('worktree')} [{claim.get('branch')}]\n"
-                f"      since  : {claim.get('claimed')}\n"
-                f"      note   : {claim.get('note')}\n"
+                f"      held by: {_safe_for_message(claim.get('worktree'))} "
+                f"[{_safe_for_message(claim.get('branch'))}]\n"
+                f"      since  : {_safe_for_message(claim.get('claimed'))}\n"
+                f"      note   : {_safe_for_message(claim.get('note'))}\n"
                 f"      Do not build it in parallel. Coordinate with that session, or if it is dead:\n"
                 f"          pwsh -NoProfile -File scripts\\coord\\claim.ps1 -Release {item} -Force"
             )
