@@ -11937,6 +11937,13 @@ repair commit, and regenerated within four days.* **Anchors have the same three 
 
 ***AND THIS ROW'S STANDING-FAILURE COUNT IS STALE.*** It was measured much higher this morning and lower
 after repairs landed. **Read the count; do not carry the row's.**
+
+**COUNT CORRECTED 2026-08-23, AT THE POINT OF THE ERROR RATHER THAN DOWNSTREAM OF IT.** This row says
+**11** standing failures on the current run. ***MEASURED: 31 failures over 28 distinct keys***, at
+scorecard `59c1b2ea` against engine `a8f5d10a`. *The row's figure is stale by roughly a factor of three.*
+
+**Recorded in the ROW and not only in a commit message, because the next reader reads the row, takes the
+stale number, and is wrong.** *No number here is a fact without the ref pair beside it.*
 ## 1246. the scorecard's residual prose carries 1,965 ungated file-line citations, and an enumeration in prose can understate a cell's own gap
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **2/10** · _fill-in_. The unchecked half is confirmed in the verifier: scripts/asvs/scorecard.py touches residual only to require non-empty prose on an na verdict (:451-453), to load it (:559) and to render it (:1998), and the retired anchor window is documented at :105-125, so no residual file-line citation is validated. The 7.2.4 evidence re-derives at HEAD, seven mark_session_* sites in messagefoundry/auth/service.py (:1582, :1822, :2160, :2195, :2199, :2464, :2597) against the two the residual enumerates, and _rotate_session_token (:1614) has callers only in tests/test_session_rotation_primitive.py; value 5 and difficulty 2 because SDS-3.6 already carries the general rule and the stated remedy is a filing rule, deliberately not a new gate. _(was 6/10 · 4/10.)_
@@ -15386,3 +15393,38 @@ enumeration that rule forbids, and it is the artifact currently before the owner
 
 **Expiry:** this stops being right if the anchors are repaired without recording their born-wrong status,
 at which point the population is gone and this row cannot be re-derived.
+
+## 1345. The claim gate decides documentation by path prefix, so executable code under docs escapes it
+
+> 🔢 **Filed 2026-08-23 - not started.** `claim_check.py` decides whether a commit "touches code" by testing the PATH PREFIX against a documentation list. ***A `.py` file under a documentation prefix therefore DECLARES ITSELF DOCUMENTATION TO THE CLAIM GATE***, and a commit touching only such files is stood down on without ever meeting the claim rule.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / gate integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no product axis (sec. 0). **The cost is that a class of real code changes is invisible to
+the gate that serialises item work.**
+
+***MEASURED: executable files sitting under a documentation prefix -- 2 in the engine, 9 in the vault***
+-- **including scripts that WRITE TO THE SECURITY RECORD.** *A commit touching only those is classified
+as documentation.*
+
+***THE CARVE-OUT ITSELF IS CORRECT AND DELIBERATE, AND MUST SURVIVE.*** The gate's own docstring says
+banner flips, doc corrections and ledger reconciles *"legitimately cite an item without building it, and
+they are exactly the commits a coordination gate must not block."* **The defect is not the exemption. It
+is that the exemption's TEST is a path prefix.**
+
+> ***A TEST ON THE SPELLING OF A PATH STANDING IN FOR A QUESTION ABOUT WHAT THE FILE IS.*** *Same
+> lexical-versus-semantic shape as a case-sensitive match on a program name.*
+
+**THE BUILD: decide on what the file IS -- extension or executability -- not on where it sits.**
+
+**Two controls, both required:** *an ordinary documentation commit under the prefix that MUST still be
+exempt*, and ***an executable file under the same prefix that MUST NOT be.*** **A gate proven only
+against the first is indistinguishable from today's.**
+
+**FOUND WHILE A SEAT CHECKED WHY A GATE DID NOT FIRE ON IT** -- *"it did not fire" and "it does not
+apply" are different facts, and it took the second reading to find this.*
+
+**Expiry:** this stops being right if the prefix list is replaced by a type test, or if executable files
+are removed from documentation directories.
