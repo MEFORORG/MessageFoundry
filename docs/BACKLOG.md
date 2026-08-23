@@ -11790,6 +11790,23 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > Closing-act: code
 
 **Cluster:** Security tooling / CI. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- this is evidence-integrity plumbing across two repositories, not shipped engine behaviour. The exposure is that the ASVS record can quietly describe code that no longer exists, which is a **stale anchor** (the evidence went stale), never an engine weakness.
+
+**DISPATCH NOTE 2026-08-23: ALL THREE LIMBS OF THE RE-SCORE VERIFIED ON THIS TREE AND THEY STAND. Whoever
+takes this does not need to re-derive them.**
+
+1. **The verifier is present in the engine and the DATA is not** -- `scripts/asvs/scorecard.py` exists;
+   `git ls-files docs/security` returns **ZERO**. ***That split IS the coupling this row is about.***
+2. **`.github/required-contexts.txt` is 141 lines with exactly ONE security-record entry**, and it is a
+   discovery gate rather than an anchor check. ***No verify context exists, so NOTHING CAN BLOCK on an
+   anchor break.***
+3. **The two engine workflows in this area verify absences and lint tallies. NEITHER VERIFIES ANCHORS.**
+
+**DEFERRED FOR RUNWAY, NOT BLOCKED.** A lane declined it with roughly half an hour left, on the ground
+that it is a **cross-repo DESIGN problem touching the vault boundary**, not an instrumentation one --
+*its own re-score says the design must hand a public repository enough to name an engine file and line
+while naming no cell id, and that the blocking limb inherits a precondition.* ***The realistic outcome
+in a short window is a half-designed cross-repo control, and a half-built control is the defect this
+whole cluster exists to prevent.***
 ## 1246. the scorecard's residual prose carries 1,965 ungated file-line citations, and an enumeration in prose can understate a cell's own gap
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **2/10** · _fill-in_. The unchecked half is confirmed in the verifier: scripts/asvs/scorecard.py touches residual only to require non-empty prose on an na verdict (:451-453), to load it (:559) and to render it (:1998), and the retired anchor window is documented at :105-125, so no residual file-line citation is validated. The 7.2.4 evidence re-derives at HEAD, seven mark_session_* sites in messagefoundry/auth/service.py (:1582, :1822, :2160, :2195, :2199, :2464, :2597) against the two the residual enumerates, and _rotate_session_token (:1614) has callers only in tests/test_session_rotation_primitive.py; value 5 and difficulty 2 because SDS-3.6 already carries the general rule and the stated remedy is a filing rule, deliberately not a new gate. _(was 6/10 · 4/10.)_
@@ -14949,3 +14966,27 @@ LOOKING FOR.***
 
 **A future reader given only the finding would conclude that a demand-gate screen exists and works.
 It does not. That is what this item builds.**
+
+***BUILT AT `2b58a213`. AND THE SECOND FALSE POSITIVE IS THE SHARPEST FINDING IN THE ITEM: THE MIGRATION
+THAT MADE THIS FIELD MACHINE-READABLE LAID A LANDMINE FOR ANY CHECKER OVER IT.***
+
+**A BARE-WORD search reports FIVE divergences, not three. Two of the five are CORRECT PROSE:**
+- one item **cross-references another item's verdict** -- a true statement about a different row;
+- ***and `#1324` CARRIES THE VOCABULARY LINE ITSELF*** -- the declared closed set of verdict values,
+  plus the distribution -- **so the item that DOCUMENTS the field looks governed by it.**
+
+***THAT LINE WAS WRITTEN INTO `#1324` BY THE SAME LANE, IN THE FIELD MIGRATION, TWO ROUNDS EARLIER.***
+**The work that made the field machine-readable is what makes a bare-word check over it wrong.**
+
+**THE DISCRIMINATOR IS THE DECLARATION FORM, NOT THE WORD.** A checker must match *`Re-scored ... -> X`*
+and the banner's *`Verdict: X`* line -- **never a loose occurrence of a verdict word**, which appears
+legitimately in cross-references, in vocabulary lines, and in any row discussing the schema. *An
+independent measurement using the declaration form returned 3; the bare-word variant returned 5.*
+**Mutation-verified: swapping the declaration needle for a bare word reds the priority arm.**
+
+***AND IT WAS CAUGHT BY LUCK, WHICH THE ROW SHOULD SAY.*** The naive matcher flagged an item the builder
+**happened to know** could not be demand-gated. **Nothing in the output distinguished the two correct
+rows from the three real ones.**
+
+**Reproduced independently from a separately written matcher: 237 open items carry a banner verdict, 26
+also carry a prose re-score, 23 agree, 3 diverge.** *Reconciles nothing, as scoped.*
