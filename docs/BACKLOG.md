@@ -13703,6 +13703,9 @@ blind window is about a day rather than open-ended.
 ## 1301. a ledger banner citing a commit sha must cite a commit whose subject names the item it sits under
 
 > 🔢 **Filed 2026-08-21 -- not started. ONE EDIT CORRUPTED TWO ITEMS IN OPPOSITE DIRECTIONS AND NO GATE COULD SEE IT, BUT A SHA-TO-ITEM AGREEMENT CHECK WOULD HAVE.** A retirement banner intended for one item was written onto another. The Markdown stayed valid, the item count did not move, the status glyph was untouched, and the misplaced paragraph carried no glyph of its own -- so `parse_items` had no second banner to object to and every ledger gate passed.
+> Verdict: build
+> Research: none
+> Closing-act: code
 
 > **THE SIGNAL THAT WAS THERE ALL ALONG.** The overwritten banner cited two commit shas whose subjects both ended in that item's own number. The paragraph that replaced it cited a sha whose subject named a DIFFERENT item. So the rule is mechanical and needs no judgement: **a banner citing a commit sha must cite a commit whose subject names the item the banner sits under.**
 
@@ -13714,6 +13717,40 @@ blind window is about a day rather than open-ended.
 
 **Cluster:** Ledger integrity / commit gates. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0) -- ledger hygiene. The cost is that a wrongly-transposed banner reads as a working cross-reference forever, and the two items it corrupts fail in opposite directions: one over-reports its status and one under-reports it.
+
+**AMENDMENT 2026-08-23, dispatcher seat. THE RULE AS LITERALLY STATED IS OVER-SCOPED BY ONE LEVEL, AND
+THE MEASUREMENT RESHAPES THE ITEM RATHER THAN SIZING IT.** Measured over this file at `a92ab10f`: 342
+items, **64 carry a sha in the banner block, 123 shas resolve against git.**
+
+| outcome | count | what it is |
+| --- | --- | --- |
+| subject names its own item | **38** | the rule's intended pass -- **and the positive control** |
+| subject names a DIFFERENT item | **53** | ***CORRECT PROSE*** -- a true cross-reference to another item's commit |
+| subject names no item | 26 | ordinary commits, legitimately cited |
+| merge commits | 6 | subject names a PR, not an item |
+
+**`BACKLOG-CLOSED.md` is no better proportionally: 14 resolved, 5 agree, 9 disagree.** So the literal
+check **would ship with 94 violations across the two files, none of them the defect.**
+
+***THE 53 ARE THE FINDING. A CHECK THAT FLAGS THEM IS NOT NOISY, IT IS WRONG*** -- it asserts a defect
+where the ledger is doing exactly what it should. `#320`'s banner truthfully says a CI symptom *"is
+already fixed"* and cites the other item's commit. **That is a useful cross-reference, and the rule as
+written calls it a violation.**
+
+***AND THE SYMMETRY IS WORTH MORE THAN THIS ITEM.*** This row warns that a screen finding **NOTHING**
+reads as a clean corpus. **This screen finds EVERYTHING and reads as a broken ledger. Both are unusable,
+and the row anticipated only one direction.** The next person adding a ledger check will reach for the
+same one-directional caution.
+
+**RULING: NARROW THE TRIGGER TO A CLOSING CLAIM** -- a sha in a CLOSED, retirement or SHIPPED banner, in
+a position asserting it closed **this** item. **The incident stays caught; the prose cross-references
+drop out; nothing rests on a baseline count.** A warn-with-baseline alternative was rejected: it bakes
+in 94 as a number that rots, and the day someone adds a legitimate cross-reference the baseline is
+wrong with nothing reporting it.
+
+**ONE INSTRUMENT NOTE, because it cost a caveat.** A subject grep for this item's target resolves to
+unrelated files, and that is not a defect in the item -- **it asks for a check that does not exist yet**,
+so no grep over the tree can resolve it. **The instrument was being asked an unanswerable question.**
 ## 1331. test_connscale_smoke_end_to_end wears six assertions under one name, so a merge-blocking flake reads as six unrelated bugs
 
 > 🔢 **Filed 2026-08-22 - not started.** One test name covers at least six separate properties, so two seats hitting it twice see two unrelated bugs rather than one recurring problem. It sits on three of the thirteen required contexts, so every occurrence is merge-blocking.
