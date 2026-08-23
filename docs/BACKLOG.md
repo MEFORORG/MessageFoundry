@@ -6219,6 +6219,32 @@ Both readings reach the same operational conclusion, which is the whole point of
 
 **Source:** BACKLOG #1073's ASCQM pass, element `ASCSM-CWE-798`. Scanner behaviour confirmed against the pinned configurations, not inferred from the tools' reputations.
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. A CONTROL BUILT FROM A CANONICAL EXAMPLE VALUE IS NOT A
+CONTROL, AND THIS ITEM NEARLY PRODUCED A SPECTACULAR FALSE ALARM ON IT.**
+
+A building lane's first positive control used **the AWS documentation access-key value** -- the one
+published in vendor docs as a sample. ***THE SCANNER IT WAS TESTING ALLOWLISTS THAT VALUE BY DESIGN.*** The scan returned zero, and the lane was one step from
+reporting **that this repository's secret scanning detects nothing at all.**
+
+***THE FAILURE IS EXACT AND IT GENERALISES: A CANONICAL EXAMPLE VALUE IS THE ONE VALUE GUARANTEED TO BE
+EXEMPT.*** Reaching for the documented sample is the natural move when you need a realistic secret, and
+it is the one choice that tests the **allowlist** rather than the **scanner**. *The control returns
+zero, the zero looks like a finding, and the finding is about the wrong component.*
+
+**RE-RUN WITH A REAL SECRET SHAPE, the lane reports:** the scanner **fires**, this repository's five
+allowlist regexes are **NOT over-broad**, and **the defect in this row stands** -- low-entropy
+credentials in `.yaml` and `.ps1` pass both required gates.
+
+**SO THE ROW IS UNCHANGED AND ITS EVIDENCE IS NOW STRONGER**, because the obvious refutation was tried
+first and failed. *Anyone re-measuring this item must not use a documentation key, and should state
+which value they used so the next reader can tell a real zero from an exempt one.*
+
+***AND THE LITERAL MUST NOT BE WRITTEN INTO THIS LEDGER TO EXPLAIN THAT, WHICH IS ITS OWN SMALL
+FINDING.*** A first attempt at this amendment quoted the sample value verbatim and **the commit-path
+secret gate REFUSED it.** So the two gates disagree about that string: **the scanner under test treats
+it as exempt, and the commit gate treats it as a leak.** *Whoever re-measures this row should say WHICH
+gate they ran, because "the scanner allowlists it" is true of one of them and false of the other.*
 ## 1092. Every gate verdict that moved under measurement moved the same way, and three of them falsify a sentence the project had written down
 
 > ✅ **Closed 2026-08-10 — PR #NNN.** Scope audit delivered as **section 4.0 rule 4** (scope is part of the verdict — a gate's name is a claim; only its measured output and scope are evidence) and **Appendix A.5**, the per-instrument scope register, in [`Code_Quality_Standards.md`](Code_Quality_Standards.md). **Claim 1 CONFIRMED by mutation**, not by reading: a planted forbidden import fails `tests/test_dependency_boundaries.py` in `transports/` and `store/` and passes in `auth/`, `anon/`, `checks.py`, `harness/`, `tee/` and `scripts/` — so the engine one-way rule is genuinely enforced, while the client-side layering convention the prose appeared to cover has **no instrument**. One half of claim 1 was **stale and is refuted**: the gate resolves `ast.ImportFrom` and relative imports, not `ast.Import` alone. Every other scorecard count was stale **in the same direction** (test functions 5,402 -> 9,706; `pytest.raises` ~1,000 -> 1,608; SECURITY.md 735 -> 1,849 ln; PHI.md 688 -> 1,335 ln; C901 122/43 files -> 132/46). Signal 2's *no blanket ignores* **stands once scoped** (zero inside the mypy-checked tree; the two in the repo are in `tests/`, which CI does not type-check). **Claims 2 and 3 are NOT closed by this item** — see the two follow-ups below; neither belongs in a public file. Register pinned by `tests/test_quality_record_scope_claims.py`.
