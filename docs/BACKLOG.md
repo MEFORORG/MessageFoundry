@@ -15742,5 +15742,35 @@ object**, not the commit; `rev-parse ^{commit}` or `%(*objectname)` returns the 
 `merge-base` and `rev-list` dereference silently, so ancestry and diffstat are unaffected -- but a tag-
 object sha published into a log will not resolve.*** *One such sha was published and corrected here.*
 
+***AMENDED A THIRD TIME, AND THIS IS THE ACTIONABLE FORM: TWO NAMESPACES CARRY NEAR-IDENTICAL NAMES FOR
+THE SAME BRANCH, AND THEY DISAGREE ABOUT ONE TIME IN SEVEN.***
+
+*For one branch, both of these exist in one clone right now:* **a `refs/tags/rescue/auto/...` tag `13`
+commits behind, and a `refs/remotes/private/rescuetags/auto/...` ref holding the head EXACTLY.** ***Both
+readings correct. The names differ by NAMESPACE ALONE.***
+
+| over 110 branches carrying BOTH and still alive | holds the current head |
+|---|---|
+| the **tag** | *86 / 110 -- **78 pct*** |
+| the **remote-tracking ref** | *99 / 110 -- **90 pct*** |
+| ***the two DISAGREE WITH EACH OTHER*** | ***16 / 110 -- 15 pct*** |
+
+***SO "CHECK YOUR RESCUE TAG" RETURNS OPPOSITE ANSWERS ABOUT ONE TIME IN SEVEN, DECIDED ONLY BY WHICH REF
+THE READER HAPPENS TO REACH FOR.***
+
+**AND THE TOOLING HIDES THE OTHER ONE FROM YOU.** *`git tag -l 'rescue/*'` **cannot see** the remotes
+ref. A reflog showing `update by push` **cannot exist** on a tag.* ***Two seats each verified a real
+object with an instrument structurally blind to the other's, then read the other's result as a
+refutation.***
+
+***THE REMEDY IS A NAMING RULE, NOT A REPAIR: QUOTE THE FULL REFNAME. NEVER WRITE "THE RESCUE TAG".***
+*Every count in this row is a slice of a different namespace and **the slices are NOT reconciled here** --
+`730`, `393`, `752`, `248` were each measured over a different set, and forcing them into one figure
+would manufacture exactly the false precision this row is about.*
+
+**WHAT SURVIVES ALL THREE AMENDMENTS:** *the snapshot is least reliable for the **MOST ACTIVE** branch --
+**a tag because it never moves, a remote ref because an active branch outruns the push*** -- *and you
+read it once, in the moment the original is already gone.*
+
 **Expiry:** this stops being right if rescue refs are written with a recorded target sha, or if the
 writer refuses any ref that is not its branch's tip.
