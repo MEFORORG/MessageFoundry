@@ -13677,7 +13677,63 @@ blind window is about a day rather than open-ended.
 
 **Consequence for any closed-item counter.** `CLOSED SINCE <ref>` measures **banner state**, not whether work finished. Without this map it is neither a floor nor a ceiling. **The discriminator, recorded so nobody re-derives it: for each item whose closing act is a re-score, compare the cell `last_verified` against the banner last touch. A cell re-scored after the banner was last touched is step one done and step two missing.**
 
-**Proposed work, unallocated.** A map from ASVS cell id to the backlog items it governs, readable from an engine checkout without the vault, plus the reverse lookup the handoff needs.
+**Proposed work, AMENDED 2026-08-22 (Central) by the ASVS Tracker, cleared by the Liaison. The
+original ask -- a cell-to-item map readable from an engine checkout without the vault -- is
+WITHDRAWN, and the reason is not a preference.** That artifact is forbidden by `CLAUDE.md`
+section 12, owner-set: the ASVS vocabulary is public, the content is not, and cell ids, coverage
+and gaps stay vaulted. This repository is public, so "readable from an engine checkout" names
+exactly the forbidden destination. **COMPLETENESS IS THE DISCLOSURE:** the (item, cell) pairs
+attached to OPEN items are already public, because an open item is already a public statement
+that something is wrong. What a COMPLETE map adds is the entries with no item -- the passes, and
+the ones nobody looked at -- handing those out by subtraction over a closed domain. **Do not
+re-propose the map; propose the check below instead.**
+
+**AND THE MAP IS NOT NEEDED, WHICH IS WHY THIS IS AN AMENDMENT AND NOT A CLOSURE.** The
+discriminator two paragraphs above runs today, without any new artifact, entirely on the vault
+side, and its OUTPUT is a list of **backlog item numbers** -- rows that are already public. The
+partial linkage it needs **already exists in the record** and did not have to be built. Measured
+2026-08-22 (Central) against `cee500cf`: **42 usable pairs over 34 distinct items.**
+
+**THE TRAP, RECORDED SO THE NEXT IMPLEMENTATION DOES NOT REDISCOVER IT AT COST. A bare `#N` in
+that record is not reliably a backlog number -- it also spells PULL REQUEST numbers, and the two
+namespaces are indistinguishable by shape.** Measured: 31 bare references over 17 distinct
+numbers carrying no `BACKLOG` prefix. **The worked case:** a security record entry reads *"the
+build is #156"*, and commit `82be0e42` is `docs(asvs): correct a false published attestation ...
+(#156)` -- a **PR** number. Backlog **#156** is *"Alert hysteresis (separate fire/clear
+thresholds)"*, unrelated. **The citation is correct in one namespace and wrong in the other, and
+nothing anywhere reports it.** The sha beside it is the only disambiguator. **Match the literal
+`BACKLOG #N` form only.** This is the same class this file already records at
+[#1301](#1301): a cross-reference that resolves cleanly to the wrong thing reads as a working
+link forever.
+
+**Scope: the ASVS Tracker seat.** It holds the record the check reads, and the check's output
+crosses the public boundary in the safe direction. **First run, 2026-08-22 (Central): zero
+confirmed missing banner flips.** Every open item with a usable pair sat against a `partial`
+grade, which is the correct in-sync state rather than a missing flip -- work remains, and the
+open item is that work. **Two apparent hits dissolved on reading**: one was the PR-number
+collision above, the other an explicit "it is not graded here" cross-reference. **A nonzero
+count still needs the entry read.**
+
+**A WORKED NEGATIVE CASE, recorded because the next objection to any screen is that it
+over-fires.** [#1026](#1026) is the strongest apparent hit the first run produced: its covering
+security-record entry says in prose that the gap closed at HEAD, while the item stays open. That
+reads like a missing banner flip. **It is not.** #1026's own banner already records
+`partly_shipped` -- the security limb discharged, a documentation line and an unactionable
+refusal string remaining -- and the covering entry is graded `partial` for exactly that reason.
+**The two records AGREE, and agreeing is what the pair looks like.**
+
+**The author of this screen misread that case first**, routed it upward as needing a human, and
+withdrew it after reading the item's banner rather than only the record's. **The failure was
+comparing one record against an EXPECTATION instead of against the other record** -- which is the
+same family as reading a stale corpus, one level up: there the instrument was fine and the corpus
+was wrong; here the comparison was fine and only one side was ever loaded. **So the screen's zero
+is a measured zero and not an untested one**, and a screen that survives a case its own author
+got wrong is worth more than one only ever run on clean data.
+
+**STILL UNRUN, so this row is amended and not closed.** The discriminator as stated compares
+against the banner's **last touch date**; the first run compared against banner **open/closed
+state**, which is weaker and needs no per-item blame. **A flip that happened, but happened late,
+would not appear.** The date comparison remains the open work here.
 
 **Source:** the two-act structure was named by the ASVS Tracker seat; this row is the Dispatcher's, whose handoff rule assumed a map that does not exist.
 
