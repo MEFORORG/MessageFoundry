@@ -4472,7 +4472,7 @@ def create_app(
             # BACKLOG #1225: the OWNER KEY is the immutable Identity.user_id, never the reassignable
             # username. This is the WRITE the other three sites read; re-keying only the readers
             # would make every newly created preset invisible to its own creator.
-            owner=identity.user_id,
+            owner_user_id=identity.user_id,
             name=body.name,
             criteria=crit.model_dump_json(),
         )
@@ -4502,7 +4502,7 @@ def create_app(
     ) -> SearchPresetDeleteResult:
         """Delete one of the caller's presets (owner-scoped). Audited."""
         deleted = await engine.store.delete_search_preset(
-            preset_id=preset_id, owner=identity.user_id
+            preset_id=preset_id, owner_user_id=identity.user_id
         )
         if not deleted:
             raise HTTPException(404, f"no such preset: {preset_id}")
@@ -4537,7 +4537,9 @@ def create_app(
             raise HTTPException(400, f"at most {_MAX_PRESET_LAYERS} presets may be layered")
         criterias: list[dict[str, Any]] = []
         for preset_id in ids:
-            row = await engine.store.get_search_preset(preset_id=preset_id, owner=identity.user_id)
+            row = await engine.store.get_search_preset(
+                preset_id=preset_id, owner_user_id=identity.user_id
+            )
             if row is None:
                 raise HTTPException(404, f"no such preset: {preset_id}")
             try:

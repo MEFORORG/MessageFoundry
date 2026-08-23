@@ -2930,6 +2930,30 @@ def route_demo_oru(msg):
 
 **Source:** Windmill/Kestra evaluation (2026-07-30); owner approved.
 
+
+***AMENDMENT 2026-08-23. THIS ROW'S PREREQUISITE SENTENCE IS FALSE, AND IT SURVIVED INSIDE A RE-SCORE.***
+
+The 2026-08-03 amendment ends *"both named backlog dependencies are still open."* ***BOTH ARE CLOSED,
+AND BOTH CLOSED BEFORE THIS ROW WAS LAST RE-SCORED.*** Read with `parse_items` over the archive, both
+carry the **DONE** banner glyph -- *not the declined or retired ones*, **which is the only reading that
+CLEARS a prerequisite: a DECLINED dependency leaves a gate shut exactly as an open one does, and only
+the banner separates them.**
+
+***THE SHARP PART: THE STALENESS SITS INSIDE A THREE-DAY-OLD RE-SCORE.*** Whoever re-scored correctly
+re-priced the difficulty and **carried the dependency sentence forward unexamined.** ***A RE-SCORE IS
+EXACTLY WHERE A READER ASSUMES EVERY CLAIM WAS JUST CHECKED, SO A STALE LINE SURVIVES BETTER THERE THAN
+ANYWHERE ELSE.***
+
+**A SECOND AND SEPARATE EDIT IS NEEDED: THE GATE SENTENCE IS NOW FALSE ABOUT THE CODE.** The dependency
+shipped **one option only, by owner ruling** -- the divergence class is **GATED by a differential test,
+not ELIMINATED** -- so the duplicated logic this row names **still exists**, with an enforced mirror test
+asserting it on every relevant CI leg. ***The gate reads as CLEARED*** -- its purpose was to stop this
+row introducing silent divergence, and an enforced differential test serves that better than elimination
+-- **but the WORDING must be replaced, not merely the status claim.**
+
+***A FIFTH DISPATCH SCREEN, WITH A WORKED INSTANCE: "DOES THIS ITEM DECLARE A PREREQUISITE, AND IS IT
+STILL OPEN?"*** The four screens in use -- already-built, gated verdict, retired-in-place, and
+subject-exists -- **none of them reads "gated on another item" out of an item's own prose.**
 ## 248. Steps view: reclassify comment-only rows as a non-opaque note row
 
 > ✅ **SHIPPED 2026-08-11 (integration-c).** Value **6/10** · Difficulty **4/10** · _quick win_. A `note` row kind is threaded through `lens.py`'s partition, `_merge_code_rows`, `_EDITABLE_KINDS` and the IDE JSON contract, so comment-only rows no longer render as opaque uneditable code. All three shipped defects the item named are fixed: the trailing comment that rendered nowhere, the adjacent comment swallowed by the coalescer, and the uneditability that contradicted `docs/STEPS-PALETTE.md:71`. ADR 0076 Amendment A was already ACCEPTED, so no gate work was needed. **The carve-out's licence was re-asserted, not assumed:** the coverage partition is proved total and the splice byte-stable, because #26 permits a Steps view only while the `.py` remains the sole artefact and the sole execution path.
@@ -4203,6 +4227,16 @@ sourced: the vault-side 13.2.2 correction of 2026-08-04 (`b0b21122`) that applie
 and scoped this sweep out of itself. Every count above was measured against the vault checkout on
 2026-08-04 for this filing; the engine-side facts were read at `origin/main` `88703a3a`.
 
+
+**DISPATCH FENCE 2026-08-23: THIS ROW EDITS THE SECURITY RECORD'S OWN PROSE, so it needs the vaulted
+data and belongs to the seat that owns that record -- NOT to a build lane.** *Do not dispatch it to a
+builder.*
+
+***THE DISTINCTION IS RECORD VERSUS TOOL, NOT DIRECTORY.*** A row that changes the WRITER or the VERIFIER
+is ordinary public engine work whose fixtures are already public; **a row that changes what the RECORD
+SAYS is not.** *A dispatcher screening on the directory alone fences off both, which is a match on
+location rather than on subject -- the same shape as a commit that CITES an item being read as one that
+BUILDS it.*
 ## 1008. Startup preflight on the store principal's effective privileges (ASVS 13.2.2)
 
 > 🔢 **Re-scored 2026-08-20 -> DEMAND-GATE.** Value **6/10** · Difficulty **4/10** · _quick win_. Gap stands in shipped code: no privilege probe exists in the four scanned packages beyond the two conditional-DDL guard hits at sqlserver.py:924/:931, and settings.py:514 gates credential kind only, so a sysadmin login would go unobserved on first deployment (value 6). The remainder is a probe across SQL Server plus Postgres with SQLite exempt, a settings plus serve gate, the still-underived Postgres grant set, and a paired out-of-repo scorecard edit, which is the difficulty-4 anchor of a feature across a seam exercised on all three backends. _(was 6/10 · 4/10.)_
@@ -4832,6 +4866,27 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 **Source:** found while auditing the session-drift installers, 2026-08-04, and adversarially re-verified at `6e481c14`. Confirmed with the title narrowed as above.
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. CONCLUDED AS RESEARCH -- NO CODE, AND THE FINDING IS THAT THE
+REMAINDER WOULD HAVE NO READER.** Measured in `scripts/worktree/install-selfheal.ps1`: of the three
+remainders this row names, **`-Status` has 0 references and a hash at the copy has 0**; the in-session
+refusal is live. *So the row is accurate about its own state.*
+
+**TWO OF THE THREE ARE REFUSED BY THIS ROW ITSELF, ON SECURITY GROUNDS THAT HOLD.** Adding `-Status`
+requires narrowing that refusal so a session can run it -- **weakening a control on a task bundle that
+never named it.** The sibling installer refuses in-session too, so **plain-terminal-only is the
+PRECEDENT, not a gap.**
+
+***THE THIRD HAS NO CONSUMER, AND THAT IS THE FINDING: IT WOULD BE WRITE-ONLY DATA -- A STAMP WHOSE SOLE
+READER IS A FEATURE THIS ROW DECLINES TO BUILD.*** The shipped instrument
+(`tests/test_selfheal_installed_parity.py:243`) reads **source bytes directly** and compares against the
+installed copy. **It needs no stamp and would not read one.** Growing the most privileged script in the
+estate to serve nothing **would read to a future maintainer as a live mechanism.**
+
+**THIS IS A CONCLUSION, NOT A DISCOVERY OF PRIOR WORK** -- the script is byte-unchanged, nobody built
+the remainder. **STAYS OPEN**, because the measurement covers only the three named remainders and **NOT**
+whether the installed-versus-source problem is solved in general. *Closing on it would assert more than
+was measured.*
 ## 1018. The raw-text gate-rule scan exists in three independent copies with nothing tying them together
 
 > ✅ **Shipped 2026-08-10.** [`tests/test_gate_rule_scan_agreement.py`](../tests/test_gate_rule_scan_agreement.py) drives all **three** extractors over one corpus and fails when they diverge: `test_install_gate_wiring.tools_the_gate_handles` (through its module constant), `test_gate_installed_parity.handled_tools` (by its text argument), and `install-gate.ps1`'s `Get-HandledTools` (lifted with the PowerShell AST, so the installer — which rewrites machine-global wiring — is never executed). **The three are deliberately NOT unified**: a shared Python helper cannot absorb the PowerShell copy, so the agreement test *is* the deliverable. Eight arms: the real gate (each must return something — three implementations all returning the empty set agree perfectly and measure nothing), six regex shapes asserting the **expected** set rather than only mutual agreement, and the ONE real difference — copy 2's whole-line `#` comment filter — **pinned with its reason** instead of hidden. Red-first in both directions, as the item prescribes: `"([A-Z][a-z]+)"` in copy 3 failed 5 of 8 printing `1: ['GhostTool','RealTool'] / 2: ['RealTool'] / 3: []`; the same change in copy 2 gave the mirror image.
@@ -5297,6 +5352,48 @@ against the gate **as it will ship**, not as it is.
 
 **Source:** identified 2026-08-05 while fixing #1032, and deliberately deferred rather than swept in, so that fix stayed scoped to one rule. Recorded here because a deferral nobody files is a deferral dropped.
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. THIS IS A SCANNER ITEM, NOT A RULE-3C ITEM, AND `#1332` IS
+RETIRED INTO IT.** I filed `#1332` for this defect without finding this row; a building lane caught the
+duplicate by reading `Get-ScannableSegments` before writing to it, where **this row's number is already
+named in the residual list** (`scripts/hooks/worktree_gate.ps1:624`).
+
+**THE SCOPE IS WIDER THAN THIS ROW'S TITLE SAYS. ALL THREE RULE SITES CALL THE SAME FUNCTION** --
+`:1211`, `:1339` and `:1602`, off the definition at `:557`, measured on the ledger base `a92ab10f`. So
+this is not one rule misreading a here-string; **it is the shared segment scanner losing the fact that
+a body was quoted, for every rule that consults it.**
+
+**AND IT IS WHY `#1305` WAS UNFIXABLE IN ITS FILED FORM.** That item's fix extended the same defect to
+the git program token rather than introducing a new one, which is how it added eleven further
+false-deny classes. **One root cause, more than one rule, one half already live on `main`.**
+
+**MEASURED DIFFERENTIALLY, controls discriminating in BOTH directions** -- an all-allow or all-deny
+harness proves nothing:
+
+| case | result |
+| --- | --- |
+| heredoc, key at LINE START | DENY |
+| heredoc, key MID-LINE | DENY |
+| heredoc, key INDENTED | DENY |
+| heredoc, key in BACKTICKS | ALLOW |
+| single-quoted echo, same line | ALLOW |
+| double-quoted echo, same line | ALLOW |
+
+**Position within the line is IRRELEVANT. The discriminator is HEREDOC versus SAME-LINE QUOTING** --
+same-line quoting is handled correctly and a heredoc body is not. A hypothesis that line 2 of a quoted
+body reads as *program position* was tested against this table and **withdrawn**.
+
+**THE BACKTICK ROW IS LUCK AND MUST NOT BE RELIED ON.** The preceding character is simply outside the
+pattern's leading class. A writer who happens to use backticks escapes; one who does not, does not.
+
+***THE OBJECTION IN THE FUNCTION'S OWN NOTE OUTRANKS THE FIX, AND IT IS THE REAL BLOCKER.*** The
+residual says this was left alone because **no test on this gate could tell the two mechanisms apart,
+and a fix whose green nobody could watch fail is not evidence.** Today a multi-line quoted body denies
+**by accident** -- every line reaches the scanner raw. **A fix that blanks those bodies removes the
+accidental deny, so blanking could trade a false DENY for a silent FAIL-OPEN.** Build the discriminator
+first. **If no test can separate *denied because the rule saw a real command* from *denied because the
+raw scan happened to see one*, then this must not be built as specified** -- and that finding is a
+complete result, not a stall.
 ## 1036. A Rule 4 deny names the first allowlisted repo's tooling regardless of which repo fired it
 
 > ✅ **SHIPPED 2026-08-10 — branch `w2-l3-gate-emitter` (`f911ebe5`).** Value **3/10** · Difficulty **2/10** · _quick win_. Rule 4 fires on the TOOL NAME alone, so it had no path to key on and named the first allowlist entry whichever repo the session was in. It now resolves the session's own governed root: by prefix for the primary and its nested `.claude/worktrees/` trees, and via `rev-parse --git-common-dir` for a sibling worktree, which lives outside every root's path. When neither answers it says so and prints NO runnable command -- a path that exists and runs against an unrelated clone is worse than no remedy. Tested with a TWO-entry allowlist across all four governed shapes plus an ungoverned cwd; the two cases the old code got right stay green on both sides.
@@ -5874,6 +5971,17 @@ The same `[^"\s]+` class truncated at a SPACE, so any governed root whose path c
 
 **Source:** recorded in #1065 by the adversarial verification pass on #1061's fix; allocated and fixed 2026-08-06. The quoted-KEY half was found by the design review of the fix for the quoted-PATH half, which is why this is a separate item rather than a line in #1065.
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. A SECOND MEASURED INSTANCE, AND A MECHANISM ITEM NOW HOLDS THE
+FIX DIRECTION.** This row frames the class around a `-C` TARGET. A building lane measured the same
+mechanism in a **MESSAGE flag that executes outright**: `git commit -m "$(...)"` is **ALLOWED on both
+tools**, while the unquoted form is denied -- the control proving the gate can see it when quoting does
+not erase it. **Both shells substitute inside double quotes before git is invoked, so the disarm runs.**
+
+***AND THIS ROW CANNOT BE FIXED ALONE.*** Its remedy pulls toward **less** blanking; `#1086`'s pulls
+toward **more**; they are one design error read from two ends. **#1336** carries the reconciliation --
+the two questions need different strings, and the segment object already provides both. **Do not narrow
+the blanking here without measuring `#1086`'s false-deny rows in the same table.**
 ## 1067. Rule 3c governs by PATH PREFIX, so an independent repo vendored under a governed root inherits its governance
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **4/10** · _fill-in_. Rule 3c still decides governance by an equality-or-slash-prefix test over the resolved git common dir, so an independent clone under a governed root inherits governance, and the deny text still asserts a shared .git that a vendored clone does not have. Value 4 because it is a false deny in developer tooling with no product surface; difficulty 4 because any fix must pin both directions at once -- allow the vendored clone while keeping the nested .claude/worktrees case denied -- and it forces the git-submodule question the item deliberately deferred. _(was 4/10 · 4/10.)_
@@ -6145,6 +6253,32 @@ Both readings reach the same operational conclusion, which is the whole point of
 
 **Source:** BACKLOG #1073's ASCQM pass, element `ASCSM-CWE-798`. Scanner behaviour confirmed against the pinned configurations, not inferred from the tools' reputations.
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. A CONTROL BUILT FROM A CANONICAL EXAMPLE VALUE IS NOT A
+CONTROL, AND THIS ITEM NEARLY PRODUCED A SPECTACULAR FALSE ALARM ON IT.**
+
+A building lane's first positive control used **the AWS documentation access-key value** -- the one
+published in vendor docs as a sample. ***THE SCANNER IT WAS TESTING ALLOWLISTS THAT VALUE BY DESIGN.*** The scan returned zero, and the lane was one step from
+reporting **that this repository's secret scanning detects nothing at all.**
+
+***THE FAILURE IS EXACT AND IT GENERALISES: A CANONICAL EXAMPLE VALUE IS THE ONE VALUE GUARANTEED TO BE
+EXEMPT.*** Reaching for the documented sample is the natural move when you need a realistic secret, and
+it is the one choice that tests the **allowlist** rather than the **scanner**. *The control returns
+zero, the zero looks like a finding, and the finding is about the wrong component.*
+
+**RE-RUN WITH A REAL SECRET SHAPE, the lane reports:** the scanner **fires**, this repository's five
+allowlist regexes are **NOT over-broad**, and **the defect in this row stands** -- low-entropy
+credentials in `.yaml` and `.ps1` pass both required gates.
+
+**SO THE ROW IS UNCHANGED AND ITS EVIDENCE IS NOW STRONGER**, because the obvious refutation was tried
+first and failed. *Anyone re-measuring this item must not use a documentation key, and should state
+which value they used so the next reader can tell a real zero from an exempt one.*
+
+***AND THE LITERAL MUST NOT BE WRITTEN INTO THIS LEDGER TO EXPLAIN THAT, WHICH IS ITS OWN SMALL
+FINDING.*** A first attempt at this amendment quoted the sample value verbatim and **the commit-path
+secret gate REFUSED it.** So the two gates disagree about that string: **the scanner under test treats
+it as exempt, and the commit gate treats it as a leak.** *Whoever re-measures this row should say WHICH
+gate they ran, because "the scanner allowlists it" is true of one of them and false of the other.*
 ## 1092. Every gate verdict that moved under measurement moved the same way, and three of them falsify a sentence the project had written down
 
 > ✅ **Closed 2026-08-10 — PR #NNN.** Scope audit delivered as **section 4.0 rule 4** (scope is part of the verdict — a gate's name is a claim; only its measured output and scope are evidence) and **Appendix A.5**, the per-instrument scope register, in [`Code_Quality_Standards.md`](Code_Quality_Standards.md). **Claim 1 CONFIRMED by mutation**, not by reading: a planted forbidden import fails `tests/test_dependency_boundaries.py` in `transports/` and `store/` and passes in `auth/`, `anon/`, `checks.py`, `harness/`, `tee/` and `scripts/` — so the engine one-way rule is genuinely enforced, while the client-side layering convention the prose appeared to cover has **no instrument**. One half of claim 1 was **stale and is refuted**: the gate resolves `ast.ImportFrom` and relative imports, not `ast.Import` alone. Every other scorecard count was stale **in the same direction** (test functions 5,402 -> 9,706; `pytest.raises` ~1,000 -> 1,608; SECURITY.md 735 -> 1,849 ln; PHI.md 688 -> 1,335 ln; C901 122/43 files -> 132/46). Signal 2's *no blanket ignores* **stands once scoped** (zero inside the mypy-checked tree; the two in the repo are in `tests/`, which CI does not type-check). **Claims 2 and 3 are NOT closed by this item** — see the two follow-ups below; neither belongs in a public file. Register pinned by `tests/test_quality_record_scope_claims.py`.
@@ -6700,6 +6834,7 @@ filing.
 ## 1107. research an honest pass for ASVS 1.2.2 -- what context-encoding the dynamic-URL surface actually needs, beyond the one FHIR search path the residual names
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. Value drops from the banner because the cell's named residual is retired in shipped code, but stays at 6 because 1.2.2 is scored across every dynamically built URL and the surface is still unenumerated: 24 transport modules exist and only some have been read, with dicomweb.py:283-296 showing a derived target URL that is quoted but was never assessed under this cell. Difficulty 4 is the enumeration plus an adversarial re-verify of a cell that has never had one, with the code fix already landed elsewhere. _(was 8/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **1.2.2** (L1) currently scores **partial**. The pinned verb asks that untrusted data be encoded for its context whenever a URL is dynamically built, and that only safe URL protocols be permitted. What holds it short is that on the shipped default a flat FHIR search string is appended to the outbound URL verbatim at `messagefoundry/transports/fhir.py:750`.
 > Verdict: research
@@ -6739,6 +6874,7 @@ filing.
 ## 1108. research an honest pass for ASVS 2.1.1 -- what the operator API's input validation rules would have to be before any documentation could define them
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Counted at HEAD, api/models.py carries 21 max_length bounds against 206 str annotations, reproducing the item's 21-of-205, expose_docs still ships False at settings.py:726, and no per-field validation reference exists under docs/ (HL7-VALIDATION.md and CODESETS.md are both data-plane). Value 7 for a real L1 gap with no workaround where the coverage half is not merely documentary; difficulty 6 because the item forbids restating field types as the honest pass, so an expected structure must first be decided for ids, connection names, globs, time ranges and free-text search and then made real across the API models under mypy strict, with the console, harness, IDE extension and apiclient all consuming those bounds. _(was 7/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **2.1.1** (L1) currently scores **partial**. The pinned verb asks that the application's documentation define input validation rules for checking data items against an expected structure. What holds it short is that no per-field validation reference exists anywhere in `docs/`, and the scorecard measured only 24 of 451 annotated fields in `messagefoundry/api/models.py` carrying any bound at all.
 > Verdict: research
@@ -6772,6 +6908,7 @@ filing.
 ## 1109. research an honest pass for ASVS 2.2.1 -- positive validation that does not sacrifice the tolerance the HL7 default exists to protect
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Both limbs stand -- validation.strict ships False at config/models.py:667 and api/models.py carries no model_config across 84 models, against five extra=forbid declarations in config/models.py. Value 7 not 8: the 2.2.1 cell is graded at LEVEL 1, so rung 8's ASVS L3 Partial limb does not reach it, and an authenticated loopback-bound API silently ignoring unknown body keys is not rung 8's production blind spot with no workaround -- it is rung 7, a real gap an operator cannot close from outside the app. Difficulty 6 stands: two independent limbs, a method ruling on which clause binds an L1 requirement inside an L3 assessment, and an API-side positive-validation change that would reach the console and apiclient callers too. _(was 8/10 · 8/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **2.2.1** (L1) currently scores **partial**. The pinned verb asks for positive validation of input against an allow list, or comparison to an expected structure and logical limits. What holds it short is two independent limbs: HL7 content gets only the tolerant peek because `validation.strict` ships False (`messagefoundry/config/models.py:651`), and `messagefoundry/api/models.py` carries no `model_config` at all, so API bodies run Pydantic's default `extra=ignore`.
 > Verdict: research
@@ -6807,6 +6944,7 @@ filing.
 ## 1110. research an honest pass for ASVS 2.2.3 -- whether cross-field reasonableness is shippable at all in a code-first engine, or belongs to the feed author
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **5/10** · _fill-in_. The gap is unchanged: consistency.py:11-17 still describes itself as a compose-it-yourself toolkit, its only non-test importer is samples/consistency/validated_adt.py:27, and nothing on the shipped message path calls it. The research question is genuinely open and its most likely output is a negative finding, so worth-if-built is bounded by the clean existing workaround of a Handler composing the primitives; difficulty carries the HL7-general rule-set research plus, if a set exists, a check on the message hot path with tests. _(was 5/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **2.2.3** (L2) currently scores **partial**. The pinned verb asks that combinations of related data items be checked as reasonable against pre-defined rules. What holds it short is that `messagefoundry/parsing/consistency.py` is a toolkit a Handler composes rather than a shipped check, and at `63bd55ba` a grep across `messagefoundry/`, `samples/` and `harness/` finds its only importer is `samples/consistency/validated_adt.py:27`.
 > Verdict: research
@@ -6840,6 +6978,7 @@ filing.
 ## 1111. research an honest pass for ASVS 2.3.3 -- what a business-logic transaction boundary means where the approval gate commits before it executes
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. The audit-record defect the item was filed on is fixed (approvals.py:141-157 plus :181-208), but the pinned verb is still unmet: a partially applied executor is now recorded 'failed' with its effect landed, which app.py:537-548 exhibits concretely because config_reload swaps the graph before its audit row is written. So the remainder is the item's real research question -- the correct boundary and whether the three operations are replay-safe -- rather than only an out-of-repo re-score (value 5, difficulty 3 for a bounded API-side decision plus its tests). _(was 6/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **2.3.3** (L2) currently scores **partial**. The pinned verb asks that a business logic operation either succeed in its entirety or roll back to the previous correct state. What holds it short is `messagefoundry/api/approvals.py:127-133`: the row transitions to `approved` first, then `op.execute(params)` runs, and there is no compensating transition if the executor raises.
 > Verdict: research
@@ -6875,6 +7014,7 @@ filing.
 ## 1112. research an honest pass for ASVS 2.3.4 -- a quota that holds across concurrent uploads and across engine shards at once
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **5/10** · _fill-in_. Only the cross-shard limb remains and it is small: settings.py:461-466 records in shipped code that shards over one uploads_dir enforce one budget, so the remainder is an at-most N-1 file overshoot on a subsystem that is OFF on shipped defaults (uploads_dir default None, settings.py:442) and whose cell the owner already ruled holds at partial. Difficulty is the store-row-versus-advisory-lock decision plus a demonstrated two-shard concurrent-writer run. _(was 6/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **2.3.4** (L2) currently scores **partial**. The pinned verb asks for business-logic locking so a limited-quantity resource cannot be double-booked by manipulating application logic. What holds it short is the per-uploader quota in `messagefoundry/uploads.py`, ~~which says of itself at line 394 that "the check-then-write is not atomic", with the check at `:397` and no lock constructed in the module.~~
 > ⚠️ **AMENDED 2026-08-12 -- HALF OF THIS ITEM IS ANSWERED BY SHIPPED CODE, AND THE STRUCK SENTENCE ABOVE IS FALSE. The item STAYS OPEN on its second half.** PR #325 added `_quota_lock` (`uploads.py:309`) and takes it at `:488` across **both** the scan (`:496`) and the build-and-write -- releasing between them was the race. The quoted string *"the check-then-write is not atomic"* **no longer occurs in the file at all**, and there is no line 394 to cite. **The concurrent-uploads half is DONE:** within one engine process the double-book is closed.
@@ -6922,6 +7062,7 @@ filing.
 ## 1113. research an honest pass for ASVS 2.3.5 -- which flows in a PHI engine are high-value enough to demand a second approver, under a default that must not strand a single-operator site
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **6/10** · _money pit_. The code matches the item's substance: the gate ships off, three operations are registered and all three are guarded at api/app.py:2236, :2730 and :2837, and the default approvable set names only two, so no user-administration and no PHI-export flow is approvable in any configuration. Value stays mid-band because the consequence is a narrow opt-in control gap with no first-deployment product effect; difficulty is 6 because an honest pass most likely means widening the registry across API, settings, audit and console while resolving the self-approval availability cost at api/approvals.py:120. _(was 5/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **2.3.5** (L3) currently scores **partial**. The pinned verb asks that high-value business logic flows require multi-user approval. What holds it short is that `[approvals].enabled` ships False (`messagefoundry/config/settings.py:3228`) and `guard()` executes the operation inline whenever the gate is off, so no flow requires a second approver as shipped.
 > Verdict: research
@@ -6960,6 +7101,7 @@ filing.
 ## 1114. research an honest pass for ASVS 2.4.1 -- anti-automation on a data plane whose senders are machines and whose intake has no authentication
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **5/10** · _quick win_. A default install would still take messages at an unbounded rate on first deployment, and for non-MLLP inbounds there is no opt-in bound at all, so no workaround exists there. Difficulty 5 covers the ruling plus the likely follow-on of taking pacing across the transport registry to at least the raw-TCP inbound, with tests and docs. _(was 8/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **2.4.1** (L2) currently scores **partial**. The pinned verb asks for anti-automation controls against excessive calls leading to exfiltration, garbage data, quota exhaustion, denial of service, or overuse of costly resources. What holds it short is that ~~no message-rate or volume control exists on the data plane in any configuration~~ **[FALSIFIED 2026-08-12 by `e0e979d5`/`b3b278e6` -- struck, not deleted. A pacer EXISTS and ships OFF by default; `transports/mllp.py:109` calls that *"a DELIBERATE DEVIATION from this module's key-absent-means-secure-default convention, ruled 2026-08-11 (ASVS 2.4.1 / 15.2.2)"* -- naming this very cell, so the module knew about this item while this item did not know about the module. THE ITEM STAYS OPEN AND ITS QUESTION HARDENS:** not *does a control exist* (answered, yes) but **can a control that ships OFF be an honest pass.** The `docs/SECURITY.md:1582` citation below also needs re-pointing -- the sentence it quotes was rewritten when the pacer landed, in the same edit that broke ASVS cell 2.1.3's anchor.]** -- the product says so in its own documentation at `docs/SECURITY.md:1582`.
 > Verdict: research
@@ -6999,6 +7141,7 @@ filing.
 ## 1115. research an honest pass for ASVS 2.4.2 -- whether human-timing pacing is meaningful for an engine whose only human surface is the console
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **6/10** · _money pit_. The research half is delivered and the code it was written against is unchanged: the /ui surface charges nothing (zero allow_admin_write references in the web console) and the only pacing is a per-request per-actor budget at config/settings.py:2017-2021, never a flow timer. Value 4 because on a first deployment this is a coverage and calibration gap on an admin surface rather than a data-plane exposure; difficulty 6 because a flow timer spanning login, MFA enrolment and approve-then-decide is a new mechanism across auth service, API and console, and the floor has to come from a measurement the record does not have. _(was 3/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **2.4.2** (L3) currently scores **partial**. The pinned verb asks that business logic flows require realistic human timing, preventing excessively rapid transaction submissions. What holds it short is that the only pacing floor is 12 admin writes per actor per second, which the shipping documentation itself calls an order of magnitude above human console interaction (`messagefoundry/config/settings.py:1952`, `docs/SECURITY.md:99`).
 > Verdict: research
@@ -7079,6 +7222,7 @@ filing.
 ## 1116. research an honest pass for ASVS 3.1.1 -- what the console's browser-support contract actually is, when the document that carried it cannot ship
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. The contract is still sited only in source at _security.py:51, docs/SYSTEM-REQUIREMENTS.md:135 asks for nothing more than a modern browser, and /docs/security/ is still blanket-ignored at .gitignore:170, so the document two earlier pass-moves cited still does not reach a deploying site; the vault scorecard confirms the cell has not moved. The remainder is a verified feature list plus a supported-browser statement in a shipped doc. _(was 4/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **3.1.1** (L3) currently scores **partial**. The pinned verb asks that documentation state the browser security features the application relies on and define how it behaves when one is unavailable. What holds it short is that the substantive contract is sited in source at `messagefoundry_webconsole/_security.py:51-159`, and the operator document two earlier pass-moves cited is not in the assessed artifact set.
 > Verdict: research
@@ -7110,6 +7254,7 @@ filing.
 ## 1117. research an honest pass for ASVS 3.3.1 -- a session cookie that carries Secure and a prefix on every startable configuration, including the undeclared-proxy topology
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **5/10** · _quick win_. Both limbs still key on the single effective_https boolean at _auth.py:91, the session and OIDC-flow cookies are written with that boolean at :738 and :814, and __Secure- appears in no shipped Python, so there is no fallback prefix when __Host- is dropped. With [api].host defaulting to 127.0.0.1 (settings.py:724) and serve_ui defaulting True (:732), the default startable console would write a bare mf_session with Secure omitted, and the undeclared-proxy topology is not detected. _(was 8/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **3.3.1** (L1) currently scores **partial**. The pinned verb asks that cookies set the Secure attribute, and that a cookie not using the `__Host-` prefix use `__Secure-` instead. What holds it short is that both limbs key on one boolean, `effective_https` (`messagefoundry_webconsole/_auth.py:91`), and the default startable configuration is not an https context.
 > Verdict: research
@@ -7143,6 +7288,7 @@ filing.
 ## 1118. research an honest pass for ASVS 3.3.3 -- keeping the __Host- prefix on the shipped default without breaking a cleartext loopback login
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. Verified at HEAD: both cookies resolve to their __Host- twin only under effective_https AND browser_hardening_enabled (messagefoundry_webconsole/_auth.py:739 and :815), HOST_COOKIE_NAME at :70 documents that cleartext keeps the bare name by design, and the opt-out env at :77 reverts to the bare name with nothing at start reporting the reversion. Difficulty 4 covers a research pass that has to settle a loopback-TLS or auto-TLS posture question for the default /ui bind rather than edit cookie code, with cannot-honestly-pass a valid outcome. _(was 6/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **3.3.3** (L2) currently scores **partial**. The pinned verb asks that cookies carry the `__Host-` prefix unless they are explicitly designed to be shared with other hosts. What holds it short is that both cookies have a `__Host-` twin but resolve to it only when `effective_https` holds and `browser_hardening_enabled()` is true (`messagefoundry_webconsole/_auth.py:739`, `:815`).
 > Verdict: research
@@ -7176,6 +7322,7 @@ filing.
 ## 1119. research an honest pass for ASVS 3.4.1 -- HSTS on all responses from an engine whose shipped bind is plaintext loopback
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. The remainder lands no code: it is a scoping ruling on the honest unit of assessment plus at most a documentation and scorecard change, on an L1 cell with no PHI effect. Difficulty 2 because the coverage construction and the single shared hsts_applies definition already exist. _(was 6/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **3.4.1** (L1) currently scores **partial**. The pinned verb asks that a Strict-Transport-Security header field be on *all* responses, with a maximum age of at least one year and, at L2 and up, applying to subdomains. What holds it short is coverage, not content: the header is emitted at `messagefoundry/api/app.py:1260-1263` with a conformant one-year `includeSubDomains` value, but the four `_limit_request_body` short-circuits and unhandled 500s were measured shipping without it.
 > Verdict: research
@@ -7209,6 +7356,7 @@ filing.
 ## 1120. research an honest pass for ASVS 3.4.4 -- proving nosniff on every response, not on the responses someone remembered
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **3/10** · Difficulty **3/10** · _fill-in_. I attacked the shipped claim first and it survives in part -- this is not an anchor-moved false negative. The item's cited anchor app.py:1257 is genuinely gone because the header literals moved to the new api/header_floor.py, and commit c49a8a7b (PR 422, confirmed ancestor of HEAD) built exactly the construction the item asked research to find: a pure-ASGI setdefault floor registered outermost, plus a hand-set baseline on the unhandled 500 because ServerErrorMiddleware sits outside user_middleware by construction. Both of the item's originally measured escape paths are closed and tested, with a vacuity guard and negative controls in tests/test_api_security_header_floor.py. So limbs A (construction), B (can Starlette ordering reach pre-middleware rejections) and C (an admissible measurement) landed. Then I attacked the other direction, because a research item closes on its verdict, not on a commit. The record of record holds the cell at partial as of a re-verification dated 2026-08-17 whose reviewer line names PR 422 itself -- so the assessment was made WITH the floor in the tree, not before it. Its arithmetic: four response-emitter classes derived structurally from create_app's registration order and the scope-type guards, two covered, two not. I verified both uncovered classes against HEAD rather than trusting the record: `websocket.http.response` returns 0 occurrences under messagefoundry/ against 7 `websocket.close` sites as positive control, and header_floor.py:91-93 still returns early on non-http scopes. I also confirmed none of the cell's own re-score triggers has fired since that measurement -- app.py:5317 still registers the floor last, BASELINE_SECURITY_HEADERS still carries the nosniff pair, and git log b8c22cc8..HEAD shows no change to header_floor.py or client_networks.py. Two failure modes I deliberately checked against. A similarly-named symbol is not the fix: I read header_floor.py end to end and traced its registration, rather than counting the module's existence as closure. And a moved anchor is not an open gap: I confirmed the setdefault relocated rather than vanished. The distinction that decides this item is that the shipped work is the honest construction the item wanted and still does not reach the honest pass the item is named for, which is partly_shipped, not confirmed_shipped. Value 3 on the remainder rather than the filed 4: the practically important half closed, since the JSON error bodies that motivated the filing now carry the header, and a websocket 403 has no body a browser sniffs. It is not 1 or 2 because real runnable work is left -- the denial-response emitter plus the guard widening -- and because a shipped security module currently justifies its scope bound on a premise the engine's own adjacent comment contradicts, which the project treats as a defect class in its own right. Difficulty 3: a small additive change on an existing seam, but it needs an ASGI extension-capability check with a fallback to the bare close, a middleware guard widened without weakening the network gate that sits inside it, and tests across all three. No migration cost is priced in -- nothing is deployed, so there is nothing to break. One scoping note on sourcing: the verdict itself lives in the maintainer-internal scorecard, which I could reach because the vault clone is checked out beside this repository. I have deliberately not reproduced cell content beyond the fact that 3.4.4 holds at partial and the emitter-class count, since coverage detail over a published catalogue discloses the complement by subtraction. _(was 4/10 · 3/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **3.4.4** (L2) currently scores **partial**. The pinned verb asks that *all* HTTP responses carry `X-Content-Type-Options: nosniff`. The control itself is as strong as a control gets -- `response.headers.setdefault("X-Content-Type-Options", "nosniff")` at `messagefoundry/api/app.py:1257` runs with no setting, no scheme test and no path test -- but the same two response paths that cost 3.4.1 were measured shipping without it.
 > Verdict: research
@@ -7242,6 +7390,7 @@ filing.
 ## 1121. research an honest pass for ASVS 3.4.6 -- frame-ancestors on every response without weakening the attachment sandbox
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The scoping is unchanged: frame-ancestors ships only on non-static /ui responses and the attachment response is served default-src 'none'; sandbox, which takes no fallback for frame-ancestors. Value 5 because the item itself records that practical clickjacking exposure on a first deployment would be low, so what is bought is posture plus the small measured hole on the 413 and 500 paths that carry neither header; difficulty 4 because the research must find a construction carrying the directive on every response without weakening either policy that is currently correct, and a global header and a per-route header interact rather than compose. _(was 5/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **3.4.6** (L2) currently scores **partial**. The pinned verb asks that the `frame-ancestors` CSP directive be used for *every* HTTP response, and explicitly refuses `X-Frame-Options` as a substitute. Where the CSP applies the directive is the strictest possible value and default-on (`messagefoundry_webconsole/_auth.py:142`, `_security.py:206`), but it is scoped to non-static `/ui` paths at `messagefoundry/api/app.py:1270`.
 > Verdict: research
@@ -7273,6 +7422,7 @@ filing.
 ## 1122. research an honest pass for ASVS 3.5.3 -- bulk PHI retrieval on GET, under the ruling that a default-off feature is scope and not mitigation
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **7/10** · _big bet_. All five bulk PHI reads the item names are still on GET (app.py:3012, :3101, :3210, :3973, :4259; anchors have shifted by roughly 40 to 190 lines) and a case-insensitive search for Sec-Fetch across messagefoundry/ returns zero hits against a console-side positive control, so neither arm of the requirement is met. Value 7 for a real gap with no configuration that avoids it; difficulty 7 because an honest pass means either POST twins for read endpoints, changing caching, logging and client contracts, or an engine-side Sec-Fetch validator that has to decide what to do with every non-browser client the product ships. _(was 7/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **3.5.3** (L1) currently scores **partial**. The pinned verb asks that sensitive functionality use unsafe HTTP methods rather than GET/HEAD/OPTIONS, *or* alternatively that `Sec-Fetch-*` request header fields be strictly validated. State mutation is fully on unsafe methods; what holds the cell short is at least five bulk PHI reads on GET plus two session-minting GETs, with no `Sec-Fetch` validation anywhere under `messagefoundry/`.
 > Verdict: research
@@ -7304,6 +7454,7 @@ filing.
 ## 1123. research an honest pass for ASVS 3.5.5 -- what a trustworthy postMessage origin check is inside a VS Code webview
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. No PHI and no engine surface, the interface exists only in the VS Code extension, and the platform-limits finding is already written down and test-enforced, which leaves value in the polish band. Difficulty 3 is the vault record plus the SDS-3.7 discharge, and that discharge is not a formality: webviewMessaging.ts claims every panel is served script-src nonce, while stepsView.ts:959 emits a CSP of default-src none plus style-src unsafe-inline with no script-src at all, so the blanket claim has to be checked panel by panel. _(was 5/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **3.5.5** (L2) currently scores **partial**. The pinned verb asks that messages received by the postMessage interface be discarded if the origin is not trusted, or if the syntax is invalid. All eight receivers in the shipped IDE extension discard on an unexpected discriminator; none of the eight reads `event.origin` or `event.source`.
 > Verdict: research
@@ -7337,6 +7488,7 @@ filing.
 ## 1124. research an honest pass for ASVS 3.7.5 -- deriving a supported-browser matrix rather than authoring one that fits
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. SYSTEM-REQUIREMENTS.md:135 still offers only a modern browser, the web-console plan still carries the matrix as open question 1 at 11-web-console.md:446, and SECURITY-DOCS-POLICY.md:5 still withholds the operator-facing copy while the behavioural half ships in _security.py and _html.py, so the antecedent the requirement grades against remains undefined. Value 4 because this is documentation completeness over a working control set with no exposure and no product effect; difficulty 3 because the deliverable is a table derived from the shipped feature floors plus two owner rulings, touching no code, no mypy surface and no test. _(was 4/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **3.7.5** (L3) currently scores **partial**. The pinned verb asks that the application behave *as documented* when the browser does not support the expected security features. The behavioural half is built and substantial; what holds the cell short is that the requirement's antecedent -- the expected browsers and versions -- has no shipped definition (`docs/testing/master-test-plan/11-web-console.md:446` records it as an open question).
 
@@ -7396,6 +7548,7 @@ filing.
 ## 1125. research an honest pass for ASVS 4.2.1 -- what a single component can claim about request smuggling when the chain is not its own
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The two intake surfaces still disagree exactly as filed -- exact equality at http_listener.py:318 against substring containment at api/app.py:1323 and :1339 -- so a legal Transfer-Encoding of gzip, chunked is classified differently by the engine's own two parsers. Value 6 is rung 6, and a fact the filing does not record bounds it further: http_listener.py:202 ships one-request-per-connection with no keep-alive, so the listener half cannot be pipelined into a following request and the desync is reachable only against an operator-chosen upstream. Difficulty 6 for the unmeasured half -- exercising both parsers across the RFC 9112 grammar, settling what all application components binds to, and re-verifying a cell whose last_verified is the oldest here. _(was 6/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **4.2.1** (L2) currently scores **partial**. The pinned verb asks that *all application components* determine HTTP message boundaries by the mechanism appropriate to the HTTP version, and that in HTTP/1.x a present `Transfer-Encoding` makes `Content-Length` ignorable. What holds it short is that the engine's two HTTP intake surfaces do not agree on how they detect chunked framing.
 > Verdict: research
@@ -7432,6 +7585,7 @@ filing.
 ## 1126. research an honest pass for ASVS 4.4.1 -- WSS everywhere from an engine that deliberately declines to terminate TLS
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The default still ships no certificate (settings.py:758) and exposure_protected still resolves from an operator declaration about the far side of the hop (:834), so in the assessed proxy posture the proxy-to-engine WebSocket leg would be plaintext on first deployment with nothing refusing or warning. Value is the awkward-workaround band rather than no-workaround because tls_policy.py:299-300 short-circuits on proxy_terminated before the attestation test and no validator forbids setting tls_cert_file alongside tls_terminated_upstream, so an operator CAN encrypt that hop today without tripping the revocation refusal. Difficulty stays high because any gate is fenced by a refusal stated in shipped code and must not make the assessed posture unstartable. _(was 7/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **4.4.1** (L1) currently scores **partial**. The pinned verb is one sentence and admits no partial reading: WebSocket over TLS for all WebSocket connections. What holds it short is that `tls_cert_file` ships `None` (`messagefoundry/config/settings.py:712`), so the proxy-to-engine WebSocket hop is plaintext `ws` and no gate refuses it.
 > Verdict: research
@@ -7465,6 +7619,7 @@ filing.
 ## 1127. research an honest pass for ASVS 5.1.1 -- a per-feature file inventory that stays true, against a doctrine that treats enumerations as liabilities
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **4/10** · _fill-in_. Both concrete defects are fixed in shipped text: the SCP is enumerated as the fourth file surface and the 16 MiB inflate ceiling the item said appeared nowhere under docs/ is now documented. The remainder is the half the item was actually filed for -- an inventory that stays true as connectors are added -- since the block states it is hand-maintained and the drift test pins tokens rather than deriving the surface list from code (value 4, difficulty 4). _(was 5/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **5.1.1** (L2) currently scores **partial**. The pinned verb asks that documentation define permitted file types, expected extensions and maximum size *including unpacked size* for *each* upload feature, plus how files are made safe. The shipped block at `docs/CONNECTIONS.md:716` opens with a completeness claim -- "MessageFoundry's file surface has three parts" -- that omits a fourth.
 > Verdict: research
@@ -7498,6 +7653,7 @@ filing.
 ## 1128. research an honest pass for ASVS 5.2.2 -- file-content validation that does not sacrifice payload-agnostic ingress
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The residual holds: the sniff still dispatches on the connection's declared type, binary and text are accepted unchecked at the catch-all arm, and zip_decompress is a Handler-facing export with no transport call site, so archive members reach Handler code unsniffed. Difficulty is 6 rather than lower because the permissiveness is ADR 0004 design, so the research must find a control that does not sacrifice payload-agnostic ingress and any build reaches two transports plus a new archive-member seam. _(was 6/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **5.2.2** (L1) currently scores **partial**. The pinned verb asks that an accepted file -- on its own or inside an archive -- have its extension checked against an expected extension and its contents validated as corresponding to that type. The engine validates leading bytes against the *connection's declared* content type, which is a different check, and two declared types are unchecked by construction.
 > Verdict: research
@@ -7533,6 +7689,7 @@ filing.
 ## 1129. research an honest pass for ASVS 5.2.3 -- a literal before-uncompressing check when the declared size is attacker-controlled
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. The permissive Handler-facing default the item re-scoped itself onto is gone: a caller must now pass max_output_bytes or an explicit None, so the severity paragraph no longer describes the code, and the file-count clause is met on the default. What remains is a method question, whether the pinned verb admits incremental per-member enforcement or wants a recorded deviation, with no code change indicated, which prices both numbers in the record-accuracy band. _(was 5/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **5.2.3** (L2) currently scores **partial**. The pinned verb asks that compressed files be checked against a maximum uncompressed size *and* a maximum file count *before* uncompressing. The engine's readers enforce their ceilings incrementally instead, deliberately, and the Handler-facing archive reader ships its size ceiling off.
 > ⚠️ **AMENDED 2026-08-13 -- THE CENTRAL PREMISE IS FALSE. A literal before-uncompressing check DOES ship, DEFAULT-ON, and it cites this very cell in its own source.** The item stays OPEN, but on a much narrower question than it was filed with.
@@ -7574,6 +7731,7 @@ filing.
 ## 1130. research an honest pass for ASVS 5.3.2 -- containment for filenames a remote SFTP or FTP server chooses
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. The security-material half shipped: a hostile listing name is refused at the source (remotefile.py:955) before the pattern filter and before the join, so the traversal primitive the item priced is gone and its founding sentence is false in the code. Value 4 on the remainder, which is a census across the file-path-constructing transports plus the record work to move the cell; difficulty 3 because the guard and its both-polarity tests exist to copy and any further sites are the same shape. _(was 7/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **5.3.2** (L1) currently scores **partial**. The pinned verb asks that file paths be built from internally generated or trusted data, and that where user-submitted names or file metadata must be used, strict validation and sanitization be applied. The remote file source joins a server-supplied listing name straight onto the configured directory with neither.
 > Verdict: research
@@ -7617,6 +7775,7 @@ filing.
 ## 1131. research an honest pass for ASVS 6.1.1 -- what the anti-automation documentation must say about malicious account lockout
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. The documentation half this item was filed against has landed, including the contradiction the item said a fix editing one parenthetical would leave standing, and the unbounded re-lock plus the step-up-gated forced-rotation remedy are both disclosed. The scored remainder is the adjudication the item re-scoped to, whether the verb grades the document alone or names a property the control must hold, plus a scorecard re-read, which is reading and writing rather than code. _(was 7/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.1.1** (L1) currently scores **partial**. The pinned verb asks that application documentation make clear how the anti-automation controls are configured and prevent malicious account lockout. One parenthetical at `docs/SECURITY.md:1474` answers the lockout clause, and its claim does not survive the shipped serial re-lock at `messagefoundry/auth/service.py:665-668`.
 > ⚠️ **AMENDED 2026-08-13 -- THE ITEM STAYS OPEN AND ITS QUESTION IS RE-SCOPED. Three corrections, and the third is the one worth reading.**
@@ -7659,6 +7818,7 @@ filing.
 ## 1132. research an honest pass for ASVS 6.1.2 -- what a documented context-word list means when no deploying site can add its own terms
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. Publication landed but the two things the item said would decide an honest pass did not: there is still no operator-supplied context-word setting, and no gate ties the twelve published terms to policy.py:38-53, so the enumeration can decay silently. Difficulty 3 covers a small drift check plus, if research says the subject is the deployment's list, one additive setting into the password policy. _(was 5/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.1.2** (L2) currently scores **partial**. The pinned verb asks that a list of context-specific words be documented so those words cannot be used in passwords. The shipped documents name four of the twelve terms enforced at `messagefoundry/auth/policy.py:38-53` and hedge them with "like" and "e.g.".
 > Verdict: research
@@ -7690,6 +7850,7 @@ filing.
 ## 1133. research an honest pass for ASVS 6.1.3 -- whether documenting an inconsistently enforced strength can satisfy the verb
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. The accuracy defects are fixed and the lockout asymmetry the item said the cell must be checked against is now documented, so what remains is the research half: whether a documentation cell can pass while the strength it documents is inconsistently enforced, plus a mechanism that keeps a five-row pathway table and its settings-key references falsifiable. That mechanism is one stdlib checker over Pydantic field names with both-direction fixtures, sitting beside the six checkers already in scripts/docs. _(was 5/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.1.3** (L2) currently scores **partial**. The pinned verb asks that multiple authentication pathways be documented together with the controls and the authentication strength which must be consistently enforced across them. The enumeration half is strong; the paragraph that cites the requirement carries statements false against the shipped code.
 > Verdict: research
@@ -7723,6 +7884,7 @@ filing.
 ## 1134. research an honest pass for ASVS 6.2.4 -- a top-3000 corpus that survives a 15-character minimum
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **5/10** · _quick win_. Still short at HEAD: password_min_length is 15 (messagefoundry/config/settings.py:1811, the item's :1757 anchor has drifted), the length clause is the first check in AuthPolicy.violations (auth/policy.py:112), password_check_breached ships True (:1818) and password_breach_corpus_file ships unset (:1826), so the bundled corpus supplies far fewer than 3000 policy-matching entries. Value 6 rather than 7 because a shipped operator-side widening path exists (_operator_corpus at auth/policy.py:65 loads a plaintext or hashed offline list), undocumented and awkward but real, and the item's own severity is modest on a first deployment. _(was 7/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.2.4** (L1) currently scores **partial**. The pinned verb asks for a check against at least the top 3000 passwords *which match the application's password policy*. The bundled corpus supplies 18 entries at or above the shipped 15-character minimum (`messagefoundry/config/settings.py:1757`, length clause at `messagefoundry/auth/policy.py:112`).
 > Verdict: research
@@ -7774,6 +7936,7 @@ filing.
 ## 1135. research an honest pass for ASVS 6.2.11 -- whether publishing the enforced context words is durable enough to count
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. The list a reader needs is published, so the remaining worth is the decay guard the item itself calls the load-bearing half plus the 6.2.11 pointer decision alongside 6.1.2. Difficulty 2: one small test asserting the doc list equals CONTEXT_WORDS, plus a docs pointer edit. _(was 4/10 · 3/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.2.11** (L2) currently scores **partial**. The pinned verb asks that *the documented list* of context-specific words be used to prevent easy-to-guess passwords. Enforcement is not in question; no document supplies the definite list the verb names.
 > Verdict: research
@@ -7807,6 +7970,7 @@ filing.
 ## 1136. research an honest pass for ASVS 6.3.2 -- a first-run bootstrap that leaves no enabled default account
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **6/10** · _big bet_. Unchanged at the shipped default: _ensure_bootstrap_admin creates a live account named admin holding Administrator with no disabled argument, and the expiry default is still 72 hours, so neither arm of the verb holds at creation. Difficulty 6 for a first-run redesign spanning the auth service, the owner-only credential file, a CLI or console claim step and the headless NSSM restart path, with the item's own named risk of stranding an install with no way in. _(was 8/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.3.2** (L1) currently scores **partial**. The pinned verb asks that default user accounts not be present, or be disabled. On first run against an empty user table the engine creates an enabled Administrator literally named `admin` (`messagefoundry/auth/service.py:71`, from `_ensure_bootstrap_admin` at `:528`).
 > Verdict: research
@@ -7842,6 +8006,7 @@ filing.
 ## 1137. research an honest pass for ASVS 6.3.4 -- consistent authentication strength when AD MFA is delegated by design
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **8/10** · _big bet_. Both directory legs still mint sessions MFA-verified unconditionally while local accounts face a second factor as an access gate, and require_mfa_scope still defaults to every_local_account, so the strength gap is widest on the shipped default. Value 6 rather than 7 because the shipped comment at service.py:879-882 names a reachable out-of-engine control -- an MFA-enforcing LDAP proxy in front of the simple bind makes the directory pathway genuinely second-factor-backed -- so the residual gap is that the engine asserts rather than verifies, which is an awkward workaround and not the absence of one; difficulty 8 because the routes the research must weigh are directory-side evidence the engine can verify or an AD enrollment authority the code deliberately defers, both new architectural seams in auth. _(was 7/10 · 8/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.3.4** (L2) currently scores **partial**. The pinned verb asks that there be no undocumented pathways and that controls and authentication strength be enforced *consistently* across them. The AD and Kerberos legs mint sessions MFA-verified unconditionally (`messagefoundry/auth/service.py:794`, `:824`) while local accounts face a second factor as an access gate (`messagefoundry/api/security.py:227`).
 
@@ -7896,6 +8061,7 @@ filing.
 ## 1138. research an honest pass for ASVS 6.3.5 -- reaching the account that has no address on a fresh on-premises install
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The early return on a missing address is unchanged at security_notify.py:127-131 and the bootstrap Administrator is still created with no email at auth/service.py:535-541, so the most privileged account would remain structurally outside the notification path on a first deployment. Value 6 is the awkward-workaround rung, the substitute being the audited pull feed at GET /me/security-events; difficulty 6 because the research has to settle whether an address can be demanded at first run when no human identity exists yet, and whether any second channel not keyed on email is viable for a loopback on-premises install. _(was 6/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.3.5** (L3) currently scores **partial**. The pinned verb asks that users be notified of suspicious authentication attempts, successful or unsuccessful. The events fire and the channel is gated fail-closed at startup; delivery returns early when the event carries no address (`messagefoundry/pipeline/security_notify.py:130`).
 > Verdict: research
@@ -7929,6 +8095,7 @@ filing.
 ## 1139. research an honest pass for ASVS 6.3.7 -- notifying a user whose authentication details the directory changed
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **5/10** · _quick win_. The rubric prices an ASVS L3 Partial on as-shipped defaults at 8, and 6.3.7 is exactly that with a real missing control arm rather than a record question: a first-run Administrator with no email would get no out-of-band notice of a credential reset (security_notify.py:127-132 returns before enqueue), and a directory-driven email overwrite that redirects every later notice on the account writes neither an audit row nor a notice (service.py:1322-1340), so the change is undetectable after the fact. Difficulty 5 is a bounded change at one upsert plus the notification-target design question, sharing its channel research with 6.3.5. _(was 5/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.3.7** (L3) currently scores **partial**. The pinned verb asks that users be notified after updates to authentication details. Local coverage is broad, but every notice passes the same address gate at `messagefoundry/pipeline/security_notify.py:130`, and the AD login path overwrites the stored email with no notice and no audit row.
 > Verdict: research
@@ -7962,6 +8129,7 @@ filing.
 ## 1140. research an honest pass for ASVS 6.3.8 -- equalizing an LDAP bind path, and whether lockout leaves the local leg fixable
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **5/10** · _quick win_. The asymmetry stands verbatim at HEAD: auth/ldap.py:243-244 returns before the password-verifying connection is constructed and bound at :247-262, so an absent or disabled principal skips a whole Server build, TCP connect and bind round trip behind an identical response, while only the local leg is equalized by _DUMMY_PASSWORD_HASH at auth/service.py:98. Value 7 because a first deployment with AD enabled would inherit a directory-namespace enumeration oracle that the sign-in limiter rate-bounds but never removes, on the posture the risk register names as the dominant intended production path; difficulty 5 because the change is contained in one auth module, security-sensitive, and verifiable the same structural way the local leg already is (tests/test_auth_hardening.py:458) against the fake-ldap3 harness in tests/test_ldap_timeouts.py. _(was 6/10 · 8/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.3.8** (L3) currently scores **partial**. The pinned verb asks that valid users not be deducible from failed challenges, including by *different response times*. The local leg is equalized by a fixed dummy verify (`messagefoundry/auth/service.py:98`); the AD leg is not.
 > Verdict: research
@@ -7999,6 +8167,7 @@ filing.
 ## 1141. research an honest pass for ASVS 6.4.5 -- a deadline and a reminder for a credential the engine cannot reach the holder of
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The gap stands: the 72-hour default at settings.py:1851 is enforced at auth/service.py:786-798 and stated nowhere a holder or issuing administrator would see it, and settings.py:4264 separately records the same field as unreported on the loosening surface. Value 5 is rung 5 -- a real conformance and usability gap with a clean out-of-band workaround, since the administrator issuing the credential can state the deadline. Difficulty 4: attaching the deadline to the reset response, the console one-time page and the create-user hint is a feature across a seam with no store work, ahead of a bounded reading of whether a 72-hour credential needs an automated reminder at all. _(was 5/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.4.5** (L3) currently scores **partial**. The pinned verb asks that renewal instructions for expiring authentication mechanisms be sent in time to act on, with automated reminders if necessary. Two engine-owned credentials expire on shipped defaults; the admin-issued temporary one carries no stated deadline anywhere.
 > Verdict: research
@@ -8034,6 +8203,7 @@ filing.
 ## 1142. research an honest pass for ASVS 6.7.1 -- what an application can honestly assert about a trust anchor stored on a host it does not own
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. Neither hole has moved: the undeterminable read still degrades to a warning (trust_anchors.py:167) and the inspection still covers the anchor file alone (:199, :218), so a writable containing directory would still permit unlink-and-replace on an instance with tls_client_ca_file plus a cert-identity map. Value sits at the awkward-workaround band because that configuration is opt-in rather than a shipped default and the optional SHA-256 pin at settings.py:769 already defeats substitution outright for an operator who sets it; difficulty is the POSIX-versus-Windows split plus measuring how often the undeterminable branch fires before it may refuse. _(was 6/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.7.1** (L3) currently scores **partial**. The pinned verb asks that certificates used to verify cryptographic authentication assertions be stored protected from modification. Two holes sit on that verb in shipped code: an undeterminable permission read degrades to a warning, and the inspection covers the anchor file but not its containing directory.
 > Verdict: research
@@ -8067,6 +8237,7 @@ filing.
 ## 1143. research an honest pass for ASVS 6.8.1 -- cross-IdP identity assumption when one username namespace serves every provider
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **7/10** · _big bet_. Every named condition still holds at HEAD, only the line numbers moved: one shared username namespace at store.py:1638, no uniqueness of any kind on the OIDC columns on any backend, AuthProvider with no OIDC member, and the continuity guard short-circuiting on accounts that never federated. Value is high because a site enabling the shipped federation feature alongside the directory could see a principal land on a never-federated AD account and inherit its roles with no credential compromise, and no audit can tell a federated session from an LDAP simple bind; difficulty is 7 because the arc is a new ADR plus a three-backend schema and index change, with the first-federated-login ceremony still an open trust decision. _(was 8/10 · 8/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.8.1** (L2) currently scores **partial**. The pinned verb asks that a user's identity cannot be spoofed via another supported identity provider, and names the standard mitigation: register and identify the user by IdP ID plus the user's ID in that IdP. What holds it short is structural -- `users.username` is `TEXT NOT NULL UNIQUE` (`messagefoundry/store/store.py:1590`), one identifier namespace shared by every provider, with the provider carried as a column beside the key rather than inside it.
 > Verdict: research
@@ -8130,6 +8301,7 @@ filing.
 ## 1144. research an honest pass for ASVS 6.8.4 -- IdP-asserted strength and recentness when two of the three login legs assert nothing
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **5/10** · _quick win_. Gap stands on both axes: auth_time appears nowhere in the auth tree, flow.py requests no max_age, and service.py:884/:914 still mint mfa_verified=True on the directory legs with no IdP evidence, so a directory session would satisfy the step-up gate on a first deployment (value 6). The remainder prices at 5, not 6: the AD arm is deferred to #296 by the item's own text, so the deliverable is a research finding plus at most an OIDC-leg recency check, a setting and a SECURITY.md fallback, with the store limb bounded to one nullable column on a sessions table that already gained reauth_at the same way (store.py:3181). _(was 6/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.8.4** (L2) currently scores **partial**. The pinned verb asks that where the application expects specific authentication strength, method or recentness for specific functions, it verifies that from what the IdP returned -- and where the IdP returns nothing, that a documented fallback assumes the MINIMUM mechanism. Recentness is unimplemented (`auth_time` appears nowhere in the auth tree; `build_authorization_url` at `auth/oidc/flow.py:193` sends no `max_age`), and on both directory legs the engine mints `mfa_verified=True` on no IdP evidence at all.
 > Verdict: research
@@ -8159,6 +8331,7 @@ filing.
 ## 1145. research an honest pass for ASVS 7.1.3 -- federated session-lifetime coordination when the Kerberos leg exposes no ticket lifetime
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **3/10** · Difficulty **5/10** · _fill-in_. Two of three mechanisms ship and the Kerberos limb is untouched: no ticket end time is read anywhere in ldap.py and ADR 0079 still records the cell as accepted-not-built with its promotion trigger unfired. Value is low because the cell carries a signed risk acceptance with a 2027-01-14 review and there is no product effect; difficulty stays mid-band because the honest answer depends on measuring whether any non-SSPI ticket-lifetime source exists on the targeted platforms without forking pyspnego, which the project has ruled out. _(was 3/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **7.1.3** (L2) currently scores **partial**. The pinned verb asks that every system creating and managing sessions in a federated ecosystem be documented together with the controls that coordinate session lifetimes, termination and re-authentication conditions. What holds it short is one leg: `pyspnego` exposes no ticket end time, so a Kerberos session's absolute lifetime is the engine's own flat cap, not the directory's.
 > Verdict: research
@@ -8190,6 +8363,7 @@ filing.
 ## 1146. research an honest pass for ASVS 7.2.4 -- what session-token rotation on re-authentication must not break
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **6/10** · _big bet_. Verified unchanged: the primitive is defined at auth/service.py:1614 and implemented on all three backends, but a tree-wide search finds no caller outside tests, and reauth (:1796-1832) stamps state on hash_token(token) rather than rotating, so a token minted at the password leg would survive the second factor. Value 8 because on a first deployment a pre-MFA token captured before the second factor would be elevated in place to a fully authenticated session; difficulty 6 because rotation must be wired without stranding the token-hash-keyed state the primitive's own test names, and in-flight requests and open WebSocket subscriptions have to be reasoned about at every elevation site. _(was 8/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **7.2.4** (L1) currently scores **partial**. The pinned verb asks for a new session token on user authentication *including re-authentication*, with the current token terminated. Initial authentication mints fresh; re-authentication does not -- `AuthService.reauth` (`auth/service.py:1683`) and `verify_mfa` (`auth/service.py:2054`) stamp state on the SAME token hash, so the token issued at the password leg survives the second factor and survives every step-up.
 > Verdict: research
@@ -8221,6 +8395,7 @@ filing.
 ## 1147. research an honest pass for ASVS 7.4.3 -- offering session termination as part of the MFA-change ceremony rather than beside it
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. disable_mfa still offers and revokes nothing, and the post-disable redirect still lands on a page whose only relation to session termination is a link, so the option remains adjacent to the ceremony rather than part of it. The capability ships and is one click away, which caps value; difficulty 4 covers research plus a uniform ceremony across five factor-change paths without cutting the caller's own session mid-flow. _(was 5/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **7.4.3** (L2) currently scores **partial**. The pinned verb asks that the application give the option to terminate all other active sessions after a successful change or removal of any authentication factor, naming an MFA settings update explicitly. The password branch over-satisfies it; the MFA-settings branch performs and offers nothing -- `disable_mfa` (`auth/service.py:2140`) calls `disable_totp` plus audit and notify, and `delete_webauthn_credential` and `confirm_mfa_enrollment` likewise revoke nothing.
 > Verdict: research
@@ -8252,6 +8427,7 @@ filing.
 ## 1148. research an honest pass for ASVS 7.5.1 -- full re-authentication on the admin lanes that strip another account's second factor
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **4/10** · _quick win_. The admin lane still rides the shared window: auth_routes.py:790 takes require_step_up, which security.py:538 documents as satisfied by a login within step_up_max_age_seconds, while admin_reset_mfa at service.py:2292 disables TOTP and deletes every passkey for another account. Difficulty stays moderate rather than high because the action-bound seam already ships at security.py:620 and is already wired at auth_routes.py:433 and :677, so once the research settles what full re-authentication means for a third-party subject the work is two routes, the console twin and tests. _(was 7/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **7.5.1** (L2) currently scores **partial**. The pinned verb asks for full re-authentication before modifications to sensitive account attributes that may affect authentication, naming MFA configuration verbatim. The self-service half satisfies it with single-use action-bound grants; the administrative half does not -- `POST /users/{user_id}/reset-mfa` (`api/auth_routes.py:779`) and its browser twin (`webconsole/routes/admin.py:271`) ride the plain login-seeded step-up window.
 > Verdict: research
@@ -8297,6 +8473,7 @@ filing.
 ## 1149. research an honest pass for ASVS 7.5.2 -- what "authenticated again" means when the step-up window is seeded at login
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. The seeding still happens at login: store/store.py carries seed_reauth as a create_session parameter defaulting True with the comment that reauth_at = now seeds the step-up window from login, one line above the INSERT (around :8380-8385; the item's :8287 anchor and the scorecard's :8263 have both drifted). View and terminate ship at api/auth_routes.py:451, :474 and :488, and seed_reauth is already threaded through auth/service.py (:887, :1039, :1177), so the open work is a semantic reading and a re-verify, not a mechanism. _(was 5/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **7.5.2** (L2) currently scores **partial**. The pinned verb asks that users be able to view and, having authenticated again with at least one factor, terminate any or all currently active sessions. Viewing and terminating are both built (`GET /me/sessions`, `DELETE /me/sessions/{session_id}`, `DELETE /me/sessions`, and the console twin at `webconsole/routes/account.py:335`); the "again" clause is what holds it short, because the step-up window is seeded from login.
 > Verdict: research
@@ -8328,6 +8505,7 @@ filing.
 ## 1150. research an honest pass for ASVS 7.6.1 -- bounding time since the IdP authentication event without forcing a credential prompt every round trip
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **5/10** · _fill-in_. With federation enabled a first deployment could not bound time since the IdP authentication event at all, and the one shipped lever destroys single sign-on, so there is no acceptable workaround. Difficulty 5: an owner ruling plus one setting, a max_age parameter on the existing authorize call and an auth_time comparison at the id_token seam, with a fallback for IdPs that omit the claim. _(was 5/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **7.6.1** (L2) currently scores **partial**. The pinned verb asks that session lifetime and termination between relying parties and IdPs behave as documented, requiring re-authentication as necessary such as when the maximum time between IdP authentication events is reached. The engine cannot see or bound that interval: it sends no `max_age` on the authorize request and never reads `auth_time`.
 > Verdict: research
@@ -8359,6 +8537,7 @@ filing.
 ## 1151. research an honest pass for ASVS 8.1.1 -- documenting the data-specific access rules where a reader can actually find them
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **5/10** · _fill-in_. The code enforces more than the documentation describes, so there is no product effect and the residual is silent drift rather than exposure, which caps this below the surfaces that would misbehave on a first deployment. Difficulty 5 holds because the deliverable is not prose: the item requires establishing whether a drift gate over data-scoping claims is constructible at all, plus the public-versus-vaulted split the dangling docs/security pointer is a symptom of. _(was 6/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **8.1.1** (L1) currently scores **partial**. The pinned verb asks that authorization documentation define rules for restricting function-level AND data-specific access, based on consumer permissions and resource attributes. The function axis is exhaustive and CI-pinned in both directions; the data axis is where it falls short.
 > Verdict: research
@@ -8390,6 +8569,7 @@ filing.
 ## 1152. research an honest pass for ASVS 8.2.2 -- object-level authorization on the uploads family, which carries PHI and no owner check
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. The PHI-bearing half is fixed in shipped code, so the cross-operator enumeration, the content oracle and the two-step injection path are gone (app.py:3749, :3941-3971). What remains is the principal-narrowing axis nothing else closes -- identity.py:38 still defaults to every channel -- plus the pageless GET /uploads against the master-test-plan clause, with per-user scoping available as an awkward workaround (value 6). The remainder is a default flip with its first-run console handling plus pagination across API and console, tested but not touching the store (difficulty 4). _(was 9/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **8.2.2** (L1) currently scores **partial**. The pinned verb asks that data-specific access be restricted to consumers with explicit permissions to specific data items, to mitigate IDOR and BOLA. **As filed**, one PHI-bearing object family had no object-level authorization at all: `GET /uploads` listed every user's files unfiltered, and browse and delete took a `file_id` straight through to `get_meta`/`read_bytes` with no channel and no owner check.
 > **UPDATE 2026-08-11 -- THE UPLOADS HALF IS BUILT; THE ITEM STAYS OPEN.** Owner-only plus a `files:access_any` Administrator override, keyed on the immutable `uploader_id` (`Identity.user_id`), owner-ratified and recorded in [ADR 0134](adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md) Amendment A. All four routes now enforce it, including resend's SOURCE file (it previously checked only the TARGET inbound). So the three specific defects named above are fixed in the shipped code and the paragraph above describes the pre-fix state, not the current one.
@@ -8427,6 +8607,7 @@ filing.
 ## 1153. research an honest pass for ASVS 8.2.4 -- adaptive controls inside a live session on a single-host loopback deployment
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **3/10** · Difficulty **6/10** · _money pit_. The one in-session contextual signal still ships off and is documented in the shipped code as never changing an authorization decision, and the allowed-networks list still ships empty with a recorded inert-behind-NAT limit, so the existing-session half of the requirement rests on nothing at the shipped bind. Value 3 because no signal changes an authorization outcome in any configuration, so what is bought is a cell rather than a closed exposure; difficulty 6 because the honest answer needs an owner boundary decision first and the four attribute classes the verb names are largely unavailable to an on-premises single-host engine, with time-of-day gating on a 24-hour clinical service actively harmful. _(was 3/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **8.2.4** (L3) currently scores **partial**. The pinned verb asks for adaptive controls based on environmental and contextual attributes -- time of day, location, IP address, device -- applied both when a consumer starts a new session AND during an existing one, as defined in the application's documentation. The session-start half ships on; the in-session half rests on a single signal that ships off.
 > Verdict: research
@@ -8458,6 +8639,7 @@ filing.
 ## 1154. research an honest pass for ASVS 8.3.2 -- directory-sourced authorization changes that lag, fail open, and have neither named mitigation
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **6/10** · _money pit_. The 300 s directory reconciliation interval is unchanged at config/settings.py:1904 and its validator at :2085-2091 constrains only the range, so no alert-on-action-while-unauthorized and no revert exists and the requirement's alternative arm is entirely unbuilt. Value 4 because the engine-owned half is already strong (opaque tokens, per-request identity re-resolution, revoke-on-mutation) and what would be built is alerting and revert over a lag in data the engine does not own; difficulty 6 because both named mitigations need definition before either could be built, and revert has no meaning for delivered clinical messages. _(was 4/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **8.3.2** (L3) currently scores **partial**. The pinned verb asks that changes to values on which authorization decisions are made apply immediately, and where they cannot, that mitigating controls alert when a consumer acts while no longer authorized and revert the change. Engine-side values do apply immediately; directory-sourced ones lag the reconciliation loop, and neither named mitigation exists.
 > Verdict: research
@@ -8489,6 +8671,7 @@ filing.
 ## 1155. research an honest pass for ASVS 10.1.1 under the owner ruling that a default-off OIDC feature is a partial
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **6/10** · _money pit_. No product effect and the enablement boundary is an owner ruling rather than a defect, but the same question governs at least 10.1.2, 10.2.1, 10.2.2, 10.5.1 and 10.5.4, so answering it once carries more than one cell and holds value at 5. Difficulty stays 6 because the two custody deltas the residual names, an operator-declared cleartext relaxation under ADR 0153 and the ECH sidecar's loopback bearer hop under ADR 0139, are cross-cutting rather than record work, and the honest outcome may still be that no pass exists. _(was 5/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **10.1.1** (L2) currently scores **partial**. The pinned verb asks that tokens reach only the components that strictly need them. What holds it short is not token custody but enablement: the owner ruled on 2026-08-05 that a feature shipping off is a rule-5 partial, and the relying party ships off at `messagefoundry/config/settings.py:1880`.
 > Verdict: research
@@ -8528,6 +8711,7 @@ filing.
 ## 1156. research an honest pass for ASVS 10.1.2 when the flow-binding secrets are unconditional but the flow ships off
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. The enablement premise is unchanged (oidc_enabled ships False, now at settings.py:1942 rather than the cited :1880, and :2190-2210 refuses it without ad_enabled) and both live deltas the research must carry are present: the flow cookie's __Host- twin at _auth.py:783 and the hardening opt-out env at :77. Value 4 because the residual reads every binding on the acceptance path as unconditional, leaving a scorecard and method question with no product effect; difficulty 3 because the code half is one conditional in a single console auth module already covered at test_ui_hardening.py:322, and the cleartext branch is decided by the browser's own rule that a __Host- cookie requires Secure, not by engineering. _(was 4/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **10.1.2** (L2) currently scores **partial**. The pinned verb asks that the client accept an authorization code or ID Token only when it came from a flow started by the same user agent session, with unguessable, transaction-specific, client-and-agent-bound secrets. What holds it short is enablement alone: the owner ruled on 2026-08-05 that a default-off feature is rule 5, and `oidc_enabled` ships False at `messagefoundry/config/settings.py:1880`.
 > Verdict: research
@@ -8565,6 +8749,7 @@ filing.
 ## 1157. research an honest pass for ASVS 10.2.1 when PKCE and state are unconditional but the code flow ships off
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **4/10** · _fill-in_. The code is not in dispute and I confirmed it: PKCE S256 is hardcoded at auth/oidc/flow.py:215 with no configuration path, and oidc_enabled still ships False at settings.py:1942, so what remains is purely the scorecard-method question. Value 4 because the item states there is no product effect and the researcher is explicitly barred from changing the method, leaving a verdict argument as the deliverable. Difficulty 4: no code lands, but the reading has to be argued from ASVS 5.0.0 front matter and conformance guidance against a standing owner ruling, which is more than a doc edit. _(was 4/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **10.2.1** (L2) currently scores **partial**. The pinned verb asks that a code-flow OAuth client defend against browser-based request forgery that triggers token requests, by PKCE or by checking `state`. Both ship and neither is conditional; what holds the cell short is that the code flow itself is reached only when `oidc_enabled` is turned on (`messagefoundry/config/settings.py:1880`).
 > Verdict: research
@@ -8602,6 +8787,7 @@ filing.
 ## 1158. research an honest pass for ASVS 10.2.2 -- whether an id_token iss claim is a real substitute for the RFC 9207 iss parameter
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The defense is still the id_token iss claim compared to the pinned issuer (oidc/claims.py:227) and the RFC 9207 authorization-response parameter is absent from all four files of the OIDC package, so the unverified equivalence the residual flags is unchanged. Severity is bounded because the back-channel legs pin their own token endpoint per connection, and the likely deliverable is a standards determination plus, if needed, one added parameter check on an existing seam. _(was 5/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **10.2.2** (L2) currently scores **partial**. The pinned verb asks that a client able to talk to more than one authorization server defends against mix-up attacks. Two things hold it short: the 2026-08-05 owner ruling on default-off features, and an equivalence the residual itself flags as unverified.
 > Verdict: research
@@ -8641,6 +8827,7 @@ filing.
 ## 1159. research an honest pass for ASVS 10.2.3 -- least-privilege OAuth scopes the engine never validates
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. Gap stands unchanged: both scope settings reach the wire through a bare str() at smart.py:305 and http_auth.py:305 with no cross-check against the connector's declared interaction, checks.py carries no scope rule, and the wildcard example survives in at least five artifacts including the shipped wiring sample at wiring.py:531 (value 6). The remainder prices at 4: a research call on whether required scope is derivable, then an additive advisory check on the established checks.py CheckResult seam (four such checks already at :219/:253/:292/:424) plus doc narrowing, with a refusing gate ruled out. _(was 6/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **10.2.3** (L3) currently scores **partial**. The pinned verb asks that the OAuth client request only the scopes it requires. What holds it short is that `smart_scope` and `oauth2_scope` travel from operator config to the wire through one `str(...)` conversion and nothing else (`messagefoundry/transports/smart.py:305`, `messagefoundry/transports/http_auth.py:305`).
 > Verdict: research
@@ -8680,6 +8867,7 @@ filing.
 ## 1160. research an honest pass for ASVS 10.5.1 when the ID Token nonce check is unconditional but the relying party ships off
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **2/10** · Difficulty **2/10** · _fill-in_. The control is complete and unguarded in the shipped code, so the cell is already substantially covered and only enablement holds it short. The item forbids both engine changes available to it, flipping oidc_enabled and adding a refuse-to-boot gate, and directs the shared optional-feature question to be answered once across all six siblings, so this item's own remainder is applying that ruling and recording the outcome, which ships nothing runnable and costs a record-grade edit. _(was 4/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **10.5.1** (L2) currently scores **partial**. The pinned verb asks that the relying party mitigate ID Token replay, for example by matching the id_token `nonce` against the value sent in the authentication request. The check is implemented with no guard around it; the owner ruled on 2026-08-05 that a feature shipping off is a rule-5 partial, and `oidc_enabled` is False at `messagefoundry/config/settings.py:1880`.
 > Verdict: research
@@ -8717,6 +8905,7 @@ filing.
 ## 1161. research an honest pass for ASVS 10.5.4 when the ID Token audience check is unconditional but the relying party ships off
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **3/10** · Difficulty **3/10** · _fill-in_. Both halves hold at HEAD: the audience check runs unconditionally in auth/oidc/claims.py:230-240 and oidc_enabled is still False by default, now at config/settings.py:1942 rather than the cited :1880, which is itself an instance of the anchor drift the item warns about. Value 3 because the code is correct and the deliverable is a record correction under a standing owner ruling with no product effect on any default; difficulty 3 because no code change is even available -- enabling federation by default is ruled out by the item -- so the remainder is a re-anchor by token plus an argued position and an owner call. _(was 4/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **10.5.4** (L2) currently scores **partial**. The pinned verb asks that the client check the id_token `aud` claim equals its own `client_id`. The check runs with no enclosing guard; what holds the cell short is the 2026-08-05 owner ruling that a feature shipping off is rule 5, with `oidc_enabled` False at `messagefoundry/config/settings.py:1880`.
 > Verdict: research
@@ -8756,6 +8945,7 @@ filing.
 ## 1162. research an honest pass for ASVS 11.1.1 -- a key-management policy covering all six keys, and an oversharing bound that does not fight escrow
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **2/10** · Difficulty **2/10** · _fill-in_. The one-of-six scope gap and the missing oversharing bound are both answered in the shipped document, and the answer took the honest route the item demanded rather than re-declaring the scope. What is left is re-verifying the cell against that text and rewriting its residual, which is a verifier run plus a vault edit rather than repo work. _(was 6/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.1.1** (L2) currently scores **partial**. The pinned verb asks for a documented key-management policy and lifecycle following a standard such as NIST SP 800-57, including that keys are not overshared. The shipped policy at `docs/ASVS-L2-PHASE0-CHANGES.md:118` governs one key of six, and nothing anywhere bounds how many entities may hold a key.
 > Verdict: research
@@ -8787,6 +8977,7 @@ filing.
 ## 1163. research an honest pass for ASVS 11.1.2 -- how a cryptographic inventory can claim ALL without an unmeasured completeness claim
 
 > 🚧 **IN PROGRESS 2026-08-22 -- builder-1 lane**, banner written by the dispatcher, same reason. Claimed via `claim.ps1`; the coord ledger and this banner are different artifacts with different writers. **Not a closure.**
+> Research: done 2026-08-20
 >
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The four uninventoried surfaces are inventoried and the unmeasured completeness claim has been replaced with at-least language, so the residual is the missing per-row usage sentences (13 of 65 section-4 table lines carry one) plus the research question about deriving the inventory mechanically. That research is cheaper than filed because crypto_inventory_check.py already walks five stated first-party roots and fails the build on undocumented usage, so a stated-corpus instrument partly exists. _(was 6/10 · 6/10.)_
 >
@@ -8821,6 +9012,7 @@ filing.
 ## 1164. research an honest pass for ASVS 11.1.3 -- whether crypto discovery can find instances rather than confirm an allow-list
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. Discovery is still import-level: scripts/security/crypto_inventory_check.py matches an import's top-level name against six stdlib modules plus four libraries, with a five-entry CRYPTO_SEAM_MODULES frozenset that lists store modules only, while pipeline/alert_sinks.py performs a verifying STARTTLS handshake (:431) importing build_smtp_tls_context from config/tls_policy (:48) and none of the triggers, and the gate is a required context (.github/required-contexts.txt:79). Value 6 because what is at stake is whether a green required gate is evidence of coverage; difficulty 6 because an AST or call-graph instrument plus a noise budget, the contested re-read and dropping the false transports/database.py join is a tooling rebuild. _(was 6/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.1.3** (L3) currently scores **partial**, and its own residual marks the verdict CONTESTED and asks for a full re-read. The pinned verb asks for discovery mechanisms that identify all instances of cryptography. The shipped gate is real and merge-blocking, but discovery is a hand-maintained import allow-list.
 
@@ -8853,6 +9045,7 @@ filing.
 ## 1165. research an honest pass for ASVS 11.2.2 -- crypto agility for the at-rest and integrity core without shipping a downgrade surface
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **5/10** · _fill-in_. A deploying site could not change the at-rest AEAD, audit MAC, KDF or argon2 parameters without a code release, but the additive-registration path is already built and ruled, so the workaround is a release rather than a redesign. Difficulty 5: research plus an ADR recording the ruling, with no migration and no store-backend leg implied. _(was 6/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.2.2** (L2) currently scores **partial**. The pinned verb asks that algorithms, key lengths, modes and ciphers be reconfigurable or swappable at any time, and that keys be replaceable with data re-encrypted. The transport and key-replacement halves ship; the at-rest and integrity core is a single hardcoded algorithm set.
 > Verdict: research
@@ -8884,6 +9077,7 @@ filing.
 ## 1166. research an honest pass for ASVS 11.2.3 -- a 128-bit floor on operator-supplied keys that healthcare partners can actually meet
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **5/10** · _quick win_. Re-measured rather than relayed: the only bit-length comparison in the tree is jwks.py:34 at 2048 bits, and _load_private_key rejects a non-RSA/EC type without ever inspecting length, so on a first deployment an operator could supply a sub-128-bit key for JWS signing, SMART client assertions or a TLS role with nothing objecting. Difficulty 5 because an honest answer needs a standards-and-partner-practice finding first, and any remedy then reaches signing.py, api/tls.py, every load_cert_chain site and the S/MIME recipient path. _(was 7/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.2.3** (L2) currently scores **partial**. The pinned verb asks that all cryptographic primitives provide at least 128 bits of security, naming RSA-3072 as the equivalent. Every primitive the engine selects for itself clears that; the only key-strength floor in the entire tree is `_MIN_RSA_BITS = 2048` at `messagefoundry/auth/oidc/jwks.py:34`, roughly 112 bits.
 > Verdict: research
@@ -8959,6 +9153,7 @@ Proof: four mutations, each red, zero vacuous -- per-character floor disabled, v
 ## 1167. research an honest pass for ASVS 11.2.4 -- constant-time recovery-code verification without turning ten argon2id slots into an amplification target
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **7/10** · _money pit_. The data-dependent early return survives on the shipped MFA path: _verify_second_factor walks the argon2id recovery hashes and returns on the first match, so the number of ~64 MiB verifications is a function of which code was presented. Value 4 because the leak is a wall-clock signal on an already-authenticated second factor rather than a bypass; difficulty 7 because the obvious constant-time loop multiplies a 64 MiB argon2id verification by the slot count on every attempt, converting a timing leak into a memory and CPU amplification target, and the evidentiary half has no precedent in this tree. _(was 4/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.2.4** (L3) currently scores **partial**. The pinned verb demands that every cryptographic operation be constant-time with no short-circuit in comparisons, calculations or returns. Two data-dependent early returns survive on the shipped default path, the sharper one at `auth/service.py:2076-2080`.
 > Verdict: research
@@ -9018,6 +9213,7 @@ Proof: four mutations, each red, zero vacuous -- per-character floor disabled, v
 ## 1168. research an honest pass for ASVS 11.3.1 -- retiring PKCS#1 v1.5 when the DIRECT key-transport half has no padding parameter to set
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **7/10** · _big bet_. All four anchors are exact at HEAD: PKCS1v15 is the unconditional RSA signing padding (signing.py:212, :239), direct.py:344 calls add_signer with no rsa_padding keyword, and direct.py:359's add_recipient takes no padding argument at all. Value 8 for a weak-padding default on every RSA signature the shipped engine produces plus RSAES-PKCS1-v1_5 key transport, holding the cell at partial with no configuration an operator can choose to avoid it. Difficulty 7 because the honest-pass question turns on partner PSS/ECDSA field data nobody has gathered and on whether the CMS EnvelopedData surface can reach RSA-OAEP without leaving the pinned cryptography, which needs a version disagreement settled before it can even be introspected. _(was 8/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.3.1** (L1) currently scores **partial**. The pinned verb bars insecure block modes and weak padding schemes, naming PKCS#1 v1.5 by example. Block modes are clean; padding is not, and the defect is in the defaults -- `transports/signing.py:212`, and `transports/direct.py:344` where `.add_signer()` is called with no `rsa_padding=`.
 > Verdict: research
@@ -9049,6 +9245,7 @@ Proof: four mutations, each red, zero vacuous -- per-character floor disabled, v
 ## 1169. research an honest pass for ASVS 11.3.3 -- a strict-ciphertext read that refuses an unmarked cipher column
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. A stripped marker would, on a first deployment, read back as plaintext instead of failing, so the integrity property the AEAD writer provides would be silently absent on that row, and the cell additionally carries the re-homed DIRECT S/MIME unauthenticated AES-128-CBC surface with no other cell to defer to. Difficulty 6 stands because strict mode must decide per-column versus global scope across dozens of decrypt call sites in three backends, and must define the mixed-marker state that arises inside a single install when encryption is enabled after rows exist or a value is purged. _(was 7/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.3.3** (L2) currently scores **partial**. The pinned verb asks that encrypted data be protected against unauthorized modification. The cipher's read path returns an unmarked value straight through -- `if not stored.startswith(MARKER_PREFIX): return stored`, `messagefoundry/store/crypto.py:751-752`, re-read at 166634c9 and still live.
 > Verdict: research
@@ -9080,6 +9277,7 @@ Proof: four mutations, each red, zero vacuous -- per-character floor disabled, v
 ## 1170. research an honest pass for ASVS 11.3.5 -- asserting encrypt-then-MAC on hops that deliberately keep CBC-SHA2 for hospital peers
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. The at-rest half is AEAD-only (store/crypto.py:109-111 registers AES-256-GCM alone) and the transport half is unchanged, with the deliberate six-CBC-SHA2 retention recorded at tls_policy.py:375-376 and no encrypt_then_mac reference anywhere under messagefoundry/, so nothing asserts, logs or refuses on the RFC 7366 state. Value 5 because a deploying site has a clean workaround in the shipped tls_ciphers setting (settings.py:766, forward-secrecy-validated at :935-940), leaving the default's breadth rather than an unfixable property; difficulty 3 because the item's named concrete unknown is now answered -- the stdlib exposes no negotiation state at all on this interpreter -- so the remainder is a documented finding plus the V11.3-versus-V12 scope ruling. _(was 4/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.3.5** (L3) currently scores **partial**. The pinned verb requires any encryption-plus-MAC combination to operate in encrypt-then-MAC mode. The application's own cryptography is AEAD-only and therefore EtM by construction; what holds the cell short is the TLS surface, at `config/tls_policy.py:349`.
 > Verdict: research
@@ -9156,6 +9354,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1171. research an honest pass for ASVS 11.4.1 -- SHA-1 TOTP and a keyed BLAKE2b de-identification seed
 
 > 🚧 **IN PROGRESS 2026-08-22 -- builder-2 lane**, banner written by the dispatcher: `BUILDER.md:253` puts banner flips outside a builder's lane and the lane-vs-broadcast expiry at `:257` is ambiguous enough that two builders read it differently, so this seat wrote it rather than leave the double-build hazard uncovered. The alerts cleartext-credential refusal is committed; the AUTH-mechanism restriction is not yet landed. **Not a closure.**
+> Research: done 2026-08-20
 >
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. Half the item is gone -- totp.py:84-85 confirms the SHA-256 cutover with the algorithm string derived so the two cannot drift -- and the cell's own last_verified of 2026-08-16 postdates that cutover while still reading partial, which independently confirms the remainder is the non-TOTP limb. Value 6 on that remainder: an L1 requirement short of pass on shipped code, one site rather than two, with the user-facing authenticator-interop question retired. Difficulty 4 because the worst case is a two-file swap plus the inventory registration at crypto_inventory_check.py:104 and :348, ahead of which sits the cheap prior question of whether a de-identification seed is a cryptographic use the verb reaches. _(was 7/10 · 5/10.)_
 >
@@ -9208,6 +9407,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1172. research an honest pass for ASVS 11.5.1 -- a 128-bit recovery code a person can still transcribe
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. The concrete IDE defect is closed by cspNonce.ts and its negative test, so what remains is the recovery-code shortfall (totp.py:58-60, 31^15 or about 74.3 bits, ten issued by default at settings.py:1798) plus the cross-language inventory question the crypto gate still cannot answer (crypto_inventory_check.py:456-472 excludes ide/ by invariant rather than inventorying it). An operator can only work around the shortfall by setting the count to 0, which is the awkward-workaround band. _(was 6/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.5.1** (L2) currently scores **partial**. The pinned verb sets a 128-bit floor on every non-guessable random value. TOTP recovery codes are CSPRNG-drawn but reach only about 74.3 bits, and the IDE extension mints its webview CSP nonces from `Math.random()`.
 > Verdict: research
@@ -9239,6 +9439,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1173. research an honest pass for ASVS 11.5.2 -- an RNG-under-demand claim that survives the IDE extension staying in scope
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **3/10** · Difficulty **2/10** · _fill-in_. The specific surface the item said held the cell is gone: cspNonce.ts draws 144 bits from node:crypto and a shipped test pins that no production source uses Math.random for a nonce, so the scope-ruling temptation the item exists to refuse no longer has to be taken. The remainder is the item's evidence question plus a verdict edit in a record this repo does not hold (value 3, difficulty 2). _(was 3/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.5.2** (L3) currently scores **partial**. The pinned verb asks that the RNG mechanism in use be designed to work securely even under heavy demand. The engine's demand story is strong; the cell is held by surface, specifically the IDE extension's `Math.random()` webview nonces.
 > Verdict: research
@@ -9270,6 +9471,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1174. research an honest pass for ASVS 11.7.2 -- encrypt-after-use for plaintext that lives in immutable CPython objects
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **3/10** · Difficulty **6/10** · _money pit_. Unchanged in code: only the cipher's mutable buffers are locked and zeroized, and the caller's plaintext str plus the bytes cryptography returns are still immutable with no wipe hook. Value is low because exploitation requires memory access to the engine process, making it defence in depth; difficulty is 6 because the item forbids narrowing the whole-message Handler contract, so the buildable arc is a field-scoped view or decrypt-on-access accessor across store crypto and the transform path, which is cross-cutting but touches neither the stage handoff nor the ACK contract. _(was 3/10 · 8/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.7.2** (L3) currently scores **partial**. The pinned verb asks for data minimization during processing plus encryption immediately after use. Both clauses have real implementations and neither is complete -- the binding half is that CPython `str`/`bytes` have no wipe hook and are never re-encrypted (`store/crypto.py:47-62`, `:708-716`).
 > Verdict: research
@@ -9301,6 +9503,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1175. research an honest pass for ASVS 12.1.2 -- which recommended-suite list binds, when six CBC suites were kept by measurement
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The IDE client gained a TLS floor at engineClient.ts:56-70 but still passes no cipher list, so the static-RSA negotiation the item measured is unaffected, and validate_tls_ciphers (tls_policy.py:339) checks the suite set without checking the order. Value 6 rather than 7 because the engine-built contexts stay forward-secret-only under harden_cipher_suites and one of the three holds has narrowed; difficulty 6 because the honest answer must first bind a recommended-suite list the standard does not name, and limb 1 cannot be asserted without re-running the MLLP and DICOM interop measurement that kept the six CBC suites. _(was 7/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **12.1.2** (L2) currently scores **partial**. The pinned verb has three limbs -- only recommended suites enabled, strongest set as preferred, and forward secrecy only at L3. The engine's own contexts are strong; the failures are off the data plane and in the ordering check.
 > Verdict: research
@@ -9335,6 +9538,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1176. research an honest pass for ASVS 12.1.5 -- whether ECH is reachable at all before CPython exposes an API
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **2/10** · Difficulty **2/10** · _fill-in_. Re-measured on the pinned runtime: an SSLContext exposes no ECH attribute, the routing half is unreachable from either authoring surface, and the Go sidecar the record leans on was retired from the tree, so the cannot-honestly-reach-pass finding is better supported now than when filed. Difficulty 2 because the deliverable is a recorded finding whose external blockers are confirmable in one probe and two greps. _(was 2/10 · 3/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **12.1.5** (L3) currently scores **fail**. The pinned verb requires ECH enabled in the application's own TLS settings. No in-scope artifact enables it in any configuration, and on the pinned runtime none could -- `hasattr(ctx, 'set_ech_config')` is False on CPython 3.14.6 / OpenSSL 3.5.7.
 > Verdict: research
@@ -9376,6 +9580,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1177. research an honest pass for ASVS 12.2.1 -- refusing a cleartext outbound hop that carries a body rather than a credential
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **2/10** · _fill-in_. The outbound refusal the item was filed against ships and fires on the DEFAULT posture, not only in production: enforcement defaults to ENFORCE at settings.py:3654 and feeds enforcing at :2471, so a cleartext non-loopback http destination is refused at construction unless the operator explicitly attests the hop, declares cleartext_accepted, or turns the dial to warn. The scored remainder is the honest-pass adjudication only, whether an audited operator declaration can carry an L1 pass and the unsettled narrow-versus-broad V12.2 reading, which is reading plus a scorecard re-read. _(was 8/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **12.2.1** (L1) currently scores **partial**. The pinned verb requires TLS on all client-to-external-HTTP-service connectivity with no insecure fallback. The inbound half would pass on its own; nothing refuses a plaintext outbound destination whose body carries no named credential.
 > Verdict: research
@@ -9407,6 +9612,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1178. research an honest pass for ASVS 12.3.1 -- what a no-fallback claim means under the owner-ratified cleartext gradient
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **4/10** · _quick win_. Both limbs re-read at HEAD and both hold: transports/tcp.py:150-152 and transports/x12.py:124-125 declare cleartext_accepted a PERMANENT, STRUCTURAL declaration with no tls parameter to migrate to, and config/tls_policy.py:503-519 documents the loopback, hop_attested, cleartext_accepted and not-enforcing arms ahead of REFUSE. Value 7 because a first deployment would put a raw-TCP or X12 partner hop on the wire in the clear with no in-product configuration that changes it; difficulty 4 because this item's own remainder is the reading against the ADR 0153 gradient plus an owner ruling, with the connector TLS build tracked at #311. _(was 7/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **12.3.1** (L2) currently scores **partial**. The pinned verb requires an encrypted protocol on every inbound and outbound connection and forbids falling back to an unencrypted one. Two limbs fail: raw TCP and X12 cannot speak TLS in any configuration, and the shared hop decision ships four ALLOW/WARN arms ahead of its REFUSE.
 > Verdict: research
@@ -9441,6 +9647,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1179. research an honest pass for ASVS 12.3.3 -- internal-hop transport encryption when a certificate cannot be a shipped default
 
 > 🚧 **IN PROGRESS 2026-08-22 -- builder-1 lane**, banner written by the dispatcher: `BUILDER.md` puts banner flips outside a builder's lane and the lane-versus-broadcast expiry is ambiguous enough that two builders read it differently, so this seat writes it. Claimed via `claim.ps1`; the coord ledger and this banner are different artifacts with different writers. The 2026-08-20 pass is being applied in its own order -- scope correction first, then the shipped-surface refusal case, then the build. **Not a closure.**
+> Research: done 2026-08-20
 >
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **5/10** · _quick win_. On a first deployment the internal hops would carry session bearer tokens and, on the assessed proxy topology, PHI reads in cleartext with no gate refusing to start, and the vendor cannot ship the certificate the control needs. Difficulty 5: a scoping ruling, a one-line Dockerfile change and a bounded startup check that can sit on the existing exposure_protected property without colliding with the revocation refusal. _(was 7/10 · 7/10.)_
 >
@@ -9476,6 +9683,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1180. research an honest pass for ASVS 12.3.4 -- narrowing internal TLS trust when the anchor is an artifact only the deployer holds
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Both shortfalls confirmed at HEAD: the anchor ships off, and on the HTTP egress family it is inexpressible, since resolve_trust_anchor reaches only dicom, mllp and remotefile while rest.py and soap.py expose verify_tls alone and both hvac sites pass no CA. On a first deployment every internal REST, SOAP, FHIR, DICOMweb and Vault hop would verify against the whole OS store, including the hop that hands out the store data-encryption key. Difficulty 6 because this is a client-construction change across rest.py, soap.py and both hvac sites plus a refuse-versus-fall-back posture decision, not a default flip. _(was 7/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **12.3.4** (L2) currently scores **partial**. The pinned verb asks that internal TLS use trusted certificates and, where internal or self-signed certificates are in play, that the consuming service trust only specific internal CAs. `trust_anchor_mode: TrustAnchorMode = "system"` at `messagefoundry/config/settings.py:969` with `internal_ca_file = None`, so internal-CA certificates are verified against the whole OS trust store.
 > Verdict: research
@@ -9509,6 +9717,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1181. research an honest pass for ASVS 12.3.5 -- intra-service endpoint authentication on an engine whose coordination is store-mediated
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **7/10** · _big bet_. The setting is still attestation-only: its sole consumer at settings.py:850 collapses four values to a boolean, so a declared "mtls" changes nothing. Value 6 rather than 7 because the hop the item's own severity names is genuinely closable today -- setting [api].tls_client_ca_file makes the API listener CERT_REQUIRED-verify the proxy's client cert (api/tls.py:58-62) -- so the gap is an unverified declaration beside a working control rather than an unavailable one; difficulty 7 because an honest pass must decide whether an attestation-only setting should exist at all, whether mutual PKI is reachable for the store and Vault hops given the drivers in use, and whether the IDE, tray and apiclient fall inside the requirement's scope. _(was 7/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **12.3.5** (L3) currently scores **partial**. The pinned verb asks for strong, PKI-based, replay-resistant authentication verifying each endpoint of an intra-service hop. The engine's only setting named for it, `proxy_intra_service_auth: Literal[...] = "none"` at `messagefoundry/config/settings.py:771`, is read in exactly one place -- `return self.proxy_intra_service_auth != "none"` at `:804` -- so nothing branches on its value (verified at 166634c9).
 > Verdict: research
@@ -9540,6 +9749,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1182. research an honest pass for ASVS 13.2.1 -- backend hops where no individual-account credential exists in any configuration
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **7/10** · _big bet_. The gate still ships off at config/settings.py:514 and its precondition method at :591-609 reads only StoreSettings, so the db_lookup pool and DATABASE connector remain uncovered exactly as filed. Value 7 for a real gap with no compliant option available to an operator on five of the hops; difficulty 7 because the research must price five separate missing mechanisms (LDAP SIMPLE bind, SMTP XOAUTH2, Vault AppRole and lease renewal, OIDC client_secret, and the Postgres validator that rejects anything but sql auth) against an owner decision on per-backend scoping the item is forbidden to pre-empt. _(was 7/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **13.2.1** (L2) currently scores **partial**. The pinned verb asks that backend component communications authenticate with individual service accounts, short-term tokens or certificates, and not with unchanging credentials. The store hop ships `auth = SqlAuth.SQL` -- a static username plus a password brace-quoted into the ODBC DSN -- and the gate that would refuse it, `require_managed_identity: bool = False` at `messagefoundry/config/settings.py:488`, ships off (verified at 166634c9).
 > Verdict: research
@@ -9574,6 +9784,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1183. research an honest pass for ASVS 13.3.2 -- least-privilege secret access, starting with whether the recorded verdict is even right
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **4/10** · _fill-in_. The item concedes no direct product effect and is explicitly an assessment-quality gap: the stated basis for the recorded partial is refuted by a sibling cell, so the work buys record accuracy rather than a control. Difficulty is a re-derivation against the pinned verb plus a survey of what the engine could introspect about its own secret-store privileges across Vault, environment-injected passwords and wincred, with no engine code change indicated. _(was 5/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **13.3.2** (L2) currently scores **partial**. The pinned verb asks that access to secret assets adhere to least privilege. The recorded basis is that `require_managed_identity: bool = False` (`messagefoundry/config/settings.py:488`) is the one engine-side check and covers only the store slice -- but the 2026-08-08 triage calls that a category error, and the sibling cell 13.2.2 says so in the scorecard's own words.
 > Verdict: research
@@ -9623,6 +9834,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1184. research an honest pass for ASVS 14.2.1 -- getting the PHI search needle off the query string without breaking GET search
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **6/10** · _big bet_. All three sibling routes still take the needle on the query string (api/app.py:3020-3022 and :3112-3114, uploaded_logs.py:173-175 with the anchor moved from :88), and logging_setup.py:174-177 records that uvicorn emits the full request line including the query string into the stream NSSM captures and an off-box forwarder ships, with neither parameter in _CREDENTIAL_QUERY_KEYS. Value 8 because redaction.py's own docstring at :68-72 concedes the residual is single-token identifiers, so an operator-typed MRN would survive into that log on a first deployment, and proxy logs, browser history and referrers are outside any filter; difficulty 6 because moving the needle off a GET URL is cross-cutting across the API, console, harness, IDE extension and apiclient, each of which must be priced explicitly. _(was 8/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **14.2.1** (L1) currently scores **partial**. The pinned verb asks that sensitive data reach the server only in the body or headers, and that the URL and query string carry none of it. Three sibling routes take a PHI needle in the query string, including `field_value: str | None = Query(None, max_length=512)` at `messagefoundry_webconsole/routes/uploaded_logs.py:88` (verified at 166634c9).
 
@@ -9711,6 +9923,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1185. research an honest pass for ASVS 14.2.2 -- cache control for PL-2 responses the coverage guard is structurally unable to see
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. The tuple at api/app.py:346 still carries the same five prefixes, the middleware at :1296-1305 has exactly two arms, and none of the three monitoring routes at :2321, :2348 and :2391 falls under either, so on a first deployment those PL-2-bearing responses would carry no cache directive. Value 7 is rung 7 -- no operator-side remedy exists in the default posture, and the second disjunct's process-lifetime decrypted caches have none at all. Difficulty 6 because the fix is structural rather than additive: the guard in tests/test_no_store_phi_coverage.py selects routes by permission gate and so can never see a monitoring-gated PL-2 route, and the item also requires rulings on whether sensitivity tracks permission or classification and on the docstring-versus-PHI.md conflict. _(was 7/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **14.2.2** (L2) currently scores **partial**. The pinned verb offers two disjuncts -- prevent sensitive data being cached in server components, or securely purge it after use -- and neither is met. `_NO_STORE_PREFIXES = ("/messages", "/dead-letters", "/search", "/logs", "/uploads")` at `messagefoundry/api/app.py:336` omits three monitoring routes that return PL-2 free text (verified at 166634c9).
 > Verdict: research
@@ -9740,6 +9953,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1186. research an honest pass for ASVS 14.2.4 -- doc-to-code fidelity when the measuring document is written as a mirror of the code
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **6/10** · _money pit_. The operator-surprise evidence that carried this item's severity is repaired -- all four named documents now describe the shipped auto-bound and record the previous inversion (CONFIGURATION.md:1529, SECURITY-LOOSENING.md:221-223 and :300, PHI.md:1061-1063) -- so the remainder is the research question plus a binding gate for gate-behaviour and integrity prose, which the item itself doubts is mechanisable. Difficulty stays at 6 for exactly that reason. _(was 7/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **14.2.4** (L2) currently scores **partial**. The pinned verb asks that the named control domains be implemented as defined in the documentation for the specific data's protection level. Retention is demonstrably not: the startup gate was inverted so an unset PHI-body window auto-bounds to 30 days under `enforce`, while four tracked documents still describe a refusal, and nothing in the tree can red on the divergence.
 > Verdict: research
@@ -9773,6 +9987,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1187. research an honest pass for ASVS 14.2.6 -- display masking in a console whose job is to show the operator the message
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. Gap stands: the raw body renders on page load at messages.py:346 with no reveal step, and the only nearby control is the permission and audit split at :371-374, so the verb's second sentence has no implementing control anywhere in the corpus (value 6). The remainder is a design ruling on what masking means for a console whose purpose is reading the failed message, then response-shaping plus console interaction plus audit reaching the API models, the apiclient and the console together (difficulty 6), with a reasoned cannot-pass an accepted outcome. _(was 6/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **14.2.6** (L3) currently scores **partial**. The pinned verb has two sentences: return only the minimum sensitive data, and mask complete data in the UI unless the user specifically views it. The second has no implementing control anywhere -- the raw body renders on page load at `messagefoundry_webconsole/pages/messages.py:346` (`raw = el("pre", detail.raw, class_="raw")`, verified at 166634c9) with no reveal interaction.
 > **SHIPPED-BUT-OPEN 2026-08-22 -- PR #514, ledger pairing authored by the LANDER per [ADR 0165](adr/0165-a-builder-pr-satisfies-the-ledger-gate-with-a-paired-commit-authored-by-the-dispatcher-or-lander.md).** Subjects 1 and 2 shipped TOGETHER and deliberately: the summary is masked on list surfaces and revealed when one message is opened. Shipping the mask alone would have left the console showing masked summaries with no way to unmask -- a regression on the surface whose stated job is showing the operator the message.
@@ -9811,6 +10026,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1188. research an honest pass for ASVS 14.2.7 -- the three classified PHI tiers no sweep reaches, under the 2026-07-30 no-auto-bound ruling
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **7/10** · _big bet_. All three undeleted tiers persist: both body purges scope every queue statement to Stage.OUTBOUND, so a dead ingress or routed row would keep a full raw PHI payload after messages.raw blanks and the message reads as purged; the reference purge still refuses a declared set; and _sweep_app_logs remains the only filesystem sweep, with no spill-directory path. Difficulty is 7 because closing it means purge changes across all three store backends, a new filesystem sweep, and an eviction-key design that does not reverse the 2026-07-30 no-auto-bound ruling. _(was 7/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **14.2.7** (L3) currently scores **partial**. The pinned verb is a conjunction: classify sensitive information for retention, and ensure outdated data is deleted automatically, on a schedule, or as the situation requires. Classification is built and machine-enforced (`MIN_PHI_RETENTION_WINDOWS: Final[int] = 9` at `messagefoundry/config/retention_classification.py:173`, verified at 166634c9); deletion misses three classified tiers.
 > Verdict: research
@@ -9850,6 +10066,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1189. research an honest pass for ASVS 15.1.4 -- risky-component highlighting when the consolidated table is policy-withheld from the tree
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. The constraint is intact and is stated policy rather than oversight: the blanket rule at .gitignore:170 keeps THREAT-MODEL.md out of every engine checkout (git ls-files docs/security = 0), leaving only the per-library ADR notes. Value 4 because a first deployment's operators would receive no risky-component highlight for the hostile-input parsers or the auth and crypto stack, which is documentation coverage rather than a product defect; difficulty 3 because the deliverable is a public-safe highlight that survives the withholding subtraction plus an owner ruling on who application documentation serves -- prose and a decision, with no code path. _(was 4/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **15.1.4** (L3) currently scores **partial**. The pinned verb asks that application documentation highlight third-party libraries considered risky components. Two libraries are highlighted in-tree; the consolidated designation over the dependency set lives in `docs/security/THREAT-MODEL.md`, which `.gitignore:147` keeps out of every checkout (verified at 166634c9).
 > Verdict: research
@@ -9883,6 +10100,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1190. research an honest pass for ASVS 15.1.5 -- which dangerous-functionality classes can be highlighted publicly without becoming the roadmap
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. Only the dynamic-execution class is highlighted in-tree, the other classes the item names appear in no shipped document, and docs/security/ is still ignored at .gitignore:170. The remainder is deciding which classes can be named publicly without the highlight becoming the exploitation guide, then writing them where an adopter receives them. _(was 4/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **15.1.5** (L3) currently scores **partial**. The pinned verb asks that application documentation highlight the parts of the application where dangerous functionality is used. One class is highlighted well in-tree and the rest only in the policy-withheld `docs/security/THREAT-MODEL.md`, while the guard that would assert over it skips at its document accessor (`tests/test_threat_model_doc_drift.py:52`).
 > Verdict: research
@@ -9917,6 +10135,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1191. research an honest pass for ASVS 15.2.2 -- an availability bound on the MLLP data plane that does not accept-and-drop
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. A per-connection pacer ships with its off-by-default position already written as a documented decision at mllp.py:109-116, which is most of what the verb asks for, so the gap is an awkward-workaround one (the operator supplies a number) rather than an absent defense. The remainder is choosing defensible non-zero values for settings.py:1066 and :1636 and settling whether any wall-clock bound is reachable off the subprocess path, each needing a written rationale. _(was 8/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **15.2.2** (L2) currently scores **partial**. The pinned verb asks for implemented defenses against loss of availability caused by time-consuming or resource-demanding functionality, grounded in documented decisions. What holds it short is that the engine's primary data plane has no message-throughput or admission ceiling, and two byte budgets ship 0 = unbounded (`config/settings.py:1020`, `:1582`).
 > Verdict: research
@@ -9948,6 +10167,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1192. research an honest pass for ASVS 15.2.3 -- getting development subcommands out of the wheel without taking dryrun off the operator's box
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. Clause (a) still binds: messagefoundry/__main__.py registers dryrun (:162), adr-analyze (:225), generate (:350), lens (:375) and import corepoint (:442, :449) as unconditional subparsers on the same entrypoint as serve (:63), while clause (b) stays clean via the sdist only-include at pyproject.toml:21. Value 5 on the item's own severity, low product effect and no added network surface, which makes this shipped-artifact hygiene; difficulty 4 for a research pass that must settle whether an entrypoint gate reads as does-not-include, plus CLI tests if it becomes a build. _(was 6/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **15.2.3** (L2) currently scores **partial**. The pinned verb is conjunctive: the production environment must include only run-required functionality AND not expose extraneous functionality such as test code, samples, and development functionality. What holds it short is clause (a) -- development subcommands ship inside the wheel as unconditional argparse subparsers on the production entrypoint (`messagefoundry/__main__.py:162`, `:225`, `:350`, `:375`, `:432`, re-read at HEAD).
 > Verdict: research
@@ -9981,6 +10201,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1193. research an honest pass for ASVS 15.2.4 -- provenance for the web-console distribution the engine loads by import name
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. The remainder is whether a claimed name satisfies the verb or the load path must verify provenance for a distribution that mounts in-process, on an L3 cell; the name-claim limb and the next-distribution guard (test_a_new_distribution_must_be_classified:172) are already covered. Difficulty 4: a provenance check at the single find_spec load site plus a test, once the ruling is made. _(was 8/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **15.2.4** (L3) currently scores **partial**. The pinned verb asks that third-party components and all transitive dependencies come from the expected repository and that there is no risk of a dependency confusion attack. What holds it short is the in-scope web console: shipped docs instruct a bare-name index install (`README.md:110`) and the engine loads whatever occupies that import name by presence, not provenance (`messagefoundry/__main__.py:1769`).
 
@@ -10015,6 +10236,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1194. research an honest pass for ASVS 15.2.5 -- isolation around Router/Handler code that does not fail closed on the sanctioned live lookups
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **6/10** · _big bet_. The rubric's 8 band names an ASVS L3 Partial on defaults, and 15.2.5 is exactly that: settings.py:1295 still defaults sandbox mode to off, the section docstring at :1279-1292 is itself the documentation limb the verb keys on, and ADR 0147, the only shape that reconciles isolation with the sanctioned live lookups, remains Proposed with no code. Difficulty 6 rather than 8 because the deliverable is a finding plus the per-message overhead measurement the project's own record leaves asserted, or a lesser in-process protection; building the broker seam would be the 8. _(was 6/10 · 8/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **15.2.5** (L3) currently scores **partial**. The pinned verb asks for additional protections -- sandboxing, encapsulation, containerization, network-level isolation -- around parts of the application documented as containing dangerous functionality. What holds it short is that a real, non-stub isolation control exists and ships off: `[sandbox].mode` is `Literal["off", "subprocess"]` defaulting to `"off"` (`config/settings.py:1241`).
 > Verdict: research
@@ -10048,6 +10270,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1195. research an honest pass for ASVS 15.4.4 -- fair thread access on the shipped SQLite posture, or a measured argument that the existing pools already suffice
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **7/10** · _money pit_. The only cross-subsystem reservation still ships off and is still SQL-Server-only by construction, so on the shipped SQLite posture route and transform CPU and all blocking transport I/O share one default pool with the argon2 semaphore as the sole reservation. Value 5 because connector timeouts bound the wait and the recorded assessor dissent may be right that bounded pools already satisfy the verb, so the practical exposure is a delay rather than starvation; difficulty 7 because any mechanism has to clear ADR 0071's measured NO-GO boundary without regressing throughput, and the operative phrase about a reasonable timeframe is recorded as unassessed, so even the argument route needs a new measurement. _(was 5/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **15.4.4** (L3) currently scores **partial**. The pinned verb asks that resource allocation policies prevent thread starvation by ensuring fair access, letting lower-priority threads proceed within a reasonable timeframe. What holds it short is that the only cross-subsystem reservation ships off and is SQL-Server-only (`fuse_thread_hops` default False, `config/settings.py:1184`; `pipeline/wiring_runner.py:759`).
 > Verdict: research
@@ -10081,6 +10304,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1196. research an honest pass for ASVS 16.2.2 -- the synchronized-sources conjunct on an engine with no shippable time peer
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The SNTP gate still ships warn-only with no peer (config/settings.py:1447-1448; the item's :1393 anchor has moved) and the validator at :1513-1515 confirms the structural bind the item describes -- flipping the flag alone makes every stock config fail to load. Value 6 for an evidence-quality gap with no in-engine skew check on the default and only an awkward out-of-product substitute; difficulty 6 because the hinge is a reading of the standard about whether host-level clock discipline satisfies a synchronization verb for an application that does not own the clock, followed by a clinical judgement on fail-closed behaviour. _(was 6/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **16.2.2** (L2) currently scores **partial**. The pinned verb has two conjuncts: log time sources synchronized, and security-event timestamps in UTC or with an explicit offset. The UTC conjunct holds on the default (`logging_setup.py:348`, `formatter.converter = time.gmtime`); the synchronization conjunct does not, because the engine's own SNTP gate ships off (`require_time_sync: bool = False`, `config/settings.py:1393`).
 > Verdict: research
@@ -10112,6 +10336,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1197. research an honest pass for ASVS 16.3.2 -- measuring the audit-flood cost that the all-decisions clause is traded against
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **4/10** · _quick win_. An explicit ASVS must is being traded against a flooding cost asserted in the settings comment and in ADR 0118 and measured nowhere, which is the weakest joint in the cell and could settle it in either direction; denials stay audited unconditionally so there is no access-control hole behind it. Difficulty 4 because part (a) is a measurable audit-row rate under a polling console, and parts (b) and (c) are method reading plus assessing the unaudited field-redaction decisions, none of it a store or seam change. _(was 7/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **16.3.2** (L2) currently scores **partial**. The pinned verb requires failed authorization attempts to be logged, and at L3 all authorization decisions including sensitive-data access. What holds it short per the scorecard is that `audit_all_authorization_decisions` ships False (`config/settings.py:3640`), so a GET records no grant row and a non-GET only for the 15 permissions in `_GRANT_AUDIT_PERMISSIONS` (`api/security.py:100`).
 > Verdict: research
@@ -10143,6 +10368,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1198. research an honest pass for ASVS 16.4.2 -- what "cannot be modified" can mean for logs the operator's substrate owns
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The disputed limb resolves in the triage's favour at HEAD -- store/store.py:2251-2254 documents that only rows missing a hash are filled and existing valid hashes are left untouched, enforced by the skip at :2259, with :2288 confirming a rewrite needs the explicit chain-verifying rekey -- while audit_verify_on_start still ships False at settings.py:3309, so the gap the item actually names, absent modification prevention, stands. Value 6 rather than 7 because prevention has an awkward but real operator-side workaround the item itself enumerates (append-only grants, a WORM volume, a write-only remote sink) on top of the shipped hash chain and its verify knob; difficulty 6 because the outcome is bimodal, either a standards reading that decides the whole cell for near-zero cost or a prevention seam the engine does not have. _(was 7/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **16.4.2** (L2) currently scores **partial**. The pinned verb is a conjunction: logs protected from unauthorized access AND unmodifiable. What holds it short, per the 2026-08-08 triage rather than the scorecard's own one-line residual, is that modification *prevention* is absent by design in every configuration -- the hash chain makes tampering evident, never impossible.
 > Verdict: research
@@ -10180,6 +10406,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1199. research an honest pass for ASVS 16.4.3 -- an engine that ships no collector against a verb that requires transmission
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **5/10** · _quick win_. Shipped defaults are unchanged: forward_host is None at settings.py:1413, the handler installs only behind if forward is not None at logging_setup.py:438, and the protocol default at :1415 is UDP. Value 6 not 7: the engine ships the entire secure-transmission mechanism (SyslogForward at logging_setup.py:240 with native TLS at :300, CA anchoring and hostname verification, plus the REFUSE gate at settings.py:2475), so an operator reaches a conforming posture by setting a host and forward_protocol=tls -- awkward, but a real workaround, which is what rung 7 requires to be absent. Difficulty 5 for measuring the REFUSE gate's actual coverage, arguing the deployed-system-versus-product reading against the text, and weighing a TLS protocol default against a precedent that a runbook edit bought and lost this cell in two days. _(was 7/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **16.4.3** (L2) currently scores **partial**. The pinned verb requires logs to be securely transmitted to a logically separate system so they survive a breach of the application. What holds it short is that no shipped default transmits anything: `forward_host` is None (`config/settings.py:1359`) and `configure_logging` installs stdout only behind `if forward is not None` (`logging_setup.py:437`).
 > Verdict: research
@@ -10965,6 +11192,84 @@ every worker session's handoff, which is the sentence the next session bases its
 **Cluster:** Store / schema legibility. **Priority:** P3. **Verdict:** build. **Severity:** none -- no behaviour changes and nothing is exposed; the cost of leaving it is a reader inferring a username from a column name.
 
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. BUILD THE RENAME EVERYWHERE AND WRITE NO MIGRATION.**
+
+**COUNTS CORRECTED against the tree**, with the needle stated: **128** references (store 44, sqlserver
+34, postgres 31, base 19), matching this row's re-score rather than its scope paragraph's lower figure.
+**Schema-hash sites: postgres 13, sqlserver 12, and store.py ZERO.** *A different needle from the row's,
+same conclusion --* ***and the ZERO, which is the half the whole argument rests on, is exact.***
+
+***THE MIGRATION QUESTION DISSOLVES ON SECTION 0.*** `_schema_hash()` hashes the shipped DDL, a match at
+open skips the batch, and the DDL is `CREATE TABLE IF NOT EXISTS` -- **so a migration function exists to
+upgrade a PRE-EXISTING database.** **There are zero deployments, so no pre-existing database exists on
+any backend.** CI builds its databases **fresh** from the DDL every run. *Section 0 is explicit that a
+staged migration is a cost paid to protect users who do not exist.*
+
+**A HALF-RENAME IS THE DANGEROUS OPTION AND MUST NOT BE BUILT.** Each backend carries its **own**
+`_SCHEMA`. Renaming the references and one backend's DDL while leaving the others **breaks those
+backends outright** -- worse than an untested migration.
+
+**THE HONEST RESIDUAL, WHICH THE BUILD MUST STATE:** an existing DEVELOPER server database **will not be
+renamed**, because `CREATE TABLE IF NOT EXISTS` skips a table that already exists. ***It fails at QUERY
+TIME rather than at open.*** **The remedy is to drop and re-create it.**
+
+***FURTHER AMENDMENT 2026-08-23. THERE ARE TWO `owner` COLUMNS IN THESE MODULES, AND A SYMBOL-LEVEL
+RENAME IS THE WRONG INSTRUMENT FOR THIS ITEM.***
+
+| column | where | what it is |
+| --- | --- | --- |
+| `search_presets.owner` | `store.py:1753`, `postgres.py:611`, `sqlserver.py:1534` | **this item's subject** |
+| **`queue.owner`** | `postgres.py:275`, `sqlserver.py:1133` | ***the row-claim LEASE HOLDER*** |
+
+***THE SECOND IS RELIABILITY-CRITICAL AND IT IS DECLARED IMMEDIATELY ABOVE `lease_expires_at`.*** The
+release path nulls the two in a single statement -- `UPDATE queue SET ... owner=NULL,
+lease_expires_at=NULL` at `postgres.py:2932`, `:2971`, `:3071`, `:3196`, `:3226`, `:3313`. **So it is
+the exact mechanism that makes a crashed worker's rows reclaimable**, which is the at-least-once
+invariant section 2 forbids breaking.
+
+***AND IT WOULD BREAK QUIETLY:*** the suites that would catch it are the ones exercising a lease
+**expiring**, not the preset suites a renamer would run.
+
+**THE CODE ALREADY NAMES THE DISTINCTION**, at `store.py:380`: *"Distinct from the row-claim `owner`
+column (a per-store-instance identity, stamped on Postgres only, NOT stable across a restart)"*.
+
+***SO THIS ROW IS COSTED AGAINST AN OPERATION THAT MUST NOT BE PERFORMED.*** A find-and-replace on
+`owner` is not a cheap version of this change; **it is a different and dangerous change.** Two columns
+share one name inside the same three modules, so ***every candidate site must be READ, not matched***.
+**No rename-surface count belongs in this row** -- an earlier figure offered as one was withdrawn by its
+author on measuring what it actually counted, and no correct figure replaces it, because the number is
+not the hazard.
+
+**REQUIRED, AND IT OUTLIVES THIS ITEM: a test asserting `queue` STILL HAS a column named `owner`, so an
+over-broad future rename goes RED.** *Build the guard before the change it guards -- a guard that lands
+afterwards never guarded anything.*
+
+***THIRD AMENDMENT 2026-08-23. THE SCOPE IS COLUMN **AND** PARAMETER. THE FILE LIST ABOVE IS
+UNDER-SCOPED, AND IT IS A DESCRIPTION RATHER THAN A FENCE.***
+
+`store/base.py`'s Protocol carries `owner` as a **keyword-only PARAMETER**, not a column -- `:1706`,
+`:1713`, `:1718`, `:1727`, across all four preset methods -- and callers outside the store modules pass
+it.
+
+***RENAMING THE COLUMN ALONE LEAVES THE PROTOCOL LYING, WHICH RECREATES THIS ITEM'S OWN DEFECT ONE
+LAYER UP.*** The defect is not *"a column has an inconvenient name"*; it is ***"the name says owner and
+the value is a user id"***, **and that is identically true of the parameter.** A column-only rename
+converts a **consistent-but-wrong** naming into an **INCONSISTENT** one, where a reader must work out
+which of the two is authoritative. ***That is worse than the current state.***
+
+**THE PROTOCOL IS DESCRIBED AS AN EXTENSION POINT** (`docs/MENTAL-MODEL.md:305`), so a parameter rename
+is a contract change for an external implementer. **Section 0 settles it: zero deployments, no external
+implementers, so that cost is currently zero.** *Prefer the correct end state over a compatibility shim.*
+
+***THE DIFFICULTY SCORE ABOVE IS COSTED AGAINST FOUR MODULES AND IS THEREFORE WRONG.*** That is a
+scoring correction, **not** a reason to build the narrow version.
+
+**NO CALL-SITE COUNT APPEARS IN THIS ROW, DELIBERATELY.** Two seats measured the surface with two
+different instruments and got two different populations; **neither was validated against the other, and
+one of the two controls was found broken.** *A wrong number here is worse than none, and the count was
+never the hazard -- the two-column collision is.* **The builder puts the number it can defend in its
+commit.**
 ## 1233. `delete_user` never removes `search_presets`, so an account deletion strands encrypted PHI-shaped `criteria`
 
 > ✅ **SHIPPED -- verified by content on `origin/main` 2026-08-20, ALL THREE BACKENDS AND THE TEST LIMB, not one of them.** `delete_user` purges `search_presets` in `store/store.py`, `store/postgres.py` and `store/sqlserver.py` -- one keyed purge each, alongside five DELETEs each. **Coverage exists for all three:** `tests/test_postgres_store.py` and `tests/test_sqlserver_store.py` directly, and the SQLite/default path through `tests/test_search_presets_api.py`. **That test is non-vacuous by construction and was checked as such rather than counted:** it asserts a PRECONDITION that the preset exists before deletion, then asserts the purge on both the id and the freed username. **It also carries two independent controls** -- it re-inserts the captured row afterwards, because with the row purged #1225's key assertions would pass TRIVIALLY and stop being evidence about the key at all. **And it records the retraction in place:** the assertion it replaced said the exact opposite, which was true when written and is the defect this item fixes. **Closed on the release condition this project uses -- the fix TEXT on `main` -- not on a merged badge.** The holder's claim can be released; that condition is met.
@@ -10994,6 +11299,24 @@ every worker session's handoff, which is the sentence the next session bases its
 
 **Cluster:** Security / observability. **Priority:** P2. **Verdict:** build. **Severity:** conditional per CLAUDE.md section 0 -- on a first deployment an over-granted store principal would be reported as observed-and-clean; **zero deployments, so nothing is mis-reported today.**
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. UNSTARTABLE, MEASURED -- RETURNED TO THE POOL, DO NOT
+DISPATCH.** I dispatched this item without checking that its subject exists where a builder would branch
+from. **It does not.**
+
+    require_least_privilege|least_privilege  on origin/main under messagefoundry/   ZERO hits
+    POSITIVE CONTROL, same probe, same ref: `store` in store/base.py                found
+
+*So the zero is a real absence, not a broken needle.* **The defect lives on a held branch:** tip twelve
+days old, **4 ahead of main and 328 behind, and no pull request has ever existed for it.**
+
+***A FIX ON A 328-BEHIND BRANCH WITH NO PR LANDS WHEN THAT BRANCH LANDS, WHICH IS NEVER ON CURRENT
+EVIDENCE.*** **WHAT CLEARS IT:** that branch is rebased onto `main` with a PR opened, **or** the
+preflight is re-implemented against current `main` as its own item. **Neither is a builder's call.**
+
+**AND THE SCREEN THAT MISSED IT CANNOT SEE THIS BY CONSTRUCTION.** Verdict, closing-act, claim state,
+build commits and retirement markers all read the LEDGER. ***"Does the subject exist on main" is the
+only check that reads the CODE, and it is the one that decides startability.***
 ## 1235. a citation to an unallocated backlog number is a trap that arms itself the day the number is issued
 
 > 🚧 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. The rule and both coverage residuals landed, leaving one gap: the detector runs only inside pytest, which is skipped on documentation-only pull requests, and a citation is introduced by editing prose. Wiring it as a workflow step with a paired must-trip and must-not-trip arm is a small additive change on an existing gate seam, and the coverage bound stands regardless since the detector cannot see the private companion repository where the filed instances live. _(was 6/10 · 2/10.)_
@@ -11501,6 +11824,126 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > Closing-act: code
 
 **Cluster:** Security tooling / CI. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- this is evidence-integrity plumbing across two repositories, not shipped engine behaviour. The exposure is that the ASVS record can quietly describe code that no longer exists, which is a **stale anchor** (the evidence went stale), never an engine weakness.
+
+**DISPATCH NOTE 2026-08-23: ALL THREE LIMBS OF THE RE-SCORE VERIFIED ON THIS TREE AND THEY STAND. Whoever
+takes this does not need to re-derive them.**
+
+1. **The verifier is present in the engine and the DATA is not** -- `scripts/asvs/scorecard.py` exists;
+   `git ls-files docs/security` returns **ZERO**. ***That split IS the coupling this row is about.***
+2. **`.github/required-contexts.txt` is 141 lines with exactly ONE security-record entry**, and it is a
+   discovery gate rather than an anchor check. ***No verify context exists, so NOTHING CAN BLOCK on an
+   anchor break.***
+3. **The two engine workflows in this area verify absences and lint tallies. NEITHER VERIFIES ANCHORS.**
+
+**DEFERRED FOR RUNWAY, NOT BLOCKED.** A lane declined it with roughly half an hour left, on the ground
+that it is a **cross-repo DESIGN problem touching the vault boundary**, not an instrumentation one --
+*its own re-score says the design must hand a public repository enough to name an engine file and line
+while naming no cell id, and that the blocking limb inherits a precondition.* ***The realistic outcome
+in a short window is a half-designed cross-repo control, and a half-built control is the defect this
+whole cluster exists to prevent.***
+
+***AMENDMENT 2026-08-23. THIS ROW SPECIFIES ITS OUTPUT CONSTRAINT PRECISELY AND ITS INPUT NOT AT ALL,
+AND THE DISCLOSURE RISK IS ENTIRELY IN THE INPUT. DO NOT BUILD IT AS FILED.***
+
+**Measured across the whole body: `manifest`, `digest`, `hash`, `token`, `credential`, `fetch` and
+"anchor set" each occur ZERO times.** *The row never says where the check gets its data.*
+
+***WHY THAT IS FATAL RATHER THAN AN OMISSION.*** Its own acceptance test is that an engine pull request
+**goes red BEFORE merge** when a pinned line is deleted. **For engine CI to do that, it must know WHICH
+LINES ARE ANCHORED at check time -- and the engine has none of that data, by deliberate design.**
+
+***AND THE ANCHOR SET IS ITSELF THE VAULTED THING.*** A list of anchored engine lines **IS a coverage
+map**, and section 12's stated harm is exactly this: such a map **hands out what is NOT covered by
+subtraction.** ***IT DISCLOSES WITH ZERO IDENTIFIERS PRESENT.***
+
+***SO THIS ROW'S CONSTRAINT -- report the line, never the identifier -- IS NECESSARY AND NOT SUFFICIENT.
+It governs the FAILURE OUTPUT. The risk lives in the INPUT, which the row does not mention.***
+
+**THE FORK, AND BOTH BRANCHES CARRY A COST THIS ROW DOES NOT STATE:**
+
+| option | buildable | the cost the row omits |
+| --- | --- | --- |
+| **(a)** publish an anchor manifest into the public repo | today, no credentials | ***the manifest AT REST is the coverage map*** -- hashing the CONTENT does not help, because **the paths and lines ARE the coverage** |
+| **(b)** fetch the anchor set at CI time with a vault read credential | yes | ***gives public-repo CI a vault credential***, and a public CI log is one careless trace flag from dumping what it fetched |
+| **(c)** keep it vault-side; make the EXISTING daily run change state observably | yes | does not deliver pre-merge -- **but opens NO new disclosure surface** |
+
+***RECOMMENDED: (c) NOW, WITH (a)-VERSUS-(b) ESCALATED TO THE OWNER.*** This row's own text says the
+third gap bites worst -- *a detector whose output is a count inside an already-failing, non-blocking job
+is indistinguishable from the same job yesterday.* **(c) fixes that and leaves the other gaps HONESTLY
+OPEN rather than answered by a design nobody ratified.**
+
+***(a) VERSUS (b) IS NOT A BUILDER'S CALL AND NOT A DISPATCHER'S.*** Both change what a public
+repository discloses about security coverage. **That is the owner's under section 12.**
+
+**AND A PRECONDITION THIS ROW ALREADY STATES, NOT TO BE LOST IN ANY RE-SCOPE:** making the verify job a
+required context **without first clearing the standing failures** *"converts a silent problem into a
+permanently blocked repository."* **That ordering is not the builder's to clear either.**
+
+***PRECEDENT WARNING 2026-08-23, from the seat that owns this vocabulary: TODAY'S OWNER RULING DOES NOT
+COVER OPTION (a), AND MUST NOT BE CITED AS PERMISSION FOR IT.***
+
+**The ruling sanctioned an individual pairing WHEN IT JUSTIFIES A DECISION** -- its whole basis is that
+a single citation in a design record or a tool comment **explains why something was built.** ***IT SAYS
+NOTHING ABOUT ENUMERATION.***
+
+***AN ANCHOR MANIFEST IS THE COMPLETENESS CASE, WHICH IS THE ONE SECTION 12 ACTUALLY FORBIDS.*** And it
+is **STRONGER than the map that was already declined for exactly this reason**: a map pairs requirements
+with items, whereas ***a manifest pairs them with FILE PATHS AND LINES*** over a closed domain -- so it
+hands out the uncovered surface by subtraction **and** tells a reader precisely where each covered
+control lives. **That is the artifact itself, not a citation about it.**
+
+| option | against today's ruling |
+| --- | --- |
+| **(a)** publish an anchor manifest | ***NOT COVERED. Enumeration over a closed domain -- the forbidden case.*** |
+| **(b)** fetch at CI time with a credential | discloses nothing publicly; the cost is a credential and a dependency |
+
+***SO IF THE OWNER PICKS (a), THAT IS A NEW DECISION AND NOT AN APPLICATION OF THIS MORNING'S.***
+
+**Recorded because the ruling WILL read as broader than it is.** *Two seats reasoned from "identifiers
+appear publicly, so this is fine" today and both were wrong in different directions.* **A narrow ruling
+cited as a general permission is how the next disclosure gets argued into place.**
+
+***DESIGN FOR OPTION (c), CONTRIBUTED BY THE SEAT THAT OWNS THE RECORD AND DECLINED THE BUILD ON
+HEADROOM. IT MAKES (c) A SMALL BUILD RATHER THAN A DESIGN PROBLEM.***
+
+**The solved form of this exact problem already exists in this repository: the tally lint's
+FORWARD-ONLY, SHRINK-ONLY BASELINE.** Its own docstring -- *"this is forward-only and it is not a
+sweep... existing tallies are recorded in a frozen baseline that may only SHRINK; a tally that is not in
+the baseline fails."*
+
+**APPLIED TO ANCHORS:**
+- commit a frozen baseline of the **currently failing** anchors -- ***read the count at implementation,
+  do not carry one***
+- the job fails **ONLY** on a failure **not in the baseline**
+- the baseline may only **SHRINK**; a repair removes its line in the same commit
+- ***so a NEW break flips the job from red to red-FOR-A-DIFFERENT-REASON, which is precisely the state
+  change gap 3 says is missing***
+
+***AND IT DISSOLVES THIS ROW'S OWN PRECONDITION RATHER THAN SEQUENCING IT.*** The row warns that making
+the verify job required *without first closing the standing failures* converts a silent problem into a
+permanently blocked repository. ***WITH A BASELINE YOU DO NOT CLOSE THEM FIRST -- YOU BASELINE THEM.***
+The standing failures stop blocking; a new one blocks immediately.
+
+**WHY IT TRANSFERS RATHER THAN RHYMES:** the tally lint solved the identical SHAPE -- a real defect, a
+large pre-existing population, and a one-time sweep that *cost about 850 net lines, needed its own
+repair commit, and regenerated within four days.* **Anchors have the same three properties.**
+
+**TWO BUILD CONSTRAINTS:**
+1. ***KEY ON SOMETHING STABLE -- NOT THE LINE NUMBER.*** Lines drift constantly and **every drift would
+   read as a new break.** Key on the path plus the expected token, or a hash of that pair.
+2. ***THE BASELINE IS VAULT-SIDE AND STAYS THERE.*** This is gap 3, the vault's own run, **so the
+   public-log disclosure constraint that makes (a) and (b) hard DOES NOT BIND HERE.** *State it
+   explicitly: a builder who has read the constraint paragraph will assume it applies to all three.*
+
+***AND THIS ROW'S STANDING-FAILURE COUNT IS STALE.*** It was measured much higher this morning and lower
+after repairs landed. **Read the count; do not carry the row's.**
+
+**COUNT CORRECTED 2026-08-23, AT THE POINT OF THE ERROR RATHER THAN DOWNSTREAM OF IT.** This row says
+**11** standing failures on the current run. ***MEASURED: 31 failures over 28 distinct keys***, at
+scorecard `59c1b2ea` against engine `a8f5d10a`. *The row's figure is stale by roughly a factor of three.*
+
+**Recorded in the ROW and not only in a commit message, because the next reader reads the row, takes the
+stale number, and is wrong.** *No number here is a fact without the ref pair beside it.*
 ## 1246. the scorecard's residual prose carries 1,965 ungated file-line citations, and an enumeration in prose can understate a cell's own gap
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **2/10** · _fill-in_. The unchecked half is confirmed in the verifier: scripts/asvs/scorecard.py touches residual only to require non-empty prose on an na verdict (:451-453), to load it (:559) and to render it (:1998), and the retired anchor window is documented at :105-125, so no residual file-line citation is validated. The 7.2.4 evidence re-derives at HEAD, seven mark_session_* sites in messagefoundry/auth/service.py (:1582, :1822, :2160, :2195, :2199, :2464, :2597) against the two the residual enumerates, and _rotate_session_token (:1614) has callers only in tests/test_session_rotation_primitive.py; value 5 and difficulty 2 because SDS-3.6 already carries the general rule and the stated remedy is a filing rule, deliberately not a new gate. _(was 6/10 · 4/10.)_
@@ -11516,6 +11959,16 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Security record / ASVS method. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- this is a defect in the assessment record, not in shipped code; its cost is that a reader **would** treat an enumerated gap as the whole surface and ship a partial fix believing it complete.
 
+
+**DISPATCH FENCE 2026-08-23: THIS ROW EDITS THE SECURITY RECORD'S OWN PROSE, so it needs the vaulted
+data and belongs to the seat that owns that record -- NOT to a build lane.** *Do not dispatch it to a
+builder.*
+
+***THE DISTINCTION IS RECORD VERSUS TOOL, NOT DIRECTORY.*** A row that changes the WRITER or the VERIFIER
+is ordinary public engine work whose fixtures are already public; **a row that changes what the RECORD
+SAYS is not.** *A dispatcher screening on the directory alone fences off both, which is a match on
+location rather than on subject -- the same shape as a commit that CITES an item being read as one that
+BUILDS it.*
 ## 1247. installing the machine-global worktree gate leaves no record: no backup, no receipt, no log line, and Copy-Item preserves the source mtime
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. A write to a shared machine-global safety control leaves no attributable record, and the inherited mtime is worse than absent because it once carried a true finding into retraction; the only workaround is a hash baseline captured in advance by luck. Difficulty 3: a receipt file plus a refuse-on-mismatch flag at one install site, with tests, and no product code touched. _(was 6/10 · 3/10.)_
@@ -11886,6 +12339,42 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **Cluster:** CI gating / doc-subject guards. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) -- CI configuration only. The cost is that documentation defects are caught **after** merge rather than before, on the branch everything else builds on, and that the standing repair is to red `main` first and fix forward.
 
+
+***AMENDMENT 2026-08-23. THE RE-DERIVE CLAUSE IS ANSWERED AND DROPPED -- BY MEASUREMENT, NOT BY
+ARGUMENT. This row asked for a measurement in an environment CI deliberately does not use.***
+
+**The re-score says the remainder is re-deriving the set in an environment carrying the five CI extras
+the original trace lacked, on the theory that a skipped test reads nothing and more members may be
+missing.** A lane built a virtualenv to the FULL CI extras -- dev, harness, fhir, dicom, x12, xml,
+webauthn, plus the web console editable -- and ran the lane:
+
+    272 passed, 89 skipped
+
+***STILL EXACTLY 89. NOT FEWER. THE EXTRAS WERE NEVER THE CAUSE.***
+
+**CAUSE, AND IT IS UNFIXABLE BY ANY INSTALL:** all 89 come from ONE module, whose own skip message says
+the document it asserts against **is withheld from public checkouts and vaulted.** *Verified
+independently:* `git ls-files docs/security` returns **ZERO**. ***NO QUANTITY OF EXTRAS PRODUCES A
+DOCUMENT THAT IS NOT IN THE REPOSITORY.***
+
+**AND CI'S DOC-GUARDS LANE DELIBERATELY DOES NOT CARRY THOSE EXTRAS.** Its install is `[dev]` only, and
+the comment above it states the reason -- the gated install adds packages **that no doc scan touches.**
+*So re-deriving under the five extras would characterise an environment that never runs.*
+
+***CI ALSO ALREADY DOCUMENTS THE 89 IN WRITING***, in its own comment: the skips are *"structural, not a
+gap to fix in this step"*, the module asserts against a vault-only document absent from the tree, and
+**152 assertions DO run -- "do not read the skips as coverage."** *The row treats this as an open
+measurement problem. It is a closed and documented one.*
+
+**WHAT GENUINELY REMAINS IS THIS ROW'S OTHER CLAUSE, AND IT IS THE HALF WORTH DOING:** demonstrate that
+a Markdown-only pull request carrying a deliberate violation actually goes RED, ***since the lane has
+never been shown able to fail.*** The lane has an existence check for path typos and **nothing proving
+a doc violation reds it.** *That is the anti-vacuity question, it is fully verifiable locally, and it is
+now the whole of this item.*
+
+**CAVEAT CARRIED FROM THE MEASURING LANE, and it is the right one to carry:** the *passed* count is
+box-specific -- a different platform and a `[dev]`-only install will differ. ***THE 89 IS THE FIGURE
+THAT TRANSFERS, because its cause is identical in both: a document that is not there.***
 ## 1263. a file:line citation into code is validated by nothing, so any bulk edit silently re-points 1,193 of them
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **4/10** · _quick win_. Re-measured with a separately written matcher at HEAD, the corpus is 904 live and 381 archived path:line citations into source, the archived figure reproducing this item's own 381 exactly while the live figure has grown past every number the item records, which is the drift it predicts. Three checkers exist and none reads a cited line, so the cheap detector plus its printed silence, its ref and denominator, and the mutation test that proves it can stay quiet remain unbuilt. _(was 7/10 · 4/10.)_
@@ -11963,6 +12452,50 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Ledger tooling / evidence integrity. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) -- documentation accuracy. The cost is that the ledger's own evidence decays invisibly, and the decay is fastest after exactly the kind of broad, correct, well-reviewed change nobody would think to re-check it against.
+
+**AMENDMENT 2026-08-23, dispatcher seat. THE CHEAP DETECTOR THIS ROW IMPLIES CANNOT FIRE FOR THE REASON
+THE ROW EXISTS. Scope corrected, and the difficulty score with it.**
+
+**Measured across both ledgers before any code was written:**
+
+| population | count |
+| --- | --- |
+| `path:line` citations into code | **3,086** |
+| directory-qualified | 2,151 |
+| ...path resolves at HEAD | 1,142 |
+| ***citing a line PAST END OF FILE*** | ***3*** |
+| ***bare filenames, unresolvable by construction*** | ***935*** |
+
+**The three past-end hits are range ENDS overshooting by one or two lines. NONE is the defect this row
+is about.**
+
+***A BOUNDS CHECK CANNOT SEE THE FILED CLASS AT ALL.*** This row's own five-for-five evidence is
+citations pointing at the **WRONG LINE** -- a line that EXISTS and says something else. *That is why
+nothing catches it and why the row calls it worse than a broken one.* **Shipped as a bounds check it
+would run green forever over 1,142 citations and read as citation integrity.**
+
+***AND THE HONEST LABEL AND THE MISLEADING GREEN HAVE DIFFERENT LIFESPANS.*** A commit message saying
+*"this does not address the filed class"* lives in the log; **the green lives in CI**, and every later
+reader takes it at face value. *That is the ship-passing-and-inspecting-nothing defect `a92ab10f`
+fixed, rebuilt deliberately.*
+
+**SO THE BUILD IS:** check a directory-qualified citation's span against **the SYMBOL the prose names**
+when one appears in backticks nearby -- that covers the filed class, and bounds-checking rides along
+free. **REFUSE the 935 bare filenames LOUDLY and PRINT the count**, because skipping them silently is
+the same lie one layer down. **And a mutation test proving the detector can STAY QUIET**: a planted
+drift reds, the clean corpus does not.
+
+***THE RESOLVER FINDING BELONGS ABOVE ALL THE NUMBERS.*** The lane's first pass reported **79** past-end
+hits. It resolved bare filenames by taking the first match, so it was measuring **the wrong files**. The
+corrected count is **3**.
+
+***THAT IS A 79-HIT RESULT THAT WAS ENTIRELY AN ARTEFACT OF THE TOOL -- THE EXACT DEFECT CLASS THIS ITEM
+EXISTS TO CATCH, PRODUCED BY THE TOOL WRITTEN TO CATCH IT.*** **And the tell was in its own output:**
+*"file is 382 lines"* against a real file of over 8,000. ***THE INSTRUMENT PRINTED ITS OWN REFUTATION IN
+A FIELD ALMOST NOBODY READS.***
+
+**The difficulty score above is costed against the bounds check and is therefore wrong.** That is a
+re-score, **not** a reason to build the version that cannot fire.
 ## 1264. The seat clock fires on cadence but its fanout skips seats, and the tick's own rubric sends every seat to look at the clock
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. Fleet tooling with no deployment axis, but silent under-delivery of wake-ups is self-concealing and cost seats a day of divided investigation, so worth is mid-range. Difficulty 4 because the remainder is undiminished: read the roster selection source, instrument send-side per-firing results, and re-measure, which is the only thing that separates a roster fault from a send fault, and it must be done against files that are not tracked in this repository. _(was 7/10 · 4/10.)_
@@ -12042,6 +12575,78 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Provenance.** Measured independently by three seats on 2026-08-14; counts come from delivered mail files, so every figure here is a **floor**. Numbers are inlined deliberately: the working lived under `mefor-coord/handoffs/`, which is never committed, and an item citing an uncommitted path resolves to nothing.
 
+
+***AMENDMENT 2026-08-23. THIS ROW'S MOST LIKELY ROOT CAUSE WAS FOUND AND FIXED THE SAME DAY THE ROW WAS
+FILED, AND THE ROW DOES NOT CITE IT. RE-MEASURE BEFORE INSTRUMENTING ANYTHING.***
+
+**`40150e04`, 2026-08-14** -- *"broadcasts addressed the roster's DISPLAY LABEL, not the recipient's
+path"*. **Verified an ancestor of `origin/main`.** Its own comment in the broadcast path records that
+hashing a bare label produced a key sitting beside the real one -- **same visible name, different key,
+and no reader ever drains it** -- with **40 messages stranded across 10 such boxes**, including a
+broadcast to every seat that nobody received. ***"An `ls` of box/ looks entirely CORRECT, which is
+exactly why it survived."***
+
+***AND THE ASYMMETRY IS THIS ROW'S SIGNATURE, LINE FOR LINE:*** the single-recipient branch never
+carried the bug because it resolves the path, **so DIRECT SENDS WORKED WHILE BROADCASTS VANISHED and the
+channel appeared to be up.** *That is exactly a firing that reaches one recipient with a median near
+two* -- **the quantisation this row measures and explicitly says its census CANNOT NAME THE CAUSE OF.**
+
+**THE UNRESOLVED FACT, AND IT DECIDES THE ITEM: this row was FILED 2026-08-14 and the fix landed
+2026-08-14.** ***Nothing in the row's text says whether its census window falls BEFORE or AFTER that
+commit*** -- and that single fact decides whether this item is **already closed** or describes a
+**second, distinct fault.**
+
+***SO: RE-MEASURE FIRST, INSTRUMENT SECOND.*** Re-run this row's own census over mail files created
+**after** the fix. *If the median is healthy, the row closes on MEASUREMENT rather than argument. If it
+is still quantised, the send-side instrumentation is justified with the box-key fix ruled out.*
+
+**THE CORPUS MAKES THIS CHEAP:** 33,079 mail files newer than 2026-08-14 against 114 older. *(File
+mtimes shift when files move between directories, so treat the 114 as a lead about sample size, not a
+finding.)*
+
+***WHY THIS ORDER AND NOT THE OTHER: A CLEAN RESULT FROM AN INSTRUMENT POINTED AT A FIXED BUG IS THE
+MOST MISLEADING ARTIFACT AVAILABLE.*** It reads as *"the defect is gone"* rather than *"I measured the
+wrong thing"*, **and nothing in the output distinguishes them.**
+
+**AND ONE SENTENCE MUST COME OUT OF THIS ROW:** the difficulty note claiming the remainder *"must be
+done against files that are not tracked in this repository"* is **FALSE**. The fanout is
+`scripts/coord/mail.ps1:352`, the `-To all` branch, in this repository. ***A lane nearly handed this
+item back on that sentence*** -- **a difficulty note that would cause a correct handback is worse than a
+wrong difficulty score.**
+
+***RE-MEASURED 2026-08-23. VERDICT: NOT REPRODUCIBLE -- AND THAT IS NOT THE SAME AS FIXED. DO NOT BUILD
+THE SEND-SIDE INSTRUMENTATION.***
+
+**Post-fix, keyed on send time over `kind=broadcast`: 514 broadcasts across 92 firings.**
+
+| | this row's data | post-fix |
+| --- | --- | --- |
+| median recipients per firing | **2** | **6** |
+| firings reaching exactly one | **~47%** | **24%** |
+
+**Daily medians climb with fleet size -- 1, 1, 3, 3, 1, 7, 6, 8, 7 -- which is CORRECT behaviour.**
+***This row's signature was COLLAPSE-AND-RECOVER*** -- ten and eleven, then a run of twos and threes,
+then back to ten and eleven, **with eleven seats demonstrably live throughout, which is what ruled out
+roster growth.** *Nothing post-fix does that.*
+
+***THE LIMIT MATTERS MORE THAN THE RESULT: THE PRE/POST DIFFERENTIAL IS NOT AVAILABLE.*** By SEND TIME
+only **27 messages** predate `40150e04` and only **8** are broadcasts, against this row's **~113
+firings**. **That population is not in the surviving corpus, so there is no baseline to compare against
+and no differential was ever possible.** *(An earlier mtime-based count suggested a larger pre-fix
+population; it was offered as a lead and it was wrong -- file mtimes shift when files move between
+directories.)*
+
+***SO: the named cause was fixed; this row's signature is absent from 514 post-fix broadcasts; the
+fanout tracks how many seats are live. WHAT CANNOT BE SAID IS THAT THE FIX IS WHY.***
+
+**ONE BLEMISH, FLAGGED RATHER THAN SMOOTHED:** the most recent tail reads 2, 1, 1, 1. *That is
+consistent with seats ENDING -- the innocent explanation this row correctly REJECTED for its own data
+because eleven seats were live.* **It cannot be ruled in or out retrospectively here.**
+
+**RECOMMEND CLOSING AS NOT REPRODUCIBLE**, citing the fix as the plausible cause and recording that the
+comparison corpus was gone. ***The instrumentation was justified only if the defect persisted. Building
+it now would point an instrument at a fault with no evidence of existing -- and a clean result from
+such an instrument is the most misleading artifact available.***
 ## 1265. the warning sign is unsanctioned decoration in 496 places across 80 files
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **4/10** · _fill-in_. Re-censused at HEAD with the ledger counts as the positive control the item demands: 499 occurrences across 81 files, with docs/BACKLOG.md at 121 and BACKLOG-CLOSED.md at 93 both reproducing, so nothing has been swept and the population has drifted up from the filed 496 across 80. Value 4 because nothing is mis-parsed and no behaviour depends on it, leaving a real but consequence-free vocabulary defect; difficulty 4 because each site needs an editorial replacement word rather than a mechanical substitution, the two ledger files must be sliced last to protect the status alphabet backlog_status_check.py genuinely parses, and whether retired ADRs are rewritten at all is still an open decision. _(was 4/10 · 4/10.)_
@@ -12207,6 +12812,25 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **Related:** the tick rubric that structurally cannot express this fault is **#1267** -- deliberately a separate item, different owner and different fix.
 **Source:** routed 2026-08-14 by the role-playbooks seat as a code item it could not claim (that seat edits `roles/` only); measurements are that seat's and two corroborating seats', reproduced here rather than re-derived.
 
+
+**AMENDMENT 2026-08-23. TWO THINGS, AND THE FIRST IS A DISPATCH WARNING.**
+
+***THIS ROW'S BANNER SAYS `Verdict: build` AND ITS RE-SCORE PROSE SAYS `DEMAND-GATE`. DO NOT DISPATCH IT
+ON THE BANNER.*** It is one of three such rows in the ledger; the divergence and its measurement are
+`#1342`'s subject. **A dispatcher screening on the field alone passes this row, and was one step from
+doing exactly that.**
+
+**SECOND: WHAT WOULD SETTLE THE FANOUT QUESTION, RECORDED HERE RATHER THAN FILED SEPARATELY BECAUSE THIS
+ROW ALREADY ENUMERATES PRESENCE-BASED ENUMERATION AS A CANDIDATE MECHANISM.**
+
+***A SEAT-COUNT SERIES TO DIVIDE AGAINST.*** Without one, *"this firing reached one recipient"* cannot
+be separated from *"one seat was live"* -- **the correct-behaviour reading and the defect reading are
+the same number.** A sibling re-measure hit exactly this wall: its post-fix daily medians track fleet
+size, and its most recent tail of ones is **unresolvable in either direction** for want of a live-seat
+denominator.
+
+**`presence.ps1` keeps no history**, so the series does not exist retrospectively. *That is a different
+measurement from this row's subject and it is named here rather than performed.*
 ## 1267. the tick rubric asks only about cadence, so it cannot express a fanout fault and its change-test conceals a stoppage
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **3/10** · Difficulty **2/10** · _fill-in_. The artefact is not in the repo at all, so I went to the live file the item names: %USERPROFILE%\.claude\mefor-usage\seat-tick.ps1 (39113 bytes, mtime 2026-08-20 13:25, plain ASCII, verified with `file` + xxd so a null grep is not an encoding artifact). What I found refutes "fully shipped" in both directions. The shipped part is real but incidental: a comment at :277-285 records a 2026-08-20 owner-instructed REWRITE that deleted the entire diagnostic rubric -- "QUANTISED", "FANOUT", "DELIVERY fault", "Act only if something actually changed", "Waking is not a reason to do work" all return 0 hits, and the body is now a 357-char bare wake-up (seat-tick.bodylen reads 357). So the offending sentences are gone. But they were removed for an unrelated reason (do not spend a turn analysing the tick), and the item's actual deliverables did not land. The replacement question is absent; the tick still carries a pending/change test ("Nothing pending -> do nothing") of the same shape the item says is compatible with total stoppage; and the Verdict's explicit second half, a check that the prose cannot silently revert, does not exist -- the three guards at :313, :324 and :347-357 assert the opening marker, the length cap, and length CHANGE, none of which can see a semantic revert. I also checked for relocation rather than assuming deletion: grep -rli "quantised" over the checkout hits only docs/BACKLOG.md, harness/load/connscale/probe.py (unrelated) and a pygments file in .venv, and "FANOUT SKIP" appears in the repo only inside #1267/#1266 prose, so the rubric was not moved into roles/ or docs/. The shared prerequisite is independently disproven from the state files themselves rather than from the item's claim about them. Item is still open in the live ledger (banner is the open numeral at docs/BACKLOG.md:9976) and absent from BACKLOG-CLOSED.md. Value drops from the filed 5 because the two worst sentences are genuinely gone and severity is none with no deployment axis; difficulty stays low and if anything fell -- the near-miss that dominated this item was the 2000-char cap with 40 chars of headroom, and headroom is now 1643, so the fleet-killing edit hazard is much reduced. Not cannot_determine: I could read the evidence, it just lives outside version control. _(was 5/10 · 2/10.)_
@@ -12547,6 +13171,14 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **Cluster:** Handler isolation / secure defaults. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0). No site runs unsandboxed handler code, because no site runs. The default should be the safe one before the first one does.
 
+
+**DISPATCH NOTE 2026-08-23: DO NOT HAND THIS TO A LANE WITH LESS THAN A FULL WINDOW.** A lane declined
+it with about an hour of runway, and the reasoning is general enough to keep: ***this row changes an
+ENGINE DEFAULT on the reliability path -- behaviour, not instrumentation -- and a HALF-VERIFIED DEFAULT
+IS WORSE THAN AN UNSTARTED ONE, BECAUSE IT LANDS LOOKING COMPLETE.***
+
+It also wants the **full engine suite**, which a previous lane measured at **37 minutes**. *Give it
+runway or give it to nobody.*
 ## 1279. treat every instance as carrying patient data and retire the synthetic-data declaration
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The opt-out still ships at settings.py:3738 and still translates to the enum at :4234-4235, while the comment at :3733-3735 continues to contradict :2318, which has said PHI since ADR 0148. Value is a secure-defaults simplification rather than a shipped-default defect, since only an explicit declaration loses the refusals; difficulty stays high on surface alone -- 77 data_class occurrences across the engine plus 45 in tests, and the api/models.py wire-contract change -- with no migration cost added per section 0. _(previously unscored.)_
@@ -12637,6 +13269,27 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **Cluster:** Worktree gate / PowerShell correctness. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0), and no live defect axis either -- `scripts/worktree/` is developer tooling and the caller currently compensates. The cost is that the next caller written against this function inherits a NULL its signature does not advertise.
 
+
+***AMENDMENT 2026-08-23. THE OBVIOUS FIX WAS BUILT, MEASURED, AND REVERTED -- IT REDS 10 OF 22 TESTS.***
+
+A lane diagnosed this row, **built the direct fix, measured it, and found it turning 10 of 22 tests red.**
+*It reverted, confirmed the baseline green again, and recorded where a second approach should begin.*
+
+***THAT NEGATIVE RESULT IS THE VALUABLE PART AND IT IS WHY THIS ROW IS AMENDED RATHER THAN LEFT CLEAN
+FOR THE NEXT READER.*** **The next person to open this item will reach for the same fix**, because it is
+the one the defect description implies. **They should know it has been tried and measured, not merely
+doubted.**
+
+**REMAINS OPEN AND UNCLAIMED.** *A second approach is genuinely new work rather than a continuation, so
+it was correctly not started under a rung that holds STARTING.*
+
+**WHERE A SECOND ATTEMPT SHOULD BEGIN, from the lane that measured the first:** try the non-enumerating
+output form, **or the comma on the EARLY RETURN ONLY**, leaving the wrapped result alone -- *the comma on
+BOTH fights the caller's own wrap and nests a populated result.* **The two suites that caught it are the
+scan-agreement and wiring tests; 22 pass on the reverted baseline.**
+
+**The lane's fuller notes live in its own handoff; this row carries the measured result and the starting
+point, which are the parts that must survive it.**
 ## 1292. connscale smoke reports a message acked but not observed at intake, and nothing discriminates harness race from real intake loss
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **3/10** · _quick win_. The harness-race branch has been substantially absorbed by the excusal and intake floor at runner.py:869-905, whose comment names this exact flake, but the discriminator the item asks for does not exist -- nothing checks whether an ingress row was written for the message counted lost, so the count-and-log branch is still not ruled out and no other instrument can rule it out. Difficulty is a store lookup wired into the record-building seam plus a test, with both ends of that seam already present (per-send control_id at sender.py:186, per-backend store access at runner.py:373-377). _(previously unscored.)_
@@ -12995,6 +13648,39 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **Cluster:** Tooling / worktree gate. **Priority:** P3. **Verdict:** build.
 **Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- developer tooling only, and it fails closed. The cost is a gate message that is false about what the command does, which is the class of defect that teaches readers to discount gate output.
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. THE READ HALF IS BUILT. THE REMAINING HALF IS #1332 AND IS
+OUT OF SCOPE HERE.** Built at `0c176a85`, on a branch cut clean from `a92ab10f`. Rule 3c now decides on
+whether a VALUE IS ASSIGNED rather than on the appearance of the key. Mutation-checked: revert the fix
+and exactly the five read tests fail while all seven write controls still pass.
+
+***THIS ROW'S OWN FIX DIRECTION IS WRONG FOR ONE OF THE TWO SHAPES, AND FOLLOWING IT FAITHFULLY WOULD
+HAVE OPENED A HOLE.*** The direction above says *decide on whether a VALUE is present*. **That is right
+for the `config` subcommand and wrong for `-c`.** Measured against real git: **`git -c <key>` WITHOUT an
+`=` still injects the key for that command, with an empty value.** So absence-of-value there is not a
+read, and an empty `core.hooksPath` is not obviously inert. The narrowing is scoped to the `config`
+subcommand and both `-c` shapes are pinned as tests. **A builder implementing this row as written would
+have loosened `-c` as well.**
+
+**TWO DEFECTS THE BUILDING LANE CAUGHT IN ITS OWN WORK, RECORDED BECAUSE BOTH ARE LIVE TRAPS FOR THE
+NEXT PERSON TOUCHING THIS GATE OR ITS TESTS.**
+
+1. **THE FIRST DRAFT FAILED OPEN ON THE RULE'S OWN POSITIVE CONTROL** -- `git config core.hooksPath
+   /dev/null` was ALLOWED. PowerShell's `-match` **replaces `$Matches` wholesale**, so computing one
+   variable before reading another left the second holding the *first* match's groups; it came back
+   null, satisfied the no-value test, and every real write took the read path. **Caught only because
+   the MUST-DENY rows were kept in the fix's test table** rather than just the row being fixed.
+2. **THE FIRST TESTS WERE VACUOUS.** All five read cases passed against the shared `primary` fixture --
+   **a tmp path that is never created**. Rule 3c asks git for the common dir and **ALLOWS when git
+   fails, by design**, so under that fixture *the rule allows everything*. Rewritten with a git-init'd
+   fixture and every read case paired with the real disarm as a control **in the same repository**, so
+   a fixture that stops discriminating goes red instead of quietly green.
+
+**SCOPE RULING: this item is the READ half only.** The heredoc half -- documentation denied because its
+quoted body is scanned as a command -- is **#1332**, measured pre-existing on `main` and rooted in
+`Get-ScannableSegments`, which all three rule sites call. It is not deferred out of this item for
+convenience: **a load-bearing change to the shared segment scanner must not ship inside a
+difficulty-2 fill-in without its own adversarial pass.** #1306 closes when `0c176a85` lands.
 ## 1310. the collision gate prints a truncated session id bare, and a reader resolves it as a commit sha
 
 > ✅ **SHIPPED 2026-08-23 -- every emitted hex token is labelled, and a TEST now proves it.** *Found by the Builder 1 seat, who chased the value into the git object store TWICE and twice reported the gate's warning unresolvable. Filed 2026-08-22 by the lander.*
@@ -13038,6 +13724,27 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **Cluster:** Tooling / CI gates. **Priority:** P2. **Verdict:** build.
 **Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- CI tooling only. The cost is that a supply-chain auto-merge control's discriminating test passes for a reason unrelated to the control.
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. STEP ONE IS BUILT; THE REMAINING THREE ARE ENUMERATED HERE SO
+THE NEXT READER DOES NOT RE-DERIVE THEM.** The building lane shipped only what this row names as step
+one, and the row correctly stays open.
+
+| step | state |
+| --- | --- |
+| surface the child's stdout/stderr in the assertion message | **DONE** (`a736e120`) |
+| **(a)** find why the stub does not interpose on the newer Windows runner image | **OPEN** |
+| **(b)** make the discriminating "aged" row honest | **OPEN**, behind (a) |
+| **(c)** decide whether the engine leg gets a retry wrapper | **OPEN** -- a decision, not a build |
+
+***(a) CANNOT BE DONE FROM A LOCAL BOX AND THIS ROW ALREADY SAYS SO.*** Both invocation forms were
+replicated and the stub won under BOTH, so the open question is which interpreter the shell helper
+resolves on that runner image -- **which this row states cannot be measured off the runner.** **It needs
+CI iteration, not a builder at a local shell.** *Do not dispatch (a) to a lane that cannot reach the leg.*
+
+**(b) IS THE ONE WORTH UNDERSTANDING BEFORE ANYONE TOUCHES IT.** The discriminating row passes today
+**because a pinned dependency really is old -- a fact about the package index, not about the guardrail.**
+***AN ASSERTION THAT CANNOT FAIL FOR THE REASON IT NAMES IS NOT A CONTROL.*** That is the same defect
+class as the release gate `a92ab10f` fixed, and it is why (b) is not cosmetic.
 ## 1309. Scope GET /metrics and /stats labels to the caller's allowed_channels
 
 > 🔢 OPEN -- allocated 2026-08-22 by the Dispatcher at a builder's request, under the standing rule that this seat allocates and the building lane does not file.
@@ -13664,12 +14371,44 @@ would not appear.** The date comparison remains the open work here.
 
 > **BOUND, stated because a clean-looking finding invites over-reading.** What is measured is: bare `Git`/`GIT` for `reset --hard` and `checkout`, on the Bash tool, with the cwd inside the governed primary. Rule 3b, the linked-worktree path, is unsampled entirely, as are the target-path attack shapes. The exhaustive spelling-by-rule matrix is kept out of this file deliberately; it is in the builder-1 episode note under the gate sections.
 
+> ***MEASURED 2026-08-23: THE CASE-INSENSITIVE FIX WAS BUILT AND IT MUST NOT LAND. The verdict is a finding, not a caution.*** *Four snapshots on the building lane's branch are labelled DO NOT LAND by their author and are kept as evidence.* **A false-deny harness against the REAL governed primary -- harness copy md5-matched to the committed gate first, controls firing in BOTH directions (`echo hello world` ALLOW/ALLOW, `git reset --hard` DENY/DENY) -- returned ELEVEN OF ELEVEN CASES FLIPPING ALLOW TO DENY.** *Class A is ordinary writing: a heredoc into a doc, a markdown bullet, a `gh pr` body, a `git commit -m` message, a PowerShell here-string, a mail body. Class B is pipelines and wrappers: `xargs`, `sudo --`, `env -i`, `Start-Process`, `script -c`.* ***THE SHARPEST CASE IS A4: `git commit -m` WITH `Git` IN THE BODY DENIES, SO THE INSTALLED GATE WOULD REFUSE THE COMMIT THAT DOCUMENTS IT.*** **It does NOT weaken the gate -- zero DENY-to-ALLOW across 735 payloads and 35 deny-side rows held. IT OVER-DENIES, which on this gate is the worse direction.**
+> ***THIS ROW'S COST CASE IS WRONG IN BOTH DIRECTIONS.*** **It prices a case-insensitive fix at twelve false denies.** *(1) **Those twelve are ALREADY LIVE IN LOWERCASE** -- 9 of the 10 programs the `:456` comment names DENY on `main` today; `cp -r "/c/backups/git" restore` is denied right now. So the row overstates what a fix must NEWLY cost.* *(2) **The built fix adds ELEVEN MORE CLASSES on top, none of them among the twelve.** So it also understates what THIS fix actually costs.*
+> **ROOT CAUSE, one line, and it is the same for all eleven: QUOTE AND LINE STATE DO NOT SURVIVE `Get-ScannableSegments`, so line 2 of any quoted body is read as PROGRAM POSITION.** ***THE FIX DIRECTION IS A POSITION TEST, NOT A WIDER MATCH.*** `Test-GitProgramPosition` was **built and reverted at `c0d6cef8`** -- **recover it there rather than re-deriving it**, and re-run the false-deny harness BEFORE writing anything. *That is a fresh build, not a continuation of the reverted attempt.*
 **Cluster:** Worktree gate / developer guardrail. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0) -- this guard is coordination tooling and is not shipped in the wheel. The cost is that a guard believed to be governing every session is bypassed by an ordinary typo-shaped variation, which is worse than a guard known to be absent.
 
+
+***AMENDMENT 2026-08-23. BLOCKED ON `#1336`, NOT MERELY RELATED TO IT. RETURNED TO THE POOL -- DO NOT
+PICK THIS UP ON THE STRENGTH OF A ONE-LINE-LOOKING FIX.***
+
+**This item needs a POSITION test** -- distinguishing a quoted absolute path used as the PROGRAM from a
+path ARGUMENT that merely ends the same way. ***A POSITION TEST OPERATES ON A LINE.*** But the shared
+scanner hands every rule a **per-line view in which a quoted body's line is indistinguishable from a
+command line**, so a token at the start of a heredoc body sits in "program position" as far as any
+position test can tell.
+
+***THAT IS WHY THIS ROW'S OWN CANDIDATE PRODUCED ELEVEN FALSE-DENY CLASSES***, including a heredoc and a
+commit message: **widening the token match MULTIPLIES a defect that lives one layer below it.**
+
+**AND `#1336` HAS NOW ESTABLISHED THAT THE LAYER BELOW IS NOT CHEAPLY FIXABLE** -- four candidates, four
+green suites, and the fix direction now waits on an owner ruling about whether a shell tokeniser is in
+scope at all.
+
+***SO IF THAT RULING COMES BACK OUT OF SCOPE, THIS ITEM AS FILED IS PROBABLY UNBUILDABLE TOO.*** **Do
+not hold a slot for it; it cannot start.** *The DO-NOT-LAND evidence commits remain reachable on a
+retained evidence branch.*
+
+***OWNER RULING 2026-08-23 LANDS ON THIS ROW TOO: the tokeniser `#1336` needs is OUT OF SCOPE, so the
+precondition this item waits on WILL NOT BE MET.*** **As filed, this item is probably UNBUILDABLE** --
+its position test operates on a line, and the per-line view it would run against cannot distinguish a
+quoted body's line from a command line. **Do not pick it up expecting a one-line fix; the layer beneath
+it has been ruled closed for now.**
 ## 1301. a ledger banner citing a commit sha must cite a commit whose subject names the item it sits under
 
 > 🔢 **Filed 2026-08-21 -- not started. ONE EDIT CORRUPTED TWO ITEMS IN OPPOSITE DIRECTIONS AND NO GATE COULD SEE IT, BUT A SHA-TO-ITEM AGREEMENT CHECK WOULD HAVE.** A retirement banner intended for one item was written onto another. The Markdown stayed valid, the item count did not move, the status glyph was untouched, and the misplaced paragraph carried no glyph of its own -- so `parse_items` had no second banner to object to and every ledger gate passed.
+> Verdict: build
+> Research: none
+> Closing-act: code
 
 > **THE SIGNAL THAT WAS THERE ALL ALONG.** The overwritten banner cited two commit shas whose subjects both ended in that item's own number. The paragraph that replaced it cited a sha whose subject named a DIFFERENT item. So the rule is mechanical and needs no judgement: **a banner citing a commit sha must cite a commit whose subject names the item the banner sits under.**
 
@@ -13681,6 +14420,60 @@ would not appear.** The date comparison remains the open work here.
 
 **Cluster:** Ledger integrity / commit gates. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0) -- ledger hygiene. The cost is that a wrongly-transposed banner reads as a working cross-reference forever, and the two items it corrupts fail in opposite directions: one over-reports its status and one under-reports it.
+
+**AMENDMENT 2026-08-23, dispatcher seat. THE RULE AS LITERALLY STATED IS OVER-SCOPED BY ONE LEVEL, AND
+THE MEASUREMENT RESHAPES THE ITEM RATHER THAN SIZING IT.** Measured over this file at `a92ab10f`: 342
+items, **64 carry a sha in the banner block, 123 shas resolve against git.**
+
+| outcome | count | what it is |
+| --- | --- | --- |
+| subject names its own item | **38** | the rule's intended pass -- **and the positive control** |
+| subject names a DIFFERENT item | **53** | ***CORRECT PROSE*** -- a true cross-reference to another item's commit |
+| subject names no item | 26 | ordinary commits, legitimately cited |
+| merge commits | 6 | subject names a PR, not an item |
+
+**`BACKLOG-CLOSED.md` is no better proportionally: 14 resolved, 5 agree, 9 disagree.** So the literal
+check **would ship with 94 violations across the two files, none of them the defect.**
+
+***THE 53 ARE THE FINDING. A CHECK THAT FLAGS THEM IS NOT NOISY, IT IS WRONG*** -- it asserts a defect
+where the ledger is doing exactly what it should. `#320`'s banner truthfully says a CI symptom *"is
+already fixed"* and cites the other item's commit. **That is a useful cross-reference, and the rule as
+written calls it a violation.**
+
+***AND THE SYMMETRY IS WORTH MORE THAN THIS ITEM.*** This row warns that a screen finding **NOTHING**
+reads as a clean corpus. **This screen finds EVERYTHING and reads as a broken ledger. Both are unusable,
+and the row anticipated only one direction.** The next person adding a ledger check will reach for the
+same one-directional caution.
+
+**RULING: NARROW THE TRIGGER TO A CLOSING CLAIM** -- a sha in a CLOSED, retirement or SHIPPED banner, in
+a position asserting it closed **this** item. **The incident stays caught; the prose cross-references
+drop out; nothing rests on a baseline count.** A warn-with-baseline alternative was rejected: it bakes
+in 94 as a number that rots, and the day someone adds a legitimate cross-reference the baseline is
+wrong with nothing reporting it.
+
+**ONE INSTRUMENT NOTE, because it cost a caveat.** A subject grep for this item's target resolves to
+unrelated files, and that is not a defect in the item -- **it asks for a check that does not exist yet**,
+so no grep over the tree can resolve it. **The instrument was being asked an unanswerable question.**
+
+**AMENDMENT 2026-08-23, dispatcher seat. BUILT AT `5a513350`** -- `scripts/docs/banner_sha_check.py`
+plus eight tests, implementing the narrowed closing-claim trigger ruled above. **The literal rule fired
+94 times across both ledgers with none of them the defect; the narrowed one fires 3.**
+
+***THE NARROWING THAT ACTUALLY MADE IT WORK IS NOT IN THE RULING ABOVE, AND IT IS THE PART TO CARRY:
+`#N` IS AMBIGUOUS BETWEEN A PULL REQUEST AND AN ITEM.*** They share **one numeric space**, and a
+squash-merge appends the PR in exactly that form -- **`(#1106)` is indistinguishable from item #1106.**
+**Only the qualified `BACKLOG #N` form is decidable.** *That is the same hazard this repository already
+warns about for citations, arriving here as a parsing constraint; the ruling above did not contain it.*
+
+**VALIDATED AGAINST A DOCUMENTED HISTORICAL MISS RATHER THAN SYNTHETIC CASES.** `#1221`'s own banner
+records that its fix *"landed under an unrelated #1220 commit title, which is why a title-level search
+missed it"* -- **for nine days.** ***THIS CHECK FINDS THAT ON DAY ZERO.*** A gate proven against a real
+recorded miss is worth more than one proven against invented input.
+
+**ALL THREE HITS WERE TRIAGED, NOT REPORTED AS DEFECTS:** one true positive, one explained false
+positive (a satisfied item legitimately citing another item's commit), **and one LEFT UNTRIAGED RATHER
+THAN DISMISSED UNEXAMINED.** ***"Untriaged" is an honest state; "no defects found" over an unexamined
+hit is not.***
 ## 1331. test_connscale_smoke_end_to_end wears six assertions under one name, so a merge-blocking flake reads as six unrelated bugs
 
 > 🔢 **Filed 2026-08-22 - not started.** One test name covers at least six separate properties, so two seats hitting it twice see two unrelated bugs rather than one recurring problem. It sits on three of the thirteen required contexts, so every occurrence is merge-blocking.
@@ -13708,9 +14501,82 @@ intake loss      engine_read 35 below confirmed sent 36 -- one message lost on i
 **NOT MEASURED, DO NOT INFER:** whether the two assertions share a root cause -- nothing here shows it either way. Neither failure was reproduced locally; both figures are read off CI. The three-PR count is the lander's observation across one evening and is not a rate.
 
 **Source:** surfaced by the LANDER while attributing reds on #529 and #530; the six-assertion count and the required-context arithmetic are the DISPATCHER's, whose handoff routed the content here for filing.
+
+***AMENDMENT 2026-08-23. THIS LEG IS NOW RED ON `main` ITSELF, NOT INTERMITTENTLY ON PULL REQUESTS --
+AND BECAUSE THE ROLL-UP AGGREGATES IT, A RED `main` BLOCKS EVERY PR THROUGH THE AGGREGATOR.***
+
+**Measured across consecutive `main` commits:**
+
+| commit | result | duration |
+| --- | --- | --- |
+| three earlier heads | success | 13.2 - 16.4 min |
+| the head where a gate fix landed | ***FAILURE*** | **18.2 min** |
+| the head after it | ***FAILURE*** | **17.9 min** |
+
+**That merge added 83 lines to the gate's test file, 615 to 698.**
+
+***CORRELATION AND A PLAUSIBLE MECHANISM, NOT A DEMONSTRATION -- and the landing seat said so itself.***
+**The two failures are DIFFERENT tests failing in DIFFERENT modes:** one a worker CRASH on `main`, one a
+`TimeoutExpired` on a pull request. ***`main`'s failing test references the gate ZERO times.***
+
+**THE MECHANISM THAT FITS BOTH: the suite got roughly 38 percent longer and now runs close enough to its
+limits that timeouts and worker crashes appear.** *A specific broken assertion would show the SAME test
+failing, not two different ones in two different ways.* **And an earlier head passed at 16.4 minutes, so
+this is a THIN MARGIN rather than a hard threshold.**
+
+***NO REVERT IS PROPOSED AND THE MERGED FIX IS NOT CALLED DEFECTIVE.*** Whether to raise the leg's
+budget, split the suite, or something else **is a design call the landing seat does not hold.**
+
+***AND THE REASONING THAT DIED HERE IS WORTH MORE THAN THE FINDING.*** Three harness and smoke failures
+were attributed to the environment tonight on the ground that *"the pull request does not touch those
+files."* **That reasoning is still true and was NEVER SUFFICIENT** -- ***`main` BEING GREEN WAS DOING THE
+REAL WORK IN THAT ARGUMENT, AND `main` IS NOT GREEN.*** *An argument that silently depends on a premise
+nobody restated is the shape that survives review.*
+
+***FALSIFIED 2026-08-23, AGAINST THE HYPOTHESIS THE AMENDMENT ABOVE CARRIES. THE SAME UNCHANGED HEAD
+PASSES ON RE-RUN.***
+
+    main a8f5d10a, repo harness tests, same tree, NO COMMIT BETWEEN
+      attempt 1  FAILURE
+      attempt 2  SUCCESS
+
+***A DETERMINISTIC REGRESSION FAILS ON BOTH ATTEMPTS. THIS DOES NOT.*** **So whatever that merge
+contributed, IT DID NOT INTRODUCE A REPRODUCIBLE BREAK**, and the table above must not be read as
+causal. *The correlation was real and was stated as correlation; it is now ACTIVELY CONTRADICTED rather
+than merely undemonstrated.*
+
+**WHAT SURVIVES UNCHANGED: the leg is INTERMITTENT and fails often enough to have hit three consecutive
+`main` heads, so it remains a fleet-wide landing block through the aggregator** -- *which is what this
+row said before the amendment, and the row was right.*
+
+**WHAT DIES: the started-at-a-particular-merge framing.** *A contention mechanism fits this result; a
+DURATION story does not, because duration would reproduce on the same tree.*
+
+***AND TWO SEATS SENT EVIDENCE POINTING HERE BEFORE THE TEST WAS RUN:*** prior excursions on this runner
+on unrelated pull requests, **which said the leg was already marginal**; and a job-budget measurement
+showing neither failure was a clock of the kind duration predicts. **Both were right and both arrived
+before the measurement that settled it.**
+
+***THE COST THIS AVOIDED IS THE POINT: the conclusion was wrong in the direction that would have had
+someone REVERT A GOOD FIX.*** *The seat that raised the alarm ran the falsifier against its own
+hypothesis and recorded the result against itself.*
 ## 1324. Promote Verdict/Research/Closing-act into the banner block parse_items reads
 
 > 🔢 **Re-scored 2026-08-22.** Filed by the workflow-analysis seat. **Priority:** P2. **Verdict:** build
+> **THE REMAINING ITEMS' `Research` FIELD IS DELIBERATELY ABSENT, AND THIS IS THE RECORD OF WHY.**
+> *Migrated 2026-08-23. `Research: done <date>` was written to the 93 open items carrying POSITIVE,
+> DATED evidence -- a `**Researched <ISO>` marker in their own body, all 93 reading 2026-08-20. No
+> `Research: none` was written anywhere, because THAT VALUE IS NOT DERIVABLE.* **This row claims it
+> is: "Research is derivable from the presence of a dated research pass." That is true of the
+> positive half and FALSE of the negative half.** *Measured by varying only the needle: `research
+> pass|round|sweep|researched` matches 95 of 246 and infers `none` for 151; adding
+> `re-measured|verified independently` matches 136 and infers `none` for 110. **The `none`
+> population swings by 46 items -- nearly a fifth of the ledger -- on word choice alone, so "no
+> mention of research" is a property of the NEEDLE, not of the item.*** **Writing it would put a
+> machine-readable value on 105-151 items whose only warrant is a regex somebody picked, and this
+> row's own rule forbids exactly that: a wrong value is worse than an absent one.** *Precedent:
+> [#320](#320), whose `Closing-act` is absent by argument rather than by omission. Stated ONCE here
+> rather than on 150 item bodies, per SDS-3.5.*
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -13769,3 +14635,885 @@ real work -- a wrong closing act is worse than an absent one, because it names t
 **Expiry:** this stops being right if `parse_items` starts reading below the banner block, or if
 the three field names change. Check `_FIELD_KEYS` in `scripts/docs/backlog_status_check.py`.
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. THIS ITEM IS PARTIALLY SHIPPED AND THE DEFECT PARAGRAPH ABOVE
+IS STALE.** Measured by the lane holding the item, and re-measured independently before this was written.
+`parse_items` is the right instrument here: a populated `Item.fields` proves the field is *in the banner
+block*, because that block is the only region the parser reads.
+
+| field | present, open items | missing |
+|---|---|---|
+| `Verdict` | 237 / 246 | 9 |
+| `Closing-act` | 236 / 246 | 10 |
+| `Research` | 1 / 246 | 245 |
+
+The single `Research` is this item's own worked example. So *"304 of 330 open items ... and zero of them are
+inside the banner blockquote"* is no longer true of two fields out of three, and the population moved from
+330 to 246 besides.
+
+- Missing `Verdict` (9): #351, #352, #353, #1008, #1093, #1301, #1305, #1319, #1322.
+- Missing `Closing-act` (10): the same nine, plus #320.
+
+**WHERE THE MIGRATION LANDED, BECAUSE THE OBVIOUS ANSWER IS WRONG.** It is `76ee9a7b` -- 734 lines added to
+this file, **473 of them banner field lines**. `7b6a5b1f` shipped the *reader* (`Item.fields`) and
+`scripts/coord/dispatch_gate.py` and added **two** field lines. Tool and data landed in different pull
+requests, and the commit carrying the data has the subject *"file #1318 -- messagefoundry init writes a
+config the loader refuses"*, which does not mention a schema migration at all. **A 473-line migration is
+invisible in `git log`.** The first seat to check attributed it to the tooling commit -- the reasonable
+place to look, and still the wrong answer.
+
+**THE REMAINING WORK IS NOT A 330-ITEM SCRIPT.** It is two jobs wanting different tools:
+
+1. **Nineteen straggler edits, BY HAND.** Nine items need `Verdict`, ten need `Closing-act`. At this size a
+   script is the wrong instrument; these are surgical and hand-checkable.
+2. **`Research` on 245 items, WHICH IS WHERE THE SCRIPT BELONGS.** This is the field the contention warning
+   above is really about, and the only part still needing a quiet window.
+
+**FIVE OF THE NINE MISSING VERDICTS ARE FREE TEXT AND MUST BE ESCALATED, NOT FLATTENED.** #351, #352, #353,
+#1008 and #1093 carry inline verdicts outside the closed vocabulary -- *"triage"*, *"consult, then decide"*,
+*"triage, then split"*. Two lose something specific under a forced mapping: #1008's ruling of record is
+*"build the runbook fix only; defer the startup preflight"*, and mapping that to `build` drops the clause
+that scopes it; #353 reads *"file now, build on owner green-light"*, a demand-gate written in prose, and
+mapping it to `build` deletes the gate. **A wrong verdict is worse than an absent one** -- this item already
+says so about closing acts, and it holds identically here. The other four (#1301, #1305, #1319, #1322) read
+*"build."* and are mechanical. #320 has no inline verdict at all and already carries a banner `Verdict`; it
+needs only `Closing-act`.
+
+
+**AMENDMENT 2026-08-23, dispatcher seat. THIS ROW'S OWN METHOD FOR `Research` IS FALSE, AND FALSE IN
+THE DANGEROUS DIRECTION.** The row says *"`Research` is derivable from the presence of a dated research
+pass."* **The POSITIVE half survives: 95 open items describe a research pass and ALL 95 carry an ISO
+date, so `Research: done <date>` is defensible for them.** ***THE NEGATIVE HALF IS NOT DERIVABLE AT
+ALL.***
+
+**`Research: none` would be an INFERENCE FROM ABSENCE, and the building lane measured how stable that
+inference is by varying only the needle:**
+
+| needle | items matched | `none` inferred for |
+| --- | --- | --- |
+| research pass / round / sweep / researched | 95 | **151** |
+| plus re-measured / verified independently | 136 | **110** |
+| any form of the word "research" | 104 | **142** |
+| plus triage / investigat\* | 141 | **105** |
+
+***THE `none` POPULATION SWINGS BY 46 ITEMS -- NEARLY A FIFTH OF THE LEDGER -- PURELY ON THE CHOICE OF
+WORDS.*** So *"no mention of research"* is **a property of the vocabulary someone picked, not a property
+of the item.** Writing that onto 105-151 rows would be writing **a machine-readable value whose
+correctness rests on a regex nobody agreed to.**
+
+***AND THIS ROW ALREADY CONTAINS THE ARGUMENT AGAINST IT, ONE FIELD OVER:*** *"a wrong closing act is
+worse than an absent one, because it names the wrong seat."* **The same holds for `Research`, and `#320`
+is the standing precedent -- an absent field with a recorded reason is a DECISION; a wrong one is a
+machine-readable lie.**
+
+**THE ASYMMETRY, WHICH IS THE WHOLE ARGUMENT: AN ABSENT FIELD MAKES A SCREEN REFUSE THE ITEM; A WRONG
+ONE BLESSES IT.** *Absence fails safe. A wrong value fails silent.*
+
+**SO THE BUILD IS: write `Research: done <date>` for the ~95 with positive dated evidence, citing the
+date from the item's own text; leave every other item's field ABSENT with a short recorded reason; write
+no `none` that cannot be evidenced.** ***THAT IS NOT A SMALLER JOB THAN THE 245-ROW SCRIPT THIS ROW
+PRESCRIBES -- IT IS A DIFFERENT AND CORRECT ONE***, and the shrinkage also dissolves most of the
+single-writer merge hazard the contention warning above is about.
+
+***THIRD ITEM IN ONE NIGHT WHOSE STATED METHOD DID NOT SURVIVE MEASUREMENT*** -- this row's verdict half
+was already 96 percent done, `#1301`'s rule fired 94 times with none of them the defect, and now this.
+**That is not three bad items; it is what filing-from-reasoning produces. Measure before prescribing a
+tool.**
+
+**AMENDMENT 2026-08-23, dispatcher seat. A CORRUPTION CLASS THE LEDGER'S OWN CHECK CANNOT SEE.** The
+Research migration was built twice -- once on a branch off a dispatcher branch, which the ledger gate
+correctly refused, and once off `main`. **Both carried the same 93 lines.**
+
+***IF BOTH HAD LANDED, 93 DUPLICATE `Research: done` LINES WOULD HAVE GONE IN AND `parse_items` WOULD
+HAVE READ PERFECTLY CLEAN OVER THEM.*** **A duplicate field line adds no item, flips no status and moves
+no count**, so the check every seat has been quoting -- *total items and open count unchanged* -- is
+***STRUCTURALLY BLIND to a duplicate-field corruption.***
+
+**The exposure was contained because only one carrier ever reached the remote**, and an explicit
+do-not-land was issued for the other. ***THAT WAS LUCK PLUS A HUMAN INSTRUCTION, NOT A CONTROL.*** **A
+count-preserving check cannot detect a count-preserving corruption**, and nothing in the current gate set
+counts *occurrences per item per field*.
+## 1332. Heredoc bodies are scanned as commands, so quoted documentation trips the secret-scanning rules
+
+> 🔢 **Filed 2026-08-23 - not started.** A heredoc body becomes its own line in `Get-ScannableSegments` ([`scripts/hooks/worktree_gate.ps1:557`](../scripts/hooks/worktree_gate.ps1)), and the fact that it is quoted DATA does not survive the newline split. Documentation that QUOTES a config key is scanned as if it SET one. This is the root cause under #1305 and one half of #1306.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**RETIRED THE HOUR IT WAS FILED -- THIS IS A DUPLICATE OF `#1086` AND SHOULD NOT BE BUILT. The number
+is kept, retired in place, because a commit (`143d0d42`) and a building lane's claim note already cite
+it.** Build the scanner fix against **#1086**, which is open, carries the same defect in the same
+function, and holds two things this row does not: **a refuted naive fix and the narrower rule that
+replaces it.**
+
+***HOW THE DUPLICATE SURVIVED THREE DISPATCH SCREENS, RECORDED BECAUSE IT IS A GAP IN THE METHOD AND
+NOT A LAPSE.*** This item was brand new, so it had **no unlanded build commit**; it had **no retirement
+marker**; its verdict was **`build`**. All three screens pass it. **The duplicate was visible only from
+the code's own comment** -- `scripts/hooks/worktree_gate.ps1:624` names `#1086` in the residual list of
+the very function the fix would change. **The building lane found it by reading the function before
+writing to it.**
+
+**SO THERE IS A FOURTH SCREEN AND IT CANNOT BE AUTOMATED FROM THE LEDGER: *does the code being changed
+already cite a different item for this change?*** It needs the file open. **As a dispatch instruction:
+read the function you are about to change, and grep it for a backlog number, before the first line of
+code.**
+
+**Cluster:** commit gates / secret scanning. **Priority:** P2. **Verdict:** build.
+**Severity:** false denies on the commit path. **Conditional, per section 0:** zero deployments; the
+cost is that a seat cannot commit honest documentation, and learns to reach for a bypass.
+
+**Measured by the building lane, differentially against `main`, with controls discriminating in BOTH
+directions.** An all-allow or all-deny harness proves nothing; both arms fired here.
+
+| case | on `main` | with the #1305 fix |
+| --- | --- | --- |
+| CONTROL allow | ALLOW | ALLOW |
+| CONTROL deny (real write) | DENY | DENY |
+| bare read | DENY | DENY |
+| `--get` read | ALLOW | ALLOW |
+| HEREDOC documentation | **DENY** | **DENY** |
+| `commit -m` documentation | ALLOW | ALLOW |
+
+**THE QUOTED-TEXT FALSE DENY IS ALREADY LIVE ON `main`** for the hooks-path rule. The #1305 fix
+neither caused nor worsened it -- it EXTENDED the same defect to the git program token, which is why
+#1305 added eleven further false-deny classes on top. **One root cause, two rules, one half already
+shipped.**
+
+**A HYPOTHESIS TESTED AND WITHDRAWN, recorded because a wrong mechanism is the more expensive
+artifact.** The lane first proposed that *"line 2 of a quoted body reads as PROGRAM POSITION"*, taking
+it from #1305's own "line 2" wording -- then tested it instead of repeating it:
+
+| case | result |
+| --- | --- |
+| heredoc, key at LINE START | DENY |
+| heredoc, key MID-LINE | DENY |
+| heredoc, key INDENTED | DENY |
+| heredoc, key in BACKTICKS | ALLOW |
+| single-quoted echo, same line | ALLOW |
+| double-quoted echo, same line | ALLOW |
+
+**Position within the line is irrelevant. The discriminator is HEREDOC versus SAME-LINE QUOTING** --
+same-line quoting is handled correctly and a heredoc body is not. The gate's own tests already say so
+in prose: `Get-ScannableSegments` *"splits on NEWLINES only"*
+([`tests/test_worktree_gate_hijack.py:536`](../tests/test_worktree_gate_hijack.py)).
+
+**THE BACKTICK ROW IS LUCK AND MUST NOT BE RELIED ON.** The character before the token is a backtick,
+which is simply not in the pattern's leading character class -- the same accident that keeps a dotted
+git reference from tripping the gate constantly. A writer who happens to use backticks escapes; one
+who does not, does not.
+
+**DO NOT BUILD THIS INSIDE #1306.** That item is two fixes: a bare-read case that must decide on
+whether a VALUE is present rather than on the appearance of a key, and this one. Burying a change to
+`Get-ScannableSegments` -- which all three rule sites call (`:1211`, `:1339`, `:1602`) -- inside a
+fill-in item is how a shared scanner changes without an adversarial pass. **Its own item, its own
+pass.**
+
+**Expiry:** this stops being right if `Get-ScannableSegments` stops splitting on newlines, or if
+heredoc bodies gain their own segment kind.
+
+## 1333. Legacy glyphs freeze security-record cells against correction, while the repair path skips the same check
+
+> 🔢 **Filed 2026-08-23 - not started.** Cells carry a banned glyph in prose written BEFORE the gate that now bans it, so each is frozen against every residual correction, by anyone, until the glyphs are removed. The same check is SKIPPED on the repair path, so the record is fully repairable and only partly correctable.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**VERDICT CORRECTED 2026-08-23, from `owner-ruling` to `build`, and the reason is a measurement rather
+than a reconsideration.** This row was filed expecting the glyphs to be spread across prose fields,
+which would have made the strip a migration across a security record and genuinely somebody's decision.
+**Measured afterwards: every occurrence sits in ONE field, none elsewhere**, and the writer reads only that
+field -- so a strip touching it alone unfreezes every affected cell. **One field per affected cell, no
+verdict moves, no anchors touched.**
+
+***AND THE DECIDING ARGUMENT IS THAT NO NEW RULING IS NEEDED: CLAUDE.md section 11 ALREADY BANS THESE
+GLYPHS.*** Stripping them EXECUTES an existing ruling. **The only direction that would need the owner is
+the other one** -- exempting pre-existing glyphs from the check, which asks the owner to carve an
+exception into their own rule. **Option 2 below is therefore the one with an owner cost, and it is no
+longer the cheaper path.**
+
+**Cluster:** record-maintenance tooling. **Priority:** P2. **Verdict:** build -- the strip is mechanical
+maintenance of the record, owned by the seat that owns the record.
+**Severity:** no deployment axis. **Conditional, per section 0:** zero deployments; this blocks
+maintenance of a security record, not any running thing.
+
+**Measured against the live record.** `apply.py` refuses any payload whose prose
+carries one ([`scripts/asvs/apply.py:281`](../scripts/asvs/apply.py)), against a `_BANNED` class
+covering the banner alphabet and the emoji planes. The glyphs predate that gate.
+
+***THE ASYMMETRY IS THE INTERESTING HALF, AND IT IS WHY THIS WENT UNNOTICED.*** The check is skipped
+entirely on a repair pass -- `blob = "" if anchor_repair else ...` -- confirmed empirically by an
+anchor repair landing cleanly on a cell that carries several. **So bookkeeping passes work and
+assessment corrections do not, which is exactly backwards from which one matters.**
+
+**THE PER-FIELD SPLIT IS MEASURED, AND THE GUESS THIS ROW FIRST CARRIED IS REFUTED.** The gate reads
+`residual` and no other prose field: `blob = "" if anchor_repair else " ".join(...)` at
+[`scripts/asvs/apply.py:280`](../scripts/asvs/apply.py), a `" ".join` over a ONE-ELEMENT tuple. This
+row originally guessed the occurrences were spread across fields, so that the freezing subset would
+be smaller than the raw count. **Measured: EVERY OCCURRENCE IS IN `residual`, and NONE is in any other
+string field on any cell.** The freezing subset is every affected cell. **It does not shrink.**
+
+***THE ACTIONABLE HALF SURVIVES, AND IT IS THE HALF THAT SIZES THE WORK: A STRIP TOUCHING `residual`
+ALONE UNFREEZES EVERY CELL.*** No other field needs opening, so this is **one field per affected
+cell** rather than a migration across the record.
+
+**A `" ".join` OVER ONE ELEMENT READS AS EXTENSIBLE AND IS NOT.** Anyone widening the check to further
+prose fields has to notice the tuple, or the widening looks done and changes nothing.
+
+**FIX DIRECTION -- the tension is named here, not resolved:**
+
+1. **Strip the glyphs.** Mechanical, but it edits verdict-bearing assessment prose across 20 records.
+   Not obviously a repair, and not obviously the tracking seat's to make.
+2. **Exempt pre-existing glyphs and enforce only on newly added ones** -- a diff-scoped check rather
+   than a whole-blob one. A tooling change, and it leaves the legacy prose in place.
+
+**A SECOND AND SEPARATE TENSION, in the same area and wanting its own number if anyone takes it.** A
+false absence claim cannot be RETIRED either, because `apply.py` refuses a cardinality shrink by
+design -- correctly, since that guard exists to stop silent truncation. **So a claim whose premise is
+genuinely retired has no clean exit.** Narrowing its pattern would turn a red green by weakening what
+the record asserts, which is a scope change wearing a bookkeeping edit's clothes. The tracking seat
+left it false on purpose, which was the right call.
+
+**At least one correction is blocked on this right now**: built, verified, and refused by the writer.
+
+**Cell identifiers, coverage and gaps stay vaulted (CLAUDE.md section 11), so this row carries counts
+and mechanism only.** The counts size the work without naming which cells are covered.
+
+**Expiry:** this stops being right if `_BANNED` moves, if the `anchor_repair` skip is removed, or if
+the residual-only scope of that `blob` changes.
+
+## 1334. The dispatch gate green-lights demand-gate and owner-ruling verdicts, the two that mean do not just build it
+
+> 🔢 **Filed 2026-08-23 - not started.** `judge()` in `scripts/coord/dispatch_gate.py` checks exactly one verdict value. `research` gets an advisory; `demand-gate` and `owner-ruling` return **`ok`** -- the same answer a plain `build` gets. The gate names the closing act correctly and says nothing about whether the item should be started at all.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** ledger tooling / dispatch safety. **Priority:** P2. **Verdict:** build.
+**Severity:** no product effect, no deployment axis (sec. 0). The cost is wasted lane slots and, worse,
+**work performed on an item whose whole point is that it must not be worked yet.**
+
+**PROVEN BY CALLING THE FUNCTION, not by reading it.** Each case is a real `judge()` return:
+
+| verdict | closing-act | gate says |
+| --- | --- | --- |
+| `build` | `code` | `ok` |
+| `research` | `code` | `advise` -- "the question may still be open" |
+| **`demand-gate`** | `code` | **`ok`** |
+| **`owner-ruling`** | `code` | **`ok`** |
+| *(no fields at all)* | -- | `refuse` |
+
+**The fail-closed case is already right:** an item declaring nothing is refused, because the dispatch
+cannot name what would close it. **The defect is the opposite end** -- an item that declares its state
+*precisely*, in the sanctioned vocabulary, saying *do not build this yet*, and the gate answers `ok`.
+
+**`demand-gate` and `owner-ruling` are both in the gate's OWN documented vocabulary** (`:26`), so this
+is not an unknown value falling through a default -- **the values are known and simply not acted on.**
+
+**Why this is worth a fix rather than a note.** The gate exists so a dispatch does not have to
+re-derive an item's state. A seat that consults it and gets `ok` has done the right thing and still
+started a gated item. **This ledger already has a worked example: a demand-gate item was dispatched on
+2026-08-22 without its verdict line being read**, and the gate would have said `ok` to it.
+
+**THE FIX IS NOT "REFUSE THEM".** `f3491468` established that refusing what a builder cannot close
+blocks real work -- *cannot close is not cannot be worked* -- and that reasoning applies here too: a
+demand-gate item can legitimately be researched or scoped. **The right shape is the `advise` branch the
+`research` verdict already has**, naming what the gate is and who lifts it.
+
+**Expiry:** this stops being right if `judge()` grows a branch for either value, or if the verdict
+vocabulary in `_FIELD_KEYS`'s documented set changes.
+
+
+**A THIRD GAP IN THE SAME FUNCTION, FOUND WHILE FILING THIS ROW AND PROVEN THE SAME WAY: RETIREMENT IS
+INVISIBLE TO THE GATE.** An item retired in place keeps its number, its banner and its fields -- that is
+the established convention, so the ledger is right and the gate is not reading enough:
+
+| item | state | fields | gate says |
+| --- | --- | --- | --- |
+| `#1332` | **retired in place**, duplicate of `#1086` | `build` / `code` | ***`ok`*** |
+| `#1309` | **retired in place**, duplicate of `#1152` | `demand-gate` / `owner-ruling` | `advise` |
+
+**`#1309` gets `advise` for the WRONG REASON** -- its closing act is not one a builder performs, so the
+note is about *who closes it*. **Neither row's retirement is mentioned at all.** A seat consulting the
+gate on `#1332` today is told `ok` about an item whose first body line says it must not be built.
+
+**So the fix has three parts, not one:** advise on `demand-gate` and `owner-ruling`, and **detect a
+retirement marker in the body**. The retirement text is prose rather than a field, so this one needs a
+body read rather than a `fields` lookup -- **or a fourth banner key, which is the cleaner answer if
+anyone is already editing the schema.**
+## 1335. Lane virtualenvs install five fewer extras than CI, so a lane can pass locally and fail on the runner
+
+> 🔢 **Filed 2026-08-23 - not started.** `scripts/worktree/new.ps1:234` builds every lane virtualenv with `dev,harness` (plus `sqlserver` on a switch). CI installs `dev,harness,fhir,dicom,x12,xml,webauthn` **and** the web console package. So a lane's green suite is a strictly weaker signal than the runner's, and the gap is silent.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** developer environment / CI parity. **Priority:** P2. **Verdict:** build.
+**Severity:** no product effect, no deployment axis (sec. 0). The cost is **merge latency and a false
+green**, which is the class of defect that teaches a seat to distrust its own local run.
+
+**Measured, both sides:**
+
+```
+scripts/worktree/new.ps1:234
+    $extras = if ($Sqlserver) { "dev,harness,sqlserver" } else { "dev,harness" }
+
+.github/workflows/ci.yml (three legs)
+    uv pip install --system --constraint constraints.lock         -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
+```
+
+**FIVE EXTRAS AND ONE PACKAGE THE LANE NEVER INSTALLS:** `fhir`, `dicom`, `x12`, `xml`, `webauthn`, and
+`packaging/messagefoundry-webconsole`. **`testpaths` now collects the web console suite**, so a lane
+is not merely missing optional-dependency tests -- **it is missing an entire test tree that CI runs.**
+
+***THE FAILURE IS ASYMMETRIC AND THAT IS WHY IT IS WORTH FIXING RATHER THAN DOCUMENTING.*** A missing
+extra makes tests SKIP or COLLECT-ERROR locally, then run on the runner. **A lane sees green, hands
+over, and CI goes red on code the lane never executed.** The lane cannot tell the difference between
+*passed* and *never ran*, which is the same shape as a fixture that stops discriminating.
+
+**Fix direction: make the lane's extras READ FROM THE SAME SOURCE AS CI rather than restating them.**
+Two restatements of one list will drift again -- they already have. If a single source is not practical,
+a test asserting the two lists match is the minimum, so the next divergence goes red instead of quiet.
+
+**Expiry:** this stops being right if the CI legs change their extras, or if `new.ps1` stops building a
+per-lane virtualenv.
+
+## 1336. Rule 3c asks one string two questions, so every fix for the false deny widens the bypass and back
+
+> 🔢 **Filed 2026-08-23 - not started.** `#1066` (a quoted danger key is invisible, FAIL OPEN) and `#1086` (a quoted body reads as a command, FALSE DENY) are **the same design error pulling in opposite directions**: rule 3c asks both questions of `$seg.Scan`, the quote-blanked text. Blanking more fixes `#1086` and widens `#1066`. Blanking less does the reverse. **Neither row can be fixed alone.**
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** commit gates / secret scanning. **Priority:** P1 -- higher than either row it reconciles,
+because **a fix to either one alone makes the other worse and the last three attempts did exactly
+that.** **Verdict:** build.
+**Severity:** developer tooling, no product or PHI axis (sec. 0). **But one arm is a live FAIL OPEN in
+a security control**, which is why this is P1 rather than P2.
+
+**THE TWO QUESTIONS, AND THEY NEED DIFFERENT STRINGS:**
+
+| question | must read | if it reads the other |
+| --- | --- | --- |
+| *is there a danger KEY here* | **`$seg.Raw`** | quoting erases the key -- **`#1066`, fail open** |
+| *is this text a COMMAND or DATA* | **`$seg.Scan`** | prose becomes a command -- **`#1086`, false deny** |
+
+***THE SEGMENT OBJECT ALREADY CARRIES BOTH, and the rule already uses `Raw` for target resolution a few
+lines later.*** So the change is **not** *blank more* and **not** *blank less* -- it is **stop asking one
+string two questions.** That framing is the item.
+
+**MEASURED, against `origin/main`'s gate, both tools, with the unquoted row as the control proving the
+gate CAN see it:**
+
+| case | PowerShell | Bash |
+| --- | --- | --- |
+| `git config core.hooksPath /dev/null` | DENY | DENY |
+| `git commit -m $(...)` **unquoted** | DENY | DENY |
+| `git commit -m "$(...)"` **quoted** | **ALLOW** | **ALLOW** |
+| `echo` with a backtick-substituted disarm | -- | **ALLOW** |
+
+**Both shells EXECUTE `$(...)` inside double quotes** -- verified separately by substitution, `"a $(1+1)
+b"` becomes `a 2 b`. **So the disarm runs and the gate does not see it.** These rows are an INSTANCE of
+`#1066`, which frames the class around a `-C` TARGET; **this is a substitution in a MESSAGE flag that
+executes outright.**
+
+***THIS RULE HAS EATEN THREE FIXES, TWO OF WHICH SHIPPED GREEN SUITES OVER REAL FAIL-OPENS.***
+`95abca70` was ruled `DO_NOT_LAND` for weakening the gate and pinning the weakening with a test -- and
+its premise, *"a MESSAGE flag's quoted span is DATA"*, is **false for exactly two of the four quoting
+forms**, because **PowerShell substitutes before git is ever invoked**:
+
+| form | after substitution | safe to blank |
+| --- | --- | --- |
+| `"..."` | `a 2 b` | **NO** |
+| `@"..."@` | `a 2 b` | **NO** |
+| `'...'` | `a $(1+1) b` | yes |
+| `@'...'@` | `a $(1+1) b` | yes |
+
+**`95abca70` blanked more, which is `#1066`'s hole widened.** That is the predicted failure of a
+one-directional fix, and it already happened once.
+
+***THE BUILD CONSTRAINT, AND IT IS THE POINT OF FILING THIS SEPARATELY: MEASURE EVERY CANDIDATE AGAINST
+`#1066`'s BYPASS ROWS AND `#1086`'s FALSE-DENY ROWS IN ONE TABLE.*** A fix that only ever sees one of
+those two lists is how this rule has been broken three times. **A green suite is not evidence here
+unless the suite contains both lists.**
+
+**THIS DOES NOT CLOSE `#1066`, `#1069` or `#1086` BY SIDE EFFECT.** They are instances; this is the
+mechanism. Close each on its own rows passing, not on this landing.
+
+**Expiry:** this stops being right if the segment object stops carrying both `Raw` and `Scan`, or if
+rule 3c stops reading `Scan` for key detection.
+
+
+***AMENDMENT 2026-08-23. FIRST CANDIDATE CONCLUDED NEGATIVE: IT OPENS THE GATE IT WAS FIXING. NOT
+LANDABLE. Verdict recorded at `caae4ce3`; the commits stay as evidence with DO NOT LAND in their
+subjects.***
+
+**Both adversarial hunts fired.** 15 shapes the candidate ALLOWS that `main` DENIES, **each proved to
+actually execute**; and 25 harmless commands that now DENY -- ***three times the disclosed false-deny
+cost, one of them this fleet's own house pattern.***
+
+***A FOUR-CHARACTER COMMENT PREFIX DISARMS THE RULE.*** Five of five reproduce, and the move is
+attributable to THIS candidate rather than its base, because three baselines were taken:
+
+| case | `main` | pre-candidate base | candidate |
+| --- | --- | --- | --- |
+| plain disarm (control) | DENY | DENY | DENY |
+| comment-prefixed heredoc opener, either shell | DENY | DENY | ***ALLOW*** |
+| opener on the same line | DENY | DENY | ***ALLOW*** |
+
+***THE PART THAT OUTLIVES THE VERDICT, AND IT CORRECTS THIS ROW'S OWN BUILD CONSTRAINT.*** The
+acceptance table was written BEFORE the fix, carrying both failure lists, exactly so a candidate could
+not be graded against a table shaped to fit it. ***THAT WAS NECESSARY AND IT WAS NOT SUFFICIENT.***
+
+**Every regression came from a mechanism THE FIX ITSELF INTRODUCED.** Block tracking did not exist when
+the table was written, **so no row could have covered it.** ***A PRE-WRITTEN TABLE CANNOT ANTICIPATE THE
+FAILURE MODES OF A DESIGN THAT DOES NOT EXIST YET.***
+
+**SO THE CONSTRAINT IS NOW TWO CLAUSES, AND THE SECOND IS THE ONE THIS ROW WAS MISSING:**
+1. **Measure every candidate against BOTH failure lists in ONE table.** *Proves you did not regress the
+   KNOWN shapes.*
+2. ***ATTACK THE CANDIDATE, NOT THE TABLE.*** *Only an adversary told to break THIS implementation finds
+   what THIS implementation invented.* **A green table is the expected appearance of a wrong answer
+   here: four fixes have now died on this rule and ALL FOUR PASSED THEIR OWN SUITE.**
+
+**STAYS OPEN, NOT RETIRED. THE DESIGN IS STILL RIGHT** -- the two questions genuinely must read
+different strings. **What failed is the BLOCK-TRACKING implementation of the second string**, and that
+is far harder than it looks: tracking multi-line quote state across a per-line scanner means **writing a
+shell tokeniser.**
+
+***AND THAT IS NOW THE SECOND INDEPENDENT PIECE OF EVIDENCE THAT THIS RULE RESISTS PARSER-SHAPED
+FIXES.*** `#1069` records an earlier attempt at structured parsing narrower than the regex it replaced,
+which produced **five new fail-opens**. **WHETHER A SHELL TOKENISER IS IN SCOPE AT ALL IS AN OWNER
+QUESTION and is routed as one. Do not attempt a fifth candidate before it is answered.**
+
+***OWNER RULING 2026-08-23: A SHELL TOKENISER IS OUT OF SCOPE FOR NOW. NO FIFTH CANDIDATE. This rule
+keeps both known defects and stays imperfect and honest.***
+
+**THE LEDGER SUPPORTS THIS FAR HARDER THAN THE FOUR-FAILURES ARGUMENT DID.** *Nine rule-3c items were
+named and every one is PRESENT AND OPEN in the live ledger* -- **`#1061`, `#1065`, `#1066`, `#1067`,
+`#1069`, `#1071`, `#1072`, `#1086`, `#1229`.** *(The relaying seat counted eleven in total; nine were
+named and all nine verified here against a negative control.)*
+
+**FOUR OF THEM ARE ONE QUOTE-HANDLING FAMILY:** strips double quotes only so a single-quoted target
+bypasses; matches the key on the quote-blanked string so a quoted key is invisible; blanks double-quoted
+spans first so a stray quote straddles; reads a here-string as a command so documentation is refused.
+
+***SO THIS IS NOT FOUR ATTEMPTS. IT IS A SUSTAINED SERIES OF QUOTE-HANDLING DEFECTS ON ONE RULE.***
+
+**THE LIMIT ON THAT CLAIM, STATED BECAUSE IT MATTERS: the relaying seat read HEADINGS, NOT HISTORIES.**
+*It did not verify that each of the nine is a FAILED FIX rather than an independent discovery.* **The
+shape is unmistakable; the causal chain is INFERRED.** *Hardening it needs the commit history per item.*
+
+**AND THE FINDING THAT OUTLIVES THE VERDICT IS THE CONSTRAINT CORRECTION, NOT THE RULING:** *a
+pre-written acceptance table proves you did not regress the KNOWN shapes and cannot anticipate the
+failure modes of a design that does not exist yet.* ***THAT EXPLAINS ALL FOUR GREEN SUITES WITHOUT
+ANYONE BEING CARELESS.*** **A suite written against the shapes you know is a REGRESSION test, not a
+CORRECTNESS test, and it is structurally incapable of the thing everyone assumed it was doing.**
+## 1337. The leak gate has no pattern for a security-record citation, and a bare-identifier screen would be switched off within a day
+
+> 🔢 **Filed 2026-08-23 - not started.** `scripts/security/scan_forbidden.py` screens routable IPs, worktree slugs, home paths, customer and vendor names, and site codes. **It has no pattern for a security-record identifier at all.** The obvious screen -- match the identifier shape -- is **measurably unusable**, and this row carries the working specification instead.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** leak gate / security tooling. **Priority:** P2. **Verdict:** build.
+**Severity:** no product or PHI axis (sec. 0). **The cost is a gate that cannot see one class of content
+it exists to keep out**, and -- if built naively -- **a gate loud enough that somebody disables it.**
+
+***THE NAIVE SCREEN IS UNUSABLE, MEASURED BEFORE ANY OF THIS WAS FILED.*** A shape-only match, filtered
+to real identifiers by corpus membership, over the **2026 tracked files** of this repository:
+
+| screen | files | occurrences | verdict |
+| --- | --- | --- | --- |
+| shape-only, corpus-filtered | 416 | **4582** | ***UNUSABLE*** |
+| context-required | 370 | 2248 | still far too broad |
+| **identifier NEAR a verdict word** | **1** | **tens** | **every hit real** |
+
+***THE ROOT CAUSE IS A GRAMMAR COLLISION: THESE IDENTIFIERS AND SEMANTIC VERSION NUMBERS ARE THE SAME
+SHAPE.*** `uv.lock` scored **229** and `ide/package-lock.json` **200** -- **every one a dependency
+version.** Corpus membership does not save you, because plenty of real identifiers are also plausible
+version numbers. **A gate firing 4582 times is switched off, and a gate that is off is worse than one
+that was never built, because the pipeline still shows a passing step.**
+
+**THE WORKING SPECIFICATION -- SCREEN FOR AN IDENTIFIER WITHIN N CHARACTERS OF A VERDICT WORD, NOT FOR
+IDENTIFIERS.** The distinction is what the identifier is DOING:
+
+- **A bare citation is a FORWARD reference** -- *this code was written with that requirement in mind*.
+  It does not assert coverage, does not assert a result, and does not name a gap. **Not record content.**
+- **An identifier sitting beside a verdict IS record content**, because the pair is the assessment.
+
+**BUILD CONSTRAINT -- TWO CONTROLS, BOTH REQUIRED, OR THE SCREEN IS NOT EVIDENCE:**
+
+1. **A prose citation carrying a verdict, which MUST fire.**
+2. **A lockfile dependency version, which MUST NOT.**
+
+**A screen with only the first is indistinguishable from one that matches everything; a screen with only
+the second is indistinguishable from one that matches nothing.** *Both failures were reached in ten
+minutes while deriving this spec, which is why they are written down as gates rather than advice.*
+
+**The identifier corpus is vendored and lawfully redistributable, so the membership filter needs no
+network and no private file.**
+
+**Expiry:** this stops being right if `scan_forbidden.py` gains a citation pattern, or if the identifier
+grammar stops colliding with semantic versions.
+
+## 1338. The ledger check is count-preserving, so a duplicated banner field is invisible to it
+
+> 🔢 **Filed 2026-08-23 - not started.** Every seat verifies a ledger edit with `parse_items` totals -- item count and open count. **A duplicated banner field line adds no item, flips no status and moves no count**, so that check reads perfectly clean over a corrupted row. **Reached as a live near-miss on 2026-08-23, caught by a human instruction rather than by any gate.**
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** ledger tooling. **Priority:** P2. **Verdict:** build.
+**Severity:** no product axis (sec. 0). The cost is **a silently corrupted machine-readable ledger** that
+every downstream screen then trusts.
+
+**THE NEAR-MISS, MEASURED.** One migration was built twice -- once on a branch off a dispatcher branch,
+which the ledger gate correctly refused, and once off `main` after a route was found. **Both carried the
+same 93 field lines.** Had both landed, **93 duplicate `> Research: done` lines would have gone in** and
+the check every seat quotes -- *total items and open count unchanged* -- **would have reported success.**
+
+***WHAT SAVED IT WAS THAT ONLY ONE CARRIER REACHED THE REMOTE, PLUS AN EXPLICIT DO-NOT-LAND WRITTEN BY
+HAND. THAT IS LUCK AND A HUMAN INSTRUCTION, NOT A CONTROL.***
+
+**THE BUILD.** A check that counts **occurrences per item per banner key** and fails on more than one.
+`parse_items` already isolates the banner block and `_FIELD_KEYS` already names the three keys, so the
+parsing is done -- **what is missing is that `Item.fields` is a DICT, and a dict cannot represent the
+defect.** The second occurrence silently overwrites the first. *A duplicate-detecting check must read the
+banner lines, not the parsed mapping.*
+
+**Two controls, both required:** a row with a duplicated key that **MUST** fail, and a clean corpus that
+**MUST** pass. *A gate proven only against a clean corpus is indistinguishable from one that matches
+nothing -- which is the defect `a92ab10f` fixed elsewhere in this repo.*
+
+***THE GENERAL SHAPE, RECORDED BECAUSE IT PRODUCED THREE MEASURED INSTANCES IN ONE NIGHT: EVERY CHECK
+THE FLEET RUNS ASKS ABOUT ONE ARTIFACT, AND THESE FAILURES ARE ALL ABOUT PAIRS.***
+
+| instance | the check that passed | what it could not see |
+| --- | --- | --- |
+| this item | two refs verified individually | content present on **both** |
+| a branch mix-up | a commit's content verified | that it sat on the **wrong ref** |
+| `#1332` filed over open `#1086` | three dispatch screens, per item | that **another item already covered it** |
+
+**A PAIR-SHAPED DEFECT IS INVISIBLE TO ANY NUMBER OF CORRECT SINGLE-ARTIFACT CHECKS.** *This item builds
+the control for the first row only; the other two are recorded as motivation, not as scope.*
+
+**Expiry:** this stops being right if `Item.fields` stops being a mapping, or if the ledger gains a
+per-field occurrence check by another route.
+
+
+***AMENDMENT 2026-08-23. THE FIRST IMPLEMENTATION OF THIS CHECK WILL FALSE-POSITIVE ON `#1324`, FOR THE
+SAME SELF-REFERENTIAL REASON `#1342` HIT.***
+
+**A per-item per-key occurrence count over the live ledger returns exactly ONE hit: `#1324`, with all
+three keys appearing twice.** ***It is not a corruption.*** **That row DOCUMENTS the field format, and
+its documentation is written IN the field format** -- a blockquoted vocabulary block enumerating the
+legal values for each key, one line per key, separated by `|`.
+
+***SO THE ROW THAT DECLARES THE SCHEMA TRIPS ANY CHECKER OVER THE SCHEMA.*** **Verified byte-identical
+on `origin/main` and on a branch rebuilt onto it**, so it is pre-existing and not an artefact of any
+rebase.
+
+**THE DISCRIMINATOR IS THE ONE `#1342` ALSO NEEDED: A DECLARATION CARRIES ONE VALUE; A VOCABULARY LINE
+ENUMERATES ALTERNATIVES.** *A check that counts occurrences without excluding the alternation form
+reports the documentation as the defect.*
+
+***AND THIS IS THE SECOND CHECKER TO HIT THIS EXACT ROW.*** **Any future tool reading the banner schema
+must expect the row that DEFINES the schema to look like a violation of it.** *That is now a measured
+property of the corpus rather than a surprise waiting for the next builder.*
+
+**Controls, updated: a planted true duplicate that MUST fire, and `#1324` itself, which MUST NOT.**
+
+***A SECOND WAY THIS LEDGER READS CLEAN WHILE BEING WRONG, RECORDED HERE BECAUSE IT IS THE SAME FAMILY
+AND THIS ROW IS ITS NATURAL HOME: READ ORDER IS NOT TRUTH ORDER.***
+
+**This file grows by appending.** Items are amended in place sometimes and superseded by later rows
+other times, so ***a reader searching for a subject hits whichever row comes first in FILE order, not
+in TRUTH order.*** **A correction appended after a wrong entry leaves the wrong entry as the first
+search hit**, and nothing marks it.
+
+**ONE VERIFIED INSTANCE, and it is enough to establish the shape:** an open row declares itself
+**SUPERSEDED** at **body line 43 of a 52-line body.** *A reader who lands on that row takes
+forty-three lines of live-sounding reasoning before reaching the notice that it no longer holds.*
+
+***AND NO POPULATION IS GIVEN, DELIBERATELY, BECAUSE THE OBVIOUS SCREEN CANNOT PRODUCE ONE.*** A search
+for retirement and supersession markers **conflates a row that IS retired with a row that DISCUSSES
+retirement** -- demonstrated on this very item, which matches such a screen at body line 43 while being
+neither retired nor superseded. ***That is the mention-versus-declaration defect this row already
+warns about, reappearing in the instrument built to measure it.***
+
+**So this is recorded as a KNOWN HAZARD WITH ONE DEMONSTRATED INSTANCE, not as a sized job.** *Anyone
+scoping it needs a discriminator that separates a DECLARATION from a MENTION first -- the same
+discriminator the verdict-divergence work needed, and the same one this row's duplicate check needs for
+the vocabulary line.* **Three checks over this corpus, one discriminator, and it has to be built before
+any of the counts mean anything.**
+
+**THE CHEAP MITIGATION, WHICH NEEDS NO TOOL: put a supersession or retirement notice at the TOP of the
+body, not at the point the correction was written.** *A handoff, a ledger row and a queue file are all
+read by someone searching for one thing, never front to back.*
+## 1342. An item's banner verdict and its re-score prose can disagree, and every tool reads the banner
+
+> 🔢 **Filed 2026-08-23 - not started.** Promoting `Verdict` into the banner block created a SECOND source of truth beside the re-score line that already carried it. **Three open items say `build` in the banner and `DEMAND-GATE` in their prose.** Every tool -- `parse_items`, the dispatch gate, a dispatcher's screens -- reads the banner, so all three read as freely dispatchable.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** ledger tooling / dispatch safety. **Priority:** P1 -- it defeats the demand-gate protection
+itself, which exists to stop work starting on an item that must not be started. **Verdict:** build.
+**Severity:** no product axis (sec. 0). The cost is **a lane building something the ledger says in prose
+must not be built.**
+
+***MEASURED, WITH A CONTROL THAT FIRES.*** Across open items, matching a `Re-scored ... -> X` line
+against the banner `Verdict` field:
+
+| | count |
+| --- | --- |
+| banner says buildable, prose says gated | ***3*** -- `#340`, `#1003`, `#1266` |
+| **both agree** (the control) | **23** |
+
+**The control is the point: 23 agreements prove the matcher can read a re-score line and compare it.**
+*A zero on the left against a zero on the right would have been indistinguishable from a broken needle.*
+
+***HOW IT NEARLY BIT, TODAY.*** A dispatcher screened the open pool for `Verdict: build`, `Closing-act:
+code`, unclaimed, no build commit, no retirement marker -- **five screens, all passed** -- and was about
+to dispatch `#1266`. *Its re-score line says `DEMAND-GATE`.* **The only thing that stopped it was reading
+the row by eye because a DIFFERENT suspicion (a possible duplicate) prompted a manual look.**
+
+***AND THE DISPATCH GATE CANNOT CATCH IT EITHER, BECAUSE IT READS THE SAME FIELD.*** `judge()` consults
+`Item.fields`, so for all three it sees `build` and returns a pass. **The structured field was supposed
+to make the gate reliable; where the two sources diverge it makes it confidently wrong.**
+
+**THE BUILD:** a check that flags any item whose banner `Verdict` contradicts a `Re-scored ... ->` line
+in its own body, and **fails rather than warns** -- a divergence is never benign, because one of the two
+is telling a machine to start work the other forbids.
+
+**Two controls, both required:** a planted contradiction that MUST fire, and the agreeing population
+that MUST NOT. *A checker proven only against the three known rows is indistinguishable from one that
+hardcodes them.*
+
+**AND THE RECONCILIATION IS A SEPARATE DECISION, DELIBERATELY NOT SCOPED HERE:** which source wins when
+they disagree is an assessor call, not a mechanical one. **This item makes the divergence VISIBLE. It
+does not resolve any of the three.**
+
+**Expiry:** this stops being right if the re-score line is retired as a carrier of verdict, or if the
+banner field becomes the sole declared source by an explicit ruling.
+
+**BUILD DETAIL FOUND WHILE SCREENING WITH THIS ITEM'S OWN RULE: THE RE-SCORE LINE CARRIES TWO DIFFERENT
+KINDS OF RE-SCORE, AND THE CHECK MUST TELL THEM APART.** *`Re-scored ... -> P2`* is a **PRIORITY**
+re-score; *`Re-scored ... -> DEMAND-GATE`* is a **VERDICT** one. **Only the second can contradict the
+banner `Verdict`.**
+
+**A naive matcher reading everything after the arrow will compare a priority against a verdict and
+report a contradiction on every priority re-score in the ledger** -- *a screen that fires on most of the
+corpus, which is the noise failure that gets a gate switched off within a day.*
+
+***THE CONTROL POPULATION ALREADY DEMONSTRATES THE DISTINCTION WORKS:*** the 23 agreements are rows whose
+arrow carries a **verdict** matching the banner, and priority re-scores fall into neither column.
+
+***THE STRONGEST ARGUMENT FOR THIS ITEM IS NOT THE COUNT, AND IT IS THE BUILDING LANE'S: THE STRUCTURED
+FIELD WAS ADDED TO MAKE THE GATE RELIABLE, AND WHERE THE TWO SOURCES DIVERGE IT MAKES IT CONFIDENTLY
+WRONG.***
+
+**Before the banner field existed, a dispatcher had to READ THE PROSE -- and would have seen
+`demand-gate`.** ***ADDING A MACHINE-READABLE FIELD REMOVED THE STEP THAT WOULD HAVE CAUGHT THIS.***
+*That is not a gap in the field; it is a COST of having one*, and it is why this is P1 rather than
+tidy-up.
+
+**PROVENANCE, RECORDED DELIBERATELY, BECAUSE HOW THE CHECK CAME TO RUN MATTERS MORE THAN THAT IT
+FIRED.** ***No demand-gate screen caught this. There is no demand-gate screen.*** The dispatcher read
+the row by eye because it suspected a **DUPLICATE** -- a pair-shaped-defect habit adopted hours earlier
+after filing a duplicate of an open item. ***THE DUPLICATE CHECK CAUGHT A GATE VIOLATION IT WAS NOT
+LOOKING FOR.***
+
+**A future reader given only the finding would conclude that a demand-gate screen exists and works.
+It does not. That is what this item builds.**
+
+***BUILT AT `2b58a213`. AND THE SECOND FALSE POSITIVE IS THE SHARPEST FINDING IN THE ITEM: THE MIGRATION
+THAT MADE THIS FIELD MACHINE-READABLE LAID A LANDMINE FOR ANY CHECKER OVER IT.***
+
+**A BARE-WORD search reports FIVE divergences, not three. Two of the five are CORRECT PROSE:**
+- one item **cross-references another item's verdict** -- a true statement about a different row;
+- ***and `#1324` CARRIES THE VOCABULARY LINE ITSELF*** -- the declared closed set of verdict values,
+  plus the distribution -- **so the item that DOCUMENTS the field looks governed by it.**
+
+***THAT LINE WAS WRITTEN INTO `#1324` BY THE SAME LANE, IN THE FIELD MIGRATION, TWO ROUNDS EARLIER.***
+**The work that made the field machine-readable is what makes a bare-word check over it wrong.**
+
+**THE DISCRIMINATOR IS THE DECLARATION FORM, NOT THE WORD.** A checker must match *`Re-scored ... -> X`*
+and the banner's *`Verdict: X`* line -- **never a loose occurrence of a verdict word**, which appears
+legitimately in cross-references, in vocabulary lines, and in any row discussing the schema. *An
+independent measurement using the declaration form returned 3; the bare-word variant returned 5.*
+**Mutation-verified: swapping the declaration needle for a bare word reds the priority arm.**
+
+***AND IT WAS CAUGHT BY LUCK, WHICH THE ROW SHOULD SAY.*** The naive matcher flagged an item the builder
+**happened to know** could not be demand-gated. **Nothing in the output distinguished the two correct
+rows from the three real ones.**
+
+**Reproduced independently from a separately written matcher: 237 open items carry a banner verdict, 26
+also carry a prose re-score, 23 agree, 3 diverge.** *Reconciles nothing, as scoped.*
+
+## 1343. The claim gate has no handoff state, so a delegated commit has no honest expression
+
+> 🔢 **Filed 2026-08-23 - not started.** The claim gate has TWO states -- held-by-me and not-held-by-me -- and a legitimate delegation is neither. **Both arms measured: a delegate's commit is refused while the author holds the claim, AND refused once the author releases it.** Releasing swaps one refusal for another, because the gate requires the COMMITTER to hold the claim.
+> Verdict: research
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / claim integrity. **Priority:** P3. **Verdict:** research -- ***the
+obvious fix is worse than the defect, so this must be measured before anything is built.***
+**Severity:** fleet tooling, no product or deployment axis (sec. 0).
+
+**MEASURED, BOTH ARMS, 2026-08-23:**
+
+| state | delegate's commit |
+| --- | --- |
+| claim held by the author | **REFUSED** -- *"claimed by ANOTHER worktree"* |
+| claim released entirely | **REFUSED** -- *"is NOT CLAIMED ... claim it, then commit again"* |
+
+***THE GATE IS CORRECT ON THE INFORMATION IT HAS, AND BOTH REFUSALS WERE SOUND.*** **A claim answers
+"is this key taken". It never answers "is this the person the holder asked to do it."** *The cost is
+that a legitimate delegation has no expression at all.*
+
+**THE TWO AVAILABLE PATHS ARE BOTH FLAWED.** A **transient take** by the delegate is honest but puts
+their name on another seat's item in the claim history. **`-Force` would record a LIVE claim as STALE,
+which is simply false** -- *and this repo already has a shipped item about claim releases leaving an
+inaccurate record, so writing a false one to buy a commit is the exact harm that work addressed.*
+
+***AND THE OBVIOUS FIX IS THE ONE THAT MUST NOT BE BUILT WITHOUT MEASUREMENT: accepting a claim whose
+NOTE names a delegate makes the gate trust FREE TEXT WRITTEN BY THE PARTY IT IS GATING.*** **That is a
+security gate consuming attacker-influenceable input, pointed at the claim registry.** *Recorded here
+rather than dropped, because it is the obvious next proposal and the next reader will have it -- the
+same practice a sibling claim item already follows.*
+
+**A SECOND ROUTE WAS TRIED AND BLOCKED BY THE MECHANISM IT WAS MEANT TO USE.** Cutting a worktree so the
+author could commit the branch themselves failed: **git refuses to check one branch out twice, and the
+delegate's own worktree already held it.** ***THE CONSTRAINT A WORKTREE WAS EXPECTED TO REMOVE WAS THE
+THING PREVENTING ONE FROM BEING CUT.*** *That advice was correct on what both parties knew and stopped
+being correct the moment the branch was checked out anywhere.*
+
+***THE PATTERN WORTH KEEPING IS THAT NONE OF THIS WAS BYPASSED.*** Four gate refusals in one evening --
+two on worktree switches, two on claim state -- **all four correct, none forced.** ***Every one was
+resolved by an act of the RIGHT PARTY*** -- a release, a fresh branch, a refusal to install an unmerged
+gate -- **rather than by a flag.**
+
+**Expiry:** this stops being right if the claim registry gains a delegation or co-holder concept, or if
+the gate stops keying on the committing worktree.
+
+## 1344. Anchors that were wrong at their own verified_at, and repairing them destroys the only evidence
+
+> 🔢 **Filed 2026-08-23 - not started.** A group of security-record anchors carry a line number that was **already wrong at the very commit the cell stamps as verified**. ***Not stale -- WRONG AT BIRTH.*** Re-measured against current vault main before filing; several remain unrepaired. **The rest were repaired earlier and their born-wrong status survives only in that commit's message, because a repair OVERWRITES the evidence.**
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** security record / assessment method. **Priority:** P2. **Verdict:** build -- *the repair half
+is mechanical; the residual question below may be research.* **Severity:** no product or deployment axis
+(sec. 0). **The cost is that the record asserts a verification that never happened.**
+
+**THE TEST, STATED SO IT IS REPRODUCIBLE WITHOUT THE DATA:** for each anchor, read the cited file **at
+the cell's own recorded commit** and look for the token it pins.
+
+| where the token is found | what it means |
+| --- | --- |
+| at the recorded line | ordinary staleness |
+| ***elsewhere in the file*** | ***the field was NEVER verified at any ref*** |
+| absent entirely | the recorded commit itself is wrong |
+
+***NONE fell in the third bucket, so no cell's stamped commit is unreadable.***
+
+***WHY THIS IS ONE DEFECT AND NOT MANY: THE DIRECTION IS SYSTEMATIC.*** The large majority record a line
+**HIGHER** than the token's real position. **Random transcription scatters both ways.** *The shape fits
+line numbers read from a LATER tree than the commit the cell stamps* -- **stated as a hypothesis, not
+proved.** ***Its falsifiable form: find a single later ref at which the recorded lines resolve. That
+either explains the whole population at once or is refuted cheaply.***
+
+***THE ARGUMENT FOR FILING NOW RATHER THAN WHEN SOMEONE GETS TO IT -- THE MEASUREMENT WINDOW IS
+SHRINKING.*** Re-deriving a line **fixes a STALE anchor completely.** It fixes a **BORN-WRONG one only
+cosmetically, AND IT DESTROYS THE WITNESS** -- the old number is overwritten, and the only evidence was
+the file at the cell's own recorded commit. ***So every silent repair makes the population permanently
+unmeasurable.***
+
+***AND THE RESIDUAL QUESTION IS THE ITEM, NOT THE LINE NUMBERS: HOW DID AN UNVERIFIED FIELD PASS REVIEW,
+REPEATEDLY?*** **"Fix the line numbers" answers none of it.** *The repair must therefore RECORD, per
+cell, that it was never verified -- otherwise the fix erases its own cause.*
+
+**Cell identifiers, file paths and their pairings stay vaulted (CLAUDE.md section 12), so this row
+carries the mechanism, the test and the direction only.** ***A path-to-identifier table is precisely the
+enumeration that rule forbids, and it is the artifact currently before the owner on a separate row.***
+
+**Expiry:** this stops being right if the anchors are repaired without recording their born-wrong status,
+at which point the population is gone and this row cannot be re-derived.
+
+## 1345. The claim gate decides documentation by path prefix, so executable code under docs escapes it
+
+> 🔢 **Filed 2026-08-23 - not started.** `claim_check.py` decides whether a commit "touches code" by testing the PATH PREFIX against a documentation list. ***A `.py` file under a documentation prefix therefore DECLARES ITSELF DOCUMENTATION TO THE CLAIM GATE***, and a commit touching only such files is stood down on without ever meeting the claim rule.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / gate integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no product axis (sec. 0). **The cost is that a class of real code changes is invisible to
+the gate that serialises item work.**
+
+***MEASURED: executable files sitting under a documentation prefix -- 2 in the engine, 9 in the vault***
+-- **including scripts that WRITE TO THE SECURITY RECORD.** *A commit touching only those is classified
+as documentation.*
+
+***THE CARVE-OUT ITSELF IS CORRECT AND DELIBERATE, AND MUST SURVIVE.*** The gate's own docstring says
+banner flips, doc corrections and ledger reconciles *"legitimately cite an item without building it, and
+they are exactly the commits a coordination gate must not block."* **The defect is not the exemption. It
+is that the exemption's TEST is a path prefix.**
+
+> ***A TEST ON THE SPELLING OF A PATH STANDING IN FOR A QUESTION ABOUT WHAT THE FILE IS.*** *Same
+> lexical-versus-semantic shape as a case-sensitive match on a program name.*
+
+**THE BUILD: decide on what the file IS -- extension or executability -- not on where it sits.**
+
+**Two controls, both required:** *an ordinary documentation commit under the prefix that MUST still be
+exempt*, and ***an executable file under the same prefix that MUST NOT be.*** **A gate proven only
+against the first is indistinguishable from today's.**
+
+**FOUND WHILE A SEAT CHECKED WHY A GATE DID NOT FIRE ON IT** -- *"it did not fire" and "it does not
+apply" are different facts, and it took the second reading to find this.*
+
+**Expiry:** this stops being right if the prefix list is replaced by a type test, or if executable files
+are removed from documentation directories.
+
+## 1346. The vault claim gate reads a registry that does not exist there, so it can never pass
+
+> 🔢 **Filed 2026-08-23 - not started.** `claim.ps1` writes to the ENGINE's claim registry. The vault's installed `claim_check.py` reads the VAULT's -- **which does not exist.** ***So no code-touching vault commit whose SUBJECT cites a ledger number can EVER pass, however honestly the item is held.*** Running the claim tool from a vault worktree REFRESHES the engine record rather than creating a vault one.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / gate integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no product axis (sec. 0). **The cost is a gate that cannot be satisfied, which is the state
+that manufactures evasion.**
+
+***THIS IS THE THIRD DISTINCT DEFECT IN ONE GATE AND THEY COMPOSE BADLY.*** One row records that it has
+no handoff state; another that it decides documentation by path prefix, so executable code under a
+documentation directory escapes it. **This one records that where it DOES apply, it cannot be
+satisfied.** ***Same gate, opposite blindnesses, and together they mean it is unpassable exactly where it
+bites.***
+
+**FOUND BECAUSE THE GATE FIRED CORRECTLY.** A vault commit touching a real code path is not under a
+documentation prefix, so unlike the earlier case the gate saw actual code and refused -- **and refusing
+was right.** *The defect is that no honest action clears the refusal.*
+
+***THE ONLY ROUTE THROUGH TODAY IS TO CITE THE ITEM IN THE COMMIT BODY***, which the gate permits by
+design -- it reads the subject only, and its docstring says a body may cite other items freely.
+
+***AND THAT MUST NOT BE READ AS THE SAME ACT AS A PREVIOUSLY RECORDED EVASION.*** A sibling row notes a
+lane moving a token into the body in 2026-08-06 to get past this gate. ***THERE, CLAIMING PROPERLY WAS
+POSSIBLE AND THE BODY WAS A WAY AROUND A PASSABLE GATE. HERE IT IS THE ONLY ROUTE THROUGH AN UNPASSABLE
+ONE.*** *The distinction is whether a correct alternative existed, and it did not.*
+
+**THE BUILD IS A DESIGN CALL, NOT A PATCH:** either the vault's gate reads the registry the claim tool
+actually writes, or the claim tool writes a vault-local registry. ***Both repositories claiming into one
+registry and both gates reading their own is the state that produced this.***
+
+**Two controls, and NEITHER IS ACHIEVABLE TODAY, which is itself the finding:** a claim held by the
+committing worktree that MUST pass, and one held elsewhere that MUST fail. *A gate that cannot
+demonstrate its own pass arm has never been shown to have one.*
+
+**Expiry:** this stops being right if the two registries are unified, or if the vault stops installing
+the gate.
