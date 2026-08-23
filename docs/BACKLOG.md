@@ -13716,3 +13716,46 @@ real work -- a wrong closing act is worse than an absent one, because it names t
 **Expiry:** this stops being right if `parse_items` starts reading below the banner block, or if
 the three field names change. Check `_FIELD_KEYS` in `scripts/docs/backlog_status_check.py`.
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. THIS ITEM IS PARTIALLY SHIPPED AND THE DEFECT PARAGRAPH ABOVE
+IS STALE.** Measured by the lane holding the item, and re-measured independently before this was written.
+`parse_items` is the right instrument here: a populated `Item.fields` proves the field is *in the banner
+block*, because that block is the only region the parser reads.
+
+| field | present, open items | missing |
+|---|---|---|
+| `Verdict` | 237 / 246 | 9 |
+| `Closing-act` | 236 / 246 | 10 |
+| `Research` | 1 / 246 | 245 |
+
+The single `Research` is this item's own worked example. So *"304 of 330 open items ... and zero of them are
+inside the banner blockquote"* is no longer true of two fields out of three, and the population moved from
+330 to 246 besides.
+
+- Missing `Verdict` (9): #351, #352, #353, #1008, #1093, #1301, #1305, #1319, #1322.
+- Missing `Closing-act` (10): the same nine, plus #320.
+
+**WHERE THE MIGRATION LANDED, BECAUSE THE OBVIOUS ANSWER IS WRONG.** It is `76ee9a7b` -- 734 lines added to
+this file, **473 of them banner field lines**. `7b6a5b1f` shipped the *reader* (`Item.fields`) and
+`scripts/coord/dispatch_gate.py` and added **two** field lines. Tool and data landed in different pull
+requests, and the commit carrying the data has the subject *"file #1318 -- messagefoundry init writes a
+config the loader refuses"*, which does not mention a schema migration at all. **A 473-line migration is
+invisible in `git log`.** The first seat to check attributed it to the tooling commit -- the reasonable
+place to look, and still the wrong answer.
+
+**THE REMAINING WORK IS NOT A 330-ITEM SCRIPT.** It is two jobs wanting different tools:
+
+1. **Nineteen straggler edits, BY HAND.** Nine items need `Verdict`, ten need `Closing-act`. At this size a
+   script is the wrong instrument; these are surgical and hand-checkable.
+2. **`Research` on 245 items, WHICH IS WHERE THE SCRIPT BELONGS.** This is the field the contention warning
+   above is really about, and the only part still needing a quiet window.
+
+**FIVE OF THE NINE MISSING VERDICTS ARE FREE TEXT AND MUST BE ESCALATED, NOT FLATTENED.** #351, #352, #353,
+#1008 and #1093 carry inline verdicts outside the closed vocabulary -- *"triage"*, *"consult, then decide"*,
+*"triage, then split"*. Two lose something specific under a forced mapping: #1008's ruling of record is
+*"build the runbook fix only; defer the startup preflight"*, and mapping that to `build` drops the clause
+that scopes it; #353 reads *"file now, build on owner green-light"*, a demand-gate written in prose, and
+mapping it to `build` deletes the gate. **A wrong verdict is worse than an absent one** -- this item already
+says so about closing acts, and it holds identically here. The other four (#1301, #1305, #1319, #1322) read
+*"build."* and are mechanical. #320 has no inline verdict at all and already carries a banner `Verdict`; it
+needs only `Closing-act`.
