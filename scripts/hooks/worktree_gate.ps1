@@ -1889,7 +1889,7 @@ turned off and I need you to do it." Do not disable it yourself.
 #                                 "already claimed by another session": the exact duplicate build the
 #                                 registry exists to stop.
 #   overlap-cache.json            overlap.ps1 trusts it as data for 60s, bounded only against a future
-#                                 stamp and a root mismatch. A `rows: []` payload makes collision_gate.ps1
+#                                 stamp and a root/HEAD mismatch. A `rows: []` payload makes collision_gate.ps1
 #                                 read "RESOLVED, and nobody else is touching it" and ALLOW with no
 #                                 additionalContext -- indistinguishable from a real all-clear, which is
 #                                 the silent-green failure that gate was built to remove.
