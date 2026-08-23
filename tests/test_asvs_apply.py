@@ -609,3 +609,92 @@ def test_the_TYPE_guard_does_NOT_refuse_a_payload_that_intentionally_retypes(
         c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"] if c["id"] == "1.1.1"
     )
     assert cell["note"] == {"now": "a table"}
+
+
+# --- BACKLOG #1307: a retirement is a SANCTIONED outcome the writer could not express -------------
+#
+# The shrink guard refuses any payload where an evidence or absence list gets shorter, and it took no
+# flag. But the tracking loop names four causes for an anchor that no longer resolves, and one of them
+# is "the gap it certified was CLOSED, so retire it" -- the case where the engine got BETTER and the
+# fix deleted the line the anchor quoted. That left a maintainer with a legitimate retirement choosing
+# between a stale anchor and the unsafe writer.
+#
+# THE GUARD IS CORRECT AND IS NOT WIDENED. It exists because a truncating repair once cut one cell
+# 15 -> 10 and another 17 -> 1 with the verifier green throughout. So the four arms below pin that the
+# only way through is a DECLARED retirement whose arithmetic agrees -- the flag alone opens nothing.
+
+
+def _shrunk_111(**over: object) -> dict:
+    """The 1.1.1 payload with one of its two evidence anchors removed."""
+    cell = _cell_111()
+    cell["evidence"] = cell["evidence"][:1]
+    cell.update(over)
+    return cell
+
+
+def test_a_shrink_is_still_refused_without_the_flag(tmp_path: Path) -> None:
+    """MUST REFUSE. The default is unchanged: a silent cardinality drop is the thing the guard is
+    for, and #1307 must not have relaxed it."""
+    rec = _record(tmp_path)
+    rc = main([str(_payload(tmp_path, [_shrunk_111()])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_text(encoding="utf-8") == FIXTURE, "a refused run must not touch the file"
+
+
+def test_the_flag_alone_does_not_unlock_a_shrink(tmp_path: Path) -> None:
+    """MUST REFUSE, AND THIS IS THE ARM THAT MAKES THE FEATURE SAFE RATHER THAN A BYPASS.
+
+    A bare `--allow-retirement` behaving like `--allow-verdict-change` would convert the guard into a
+    speed bump: the flag would be reached for reflexively on any refusal. The payload has to say WHAT
+    is being retired."""
+    rec = _record(tmp_path)
+    rc = main(
+        [
+            str(_payload(tmp_path, [_shrunk_111()])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+            "--allow-retirement",
+        ]
+    )
+    assert rc == 1
+    assert rec.read_text(encoding="utf-8") == FIXTURE
+
+
+def test_a_declaration_whose_arithmetic_disagrees_is_refused(tmp_path: Path) -> None:
+    """MUST REFUSE. Declaring ONE retirement while the count drops by TWO is the shape that would
+    let a truncation ride in behind a legitimate-looking declaration -- which is precisely the
+    incident the guard was built for, wearing a permit."""
+    rec = _record(tmp_path)
+    # DROPS ONE (2 -> 1) but DECLARES TWO. Deliberately this direction rather than dropping both:
+    # an empty evidence list trips a DIFFERENT guard ("partial needs at least one anchor"), and the
+    # first version of this test did exactly that -- it passed while never reaching the arithmetic
+    # check at all. Caught by mutating the check away and seeing NOTHING go red.
+    cell = _cell_111()
+    cell["evidence"] = cell["evidence"][:1]
+    cell["retired_evidence"] = ["messagefoundry/m.py:10", "messagefoundry/m.py:20"]
+    rc = main(
+        [str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply", "--allow-retirement"]
+    )
+    assert rc == 1
+    assert rec.read_text(encoding="utf-8") == FIXTURE
+
+
+def test_a_declared_retirement_whose_arithmetic_agrees_is_applied(tmp_path: Path) -> None:
+    """MUST APPLY -- the arm without which the other three are satisfied by a writer that refuses
+    everything, and the outcome the item exists to make reachable."""
+    rec = _record(tmp_path)
+    rc = main(
+        [
+            str(_payload(tmp_path, [_shrunk_111(retired_evidence=["messagefoundry/m.py:20"])])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+            "--allow-retirement",
+        ]
+    )
+    assert rc == 0, "a declared, arithmetic-consistent retirement must go through"
+    after = rec.read_text(encoding="utf-8")
+    assert "verify_mode" not in after, "the retired anchor should be gone"
+    assert "tls_cert_file" in after, "the surviving anchor must remain"
+    assert "5.4.3" in after, "the untouched cell must survive byte-for-byte"
