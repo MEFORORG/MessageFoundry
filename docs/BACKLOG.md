@@ -14806,3 +14806,50 @@ the control for the first row only; the other two are recorded as motivation, no
 
 **Expiry:** this stops being right if `Item.fields` stops being a mapping, or if the ledger gains a
 per-field occurrence check by another route.
+
+## 1342. An item's banner verdict and its re-score prose can disagree, and every tool reads the banner
+
+> 🔢 **Filed 2026-08-23 - not started.** Promoting `Verdict` into the banner block created a SECOND source of truth beside the re-score line that already carried it. **Three open items say `build` in the banner and `DEMAND-GATE` in their prose.** Every tool -- `parse_items`, the dispatch gate, a dispatcher's screens -- reads the banner, so all three read as freely dispatchable.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** ledger tooling / dispatch safety. **Priority:** P1 -- it defeats the demand-gate protection
+itself, which exists to stop work starting on an item that must not be started. **Verdict:** build.
+**Severity:** no product axis (sec. 0). The cost is **a lane building something the ledger says in prose
+must not be built.**
+
+***MEASURED, WITH A CONTROL THAT FIRES.*** Across open items, matching a `Re-scored ... -> X` line
+against the banner `Verdict` field:
+
+| | count |
+| --- | --- |
+| banner says buildable, prose says gated | ***3*** -- `#340`, `#1003`, `#1266` |
+| **both agree** (the control) | **23** |
+
+**The control is the point: 23 agreements prove the matcher can read a re-score line and compare it.**
+*A zero on the left against a zero on the right would have been indistinguishable from a broken needle.*
+
+***HOW IT NEARLY BIT, TODAY.*** A dispatcher screened the open pool for `Verdict: build`, `Closing-act:
+code`, unclaimed, no build commit, no retirement marker -- **five screens, all passed** -- and was about
+to dispatch `#1266`. *Its re-score line says `DEMAND-GATE`.* **The only thing that stopped it was reading
+the row by eye because a DIFFERENT suspicion (a possible duplicate) prompted a manual look.**
+
+***AND THE DISPATCH GATE CANNOT CATCH IT EITHER, BECAUSE IT READS THE SAME FIELD.*** `judge()` consults
+`Item.fields`, so for all three it sees `build` and returns a pass. **The structured field was supposed
+to make the gate reliable; where the two sources diverge it makes it confidently wrong.**
+
+**THE BUILD:** a check that flags any item whose banner `Verdict` contradicts a `Re-scored ... ->` line
+in its own body, and **fails rather than warns** -- a divergence is never benign, because one of the two
+is telling a machine to start work the other forbids.
+
+**Two controls, both required:** a planted contradiction that MUST fire, and the agreeing population
+that MUST NOT. *A checker proven only against the three known rows is indistinguishable from one that
+hardcodes them.*
+
+**AND THE RECONCILIATION IS A SEPARATE DECISION, DELIBERATELY NOT SCOPED HERE:** which source wins when
+they disagree is an assessor call, not a mechanical one. **This item makes the divergence VISIBLE. It
+does not resolve any of the three.**
+
+**Expiry:** this stops being right if the re-score line is retired as a carrier of verdict, or if the
+banner field becomes the sole declared source by an explicit ruling.
