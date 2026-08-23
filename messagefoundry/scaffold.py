@@ -100,17 +100,25 @@ _SERVICE_TOML = """\
 # path = "messagefoundry.db"   # SQLite (default). Use a server DB for Test/Prod — see docs/DEPLOY-SERVER-DB.md.
 
 [api]
-host = "127.0.0.1"             # loopback only; an off-loopback bind requires TLS — see docs/DEPLOYMENT.md.
 port = 8765
+
+[security]
+# Posture switches (ADR 0118). These MOVED here from [api]/[ai]/[egress]; setting one in its old
+# section is REFUSED by the loader, so add new posture keys here and nowhere else.
+# Loopback-only is the DEFAULT. To expose the API/console off this machine, uncomment BOTH of the
+# next two lines together (TLS is then required) — listen_address alone is refused as contradictory:
+# local_access_only = false
+# listen_address = "0.0.0.0"
+# handles_real_patient_data = true    # does this instance carry REAL PHI? (drives at-rest + egress advisories)
+# production_instance = true          # production tier? (drives the prod-DEBUG refusal + the AI data-scope ceiling)
+# block_unlisted_outbound = true      # lock outbound destinations down (recommended for Test/Prod)
 
 [ai]
 # The active-environment NAME — REQUIRED (also passable as `serve --env <name>`). Free-form: name
 # instances dev/staging/test/prod/poc/... Built-in names dev/staging/prod carry a default posture; a
-# CUSTOM name MUST also set data_class + production below (posture is never inferred from the name).
+# CUSTOM name MUST also set handles_real_patient_data + production_instance in [security] above
+# (posture is never inferred from the name).
 environment = "dev"
-# Security posture, decoupled from the name (ADR 0017). Derived for dev/staging/prod when omitted:
-#   data_class = "phi"    # synthetic | phi — does this instance carry REAL PHI? (drives at-rest + egress advisories)
-#   production = true     # production tier? (drives the prod-DEBUG refusal + the AI data-scope ceiling)
 
 [environments]
 # Where environments/<env>.toml value files resolve FROM. Default (unset) = the process working
@@ -120,8 +128,7 @@ environment = "dev"
 # base_dir = "C:/srv/mefor/this-config-repo"
 
 [egress]
-# Lock down outbound destinations on any PHI-carrying instance (recommended for Test/Prod):
-# deny_by_default = true
+# The outbound allow-lists. The deny-by-default SWITCH is [security].block_unlisted_outbound above.
 # allowed_mllp = ["receiver.test.example:2601"]
 """
 
