@@ -109,7 +109,7 @@ not revocation checking**"* (`:202`).
 | Engine-to-store (asyncpg) | `store/postgres.py:752`, and `:760` where asyncpg builds it (`:729` is the `trust_server_certificate` escape, `CERT_NONE` at `:731`) | the whole PHI store |
 | Syslog / SIEM forwarder (RFC 5425) | `logging_setup.py:310` | audit records |
 | OIDC / IdP token and JWKS legs | `auth/oidc_http.py:99-101` | the client secret, the authorization code |
-| SMART Backend Services token endpoint | `transports/smart.py:183-184` | a signed `client_assertion`, a bearer token |
+| SMART Backend Services token endpoint | **NOT A TLS SITE -- row withdrawn 2026-08-23.** `transports/smart.py` contains ZERO `ssl` usage (`create_default_context`, `SSLContext`, `ssl.` all absent; control: 153 hits package-wide). `:183-184` is an opener and redirect handler. It rides urllib's own context. | -- |
 | Shared engine-API client | `apiclient/client.py:214`, `:222` | session credentials |
 | Windows tray probe | `tray/probe.py:123` | health only |
 | TLS version prober | `config/tls_probe.py:97` | nothing; it scopes itself out at `:32` |
@@ -198,7 +198,7 @@ of the three carry authentication material:
 
 | Hop | Site | Crosses with |
 |---|---|---|
-| SMART Backend Services token endpoint | `transports/smart.py:183-184` | a signed `client_assertion` JWT out, a bearer token back |
+| SMART Backend Services token endpoint | **NOT A TLS SITE -- see the withdrawal in §1.3.** No `ssl` usage in the file at all. | -- |
 | OIDC / IdP token and JWKS legs | `auth/oidc_http.py:99-101` | the client secret, the authorization code, the identity assertion (its own comment, `:105-107`) |
 | Syslog / SIEM TLS forwarder | `logging_setup.py:310` | audit records; no `harden_verify_flags` either -- shared with the other two unguarded hops, not peculiar to this one |
 
@@ -460,7 +460,7 @@ What a cell may take from here:
   `config/tls_policy.py:963-973` and `:1040`, wired at the seven sites in §1.5 rider 1.
 - **Direction 3** is **present and must not be counted toward either**, evidenced at
   `config/tls_policy.py:215-276` with exactly three call sites, all on `PROTOCOL_TLS_SERVER` contexts.
-- **Three originating hops carry no guard**, evidenced at `transports/smart.py:183-184`,
+- **The unguarded-hop population is LARGER THAN TWO AND UNGRADED** -- corrected 2026-08-23. Two hops are confirmed and evidenced below. A third citation, `transports/smart.py:183-184`, is **WITHDRAWN: that file has no `ssl` usage at all** and cannot carry a guard. Separately, at least six further unguarded context constructions exist (`apiclient/client.py:214`, `store/postgres.py:729`, `rest.py:275`, `:296`, `soap.py:202`, `tls_policy.py:1218`) and **NONE of them has been graded** -- several are outbound client contexts where the answer may differ. **Do not scope this rider as a well-specified three-hop job.** The confirmed two are at
   `auth/oidc_http.py:99-101`, `logging_setup.py:310`; the build rider is §4.3.
 
 Anchor these to code, not to this ADR's line numbers. **This document is prose and will be edited;
