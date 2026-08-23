@@ -15543,3 +15543,85 @@ demonstrate its own pass arm has never been shown to have one.*
 
 **Expiry:** this stops being right if the two registries are unified, or if the vault stops installing
 the gate.
+
+## 1347. a multi-item commit cites only its first number with the BACKLOG prefix, so sibling items read as unbuilt to every citation-based check
+
+> 🔢 **Filed 2026-08-23 - not started.** The house form is `(BACKLOG #1319, #1322, #1323, #1331)` -- **the prefix appears ONCE and the siblings carry a bare `#N`.** So any check greping `BACKLOG #<N>` finds the first item and misses the rest. **Measured on `origin/main`: `#1319` matches, its three siblings do not.** ***The failure direction is the expensive one -- a sibling whose work landed months ago reads as unbuilt, and a dispatcher hands a builder work that is already done.***
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / gate integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no product axis (sec. 0). **The cost is wasted lane capacity and a ledger that overstates
+what is open.**
+
+**THE HALF THAT IS ALREADY SOLVED, SO THIS ROW DOES NOT FILE A FIXED THING.** `scripts/hooks/claim_check.py:42`
+handles the sibling case correctly and states why, verbatim: *"(BACKLOG #71, #72) is the house form, so
+once BACKLOG appears in the subject every #N after it in that line counts -- otherwise the second item of
+a paired commit would slip through unclaimed."* ***THE FIX PATTERN EXISTS IN-REPO. That is the useful part
+of this item, not the count.***
+
+**TWO SHAPES, AND ONLY ONE HAS A REMEDY ANYWHERE.**
+
+**SHAPE A -- siblings after the prefix.** Solved for CLAIMS by the gate above; **re-derived and got wrong
+by every ad-hoc screen.** *Two seats built the same broken screen independently on 2026-08-23.*
+
+***SHAPE B -- NO `BACKLOG` TOKEN AT ALL.*** A commit reading `init writes a loadable config, and check can
+fail on one (#1318, #1320)` declares nothing to any checker. **The claim gate read it as citing no item and
+passed it correctly -- while `#1318` was claimed by another worktree.** ***Invisible everywhere, gate
+included, and unsolved.***
+
+**MEASURED TWICE, INDEPENDENTLY, AND THE TWO DERIVATIONS DIFFER BY ONE.** Scanning `--all` subjects and
+counting only `#N` tokens INSIDE the `(BACKLOG ...)` parenthetical: **34 and 35 multi-item commits, over a
+denominator of 787 and 809 commits carrying such a parenthetical.** *Both derivations are recorded rather
+than reconciled; the disagreement is smaller than the finding.*
+
+***AND THE OBVIOUS COUNT IS INFLATED BY AN ORDER OF MAGNITUDE, WHICH IS WHY THE DENOMINATOR IS STATED.***
+Counting `BACKLOG` followed by more than one `#N` anywhere in the subject scores **593**, because a
+squash-merge appends the PR number as a trailing group -- `(BACKLOG #1040) (#547)` is one item and one pull
+request. A comma-based count scores **110**, of which **85 are `BACKLOG #1171, ASVS 11.4.1`** -- a comma
+followed by something that is not an item at all. **Scope the match to inside the parenthetical.**
+
+**Control:** `df8acc95` -- the commit that misled two seats into holding three claims for landed work -- is
+in the 34, carrying `#1319, #1322, #1323, #1331`.
+
+**Expiry:** this stops being right if the house form changes, or if screens are replaced by content
+checks (`git log -S` on a symbol the fix must touch) rather than citation greps.
+
+## 1348. claim.ps1 reads directory existence as occupancy, so a worktree that outlives its session holds claims no sanctioned verb can move
+
+> 🔢 **Filed 2026-08-23 - not started.** `claim.ps1` refuses a `-Take` with **`HOLDER IS STILL THERE -- that worktree exists and last committed 23h ago.`** ***Its occupancy test is DIRECTORY EXISTENCE PLUS COMMIT RECENCY. It is not asking whether anyone is there.*** **Measured 2026-08-23: `ListAgents` returned seven live peers and the holding worktree was not among them, while its directory sat on disk and the tool reported it occupied in a confident sentence.**
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / gate integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no product axis (sec. 0). **The cost is a claim that cannot be regularised by any verb the
+rules permit.**
+
+***THIS IS A THIRD STATE THE TOOL CANNOT REPRESENT.*** A **removed** worktree strands its claims -- that is
+a sibling row's case and it is handled. A **live** worktree holds them legitimately. ***A worktree whose
+DIRECTORY OUTLIVES ITS SESSION is neither, and the tool renders it as the second.*** *It is the same
+distinction that made a fleet roster report four live seats when seven were running: **a record read as
+presence.***
+
+**THE LIVE INSTANCE, AND IT SHOWS WHY THIS MATTERS MORE THAN TIDINESS.** A lane built, verified and
+mutation-proved a fix for an item claimed by a dead checkout of **its own role**. *The dispatcher ruled
+that same-role-dead-checkout may be taken in place, which is correct.* ***The sanctioned verb refused. Only
+`-Force` would move it, and `CLAUDE.md` forbids releasing another worktree's claim.*** **So the item is
+built, correct, and unattributable.**
+
+***TWO GAPS MET IN THE MIDDLE AND EITHER ALONE WOULD HAVE BEEN SURVIVABLE.*** The claim gate could not stop
+the commit because it used no `BACKLOG` token (**Shape B, `#1347`**). The claim tool would not let the
+author regularise it because it reads a directory as a person. **Together they produce work that is done,
+correct, and held by nobody.**
+
+**THE LANE DID NOT REACH FOR `-Force` AND THAT IS THE RIGHT PRECEDENT:** *a sanctioned verb refusing is not
+an authority gap, and the refusal of the permitted tool is not an invitation to the forbidden one.*
+
+**One control, and it is achievable:** a claim held by a worktree with a **live session** must still
+refuse, and one held by a directory with **no live session** must be distinguishable from it. *A tool that
+cannot tell those apart has never demonstrated it is testing occupancy at all.*
+
+**Expiry:** this stops being right if `claim.ps1` gains a liveness probe, or if worktree directories are
+removed with their sessions.
