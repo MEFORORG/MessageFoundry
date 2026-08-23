@@ -324,10 +324,32 @@ is slow must say so and tell you to go direct.
 **Reach them with `mail.ps1` (leaves a receipt, reaches an idle or different-login peer) or a
 cross-session message (faster, no receipt, dies with the session).**
 
-**ROUTING IS NOT AUTHORITY, and this is the half to get right.** The owner still approves every push,
-PR and merge. **The Lander EXECUTES an approved action; it does not AUTHORISE one**, and handing it
-your branch does not convert your unapproved push into an approved one. Same for the Liaison: it
-compresses and presents your question, and it does not answer it.
+**WHO MAY DO WHAT. Three rules, and the first two only look contradictory.**
+
+1. **The LANDER holds STANDING authority to push, PR and merge, on the engine repo AND the vault, and
+   needs no per-action owner approval.** Source: `roles/LANDER.md` line 87 **on `origin/main`**, which
+   states the grant and adds that you should not go looking for a separate one; ratified by the owner
+   2026-08-22.
+2. **Every OTHER seat still needs the owner's approval to PERFORM an outward-facing action itself** --
+   your own push, your own PR, your own merge. The Lander's grant covers the LANDER'S act of landing.
+   It does not cover yours.
+3. **HANDING YOUR BRANCH TO THE LANDER IS THE DEFAULT ACTION, NOT A QUESTION.** It needs no approval
+   and you do not ask for one.
+
+**Rules 2 and 3 govern different acts: PERFORMING a push versus ROUTING one.** The version of this
+paragraph they replace collapsed the two, so it read as forbidding the handover as well, and seats sat
+on finished work waiting for an approval nobody owed them. **The Liaison half is unchanged: it
+compresses and presents your question, and it does not answer it.**
+
+**READ A ROLE PLAYBOOK WITH `git show origin/main:roles/<FILE>.md`, NEVER FROM THE
+`MessageFoundry-vault` WORKING TREE.** That checkout sits on a branch `git merge-base --is-ancestor`
+reports is **not** an ancestor of `origin/main`, so every file in it can be stale in a way a directory
+listing cannot show. Measured 2026-08-22, independently by several seats within about twenty minutes,
+three of which broadcast confident wrong conclusions drawn from it -- including on the authority
+question this section states, where the correcting text was among the lines a stale copy was missing.
+**And two playbooks do not exist in that checkout at all**, so the folder looks complete while the
+document about instruments that lie is absent entirely. **An `ls` of that directory is not evidence
+that you have the file.**
 
 ### Git discipline
 - Work on a **feature branch and open a PR**; commit at logical stops, **one coherent layer per
@@ -335,8 +357,10 @@ compresses and presents your question, and it does not answer it.
   branch + PR is the path.)
 - **Commits at logical stops are Claude's own judgment** — proactively commit coherent, tested,
   one-layer-per-commit changes and narrate each (respect the ledger gate — never `--no-verify` or a
-  rename workaround). **Pushes, PRs, and merges need the owner's approval**: they are outward-facing
-  and, with auto-merge on, a PR effectively merges to `main`.
+  rename workaround). **A push, PR or merge YOU perform needs the owner's approval**: it is
+  outward-facing and, with auto-merge on, a PR effectively merges to `main`. **Handing the branch to
+  the Lander instead needs no approval and is the default** -- its standing grant is stated above, and
+  waiting on an approval for the handover is the failure that rule exists to stop.
 - **Whoever executes a push or merge announces it** — one `mail.ps1 -Send -To all` line, before
   (heads-up: `"pushing #N now, touches X"`) and/or after (`"landed #N at <sha>, touches X, rebase if
   BEHIND"`). Worded around the *action*, not a fixed identity — no gate enforces *who* may push a
