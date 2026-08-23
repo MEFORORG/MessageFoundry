@@ -15718,5 +15718,29 @@ FAIL a tip check, and **a ref must be verifiable without the branch it names** -
 it captured at write time, or by refusing to write a ref that is not the tip.* ***A rescue mechanism that
 can only be audited while the thing it rescues still exists has never been shown to work.***
 
+***AMENDED SAME DAY -- THE TWO SCHEMES ARE DIFFERENT MECHANISMS AND MUST NOT BE GENERALISED TOGETHER.
+TWO SEATS MEASURED OPPOSITE OBJECTS AND BOTH SAID "rescue tags".***
+
+| scheme | mechanism | staleness |
+|---|---|---|
+| ***dated tags, 730 refs*** | ***TRUE ONE-TIME SNAPSHOT. Nothing re-takes it.*** | ***PERMANENT*** |
+| auto refs, 248 refs | ***UPDATED BY PUSH*** -- *one ref's reflog shows six updates* | *TRANSIENT LAG* |
+
+*A seat reported an **auto** ref 13 commits behind. That reading was **correct and transient**: it sits at
+that ref's reflog `@{4}` with four pushes after it, and the mechanism caught up.* ***An auto ref that
+looks stale may simply be lagging. A DATED TAG NEVER CATCHES UP, because there is no mechanism behind
+it.*** **The confirmed instance in this row is a DATED tag, which is the half where staleness is
+permanent and therefore the half worth alerting on.**
+
+***AND THE STRUCTURAL PROBLEM IS WORSE THAN THIS ROW FIRST STATED: ALL 730 DATED TAGS ARE UNCOMPARABLE BY
+NAME.*** *Their leaf is a **date-scoped label**, not a branch name, so **zero** of them can be censused
+the way the auto scheme was.* **The confirmed instance was checkable only because the branch it belonged
+to was already known** -- *not because anything in the ref said so.*
+
+**INSTRUMENT NOTE, MEASURED: these are ANNOTATED tags -- 4 of the 730.** *`rev-parse` returns the **tag
+object**, not the commit; `rev-parse ^{commit}` or `%(*objectname)` returns the commit.* ***`diff`,
+`merge-base` and `rev-list` dereference silently, so ancestry and diffstat are unaffected -- but a tag-
+object sha published into a log will not resolve.*** *One such sha was published and corrected here.*
+
 **Expiry:** this stops being right if rescue refs are written with a recorded target sha, or if the
 writer refuses any ref that is not its branch's tip.
