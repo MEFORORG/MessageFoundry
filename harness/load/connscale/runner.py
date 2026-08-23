@@ -957,9 +957,36 @@ def _empty_claims_per_msg(total_per_s: float, achieved_read_per_s: float) -> flo
     """Empty claims per message absorbed — the wall-clock-free form of wall #3 (BACKLOG #1101).
 
     Both inputs are Δ/span over the SAME first→last in-hold samples, so ``span`` cancels and this is
-    exactly ``Δempty_claims / Δread``. That is why it survives runner contention: slowing the run
-    scales numerator and denominator identically. The per-SECOND form does not — it keeps ``span`` in
-    the denominator, so a slow arm reads as an improvement, which is the defect #1101 records.
+    exactly ``Δempty_claims / Δread``. That removes the per-SECOND form's defect, which keeps ``span``
+    in the denominator so a slow arm reads as an improvement (#1101).
+
+    **IT IS NOT CONTENTION-IMMUNE, AND THIS DOCSTRING USED TO SAY IT WAS** (BACKLOG #1211). The old
+    wording — *"that is why it survives runner contention: slowing the run scales numerator and
+    denominator identically"* — is an argument from the algebra that the measurements refute. Three
+    excursions past the SLO band were recorded on `windows-2025`, on pull requests with ZERO overlap
+    with connscale, the store or the pipeline:
+
+    ===========  ============================  =====================  ==========
+    PR           reading at ``N=24``           band floor             short by
+    ===========  ============================  =====================  ==========
+    #343         36                            48.4 * 0.75 = 36.30    0.30
+    #355         34.9                          48.2 * 0.75 = 36.15    1.25
+    ===========  ============================  =====================  ==========
+
+    **The margin is widening across independent runs** (0.30 then 1.25) against a ``prior`` that
+    barely moved, which is a different signal from a single excursion.
+
+    WHY THE ALGEBRA DOES NOT DELIVER WHAT IT LOOKS LIKE IT DELIVERS: ``span`` cancelling makes the
+    ratio free of WALL CLOCK, not free of CONTENTION. The two counters do not respond to load
+    identically — empty claims are produced by POLLING, which continues on its own cadence, while
+    reads are produced by WORK ARRIVING. Under contention those two decouple, so their ratio moves
+    even though neither is divided by time. Cancelling ``span`` was necessary and is not sufficient.
+
+    **The SLO band is NOT widened here, deliberately.** ``_MONOTONIC_TOLERANCE`` is 0.25 and the row's
+    own re-score says the true distribution needs several deliberate samples at one N on a hosted
+    runner before anything is widened. Picking a wider number from these three points would be
+    choosing a constant to fit the failures I happen to have, which is how the 0.25 came to be
+    trusted in the first place. That half needs a seat that can iterate against the runner.
 
     Returns ``None`` when no messages were absorbed in the window. The ratio is genuinely undefined
     there and returning 0.0 would be a fabricated reading that then chains through the monotonicity

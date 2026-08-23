@@ -1703,19 +1703,25 @@ class AuthStore(Protocol):
     # --- saved-search presets (ADR 0136, BACKLOG #151) — per-user, criteria encrypted at rest -----
 
     async def upsert_search_preset(
-        self, *, preset_id: str, owner: str, name: str, criteria: str, now: float | None = None
+        self,
+        *,
+        preset_id: str,
+        owner_user_id: str,
+        name: str,
+        criteria: str,
+        now: float | None = None,
     ) -> tuple[str, bool]:
         """Create-or-replace a per-user preset by ``(owner, name)`` (id reused on a name collision so the
         cell-AAD stays stable). ``criteria`` is a JSON blob encrypted at rest. Returns
         ``(effective_id, replaced)``."""
         ...
 
-    async def list_search_presets(self, owner: str) -> list[dict[str, Any]]:
+    async def list_search_presets(self, owner_user_id: str) -> list[dict[str, Any]]:
         """A user's presets (id/name/timestamps only — NEVER the criteria)."""
         ...
 
     async def get_search_preset(
-        self, *, preset_id: str, owner: str, now: float | None = None
+        self, *, preset_id: str, owner_user_id: str, now: float | None = None
     ) -> dict[str, Any] | None:
         """One owner-scoped preset with its criteria DECRYPTED, or ``None``.
 
@@ -1724,8 +1730,8 @@ class AuthStore(Protocol):
         swallowed, never raised, so it cannot break the recall. ``now`` overrides the clock (tests)."""
         ...
 
-    async def delete_search_preset(self, *, preset_id: str, owner: str) -> bool:
-        """Delete an owner-scoped preset; ``True`` iff a row was removed. Idempotent."""
+    async def delete_search_preset(self, *, preset_id: str, owner_user_id: str) -> bool:
+        """Delete an owner_user_id-scoped preset; ``True`` iff a row was removed. Idempotent."""
         ...
 
     async def set_user_roles(
