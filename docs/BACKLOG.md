@@ -11184,6 +11184,32 @@ not the hazard.
 **REQUIRED, AND IT OUTLIVES THIS ITEM: a test asserting `queue` STILL HAS a column named `owner`, so an
 over-broad future rename goes RED.** *Build the guard before the change it guards -- a guard that lands
 afterwards never guarded anything.*
+
+***THIRD AMENDMENT 2026-08-23. THE SCOPE IS COLUMN **AND** PARAMETER. THE FILE LIST ABOVE IS
+UNDER-SCOPED, AND IT IS A DESCRIPTION RATHER THAN A FENCE.***
+
+`store/base.py`'s Protocol carries `owner` as a **keyword-only PARAMETER**, not a column -- `:1706`,
+`:1713`, `:1718`, `:1727`, across all four preset methods -- and callers outside the store modules pass
+it.
+
+***RENAMING THE COLUMN ALONE LEAVES THE PROTOCOL LYING, WHICH RECREATES THIS ITEM'S OWN DEFECT ONE
+LAYER UP.*** The defect is not *"a column has an inconvenient name"*; it is ***"the name says owner and
+the value is a user id"***, **and that is identically true of the parameter.** A column-only rename
+converts a **consistent-but-wrong** naming into an **INCONSISTENT** one, where a reader must work out
+which of the two is authoritative. ***That is worse than the current state.***
+
+**THE PROTOCOL IS DESCRIBED AS AN EXTENSION POINT** (`docs/MENTAL-MODEL.md:305`), so a parameter rename
+is a contract change for an external implementer. **Section 0 settles it: zero deployments, no external
+implementers, so that cost is currently zero.** *Prefer the correct end state over a compatibility shim.*
+
+***THE DIFFICULTY SCORE ABOVE IS COSTED AGAINST FOUR MODULES AND IS THEREFORE WRONG.*** That is a
+scoring correction, **not** a reason to build the narrow version.
+
+**NO CALL-SITE COUNT APPEARS IN THIS ROW, DELIBERATELY.** Two seats measured the surface with two
+different instruments and got two different populations; **neither was validated against the other, and
+one of the two controls was found broken.** *A wrong number here is worse than none, and the count was
+never the hazard -- the two-column collision is.* **The builder puts the number it can defend in its
+commit.**
 ## 1233. `delete_user` never removes `search_presets`, so an account deletion strands encrypted PHI-shaped `criteria`
 
 > ✅ **SHIPPED -- verified by content on `origin/main` 2026-08-20, ALL THREE BACKENDS AND THE TEST LIMB, not one of them.** `delete_user` purges `search_presets` in `store/store.py`, `store/postgres.py` and `store/sqlserver.py` -- one keyed purge each, alongside five DELETEs each. **Coverage exists for all three:** `tests/test_postgres_store.py` and `tests/test_sqlserver_store.py` directly, and the SQLite/default path through `tests/test_search_presets_api.py`. **That test is non-vacuous by construction and was checked as such rather than counted:** it asserts a PRECONDITION that the preset exists before deletion, then asserts the purge on both the id and the freed username. **It also carries two independent controls** -- it re-inserts the captured row afterwards, because with the row purged #1225's key assertions would pass TRIVIALLY and stop being evidence about the key at all. **And it records the retraction in place:** the assertion it replaced said the exact opposite, which was true when written and is the defect this item fixes. **Closed on the release condition this project uses -- the fix TEXT on `main` -- not on a merged badge.** The holder's claim can be released; that condition is met.
