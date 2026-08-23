@@ -6402,7 +6402,8 @@ So `-Com` and `-Comm` are working spellings. `-Cm` is not, which bounds the fami
 
 ## 1098. The coordination hook prints a session UUID where a commit SHA is expected
 
-> ✅ **Shipped 2026-08-10.** The registry session id is labelled **in every row**: `session <id>` on `session-context.ps1`'s live-peer roster and its in-flight list, and a named column header (`sess-id  surface  worktree  branch`) on `presence.ps1`'s fixed-width table — a header governs every row, which is the same property. The ambiguity is **measured, not asserted**: the test keys on `git rev-parse HEAD` to prove the same banner really does print real abbreviated SHAs in that shape (`<path> 8ba9b65 [master]`), so the claim rests on an object rather than a resemblance. Both tests read the EMITTED TEXT, which is the only place either defect can exist — every other test of these two scripts reads `-Json`, where the field is called `Short` and no ambiguity is possible. No consumer parses the human table: `mail.ps1`, `announce-session.ps1` and `session-context.ps1` all invoke presence with `-Json`, which returns before it.
+> ✅ **Shipped 2026-08-10 -- BUT THIS BANNER'S COMPLETENESS CLAIM WAS FALSE WHEN WRITTEN, corrected 2026-08-23 while closing [#1310](#1310).** *It said "in every row" and three sites were bare: `collision_gate.ps1:230`, `collision_gate.ps1:243`, `overlap.ps1:319`. The sweep scoped itself to PRODUCERS and missed the `-Json` CONSUMERS that re-render the value into prose. **#1310 is this defect recurring**, and it is closed on a test rather than on another enumeration.* Original text follows.
+> The registry session id is labelled **in every row**: `session <id>` on `session-context.ps1`'s live-peer roster and its in-flight list, and a named column header (`sess-id  surface  worktree  branch`) on `presence.ps1`'s fixed-width table — a header governs every row, which is the same property. The ambiguity is **measured, not asserted**: the test keys on `git rev-parse HEAD` to prove the same banner really does print real abbreviated SHAs in that shape (`<path> 8ba9b65 [master]`), so the claim rests on an object rather than a resemblance. Both tests read the EMITTED TEXT, which is the only place either defect can exist — every other test of these two scripts reads `-Json`, where the field is called `Short` and no ambiguity is possible. No consumer parses the human table: `mail.ps1`, `announce-session.ps1` and `session-context.ps1` all invoke presence with `-Json`, which returns before it.
 > printed at session start lists each live worktree with what reads as a commit SHA in the trailing
 > column. For at least one row the value is a **session UUID**: `061726a4` resolves to
 > `.git/mefor-coord/announce/061726a4-....json`, not to any object in the repository. The branch
@@ -12495,6 +12496,8 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 > **FIVE WRITTEN "DEV ONLY" PROHIBITIONS MUST BE REWRITTEN IN THE SAME CHANGE, or the tree ships a control its own docstring forbids.** `pki.py:141-143` records that the returned key is unencrypted PKCS#8 and that a self-signed certificate *"has no chain of trust and must never front production PHI"*; `__main__.py:578`, `:3642`, `:3677` and `:3689` repeat the restriction in the CLI help, the docstring, the JSON note and the console note. **The owner has authorised the override (2026-08-16).** The honest replacement text is that an untrusted certificate is strictly better than cleartext and strictly worse than an operator-supplied chain, so the generated pair is a **placeholder to be replaced**, not an endorsed production terminator.
 > **WHAT AN OPERATOR NOTICES, and half of it is unpleasant.** A browser reaching the console gets a full-page trust interstitial until the certificate is imported into Local Computer / Trusted Root ([`docs/TRAY.md:133`](TRAY.md) already documents that import). More importantly, **the first-party clients infer the scheme from CONFIGURATION, not from the socket**: the tray reads `[api].tls_cert_file` out of the service TOML to choose `http` or `https` ([`messagefoundry/tray/config.py:207-219`](../messagefoundry/tray/config.py)). A generated certificate that does not surface through that key would leave the tray, the harness, `apiclient` and the IDE dialling `http` at an `https` listener.
 > **SCOPE, AND THE PART DELIBERATELY OUTSIDE IT.** [ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md) sec. *"Deferred (considered, not built): auto-TLS on loopback"* sized the whole move as **XL**, precisely because it forces a lockstep client migration across the harness, `apiclient`, the tray and the IDE. **This item is the mint-and-serve half plus whatever minimum makes those four agree on the scheme.** If the client work turns out to be the bulk, split it rather than letting this item quietly become ADR 0143's XL.
+> **BUILD STATE, MEASURED ON THE BRANCH AND NOT ON `main` -- so a lane does not rebuild what exists.** *All of it on `claude/builder-1-1245-1276a` at `17c16128` (PR 534), by the builder holding the lane, with controls. `origin/main` carries NONE of it.* **ALREADY BUILT THERE: (a) the superseding ADR.** `docs/adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md` exists on that head and is **x0 on `origin/main`** -- so it is allocated and written. ***NOBODY ALLOCATES A SECOND NUMBER FOR THIS***; two separate dispatch messages told a lane to allocate one, and both were wrong. **(b) Part A**, `api/tls.py:133` mints on first run, and `make_self_signed` has **3 call sites there against `main`'s 2**. **STILL ABSENT: the audited re-mint.** `cert_expiry.py` carries **0** re-mint references against a control of **9** definitions, and `api/tls.py:106-109` is a docstring *admitting* nothing re-mints an expired pair, so day 366 serves a certificate every client rejects. **AND ONE CITATION IN THIS ROW IS OFF BY SIX LINES:** part B's prose is at **`pki.py:227`**, not the cited `221-222`; `:221` is the DEV ONLY line. *Locate by phrase.* **NOT A TARGET, stated so nobody widens the sweep into a breakage:** the XML namespace constants in `wsdl.py` and `soap.py` are `http://` by specification. **Changing them breaks SOAP.**
+> **THE CLIENT-SIDE SCHEME DEFAULTS ARE AT LEAST 14, AND THE FIGURE TRAVELLING IN SESSION MAIL WAS 8.** *Measured 2026-08-23 by the builder holding the lane, on `claude/builder-1-1245-1276a` at `17c16128`, and written here because a count that lives only in mail is re-derived at full cost by the next reader.* A strict `= "http://` predicate over engine-URL defaults -- non-test, XML namespaces excluded with a working control that correctly dropped 13 namespace lines -- returns **11 sites**. **That predicate provably misses at least three more**: list comprehensions at `harness/load/shardcert.py:3383` and `:4453`, and a positional argument at `harness/load/connscale/batchbox.py:200`. **So the number is AT LEAST 14, stated as a floor rather than a total, because the predicate is known to under-count and no exhaustive form of it has been run.** `apiclient/client.py:237` is confirmed as the public constructor default. *Nothing in this row previously carried a count; the 8 was never in the ledger, which is how it stayed unchecked while being quoted.*
 > Verdict: build
 > Closing-act: code
 
@@ -12994,7 +12997,9 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 ## 1310. the collision gate prints a truncated session id bare, and a reader resolves it as a commit sha
 
-> 🔢 **Filed 2026-08-22 by the lander. Found by the Builder 1 seat, who chased the value into the git object store TWICE and twice reported the gate's warning unresolvable.** Value **4/10** -- Difficulty **1/10** -- _quick win_. `collision_gate.ps1` names the blocking session by an **8-hex-character token, printed bare with no label**, inside a git-centric diagnostic. Every reader resolves that shape as a short commit sha. It is a truncated session id and resolves to nothing.
+> ✅ **SHIPPED 2026-08-23 -- every emitted hex token is labelled, and a TEST now proves it.** *Found by the Builder 1 seat, who chased the value into the git object store TWICE and twice reported the gate's warning unresolvable. Filed 2026-08-22 by the lander.*
+> **THIS IS [#1098](#1098) RECURRING, and that row is corrected in the same commit.** #1098 shipped 2026-08-10 claiming the id was labelled *"in every row"*. It was not: `collision_gate.ps1:230`, `collision_gate.ps1:243` and `overlap.ps1:319` were left bare. **Its own reasoning carried the escape hatch** -- *"every other test of these two scripts reads `-Json`, where the field is called `Short` and no ambiguity is possible"* -- which is **false for a `-Json` CONSUMER that re-renders the value into prose**. The sweep scoped itself to PRODUCERS. That is the SDS-3.6 completeness liability, and it cost four seats a chase each.
+> **THE CLOSING INSTRUMENT IS THE TEST, NOT THIS ITEM'S OWN STATED CHECK.** #1310 proposed `grep -c 'session=' scripts/hooks/collision_gate.ps1`. That answers *"does this file contain the string `session=`"*; the question is *"is every emitted hex token labelled"*. **The shipped check drives the real gate** and scans the emitted text for any 7-to-40 character lowercase-hex token not introduced by the word `session`, **with a hand-written positive control proving the scanner sees the token that was actually misread**. *The grep was measured at 3 on 2026-08-23, every hit a comment line -- writing the claim expired it.* Value **4/10** -- Difficulty **1/10** -- _quick win_. `collision_gate.ps1` names the blocking session by an **8-hex-character token, printed bare with no label**, inside a git-centric diagnostic. Every reader resolves that shape as a short commit sha. It is a truncated session id and resolves to nothing.
 > **THE MECHANISM, three sites, verified in the source rather than inferred:**
 > ```
 > scripts/coord/occupancy.ps1:251   Short = $sid.Substring(0, [Math]::Min(8, $sid.Length))
@@ -13647,4 +13652,64 @@ intake loss      engine_read 35 below confirmed sent 36 -- one message lost on i
 **NOT MEASURED, DO NOT INFER:** whether the two assertions share a root cause -- nothing here shows it either way. Neither failure was reproduced locally; both figures are read off CI. The three-PR count is the lander's observation across one evening and is not a rate.
 
 **Source:** surfaced by the LANDER while attributing reds on #529 and #530; the six-assertion count and the required-context arithmetic are the DISPATCHER's, whose handoff routed the content here for filing.
+## 1324. Promote Verdict/Research/Closing-act into the banner block parse_items reads
+
+> 🔢 **Re-scored 2026-08-22.** Filed by the workflow-analysis seat. **Priority:** P2. **Verdict:** build
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** ledger tooling. **This item carries the three fields itself, as the worked example the
+migration should copy.** The inline `**Verdict:** build` above is the OLD form, kept so the script
+that promotes it has a case with both spellings present.
+
+**The defect, measured 2026-08-22.** 304 of 330 open items declare a `**Verdict:**`, and **zero of
+them are inside the banner blockquote**, which is the only region `scripts/docs/backlog_status_check.py`
+`parse_items` reads (it stops at the first line that is neither blank nor a blockquote). So the
+field every item already carries is invisible to every tool that reads this ledger. It is written
+inline beside Priority -- `**Priority:** P2. **Verdict:** build` -- and the distribution is real:
+roughly 158 build, 94 research, 41 demand-gate.
+
+**Why it matters, with the incident.** On 2026-08-21 thirty items were dispatched overnight to two
+builder lanes. Nine product-code commits landed and reached `main`; **zero items closed.** Every
+item in the assigned range carried `Verdict: research`, and across 330 closed items **145 carry
+`Verdict: build` and zero carry `Verdict: research`** -- that verdict has never closed, because its
+closing act is a re-score in the vault scorecard, which is gitignored from every engine checkout.
+`DISPATCHER.md:330` predicted it before the wave: *"a builder can finish the research, the code and
+the tests and still be unable to close the item."* The information needed to see that was already
+on 304 items and no tool could reach it.
+
+**The build.** Promote three lines into each item's banner blockquote:
+
+```
+> Verdict: build | research | demand-gate | owner-ruling
+> Research: none | done <date>
+> Closing-act: code | scorecard-rescore | owner-ruling | banner-only
+```
+
+`parse_items` already reads them (`Item.fields`, shipped in PR #526) and
+`scripts/coord/dispatch_gate.py` already consumes them. **Only the ledger data is missing.**
+
+**Do it with a script, not by hand.** 330 items times three lines is not a hand edit, and the
+existing inline `**Verdict:**` makes the first field mechanical. `Research` is derivable from the
+presence of a dated research pass. `Closing-act` is NOT mechanical for every item and that is the
+real work -- a wrong closing act is worse than an absent one, because it names the wrong seat.
+
+**Two things a builder must not get wrong here.**
+
+1. **A closing act is TWO acts with two owners.** The work act and the banner flip are separate:
+   `BUILDER.md:253` forbids a builder concluding an item closed, `:148` gives the banner to the
+   Lander. The re-score lands in a vault file invisible from an engine checkout, so the seat that
+   must flip the banner cannot see the first act happened. Name both, or the field tells a reader
+   the item finishes somewhere it does not.
+2. **The gate ADVISES, it does not refuse.** An earlier version refused any closing act a builder
+   could not perform, which would have blocked #1112, #1171 and #1187 -- all of which reached
+   `main`, #1171 being the SMTP credential-exposure fix. Cannot close is not cannot be worked.
+   Corrected in `f3491468`; do not reintroduce the refusal.
+
+**Contention warning.** `docs/BACKLOG.md` took 163 commits in 36 hours across seven seats. A
+330-item rewrite needs a quiet window or it will collide. Land the script first, run it second.
+
+**Expiry:** this stops being right if `parse_items` starts reading below the banner block, or if
+the three field names change. Check `_FIELD_KEYS` in `scripts/docs/backlog_status_check.py`.
 
