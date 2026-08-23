@@ -1230,6 +1230,32 @@ def _find_service_toml(config_dir: str | Path) -> Path | None:
     return None
 
 
+def _refused_settings(name: str, exc: Exception, *, required: bool) -> CheckResult:
+    """A config that EXISTS and will not load is a FAILURE, never a skip (BACKLOG #1320).
+
+    ABSENT and PRESENT-BUT-REFUSED are two states with opposite remedies, and the ``except`` clause
+    the callers share used to render them identically. So ``messagefoundry check`` LOADED a refused
+    config, RECEIVED the exact refusal, PRINTED it, and returned ``rc=0`` as a skip -- no config
+    error of this class had ever been failable, in the commit gate or in CI.
+
+    THE ABSENT ARM IS ALREADY HANDLED ABOVE EVERY CALLER, and that is what makes this unconditional
+    rather than a second presence check. Each caller resolves ``toml`` to ``Path | None`` through
+    ``is_file()`` and returns a ``"no messagefoundry.toml"`` skip while it is ``None``, so reaching
+    here means the file is present and the loader refused what it found. A missing config still
+    skips, at that guard, untouched.
+
+    ``required`` stays the caller's own policy and is NOT normalised here: ``alert-smtp-tls`` is
+    ``required=False`` by design, so it reports the failure without blocking the gate, exactly as it
+    reported the skip before.
+
+    THE REASON WAS NEVER THE MISSING HALF -- ``detail`` already carried the loader's own message, and
+    the capture in the item shows it printed. Only the exit code discarded it, so only the exit code
+    changes here. ``skipped`` is dropped rather than set False so ``blocking`` (``required and not ok
+    and not skipped``) can see it.
+    """
+    return CheckResult(name, ok=False, required=required, detail=f"settings did not load: {exc}")
+
+
 def _check_posture(
     config_dir: str | Path,
     *,
@@ -1267,9 +1293,7 @@ def _check_posture(
     try:
         settings = load_settings(config_path=toml)
     except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
-        return CheckResult(
-            "posture", ok=True, required=True, skipped=True, detail=f"settings did not load: {exc}"
-        )
+        return _refused_settings("posture", exc, required=True)
 
     if settings.ai.environment is None:
         # No active environment is a serve-time error of its own; don't conflate it with posture.
@@ -1355,13 +1379,7 @@ def _check_build(
     try:
         settings = load_settings(config_path=toml, cli=cli)
     except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
-        return CheckResult(
-            "build-check",
-            ok=True,
-            required=True,
-            skipped=True,
-            detail=f"settings did not load: {exc}",
-        )
+        return _refused_settings("build-check", exc, required=True)
     try:
         registry = load_config(config_dir)
     except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
@@ -1455,13 +1473,7 @@ def _check_alert_smtp_tls(
     try:
         settings = load_settings(config_path=toml)
     except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
-        return CheckResult(
-            "alert-smtp-tls",
-            ok=True,
-            required=False,
-            skipped=True,
-            detail=f"settings did not load: {exc}",
-        )
+        return _refused_settings("alert-smtp-tls", exc, required=False)
     alerts = settings.alerts
     if not (alerts.email_smtp_host and alerts.email_from):
         return CheckResult(
@@ -1702,13 +1714,7 @@ def _check_reference_backend(
     try:
         settings = load_settings(config_path=toml)
     except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
-        return CheckResult(
-            "reference-backend",
-            ok=True,
-            required=True,
-            skipped=True,
-            detail=f"settings did not load: {exc}",
-        )
+        return _refused_settings("reference-backend", exc, required=True)
     try:
         registry = load_config(config_dir)
     except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
