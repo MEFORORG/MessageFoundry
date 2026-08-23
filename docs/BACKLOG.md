@@ -14181,6 +14181,9 @@ which both readings of the cell now require.
 > Verdict: build
 > Closing-act: code
 
+***BUILT 2026-08-23 AT `d4c96f14`, branch `claude/builder-2-1318-checks-falsegreen`, off current main -- PR 551.*** **The scaffold half and the loader half are one coherent commit; code and tests were NOT split.**
+*Verified by running, not by assuming: the previously-passing sites now report `ok=False`, the **four legitimate absent-file skips survive**, 10 tests pass, `mypy --strict` clean, `ruff` clean.* ***MUTATION: reverting the posture site ALONE turns the test red, then restores to 10 pass*** -- *which confirms the test's own docstring claim that an rc-only assertion stayed green when a single site regressed.* **The claim was confirmed rather than quoted.**
+
 **Cluster:** Onboarding / configuration. **Priority:** P1. **Verdict:** build.
 **Severity:** no exposure. **On first deployment**, an adopter running `messagefoundry init` then `messagefoundry serve` would hit a load failure with no working config, on their first two commands.
 
@@ -14215,6 +14218,10 @@ this fix is larger than this item and independently true.***
 > 🔢 **Filed 2026-08-22 - not started.** Value **9/10** · Difficulty **3/10** · _quick win_. **The commit and CI gate LOADS a refused config, RECEIVES the exact refusal, PRINTS it, and returns rc=0 as a SKIP.** Value 9 because it is not one bug -- no config error of this class has ever been failable; difficulty 3 because the fix is to distinguish two states the `except` clause currently merges.
 > Verdict: build
 > Closing-act: code
+
+***BUILT 2026-08-23 AT `d4c96f14` alongside `#1318` -- PR 551.*** **The `except` clause now distinguishes the two states it merged: an ABSENT file is the legitimate skip and is handled earlier, so reaching the handler means the file EXISTS and the loader refused it.**
+***THE SCOPE IS WIDER THAN THIS ROW STATES AND THE COUNT IS DELIBERATELY OPEN-ENDED: AT LEAST FOUR SITES, THREE OF THEM `required=True`.*** *Found by scanning for the detail string `settings did not load`.* **A second scan by CLASS -- any except-handler returning `ok=True` -- surfaces a second string, `config did not load`, at two further `required=True` sites.** *One of those states its reason verbatim and is deliberate; **the other carries the same shape with NO stated reason and is unresolved.*** ***That limb is NOT filed as a number and is named as a subject instead, because whether it is a defect or an undocumented instance of the justified case cannot be settled without establishing what `validate` blocks -- and nobody should guess on a required check.***
+**The enumeration is the hazard here.** *`four` was written where `at least four` was available, twice, at two different levels -- **once from the string the report was phrased in, once inherited from it.*** *Prefer `at least`.*
 
 **Cluster:** Tooling / gates. **Priority:** P1. **Verdict:** build.
 **Severity:** no exposure. **On first deployment**, and in CI today, a service config that cannot load would pass `messagefoundry check` rather than failing it.
