@@ -158,19 +158,52 @@ def test_field_parsing_did_not_break_status_parsing(parser: ModuleType) -> None:
     assert item.fields["closing-act"] == "code"
 
 
+# THESE TWO POINTED AT A REAL ITEM NUMBER IN THE LIVE LEDGER, AND THE LEDGER MOVED UNDER THEM.
+# Measured 2026-08-23 while landing this branch: the item they used carried no `Closing-act` at this
+# branch's base and carries one on `main`, because somebody declared it in between. The refuse test
+# then failed -- and the DEFAULT test above it kept PASSING FOR THE WRONG REASON, asserting exit 0
+# against an item that no longer had the property under test. A green that survives the loss of its
+# own subject is worse than the red beside it.
+#
+# The subject is "an item whose state nobody has declared", so the fixture must OWN that property
+# rather than borrow it from a file other people edit.
+# PADDED PAST THE GATE'S OWN INSTRUMENT-ERROR FLOOR, which is 50 items. A one-item fixture is
+# REFUSED as an unresolved ledger -- and the refuse test then passes on the instrument error rather
+# than on the refusal, which is the same wrong-reason green this whole change exists to remove.
+_FILLER = "".join(
+    f"## {n}. filler\n{_OPEN}\n> Closing-act: code\n\nbody\n" for n in range(999900, 999960)
+)
+_UNDECLARED = _FILLER + f"## 999998. an item whose state nobody has declared\n{_OPEN}\n\nbody\n"
+
+
+def _ledger_root(tmp_path: Path, body: str) -> Path:
+    """A throwaway repo root whose ledger contains exactly the item under test."""
+    (tmp_path / "docs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "docs" / "BACKLOG.md").write_text(body, encoding="utf-8")
+    return tmp_path
+
+
 def test_an_undeclared_item_does_not_block_by_default(
-    gate: ModuleType, capsys: pytest.CaptureFixture[str]
+    gate: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Exit 0 without --refuse. A dispatch names closing acts; it does not withhold permission."""
-    assert gate.main(["1108", "--root", str(_ROOT)]) == 0
-    assert "NAMING, NOT REFUSING" in capsys.readouterr().out
+    root = _ledger_root(tmp_path, _UNDECLARED)
+    assert gate.main(["999998", "--root", str(root)]) == 0
+    out = capsys.readouterr().out
+    assert "NAMING, NOT REFUSING" in out
+    # AND ASSERT THE SUBJECT, not just the banner. "NAMING, NOT REFUSING" is printed on EVERY run,
+    # so on its own it survives the item becoming declared and this test would pass having tested
+    # nothing. Measured with a negative control: give the fixture item a Closing-act and the two
+    # assertions above BOTH still hold. Only this one falls.
+    assert "declares no Closing-act" in out
 
 
 def test_refuse_flag_makes_an_undeclared_item_blocking(
-    gate: ModuleType, capsys: pytest.CaptureFixture[str]
+    gate: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The strict behaviour survives, opt-in, for a wave planned specifically to close items."""
-    assert gate.main(["1108", "--root", str(_ROOT), "--refuse"]) == 1
+    root = _ledger_root(tmp_path, _UNDECLARED)
+    assert gate.main(["999998", "--root", str(root), "--refuse"]) == 1
 
 
 def test_a_ledger_that_did_not_parse_refuses_to_report(
