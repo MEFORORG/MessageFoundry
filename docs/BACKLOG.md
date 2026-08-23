@@ -12411,6 +12411,44 @@ re-score, **not** a reason to build the version that cannot fire.
 
 **Provenance.** Measured independently by three seats on 2026-08-14; counts come from delivered mail files, so every figure here is a **floor**. Numbers are inlined deliberately: the working lived under `mefor-coord/handoffs/`, which is never committed, and an item citing an uncommitted path resolves to nothing.
 
+
+***AMENDMENT 2026-08-23. THIS ROW'S MOST LIKELY ROOT CAUSE WAS FOUND AND FIXED THE SAME DAY THE ROW WAS
+FILED, AND THE ROW DOES NOT CITE IT. RE-MEASURE BEFORE INSTRUMENTING ANYTHING.***
+
+**`40150e04`, 2026-08-14** -- *"broadcasts addressed the roster's DISPLAY LABEL, not the recipient's
+path"*. **Verified an ancestor of `origin/main`.** Its own comment in the broadcast path records that
+hashing a bare label produced a key sitting beside the real one -- **same visible name, different key,
+and no reader ever drains it** -- with **40 messages stranded across 10 such boxes**, including a
+broadcast to every seat that nobody received. ***"An `ls` of box/ looks entirely CORRECT, which is
+exactly why it survived."***
+
+***AND THE ASYMMETRY IS THIS ROW'S SIGNATURE, LINE FOR LINE:*** the single-recipient branch never
+carried the bug because it resolves the path, **so DIRECT SENDS WORKED WHILE BROADCASTS VANISHED and the
+channel appeared to be up.** *That is exactly a firing that reaches one recipient with a median near
+two* -- **the quantisation this row measures and explicitly says its census CANNOT NAME THE CAUSE OF.**
+
+**THE UNRESOLVED FACT, AND IT DECIDES THE ITEM: this row was FILED 2026-08-14 and the fix landed
+2026-08-14.** ***Nothing in the row's text says whether its census window falls BEFORE or AFTER that
+commit*** -- and that single fact decides whether this item is **already closed** or describes a
+**second, distinct fault.**
+
+***SO: RE-MEASURE FIRST, INSTRUMENT SECOND.*** Re-run this row's own census over mail files created
+**after** the fix. *If the median is healthy, the row closes on MEASUREMENT rather than argument. If it
+is still quantised, the send-side instrumentation is justified with the box-key fix ruled out.*
+
+**THE CORPUS MAKES THIS CHEAP:** 33,079 mail files newer than 2026-08-14 against 114 older. *(File
+mtimes shift when files move between directories, so treat the 114 as a lead about sample size, not a
+finding.)*
+
+***WHY THIS ORDER AND NOT THE OTHER: A CLEAN RESULT FROM AN INSTRUMENT POINTED AT A FIXED BUG IS THE
+MOST MISLEADING ARTIFACT AVAILABLE.*** It reads as *"the defect is gone"* rather than *"I measured the
+wrong thing"*, **and nothing in the output distinguishes them.**
+
+**AND ONE SENTENCE MUST COME OUT OF THIS ROW:** the difficulty note claiming the remainder *"must be
+done against files that are not tracked in this repository"* is **FALSE**. The fanout is
+`scripts/coord/mail.ps1:352`, the `-To all` branch, in this repository. ***A lane nearly handed this
+item back on that sentence*** -- **a difficulty note that would cause a correct handback is worse than a
+wrong difficulty score.**
 ## 1265. the warning sign is unsanctioned decoration in 496 places across 80 files
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **4/10** · _fill-in_. Re-censused at HEAD with the ledger counts as the positive control the item demands: 499 occurrences across 81 files, with docs/BACKLOG.md at 121 and BACKLOG-CLOSED.md at 93 both reproducing, so nothing has been swept and the population has drifted up from the filed 496 across 80. Value 4 because nothing is mis-parsed and no behaviour depends on it, leaving a real but consequence-free vocabulary defect; difficulty 4 because each site needs an editorial replacement word rather than a mechanical substitution, the two ledger files must be sliced last to protect the status alphabet backlog_status_check.py genuinely parses, and whether retired ADRs are rewritten at all is still an open decision. _(was 4/10 · 4/10.)_
