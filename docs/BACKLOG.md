@@ -11395,9 +11395,13 @@ only check that reads the CODE, and it is the one that decides startability.***
 > **How to prove a fix:** lock the sole administrator, then recover **without** editing the database by hand and **without** an already-authenticated second admin -- and assert the recovery path is itself gated, since an unlock affordance is a control an attacker wants. A fix that only lengthens the docs, or that opens an ungated reset, fails on opposite sides.
 
 ***RE-CORRECTED 2026-08-23, SAME HOUR. `admin-unlock` DOES SHIP, AND AN EARLIER CORRECTION IN THIS ROW
-CLAIMING OTHERWISE WAS ITSELF WRONG.*** *Verified repo-wide with both controls firing:* **`__main__.py:603`
+CLAIMING OTHERWISE WAS ITSELF WRONG.*** *Verified repo-wide with both controls firing:* **`__main__.py:604`
 registers the `admin-unlock` subcommand with `--username`, `--db` and `--json`; `:3962` clears the lock via
-`record_login_failure(user.id, failed_attempts=0, locked_until=None)`; `:3964` audits `auth.admin_unlocked`.**
+`record_login_failure(user.id, failed_attempts=0, locked_until=None)`; `:3964` audits `auth.admin_unlocked`;
+and `:5091` is the DISPATCH-TABLE ENTRY `"admin-unlock": _admin_unlock` -- **the line that makes the
+subcommand reachable at all**.** *Four sites, not three; an earlier draft of this paragraph said `:603`
+and named three. **Both were corrected by an independent repo-wide re-derivation, because a line number
+in a ledger row gets followed.***
 *`3ab27755` added 92 lines to `__main__.py`.*
 
 ***SO THE ON-DEMAND AFFORDANCE ALREADY EXISTS AND NEEDS NO BUILD.*** **What remains is narrower:** *a
