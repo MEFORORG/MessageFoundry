@@ -15456,3 +15456,43 @@ apply" are different facts, and it took the second reading to find this.*
 
 **Expiry:** this stops being right if the prefix list is replaced by a type test, or if executable files
 are removed from documentation directories.
+
+## 1346. The vault claim gate reads a registry that does not exist there, so it can never pass
+
+> 🔢 **Filed 2026-08-23 - not started.** `claim.ps1` writes to the ENGINE's claim registry. The vault's installed `claim_check.py` reads the VAULT's -- **which does not exist.** ***So no code-touching vault commit whose SUBJECT cites a ledger number can EVER pass, however honestly the item is held.*** Running the claim tool from a vault worktree REFRESHES the engine record rather than creating a vault one.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / gate integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no product axis (sec. 0). **The cost is a gate that cannot be satisfied, which is the state
+that manufactures evasion.**
+
+***THIS IS THE THIRD DISTINCT DEFECT IN ONE GATE AND THEY COMPOSE BADLY.*** One row records that it has
+no handoff state; another that it decides documentation by path prefix, so executable code under a
+documentation directory escapes it. **This one records that where it DOES apply, it cannot be
+satisfied.** ***Same gate, opposite blindnesses, and together they mean it is unpassable exactly where it
+bites.***
+
+**FOUND BECAUSE THE GATE FIRED CORRECTLY.** A vault commit touching a real code path is not under a
+documentation prefix, so unlike the earlier case the gate saw actual code and refused -- **and refusing
+was right.** *The defect is that no honest action clears the refusal.*
+
+***THE ONLY ROUTE THROUGH TODAY IS TO CITE THE ITEM IN THE COMMIT BODY***, which the gate permits by
+design -- it reads the subject only, and its docstring says a body may cite other items freely.
+
+***AND THAT MUST NOT BE READ AS THE SAME ACT AS A PREVIOUSLY RECORDED EVASION.*** A sibling row notes a
+lane moving a token into the body in 2026-08-06 to get past this gate. ***THERE, CLAIMING PROPERLY WAS
+POSSIBLE AND THE BODY WAS A WAY AROUND A PASSABLE GATE. HERE IT IS THE ONLY ROUTE THROUGH AN UNPASSABLE
+ONE.*** *The distinction is whether a correct alternative existed, and it did not.*
+
+**THE BUILD IS A DESIGN CALL, NOT A PATCH:** either the vault's gate reads the registry the claim tool
+actually writes, or the claim tool writes a vault-local registry. ***Both repositories claiming into one
+registry and both gates reading their own is the state that produced this.***
+
+**Two controls, and NEITHER IS ACHIEVABLE TODAY, which is itself the finding:** a claim held by the
+committing worktree that MUST pass, and one held elsewhere that MUST fail. *A gate that cannot
+demonstrate its own pass arm has never been shown to have one.*
+
+**Expiry:** this stops being right if the two registries are unified, or if the vault stops installing
+the gate.
