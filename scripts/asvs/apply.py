@@ -205,6 +205,15 @@ def main(argv: list[str] | None = None) -> int:
         help="write. Omitted, the run is a dry run and the file is not touched.",
     )
     ap.add_argument(
+        "--allow-retirement",
+        action="store_true",
+        help=(
+            "permit an evidence/absence list to SHRINK, but ONLY where the payload DECLARES the "
+            "retirement. Refused by default: a silent cardinality drop is what this guard exists "
+            "to stop, and the flag alone is not enough -- see retired_evidence / retired_absence."
+        ),
+    )
+    ap.add_argument(
         "--allow-verdict-change",
         action="store_true",
         help=(
@@ -215,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = ap.parse_args(argv)
     allow_verdict_change = args.allow_verdict_change
+    allow_retirement = args.allow_retirement
     SCORECARD = args.scorecard
     payload = json.loads(args.payload.read_text(encoding="utf-8"))
     dry = not args.apply
@@ -392,12 +402,46 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
         for sub in ("evidence", "absence"):
-            if len(now.get(sub, [])) < len(was.get(sub, [])):
+            before, after = len(was.get(sub, [])), len(now.get(sub, []))
+            if after < before:
+                # RETIREMENT IS A SANCTIONED OUTCOME THIS WRITER COULD NOT EXPRESS (BACKLOG #1307).
+                # One of the tracking loop's four causes for an anchor that no longer resolves is
+                # "the gap it certified was CLOSED, so retire it" -- the case where the engine got
+                # BETTER and the fix deleted the line the anchor quoted. Before this the only ways
+                # out were leaving a stale anchor in place or reaching for the unsafe writer.
+                #
+                # THE FLAG ALONE DELIBERATELY DOES NOT UNLOCK IT. A bare --allow-retirement would
+                # be a blanket bypass, and this guard exists because a truncating repair once cut
+                # one cell 15 -> 10 and another 17 -> 1 WITH THE VERIFIER GREEN THROUGHOUT. So the
+                # payload must DECLARE the retirement AND the arithmetic must agree: declare one
+                # and drop two and this still refuses. The declaration is what keeps the refusal
+                # answerable instead of turning the guard into a speed bump.
+                declared = c.get(f"retired_{sub}") or []
+                if not allow_retirement:
+                    print(
+                        f"REFUSING: cell {c['id']} {sub} count would DROP {before} -> {after}. "
+                        f"If this is a RETIREMENT, declare it in the payload as "
+                        f"'retired_{sub}' and re-run with --allow-retirement"
+                    )
+                    return 1
+                if not declared:
+                    print(
+                        f"REFUSING: cell {c['id']} {sub} would DROP {before} -> {after} and "
+                        f"--allow-retirement was given, but the payload declares no "
+                        f"'retired_{sub}'. The flag permits a DECLARED retirement, not any drop"
+                    )
+                    return 1
+                if before - after != len(declared):
+                    print(
+                        f"REFUSING: cell {c['id']} {sub} declares {len(declared)} retirement(s) "
+                        f"but the count drops by {before - after} ({before} -> {after}). The "
+                        f"declaration must account for every removed entry"
+                    )
+                    return 1
                 print(
-                    f"REFUSING: cell {c['id']} {sub} count would DROP "
-                    f"{len(was.get(sub, []))} -> {len(now.get(sub, []))}"
+                    f"RETIRING: cell {c['id']} {sub} {before} -> {after}, declared: "
+                    f"{', '.join(str(d) for d in declared)}"
                 )
-                return 1
             # ...and the same question one level down (#1242 limb 4). Counting ENTRIES cannot see a
             # FIELD vanish from inside one, so a sub-table entry could be rewritten with fewer keys
             # while the count matched and this invariant reported green -- exactly the state the
