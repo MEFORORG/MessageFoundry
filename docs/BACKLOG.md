@@ -13963,7 +13963,7 @@ heredoc bodies gain their own segment kind.
 
 ## 1333. Legacy glyphs freeze security-record cells against correction, while the repair path skips the same check
 
-> 🔢 **Filed 2026-08-23 - not started.** 20 of 345 cells carry a banned glyph in prose written BEFORE the gate that now bans it, so each is frozen against every residual correction, by anyone, until the glyphs are removed. The same check is SKIPPED on the repair path, so the record is fully repairable and only partly correctable.
+> 🔢 **Filed 2026-08-23 - not started.** Cells carry a banned glyph in prose written BEFORE the gate that now bans it, so each is frozen against every residual correction, by anyone, until the glyphs are removed. The same check is SKIPPED on the repair path, so the record is fully repairable and only partly correctable.
 > Verdict: build
 > Research: none
 > Closing-act: code
@@ -13971,8 +13971,8 @@ heredoc bodies gain their own segment kind.
 **VERDICT CORRECTED 2026-08-23, from `owner-ruling` to `build`, and the reason is a measurement rather
 than a reconsideration.** This row was filed expecting the glyphs to be spread across prose fields,
 which would have made the strip a migration across a security record and genuinely somebody's decision.
-**Measured afterwards: all 181 are in ONE field, zero elsewhere**, and the writer reads only that
-field -- so a strip touching it alone unfreezes every affected cell. **Twenty cells, one field each, no
+**Measured afterwards: every occurrence sits in ONE field, none elsewhere**, and the writer reads only that
+field -- so a strip touching it alone unfreezes every affected cell. **One field per affected cell, no
 verdict moves, no anchors touched.**
 
 ***AND THE DECIDING ARGUMENT IS THAT NO NEW RULING IS NEEDED: CLAUDE.md section 11 ALREADY BANS THESE
@@ -13986,26 +13986,25 @@ maintenance of the record, owned by the seat that owns the record.
 **Severity:** no deployment axis. **Conditional, per section 0:** zero deployments; this blocks
 maintenance of a security record, not any running thing.
 
-**Measured, 181 occurrences across 20 of 345 cells.** `apply.py` refuses any payload whose prose
+**Measured against the live record.** `apply.py` refuses any payload whose prose
 carries one ([`scripts/asvs/apply.py:281`](../scripts/asvs/apply.py)), against a `_BANNED` class
 covering the banner alphabet and the emoji planes. The glyphs predate that gate.
 
 ***THE ASYMMETRY IS THE INTERESTING HALF, AND IT IS WHY THIS WENT UNNOTICED.*** The check is skipped
 entirely on a repair pass -- `blob = "" if anchor_repair else ...` -- confirmed empirically by an
-11-anchor repair landing cleanly on a cell carrying 17 glyphs. **So bookkeeping passes work and
+anchor repair landing cleanly on a cell that carries several. **So bookkeeping passes work and
 assessment corrections do not, which is exactly backwards from which one matters.**
 
 **THE PER-FIELD SPLIT IS MEASURED, AND THE GUESS THIS ROW FIRST CARRIED IS REFUTED.** The gate reads
 `residual` and no other prose field: `blob = "" if anchor_repair else " ".join(...)` at
 [`scripts/asvs/apply.py:280`](../scripts/asvs/apply.py), a `" ".join` over a ONE-ELEMENT tuple. This
-row originally guessed the 181 occurrences were spread across fields, so that the freezing subset
-would be smaller than 181. **Measured: ALL 181 ARE IN `residual`, and ZERO are in any other string
-field on any cell.** The freezing subset is the full 20 cells and 181 occurrences. **The count does
-not shrink.**
+row originally guessed the occurrences were spread across fields, so that the freezing subset would
+be smaller than the raw count. **Measured: EVERY OCCURRENCE IS IN `residual`, and NONE is in any other
+string field on any cell.** The freezing subset is every affected cell. **It does not shrink.**
 
 ***THE ACTIONABLE HALF SURVIVES, AND IT IS THE HALF THAT SIZES THE WORK: A STRIP TOUCHING `residual`
-ALONE UNFREEZES EVERY CELL.*** No other field needs opening, so this is **20 cells, one field each**
-rather than a migration across the record.
+ALONE UNFREEZES EVERY CELL.*** No other field needs opening, so this is **one field per affected
+cell** rather than a migration across the record.
 
 **A `" ".join` OVER ONE ELEMENT READS AS EXTENSIBLE AND IS NOT.** Anyone widening the check to further
 prose fields has to notice the tuple, or the widening looks done and changes nothing.
