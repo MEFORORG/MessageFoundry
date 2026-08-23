@@ -1078,6 +1078,54 @@ def test_crypto_roots_carry_no_unrecorded_call_site() -> None:
     assert outside == _CRYPTO_SITES_OUTSIDE_THE_PACKAGE
 
 
+def test_the_crypto_seam_set_is_not_confined_to_one_package() -> None:
+    """A single-package seam set is blind BY CONSTRUCTION to seams anywhere else (BACKLOG #1323).
+
+    Before this pin, all five first-party seams were ``messagefoundry.store.*``, so no import made by
+    a first-party TLS seam in another package could trigger a review — and a required, merge-blocking
+    gate reported the same green whether that surface was sound or not.
+
+    This asserts the SHAPE rather than a membership list, so it keeps biting as seams are added: a
+    future narrowing back to one package reds it without anyone having to remember why.
+    """
+    gate = _crypto_gate_module()
+    first_party = {s for s in gate.CRYPTO_SEAM_MODULES if s.startswith("messagefoundry.")}
+    assert first_party, "no first-party seams at all — CRYPTO_SEAM_MODULES parse drifted"
+    packages = {s.split(".")[1] for s in first_party}
+    assert len(packages) > 1, (
+        "every first-party crypto seam lives under messagefoundry."
+        f"{next(iter(packages))}, so the gate cannot see a delegated-crypto seam in any other "
+        f"package: {sorted(first_party)}"
+    )
+
+
+def test_the_alert_smtp_tls_seam_is_visible_to_the_gate() -> None:
+    """BACKLOG #1323's worked example, pinned so the widening cannot silently revert.
+
+    ``pipeline/alert_sinks.py`` imports ``smtplib`` and ``config.tls_policy`` and none of the six
+    stdlib crypto modules. MEASURED before the fix: the gate reported GREEN over 64 sites with this
+    file INVISIBLE — not undocumented, UNSEEN, which is the state a green cannot report. Adding the
+    TLS-policy seam made it and ten siblings visible, taking the gate to 75 sites, still green.
+
+    Asserts BOTH limbs on purpose: discovered (the gate can see it) and inventoried (it is accounted
+    for). Either alone can hold while the other fails, and they fail for opposite reasons.
+    """
+    gate = _crypto_gate_module()
+    discovered: dict[str, frozenset[str]] = {}
+    for root in _CRYPTO_ROOTS:
+        discovered |= gate.discover(root)
+
+    target = "messagefoundry/pipeline/alert_sinks.py"
+    assert (_REPO / target).is_file(), f"{target} has moved — re-derive this pin from the symbol"
+    assert target in discovered, (
+        f"{target} is a first-party TLS seam the crypto gate cannot SEE. It imports smtplib and "
+        "messagefoundry.config.tls_policy but no stdlib crypto module, so it is only reachable "
+        "through the seam set — check that messagefoundry.config.tls_policy is still in "
+        "CRYPTO_SEAM_MODULES."
+    )
+    assert target in gate.INVENTORY, f"{target} is seen by the gate but carries no inventory row"
+
+
 def test_crypto_inventory_gate_clean_on_real_tree() -> None:
     # The maintained inventory matches the actual crypto call sites — no drift.
     r = subprocess.run(
