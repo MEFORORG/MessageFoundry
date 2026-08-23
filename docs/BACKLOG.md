@@ -14093,6 +14093,26 @@ would not appear.** The date comparison remains the open work here.
 **Cluster:** Worktree gate / developer guardrail. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0) -- this guard is coordination tooling and is not shipped in the wheel. The cost is that a guard believed to be governing every session is bypassed by an ordinary typo-shaped variation, which is worse than a guard known to be absent.
 
+
+***AMENDMENT 2026-08-23. BLOCKED ON `#1336`, NOT MERELY RELATED TO IT. RETURNED TO THE POOL -- DO NOT
+PICK THIS UP ON THE STRENGTH OF A ONE-LINE-LOOKING FIX.***
+
+**This item needs a POSITION test** -- distinguishing a quoted absolute path used as the PROGRAM from a
+path ARGUMENT that merely ends the same way. ***A POSITION TEST OPERATES ON A LINE.*** But the shared
+scanner hands every rule a **per-line view in which a quoted body's line is indistinguishable from a
+command line**, so a token at the start of a heredoc body sits in "program position" as far as any
+position test can tell.
+
+***THAT IS WHY THIS ROW'S OWN CANDIDATE PRODUCED ELEVEN FALSE-DENY CLASSES***, including a heredoc and a
+commit message: **widening the token match MULTIPLIES a defect that lives one layer below it.**
+
+**AND `#1336` HAS NOW ESTABLISHED THAT THE LAYER BELOW IS NOT CHEAPLY FIXABLE** -- four candidates, four
+green suites, and the fix direction now waits on an owner ruling about whether a shell tokeniser is in
+scope at all.
+
+***SO IF THAT RULING COMES BACK OUT OF SCOPE, THIS ITEM AS FILED IS PROBABLY UNBUILDABLE TOO.*** **Do
+not hold a slot for it; it cannot start.** *The DO-NOT-LAND evidence commits remain reachable on a
+retained evidence branch.*
 ## 1301. a ledger banner citing a commit sha must cite a commit whose subject names the item it sits under
 
 > 🔢 **Filed 2026-08-21 -- not started. ONE EDIT CORRUPTED TWO ITEMS IN OPPOSITE DIRECTIONS AND NO GATE COULD SEE IT, BUT A SHA-TO-ITEM AGREEMENT CHECK WOULD HAVE.** A retirement banner intended for one item was written onto another. The Markdown stayed valid, the item count did not move, the status glyph was untouched, and the misplaced paragraph carried no glyph of its own -- so `parse_items` had no second banner to object to and every ledger gate passed.
@@ -14853,3 +14873,15 @@ does not resolve any of the three.**
 
 **Expiry:** this stops being right if the re-score line is retired as a carrier of verdict, or if the
 banner field becomes the sole declared source by an explicit ruling.
+
+**BUILD DETAIL FOUND WHILE SCREENING WITH THIS ITEM'S OWN RULE: THE RE-SCORE LINE CARRIES TWO DIFFERENT
+KINDS OF RE-SCORE, AND THE CHECK MUST TELL THEM APART.** *`Re-scored ... -> P2`* is a **PRIORITY**
+re-score; *`Re-scored ... -> DEMAND-GATE`* is a **VERDICT** one. **Only the second can contradict the
+banner `Verdict`.**
+
+**A naive matcher reading everything after the arrow will compare a priority against a verdict and
+report a contradiction on every priority re-score in the ledger** -- *a screen that fires on most of the
+corpus, which is the noise failure that gets a gate switched off within a day.*
+
+***THE CONTROL POPULATION ALREADY DEMONSTRATES THE DISTINCTION WORKS:*** the 23 agreements are rows whose
+arrow carries a **verdict** matching the banner, and priority re-scores fall into neither column.
