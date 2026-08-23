@@ -403,3 +403,110 @@ def test_removal_still_succeeds_with_no_claims_directory(fx: Fixture) -> None:
     proc = run(fx, "-Name", "alpha")
     assert proc.returncode == 0, proc.stderr
     assert not fx.is_registered(fx.sibling("alpha"))
+
+
+# --- BACKLOG #1293: allocations a removed worktree owns ------------------------
+#
+# Ownership of a ledger number is a casefolded PATH-STRING comparison against the worktree recorded
+# at allocation time, with no fallback when that directory is gone. So removal BURNS the number:
+# `owns()` returns false for every session forever and any PR that must re-introduce the heading is
+# unlandable by anyone. PR #397 was stranded exactly this way.
+#
+# IT REFUSES RATHER THAN WARNS BECAUSE THERE IS NO POST-HOC FIX. A claim can be released afterwards;
+# an allocation cannot be re-keyed -- ownership is documented non-transferable -- so the removal is
+# the only moment this can be stopped.
+
+
+def _alloc_dir(fx: Fixture, kind: str = "backlog") -> Path:
+    common = _git(fx.primary, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    d = Path(common) / "mefor-coord" / "alloc" / kind
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _write_alloc(fx: Fixture, number: str, worktree: Path | str, kind: str = "backlog") -> Path:
+    f = _alloc_dir(fx, kind) / f"{number}.json"
+    f.write_text(
+        json.dumps(
+            {
+                "number": number,
+                "kind": kind,
+                "title": "t",
+                "branch": "b",
+                "worktree": str(worktree).replace("\\", "/"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return f
+
+
+def _put_on_main(fx: Fixture, body: str) -> None:
+    """Put a docs/BACKLOG.md on origin/main WITHOUT touching the working tree, so the guard's
+    ls-tree/show read is what is exercised rather than a file on disk."""
+    (fx.primary / "docs").mkdir(exist_ok=True)
+    (fx.primary / "docs" / "BACKLOG.md").write_text(body, encoding="utf-8")
+    _git(fx.primary, "add", "docs/BACKLOG.md")
+    _git(fx.primary, "commit", "-qm", "ledger")
+    head = _git(fx.primary, "rev-parse", "HEAD").strip()
+    _git(fx.primary, "update-ref", "refs/remotes/origin/main", head)
+
+
+def test_removal_is_REFUSED_when_the_worktree_owns_an_unlanded_number(fx: Fixture) -> None:
+    wt = fx.add("alpha")
+    _write_alloc(fx, "9101", wt)
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode != 0, "the removal proceeded and burned the number"
+    assert "9101" in proc.stderr, "the refusal does not name the number, so nobody can act on it"
+    assert fx.is_registered(wt), "the worktree was removed despite the refusal"
+
+
+def test_removal_PROCEEDS_when_the_owned_number_is_already_on_main(fx: Fixture) -> None:
+    """THE CONTROL THAT MAKES THE REFUSAL ABOVE MEAN SOMETHING. Without it, a guard that refused
+    unconditionally would pass every other test here and block every removal in the repo."""
+    wt = fx.add("alpha")
+    _write_alloc(fx, "9102", wt)
+    _put_on_main(fx, "# Backlog" + chr(10) * 2 + "## 9102. already landed" + chr(10))
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode == 0, proc.stderr
+    assert not fx.is_registered(wt)
+
+
+def test_an_allocation_owned_by_a_DIFFERENT_worktree_does_not_block(fx: Fixture) -> None:
+    wt = fx.add("alpha")
+    other = fx.add("beta")
+    _write_alloc(fx, "9103", other)
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode == 0, proc.stderr
+    assert not fx.is_registered(wt)
+
+
+def test_an_unreadable_allocation_record_refuses(fx: Fixture) -> None:
+    """CANNOT-TELL COUNTS AS AT-RISK. An unparseable record might name this worktree, and proceeding
+    on that ambiguity is the irreversible direction."""
+    wt = fx.add("alpha")
+    (_alloc_dir(fx) / "9104.json").write_text("{not json", encoding="utf-8")
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode != 0, "removal proceeded past a record it could not read"
+    assert "9104" in proc.stderr
+    assert fx.is_registered(wt)
+
+
+def test_the_override_is_NOT_Force(fx: Fixture) -> None:
+    """-Force means "I accept losing uncommitted changes". It must not also mean "I accept burning a
+    ledger number" -- one consent covering two unrelated risks is how an irreversible one gets given
+    away by accident."""
+    wt = fx.add("alpha")
+    _write_alloc(fx, "9105", wt)
+
+    forced = run(fx, "-Name", "alpha", "-Force")
+    assert forced.returncode != 0, "-Force bypassed the allocation guard"
+    assert fx.is_registered(wt)
+
+    allowed = run(fx, "-Name", "alpha", "-AllowOrphanedAllocations")
+    assert allowed.returncode == 0, allowed.stderr
+    assert not fx.is_registered(wt)

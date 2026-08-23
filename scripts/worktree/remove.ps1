@@ -43,6 +43,12 @@ param(
     [string]$Name,
     [switch]$Force,         # remove even with uncommitted tracked changes
     [switch]$DeleteBranch,  # also delete the local branch
+    # Remove even when this worktree OWNS a ledger number whose item is not yet on origin/main
+    # (BACKLOG #1293). DELIBERATELY NOT -Force: that one means "I accept losing uncommitted changes",
+    # and one consent must not silently cover an unrelated, IRREVERSIBLE risk. A stranded allocation
+    # cannot be re-keyed -- ownership is non-transferable -- so the number is burned and the PR
+    # carrying it is unlandable BY ANYONE.
+    [switch]$AllowOrphanedAllocations,
     # Repo to operate on. Defaults to this script's own checkout -- which is what makes an absolute-
     # path invocation from ANY cwd resolve the checkout that owns the worktree. Tests point it at a
     # fixture so the real logic is what gets exercised.
@@ -69,6 +75,88 @@ $tracked = & git -C $WorktreePath status --porcelain | Where-Object { $_ -notmat
 if ($tracked -and -not $Force) {
     Write-Host ($tracked -join "`n")
     throw "Worktree has uncommitted tracked changes. Commit/push them, or re-run with -Force."
+}
+
+# --- BACKLOG #1293: refuse to strand a ledger number ---------------------------
+#
+# `Checker.owns` (scripts/hooks/ledger_check.py) decides ownership by CASEFOLDED PATH-STRING
+# EQUALITY against the worktree recorded at allocation time. There is no fallback for a recorded
+# worktree that no longer exists, so once this directory is gone `owns()` returns false for EVERY
+# session, forever. The number is burned and any PR that must re-introduce its heading is
+# unlandable by anybody. PR #397 was stranded exactly this way.
+#
+# THE GATE IS NOT WRONG AND THIS DOES NOT WIDEN IT. It fails closed and is behaving correctly; the
+# defect is that there is no route back. Recovery for ALREADY-stranded numbers is an open route
+# decision (three candidates, none obviously right -- see the item). PREVENTION needs no such
+# decision, which is why it is here and the recovery is not.
+#
+# WHY IT REFUSES RATHER THAN WARNS. A claim can be released after the fact; an allocation CANNOT be
+# re-keyed, because ownership is documented non-transferable. There is no post-hoc fix, so the only
+# moment this can be stopped is before the removal.
+#
+# CANNOT-TELL COUNTS AS AT-RISK. An unreadable allocation record might name this worktree, and an
+# unreadable ledger read might hide a heading. Both refuse.
+$allocDirRoot = ''
+$commonDirPre = "$(& git -C $RepoRoot rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
+if ($commonDirPre) { $allocDirRoot = Join-Path $commonDirPre 'mefor-coord/alloc' }
+
+function Test-LedgerNumberOnMain([string]$Kind, [string]$Number) {
+    <# $true on origin/main, $false absent, $null CANNOT TELL (which the caller treats as at-risk).
+
+    `git show` on a missing path prints nothing and can exit 0 through a pipe, so EXISTENCE is
+    probed with ls-tree and only then read -- the trap the fleet hit twice reading role playbooks. #>
+    if ($Kind -eq 'adr') {
+        $listed = & git -C $RepoRoot ls-tree -r --name-only 'origin/main' 'docs/adr/' 2>$null
+        if ($LASTEXITCODE -ne 0) { return $null }
+        $pad = $Number.PadLeft(4, '0')
+        foreach ($n in @($listed)) { if ($n -match "/$pad-") { return $true } }
+        return $false
+    }
+    foreach ($ledger in @('docs/BACKLOG.md', 'docs/archive/backlog/BACKLOG-CLOSED.md')) {
+        $present = & git -C $RepoRoot ls-tree --name-only 'origin/main' $ledger 2>$null
+        if ($LASTEXITCODE -ne 0) { return $null }
+        if (-not $present) { continue }
+        $body = & git -C $RepoRoot show "origin/main:$ledger" 2>$null
+        if ($LASTEXITCODE -ne 0) { return $null }
+        foreach ($ln in @($body)) { if ($ln -match "^##\s+$([regex]::Escape($Number))\.") { return $true } }
+    }
+    return $false
+}
+
+if ($allocDirRoot -and (Test-Path -LiteralPath $allocDirRoot)) {
+    . "$PSScriptRoot\..\coord\occupancy.ps1"
+    $allocTarget = ConvertTo-Norm $WorktreePath
+    $atRisk = @()
+    $allocUnreadable = @()
+    foreach ($f in @(Get-ChildItem -LiteralPath $allocDirRoot -Filter *.json -File -Recurse -EA SilentlyContinue | Sort-Object FullName)) {
+        $a = $null
+        try { $a = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop }
+        catch { $allocUnreadable += $f.Name; continue }
+        if ((ConvertTo-Norm ([string]$a.worktree)) -ne $allocTarget) { continue }
+        $onMain = Test-LedgerNumberOnMain ([string]$a.kind) ([string]$a.number)
+        if ($onMain -ne $true) {
+            $why = if ($null -eq $onMain) { 'COULD NOT CHECK origin/main' } else { 'not on origin/main' }
+            $atRisk += "$([string]$a.kind) #$([string]$a.number) -- $why -- $([string]$a.title)"
+        }
+    }
+    if (($atRisk.Count -gt 0 -or $allocUnreadable.Count -gt 0) -and -not $AllowOrphanedAllocations) {
+        $lines = @("This worktree OWNS ledger number(s) whose item is not yet on origin/main.", "")
+        foreach ($r in $atRisk) { $lines += "  $r" }
+        if ($allocUnreadable.Count -gt 0) {
+            $lines += "  $($allocUnreadable.Count) allocation record(s) could not be parsed, and an unreadable"
+            $lines += "  record MIGHT name this worktree: $($allocUnreadable -join ', ')"
+        }
+        $lines += ""
+        $lines += "Removing it BURNS those numbers. Ownership is a path-string comparison against this"
+        $lines += "directory and is NON-TRANSFERABLE, so once it is gone ledger_check.owns() returns"
+        $lines += "false for every session forever and any PR that must re-introduce the heading is"
+        $lines += "unlandable BY ANYONE. This is not recoverable after the fact."
+        $lines += ""
+        $lines += "Do this instead:"
+        $lines += "  land the item(s) first, so the heading is on origin/main and ownership stops mattering;"
+        $lines += "  or, if you accept burning them, re-run with -AllowOrphanedAllocations."
+        throw ($lines -join "`n")
+    }
 }
 
 # The branch is a FACT ABOUT THE WORKTREE, not a function of its directory name -- since new.ps1 gained
