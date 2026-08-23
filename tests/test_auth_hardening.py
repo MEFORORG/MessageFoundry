@@ -118,7 +118,11 @@ async def test_summary_redacted_for_caller_without_view_summary(engine: Engine) 
         vw = _auth((await _login(c, "vw")).json()["token"])
         op_msg = (await c.get("/messages", headers=op)).json()["messages"][0]
         vw_msg = (await c.get("/messages", headers=vw)).json()["messages"][0]
-        assert op_msg["summary"] == "MRN 1 · DOE"
+        # The LIST is the census surface, so an authorized operator sees the summary MASKED here
+        # (ASVS 14.2.6); opening one message is the act that reveals it. `error` is not a masked
+        # property, so it comes through complete in the same response -- which is what keeps this a
+        # test of the mask rather than of redaction.
+        assert op_msg["summary"] == "MRN **** · ****"
         assert op_msg["error"] == "bad PID-5: DOE^JANE"
         assert vw_msg["summary"] is None  # redacted: viewer lacks messages:view_summary
         assert vw_msg["error"] is None  # error text is PHI-gated the same way (low-8)
@@ -625,7 +629,7 @@ async def test_dead_letter_summary_redacted_for_non_viewers(engine: Engine) -> N
         vw = _auth((await _login(c, "vw")).json()["token"])
         op_dead = (await c.get("/dead-letters", headers=op)).json()["dead_letters"][0]
         vw_dead = (await c.get("/dead-letters", headers=vw)).json()["dead_letters"][0]
-        assert op_dead["summary"] == "MRN 1 · DOE"
+        assert op_dead["summary"] == "MRN **** · ****"  # list surface: masked (ASVS 14.2.6)
         assert vw_dead["summary"] is None  # redacted: viewer lacks messages:view_summary
 
 

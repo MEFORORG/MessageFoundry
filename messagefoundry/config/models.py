@@ -252,6 +252,21 @@ class Source(BaseModel):
     # when it suppresses a would-be production refusal. `tls_hop_attested_reason` records why (audit).
     tls_hop_attested: bool = False
     tls_hop_attested_reason: str | None = None
+    # BACKLOG #1005: the INBOUND mirror of Destination.tls_revocation_attested. Per-connection
+    # attestation that a revocation-checking PKI backs a VERIFYING mTLS listener -- the operator
+    # taking responsibility for revocation, exactly as the outbound flag does.
+    #
+    # Needed because the three server builders load a CA and set CERT_REQUIRED but check no
+    # revocation, so a revoked-but-chain-valid client authenticates until its notAfter. #1005 adds
+    # an opt-in `tls_crl_file`; this flag is what lets a site whose PKI covers revocation OUT of the
+    # engine decline it without being refused. Every sibling refusal here pairs with an attestation
+    # (`tls_hop_attested` for a cleartext/verify-off hop, #200), and a revocation refusal with no
+    # escape would be the only control without one.
+    #
+    # Default False -> keyed purely on posture, so every existing inbound is byte-identical.
+    # DISTINCT from tls_hop_attested: that one attests a hop is secure DESPITE no/weak TLS; this one
+    # attests that a VERIFYING hop's certificates are checked for revocation elsewhere.
+    tls_revocation_attested: bool = False
 
     @model_validator(mode="after")
     def _validate_hop_attestation(self) -> Source:

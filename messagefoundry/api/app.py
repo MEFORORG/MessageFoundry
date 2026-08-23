@@ -60,7 +60,7 @@ from messagefoundry.api._ui_seam import ENGINE_UI_SEAM, CoreHandlers, UiDeps
 from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.api.auth_routes import add_auth_routes
 from messagefoundry.api.client_networks import ClientNetworkMiddleware
-from messagefoundry.api.field_authz import count_exposed, redact_unauthorized
+from messagefoundry.api.field_authz import count_exposed, count_masked, redact_unauthorized
 from messagefoundry.api.header_floor import (
     BASELINE_SECURITY_HEADERS,
     HSTS_HEADER,
@@ -1007,47 +1007,70 @@ class _SummaryAuditCoalescer:
     because the engine is a single uvicorn worker (single-connection store + ``asyncio.Lock``)."""
 
     def __init__(self) -> None:
-        # (actor, scope) -> {"hour": int, "count": int}; scope is the channel filter ("" = all channels)
+        # (actor, scope) -> {"hour": int, "count": int, "masked": int}; scope is the channel filter
+        # ("" = all channels). ``count`` is summaries the caller could READ; ``masked`` is rows
+        # returned display-masked, kept apart so one can never be read as the other.
         self._windows: dict[tuple[str | None, str], dict[str, int]] = {}
 
     def _roll(
-        self, actor: str | None, scope: str, count: int, hour: int
-    ) -> list[tuple[str | None, str, int, int]]:
-        """Accumulate ``count`` into the ``(actor, scope)`` window for ``hour`` and return any windows
-        to flush now — every window whose hour has passed. Synchronous (no ``await``), so the dict is
-        mutated atomically w.r.t. the event loop and a window can't be double-emitted."""
-        emit: list[tuple[str | None, str, int, int]] = []
+        self, actor: str | None, scope: str, count: int, hour: int, *, masked: int = 0
+    ) -> list[tuple[str | None, str, int, int, int]]:
+        """Accumulate ``count`` and ``masked`` into the ``(actor, scope)`` window for ``hour`` and
+        return any windows to flush now — every window whose hour has passed. Synchronous (no
+        ``await``), so the dict is mutated atomically w.r.t. the event loop and a window can't be
+        double-emitted."""
+        emit: list[tuple[str | None, str, int, int, int]] = []
         for (a, sc), win in list(self._windows.items()):
             if win["hour"] != hour:
-                emit.append((a, sc, win["hour"], win["count"]))
+                emit.append((a, sc, win["hour"], win["count"], win.get("masked", 0)))
                 del self._windows[(a, sc)]
-        self._windows.setdefault((actor, scope), {"hour": hour, "count": 0})["count"] += count
+        win = self._windows.setdefault((actor, scope), {"hour": hour, "count": 0, "masked": 0})
+        win["count"] += count
+        win["masked"] += masked
         return emit
 
     async def note(
-        self, store: Store, actor: str | None, scope: str | None, count: int, now: float
+        self,
+        store: Store,
+        actor: str | None,
+        scope: str | None,
+        count: int,
+        now: float,
+        *,
+        masked: int = 0,
     ) -> None:
-        """Count ``count`` exposed summaries for ``actor``; emit a coalesced audit row for any window
-        that just rolled over. No-op when nothing was exposed."""
-        if count <= 0:
+        """Count ``count`` exposed and ``masked`` display-masked summaries for ``actor``; emit a
+        coalesced audit row for any window that just rolled over.
+
+        A window is opened by EITHER count, so a bulk list fetch that returned only masked rows is
+        still audited (ASVS 14.2.6, BACKLOG #1187) -- it disclosed nothing, but a 5,000-row scrape
+        must not become indistinguishable from no request at all. ``count`` keeps its meaning:
+        summaries the caller could actually READ."""
+        if count <= 0 and masked <= 0:
             return
-        for a, sc, win_hour, win_count in self._roll(actor, scope or "", count, int(now // 3600)):
-            await self._emit(store, a, sc, win_hour, win_count)
+        rolled = self._roll(actor, scope or "", count, int(now // 3600), masked=masked)
+        for a, sc, win_hour, win_count, win_masked in rolled:
+            await self._emit(store, a, sc, win_hour, win_count, win_masked)
 
     async def flush(self, store: Store) -> None:
         """Emit every pending window (e.g. on engine shutdown) so an active window isn't lost."""
         windows = list(self._windows.items())
         self._windows.clear()
         for (a, sc), win in windows:
-            await self._emit(store, a, sc, win["hour"], win["count"])
+            await self._emit(store, a, sc, win["hour"], win["count"], win.get("masked", 0))
 
     @staticmethod
-    async def _emit(store: Store, actor: str | None, scope: str, hour: int, count: int) -> None:
+    async def _emit(
+        store: Store, actor: str | None, scope: str, hour: int, count: int, masked: int = 0
+    ) -> None:
+        # ``count`` keeps its documented meaning -- summaries the caller could READ -- so a reader
+        # of an older row is not silently re-scoped. ``masked`` is additive and distinguishes a
+        # scrape that harvested nothing from one that harvested identifiers.
         await store.record_audit(
             "summary_access",
             actor=actor,
             channel_id=(scope or None),
-            detail=json.dumps({"count": count, "window_start": hour * 3600}),
+            detail=json.dumps({"count": count, "masked": masked, "window_start": hour * 3600}),
         )
 
 
@@ -2721,10 +2744,10 @@ def create_app(
         # patient-identifying `summary` and the delivery `last_error` (which can quote field values —
         # review low-8); a caller without it gets them nulled. Exposure audited server-side (M-5).
         dead = [redact_unauthorized(d, identity) for d in dead]
-        exposed = count_exposed(dead)
-        if exposed:
+        exposed, masked = count_exposed(dead), count_masked(dead)
+        if exposed or masked:
             await request.app.state.summary_auditor.note(
-                engine.store, identity.username, channel_id, exposed, time.time()
+                engine.store, identity.username, channel_id, exposed, time.time(), masked=masked
             )
         return DeadLetterList(total=total, limit=limit, offset=offset, dead_letters=dead)
 
@@ -3026,10 +3049,10 @@ def create_app(
         # Every patient-identifying value actually returned is audited SERVER-SIDE (coalesced per
         # actor/hour) — never gated on a client flag, so a scripted bulk fetch can't harvest the
         # patient census unaudited (review M-5). Counted post-redaction = exactly what's returned.
-        exposed = count_exposed(messages)
-        if exposed:
+        exposed, masked = count_exposed(messages), count_masked(messages)
+        if exposed or masked:
             await request.app.state.summary_auditor.note(
-                engine.store, identity.username, channel_id, exposed, time.time()
+                engine.store, identity.username, channel_id, exposed, time.time(), masked=masked
             )
         return MessageList(total=total, limit=limit, offset=offset, messages=messages)
 
@@ -3115,10 +3138,10 @@ def create_app(
         )
         # The summary exposure (matched rows actually carrying a summary) is ALSO coalesced into the
         # standard summary_access audit, mirroring /messages — so a search-then-harvest can't dodge it.
-        exposed = count_exposed(messages)
-        if exposed:
+        exposed, masked = count_exposed(messages), count_masked(messages)
+        if exposed or masked:
             await request.app.state.summary_auditor.note(
-                engine.store, identity.username, channel_id, exposed, time.time()
+                engine.store, identity.username, channel_id, exposed, time.time(), masked=masked
             )
         return MessageSearchResults(
             messages=messages,
@@ -3441,15 +3464,27 @@ def create_app(
         # EXACT type (no MRO walk), so the MessageDetail wrapper and each nested OutboxInfo/EventInfo are
         # redacted individually. The raw body stays on this route's view_raw gate. Exposure is audited
         # server-side, mirroring the list endpoints (count after redaction = what's actually returned).
+        # OPENING ONE MESSAGE IS THE REVEAL ACT (ASVS 14.2.6). The list and search surfaces mask the
+        # summary, because those are where complete identifiers could be read off a screen opened for
+        # another reason. This route is a deliberate, per-message, already-audited open — record_view
+        # above plus the tamper-evident audit chain — so it is the specific act that lifts the mask,
+        # and it lifts it for THIS message only. The reveal is a call argument with nowhere to live
+        # between calls, so it cannot become a session-wide toggle by accident.
         outbox = [redact_unauthorized(o, identity) for o in detail.outbox]
         events = [redact_unauthorized(e, identity) for e in detail.events]
-        detail = redact_unauthorized(detail, identity).model_copy(
+        detail = redact_unauthorized(detail, identity, revealed=frozenset({"summary"})).model_copy(
             update={"outbox": outbox, "events": events}
         )
-        exposed = count_exposed([detail, *outbox, *events])
-        if exposed:
+        rows = [detail, *outbox, *events]
+        exposed, masked = count_exposed(rows), count_masked(rows)
+        if exposed or masked:
             await request.app.state.summary_auditor.note(
-                engine.store, identity.username, row["channel_id"], exposed, time.time()
+                engine.store,
+                identity.username,
+                row["channel_id"],
+                exposed,
+                time.time(),
+                masked=masked,
             )
         return detail
 
