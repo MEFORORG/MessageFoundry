@@ -258,6 +258,18 @@ def scan(
         else:
             seen[it.num] = (label, it.line)
 
+        # THE CHECK ITSELF MUST REPORT IT, not merely the reader (#1338). This gate runs UNGATED
+        # on every pull request including docs-only ones, which is the change shape that
+        # introduces a duplicate; the pytest guard covers the same ground but rides a lane that a
+        # curated allowlist could silently drop it from.
+        for key, dup_line, displaced, kept in it.duplicate_fields:
+            errors.append(
+                f"{label}:{dup_line}: item #{it.num} declares '{key}' twice — {displaced!r} is "
+                f"overwritten by {kept!r}. A duplicate moves NO count, so the item and open "
+                f"totals every seat checks after a ledger edit report success over it, and "
+                f"dispatch_gate.py then acts on whichever copy happened to come last."
+            )
+
         if not it.closed and not it.open:
             errors.append(
                 f"{label}:{it.line}: item #{it.num} declares no status. Add exactly one leading "

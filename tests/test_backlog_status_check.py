@@ -538,3 +538,21 @@ def test_the_real_backlog_carries_no_duplicate_banner_field() -> None:
         "anything, so the zero below would be an artefact of an empty parse, not a result"
     )
     assert not offenders, "duplicated banner field(s):\n  " + "\n  ".join(offenders)
+
+
+def test_scan_reports_a_duplicated_banner_field_as_an_error() -> None:
+    """MUST FIRE THROUGH THE CHECKER, not only through the reader.
+
+    The item names THE LEDGER CHECK, and this gate runs ungated on every PR -- including the
+    docs-only shape that introduces a duplicate in the first place. Recording it on the Item
+    without reporting it here would leave the defect visible to nothing that actually runs."""
+    errors, _ = _scan(_WITH_DUP)
+    assert len(errors) == 1, errors
+    assert "declares 'research' twice" in errors[0]
+    assert "'none'" in errors[0] and "'done 2026-08-20'" in errors[0]
+
+
+def test_scan_is_silent_on_the_same_item_without_the_duplicate() -> None:
+    """MUST NOT FIRE -- the twin. A checker that errored unconditionally would pass the arm
+    above while making every ledger unmergeable."""
+    assert _scan(_WITHOUT_DUP)[0] == []
