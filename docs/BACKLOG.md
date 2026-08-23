@@ -11406,11 +11406,29 @@ in a ledger row gets followed.***
 
 ***SO THE ON-DEMAND AFFORDANCE ALREADY EXISTS AND NEEDS NO BUILD.*** **What remains is narrower:** *a
 **duration-bearing refusal** is absent at all three sites -- `:797` password, `:2243` MFA, `:2608`
-WebAuthn -- and **lock CYCLES are still uncapped**, since `_register_failure` has no counter.*
+WebAuthn -- and **lock CYCLES are still uncapped**, since `_register_failure` has no counter.* ***THE
+DURATION LIMB IS BLOCKED ON AN OWNER RULING (see below). THE CYCLE CAP IS NOT.***
 
-**THE ENUMERATION TENSION IS SPENT AND NEEDS NO OWNER RULING:** *`"account locked"` is **already
-distinct** from `"invalid credentials"` at `:795`, `:819` and `:856`, so a duration-bearing refusal
-refines a signal that already ships.*
+***THE ENUMERATION TENSION IS NOT SPENT. THIS ROW SAID TWICE THAT IT WAS, AND THAT WAS WRONG BOTH
+TIMES.*** **The distinct strings live ONLY in logs and audit. Verified at the BOUNDARY, with the control
+firing:**
+
+- *`auth/service.py:147`, the `LoginOutcome` contract, verbatim:* **"``error`` is for logs/audit -- never
+  leak the reason to clients"**
+- *`api/auth_routes.py:259` raises* **`HTTPException(401, "invalid credentials")` -- a FIXED STRING**,
+  *whenever `not outcome.ok`, regardless of `outcome.error`*
+- ***`outcome.error` appears ZERO times in `auth_routes.py`, against a control of 7 for `outcome.`***
+
+***SO A CLIENT SEES "invalid credentials" WHETHER THE ACCOUNT IS LOCKED, THE PASSWORD IS WRONG, OR THE
+USER DOES NOT EXIST. THERE IS NO ENUMERATION LEAK TODAY.***
+
+**THAT INVERTS THE CONCLUSION.** *A duration that reaches the locked-out operator is a **NEW
+DISCLOSURE**: it tells an **unauthenticated** caller that the account exists, is locked, and for how
+long.* ***OWNER-LEVEL, AND ROUTED.*** *And a duration added only to the `error` field would help nobody,
+because the operator never sees that field.*
+
+**MFA AND WEBAUTHN RETURN A BARE `False` WITH NO ERROR CHANNEL AT ALL**, *so a duration there needs a
+different mechanism -- **not the same edit three times**, which is what a three-site brief implied.*
 
 ## ***HOW THE WRONG CORRECTION WAS PRODUCED, BECAUSE THE CONTROL IS THE LESSON***
 
