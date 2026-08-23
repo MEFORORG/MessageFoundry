@@ -12916,6 +12916,14 @@ re-score, **not** a reason to build the version that cannot fire.
 **Cluster:** Handler isolation / secure defaults. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0). No site runs unsandboxed handler code, because no site runs. The default should be the safe one before the first one does.
 
+
+**DISPATCH NOTE 2026-08-23: DO NOT HAND THIS TO A LANE WITH LESS THAN A FULL WINDOW.** A lane declined
+it with about an hour of runway, and the reasoning is general enough to keep: ***this row changes an
+ENGINE DEFAULT on the reliability path -- behaviour, not instrumentation -- and a HALF-VERIFIED DEFAULT
+IS WORSE THAN AN UNSTARTED ONE, BECAUSE IT LANDS LOOKING COMPLETE.***
+
+It also wants the **full engine suite**, which a previous lane measured at **37 minutes**. *Give it
+runway or give it to nobody.*
 ## 1279. treat every instance as carrying patient data and retire the synthetic-data declaration
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The opt-out still ships at settings.py:3738 and still translates to the enum at :4234-4235, while the comment at :3733-3735 continues to contradict :2318, which has said PHI since ADR 0148. Value is a secure-defaults simplification rather than a shipped-default defect, since only an explicit declaration loses the refusals; difficulty stays high on surface alone -- 77 data_class occurrences across the engine plus 45 in tests, and the api/models.py wire-contract change -- with no migration cost added per section 0. _(previously unscored.)_
@@ -14885,3 +14893,21 @@ corpus, which is the noise failure that gets a gate switched off within a day.*
 
 ***THE CONTROL POPULATION ALREADY DEMONSTRATES THE DISTINCTION WORKS:*** the 23 agreements are rows whose
 arrow carries a **verdict** matching the banner, and priority re-scores fall into neither column.
+
+***THE STRONGEST ARGUMENT FOR THIS ITEM IS NOT THE COUNT, AND IT IS THE BUILDING LANE'S: THE STRUCTURED
+FIELD WAS ADDED TO MAKE THE GATE RELIABLE, AND WHERE THE TWO SOURCES DIVERGE IT MAKES IT CONFIDENTLY
+WRONG.***
+
+**Before the banner field existed, a dispatcher had to READ THE PROSE -- and would have seen
+`demand-gate`.** ***ADDING A MACHINE-READABLE FIELD REMOVED THE STEP THAT WOULD HAVE CAUGHT THIS.***
+*That is not a gap in the field; it is a COST of having one*, and it is why this is P1 rather than
+tidy-up.
+
+**PROVENANCE, RECORDED DELIBERATELY, BECAUSE HOW THE CHECK CAME TO RUN MATTERS MORE THAN THAT IT
+FIRED.** ***No demand-gate screen caught this. There is no demand-gate screen.*** The dispatcher read
+the row by eye because it suspected a **DUPLICATE** -- a pair-shaped-defect habit adopted hours earlier
+after filing a duplicate of an open item. ***THE DUPLICATE CHECK CAUGHT A GATE VIOLATION IT WAS NOT
+LOOKING FOR.***
+
+**A future reader given only the finding would conclude that a demand-gate screen exists and works.
+It does not. That is what this item builds.**
