@@ -32,6 +32,7 @@ a `vX.Y.Z-rc1` pre-release tag.
 
 from __future__ import annotations
 
+import gzip
 import io
 import os
 import re
@@ -728,6 +729,59 @@ def _fixture_someone_elses_sdist(dist: Path) -> None:
             tf.addfile(info, io.BytesIO(payload))
 
 
+def _tar_bytes(members: Sequence[str]) -> bytes:
+    """An UNCOMPRESSED tar of ``members`` under the sdist prefix, for callers that truncate or concatenate.
+
+    Same prefixing as :func:`_write_sdist` -- these fixtures differ in how the STREAM is assembled, not
+    in what a member is called, and a fixture that roots its members differently would be rejected by
+    the gate's identity check before reaching the behaviour under test.
+    """
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for member in members:
+            payload = b"fixture\n"
+            info = tarfile.TarInfo(f"{_SDIST_PREFIX}/{member}")
+            info.size = len(payload)
+            tf.addfile(info, io.BytesIO(payload))
+    return buf.getvalue()
+
+
+def _fixture_prefix_laundered_private_doc(dist: Path) -> None:
+    """A private doc that laundered itself through the OLD per-line prefix strip.
+
+    `docs/messagefoundry/security/PRIVATE.md` under the real root became
+    `messagefoundry/security/PRIVATE.md` once each line had its own first component removed, and the
+    allowlist trusts anything starting `messagefoundry/`.
+    """
+    _write_sdist(
+        dist / f"{_SDIST_PREFIX}.tar.gz",
+        [*_CLEAN_MEMBERS, "docs/messagefoundry/security/PRIVATE.md"],
+    )
+
+
+def _fixture_concatenated_gzip_streams(dist: Path) -> None:
+    """A clean sdist with a SECOND gzip stream appended, carrying a private doc.
+
+    Plain `tar tzf` stops at the first end-of-archive marker and exits 0, so the second stream's
+    members never reach the allowlist while their bytes ship inside the published file.
+    """
+    dist.mkdir(parents=True, exist_ok=True)
+    clean = gzip.compress(_tar_bytes(list(_CLEAN_MEMBERS)))
+    hidden = gzip.compress(_tar_bytes(["docs/security/PRIVATE.md"]))
+    (dist / f"{_SDIST_PREFIX}.tar.gz").write_bytes(clean + hidden)
+
+
+def _fixture_truncated_archive(dist: Path) -> None:
+    """A tar cut in half and THEN gzipped: a valid gzip of a short tar.
+
+    Measured against the real gate before the fix: `tar` listed a partial member set, exited 0, and
+    warned about nothing. The cut is a whole multiple of 512, so block alignment does not reveal it.
+    """
+    dist.mkdir(parents=True, exist_ok=True)
+    raw = _tar_bytes([*_CLEAN_MEMBERS, *(f"messagefoundry/m{i}.py" for i in range(40))])
+    (dist / f"{_SDIST_PREFIX}.tar.gz").write_bytes(gzip.compress(raw[: len(raw) // 2]))
+
+
 #: Each case pairs a dist/ builder with fragments ONLY THAT CASE can produce. Asserting merely "it
 #: failed" would let all six fail for one shared wrong reason and still report six passes — and three of
 #: the six (corrupt, two tarballs, zero members) are the exact inputs the previous gate body passed, so
@@ -748,8 +802,26 @@ _REJECTIONS: list[tuple[Callable[[Path], None], list[str]]] = [
     # A listing that succeeds and yields nothing is not a clean sdist, it is no evidence at all.
     (_fixture_sdist_listing_zero_members, ["ZERO members", "nothing was inspected"]),
     # An allowlist check over another project's tarball passes trivially and says nothing about the
-    # artifact this job is about to publish.
-    (_fixture_someone_elses_sdist, ["no messagefoundry/ package tree"]),
+    # artifact this job is about to publish. The gate rejects on the archive's single ROOT, not on
+    # "some member mentions messagefoundry" -- an adversarial pass defeated the latter with a tarball
+    # whose members were `evilpkg-9.9/messagefoundry/...`, which satisfied a second-component test.
+    (_fixture_someone_elses_sdist, ["found root 'otherproject-1.0'", "not messagefoundry-"]),
+    # The same root check closes prefix laundering: `docs/messagefoundry/security/PRIVATE.md` inside
+    # an sdist rooted at messagefoundry-<version>/ used to strip to `messagefoundry/security/...` and
+    # be trusted, because the strip ran per line instead of removing one known prefix.
+    (
+        _fixture_prefix_laundered_private_doc,
+        ["private-doc leak guard tripped", "docs/messagefoundry/security/PRIVATE.md"],
+    ),
+    # `tar tzf` stops at the first end-of-archive marker and exits 0, so a second gzip stream appended
+    # to a clean sdist hid a private doc from the listing while shipping its bytes. --ignore-zeros.
+    (
+        _fixture_concatenated_gzip_streams,
+        ["private-doc leak guard tripped", "docs/security/PRIVATE.md"],
+    ),
+    # A tar truncated and THEN gzipped is a valid gzip of a short tar: tar lists a partial member set
+    # and exits 0 with no warning. Publishing it burns the version number on PyPI forever.
+    (_fixture_truncated_archive, ["does not end in a tar end-of-archive marker"]),
 ]
 
 
