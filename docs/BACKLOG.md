@@ -12252,6 +12252,50 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 
 **Cluster:** Ledger tooling / evidence integrity. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) -- documentation accuracy. The cost is that the ledger's own evidence decays invisibly, and the decay is fastest after exactly the kind of broad, correct, well-reviewed change nobody would think to re-check it against.
+
+**AMENDMENT 2026-08-23, dispatcher seat. THE CHEAP DETECTOR THIS ROW IMPLIES CANNOT FIRE FOR THE REASON
+THE ROW EXISTS. Scope corrected, and the difficulty score with it.**
+
+**Measured across both ledgers before any code was written:**
+
+| population | count |
+| --- | --- |
+| `path:line` citations into code | **3,086** |
+| directory-qualified | 2,151 |
+| ...path resolves at HEAD | 1,142 |
+| ***citing a line PAST END OF FILE*** | ***3*** |
+| ***bare filenames, unresolvable by construction*** | ***935*** |
+
+**The three past-end hits are range ENDS overshooting by one or two lines. NONE is the defect this row
+is about.**
+
+***A BOUNDS CHECK CANNOT SEE THE FILED CLASS AT ALL.*** This row's own five-for-five evidence is
+citations pointing at the **WRONG LINE** -- a line that EXISTS and says something else. *That is why
+nothing catches it and why the row calls it worse than a broken one.* **Shipped as a bounds check it
+would run green forever over 1,142 citations and read as citation integrity.**
+
+***AND THE HONEST LABEL AND THE MISLEADING GREEN HAVE DIFFERENT LIFESPANS.*** A commit message saying
+*"this does not address the filed class"* lives in the log; **the green lives in CI**, and every later
+reader takes it at face value. *That is the ship-passing-and-inspecting-nothing defect `a92ab10f`
+fixed, rebuilt deliberately.*
+
+**SO THE BUILD IS:** check a directory-qualified citation's span against **the SYMBOL the prose names**
+when one appears in backticks nearby -- that covers the filed class, and bounds-checking rides along
+free. **REFUSE the 935 bare filenames LOUDLY and PRINT the count**, because skipping them silently is
+the same lie one layer down. **And a mutation test proving the detector can STAY QUIET**: a planted
+drift reds, the clean corpus does not.
+
+***THE RESOLVER FINDING BELONGS ABOVE ALL THE NUMBERS.*** The lane's first pass reported **79** past-end
+hits. It resolved bare filenames by taking the first match, so it was measuring **the wrong files**. The
+corrected count is **3**.
+
+***THAT IS A 79-HIT RESULT THAT WAS ENTIRELY AN ARTEFACT OF THE TOOL -- THE EXACT DEFECT CLASS THIS ITEM
+EXISTS TO CATCH, PRODUCED BY THE TOOL WRITTEN TO CATCH IT.*** **And the tell was in its own output:**
+*"file is 382 lines"* against a real file of over 8,000. ***THE INSTRUMENT PRINTED ITS OWN REFUTATION IN
+A FIELD ALMOST NOBODY READS.***
+
+**The difficulty score above is costed against the bounds check and is therefore wrong.** That is a
+re-score, **not** a reason to build the version that cannot fire.
 ## 1264. The seat clock fires on cadence but its fanout skips seats, and the tick's own rubric sends every seat to look at the clock
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. Fleet tooling with no deployment axis, but silent under-delivery of wake-ups is self-concealing and cost seats a day of divided investigation, so worth is mid-range. Difficulty 4 because the remainder is undiminished: read the roster selection source, instrument send-side per-firing results, and re-measure, which is the only thing that separates a roster fault from a send fault, and it must be done against files that are not tracked in this repository. _(was 7/10 · 4/10.)_
