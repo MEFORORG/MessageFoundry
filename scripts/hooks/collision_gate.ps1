@@ -277,9 +277,15 @@ if ($editing.Count -eq 0) {
     # #1310 asks for `session=<id>` and this prints `session <id>`, which is the idiom already shipped
     # at overlap.ps1's single-file printer and session-context.ps1's roster and reads better inside a
     # sentence. The divergence lands on the ITEM, not on the code: #1310's stated check is a grep for
-    # `session=`, which still returns 0 against this file and would report the defect as unfixed.
-    # tests/test_collision_gate.py checks the PROPERTY instead -- no hex-shaped token in the emitted
-    # text without the word in front of it -- and is the check to run in its place.
+    # `session=`, and that grep asks about this FILE, not about what the gate PRINTS. Every hit it
+    # returns is a COMMENT line, the ones you are reading among them -- which is how the sentence that
+    # used to stand here, "still returns 0 against this file", was falsified by the paragraph written
+    # to explain it. Nothing this gate emits contains `session=` anywhere, so that count moves when
+    # this prose is re-worded and never when the printed text changes. DO NOT RESTATE THE COUNT HERE:
+    # the first correction to this paragraph quoted its own fresh number and was wrong by one on the
+    # line that quoted it. tests/test_collision_gate.py checks the PROPERTY instead -- no hex-shaped
+    # token in the emitted text without the word in front of it -- and is the check to run in its
+    # place.
     #
     # The word goes on the ROW rather than into a legend -- these rows are not uniform, so a legend
     # could not govern every one of them.
