@@ -24,8 +24,20 @@
 # pytest assertion (exit 1), so this wrapper can never hide one. Each retry emits a visible
 # ::warning:: (grep CI logs for "NATIVE CRASH" to track the flake frequency against #1459).
 #
-# REMOVE THIS WRAPPER once #1459 ships a fix and pyproject's pyodbc floor moves to the fixed
-# release (the throughput-invariant step in .github/workflows/ci.yml calls this).
+# REMOVING THIS WRAPPER IS NOT A BLANKET DELETION -- READ THE CALLER SET FIRST (BACKLOG #1260).
+# #1459 covers the DATABASE legs. It says nothing about any other caller, and this note previously
+# named one call site ("the throughput-invariant step") when ci.yml had TEN.
+#
+# THE DISCRIMINATOR IS IN THE WORKFLOW, NOT IN A MEMORY: any caller setting
+# RETRY_NATIVE_CRASH_CAUSE="" has declared that ITS crash cause is NOT established as the pyodbc
+# class. A fix to #1459 therefore does not license removing the wrapper from that leg -- doing so
+# would silently strip its crash handling on the strength of an upstream fix that does not address
+# it. Today the engine test suite is such a caller.
+#
+# SO: when #1459 ships and pyproject's pyodbc floor moves, remove the wrapper from the pyodbc
+# callers, and decide each opted-out caller SEPARATELY on its own evidence.
+# `tests/test_ci_retry_native_crash.py` fails if an opted-out caller exists and this note stops
+# saying so, because the whole defect is a future reader deleting one line in good faith.
 #
 # THE ATTRIBUTION IS PER-CALLER, AND THAT IS THE POINT (BACKLOG #1260). The pyodbc class above is
 # ESTABLISHED for the database legs and is NOT established anywhere else. A wrapper that names it

@@ -163,3 +163,34 @@ def test_the_wrappers_own_grep_hint_matches_what_it_prints() -> None:
     assert token in src.split("is_native_crash", 1)[1], (
         "the hint names a string the messages do not print"
     )
+
+
+def test_the_removal_note_cannot_silently_strip_an_opted_out_caller() -> None:
+    """THE DEFECT NEITHER DESIGN ADDRESSED, and it is a future-reader defect rather than a runtime one.
+
+    The wrapper's header instructs whoever fixes upstream pyodbc #1459 to remove it. That is correct
+    for the database legs and WRONG for any caller whose crash cause is not that class -- and the
+    note previously named ONE call site while ci.yml had ten.
+
+    So the failure mode is somebody deleting one line in good faith, on the strength of an upstream
+    fix that does not address the leg they are stripping. Nothing at runtime can catch that; the
+    only guard is that the instruction stays honest about its own caller set.
+
+    THE PREDICATE IS THE WORKFLOW, NOT A HARDCODED NAME: if any step opts out of the pyodbc
+    attribution, the removal note must say removal is caller-dependent. Add such a caller without
+    updating the note and this reds."""
+    ci = _CI.read_text(encoding="utf-8")
+    src = _WRAPPER.read_text(encoding="utf-8")
+    opted_out = 'RETRY_NATIVE_CRASH_CAUSE: ""' in ci
+    assert opted_out, (
+        "no caller opts out any more -- if that is deliberate this arm is now vacuous and should be "
+        "deleted with a reason, not left passing over nothing"
+    )
+    note = src.split("REMOVING THIS WRAPPER", 1)
+    assert len(note) == 2, (
+        "the removal instruction no longer warns that removal depends on the caller set; a reader "
+        "fixing #1459 would strip the opted-out leg's crash handling silently (BACKLOG #1260)"
+    )
+    assert "RETRY_NATIVE_CRASH_CAUSE" in note[1].split("set -uo", 1)[0], (
+        "the note must name the DISCRIMINATOR a reader can check, not just caution them in prose"
+    )
