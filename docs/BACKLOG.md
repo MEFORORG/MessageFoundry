@@ -14637,6 +14637,48 @@ mechanism. Close each on its own rows passing, not on this landing.
 **Expiry:** this stops being right if the segment object stops carrying both `Raw` and `Scan`, or if
 rule 3c stops reading `Scan` for key detection.
 
+
+***AMENDMENT 2026-08-23. FIRST CANDIDATE CONCLUDED NEGATIVE: IT OPENS THE GATE IT WAS FIXING. NOT
+LANDABLE. Verdict recorded at `caae4ce3`; the commits stay as evidence with DO NOT LAND in their
+subjects.***
+
+**Both adversarial hunts fired.** 15 shapes the candidate ALLOWS that `main` DENIES, **each proved to
+actually execute**; and 25 harmless commands that now DENY -- ***three times the disclosed false-deny
+cost, one of them this fleet's own house pattern.***
+
+***A FOUR-CHARACTER COMMENT PREFIX DISARMS THE RULE.*** Five of five reproduce, and the move is
+attributable to THIS candidate rather than its base, because three baselines were taken:
+
+| case | `main` | pre-candidate base | candidate |
+| --- | --- | --- | --- |
+| plain disarm (control) | DENY | DENY | DENY |
+| comment-prefixed heredoc opener, either shell | DENY | DENY | ***ALLOW*** |
+| opener on the same line | DENY | DENY | ***ALLOW*** |
+
+***THE PART THAT OUTLIVES THE VERDICT, AND IT CORRECTS THIS ROW'S OWN BUILD CONSTRAINT.*** The
+acceptance table was written BEFORE the fix, carrying both failure lists, exactly so a candidate could
+not be graded against a table shaped to fit it. ***THAT WAS NECESSARY AND IT WAS NOT SUFFICIENT.***
+
+**Every regression came from a mechanism THE FIX ITSELF INTRODUCED.** Block tracking did not exist when
+the table was written, **so no row could have covered it.** ***A PRE-WRITTEN TABLE CANNOT ANTICIPATE THE
+FAILURE MODES OF A DESIGN THAT DOES NOT EXIST YET.***
+
+**SO THE CONSTRAINT IS NOW TWO CLAUSES, AND THE SECOND IS THE ONE THIS ROW WAS MISSING:**
+1. **Measure every candidate against BOTH failure lists in ONE table.** *Proves you did not regress the
+   KNOWN shapes.*
+2. ***ATTACK THE CANDIDATE, NOT THE TABLE.*** *Only an adversary told to break THIS implementation finds
+   what THIS implementation invented.* **A green table is the expected appearance of a wrong answer
+   here: four fixes have now died on this rule and ALL FOUR PASSED THEIR OWN SUITE.**
+
+**STAYS OPEN, NOT RETIRED. THE DESIGN IS STILL RIGHT** -- the two questions genuinely must read
+different strings. **What failed is the BLOCK-TRACKING implementation of the second string**, and that
+is far harder than it looks: tracking multi-line quote state across a per-line scanner means **writing a
+shell tokeniser.**
+
+***AND THAT IS NOW THE SECOND INDEPENDENT PIECE OF EVIDENCE THAT THIS RULE RESISTS PARSER-SHAPED
+FIXES.*** `#1069` records an earlier attempt at structured parsing narrower than the regex it replaced,
+which produced **five new fail-opens**. **WHETHER A SHELL TOKENISER IS IN SCOPE AT ALL IS AN OWNER
+QUESTION and is routed as one. Do not attempt a fifth candidate before it is answered.**
 ## 1337. The leak gate has no pattern for a security-record citation, and a bare-identifier screen would be switched off within a day
 
 > 🔢 **Filed 2026-08-23 - not started.** `scripts/security/scan_forbidden.py` screens routable IPs, worktree slugs, home paths, customer and vendor names, and site codes. **It has no pattern for a security-record identifier at all.** The obvious screen -- match the identifier shape -- is **measurably unusable**, and this row carries the working specification instead.
