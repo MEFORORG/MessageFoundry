@@ -12995,6 +12995,39 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **Cluster:** Tooling / worktree gate. **Priority:** P3. **Verdict:** build.
 **Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- developer tooling only, and it fails closed. The cost is a gate message that is false about what the command does, which is the class of defect that teaches readers to discount gate output.
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. THE READ HALF IS BUILT. THE REMAINING HALF IS #1332 AND IS
+OUT OF SCOPE HERE.** Built at `0c176a85`, on a branch cut clean from `a92ab10f`. Rule 3c now decides on
+whether a VALUE IS ASSIGNED rather than on the appearance of the key. Mutation-checked: revert the fix
+and exactly the five read tests fail while all seven write controls still pass.
+
+***THIS ROW'S OWN FIX DIRECTION IS WRONG FOR ONE OF THE TWO SHAPES, AND FOLLOWING IT FAITHFULLY WOULD
+HAVE OPENED A HOLE.*** The direction above says *decide on whether a VALUE is present*. **That is right
+for the `config` subcommand and wrong for `-c`.** Measured against real git: **`git -c <key>` WITHOUT an
+`=` still injects the key for that command, with an empty value.** So absence-of-value there is not a
+read, and an empty `core.hooksPath` is not obviously inert. The narrowing is scoped to the `config`
+subcommand and both `-c` shapes are pinned as tests. **A builder implementing this row as written would
+have loosened `-c` as well.**
+
+**TWO DEFECTS THE BUILDING LANE CAUGHT IN ITS OWN WORK, RECORDED BECAUSE BOTH ARE LIVE TRAPS FOR THE
+NEXT PERSON TOUCHING THIS GATE OR ITS TESTS.**
+
+1. **THE FIRST DRAFT FAILED OPEN ON THE RULE'S OWN POSITIVE CONTROL** -- `git config core.hooksPath
+   /dev/null` was ALLOWED. PowerShell's `-match` **replaces `$Matches` wholesale**, so computing one
+   variable before reading another left the second holding the *first* match's groups; it came back
+   null, satisfied the no-value test, and every real write took the read path. **Caught only because
+   the MUST-DENY rows were kept in the fix's test table** rather than just the row being fixed.
+2. **THE FIRST TESTS WERE VACUOUS.** All five read cases passed against the shared `primary` fixture --
+   **a tmp path that is never created**. Rule 3c asks git for the common dir and **ALLOWS when git
+   fails, by design**, so under that fixture *the rule allows everything*. Rewritten with a git-init'd
+   fixture and every read case paired with the real disarm as a control **in the same repository**, so
+   a fixture that stops discriminating goes red instead of quietly green.
+
+**SCOPE RULING: this item is the READ half only.** The heredoc half -- documentation denied because its
+quoted body is scanned as a command -- is **#1332**, measured pre-existing on `main` and rooted in
+`Get-ScannableSegments`, which all three rule sites call. It is not deferred out of this item for
+convenience: **a load-bearing change to the shared segment scanner must not ship inside a
+difficulty-2 fill-in without its own adversarial pass.** #1306 closes when `0c176a85` lands.
 ## 1310. the collision gate prints a truncated session id bare, and a reader resolves it as a commit sha
 
 > ✅ **SHIPPED 2026-08-23 -- every emitted hex token is labelled, and a TEST now proves it.** *Found by the Builder 1 seat, who chased the value into the git object store TWICE and twice reported the gate's warning unresolvable. Filed 2026-08-22 by the lander.*
