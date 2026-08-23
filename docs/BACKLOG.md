@@ -14511,6 +14511,34 @@ were attributed to the environment tonight on the ground that *"the pull request
 files."* **That reasoning is still true and was NEVER SUFFICIENT** -- ***`main` BEING GREEN WAS DOING THE
 REAL WORK IN THAT ARGUMENT, AND `main` IS NOT GREEN.*** *An argument that silently depends on a premise
 nobody restated is the shape that survives review.*
+
+***FALSIFIED 2026-08-23, AGAINST THE HYPOTHESIS THE AMENDMENT ABOVE CARRIES. THE SAME UNCHANGED HEAD
+PASSES ON RE-RUN.***
+
+    main a8f5d10a, repo harness tests, same tree, NO COMMIT BETWEEN
+      attempt 1  FAILURE
+      attempt 2  SUCCESS
+
+***A DETERMINISTIC REGRESSION FAILS ON BOTH ATTEMPTS. THIS DOES NOT.*** **So whatever that merge
+contributed, IT DID NOT INTRODUCE A REPRODUCIBLE BREAK**, and the table above must not be read as
+causal. *The correlation was real and was stated as correlation; it is now ACTIVELY CONTRADICTED rather
+than merely undemonstrated.*
+
+**WHAT SURVIVES UNCHANGED: the leg is INTERMITTENT and fails often enough to have hit three consecutive
+`main` heads, so it remains a fleet-wide landing block through the aggregator** -- *which is what this
+row said before the amendment, and the row was right.*
+
+**WHAT DIES: the started-at-a-particular-merge framing.** *A contention mechanism fits this result; a
+DURATION story does not, because duration would reproduce on the same tree.*
+
+***AND TWO SEATS SENT EVIDENCE POINTING HERE BEFORE THE TEST WAS RUN:*** prior excursions on this runner
+on unrelated pull requests, **which said the leg was already marginal**; and a job-budget measurement
+showing neither failure was a clock of the kind duration predicts. **Both were right and both arrived
+before the measurement that settled it.**
+
+***THE COST THIS AVOIDED IS THE POINT: the conclusion was wrong in the direction that would have had
+someone REVERT A GOOD FIX.*** *The seat that raised the alarm ran the falsifier against its own
+hypothesis and recorded the result against itself.*
 ## 1324. Promote Verdict/Research/Closing-act into the banner block parse_items reads
 
 > 🔢 **Re-scored 2026-08-22.** Filed by the workflow-analysis seat. **Priority:** P2. **Verdict:** build
