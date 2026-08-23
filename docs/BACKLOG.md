@@ -13001,6 +13001,20 @@ measurement from this row's subject and it is named here rather than performed.*
 > Verdict: build
 > Closing-act: code
 
+***AMENDED 2026-08-23 -- THE MECHANISM THIS ROW PRESCRIBED IS BUILT ON A FILE THAT CANNOT ANSWER THE QUESTION, AND `seat-tick.ps1` SAYS SO IN ITS OWN COMMENT.***
+
+*The row directed the alarm to read `seat-tick.last`. The tool's comment at the state-file declaration states verbatim that it* **"cannot answer 'when did THIS seat last actually get a tick', because a run that reported COLD for a seat OVERWRITES the run in which that seat was SENT"** -- *and that the throttle, needing the same second question, was therefore given `seat-tick.state.json`.*
+
+***BUILDING THIS ROW AS WRITTEN WOULD HAVE PRODUCED THE DEFECT IT WAS FILED TO FIX.*** *The title is "the obvious implementation reads healthy at the moment it should fire"; **an alarm reading that file goes healthy on the overwrite.*** **The row specified its own subject.**
+
+**INVERTED SCOPE, RULED 2026-08-23:** ***`seat-tick.state.json` -- keyed by ABSOLUTE WORKTREE PATH, values unix seconds -- answers WHEN and WHO. `seat-tick.last` answers only WHY NOT, for the exclusion decision alone.*** *Unchanged and still required: the tick-identity dedupe, the exclusion rule, the pinned absolute path, the throttle-age consistency check, and a discriminating test that actually fires.* **The alarm's job did not shrink; only the file assignment moved.**
+
+***AND THE SEAT NAME IS NOT UNIQUE IN `seat-tick.last`.*** *Measured 2026-08-23: `steward`, `lander` and `dispatcher` each appear **TWICE** in one live line -- once `STALE(no-live-session)`, once `SENT:<id>`.* **A first-match scan gets `STALE` for all three.** ***That is the same first-match trap as the fleet roster, in the file this alarm was told to parse*** -- *a third instance of one shape in one day.*
+
+**SCOPE NOTE, NOT A SEPARATE ITEM:** *the emitted vocabulary grew after this row was written.* **`STALE(no-live-session)` at `seat-tick.ps1:654` and the `(roster-blind)` suffix at `:767` are absent from the exclusion list here.** *The list is INCOMPLETE rather than wrong; build against the vocabulary as it stands and say so.*
+
+***THE PIN-THE-PATH RULE IS RIGHT AND ITS EVIDENCE IS STALE, WHICH STRENGTHENS IT.*** *The two decoys this row names are gone; **three exist today, all under a live lane's scratchpad, one in a directory called `ticktest`.*** **Newest-wins would today land in a live lane's test fixture.** *Keep the rule exactly as stated.*
+
 **Cluster:** Fleet coordination / observability. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) -- this is fleet tooling, not engine code. The cost is that the mechanism which keeps every seat alive has no independent observer, so its death is silent by construction, and the first implementation anyone reaches for is green at precisely the moment it should be red.
 
