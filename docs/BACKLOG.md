@@ -15012,3 +15012,50 @@ rows from the three real ones.**
 
 **Reproduced independently from a separately written matcher: 237 open items carry a banner verdict, 26
 also carry a prose re-score, 23 agree, 3 diverge.** *Reconciles nothing, as scoped.*
+
+## 1343. The claim gate has no handoff state, so a delegated commit has no honest expression
+
+> 🔢 **Filed 2026-08-23 - not started.** The claim gate has TWO states -- held-by-me and not-held-by-me -- and a legitimate delegation is neither. **Both arms measured: a delegate's commit is refused while the author holds the claim, AND refused once the author releases it.** Releasing swaps one refusal for another, because the gate requires the COMMITTER to hold the claim.
+> Verdict: research
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / claim integrity. **Priority:** P3. **Verdict:** research -- ***the
+obvious fix is worse than the defect, so this must be measured before anything is built.***
+**Severity:** fleet tooling, no product or deployment axis (sec. 0).
+
+**MEASURED, BOTH ARMS, 2026-08-23:**
+
+| state | delegate's commit |
+| --- | --- |
+| claim held by the author | **REFUSED** -- *"claimed by ANOTHER worktree"* |
+| claim released entirely | **REFUSED** -- *"is NOT CLAIMED ... claim it, then commit again"* |
+
+***THE GATE IS CORRECT ON THE INFORMATION IT HAS, AND BOTH REFUSALS WERE SOUND.*** **A claim answers
+"is this key taken". It never answers "is this the person the holder asked to do it."** *The cost is
+that a legitimate delegation has no expression at all.*
+
+**THE TWO AVAILABLE PATHS ARE BOTH FLAWED.** A **transient take** by the delegate is honest but puts
+their name on another seat's item in the claim history. **`-Force` would record a LIVE claim as STALE,
+which is simply false** -- *and this repo already has a shipped item about claim releases leaving an
+inaccurate record, so writing a false one to buy a commit is the exact harm that work addressed.*
+
+***AND THE OBVIOUS FIX IS THE ONE THAT MUST NOT BE BUILT WITHOUT MEASUREMENT: accepting a claim whose
+NOTE names a delegate makes the gate trust FREE TEXT WRITTEN BY THE PARTY IT IS GATING.*** **That is a
+security gate consuming attacker-influenceable input, pointed at the claim registry.** *Recorded here
+rather than dropped, because it is the obvious next proposal and the next reader will have it -- the
+same practice a sibling claim item already follows.*
+
+**A SECOND ROUTE WAS TRIED AND BLOCKED BY THE MECHANISM IT WAS MEANT TO USE.** Cutting a worktree so the
+author could commit the branch themselves failed: **git refuses to check one branch out twice, and the
+delegate's own worktree already held it.** ***THE CONSTRAINT A WORKTREE WAS EXPECTED TO REMOVE WAS THE
+THING PREVENTING ONE FROM BEING CUT.*** *That advice was correct on what both parties knew and stopped
+being correct the moment the branch was checked out anywhere.*
+
+***THE PATTERN WORTH KEEPING IS THAT NONE OF THIS WAS BYPASSED.*** Four gate refusals in one evening --
+two on worktree switches, two on claim state -- **all four correct, none forced.** ***Every one was
+resolved by an act of the RIGHT PARTY*** -- a release, a fresh branch, a refusal to install an unmerged
+gate -- **rather than by a flag.**
+
+**Expiry:** this stops being right if the claim registry gains a delegation or co-holder concept, or if
+the gate stops keying on the committing worktree.
