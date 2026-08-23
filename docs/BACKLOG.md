@@ -14394,6 +14394,37 @@ intake loss      engine_read 35 below confirmed sent 36 -- one message lost on i
 **NOT MEASURED, DO NOT INFER:** whether the two assertions share a root cause -- nothing here shows it either way. Neither failure was reproduced locally; both figures are read off CI. The three-PR count is the lander's observation across one evening and is not a rate.
 
 **Source:** surfaced by the LANDER while attributing reds on #529 and #530; the six-assertion count and the required-context arithmetic are the DISPATCHER's, whose handoff routed the content here for filing.
+
+***AMENDMENT 2026-08-23. THIS LEG IS NOW RED ON `main` ITSELF, NOT INTERMITTENTLY ON PULL REQUESTS --
+AND BECAUSE THE ROLL-UP AGGREGATES IT, A RED `main` BLOCKS EVERY PR THROUGH THE AGGREGATOR.***
+
+**Measured across consecutive `main` commits:**
+
+| commit | result | duration |
+| --- | --- | --- |
+| three earlier heads | success | 13.2 - 16.4 min |
+| the head where a gate fix landed | ***FAILURE*** | **18.2 min** |
+| the head after it | ***FAILURE*** | **17.9 min** |
+
+**That merge added 83 lines to the gate's test file, 615 to 698.**
+
+***CORRELATION AND A PLAUSIBLE MECHANISM, NOT A DEMONSTRATION -- and the landing seat said so itself.***
+**The two failures are DIFFERENT tests failing in DIFFERENT modes:** one a worker CRASH on `main`, one a
+`TimeoutExpired` on a pull request. ***`main`'s failing test references the gate ZERO times.***
+
+**THE MECHANISM THAT FITS BOTH: the suite got roughly 38 percent longer and now runs close enough to its
+limits that timeouts and worker crashes appear.** *A specific broken assertion would show the SAME test
+failing, not two different ones in two different ways.* **And an earlier head passed at 16.4 minutes, so
+this is a THIN MARGIN rather than a hard threshold.**
+
+***NO REVERT IS PROPOSED AND THE MERGED FIX IS NOT CALLED DEFECTIVE.*** Whether to raise the leg's
+budget, split the suite, or something else **is a design call the landing seat does not hold.**
+
+***AND THE REASONING THAT DIED HERE IS WORTH MORE THAN THE FINDING.*** Three harness and smoke failures
+were attributed to the environment tonight on the ground that *"the pull request does not touch those
+files."* **That reasoning is still true and was NEVER SUFFICIENT** -- ***`main` BEING GREEN WAS DOING THE
+REAL WORK IN THAT ARGUMENT, AND `main` IS NOT GREEN.*** *An argument that silently depends on a premise
+nobody restated is the shape that survives review.*
 ## 1324. Promote Verdict/Research/Closing-act into the banner block parse_items reads
 
 > 🔢 **Re-scored 2026-08-22.** Filed by the workflow-analysis seat. **Priority:** P2. **Verdict:** build
