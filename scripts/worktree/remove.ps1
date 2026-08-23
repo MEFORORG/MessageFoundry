@@ -92,6 +92,66 @@ if ($DeleteBranch) {
 if ($LASTEXITCODE -ne 0) { throw "git worktree remove failed (exit $LASTEXITCODE)" }
 & git -C $RepoRoot worktree prune
 
+# --- BACKLOG #1295: release the claims this worktree held ---------------------
+#
+# `claim.ps1 -Release` is WORKTREE-SCOPED, so once the holder directory is gone NOBODY can release
+# its keys normally and each one reads as actively-being-built forever. Measured 2026-08-19: 19 of
+# 28 live claims were already orphaned exactly this way -- and THIS script, the sanctioned removal
+# path, had no claim handling at all, so it was a source of them rather than a cure.
+#
+# AFTER THE REMOVAL, NEVER BEFORE. The removal is the event that orphans a claim. Releasing first
+# and then failing to remove would hand a LIVE worktree's keys to another session, which is the
+# duplicate build the registry exists to stop -- strictly worse than the orphan being fixed.
+#
+# MATCH ON THE FULL NORMALISED PATH AND NOTHING ELSE: no leaf name, no prefix, no StartsWith. Same
+# rule Remove-ClaimsHeldBy states in prune-merged.ps1, for the same reason -- releasing a claim held
+# by a DIFFERENT, living worktree is worse than the defect. `ConvertTo-Norm` is DOT-SOURCED rather
+# than copied because it must agree with claim.ps1's writer; a fifth private copy of a path
+# normaliser is exactly where that agreement breaks without anyone noticing.
+#
+# UNREADABLE IS NOT ABSENT. A claim file that will not parse MIGHT name this worktree, so it is
+# reported and LEFT ALONE rather than deleted on a guess.
+#
+# REPORTS, NEVER THROWS. The worktree is already gone by this point; throwing here would report the
+# whole removal as failed and invite a re-run of something that already succeeded.
+try {
+    . "$PSScriptRoot\..\coord\occupancy.ps1"
+    $commonDir = "$(& git -C $RepoRoot rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
+    $claimsDir = if ($commonDir) { Join-Path $commonDir 'mefor-coord/claims' } else { '' }
+    if ($claimsDir -and (Test-Path -LiteralPath $claimsDir)) {
+        $target = ConvertTo-Norm $WorktreePath
+        $released = @()
+        $unreadable = @()
+        foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA SilentlyContinue | Sort-Object Name)) {
+            $c = $null
+            try { $c = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop }
+            catch { $unreadable += $f.Name; continue }
+            if ((ConvertTo-Norm ([string]$c.worktree)) -ne $target) { continue }
+            try {
+                Remove-Item -LiteralPath $f.FullName -Force -EA Stop
+                $released += [string]$c.key
+            }
+            catch {
+                Write-Warning ("claim '$([string]$c.key)' was held by the removed worktree and could NOT be " +
+                               "released: $($_.Exception.Message). Release it yourself: " +
+                               "claim.ps1 -Release $([string]$c.key) -Force")
+            }
+        }
+        if ($released.Count -gt 0) {
+            Write-Host "Released $($released.Count) claim(s) held by the removed worktree: $($released -join ', ')"
+        }
+        if ($unreadable.Count -gt 0) {
+            Write-Warning ("$($unreadable.Count) claim file(s) could not be parsed and were LEFT IN PLACE " +
+                           "($($unreadable -join ', ')). One of them may name the removed worktree; an " +
+                           "unreadable claim is not an absent one, so it is not deleted on a guess.")
+        }
+    }
+}
+catch {
+    Write-Warning ("could not sweep claims for the removed worktree: $($_.Exception.Message). Any claim it " +
+                   "held is now orphaned -- `claim.ps1 -Release` is worktree-scoped, so use -Force to clear it.")
+}
+
 if ($DeleteBranch) {
     # LOSSLESS-DELETE DISCIPLINE, as defined by prune-merged.ps1's Remove-BranchSafely: `-d` first, and
     # `-D` only after re-verifying at THAT MOMENT that the branch has nothing beyond the main ref.

@@ -34,6 +34,7 @@ on the branch merely existing.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -299,3 +300,106 @@ def test_the_script_location_default_still_anchors_when_no_root_is_passed(fx: Fi
     assert proc.returncode == 0, proc.stderr
     assert not wt.exists()
     assert not fx.is_registered(wt)
+
+
+# --- BACKLOG #1295: claims held by a removed worktree --------------------------
+#
+# `claim.ps1 -Release` is WORKTREE-SCOPED, so a claim outliving its holder can never be released
+# normally and reads as actively-being-built forever. Measured 2026-08-19: 19 of 28 live claims were
+# already orphaned this way, and this script -- the sanctioned removal path -- had no claim handling,
+# so it was a source of them.
+#
+# THE FALSE POSITIVE IS THE ONE TO FEAR, not the missed release. Handing a LIVE worktree's key to
+# another session invites the duplicate build the registry exists to stop, which is strictly worse
+# than the orphan. That is why two of the tests below assert a claim SURVIVES.
+
+
+def _claims_dir(fx: Fixture) -> Path:
+    common = _git(fx.primary, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    d = Path(common) / "mefor-coord" / "claims"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _write_claim(fx: Fixture, key: str, worktree: Path | str) -> Path:
+    f = _claims_dir(fx) / f"{key}.json"
+    f.write_text(
+        json.dumps({"key": key, "worktree": str(worktree).replace("\\", "/"), "note": "t"}),
+        encoding="utf-8",
+    )
+    return f
+
+
+def test_a_claim_held_by_the_removed_worktree_is_released(fx: Fixture) -> None:
+    wt = fx.add("alpha")
+    claim = _write_claim(fx, "9001", wt)
+    assert claim.exists(), (
+        "POSITIVE CONTROL: the claim must exist before removal, or this proves nothing"
+    )
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode == 0, proc.stderr
+    assert not claim.exists(), (
+        "the claim outlived its holder and can now never be released normally"
+    )
+    assert "9001" in proc.stdout, (
+        "the release happened silently; an operator cannot audit what they cannot see"
+    )
+
+
+def test_a_claim_held_by_a_DIFFERENT_worktree_survives(fx: Fixture) -> None:
+    """THE FALSE-POSITIVE GUARD, and it matters more than the release itself."""
+    wt = fx.add("alpha")
+    other = fx.add("beta")
+    mine = _write_claim(fx, "9002", wt)
+    theirs = _write_claim(fx, "9003", other)
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode == 0, proc.stderr
+    assert not mine.exists(), "the removed worktree's own claim was not released"
+    assert theirs.exists(), (
+        "a claim belonging to a LIVING worktree was released. That hands its key to another session "
+        "and invites the duplicate build the registry exists to stop -- worse than the orphan."
+    )
+
+
+def test_a_claim_whose_path_merely_PREFIXES_the_removed_one_survives(fx: Fixture) -> None:
+    """`repo-alpha` is a string prefix of `repo-alpha-two`. A StartsWith match would release both.
+
+    This is the exact shape the matching rule forbids -- full normalised path, no prefix, no leaf.
+    """
+    wt = fx.add("alpha")
+    nested = fx.add("alpha-two")
+    exact = _write_claim(fx, "9004", wt)
+    victim = _write_claim(fx, "9005", nested)
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode == 0, proc.stderr
+    # CONTROL: without this the test passes when the sweep does nothing at all.
+    assert not exact.exists(), "the sweep did not run, so the prefix result below proves nothing"
+    assert victim.exists(), "a prefix match released a different worktree's claim"
+
+
+def test_an_unreadable_claim_is_left_in_place_and_reported(fx: Fixture) -> None:
+    """UNREADABLE IS NOT ABSENT. A file that will not parse might name this worktree, so it is
+    reported rather than deleted on a guess -- and rather than silently skipped, which would make a
+    stranded claim look like a clean sweep."""
+    fx.add("alpha")
+    bad = _claims_dir(fx) / "9006.json"
+    bad.write_text("{not json", encoding="utf-8")
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode == 0, proc.stderr
+    assert bad.exists(), "an unparseable claim was deleted on a guess"
+    combined = proc.stdout + proc.stderr
+    assert "9006" in combined, (
+        "the unreadable claim was skipped silently, which reads as a clean sweep"
+    )
+
+
+def test_removal_still_succeeds_with_no_claims_directory(fx: Fixture) -> None:
+    """The sweep must not turn a working removal into a failure on a repo that has never claimed."""
+    fx.add("alpha")
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode == 0, proc.stderr
+    assert not fx.is_registered(fx.sibling("alpha"))
