@@ -62,6 +62,7 @@ tests/test_coord_overlap_cache.py
 tests/test_coord_overlap_signals.py
 tests/test_coord_presence.py
 tests/test_coord_dispatch_gate.py
+tests/test_coord_seat_clock_alarm.py
 tests/test_coord_throughput.py
 tests/test_doc_guards_lane.py
 tests/test_quality_expiry_audit.py
