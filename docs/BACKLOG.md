@@ -13759,3 +13759,112 @@ mapping it to `build` deletes the gate. **A wrong verdict is worse than an absen
 says so about closing acts, and it holds identically here. The other four (#1301, #1305, #1319, #1322) read
 *"build."* and are mechanical. #320 has no inline verdict at all and already carries a banner `Verdict`; it
 needs only `Closing-act`.
+
+## 1332. Heredoc bodies are scanned as commands, so quoted documentation trips the secret-scanning rules
+
+> 🔢 **Filed 2026-08-23 - not started.** A heredoc body becomes its own line in `Get-ScannableSegments` ([`scripts/hooks/worktree_gate.ps1:557`](../scripts/hooks/worktree_gate.ps1)), and the fact that it is quoted DATA does not survive the newline split. Documentation that QUOTES a config key is scanned as if it SET one. This is the root cause under #1305 and one half of #1306.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** commit gates / secret scanning. **Priority:** P2. **Verdict:** build.
+**Severity:** false denies on the commit path. **Conditional, per section 0:** zero deployments; the
+cost is that a seat cannot commit honest documentation, and learns to reach for a bypass.
+
+**Measured by the building lane, differentially against `main`, with controls discriminating in BOTH
+directions.** An all-allow or all-deny harness proves nothing; both arms fired here.
+
+| case | on `main` | with the #1305 fix |
+| --- | --- | --- |
+| CONTROL allow | ALLOW | ALLOW |
+| CONTROL deny (real write) | DENY | DENY |
+| bare read | DENY | DENY |
+| `--get` read | ALLOW | ALLOW |
+| HEREDOC documentation | **DENY** | **DENY** |
+| `commit -m` documentation | ALLOW | ALLOW |
+
+**THE QUOTED-TEXT FALSE DENY IS ALREADY LIVE ON `main`** for the hooks-path rule. The #1305 fix
+neither caused nor worsened it -- it EXTENDED the same defect to the git program token, which is why
+#1305 added eleven further false-deny classes on top. **One root cause, two rules, one half already
+shipped.**
+
+**A HYPOTHESIS TESTED AND WITHDRAWN, recorded because a wrong mechanism is the more expensive
+artifact.** The lane first proposed that *"line 2 of a quoted body reads as PROGRAM POSITION"*, taking
+it from #1305's own "line 2" wording -- then tested it instead of repeating it:
+
+| case | result |
+| --- | --- |
+| heredoc, key at LINE START | DENY |
+| heredoc, key MID-LINE | DENY |
+| heredoc, key INDENTED | DENY |
+| heredoc, key in BACKTICKS | ALLOW |
+| single-quoted echo, same line | ALLOW |
+| double-quoted echo, same line | ALLOW |
+
+**Position within the line is irrelevant. The discriminator is HEREDOC versus SAME-LINE QUOTING** --
+same-line quoting is handled correctly and a heredoc body is not. The gate's own tests already say so
+in prose: `Get-ScannableSegments` *"splits on NEWLINES only"*
+([`tests/test_worktree_gate_hijack.py:536`](../tests/test_worktree_gate_hijack.py)).
+
+**THE BACKTICK ROW IS LUCK AND MUST NOT BE RELIED ON.** The character before the token is a backtick,
+which is simply not in the pattern's leading character class -- the same accident that keeps a dotted
+git reference from tripping the gate constantly. A writer who happens to use backticks escapes; one
+who does not, does not.
+
+**DO NOT BUILD THIS INSIDE #1306.** That item is two fixes: a bare-read case that must decide on
+whether a VALUE is present rather than on the appearance of a key, and this one. Burying a change to
+`Get-ScannableSegments` -- which all three rule sites call (`:1211`, `:1339`, `:1602`) -- inside a
+fill-in item is how a shared scanner changes without an adversarial pass. **Its own item, its own
+pass.**
+
+**Expiry:** this stops being right if `Get-ScannableSegments` stops splitting on newlines, or if
+heredoc bodies gain their own segment kind.
+
+## 1333. Legacy glyphs freeze security-record cells against correction, while the repair path skips the same check
+
+> 🔢 **Filed 2026-08-23 - not started.** 20 of 345 cells carry a banned glyph in prose written BEFORE the gate that now bans it, so each is frozen against every residual correction, by anyone, until the glyphs are removed. The same check is SKIPPED on the repair path, so the record is fully repairable and only partly correctable.
+> Verdict: owner-ruling
+> Research: none
+> Closing-act: owner-ruling
+
+**Cluster:** record-maintenance tooling. **Priority:** P2. **Verdict:** owner-ruling -- the fix
+direction is a decision, not a build, and the tracking seat correctly declined to take it.
+**Severity:** no deployment axis. **Conditional, per section 0:** zero deployments; this blocks
+maintenance of a security record, not any running thing.
+
+**Measured, 181 occurrences across 20 of 345 cells.** `apply.py` refuses any payload whose prose
+carries one ([`scripts/asvs/apply.py:281`](../scripts/asvs/apply.py)), against a `_BANNED` class
+covering the banner alphabet and the emoji planes. The glyphs predate that gate.
+
+***THE ASYMMETRY IS THE INTERESTING HALF, AND IT IS WHY THIS WENT UNNOTICED.*** The check is skipped
+entirely on a repair pass -- `blob = "" if anchor_repair else ...` -- confirmed empirically by an
+11-anchor repair landing cleanly on a cell carrying 17 glyphs. **So bookkeeping passes work and
+assessment corrections do not, which is exactly backwards from which one matters.**
+
+**A NARROWING WORTH MEASURING BEFORE ANYONE SIZES THE MIGRATION.** That `blob` is a `" ".join` over a
+ONE-ELEMENT tuple, so the gate reads `residual` **and no other prose field**. If the 181 occurrences
+are spread across fields, the count that actually freezes anything is smaller than 181 -- possibly
+much smaller -- and a strip touching `residual` alone would unfreeze every cell. **Nobody has
+measured the per-field split. Do that first: it decides whether this is a migration or an afternoon.**
+
+**FIX DIRECTION -- the tension is named here, not resolved:**
+
+1. **Strip the glyphs.** Mechanical, but it edits verdict-bearing assessment prose across 20 records.
+   Not obviously a repair, and not obviously the tracking seat's to make.
+2. **Exempt pre-existing glyphs and enforce only on newly added ones** -- a diff-scoped check rather
+   than a whole-blob one. A tooling change, and it leaves the legacy prose in place.
+
+**A SECOND AND SEPARATE TENSION, in the same area and wanting its own number if anyone takes it.** A
+false absence claim cannot be RETIRED either, because `apply.py` refuses a cardinality shrink by
+design -- correctly, since that guard exists to stop silent truncation. **So a claim whose premise is
+genuinely retired has no clean exit.** Narrowing its pattern would turn a red green by weakening what
+the record asserts, which is a scope change wearing a bookkeeping edit's clothes. The tracking seat
+left it false on purpose, which was the right call.
+
+**At least one correction is blocked on this right now**: built, verified, and refused by the writer.
+
+**Cell identifiers, coverage and gaps stay vaulted (CLAUDE.md section 11), so this row carries counts
+and mechanism only.** The counts size the work without naming which cells are covered.
+
+**Expiry:** this stops being right if `_BANNED` moves, if the `anchor_repair` skip is removed, or if
+the residual-only scope of that `blob` changes.
