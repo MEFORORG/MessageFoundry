@@ -13269,6 +13269,22 @@ runway or give it to nobody.*
 **Cluster:** Worktree gate / PowerShell correctness. **Priority:** P3. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0), and no live defect axis either -- `scripts/worktree/` is developer tooling and the caller currently compensates. The cost is that the next caller written against this function inherits a NULL its signature does not advertise.
 
+
+***AMENDMENT 2026-08-23. THE OBVIOUS FIX WAS BUILT, MEASURED, AND REVERTED -- IT REDS 10 OF 22 TESTS.***
+
+A lane diagnosed this row, **built the direct fix, measured it, and found it turning 10 of 22 tests red.**
+*It reverted, confirmed the baseline green again, and recorded where a second approach should begin.*
+
+***THAT NEGATIVE RESULT IS THE VALUABLE PART AND IT IS WHY THIS ROW IS AMENDED RATHER THAN LEFT CLEAN
+FOR THE NEXT READER.*** **The next person to open this item will reach for the same fix**, because it is
+the one the defect description implies. **They should know it has been tried and measured, not merely
+doubted.**
+
+**REMAINS OPEN AND UNCLAIMED.** *A second approach is genuinely new work rather than a continuation, so
+it was correctly not started under a rung that holds STARTING.*
+
+**The lane's fuller notes on where to begin live in its own handoff; this row carries the measured
+result, which is the part that must survive the handoff.**
 ## 1292. connscale smoke reports a message acked but not observed at intake, and nothing discriminates harness race from real intake loss
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **3/10** · _quick win_. The harness-race branch has been substantially absorbed by the excusal and intake floor at runner.py:869-905, whose comment names this exact flake, but the discriminator the item asks for does not exist -- nothing checks whether an ingress row was written for the message counted lost, so the count-and-log branch is still not ruled out and no other instrument can rule it out. Difficulty is a store lookup wired into the record-building seam plus a test, with both ends of that seam already present (per-send control_id at sender.py:186, per-backend store access at runner.py:373-377). _(previously unscored.)_
