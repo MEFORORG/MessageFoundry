@@ -2930,6 +2930,30 @@ def route_demo_oru(msg):
 
 **Source:** Windmill/Kestra evaluation (2026-07-30); owner approved.
 
+
+***AMENDMENT 2026-08-23. THIS ROW'S PREREQUISITE SENTENCE IS FALSE, AND IT SURVIVED INSIDE A RE-SCORE.***
+
+The 2026-08-03 amendment ends *"both named backlog dependencies are still open."* ***BOTH ARE CLOSED,
+AND BOTH CLOSED BEFORE THIS ROW WAS LAST RE-SCORED.*** Read with `parse_items` over the archive, both
+carry the **DONE** banner glyph -- *not the declined or retired ones*, **which is the only reading that
+CLEARS a prerequisite: a DECLINED dependency leaves a gate shut exactly as an open one does, and only
+the banner separates them.**
+
+***THE SHARP PART: THE STALENESS SITS INSIDE A THREE-DAY-OLD RE-SCORE.*** Whoever re-scored correctly
+re-priced the difficulty and **carried the dependency sentence forward unexamined.** ***A RE-SCORE IS
+EXACTLY WHERE A READER ASSUMES EVERY CLAIM WAS JUST CHECKED, SO A STALE LINE SURVIVES BETTER THERE THAN
+ANYWHERE ELSE.***
+
+**A SECOND AND SEPARATE EDIT IS NEEDED: THE GATE SENTENCE IS NOW FALSE ABOUT THE CODE.** The dependency
+shipped **one option only, by owner ruling** -- the divergence class is **GATED by a differential test,
+not ELIMINATED** -- so the duplicated logic this row names **still exists**, with an enforced mirror test
+asserting it on every relevant CI leg. ***The gate reads as CLEARED*** -- its purpose was to stop this
+row introducing silent divergence, and an enforced differential test serves that better than elimination
+-- **but the WORDING must be replaced, not merely the status claim.**
+
+***A FIFTH DISPATCH SCREEN, WITH A WORKED INSTANCE: "DOES THIS ITEM DECLARE A PREREQUISITE, AND IS IT
+STILL OPEN?"*** The four screens in use -- already-built, gated verdict, retired-in-place, and
+subject-exists -- **none of them reads "gated on another item" out of an item's own prose.**
 ## 248. Steps view: reclassify comment-only rows as a non-opaque note row
 
 > ✅ **SHIPPED 2026-08-11 (integration-c).** Value **6/10** · Difficulty **4/10** · _quick win_. A `note` row kind is threaded through `lens.py`'s partition, `_merge_code_rows`, `_EDITABLE_KINDS` and the IDE JSON contract, so comment-only rows no longer render as opaque uneditable code. All three shipped defects the item named are fixed: the trailing comment that rendered nowhere, the adjacent comment swallowed by the coalescer, and the uneditability that contradicted `docs/STEPS-PALETTE.md:71`. ADR 0076 Amendment A was already ACCEPTED, so no gate work was needed. **The carve-out's licence was re-asserted, not assumed:** the coverage partition is proved total and the splice byte-stable, because #26 permits a Steps view only while the `.py` remains the sole artefact and the sole execution path.
@@ -11868,6 +11892,41 @@ control lives. **That is the artifact itself, not a citation about it.**
 **Recorded because the ruling WILL read as broader than it is.** *Two seats reasoned from "identifiers
 appear publicly, so this is fine" today and both were wrong in different directions.* **A narrow ruling
 cited as a general permission is how the next disclosure gets argued into place.**
+
+***DESIGN FOR OPTION (c), CONTRIBUTED BY THE SEAT THAT OWNS THE RECORD AND DECLINED THE BUILD ON
+HEADROOM. IT MAKES (c) A SMALL BUILD RATHER THAN A DESIGN PROBLEM.***
+
+**The solved form of this exact problem already exists in this repository: the tally lint's
+FORWARD-ONLY, SHRINK-ONLY BASELINE.** Its own docstring -- *"this is forward-only and it is not a
+sweep... existing tallies are recorded in a frozen baseline that may only SHRINK; a tally that is not in
+the baseline fails."*
+
+**APPLIED TO ANCHORS:**
+- commit a frozen baseline of the **currently failing** anchors -- ***read the count at implementation,
+  do not carry one***
+- the job fails **ONLY** on a failure **not in the baseline**
+- the baseline may only **SHRINK**; a repair removes its line in the same commit
+- ***so a NEW break flips the job from red to red-FOR-A-DIFFERENT-REASON, which is precisely the state
+  change gap 3 says is missing***
+
+***AND IT DISSOLVES THIS ROW'S OWN PRECONDITION RATHER THAN SEQUENCING IT.*** The row warns that making
+the verify job required *without first closing the standing failures* converts a silent problem into a
+permanently blocked repository. ***WITH A BASELINE YOU DO NOT CLOSE THEM FIRST -- YOU BASELINE THEM.***
+The standing failures stop blocking; a new one blocks immediately.
+
+**WHY IT TRANSFERS RATHER THAN RHYMES:** the tally lint solved the identical SHAPE -- a real defect, a
+large pre-existing population, and a one-time sweep that *cost about 850 net lines, needed its own
+repair commit, and regenerated within four days.* **Anchors have the same three properties.**
+
+**TWO BUILD CONSTRAINTS:**
+1. ***KEY ON SOMETHING STABLE -- NOT THE LINE NUMBER.*** Lines drift constantly and **every drift would
+   read as a new break.** Key on the path plus the expected token, or a hash of that pair.
+2. ***THE BASELINE IS VAULT-SIDE AND STAYS THERE.*** This is gap 3, the vault's own run, **so the
+   public-log disclosure constraint that makes (a) and (b) hard DOES NOT BIND HERE.** *State it
+   explicitly: a builder who has read the constraint paragraph will assume it applies to all three.*
+
+***AND THIS ROW'S STANDING-FAILURE COUNT IS STALE.*** It was measured much higher this morning and lower
+after repairs landed. **Read the count; do not carry the row's.**
 ## 1246. the scorecard's residual prose carries 1,965 ungated file-line citations, and an enumeration in prose can understate a cell's own gap
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **2/10** · _fill-in_. The unchecked half is confirmed in the verifier: scripts/asvs/scorecard.py touches residual only to require non-empty prose on an na verdict (:451-453), to load it (:559) and to render it (:1998), and the retired anchor window is documented at :105-125, so no residual file-line citation is validated. The 7.2.4 evidence re-derives at HEAD, seven mark_session_* sites in messagefoundry/auth/service.py (:1582, :1822, :2160, :2195, :2199, :2464, :2597) against the two the residual enumerates, and _rotate_session_token (:1614) has callers only in tests/test_session_rotation_primitive.py; value 5 and difficulty 2 because SDS-3.6 already carries the general rule and the stated remedy is a filing rule, deliberately not a new gate. _(was 6/10 · 4/10.)_
