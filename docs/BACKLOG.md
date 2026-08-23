@@ -14176,6 +14176,12 @@ scope at all.
 ***SO IF THAT RULING COMES BACK OUT OF SCOPE, THIS ITEM AS FILED IS PROBABLY UNBUILDABLE TOO.*** **Do
 not hold a slot for it; it cannot start.** *The DO-NOT-LAND evidence commits remain reachable on a
 retained evidence branch.*
+
+***OWNER RULING 2026-08-23 LANDS ON THIS ROW TOO: the tokeniser `#1336` needs is OUT OF SCOPE, so the
+precondition this item waits on WILL NOT BE MET.*** **As filed, this item is probably UNBUILDABLE** --
+its position test operates on a line, and the per-line view it would run against cannot distinguish a
+quoted body's line from a command line. **Do not pick it up expecting a one-line fix; the layer beneath
+it has been ruled closed for now.**
 ## 1301. a ledger banner citing a commit sha must cite a commit whose subject names the item it sits under
 
 > 🔢 **Filed 2026-08-21 -- not started. ONE EDIT CORRUPTED TWO ITEMS IN OPPOSITE DIRECTIONS AND NO GATE COULD SEE IT, BUT A SHA-TO-ITEM AGREEMENT CHECK WOULD HAVE.** A retirement banner intended for one item was written onto another. The Markdown stayed valid, the item count did not move, the status glyph was untouched, and the misplaced paragraph carried no glyph of its own -- so `parse_items` had no second banner to object to and every ledger gate passed.
@@ -14798,6 +14804,30 @@ shell tokeniser.**
 FIXES.*** `#1069` records an earlier attempt at structured parsing narrower than the regex it replaced,
 which produced **five new fail-opens**. **WHETHER A SHELL TOKENISER IS IN SCOPE AT ALL IS AN OWNER
 QUESTION and is routed as one. Do not attempt a fifth candidate before it is answered.**
+
+***OWNER RULING 2026-08-23: A SHELL TOKENISER IS OUT OF SCOPE FOR NOW. NO FIFTH CANDIDATE. This rule
+keeps both known defects and stays imperfect and honest.***
+
+**THE LEDGER SUPPORTS THIS FAR HARDER THAN THE FOUR-FAILURES ARGUMENT DID.** *Nine rule-3c items were
+named and every one is PRESENT AND OPEN in the live ledger* -- **`#1061`, `#1065`, `#1066`, `#1067`,
+`#1069`, `#1071`, `#1072`, `#1086`, `#1229`.** *(The relaying seat counted eleven in total; nine were
+named and all nine verified here against a negative control.)*
+
+**FOUR OF THEM ARE ONE QUOTE-HANDLING FAMILY:** strips double quotes only so a single-quoted target
+bypasses; matches the key on the quote-blanked string so a quoted key is invisible; blanks double-quoted
+spans first so a stray quote straddles; reads a here-string as a command so documentation is refused.
+
+***SO THIS IS NOT FOUR ATTEMPTS. IT IS A SUSTAINED SERIES OF QUOTE-HANDLING DEFECTS ON ONE RULE.***
+
+**THE LIMIT ON THAT CLAIM, STATED BECAUSE IT MATTERS: the relaying seat read HEADINGS, NOT HISTORIES.**
+*It did not verify that each of the nine is a FAILED FIX rather than an independent discovery.* **The
+shape is unmistakable; the causal chain is INFERRED.** *Hardening it needs the commit history per item.*
+
+**AND THE FINDING THAT OUTLIVES THE VERDICT IS THE CONSTRAINT CORRECTION, NOT THE RULING:** *a
+pre-written acceptance table proves you did not regress the KNOWN shapes and cannot anticipate the
+failure modes of a design that does not exist yet.* ***THAT EXPLAINS ALL FOUR GREEN SUITES WITHOUT
+ANYONE BEING CARELESS.*** **A suite written against the shapes you know is a REGRESSION test, not a
+CORRECTNESS test, and it is structurally incapable of the thing everyone assumed it was doing.**
 ## 1337. The leak gate has no pattern for a security-record citation, and a bare-identifier screen would be switched off within a day
 
 > 🔢 **Filed 2026-08-23 - not started.** `scripts/security/scan_forbidden.py` screens routable IPs, worktree slugs, home paths, customer and vendor names, and site codes. **It has no pattern for a security-record identifier at all.** The obvious screen -- match the identifier shape -- is **measurably unusable**, and this row carries the working specification instead.
