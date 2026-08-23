@@ -376,6 +376,32 @@ def test_a_QUOTED_absolute_git_program_is_DENIED_in_every_spelling(
     assert run_gate(shell(ungoverned, repo.primary.parent, tool), repo.repos) is None
 
 
+@pytest.mark.parametrize(
+    "path_shape,tool",
+    [
+        ("C:\\tools\\{leaf}", "PowerShell"),  # a Windows absolute path, backslashes intact
+        ("C:/tools/{leaf}", "Bash"),  # the same path in the spelling Git Bash takes
+        ("C:/PROGRA~1/Git/bin/{leaf}", "Bash"),  # an 8.3 SHORT path
+        ("/usr/bin/{leaf}", "Bash"),  # a POSIX absolute path
+        ("./{leaf}", "Bash"),  # relative
+    ],
+)
+@pytest.mark.parametrize("leaf", ["git.exe", "GIT.EXE", "Git"])
+def test_an_UNQUOTED_absolute_path_to_git_is_DENIED_in_every_spelling(
+    repo: SimpleNamespace, path_shape: str, tool: str, leaf: str
+) -> None:
+    """Two of the item's four predicted next-bypasses, checked rather than assumed.
+
+    The item warns the next bypass is "a trailing dot, a short path, a quoted absolute path, or an
+    alias, and each one closes as its own item forever". A short path and an absolute path need no
+    separate handling here: the comparison is on the LAST PATH COMPONENT, so `PROGRA~1` never enters
+    it. (The trailing dot is not a live bypass at all -- measured, neither host runs `git.` or
+    `git.exe.`. The alias is real and stays open; it is pinned below.)
+    """
+    shaped = path_shape.format(leaf=leaf) + f" -C {repo.primary} reset --hard"
+    assert_denied(run_gate(shell(shaped, repo.primary, tool), repo.repos))
+
+
 # --- the residuals, pinned as OPEN so nobody over-reads the fix -----------------------------------
 
 
@@ -417,6 +443,12 @@ def test_the_shapes_this_fix_does_NOT_close_are_pinned_as_KNOWN_OPEN(
 
     THE FIRST TWO ARE UNREACHABLE FROM A LINE SCANNER at all: the name ``g`` carries no evidence. The
     last two are allowlist misses and could be closed by extending the scanner.
+
+    ONE MORE ASYMMETRY IS DELIBERATELY NOT PINNED HERE, because closing it would not be a win.
+    ``echo "oops ; GIT -C <governed> reset --hard`` allows while its lowercase twin denies, on both
+    blobs -- an unterminated quoted span is left VISIBLE rather than blanked, and the scan reads it as
+    one long token. Measured: NEITHER host runs an unterminated quote (bash reports unexpected EOF,
+    pwsh exits 1), so no command exists for the capitalised spelling to bypass.
 
     WHEN A ROW REDS, that is the success signal -- somebody closed it. Delete the row; do not restore
     the ALLOW, and re-check that the argument-position family above still allows.

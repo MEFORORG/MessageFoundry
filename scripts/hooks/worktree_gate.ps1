@@ -399,9 +399,18 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
 #     means letting a position test GATE the token match, which is precisely the reverted direction
 #     above. Fixing the bypass and fixing that false deny are two different changes with opposite risk
 #     profiles, and only one of them is #1305.
-#   * A TRAILING DOT (`git.`, `git.exe.`) is NOT a live bypass on this box -- measured, neither host
-#     runs it -- so nothing here addresses it. 8.3 short paths and quoted absolute paths in lowercase
-#     already DENY.
+#   * AN UNTERMINATED QUOTE ahead of the token: `echo "oops ; GIT -C <governed> reset --hard` ALLOWs
+#     while its lowercase twin DENIES, here and on main. That falls out of the deliberate rule below
+#     that an unterminated span is left VISIBLE rather than blanked, which this scan reads as one long
+#     token. It is not a live bypass: measured, NEITHER host runs an unterminated quote (bash reports
+#     unexpected EOF, pwsh exits 1), so nothing executes for the capitalised spelling to reach.
+#
+# WHAT THE ITEM PREDICTED AND WHAT ACTUALLY HAPPENED, since three of its four named next-bypasses were
+# checkable and the answers are not what the list implies. A QUOTED ABSOLUTE PATH now denies in every
+# case, on both hosts. An 8.3 SHORT PATH (`C:/PROGRA~1/Git/bin/GIT.EXE`) now denies -- it never needed
+# separate handling, because the leaf is what is compared. A TRAILING DOT (`git.`, `git.exe.`) is not a
+# live bypass at all: measured, neither host runs it, so there is nothing to close. Only the ALIAS is
+# both real and open, and it is open by construction rather than by omission.
 #
 # PLATFORM PREMISE, since it is a fact about the host and not about the characters: this rests on
 # Windows resolving `Git` and `git` to one executable. On a case-sensitive filesystem they are different
