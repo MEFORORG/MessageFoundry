@@ -39,6 +39,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 import yaml
@@ -159,13 +160,33 @@ def _assert_stubs_win(bash: str, path_prepend: Path, full_env: dict[str, str]) -
     )
 
 
+class StepRun(NamedTuple):
+    """What a step body did, INCLUDING what it said (BACKLOG #1312).
+
+    The stdout/stderr fields exist because their absence cost a real diagnosis. This helper used to
+    run the child with ``capture_output=True`` and return only ``(rc, outputs)``, so the step's own
+    ``::notice::'<name>==<ver>' was published Nh ago`` and every ``::warning::`` were captured and
+    then DISCARDED. A failing row therefore reported a wrong boolean and withheld the one sentence
+    that says WHY -- the age the step actually computed, and from which payload.
+
+    That is what made the live-PyPI reach on ``windows-2025`` hard to see rather than obvious: the
+    harness had the evidence in hand at the moment of failure and threw it away. Whoever debugs a row
+    here should read the child's own words BEFORE theorising about PATH interposition.
+    """
+
+    rc: int
+    outputs: dict[str, str]
+    stdout: str
+    stderr: str
+
+
 def _run_step_body(
     step_id: str,
     env: dict[str, str],
     tmp_path: Path,
     path_prepend: Path | None = None,
-) -> tuple[int, dict[str, str]]:
-    """Run a step's shipped ``run:`` body under ``bash -e``; return ``(rc, $GITHUB_OUTPUT map)``.
+) -> StepRun:
+    """Run a step's shipped ``run:`` body under ``bash -e``; return rc, outputs, stdout and stderr.
 
     The body is executed VERBATIM — no substitution, no rewriting — which is only sound because the
     step interpolates no ``${{ }}`` expressions. That invariant is asserted separately.
@@ -222,7 +243,19 @@ def _run_step_body(
         if "=" in line:
             key, _, value = line.partition("=")
             parsed[key.strip()] = value.strip()
-    return proc.returncode, parsed
+    return StepRun(proc.returncode, parsed, proc.stdout, proc.stderr)
+
+
+def _diagnostic(run: StepRun) -> str:
+    """The child's own words, for an assertion message. Empty streams say so explicitly.
+
+    ``(no stdout)`` is not padding: a silent child and a child whose output was dropped by the
+    harness are different faults with the same appearance, and this is the line that separates
+    them."""
+    return (
+        f"\n--- step stdout ---\n{run.stdout.strip() or '(no stdout)'}"
+        f"\n--- step stderr ---\n{run.stderr.strip() or '(no stderr)'}"
+    )
 
 
 # --------------------------------------------------------------------------------------------------
@@ -452,14 +485,17 @@ def test_allowset_holds_everything_not_named(
     ecosystem: str, names: str, expected: str, tmp_path: Path
 ) -> None:
     """Execute the shipped allow-set body and check what it actually decides."""
-    rc, out = _run_step_body(
+    run = _run_step_body(
         "allowset",
         {"DEP_NAMES": names, "DEP_ECOSYSTEM": ecosystem},
         tmp_path,
     )
-    assert rc == 0, f"the allowset body aborted under `bash -e` (rc={rc}) — CI would fail the step"
-    assert out.get("eligible") == expected, (
-        f"ecosystem={ecosystem!r} names={names!r} -> eligible={out.get('eligible')!r}, "
+    assert run.rc == 0, (
+        f"the allowset body aborted under `bash -e` (rc={run.rc}) — CI would fail the step"
+        f"{_diagnostic(run)}"
+    )
+    assert run.outputs.get("eligible") == expected, (
+        f"ecosystem={ecosystem!r} names={names!r} -> eligible={run.outputs.get('eligible')!r}, "
         f"expected {expected!r}"
     )
 
@@ -488,7 +524,7 @@ def test_release_age_holds_the_version_track_and_undatable_ecosystems(
     unconditionally-false step would also pass — so the discriminating ``true`` case is supplied by
     ``test_release_age_passes_an_aged_release_and_holds_a_fresh_one`` below. These two tests are a
     pair; this one runs everywhere, that one needs jq."""
-    rc, out = _run_step_body(
+    run = _run_step_body(
         "age",
         {
             "SECURITY_TRACK": security_track,
@@ -497,10 +533,14 @@ def test_release_age_holds_the_version_track_and_undatable_ecosystems(
         },
         tmp_path,
     )
-    assert rc == 0, f"the age body aborted under `bash -e` (rc={rc}) — CI would fail the step"
-    assert out.get("age_ok") == "false", (
+    assert run.rc == 0, (
+        f"the age body aborted under `bash -e` (rc={run.rc}) — CI would fail the step"
+        f"{_diagnostic(run)}"
+    )
+    assert run.outputs.get("age_ok") == "false", (
         f"security_track={security_track!r} ecosystem={ecosystem!r} -> "
-        f"age_ok={out.get('age_ok')!r}, expected 'false'"
+        f"age_ok={run.outputs.get('age_ok')!r}, expected 'false'"
+        f"{_diagnostic(run)}"
     )
 
 
@@ -560,7 +600,7 @@ def test_the_advisory_guard_fails_closed_when_the_api_errors(
     version of exactly that check. Asserting on the emitted OUTPUT is what makes the difference
     visible.
     """
-    rc, out = _run_step_body(
+    run = _run_step_body(
         "ghsa",
         {
             "DEP_GROUP": "pip-security",
@@ -570,10 +610,16 @@ def test_the_advisory_guard_fails_closed_when_the_api_errors(
         tmp_path,
         path_prepend=_gh_stub(tmp_path, count),
     )
-    assert rc == 0, f"the ghsa body aborted under `bash -e` (rc={rc}) — CI would fail the step"
-    assert out.get("security_track") == "true", "the fixture should select the security track"
-    assert out.get("advisory_ok") == expected, (
-        f"{label} -> advisory_ok={out.get('advisory_ok')!r}, expected {expected!r}"
+    assert run.rc == 0, (
+        f"the ghsa body aborted under `bash -e` (rc={run.rc}) — CI would fail the step"
+        f"{_diagnostic(run)}"
+    )
+    assert run.outputs.get("security_track") == "true", (
+        "the fixture should select the security track"
+    )
+    assert run.outputs.get("advisory_ok") == expected, (
+        f"{label} -> advisory_ok={run.outputs.get('advisory_ok')!r}, expected {expected!r}"
+        f"{_diagnostic(run)}"
     )
 
 
@@ -627,7 +673,7 @@ def test_release_age_passes_an_aged_release_and_holds_a_fresh_one(
     label: str, payload: str | None, expected: str, tmp_path: Path
 ) -> None:
     """The security-track happy path and its three failure modes, against a stubbed PyPI."""
-    rc, out = _run_step_body(
+    run = _run_step_body(
         "age",
         {
             "SECURITY_TRACK": "true",
@@ -637,9 +683,12 @@ def test_release_age_passes_an_aged_release_and_holds_a_fresh_one(
         tmp_path,
         path_prepend=_curl_stub(tmp_path, payload),
     )
-    assert rc == 0, f"the age body aborted under `bash -e` (rc={rc}) — CI would fail the step"
-    assert out.get("age_ok") == expected, (
-        f"{label} -> age_ok={out.get('age_ok')!r}, expected {expected!r}"
+    assert run.rc == 0, (
+        f"the age body aborted under `bash -e` (rc={run.rc}) — CI would fail the step"
+        f"{_diagnostic(run)}"
+    )
+    assert run.outputs.get("age_ok") == expected, (
+        f"{label} -> age_ok={run.outputs.get('age_ok')!r}, expected {expected!r}{_diagnostic(run)}"
     )
 
 
