@@ -215,6 +215,13 @@ becomes real when someone runs the installer.
   number space; it is the seam any further commit-time rule should hang off.)
 - **It does not stop one session writing into another session's worktree** by absolute path. That is the
   unavoidable price of keying on the target path, and the alternative (keying on cwd) is strictly worse.
+- **It identifies git by NAME, so a different name for the same program is not seen.** The git rules read
+  a command line, never a dispatch, so the strongest available test is "the program token's last path
+  component spells `git`". Every *spelling* of that name is now covered — `Git`, `GIT`, `GIT.EXE`, an
+  absolute path, an 8.3 short path, quoted or not (BACKLOG #1305). An **alias** (`Set-Alias g git`), a
+  **shell function**, and a **renamed copy of `git.exe`** are not, and no line scanner closes them: the
+  name `g` carries no evidence of what it runs. The `pre-commit` backstop above is what catches the
+  result of those routes, because it inspects the tree rather than the command.
 - **It does not prevent merge conflicts** — and does not need to. The measured cross-session conflict rate
   in this repo is **zero** (28/28 merged branches and 6/6 in-flight pairs merge clean). This gate exists to
   stop concurrent sessions trampling one shared working tree, not to arbitrate merges.

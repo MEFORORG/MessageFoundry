@@ -357,8 +357,8 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
 # so an absolute program path matches -- so it also matches any PATH ARGUMENT whose last component is
 # `git`. Widening it by case alone therefore reads `cp -r "/c/backups/Git" restore` as a git command and
 # the next ordinary word as its verb. That was built during BACKLOG #1229 and reverted at a measured cost
-# of twelve false denies (`cp`, `mv`, `ls`, `rsync`, `find -exec`, `7z`, `echo`, `python --src`,
-# `Copy-Item`, `Move-Item`). A false DENY on this gate blocks ordinary developer commands, and that is
+# of twelve false denies -- the shapes are enumerated once, at the emit site inside Remove-QuotedSpans,
+# and are not restated here. A false DENY on this gate blocks ordinary developer commands, and that is
 # what buys a gate uninstalled -- the failure this file's own preamble names.
 #
 # SO THE ANSWER NEEDS A POSITION TEST, and this function is it: a forward, quote-aware token scan that
@@ -367,10 +367,21 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
 # because that span is dispatched; `cp -r "/c/backups/Git" restore` is not, because `cp` already
 # occupies program position and the quoted span is an argument.
 #
-# THIS IS NOT THE REVERTED PREDICATE, AND THE DIFFERENCE IS THE WHOLE SAFETY ARGUMENT. `Test-GitProgramPosition`
-# (fb93c9ca, reverted in c0d6cef8) used a position test to GATE the existing quoted-program emit, so
-# every shape its wrapper list did not know went from DENY to ALLOW -- two measured fail-opens,
-# `cmd /c "<...>\git.exe"` and a PowerShell dot-source, both of which `origin/main` denies. This
+# THIS IS NOT A RESOLVED-EXECUTABLE COMPARISON, AND THE ITEM ASKED FOR ONE. Saying so plainly, because
+# a fix that quietly under-delivers on its own brief is worse than one that names the gap. The item's
+# direction is "compare the RESOLVED EXECUTABLE, not a spelling", and that is not reachable here: the
+# rules see a STRING, never a dispatch, so resolving a token against PATH would first have to know the
+# token is in program position -- resolution SITS ON a position test, it does not replace one. It would
+# also mean touching the filesystem on every tool call inside a hook whose contract is to fail open and
+# be fast. What is reachable is program IDENTITY at a position: last path component, `.exe` stripped,
+# compared case-insensitively -- the same comparison Get-FlagOwner already makes below. That closes
+# every spelling of the same file NAME; it does not close a DIFFERENT name for the same file, which is
+# why an alias and a renamed copy stay open in the list further down.
+#
+# THIS IS NOT THE REVERTED PREDICATE, AND THE DIFFERENCE IS THE WHOLE SAFETY ARGUMENT.
+# `Test-GitProgramPosition` (fb93c9ca, reverted in c0d6cef8) used a position test to GATE the existing
+# quoted-program emit, so every shape its wrapper list did not know went from DENY to ALLOW -- two
+# measured fail-opens, `cmd /c "<...>\git.exe"` and a PowerShell dot-source, both denied on main. This
 # function only ever REWRITES CASE, and only on a token whose leaf already spells git. It is therefore
 # THE IDENTITY on every command line that spells git in lowercase, which is every line that denies
 # today: no existing DENY can be reached by this code path, so none can be lost. A position MISS here

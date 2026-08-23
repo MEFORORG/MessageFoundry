@@ -217,7 +217,8 @@ def test_a_PATH_ARGUMENT_whose_leaf_spells_git_is_still_ALLOWED(
 
     A directory whose last component happens to be ``Git``, followed by an ordinary word that happens
     to be a git verb, is not a git command. Match the token case-insensitively without a position test
-    and all of these DENY -- the twelve measured shapes that got the BACKLOG #1229 widening reverted.
+    and every row here DENIES. This is the family whose twelve measured members got the BACKLOG #1229
+    widening reverted; the members are enumerated once, in the hook, at the emit site.
 
     THE CWD IS LOAD-BEARING AND A PREVIOUS VERSION OF THIS SHAPE GOT IT WRONG. Run from outside the
     governed repo, a bare ``git restore`` names no governed target and the row allows whatever the
@@ -230,8 +231,8 @@ def test_a_PATH_ARGUMENT_whose_leaf_spells_git_is_still_ALLOWED(
     shaped = argument_shape.replace("{q}", quoted)
     assert run_gate(shell(shaped, repo.primary), repo.repos) is None, (
         f"{shaped!r} DENIED. A path argument whose leaf spells `Git` is not a git invocation, and "
-        "denying it stops legitimate work over a directory name -- this is the twelve-false-deny "
-        "family that got the BACKLOG #1229 widening reverted (BACKLOG #1305)."
+        "denying it stops legitimate work over a directory name -- this is the false-deny family "
+        "that got the BACKLOG #1229 widening reverted (BACKLOG #1305)."
     )
 
 

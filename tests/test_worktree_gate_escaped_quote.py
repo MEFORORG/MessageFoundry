@@ -465,8 +465,8 @@ def test_a_TITLE_CASED_quoted_git_leaf_cannot_supply_a_verb(
 # WHAT CLOSED IT is upstream of this file's subject and is NOT the remedy that docstring warned off.
 # `ConvertTo-CanonicalGitProgram` lowercases the leaf of a token it has decided is in PROGRAM position,
 # on the line BEFORE `Remove-QuotedSpans` reads it, so the emit here stays case-SENSITIVE and its
-# twelve-false-deny bound is untouched -- the two rows below still hold, measured. The DENY is pinned in
-# tests/test_worktree_gate_program_case.py, not restated here.
+# twelve-false-deny bound is untouched -- the argument-position rows above and below both still hold,
+# measured. The DENY is pinned in tests/test_worktree_gate_program_case.py, not restated here.
 
 
 def test_a_LOWERCASE_quoted_git_LEAF_in_argument_position_is_a_known_open_FALSE_DENY(
