@@ -15926,6 +15926,38 @@ writer refuses any ref that is not its branch's tip.
 
 **Source:** filed 2026-08-23 by the ASVS-TRACKER seat, owner-directed. The 2026-08-08 ledger-coverage sweep that produced this family of items scanned the **partial and fail** cells and did not cover **needs-review**, so all three contested cells were absent from the ledger while 186 of their siblings carried an item. That is a gap in the sweep's domain, not a lapse in anyone's diligence -- and it is why a cell can stay contested for three weeks with nothing scheduling it.
 
+**RESEARCHED 2026-08-23** (dispatcher workflow `wf_8ae5d086-a15`, 10 agents, each finding attacked
+by two refuters; findings file `DISPATCHER-2026-08-23-HANDOFF-FINDINGS-asvs-1350-1352-research.md`).
+**Verdict: CANNOT HONESTLY PASS WITHOUT WORK. Neither refuter broke it.**
+
+**CORRECTION TO THIS ITEM'S OWN PREMISE, and it is mine.** The text above asks whether the sandbox
+"holds for every response path or only the download route", which assumes the CSP is reached
+*through* the classifier. It is not. `_ATTACHMENT_CSP` is re-asserted on **every** attachment
+response by middleware (`api/app.py:720`, `:749`) and set directly at `:3571`, and
+`Content-Disposition: attachment` is unconditional. **The classifier does not gate the sandbox --
+it downgrades the declared `Content-Type`.** So sub-question (2) as written is answered "every
+path", and the real question is narrower: what an active type that the classifier does not
+recognise is *labelled* as while being served under the sandbox.
+
+**The decisive measurement, reproduced by this seat.** `_BROWSER_ACTIVE_SUBTYPE_TOKENS` is a
+**FOUR-TOKEN DENY-LIST** -- `html`, `xml`, `script`, `svg` -- plus a `multipart` top-type rule.
+Verified against the shipped source: `application/hta` is **NOT** flagged browser-active, and
+`mimetypes.guess_extension("application/hta")` returns `.hta` **from the Windows registry**, so the
+served extension is **host-derived**. A refuter found six further pass-through types.
+
+**Work that would reach an honest pass**, in the findings' order:
+1. **Invert the classifier to a short ALLOW-LIST.** Completeness then becomes a property of a
+   reviewable list rather than an unprovable negative.
+2. **Stop calling `mimetypes.guess_extension`.** Map the extension from the same allow-list,
+   default `.bin`. A host-derived extension is not a property of the product.
+3. **Decide the PDF question in writing.** A genuine PDF passes both the token test and the magic
+   check, and PDF JavaScript runs in the viewer once a saved file is opened.
+
+**STILL UNMEASURED, and the findings say so: no browser was exercised by anyone.** Three claims
+rest on specification alone, including that `Content-Disposition: attachment` suppresses inline
+rendering. That is the gap a pass would have to close with a real user agent.
+
+
 ## 1352. research an honest pass for ASVS 11.4.4 -- key-derivation parameters that balance security against brute force, at every derivation site
 
 > 🔢 **Filed 2026-08-23 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.4.4** (L2) is one of the three cells the assessment record holds as CONTESTED between assessors rather than merely unbuilt, so the blocker is a reading to be settled before any build is scoped. Value **5/10** - Difficulty **3/10** - _fill-in_.
@@ -15945,6 +15977,37 @@ writer refuses any ref that is not its branch's tip.
 
 **Source:** filed 2026-08-23 by the ASVS-TRACKER seat, owner-directed. The 2026-08-08 ledger-coverage sweep that produced this family of items scanned the **partial and fail** cells and did not cover **needs-review**, so all three contested cells were absent from the ledger while 186 of their siblings carried an item. That is a gap in the sweep's domain, not a lapse in anyone's diligence -- and it is why a cell can stay contested for three weeks with nothing scheduling it.
 
+**RESEARCHED 2026-08-23** (same workflow and findings file as #1350). **Verdict: CANNOT HONESTLY
+PASS WITHOUT WORK. Both refuters reproduced the decisive control and neither refuted it.**
+
+***THE DECISIVE FINDING, REPRODUCED INDEPENDENTLY BY THIS SEAT: ALL FIVE PINNED VALUES ARE
+BYTE-IDENTICAL TO THE LIBRARY DEFAULTS THEY SAY THEY ARE NOT.***
+
+    engine, auth/passwords.py:19-23   t=3  m=65536  p=4  hash_len=32  salt_len=16
+    argon2-cffi 25.1.0 PasswordHasher t=3  m=65536  p=4  hash_len=32  salt_len=16
+
+The comment directly above them (`auth/passwords.py:14`) reads *"pinned EXPLICITLY rather than
+relying on argon2-cffi's library defaults"*. **Every value equals the default.** The values are not
+wrong -- they meet OWASP guidance -- but *pinned deliberately* and *inherited* are indistinguishable
+in the artifact, which is exactly what this item said would not be an honest pass.
+
+**No measurement backs them.** No target hardware, no login-latency budget, no rejected alternative
+appears anywhere. The only recorded reason is a security floor. A refuter timed the heavy profile at
+**696.5ms** against the shipped **34-36ms**, so a cost/latency trade-off is measurable and was never
+measured.
+
+**Work that would reach an honest pass -- small, and it is WRITING, not code:**
+1. **Record the choice where the parameters live**: reference hardware, measured per-verify cost,
+   the login concurrency the engine must sustain, and why the heavier profile was declined.
+2. **Resolve the defaults coincidence explicitly.** Leaving `passwords.py:14` as written is worse
+   than silence, because it asserts a deliberation the values cannot evidence.
+3. **Cover the recovery-code multiplier**: `auth/service.py:2323` runs `mfa_recovery_code_count`
+   verifies per attempt, default 10 and capped at 50.
+
+**STILL UNMEASURED:** whether the second sentence this item quotes is actually part of ASVS 11.4.4.
+**If it is not, the first question alone is a clean pass** -- so that check comes before the work.
+
+
 ## 1351. research an honest pass for ASVS 10.4.13 -- whether the OIDC authorization request must leave the browser-visible front channel
 
 > 🔢 **Filed 2026-08-23 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **10.4.13** (L3) is one of the three cells the assessment record holds as CONTESTED between assessors rather than merely unbuilt, so the blocker is a reading to be settled before any build is scoped. Value **4/10** - Difficulty **3/10** - _fill-in_.
@@ -15963,3 +16026,29 @@ writer refuses any ref that is not its branch's tip.
 **What would NOT be an honest pass.** Treating PKCE as a general answer to a requirement about request confidentiality. PKCE binds an authorization code to the client that requested it; it does not conceal or integrity-protect request parameters travelling through the user agent. If the pinned text asks for the latter, PKCE is the wrong control cited for a right-sounding reason. Equally: restoring not-applicable because no in-scope identity provider supports PAR -- deployment availability is a difficulty input, not a scope argument.
 
 **Source:** filed 2026-08-23 by the ASVS-TRACKER seat, owner-directed. The 2026-08-08 ledger-coverage sweep that produced this family of items scanned the **partial and fail** cells and did not cover **needs-review**, so all three contested cells were absent from the ledger while 186 of their siblings carried an item. That is a gap in the sweep's domain, not a lapse in anyone's diligence -- and it is why a cell can stay contested for three weeks with nothing scheduling it.
+
+**RESEARCHED 2026-08-23** (same workflow and findings file as #1350). ***THE RESEARCH VERDICT DOES
+NOT HOLD, AND THE REFUTER WHO BROKE IT WAS RIGHT.*** The engine observations are accurate; the
+disposition -- "the relying party must build PAR" -- does not follow.
+
+**WHY IT BREAKS, and the first reason is this item's fault as much as the researcher's.**
+**APPLICABILITY WAS NEVER ASKED.** `docs/ASVS-ASSESSMENT-METHOD.md:44-45` makes *"does the
+requirement apply on the declared scope"* **rule 1, ahead of every control question**. V10.4 is the
+**OAuth AUTHORIZATION SERVER** section, and **this engine hosts none** -- it is a relying party.
+The item text above jumps straight to "does the pinned text require PAR", which is a control
+question. It skipped the rule that comes first.
+
+Second, the finding admits it **never read the 10.4.13 text** and reasoned from a paraphrase --
+which `ASVS-ASSESSMENT-METHOD.md:36` defines as unverified. Third, it carried a **false cost
+claim** about client-side signing keys, caught independently by both refuters.
+
+**WHAT REACHES AN HONEST DISPOSITION: NOT CODE.** Read the ASVS 5.0.0 text of 10.4.13 at a known
+commit and apply rule 1. If V10.4 governs the authorization server, the cell is very likely `na`
+on scope and no build is owed. **Building PAR before asking that question would be engineering
+against a requirement that may not apply.**
+
+**The narrow engineering statement survives and is worth keeping:** on a first deployment with
+federation on, the authorization request would travel the browser-visible front channel, where the
+identity provider is the only party positioned to reject tampering. That is true, and it is not by
+itself a finding against this cell.
+
