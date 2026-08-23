@@ -49,10 +49,16 @@ A false-positive watchdog is not a safe failure mode; it is a slow-acting off sw
 * **Do not read a suppressed seat as a dead one.** An 88-minute gap that read as "chain broken" was
   deliberate suppression on a seat taking continuous turns.
 
-VOCABULARY IS AS MEASURED TODAY, NOT AS THE ITEM LISTED IT. The item names COLD/BACKLOG/THROTTLED.
-``seat-tick.ps1`` also emits ``STALE(no-live-session)`` at :654 and can suffix a send with
-``(roster-blind)`` at :767, both of which postdate the item. Re-read :647, :654, :719, :740 and :767
-before trusting this list -- it is a snapshot of an emitter that has already grown once.
+VOCABULARY IS AS MEASURED TODAY, NOT AS THE ITEM LISTED IT. The item names
+COLD/BACKLOG/THROTTLED. The emitter also produces ``STALE(no-live-session)`` and can suffix a
+send with ``(roster-blind)``, both of which postdate the item.
+
+THE EMITTER IS NOT IN THIS REPOSITORY. ``seat-tick.ps1`` is a machine-global install:
+``git ls-tree -r origin/main`` returns zero for it, against a positive control of one for
+``scripts/coord/seat.ps1``. So no line number could be resolved by a reader of this repo, and
+any quoted here would drift silently. Grep that file for its ``$results.Add`` sites instead --
+each token is minted in exactly one place. Treat this list as a snapshot of a file this
+repository cannot pin, and re-derive it rather than trusting it.
 """
 
 from __future__ import annotations
