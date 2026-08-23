@@ -1542,7 +1542,7 @@ _SCHEMA: list[str] = [
     # byte-identical to pre-#306. Adding this DDL moves _schema_hash() — the ADR 0064 bump.
     """IF COL_LENGTH('search_presets','last_used_at') IS NULL
         ALTER TABLE search_presets ADD last_used_at FLOAT NULL""",
-    # UNIQUE(owner, name) covers the owner-scoped list + the upsert; get/delete use the id PK (no
+    # UNIQUE(owner_user_id, name) covers the owner-scoped list + the upsert; get/delete use the id PK (no
     # separate owner index needed — ADR 0136, review follow-up).
     """IF INDEXPROPERTY(OBJECT_ID('search_presets'),'ux_search_presets_owner_name','IndexID') IS NULL
         CREATE UNIQUE INDEX ux_search_presets_owner_name ON search_presets(owner_user_id, name)""",
@@ -4837,13 +4837,20 @@ class SqlServerStore:
     # --- saved-search presets (ADR 0136, BACKLOG #151) -----------------------
 
     async def upsert_search_preset(
-        self, *, preset_id: str, owner: str, name: str, criteria: str, now: float | None = None
+        self,
+        *,
+        preset_id: str,
+        owner_user_id: str,
+        name: str,
+        criteria: str,
+        now: float | None = None,
     ) -> tuple[str, bool]:
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    "SELECT id FROM search_presets WHERE owner_user_id=? AND name=?", (owner, name)
+                    "SELECT id FROM search_presets WHERE owner_user_id=? AND name=?",
+                    (owner_user_id, name),
                 )
                 row = await cur.fetchone()
                 effective_id = str(row[0]) if row is not None else preset_id
@@ -4858,7 +4865,7 @@ class SqlServerStore:
                     await cur.execute(
                         "INSERT INTO search_presets"
                         " (id, owner_user_id, name, criteria, created_at, updated_at) VALUES (?,?,?,?,?,?)",
-                        (effective_id, owner, name, enc, now, now),
+                        (effective_id, owner_user_id, name, enc, now, now),
                     )
                     replaced = False
                 await self._commit(conn)
@@ -4867,20 +4874,20 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
 
-    async def list_search_presets(self, owner: str) -> list[dict[str, Any]]:
+    async def list_search_presets(self, owner_user_id: str) -> list[dict[str, Any]]:
         return await self._fetchall(
             "SELECT id, name, created_at, updated_at FROM search_presets"
             " WHERE owner_user_id=? ORDER BY name",
-            (owner,),
+            (owner_user_id,),
         )
 
     async def get_search_preset(
-        self, *, preset_id: str, owner: str, now: float | None = None
+        self, *, preset_id: str, owner_user_id: str, now: float | None = None
     ) -> dict[str, Any] | None:
         row = await self._fetchone(
             "SELECT id, name, criteria, created_at, updated_at, last_used_at FROM search_presets"
             " WHERE id=? AND owner_user_id=?",
-            (preset_id, owner),
+            (preset_id, owner_user_id),
         )
         if row is None:
             return None
@@ -4898,11 +4905,12 @@ class SqlServerStore:
             log.warning("failed to stamp search-preset last_used_at", exc_info=True)
         return row
 
-    async def delete_search_preset(self, *, preset_id: str, owner: str) -> bool:
+    async def delete_search_preset(self, *, preset_id: str, owner_user_id: str) -> bool:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    "DELETE FROM search_presets WHERE id=? AND owner_user_id=?", (preset_id, owner)
+                    "DELETE FROM search_presets WHERE id=? AND owner_user_id=?",
+                    (preset_id, owner_user_id),
                 )
                 deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
                 await self._commit(conn)

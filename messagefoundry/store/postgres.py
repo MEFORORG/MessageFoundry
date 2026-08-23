@@ -4085,12 +4085,20 @@ class PostgresStore:
     # --- saved-search presets (ADR 0136, BACKLOG #151) -----------------------
 
     async def upsert_search_preset(
-        self, *, preset_id: str, owner: str, name: str, criteria: str, now: float | None = None
+        self,
+        *,
+        preset_id: str,
+        owner_user_id: str,
+        name: str,
+        criteria: str,
+        now: float | None = None,
     ) -> tuple[str, bool]:
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             existing = await conn.fetchval(
-                "SELECT id FROM search_presets WHERE owner_user_id=$1 AND name=$2", owner, name
+                "SELECT id FROM search_presets WHERE owner_user_id=$1 AND name=$2",
+                owner_user_id,
+                name,
             )
             effective_id = str(existing) if existing is not None else preset_id
             enc = self._enc(criteria, aad=cell_aad("search_presets", "criteria", effective_id))
@@ -4106,7 +4114,7 @@ class PostgresStore:
                 "INSERT INTO search_presets (id, owner_user_id, name, criteria, created_at, updated_at)"
                 " VALUES ($1,$2,$3,$4,$5,$6)",
                 effective_id,
-                owner,
+                owner_user_id,
                 name,
                 enc,
                 now,
@@ -4114,22 +4122,22 @@ class PostgresStore:
             )
             return effective_id, False
 
-    async def list_search_presets(self, owner: str) -> list[dict[str, Any]]:
+    async def list_search_presets(self, owner_user_id: str) -> list[dict[str, Any]]:
         rows = await self._pool.fetch(
             "SELECT id, name, created_at, updated_at FROM search_presets"
             " WHERE owner_user_id=$1 ORDER BY name",
-            owner,
+            owner_user_id,
         )
         return [dict(r) for r in rows]
 
     async def get_search_preset(
-        self, *, preset_id: str, owner: str, now: float | None = None
+        self, *, preset_id: str, owner_user_id: str, now: float | None = None
     ) -> dict[str, Any] | None:
         row = await self._pool.fetchrow(
             "SELECT id, name, criteria, created_at, updated_at, last_used_at FROM search_presets"
             " WHERE id=$1 AND owner_user_id=$2",
             preset_id,
-            owner,
+            owner_user_id,
         )
         if row is None:
             return None
@@ -4149,10 +4157,12 @@ class PostgresStore:
             log.warning("failed to stamp search-preset last_used_at", exc_info=True)
         return out
 
-    async def delete_search_preset(self, *, preset_id: str, owner: str) -> bool:
+    async def delete_search_preset(self, *, preset_id: str, owner_user_id: str) -> bool:
         deleted = _delete_count(
             await self._pool.execute(
-                "DELETE FROM search_presets WHERE id=$1 AND owner_user_id=$2", preset_id, owner
+                "DELETE FROM search_presets WHERE id=$1 AND owner_user_id=$2",
+                preset_id,
+                owner_user_id,
             )
         )
         return deleted > 0

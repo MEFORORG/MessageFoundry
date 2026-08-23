@@ -31,7 +31,7 @@ async def store(tmp_path: Path) -> AsyncIterator[MessageStore]:
 
 async def test_create_encrypts_and_lists(store: MessageStore, tmp_path: Path) -> None:
     eid, replaced = await store.upsert_search_preset(
-        preset_id="p1", owner="op", name="ACME ADT", criteria=CRIT
+        preset_id="p1", owner_user_id="op", name="ACME ADT", criteria=CRIT
     )
     assert eid == "p1" and replaced is False
 
@@ -39,7 +39,7 @@ async def test_create_encrypts_and_lists(store: MessageStore, tmp_path: Path) ->
     assert [p["name"] for p in listed] == ["ACME ADT"]
     assert "criteria" not in listed[0]  # list NEVER carries criteria
 
-    got = await store.get_search_preset(preset_id="p1", owner="op")
+    got = await store.get_search_preset(preset_id="p1", owner_user_id="op")
     assert got is not None and json.loads(got["criteria"]) == json.loads(CRIT)
 
     # On-disk criteria is ciphertext, not the PHI-shaped needle.
@@ -50,36 +50,38 @@ async def test_create_encrypts_and_lists(store: MessageStore, tmp_path: Path) ->
 
 
 async def test_presets_are_owner_scoped(store: MessageStore) -> None:
-    await store.upsert_search_preset(preset_id="pa", owner="alice", name="mine", criteria=CRIT)
+    await store.upsert_search_preset(
+        preset_id="pa", owner_user_id="alice", name="mine", criteria=CRIT
+    )
     # Bob can't see, get, or delete Alice's preset.
     assert await store.list_search_presets("bob") == []
-    assert await store.get_search_preset(preset_id="pa", owner="bob") is None
-    assert await store.delete_search_preset(preset_id="pa", owner="bob") is False
+    assert await store.get_search_preset(preset_id="pa", owner_user_id="bob") is None
+    assert await store.delete_search_preset(preset_id="pa", owner_user_id="bob") is False
     # Alice still has it.
-    assert await store.get_search_preset(preset_id="pa", owner="alice") is not None
+    assert await store.get_search_preset(preset_id="pa", owner_user_id="alice") is not None
 
 
 async def test_save_by_name_replaces(store: MessageStore) -> None:
     id1, r1 = await store.upsert_search_preset(
-        preset_id="first", owner="op", name="dup", criteria=CRIT
+        preset_id="first", owner_user_id="op", name="dup", criteria=CRIT
     )
     other = json.dumps({"field_path": "PID-3", "field_value": "X", "target": "raw"})
     id2, r2 = await store.upsert_search_preset(
-        preset_id="second", owner="op", name="dup", criteria=other
+        preset_id="second", owner_user_id="op", name="dup", criteria=other
     )
     assert r1 is False and r2 is True
     assert id2 == id1  # the id is reused (stable cell-AAD across a replace)
     # Only one row, carrying the NEW criteria (decrypts under the reused id's AAD).
     listed = await store.list_search_presets("op")
     assert len(listed) == 1
-    got = await store.get_search_preset(preset_id=id1, owner="op")
+    got = await store.get_search_preset(preset_id=id1, owner_user_id="op")
     assert got is not None and json.loads(got["criteria"]) == json.loads(other)
 
 
 async def test_delete_is_idempotent(store: MessageStore) -> None:
-    await store.upsert_search_preset(preset_id="p", owner="op", name="n", criteria=CRIT)
-    assert await store.delete_search_preset(preset_id="p", owner="op") is True
-    assert await store.delete_search_preset(preset_id="p", owner="op") is False
+    await store.upsert_search_preset(preset_id="p", owner_user_id="op", name="n", criteria=CRIT)
+    assert await store.delete_search_preset(preset_id="p", owner_user_id="op") is True
+    assert await store.delete_search_preset(preset_id="p", owner_user_id="op") is False
     assert await store.list_search_presets("op") == []
 
 
