@@ -13124,6 +13124,27 @@ difficulty-2 fill-in without its own adversarial pass.** #1306 closes when `0c17
 **Cluster:** Tooling / CI gates. **Priority:** P2. **Verdict:** build.
 **Severity:** no product effect, no PHI effect, no deployment axis (sec. 0) -- CI tooling only. The cost is that a supply-chain auto-merge control's discriminating test passes for a reason unrelated to the control.
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. STEP ONE IS BUILT; THE REMAINING THREE ARE ENUMERATED HERE SO
+THE NEXT READER DOES NOT RE-DERIVE THEM.** The building lane shipped only what this row names as step
+one, and the row correctly stays open.
+
+| step | state |
+| --- | --- |
+| surface the child's stdout/stderr in the assertion message | **DONE** (`a736e120`) |
+| **(a)** find why the stub does not interpose on the newer Windows runner image | **OPEN** |
+| **(b)** make the discriminating "aged" row honest | **OPEN**, behind (a) |
+| **(c)** decide whether the engine leg gets a retry wrapper | **OPEN** -- a decision, not a build |
+
+***(a) CANNOT BE DONE FROM A LOCAL BOX AND THIS ROW ALREADY SAYS SO.*** Both invocation forms were
+replicated and the stub won under BOTH, so the open question is which interpreter the shell helper
+resolves on that runner image -- **which this row states cannot be measured off the runner.** **It needs
+CI iteration, not a builder at a local shell.** *Do not dispatch (a) to a lane that cannot reach the leg.*
+
+**(b) IS THE ONE WORTH UNDERSTANDING BEFORE ANYONE TOUCHES IT.** The discriminating row passes today
+**because a pinned dependency really is old -- a fact about the package index, not about the guardrail.**
+***AN ASSERTION THAT CANNOT FAIL FOR THE REASON IT NAMES IS NOT A CONTROL.*** That is the same defect
+class as the release gate `a92ab10f` fixed, and it is why (b) is not cosmetic.
 ## 1309. Scope GET /metrics and /stats labels to the caller's allowed_channels
 
 > 🔢 OPEN -- allocated 2026-08-22 by the Dispatcher at a builder's request, under the standing rule that this seat allocates and the building lane does not file.
@@ -13807,6 +13828,26 @@ wrong with nothing reporting it.
 **ONE INSTRUMENT NOTE, because it cost a caveat.** A subject grep for this item's target resolves to
 unrelated files, and that is not a defect in the item -- **it asks for a check that does not exist yet**,
 so no grep over the tree can resolve it. **The instrument was being asked an unanswerable question.**
+
+**AMENDMENT 2026-08-23, dispatcher seat. BUILT AT `5a513350`** -- `scripts/docs/banner_sha_check.py`
+plus eight tests, implementing the narrowed closing-claim trigger ruled above. **The literal rule fired
+94 times across both ledgers with none of them the defect; the narrowed one fires 3.**
+
+***THE NARROWING THAT ACTUALLY MADE IT WORK IS NOT IN THE RULING ABOVE, AND IT IS THE PART TO CARRY:
+`#N` IS AMBIGUOUS BETWEEN A PULL REQUEST AND AN ITEM.*** They share **one numeric space**, and a
+squash-merge appends the PR in exactly that form -- **`(#1106)` is indistinguishable from item #1106.**
+**Only the qualified `BACKLOG #N` form is decidable.** *That is the same hazard this repository already
+warns about for citations, arriving here as a parsing constraint; the ruling above did not contain it.*
+
+**VALIDATED AGAINST A DOCUMENTED HISTORICAL MISS RATHER THAN SYNTHETIC CASES.** `#1221`'s own banner
+records that its fix *"landed under an unrelated #1220 commit title, which is why a title-level search
+missed it"* -- **for nine days.** ***THIS CHECK FINDS THAT ON DAY ZERO.*** A gate proven against a real
+recorded miss is worth more than one proven against invented input.
+
+**ALL THREE HITS WERE TRIAGED, NOT REPORTED AS DEFECTS:** one true positive, one explained false
+positive (a satisfied item legitimately citing another item's commit), **and one LEFT UNTRIAGED RATHER
+THAN DISMISSED UNEXAMINED.** ***"Untriaged" is an honest state; "no defects found" over an unexamined
+hit is not.***
 ## 1331. test_connscale_smoke_end_to_end wears six assertions under one name, so a merge-blocking flake reads as six unrelated bugs
 
 > 🔢 **Filed 2026-08-22 - not started.** One test name covers at least six separate properties, so two seats hitting it twice see two unrelated bugs rather than one recurring problem. It sits on three of the thirteen required contexts, so every occurrence is merge-blocking.
