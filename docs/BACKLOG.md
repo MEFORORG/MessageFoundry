@@ -15666,23 +15666,27 @@ removed with their sessions.
 
 ## 1349. a rescue ref can silently hold an ancestor instead of the tip, and the population where that matters is the population where it cannot be checked
 
-> 🔢 **Filed 2026-08-23 - not started.** ***A rescue ref whose NAME contains a branch name can dereference to an ANCESTOR of that branch rather than its tip, with nothing reporting it.*** **Confirmed instance, re-derived independently by two seats to the file and the insertion: one dated rescue tag is a STRICT ANCESTOR of the branch its name contains -- 75 commits short, `167 files changed, 23410 insertions(+), 1578 deletions(-)`, holding ZERO commits that branch lacks.** ***That branch is gone from every worktree, so the tag is the only thing standing between that work and nothing.***
+> 🔢 **Filed 2026-08-23 - not started.** ***A rescue ref whose NAME contains a branch name can dereference to an ANCESTOR of that branch rather than its tip, with nothing reporting it.*** **Confirmed instance, re-derived independently by two seats to the file and the insertion: one dated rescue tag is a STRICT ANCESTOR of the branch its name contains -- 75 commits short, `167 files changed, 23410 insertions(+), 1578 deletions(-)`, holding ZERO commits that branch lacks.** ***THE WORK IS NOT AT RISK AND THE FIRST FILING SAID IT WAS.*** *That branch is gone from every WORKTREE, which was read as gone. **It exists as a ref, and the push-updated namespace holds its tip exactly.** The hazard is a reader reaching for the wrong ref and concluding work is lost, or recovering 75 commits short.*
 > Verdict: build
 > Research: none
 > Closing-act: code
 
-**Cluster:** coordination tooling / data safety. **Priority:** P1. **Verdict:** build.
-**Severity:** no product axis (sec. 0). **The cost is unrecoverable loss of committed work, discovered at
-the moment recovery is attempted.**
+**Cluster:** coordination tooling / naming. **Priority:** P2. **Verdict:** build.
+**Severity:** no product axis (sec. 0). ***The cost is a WRONG RECOVERY DECISION -- reaching for a ref that
+is short, or concluding work is gone when another namespace holds it.*** *NOT data loss: no instance of
+actual loss has been demonstrated, and the one examined case is fully held elsewhere.*
 
-***CAPTURING THE TIP IS PLAINLY THE INTENDED BEHAVIOUR, WHICH IS WHAT MAKES THE SHORT ONES A DEFECT
-RATHER THAN A DOCUMENTATION GAP.*** *Of 730 refs under `refs/tags/rescue`, **374 hold the tip exactly**.
-If holding the tip were not the contract that number would be near zero.*
+***THE ARGUMENT THAT THIS IS A WRITER DEFECT WAS WITHDRAWN BY ITS AUTHOR AND IS RECORDED HERE ONLY SO IT
+IS NOT RE-DERIVED.*** *It ran: 374 of 730 tags hold the tip, therefore capturing a tip is intended,
+therefore the short ones are broken.* ***374 IS ALSO EXACTLY WHAT SNAPSHOTS OF MOSTLY-DORMANT BRANCHES
+LOOK LIKE.*** **That measurement cannot distinguish "tags track heads" from "most branches have not moved
+since their snapshot" -- a correlation read as intent.** *Tags in this repository are **snapshots by
+design**; the live tracking mechanism is the push-updated namespace.*
 
 | tag-scheme census, 730 refs | count | reading |
 |---|---|---|
 | **hold the tip exactly** | ***374*** | *the contract, working* |
-| ***ANCESTOR -- short of the tip*** | ***22*** | ***MEASURED DEFECT*** |
+| ***ANCESTOR -- short of the tip*** | ***22*** | ***MEASURED FACT. Not a defect -- a snapshot older than its branch.*** |
 | diverged from the named branch | *32* | ***UNVERIFIED*** -- *the matcher takes the longest branch name in the tag name, so a pairing may be spurious* |
 | name no local branch | *302* | **NOT a defect** -- *a deleted branch is the case rescue refs exist for* |
 
