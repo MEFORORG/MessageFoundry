@@ -4832,6 +4832,27 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 **Source:** found while auditing the session-drift installers, 2026-08-04, and adversarially re-verified at `6e481c14`. Confirmed with the title narrowed as above.
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. CONCLUDED AS RESEARCH -- NO CODE, AND THE FINDING IS THAT THE
+REMAINDER WOULD HAVE NO READER.** Measured in `scripts/worktree/install-selfheal.ps1`: of the three
+remainders this row names, **`-Status` has 0 references and a hash at the copy has 0**; the in-session
+refusal is live. *So the row is accurate about its own state.*
+
+**TWO OF THE THREE ARE REFUSED BY THIS ROW ITSELF, ON SECURITY GROUNDS THAT HOLD.** Adding `-Status`
+requires narrowing that refusal so a session can run it -- **weakening a control on a task bundle that
+never named it.** The sibling installer refuses in-session too, so **plain-terminal-only is the
+PRECEDENT, not a gap.**
+
+***THE THIRD HAS NO CONSUMER, AND THAT IS THE FINDING: IT WOULD BE WRITE-ONLY DATA -- A STAMP WHOSE SOLE
+READER IS A FEATURE THIS ROW DECLINES TO BUILD.*** The shipped instrument
+(`tests/test_selfheal_installed_parity.py:243`) reads **source bytes directly** and compares against the
+installed copy. **It needs no stamp and would not read one.** Growing the most privileged script in the
+estate to serve nothing **would read to a future maintainer as a live mechanism.**
+
+**THIS IS A CONCLUSION, NOT A DISCOVERY OF PRIOR WORK** -- the script is byte-unchanged, nobody built
+the remainder. **STAYS OPEN**, because the measurement covers only the three named remainders and **NOT**
+whether the installed-versus-source problem is solved in general. *Closing on it would assert more than
+was measured.*
 ## 1018. The raw-text gate-rule scan exists in three independent copies with nothing tying them together
 
 > ✅ **Shipped 2026-08-10.** [`tests/test_gate_rule_scan_agreement.py`](../tests/test_gate_rule_scan_agreement.py) drives all **three** extractors over one corpus and fails when they diverge: `test_install_gate_wiring.tools_the_gate_handles` (through its module constant), `test_gate_installed_parity.handled_tools` (by its text argument), and `install-gate.ps1`'s `Get-HandledTools` (lifted with the PowerShell AST, so the installer — which rewrites machine-global wiring — is never executed). **The three are deliberately NOT unified**: a shared Python helper cannot absorb the PowerShell copy, so the agreement test *is* the deliverable. Eight arms: the real gate (each must return something — three implementations all returning the empty set agree perfectly and measure nothing), six regex shapes asserting the **expected** set rather than only mutual agreement, and the ONE real difference — copy 2's whole-line `#` comment filter — **pinned with its reason** instead of hidden. Red-first in both directions, as the item prescribes: `"([A-Z][a-z]+)"` in copy 3 failed 5 of 8 printing `1: ['GhostTool','RealTool'] / 2: ['RealTool'] / 3: []`; the same change in copy 2 gave the mirror image.
@@ -11111,6 +11132,27 @@ every worker session's handoff, which is the sentence the next session bases its
 **Cluster:** Store / schema legibility. **Priority:** P3. **Verdict:** build. **Severity:** none -- no behaviour changes and nothing is exposed; the cost of leaving it is a reader inferring a username from a column name.
 
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. BUILD THE RENAME EVERYWHERE AND WRITE NO MIGRATION.**
+
+**COUNTS CORRECTED against the tree**, with the needle stated: **128** references (store 44, sqlserver
+34, postgres 31, base 19), matching this row's re-score rather than its scope paragraph's lower figure.
+**Schema-hash sites: postgres 13, sqlserver 12, and store.py ZERO.** *A different needle from the row's,
+same conclusion --* ***and the ZERO, which is the half the whole argument rests on, is exact.***
+
+***THE MIGRATION QUESTION DISSOLVES ON SECTION 0.*** `_schema_hash()` hashes the shipped DDL, a match at
+open skips the batch, and the DDL is `CREATE TABLE IF NOT EXISTS` -- **so a migration function exists to
+upgrade a PRE-EXISTING database.** **There are zero deployments, so no pre-existing database exists on
+any backend.** CI builds its databases **fresh** from the DDL every run. *Section 0 is explicit that a
+staged migration is a cost paid to protect users who do not exist.*
+
+**A HALF-RENAME IS THE DANGEROUS OPTION AND MUST NOT BE BUILT.** Each backend carries its **own**
+`_SCHEMA`. Renaming the references and one backend's DDL while leaving the others **breaks those
+backends outright** -- worse than an untested migration.
+
+**THE HONEST RESIDUAL, WHICH THE BUILD MUST STATE:** an existing DEVELOPER server database **will not be
+renamed**, because `CREATE TABLE IF NOT EXISTS` skips a table that already exists. ***It fails at QUERY
+TIME rather than at open.*** **The remedy is to drop and re-create it.**
 ## 1233. `delete_user` never removes `search_presets`, so an account deletion strands encrypted PHI-shaped `criteria`
 
 > ✅ **SHIPPED -- verified by content on `origin/main` 2026-08-20, ALL THREE BACKENDS AND THE TEST LIMB, not one of them.** `delete_user` purges `search_presets` in `store/store.py`, `store/postgres.py` and `store/sqlserver.py` -- one keyed purge each, alongside five DELETEs each. **Coverage exists for all three:** `tests/test_postgres_store.py` and `tests/test_sqlserver_store.py` directly, and the SQLite/default path through `tests/test_search_presets_api.py`. **That test is non-vacuous by construction and was checked as such rather than counted:** it asserts a PRECONDITION that the preset exists before deletion, then asserts the purge on both the id and the freed username. **It also carries two independent controls** -- it re-inserts the captured row afterwards, because with the row purged #1225's key assertions would pass TRIVIALLY and stop being evidence about the key at all. **And it records the retraction in place:** the assertion it replaced said the exact opposite, which was true when written and is the defect this item fixes. **Closed on the release condition this project uses -- the fix TEXT on `main` -- not on a merged badge.** The holder's claim can be released; that condition is met.
@@ -11140,6 +11182,24 @@ every worker session's handoff, which is the sentence the next session bases its
 
 **Cluster:** Security / observability. **Priority:** P2. **Verdict:** build. **Severity:** conditional per CLAUDE.md section 0 -- on a first deployment an over-granted store principal would be reported as observed-and-clean; **zero deployments, so nothing is mis-reported today.**
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. UNSTARTABLE, MEASURED -- RETURNED TO THE POOL, DO NOT
+DISPATCH.** I dispatched this item without checking that its subject exists where a builder would branch
+from. **It does not.**
+
+    require_least_privilege|least_privilege  on origin/main under messagefoundry/   ZERO hits
+    POSITIVE CONTROL, same probe, same ref: `store` in store/base.py                found
+
+*So the zero is a real absence, not a broken needle.* **The defect lives on a held branch:** tip twelve
+days old, **4 ahead of main and 328 behind, and no pull request has ever existed for it.**
+
+***A FIX ON A 328-BEHIND BRANCH WITH NO PR LANDS WHEN THAT BRANCH LANDS, WHICH IS NEVER ON CURRENT
+EVIDENCE.*** **WHAT CLEARS IT:** that branch is rebased onto `main` with a PR opened, **or** the
+preflight is re-implemented against current `main` as its own item. **Neither is a builder's call.**
+
+**AND THE SCREEN THAT MISSED IT CANNOT SEE THIS BY CONSTRUCTION.** Verdict, closing-act, claim state,
+build commits and retirement markers all read the LEDGER. ***"Does the subject exist on main" is the
+only check that reads the CODE, and it is the one that decides startability.***
 ## 1235. a citation to an unallocated backlog number is a trap that arms itself the day the number is issued
 
 > 🚧 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. The rule and both coverage residuals landed, leaving one gap: the detector runs only inside pytest, which is skipped on documentation-only pull requests, and a citation is introduced by editing prose. Wiring it as a workflow step with a paired must-trip and must-not-trip arm is a small additive change on an existing gate seam, and the coverage bound stands regardless since the detector cannot see the private companion repository where the filed instances live. _(was 6/10 · 2/10.)_
@@ -14127,6 +14187,20 @@ single-writer merge hazard the contention warning above is about.
 was already 96 percent done, `#1301`'s rule fired 94 times with none of them the defect, and now this.
 **That is not three bad items; it is what filing-from-reasoning produces. Measure before prescribing a
 tool.**
+
+**AMENDMENT 2026-08-23, dispatcher seat. A CORRUPTION CLASS THE LEDGER'S OWN CHECK CANNOT SEE.** The
+Research migration was built twice -- once on a branch off a dispatcher branch, which the ledger gate
+correctly refused, and once off `main`. **Both carried the same 93 lines.**
+
+***IF BOTH HAD LANDED, 93 DUPLICATE `Research: done` LINES WOULD HAVE GONE IN AND `parse_items` WOULD
+HAVE READ PERFECTLY CLEAN OVER THEM.*** **A duplicate field line adds no item, flips no status and moves
+no count**, so the check every seat has been quoting -- *total items and open count unchanged* -- is
+***STRUCTURALLY BLIND to a duplicate-field corruption.***
+
+**The exposure was contained because only one carrier ever reached the remote**, and an explicit
+do-not-land was issued for the other. ***THAT WAS LUCK PLUS A HUMAN INSTRUCTION, NOT A CONTROL.*** **A
+count-preserving check cannot detect a count-preserving corruption**, and nothing in the current gate set
+counts *occurrences per item per field*.
 ## 1332. Heredoc bodies are scanned as commands, so quoted documentation trips the secret-scanning rules
 
 > 🔢 **Filed 2026-08-23 - not started.** A heredoc body becomes its own line in `Get-ScannableSegments` ([`scripts/hooks/worktree_gate.ps1:557`](../scripts/hooks/worktree_gate.ps1)), and the fact that it is quoted DATA does not survive the newline split. Documentation that QUOTES a config key is scanned as if it SET one. This is the root cause under #1305 and one half of #1306.
