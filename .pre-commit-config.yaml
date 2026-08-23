@@ -229,6 +229,16 @@ repos:
         pass_filenames: true
         files: \.(py|ps1|sh|ts|js|go|md|toml|ya?ml|json|cfg|ini|txt)$
 
+      # BACKLOG #1226. always_run with pass_filenames FALSE: the screen walks its own DEFAULT_SCOPE,
+      # and handing it a changed-file list would silently narrow what it looked at while still
+      # printing a confident total -- the shape this screen exists to catch, in its own wiring.
+      - id: username-access-key
+        name: username-as-access-key screen (new sites only)
+        entry: python scripts/quality/username_access_key_screen.py --baseline scripts/quality/username_access_key_baseline.txt
+        language: system
+        pass_filenames: false
+        always_run: true
+
   # Secret scanning — blocks a commit that would introduce a credential/token/key.
   # (rev is verified by `pre-commit autoupdate` on first install; a wrong tag fails loudly there,
   # never silently in CI. Run it TARGETED -- `pre-commit autoupdate --repo
