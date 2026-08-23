@@ -53,3 +53,60 @@ regexes = [
   # the startup error (#1183). Never a real credential; it is chosen to FAIL int() on purpose.
   '''pw-C4st_Val-66''',
 ]
+
+# --- BACKLOG #1091 -- a credential-named key given a hard-coded literal ---------------------------
+#
+# WHY A RULE AND NOT A THRESHOLD. gitleaks' operative generic rule is ENTROPY-GATED, and the
+# credentials that matter here sit below any useful threshold -- `changeme`, a dev default, a short
+# site code. bandit cannot help: it is a Python AST scanner and does not parse .yaml or .ps1 at all.
+# So the two required gates share a blind spot over most of the places a credential would actually
+# live. Lowering the entropy floor would trade that blind spot for a flood of false positives in a
+# REQUIRED gate, which is how a security control gets disabled rather than fixed.
+#
+# THE ENV INDIRECTION IS NOT THE DEFECT -- THE FALLBACK IS. `${MEFOR_STORE_PASSWORD}` is correct
+# usage and must never match. `${MEFOR_STORE_PASSWORD:-mefor-dev-password}` SHIPS that literal the
+# moment the variable is unset, which on a first deployment is exactly what happens.
+#
+# MEASURED BOTH DIRECTIONS against gitleaks 8.30.1 before this landed. Fires on docker/compose.yaml
+# and on a fresh `${REAL_SECRET:-changeme}`. Silent on: `${VAR}` with no fallback; the documented
+# REPLACE_or_omit placeholders; and .github/workflows/release.yml, which carries NINE `id-token:
+# write` lines. That last one is the load-bearing negative -- those are GitHub PERMISSIONS, not
+# credentials, and a naive `token\s*[:=]` rule reddens a required gate nine times on its first run.
+#
+# DIFFERENTIALLY VERIFIED: against the real tree this rule adds EXACTLY ONE finding. The repo config
+# alone already reports one pre-existing hit in docs/testing/master-test-plan/ that is NOT this rule
+# and NOT this change.
+[[rules]]
+id = "mefor-defaulted-credential"
+description = "A credential-named key given a hard-coded literal via a shell default -- ${VAR:-literal}"
+# THE KEY-NAME GROUP IS NON-CAPTURING, AND THAT IS NOT COSMETIC. gitleaks reports the FIRST CAPTURE
+# GROUP as `Secret`, and allowlist regexes are matched against it. With the key name captured, every
+# finding reported `Secret: "password"` -- useless in a report, and it SILENTLY BROKE THE ALLOWLIST,
+# because no placeholder regex can match the literal word "password". Caught by the allowlist test in
+# tests/test_gitleaks_credential_rule.py, which is the only reason it was not shipped that way.
+# `secretGroup` names the DEFAULT VALUE, which is the part a reader needs to see and the part an
+# allowlist needs to test.
+regex = '''(?i)(?:password|passwd|secret|token|api[_-]?key)[^\n:=]*[:=][^\n]*\$\{[A-Za-z_][A-Za-z0-9_]*:-([^}\s]+)\}'''
+secretGroup = 1
+tags = ["credential", "default", "mefor"]
+
+# SINGLE bracket. `[[rules.allowlist]]` builds an ARRAY and gitleaks 8.30 refuses the config outright
+# with "expected a map, got 'slice'" -- loudly, which is the right behaviour for a scanner and is how
+# this was caught.
+[rules.allowlist]
+description = "Documented placeholders that exist to be replaced. NEVER allowlist a real credential."
+# THE RULE'S OWN TEST FILE IS EXEMPT, AND THIS EXEMPTION IS THE NARROWEST ONE THAT WORKS. Its
+# fixtures ARE the detected shape -- that is what they are for -- so on the first commit this rule
+# blocked the commit that introduced it, exactly as BACKLOG #1086 describes rule 3c refusing the
+# commit that documents it. Scoped to THIS rule and THIS path: the file stays covered by every other
+# rule and by the top-level allowlist, so a real high-entropy credential dropped into it is still
+# caught. A repository-wide exemption, or widening the pattern to miss the fixtures, would both have
+# bought the same convenience by making the rule worse.
+paths = ['''tests/test_gitleaks_credential_rule\.py''']
+regexes = [
+  # Fill-me-in markers of the shape docker/k8s/secret.example.yaml uses. NOTE: that file's own
+  # placeholders carry no `${VAR:-...}` wrapper today, so this rule does not currently see them --
+  # these entries cover the shape appearing INSIDE a default, which is the form that would ship.
+  '''REPLACE_or_omit''',
+  '''CHANGE_?ME_?BEFORE''',
+]
