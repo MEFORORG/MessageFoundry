@@ -15321,3 +15321,48 @@ gate -- **rather than by a flag.**
 
 **Expiry:** this stops being right if the claim registry gains a delegation or co-holder concept, or if
 the gate stops keying on the committing worktree.
+
+## 1344. Anchors that were wrong at their own verified_at, and repairing them destroys the only evidence
+
+> 🔢 **Filed 2026-08-23 - not started.** A group of security-record anchors carry a line number that was **already wrong at the very commit the cell stamps as verified**. ***Not stale -- WRONG AT BIRTH.*** Re-measured against current vault main before filing; several remain unrepaired. **The rest were repaired earlier and their born-wrong status survives only in that commit's message, because a repair OVERWRITES the evidence.**
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** security record / assessment method. **Priority:** P2. **Verdict:** build -- *the repair half
+is mechanical; the residual question below may be research.* **Severity:** no product or deployment axis
+(sec. 0). **The cost is that the record asserts a verification that never happened.**
+
+**THE TEST, STATED SO IT IS REPRODUCIBLE WITHOUT THE DATA:** for each anchor, read the cited file **at
+the cell's own recorded commit** and look for the token it pins.
+
+| where the token is found | what it means |
+| --- | --- |
+| at the recorded line | ordinary staleness |
+| ***elsewhere in the file*** | ***the field was NEVER verified at any ref*** |
+| absent entirely | the recorded commit itself is wrong |
+
+***NONE fell in the third bucket, so no cell's stamped commit is unreadable.***
+
+***WHY THIS IS ONE DEFECT AND NOT MANY: THE DIRECTION IS SYSTEMATIC.*** The large majority record a line
+**HIGHER** than the token's real position. **Random transcription scatters both ways.** *The shape fits
+line numbers read from a LATER tree than the commit the cell stamps* -- **stated as a hypothesis, not
+proved.** ***Its falsifiable form: find a single later ref at which the recorded lines resolve. That
+either explains the whole population at once or is refuted cheaply.***
+
+***THE ARGUMENT FOR FILING NOW RATHER THAN WHEN SOMEONE GETS TO IT -- THE MEASUREMENT WINDOW IS
+SHRINKING.*** Re-deriving a line **fixes a STALE anchor completely.** It fixes a **BORN-WRONG one only
+cosmetically, AND IT DESTROYS THE WITNESS** -- the old number is overwritten, and the only evidence was
+the file at the cell's own recorded commit. ***So every silent repair makes the population permanently
+unmeasurable.***
+
+***AND THE RESIDUAL QUESTION IS THE ITEM, NOT THE LINE NUMBERS: HOW DID AN UNVERIFIED FIELD PASS REVIEW,
+REPEATEDLY?*** **"Fix the line numbers" answers none of it.** *The repair must therefore RECORD, per
+cell, that it was never verified -- otherwise the fix erases its own cause.*
+
+**Cell identifiers, file paths and their pairings stay vaulted (CLAUDE.md section 12), so this row
+carries the mechanism, the test and the direction only.** ***A path-to-identifier table is precisely the
+enumeration that rule forbids, and it is the artifact currently before the owner on a separate row.***
+
+**Expiry:** this stops being right if the anchors are repaired without recording their born-wrong status,
+at which point the population is gone and this row cannot be re-derived.
