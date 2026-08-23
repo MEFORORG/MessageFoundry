@@ -15846,5 +15846,28 @@ would manufacture exactly the false precision this row is about.*
 **a tag because it never moves, a remote ref because an active branch outruns the push*** -- *and you
 read it once, in the moment the original is already gone.*
 
+***FOURTH AMENDMENT -- THE RATES REPRODUCE ACROSS TWO INDEPENDENT DERIVATIONS. THE ABSOLUTE COUNTS DO
+NOT, AND THAT IS RECORDED RATHER THAN RECONCILED.***
+
+| namespace | population | alive here | current | ***STALE*** | uncheckable |
+|---|---|---|---|---|---|
+| `refs/tags/rescue/*` -- ***a TAG, never re-taken*** | *730* | *111* | *87 = **78 pct*** | ***24*** | ***619*** |
+| `refs/remotes/private/rescuetags/*` -- *PUSH-updated* | *815* | *124* | *112 = **90 pct*** | *12* | ***691*** |
+
+***TWO SEATS MEASURED 78 PCT AND 90 PCT BY DIFFERENT METHODS AND AGREED TO THE PERCENT.*** *That is the
+first figure in this row with a second derivation behind it, and it is why the RATE is trustworthy while
+the raw counts above are not:* **an earlier pass over the same tag namespace reported 374 holding the tip
+against this pass's 87, because the two paired tags to branches by different rules.** ***Both are
+recorded; neither is folded into the other.***
+
+***THE TAG NAMESPACE IS TWICE AS STALE AS THE PUSH-UPDATED ONE -- 24 AGAINST 12.*** *A fleet-wide
+"10 pct stale" figure was published covering only the push-updated namespace and was withdrawn by its
+author.* **Anyone who read that and then checked a `refs/tags/rescue/*` ref got a rosier expectation than
+the data supports** -- *the exact cost of the naming collapse this row exists to name.*
+
+***AND THE LARGEST NUMBER IN BOTH ROWS IS THE UNCHECKABLE ONE: 619 AND 691.*** **That is not a clean
+bucket, it is the bucket this clone cannot grade** -- *and it is where the refs that matter live, because
+a rescue ref is for a branch that is gone.*
+
 **Expiry:** this stops being right if rescue refs are written with a recorded target sha, or if the
 writer refuses any ref that is not its branch's tip.
