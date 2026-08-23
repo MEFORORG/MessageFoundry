@@ -1267,8 +1267,16 @@ def _check_posture(
     try:
         settings = load_settings(config_path=toml)
     except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        # PRESENT-BUT-REFUSED IS A FAILURE, NOT A SKIP (BACKLOG #1318). `toml` was resolved to an
+        # existing file above, so reaching here means the file EXISTS and the loader rejected it.
+        # Absent is the legitimate skip and is handled earlier; rendering both states identically
+        # is what let `messagefoundry init` ship a config this very gate refuses -- the gate LOADED
+        # it, got the refusal, printed it, and returned skip with rc 0.
         return CheckResult(
-            "posture", ok=True, required=True, skipped=True, detail=f"settings did not load: {exc}"
+            "posture",
+            ok=False,
+            required=True,
+            detail=f"settings did not load: {exc}",
         )
 
     if settings.ai.environment is None:
@@ -1355,11 +1363,15 @@ def _check_build(
     try:
         settings = load_settings(config_path=toml, cli=cli)
     except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        # PRESENT-BUT-REFUSED IS A FAILURE, NOT A SKIP (BACKLOG #1318). `toml` was resolved to an
+        # existing file above, so reaching here means the file EXISTS and the loader rejected it.
+        # Absent is the legitimate skip and is handled earlier; rendering both states identically
+        # is what let `messagefoundry init` ship a config this very gate refuses -- the gate LOADED
+        # it, got the refusal, printed it, and returned skip with rc 0.
         return CheckResult(
             "build-check",
-            ok=True,
+            ok=False,
             required=True,
-            skipped=True,
             detail=f"settings did not load: {exc}",
         )
     try:
@@ -1455,11 +1467,15 @@ def _check_alert_smtp_tls(
     try:
         settings = load_settings(config_path=toml)
     except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        # PRESENT-BUT-REFUSED IS A FAILURE, NOT A SKIP (BACKLOG #1318). `toml` was resolved to an
+        # existing file above, so reaching here means the file EXISTS and the loader rejected it.
+        # Absent is the legitimate skip and is handled earlier; rendering both states identically
+        # is what let `messagefoundry init` ship a config this very gate refuses -- the gate LOADED
+        # it, got the refusal, printed it, and returned skip with rc 0.
         return CheckResult(
             "alert-smtp-tls",
-            ok=True,
+            ok=False,
             required=False,
-            skipped=True,
             detail=f"settings did not load: {exc}",
         )
     alerts = settings.alerts
@@ -1702,11 +1718,15 @@ def _check_reference_backend(
     try:
         settings = load_settings(config_path=toml)
     except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        # PRESENT-BUT-REFUSED IS A FAILURE, NOT A SKIP (BACKLOG #1318). `toml` was resolved to an
+        # existing file above, so reaching here means the file EXISTS and the loader rejected it.
+        # Absent is the legitimate skip and is handled earlier; rendering both states identically
+        # is what let `messagefoundry init` ship a config this very gate refuses -- the gate LOADED
+        # it, got the refusal, printed it, and returned skip with rc 0.
         return CheckResult(
             "reference-backend",
-            ok=True,
+            ok=False,
             required=True,
-            skipped=True,
             detail=f"settings did not load: {exc}",
         )
     try:
