@@ -12175,6 +12175,42 @@ _FHIR_ID_RE.fullmatch("abc\n")    -> False    the fix
 **Cluster:** CI gating / doc-subject guards. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) -- CI configuration only. The cost is that documentation defects are caught **after** merge rather than before, on the branch everything else builds on, and that the standing repair is to red `main` first and fix forward.
 
+
+***AMENDMENT 2026-08-23. THE RE-DERIVE CLAUSE IS ANSWERED AND DROPPED -- BY MEASUREMENT, NOT BY
+ARGUMENT. This row asked for a measurement in an environment CI deliberately does not use.***
+
+**The re-score says the remainder is re-deriving the set in an environment carrying the five CI extras
+the original trace lacked, on the theory that a skipped test reads nothing and more members may be
+missing.** A lane built a virtualenv to the FULL CI extras -- dev, harness, fhir, dicom, x12, xml,
+webauthn, plus the web console editable -- and ran the lane:
+
+    272 passed, 89 skipped
+
+***STILL EXACTLY 89. NOT FEWER. THE EXTRAS WERE NEVER THE CAUSE.***
+
+**CAUSE, AND IT IS UNFIXABLE BY ANY INSTALL:** all 89 come from ONE module, whose own skip message says
+the document it asserts against **is withheld from public checkouts and vaulted.** *Verified
+independently:* `git ls-files docs/security` returns **ZERO**. ***NO QUANTITY OF EXTRAS PRODUCES A
+DOCUMENT THAT IS NOT IN THE REPOSITORY.***
+
+**AND CI'S DOC-GUARDS LANE DELIBERATELY DOES NOT CARRY THOSE EXTRAS.** Its install is `[dev]` only, and
+the comment above it states the reason -- the gated install adds packages **that no doc scan touches.**
+*So re-deriving under the five extras would characterise an environment that never runs.*
+
+***CI ALSO ALREADY DOCUMENTS THE 89 IN WRITING***, in its own comment: the skips are *"structural, not a
+gap to fix in this step"*, the module asserts against a vault-only document absent from the tree, and
+**152 assertions DO run -- "do not read the skips as coverage."** *The row treats this as an open
+measurement problem. It is a closed and documented one.*
+
+**WHAT GENUINELY REMAINS IS THIS ROW'S OTHER CLAUSE, AND IT IS THE HALF WORTH DOING:** demonstrate that
+a Markdown-only pull request carrying a deliberate violation actually goes RED, ***since the lane has
+never been shown able to fail.*** The lane has an existence check for path typos and **nothing proving
+a doc violation reds it.** *That is the anti-vacuity question, it is fully verifiable locally, and it is
+now the whole of this item.*
+
+**CAVEAT CARRIED FROM THE MEASURING LANE, and it is the right one to carry:** the *passed* count is
+box-specific -- a different platform and a `[dev]`-only install will differ. ***THE 89 IS THE FIGURE
+THAT TRANSFERS, because its cause is identical in both: a document that is not there.***
 ## 1263. a file:line citation into code is validated by nothing, so any bulk edit silently re-points 1,193 of them
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **4/10** · _quick win_. Re-measured with a separately written matcher at HEAD, the corpus is 904 live and 381 archived path:line citations into source, the archived figure reproducing this item's own 381 exactly while the live figure has grown past every number the item records, which is the drift it predicts. Three checkers exist and none reads a cited line, so the cheap detector plus its printed silence, its ref and denominator, and the mutation test that proves it can stay quiet remain unbuilt. _(was 7/10 · 4/10.)_
