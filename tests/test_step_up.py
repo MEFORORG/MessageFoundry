@@ -74,6 +74,18 @@ async def _login(
     return str(r.json()["token"])
 
 
+async def _ad_login(service: AuthService, principal: AdPrincipal) -> str:
+    """Mint an AD session without an AD PASSWORD LOGIN, which is retired (BACKLOG #1137).
+
+    Both tests below are about the step-up RE-BIND, not about how the session was obtained, so they
+    take the shared tail Kerberos and OIDC end at. The re-bind itself still uses the directory
+    password -- that pathway survived the retirement deliberately, and these tests are its witness.
+    """
+    out = await service._complete_ad_login(principal, None, mfa_verified=True)
+    assert out.ok and out.token is not None, out.error
+    return out.token
+
+
 def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
@@ -159,7 +171,7 @@ async def test_ad_user_reauth_uses_a_live_rebind(engine: Engine) -> None:
     await service.initialize()
     await service.set_ad_group_map([("CN=MF-Admins,DC=x", Role.ADMINISTRATOR.value)], actor="admin")
     async with _client(engine, service) as c:
-        token = await _login(c, "jdoe", "ad-pw", provider="ad")
+        token = await _ad_login(service, principal)
         await _make_stale(service, token)
         assert (await c.post("/users", headers=_auth(token), json=NEW_USER)).status_code == 403
         # Wrong AD password fails the live re-bind.
@@ -401,16 +413,15 @@ async def test_ad_reauth_mints_action_grant_via_live_rebind(engine: Engine) -> N
     service = AuthService(engine.store, settings, ldap=_FakeLdap())  # type: ignore[arg-type]
     await service.initialize()
     await service.set_ad_group_map([("CN=MF-Admins,DC=x", Role.ADMINISTRATOR.value)], actor="admin")
-    async with _client(engine, service) as c:
-        token = await _login(c, "jdoe", "ad-pw", provider="ad")
-        identity = await service.identity_for_token(token)
-        assert identity is not None
-        # Wrong AD password: the live re-bind fails and mints nothing.
-        assert await service.reauth(identity, "wrong", token=token, purpose="mfa_disable") is False
-        assert await service.has_action_step_up(token, "mfa_disable") is False
-        # Correct AD password: the re-bind succeeds and the single-use grant is minted.
-        assert await service.reauth(identity, "ad-pw", token=token, purpose="mfa_disable") is True
-        assert await service.has_action_step_up(token, "mfa_disable") is True
+    token = await _ad_login(service, principal)
+    identity = await service.identity_for_token(token)
+    assert identity is not None
+    # Wrong AD password: the live re-bind fails and mints nothing.
+    assert await service.reauth(identity, "wrong", token=token, purpose="mfa_disable") is False
+    assert await service.has_action_step_up(token, "mfa_disable") is False
+    # Correct AD password: the re-bind succeeds and the single-use grant is minted.
+    assert await service.reauth(identity, "ad-pw", token=token, purpose="mfa_disable") is True
+    assert await service.has_action_step_up(token, "mfa_disable") is True
 
 
 async def test_create_session_stamps_reauth_at(engine: Engine) -> None:

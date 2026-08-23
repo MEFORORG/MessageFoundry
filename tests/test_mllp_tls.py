@@ -326,3 +326,101 @@ def test_factory_carries_tls_key_password_and_redacts_it() -> None:
     assert spec.settings["tls_key_password"] == "pw"
     # Defence in depth: an inline passphrase is scrubbed from the /metadata view (it should be an env() ref).
     assert redacted_settings(spec.settings)["tls_key_password"] == "***"
+
+
+def _ca_and_crl(tmp_path: Path, *, revoked_serial: int = 4000) -> str:
+    """A CA bundled with its own fresh CRL, written as one PEM -- the shape harden_crl_check loads.
+
+    Separate from :func:`_cert` because that one is self-signed-and-CA:TRUE for convenience, while a
+    CRL has to be signed by the key whose certificate is the trust anchor.
+    """
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mllp-crl-ca")])
+    now = datetime.datetime.now(datetime.UTC)
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(ca.subject)
+        .last_update(now - datetime.timedelta(days=1))
+        .next_update(now + datetime.timedelta(days=30))
+        .add_revoked_certificate(
+            x509.RevokedCertificateBuilder()
+            .serial_number(revoked_serial)
+            .revocation_date(now - datetime.timedelta(hours=1))
+            .build()
+        )
+        .sign(key, hashes.SHA256())
+    )
+    bundle = tmp_path / "ca_and_crl.pem"
+    bundle.write_bytes(
+        ca.public_bytes(serialization.Encoding.PEM) + crl.public_bytes(serialization.Encoding.PEM)
+    )
+    return str(bundle)
+
+
+def test_server_mtls_loads_the_crl_when_configured(tmp_path: Path) -> None:
+    # BACKLOG #1005. The setting must reach the trust store, not merely be accepted by the factory.
+    # cert_store_stats()["crl"] is the only thing separating "loaded" from "silently ignored" --
+    # a context can carry the check flag with zero CRLs and then refuse EVERY client.
+    cert, key = _cert(tmp_path)
+    bundle = _ca_and_crl(tmp_path)
+    ctx = _mllp_ssl_context(
+        {
+            "tls": True,
+            "tls_cert_file": cert,
+            "tls_key_file": key,
+            "tls_ca_file": bundle,
+            "tls_crl_file": bundle,
+        },
+        server=True,
+    )
+    assert ctx is not None
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    assert ctx.cert_store_stats()["crl"] >= 1
+    assert ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_server_mtls_without_a_crl_does_no_revocation_checking(tmp_path: Path) -> None:
+    # NEGATIVE CONTROL, and it pins the SHIPPED GAP this item is filed against: mTLS on, chain
+    # verified, RFC 5280 strictness applied -- and no revocation whatsoever, so a partner
+    # certificate revoked this morning keeps authenticating until its notAfter.
+    #
+    # If this ever starts failing, revocation arrived by some other route and the item's premise
+    # needs re-deriving. Do not relax it to make it pass.
+    cert, key = _cert(tmp_path)
+    ctx = _mllp_ssl_context(
+        {"tls": True, "tls_cert_file": cert, "tls_key_file": key, "tls_ca_file": cert},
+        server=True,
+    )
+    assert ctx is not None
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    assert not (ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF)
+
+
+def test_a_crl_without_mtls_is_not_loaded(tmp_path: Path) -> None:
+    # PLACEMENT GUARD. The CRL call lives INSIDE the mTLS branch: with no client certificate
+    # required there is nothing to revoke, and loading one anyway would set a check flag on a
+    # context that never asks for a peer certificate.
+    cert, key = _cert(tmp_path)
+    ctx = _mllp_ssl_context(
+        {
+            "tls": True,
+            "tls_cert_file": cert,
+            "tls_key_file": key,
+            "tls_crl_file": _ca_and_crl(tmp_path),
+        },
+        server=True,
+    )
+    assert ctx is not None
+    assert ctx.verify_mode == ssl.CERT_NONE
+    assert not (ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF)

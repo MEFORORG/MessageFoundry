@@ -768,6 +768,15 @@ class ApiSettings(_Section):
     tls_ciphers: str | None = None
     # Optional CA bundle to verify CLIENT certs (mTLS for the console; opt-in, future).
     tls_client_ca_file: str | None = None
+    #: Opt-in CRL for the mTLS client certificates `tls_client_ca_file` verifies (BACKLOG #1005).
+    #: A PEM carrying the CA **and** its CRL. Absent, client certificates are verified for chain
+    #: and RFC 5280 conformance but NOT for revocation -- measured, a revoked-but-chain-valid
+    #: client is ACCEPTED. Set it and a revoked partner certificate is refused at the handshake.
+    #:
+    #: **An expired CRL refuses EVERY client, not only revoked ones**, so this is read at startup
+    #: and refused loudly there rather than at the first partner handshake. See
+    #: :func:`~messagefoundry.config.tls_policy.harden_crl_check`.
+    tls_client_crl_file: str | None = None
     # WP #285 (ASVS 6.7.1): optional SHA-256 pin over the mTLS client-CA trust anchor above. Set to the
     # lowercase-hex SHA-256 of the PEM file's bytes; the loaded anchor's fingerprint is checked against
     # it at construction AND at reload and a mismatch REFUSES to start — always, independent of
@@ -1864,7 +1873,6 @@ class AuthSettings(_Section):
     # credential-accepting surface, since `oidc_enabled` refuses to validate without `ad_enabled`.
     # Defaults True so the split alone changes nothing; whether this pathway should survive at all is a
     # separate question and deliberately not decided here.
-    ad_password_login_enabled: bool = True
     ad_server: str | None = None  # e.g. ldaps://dc1.example.com:636
     ad_domain: str | None = None  # e.g. example.com (UPN suffix)
     ad_user_search_base: str | None = None

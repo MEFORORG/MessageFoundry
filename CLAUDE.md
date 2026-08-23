@@ -296,6 +296,39 @@ diverge enough to warrant it; keep this root file general.
 - **An undeclared seat is now visible rather than silent.** `goalPromptedAt` separates *asked and
   ignored* from *never asked* — two states with opposite fixes that used to render identically.
 
+### Route it to the seat that owns it
+
+**Owner-set 2026-08-22. Two routes, each conditional on that seat actually running:**
+
+| What you are holding | Send it to | Instead of |
+|---|---|---|
+| A question or issue for the owner | the **Liaison** | asking the owner directly |
+| A push, PR, or merge | the **Lander** | doing it yourself |
+
+**Check which seats are live with one command** — read the `SEAT` column on rows whose `STATE` is
+`RUNNING`:
+
+```
+pwsh -NoProfile -File scripts\coord\fleet.ps1
+```
+
+**MATCH THE SEAT NAME CASE-INSENSITIVELY.** Measured 2026-08-22, the live rows carried `liaison`,
+`LANDER`, `Steward` and `asvs-tracker` — four seats, four casings, in one render. A case-sensitive
+test for `lander` finds nothing and reports it as "no Lander running", which is the failure that
+looks like a clean answer.
+
+**No such seat running? The old path stands** — ask the owner directly, and get their approval for
+your own push. **Neither seat is a required hop.** Neither may sit on your item either: a Liaison that
+is slow must say so and tell you to go direct.
+
+**Reach them with `mail.ps1` (leaves a receipt, reaches an idle or different-login peer) or a
+cross-session message (faster, no receipt, dies with the session).**
+
+**ROUTING IS NOT AUTHORITY, and this is the half to get right.** The owner still approves every push,
+PR and merge. **The Lander EXECUTES an approved action; it does not AUTHORISE one**, and handing it
+your branch does not convert your unapproved push into an approved one. Same for the Liaison: it
+compresses and presents your question, and it does not answer it.
+
 ### Git discipline
 - Work on a **feature branch and open a PR**; commit at logical stops, **one coherent layer per
   commit**, with clear messages. (Direct pushes to `main` are blocked by the harness, so

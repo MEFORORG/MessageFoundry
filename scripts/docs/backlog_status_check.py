@@ -283,6 +283,25 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: --backlog {p} does not exist", file=sys.stderr)
         return 1
 
+    # BACKLOG #1259: surface the conflict refusal as a REPORT, not a traceback, and NAME THE FILE.
+    #
+    # `parse_items` already refuses a source carrying conflict markers, and that refusal is what makes
+    # this file safe to read. But it raises from inside `scan`, so every caller -- the CI leg and now
+    # the pre-commit hook -- rendered it as an uncaught ValueError. Two costs, and the second is the
+    # one that matters: a traceback reads as *the checker is broken* rather than *your ledger is
+    # conflicted*, which sends an author to the wrong file; and the exception carries a LINE number
+    # but no PATH, so with several sources scanned it does not say which one to open.
+    #
+    # Parsing each source here also removes a real double-parse -- the count and the scanned-list
+    # below each called `parse_items` again on every source.
+    parsed: list[tuple[str, int]] = []
+    for label, text in sources:
+        try:
+            parsed.append((label, len(parse_items(text))))
+        except ValueError as exc:
+            print(f"ERROR: {label}: {exc}", file=sys.stderr)
+            return 1
+
     changelog = args.changelog.read_text(encoding="utf-8") if args.changelog else None
     errors, warnings = scan(sources, changelog)
 
@@ -291,8 +310,8 @@ def main(argv: list[str] | None = None) -> int:
     for e in errors:
         print(f"ERROR: {e}", file=sys.stderr)
 
-    n = sum(len(parse_items(text)) for _, text in sources)
-    scanned = ", ".join(f"{label} ({len(parse_items(text))})" for label, text in sources)
+    n = sum(count for _, count in parsed)
+    scanned = ", ".join(f"{label} ({count})" for label, count in parsed)
 
     if args.min_items is not None and n < args.min_items:
         # Printed to stderr *with the file list*, because "which files did you actually read" is the

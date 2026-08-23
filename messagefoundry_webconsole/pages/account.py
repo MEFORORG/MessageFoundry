@@ -50,15 +50,14 @@ def _when(ts: object) -> str:
 def login(
     error: str | None = None,
     *,
-    ad_enabled: bool = False,
     sso_enabled: bool = False,
     oidc_enabled: bool = False,
 ) -> Markup:
     """The sign-in form. Same-origin POST to /ui/login (form-action 'self').
 
-    ``ad_enabled`` (L5b, ADR 0068 §8) renders the provider selector — zero visual change for
-    local-only installs. AD passwords verify via the existing live directory bind; AD sessions
-    arrive MFA-delegated exactly as on the JSON surface."""
+    Local credentials only. The AD provider selector was removed with the simple-bind login pathway
+    it drove (BACKLOG #1137); ``sso_enabled`` / ``oidc_enabled`` are the surviving directory routes
+    and render their own affordances."""
     notes = {
         "must_change": "Password change required — sign in to rotate it.",
         "bad": "Invalid credentials.",
@@ -85,21 +84,16 @@ def login(
         ),
     }
     banner = el("p", notes.get(error or "", ""), class_="banner") if error else Markup("")
-    provider: Markup = Markup("")
-    if ad_enabled:
-        provider = el(
-            "label",
-            "Sign in with",
-            el(
-                "select",
-                el("option", "Local account", value="local"),
-                el("option", "Active Directory", value="ad"),
-                name="provider",
-            ),
-        )
+    # NO PROVIDER SELECTOR. The directory simple-bind login pathway is retired (BACKLOG #1137,
+    # owner ruling 2026-08-22) -- the engine refuses a directory password, so an "Active Directory"
+    # option here could only ever produce a refusal. A sign-in form that cannot succeed is worse
+    # than one that is absent: it tells the operator a route exists and then denies it.
+    #
+    # AD users sign in through Windows SSO or OIDC, which have their own affordances below and are
+    # unaffected. The POST handler's provider allow-list is deliberately NOT narrowed in the same
+    # change, so the ENGINE stays the single point that refuses -- two refusal points would drift.
     form = el(
         "form",
-        provider,
         el(
             "label",
             "Username",

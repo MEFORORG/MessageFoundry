@@ -1001,12 +1001,16 @@ async def test_ad_login_syncs_roles_from_group_map() -> None:
         await service.initialize()
         await service.set_ad_group_map([("CN=MF-Ops,DC=x", "operator")], actor="admin")
 
-        out = await service.login("jdoe", "pw", provider=AuthProvider.AD)
+        # The subject is the GROUP MAP, not the login mechanism. The simple-bind pathway that used
+        # to mint this session is retired (BACKLOG #1137), so this goes through _complete_ad_login
+        # -- the shared tail Kerberos and OIDC both end at, and where the group map is applied.
+        out = await service._complete_ad_login(principal, None, mfa_verified=True)
         assert out.ok and out.identity is not None
         assert out.identity.auth_provider is AuthProvider.AD
         assert out.identity.roles == frozenset({Role.OPERATOR})
-        # bad AD password is rejected
-        assert not (await service.login("jdoe", "bad", provider=AuthProvider.AD)).ok
+        # The retired pathway is refused regardless of the password; that it refuses at all, and
+        # never reaches the directory, is pinned in tests/test_ad_login_pathway_split.py.
+        assert not (await service.login("jdoe", "pw", provider=AuthProvider.AD)).ok
     finally:
         await store.close()
 
@@ -1184,17 +1188,20 @@ async def test_notifier_fires_on_ad_driven_role_change() -> None:
             return [e for e in notifier.events if e.event_type == ROLES_CHANGED]
 
         # First login provisions the role (none → operator): a change, so it notifies.
+        # Each "login" here goes through _complete_ad_login: the simple-bind pathway is retired
+        # (BACKLOG #1137) and this test is about ROLE RESYNC ON LOGIN, which is that tail's job and
+        # is reached identically by Kerberos and OIDC.
         await service.set_ad_group_map([("CN=MF-Ops,DC=x", "operator")], actor="admin")
-        assert (await service.login("jdoe", "pw", provider=AuthProvider.AD)).ok
+        assert (await service._complete_ad_login(principal, None, mfa_verified=True)).ok
         assert len(role_changes()) == 1
 
         # A repeat login with the SAME mapping is not a change → no new notice (silent when unchanged).
-        assert (await service.login("jdoe", "pw", provider=AuthProvider.AD)).ok
+        assert (await service._complete_ad_login(principal, None, mfa_verified=True)).ok
         assert len(role_changes()) == 1
 
         # Re-mapping the group resyncs the role on the next login (operator → viewer) → a fresh notice.
         await service.set_ad_group_map([("CN=MF-Ops,DC=x", "viewer")], actor="admin")
-        assert (await service.login("jdoe", "pw", provider=AuthProvider.AD)).ok
+        assert (await service._complete_ad_login(principal, None, mfa_verified=True)).ok
         changes = role_changes()
         assert len(changes) == 2
         assert changes[-1].username == "jdoe" and changes[-1].email == "jdoe@example.org"

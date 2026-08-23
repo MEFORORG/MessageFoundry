@@ -50,7 +50,17 @@ def emit_audit_tee(
     ``detail``) so a SIEM can index it without parsing the redacted blob.
 
     **Never emits a raw message body.** ``detail`` can embed raw HL7 fragments from an exception
-    message (it is a cipher column at rest for exactly that reason), so it is run through
+    message, and **it is NOT a cipher column at rest** -- `audit_log` is absent from
+    ``SqliteStore._CIPHER_COLUMNS`` on every backend, while the comment block in that same tuple names
+    ``message_events.detail``, ``connection_event.reason`` and ``alert_instance.reason`` as covered. So
+    on an encrypted store the security log's free-text column is the plaintext outlier and three lesser
+    operational logs are sealed. (This docstring asserted the opposite until 2026-08-22, which made the
+    redaction below look like defence in depth over an already-sealed column. It is not: it is the only
+    thing standing between an HL7 fragment and the off-box copy.) Covering the column is not a one-line
+    change and must not be attempted as one -- ``audit_row_hash`` hashes the PLAINTEXT ``detail`` into
+    the tamper-evident chain, and key rotation rewrites every cipher column, so naive coverage would
+    break chain verification on the first rekey. See BACKLOG #1198. Because of all that, ``detail`` is
+    run through
     :func:`~messagefoundry.redaction.safe_text` — which scrubs HL7-shaped spans and bounds length —
     before it leaves the process. The handler-level ``RedactionFilter`` re-scrubs as a backstop, but
     redacting here keeps the off-box guarantee independent of handler config and **identical across
