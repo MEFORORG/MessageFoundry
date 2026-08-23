@@ -6753,6 +6753,7 @@ filing.
 ## 1107. research an honest pass for ASVS 1.2.2 -- what context-encoding the dynamic-URL surface actually needs, beyond the one FHIR search path the residual names
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. Value drops from the banner because the cell's named residual is retired in shipped code, but stays at 6 because 1.2.2 is scored across every dynamically built URL and the surface is still unenumerated: 24 transport modules exist and only some have been read, with dicomweb.py:283-296 showing a derived target URL that is quoted but was never assessed under this cell. Difficulty 4 is the enumeration plus an adversarial re-verify of a cell that has never had one, with the code fix already landed elsewhere. _(was 8/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **1.2.2** (L1) currently scores **partial**. The pinned verb asks that untrusted data be encoded for its context whenever a URL is dynamically built, and that only safe URL protocols be permitted. What holds it short is that on the shipped default a flat FHIR search string is appended to the outbound URL verbatim at `messagefoundry/transports/fhir.py:750`.
 > Verdict: research
@@ -6792,6 +6793,7 @@ filing.
 ## 1108. research an honest pass for ASVS 2.1.1 -- what the operator API's input validation rules would have to be before any documentation could define them
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Counted at HEAD, api/models.py carries 21 max_length bounds against 206 str annotations, reproducing the item's 21-of-205, expose_docs still ships False at settings.py:726, and no per-field validation reference exists under docs/ (HL7-VALIDATION.md and CODESETS.md are both data-plane). Value 7 for a real L1 gap with no workaround where the coverage half is not merely documentary; difficulty 6 because the item forbids restating field types as the honest pass, so an expected structure must first be decided for ids, connection names, globs, time ranges and free-text search and then made real across the API models under mypy strict, with the console, harness, IDE extension and apiclient all consuming those bounds. _(was 7/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **2.1.1** (L1) currently scores **partial**. The pinned verb asks that the application's documentation define input validation rules for checking data items against an expected structure. What holds it short is that no per-field validation reference exists anywhere in `docs/`, and the scorecard measured only 24 of 451 annotated fields in `messagefoundry/api/models.py` carrying any bound at all.
 > Verdict: research
@@ -6825,6 +6827,7 @@ filing.
 ## 1109. research an honest pass for ASVS 2.2.1 -- positive validation that does not sacrifice the tolerance the HL7 default exists to protect
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Both limbs stand -- validation.strict ships False at config/models.py:667 and api/models.py carries no model_config across 84 models, against five extra=forbid declarations in config/models.py. Value 7 not 8: the 2.2.1 cell is graded at LEVEL 1, so rung 8's ASVS L3 Partial limb does not reach it, and an authenticated loopback-bound API silently ignoring unknown body keys is not rung 8's production blind spot with no workaround -- it is rung 7, a real gap an operator cannot close from outside the app. Difficulty 6 stands: two independent limbs, a method ruling on which clause binds an L1 requirement inside an L3 assessment, and an API-side positive-validation change that would reach the console and apiclient callers too. _(was 8/10 · 8/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **2.2.1** (L1) currently scores **partial**. The pinned verb asks for positive validation of input against an allow list, or comparison to an expected structure and logical limits. What holds it short is two independent limbs: HL7 content gets only the tolerant peek because `validation.strict` ships False (`messagefoundry/config/models.py:651`), and `messagefoundry/api/models.py` carries no `model_config` at all, so API bodies run Pydantic's default `extra=ignore`.
 > Verdict: research
@@ -6860,6 +6863,7 @@ filing.
 ## 1110. research an honest pass for ASVS 2.2.3 -- whether cross-field reasonableness is shippable at all in a code-first engine, or belongs to the feed author
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **5/10** · _fill-in_. The gap is unchanged: consistency.py:11-17 still describes itself as a compose-it-yourself toolkit, its only non-test importer is samples/consistency/validated_adt.py:27, and nothing on the shipped message path calls it. The research question is genuinely open and its most likely output is a negative finding, so worth-if-built is bounded by the clean existing workaround of a Handler composing the primitives; difficulty carries the HL7-general rule-set research plus, if a set exists, a check on the message hot path with tests. _(was 5/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **2.2.3** (L2) currently scores **partial**. The pinned verb asks that combinations of related data items be checked as reasonable against pre-defined rules. What holds it short is that `messagefoundry/parsing/consistency.py` is a toolkit a Handler composes rather than a shipped check, and at `63bd55ba` a grep across `messagefoundry/`, `samples/` and `harness/` finds its only importer is `samples/consistency/validated_adt.py:27`.
 > Verdict: research
@@ -6893,6 +6897,7 @@ filing.
 ## 1111. research an honest pass for ASVS 2.3.3 -- what a business-logic transaction boundary means where the approval gate commits before it executes
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. The audit-record defect the item was filed on is fixed (approvals.py:141-157 plus :181-208), but the pinned verb is still unmet: a partially applied executor is now recorded 'failed' with its effect landed, which app.py:537-548 exhibits concretely because config_reload swaps the graph before its audit row is written. So the remainder is the item's real research question -- the correct boundary and whether the three operations are replay-safe -- rather than only an out-of-repo re-score (value 5, difficulty 3 for a bounded API-side decision plus its tests). _(was 6/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **2.3.3** (L2) currently scores **partial**. The pinned verb asks that a business logic operation either succeed in its entirety or roll back to the previous correct state. What holds it short is `messagefoundry/api/approvals.py:127-133`: the row transitions to `approved` first, then `op.execute(params)` runs, and there is no compensating transition if the executor raises.
 > Verdict: research
@@ -6928,6 +6933,7 @@ filing.
 ## 1112. research an honest pass for ASVS 2.3.4 -- a quota that holds across concurrent uploads and across engine shards at once
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **5/10** · _fill-in_. Only the cross-shard limb remains and it is small: settings.py:461-466 records in shipped code that shards over one uploads_dir enforce one budget, so the remainder is an at-most N-1 file overshoot on a subsystem that is OFF on shipped defaults (uploads_dir default None, settings.py:442) and whose cell the owner already ruled holds at partial. Difficulty is the store-row-versus-advisory-lock decision plus a demonstrated two-shard concurrent-writer run. _(was 6/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **2.3.4** (L2) currently scores **partial**. The pinned verb asks for business-logic locking so a limited-quantity resource cannot be double-booked by manipulating application logic. What holds it short is the per-uploader quota in `messagefoundry/uploads.py`, ~~which says of itself at line 394 that "the check-then-write is not atomic", with the check at `:397` and no lock constructed in the module.~~
 > ⚠️ **AMENDED 2026-08-12 -- HALF OF THIS ITEM IS ANSWERED BY SHIPPED CODE, AND THE STRUCK SENTENCE ABOVE IS FALSE. The item STAYS OPEN on its second half.** PR #325 added `_quota_lock` (`uploads.py:309`) and takes it at `:488` across **both** the scan (`:496`) and the build-and-write -- releasing between them was the race. The quoted string *"the check-then-write is not atomic"* **no longer occurs in the file at all**, and there is no line 394 to cite. **The concurrent-uploads half is DONE:** within one engine process the double-book is closed.
@@ -6975,6 +6981,7 @@ filing.
 ## 1113. research an honest pass for ASVS 2.3.5 -- which flows in a PHI engine are high-value enough to demand a second approver, under a default that must not strand a single-operator site
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **6/10** · _money pit_. The code matches the item's substance: the gate ships off, three operations are registered and all three are guarded at api/app.py:2236, :2730 and :2837, and the default approvable set names only two, so no user-administration and no PHI-export flow is approvable in any configuration. Value stays mid-band because the consequence is a narrow opt-in control gap with no first-deployment product effect; difficulty is 6 because an honest pass most likely means widening the registry across API, settings, audit and console while resolving the self-approval availability cost at api/approvals.py:120. _(was 5/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **2.3.5** (L3) currently scores **partial**. The pinned verb asks that high-value business logic flows require multi-user approval. What holds it short is that `[approvals].enabled` ships False (`messagefoundry/config/settings.py:3228`) and `guard()` executes the operation inline whenever the gate is off, so no flow requires a second approver as shipped.
 > Verdict: research
@@ -7013,6 +7020,7 @@ filing.
 ## 1114. research an honest pass for ASVS 2.4.1 -- anti-automation on a data plane whose senders are machines and whose intake has no authentication
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **5/10** · _quick win_. A default install would still take messages at an unbounded rate on first deployment, and for non-MLLP inbounds there is no opt-in bound at all, so no workaround exists there. Difficulty 5 covers the ruling plus the likely follow-on of taking pacing across the transport registry to at least the raw-TCP inbound, with tests and docs. _(was 8/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **2.4.1** (L2) currently scores **partial**. The pinned verb asks for anti-automation controls against excessive calls leading to exfiltration, garbage data, quota exhaustion, denial of service, or overuse of costly resources. What holds it short is that ~~no message-rate or volume control exists on the data plane in any configuration~~ **[FALSIFIED 2026-08-12 by `e0e979d5`/`b3b278e6` -- struck, not deleted. A pacer EXISTS and ships OFF by default; `transports/mllp.py:109` calls that *"a DELIBERATE DEVIATION from this module's key-absent-means-secure-default convention, ruled 2026-08-11 (ASVS 2.4.1 / 15.2.2)"* -- naming this very cell, so the module knew about this item while this item did not know about the module. THE ITEM STAYS OPEN AND ITS QUESTION HARDENS:** not *does a control exist* (answered, yes) but **can a control that ships OFF be an honest pass.** The `docs/SECURITY.md:1582` citation below also needs re-pointing -- the sentence it quotes was rewritten when the pacer landed, in the same edit that broke ASVS cell 2.1.3's anchor.]** -- the product says so in its own documentation at `docs/SECURITY.md:1582`.
 > Verdict: research
@@ -7052,6 +7060,7 @@ filing.
 ## 1115. research an honest pass for ASVS 2.4.2 -- whether human-timing pacing is meaningful for an engine whose only human surface is the console
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **6/10** · _money pit_. The research half is delivered and the code it was written against is unchanged: the /ui surface charges nothing (zero allow_admin_write references in the web console) and the only pacing is a per-request per-actor budget at config/settings.py:2017-2021, never a flow timer. Value 4 because on a first deployment this is a coverage and calibration gap on an admin surface rather than a data-plane exposure; difficulty 6 because a flow timer spanning login, MFA enrolment and approve-then-decide is a new mechanism across auth service, API and console, and the floor has to come from a measurement the record does not have. _(was 3/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **2.4.2** (L3) currently scores **partial**. The pinned verb asks that business logic flows require realistic human timing, preventing excessively rapid transaction submissions. What holds it short is that the only pacing floor is 12 admin writes per actor per second, which the shipping documentation itself calls an order of magnitude above human console interaction (`messagefoundry/config/settings.py:1952`, `docs/SECURITY.md:99`).
 > Verdict: research
@@ -7132,6 +7141,7 @@ filing.
 ## 1116. research an honest pass for ASVS 3.1.1 -- what the console's browser-support contract actually is, when the document that carried it cannot ship
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. The contract is still sited only in source at _security.py:51, docs/SYSTEM-REQUIREMENTS.md:135 asks for nothing more than a modern browser, and /docs/security/ is still blanket-ignored at .gitignore:170, so the document two earlier pass-moves cited still does not reach a deploying site; the vault scorecard confirms the cell has not moved. The remainder is a verified feature list plus a supported-browser statement in a shipped doc. _(was 4/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **3.1.1** (L3) currently scores **partial**. The pinned verb asks that documentation state the browser security features the application relies on and define how it behaves when one is unavailable. What holds it short is that the substantive contract is sited in source at `messagefoundry_webconsole/_security.py:51-159`, and the operator document two earlier pass-moves cited is not in the assessed artifact set.
 > Verdict: research
@@ -7163,6 +7173,7 @@ filing.
 ## 1117. research an honest pass for ASVS 3.3.1 -- a session cookie that carries Secure and a prefix on every startable configuration, including the undeclared-proxy topology
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **5/10** · _quick win_. Both limbs still key on the single effective_https boolean at _auth.py:91, the session and OIDC-flow cookies are written with that boolean at :738 and :814, and __Secure- appears in no shipped Python, so there is no fallback prefix when __Host- is dropped. With [api].host defaulting to 127.0.0.1 (settings.py:724) and serve_ui defaulting True (:732), the default startable console would write a bare mf_session with Secure omitted, and the undeclared-proxy topology is not detected. _(was 8/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **3.3.1** (L1) currently scores **partial**. The pinned verb asks that cookies set the Secure attribute, and that a cookie not using the `__Host-` prefix use `__Secure-` instead. What holds it short is that both limbs key on one boolean, `effective_https` (`messagefoundry_webconsole/_auth.py:91`), and the default startable configuration is not an https context.
 > Verdict: research
@@ -7196,6 +7207,7 @@ filing.
 ## 1118. research an honest pass for ASVS 3.3.3 -- keeping the __Host- prefix on the shipped default without breaking a cleartext loopback login
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. Verified at HEAD: both cookies resolve to their __Host- twin only under effective_https AND browser_hardening_enabled (messagefoundry_webconsole/_auth.py:739 and :815), HOST_COOKIE_NAME at :70 documents that cleartext keeps the bare name by design, and the opt-out env at :77 reverts to the bare name with nothing at start reporting the reversion. Difficulty 4 covers a research pass that has to settle a loopback-TLS or auto-TLS posture question for the default /ui bind rather than edit cookie code, with cannot-honestly-pass a valid outcome. _(was 6/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **3.3.3** (L2) currently scores **partial**. The pinned verb asks that cookies carry the `__Host-` prefix unless they are explicitly designed to be shared with other hosts. What holds it short is that both cookies have a `__Host-` twin but resolve to it only when `effective_https` holds and `browser_hardening_enabled()` is true (`messagefoundry_webconsole/_auth.py:739`, `:815`).
 > Verdict: research
@@ -7229,6 +7241,7 @@ filing.
 ## 1119. research an honest pass for ASVS 3.4.1 -- HSTS on all responses from an engine whose shipped bind is plaintext loopback
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. The remainder lands no code: it is a scoping ruling on the honest unit of assessment plus at most a documentation and scorecard change, on an L1 cell with no PHI effect. Difficulty 2 because the coverage construction and the single shared hsts_applies definition already exist. _(was 6/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **3.4.1** (L1) currently scores **partial**. The pinned verb asks that a Strict-Transport-Security header field be on *all* responses, with a maximum age of at least one year and, at L2 and up, applying to subdomains. What holds it short is coverage, not content: the header is emitted at `messagefoundry/api/app.py:1260-1263` with a conformant one-year `includeSubDomains` value, but the four `_limit_request_body` short-circuits and unhandled 500s were measured shipping without it.
 > Verdict: research
@@ -7262,6 +7275,7 @@ filing.
 ## 1120. research an honest pass for ASVS 3.4.4 -- proving nosniff on every response, not on the responses someone remembered
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **3/10** · Difficulty **3/10** · _fill-in_. I attacked the shipped claim first and it survives in part -- this is not an anchor-moved false negative. The item's cited anchor app.py:1257 is genuinely gone because the header literals moved to the new api/header_floor.py, and commit c49a8a7b (PR 422, confirmed ancestor of HEAD) built exactly the construction the item asked research to find: a pure-ASGI setdefault floor registered outermost, plus a hand-set baseline on the unhandled 500 because ServerErrorMiddleware sits outside user_middleware by construction. Both of the item's originally measured escape paths are closed and tested, with a vacuity guard and negative controls in tests/test_api_security_header_floor.py. So limbs A (construction), B (can Starlette ordering reach pre-middleware rejections) and C (an admissible measurement) landed. Then I attacked the other direction, because a research item closes on its verdict, not on a commit. The record of record holds the cell at partial as of a re-verification dated 2026-08-17 whose reviewer line names PR 422 itself -- so the assessment was made WITH the floor in the tree, not before it. Its arithmetic: four response-emitter classes derived structurally from create_app's registration order and the scope-type guards, two covered, two not. I verified both uncovered classes against HEAD rather than trusting the record: `websocket.http.response` returns 0 occurrences under messagefoundry/ against 7 `websocket.close` sites as positive control, and header_floor.py:91-93 still returns early on non-http scopes. I also confirmed none of the cell's own re-score triggers has fired since that measurement -- app.py:5317 still registers the floor last, BASELINE_SECURITY_HEADERS still carries the nosniff pair, and git log b8c22cc8..HEAD shows no change to header_floor.py or client_networks.py. Two failure modes I deliberately checked against. A similarly-named symbol is not the fix: I read header_floor.py end to end and traced its registration, rather than counting the module's existence as closure. And a moved anchor is not an open gap: I confirmed the setdefault relocated rather than vanished. The distinction that decides this item is that the shipped work is the honest construction the item wanted and still does not reach the honest pass the item is named for, which is partly_shipped, not confirmed_shipped. Value 3 on the remainder rather than the filed 4: the practically important half closed, since the JSON error bodies that motivated the filing now carry the header, and a websocket 403 has no body a browser sniffs. It is not 1 or 2 because real runnable work is left -- the denial-response emitter plus the guard widening -- and because a shipped security module currently justifies its scope bound on a premise the engine's own adjacent comment contradicts, which the project treats as a defect class in its own right. Difficulty 3: a small additive change on an existing seam, but it needs an ASGI extension-capability check with a fallback to the bare close, a middleware guard widened without weakening the network gate that sits inside it, and tests across all three. No migration cost is priced in -- nothing is deployed, so there is nothing to break. One scoping note on sourcing: the verdict itself lives in the maintainer-internal scorecard, which I could reach because the vault clone is checked out beside this repository. I have deliberately not reproduced cell content beyond the fact that 3.4.4 holds at partial and the emitter-class count, since coverage detail over a published catalogue discloses the complement by subtraction. _(was 4/10 · 3/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **3.4.4** (L2) currently scores **partial**. The pinned verb asks that *all* HTTP responses carry `X-Content-Type-Options: nosniff`. The control itself is as strong as a control gets -- `response.headers.setdefault("X-Content-Type-Options", "nosniff")` at `messagefoundry/api/app.py:1257` runs with no setting, no scheme test and no path test -- but the same two response paths that cost 3.4.1 were measured shipping without it.
 > Verdict: research
@@ -7295,6 +7309,7 @@ filing.
 ## 1121. research an honest pass for ASVS 3.4.6 -- frame-ancestors on every response without weakening the attachment sandbox
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The scoping is unchanged: frame-ancestors ships only on non-static /ui responses and the attachment response is served default-src 'none'; sandbox, which takes no fallback for frame-ancestors. Value 5 because the item itself records that practical clickjacking exposure on a first deployment would be low, so what is bought is posture plus the small measured hole on the 413 and 500 paths that carry neither header; difficulty 4 because the research must find a construction carrying the directive on every response without weakening either policy that is currently correct, and a global header and a per-route header interact rather than compose. _(was 5/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **3.4.6** (L2) currently scores **partial**. The pinned verb asks that the `frame-ancestors` CSP directive be used for *every* HTTP response, and explicitly refuses `X-Frame-Options` as a substitute. Where the CSP applies the directive is the strictest possible value and default-on (`messagefoundry_webconsole/_auth.py:142`, `_security.py:206`), but it is scoped to non-static `/ui` paths at `messagefoundry/api/app.py:1270`.
 > Verdict: research
@@ -7326,6 +7341,7 @@ filing.
 ## 1122. research an honest pass for ASVS 3.5.3 -- bulk PHI retrieval on GET, under the ruling that a default-off feature is scope and not mitigation
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **7/10** · _big bet_. All five bulk PHI reads the item names are still on GET (app.py:3012, :3101, :3210, :3973, :4259; anchors have shifted by roughly 40 to 190 lines) and a case-insensitive search for Sec-Fetch across messagefoundry/ returns zero hits against a console-side positive control, so neither arm of the requirement is met. Value 7 for a real gap with no configuration that avoids it; difficulty 7 because an honest pass means either POST twins for read endpoints, changing caching, logging and client contracts, or an engine-side Sec-Fetch validator that has to decide what to do with every non-browser client the product ships. _(was 7/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **3.5.3** (L1) currently scores **partial**. The pinned verb asks that sensitive functionality use unsafe HTTP methods rather than GET/HEAD/OPTIONS, *or* alternatively that `Sec-Fetch-*` request header fields be strictly validated. State mutation is fully on unsafe methods; what holds the cell short is at least five bulk PHI reads on GET plus two session-minting GETs, with no `Sec-Fetch` validation anywhere under `messagefoundry/`.
 > Verdict: research
@@ -7357,6 +7373,7 @@ filing.
 ## 1123. research an honest pass for ASVS 3.5.5 -- what a trustworthy postMessage origin check is inside a VS Code webview
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. No PHI and no engine surface, the interface exists only in the VS Code extension, and the platform-limits finding is already written down and test-enforced, which leaves value in the polish band. Difficulty 3 is the vault record plus the SDS-3.7 discharge, and that discharge is not a formality: webviewMessaging.ts claims every panel is served script-src nonce, while stepsView.ts:959 emits a CSP of default-src none plus style-src unsafe-inline with no script-src at all, so the blanket claim has to be checked panel by panel. _(was 5/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **3.5.5** (L2) currently scores **partial**. The pinned verb asks that messages received by the postMessage interface be discarded if the origin is not trusted, or if the syntax is invalid. All eight receivers in the shipped IDE extension discard on an unexpected discriminator; none of the eight reads `event.origin` or `event.source`.
 > Verdict: research
@@ -7390,6 +7407,7 @@ filing.
 ## 1124. research an honest pass for ASVS 3.7.5 -- deriving a supported-browser matrix rather than authoring one that fits
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. SYSTEM-REQUIREMENTS.md:135 still offers only a modern browser, the web-console plan still carries the matrix as open question 1 at 11-web-console.md:446, and SECURITY-DOCS-POLICY.md:5 still withholds the operator-facing copy while the behavioural half ships in _security.py and _html.py, so the antecedent the requirement grades against remains undefined. Value 4 because this is documentation completeness over a working control set with no exposure and no product effect; difficulty 3 because the deliverable is a table derived from the shipped feature floors plus two owner rulings, touching no code, no mypy surface and no test. _(was 4/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **3.7.5** (L3) currently scores **partial**. The pinned verb asks that the application behave *as documented* when the browser does not support the expected security features. The behavioural half is built and substantial; what holds the cell short is that the requirement's antecedent -- the expected browsers and versions -- has no shipped definition (`docs/testing/master-test-plan/11-web-console.md:446` records it as an open question).
 
@@ -7449,6 +7467,7 @@ filing.
 ## 1125. research an honest pass for ASVS 4.2.1 -- what a single component can claim about request smuggling when the chain is not its own
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The two intake surfaces still disagree exactly as filed -- exact equality at http_listener.py:318 against substring containment at api/app.py:1323 and :1339 -- so a legal Transfer-Encoding of gzip, chunked is classified differently by the engine's own two parsers. Value 6 is rung 6, and a fact the filing does not record bounds it further: http_listener.py:202 ships one-request-per-connection with no keep-alive, so the listener half cannot be pipelined into a following request and the desync is reachable only against an operator-chosen upstream. Difficulty 6 for the unmeasured half -- exercising both parsers across the RFC 9112 grammar, settling what all application components binds to, and re-verifying a cell whose last_verified is the oldest here. _(was 6/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **4.2.1** (L2) currently scores **partial**. The pinned verb asks that *all application components* determine HTTP message boundaries by the mechanism appropriate to the HTTP version, and that in HTTP/1.x a present `Transfer-Encoding` makes `Content-Length` ignorable. What holds it short is that the engine's two HTTP intake surfaces do not agree on how they detect chunked framing.
 > Verdict: research
@@ -7485,6 +7504,7 @@ filing.
 ## 1126. research an honest pass for ASVS 4.4.1 -- WSS everywhere from an engine that deliberately declines to terminate TLS
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The default still ships no certificate (settings.py:758) and exposure_protected still resolves from an operator declaration about the far side of the hop (:834), so in the assessed proxy posture the proxy-to-engine WebSocket leg would be plaintext on first deployment with nothing refusing or warning. Value is the awkward-workaround band rather than no-workaround because tls_policy.py:299-300 short-circuits on proxy_terminated before the attestation test and no validator forbids setting tls_cert_file alongside tls_terminated_upstream, so an operator CAN encrypt that hop today without tripping the revocation refusal. Difficulty stays high because any gate is fenced by a refusal stated in shipped code and must not make the assessed posture unstartable. _(was 7/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **4.4.1** (L1) currently scores **partial**. The pinned verb is one sentence and admits no partial reading: WebSocket over TLS for all WebSocket connections. What holds it short is that `tls_cert_file` ships `None` (`messagefoundry/config/settings.py:712`), so the proxy-to-engine WebSocket hop is plaintext `ws` and no gate refuses it.
 > Verdict: research
@@ -7518,6 +7538,7 @@ filing.
 ## 1127. research an honest pass for ASVS 5.1.1 -- a per-feature file inventory that stays true, against a doctrine that treats enumerations as liabilities
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **4/10** · _fill-in_. Both concrete defects are fixed in shipped text: the SCP is enumerated as the fourth file surface and the 16 MiB inflate ceiling the item said appeared nowhere under docs/ is now documented. The remainder is the half the item was actually filed for -- an inventory that stays true as connectors are added -- since the block states it is hand-maintained and the drift test pins tokens rather than deriving the surface list from code (value 4, difficulty 4). _(was 5/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **5.1.1** (L2) currently scores **partial**. The pinned verb asks that documentation define permitted file types, expected extensions and maximum size *including unpacked size* for *each* upload feature, plus how files are made safe. The shipped block at `docs/CONNECTIONS.md:716` opens with a completeness claim -- "MessageFoundry's file surface has three parts" -- that omits a fourth.
 > Verdict: research
@@ -7551,6 +7572,7 @@ filing.
 ## 1128. research an honest pass for ASVS 5.2.2 -- file-content validation that does not sacrifice payload-agnostic ingress
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The residual holds: the sniff still dispatches on the connection's declared type, binary and text are accepted unchecked at the catch-all arm, and zip_decompress is a Handler-facing export with no transport call site, so archive members reach Handler code unsniffed. Difficulty is 6 rather than lower because the permissiveness is ADR 0004 design, so the research must find a control that does not sacrifice payload-agnostic ingress and any build reaches two transports plus a new archive-member seam. _(was 6/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **5.2.2** (L1) currently scores **partial**. The pinned verb asks that an accepted file -- on its own or inside an archive -- have its extension checked against an expected extension and its contents validated as corresponding to that type. The engine validates leading bytes against the *connection's declared* content type, which is a different check, and two declared types are unchecked by construction.
 > Verdict: research
@@ -7586,6 +7608,7 @@ filing.
 ## 1129. research an honest pass for ASVS 5.2.3 -- a literal before-uncompressing check when the declared size is attacker-controlled
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. The permissive Handler-facing default the item re-scoped itself onto is gone: a caller must now pass max_output_bytes or an explicit None, so the severity paragraph no longer describes the code, and the file-count clause is met on the default. What remains is a method question, whether the pinned verb admits incremental per-member enforcement or wants a recorded deviation, with no code change indicated, which prices both numbers in the record-accuracy band. _(was 5/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **5.2.3** (L2) currently scores **partial**. The pinned verb asks that compressed files be checked against a maximum uncompressed size *and* a maximum file count *before* uncompressing. The engine's readers enforce their ceilings incrementally instead, deliberately, and the Handler-facing archive reader ships its size ceiling off.
 > ⚠️ **AMENDED 2026-08-13 -- THE CENTRAL PREMISE IS FALSE. A literal before-uncompressing check DOES ship, DEFAULT-ON, and it cites this very cell in its own source.** The item stays OPEN, but on a much narrower question than it was filed with.
@@ -7627,6 +7650,7 @@ filing.
 ## 1130. research an honest pass for ASVS 5.3.2 -- containment for filenames a remote SFTP or FTP server chooses
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. The security-material half shipped: a hostile listing name is refused at the source (remotefile.py:955) before the pattern filter and before the join, so the traversal primitive the item priced is gone and its founding sentence is false in the code. Value 4 on the remainder, which is a census across the file-path-constructing transports plus the record work to move the cell; difficulty 3 because the guard and its both-polarity tests exist to copy and any further sites are the same shape. _(was 7/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **5.3.2** (L1) currently scores **partial**. The pinned verb asks that file paths be built from internally generated or trusted data, and that where user-submitted names or file metadata must be used, strict validation and sanitization be applied. The remote file source joins a server-supplied listing name straight onto the configured directory with neither.
 > Verdict: research
@@ -7670,6 +7694,7 @@ filing.
 ## 1131. research an honest pass for ASVS 6.1.1 -- what the anti-automation documentation must say about malicious account lockout
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. The documentation half this item was filed against has landed, including the contradiction the item said a fix editing one parenthetical would leave standing, and the unbounded re-lock plus the step-up-gated forced-rotation remedy are both disclosed. The scored remainder is the adjudication the item re-scoped to, whether the verb grades the document alone or names a property the control must hold, plus a scorecard re-read, which is reading and writing rather than code. _(was 7/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.1.1** (L1) currently scores **partial**. The pinned verb asks that application documentation make clear how the anti-automation controls are configured and prevent malicious account lockout. One parenthetical at `docs/SECURITY.md:1474` answers the lockout clause, and its claim does not survive the shipped serial re-lock at `messagefoundry/auth/service.py:665-668`.
 > ⚠️ **AMENDED 2026-08-13 -- THE ITEM STAYS OPEN AND ITS QUESTION IS RE-SCOPED. Three corrections, and the third is the one worth reading.**
@@ -7712,6 +7737,7 @@ filing.
 ## 1132. research an honest pass for ASVS 6.1.2 -- what a documented context-word list means when no deploying site can add its own terms
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. Publication landed but the two things the item said would decide an honest pass did not: there is still no operator-supplied context-word setting, and no gate ties the twelve published terms to policy.py:38-53, so the enumeration can decay silently. Difficulty 3 covers a small drift check plus, if research says the subject is the deployment's list, one additive setting into the password policy. _(was 5/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.1.2** (L2) currently scores **partial**. The pinned verb asks that a list of context-specific words be documented so those words cannot be used in passwords. The shipped documents name four of the twelve terms enforced at `messagefoundry/auth/policy.py:38-53` and hedge them with "like" and "e.g.".
 > Verdict: research
@@ -7743,6 +7769,7 @@ filing.
 ## 1133. research an honest pass for ASVS 6.1.3 -- whether documenting an inconsistently enforced strength can satisfy the verb
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. The accuracy defects are fixed and the lockout asymmetry the item said the cell must be checked against is now documented, so what remains is the research half: whether a documentation cell can pass while the strength it documents is inconsistently enforced, plus a mechanism that keeps a five-row pathway table and its settings-key references falsifiable. That mechanism is one stdlib checker over Pydantic field names with both-direction fixtures, sitting beside the six checkers already in scripts/docs. _(was 5/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.1.3** (L2) currently scores **partial**. The pinned verb asks that multiple authentication pathways be documented together with the controls and the authentication strength which must be consistently enforced across them. The enumeration half is strong; the paragraph that cites the requirement carries statements false against the shipped code.
 > Verdict: research
@@ -7776,6 +7803,7 @@ filing.
 ## 1134. research an honest pass for ASVS 6.2.4 -- a top-3000 corpus that survives a 15-character minimum
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **5/10** · _quick win_. Still short at HEAD: password_min_length is 15 (messagefoundry/config/settings.py:1811, the item's :1757 anchor has drifted), the length clause is the first check in AuthPolicy.violations (auth/policy.py:112), password_check_breached ships True (:1818) and password_breach_corpus_file ships unset (:1826), so the bundled corpus supplies far fewer than 3000 policy-matching entries. Value 6 rather than 7 because a shipped operator-side widening path exists (_operator_corpus at auth/policy.py:65 loads a plaintext or hashed offline list), undocumented and awkward but real, and the item's own severity is modest on a first deployment. _(was 7/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.2.4** (L1) currently scores **partial**. The pinned verb asks for a check against at least the top 3000 passwords *which match the application's password policy*. The bundled corpus supplies 18 entries at or above the shipped 15-character minimum (`messagefoundry/config/settings.py:1757`, length clause at `messagefoundry/auth/policy.py:112`).
 > Verdict: research
@@ -7827,6 +7855,7 @@ filing.
 ## 1135. research an honest pass for ASVS 6.2.11 -- whether publishing the enforced context words is durable enough to count
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. The list a reader needs is published, so the remaining worth is the decay guard the item itself calls the load-bearing half plus the 6.2.11 pointer decision alongside 6.1.2. Difficulty 2: one small test asserting the doc list equals CONTEXT_WORDS, plus a docs pointer edit. _(was 4/10 · 3/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.2.11** (L2) currently scores **partial**. The pinned verb asks that *the documented list* of context-specific words be used to prevent easy-to-guess passwords. Enforcement is not in question; no document supplies the definite list the verb names.
 > Verdict: research
@@ -7860,6 +7889,7 @@ filing.
 ## 1136. research an honest pass for ASVS 6.3.2 -- a first-run bootstrap that leaves no enabled default account
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **6/10** · _big bet_. Unchanged at the shipped default: _ensure_bootstrap_admin creates a live account named admin holding Administrator with no disabled argument, and the expiry default is still 72 hours, so neither arm of the verb holds at creation. Difficulty 6 for a first-run redesign spanning the auth service, the owner-only credential file, a CLI or console claim step and the headless NSSM restart path, with the item's own named risk of stranding an install with no way in. _(was 8/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.3.2** (L1) currently scores **partial**. The pinned verb asks that default user accounts not be present, or be disabled. On first run against an empty user table the engine creates an enabled Administrator literally named `admin` (`messagefoundry/auth/service.py:71`, from `_ensure_bootstrap_admin` at `:528`).
 > Verdict: research
@@ -7895,6 +7925,7 @@ filing.
 ## 1137. research an honest pass for ASVS 6.3.4 -- consistent authentication strength when AD MFA is delegated by design
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **8/10** · _big bet_. Both directory legs still mint sessions MFA-verified unconditionally while local accounts face a second factor as an access gate, and require_mfa_scope still defaults to every_local_account, so the strength gap is widest on the shipped default. Value 6 rather than 7 because the shipped comment at service.py:879-882 names a reachable out-of-engine control -- an MFA-enforcing LDAP proxy in front of the simple bind makes the directory pathway genuinely second-factor-backed -- so the residual gap is that the engine asserts rather than verifies, which is an awkward workaround and not the absence of one; difficulty 8 because the routes the research must weigh are directory-side evidence the engine can verify or an AD enrollment authority the code deliberately defers, both new architectural seams in auth. _(was 7/10 · 8/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.3.4** (L2) currently scores **partial**. The pinned verb asks that there be no undocumented pathways and that controls and authentication strength be enforced *consistently* across them. The AD and Kerberos legs mint sessions MFA-verified unconditionally (`messagefoundry/auth/service.py:794`, `:824`) while local accounts face a second factor as an access gate (`messagefoundry/api/security.py:227`).
 
@@ -7949,6 +7980,7 @@ filing.
 ## 1138. research an honest pass for ASVS 6.3.5 -- reaching the account that has no address on a fresh on-premises install
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The early return on a missing address is unchanged at security_notify.py:127-131 and the bootstrap Administrator is still created with no email at auth/service.py:535-541, so the most privileged account would remain structurally outside the notification path on a first deployment. Value 6 is the awkward-workaround rung, the substitute being the audited pull feed at GET /me/security-events; difficulty 6 because the research has to settle whether an address can be demanded at first run when no human identity exists yet, and whether any second channel not keyed on email is viable for a loopback on-premises install. _(was 6/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.3.5** (L3) currently scores **partial**. The pinned verb asks that users be notified of suspicious authentication attempts, successful or unsuccessful. The events fire and the channel is gated fail-closed at startup; delivery returns early when the event carries no address (`messagefoundry/pipeline/security_notify.py:130`).
 > Verdict: research
@@ -7982,6 +8014,7 @@ filing.
 ## 1139. research an honest pass for ASVS 6.3.7 -- notifying a user whose authentication details the directory changed
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **5/10** · _quick win_. The rubric prices an ASVS L3 Partial on as-shipped defaults at 8, and 6.3.7 is exactly that with a real missing control arm rather than a record question: a first-run Administrator with no email would get no out-of-band notice of a credential reset (security_notify.py:127-132 returns before enqueue), and a directory-driven email overwrite that redirects every later notice on the account writes neither an audit row nor a notice (service.py:1322-1340), so the change is undetectable after the fact. Difficulty 5 is a bounded change at one upsert plus the notification-target design question, sharing its channel research with 6.3.5. _(was 5/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.3.7** (L3) currently scores **partial**. The pinned verb asks that users be notified after updates to authentication details. Local coverage is broad, but every notice passes the same address gate at `messagefoundry/pipeline/security_notify.py:130`, and the AD login path overwrites the stored email with no notice and no audit row.
 > Verdict: research
@@ -8015,6 +8048,7 @@ filing.
 ## 1140. research an honest pass for ASVS 6.3.8 -- equalizing an LDAP bind path, and whether lockout leaves the local leg fixable
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **5/10** · _quick win_. The asymmetry stands verbatim at HEAD: auth/ldap.py:243-244 returns before the password-verifying connection is constructed and bound at :247-262, so an absent or disabled principal skips a whole Server build, TCP connect and bind round trip behind an identical response, while only the local leg is equalized by _DUMMY_PASSWORD_HASH at auth/service.py:98. Value 7 because a first deployment with AD enabled would inherit a directory-namespace enumeration oracle that the sign-in limiter rate-bounds but never removes, on the posture the risk register names as the dominant intended production path; difficulty 5 because the change is contained in one auth module, security-sensitive, and verifiable the same structural way the local leg already is (tests/test_auth_hardening.py:458) against the fake-ldap3 harness in tests/test_ldap_timeouts.py. _(was 6/10 · 8/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.3.8** (L3) currently scores **partial**. The pinned verb asks that valid users not be deducible from failed challenges, including by *different response times*. The local leg is equalized by a fixed dummy verify (`messagefoundry/auth/service.py:98`); the AD leg is not.
 > Verdict: research
@@ -8052,6 +8086,7 @@ filing.
 ## 1141. research an honest pass for ASVS 6.4.5 -- a deadline and a reminder for a credential the engine cannot reach the holder of
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The gap stands: the 72-hour default at settings.py:1851 is enforced at auth/service.py:786-798 and stated nowhere a holder or issuing administrator would see it, and settings.py:4264 separately records the same field as unreported on the loosening surface. Value 5 is rung 5 -- a real conformance and usability gap with a clean out-of-band workaround, since the administrator issuing the credential can state the deadline. Difficulty 4: attaching the deadline to the reset response, the console one-time page and the create-user hint is a feature across a seam with no store work, ahead of a bounded reading of whether a 72-hour credential needs an automated reminder at all. _(was 5/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.4.5** (L3) currently scores **partial**. The pinned verb asks that renewal instructions for expiring authentication mechanisms be sent in time to act on, with automated reminders if necessary. Two engine-owned credentials expire on shipped defaults; the admin-issued temporary one carries no stated deadline anywhere.
 > Verdict: research
@@ -8087,6 +8122,7 @@ filing.
 ## 1142. research an honest pass for ASVS 6.7.1 -- what an application can honestly assert about a trust anchor stored on a host it does not own
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. Neither hole has moved: the undeterminable read still degrades to a warning (trust_anchors.py:167) and the inspection still covers the anchor file alone (:199, :218), so a writable containing directory would still permit unlink-and-replace on an instance with tls_client_ca_file plus a cert-identity map. Value sits at the awkward-workaround band because that configuration is opt-in rather than a shipped default and the optional SHA-256 pin at settings.py:769 already defeats substitution outright for an operator who sets it; difficulty is the POSIX-versus-Windows split plus measuring how often the undeterminable branch fires before it may refuse. _(was 6/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.7.1** (L3) currently scores **partial**. The pinned verb asks that certificates used to verify cryptographic authentication assertions be stored protected from modification. Two holes sit on that verb in shipped code: an undeterminable permission read degrades to a warning, and the inspection covers the anchor file but not its containing directory.
 > Verdict: research
@@ -8120,6 +8156,7 @@ filing.
 ## 1143. research an honest pass for ASVS 6.8.1 -- cross-IdP identity assumption when one username namespace serves every provider
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **7/10** · _big bet_. Every named condition still holds at HEAD, only the line numbers moved: one shared username namespace at store.py:1638, no uniqueness of any kind on the OIDC columns on any backend, AuthProvider with no OIDC member, and the continuity guard short-circuiting on accounts that never federated. Value is high because a site enabling the shipped federation feature alongside the directory could see a principal land on a never-federated AD account and inherit its roles with no credential compromise, and no audit can tell a federated session from an LDAP simple bind; difficulty is 7 because the arc is a new ADR plus a three-backend schema and index change, with the first-federated-login ceremony still an open trust decision. _(was 8/10 · 8/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.8.1** (L2) currently scores **partial**. The pinned verb asks that a user's identity cannot be spoofed via another supported identity provider, and names the standard mitigation: register and identify the user by IdP ID plus the user's ID in that IdP. What holds it short is structural -- `users.username` is `TEXT NOT NULL UNIQUE` (`messagefoundry/store/store.py:1590`), one identifier namespace shared by every provider, with the provider carried as a column beside the key rather than inside it.
 > Verdict: research
@@ -8183,6 +8220,7 @@ filing.
 ## 1144. research an honest pass for ASVS 6.8.4 -- IdP-asserted strength and recentness when two of the three login legs assert nothing
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **5/10** · _quick win_. Gap stands on both axes: auth_time appears nowhere in the auth tree, flow.py requests no max_age, and service.py:884/:914 still mint mfa_verified=True on the directory legs with no IdP evidence, so a directory session would satisfy the step-up gate on a first deployment (value 6). The remainder prices at 5, not 6: the AD arm is deferred to #296 by the item's own text, so the deliverable is a research finding plus at most an OIDC-leg recency check, a setting and a SECURITY.md fallback, with the store limb bounded to one nullable column on a sessions table that already gained reauth_at the same way (store.py:3181). _(was 6/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **6.8.4** (L2) currently scores **partial**. The pinned verb asks that where the application expects specific authentication strength, method or recentness for specific functions, it verifies that from what the IdP returned -- and where the IdP returns nothing, that a documented fallback assumes the MINIMUM mechanism. Recentness is unimplemented (`auth_time` appears nowhere in the auth tree; `build_authorization_url` at `auth/oidc/flow.py:193` sends no `max_age`), and on both directory legs the engine mints `mfa_verified=True` on no IdP evidence at all.
 > Verdict: research
@@ -8212,6 +8250,7 @@ filing.
 ## 1145. research an honest pass for ASVS 7.1.3 -- federated session-lifetime coordination when the Kerberos leg exposes no ticket lifetime
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **3/10** · Difficulty **5/10** · _fill-in_. Two of three mechanisms ship and the Kerberos limb is untouched: no ticket end time is read anywhere in ldap.py and ADR 0079 still records the cell as accepted-not-built with its promotion trigger unfired. Value is low because the cell carries a signed risk acceptance with a 2027-01-14 review and there is no product effect; difficulty stays mid-band because the honest answer depends on measuring whether any non-SSPI ticket-lifetime source exists on the targeted platforms without forking pyspnego, which the project has ruled out. _(was 3/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **7.1.3** (L2) currently scores **partial**. The pinned verb asks that every system creating and managing sessions in a federated ecosystem be documented together with the controls that coordinate session lifetimes, termination and re-authentication conditions. What holds it short is one leg: `pyspnego` exposes no ticket end time, so a Kerberos session's absolute lifetime is the engine's own flat cap, not the directory's.
 > Verdict: research
@@ -8243,6 +8282,7 @@ filing.
 ## 1146. research an honest pass for ASVS 7.2.4 -- what session-token rotation on re-authentication must not break
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **6/10** · _big bet_. Verified unchanged: the primitive is defined at auth/service.py:1614 and implemented on all three backends, but a tree-wide search finds no caller outside tests, and reauth (:1796-1832) stamps state on hash_token(token) rather than rotating, so a token minted at the password leg would survive the second factor. Value 8 because on a first deployment a pre-MFA token captured before the second factor would be elevated in place to a fully authenticated session; difficulty 6 because rotation must be wired without stranding the token-hash-keyed state the primitive's own test names, and in-flight requests and open WebSocket subscriptions have to be reasoned about at every elevation site. _(was 8/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **7.2.4** (L1) currently scores **partial**. The pinned verb asks for a new session token on user authentication *including re-authentication*, with the current token terminated. Initial authentication mints fresh; re-authentication does not -- `AuthService.reauth` (`auth/service.py:1683`) and `verify_mfa` (`auth/service.py:2054`) stamp state on the SAME token hash, so the token issued at the password leg survives the second factor and survives every step-up.
 > Verdict: research
@@ -8274,6 +8314,7 @@ filing.
 ## 1147. research an honest pass for ASVS 7.4.3 -- offering session termination as part of the MFA-change ceremony rather than beside it
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. disable_mfa still offers and revokes nothing, and the post-disable redirect still lands on a page whose only relation to session termination is a link, so the option remains adjacent to the ceremony rather than part of it. The capability ships and is one click away, which caps value; difficulty 4 covers research plus a uniform ceremony across five factor-change paths without cutting the caller's own session mid-flow. _(was 5/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **7.4.3** (L2) currently scores **partial**. The pinned verb asks that the application give the option to terminate all other active sessions after a successful change or removal of any authentication factor, naming an MFA settings update explicitly. The password branch over-satisfies it; the MFA-settings branch performs and offers nothing -- `disable_mfa` (`auth/service.py:2140`) calls `disable_totp` plus audit and notify, and `delete_webauthn_credential` and `confirm_mfa_enrollment` likewise revoke nothing.
 > Verdict: research
@@ -8305,6 +8346,7 @@ filing.
 ## 1148. research an honest pass for ASVS 7.5.1 -- full re-authentication on the admin lanes that strip another account's second factor
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **4/10** · _quick win_. The admin lane still rides the shared window: auth_routes.py:790 takes require_step_up, which security.py:538 documents as satisfied by a login within step_up_max_age_seconds, while admin_reset_mfa at service.py:2292 disables TOTP and deletes every passkey for another account. Difficulty stays moderate rather than high because the action-bound seam already ships at security.py:620 and is already wired at auth_routes.py:433 and :677, so once the research settles what full re-authentication means for a third-party subject the work is two routes, the console twin and tests. _(was 7/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **7.5.1** (L2) currently scores **partial**. The pinned verb asks for full re-authentication before modifications to sensitive account attributes that may affect authentication, naming MFA configuration verbatim. The self-service half satisfies it with single-use action-bound grants; the administrative half does not -- `POST /users/{user_id}/reset-mfa` (`api/auth_routes.py:779`) and its browser twin (`webconsole/routes/admin.py:271`) ride the plain login-seeded step-up window.
 > Verdict: research
@@ -8350,6 +8392,7 @@ filing.
 ## 1149. research an honest pass for ASVS 7.5.2 -- what "authenticated again" means when the step-up window is seeded at login
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. The seeding still happens at login: store/store.py carries seed_reauth as a create_session parameter defaulting True with the comment that reauth_at = now seeds the step-up window from login, one line above the INSERT (around :8380-8385; the item's :8287 anchor and the scorecard's :8263 have both drifted). View and terminate ship at api/auth_routes.py:451, :474 and :488, and seed_reauth is already threaded through auth/service.py (:887, :1039, :1177), so the open work is a semantic reading and a re-verify, not a mechanism. _(was 5/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **7.5.2** (L2) currently scores **partial**. The pinned verb asks that users be able to view and, having authenticated again with at least one factor, terminate any or all currently active sessions. Viewing and terminating are both built (`GET /me/sessions`, `DELETE /me/sessions/{session_id}`, `DELETE /me/sessions`, and the console twin at `webconsole/routes/account.py:335`); the "again" clause is what holds it short, because the step-up window is seeded from login.
 > Verdict: research
@@ -8381,6 +8424,7 @@ filing.
 ## 1150. research an honest pass for ASVS 7.6.1 -- bounding time since the IdP authentication event without forcing a credential prompt every round trip
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **5/10** · _fill-in_. With federation enabled a first deployment could not bound time since the IdP authentication event at all, and the one shipped lever destroys single sign-on, so there is no acceptable workaround. Difficulty 5: an owner ruling plus one setting, a max_age parameter on the existing authorize call and an auth_time comparison at the id_token seam, with a fallback for IdPs that omit the claim. _(was 5/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **7.6.1** (L2) currently scores **partial**. The pinned verb asks that session lifetime and termination between relying parties and IdPs behave as documented, requiring re-authentication as necessary such as when the maximum time between IdP authentication events is reached. The engine cannot see or bound that interval: it sends no `max_age` on the authorize request and never reads `auth_time`.
 > Verdict: research
@@ -8412,6 +8456,7 @@ filing.
 ## 1151. research an honest pass for ASVS 8.1.1 -- documenting the data-specific access rules where a reader can actually find them
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **5/10** · _fill-in_. The code enforces more than the documentation describes, so there is no product effect and the residual is silent drift rather than exposure, which caps this below the surfaces that would misbehave on a first deployment. Difficulty 5 holds because the deliverable is not prose: the item requires establishing whether a drift gate over data-scoping claims is constructible at all, plus the public-versus-vaulted split the dangling docs/security pointer is a symptom of. _(was 6/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **8.1.1** (L1) currently scores **partial**. The pinned verb asks that authorization documentation define rules for restricting function-level AND data-specific access, based on consumer permissions and resource attributes. The function axis is exhaustive and CI-pinned in both directions; the data axis is where it falls short.
 > Verdict: research
@@ -8443,6 +8488,7 @@ filing.
 ## 1152. research an honest pass for ASVS 8.2.2 -- object-level authorization on the uploads family, which carries PHI and no owner check
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. The PHI-bearing half is fixed in shipped code, so the cross-operator enumeration, the content oracle and the two-step injection path are gone (app.py:3749, :3941-3971). What remains is the principal-narrowing axis nothing else closes -- identity.py:38 still defaults to every channel -- plus the pageless GET /uploads against the master-test-plan clause, with per-user scoping available as an awkward workaround (value 6). The remainder is a default flip with its first-run console handling plus pagination across API and console, tested but not touching the store (difficulty 4). _(was 9/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **8.2.2** (L1) currently scores **partial**. The pinned verb asks that data-specific access be restricted to consumers with explicit permissions to specific data items, to mitigate IDOR and BOLA. **As filed**, one PHI-bearing object family had no object-level authorization at all: `GET /uploads` listed every user's files unfiltered, and browse and delete took a `file_id` straight through to `get_meta`/`read_bytes` with no channel and no owner check.
 > **UPDATE 2026-08-11 -- THE UPLOADS HALF IS BUILT; THE ITEM STAYS OPEN.** Owner-only plus a `files:access_any` Administrator override, keyed on the immutable `uploader_id` (`Identity.user_id`), owner-ratified and recorded in [ADR 0134](adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md) Amendment A. All four routes now enforce it, including resend's SOURCE file (it previously checked only the TARGET inbound). So the three specific defects named above are fixed in the shipped code and the paragraph above describes the pre-fix state, not the current one.
@@ -8480,6 +8526,7 @@ filing.
 ## 1153. research an honest pass for ASVS 8.2.4 -- adaptive controls inside a live session on a single-host loopback deployment
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **3/10** · Difficulty **6/10** · _money pit_. The one in-session contextual signal still ships off and is documented in the shipped code as never changing an authorization decision, and the allowed-networks list still ships empty with a recorded inert-behind-NAT limit, so the existing-session half of the requirement rests on nothing at the shipped bind. Value 3 because no signal changes an authorization outcome in any configuration, so what is bought is a cell rather than a closed exposure; difficulty 6 because the honest answer needs an owner boundary decision first and the four attribute classes the verb names are largely unavailable to an on-premises single-host engine, with time-of-day gating on a 24-hour clinical service actively harmful. _(was 3/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **8.2.4** (L3) currently scores **partial**. The pinned verb asks for adaptive controls based on environmental and contextual attributes -- time of day, location, IP address, device -- applied both when a consumer starts a new session AND during an existing one, as defined in the application's documentation. The session-start half ships on; the in-session half rests on a single signal that ships off.
 > Verdict: research
@@ -8511,6 +8558,7 @@ filing.
 ## 1154. research an honest pass for ASVS 8.3.2 -- directory-sourced authorization changes that lag, fail open, and have neither named mitigation
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **6/10** · _money pit_. The 300 s directory reconciliation interval is unchanged at config/settings.py:1904 and its validator at :2085-2091 constrains only the range, so no alert-on-action-while-unauthorized and no revert exists and the requirement's alternative arm is entirely unbuilt. Value 4 because the engine-owned half is already strong (opaque tokens, per-request identity re-resolution, revoke-on-mutation) and what would be built is alerting and revert over a lag in data the engine does not own; difficulty 6 because both named mitigations need definition before either could be built, and revert has no meaning for delivered clinical messages. _(was 4/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **8.3.2** (L3) currently scores **partial**. The pinned verb asks that changes to values on which authorization decisions are made apply immediately, and where they cannot, that mitigating controls alert when a consumer acts while no longer authorized and revert the change. Engine-side values do apply immediately; directory-sourced ones lag the reconciliation loop, and neither named mitigation exists.
 > Verdict: research
@@ -8542,6 +8590,7 @@ filing.
 ## 1155. research an honest pass for ASVS 10.1.1 under the owner ruling that a default-off OIDC feature is a partial
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **6/10** · _money pit_. No product effect and the enablement boundary is an owner ruling rather than a defect, but the same question governs at least 10.1.2, 10.2.1, 10.2.2, 10.5.1 and 10.5.4, so answering it once carries more than one cell and holds value at 5. Difficulty stays 6 because the two custody deltas the residual names, an operator-declared cleartext relaxation under ADR 0153 and the ECH sidecar's loopback bearer hop under ADR 0139, are cross-cutting rather than record work, and the honest outcome may still be that no pass exists. _(was 5/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **10.1.1** (L2) currently scores **partial**. The pinned verb asks that tokens reach only the components that strictly need them. What holds it short is not token custody but enablement: the owner ruled on 2026-08-05 that a feature shipping off is a rule-5 partial, and the relying party ships off at `messagefoundry/config/settings.py:1880`.
 > Verdict: research
@@ -8581,6 +8630,7 @@ filing.
 ## 1156. research an honest pass for ASVS 10.1.2 when the flow-binding secrets are unconditional but the flow ships off
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. The enablement premise is unchanged (oidc_enabled ships False, now at settings.py:1942 rather than the cited :1880, and :2190-2210 refuses it without ad_enabled) and both live deltas the research must carry are present: the flow cookie's __Host- twin at _auth.py:783 and the hardening opt-out env at :77. Value 4 because the residual reads every binding on the acceptance path as unconditional, leaving a scorecard and method question with no product effect; difficulty 3 because the code half is one conditional in a single console auth module already covered at test_ui_hardening.py:322, and the cleartext branch is decided by the browser's own rule that a __Host- cookie requires Secure, not by engineering. _(was 4/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **10.1.2** (L2) currently scores **partial**. The pinned verb asks that the client accept an authorization code or ID Token only when it came from a flow started by the same user agent session, with unguessable, transaction-specific, client-and-agent-bound secrets. What holds it short is enablement alone: the owner ruled on 2026-08-05 that a default-off feature is rule 5, and `oidc_enabled` ships False at `messagefoundry/config/settings.py:1880`.
 > Verdict: research
@@ -8618,6 +8668,7 @@ filing.
 ## 1157. research an honest pass for ASVS 10.2.1 when PKCE and state are unconditional but the code flow ships off
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **4/10** · _fill-in_. The code is not in dispute and I confirmed it: PKCE S256 is hardcoded at auth/oidc/flow.py:215 with no configuration path, and oidc_enabled still ships False at settings.py:1942, so what remains is purely the scorecard-method question. Value 4 because the item states there is no product effect and the researcher is explicitly barred from changing the method, leaving a verdict argument as the deliverable. Difficulty 4: no code lands, but the reading has to be argued from ASVS 5.0.0 front matter and conformance guidance against a standing owner ruling, which is more than a doc edit. _(was 4/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **10.2.1** (L2) currently scores **partial**. The pinned verb asks that a code-flow OAuth client defend against browser-based request forgery that triggers token requests, by PKCE or by checking `state`. Both ship and neither is conditional; what holds the cell short is that the code flow itself is reached only when `oidc_enabled` is turned on (`messagefoundry/config/settings.py:1880`).
 > Verdict: research
@@ -8655,6 +8706,7 @@ filing.
 ## 1158. research an honest pass for ASVS 10.2.2 -- whether an id_token iss claim is a real substitute for the RFC 9207 iss parameter
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The defense is still the id_token iss claim compared to the pinned issuer (oidc/claims.py:227) and the RFC 9207 authorization-response parameter is absent from all four files of the OIDC package, so the unverified equivalence the residual flags is unchanged. Severity is bounded because the back-channel legs pin their own token endpoint per connection, and the likely deliverable is a standards determination plus, if needed, one added parameter check on an existing seam. _(was 5/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **10.2.2** (L2) currently scores **partial**. The pinned verb asks that a client able to talk to more than one authorization server defends against mix-up attacks. Two things hold it short: the 2026-08-05 owner ruling on default-off features, and an equivalence the residual itself flags as unverified.
 > Verdict: research
@@ -8694,6 +8746,7 @@ filing.
 ## 1159. research an honest pass for ASVS 10.2.3 -- least-privilege OAuth scopes the engine never validates
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. Gap stands unchanged: both scope settings reach the wire through a bare str() at smart.py:305 and http_auth.py:305 with no cross-check against the connector's declared interaction, checks.py carries no scope rule, and the wildcard example survives in at least five artifacts including the shipped wiring sample at wiring.py:531 (value 6). The remainder prices at 4: a research call on whether required scope is derivable, then an additive advisory check on the established checks.py CheckResult seam (four such checks already at :219/:253/:292/:424) plus doc narrowing, with a refusing gate ruled out. _(was 6/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **10.2.3** (L3) currently scores **partial**. The pinned verb asks that the OAuth client request only the scopes it requires. What holds it short is that `smart_scope` and `oauth2_scope` travel from operator config to the wire through one `str(...)` conversion and nothing else (`messagefoundry/transports/smart.py:305`, `messagefoundry/transports/http_auth.py:305`).
 > Verdict: research
@@ -8733,6 +8786,7 @@ filing.
 ## 1160. research an honest pass for ASVS 10.5.1 when the ID Token nonce check is unconditional but the relying party ships off
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **2/10** · Difficulty **2/10** · _fill-in_. The control is complete and unguarded in the shipped code, so the cell is already substantially covered and only enablement holds it short. The item forbids both engine changes available to it, flipping oidc_enabled and adding a refuse-to-boot gate, and directs the shared optional-feature question to be answered once across all six siblings, so this item's own remainder is applying that ruling and recording the outcome, which ships nothing runnable and costs a record-grade edit. _(was 4/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **10.5.1** (L2) currently scores **partial**. The pinned verb asks that the relying party mitigate ID Token replay, for example by matching the id_token `nonce` against the value sent in the authentication request. The check is implemented with no guard around it; the owner ruled on 2026-08-05 that a feature shipping off is a rule-5 partial, and `oidc_enabled` is False at `messagefoundry/config/settings.py:1880`.
 > Verdict: research
@@ -8770,6 +8824,7 @@ filing.
 ## 1161. research an honest pass for ASVS 10.5.4 when the ID Token audience check is unconditional but the relying party ships off
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **3/10** · Difficulty **3/10** · _fill-in_. Both halves hold at HEAD: the audience check runs unconditionally in auth/oidc/claims.py:230-240 and oidc_enabled is still False by default, now at config/settings.py:1942 rather than the cited :1880, which is itself an instance of the anchor drift the item warns about. Value 3 because the code is correct and the deliverable is a record correction under a standing owner ruling with no product effect on any default; difficulty 3 because no code change is even available -- enabling federation by default is ruled out by the item -- so the remainder is a re-anchor by token plus an argued position and an owner call. _(was 4/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **10.5.4** (L2) currently scores **partial**. The pinned verb asks that the client check the id_token `aud` claim equals its own `client_id`. The check runs with no enclosing guard; what holds the cell short is the 2026-08-05 owner ruling that a feature shipping off is rule 5, with `oidc_enabled` False at `messagefoundry/config/settings.py:1880`.
 > Verdict: research
@@ -8809,6 +8864,7 @@ filing.
 ## 1162. research an honest pass for ASVS 11.1.1 -- a key-management policy covering all six keys, and an oversharing bound that does not fight escrow
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **2/10** · Difficulty **2/10** · _fill-in_. The one-of-six scope gap and the missing oversharing bound are both answered in the shipped document, and the answer took the honest route the item demanded rather than re-declaring the scope. What is left is re-verifying the cell against that text and rewriting its residual, which is a verifier run plus a vault edit rather than repo work. _(was 6/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.1.1** (L2) currently scores **partial**. The pinned verb asks for a documented key-management policy and lifecycle following a standard such as NIST SP 800-57, including that keys are not overshared. The shipped policy at `docs/ASVS-L2-PHASE0-CHANGES.md:118` governs one key of six, and nothing anywhere bounds how many entities may hold a key.
 > Verdict: research
@@ -8840,6 +8896,7 @@ filing.
 ## 1163. research an honest pass for ASVS 11.1.2 -- how a cryptographic inventory can claim ALL without an unmeasured completeness claim
 
 > 🚧 **IN PROGRESS 2026-08-22 -- builder-1 lane**, banner written by the dispatcher, same reason. Claimed via `claim.ps1`; the coord ledger and this banner are different artifacts with different writers. **Not a closure.**
+> Research: done 2026-08-20
 >
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. The four uninventoried surfaces are inventoried and the unmeasured completeness claim has been replaced with at-least language, so the residual is the missing per-row usage sentences (13 of 65 section-4 table lines carry one) plus the research question about deriving the inventory mechanically. That research is cheaper than filed because crypto_inventory_check.py already walks five stated first-party roots and fails the build on undocumented usage, so a stated-corpus instrument partly exists. _(was 6/10 · 6/10.)_
 >
@@ -8874,6 +8931,7 @@ filing.
 ## 1164. research an honest pass for ASVS 11.1.3 -- whether crypto discovery can find instances rather than confirm an allow-list
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. Discovery is still import-level: scripts/security/crypto_inventory_check.py matches an import's top-level name against six stdlib modules plus four libraries, with a five-entry CRYPTO_SEAM_MODULES frozenset that lists store modules only, while pipeline/alert_sinks.py performs a verifying STARTTLS handshake (:431) importing build_smtp_tls_context from config/tls_policy (:48) and none of the triggers, and the gate is a required context (.github/required-contexts.txt:79). Value 6 because what is at stake is whether a green required gate is evidence of coverage; difficulty 6 because an AST or call-graph instrument plus a noise budget, the contested re-read and dropping the false transports/database.py join is a tooling rebuild. _(was 6/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.1.3** (L3) currently scores **partial**, and its own residual marks the verdict CONTESTED and asks for a full re-read. The pinned verb asks for discovery mechanisms that identify all instances of cryptography. The shipped gate is real and merge-blocking, but discovery is a hand-maintained import allow-list.
 
@@ -8906,6 +8964,7 @@ filing.
 ## 1165. research an honest pass for ASVS 11.2.2 -- crypto agility for the at-rest and integrity core without shipping a downgrade surface
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **5/10** · _fill-in_. A deploying site could not change the at-rest AEAD, audit MAC, KDF or argon2 parameters without a code release, but the additive-registration path is already built and ruled, so the workaround is a release rather than a redesign. Difficulty 5: research plus an ADR recording the ruling, with no migration and no store-backend leg implied. _(was 6/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.2.2** (L2) currently scores **partial**. The pinned verb asks that algorithms, key lengths, modes and ciphers be reconfigurable or swappable at any time, and that keys be replaceable with data re-encrypted. The transport and key-replacement halves ship; the at-rest and integrity core is a single hardcoded algorithm set.
 > Verdict: research
@@ -8937,6 +8996,7 @@ filing.
 ## 1166. research an honest pass for ASVS 11.2.3 -- a 128-bit floor on operator-supplied keys that healthcare partners can actually meet
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **5/10** · _quick win_. Re-measured rather than relayed: the only bit-length comparison in the tree is jwks.py:34 at 2048 bits, and _load_private_key rejects a non-RSA/EC type without ever inspecting length, so on a first deployment an operator could supply a sub-128-bit key for JWS signing, SMART client assertions or a TLS role with nothing objecting. Difficulty 5 because an honest answer needs a standards-and-partner-practice finding first, and any remedy then reaches signing.py, api/tls.py, every load_cert_chain site and the S/MIME recipient path. _(was 7/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.2.3** (L2) currently scores **partial**. The pinned verb asks that all cryptographic primitives provide at least 128 bits of security, naming RSA-3072 as the equivalent. Every primitive the engine selects for itself clears that; the only key-strength floor in the entire tree is `_MIN_RSA_BITS = 2048` at `messagefoundry/auth/oidc/jwks.py:34`, roughly 112 bits.
 > Verdict: research
@@ -9012,6 +9072,7 @@ Proof: four mutations, each red, zero vacuous -- per-character floor disabled, v
 ## 1167. research an honest pass for ASVS 11.2.4 -- constant-time recovery-code verification without turning ten argon2id slots into an amplification target
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **7/10** · _money pit_. The data-dependent early return survives on the shipped MFA path: _verify_second_factor walks the argon2id recovery hashes and returns on the first match, so the number of ~64 MiB verifications is a function of which code was presented. Value 4 because the leak is a wall-clock signal on an already-authenticated second factor rather than a bypass; difficulty 7 because the obvious constant-time loop multiplies a 64 MiB argon2id verification by the slot count on every attempt, converting a timing leak into a memory and CPU amplification target, and the evidentiary half has no precedent in this tree. _(was 4/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.2.4** (L3) currently scores **partial**. The pinned verb demands that every cryptographic operation be constant-time with no short-circuit in comparisons, calculations or returns. Two data-dependent early returns survive on the shipped default path, the sharper one at `auth/service.py:2076-2080`.
 > Verdict: research
@@ -9071,6 +9132,7 @@ Proof: four mutations, each red, zero vacuous -- per-character floor disabled, v
 ## 1168. research an honest pass for ASVS 11.3.1 -- retiring PKCS#1 v1.5 when the DIRECT key-transport half has no padding parameter to set
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **7/10** · _big bet_. All four anchors are exact at HEAD: PKCS1v15 is the unconditional RSA signing padding (signing.py:212, :239), direct.py:344 calls add_signer with no rsa_padding keyword, and direct.py:359's add_recipient takes no padding argument at all. Value 8 for a weak-padding default on every RSA signature the shipped engine produces plus RSAES-PKCS1-v1_5 key transport, holding the cell at partial with no configuration an operator can choose to avoid it. Difficulty 7 because the honest-pass question turns on partner PSS/ECDSA field data nobody has gathered and on whether the CMS EnvelopedData surface can reach RSA-OAEP without leaving the pinned cryptography, which needs a version disagreement settled before it can even be introspected. _(was 8/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.3.1** (L1) currently scores **partial**. The pinned verb bars insecure block modes and weak padding schemes, naming PKCS#1 v1.5 by example. Block modes are clean; padding is not, and the defect is in the defaults -- `transports/signing.py:212`, and `transports/direct.py:344` where `.add_signer()` is called with no `rsa_padding=`.
 > Verdict: research
@@ -9102,6 +9164,7 @@ Proof: four mutations, each red, zero vacuous -- per-character floor disabled, v
 ## 1169. research an honest pass for ASVS 11.3.3 -- a strict-ciphertext read that refuses an unmarked cipher column
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. A stripped marker would, on a first deployment, read back as plaintext instead of failing, so the integrity property the AEAD writer provides would be silently absent on that row, and the cell additionally carries the re-homed DIRECT S/MIME unauthenticated AES-128-CBC surface with no other cell to defer to. Difficulty 6 stands because strict mode must decide per-column versus global scope across dozens of decrypt call sites in three backends, and must define the mixed-marker state that arises inside a single install when encryption is enabled after rows exist or a value is purged. _(was 7/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.3.3** (L2) currently scores **partial**. The pinned verb asks that encrypted data be protected against unauthorized modification. The cipher's read path returns an unmarked value straight through -- `if not stored.startswith(MARKER_PREFIX): return stored`, `messagefoundry/store/crypto.py:751-752`, re-read at 166634c9 and still live.
 > Verdict: research
@@ -9133,6 +9196,7 @@ Proof: four mutations, each red, zero vacuous -- per-character floor disabled, v
 ## 1170. research an honest pass for ASVS 11.3.5 -- asserting encrypt-then-MAC on hops that deliberately keep CBC-SHA2 for hospital peers
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. The at-rest half is AEAD-only (store/crypto.py:109-111 registers AES-256-GCM alone) and the transport half is unchanged, with the deliberate six-CBC-SHA2 retention recorded at tls_policy.py:375-376 and no encrypt_then_mac reference anywhere under messagefoundry/, so nothing asserts, logs or refuses on the RFC 7366 state. Value 5 because a deploying site has a clean workaround in the shipped tls_ciphers setting (settings.py:766, forward-secrecy-validated at :935-940), leaving the default's breadth rather than an unfixable property; difficulty 3 because the item's named concrete unknown is now answered -- the stdlib exposes no negotiation state at all on this interpreter -- so the remainder is a documented finding plus the V11.3-versus-V12 scope ruling. _(was 4/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.3.5** (L3) currently scores **partial**. The pinned verb requires any encryption-plus-MAC combination to operate in encrypt-then-MAC mode. The application's own cryptography is AEAD-only and therefore EtM by construction; what holds the cell short is the TLS surface, at `config/tls_policy.py:349`.
 > Verdict: research
@@ -9209,6 +9273,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1171. research an honest pass for ASVS 11.4.1 -- SHA-1 TOTP and a keyed BLAKE2b de-identification seed
 
 > 🚧 **IN PROGRESS 2026-08-22 -- builder-2 lane**, banner written by the dispatcher: `BUILDER.md:253` puts banner flips outside a builder's lane and the lane-vs-broadcast expiry at `:257` is ambiguous enough that two builders read it differently, so this seat wrote it rather than leave the double-build hazard uncovered. The alerts cleartext-credential refusal is committed; the AUTH-mechanism restriction is not yet landed. **Not a closure.**
+> Research: done 2026-08-20
 >
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. Half the item is gone -- totp.py:84-85 confirms the SHA-256 cutover with the algorithm string derived so the two cannot drift -- and the cell's own last_verified of 2026-08-16 postdates that cutover while still reading partial, which independently confirms the remainder is the non-TOTP limb. Value 6 on that remainder: an L1 requirement short of pass on shipped code, one site rather than two, with the user-facing authenticator-interop question retired. Difficulty 4 because the worst case is a two-file swap plus the inventory registration at crypto_inventory_check.py:104 and :348, ahead of which sits the cheap prior question of whether a de-identification seed is a cryptographic use the verb reaches. _(was 7/10 · 5/10.)_
 >
@@ -9261,6 +9326,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1172. research an honest pass for ASVS 11.5.1 -- a 128-bit recovery code a person can still transcribe
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **3/10** · _quick win_. The concrete IDE defect is closed by cspNonce.ts and its negative test, so what remains is the recovery-code shortfall (totp.py:58-60, 31^15 or about 74.3 bits, ten issued by default at settings.py:1798) plus the cross-language inventory question the crypto gate still cannot answer (crypto_inventory_check.py:456-472 excludes ide/ by invariant rather than inventorying it). An operator can only work around the shortfall by setting the count to 0, which is the awkward-workaround band. _(was 6/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.5.1** (L2) currently scores **partial**. The pinned verb sets a 128-bit floor on every non-guessable random value. TOTP recovery codes are CSPRNG-drawn but reach only about 74.3 bits, and the IDE extension mints its webview CSP nonces from `Math.random()`.
 > Verdict: research
@@ -9292,6 +9358,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1173. research an honest pass for ASVS 11.5.2 -- an RNG-under-demand claim that survives the IDE extension staying in scope
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **3/10** · Difficulty **2/10** · _fill-in_. The specific surface the item said held the cell is gone: cspNonce.ts draws 144 bits from node:crypto and a shipped test pins that no production source uses Math.random for a nonce, so the scope-ruling temptation the item exists to refuse no longer has to be taken. The remainder is the item's evidence question plus a verdict edit in a record this repo does not hold (value 3, difficulty 2). _(was 3/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.5.2** (L3) currently scores **partial**. The pinned verb asks that the RNG mechanism in use be designed to work securely even under heavy demand. The engine's demand story is strong; the cell is held by surface, specifically the IDE extension's `Math.random()` webview nonces.
 > Verdict: research
@@ -9323,6 +9390,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1174. research an honest pass for ASVS 11.7.2 -- encrypt-after-use for plaintext that lives in immutable CPython objects
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **3/10** · Difficulty **6/10** · _money pit_. Unchanged in code: only the cipher's mutable buffers are locked and zeroized, and the caller's plaintext str plus the bytes cryptography returns are still immutable with no wipe hook. Value is low because exploitation requires memory access to the engine process, making it defence in depth; difficulty is 6 because the item forbids narrowing the whole-message Handler contract, so the buildable arc is a field-scoped view or decrypt-on-access accessor across store crypto and the transform path, which is cross-cutting but touches neither the stage handoff nor the ACK contract. _(was 3/10 · 8/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **11.7.2** (L3) currently scores **partial**. The pinned verb asks for data minimization during processing plus encryption immediately after use. Both clauses have real implementations and neither is complete -- the binding half is that CPython `str`/`bytes` have no wipe hook and are never re-encrypted (`store/crypto.py:47-62`, `:708-716`).
 > Verdict: research
@@ -9354,6 +9422,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1175. research an honest pass for ASVS 12.1.2 -- which recommended-suite list binds, when six CBC suites were kept by measurement
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The IDE client gained a TLS floor at engineClient.ts:56-70 but still passes no cipher list, so the static-RSA negotiation the item measured is unaffected, and validate_tls_ciphers (tls_policy.py:339) checks the suite set without checking the order. Value 6 rather than 7 because the engine-built contexts stay forward-secret-only under harden_cipher_suites and one of the three holds has narrowed; difficulty 6 because the honest answer must first bind a recommended-suite list the standard does not name, and limb 1 cannot be asserted without re-running the MLLP and DICOM interop measurement that kept the six CBC suites. _(was 7/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **12.1.2** (L2) currently scores **partial**. The pinned verb has three limbs -- only recommended suites enabled, strongest set as preferred, and forward secrecy only at L3. The engine's own contexts are strong; the failures are off the data plane and in the ordering check.
 > Verdict: research
@@ -9388,6 +9457,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1176. research an honest pass for ASVS 12.1.5 -- whether ECH is reachable at all before CPython exposes an API
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **2/10** · Difficulty **2/10** · _fill-in_. Re-measured on the pinned runtime: an SSLContext exposes no ECH attribute, the routing half is unreachable from either authoring surface, and the Go sidecar the record leans on was retired from the tree, so the cannot-honestly-reach-pass finding is better supported now than when filed. Difficulty 2 because the deliverable is a recorded finding whose external blockers are confirmable in one probe and two greps. _(was 2/10 · 3/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **12.1.5** (L3) currently scores **fail**. The pinned verb requires ECH enabled in the application's own TLS settings. No in-scope artifact enables it in any configuration, and on the pinned runtime none could -- `hasattr(ctx, 'set_ech_config')` is False on CPython 3.14.6 / OpenSSL 3.5.7.
 > Verdict: research
@@ -9429,6 +9499,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1177. research an honest pass for ASVS 12.2.1 -- refusing a cleartext outbound hop that carries a body rather than a credential
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **2/10** · _fill-in_. The outbound refusal the item was filed against ships and fires on the DEFAULT posture, not only in production: enforcement defaults to ENFORCE at settings.py:3654 and feeds enforcing at :2471, so a cleartext non-loopback http destination is refused at construction unless the operator explicitly attests the hop, declares cleartext_accepted, or turns the dial to warn. The scored remainder is the honest-pass adjudication only, whether an audited operator declaration can carry an L1 pass and the unsettled narrow-versus-broad V12.2 reading, which is reading plus a scorecard re-read. _(was 8/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **12.2.1** (L1) currently scores **partial**. The pinned verb requires TLS on all client-to-external-HTTP-service connectivity with no insecure fallback. The inbound half would pass on its own; nothing refuses a plaintext outbound destination whose body carries no named credential.
 > Verdict: research
@@ -9460,6 +9531,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1178. research an honest pass for ASVS 12.3.1 -- what a no-fallback claim means under the owner-ratified cleartext gradient
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **4/10** · _quick win_. Both limbs re-read at HEAD and both hold: transports/tcp.py:150-152 and transports/x12.py:124-125 declare cleartext_accepted a PERMANENT, STRUCTURAL declaration with no tls parameter to migrate to, and config/tls_policy.py:503-519 documents the loopback, hop_attested, cleartext_accepted and not-enforcing arms ahead of REFUSE. Value 7 because a first deployment would put a raw-TCP or X12 partner hop on the wire in the clear with no in-product configuration that changes it; difficulty 4 because this item's own remainder is the reading against the ADR 0153 gradient plus an owner ruling, with the connector TLS build tracked at #311. _(was 7/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **12.3.1** (L2) currently scores **partial**. The pinned verb requires an encrypted protocol on every inbound and outbound connection and forbids falling back to an unencrypted one. Two limbs fail: raw TCP and X12 cannot speak TLS in any configuration, and the shared hop decision ships four ALLOW/WARN arms ahead of its REFUSE.
 > Verdict: research
@@ -9494,6 +9566,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1179. research an honest pass for ASVS 12.3.3 -- internal-hop transport encryption when a certificate cannot be a shipped default
 
 > 🚧 **IN PROGRESS 2026-08-22 -- builder-1 lane**, banner written by the dispatcher: `BUILDER.md` puts banner flips outside a builder's lane and the lane-versus-broadcast expiry is ambiguous enough that two builders read it differently, so this seat writes it. Claimed via `claim.ps1`; the coord ledger and this banner are different artifacts with different writers. The 2026-08-20 pass is being applied in its own order -- scope correction first, then the shipped-surface refusal case, then the build. **Not a closure.**
+> Research: done 2026-08-20
 >
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **5/10** · _quick win_. On a first deployment the internal hops would carry session bearer tokens and, on the assessed proxy topology, PHI reads in cleartext with no gate refusing to start, and the vendor cannot ship the certificate the control needs. Difficulty 5: a scoping ruling, a one-line Dockerfile change and a bounded startup check that can sit on the existing exposure_protected property without colliding with the revocation refusal. _(was 7/10 · 7/10.)_
 >
@@ -9529,6 +9602,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1180. research an honest pass for ASVS 12.3.4 -- narrowing internal TLS trust when the anchor is an artifact only the deployer holds
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Both shortfalls confirmed at HEAD: the anchor ships off, and on the HTTP egress family it is inexpressible, since resolve_trust_anchor reaches only dicom, mllp and remotefile while rest.py and soap.py expose verify_tls alone and both hvac sites pass no CA. On a first deployment every internal REST, SOAP, FHIR, DICOMweb and Vault hop would verify against the whole OS store, including the hop that hands out the store data-encryption key. Difficulty 6 because this is a client-construction change across rest.py, soap.py and both hvac sites plus a refuse-versus-fall-back posture decision, not a default flip. _(was 7/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **12.3.4** (L2) currently scores **partial**. The pinned verb asks that internal TLS use trusted certificates and, where internal or self-signed certificates are in play, that the consuming service trust only specific internal CAs. `trust_anchor_mode: TrustAnchorMode = "system"` at `messagefoundry/config/settings.py:969` with `internal_ca_file = None`, so internal-CA certificates are verified against the whole OS trust store.
 > Verdict: research
@@ -9562,6 +9636,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1181. research an honest pass for ASVS 12.3.5 -- intra-service endpoint authentication on an engine whose coordination is store-mediated
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **7/10** · _big bet_. The setting is still attestation-only: its sole consumer at settings.py:850 collapses four values to a boolean, so a declared "mtls" changes nothing. Value 6 rather than 7 because the hop the item's own severity names is genuinely closable today -- setting [api].tls_client_ca_file makes the API listener CERT_REQUIRED-verify the proxy's client cert (api/tls.py:58-62) -- so the gap is an unverified declaration beside a working control rather than an unavailable one; difficulty 7 because an honest pass must decide whether an attestation-only setting should exist at all, whether mutual PKI is reachable for the store and Vault hops given the drivers in use, and whether the IDE, tray and apiclient fall inside the requirement's scope. _(was 7/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **12.3.5** (L3) currently scores **partial**. The pinned verb asks for strong, PKI-based, replay-resistant authentication verifying each endpoint of an intra-service hop. The engine's only setting named for it, `proxy_intra_service_auth: Literal[...] = "none"` at `messagefoundry/config/settings.py:771`, is read in exactly one place -- `return self.proxy_intra_service_auth != "none"` at `:804` -- so nothing branches on its value (verified at 166634c9).
 > Verdict: research
@@ -9593,6 +9668,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1182. research an honest pass for ASVS 13.2.1 -- backend hops where no individual-account credential exists in any configuration
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **7/10** · _big bet_. The gate still ships off at config/settings.py:514 and its precondition method at :591-609 reads only StoreSettings, so the db_lookup pool and DATABASE connector remain uncovered exactly as filed. Value 7 for a real gap with no compliant option available to an operator on five of the hops; difficulty 7 because the research must price five separate missing mechanisms (LDAP SIMPLE bind, SMTP XOAUTH2, Vault AppRole and lease renewal, OIDC client_secret, and the Postgres validator that rejects anything but sql auth) against an owner decision on per-backend scoping the item is forbidden to pre-empt. _(was 7/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **13.2.1** (L2) currently scores **partial**. The pinned verb asks that backend component communications authenticate with individual service accounts, short-term tokens or certificates, and not with unchanging credentials. The store hop ships `auth = SqlAuth.SQL` -- a static username plus a password brace-quoted into the ODBC DSN -- and the gate that would refuse it, `require_managed_identity: bool = False` at `messagefoundry/config/settings.py:488`, ships off (verified at 166634c9).
 > Verdict: research
@@ -9627,6 +9703,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1183. research an honest pass for ASVS 13.3.2 -- least-privilege secret access, starting with whether the recorded verdict is even right
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **4/10** · _fill-in_. The item concedes no direct product effect and is explicitly an assessment-quality gap: the stated basis for the recorded partial is refuted by a sibling cell, so the work buys record accuracy rather than a control. Difficulty is a re-derivation against the pinned verb plus a survey of what the engine could introspect about its own secret-store privileges across Vault, environment-injected passwords and wincred, with no engine code change indicated. _(was 5/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **13.3.2** (L2) currently scores **partial**. The pinned verb asks that access to secret assets adhere to least privilege. The recorded basis is that `require_managed_identity: bool = False` (`messagefoundry/config/settings.py:488`) is the one engine-side check and covers only the store slice -- but the 2026-08-08 triage calls that a category error, and the sibling cell 13.2.2 says so in the scorecard's own words.
 > Verdict: research
@@ -9676,6 +9753,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1184. research an honest pass for ASVS 14.2.1 -- getting the PHI search needle off the query string without breaking GET search
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **6/10** · _big bet_. All three sibling routes still take the needle on the query string (api/app.py:3020-3022 and :3112-3114, uploaded_logs.py:173-175 with the anchor moved from :88), and logging_setup.py:174-177 records that uvicorn emits the full request line including the query string into the stream NSSM captures and an off-box forwarder ships, with neither parameter in _CREDENTIAL_QUERY_KEYS. Value 8 because redaction.py's own docstring at :68-72 concedes the residual is single-token identifiers, so an operator-typed MRN would survive into that log on a first deployment, and proxy logs, browser history and referrers are outside any filter; difficulty 6 because moving the needle off a GET URL is cross-cutting across the API, console, harness, IDE extension and apiclient, each of which must be priced explicitly. _(was 8/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **14.2.1** (L1) currently scores **partial**. The pinned verb asks that sensitive data reach the server only in the body or headers, and that the URL and query string carry none of it. Three sibling routes take a PHI needle in the query string, including `field_value: str | None = Query(None, max_length=512)` at `messagefoundry_webconsole/routes/uploaded_logs.py:88` (verified at 166634c9).
 
@@ -9764,6 +9842,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1185. research an honest pass for ASVS 14.2.2 -- cache control for PL-2 responses the coverage guard is structurally unable to see
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **6/10** · _big bet_. The tuple at api/app.py:346 still carries the same five prefixes, the middleware at :1296-1305 has exactly two arms, and none of the three monitoring routes at :2321, :2348 and :2391 falls under either, so on a first deployment those PL-2-bearing responses would carry no cache directive. Value 7 is rung 7 -- no operator-side remedy exists in the default posture, and the second disjunct's process-lifetime decrypted caches have none at all. Difficulty 6 because the fix is structural rather than additive: the guard in tests/test_no_store_phi_coverage.py selects routes by permission gate and so can never see a monitoring-gated PL-2 route, and the item also requires rulings on whether sensitivity tracks permission or classification and on the docstring-versus-PHI.md conflict. _(was 7/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **14.2.2** (L2) currently scores **partial**. The pinned verb offers two disjuncts -- prevent sensitive data being cached in server components, or securely purge it after use -- and neither is met. `_NO_STORE_PREFIXES = ("/messages", "/dead-letters", "/search", "/logs", "/uploads")` at `messagefoundry/api/app.py:336` omits three monitoring routes that return PL-2 free text (verified at 166634c9).
 > Verdict: research
@@ -9793,6 +9872,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1186. research an honest pass for ASVS 14.2.4 -- doc-to-code fidelity when the measuring document is written as a mirror of the code
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **6/10** · _money pit_. The operator-surprise evidence that carried this item's severity is repaired -- all four named documents now describe the shipped auto-bound and record the previous inversion (CONFIGURATION.md:1529, SECURITY-LOOSENING.md:221-223 and :300, PHI.md:1061-1063) -- so the remainder is the research question plus a binding gate for gate-behaviour and integrity prose, which the item itself doubts is mechanisable. Difficulty stays at 6 for exactly that reason. _(was 7/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **14.2.4** (L2) currently scores **partial**. The pinned verb asks that the named control domains be implemented as defined in the documentation for the specific data's protection level. Retention is demonstrably not: the startup gate was inverted so an unset PHI-body window auto-bounds to 30 days under `enforce`, while four tracked documents still describe a refusal, and nothing in the tree can red on the divergence.
 > Verdict: research
@@ -9826,6 +9906,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1187. research an honest pass for ASVS 14.2.6 -- display masking in a console whose job is to show the operator the message
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. Gap stands: the raw body renders on page load at messages.py:346 with no reveal step, and the only nearby control is the permission and audit split at :371-374, so the verb's second sentence has no implementing control anywhere in the corpus (value 6). The remainder is a design ruling on what masking means for a console whose purpose is reading the failed message, then response-shaping plus console interaction plus audit reaching the API models, the apiclient and the console together (difficulty 6), with a reasoned cannot-pass an accepted outcome. _(was 6/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **14.2.6** (L3) currently scores **partial**. The pinned verb has two sentences: return only the minimum sensitive data, and mask complete data in the UI unless the user specifically views it. The second has no implementing control anywhere -- the raw body renders on page load at `messagefoundry_webconsole/pages/messages.py:346` (`raw = el("pre", detail.raw, class_="raw")`, verified at 166634c9) with no reveal interaction.
 > **SHIPPED-BUT-OPEN 2026-08-22 -- PR #514, ledger pairing authored by the LANDER per [ADR 0165](adr/0165-a-builder-pr-satisfies-the-ledger-gate-with-a-paired-commit-authored-by-the-dispatcher-or-lander.md).** Subjects 1 and 2 shipped TOGETHER and deliberately: the summary is masked on list surfaces and revealed when one message is opened. Shipping the mask alone would have left the console showing masked summaries with no way to unmask -- a regression on the surface whose stated job is showing the operator the message.
@@ -9864,6 +9945,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1188. research an honest pass for ASVS 14.2.7 -- the three classified PHI tiers no sweep reaches, under the 2026-07-30 no-auto-bound ruling
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **7/10** · _big bet_. All three undeleted tiers persist: both body purges scope every queue statement to Stage.OUTBOUND, so a dead ingress or routed row would keep a full raw PHI payload after messages.raw blanks and the message reads as purged; the reference purge still refuses a declared set; and _sweep_app_logs remains the only filesystem sweep, with no spill-directory path. Difficulty is 7 because closing it means purge changes across all three store backends, a new filesystem sweep, and an eviction-key design that does not reverse the 2026-07-30 no-auto-bound ruling. _(was 7/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **14.2.7** (L3) currently scores **partial**. The pinned verb is a conjunction: classify sensitive information for retention, and ensure outdated data is deleted automatically, on a schedule, or as the situation requires. Classification is built and machine-enforced (`MIN_PHI_RETENTION_WINDOWS: Final[int] = 9` at `messagefoundry/config/retention_classification.py:173`, verified at 166634c9); deletion misses three classified tiers.
 > Verdict: research
@@ -9903,6 +9985,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1189. research an honest pass for ASVS 15.1.4 -- risky-component highlighting when the consolidated table is policy-withheld from the tree
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. The constraint is intact and is stated policy rather than oversight: the blanket rule at .gitignore:170 keeps THREAT-MODEL.md out of every engine checkout (git ls-files docs/security = 0), leaving only the per-library ADR notes. Value 4 because a first deployment's operators would receive no risky-component highlight for the hostile-input parsers or the auth and crypto stack, which is documentation coverage rather than a product defect; difficulty 3 because the deliverable is a public-safe highlight that survives the withholding subtraction plus an owner ruling on who application documentation serves -- prose and a decision, with no code path. _(was 4/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **15.1.4** (L3) currently scores **partial**. The pinned verb asks that application documentation highlight third-party libraries considered risky components. Two libraries are highlighted in-tree; the consolidated designation over the dependency set lives in `docs/security/THREAT-MODEL.md`, which `.gitignore:147` keeps out of every checkout (verified at 166634c9).
 > Verdict: research
@@ -9936,6 +10019,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1190. research an honest pass for ASVS 15.1.5 -- which dangerous-functionality classes can be highlighted publicly without becoming the roadmap
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. Only the dynamic-execution class is highlighted in-tree, the other classes the item names appear in no shipped document, and docs/security/ is still ignored at .gitignore:170. The remainder is deciding which classes can be named publicly without the highlight becoming the exploitation guide, then writing them where an adopter receives them. _(was 4/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **15.1.5** (L3) currently scores **partial**. The pinned verb asks that application documentation highlight the parts of the application where dangerous functionality is used. One class is highlighted well in-tree and the rest only in the policy-withheld `docs/security/THREAT-MODEL.md`, while the guard that would assert over it skips at its document accessor (`tests/test_threat_model_doc_drift.py:52`).
 > Verdict: research
@@ -9970,6 +10054,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1191. research an honest pass for ASVS 15.2.2 -- an availability bound on the MLLP data plane that does not accept-and-drop
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. A per-connection pacer ships with its off-by-default position already written as a documented decision at mllp.py:109-116, which is most of what the verb asks for, so the gap is an awkward-workaround one (the operator supplies a number) rather than an absent defense. The remainder is choosing defensible non-zero values for settings.py:1066 and :1636 and settling whether any wall-clock bound is reachable off the subprocess path, each needing a written rationale. _(was 8/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **15.2.2** (L2) currently scores **partial**. The pinned verb asks for implemented defenses against loss of availability caused by time-consuming or resource-demanding functionality, grounded in documented decisions. What holds it short is that the engine's primary data plane has no message-throughput or admission ceiling, and two byte budgets ship 0 = unbounded (`config/settings.py:1020`, `:1582`).
 > Verdict: research
@@ -10001,6 +10086,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1192. research an honest pass for ASVS 15.2.3 -- getting development subcommands out of the wheel without taking dryrun off the operator's box
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. Clause (a) still binds: messagefoundry/__main__.py registers dryrun (:162), adr-analyze (:225), generate (:350), lens (:375) and import corepoint (:442, :449) as unconditional subparsers on the same entrypoint as serve (:63), while clause (b) stays clean via the sdist only-include at pyproject.toml:21. Value 5 on the item's own severity, low product effect and no added network surface, which makes this shipped-artifact hygiene; difficulty 4 for a research pass that must settle whether an entrypoint gate reads as does-not-include, plus CLI tests if it becomes a build. _(was 6/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **15.2.3** (L2) currently scores **partial**. The pinned verb is conjunctive: the production environment must include only run-required functionality AND not expose extraneous functionality such as test code, samples, and development functionality. What holds it short is clause (a) -- development subcommands ship inside the wheel as unconditional argparse subparsers on the production entrypoint (`messagefoundry/__main__.py:162`, `:225`, `:350`, `:375`, `:432`, re-read at HEAD).
 > Verdict: research
@@ -10034,6 +10120,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1193. research an honest pass for ASVS 15.2.4 -- provenance for the web-console distribution the engine loads by import name
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **4/10** · _quick win_. The remainder is whether a claimed name satisfies the verb or the load path must verify provenance for a distribution that mounts in-process, on an L3 cell; the name-claim limb and the next-distribution guard (test_a_new_distribution_must_be_classified:172) are already covered. Difficulty 4: a provenance check at the single find_spec load site plus a test, once the ruling is made. _(was 8/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **15.2.4** (L3) currently scores **partial**. The pinned verb asks that third-party components and all transitive dependencies come from the expected repository and that there is no risk of a dependency confusion attack. What holds it short is the in-scope web console: shipped docs instruct a bare-name index install (`README.md:110`) and the engine loads whatever occupies that import name by presence, not provenance (`messagefoundry/__main__.py:1769`).
 
@@ -10068,6 +10155,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1194. research an honest pass for ASVS 15.2.5 -- isolation around Router/Handler code that does not fail closed on the sanctioned live lookups
 
 > 🔢 **Re-scored 2026-08-20 -> P1.** Value **8/10** · Difficulty **6/10** · _big bet_. The rubric's 8 band names an ASVS L3 Partial on defaults, and 15.2.5 is exactly that: settings.py:1295 still defaults sandbox mode to off, the section docstring at :1279-1292 is itself the documentation limb the verb keys on, and ADR 0147, the only shape that reconciles isolation with the sanctioned live lookups, remains Proposed with no code. Difficulty 6 rather than 8 because the deliverable is a finding plus the per-message overhead measurement the project's own record leaves asserted, or a lesser in-process protection; building the broker seam would be the 8. _(was 6/10 · 8/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **15.2.5** (L3) currently scores **partial**. The pinned verb asks for additional protections -- sandboxing, encapsulation, containerization, network-level isolation -- around parts of the application documented as containing dangerous functionality. What holds it short is that a real, non-stub isolation control exists and ships off: `[sandbox].mode` is `Literal["off", "subprocess"]` defaulting to `"off"` (`config/settings.py:1241`).
 > Verdict: research
@@ -10101,6 +10189,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1195. research an honest pass for ASVS 15.4.4 -- fair thread access on the shipped SQLite posture, or a measured argument that the existing pools already suffice
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **7/10** · _money pit_. The only cross-subsystem reservation still ships off and is still SQL-Server-only by construction, so on the shipped SQLite posture route and transform CPU and all blocking transport I/O share one default pool with the argon2 semaphore as the sole reservation. Value 5 because connector timeouts bound the wait and the recorded assessor dissent may be right that bounded pools already satisfy the verb, so the practical exposure is a delay rather than starvation; difficulty 7 because any mechanism has to clear ADR 0071's measured NO-GO boundary without regressing throughput, and the operative phrase about a reasonable timeframe is recorded as unassessed, so even the argument route needs a new measurement. _(was 5/10 · 7/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **15.4.4** (L3) currently scores **partial**. The pinned verb asks that resource allocation policies prevent thread starvation by ensuring fair access, letting lower-priority threads proceed within a reasonable timeframe. What holds it short is that the only cross-subsystem reservation ships off and is SQL-Server-only (`fuse_thread_hops` default False, `config/settings.py:1184`; `pipeline/wiring_runner.py:759`).
 > Verdict: research
@@ -10134,6 +10223,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1196. research an honest pass for ASVS 16.2.2 -- the synchronized-sources conjunct on an engine with no shippable time peer
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The SNTP gate still ships warn-only with no peer (config/settings.py:1447-1448; the item's :1393 anchor has moved) and the validator at :1513-1515 confirms the structural bind the item describes -- flipping the flag alone makes every stock config fail to load. Value 6 for an evidence-quality gap with no in-engine skew check on the default and only an awkward out-of-product substitute; difficulty 6 because the hinge is a reading of the standard about whether host-level clock discipline satisfies a synchronization verb for an application that does not own the clock, followed by a clinical judgement on fail-closed behaviour. _(was 6/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **16.2.2** (L2) currently scores **partial**. The pinned verb has two conjuncts: log time sources synchronized, and security-event timestamps in UTC or with an explicit offset. The UTC conjunct holds on the default (`logging_setup.py:348`, `formatter.converter = time.gmtime`); the synchronization conjunct does not, because the engine's own SNTP gate ships off (`require_time_sync: bool = False`, `config/settings.py:1393`).
 > Verdict: research
@@ -10165,6 +10255,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1197. research an honest pass for ASVS 16.3.2 -- measuring the audit-flood cost that the all-decisions clause is traded against
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **7/10** · Difficulty **4/10** · _quick win_. An explicit ASVS must is being traded against a flooding cost asserted in the settings comment and in ADR 0118 and measured nowhere, which is the weakest joint in the cell and could settle it in either direction; denials stay audited unconditionally so there is no access-control hole behind it. Difficulty 4 because part (a) is a measurable audit-row rate under a polling console, and parts (b) and (c) are method reading plus assessing the unaudited field-redaction decisions, none of it a store or seam change. _(was 7/10 · 4/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **16.3.2** (L2) currently scores **partial**. The pinned verb requires failed authorization attempts to be logged, and at L3 all authorization decisions including sensitive-data access. What holds it short per the scorecard is that `audit_all_authorization_decisions` ships False (`config/settings.py:3640`), so a GET records no grant row and a non-GET only for the 15 permissions in `_GRANT_AUDIT_PERMISSIONS` (`api/security.py:100`).
 > Verdict: research
@@ -10196,6 +10287,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1198. research an honest pass for ASVS 16.4.2 -- what "cannot be modified" can mean for logs the operator's substrate owns
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **6/10** · _big bet_. The disputed limb resolves in the triage's favour at HEAD -- store/store.py:2251-2254 documents that only rows missing a hash are filled and existing valid hashes are left untouched, enforced by the skip at :2259, with :2288 confirming a rewrite needs the explicit chain-verifying rekey -- while audit_verify_on_start still ships False at settings.py:3309, so the gap the item actually names, absent modification prevention, stands. Value 6 rather than 7 because prevention has an awkward but real operator-side workaround the item itself enumerates (append-only grants, a WORM volume, a write-only remote sink) on top of the shipped hash chain and its verify knob; difficulty 6 because the outcome is bimodal, either a standards reading that decides the whole cell for near-zero cost or a prevention seam the engine does not have. _(was 7/10 · 6/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **16.4.2** (L2) currently scores **partial**. The pinned verb is a conjunction: logs protected from unauthorized access AND unmodifiable. What holds it short, per the 2026-08-08 triage rather than the scorecard's own one-line residual, is that modification *prevention* is absent by design in every configuration -- the hash chain makes tampering evident, never impossible.
 > Verdict: research
@@ -10233,6 +10325,7 @@ Nothing here touches the TLS/FTPS context in the same module, which was already 
 ## 1199. research an honest pass for ASVS 16.4.3 -- an engine that ships no collector against a verb that requires transmission
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **6/10** · Difficulty **5/10** · _quick win_. Shipped defaults are unchanged: forward_host is None at settings.py:1413, the handler installs only behind if forward is not None at logging_setup.py:438, and the protocol default at :1415 is UDP. Value 6 not 7: the engine ships the entire secure-transmission mechanism (SyslogForward at logging_setup.py:240 with native TLS at :300, CA anchoring and hostname verification, plus the REFUSE gate at settings.py:2475), so an operator reaches a conforming posture by setting a host and forward_protocol=tls -- awkward, but a real workaround, which is what rung 7 requires to be absent. Difficulty 5 for measuring the REFUSE gate's actual coverage, arguing the deployed-system-versus-product reading against the text, and weighing a TLS protocol default against a precedent that a runbook edit bought and lost this cell in two days. _(was 7/10 · 5/10.)_
+> Research: done 2026-08-20
 >
 > **Filed 2026-08-08 - not started. RESEARCH item: the goal is an HONEST pass, and "cannot honestly reach pass" is a valid finding.** ASVS **16.4.3** (L2) currently scores **partial**. The pinned verb requires logs to be securely transmitted to a logically separate system so they survive a breach of the application. What holds it short is that no shipped default transmits anything: `forward_host` is None (`config/settings.py:1359`) and `configure_logging` installs stdout only behind `if forward is not None` (`logging_setup.py:437`).
 > Verdict: research
@@ -13878,6 +13971,20 @@ intake loss      engine_read 35 below confirmed sent 36 -- one message lost on i
 ## 1324. Promote Verdict/Research/Closing-act into the banner block parse_items reads
 
 > 🔢 **Re-scored 2026-08-22.** Filed by the workflow-analysis seat. **Priority:** P2. **Verdict:** build
+> **THE REMAINING ITEMS' `Research` FIELD IS DELIBERATELY ABSENT, AND THIS IS THE RECORD OF WHY.**
+> *Migrated 2026-08-23. `Research: done <date>` was written to the 93 open items carrying POSITIVE,
+> DATED evidence -- a `**Researched <ISO>` marker in their own body, all 93 reading 2026-08-20. No
+> `Research: none` was written anywhere, because THAT VALUE IS NOT DERIVABLE.* **This row claims it
+> is: "Research is derivable from the presence of a dated research pass." That is true of the
+> positive half and FALSE of the negative half.** *Measured by varying only the needle: `research
+> pass|round|sweep|researched` matches 95 of 246 and infers `none` for 151; adding
+> `re-measured|verified independently` matches 136 and infers `none` for 110. **The `none`
+> population swings by 46 items -- nearly a fifth of the ledger -- on word choice alone, so "no
+> mention of research" is a property of the NEEDLE, not of the item.*** **Writing it would put a
+> machine-readable value on 105-151 items whose only warrant is a regex somebody picked, and this
+> row's own rule forbids exactly that: a wrong value is worse than an absent one.** *Precedent:
+> [#320](#320), whose `Closing-act` is absent by argument rather than by omission. Stated ONCE here
+> rather than on 150 item bodies, per SDS-3.5.*
 > Verdict: build
 > Research: none
 > Closing-act: code
