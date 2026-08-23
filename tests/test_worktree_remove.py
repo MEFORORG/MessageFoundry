@@ -34,6 +34,7 @@ on the branch merely existing.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -298,4 +299,214 @@ def test_the_script_location_default_still_anchors_when_no_root_is_passed(fx: Fi
 
     assert proc.returncode == 0, proc.stderr
     assert not wt.exists()
+    assert not fx.is_registered(wt)
+
+
+# --- BACKLOG #1295: claims held by a removed worktree --------------------------
+#
+# `claim.ps1 -Release` is WORKTREE-SCOPED, so a claim outliving its holder can never be released
+# normally and reads as actively-being-built forever. Measured 2026-08-19: 19 of 28 live claims were
+# already orphaned this way, and this script -- the sanctioned removal path -- had no claim handling,
+# so it was a source of them.
+#
+# THE FALSE POSITIVE IS THE ONE TO FEAR, not the missed release. Handing a LIVE worktree's key to
+# another session invites the duplicate build the registry exists to stop, which is strictly worse
+# than the orphan. That is why two of the tests below assert a claim SURVIVES.
+
+
+def _claims_dir(fx: Fixture) -> Path:
+    common = _git(fx.primary, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    d = Path(common) / "mefor-coord" / "claims"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _write_claim(fx: Fixture, key: str, worktree: Path | str) -> Path:
+    f = _claims_dir(fx) / f"{key}.json"
+    f.write_text(
+        json.dumps({"key": key, "worktree": str(worktree).replace("\\", "/"), "note": "t"}),
+        encoding="utf-8",
+    )
+    return f
+
+
+def test_a_claim_held_by_the_removed_worktree_is_released(fx: Fixture) -> None:
+    wt = fx.add("alpha")
+    claim = _write_claim(fx, "9001", wt)
+    assert claim.exists(), (
+        "POSITIVE CONTROL: the claim must exist before removal, or this proves nothing"
+    )
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode == 0, proc.stderr
+    assert not claim.exists(), (
+        "the claim outlived its holder and can now never be released normally"
+    )
+    assert "9001" in proc.stdout, (
+        "the release happened silently; an operator cannot audit what they cannot see"
+    )
+
+
+def test_a_claim_held_by_a_DIFFERENT_worktree_survives(fx: Fixture) -> None:
+    """THE FALSE-POSITIVE GUARD, and it matters more than the release itself."""
+    wt = fx.add("alpha")
+    other = fx.add("beta")
+    mine = _write_claim(fx, "9002", wt)
+    theirs = _write_claim(fx, "9003", other)
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode == 0, proc.stderr
+    assert not mine.exists(), "the removed worktree's own claim was not released"
+    assert theirs.exists(), (
+        "a claim belonging to a LIVING worktree was released. That hands its key to another session "
+        "and invites the duplicate build the registry exists to stop -- worse than the orphan."
+    )
+
+
+def test_a_claim_whose_path_merely_PREFIXES_the_removed_one_survives(fx: Fixture) -> None:
+    """`repo-alpha` is a string prefix of `repo-alpha-two`. A StartsWith match would release both.
+
+    This is the exact shape the matching rule forbids -- full normalised path, no prefix, no leaf.
+    """
+    wt = fx.add("alpha")
+    nested = fx.add("alpha-two")
+    exact = _write_claim(fx, "9004", wt)
+    victim = _write_claim(fx, "9005", nested)
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode == 0, proc.stderr
+    # CONTROL: without this the test passes when the sweep does nothing at all.
+    assert not exact.exists(), "the sweep did not run, so the prefix result below proves nothing"
+    assert victim.exists(), "a prefix match released a different worktree's claim"
+
+
+def test_an_unreadable_claim_is_left_in_place_and_reported(fx: Fixture) -> None:
+    """UNREADABLE IS NOT ABSENT. A file that will not parse might name this worktree, so it is
+    reported rather than deleted on a guess -- and rather than silently skipped, which would make a
+    stranded claim look like a clean sweep."""
+    fx.add("alpha")
+    bad = _claims_dir(fx) / "9006.json"
+    bad.write_text("{not json", encoding="utf-8")
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode == 0, proc.stderr
+    assert bad.exists(), "an unparseable claim was deleted on a guess"
+    combined = proc.stdout + proc.stderr
+    assert "9006" in combined, (
+        "the unreadable claim was skipped silently, which reads as a clean sweep"
+    )
+
+
+def test_removal_still_succeeds_with_no_claims_directory(fx: Fixture) -> None:
+    """The sweep must not turn a working removal into a failure on a repo that has never claimed."""
+    fx.add("alpha")
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode == 0, proc.stderr
+    assert not fx.is_registered(fx.sibling("alpha"))
+
+
+# --- BACKLOG #1293: allocations a removed worktree owns ------------------------
+#
+# Ownership of a ledger number is a casefolded PATH-STRING comparison against the worktree recorded
+# at allocation time, with no fallback when that directory is gone. So removal BURNS the number:
+# `owns()` returns false for every session forever and any PR that must re-introduce the heading is
+# unlandable by anyone. PR #397 was stranded exactly this way.
+#
+# IT REFUSES RATHER THAN WARNS BECAUSE THERE IS NO POST-HOC FIX. A claim can be released afterwards;
+# an allocation cannot be re-keyed -- ownership is documented non-transferable -- so the removal is
+# the only moment this can be stopped.
+
+
+def _alloc_dir(fx: Fixture, kind: str = "backlog") -> Path:
+    common = _git(fx.primary, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    d = Path(common) / "mefor-coord" / "alloc" / kind
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _write_alloc(fx: Fixture, number: str, worktree: Path | str, kind: str = "backlog") -> Path:
+    f = _alloc_dir(fx, kind) / f"{number}.json"
+    f.write_text(
+        json.dumps(
+            {
+                "number": number,
+                "kind": kind,
+                "title": "t",
+                "branch": "b",
+                "worktree": str(worktree).replace("\\", "/"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return f
+
+
+def _put_on_main(fx: Fixture, body: str) -> None:
+    """Put a docs/BACKLOG.md on origin/main WITHOUT touching the working tree, so the guard's
+    ls-tree/show read is what is exercised rather than a file on disk."""
+    (fx.primary / "docs").mkdir(exist_ok=True)
+    (fx.primary / "docs" / "BACKLOG.md").write_text(body, encoding="utf-8")
+    _git(fx.primary, "add", "docs/BACKLOG.md")
+    _git(fx.primary, "commit", "-qm", "ledger")
+    head = _git(fx.primary, "rev-parse", "HEAD").strip()
+    _git(fx.primary, "update-ref", "refs/remotes/origin/main", head)
+
+
+def test_removal_is_REFUSED_when_the_worktree_owns_an_unlanded_number(fx: Fixture) -> None:
+    wt = fx.add("alpha")
+    _write_alloc(fx, "9101", wt)
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode != 0, "the removal proceeded and burned the number"
+    assert "9101" in proc.stderr, "the refusal does not name the number, so nobody can act on it"
+    assert fx.is_registered(wt), "the worktree was removed despite the refusal"
+
+
+def test_removal_PROCEEDS_when_the_owned_number_is_already_on_main(fx: Fixture) -> None:
+    """THE CONTROL THAT MAKES THE REFUSAL ABOVE MEAN SOMETHING. Without it, a guard that refused
+    unconditionally would pass every other test here and block every removal in the repo."""
+    wt = fx.add("alpha")
+    _write_alloc(fx, "9102", wt)
+    _put_on_main(fx, "# Backlog" + chr(10) * 2 + "## 9102. already landed" + chr(10))
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode == 0, proc.stderr
+    assert not fx.is_registered(wt)
+
+
+def test_an_allocation_owned_by_a_DIFFERENT_worktree_does_not_block(fx: Fixture) -> None:
+    wt = fx.add("alpha")
+    other = fx.add("beta")
+    _write_alloc(fx, "9103", other)
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode == 0, proc.stderr
+    assert not fx.is_registered(wt)
+
+
+def test_an_unreadable_allocation_record_refuses(fx: Fixture) -> None:
+    """CANNOT-TELL COUNTS AS AT-RISK. An unparseable record might name this worktree, and proceeding
+    on that ambiguity is the irreversible direction."""
+    wt = fx.add("alpha")
+    (_alloc_dir(fx) / "9104.json").write_text("{not json", encoding="utf-8")
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode != 0, "removal proceeded past a record it could not read"
+    assert "9104" in proc.stderr
+    assert fx.is_registered(wt)
+
+
+def test_the_override_is_NOT_Force(fx: Fixture) -> None:
+    """-Force means "I accept losing uncommitted changes". It must not also mean "I accept burning a
+    ledger number" -- one consent covering two unrelated risks is how an irreversible one gets given
+    away by accident."""
+    wt = fx.add("alpha")
+    _write_alloc(fx, "9105", wt)
+
+    forced = run(fx, "-Name", "alpha", "-Force")
+    assert forced.returncode != 0, "-Force bypassed the allocation guard"
+    assert fx.is_registered(wt)
+
+    allowed = run(fx, "-Name", "alpha", "-AllowOrphanedAllocations")
+    assert allowed.returncode == 0, allowed.stderr
     assert not fx.is_registered(wt)
