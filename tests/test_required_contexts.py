@@ -230,3 +230,37 @@ def test_ci_doc_does_not_contradict_the_zizmor_and_scorecard_workflows() -> None
             f"(it has {sorted(triggers)}). The advisory-vs-required reasoning in that sentence is "
             "sound for CodeQL and does not apply to a workflow that never reports on a PR at all."
         )
+
+
+def test_the_ci_gate_rollup_comment_names_every_job_the_job_actually_needs() -> None:
+    """BACKLOG #1300. ``required-contexts.txt`` described the ``CI gate`` roll-up as SIX legs when
+    ``ci-gate`` needs EIGHT -- omitting ``webconsole`` and ``tooling``.
+
+    THE TWO OMITTED ONES ARE THE TWO THAT MOST OFTEN REPORT. The other six are path-gated or nightly
+    and skip on an ordinary pull request; these two run on every one. So the file that exists to
+    answer *"does this check block a merge"* answered it wrong for precisely the legs a reader is most
+    likely to be asking about -- and answered it in the reassuring direction, because a context this
+    file does not name reads as not-blocking.
+
+    **A PROSE-ONLY FIX WOULD ROT AGAIN THE NEXT TIME A JOB JOINS THE ROLL-UP**, which is how it got
+    here: `webconsole` and `tooling` were added to `needs:` and the comment was not. This reconciles
+    the comment against the LIVE `needs:` list, so the two cannot drift silently.
+
+    Deliberately NOT asserting a count. The row's own numbers -- six versus eight -- are the thing
+    that went stale; a test pinning "eight" would need editing on the next legitimate addition and
+    would tempt whoever edits it to change the number rather than the comment."""
+    import yaml
+
+    workflow = yaml.safe_load(
+        (_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    )
+    needs = workflow["jobs"]["ci-gate"]["needs"]
+    assert needs, "ci-gate declares no needs -- the roll-up would gate nothing"
+
+    doc = (_ROOT / ".github" / "required-contexts.txt").read_text(encoding="utf-8")
+    unnamed = [job for job in needs if job not in doc]
+    assert not unnamed, (
+        f"ci-gate needs {sorted(needs)} but required-contexts.txt never names {sorted(unnamed)}. "
+        f"A reader asking whether a red {unnamed[0]!r} blocks their merge finds no such context here "
+        f"and concludes it does not (BACKLOG #1300)."
+    )
