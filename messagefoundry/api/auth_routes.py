@@ -233,7 +233,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # so a native client can hide its SSO affordance when the acceptor is degraded.
         return ProvidersInfo(
             local=True,
-            ad=service.ad_password_login_enabled,
+            # RETIRED (BACKLOG #1137): the engine accepts no directory password, so no client should
+            # offer an AD username/password form. Reported as a constant False rather than removed,
+            # so a client built against the older contract hides the form instead of failing to
+            # parse the response; the field itself is a follow-up removal.
+            ad=False,
             kerberos=service.kerberos_available,
             oidc=service.oidc_available,
         )

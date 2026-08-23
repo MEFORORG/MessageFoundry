@@ -459,15 +459,12 @@ class AuthService:
     @property
     def ad_enabled(self) -> bool:
         """Whether this engine can BIND to the directory -- what Kerberos SSO, federated OIDC and the
-        session reconciler each need. Not the same question as whether we accept an AD password; see
-        :attr:`ad_password_login_enabled` (BACKLOG #1137)."""
-        return self._ldap is not None
+        session reconciler each need.
 
-    @property
-    def ad_password_login_enabled(self) -> bool:
-        """Whether a user may present an AD password to our login form. Requires the bind (there is
-        nothing to verify against otherwise) AND the operator leaving the pathway on."""
-        return self._ldap is not None and self._settings.ad_password_login_enabled
+        This is a DIRECTORY-BIND capability, never a statement that a user may present a directory
+        password: that pathway is retired (BACKLOG #1137). The step-up re-bind still uses the bind,
+        so this staying true is correct and is not a leftover."""
+        return self._ldap is not None
 
     @property
     def action_step_up_required(self) -> bool:
@@ -736,7 +733,26 @@ class AuthService:
         client: str | None = None,
     ) -> LoginOutcome:
         if provider is AuthProvider.AD:
-            return await self._login_ad(username, password, client=client)
+            # RETIRED (BACKLOG #1137, owner ruling 2026-08-22). The engine no longer accepts a
+            # directory password: current good practice is that an application does not collect
+            # directory credentials, and supporting AD is not the same as supporting simple bind --
+            # every real AD deployment already provides Kerberos, so the replacement is in place
+            # wherever the pathway was.
+            #
+            # Refused here rather than deleted from the dispatch, because falling through to the
+            # local path would authenticate an AD username against the LOCAL credential store, which
+            # is a worse failure than a refusal: a directory name that happens to collide with a
+            # local account would silently log in as that account.
+            #
+            # THE STEP-UP RE-BIND (`_reauth_ad`) DELIBERATELY SURVIVES THIS. It is the only step-up
+            # path any AD-stamped identity has -- Kerberos and OIDC logins are stamped AD too -- so
+            # removing it in the same change would lock every AD operator out of factor enrolment
+            # and MFA-disable. See docs/research/ad-step-up-after-simple-bind-retirement.md.
+            await self._directory_reject_audit(username, "simple_bind", "pathway_retired")
+            return LoginOutcome(
+                ok=False,
+                error="Directory password sign-in has been retired; use Windows SSO or OIDC",
+            )
         return await self._login_local(username, password, client=client)
 
     async def _login_local(
@@ -900,35 +916,6 @@ class AuthService:
         )
         return attempts, locked_until is not None
 
-    async def _login_ad(self, username: str, password: str, *, client: str | None) -> LoginOutcome:
-        # Refuse BEFORE the bind, not after: binding first would still probe the directory for a
-        # pathway the operator turned off, and the bind's own outcome distinguishes a real account
-        # from an absent one. Spelled out rather than via `ad_password_login_enabled` because a
-        # property call does not narrow `self._ldap` for the type checker; the two are equivalent.
-        if not self._settings.ad_password_login_enabled or self._ldap is None:
-            return LoginOutcome(ok=False, error="AD authentication is not configured")
-        try:
-            principal = await asyncio.to_thread(self._ldap.authenticate, username, password)
-        except LdapError as exc:
-            await self._audit(
-                "auth.login_error",
-                actor=username,
-                detail=_json({"provider": "ad", "error": str(exc)}),
-                client=client,
-            )
-            return LoginOutcome(ok=False, error="directory unavailable")
-        if principal is None:
-            await self._audit(
-                "auth.login_failed", actor=username, detail=_json({"provider": "ad"}), client=client
-            )
-            return LoginOutcome(ok=False, error="invalid credentials")
-        # Signed relaxation (ASVS 6.3.4): a SIMPLE bind proves the password only — it carries no
-        # assertion about what the directory enforced — so strength is delegated to Entra Conditional
-        # Access / the MFA proxy. Minting at the MINIMUM instead is 6.8.4 arm 3, deferred to #296:
-        # an AD identity has no enrollable engine factor, so flipping it here locks directory admins
-        # out. This parameter is the seam that flip uses.
-        return await self._complete_ad_login(principal, client, mfa_verified=True)
-
     async def authenticate_kerberos(
         self, token: bytes, *, client: str | None = None, seed_reauth: bool = True
     ) -> LoginOutcome:
@@ -954,8 +941,10 @@ class AuthService:
         if principal is None:
             await self._directory_reject_audit(username, "kerberos", "not_in_directory")
             return LoginOutcome(ok=False, error="user not found in directory")
-        # Same signed relaxation as the simple-bind leg (ASVS 6.3.4): a Kerberos service ticket carries
-        # no factor-strength assertion that pyspnego surfaces, so directory delegation stands.
+        # The signed delegated-directory relaxation (ASVS 6.3.4): a Kerberos service ticket carries no
+        # factor-strength assertion that pyspnego surfaces, so directory delegation stands. Since the
+        # AD password sign-in was retired (BACKLOG #1137) this is the ONLY leg passing a hard True --
+        # docs/SECURITY.md's Kerberos rows are where that grant is now disclosed.
         return await self._complete_ad_login(
             principal, client, mfa_verified=True, seed_reauth=seed_reauth
         )
@@ -1227,8 +1216,8 @@ class AuthService:
         federated_subject: tuple[str, str] | None = None,
     ) -> LoginOutcome:
         # ``federated_subject`` is the verified OIDC ``(issuer, sub)`` and is passed ONLY by the
-        # federated path (BACKLOG #1015). It defaults to None, so the AD-simple-bind and Kerberos
-        # callers stay byte-identical — no extra store write, no changed audit row. The federated
+        # federated path (BACKLOG #1015). It defaults to None, so the Kerberos caller stays
+        # byte-identical — no extra store write, no changed audit row. The federated
         # caller has already enforced the subject-continuity guard before reaching here.
         existing = await self._store.get_user_by_username(principal.username)
         if existing is not None and existing.auth_provider != AuthProvider.AD.value:

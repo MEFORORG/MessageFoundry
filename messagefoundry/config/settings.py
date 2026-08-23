@@ -1873,7 +1873,6 @@ class AuthSettings(_Section):
     # credential-accepting surface, since `oidc_enabled` refuses to validate without `ad_enabled`.
     # Defaults True so the split alone changes nothing; whether this pathway should survive at all is a
     # separate question and deliberately not decided here.
-    ad_password_login_enabled: bool = True
     ad_server: str | None = None  # e.g. ldaps://dc1.example.com:636
     ad_domain: str | None = None  # e.g. example.com (UPN suffix)
     ad_user_search_base: str | None = None
