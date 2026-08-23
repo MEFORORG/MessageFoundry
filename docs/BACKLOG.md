@@ -13841,11 +13841,20 @@ entirely on a repair pass -- `blob = "" if anchor_repair else ...` -- confirmed 
 11-anchor repair landing cleanly on a cell carrying 17 glyphs. **So bookkeeping passes work and
 assessment corrections do not, which is exactly backwards from which one matters.**
 
-**A NARROWING WORTH MEASURING BEFORE ANYONE SIZES THE MIGRATION.** That `blob` is a `" ".join` over a
-ONE-ELEMENT tuple, so the gate reads `residual` **and no other prose field**. If the 181 occurrences
-are spread across fields, the count that actually freezes anything is smaller than 181 -- possibly
-much smaller -- and a strip touching `residual` alone would unfreeze every cell. **Nobody has
-measured the per-field split. Do that first: it decides whether this is a migration or an afternoon.**
+**THE PER-FIELD SPLIT IS MEASURED, AND THE GUESS THIS ROW FIRST CARRIED IS REFUTED.** The gate reads
+`residual` and no other prose field: `blob = "" if anchor_repair else " ".join(...)` at
+[`scripts/asvs/apply.py:280`](../scripts/asvs/apply.py), a `" ".join` over a ONE-ELEMENT tuple. This
+row originally guessed the 181 occurrences were spread across fields, so that the freezing subset
+would be smaller than 181. **Measured: ALL 181 ARE IN `residual`, and ZERO are in any other string
+field on any cell.** The freezing subset is the full 20 cells and 181 occurrences. **The count does
+not shrink.**
+
+***THE ACTIONABLE HALF SURVIVES, AND IT IS THE HALF THAT SIZES THE WORK: A STRIP TOUCHING `residual`
+ALONE UNFREEZES EVERY CELL.*** No other field needs opening, so this is **20 cells, one field each**
+rather than a migration across the record.
+
+**A `" ".join` OVER ONE ELEMENT READS AS EXTENSIBLE AND IS NOT.** Anyone widening the check to further
+prose fields has to notice the tuple, or the widening looks done and changes nothing.
 
 **FIX DIRECTION -- the tension is named here, not resolved:**
 
