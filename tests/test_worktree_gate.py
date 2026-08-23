@@ -613,3 +613,86 @@ def test_malformed_input_fails_open(repos_file: Path, junk: str) -> None:
     """A guardrail that wedges every tool call on a bad payload gets uninstalled, and then it guards
     nothing. Every error path must allow."""
     assert run_gate(junk, repos_file) is None
+
+
+# --- rule 3c: a READ is not a write (BACKLOG #1306) -------------------------------------------------
+#
+# The rule decided on COMMAND SHAPE -- the appearance of a disarm KEY -- rather than on whether a
+# VALUE was being assigned, so `git config core.hooksPath`, which assigns nothing, was refused with
+# "would change the SHARED git configuration". The message was false about what the command does.
+#
+# THESE TESTS NEED A REAL GIT REPOSITORY, and that is not a detail. Rule 3c asks git for the common
+# dir and ALLOWS when git fails, by design (a guardrail that wedges on an unexpected shape gets
+# uninstalled). The shared `primary` fixture is a bare tmp path that is never created, so under it
+# this rule allows EVERYTHING -- a first draft of these tests passed all five read cases against it
+# while measuring nothing at all.
+#
+# SO EVERY TEST BELOW CARRIES ITS OWN POSITIVE CONTROL IN THE SAME REPOSITORY. If the fixture ever
+# stops discriminating, the control fails and the test goes red instead of quietly going green.
+
+
+@pytest.fixture
+def git_primary(tmp_path: Path) -> Path:
+    """A REAL git repository registered as governed -- rule 3c is inert without one."""
+    repo = tmp_path / "GitRepo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True)
+    return repo
+
+
+@pytest.fixture
+def git_repos_file(tmp_path: Path, git_primary: Path) -> Path:
+    f = tmp_path / "git_repos.txt"
+    f.write_text(f"# governed\n{git_primary}\n", encoding="utf-8")
+    return f
+
+
+#: The write that rule 3c exists to catch. Paired into every read test as the control.
+DISARM_WRITE = "git config core.hooksPath /dev/null"
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git config core.hooksPath",
+        "git config core.worktree",
+        "git config alias.co",
+        "git config core.hooksPath   ",  # trailing whitespace is not a value
+        "git config core.hooksPath && echo done",  # nor is a command separator
+    ],
+)
+def test_a_bare_config_read_of_a_disarm_key_is_allowed(
+    git_primary: Path, git_repos_file: Path, cmd: str
+) -> None:
+    """`git config <key>` with no value assigns nothing -- measured against real git, it exits 1 on an
+    unset key and stores nothing. `--get` is merely the explicit spelling of the same read."""
+    assert_denied(run_gate(bash(DISARM_WRITE, cwd=git_primary), git_repos_file))  # control
+    assert run_gate(bash(cmd, cwd=git_primary), git_repos_file) is None
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        DISARM_WRITE,
+        "git config --local core.hooksPath nowhere",
+        "git config core.worktree /tmp/elsewhere",
+        "git config alias.co checkout",
+        'git config core.hooksPath ""',  # assigning empty IS a write
+        # `-c` is a DIFFERENT form and is deliberately NOT narrowed. Measured against real git, `-c
+        # <key>` without an `=` still injects the key for that command, so absence-of-value there is
+        # not a read and an empty core.hooksPath is not obviously inert.
+        "git -c core.hooksPath=/dev/null status",
+        "git -c core.hooksPath status",
+    ],
+)
+def test_a_config_write_to_a_disarm_key_still_denies(
+    git_primary: Path, git_repos_file: Path, cmd: str
+) -> None:
+    """The positive controls for rule 3c, kept in the file on purpose.
+
+    A first draft of the #1306 fix FAILED OPEN on exactly these rows -- the real disarm was ALLOWED --
+    because PowerShell's `-match` replaces $Matches wholesale and the value-presence test then read a
+    later match's groups. A test file covering only the row being fixed would have shipped that hole.
+    """
+    reason = assert_denied(run_gate(bash(cmd, cwd=git_primary), git_repos_file))
+    assert "SHARED git configuration" in reason
