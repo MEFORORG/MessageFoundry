@@ -936,8 +936,16 @@ An `action` / `lookup` row gains one field:
 - `param_modes` is **total over `params`**. Every argument gets a mode, never a partial map, so a
   consumer never has to decide what a missing key means.
 - `literal_params` is **retained unchanged**, not replaced. It is in the shipped contract and E.8 depends
-  on an older consumer continuing to read it. `static` and `literal_params` membership must agree
-  exactly, and AC-M2 asserts that rather than assuming it.
+  on an older consumer continuing to read it. **`static` and `literal_params` must agree exactly OVER THE
+  EDITABLE PARAMS**, and AC-M2 asserts that rather than assuming it.
+
+**WHY THAT SCOPE, AND IT IS THE WHOLE REASON THIS CRITERION NEEDED CORRECTING (see E.10): THE TWO FIELDS
+ANSWER DIFFERENT QUESTIONS.** `literal_params` answers *is this argument EDITABLE*. `param_modes` answers
+*what SHAPE is this argument*. Those coincide almost everywhere, which is what makes the collision easy
+to miss -- but **a read-only display kwarg is a LITERAL THAT IS NOT EDITABLE**, and that is a coherent
+state an unscoped biconditional cannot express. On the native-action path `params` is built from
+`native.slots` **plus** `native.display` while `literal_params` covers slots only, deliberately, because
+a display kwarg is never editable in Phase A.
 
 ### E.5 §4 delta — the admitted interpolation, stated as a closed set
 
@@ -1012,14 +1020,50 @@ The reverse direction needs its own handling. A newer IDE meeting an older engin
 - One new rewrite class enters `lens rewrite`, the first widening of §5's emit surface since this ADR was
   written. E.6.3 and E.6.4 are the gates that bound it.
 
+### E.10 Correction (2026-08-23) — AC-M2 was unsatisfiable as written, and the fix is a scope
+
+**AC-M1 AND AC-M2 COULD NOT BOTH HOLD.** AC-M1 requires `param_modes` total over `params`; AC-M2 as
+originally written required `static` if and only if the argument appears in `literal_params`. Those are
+jointly satisfiable only where the two sets coincide, and **on the native-action path they do not**.
+
+**Found by building to the criteria, not by reading them**, which is the only way this surfaces: the
+step-1 classifier is correct under both readings, and the contradiction appears the moment emission is
+attempted. The live instance is `tests/test_lens_native.py`, whose `msg.set("OBX-5", "V", occurrence=2)`
+row carries `occurrence` in `params`, classifies `static` by shape, and asserts `occurrence` is **not**
+in `literal_params` — commented there as *"never promoted to an editable literal_param"*.
+
+**OWNER RULING, 2026-08-23: scope AC-M2 to editable params.** So `static`-and-editable equals
+`literal_params`, on both paths. The criterion keeps its entire anti-drift purpose — stopping
+`param_modes` becoming a second, drifting truth about which arguments are literals — and becomes true.
+
+**Two repairs were considered and NOT taken, recorded so neither is re-opened:**
+
+- **Making `literal_params` include constant display kwargs.** That flips a deliberate shipped choice,
+  and E.8 depends on an older consumer reading `literal_params` unchanged.
+- **Dropping AC-M2.** The anti-drift guarantee is the reason the criterion exists.
+
+**This changes no substance.** `templated` stays writable, E.5's admitted set is untouched, and nothing
+the owner ruled on 2026-08-23 is revisited. It corrects a criterion that could not be met, which is a
+different act from relaxing one that could.
+
+**THE ROOT CAUSE IS WORTH MORE THAN THE FIX, and it is why E.4 now carries it inline: the two fields
+answer different questions.** `literal_params` answers *is this editable*; `param_modes` answers *what
+shape is this*. The amendment was written assuming one question, so a literal-but-not-editable argument
+had no expressible state. Any future field added beside these two should be checked against that
+question before it is checked against these sets.
+
 ## Acceptance Criteria (Amendment E)
 
 - [ ] **AC-M1** — WHEN `lens parse` emits an `action` or `lookup` row, THE SYSTEM SHALL emit a
   `param_modes` map TOTAL over that row's `params` — every argument named, none missing — so a consumer
   never has to interpret an absent key.
-- [ ] **AC-M2** — THE SYSTEM SHALL classify an argument `static` IF AND ONLY IF it appears in
-  `literal_params`. The test asserts the two agree across the whole samples corpus in BOTH directions, so
-  drift in either field fails rather than the newer field quietly becoming the only truth.
+- [ ] **AC-M2** *(corrected 2026-08-23 by owner ruling — see E.10)* — WHERE an argument is EDITABLE,
+  THE SYSTEM SHALL classify it `static` IF AND ONLY IF it appears in `literal_params`. The test asserts
+  the two agree across the whole samples corpus in BOTH directions **over the editable params**, so drift
+  in either field fails rather than the newer field quietly becoming the only truth. **The scope is
+  load-bearing, not a hedge:** a constant `display` kwarg is `static` by shape and absent from
+  `literal_params` by design, so an unscoped biconditional is unsatisfiable on the native path — it is
+  not merely hard to meet.
 - [ ] **AC-M3** — WHEN an argument is an f-string meeting E.5 exactly, THE SYSTEM SHALL classify it
   `templated`; WHEN it is any shape on E.5's exclusion list, THE SYSTEM SHALL classify it `dynamic`. The
   test carries one case per excluded shape, so widening the admitted set fails a test rather than passing
