@@ -15663,3 +15663,60 @@ cannot tell those apart has never demonstrated it is testing occupancy at all.*
 
 **Expiry:** this stops being right if `claim.ps1` gains a liveness probe, or if worktree directories are
 removed with their sessions.
+
+## 1349. a rescue ref can silently hold an ancestor instead of the tip, and the population where that matters is the population where it cannot be checked
+
+> 🔢 **Filed 2026-08-23 - not started.** ***A rescue ref whose NAME contains a branch name can dereference to an ANCESTOR of that branch rather than its tip, with nothing reporting it.*** **Confirmed instance, re-derived independently by two seats to the file and the insertion: one dated rescue tag is a STRICT ANCESTOR of the branch its name contains -- 75 commits short, `167 files changed, 23410 insertions(+), 1578 deletions(-)`, holding ZERO commits that branch lacks.** ***That branch is gone from every worktree, so the tag is the only thing standing between that work and nothing.***
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / data safety. **Priority:** P1. **Verdict:** build.
+**Severity:** no product axis (sec. 0). **The cost is unrecoverable loss of committed work, discovered at
+the moment recovery is attempted.**
+
+***CAPTURING THE TIP IS PLAINLY THE INTENDED BEHAVIOUR, WHICH IS WHAT MAKES THE SHORT ONES A DEFECT
+RATHER THAN A DOCUMENTATION GAP.*** *Of 730 refs under `refs/tags/rescue`, **374 hold the tip exactly**.
+If holding the tip were not the contract that number would be near zero.*
+
+| tag-scheme census, 730 refs | count | reading |
+|---|---|---|
+| **hold the tip exactly** | ***374*** | *the contract, working* |
+| ***ANCESTOR -- short of the tip*** | ***22*** | ***MEASURED DEFECT*** |
+| diverged from the named branch | *32* | ***UNVERIFIED*** -- *the matcher takes the longest branch name in the tag name, so a pairing may be spurious* |
+| name no local branch | *302* | **NOT a defect** -- *a deleted branch is the case rescue refs exist for* |
+
+***AT LEAST 22 OF 730. The `32` is deliberately NOT added to that figure.***
+
+**A second scheme was censused separately and its numbers do NOT cover the first.** *Of 248 refs under
+`private/rescuetags/auto/`, 114 name a branch that still exists: **103 hold the tip, 10 DIVERGED, 1
+ahead, 0 purely stale**.* ***The `0 purely stale` must not be read as refuting the tag-scheme finding --
+different population, different scheme, and it is evidence about neither.***
+
+**FOUR SHORT REFS WERE IDENTIFIED, AND TWO OF THEM NAME THE SAME BRANCH BY DIFFERENT AMOUNTS -- `75`
+and `106` behind, one in each naming scheme.** *The other two are `55` and `13` behind, and **the
+`55`-behind ref names a branch an independent triage had classified LANDABLE***. *Ref names are held
+outside this file: internal worktree slugs do not belong in a public ledger, and the finding is the
+shape and the counts, not the identifiers.*
+
+## ***THE STRUCTURAL FINDING, AND IT IS WORSE THAN ANY COUNT***
+
+***A RESCUE REF CAN ONLY BE VERIFIED AGAINST A BRANCH THAT STILL EXISTS. 436 REFS NAME A BRANCH THAT IS
+GONE -- AND THOSE ARE PRECISELY THE ONES A RESCUE REF IS FOR.***
+
+> **THE MEASUREMENT IS POSSIBLE EXACTLY WHERE IT DOES NOT MATTER AND IMPOSSIBLE EXACTLY WHERE IT DOES.**
+> ***No census of this kind can bound the risk.*** *The confirmed instance was findable ONLY because its
+> branch happened to survive alongside the tag; had the branch been pruned, the ref would have looked
+> like any of the 302.*
+
+**This is also the one instrument whose failure surfaces only when it is too late to fix** -- *a rescue
+ref is consulted once, in the moment the original is already gone.* ***Every other wrong reading recorded
+today was survivable because something else could still be measured.***
+
+**Two controls, and the second is the hard one:** a ref written for a branch that is then advanced must
+FAIL a tip check, and **a ref must be verifiable without the branch it names** -- *by recording the sha
+it captured at write time, or by refusing to write a ref that is not the tip.* ***A rescue mechanism that
+can only be audited while the thing it rescues still exists has never been shown to work.***
+
+**Expiry:** this stops being right if rescue refs are written with a recorded target sha, or if the
+writer refuses any ref that is not its branch's tip.
