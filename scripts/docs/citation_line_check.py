@@ -72,10 +72,34 @@ _ROOT = Path(__file__).resolve().parent.parent.parent
 #: `path/to/file.py:123` or `:123-145`, with or without surrounding backticks.
 _CITE = re.compile(r"`?([A-Za-z0-9_./-]+\.(?:py|ts|ps1|sh|js))`?:(\d+)(?:-(\d+))?")
 
-#: A backticked CODE IDENTIFIER: it must carry an underscore or a call form. A bare word like
-#: `client` is prose as often as it is a symbol, and matching it is what makes a naive version fire
-#: on two thirds of the corpus.
-_SYM = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*(?:_[A-Za-z0-9_]+)+|[A-Za-z_][A-Za-z0-9_]*\(\))`")
+#: A backticked identifier. DELIBERATELY LINEAR: one character class, one quantifier, no alternation
+#: and no nesting.
+#:
+#: THE FIRST VERSION WAS A ReDoS AND CodeQL CAUGHT IT AS HIGH SEVERITY. It read
+#: ``[A-Za-z_][A-Za-z0-9_]*(?:_[A-Za-z0-9_]+)+``, where ``[A-Za-z0-9_]*`` and the ``(?:_...)+`` group
+#: BOTH match an underscore. On an input like ``A_0_0_0_0...`` the engine can split those repetitions
+#: exponentially many ways before failing, so a crafted ledger line hangs the checker. That is
+#: catastrophic backtracking, and the fix is to remove the AMBIGUITY rather than to tune the pattern:
+#: two constructs that can consume the same character are the defect, not the length of the input.
+#:
+#: The "must carry an underscore or a call form" requirement -- which is what takes the flag rate from
+#: two thirds down to something reviewable -- now lives in :func:`_is_symbol`, where it is a linear
+#: string test and cannot backtrack at all.
+_SYM = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*(?:\(\))?)`")
+
+
+def _is_symbol(token: str) -> bool:
+    """True for a CODE IDENTIFIER, false for a prose word.
+
+    A bare word like ``client`` is prose as often as it is a symbol; requiring an underscore or a
+    call form is the narrowing measured to take a naive matcher from 379 flags of 575 down to a
+    reviewable number. Expressed here rather than in the regex because a regex that encodes it
+    needs alternation over overlapping classes, which is exactly what made the first version a ReDoS.
+    """
+    if token.endswith("()"):
+        return True
+    return "_" in token
+
 
 #: How far either side of the citation to look for the symbol it is about.
 _PROSE_WINDOW = 80
@@ -121,7 +145,7 @@ def scan(ledgers: list[Path], root: Path) -> Report:
 
             lo = max(0, m.start() - _PROSE_WINDOW)
             hi = min(len(text), m.end() + _PROSE_WINDOW)
-            symbols = {s.rstrip("()") for s in _SYM.findall(text[lo:hi])}
+            symbols = {s.rstrip("()") for s in _SYM.findall(text[lo:hi]) if _is_symbol(s)}
             symbols = {
                 s for s in symbols if "/" not in s and not s.endswith((".py", ".ts", ".ps1"))
             }

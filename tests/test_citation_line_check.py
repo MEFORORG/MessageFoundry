@@ -122,3 +122,40 @@ def test_the_summary_states_its_denominator_even_when_clean(tree: Path, capsys) 
     assert "1 path:line citation(s)" in out
     assert "carried a named symbol and were checked" in out
     assert "OK" in out
+
+
+def test_the_symbol_pattern_cannot_backtrack_exponentially() -> None:
+    """REGRESSION FOR A CodeQL HIGH-SEVERITY ReDoS, caught on the PR that introduced this script.
+
+    The first pattern was ``[A-Za-z_][A-Za-z0-9_]*(?:_[A-Za-z0-9_]+)+``, where ``[A-Za-z0-9_]*`` and
+    the ``(?:_...)+`` group BOTH match an underscore. On ``A_`` followed by many ``0_`` the engine can
+    split those repetitions exponentially many ways before failing. MEASURED on the old pattern:
+    1.2 ms at 14 repetitions, 18 ms at 18, 291 ms at 22 -- roughly sixteenfold per four, which is the
+    signature. The replacement is flat in microseconds across all three.
+
+    The bound below is deliberately loose. This is not a performance assertion: at 60 repetitions the
+    old pattern would take longer than the age of this repository, so ANY bound a human would wait for
+    separates the two. A tight bound would flake on a loaded runner and teach the next person to
+    delete it."""
+    import time
+
+    hostile = "`A_" + "0_" * 60 + "!"  # no closing backtick, so the match must fail
+    start = time.perf_counter()
+    _load()._SYM.search(hostile)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 1.0, (
+        f"the symbol pattern took {elapsed:.3f}s on a crafted input -- that is the exponential "
+        "backtracking CodeQL flagged, not slowness"
+    )
+
+
+def test_the_underscore_requirement_survived_moving_out_of_the_regex() -> None:
+    """The narrowing that takes the flag rate from two thirds to reviewable now lives in a linear
+    string test rather than in the pattern. It must still hold, or the ReDoS fix would have silently
+    widened the matcher -- trading a hang for the noise the narrowing exists to prevent."""
+    is_symbol = _load()._is_symbol
+    assert is_symbol("_audit_upload_prune")
+    assert is_symbol("verify_audit_chain")
+    assert is_symbol("scan_text()")
+    assert not is_symbol("client"), "a bare prose word must not read as a symbol"
+    assert not is_symbol("Users"), "a path fragment must not read as a symbol"
