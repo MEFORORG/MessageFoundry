@@ -4227,6 +4227,16 @@ sourced: the vault-side 13.2.2 correction of 2026-08-04 (`b0b21122`) that applie
 and scoped this sweep out of itself. Every count above was measured against the vault checkout on
 2026-08-04 for this filing; the engine-side facts were read at `origin/main` `88703a3a`.
 
+
+**DISPATCH FENCE 2026-08-23: THIS ROW EDITS THE SECURITY RECORD'S OWN PROSE, so it needs the vaulted
+data and belongs to the seat that owns that record -- NOT to a build lane.** *Do not dispatch it to a
+builder.*
+
+***THE DISTINCTION IS RECORD VERSUS TOOL, NOT DIRECTORY.*** A row that changes the WRITER or the VERIFIER
+is ordinary public engine work whose fixtures are already public; **a row that changes what the RECORD
+SAYS is not.** *A dispatcher screening on the directory alone fences off both, which is a match on
+location rather than on subject -- the same shape as a commit that CITES an item being read as one that
+BUILDS it.*
 ## 1008. Startup preflight on the store principal's effective privileges (ASVS 13.2.2)
 
 > 🔢 **Re-scored 2026-08-20 -> DEMAND-GATE.** Value **6/10** · Difficulty **4/10** · _quick win_. Gap stands in shipped code: no privilege probe exists in the four scanned packages beyond the two conditional-DDL guard hits at sqlserver.py:924/:931, and settings.py:514 gates credential kind only, so a sysadmin login would go unobserved on first deployment (value 6). The remainder is a probe across SQL Server plus Postgres with SQLite exempt, a settings plus serve gate, the still-underived Postgres grant set, and a paired out-of-repo scorecard edit, which is the difficulty-4 anchor of a feature across a seam exercised on all three backends. _(was 6/10 · 4/10.)_
@@ -11942,6 +11952,16 @@ after repairs landed. **Read the count; do not carry the row's.**
 
 **Cluster:** Security record / ASVS method. **Priority:** P2. **Verdict:** build. **Severity:** no deployment axis -- this is a defect in the assessment record, not in shipped code; its cost is that a reader **would** treat an enumerated gap as the whole surface and ship a partial fix believing it complete.
 
+
+**DISPATCH FENCE 2026-08-23: THIS ROW EDITS THE SECURITY RECORD'S OWN PROSE, so it needs the vaulted
+data and belongs to the seat that owns that record -- NOT to a build lane.** *Do not dispatch it to a
+builder.*
+
+***THE DISTINCTION IS RECORD VERSUS TOOL, NOT DIRECTORY.*** A row that changes the WRITER or the VERIFIER
+is ordinary public engine work whose fixtures are already public; **a row that changes what the RECORD
+SAYS is not.** *A dispatcher screening on the directory alone fences off both, which is a match on
+location rather than on subject -- the same shape as a commit that CITES an item being read as one that
+BUILDS it.*
 ## 1247. installing the machine-global worktree gate leaves no record: no backup, no receipt, no log line, and Copy-Item preserves the source mtime
 
 > 🔢 **Re-scored 2026-08-20 -> P2.** Value **5/10** · Difficulty **3/10** · _fill-in_. A write to a shared machine-global safety control leaves no attributable record, and the inherited mtime is worse than absent because it once carried a true finding into retraction; the only workaround is a hash baseline captured in advance by luck. Difficulty 3: a receipt file plus a refuse-on-mismatch flag at one install site, with tests, and no product code touched. _(was 6/10 · 3/10.)_
