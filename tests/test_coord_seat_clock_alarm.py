@@ -118,7 +118,11 @@ def test_a_long_gap_under_a_suppression_token_does_not_alarm(status: str) -> Non
     a seat taking continuous turns. All four tokens are read from the emitter, not from the item --
     STALE and the (roster-blind) suffix postdate the item's list."""
     v = alarm.evaluate(
-        WATCHED, "lane-a", _state(**{r"c:\work\lane-a": STALE_TICK}), f"lane-a={status}", NOW
+        WATCHED,
+        "lane-a",
+        _state(**{r"c:\work\lane-a": STALE_TICK}),
+        f"lane-a={status}",
+        NOW,
     )
     assert v.alarm is False
     assert v.code == "SUPPRESSED"
@@ -128,7 +132,11 @@ def test_the_same_long_gap_with_NO_suppression_token_does_alarm() -> None:
     """MUST FIRE -- the twin. Otherwise 'honour suppression' could be implemented as 'never alarm on
     age' and every suppression arm above would still pass."""
     v = alarm.evaluate(
-        WATCHED, "lane-a", _state(**{r"c:\work\lane-a": STALE_TICK}), "lane-a=SENT:abc", NOW
+        WATCHED,
+        "lane-a",
+        _state(**{r"c:\work\lane-a": STALE_TICK}),
+        "lane-a=SENT:abc",
+        NOW,
     )
     assert v.alarm is True
     assert v.code == "DEAD"
@@ -213,7 +221,9 @@ def test_the_watched_path_matches_regardless_of_case_and_separator() -> None:
     assert v.code == "OK", "a case- or separator-differing path must still find its entry"
 
 
-def test_a_missing_instrument_returns_2_rather_than_reporting_OK(tmp_path: Path) -> None:
+def test_a_missing_instrument_returns_2_rather_than_reporting_OK(
+    tmp_path: Path,
+) -> None:
     """A MISSING INSTRUMENT IS NOT A CLEAN RESULT. Returning 0 here would be the same false green the
     alarm exists to catch, one level up -- and it is how a glob that lands nowhere reports health."""
     rc = alarm.main(
@@ -240,6 +250,96 @@ def test_the_cli_reports_its_denominator(
     last = tmp_path / "s.last"
     last.write_text("2026-01-01T00:00:00Z\tlane-a=SENT:abc", encoding="utf-8")
     alarm.main(
-        ["--worktree", WATCHED, "--seat", "lane-a", "--state", str(state), "--last", str(last)]
+        [
+            "--worktree",
+            WATCHED,
+            "--seat",
+            "lane-a",
+            "--state",
+            str(state),
+            "--last",
+            str(last),
+        ]
     )
     assert "2 worktrees in state" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------------------------
+# A BROKEN INSTRUMENT IS NOT AN ALARM CONDITION.
+#
+# The first cut reported DEAD/ABSENT when it could not READ the state file -- a false positive that
+# fires for EVERY watched seat at once, so the first false alarm is also the loudest. That is the
+# worst possible introduction for a tool whose only value is being believed, and the module docstring
+# already names the consequence: a false-positive watchdog is a slow-acting off switch.
+#
+# exit 2 CANNOT MEASURE already existed for the MISSING file. These arms are its second application.
+# ---------------------------------------------------------------------------------------------
+
+
+def _files(tmp_path: Path, state_text: str) -> tuple[Path, Path]:
+    s = tmp_path / "state.json"
+    s.write_text(state_text, encoding="utf-8")
+    last = tmp_path / "state.last"
+    last.write_text("2026-01-01T00:00:00Z\tlane-a=SENT:abc", encoding="utf-8")
+    return s, last
+
+
+def _rc(tmp_path: Path, state_text: str) -> int:
+    s, last = _files(tmp_path, state_text)
+    return alarm.main(
+        [
+            "--worktree",
+            WATCHED,
+            "--seat",
+            "lane-a",
+            "--state",
+            str(s),
+            "--last",
+            str(last),
+        ]
+    )
+
+
+def test_a_CORRUPT_state_file_cannot_measure_rather_than_alarming(
+    tmp_path: Path,
+) -> None:
+    """MUST NOT ALARM. This is an OBSERVED event here, not a hypothetical: the item records that a
+    Windows path-casing collision killed this clock once already by dying on a JSON parse."""
+    assert _rc(tmp_path, '{"c:\\work\\lane-a": 178700') == 2
+
+
+def test_a_state_SCHEMA_this_reader_does_not_know_cannot_measure(
+    tmp_path: Path,
+) -> None:
+    """MUST NOT ALARM. Every record skipped is a signal the schema changed, never an empty registry.
+
+    Before this, the reader dropped them silently and the alarm reported ABSENT for every seat --
+    confidently, on data it had never understood. The Liaison's form of the same rule: when every
+    field you asked for comes back empty, you are querying a schema you did not read."""
+    assert _rc(tmp_path, '{"c:\\work\\lane-a": {"last": 1787000000}}') == 2
+
+
+def test_a_GENUINELY_EMPTY_registry_still_alarms(tmp_path: Path) -> None:
+    """MUST ALARM -- THE TWIN, and the arm that stops the fix swallowing the real case.
+
+    An empty object is not an unreadable one. No records means the watched seat really has no tick,
+    which is the discriminating condition this whole tool exists for. A schema check that treated
+    {} as unreadable would silence the alarm exactly when it should fire."""
+    assert _rc(tmp_path, "{}") == 1
+
+
+def test_a_MISSING_state_file_still_cannot_measure(tmp_path: Path) -> None:
+    """REGRESSION. The original exit-2 arm must survive the new ones."""
+    rc = alarm.main(
+        [
+            "--worktree",
+            WATCHED,
+            "--seat",
+            "lane-a",
+            "--state",
+            str(tmp_path / "absent.json"),
+            "--last",
+            str(tmp_path / "absent.last"),
+        ]
+    )
+    assert rc == 2

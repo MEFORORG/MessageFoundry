@@ -103,18 +103,50 @@ class Verdict(NamedTuple):
     detail: str
 
 
+class Unreadable(Exception):
+    """The state file EXISTS but cannot be understood. NOT an alarm condition.
+
+    A watchdog that reports DEAD because its own instrument broke is a false positive that fires for
+    EVERY watched seat at once, and the first false alarm is the loudest -- the worst possible
+    introduction for a tool whose only value is being believed. The item calls that a slow-acting off
+    switch: it does not fail on the day it fires, it fails weeks later, having been discounted.
+
+    This is the SAME QUESTION the missing-file check already answers, in its second form. The shape
+    was never missing; only its second application was.
+    """
+
+
 def read_state(path: Path) -> dict[str, int]:
     """Worktree path (normalised) -> unix seconds of that worktree's last real tick.
 
     Keys are lowercased because a Windows path-casing collision has already killed this clock once:
     ``seats.json`` carried the same directory under two casings and the tick script died on the parse.
     """
-    doc = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        # NOT HYPOTHETICAL. The item records that a Windows path-casing collision killed this clock
+        # once already BY DYING ON A JSON PARSE. Uncaught, that arrived here as a traceback and a
+        # nonzero exit -- which reads as ALARM.
+        raise Unreadable(f"{path} could not be parsed: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise Unreadable(
+            f"{path} holds a {type(doc).__name__} at the top level, expected an object"
+        )
+
     out: dict[str, int] = {}
     for key, value in doc.items():
         if not isinstance(key, str) or not isinstance(value, int):
             continue
         out[key.replace("/", "\\").lower()] = value
+
+    # EVERY RECORD SKIPPED IS A SCHEMA SIGNAL, NOT AN EMPTY REGISTRY. Dropping them silently left the
+    # alarm reporting ABSENT for every seat, confidently, on data it had not understood.
+    if doc and not out:
+        raise Unreadable(
+            f"{path} holds {len(doc)} record(s) and NONE match the expected path -> unix-seconds "
+            "shape. That is a schema this reader does not know, not an empty registry."
+        )
     return out
 
 
@@ -175,7 +207,9 @@ def evaluate(
         # file fresh -- and this is exactly when the watched seat has stopped being woken.
         if suppression is not None:
             return Verdict(
-                False, "SUPPRESSED-ABSENT", f"{seat} absent from state but {suppression}"
+                False,
+                "SUPPRESSED-ABSENT",
+                f"{seat} absent from state but {suppression}",
             )
         return Verdict(True, "ABSENT", f"{seat} ({watched}) has no entry in the state file at all")
 
@@ -194,10 +228,14 @@ def evaluate(
     if age > DEAD_AFTER_SECONDS:
         if suppression is not None:
             return Verdict(
-                False, "SUPPRESSED", f"{age}s since last tick, but {seat} is {suppression}"
+                False,
+                "SUPPRESSED",
+                f"{age}s since last tick, but {seat} is {suppression}",
             )
         return Verdict(
-            True, "DEAD", f"{age}s since {seat} last ticked (dead after {DEAD_AFTER_SECONDS}s)"
+            True,
+            "DEAD",
+            f"{age}s since {seat} last ticked (dead after {DEAD_AFTER_SECONDS}s)",
         )
 
     return Verdict(False, "OK", f"{age}s since last tick")
@@ -221,7 +259,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"seat-clock-alarm: CANNOT MEASURE -- {path} is absent", file=sys.stderr)
             return 2
 
-    state = read_state(args.state)
+    try:
+        state = read_state(args.state)
+    except Unreadable as exc:
+        print(f"seat-clock-alarm: CANNOT MEASURE -- {exc}", file=sys.stderr)
+        return 2
     last_line = args.last.read_text(encoding="utf-8", errors="replace").strip()
 
     verdict = evaluate(args.worktree, args.seat, state, last_line, time.time(), args.previous_tick)
