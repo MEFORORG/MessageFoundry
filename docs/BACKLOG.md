@@ -14890,6 +14890,28 @@ the control for the first row only; the other two are recorded as motivation, no
 **Expiry:** this stops being right if `Item.fields` stops being a mapping, or if the ledger gains a
 per-field occurrence check by another route.
 
+
+***AMENDMENT 2026-08-23. THE FIRST IMPLEMENTATION OF THIS CHECK WILL FALSE-POSITIVE ON `#1324`, FOR THE
+SAME SELF-REFERENTIAL REASON `#1342` HIT.***
+
+**A per-item per-key occurrence count over the live ledger returns exactly ONE hit: `#1324`, with all
+three keys appearing twice.** ***It is not a corruption.*** **That row DOCUMENTS the field format, and
+its documentation is written IN the field format** -- a blockquoted vocabulary block enumerating the
+legal values for each key, one line per key, separated by `|`.
+
+***SO THE ROW THAT DECLARES THE SCHEMA TRIPS ANY CHECKER OVER THE SCHEMA.*** **Verified byte-identical
+on `origin/main` and on a branch rebuilt onto it**, so it is pre-existing and not an artefact of any
+rebase.
+
+**THE DISCRIMINATOR IS THE ONE `#1342` ALSO NEEDED: A DECLARATION CARRIES ONE VALUE; A VOCABULARY LINE
+ENUMERATES ALTERNATIVES.** *A check that counts occurrences without excluding the alternation form
+reports the documentation as the defect.*
+
+***AND THIS IS THE SECOND CHECKER TO HIT THIS EXACT ROW.*** **Any future tool reading the banner schema
+must expect the row that DEFINES the schema to look like a violation of it.** *That is now a measured
+property of the corpus rather than a surprise waiting for the next builder.*
+
+**Controls, updated: a planted true duplicate that MUST fire, and `#1324` itself, which MUST NOT.**
 ## 1342. An item's banner verdict and its re-score prose can disagree, and every tool reads the banner
 
 > 🔢 **Filed 2026-08-23 - not started.** Promoting `Verdict` into the banner block created a SECOND source of truth beside the re-score line that already carried it. **Three open items say `build` in the banner and `DEMAND-GATE` in their prose.** Every tool -- `parse_items`, the dispatch gate, a dispatcher's screens -- reads the banner, so all three read as freely dispatchable.
