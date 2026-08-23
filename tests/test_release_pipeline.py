@@ -2,11 +2,20 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """Guard the release PIPELINE's load-bearing policy (pyproject sdist allowlist + .github/workflows/release.yml).
 
-Nothing in the test suite executes release.yml (it needs a tag push, GitHub OIDC, a real build/SBOM/sign
+Almost none of release.yml can be executed here (it needs a tag push, GitHub OIDC, a real build/SBOM/sign
 run and PyPI Trusted Publishing), so a refactor could silently delete the sdist leak gate, revert the
 publish step off Trusted Publishing onto a token, drop the Sigstore/SBOM steps, or let the pyproject
 `only-include` allowlist drift out of sync with the workflow's leak-gate regex — and every other test would
 still pass. Each test here fails LOUDLY if a guard disappears.
+
+ONE STEP IS EXECUTED, and section (7) is why that stopped being optional. Reading a workflow can only
+tell you a gate is PRESENT. The leak gate WAS present, well-formed and unable to fire: it decided on the
+ABSENCE of `grep` matches instead of on evidence that a listing had happened, so a corrupt tarball, two
+tarballs in dist/ (one of them carrying a private doc) and a tarball listing zero members all printed
+"sdist is package-only" and exited 0. Every text check in sections (1) to (6) passed on that body, because
+every string they look for was in it. Section (7) extracts the step's `run:` block by step name, writes it
+to a script, and RUNS it under bash against fixture dist/ directories — so the claim under test becomes
+"the gate rejects a leak" rather than "the gate is still spelled the way it was".
 
 The single highest-value check is the CROSS-CHECK between the two allowlists (pyproject
 `[tool.hatch.build.targets.sdist].only-include` and release.yml's leak-gate `grep -vE` regex): that exact
@@ -14,16 +23,26 @@ drift is the documented real defect — hatchling's whole-repo VCS sweep leaked 
 PyPI on releases 0.1.0..0.2.15. If the two lists silently diverge a private doc can re-leak, so they are
 pinned together here.
 
-These are pure text / `re` / `tomllib` checks (no `python -m build`, no network) so they run everywhere the
-suite runs. They do NOT and cannot assert the artifacts are actually built/signed/SBOM'd/uploaded — that
-remains a CI-leg claim validated by the workflow_dispatch dry-run + a `vX.Y.Z-rc1` pre-release tag.
+Sections (1) to (6) are pure text / `re` / `tomllib` checks; section (7) additionally shells out to bash
+and `tar` over tarballs it builds with `tarfile`. Neither needs `python -m build` or the network, so they
+run everywhere the suite runs. They do NOT and cannot assert the artifacts are actually
+built/signed/SBOM'd/uploaded — that remains a CI-leg claim validated by the workflow_dispatch dry-run +
+a `vX.Y.Z-rc1` pre-release tag.
 """
 
 from __future__ import annotations
 
+import io
+import os
 import re
+import subprocess
+import tarfile
 import tomllib
+from collections.abc import Callable, Sequence
 from pathlib import Path
+
+import pytest
+from _bash_resolver import bash_candidates, explain_returncode, require_bash
 
 _REPO = Path(__file__).resolve().parents[1]
 PYPROJECT = _REPO / "pyproject.toml"
@@ -505,4 +524,266 @@ def test_every_release_creating_job_is_rerunnable() -> None:
     assert code.count("gh release view") >= creators, (
         f"{creators} job(s) run `gh release create` but only {code.count('gh release view')} check for "
         f"an existing release first — a re-run will deadlock before the publish step"
+    )
+
+
+# --- (7) the leak gate EXECUTED against fixture sdists (not read — RUN) -------------------------------
+
+#: Located by step NAME, and by a PREFIX rather than the whole string: the full name carries an em dash,
+#: and pinning punctuation here would break the harness on a cosmetic edit while the gate it guards was
+#: fine. Section (3)'s canary already pins the full name, so nothing is lost by being lenient here.
+_LEAK_GATE_STEP_PREFIX = "Leak gate"
+
+#: hatchling names every sdist member `<project>-<version>/...`, and the gate strips that first path
+#: component before matching the allowlist. The fixtures must carry it or they would be testing a shape
+#: no real sdist has.
+_SDIST_PREFIX = "messagefoundry-0.3.0"
+
+#: What a package-only sdist legitimately contains. One member per allowlist branch a real build
+#: produces, so the positive control exercises the allowlist rather than one lucky path.
+_CLEAN_MEMBERS = (
+    "messagefoundry/__init__.py",
+    "messagefoundry/py.typed",
+    "PKG-INFO",
+    "pyproject.toml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+)
+
+
+def _leak_gate_script() -> str:
+    """The leak gate's ``run:`` block, taken from the PARSED workflow rather than sliced out of the text.
+
+    Exactly one step may match. Two would mean the extractor is choosing between them arbitrarily, and a
+    harness that silently exercises the wrong step is worse than no harness at all.
+    """
+    steps = [
+        step
+        for job in _jobs().values()
+        for step in (job.get("steps") or [])
+        if isinstance(step, dict) and str(step.get("name") or "").startswith(_LEAK_GATE_STEP_PREFIX)
+    ]
+    assert len(steps) == 1, (
+        f"expected exactly one release.yml step whose name starts with {_LEAK_GATE_STEP_PREFIX!r}, "
+        f"found {len(steps)} — the execution tests below cannot know which one to run"
+    )
+    run = steps[0].get("run")
+    assert isinstance(run, str) and run.strip(), (
+        "the leak gate step has no `run:` script to execute"
+    )
+    return run
+
+
+def _write_sdist(path: Path, members: Sequence[str]) -> None:
+    """A gzip tarball at ``path`` holding ``members`` under the ``<project>-<version>/`` prefix."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(path, "w:gz") as tf:
+        for member in members:
+            payload = b"fixture\n"
+            info = tarfile.TarInfo(f"{_SDIST_PREFIX}/{member}")
+            info.size = len(payload)
+            tf.addfile(info, io.BytesIO(payload))
+
+
+def _posix_tool_env() -> dict[str, str]:
+    """``os.environ`` with every candidate bash's own bin directory on the FRONT of PATH.
+
+    The extracted step calls ``tar``, ``sed`` and ``grep``. On a GitHub runner those are simply there;
+    on Windows they live beside the interpreter in Git's ``usr/bin``, and nothing puts that directory
+    on PATH unless the parent process is ALREADY a Git Bash. Measured on this box: launched from
+    PowerShell, ``Git/usr/bin/bash.exe`` resolves only ``tar`` (Windows ships one in system32) and the
+    step dies on ``sed: command not found`` — a HARNESS fault that would read as a finding about the
+    gate, and one that every rejection test would happily accept as a non-zero exit.
+
+    Derived from ``bash_candidates()`` rather than a hardcoded install path, so it follows the same git
+    anchor the resolver uses instead of becoming a second, silently different one. On Linux this
+    re-prepends ``/usr/bin``, which is a no-op.
+    """
+    env = dict(os.environ)
+    tool_dirs = [str(candidate.parent) for candidate in bash_candidates() if candidate.is_file()]
+    env["PATH"] = os.pathsep.join([*tool_dirs, env.get("PATH", "")])
+    return env
+
+
+def _run_leak_gate(bash: str, workdir: Path, script: Path, env: dict[str, str]) -> tuple[int, str]:
+    """Run the extracted step from ``workdir`` the way the runner would; return (rc, combined output).
+
+    ``bash -e`` IS THE RUNNER'S DEFAULT, and using exactly it is the point. The step sets no ``shell:``
+    and neither the workflow nor the job sets ``defaults.run.shell``, so Actions runs it as
+    ``bash -e {0}`` — WITHOUT ``pipefail``. Adding ``-o pipefail`` here would test a shell the release
+    never uses, and would paper over the precise blindness this section exists to detect.
+
+    Output is decoded as UTF-8 explicitly: the gate's own error line contains an em dash, and letting a
+    Windows console's cp1252 default decode it would turn an assertion about the gate's message into an
+    assertion about the harness's locale.
+    """
+    proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
+        [bash, "-e", str(script)],
+        cwd=str(workdir),
+        env=env,
+        capture_output=True,
+        timeout=60,
+    )
+    return proc.returncode, (proc.stdout + proc.stderr).decode("utf-8", "replace")
+
+
+@pytest.fixture
+def leak_gate(tmp_path: Path) -> tuple[str, Path, dict[str, str]]:
+    r"""A usable bash, plus the extracted step written to disk as BYTES.
+
+    NO ``skipif`` ON ``shutil.which("bash")`` (BACKLOG #1216; ``tests/_bash_resolver.py`` is the single
+    source, and every private copy of that guard kept the defect). It asks whether A bash exists, not
+    whether the one it found can read the fixture this process just wrote — on Windows, PATH order often
+    answers with ``C:\Windows\System32\bash.exe``, the WSL launcher, which lives in a different
+    filesystem namespace. ``require_bash`` probes git-derived candidates with a live read-back and fails
+    LOUDLY when none can do the job.
+
+    Loud is doubly right here. A skip in the one test that proves a publish gate CAN FIRE is a green
+    that proves nothing — the same silent-control shape (ADR 0158) as the defect this section was
+    written for, rebuilt one layer up in the harness meant to catch it.
+
+    WRITTEN AS BYTES, never ``write_text``. On Windows ``write_text`` translates ``\n`` to ``\r\n``, bash
+    then reads ``shopt -s nullglob\r``, and every case below fails for a harness reason while reading as
+    a finding about the gate.
+    """
+    script = tmp_path / "leak_gate.sh"
+    script.write_bytes(_leak_gate_script().encode("utf-8"))
+    env = _posix_tool_env()
+    # The SAME env for resolution and for the run. Resolving under one PATH and executing under another
+    # would mean the controls certified an interpreter the script never actually gets.
+    return require_bash(tmp_path, env), script, env
+
+
+def test_the_extracted_leak_gate_script_is_actually_the_gate() -> None:
+    """Liveness for the extractor. If it ever returns another step's script — or an empty one — the
+    execution tests below would exercise the wrong thing and stay green while doing it."""
+    script = _leak_gate_script()
+    for token in ("dist/*.tar.gz", "tar tzf", "grep -vE"):
+        assert token in script, (
+            f"the step extracted as the leak gate does not contain {token!r}; the extractor is picking "
+            f"up the wrong step, so section (7) would be testing something else entirely"
+        )
+
+
+def test_the_leak_gate_passes_a_package_only_sdist(
+    leak_gate: tuple[str, Path, dict[str, str]], tmp_path: Path
+) -> None:
+    """POSITIVE CONTROL, and it is what makes every rejection test below mean anything.
+
+    Those all assert a NON-ZERO exit. A harness that cannot run the script at all — no bash, no ``tar``,
+    a CRLF script, the wrong working directory — exits non-zero on all of them, and they all pass while
+    measuring nothing. That is the same false green the gate itself was shipping, rebuilt one layer up.
+    This is the only test in the section that can fail in that direction, so the others are evidence
+    only while it holds.
+    """
+    bash, script, env = leak_gate
+    work = tmp_path / "clean"
+    _write_sdist(work / "dist" / f"{_SDIST_PREFIX}.tar.gz", _CLEAN_MEMBERS)
+
+    rc, out = _run_leak_gate(bash, work, script, env)
+    assert rc == 0, (
+        f"the leak gate REJECTED a package-only sdist, so every rejection test below is measuring a "
+        f"broken harness rather than the gate.\n  {explain_returncode(rc, 'the leak gate step')}\n{out}"
+    )
+    # A pass must name what it inspected. "it exited 0" is exactly what the old body did while
+    # inspecting nothing, so the count is the part that makes a green readable as evidence.
+    assert f"inspected {len(_CLEAN_MEMBERS)} members" in out, (
+        f"the leak gate passed without reporting how many members it inspected — a green that cannot "
+        f"say what it looked at is the original defect's own signature.\n{out}"
+    )
+
+
+def _fixture_private_doc_in_the_sdist(dist: Path) -> None:
+    _write_sdist(dist / f"{_SDIST_PREFIX}.tar.gz", [*_CLEAN_MEMBERS, PRIVATE_CANARY])
+
+
+def _fixture_corrupt_sdist(dist: Path) -> None:
+    tarball = dist / f"{_SDIST_PREFIX}.tar.gz"
+    _write_sdist(tarball, _CLEAN_MEMBERS)
+    whole = tarball.read_bytes()
+    tarball.write_bytes(whole[: len(whole) // 2])  # truncated mid-stream: gzip cannot finish it
+
+
+def _fixture_two_sdists_one_leaking(dist: Path) -> None:
+    _write_sdist(dist / f"{_SDIST_PREFIX}.tar.gz", _CLEAN_MEMBERS)
+    _write_sdist(dist / f"{_SDIST_PREFIX}rc1.tar.gz", [*_CLEAN_MEMBERS, PRIVATE_CANARY])
+
+
+def _fixture_empty_dist(dist: Path) -> None:
+    dist.mkdir(parents=True, exist_ok=True)
+
+
+def _fixture_sdist_listing_zero_members(dist: Path) -> None:
+    _write_sdist(dist / f"{_SDIST_PREFIX}.tar.gz", [])
+
+
+def _fixture_someone_elses_sdist(dist: Path) -> None:
+    dist.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(dist / "otherproject-1.0.tar.gz", "w:gz") as tf:
+        for member in ("otherproject-1.0/PKG-INFO", "otherproject-1.0/README.md"):
+            payload = b"fixture\n"
+            info = tarfile.TarInfo(member)
+            info.size = len(payload)
+            tf.addfile(info, io.BytesIO(payload))
+
+
+#: Each case pairs a dist/ builder with fragments ONLY THAT CASE can produce. Asserting merely "it
+#: failed" would let all six fail for one shared wrong reason and still report six passes — and three of
+#: the six (corrupt, two tarballs, zero members) are the exact inputs the previous gate body passed, so
+#: a revert has to come back red HERE, on the message, not only on a status.
+_REJECTIONS: list[tuple[Callable[[Path], None], list[str]]] = [
+    # The leak class itself: 0.1.0..0.2.15 shipped docs/security/* to public PyPI.
+    (
+        _fixture_private_doc_in_the_sdist,
+        ["::error::sdist contains non-package files", PRIVATE_CANARY],
+    ),
+    # `tar` fails; the old body read its empty output as "no members outside the allowlist".
+    (_fixture_corrupt_sdist, ["could not list", "nothing was inspected"]),
+    # Two matches made `sd` multiline, so the tar argument was malformed and nothing was listed. The
+    # count is asserted because it is the only thing separating this message from the empty-dist one.
+    (_fixture_two_sdists_one_leaking, ["needs exactly one sdist", "found 2"]),
+    # Zero matches: the same precondition, the other direction.
+    (_fixture_empty_dist, ["needs exactly one sdist", "found 0"]),
+    # A listing that succeeds and yields nothing is not a clean sdist, it is no evidence at all.
+    (_fixture_sdist_listing_zero_members, ["ZERO members", "nothing was inspected"]),
+    # An allowlist check over another project's tarball passes trivially and says nothing about the
+    # artifact this job is about to publish.
+    (_fixture_someone_elses_sdist, ["no messagefoundry/ package tree"]),
+]
+
+
+@pytest.mark.parametrize(
+    ("build_dist", "must_say"),
+    _REJECTIONS,
+    ids=[case[0].__name__.removeprefix("_fixture_") for case in _REJECTIONS],
+)
+def test_the_leak_gate_rejects(
+    build_dist: Callable[[Path], None],
+    must_say: list[str],
+    leak_gate: tuple[str, Path, dict[str, str]],
+    tmp_path: Path,
+) -> None:
+    """Each input must fail the release AND say which check caught it.
+
+    The message is asserted, not just the status, because these six inputs are the ones a blind gate
+    gets wrong in the SAME direction. Run them against the pre-fix body: three exit 0 printing
+    "package-only", one dies on a bare ``ls`` with no annotation at all, and one trips only by luck
+    because its own members happened to sit outside the allowlist. Pinning the fragment is what makes
+    each case testify about its own precondition instead of about an exit status alone.
+    """
+    bash, script, env = leak_gate
+    work = tmp_path / "case"
+    build_dist(work / "dist")
+
+    rc, out = _run_leak_gate(bash, work, script, env)
+    assert rc != 0, (
+        f"the leak gate PASSED an sdist it must reject — this is the false green that let private docs "
+        f"reach public PyPI on 0.1.0..0.2.15.\n{out}"
+    )
+    missing = [fragment for fragment in must_say if fragment not in out]
+    assert not missing, (
+        f"the leak gate failed (rc={rc}) but not for the reason under test — missing {missing} from its "
+        f"output. A rejection that cannot name its own cause is indistinguishable from a rejection for "
+        f"an unrelated harness fault.\n  {explain_returncode(rc, 'the leak gate step')}\n{out}"
     )
