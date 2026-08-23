@@ -231,7 +231,16 @@ if ($NoInstall) {
 # editable install would import whichever checkout it was installed from).
 $venv = Join-Path $WorktreePath ".venv"
 $venvPy = Join-Path $venv "Scripts\python.exe"
-$extras = if ($Sqlserver) { "dev,harness,sqlserver" } else { "dev,harness" }
+# EXTRAS MUST MATCH ci.yml's TEST LEG, and the reason is a FALSE GREEN rather than convenience
+# (BACKLOG #1335). A lane installing fewer extras COLLECTS FEWER TESTS: the extras-gated suites skip
+# at MODULE scope, so a large number of absent tests collapses into a handful of skip lines and the
+# lane reads green over a tree it never ran. `testpaths` also collects the web console suite, which
+# needs the console package installed -- without it that whole suite is silently absent.
+#
+# KEPT IN SYNC BY A TEST, NOT BY CARE: tests/test_worktree_venv_extras_parity.py fails if this line
+# and ci.yml's install line drift. Same remedy tests/test_lint_scope_parity.py already applies to
+# ruff and bandit, whose scopes were written twice and drifted until a test held them together.
+$extras = if ($Sqlserver) { "dev,harness,fhir,dicom,x12,xml,webauthn,sqlserver" } else { "dev,harness,fhir,dicom,x12,xml,webauthn" }
 
 Write-Host "Creating virtualenv + installing .[$extras] (this can take a minute)..."
 & $Python -m venv $venv
@@ -261,8 +270,8 @@ try {
     #
     # This is the same reasoning as the DEP-1 `--require-hashes` install, one rung down: CI proves the
     # lock installs, this makes a developer's environment agree with it.
-    & $venvPy -m pip install --constraint constraints.lock -e ".[$extras]"
-    if ($LASTEXITCODE -ne 0) { throw "pip install -e .[$extras] failed (exit $LASTEXITCODE)" }
+    & $venvPy -m pip install --constraint constraints.lock -e ".[$extras]" -e packaging/messagefoundry-webconsole
+    if ($LASTEXITCODE -ne 0) { throw "pip install -e .[$extras] + webconsole failed (exit $LASTEXITCODE)" }
 } finally {
     Pop-Location
 }

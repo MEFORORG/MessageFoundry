@@ -130,5 +130,6 @@ tests/test_worktree_prune_merged.py
 tests/test_worktree_remove.py
 tests/test_worktree_selfheal_wiring.py
 tests/test_worktree_venv_constraint.py
+tests/test_worktree_venv_extras_parity.py
 tests/test_write_share_denominator.py
 tests/test_zizmor_config_hygiene.py
