@@ -67,7 +67,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.08.13.1"
+$GateVersion = "2026.08.23.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -384,11 +384,14 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
 #     `g(){ git "$@"; }; g -C <governed> reset --hard` both run and both ALLOW, here and on main. No
 #     line scanner closes that: the name `g` carries no evidence at all.
 #   * A RENAMED COPY of git.exe, for the same reason.
-#   * A WRAPPER WORD NOT ON THE $transparent LIST BELOW, and any wrapper option that takes a bare-word
-#     operand: `sudo -u root Git ...` stops at `root`, `ssh box Git ...` stops at the host name. Those
-#     keep ALLOWing, as on main.
+#   * A WRAPPER WORD NOT ON THE $transparent LIST BELOW. `ssh box Git ...` is the measured one: `ssh`
+#     is absent because its first operand is a HOST, not a program, so listing it would buy nothing.
+#     It keeps ALLOWing, as on main. (`sudo -u root Git ...` and `find -exec Git ...` DO deny -- see
+#     the operand rule and the `-exec` entry point below.)
 #   * A CONCATENATED cmd SWITCH RUN, `cmd /Q/C Git ...` -- the single-component skip below reaches `/c`
-#     and `/d`, not `/Q/C`. Same direction: a miss, not a false deny.
+#     and `/d`, not `/Q/C`. Widening it to any slash-led token would skip `/usr/bin/python` too and
+#     hand program position to that command's first PATH argument, which is the false-deny direction.
+#     Same result as the row above: a miss, not a false deny.
 #   * `-File <script>` and any other route where the command is not in the text at all -- the shell-write
 #     blind spot the file's docstring already names.
 #   * THE LOWERCASE ARGUMENT-POSITION FALSE DENY. `cp -r /c/backups/git restore` DENIES today and still
@@ -444,11 +447,18 @@ function ConvertTo-CanonicalGitProgram([string]$Text, [bool]$PosixEscapes = $fal
     # -- every remaining token on the command is an ARGUMENT and is left alone until the next boundary.
     # That single flag is what keeps `cp -r "/c/backups/Git" restore` untouched.
     $seeking = $true
+    # Has a transparent word been passed on this command? Only then may an option's BARE-WORD operand be
+    # skipped, which is what carries `sudo -u root Git ...`. Off by default so the pair rule can never
+    # reach an ordinary program's arguments -- after `cp` the scan has already stopped.
+    $sawTransparent = $false
+    $prevWasOption = $false
     $hits = @()
     while ($i -lt $len) {
         $ch = $Text[$i]
         if ($ch -eq ' ' -or $ch -eq "`t") { $i++; continue }
-        if ($boundaryChars -contains $ch) { $i++; $seeking = $true; continue }
+        if ($boundaryChars -contains $ch) {
+            $i++; $seeking = $true; $sawTransparent = $false; $prevWasOption = $false; continue
+        }
 
         # ONE TOKEN, QUOTE-AWARE, and the quote-awareness is load-bearing rather than tidy: a `;` that
         # lives INSIDE a quoted word is not a command separator, so `echo "hello; Git reset --hard"`
@@ -480,28 +490,45 @@ function ConvertTo-CanonicalGitProgram([string]$Text, [bool]$PosixEscapes = $fal
             }
             [void]$sb.Append($c); $i++
         }
-        if (-not $seeking) { continue }
         $tok = $sb.ToString()
+        # A SECOND DISPATCH POINT, TESTED BEFORE $seeking (`find . -name x -exec git ... \;` really runs
+        # git). No chain of transparent words can reach it: `find` is not a wrapper -- it dispatches
+        # ONLY behind this flag -- so the scan has already stopped by the time the flag appears, and the
+        # flag has to be able to restart it. Measured: without this, the capitalised spelling ALLOWs
+        # here while the lowercase one DENIES, which is the same asymmetry #1305 is about.
+        if ($tok -match '^-{1,2}(exec|execdir)$') {
+            $seeking = $true; $sawTransparent = $true; $prevWasOption = $false; continue
+        }
+        if (-not $seeking) { continue }
         if (-not $tok) { continue }     # an empty quoted pair dispatches nothing; keep looking
 
         # PROGRAM IDENTITY THE WAY Get-FlagOwner ALREADY DOES IT (see below): last path component,
         # `.exe` stripped, compared lowercased. That is case-insensitive identity done SAFELY, because
         # by this line the position question is already answered.
+        #
+        # TESTED FIRST, AND THE ORDER IS LOAD-BEARING: `env -i Git reset --hard` really runs git, and
+        # the operand rule at the bottom would otherwise eat `Git` as the operand of `-i`.
         $name = (($tok -split '[\\/]')[-1] -replace '(?i)\.exe$', '').ToLowerInvariant()
         if ($name -eq 'git') {
             $hits += [pscustomobject]@{ Start = $start; Length = $i - $start }
             $seeking = $false
             continue
         }
-        if ($transparent -contains $name) { continue }
+        if ($transparent -contains $name) { $sawTransparent = $true; $prevWasOption = $false; continue }
         # An option of a transparent word, tested on the CAPTURED value so a quoted `"-u"` still counts.
-        if ($tok.StartsWith('-')) { continue }
+        if ($tok.StartsWith('-')) { $prevWasOption = $true; continue }
         # A single-component slash token is a cmd switch (`/c`, `/d`); a MULTI-component one is a POSIX
         # path and IS a program, so this cannot be a blanket "starts with a slash" skip -- `/usr/bin/GIT`
         # must still be reached. It is tested after the git leaf above for the same reason.
-        if ($tok -match '^/[^/]*$') { continue }
-        if ($tok -match '^[A-Za-z_][A-Za-z0-9_]*=') { continue }   # FOO=1, an assignment prefix
-        if ($tok -match '^[0-9]+$') { continue }                   # `timeout 5`, `nice -n 10`
+        if ($tok -match '^/[^/]*$') { $prevWasOption = $false; continue }
+        if ($tok -match '^[A-Za-z_][A-Za-z0-9_]*=') { $prevWasOption = $false; continue }  # FOO=1
+        if ($tok -match '^[0-9]+$') { $prevWasOption = $false; continue }   # `timeout 5`, `nice -n 10`
+        # THE OPERAND OF A TRANSPARENT WORD'S OPTION -- `sudo -u root git`, where `root` is a bare word
+        # that would otherwise be read as the program. This cannot reach an ordinary command's
+        # arguments, because an ordinary command is not transparent and the scan stopped at it. And it
+        # cannot invent a program where there is none: after a true wrapper, whatever word ends up here
+        # IS dispatched, so the only question this rule answers is WHICH word, never whether.
+        if ($sawTransparent -and $prevWasOption) { $prevWasOption = $false; continue }
         # An ordinary word. It is this command's program, it is not git, and everything after it is an
         # argument.
         $seeking = $false
