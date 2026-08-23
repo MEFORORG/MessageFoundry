@@ -13447,7 +13447,8 @@ twice in one hour.
 
 ## 1321. the server-DB path gate does not list `messagefoundry/api/`, so an api change selects those legs on neither a PR nor a push
 
-> 🔢 **Filed 2026-08-22 - not started.** `main` can merge a change that breaks the Postgres and SQL Server suites and still report green, because neither leg runs on a push. The first pull request afterwards inherits the red and its author debugs someone else's change.
+> 🪦 **CLOSED 2026-08-23 as a duplicate of [#1322](#1322) -- the defect is real and remains OPEN there.** *Banner flipped by the lander; the filer correctly declined to close their own row.* **This glyph does NOT mean the gate hole is fixed.** It means this ROW is void, because #1322 records the same root cause better. **A reader wanting the live item wants #1322.**
+> *Original filing, kept so nothing is lost:* `main` can merge a change that breaks the Postgres and SQL Server suites and still report green, because neither leg runs on a push. The first pull request afterwards inherits the red and its author debugs someone else's change.
 > Verdict: build
 > Closing-act: code
 > 
@@ -13457,9 +13458,14 @@ twice in one hour.
 > collision.* **#1322 is the better record and carries everything this row does**, including the
 > `tests/test_api.py:587` substring-versus-equality point.
 > 
-> ⚠️ **I DID NOT FLIP THE BANNER.** *Closing is the Lander's act (`BUILDER.md:253` forbids the filer,
-> `:148` assigns it), so it is handed over rather than taken.* **Until it is flipped this is an open
-> duplicate, and a reader who reaches it before #1322 will re-derive work already recorded.**
+> **BANNER FLIPPED 2026-08-23 by the lander, discharging the hand-over above.** *The filer was right
+> not to take it: closing is the Lander's act (`BUILDER.md:253` forbids the filer, `:148` assigns it).*
+> **Verified before flipping, not relayed:** #1322 carries every point this row does, including the
+> `tests/test_api.py:587` substring-versus-equality half, and adds a fired-in-practice case (#514 /
+> BACKLOG #1187, `fdd89b49`) plus the nightly-arm severity bound. **Glyph choice is deliberate and has
+> no precedent to follow:** the live ledger had no prior close-as-duplicate-of-an-OPEN-item, and the
+> other two closed glyphs would each assert something false -- `✅` that the gate hole is fixed, `⛔`
+> that an owner declined the work. Neither is true; the work is open at #1322.
 
 **Cluster:** CI / test-gate coverage. **Priority:** P2. **Verdict:** build.
 **Severity:** gate-coverage gap, not a runtime defect. Nothing would ship broken to a deploying site; what is at stake is that the gate protecting two of three store backends is not armed on the branch it is supposed to protect.
