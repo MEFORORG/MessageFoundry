@@ -311,6 +311,84 @@ function ConvertTo-WorktreeSlug([string]$Branch) {
 # resolved to `../elsewhere` and allowed a swap of the tree the git call had already acted on. A prefix
 # that is ambiguous -- `popd`, `cd -`, a subshell, or more than one `cd` -- falls back to the session cwd,
 # which is the DENY-side default.
+# --- BACKLOG #1059: shell variable indirection -------------------------------
+#
+# The gate reads a tool ARGUMENT before anything runs, so a variable's value is generally a runtime
+# fact no static resolver can follow. That much was already recorded as a pinned residual, and it is
+# TRUE FOR COMPUTED VALUES. It is NOT true of the two spellings the residual actually pinned:
+#
+#     p="<governed wt>"; git worktree remove "$p"
+#     p=../Primary-wt;   git worktree remove "$p"
+#
+# Both assign from a LITERAL, in the SAME line the gate is already holding. A segment here is a LINE
+# (see Get-ScannableSegments), so the assignment is not somewhere else in the process -- it is in
+# the string under the scanner's nose. The residual's justification was broader than its own test
+# data, which is why two gate versions passed over this.
+#
+# SCOPE, AND IT IS DELIBERATELY THE STATICALLY-KNOWABLE SUBSET ONLY. Anything computed -- `$(...)`,
+# a reference to another variable, an environment value, a value set on an earlier line -- returns
+# $null and the caller keeps today's behaviour. This closes accidental indirection, which is what a
+# GUARDRAIL is for; it does not pretend to stop a deliberate evasion, and the gate's own .SYNOPSIS
+# already says it is not a security boundary.
+
+function Get-LiteralAssignments([string]$Prefix) {
+    <#
+    Variable name -> literal value, for assignments in ``$Prefix`` whose value is a plain literal.
+
+    A value carrying `$`, `%` or a backtick is NOT a literal -- it is another indirection, and
+    resolving it would be guessing. Those are skipped, so the name stays unresolved and the caller
+    refuses rather than substituting something it cannot stand behind.
+    #>
+    $map = @{}
+    # POSIX `NAME=VALUE` at a command position, plus cmd's `set NAME=VALUE`. Anchored on a command
+    # boundary so `--opt=x` and a bare `a=b` inside a longer token are not read as assignments.
+    $pattern = '(?:^|[;&|]|\s)(?:set\s+)?(?<n>[A-Za-z_][A-Za-z0-9_]*)=(?<v>"[^"]*"|''[^'']*''|[^\s;&|]*)'
+    foreach ($m in [regex]::Matches($Prefix, $pattern)) {
+        $v = $m.Groups['v'].Value
+        if ($v.Length -ge 2) {
+            $first = $v[0]; $last = $v[$v.Length - 1]
+            if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
+                $v = $v.Substring(1, $v.Length - 2)
+            }
+        }
+        # \x24 = $, \x25 = %, \x60 = backtick. Written as hex so the class cannot be broken by the
+        # quoting of whatever edits this line next -- a `$` inside a PowerShell string is a live wire.
+        if ($v -match '[\x24\x25\x60]') { continue }
+        $map[$m.Groups['n'].Value] = $v
+    }
+    $map
+}
+
+function Resolve-ShellIndirection([string]$Token, [string]$Prefix) {
+    <#
+    ``$Token`` with every variable reference replaced by a literal assigned in ``$Prefix``, or
+    ``$null`` when it cannot be resolved WITHOUT GUESSING.
+
+    $null is the honest answer, not a failure: it means the value is a runtime fact. The caller
+    decides what to do with that, and today it keeps existing behaviour so this change can only
+    convert an ALLOW the gate could already have decided -- never alter one it could not.
+    #>
+    # \x24 = $, \x25 = %. No sigil at all is the overwhelmingly common case: return unchanged so the
+    # ordinary path pays nothing.
+    if ($Token -notmatch '[\x24\x25]') { return $Token }
+
+    $refPattern = '\$\{(?<n>[A-Za-z_][A-Za-z0-9_]*)\}|\$(?<n>[A-Za-z_][A-Za-z0-9_]*)|%(?<n>[A-Za-z_][A-Za-z0-9_]*)%'
+    $refs = [regex]::Matches($Token, $refPattern)
+    # A sigil we do NOT model -- `$(...)`, `$1`, a bare `$` -- is unresolvable by construction.
+    if ($refs.Count -eq 0) { return $null }
+
+    $map = Get-LiteralAssignments $Prefix
+    foreach ($r in $refs) {
+        if (-not $map.ContainsKey($r.Groups['n'].Value)) { return $null }
+    }
+    $out = $Token
+    foreach ($r in $refs) { $out = $out.Replace($r.Value, $map[$r.Groups['n'].Value]) }
+    # A sigil surviving substitution means a literal itself contained one, so the result is still
+    # partly unresolved. Half-resolved is worse than unresolved: it looks decided.
+    if ($out -match '[\x24\x25]') { return $null }
+    $out
+}
+
 function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$CwdRaw) {
     $out = @()
 
@@ -1407,6 +1485,14 @@ What to do instead:
         }
         if (-not $victimRaw) { continue }
 
+        # BACKLOG #1059 -- resolve a victim named through a shell variable, WHERE THAT IS DECIDABLE.
+        # A segment is a LINE, so `p=<path>; git worktree remove "$p"` carries its own assignment.
+        # ADDITIVE BY CONSTRUCTION: an unresolvable token returns $null and falls through to exactly
+        # today's handling, so this can only DENY a case the gate could already have decided.
+        $prefixForVars = ($seg.Raw -split ('(?s)\bworktree\s+' + $wtVerb + '\b'), 2)[0]
+        $victimResolved = Resolve-ShellIndirection $victimRaw $prefixForVars
+        if ($victimResolved) { $victimRaw = $victimResolved }
+
         # RESOLVE THE VICTIM AGAINST THE BEST AVAILABLE ESTIMATE OF THE DIRECTORY GIT WILL STAND IN
         # (defect B) -- an ESTIMATE, and the residual list below names where it is wrong -- by calling
         # the resolver rules 3 and 3c already use rather than growing a fourth. This read
@@ -1429,6 +1515,14 @@ What to do instead:
         # in". That is FALSE for every shape below, and an adversarial re-read found them in an hour,
         # which is the reason for the hedge rather than a longer list (CLAUDE.md section 11, SDS-3.6).
         #
+        #   * A VICTIM NAMED THROUGH A COMPUTED VARIABLE. `Resolve-ShellIndirection` (BACKLOG #1059)
+        #     now follows a variable assigned from a LITERAL earlier in the same line, which is what
+        #     the two spellings pinned as an open residual actually were. It does NOT follow `$(...)`,
+        #     a variable of a variable, an environment value, or an assignment on an earlier line --
+        #     those are runtime facts, it returns $null, and this rule keeps its prior behaviour.
+        #     tests/test_worktree_gate_control_plane.py asserts BOTH halves; the ALLOW half is a
+        #     negative control (BACKLOG #1000), not an endorsement, and it is what stops a later fix
+        #     from denying every sigil and breaking `git worktree remove "$HOME/scratch"`.
         #   * A `-C` VALUE CONTAINING A SPACE. Get-GitTargetCandidatesRaw matches `-C\s+"?([^"\s]+)"?`,
         #     and `[^"\s]+` stops at the space: measured, `git -C "C:/Pri mary" ...` captures
         #     `C:/Pri`. This is the SAME space family the victim scan above now handles, so this rule
