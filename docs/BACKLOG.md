@@ -15056,6 +15056,34 @@ must expect the row that DEFINES the schema to look like a violation of it.** *T
 property of the corpus rather than a surprise waiting for the next builder.*
 
 **Controls, updated: a planted true duplicate that MUST fire, and `#1324` itself, which MUST NOT.**
+
+***A SECOND WAY THIS LEDGER READS CLEAN WHILE BEING WRONG, RECORDED HERE BECAUSE IT IS THE SAME FAMILY
+AND THIS ROW IS ITS NATURAL HOME: READ ORDER IS NOT TRUTH ORDER.***
+
+**This file grows by appending.** Items are amended in place sometimes and superseded by later rows
+other times, so ***a reader searching for a subject hits whichever row comes first in FILE order, not
+in TRUTH order.*** **A correction appended after a wrong entry leaves the wrong entry as the first
+search hit**, and nothing marks it.
+
+**ONE VERIFIED INSTANCE, and it is enough to establish the shape:** an open row declares itself
+**SUPERSEDED** at **body line 43 of a 52-line body.** *A reader who lands on that row takes
+forty-three lines of live-sounding reasoning before reaching the notice that it no longer holds.*
+
+***AND NO POPULATION IS GIVEN, DELIBERATELY, BECAUSE THE OBVIOUS SCREEN CANNOT PRODUCE ONE.*** A search
+for retirement and supersession markers **conflates a row that IS retired with a row that DISCUSSES
+retirement** -- demonstrated on this very item, which matches such a screen at body line 43 while being
+neither retired nor superseded. ***That is the mention-versus-declaration defect this row already
+warns about, reappearing in the instrument built to measure it.***
+
+**So this is recorded as a KNOWN HAZARD WITH ONE DEMONSTRATED INSTANCE, not as a sized job.** *Anyone
+scoping it needs a discriminator that separates a DECLARATION from a MENTION first -- the same
+discriminator the verdict-divergence work needed, and the same one this row's duplicate check needs for
+the vocabulary line.* **Three checks over this corpus, one discriminator, and it has to be built before
+any of the counts mean anything.**
+
+**THE CHEAP MITIGATION, WHICH NEEDS NO TOOL: put a supersession or retirement notice at the TOP of the
+body, not at the point the correction was written.** *A handoff, a ledger row and a queue file are all
+read by someone searching for one thing, never front to back.*
 ## 1342. An item's banner verdict and its re-score prose can disagree, and every tool reads the banner
 
 > 🔢 **Filed 2026-08-23 - not started.** Promoting `Verdict` into the banner block created a SECOND source of truth beside the re-score line that already carried it. **Three open items say `build` in the banner and `DEMAND-GATE` in their prose.** Every tool -- `parse_items`, the dispatch gate, a dispatcher's screens -- reads the banner, so all three read as freely dispatchable.
