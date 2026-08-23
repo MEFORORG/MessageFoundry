@@ -250,3 +250,80 @@ def test_two_nested_sessions_each_land_in_their_own_worktree(
     assert by_path.get(str(other).replace("\\", "/").lower()) == (True, "dddddddd")
     got = by_path.get(str(primary).replace("\\", "/").lower())
     assert got is None or got[0] is False, f"the primary owns neither session: {got}"
+
+
+# ------------------------------------------------------- the human table names what its id IS
+#
+# Measured 2026-08-22 (BACKLOG #1310): this value is ``Substring(0, 8)`` of a registry session UUID,
+# so it is hex by construction and indistinguishable by inspection from an abbreviated commit hash --
+# and this repo prints REAL abbreviated hashes elsewhere in the same shape. A reader took one for a
+# revision, searched three object stores for it, found nothing, and concluded the warning was invented.
+#
+# The scan is on the SHAPE OF THE LINE rather than on the value, because the value itself carries no
+# evidence of which kind it is. The only thing that separates them is the word in front.
+
+
+def human_table(vantage: Path, config_root: Path, tmp_path: Path) -> str:
+    """The non-JSON report, which is what a person reads and what nothing else in this file covers."""
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(OVERLAP),
+            "-Repo",
+            str(vantage),
+            "-Refresh",
+            "-ConfigRoot",
+            str(config_root),
+            "-TasksDir",
+            str(tmp_path / "no-such-tasks"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, f"overlap exited {proc.returncode}: {proc.stderr}"
+    return proc.stdout
+
+
+def test_the_human_table_labels_the_session_id(
+    nested_layout: tuple[Path, Path, Path], config_root: Path, tmp_path: Path
+) -> None:
+    """The id is SHOWN and it is NAMED. Suppressing it would satisfy half of this and hide the peer."""
+    _primary, nested, vantage = nested_layout
+    (nested / "alpha.txt").write_text("base\npeer edit\n", encoding="utf-8")
+    write_session(config_root, pid=os.getpid(), cwd=nested, session_id="aaaaaaaa-1111")
+
+    out = human_table(vantage, config_root, tmp_path)
+    rows = [ln for ln in out.splitlines() if "aaaaaaaa" in ln]
+    assert rows, f"the peer's identity was suppressed entirely:\n{out}"
+    for ln in rows:
+        before = ln[: ln.index("aaaaaaaa")]
+        assert before.rstrip().lower().endswith("session"), (
+            "this line ends in an 8-hex token beside a branch name with no noun in front of it, which "
+            f"is the shape of an abbreviated commit hash:\n{ln}"
+        )
+
+
+def test_the_changed_file_count_says_what_it_counts(
+    nested_layout: tuple[Path, Path, Path], config_root: Path, tmp_path: Path
+) -> None:
+    """``Files``' committed half is narrowed against the HEAD of whoever asked.
+
+    So the number on this line is "beyond what you already have", not "what this peer changed", and the
+    same peer yields a different one for a different caller. A bare "changed file(s)" overstates it.
+    """
+    _primary, nested, vantage = nested_layout
+    (nested / "alpha.txt").write_text("base\npeer edit\n", encoding="utf-8")
+    write_session(config_root, pid=os.getpid(), cwd=nested, session_id="aaaaaaaa-1111")
+
+    out = human_table(vantage, config_root, tmp_path)
+    counts = [ln.strip() for ln in out.splitlines() if "file(s)" in ln]
+    assert counts, f"no file count in the table at all:\n{out}"
+    for ln in counts:
+        assert "beyond yours" in ln, (
+            f"the count reads as absolute when it is caller-relative:\n{ln}"
+        )

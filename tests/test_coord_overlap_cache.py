@@ -187,3 +187,37 @@ def test_a_walk_that_finds_nobody_caches_an_empty_array_not_null(tmp_path: Path)
     assert "changed file(s)" not in second.stdout, (
         f"a phantom row was printed from the cache:\n{second.stdout!r}"
     )
+
+
+def test_the_cache_is_keyed_on_the_querying_head_and_not_only_its_root(tmp_path: Path) -> None:
+    """A CACHE WHOSE VALUE DEPENDS ON AN INPUT ITS KEY DOES NOT NAME IS A CACHE THAT LIES.
+
+    ``Files``' committed half is narrowed against the HEAD of whoever asked, and HEAD moves under a
+    fixed root every time that caller commits or merges. Keyed on root alone, the map is answered from
+    a walk computed at the PREVIOUS HEAD for the rest of the window -- which reads as a correct answer
+    and is an answer to a question nobody asked.
+
+    Nothing here changes except HEAD: same repo, same root, same peer, same peer commit. The first
+    query is the control -- without it, a fix that simply stopped reporting the peer would pass.
+    """
+    primary = _repo(tmp_path, "keyed")
+    peer = tmp_path / "peer-wt"
+    _git(primary, "worktree", "add", "-q", "-b", "peer-branch", str(peer))
+    (peer / "shared.txt").write_text("theirs\n", encoding="utf-8")
+    _git(peer, "add", "shared.txt")
+    _git(peer, "commit", "-qm", "work the peer authored")
+
+    first = _run(primary, tmp_path, "-File", "shared.txt", "-Json", "-Refresh").stdout.strip()
+    assert json.loads(first or "[]"), (
+        "the peer's own commit is real overlap and must be reported before HEAD moves, or the "
+        "assertion below cannot tell a cache hit from a correct answer"
+    )
+
+    # The querying worktree now HAS that commit, so the peer changed nothing beyond it.
+    _git(primary, "merge", "-q", "--ff-only", "peer-branch")
+
+    second = _run(primary, tmp_path, "-File", "shared.txt", "-Json").stdout.strip()  # NO -Refresh
+    assert json.loads(second or "[]") == [], (
+        "the cached map survived a HEAD move under the same root, so the answer describes a commit "
+        "the caller has since taken -- the peer is credited with the caller's own work"
+    )

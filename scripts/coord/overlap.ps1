@@ -13,8 +13,17 @@
 
     So two independent signals, because they catch different failures:
 
-      FILES  -- per worktree: committed changes vs origin/main, plus the uncommitted working tree.
-                Catches concurrent edits. Exact, cheap, no cooperation required.
+      FILES  -- per worktree: committed changes vs origin/main that the CALLER does not already have,
+                plus the uncommitted working tree. Catches concurrent edits. Exact, cheap, no
+                cooperation required.
+
+                RELATIVE TO WHOEVER ASKED, and that is not a detail a consumer can ignore. The
+                committed half is narrowed by the querying worktree's own HEAD, so the same peer
+                yields a different Files for a different caller, and a peer whose only committed work
+                the caller already has can drop out of the map entirely. A count taken from it is
+                "files this peer changed beyond mine", never "files this peer changed". The
+                uncommitted half is absolute -- see the third intersect term in Build-Map for why the
+                narrowing stops there.
       WORK   -- per session: the subjects of its task list (~/.claude/tasks/<sessionId>/*.json).
                 Catches duplicate EFFORT on different files. Free: sessions write these anyway, so
                 nobody has to remember to declare anything.
@@ -29,9 +38,17 @@
     already be done), but it cannot be racing you. Callers are expected to treat these differently:
     block on live, mention dormant.
 
-    CACHED, because the git walk costs ~1.5s across a dozen worktrees and a PreToolUse hook runs on
-    every single edit. The cache is a plain last-write-wins file: a stale-by-seconds view of who is
-    editing what is fine, and two sessions refreshing at once cost a duplicate walk, not corruption.
+    CACHED, because the walk is not cheap and a PreToolUse hook runs it on every single edit. The cost
+    is PROCESS COUNT -- one git per term per worktree -- so it scales with how many worktrees exist,
+    not with how much work they contain. MEASURED 2026-08-22 on this box at 73 worktrees: 11.4s before
+    the caller-relative term, 14.6s with it evaluated per peer, 12.0s with it gated on one up-front
+    `for-each-ref` (which is what ships). The collision gate's harness timeout is 20s, so treat that
+    figure as the budget it is, re-measure after touching this loop, and see -TimeBudgetSeconds for
+    what happens when it is blown.
+
+    The cache is a plain last-write-wins file: a stale-by-seconds view of who is editing what is fine,
+    and two sessions refreshing at once cost a duplicate walk, not corruption. It is keyed on the
+    querying worktree's root AND HEAD, because Files depends on both.
 
 .EXAMPLE
     pwsh -NoProfile -File scripts\coord\overlap.ps1                       # human summary
@@ -55,7 +72,24 @@ param(
     # Config roots for the session registry (tests point this at a fixture).
     [string[]]$ConfigRoot,
     # Where task lists live. Separate param so tests can supply their own.
-    [string]$TasksDir = (Join-Path $env:USERPROFILE ".claude\tasks")
+    [string]$TasksDir = (Join-Path $env:USERPROFILE ".claude\tasks"),
+    # ABANDON THE WALK AND EXIT 3 if it has not finished within this many seconds. 0 = unbounded,
+    # which is the right default for a human at a prompt: a slow answer beats no answer.
+    #
+    # It exists for the HOOK, which has the opposite need. collision_gate.ps1 spawns this script under
+    # a harness timeout it does not control; when that timeout fires the hook process is killed, so it
+    # emits nothing -- and empty stdout from a PreToolUse hook is byte-identical to "checked, nobody
+    # else is touching this file". That is the silent all-clear the gate's own docstring says it was
+    # rewritten to eliminate, and the ONE failure path it cannot narrate, because it is not running
+    # any more when it happens. Bailing out UNDER the harness budget converts it into an exit code the
+    # gate is already wired to report.
+    #
+    # A PARTIAL MAP IS NEVER RETURNED. Half a walk is an under-report, and an under-report from this
+    # script is a silent collision -- exactly what it exists to prevent. Overrun means no answer and
+    # no cache write, said out loud.
+    #
+    # Fractional, so a test can pin the bail deterministically instead of racing a one-second floor.
+    [double]$TimeBudgetSeconds = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -92,6 +126,52 @@ if ($LASTEXITCODE -ne 0 -or -not $common) {
 $common = $common.Trim()
 $myRoot = (& git @gitArgs rev-parse --path-format=absolute --show-toplevel 2>$null)
 $myRootNorm = ConvertTo-Norm $myRoot
+
+# THE QUERYING WORKTREE'S OWN HEAD, used below to stop crediting a peer with a commit the caller wrote.
+# Empty when it cannot be resolved, and every use is guarded on that -- see the note at the third
+# intersect term for why the failure direction has to be "report more", not "report less".
+#
+# `-q --verify` and NOT a bare `rev-parse HEAD`. On an unborn branch the bare form prints the literal
+# string "HEAD" on stdout while exiting 128, so a caller that tested the output instead of the exit code
+# would anchor a diff on the word HEAD. Measured: `-q --verify` exits 1 and prints nothing.
+$myHead = ""
+$headOut = (& git @gitArgs rev-parse -q --verify HEAD 2>$null)
+if ($LASTEXITCODE -eq 0 -and $headOut) { $myHead = ([string]$headOut).Trim() }
+
+# WHICH BRANCHES INHERITED MY UNLANDED WORK -- computed ONCE for the whole walk, because the third
+# intersect term below is only ever non-trivial for a peer that holds one of my commits.
+#
+# THE COST IS PROCESS COUNT, and that is measured rather than assumed. This walk spawns one git per
+# term per worktree; on this box at 73 worktrees each one costs ~49 ms, so a term evaluated per peer is
+# ~3.5 s added to a script the PreToolUse gate runs on every Edit and Write, under a harness timeout of
+# 20 s. Asking the question once instead costs ONE `rev-list` plus ONE `for-each-ref --contains`
+# (measured 130 ms against 639 refs) and answered it for 72 of 73 worktrees here.
+#
+# THE OLDEST unlanded commit, not all of them. Along a linear branch, containing any of my commits
+# implies containing the oldest, so one ref query settles it. A branch of mine carrying a merge could
+# in principle hand a peer a newer commit without the oldest; that peer is then NOT matched, keeps
+# today's wider set, and is over-reported -- the same direction every other fallback here takes.
+#
+# $null means "could not tell" (no HEAD, no origin/main, a git error) and restores the per-peer diff.
+# An EMPTY set is a different answer and a real one: I have nothing unlanded, so no peer can have
+# inherited anything of mine and the term cannot narrow any row.
+$inheritors = $null
+if ($myHead) {
+    $mine = @(& git @gitArgs rev-list origin/main..$myHead 2>$null)
+    if ($LASTEXITCODE -eq 0) {
+        if ($mine.Count -eq 0) {
+            $inheritors = [System.Collections.Generic.HashSet[string]]::new(
+                [string[]]@(), [System.StringComparer]::Ordinal)
+        }
+        else {
+            $refs = @(& git @gitArgs for-each-ref --format='%(refname:short)' --contains $mine[-1] refs/heads 2>$null)
+            if ($LASTEXITCODE -eq 0) {
+                $inheritors = [System.Collections.Generic.HashSet[string]]::new(
+                    [string[]]$refs, [System.StringComparer]::Ordinal)
+            }
+        }
+    }
+}
 
 $cacheFile = Join-Path $common "mefor-coord/overlap-cache.json"
 
@@ -179,7 +259,17 @@ function Build-Map {
     }
 
     $rows = @()
+    $script:WalkAbandoned = $false   # declared, not left to $null: the caller reads it unconditionally
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
     foreach ($w in $worktrees) {
+        # THE BUDGET IS CHECKED HERE, at the top of the per-worktree body, because that is the only
+        # place the walk can stop having done a whole number of worktrees. $script: so the caller sees
+        # it: a `return` from inside a foreach yields the rows collected so far, which is a partial map
+        # and reads exactly like a complete one.
+        if ($TimeBudgetSeconds -gt 0 -and $clock.Elapsed.TotalSeconds -ge $TimeBudgetSeconds) {
+            $script:WalkAbandoned = $true
+            return @()
+        }
         $norm = ConvertTo-Norm $w.Path
         if ($norm -eq $myRootNorm) { continue }   # not a collision with yourself
         if (-not (Test-Path -LiteralPath $w.Path)) { continue }
@@ -200,7 +290,11 @@ function Build-Map {
         # outstanding work was unchanged (101/101, 21/21, 11/11).
         $files = @()
         $authored = @(& git -C $w.Path diff --name-only origin/main...HEAD 2>$null)
-        if ($LASTEXITCODE -eq 0) {
+        # An EMPTY authored set makes both remaining terms dead: an intersection with nothing is
+        # nothing, and the third term below can only shrink it further. Skipping them is not a
+        # heuristic or a sampling trade -- it is the same answer for two fewer git processes, and
+        # process count is what this walk costs. Measured on this box: 18 of 73 worktrees.
+        if ($LASTEXITCODE -eq 0 -and $authored.Count -gt 0) {
             $outstanding = @(& git -C $w.Path diff --name-only origin/main..HEAD 2>$null)
             if ($LASTEXITCODE -eq 0) {
                 # Fall back to the authored set if the two-dot diff fails, so a git hiccup
@@ -210,6 +304,47 @@ function Build-Map {
                 $files += @($authored | Where-Object { $still.Contains($_) })
             }
             else { $files += $authored }
+
+            # AND A THIRD TERM: what the peer changed BEYOND WHAT I ALREADY HAVE.
+            #
+            # Both anchors above are origin/main, evaluated inside the peer's worktree, so neither knows
+            # anything about the session asking. A commit the CALLER authored, which the peer inherited
+            # by being cut from the caller's branch, is credited to the peer -- indistinguishable from
+            # work the peer did. Measured 2026-08-22: the gate told a session that handoff.ps1 had been
+            # "CHANGED AND COMMITTED" on a peer's branch and to check its commits. The peer had never
+            # touched the file in a commit it owned; the blob was identical across its whole branch, and
+            # the one commit that authored it was the reader's. So the reader went looking for a peer's
+            # conflicting commit, found only their own, and could only read that as the gate being
+            # broken -- which is how a gate stops being read, and then gets uninstalled.
+            #
+            # Three-dot, so it resolves the merge base and asks the ANCESTRY question. A tree diff
+            # (`<myHEAD> <peerHEAD>`, two arguments) is a different sentence and fails BOTH ways here:
+            # it still flags the inherited file, because our trees genuinely differ in it once I commit
+            # again, AND it credits the peer with files only I have ever touched.
+            #
+            # ADDED, never substituted. Re-anchoring either term above on $myHead would suppress this
+            # false positive and silently restore the squash-merge one: the two-dot term only self-clears
+            # a landed branch because it is measured against origin/main, where the squashed commit
+            # actually is. tests/test_coord_overlap_signals.py pins both directions.
+            #
+            # DEGRADES BY OVER-REPORTING. No $myHead, or a diff that fails, drops the term entirely and
+            # leaves today's wider set -- the same choice the two-dot fallback above makes, for the same
+            # reason: an over-report is loud and annoying, an under-report is a silent collision.
+            #
+            # $inheritors GATES THE SPAWN, not the answer. A peer holding none of my unlanded commits
+            # cannot be narrowed by this term, so running the diff for it buys a guaranteed no-op at
+            # ~49 ms on the hot path of every edit -- see the note where $inheritors is built. Every
+            # branch of that guard that is uncertain runs the diff.
+            $mayHaveMine = ($null -eq $inheritors) -or (-not $w.Branch) -or
+                ($w.Branch -eq "(detached)") -or $inheritors.Contains($w.Branch)
+            if ($myHead -and $files.Count -gt 0 -and $mayHaveMine) {
+                $beyondMine = @(& git -C $w.Path diff --name-only "$myHead...HEAD" 2>$null)
+                if ($LASTEXITCODE -eq 0) {
+                    $theirs = [System.Collections.Generic.HashSet[string]]::new(
+                        [string[]]$beyondMine, [System.StringComparer]::Ordinal)
+                    $files = @($files | Where-Object { $theirs.Contains($_) })
+                }
+            }
         }
         # --no-optional-locks: a plain `git status` REWRITES the index of the repo it inspects, and this
         # walks every peer worktree -- so merely asking "what is in flight" would mutate other sessions'
@@ -234,10 +369,12 @@ function Build-Map {
             Short     = if ($sess -and $sess.sessionId) { ([string]$sess.sessionId).Substring(0, 8) } else { "" }
             Surface   = if ($sess) { ([string]$sess.entrypoint) -replace '^claude-', '' } else { "" }
             Files     = $files
-            # Files is the UNION of committed-and-unlanded and working-tree. A caller that must
-            # distinguish "someone is typing in this file right now" from "this branch authored it and
-            # is done" cannot do it from Files -- and this script's own contract (see LIVE vs DORMANT
-            # above) tells callers to treat signals differently, which was not honourable until now.
+            # Files is the UNION of (committed-and-unlanded MINUS what the caller already has) and
+            # working-tree, so the committed half is RELATIVE TO WHOEVER ASKED -- see the FILES entry
+            # in the header. A caller that must distinguish "someone is typing in this file right now"
+            # from "this branch authored it and is done" cannot do it from Files -- and this script's
+            # own contract (see LIVE vs DORMANT above) tells callers to treat signals differently,
+            # which was not honourable until now.
             # Reported 2026-08-01: a session that had COMMITTED a file, gone clean, and said in writing
             # it was finished still blocked every other session from that file, because a committed
             # file stays in Files until the branch lands -- and while PRs cannot merge, that is forever.
@@ -256,7 +393,18 @@ if (-not $Refresh -and (Test-Path -LiteralPath $cacheFile)) {
         $age = ((Get-Date) - [datetime]::Parse($c.at)).TotalSeconds
         # Bound BOTH ways: a cache stamped in the future (clock skew, or a file copied between boxes)
         # would otherwise look eternally fresh and pin a stale map forever.
-        if ($age -ge 0 -and $age -lt $CacheSeconds -and $c.root -eq $myRootNorm) { $map = @($c.rows) }
+        #
+        # KEYED ON $myHead AS WELL AS $myRootNorm, because Files now depends on it. Root alone was NOT
+        # already sufficient, which is worth stating because it looks like it should be: the root is
+        # what identifies the querying worktree, but the third intersect term above is a function of
+        # that worktree's HEAD, and HEAD moves under a fixed root every time the caller commits. Left
+        # out, the map would be answered from a walk computed at the previous HEAD for the rest of the
+        # window. That errs toward over-reporting (an older HEAD yields a merge base no newer, so the
+        # term is no smaller), so it is not a collision risk -- but a cache whose value depends on an
+        # input its key does not name is a cache that lies, and the fix is one field. A cache written
+        # before this field existed reads back as $null, misses, and re-walks once.
+        if ($age -ge 0 -and $age -lt $CacheSeconds -and $c.root -eq $myRootNorm -and
+            [string]$c.head -eq $myHead) { $map = @($c.rows) }
     } catch { $map = $null }
 }
 if ($null -eq $map) {
@@ -268,11 +416,17 @@ if ($null -eq $map) {
     # collision_gate.ps1 runs `overlap.ps1 -File ... -Json` on every gated edit and the cache is written
     # before the -File early exit, so any bare `overlap.ps1` inside $CacheSeconds inherits it.
     $map = @(Build-Map)
+    # OVERRAN THE BUDGET: no map, no cache, no stdout, exit 3. Every one of those matters. Printing the
+    # partial map would under-report and read as an all-clear; caching it would pin that under-report
+    # for the whole window; printing "[]" would be the literal all-clear this script exists to make
+    # distinguishable from silence. A non-zero exit is the one channel collision_gate.ps1 already
+    # treats as "the gate did not check", so it says so and allows the edit.
+    if ($script:WalkAbandoned) { exit 3 }
     try {
         New-Item -ItemType Directory -Force -Path (Split-Path $cacheFile) | Out-Null
         # Last-write-wins on purpose: a duplicate walk is the only cost of a race, and a lock on the
         # hot path of every edit would be worse than the thing it protects.
-        @{ at = (Get-Date).ToString("o"); root = $myRootNorm; rows = $map } |
+        @{ at = (Get-Date).ToString("o"); root = $myRootNorm; head = $myHead; rows = $map } |
             ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cacheFile -Encoding UTF8
     } catch { }   # a cache we cannot write is a slow hook, not a broken one
 }
@@ -316,9 +470,19 @@ if ($Json) { (Write-JsonArray $map); exit 0 }
 if (@($map).Count -eq 0) { Write-Host "No other worktree has changes."; exit 0 }
 Write-Host ""
 foreach ($r in $map) {
-    $who = if ($r.Live) { "LIVE $($r.Surface) $($r.Short)" } else { "dormant" }
+    # "session" here too (BACKLOG #1310). Unlabelled, this column ends in an 8-hex token and the column
+    # beside it is a branch name -- the shape of an abbreviated commit hash, and read as one on
+    # 2026-08-22 when the collision gate re-rendered the same value into prose.
+    #
+    # The word goes on the ROW here because these rows are NOT uniform: a dormant peer prints just
+    # "dormant" in this column, so a header could not govern every row. presence.ps1 carries the same
+    # value in a table whose rows ARE uniform and labels it from a header instead (BACKLOG #1098).
+    # Both are right for their own table; neither is the general rule.
+    $who = if ($r.Live) { "LIVE $($r.Surface) session $($r.Short)" } else { "dormant" }
     Write-Host ("{0,-38} {1,-38} {2}" -f $r.Worktree, $r.Branch, $who)
     foreach ($w in @($r.Work | Select-Object -First 3)) { Write-Host "    building: $w" }
-    Write-Host ("    {0} changed file(s)" -f @($r.Files).Count)
+    # "beyond yours", not "changed": the committed half of Files is narrowed by the querying HEAD, so
+    # this count is relative to the caller. See the FILES entry in the header.
+    Write-Host ("    {0} changed file(s) beyond yours" -f @($r.Files).Count)
 }
 Write-Host ""

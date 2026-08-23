@@ -49,7 +49,11 @@ param(
     # one directory with the suite would make the first test's notice suppress the second's.
     [string]$StateDir,
     # How long one unresolved reason stays quiet after being reported.
-    [int]$NoticeCooldownMinutes = 30
+    [int]$NoticeCooldownMinutes = 30,
+    # Handed to overlap.ps1 as its walk budget. It must sit UNDER the harness timeout wired for this
+    # hook (`Timeout = 20` in install-coordination.ps1), with room for two pwsh startups and the notice
+    # write, because the point is to still be running when the budget is hit. Tests drive it low.
+    [int]$OverlapTimeBudgetSeconds = 16
 )
 
 # No $ErrorActionPreference = Stop: this gate fails OPEN, and a throw would be a deny-by-crash.
@@ -71,19 +75,36 @@ $ErrorActionPreference = "SilentlyContinue"
 # session registry. All of them are folded, because deciding value by value is what left the last one
 # bare.
 #
-# PROSE ONLY, and that is a statement about this file rather than a general rule. Every command this
-# gate prints is a LITERAL with no interpolation in it, so there is no command-bound value here and no
-# quoting helper. If a command line here ever gains an interpolation, folding is NOT the treatment for
-# it -- see the worktree gate's Get-SafeForCommand, and keep the two named apart.
+# THIS FOLD IS FOR PROSE, AND PROSE ONLY. It neutralises LINE STRUCTURE, which is the whole exposure a
+# value has inside a sentence; it leaves '$', a backtick, ';' and '&' alone, because those do nothing in
+# a sentence. The committed-and-clean notice below now emits a runnable `git log` naming the peer's
+# branch, so this file DOES have a command-bound value, and folding is not its treatment -- see
+# Get-SafeForCommand directly beneath, and keep the two named apart.
 #
 # A LOCAL COPY, deliberately, and the alternative is worse. worktree_gate.ps1 is installed OUTSIDE
 # every working tree by install-gate.ps1, so it can dot-source nothing from a checkout; a shared module
 # would therefore be importable by this hook and not by that one, which is two definitions of one rule
-# that drift invisibly. Four lines duplicated, with the divergence visible to grep, beats that.
+# that drift invisibly. A few lines duplicated, with the divergence visible to grep, beats that.
 function Get-SafeForMessage([string]$Value) {
     $t = ("$Value" -replace '[\r\n\t]', ' ')
     if ($t.Length -gt 400) { return $t.Substring(0, 400) + '...' }
     return $t
+}
+
+# COMMAND-BOUND values -- the other half of the pair, and QUOTING is its fix rather than folding. The
+# rule, the measurements behind it, why the quotes are single and why $Prefix/$Suffix live INSIDE the
+# span are recorded once at worktree_gate.ps1's Get-SafeForCommand. This is that function, byte for
+# byte, for the reason the fold above is.
+#
+# WHY IT ARRIVED HERE. Until 2026-08-22 this gate's remediations were literals with placeholders, and
+# `git log --oneline origin/main..<that branch> -- <this file>` looked like one. It is not: the branch it
+# asks for is printed two clauses earlier, so the reader performs the interpolation the script declined
+# to. `git check-ref-format --branch 'evil;whoami'` exits 0, so that is a legal refname, and a public
+# fork can create it (`gh pr checkout`, `git fetch origin <ref>:<ref>`). Relocating an interpolation into
+# the reader does not remove it, and the reader has no fold and no quoting helper.
+function Get-SafeForCommand([string]$Value, [string]$Prefix = "", [string]$Suffix = "") {
+    $body = "$Prefix" + (Get-SafeForMessage $Value) + "$Suffix"
+    return "'" + ($body -replace "'", "''") + "'"
 }
 
 function Deny([string]$Reason) {
@@ -184,11 +205,27 @@ if (-not (Test-Path -LiteralPath $OverlapScript)) {
 
 $raw = $null
 $code = 0
+# -TimeBudgetSeconds is passed unconditionally rather than probed for. The installed shim resolves BOTH
+# this gate and its callee from the same checkout (docs/WORKTREES.md, "which copy runs"), so they move
+# together; a copy that predates the parameter fails the invocation, which lands on the unresolved
+# notice below -- loud and allowing, which is this gate's posture for everything it cannot check.
 try {
-    $raw = & pwsh -NoProfile -NonInteractive -File $OverlapScript -File $target -Json 2>$null
+    $raw = & pwsh -NoProfile -NonInteractive -File $OverlapScript `
+        -File $target -Json -TimeBudgetSeconds $OverlapTimeBudgetSeconds 2>$null
     $code = $LASTEXITCODE
 } catch {
     Write-Unresolved "overlap-threw" "invoking the overlap script raised: $($_.Exception.Message)"
+}
+# EXIT 3 IS THE BUDGET, and it gets its own sentence because it is the one failure this gate could not
+# previously report AT ALL. Measured 2026-08-22 on this box: the walk costs ~12 s across 73 worktrees,
+# under a harness timeout of 20 s that kills THIS process when it fires -- and a killed PreToolUse hook
+# writes nothing, which on stdout is byte-identical to "checked, nobody else is touching this file".
+# overlap.ps1 bailing out under its own budget converts that silence into an exit code, which is the
+# channel below. If the budget is ever hit routinely the answer is to make the walk cheaper, not to
+# raise the number past the harness's.
+if ($code -eq 3) {
+    Write-Unresolved "overlap-slow" `
+        "the overlap walk did not finish within its ${OverlapTimeBudgetSeconds}s budget, so it returned no map rather than a partial one"
 }
 if ($code -ne 0) {
     Write-Unresolved "overlap-failed" "the overlap script exited $code"
@@ -226,12 +263,62 @@ $editing = @($live | Where-Object { $null -eq $_.PSObject.Properties['MatchedDir
 if ($editing.Count -eq 0) {
     # Committed-and-clean in every live worktree: report it, do not block. The peer may well have
     # already done what you are about to do, which is worth knowing and not worth refusing over.
+    #
+    # LABEL THE ID, AND HAND OVER THE BRANCH (BACKLOG #1310). Measured 2026-08-22: this sentence named
+    # a peer as "80c88a83 [claude/<peer-branch>]" and its reader took the leading token for an
+    # abbreviated commit hash. Reasonably so -- the verb is "CHANGED AND COMMITTED", the noun beside it
+    # is "branch", the remediation said "check its commits", and this repo prints REAL short hashes in
+    # exactly this `<hex> [<branch>]` shape elsewhere (prune-merged.ps1, rescue.ps1). They searched
+    # three separate object stores, found it in none of them, and concluded the gate had invented a
+    # revision. It had not, and it could not have: `Short` is the first eight characters of a registry
+    # session UUID (overlap.ps1), so it is hex by construction. No git revision is read in this code
+    # path at all.
+    #
+    # #1310 asks for `session=<id>` and this prints `session <id>`, which is the idiom already shipped
+    # at overlap.ps1's single-file printer and session-context.ps1's roster and reads better inside a
+    # sentence. The divergence lands on the ITEM, not on the code: #1310's stated check is a grep for
+    # `session=`, and that grep asks about this FILE, not about what the gate PRINTS. Every hit it
+    # returns is a COMMENT line, the ones you are reading among them -- which is how the sentence that
+    # used to stand here, "still returns 0 against this file", was falsified by the paragraph written
+    # to explain it. Nothing this gate emits contains `session=` anywhere, so that count moves when
+    # this prose is re-worded and never when the printed text changes. DO NOT RESTATE THE COUNT HERE:
+    # the first correction to this paragraph quoted its own fresh number and was wrong by one on the
+    # line that quoted it. tests/test_collision_gate.py checks the PROPERTY instead -- no hex-shaped
+    # token in the emitted text without the word in front of it -- and is the check to run in its
+    # place.
+    #
+    # The word goes on the ROW rather than into a legend -- these rows are not uniform, so a legend
+    # could not govern every one of them.
+    #
+    # VERIFYING THE VALUE AS A REVISION IS NOT THE FIX. `git cat-file -e` answers "is this string a git
+    # object" when the question is "what KIND of identifier is this", and it answers NO for every real
+    # session id -- so guarding on it would suppress the peer's identity and restore the silence. A
+    # prefix that happened to collide with one of this repo's objects would then be printed as a
+    # VALIDATED revision, which is worse than the ambiguity it replaced. That collision is also why the
+    # notice claims the id IS a session id rather than claiming it RESOLVES to nothing: the first is
+    # unconditionally true, and the second is the sentence a curious reader can catch out by running
+    # `git show` and finding an unrelated object. A control disbelieved on a detail is disbelieved.
+    #
+    # THE BRANCH IS THE ACTIONABLE HALF. `git log` takes a branch and takes no session id, which is
+    # exactly why "check its commits" pointed that reader at the one identifier they could not use. It
+    # is emitted through Get-SafeForCommand, quoted, and NOT as a `<that branch>` placeholder the reader
+    # fills in from the clause above -- see the note on that helper for why a placeholder next to a
+    # printed refname is an interpolation with an extra step.
+    #
+    # A GLOB PATHSPEC, not the bare leaf. `git log -- overlap.ps1` matches nothing: pathspecs are
+    # anchored at the repo root, so the leaf this notice prints resolves to zero commits -- and an empty
+    # `git log` reads as "the peer has no commits here", which is the exact false conclusion this notice
+    # exists to prevent, reached through a command the gate supplied. Verified in this repo: the leaf
+    # returns 0 lines and '*<leaf>' returns the real commits.
     $names = (@($live | ForEach-Object {
-                "$(Get-SafeForMessage $_.Short) [$(Get-SafeForMessage $_.Branch)]" }) -join ', ')
+                "session $(Get-SafeForMessage $_.Short) on branch $(Get-SafeForMessage $_.Branch)" }) -join '; ')
+    $leafQ = Get-SafeForCommand (Split-Path $target -Leaf) -Prefix '*'
+    $cmds = (@($live | ForEach-Object {
+                "  git log --oneline $(Get-SafeForCommand $_.Branch -Prefix 'origin/main..') -- $leafQ" }) -join "`n")
     [Console]::Out.Write((@{
                 hookSpecificOutput = @{
                     hookEventName     = "PreToolUse"
-                    additionalContext = "[collision] $(Get-SafeForMessage (Split-Path $target -Leaf)) was already CHANGED AND COMMITTED on another live session's branch ($names), whose tree is now clean. Not blocking -- but that work may overlap yours, so check its commits before you duplicate or revert it."
+                    additionalContext = "[collision] $(Get-SafeForMessage (Split-Path $target -Leaf)) was already CHANGED AND COMMITTED in another LIVE session's worktree ($names), whose tree is now clean. Not blocking -- but that work may overlap yours. Each id above is a coordination-registry session id and NOT a commit -- do not look one up as a revision. Read the BRANCH beside it instead, before you duplicate or revert what is on it:`n$cmds"
                 }
             } | ConvertTo-Json -Compress -Depth 6))
     exit 0
@@ -240,7 +327,9 @@ if ($editing.Count -eq 0) {
 $leaf = Get-SafeForMessage (Split-Path $target -Leaf)
 $lines = @("$leaf has UNCOMMITTED changes in another LIVE session's worktree -- editing it now means one of you loses work at merge.", "")
 foreach ($r in $editing) {
-    $lines += "  $(Get-SafeForMessage $r.Short) ($(Get-SafeForMessage $r.Surface)) in " +
+    # "session" for the same reason as the notice above (BACKLOG #1310): unlabelled, this row leads
+    # with an 8-hex token immediately before a bracketed branch, the shape of an abbreviated hash.
+    $lines += "  session $(Get-SafeForMessage $r.Short) ($(Get-SafeForMessage $r.Surface)) in " +
               "$(Get-SafeForMessage $r.Worktree) [$(Get-SafeForMessage $r.Branch)]"
     foreach ($w in @($r.Work | Select-Object -First 2)) {
         $lines += "      building: $(Get-SafeForMessage $w)"
