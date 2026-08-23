@@ -14012,6 +14012,24 @@ demand-gate item can legitimately be researched or scoped. **The right shape is 
 **Expiry:** this stops being right if `judge()` grows a branch for either value, or if the verdict
 vocabulary in `_FIELD_KEYS`'s documented set changes.
 
+
+**A THIRD GAP IN THE SAME FUNCTION, FOUND WHILE FILING THIS ROW AND PROVEN THE SAME WAY: RETIREMENT IS
+INVISIBLE TO THE GATE.** An item retired in place keeps its number, its banner and its fields -- that is
+the established convention, so the ledger is right and the gate is not reading enough:
+
+| item | state | fields | gate says |
+| --- | --- | --- | --- |
+| `#1332` | **retired in place**, duplicate of `#1086` | `build` / `code` | ***`ok`*** |
+| `#1309` | **retired in place**, duplicate of `#1152` | `demand-gate` / `owner-ruling` | `advise` |
+
+**`#1309` gets `advise` for the WRONG REASON** -- its closing act is not one a builder performs, so the
+note is about *who closes it*. **Neither row's retirement is mentioned at all.** A seat consulting the
+gate on `#1332` today is told `ok` about an item whose first body line says it must not be built.
+
+**So the fix has three parts, not one:** advise on `demand-gate` and `owner-ruling`, and **detect a
+retirement marker in the body**. The retirement text is prose rather than a field, so this one needs a
+body read rather than a `fields` lookup -- **or a fourth banner key, which is the cleaner answer if
+anyone is already editing the schema.**
 ## 1335. Lane virtualenvs install five fewer extras than CI, so a lane can pass locally and fail on the runner
 
 > 🔢 **Filed 2026-08-23 - not started.** `scripts/worktree/new.ps1:234` builds every lane virtualenv with `dev,harness` (plus `sqlserver` on a switch). CI installs `dev,harness,fhir,dicom,x12,xml,webauthn` **and** the web console package. So a lane's green suite is a strictly weaker signal than the runner's, and the gap is silent.
