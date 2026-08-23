@@ -14192,3 +14192,51 @@ mechanism. Close each on its own rows passing, not on this landing.
 
 **Expiry:** this stops being right if the segment object stops carrying both `Raw` and `Scan`, or if
 rule 3c stops reading `Scan` for key detection.
+
+## 1337. The leak gate has no pattern for a security-record citation, and a bare-identifier screen would be switched off within a day
+
+> 🔢 **Filed 2026-08-23 - not started.** `scripts/security/scan_forbidden.py` screens routable IPs, worktree slugs, home paths, customer and vendor names, and site codes. **It has no pattern for a security-record identifier at all.** The obvious screen -- match the identifier shape -- is **measurably unusable**, and this row carries the working specification instead.
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** leak gate / security tooling. **Priority:** P2. **Verdict:** build.
+**Severity:** no product or PHI axis (sec. 0). **The cost is a gate that cannot see one class of content
+it exists to keep out**, and -- if built naively -- **a gate loud enough that somebody disables it.**
+
+***THE NAIVE SCREEN IS UNUSABLE, MEASURED BEFORE ANY OF THIS WAS FILED.*** A shape-only match, filtered
+to real identifiers by corpus membership, over the **2026 tracked files** of this repository:
+
+| screen | files | occurrences | verdict |
+| --- | --- | --- | --- |
+| shape-only, corpus-filtered | 416 | **4582** | ***UNUSABLE*** |
+| context-required | 370 | 2248 | still far too broad |
+| **identifier NEAR a verdict word** | **1** | **tens** | **every hit real** |
+
+***THE ROOT CAUSE IS A GRAMMAR COLLISION: THESE IDENTIFIERS AND SEMANTIC VERSION NUMBERS ARE THE SAME
+SHAPE.*** `uv.lock` scored **229** and `ide/package-lock.json` **200** -- **every one a dependency
+version.** Corpus membership does not save you, because plenty of real identifiers are also plausible
+version numbers. **A gate firing 4582 times is switched off, and a gate that is off is worse than one
+that was never built, because the pipeline still shows a passing step.**
+
+**THE WORKING SPECIFICATION -- SCREEN FOR AN IDENTIFIER WITHIN N CHARACTERS OF A VERDICT WORD, NOT FOR
+IDENTIFIERS.** The distinction is what the identifier is DOING:
+
+- **A bare citation is a FORWARD reference** -- *this code was written with that requirement in mind*.
+  It does not assert coverage, does not assert a result, and does not name a gap. **Not record content.**
+- **An identifier sitting beside a verdict IS record content**, because the pair is the assessment.
+
+**BUILD CONSTRAINT -- TWO CONTROLS, BOTH REQUIRED, OR THE SCREEN IS NOT EVIDENCE:**
+
+1. **A prose citation carrying a verdict, which MUST fire.**
+2. **A lockfile dependency version, which MUST NOT.**
+
+**A screen with only the first is indistinguishable from one that matches everything; a screen with only
+the second is indistinguishable from one that matches nothing.** *Both failures were reached in ten
+minutes while deriving this spec, which is why they are written down as gates rather than advice.*
+
+**The identifier corpus is vendored and lawfully redistributable, so the membership filter needs no
+network and no private file.**
+
+**Expiry:** this stops being right if `scan_forbidden.py` gains a citation pattern, or if the identifier
+grammar stops colliding with semantic versions.
