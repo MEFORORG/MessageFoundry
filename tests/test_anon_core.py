@@ -5,6 +5,8 @@ fail-closed leak-check — engine side."""
 
 from __future__ import annotations
 
+import secrets
+import string
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -24,6 +26,12 @@ from messagefoundry.anon import (
     leak_check,
     leak_report,
     load_rules,
+)
+from messagefoundry.anon.keying import (
+    MAX_SALT_BYTES,
+    MIN_SALT_ENTROPY_BITS,
+    MIN_SALT_LEN,
+    _estimated_entropy_bits,
 )
 from messagefoundry.anon.surrogates import Seps, scrub_site_codes, surrogate_field
 
@@ -84,7 +92,7 @@ _SAMPLE = _msg(
 
 
 def test_keyer_deterministic_and_salt_sensitive() -> None:
-    a, b = Keyer("salt-aaaaaaaaaaaaaaaa"), Keyer("salt-aaaaaaaaaaaaaaaa")
+    a, b = Keyer("salt-7Kq2mVz9pLx4Rw"), Keyer("salt-7Kq2mVz9pLx4Rw")
     assert a.seed("mrn", "12345") == b.seed("mrn", "12345")
     assert a.seed("mrn", "12345") != a.seed("mrn", "54321")
     assert a.seed("mrn", "12345") != a.seed("name", "12345")  # kind is part of the key
@@ -96,6 +104,91 @@ def test_keyer_rejects_weak_salt() -> None:
         Keyer("short")
     with pytest.raises(ValueError):
         Keyer("")
+
+
+# A salt that is genuinely random yet REPEATS characters -- generated with secrets.token_hex(8),
+# nine distinct characters over sixteen, one of them appearing five times. It is the POSITIVE
+# CONTROL for the entropy gate: without it, a check that refused every salt would still satisfy the
+# rejection tests below, and the gate would be indistinguishable from a permanent outage.
+_REAL_RANDOM_SALT_WITH_REPEATS = "0222439f2bb823dd"
+
+
+def test_keyer_accepts_real_high_entropy_salts_including_one_with_repeats() -> None:
+    """POSITIVE CONTROL -- the gate must not refuse a salt an operator would actually generate."""
+    assert len(set(_REAL_RANDOM_SALT_WITH_REPEATS)) < len(_REAL_RANDOM_SALT_WITH_REPEATS), (
+        "this control is only meaningful if the salt repeats a character"
+    )
+    for salt in (
+        _REAL_RANDOM_SALT_WITH_REPEATS,
+        secrets.token_hex(8),  # 16 characters -- exactly at MIN_SALT_LEN, no length headroom
+        secrets.token_urlsafe(24),
+        secrets.token_hex(32),
+    ):
+        assert Keyer(salt).seed("mrn", "12345") > 0  # constructs and keys, no raise
+
+
+def test_keyer_rejects_a_long_salt_with_too_little_entropy() -> None:
+    """Character COUNT is not entropy: each of these clears MIN_SALT_LEN and is still guessable."""
+    for salt in (
+        "a" * MIN_SALT_LEN,  # the exact case the length-only gate accepted
+        "a" * 64,  # length does not rescue a one-symbol salt
+        "0" * 32,
+        "abababababababab",  # two symbols
+        "xxxxxxxxxxxxxxxy",  # skewed: diverse by distinct count, one symbol in practice
+        "salt-aaaaaaaaaaaaaaaa",  # a plausible-looking placeholder
+    ):
+        assert len(salt) >= MIN_SALT_LEN, "the length gate must not be what fires here"
+        with pytest.raises(ValueError, match="too predictable"):
+            Keyer(salt)
+
+
+def test_keyer_rejects_an_oversized_salt_at_construction_not_at_first_message() -> None:
+    """A salt past BLAKE2b's keyed-mode limit used to build fine and crash on the FIRST message.
+
+    Measured on the pre-fix code: ``Keyer(secrets.token_urlsafe(64))`` -- 86 bytes -- constructed
+    without complaint, then raised a bare "maximum key length is 64 bytes" from inside ``seed``.
+    On a first deployment that would surface as a mid-dataset failure rather than a rejected
+    configuration. The boundary owns it now.
+    """
+    oversized = secrets.token_urlsafe(64)
+    assert len(oversized.encode("utf-8")) > MAX_SALT_BYTES  # the case is what we think it is
+    with pytest.raises(ValueError, match="at most"):
+        Keyer(oversized)
+    # ...and a salt exactly AT the ceiling still works -- the bound must not be off by one.
+    at_ceiling = secrets.token_hex(MAX_SALT_BYTES // 2)
+    assert len(at_ceiling.encode("utf-8")) == MAX_SALT_BYTES
+    assert Keyer(at_ceiling).seed("mrn", "12345") > 0
+
+
+def test_keyer_weak_salt_error_never_quotes_the_salt() -> None:
+    """The salt is a re-identification key -- an exception that echoed it would leak it to a log."""
+    salt = "a" * MIN_SALT_LEN
+    with pytest.raises(ValueError) as excinfo:
+        Keyer(salt)
+    assert salt not in str(excinfo.value)
+    assert "aaaa" not in str(excinfo.value)
+
+
+def test_entropy_estimate_is_order_blind_which_is_the_declared_blind_spot() -> None:
+    """Pin the limitation the estimator's docstring admits, so nobody later overstates the gate.
+
+    Sixteen distinct characters in alphabetical order score the arithmetic maximum for that length
+    and are ACCEPTED, even though the string is trivially guessable. A distribution-based estimator
+    cannot see order; claiming otherwise would be the dishonest reading of this check.
+    """
+    assert _estimated_entropy_bits("abcdefghijklmnop") == _estimated_entropy_bits(
+        "pnmlkjihgfedcba" + "o"
+    )
+    assert _estimated_entropy_bits("abcdefghijklmnop") >= MIN_SALT_ENTROPY_BITS
+    Keyer("abcdefghijklmnop")  # accepted -- documented blind spot, not an oversight
+
+
+def test_entropy_estimate_grades_the_measured_cases() -> None:
+    """Executed values behind the floor, so a future edit to the estimator has to face them."""
+    assert _estimated_entropy_bits("a" * MIN_SALT_LEN) == 0.0
+    assert _estimated_entropy_bits("") == 0.0  # helper is safe on empty; the length gate owns it
+    assert _estimated_entropy_bits("abababababababab") == pytest.approx(16.0)
+    assert _estimated_entropy_bits(_REAL_RANDOM_SALT_WITH_REPEATS) == pytest.approx(46.39, abs=0.01)
 
 
 # --- rule model -----------------------------------------------------------------------------------
@@ -458,3 +551,47 @@ def test_site_prefix_fixture_leaves_module_globals_consistent_with_the_environme
         "surrogates._SITE_PREFIXES drifted from what the current environment yields — a fixture "
         "recomputed them under a patched environment and did not restore them afterwards"
     )
+
+
+# --- the per-character floor: length must not rescue a degenerate pattern ----------------------
+#
+# The total-bits floor is length-scaled, so a repeating two-symbol pattern reaches it by being
+# long: "ab" x8 scored 16.00 bits and was refused, while the IDENTICAL pattern at "ab" x16 scored
+# 32.00 and passed. That is the length floor defeating the entropy floor, not a blind spot the
+# estimator can disclaim, so the RATE is now checked separately and a salt must clear both.
+
+
+@pytest.mark.parametrize(
+    "salt,label",
+    [
+        ("ab" * 16, "two symbols, 32 chars -- reached the total floor by length alone"),
+        ("ab" * 32, "two symbols, 64 chars"),
+        ("abc" * 21 + "a", "three symbols, 64 chars -- scored 101 bits on the total"),
+    ],
+)
+def test_length_does_not_rescue_a_repeating_pattern(salt: str, label: str) -> None:
+    with pytest.raises(ValueError, match="too few distinct characters"):
+        Keyer(salt)
+
+
+def test_real_generated_salts_are_still_accepted() -> None:
+    """THE CONTROL THAT MATTERS. A floor that refuses everything would pass every rejection test
+    above while making the anonymizer unusable, which is worse than the defect it fixes. Decimal is
+    the narrowest alphabet a real generator would produce, so it is the binding case."""
+    for salt in (
+        secrets.token_urlsafe(24),
+        secrets.token_hex(8),
+        secrets.token_hex(16),
+        "".join(secrets.choice(string.digits) for _ in range(MIN_SALT_LEN)),
+    ):
+        Keyer(salt)  # must not raise
+
+
+def test_the_two_floors_are_independent() -> None:
+    """Neither floor substitutes for the other, so both must be able to fire alone. A single
+    repeated character fails the TOTAL (0 bits); a two-symbol pattern long enough to clear the
+    total fails the RATE. If one message could serve both, one floor would be redundant."""
+    with pytest.raises(ValueError, match="too predictable"):
+        Keyer("a" * MIN_SALT_LEN)
+    with pytest.raises(ValueError, match="too few distinct characters"):
+        Keyer("ab" * MIN_SALT_LEN)

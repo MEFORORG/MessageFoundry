@@ -8938,6 +8938,23 @@ private-key floor has the opposite profile: the operator generates that key and 
 public half, so raising it can break no handshake with anybody. Folding the two together would have
 smuggled a counterparty-facing refusal into a change whose entire justification is that it has none.
 The JWKS floor is real, is unfiled, and is named here by subject rather than by a number.
+
+**A SECOND #1166 LIMB BUILT 2026-08-22: the anonymizer salt-entropy floor.** This item's prose named it -- "the minimum-salt check counts CHARACTERS rather than measuring entropy". Measured before building: a salt of sixteen letter-a characters was ACCEPTED while a short salt was refused in the same run, so the gate was live and measuring the wrong property. It now estimates Shannon entropy over the observed character distribution and refuses below a floor.
+
+**THREE DEFECTS IN THE FIRST CUT, ALL FOUND BY AN ADVERSARIAL REVIEWER AND ALL CORRECTED BEFORE THIS LANDED.** Recorded because each is a shape worth recognising again.
+
+1. **LENGTH RESCUED A DEGENERATE PATTERN.** The total-bits estimate is length-scaled, so a two-symbol cycle at sixteen characters scored 16.00 bits and was refused while the IDENTICAL pattern at thirty-two characters scored 32.00 and PASSED. That is the length floor defeating the entropy floor, not a blind spot a docstring can disclaim. Fixed by checking the RATE separately: a new `MIN_SALT_ENTROPY_BITS_PER_CHAR` of 2.0, which refuses a two- or three-symbol cycle at any length while leaving a random decimal salt -- about 3.32 bits per character, the narrowest alphabet a real generator produces -- untouched.
+
+2. **THE REFUSAL NEVER REACHED THE OPERATOR.** The salt was validated inside the per-message loop, and the tee CLI wraps each message in a total `except Exception`. That is correct -- it must never let an anonymizer failure surface a body -- but it swallowed a CONFIGURATION error and reported it as N failed messages, steering an operator with a weak salt to extend their rule map, the wrong file entirely. Fixed by validating once BEFORE the loop, where the salt belongs: it is a property of the run, not of any message.
+
+3. **THE FLOOR CONTRADICTED THE ADR AND CITED IT AS AUTHORITY WHILE DOING SO.** The error text invoked ADR 0030 section 4 while accepting a salt at 32 estimated bits, where that ADR requires 128. Both facts are now stated: the ADR governs GENERATION, this estimator grades a SUPPLIED string and is a loose LOWER BOUND -- a genuine 128-bit secret rendered as sixteen decimal digits estimates about 40 bits here, so a floor at 128 would refuse conformant secrets. Clearing this screen therefore does NOT establish ADR compliance, and the comment now says so outright instead of implying the reverse.
+
+**A FOURTH, CAUGHT WHILE VERIFYING THOSE FIXES, AND THE REPOSITORY ALREADY GUARDED IT.** `tee/anon/keying.py` is a verbatim vendored copy and the tee CLI imports the VENDORED one, so fixing only the engine module left the CLI accepting a salt the engine refused. I nearly added a drift guard for it; `tests/test_anon_parity.py::test_shared_logic_files_are_byte_identical` already exists and fires on exactly that drift, verified by desyncing the file and watching it fail. The real lesson is narrower and about method: I ran one test FILE rather than the suite, and a file-scoped run cannot see a guard that lives in another file.
+
+Proof: four mutations, each red, zero vacuous -- per-character floor disabled, vendored copy drifted, total-bits floor disabled, and the two floors shown to fire independently. 66 passed across the anonymizer core and the tee CLI.
+
+**Residual:** the estimator stays ORDER-blind and DICTIONARY-blind, so a string of sixteen distinct sequential letters measures the arithmetic maximum and passes. Nothing short of generating the salt ourselves fixes that, which is what ADR 0030 already requires.
+
 ## 1167. research an honest pass for ASVS 11.2.4 -- constant-time recovery-code verification without turning ten argon2id slots into an amplification target
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **7/10** · _money pit_. The data-dependent early return survives on the shipped MFA path: _verify_second_factor walks the argon2id recovery hashes and returns on the first match, so the number of ~64 MiB verifications is a function of which code was presented. Value 4 because the leak is a wall-clock signal on an already-authenticated second factor rather than a bypass; difficulty 7 because the obvious constant-time loop multiplies a 64 MiB argon2id verification by the slot count on every attempt, converting a timing leak into a memory and CPU amplification target, and the evidentiary half has no precedent in this tree. _(was 4/10 · 7/10.)_

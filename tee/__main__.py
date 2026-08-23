@@ -45,6 +45,7 @@ from pathlib import Path
 
 from tee import __version__, mefor_api
 from tee.anon import anonymize_checked
+from tee.anon.keying import Keyer
 from tee.correlate import CorepointOutput, CorrelateConfig
 from tee.relay import Endpoint, RelayConfig, TeeRelay
 from tee.report import build_report
@@ -511,6 +512,20 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         return 1
 
     overlay = Path(args.overlay) if args.overlay else None
+
+    # VALIDATE THE SALT ONCE, HERE, BEFORE THE LOOP. The per-message `except Exception` below is
+    # deliberately total -- it must never let an anonymizer failure surface a body -- but that also
+    # swallows a CONFIGURATION error and reports it as N failed messages. A weak salt would then
+    # steer the operator to extend their rule map, which is the wrong file, while the message
+    # naming the actual problem was discarded. The salt is a property of the RUN, not of any
+    # message, so it belongs outside the loop; checking it here also means a bad salt costs one
+    # check instead of one per message.
+    try:
+        Keyer(salt)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
     lines: list[str] = []
     failed = 0
     for row in rows:
