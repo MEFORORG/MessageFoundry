@@ -25,7 +25,7 @@ import pytest
 
 from harness.load.connscale.probe import ProbeDegraded
 from harness.load.connscale.profile import load_connscale_profile_text
-from harness.load.connscale.report import ConnScaleRecord
+from harness.load.connscale.report import ConnScaleRecord, ConnScaleReport
 from harness.load.connscale.runner import run_connscale
 from tests._connscale_ports import (
     INBOUND_PORT_HI,
@@ -173,7 +173,25 @@ def _assert_fd_probe(records: Sequence[ConnScaleRecord]) -> None:
     )
 
 
-async def test_connscale_smoke_end_to_end() -> None:
+# --- the one expensive run, shared by every property below ----------------------------------------
+
+
+@pytest.fixture(scope="module")
+async def smoke_report() -> ConnScaleReport:
+    """ONE ``run_connscale`` sweep for the whole module (BACKLOG #1331).
+
+    THE SWEEP SPAWNS AN ENGINE SUBPROCESS PER STEP, so re-running it per property would multiply this
+    module's cost by the number of properties — which is precisely why they were welded into a single
+    test to begin with. Sharing the run buys the separate NAMES without buying a second sweep.
+
+    MODULE-SCOPED AND ASYNC ON PURPOSE. ``pyproject.toml`` sets
+    ``asyncio_default_fixture_loop_scope = "session"``, so this still runs on the suite's one shared
+    loop. Do NOT "simplify" it to ``asyncio.run()``: that opens a SECOND loop, which is the exact
+    cross-loop split that setting exists to prevent, and its comment says so.
+
+    The setup cost lands on whichever test pytest runs first. That is the same work the module's
+    ``timeout(120)`` already covered when it was inline, so the budget is unchanged, not tightened.
+    """
     # Reserve a contiguous inbound-port block (BACKLOG #1014). The sweep's max connection count
     # needs that many contiguous inbound ports, and the engine binds base_port + i for each. A
     # RANDOM anchor de-correlates concurrent worktrees so they no longer contend for one fixed
@@ -193,7 +211,7 @@ async def test_connscale_smoke_end_to_end() -> None:
     # below the OS ephemeral floors, so the kernel cannot hand one out after it is probed.
     api_port, sink_port = reserve_api_and_sink_bases(profile, sink_ports=1)  # type: ignore[arg-type]
 
-    report = await run_connscale(
+    return await run_connscale(
         profile,  # type: ignore[arg-type]
         engine_api_port_base=api_port,
         sink_host="127.0.0.1",
@@ -202,9 +220,26 @@ async def test_connscale_smoke_end_to_end() -> None:
         install_executor_shim=True,
     )
 
-    # (1) A record per (sweep_mode, N): both modes × {12, 24} = 4 rows.
-    assert len(report.records) == 4
-    modes = {(r.sweep_mode, r.count) for r in report.records}
+
+# --- the properties, ONE NAME EACH ----------------------------------------------------------------
+#
+# BACKLOG #1331: these were one test named ``test_connscale_smoke_end_to_end`` over at least six
+# separate properties. It sits on three of the thirteen required contexts, so every occurrence is
+# merge-blocking -- and because one name covered all of them, TWO SEATS HITTING IT TWICE SAW TWO
+# UNRELATED BUGS RATHER THAN ONE RECURRING PROBLEM, and nobody owned it. The assertions below are
+# UNCHANGED; only their names are new. A failing context now says which property broke without
+# anyone reading the module.
+#
+# DECOMPOSITION ONLY -- this deliberately does NOT attempt to fix the underlying flake. The item is
+# explicit that the cause is uncharacterised and that the intake arm does not fail by a constant
+# (1 of 36 in one run, 17 of 36 in another), so any bound tweak here would be untested against the
+# wide case and would manufacture a green rather than earn one.
+
+
+def test_the_sweep_produces_one_record_per_mode_and_count(smoke_report: ConnScaleReport) -> None:
+    """A record per (sweep_mode, N): both modes x {12, 24} = 4 rows."""
+    assert len(smoke_report.records) == 4
+    modes = {(r.sweep_mode, r.count) for r in smoke_report.records}
     assert modes == {
         ("fixed_aggregate", 12),
         ("fixed_aggregate", 24),
@@ -212,46 +247,73 @@ async def test_connscale_smoke_end_to_end() -> None:
         ("fixed_per_conn", 24),
     }
 
-    # (2) No-loss at each N (sent == engine_read, engine_written == sink_received, backlog drained).
-    for r in report.records:
+
+def test_no_loss_reconciles_at_every_step(smoke_report: ConnScaleReport) -> None:
+    """No-loss at each N (sent == engine_read, engine_written == sink_received, backlog drained).
+
+    THIS IS THE INTAKE-LOSS ARM the item names -- ``engine_read 35 below confirmed sent 36``. When this
+    context reds, read the failure here rather than anywhere else in the module.
+    """
+    for r in smoke_report.records:
         assert r.sent > 0, r
         assert r.no_loss.ok, (r.sweep_mode, r.count, r.no_loss.detail)
 
-    # (3) Curve monotonicity smoke (a LOOSE >= per mode; CI runners are noisy): FD count + empty-claims
-    # at N=24 >= N=12. Asserted via the report's monotonicity SLOs.
-    slo_by_name = {c.name: c for c in report.slos}
+
+def test_the_fd_and_empty_claim_curves_are_monotonic_in_n(smoke_report: ConnScaleReport) -> None:
+    """Curve monotonicity smoke (a LOOSE >= per mode; CI runners are noisy): FD count + empty-claims
+    at N=24 >= N=12. Asserted via the report's monotonicity SLOs.
+
+    THIS IS THE THROUGHPUT-SLO ARM the item names, distinct from the intake arm above. Nothing
+    measured shows the two share a root cause; separate names keep that question open instead of
+    quietly answering it.
+    """
+    slo_by_name = {c.name: c for c in smoke_report.slos}
     assert slo_by_name["fd_count_monotonic"].ok, slo_by_name["fd_count_monotonic"].observed
     assert slo_by_name["empty_claims_monotonic"].ok, slo_by_name["empty_claims_monotonic"].observed
 
-    # (4) The additive engine fields are present + non-None where the shim/probe ran (back-compat
-    # works): the executor boot-shim populates wall #1, and the FD probe reads the engine PID.
-    assert report.shim_installed
-    for r in report.records:
+
+def test_the_additive_engine_fields_are_populated(smoke_report: ConnScaleReport) -> None:
+    """The additive engine fields are present + non-None where the shim/probe ran (back-compat
+    works): the executor boot-shim populates wall #1, and the FD probe reads the engine PID."""
+    assert smoke_report.shim_installed
+    for r in smoke_report.records:
         assert r.executor_queue_depth_peak is not None, r  # the shim installed the default executor
         assert r.executor_busy_peak is not None, r
         # Wall #3 is separated, never summed into one number; both halves are non-negative.
         assert r.idle_poll_per_s >= 0.0 and r.wake_fanout_per_s >= 0.0
 
-    # (4b) Wall #4 (FD), asserted only as far as this test is ENTITLED to. See _assert_fd_probe.
-    _assert_fd_probe(report.records)
 
-    # (5) The reload-latency probe (wall #5) times an O(connections) quiesce-and-swap. Like the other
-    # OS-side probes it is best-effort and gap-tolerant BY DESIGN: a reload fired mid-hold at the highest
-    # connection count can occasionally exceed the client timeout under peak load, and the probe records a
-    # gap (None) rather than a fabricated number (see harness/load/connscale/probe.py time_reload). Require
-    # it to have MEASURED at least one step (the probe is wired and works) and to be finite wherever present
-    # — asserting a number at EVERY step would be stricter than the probe's own contract and flakes on slow
-    # CI runners.
-    measured_reloads = [r.reload_seconds for r in report.records if r.reload_seconds is not None]
-    assert measured_reloads, [(r.sweep_mode, r.count) for r in report.records]
+def test_the_fd_probe_measured_or_named_why_it_could_not(smoke_report: ConnScaleReport) -> None:
+    """Wall #4 (FD), asserted only as far as this module is ENTITLED to. See ``_assert_fd_probe``."""
+    _assert_fd_probe(smoke_report.records)
+
+
+def test_the_reload_probe_measured_at_least_one_step(smoke_report: ConnScaleReport) -> None:
+    """The reload-latency probe (wall #5) times an O(connections) quiesce-and-swap. Like the other
+    OS-side probes it is best-effort and gap-tolerant BY DESIGN: a reload fired mid-hold at the highest
+    connection count can occasionally exceed the client timeout under peak load, and the probe records a
+    gap (None) rather than a fabricated number (see harness/load/connscale/probe.py time_reload). Require
+    it to have MEASURED at least one step (the probe is wired and works) and to be finite wherever present
+    — asserting a number at EVERY step would be stricter than the probe's own contract and flakes on slow
+    CI runners."""
+    measured_reloads = [
+        r.reload_seconds for r in smoke_report.records if r.reload_seconds is not None
+    ]
+    assert measured_reloads, [(r.sweep_mode, r.count) for r in smoke_report.records]
     assert all(s >= 0.0 for s in measured_reloads)
 
-    # (6) Wall #2 (pool) is a documented no-op on SQLite — recorded as absent (None), not a fake 0.
-    for r in report.records:
+
+def test_the_pool_wall_is_absent_rather_than_zero_on_sqlite(smoke_report: ConnScaleReport) -> None:
+    """Wall #2 (pool) is a documented no-op on SQLite — recorded as absent (None), not a fake 0."""
+    for r in smoke_report.records:
         assert r.pool_wait_p99_ms is None, r
         assert r.pool_idle_min is None, r
 
-    assert report.result_ok and report.exit_code == 0
+
+def test_the_run_reports_overall_success(smoke_report: ConnScaleReport) -> None:
+    """The runner's own verdict, kept separate from the individual properties above: this can red
+    while every property passes (or the reverse), and merging the two hid which had happened."""
+    assert smoke_report.result_ok and smoke_report.exit_code == 0
 
 
 @pytest.mark.skipif(sys.platform != "win32" and sys.platform != "linux", reason="OS FD probe path")
