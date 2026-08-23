@@ -10870,6 +10870,10 @@ gate is the wrong shape, validation of the walk is the right one.
 > **COUNT DRIFT, recorded so it is not read as a discrepancy:** this item says *"154 shell blocks; 154 failed"*; the same instrument reported **160 of 160** on 2026-08-14. **The corpus grew; the 100-percent signature -- which is the actual finding -- held at both sizes.**
 > **`#1272` IS THIS ITEM'S DUPLICATE and closes with a pointer here.** It was filed onto an unpushed branch and named the 160 where this one names the 154 -- **two symptoms of one PATH-order defect, filed twice because neither author could see the other's tree.** This number survives on a mechanical asymmetry, not on merit: **a landed item is amendable from any worktree; an unpushed one is editable only by the branch holder.**
 
+***VERIFIED FIXED ON MAIN 2026-08-23 -- FLIP-READY, NOT YET CLOSED.*** **All four resolving test modules import `tests/_bash_resolver.py`. No live `skipif` on bash existence remains anywhere in `tests/`.**
+*Control that qualifies it: `skipif` filtered to bash returned five lines, all prose; unfiltered `skipif` returned hits in dozens of test files.* **A search finding nothing anywhere is a broken search, not an absence, so the control is stated rather than implied.**
+***DECIDED BY READING THE CODE, NOT BY COUNTING CITATIONS*** -- *a citation is identity and the question was content (see `#1347`).* **Closing still needs the banner flip, the dropped Priority line and the move to the archive; this row records the measurement, not the disposition.**
+
 > **SHIPPED-BUT-OPEN 2026-08-22 -- builder-2 round 3, same [ADR 0165](adr/0165-a-builder-pr-satisfies-the-ledger-gate-with-a-paired-commit-authored-by-the-dispatcher-or-lander.md) pairing.** A shared resolver now finds a bash that can SEE this process's files, adopted in all four modules that resolve one.
 > **THE SECOND COMMIT IS THE ONE TO READ, AND IT IS AN ADMISSION.** The author's own positive control was an identity -- `assert bash_sees(require_bash(...))`, where `require_bash` returns only a candidate `bash_sees` has already approved, so it was true by construction and incapable of failing. Mutating the probe to `return True` left it GREEN while two sibling tests went red. It certified a resolver with no working namespace check: **the #1216 defect itself, one level up**, in a test written an hour earlier by someone who had spent the night on exactly that class. Kept as a separate commit deliberately, so folding it in cannot erase that it happened.
 > Verdict: build
@@ -12150,6 +12154,10 @@ BUILDS it.*
 > Verdict: build
 > Closing-act: code
 
+***VERIFIED FIXED ON MAIN 2026-08-23 -- FLIP-READY, NOT YET CLOSED.*** **One implementation survives at `controlchars.py:67` with six real importers. The seven remaining `0x7F` lines are unrelated or excluded by this row's own terms.**
+*Control that qualifies it: the `0x7F` sweep returned seven real hits INCLUDING the known-good `controlchars.py:67`, so the pattern matches this predicate's spelling.* **A search finding nothing anywhere is a broken search, not an absence, so the control is stated rather than implied.**
+***DECIDED BY READING THE CODE, NOT BY COUNTING CITATIONS*** -- *a citation is identity and the question was content (see `#1347`).* **Closing still needs the banner flip, the dropped Priority line and the move to the archive; this row records the measurement, not the disposition.**
+
 **Cluster:** Code quality / drift hazard. **Priority:** P3. **Verdict:** build (small).
 **Severity:** none today, and no deployment axis (§0).
 
@@ -12305,6 +12313,10 @@ BUILDS it.*
 > **REPRODUCED WITH A CONTROL.** The live ledger and a copy poisoned with conflict markers both parse to **287 items / 207 open**, and no exception is raised. The two counts are identical, so the census cannot be used to detect the condition -- **it is not that the number is wrong, it is that the number is right and the file is unusable.**
 > Verdict: build
 > Closing-act: code
+
+***VERIFIED FIXED ON MAIN 2026-08-23 -- FLIP-READY, NOT YET CLOSED.*** **`.pre-commit-config.yaml:178` wires `backlog-parses` to `backlog_status_check.py --quiet` -- the half this row was still open against.**
+*Control that qualifies it: `git grep` for `ledger-gate|backlog-parses` returned both, with the known-present `ledger-gate` proving the path resolves on `origin/main`.* **A search finding nothing anywhere is a broken search, not an absence, so the control is stated rather than implied.**
+***DECIDED BY READING THE CODE, NOT BY COUNTING CITATIONS*** -- *a citation is identity and the question was content (see `#1347`).* **Closing still needs the banner flip, the dropped Priority line and the move to the archive; this row records the measurement, not the disposition.**
 
 **Cluster:** Ledger tooling / silent-pass gate. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) -- nothing shipped changes. The cost is a gate that certifies a file no one can parse.
@@ -13902,6 +13914,10 @@ class as the release gate `a92ab10f` fixed, and it is why (b) is not cosmetic.
 > Verdict: build
 > Closing-act: code
 
+***VERIFIED FIXED ON MAIN 2026-08-23 -- FLIP-READY, NOT YET CLOSED.*** **`release.yml:148-159` now exits 1 when `tar` fails or lists zero members, so the gate proves a listing happened before asking the allowlist question.**
+*Control that qualifies it: `grep -n '|| true'` returned 9 hits on the dumped blob and `tar tzf` returned 2, both inside comments -- the pattern demonstrably matches live text in that file.* **A search finding nothing anywhere is a broken search, not an absence, so the control is stated rather than implied.**
+***DECIDED BY READING THE CODE, NOT BY COUNTING CITATIONS*** -- *a citation is identity and the question was content (see `#1347`).* **Closing still needs the banner flip, the dropped Priority line and the move to the archive; this row records the measurement, not the disposition.**
+
 **Cluster:** CI reliability / supply chain. **Priority:** P1. **Verdict:** build.
 **Severity:** no engine-runtime effect and no deployment axis (sec. 0) -- but this is the **disclosure** path, not the deployment one, and publishing to PyPI is real and current. A silent pass here would let a regression in the `only-include` allowlist republish private documentation to a public index, which is what releases 0.1.0..0.2.15 already did once.
 ## 1314. tls_check_hostname=false bypasses both SMTP credential gates, so a credentialed hop trusts any peer chaining to the anchor
@@ -13909,6 +13925,10 @@ class as the release gate `a92ab10f` fixed, and it is why (b) is not cosmetic.
 > 🔢 **Filed 2026-08-22 - not started.** Value **8/10** · Difficulty **3/10** · _quick win_. **A third TLS weakening axis reaches `smtp.login()` with no refusal, no attestation and no warning**, while the two axes beside it are gated absolutely. Value 8 because a deploying site would put SMTP AUTH credentials on a connection authenticated only to the anchor, not to the name; difficulty 3 because the fix is a third arm matching two that already exist in the same constructors.
 > Verdict: build
 > Closing-act: code
+
+***VERIFIED FIXED ON MAIN 2026-08-23 -- FLIP-READY, NOT YET CLOSED.*** **`email.py:221` and `direct.py:243` both raise `ValueError` when `tls_check_hostname` is false and a username is set, outside any escape conditional.**
+*Control that qualifies it: `tls_verify` returned 7 hits from the pre-existing gates and `check_hostname` returned 5 in each file.* **A search finding nothing anywhere is a broken search, not an absence, so the control is stated rather than implied.**
+***DECIDED BY READING THE CODE, NOT BY COUNTING CITATIONS*** -- *a citation is identity and the question was content (see `#1347`).* **Closing still needs the banner flip, the dropped Priority line and the move to the archive; this row records the measurement, not the disposition.**
 
 **Cluster:** Security / transport posture. **Priority:** P1. **Verdict:** build.
 **Severity:** no exposure today ([§0](../CLAUDE.md) - zero deployments). **On first deployment**, a site that set `tls_check_hostname=false` would send SMTP AUTH credentials to any peer presenting a certificate that chains to the configured anchor, **regardless of the name on it**.
@@ -14095,6 +14115,10 @@ which both readings of the cell now require.
 > **THE FIX IS ALREADY AVAILABLE IN THE TEST DOUBLE AND NEEDS NO NEW TIMING.** `_Source` records `stop_started`. Sampling how many sources have started before any completes separates all four rows above -- 200 / 1 / 8 / 64 -- with no dependence on how fast the runner is. It is also the stronger assertion on its own terms: `_stop_sources_demote` creates every task eagerly before its first `await`, and [`wiring_runner.py:2645`](../messagefoundry/pipeline/wiring_runner.py) says so in its own docstring (*"Tasks are created eagerly, outside any gate"*), so *all N started* is a property of the shipped design rather than of the box. Keep a generous wall-clock bound underneath if a second signal is wanted, but it must stop being the discriminator.
 > **WHAT IS NOT ESTABLISHED, stated so nobody reads more into it.** This is **at least one** observed failure. The rate under runner load was never measured, no re-run of the same head was recorded before the session ended, and no cross-branch pair like #1290's was collected. The mutation table above is the strong evidence here; the frequency is not.
 > **DO NOT MERGE THIS INTO #1290 -- same cluster, different failure.** #1290 is a process-table walk on hosted **Windows** that never completes, so its regression assertion never runs. This is a **ubuntu** bound that a fully completed, correct run exceeds. Neither fix touches the other's file.
+
+***VERIFIED FIXED ON MAIN 2026-08-23 -- FLIP-READY, NOT YET CLOSED.*** **The wall-clock bound is gone. `tests/test_adr0157_demote_teardown.py:161` asserts `width == _N_SOURCES`, and the file has no `import time` at all.**
+*Control that qualifies it: `assert ` returned 41 hits, so the file was read; the elapsed/wall-clock pattern returned one docstring line and no assertion.* **A search finding nothing anywhere is a broken search, not an absence, so the control is stated rather than implied.**
+***DECIDED BY READING THE CODE, NOT BY COUNTING CITATIONS*** -- *a citation is identity and the question was content (see `#1347`).* **Closing still needs the banner flip, the dropped Priority line and the move to the archive; this row records the measurement, not the disposition.**
 
 **Cluster:** CI reliability / teardown tests. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0) -- `tests/` ships in no engine path. The cost is that a required context can redden on `main` from runner load alone, and that while it is loaded the test cannot perform the discrimination it was written for.
@@ -15568,3 +15592,85 @@ demonstrate its own pass arm has never been shown to have one.*
 
 **Expiry:** this stops being right if the two registries are unified, or if the vault stops installing
 the gate.
+
+## 1347. a multi-item commit cites only its first number with the BACKLOG prefix, so sibling items read as unbuilt to every citation-based check
+
+> 🔢 **Filed 2026-08-23 - not started.** The house form is `(BACKLOG #1319, #1322, #1323, #1331)` -- **the prefix appears ONCE and the siblings carry a bare `#N`.** So any check greping `BACKLOG #<N>` finds the first item and misses the rest. **Measured on `origin/main`: `#1319` matches, its three siblings do not.** ***The failure direction is the expensive one -- a sibling whose work landed months ago reads as unbuilt, and a dispatcher hands a builder work that is already done.***
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / gate integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no product axis (sec. 0). **The cost is wasted lane capacity and a ledger that overstates
+what is open.**
+
+**THE HALF THAT IS ALREADY SOLVED, SO THIS ROW DOES NOT FILE A FIXED THING.** `scripts/hooks/claim_check.py:42`
+handles the sibling case correctly and states why, verbatim: *"(BACKLOG #71, #72) is the house form, so
+once BACKLOG appears in the subject every #N after it in that line counts -- otherwise the second item of
+a paired commit would slip through unclaimed."* ***THE FIX PATTERN EXISTS IN-REPO. That is the useful part
+of this item, not the count.***
+
+**TWO SHAPES, AND ONLY ONE HAS A REMEDY ANYWHERE.**
+
+**SHAPE A -- siblings after the prefix.** Solved for CLAIMS by the gate above; **re-derived and got wrong
+by every ad-hoc screen.** *Two seats built the same broken screen independently on 2026-08-23.*
+
+***SHAPE B -- NO `BACKLOG` TOKEN AT ALL.*** A commit reading `init writes a loadable config, and check can
+fail on one (#1318, #1320)` declares nothing to any checker. **The claim gate read it as citing no item and
+passed it correctly -- while `#1318` was claimed by another worktree.** ***Invisible everywhere, gate
+included, and unsolved.***
+
+**MEASURED TWICE, INDEPENDENTLY, AND THE TWO DERIVATIONS DIFFER BY ONE.** Scanning `--all` subjects and
+counting only `#N` tokens INSIDE the `(BACKLOG ...)` parenthetical: **34 and 35 multi-item commits, over a
+denominator of 787 and 809 commits carrying such a parenthetical.** *Both derivations are recorded rather
+than reconciled; the disagreement is smaller than the finding.*
+
+***AND THE OBVIOUS COUNT IS INFLATED BY AN ORDER OF MAGNITUDE, WHICH IS WHY THE DENOMINATOR IS STATED.***
+Counting `BACKLOG` followed by more than one `#N` anywhere in the subject scores **593**, because a
+squash-merge appends the PR number as a trailing group -- `(BACKLOG #1040) (#547)` is one item and one pull
+request. A comma-based count scores **110**, of which **85 are `BACKLOG #1171, ASVS 11.4.1`** -- a comma
+followed by something that is not an item at all. **Scope the match to inside the parenthetical.**
+
+**Control:** `df8acc95` -- the commit that misled two seats into holding three claims for landed work -- is
+in the 34, carrying `#1319, #1322, #1323, #1331`.
+
+**Expiry:** this stops being right if the house form changes, or if screens are replaced by content
+checks (`git log -S` on a symbol the fix must touch) rather than citation greps.
+
+## 1348. claim.ps1 reads directory existence as occupancy, so a worktree that outlives its session holds claims no sanctioned verb can move
+
+> 🔢 **Filed 2026-08-23 - not started.** `claim.ps1` refuses a `-Take` with **`HOLDER IS STILL THERE -- that worktree exists and last committed 23h ago.`** ***Its occupancy test is DIRECTORY EXISTENCE PLUS COMMIT RECENCY. It is not asking whether anyone is there.*** **Measured 2026-08-23: `ListAgents` returned seven live peers and the holding worktree was not among them, while its directory sat on disk and the tool reported it occupied in a confident sentence.**
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / gate integrity. **Priority:** P2. **Verdict:** build.
+**Severity:** no product axis (sec. 0). **The cost is a claim that cannot be regularised by any verb the
+rules permit.**
+
+***THIS IS A THIRD STATE THE TOOL CANNOT REPRESENT.*** A **removed** worktree strands its claims -- that is
+a sibling row's case and it is handled. A **live** worktree holds them legitimately. ***A worktree whose
+DIRECTORY OUTLIVES ITS SESSION is neither, and the tool renders it as the second.*** *It is the same
+distinction that made a fleet roster report four live seats when seven were running: **a record read as
+presence.***
+
+**THE LIVE INSTANCE, AND IT SHOWS WHY THIS MATTERS MORE THAN TIDINESS.** A lane built, verified and
+mutation-proved a fix for an item claimed by a dead checkout of **its own role**. *The dispatcher ruled
+that same-role-dead-checkout may be taken in place, which is correct.* ***The sanctioned verb refused. Only
+`-Force` would move it, and `CLAUDE.md` forbids releasing another worktree's claim.*** **So the item is
+built, correct, and unattributable.**
+
+***TWO GAPS MET IN THE MIDDLE AND EITHER ALONE WOULD HAVE BEEN SURVIVABLE.*** The claim gate could not stop
+the commit because it used no `BACKLOG` token (**Shape B, `#1347`**). The claim tool would not let the
+author regularise it because it reads a directory as a person. **Together they produce work that is done,
+correct, and held by nobody.**
+
+**THE LANE DID NOT REACH FOR `-Force` AND THAT IS THE RIGHT PRECEDENT:** *a sanctioned verb refusing is not
+an authority gap, and the refusal of the permitted tool is not an invitation to the forbidden one.*
+
+**One control, and it is achievable:** a claim held by a worktree with a **live session** must still
+refuse, and one held by a directory with **no live session** must be distinguishable from it. *A tool that
+cannot tell those apart has never demonstrated it is testing occupancy at all.*
+
+**Expiry:** this stops being right if `claim.ps1` gains a liveness probe, or if worktree directories are
+removed with their sessions.
