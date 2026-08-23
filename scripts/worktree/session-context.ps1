@@ -136,7 +136,11 @@ if ($root) {
                     $lines += "WHAT THEY ARE BUILDING -- check before you start, so you don't build it twice:"
                     foreach ($b in $busy) {
                         # Same id, same banner, same label -- see the note on the roster rows above.
-                        $lines += "  session $($b.Short) [$($b.Branch)] -- $(@($b.Files).Count) file(s) changed"
+                        #
+                        # "beyond yours" is not decoration. overlap.ps1's Files narrows its committed
+                        # half against the HEAD of whoever asked, so this count is relative to THIS
+                        # session and a bare "changed" would overstate what the peer did.
+                        $lines += "  session $($b.Short) [$($b.Branch)] -- $(@($b.Files).Count) file(s) changed beyond yours"
                         foreach ($w in @($b.Work | Select-Object -First 3)) { $lines += "      $w" }
                     }
                     $lines += "  Everything in flight:  pwsh -NoProfile -File scripts\coord\overlap.ps1"
