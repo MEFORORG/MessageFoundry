@@ -262,7 +262,7 @@ async def test_purge_dead_letters_respects_window_and_is_idempotent(store: Messa
 async def _preset(store: MessageStore, name: str, *, now: float, owner: str = "alice") -> str:
     pid, _ = await store.upsert_search_preset(
         preset_id=f"p-{name}",
-        owner=owner,
+        owner_user_id=owner,
         name=name,
         criteria='{"content": "MRN001"}',  # a PHI-shaped needle — synthetic
         now=now,
@@ -318,7 +318,9 @@ async def test_purge_search_presets_keeps_a_read_but_unedited_preset(store: Mess
     await _preset(store, "abandoned", now=0.0)
 
     # Recall (not a list) at day 40 — this is what "used" means.
-    got = await store.get_search_preset(preset_id="p-daily-driver", owner="alice", now=40 * DAY)
+    got = await store.get_search_preset(
+        preset_id="p-daily-driver", owner_user_id="alice", now=40 * DAY
+    )
     assert got is not None
 
     assert await store.purge_search_presets(older_than=30 * DAY) == 1
@@ -338,16 +340,19 @@ async def test_get_search_preset_stamps_last_used_at(store: MessageStore) -> Non
 
     assert await _stamp() is None  # a fresh save leaves it unstamped
 
-    first = await store.get_search_preset(preset_id="p-p", owner="alice", now=5 * DAY)
+    first = await store.get_search_preset(preset_id="p-p", owner_user_id="alice", now=5 * DAY)
     assert first is not None and first["last_used_at"] is None  # pre-stamp snapshot
     assert await _stamp() == 5 * DAY
 
-    second = await store.get_search_preset(preset_id="p-p", owner="alice", now=9 * DAY)
+    second = await store.get_search_preset(preset_id="p-p", owner_user_id="alice", now=9 * DAY)
     assert second is not None and second["last_used_at"] == 5 * DAY  # the previous use
     assert await _stamp() == 9 * DAY  # every recall re-stamps
 
     # A miss (wrong owner) must not stamp anything.
-    assert await store.get_search_preset(preset_id="p-p", owner="mallory", now=99 * DAY) is None
+    assert (
+        await store.get_search_preset(preset_id="p-p", owner_user_id="mallory", now=99 * DAY)
+        is None
+    )
     assert await _stamp() == 9 * DAY
 
 
@@ -394,7 +399,7 @@ async def test_reopening_a_pre_306_db_migrates_last_used_at_in(tmp_path) -> None
         async with s._read() as db:
             cur = await db.execute("PRAGMA table_info(search_presets)")
             assert "last_used_at" in {r["name"] for r in await cur.fetchall()}
-        got = await s.get_search_preset(preset_id="p-carried-over", owner="alice", now=1.0)
+        got = await s.get_search_preset(preset_id="p-carried-over", owner_user_id="alice", now=1.0)
         assert got is not None  # the row survived the ALTER with its criteria intact
         # NULL last_used_at at purge time (undo the recall stamp above) still ages out on updated_at.
         async with s._lock:
