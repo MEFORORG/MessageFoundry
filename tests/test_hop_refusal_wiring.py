@@ -22,6 +22,7 @@ from messagefoundry.config.wiring import (
     Registry,
     build_outbound_connection,
 )
+from messagefoundry.pipeline.wiring_runner import WiringError, check_inbound_revocation
 
 
 # --- decision 2: the escape clamp (MEFOR_ALLOW_INSECURE_TLS downgrades REFUSE->WARN, non-enforcing) ---
@@ -437,3 +438,86 @@ def test_logging_forward_hop_attestation_also_requires_a_reason() -> None:
         forward_hop_attested=True, forward_hop_attested_reason="management segment is isolated"
     )
     assert ok.forward_hop_attested is True
+
+
+# --- BACKLOG #1005 scope 3: the revocation-gap refusal ------------------------------------------
+#
+# The revocation sibling of the cleartext exposed-gate above, and it fires on the OPPOSITE
+# condition: those refuse a listener with NO TLS, this refuses one whose TLS is correct but whose
+# client certificates are never checked for revocation. Measured on this tree, a revoked-but-
+# chain-valid client is ACCEPTED, so a partner certificate revoked this morning would keep
+# authenticating until its notAfter.
+
+
+def _mtls(**overrides: object) -> Source:
+    """An MLLP listener with mTLS ON. Paths are never opened by the gate -- it reads settings only."""
+    settings: dict[str, object] = {"tls": True, "tls_cert_file": "c.pem", "tls_ca_file": "ca.pem"}
+    settings.update({k: v for k, v in overrides.items() if k != "attested"})
+    return Source(
+        type=ConnectorType.MLLP,
+        settings=settings,
+        tls_revocation_attested=bool(overrides.get("attested", False)),
+    )
+
+
+_PHI_ENFORCING = HopPosture(is_phi=True, enforcing=True)
+
+
+def test_mtls_without_a_crl_is_refused_on_an_enforcing_phi_instance() -> None:
+    # THE CONTROL ITSELF. Everything below is a rung of its escape ladder, so this must fail first
+    # or none of them mean anything.
+    with pytest.raises(WiringError, match="no revocation"):
+        check_inbound_revocation(_mtls(), "IB_PARTNER", posture=_PHI_ENFORCING)
+
+
+def test_a_configured_crl_passes() -> None:
+    # POSITIVE CONTROL: the refusal can be SATISFIED, not merely avoided. Without this the test
+    # above would pass equally well against a gate that refuses every mTLS listener.
+    check_inbound_revocation(_mtls(tls_crl_file="ca_and_crl.pem"), "IB", posture=_PHI_ENFORCING)
+
+
+def test_the_per_connection_attestation_passes() -> None:
+    # The surgical opt-in: a site whose PKI checks revocation OUTSIDE the engine declines the
+    # in-engine control without being refused. Mirrors Destination.tls_revocation_attested, and
+    # every sibling refusal here pairs with an attestation.
+    check_inbound_revocation(_mtls(attested=True), "IB", posture=_PHI_ENFORCING)
+
+
+def test_a_non_phi_instance_warns_rather_than_refusing() -> None:
+    check_inbound_revocation(_mtls(), "IB", posture=HopPosture(is_phi=False, enforcing=True))
+
+
+def test_a_non_enforcing_instance_warns_rather_than_refusing() -> None:
+    check_inbound_revocation(_mtls(), "IB", posture=HopPosture(is_phi=True, enforcing=False))
+
+
+def test_an_unstamped_posture_never_acquires_a_new_refusal() -> None:
+    # posture=None means the check ran OUTSIDE the enforced gate -- a direct or embedding call.
+    # The sibling makes the same promise, and it is what keeps this an ADD at the enforced surface
+    # rather than a new refusal for callers who never opted into the gate.
+    check_inbound_revocation(_mtls(), "IB", posture=None)
+
+
+def test_tls_without_mtls_is_not_a_revocation_gap() -> None:
+    # PLACEMENT GUARD: no tls_ca_file means no client certificate is requested, so there is nothing
+    # whose revocation could matter. Refusing here would demand a CRL from every TLS listener.
+    src = Source(type=ConnectorType.MLLP, settings={"tls": True, "tls_cert_file": "c.pem"})
+    check_inbound_revocation(src, "IB", posture=_PHI_ENFORCING)
+
+
+def test_a_connector_with_no_mtls_surface_is_ignored() -> None:
+    # Raw TCP/X12 have no TLS option at all, so they cannot hold a client certificate to revoke.
+    src = Source(type=ConnectorType.TCP, settings={"tls": True, "tls_ca_file": "ca.pem"})
+    check_inbound_revocation(src, "IB", posture=_PHI_ENFORCING)
+
+
+def test_the_dimse_and_http_listeners_are_covered_too() -> None:
+    # The item's whole point is that an HTTP proxy can terminate neither MLLP framing nor DIMSE, so
+    # for those the documented out-of-engine delegation does not reach. Both must be gated.
+    for connector in (ConnectorType.DIMSE, ConnectorType.HTTP):
+        src = Source(
+            type=connector,
+            settings={"tls": True, "tls_cert_file": "c.pem", "tls_ca_file": "ca.pem"},
+        )
+        with pytest.raises(WiringError, match="no revocation"):
+            check_inbound_revocation(src, f"IB_{connector.name}", posture=_PHI_ENFORCING)

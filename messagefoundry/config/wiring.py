@@ -1068,6 +1068,8 @@ def MLLP(
     | None = None,  # passphrase for an ENCRYPTED tls_key_file (put the secret in env())
     tls_ca_file: str
     | None = None,  # trust anchor — inbound: verify client certs (mTLS); outbound: verify server
+    tls_crl_file: str
+    | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005) — CA bundle + CRL, PEM
     tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able → needs MEFOR_ALLOW_INSECURE_TLS)
     tls_check_hostname: bool = True,  # OUTBOUND: require the server cert to match `host`
     tls_allow_expired: bool = False,  # OUTBOUND: honour an EXPIRED server cert (chain+hostname still verified; #129)
@@ -1183,6 +1185,7 @@ def MLLP(
             "tls_key_file": tls_key_file,
             "tls_key_password": tls_key_password,
             "tls_ca_file": tls_ca_file,
+            "tls_crl_file": tls_crl_file,
             "tls_verify": tls_verify,
             "tls_check_hostname": tls_check_hostname,
             "tls_allow_expired": tls_allow_expired,
@@ -1350,6 +1353,8 @@ def Http(
     | EnvRef
     | None = None,  # passphrase for an ENCRYPTED tls_key_file (put the secret in env())
     tls_ca_file: str | None = None,  # trust anchor — opt-in mTLS (require + verify a client cert)
+    tls_crl_file: str
+    | None = None,  # opt-in CRL for mTLS client certs (#1005) — CA bundle + CRL, PEM
     # --- Intake authentication (ADR 0154 D6) — a PEER control on this connector, not admin RBAC ---
     intake_auth: Literal[
         "none", "api_key", "bearer", "mtls_subject"
@@ -1460,6 +1465,7 @@ def Http(
         "tls_key_file": tls_key_file,
         "tls_key_password": tls_key_password,
         "tls_ca_file": tls_ca_file,
+        "tls_crl_file": tls_crl_file,
         "intake_auth": intake_auth,
         "intake_api_key": intake_api_key,
         "intake_api_key_next": intake_api_key_next,
@@ -2191,6 +2197,9 @@ def DICOM(
     tls_ca_file: str
     | EnvRef
     | None = None,  # opt-in mTLS: require + verify a calling peer's client cert
+    tls_crl_file: str
+    | EnvRef
+    | None = None,  # opt-in CRL for mTLS client certs (#1005) — CA bundle + CRL, PEM
     tls_allow_expired: bool = False,  # OUTBOUND SCU: honour an EXPIRED PACS cert (chain+hostname still verified; #129)
     max_object_bytes: int | None = 128 * 1024 * 1024,  # per-C-STORE-object cap; over-cap → DIMSE
     # failure BEFORE the durable commit (the X12 max_interchange_bytes analog; OOM/DoS guard, §9)
@@ -2234,6 +2243,7 @@ def DICOM(
             "tls_key_file": tls_key_file,
             "tls_key_password": tls_key_password,
             "tls_ca_file": tls_ca_file,
+            "tls_crl_file": tls_crl_file,
             "tls_allow_expired": tls_allow_expired,
             "max_object_bytes": max_object_bytes,
             "max_associations": max_associations,

@@ -336,3 +336,69 @@ def test_a_setext_heading_underline_is_NOT_read_as_a_conflict_marker() -> None:
     text = "A Heading\n=======\n\n## 1. An item\n\nprose\n"
     items = bsc.parse_items(text)
     assert [it.num for it in items] == [1]
+
+
+# --- BACKLOG #1259: the refusal must reach the COMMIT path, and reach it as a REPORT -------------
+
+
+def test_a_conflicted_source_is_reported_with_its_PATH_not_raised(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``main`` must NAME THE FILE and exit 1, rather than let the ValueError escape.
+
+    Two costs, and the second is the one that matters. A traceback reads as *the checker is broken*
+    rather than *your ledger is conflicted*, which sends an author to the wrong file. And the
+    exception carries a LINE number but no PATH, so with several sources scanned it does not say
+    which one to open -- and this checker scans the published ledger plus every archive file by
+    default.
+    """
+    ledger = tmp_path / "BACKLOG.md"
+    ledger.write_text(
+        "## 1. An item\n\n<<<<<<< HEAD\nmine\n=======\ntheirs\n>>>>>>> other\n", encoding="utf-8"
+    )
+    assert bsc.main(["--backlog", str(ledger)]) == 1
+    err = capsys.readouterr().err
+    assert "BACKLOG.md" in err, "the report must name which source is conflicted"
+    assert "conflict marker" in err
+    assert "Traceback" not in err
+
+
+def test_a_clean_source_still_passes(tmp_path: Path) -> None:
+    """The negative control. A gate that fires on the healthy case is one everybody learns to skip."""
+    ledger = tmp_path / "BACKLOG.md"
+    ledger.write_text("## 1. An item\n\n> \U0001f6a7 open\n\nprose\n", encoding="utf-8")
+    assert bsc.main(["--backlog", str(ledger), "--quiet"]) == 0
+
+
+def test_the_checker_is_WIRED_to_the_commit_path() -> None:
+    """The whole of what #1259 had left, and it is a wiring fact rather than a code one.
+
+    The refusal shipped and protected programmatic readers and CI, while NOTHING called it before a
+    commit. Measured at dd655da2 against a docs/BACKLOG.md carrying a realistic PROSE-level conflict:
+    every wired hook passed, overall rc 0. Asserted on the config rather than by running pre-commit,
+    because the executable resolves from the PRIMARY checkout's venv and is absent from a lane venv --
+    a test that shelled out would skip silently in exactly the trees this repo is developed in.
+
+    A conflict that ADDS A HEADING is already caught incidentally by the ledger gate (both sides'
+    numbers read as unallocated), which is why the case that needed covering is the prose one.
+    """
+    raw = (Path(__file__).resolve().parents[1] / ".pre-commit-config.yaml").read_text(
+        encoding="utf-8"
+    )
+    # Read the DIRECTIVES, never the raw text. Both assertions below name strings this file's own
+    # explanatory comments also contain, and the first draft of this test FAILED on its own prose --
+    # which is the same no-inline-code-stripping shape that makes a certain CI grep read a quoted
+    # token as a claim. A substring check over a commented config cannot tell a wiring from a note
+    # explaining why that wiring was NOT chosen.
+    directives = [
+        line.split("#", 1)[0] for line in raw.splitlines() if line.split("#", 1)[0].strip()
+    ]
+    body = "\n".join(directives)
+    assert "backlog_status_check.py" in body, (
+        "the ledger parse check is not wired into .pre-commit-config.yaml, so a conflicted "
+        "docs/BACKLOG.md commits with every gate green (BACKLOG #1259)"
+    )
+    assert "check-merge-conflict" not in body, (
+        "a generic textual matcher is a SECOND definition of what a readable ledger is; "
+        "CLAUDE.md section 11 requires this file be read through parse_items and nothing else"
+    )

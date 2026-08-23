@@ -2199,6 +2199,10 @@ class RegistryRunner:
             allow_insecure_bind=self._allow_insecure_bind,
             posture=self._hop_posture,
         )
+        # #1005: the revocation sibling of the four gates above. Separate because it fires on the
+        # opposite condition -- those refuse a listener with NO TLS, this one refuses a listener
+        # whose TLS is correct but whose client certificates are never checked for revocation.
+        check_inbound_revocation(source_cfg, ic.name, posture=self._hop_posture)
         # ADR 0154 D7, immediately after its confidentiality sibling and deliberately separate from it:
         # check_http_tls_exposure returns early whenever tls is truthy, which is exactly the case an
         # authentication requirement most needs to cover. No allow_insecure_bind is passed — a
@@ -6745,6 +6749,81 @@ def _inbound_insecure_bind_permitted(
     if posture is None:
         return True  # un-postured (direct/embedding) call: preserve the shipped warn (see above)
     return not (posture.enforcing and posture.is_phi)
+
+
+def _inbound_revocation_gap_permitted(*, attested: bool, posture: HopPosture | None) -> bool:
+    """Whether a VERIFYING inbound mTLS listener that checks NO revocation may bind (warn-and-cross)
+    rather than being REFUSED (BACKLOG #1005). The revocation sibling of
+    :func:`_inbound_insecure_bind_permitted`, and deliberately the same three rungs in the same order.
+
+    A per-connection ``tls_revocation_attested`` permits it -- the operator declaring that a
+    revocation-checking PKI covers these certificates outside the engine, exactly as the outbound
+    ``Destination.tls_revocation_attested`` does for a verified outbound hop.
+
+    An **unstamped** posture (``None``) permits it, for the same reason the sibling does: the check
+    ran outside the ENFORCED gate, so this is a direct / embedding call and must never acquire a new
+    refusal there. Otherwise it is refused only on an instance that is BOTH enforcing AND PHI --
+    every other instance warns and crosses.
+
+    There is deliberately NO blunt process-wide escape here. ``MEFOR_ALLOW_INSECURE_TLS`` governs
+    weakened TLS, and a listener that verifies its peers correctly but does not check revocation is
+    not a weakened-TLS hop; reusing that escape would let one env var silence a control it was never
+    scoped to."""
+    if attested:
+        return True
+    if posture is None:
+        return True  # un-postured (direct/embedding) call: never a new refusal (see above)
+    return not (posture.enforcing and posture.is_phi)
+
+
+def check_inbound_revocation(
+    source: Source, name: str, *, posture: HopPosture | None = None
+) -> None:
+    """Exposed-gate sibling (BACKLOG #1005, ASVS 12.1.4 band B1): refuse an mTLS listener that
+    verifies client certificates but checks NO revocation, on an enforcing production-PHI instance.
+
+    **Measured on this tree**: the three server builders load a CA, set ``CERT_REQUIRED`` and finish
+    with ``harden_verify_flags`` -- strict RFC 5280 path validation, NOT revocation -- so a client
+    certificate revoked this morning keeps authenticating until its ``notAfter``. Set
+    ``tls_crl_file`` on the connection (a PEM carrying the CA and its CRL), or declare
+    ``tls_revocation_attested=true`` if your PKI checks revocation outside the engine.
+
+    **Why this refusal cannot be delegated away for two of the three listeners.**
+    ``harden_verify_flags``' own docstring delegates live revocation to the deploying org -- OCSP
+    must-staple at a proxy plus the OS trust store. That is credible for the API/UI surface. **An
+    HTTP proxy can terminate neither MLLP framing nor DIMSE**, so for those two the named delegation
+    does not reach and no workaround remains.
+
+    Applies only where an mTLS listener exists: MLLP (which also serves the inbound HTTP listener),
+    HTTP and DIMSE. Raw TCP/X12 have no TLS option at all, so they cannot have a client certificate
+    to revoke."""
+    if source.type not in (ConnectorType.MLLP, ConnectorType.HTTP, ConnectorType.DIMSE):
+        return
+    settings = source.settings
+    # No mTLS means no client certificate is requested, so there is nothing whose revocation could
+    # matter -- the same composition rule the outbound verify-off arm states.
+    if not settings.get("tls") or not settings.get("tls_ca_file"):
+        return
+    if settings.get("tls_crl_file"):
+        return
+    if _inbound_revocation_gap_permitted(attested=source.tls_revocation_attested, posture=posture):
+        log.warning(
+            "inbound %r requires and verifies a client certificate (mTLS) but checks NO revocation: "
+            "a revoked partner certificate would keep authenticating until its notAfter. Set "
+            "tls_crl_file on the connection, or tls_revocation_attested=true if your PKI checks "
+            "revocation outside the engine.",
+            name,
+        )
+        return
+    raise WiringError(
+        f"inbound connection {name!r} requires and verifies a client certificate (mTLS) but checks "
+        "no revocation, on an enforcing production-PHI instance; a partner certificate revoked "
+        "today would keep authenticating to this interface until its notAfter. Set tls_crl_file "
+        "(a PEM carrying the CA and its CRL) on the connection, or set "
+        "tls_revocation_attested=true if a revocation-checking PKI covers these certificates "
+        "outside the engine. An HTTP proxy can terminate neither MLLP nor DIMSE, so for those "
+        "listeners the documented out-of-engine delegation does not reach."
+    )
 
 
 def check_mllp_tls_exposure(
