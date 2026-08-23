@@ -680,23 +680,65 @@ def test_the_victim_is_folded_before_it_reaches_the_deny_reason(
     [
         'p="{wt}"; git worktree remove "$p"',
         'p=../Primary-wt; git worktree remove "$p"',
+        'p={wt}; git worktree remove "${{p}}"',
+        'set p={wt}& git worktree remove "%p%"',
     ],
 )
-def test_indirection_through_a_shell_variable_is_a_KNOWN_open_residual(
+def test_indirection_through_a_literal_assignment_is_resolved_and_DENIED(
     repo: SimpleNamespace, tmp_path: Path, command: str
 ) -> None:
-    """A PINNED RESIDUAL, asserting ALLOW, and that is NOT an endorsement.
+    """REPLACES A PINNED ALLOW (BACKLOG #1059), on that pin's own instructions.
 
-    The victim token here is ``$p``. Its value is a runtime fact, and this hook inspects a tool
-    ARGUMENT before anything runs -- no static resolver can follow it, and the gate's own .SYNOPSIS
-    already says it is a guardrail rather than a security boundary. So this is a limit of the shape,
-    not an oversight, and the #1064 fix does not close it.
+    The residual this replaces said a variable's value "is a runtime fact ... no static resolver can
+    follow it". THAT IS TRUE OF COMPUTED VALUES AND WAS NEVER TRUE OF THE CASES IT PINNED: both
+    assigned from a LITERAL, in the same line the gate was already holding. A segment here is a line,
+    so the assignment was never elsewhere in the process -- it was in the string under the scanner.
 
-    It is pinned because the alternative is silence, and silence reads as coverage. If this ever
-    reds, somebody taught the gate to follow a variable: delete this test and the residual note in
-    the gate. Do NOT restore the ALLOW."""
+    The justification was broader than its own test data, which is why two gate versions passed over
+    it. The pin was right to exist; silence would have been worse. It was wrong about its scope.
+    """
+    foreign = repo.other
+    reason = assert_denied(run_gate(shell(command.format(wt=repo.wt), cwd=foreign), repo.repos))
+    assert "$p" not in reason and "%p%" not in reason, (
+        "the deny reason names the VARIABLE rather than the path it resolved to. An operator cannot "
+        "act on `$p`, and a remedy nobody can follow is routed around -- resolve before interpolating."
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(
+            'p=$(printf %s ../Primary-wt); git worktree remove "$p"', id="command-substitution"
+        ),
+        pytest.param(
+            'q=../Primary-wt; p=$q; git worktree remove "$p"', id="variable-from-variable"
+        ),
+        pytest.param('git worktree remove "$P_FROM_ENV"', id="no-assignment-in-this-line"),
+        pytest.param(
+            "p=../Primary-wt" + chr(10) + 'git worktree remove "$p"',
+            id="assignment-on-an-earlier-line",
+        ),
+    ],
+)
+def test_indirection_the_resolver_CANNOT_follow_still_allows(
+    repo: SimpleNamespace, tmp_path: Path, command: str
+) -> None:
+    """THE NEGATIVE CONTROL (BACKLOG #1000), and it is the half that proves the fix is SCOPED.
+
+    Every case here is a genuine runtime fact: computed, indirected through a second variable, taken
+    from the environment, or assigned on a different line than the one the gate is holding. The
+    resolver returns null for each and the caller keeps existing behaviour.
+
+    ASSERTING ALLOW IS NOT AN ENDORSEMENT, exactly as the pin it descends from was not. It records
+    that the residual SURVIVES for computed values, and it is what stops a later "improvement" from
+    quietly guessing: if one of these ever denies, somebody taught the gate to invent a value.
+
+    Without this, a fix that denied EVERY sigil unconditionally would pass the positive test above
+    and look complete -- while breaking `git worktree remove "$HOME/scratch"` for every operator.
+    """
     foreign = repo.other
     assert run_gate(shell(command.format(wt=repo.wt), cwd=foreign), repo.repos) is None, (
-        "indirection now DENIES. If that was deliberate, delete this test and the residual note in "
-        "the gate; do not restore the ALLOW to make it pass."
+        "the gate resolved something it cannot know. A value computed at runtime is not available to "
+        "a hook inspecting an argument BEFORE anything runs -- denying here is guessing, not closing."
     )
