@@ -13927,12 +13927,25 @@ heredoc bodies gain their own segment kind.
 ## 1333. Legacy glyphs freeze security-record cells against correction, while the repair path skips the same check
 
 > 🔢 **Filed 2026-08-23 - not started.** 20 of 345 cells carry a banned glyph in prose written BEFORE the gate that now bans it, so each is frozen against every residual correction, by anyone, until the glyphs are removed. The same check is SKIPPED on the repair path, so the record is fully repairable and only partly correctable.
-> Verdict: owner-ruling
+> Verdict: build
 > Research: none
-> Closing-act: owner-ruling
+> Closing-act: code
 
-**Cluster:** record-maintenance tooling. **Priority:** P2. **Verdict:** owner-ruling -- the fix
-direction is a decision, not a build, and the tracking seat correctly declined to take it.
+**VERDICT CORRECTED 2026-08-23, from `owner-ruling` to `build`, and the reason is a measurement rather
+than a reconsideration.** This row was filed expecting the glyphs to be spread across prose fields,
+which would have made the strip a migration across a security record and genuinely somebody's decision.
+**Measured afterwards: all 181 are in ONE field, zero elsewhere**, and the writer reads only that
+field -- so a strip touching it alone unfreezes every affected cell. **Twenty cells, one field each, no
+verdict moves, no anchors touched.**
+
+***AND THE DECIDING ARGUMENT IS THAT NO NEW RULING IS NEEDED: CLAUDE.md section 11 ALREADY BANS THESE
+GLYPHS.*** Stripping them EXECUTES an existing ruling. **The only direction that would need the owner is
+the other one** -- exempting pre-existing glyphs from the check, which asks the owner to carve an
+exception into their own rule. **Option 2 below is therefore the one with an owner cost, and it is no
+longer the cheaper path.**
+
+**Cluster:** record-maintenance tooling. **Priority:** P2. **Verdict:** build -- the strip is mechanical
+maintenance of the record, owned by the seat that owns the record.
 **Severity:** no deployment axis. **Conditional, per section 0:** zero deployments; this blocks
 maintenance of a security record, not any running thing.
 
