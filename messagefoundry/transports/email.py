@@ -210,6 +210,20 @@ class EmailDestination(DestinationConnector):
             # whose revocation status could matter, and the composition rule forbids two gates deciding
             # the same hop (docs/DEPLOYMENT.md §"composition"). The refusal above is that hop's gate.
         else:
+            # BACKLOG #1314: the THIRD weakening axis. The chain IS verified here, but with
+            # `tls_check_hostname=false` the peer NAME is not, so any certificate chaining to the
+            # configured anchor is accepted whatever it was issued to -- the AUTH exchange then
+            # hands the credential to a peer whose identity was never established.
+            #
+            # ABSOLUTE, like the two arms above, and deliberately keyed on no escape: in both of
+            # them the escape governs the BODY posture and never the CREDENTIAL. A third arm keeps
+            # that split, so a hop cannot attest its way to a credentialed unverified-name session.
+            if not self.tls_check_hostname and self.username is not None:
+                raise ValueError(
+                    "Email destination sends SMTP AUTH credentials over a TLS session whose peer NAME is "
+                    "unverified (tls_check_hostname=false); refused — credentials require a "
+                    "session bound to the host, not merely to the trust anchor"
+                )
             # #201 (ADR 0078 amendment): the hop now genuinely verifies the server cert (#323 — it did
             # not before; smtplib's default context is ssl._create_unverified_context), but stdlib ssl
             # does NO OCSP/CRL revocation, so a revoked-but-unexpired SMTP-server cert is still

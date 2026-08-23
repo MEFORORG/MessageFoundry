@@ -31,6 +31,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from messagefoundry.config.tls_policy import harden_cipher_suites
 from messagefoundry.redaction import redact
 
 __all__ = [
@@ -314,6 +315,10 @@ def _build_tls_context(forward: SyslogForward) -> ssl.SSLContext:
     if forward.tls_client_cert is not None:
         # Mutual TLS: a single PEM carrying both the client cert and its key (keyfile defaults to it).
         ctx.load_cert_chain(certfile=forward.tls_client_cert)
+    # Assert forward secrecy LAST, so it sees the final suite list (ASVS 12.1.2). This runs on the
+    # tls_verify=False arm too: that opt-out drops peer AUTHENTICATION, and the log records still cross
+    # the network encrypted, so the suite list still decides whether a recorded session stays private.
+    harden_cipher_suites(ctx, connector="syslog TLS forwarder")
     return ctx
 
 

@@ -768,6 +768,15 @@ class ApiSettings(_Section):
     tls_ciphers: str | None = None
     # Optional CA bundle to verify CLIENT certs (mTLS for the console; opt-in, future).
     tls_client_ca_file: str | None = None
+    #: Opt-in CRL for the mTLS client certificates `tls_client_ca_file` verifies (BACKLOG #1005).
+    #: A PEM carrying the CA **and** its CRL. Absent, client certificates are verified for chain
+    #: and RFC 5280 conformance but NOT for revocation -- measured, a revoked-but-chain-valid
+    #: client is ACCEPTED. Set it and a revoked partner certificate is refused at the handshake.
+    #:
+    #: **An expired CRL refuses EVERY client, not only revoked ones**, so this is read at startup
+    #: and refused loudly there rather than at the first partner handshake. See
+    #: :func:`~messagefoundry.config.tls_policy.harden_crl_check`.
+    tls_client_crl_file: str | None = None
     # WP #285 (ASVS 6.7.1): optional SHA-256 pin over the mTLS client-CA trust anchor above. Set to the
     # lowercase-hex SHA-256 of the PEM file's bytes; the loaded anchor's fingerprint is checked against
     # it at construction AND at reload and a mismatch REFUSES to start — always, independent of

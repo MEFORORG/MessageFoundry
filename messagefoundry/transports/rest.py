@@ -47,9 +47,11 @@ from messagefoundry.config.tls_policy import (
     HopPosture,
     InsecureHopRefused,
     RevocationHopGuard,
+    build_asserted_https_handler,
     cleartext_acceptance_audit_sink,
     current_hop_posture,
     enforce_insecure_hop,
+    harden_cipher_suites,
     insecure_hop_disposition,
     is_loopback_hop_host,
     relax_verify_expiry,
@@ -226,8 +228,21 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-# Shared opener that verifies TLS (urllib's default context) and never follows redirects.
-_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+def _asserted_https_handler() -> urllib.request.HTTPSHandler:
+    """urllib's own default https handler for this connector family, with its context ASSERTED.
+
+    ``build_opener(_NoRedirectHandler)`` alone leaves urllib to fill in the ``HTTPSHandler``, and the
+    context that handler builds is one the engine never names — so the default REST / FHIR /
+    DICOMweb / ``fhir_lookup`` egress path, which every HTTP-family destination falls back to unless
+    it needs a proxy, an escape or an expiry relaxation, had an inherited suite list that nothing
+    checked. Naming the handler here lets
+    :func:`~messagefoundry.config.tls_policy.harden_cipher_suites` run on the context it carries.
+
+    It does NOT substitute a context: urllib's own is asserted in place. See
+    :func:`~messagefoundry.config.tls_policy.build_asserted_https_handler` for the measurement that
+    forced that choice — a hand-built ``ssl.create_default_context()`` differs from urllib's on ALPN
+    and post-handshake auth, so passing one would have changed the handshake."""
+    return build_asserted_https_handler(connector="HTTP-family destination (REST/FHIR/DICOMweb)")
 
 
 def _no_redirect_opener(
@@ -239,7 +254,17 @@ def _no_redirect_opener(
     opener is **never** mutated (ADR 0126). Passing a ``ProxyHandler`` here also suppresses urllib's
     default env-reading ProxyHandler (``build_opener`` skips a default whose class a supplied handler
     already covers), so there is never a competing double-proxy."""
-    return urllib.request.build_opener(_NoRedirectHandler, *extra_handlers)
+    return urllib.request.build_opener(
+        _NoRedirectHandler, _asserted_https_handler(), *extra_handlers
+    )
+
+
+# Shared opener that verifies TLS and never follows redirects, reused by every connection that needs
+# no extra handler. Built through _no_redirect_opener with no extras rather than repeating the
+# expression, so there is exactly ONE construction of this opener to keep asserted. Handler-for-handler
+# identical to the previous `build_opener(_NoRedirectHandler)`: build_opener would have added an
+# HTTPSHandler of its own, and this supplies the same class built the same way.
+_NO_REDIRECT_OPENER = _no_redirect_opener()
 
 
 def _insecure_opener(
@@ -250,6 +275,9 @@ def _insecure_opener(
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    # Verification is off, but the traffic is still encrypted, so the suite list still matters: assert
+    # forward secrecy here too (ASVS 12.1.2), after the verify-off configuration is applied.
+    harden_cipher_suites(ctx, connector="HTTP-family destination (TLS verification disabled)")
     return urllib.request.build_opener(
         _NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx), *extra_handlers
     )
@@ -267,6 +295,7 @@ def _expiry_relaxed_opener(
     still rejected. Shared verbatim by the SOAP destination."""
     ctx = ssl.create_default_context()
     relax_verify_expiry(ctx, host=host)  # chain + hostname stay enforced; only expiry is relaxed
+    harden_cipher_suites(ctx, connector="HTTP-family destination (expired-certificate tolerance)")
     return urllib.request.build_opener(
         _NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx), *extra_handlers
     )
@@ -1366,7 +1395,10 @@ class RestDestination(DestinationConnector):
                 )
             if self._opener is _NO_REDIRECT_OPENER:
                 # Rebuild a per-connection verifying opener so add_handler never touches the shared one.
-                self._opener = urllib.request.build_opener(_NoRedirectHandler)
+                # Through _no_redirect_opener, not a bare build_opener: the bare form lets urllib
+                # fill in an HTTPSHandler whose context the engine never names, so the forward-secrecy
+                # assertion cannot reach this hop (ASVS 12.1.2).
+                self._opener = _no_redirect_opener()
             self._opener.add_handler(digest)
         if self._ech_sidecar is not None:
             # ECH mode (ADR 0139): the engine->sidecar hop is cleartext http over loopback (the sidecar

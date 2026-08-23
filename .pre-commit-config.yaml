@@ -151,6 +151,36 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      # BACKLOG #1259: the ledger must PARSE at commit time, not only in CI.
+      #
+      # `parse_items` refuses a source carrying conflict markers, and that refusal landed -- but it
+      # protected only programmatic readers and the CI leg. NOTHING called it on the commit path.
+      # MEASURED at dd655da2 against a docs/BACKLOG.md carrying a realistic prose-level conflict:
+      # every wired hook PASSED, overall rc 0, so the conflicted ledger commits cleanly, while the
+      # checker itself exits 1 on the same file. The capability existed and was simply not wired.
+      #
+      # NOT `pre-commit/pre-commit-hooks`' check-merge-conflict, and the reason is not dependency
+      # squeamishness. That repo is absent from this config, so it would be a NEW third-party source
+      # with its own pinned rev -- but the deciding argument is SINGLE SOURCE: `parse_items` *defines*
+      # what a readable ledger is, and CLAUDE.md section 11 requires this file be read through it and
+      # never through a hand-rolled scan. A generic textual matcher is exactly that second, silently
+      # different definition, and it would drift from the one every other reader uses.
+      #
+      # SCOPED TO THE LEDGER FILES, not always_run: the checker reads the whole namespace itself, so
+      # running it on unrelated commits buys nothing and spends the credibility a gate needs on the
+      # day it fires. `pass_filenames: false` because it resolves its own sources -- feeding it a
+      # staged path list would narrow the corpus that `--min-items` exists to protect.
+      #
+      # A CONFLICT THAT ADDS A HEADING IS ALREADY CAUGHT, INCIDENTALLY, BY THE GATE ABOVE -- both
+      # sides' `## N.` headings read as unallocated numbers. That is why the measurement above uses a
+      # PROSE conflict: it is the case nothing covers, and testing the heading case instead would
+      # have shown a green gate and concluded there was no defect.
+      - id: backlog-parses
+        name: backlog ledger parses (conflict markers)
+        entry: python scripts/docs/backlog_status_check.py --quiet
+        language: system
+        pass_filenames: false
+        files: ^docs/(BACKLOG\.md|archive/backlog/.*\.md)$
       # Leak guard (always on): keep customer/PHI-adjacent strings -- partner names, site data,
       # routable host IPs, internal worktree slugs and absolute home paths -- out of the TRACKED tree
       # so they can never reach this public repo. Mirrors the CI forbidden-content gate.

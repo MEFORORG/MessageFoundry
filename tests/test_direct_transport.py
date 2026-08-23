@@ -470,3 +470,26 @@ def test_direct_factory_exported(pki: dict[str, Any]) -> None:
     assert spec.settings["host"] == "hisp.partner.example"
     assert spec.settings["port"] == 587
     assert "Direct" in mf.__all__
+
+
+def test_check_hostname_false_refuses_credentials(pki: dict[str, Any]) -> None:
+    # BACKLOG #1314, the THIRD weakening axis, mirroring the EMAIL connector. The chain IS
+    # verified but the peer NAME is not, so any certificate chaining to the trust anchor is
+    # accepted whatever it was issued to, and the AUTH exchange goes to an unidentified peer.
+    #
+    # This connector had NO else arm before #1314 -- the branch is new, so these three tests are
+    # the only thing standing between it and a silent no-op.
+    with pytest.raises(ValueError, match="tls_check_hostname=false"):
+        DirectDestination(_dest(pki, tls_check_hostname=False, username="svc", password="pw"))
+
+
+def test_check_hostname_false_without_credentials_still_constructs(pki: dict[str, Any]) -> None:
+    # NEGATIVE CONTROL: the gate is keyed on the CREDENTIAL, not on the posture. Widening it to a
+    # name-unchecked hop carrying no username is the "must not widen the existing arms" failure.
+    DirectDestination(_dest(pki, tls_check_hostname=False))
+
+
+def test_credentials_over_a_fully_verified_hop_still_construct(pki: dict[str, Any]) -> None:
+    # POSITIVE CONTROL: proves the new gate can be PASSED, so the refusal test above is not green
+    # merely because DirectDestination rejects every credentialed construction.
+    DirectDestination(_dest(pki, username="svc", password="pw"))

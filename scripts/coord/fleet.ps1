@@ -274,6 +274,34 @@ if ($liveWithoutRecord.Count -gt 0) { $stops += "liveSessionsWithoutRecord=$($li
 if ($records.Count -eq 0 -and $heartbeats.Count -eq 0) { $stops += 'recordsExamined=0 AND writerHeartbeatIn=0 -- indistinguishable from a writer that was never installed' }
 if ($null -ne $originMainAgeMinutes -and $originMainAgeMinutes -gt 60) { $stops += "originMainAgeMinutes=$originMainAgeMinutes -- origin/main has not been fetched recently; landed verdicts would be computed against a stale ref" }
 
+# POINTER CENSUS, resolved here rather than trusted from the records. Printed as a RATIO because the
+# numerator alone cannot be read: "1 dangling" is a crisis at 2 pointers and noise at 200. Measured
+# 2026-08-22 the ratio was 2 broken of 3 recorded against 262 records -- the denominator is the part
+# that says the mechanism is unused, and the numerator is the part that says the few uses are wrong.
+$ptrTotal = 0; $ptrDangling = 0; $ptrDrifted = 0; $ptrUnreadable = 0
+$ptrBoxes = @{}
+foreach ($o in $records) {
+    $h = $o.Rec.handoff
+    if (-not ($h -and $h.path)) { continue }
+    $ptrTotal++
+    # BOXES AS WELL AS RECORDS, because ONE SEAT CAN HOLD SEVERAL RECORDS AND THE COUNTS DIVERGE.
+    # A seat whose declaration landed in nosid.json and then re-declared under its session id leaves
+    # BOTH records in place, each carrying the same pointer -- measured 2026-08-22, 5 pointers across
+    # 4 boxes, with one box holding two records naming one file. Counting records answers "how many
+    # rows carry a pointer", which is right for the per-row render below. It is the WRONG denominator
+    # for "how many seats would be sent somewhere broken", and it inflates the moment anyone
+    # remediates. Both are printed so a reader can see 5-across-4 rather than inferring 5 seats.
+    $ptrBoxes[$o.Box] = $true
+    try {
+        if (-not (Test-Path -LiteralPath ([string]$h.path) -PathType Leaf)) { $ptrDangling++ }
+        elseif ($null -ne $h.bytes -and [long]$h.bytes -ne (Get-Item -LiteralPath ([string]$h.path) -EA Stop).Length) { $ptrDrifted++ }
+    } catch { $ptrUnreadable++ }
+}
+if ($ptrDangling -gt 0 -or $ptrDrifted -gt 0) {
+    $spread = if ($ptrBoxes.Count -ne $ptrTotal) { " across $($ptrBoxes.Count) seat(s) -- records exceed seats, so at least one seat holds duplicate records" } else { " across $($ptrBoxes.Count) seat(s)" }
+    $stops += "handoffPointersBroken=$($ptrDangling + $ptrDrifted) of $ptrTotal$spread -- a seat told to READ THE HANDOFF would be sent to a file that is missing or is no longer the one that was pointed at"
+}
+
 $receipt = [ordered]@{
     renderedAtUtc             = $now.ToString('yyyy-MM-ddTHH:mm:ssZ')
     seatsDir                  = $seatsDir
@@ -288,6 +316,11 @@ $receipt = [ordered]@{
     repoWorktrees             = $repoWorktrees.Count
     originMainSha             = $originMainSha
     originMainAgeMinutes      = $originMainAgeMinutes
+    handoffPointers           = $ptrTotal
+    handoffPointerSeats       = $ptrBoxes.Count
+    handoffPointersDangling   = $ptrDangling
+    handoffPointersDrifted    = $ptrDrifted
+    handoffPointersUnreadable = $ptrUnreadable
     stopConditions            = @($stops)
 }
 
@@ -367,8 +400,25 @@ if ($Chip) {
     if ($rec.handoff -and $rec.handoff.path) {
         $lines += ""
         $lines += "  4. READ THE HANDOFF: $($rec.handoff.path)"
-        if ($rec.handoff.PSObject.Properties.Name -contains 'unresolved' -and $rec.handoff.unresolved) {
-            $lines += "     WARNING: that path DID NOT RESOLVE when it was recorded. Treat it as a lead, not a document."
+        # RESOLVED HERE, AT RENDER, NOT READ OUT OF THE RECORD. seat.ps1 re-checks the pointer on
+        # every Stop, which covers a LIVE seat -- but the pointer most likely to be wrong belongs to
+        # a seat that will never run again, and a dead seat's writer cannot report its own decay.
+        # Measured 2026-08-22: the one DANGLING pointer on disk belongs to nice-payne-4dcee0, whose
+        # last turn ended 2026-08-19. Only a reader was ever going to catch it.
+        $hp = [string]$rec.handoff.path
+        $live = $null
+        try { if (Test-Path -LiteralPath $hp -PathType Leaf) { $live = (Get-Item -LiteralPath $hp -EA Stop).Length } }
+        catch { $live = $null }
+        $wasBytes = $rec.handoff.bytes
+        if ($null -eq $live) {
+            $lines += "     WARNING: THAT FILE IS NOT THERE NOW. Treat it as a lead, not a document."
+        }
+        elseif ($null -ne $wasBytes -and [long]$wasBytes -ne [long]$live) {
+            # Named separately because it is the failure that does NOT announce itself: the path
+            # opens, so nothing looks wrong, and the reader believes they were handed the document
+            # that was pointed at.
+            $lines += "     WARNING: THAT FILE HAS CHANGED SINCE IT WAS POINTED AT -- $wasBytes bytes recorded, $live now."
+            $lines += "     It still opens, so nothing else will tell you. Read it as current work, not as a settled handoff."
         }
     }
     $lines += ""
@@ -384,7 +434,21 @@ if ($Chip) {
 if ($Json) {
     [ordered]@{
         receipt = $receipt
-        rows    = @($rows | Select-Object Box, SessionKey, Seat, State, Fence, AgeHours, WriterStale, Branch, Worktree, Epoch)
+        # Handoff* are computed here, not read from the record: -Json is what another tool consumes,
+        # and a consumer that got the recorded flag would inherit the same never-re-checked value the
+        # human render stopped trusting above.
+        rows    = @($rows | Select-Object Box, SessionKey, Seat, State, Fence, AgeHours, WriterStale, Branch, Worktree, Epoch,
+            @{n = 'HandoffPath'; e = { if ($_.Rec.handoff) { [string]$_.Rec.handoff.path } else { $null } } },
+            @{n = 'HandoffState'; e = {
+                    $h = $_.Rec.handoff
+                    if (-not ($h -and $h.path)) { return $null }
+                    try {
+                        if (-not (Test-Path -LiteralPath ([string]$h.path) -PathType Leaf)) { return 'dangling' }
+                        if ($null -ne $h.bytes -and [long]$h.bytes -ne (Get-Item -LiteralPath ([string]$h.path) -EA Stop).Length) { return 'drifted' }
+                        return 'resolves'
+                    } catch { return 'unreadable' }
+                }
+            })
     } | ConvertTo-Json -Depth 8
     $code = if ($fenceAvailable) { 0 } else { 2 }
 exit $code
