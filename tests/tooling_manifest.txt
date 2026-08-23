@@ -75,6 +75,7 @@ tests/test_freethread_smoke_liveness.py
 tests/test_gate_installed_parity.py
 tests/test_gate_liveness.py
 tests/test_gate_rule_scan_agreement.py
+tests/test_gitleaks_credential_rule.py
 tests/test_ide_licence_packaging.py
 tests/test_incomplete_run_banner.py
 tests/test_install_gate_wiring.py
