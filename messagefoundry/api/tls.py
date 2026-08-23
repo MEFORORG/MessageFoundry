@@ -16,6 +16,7 @@ from messagefoundry.auth.trust_anchors import api_client_anchor_spec, enforce_an
 from messagefoundry.config.settings import ApiSettings
 from messagefoundry.config.tls_policy import (
     harden_cipher_suites,
+    harden_crl_check,
     harden_kex_groups,
     harden_verify_flags,
 )
@@ -60,4 +61,10 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
         enforce_anchor(client_ca, enforcing=enforcing)  # #285: pin + owner-only-DACL preflight
         ctx.load_verify_locations(cafile=api.tls_client_ca_file)
         ctx.verify_mode = ssl.CERT_REQUIRED
+        # Opt-in revocation (#1005). NOTE THE POSITION: harden_verify_flags runs ABOVE, before the
+        # CA is loaded, and this must NOT sit beside it. The CRL goes into the trust store, so
+        # loading it before the CA yields a context with the check flag set and zero CRLs -- which
+        # refuses EVERY client rather than skipping the check.
+        if api.tls_client_crl_file:
+            harden_crl_check(ctx, api.tls_client_crl_file)
     return ctx

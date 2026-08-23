@@ -127,6 +127,90 @@ function Write-WriterError {
     } catch { }
 }
 
+function Test-HandoffPointer {
+    <#
+    .SYNOPSIS
+        Re-check a recorded handoff pointer against the file it names, and return the pointer with a
+        live verdict beside the recorded values. NEVER throws and NEVER edits what was declared.
+
+    .DESCRIPTION
+        A POINTER WAS ONLY EVER CHECKED ONCE, AT -Declare. `unresolved` is set in that one branch and
+        no code path anywhere re-reads it, so a pointer that was true when recorded stays reported as
+        true forever. Measured 2026-08-22 over every record on disk: THREE pointers exist and TWO ARE
+        WRONG.
+
+            nice-payne-4dcee0-26279d9a  6232 bytes recorded, file absent      DANGLING
+            lander-5c09c3-6b54f797      6246 bytes recorded, 110001 on disk   DRIFTED
+            vigorous-hugle-802758-...   4801 bytes recorded, 4801 on disk     resolves
+
+        THE DRIFTED ONE IS THE WORSE DEFECT AND NOTHING REPORTED IT. A dangling pointer advertises its
+        own brokenness -- a reader opens nothing and knows. A drifted one resolves, so fleet.ps1 tells
+        an arriving seat "READ THE HANDOFF" for a document it believes is 6 KB and hands them 110 KB,
+        and that reads as a working reference for as long as the record survives. This is the same
+        shape as the stale-anchor rule in CLAUDE.md section 11: the evidence moved, and the citation
+        kept resolving to something.
+
+        RECORDED VALUES ARE NEVER REPAIRED. `path`, `bytes`, `sha256` and `pointedAt` are what the
+        declaring seat asserted; overwriting them with today's numbers would erase the drift instead
+        of reporting it, turning the instrument into the thing it exists to catch.
+
+        NO RE-HASH ON THIS PATH. The live pointer names a 110,001-byte file and this runs on every
+        Stop across every seat; size plus existence separates all three states and costs a stat.
+        sha256 is re-taken only under -Declare, where the seat is asserting a new pointer anyway.
+    #>
+    param($Pointer, [string]$Now)
+
+    # Reads one field off EITHER shape. -Declare builds an ordered hashtable and ConvertFrom-Json
+    # hands back a PSCustomObject, and a single -Declare turn runs this over both.
+    function Get-PointerField($Obj, [string]$Name) {
+        if ($null -eq $Obj) { return $null }
+        if ($Obj -is [System.Collections.IDictionary]) {
+            if ($Obj.Contains($Name)) { return $Obj[$Name] }
+            return $null
+        }
+        if ($Obj.PSObject.Properties.Name -contains $Name) { return $Obj.$Name }
+        return $null
+    }
+
+    $path = [string](Get-PointerField $Pointer 'path')
+    if (-not $path) { return $Pointer }
+
+    $out = [ordered]@{
+        path      = $path
+        bytes     = Get-PointerField $Pointer 'bytes'
+        sha256    = Get-PointerField $Pointer 'sha256'
+        pointedAt = Get-PointerField $Pointer 'pointedAt'
+    }
+    # Kept when present. It is the historical fact "this did not resolve the day it was declared",
+    # which `state` does not carry and which a reader may still want.
+    $wasUnresolved = Get-PointerField $Pointer 'unresolved'
+    if ($null -ne $wasUnresolved) { $out['unresolved'] = $wasUnresolved }
+
+    # `unreadable` is the DEFAULT, not an error branch, for the reason session-registry.ps1:241 gives
+    # about its own fence: an unevaluated check is not a passed check. A pointer this function could
+    # not stat must never fall through reading as one that resolved.
+    $state = 'unreadable'
+    $bytesNow = $null
+    try {
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            $bytesNow = (Get-Item -LiteralPath $path -EA Stop).Length
+            $recorded = $out['bytes']
+            $state = if ($null -eq $recorded) { 'resolves' }
+                     elseif ([long]$recorded -eq [long]$bytesNow) { 'resolves' }
+                     else { 'drifted' }
+        } else {
+            $state = 'dangling'
+        }
+    } catch {
+        Write-WriterError -Stage 'handoff-recheck' -Message $_.Exception.Message
+    }
+
+    $out['state'] = $state
+    $out['bytesNow'] = $bytesNow
+    $out['checkedAt'] = $Now
+    return $out
+}
+
 function Invoke-Git {
     # Returns trimmed stdout, or $null when git failed. NEVER throws: a repo in a state git dislikes
     # must degrade one field, not lose the whole record.
@@ -521,6 +605,12 @@ try {
             Write-WriterError -Stage 'handoff-pointer' -Message "declared handoff does not exist: $Handoff"
         }
     }
+    # ON EVERY INVOCATION, INCLUDING -Record. Rule 3 above keeps "the writer ran" separate from "the
+    # seat had something to say"; this is the same separation for the pointer. A seat that declares a
+    # handoff and then works for six hours has a pointer whose truth was established once, at the
+    # start, and the file it names is the one thing in the record that a DIFFERENT process is still
+    # writing to.
+    if ($handoffObj) { $handoffObj = Test-HandoffPointer -Pointer $handoffObj -Now $now }
 
     $pred = Prior 'predecessor' $null
     if ($Declare -and $Predecessor) {

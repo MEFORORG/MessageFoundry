@@ -3896,35 +3896,59 @@ def _ad_service(engine: Engine) -> AuthService:
     return AuthService(engine.store, settings, ldap=_FakeLdap())  # type: ignore[arg-type]
 
 
-async def test_login_provider_select_renders_only_with_ad(engine: Engine) -> None:
-    # Zero visual change for local-only installs; the selector appears when AD is enabled.
+async def test_login_offers_no_ad_provider_even_with_a_live_directory(engine: Engine) -> None:
+    """The sign-in form never offers Active Directory (BACKLOG #1137).
+
+    The simple-bind login pathway is retired, so the engine refuses a directory password. Rendering
+    the option anyway would advertise a route that can only produce a refusal -- worse than absent,
+    because it tells the operator the route exists.
+
+    The AD-configured service is the load-bearing half: a directory BIND is still live (Kerberos,
+    OIDC and the step-up re-bind all need it), and the selector must stay absent anyway. That is
+    exactly what regressed once -- a getattr fallback fell through to the bind flag and re-rendered
+    the form after the pathway was removed.
+    """
     service = await _service(engine)
     async with _client(engine, service) as c:
         r = await c.get("/ui/login")
         assert 'name="provider"' not in r.text
+        assert "Active Directory" not in r.text
+        assert 'name="username"' in r.text  # CONTROL: the form itself rendered
+
     ad = _ad_service(engine)
     await ad.initialize()
     async with _client(engine, ad) as c:
         r = await c.get("/ui/login")
-        assert 'name="provider"' in r.text and "Active Directory" in r.text
+        assert 'name="provider"' not in r.text
+        assert "Active Directory" not in r.text
+        assert 'name="username"' in r.text  # CONTROL: still a real login page
 
 
-async def test_ad_password_browser_login(engine: Engine) -> None:
-    # provider=ad rides the SAME auth.login seam: one cookie session, MFA-delegated (AD), and the
-    # /ui surface treats it exactly like the JSON path's AD identity.
+async def test_ad_password_browser_login_is_refused(engine: Engine) -> None:
+    """A hand-posted provider=ad is refused at the browser surface too (BACKLOG #1137).
+
+    The form no longer offers the option, but removing an affordance is not a control -- anyone can
+    post the field. The refusal must come from the ENGINE, which is why the console's provider
+    allow-list was deliberately left alone: one refusal point, not two that can drift.
+
+    The bounce is the ordinary bad-credentials landing rather than a distinct "retired" page, on
+    purpose: a browser surface that distinguishes them tells an unauthenticated caller which
+    directory names exist.
+    """
     ad = _ad_service(engine)
     await ad.initialize()
     async with _client(engine, ad) as c:
         r = await c.post("/ui/login", data={"username": "jdoe", "password": "pw", "provider": "ad"})
-        assert r.status_code == 303 and r.headers["location"] == "/ui"
-        r = await c.get("/ui/account")
-        assert r.status_code == 200 and "Signed in as jdoe (ad)" in r.text
-        # Wrong AD password stays a generic bad-credentials bounce.
-        c.cookies.clear()
-        r = await c.post(
-            "/ui/login", data={"username": "jdoe", "password": "nope", "provider": "ad"}
-        )
         assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=bad"
+        # And no session was minted -- the refusal is not a redirect over a live cookie.
+        r = await c.get("/ui/account")
+        assert r.status_code in (302, 303) or "Signed in as" not in r.text
+
+    # CONTROL: the directory this service talks to is LIVE. Without it the refusal above would pass
+    # on a service with no directory at all, which proves nothing about the pathway being retired.
+    # ad_enabled is the BIND capability and it deliberately survives the retirement -- Kerberos,
+    # OIDC and the step-up re-bind all still need it.
+    assert ad.ad_enabled is True
 
 
 async def test_login_provider_allowlist(engine: Engine) -> None:
@@ -4155,11 +4179,13 @@ async def test_sso_session_not_reauth_seeded(
         )
         assert r.status_code == 200 and 'action="/ui/account/webauthn/enroll"' in r.text
 
-    # The regression pins: AD-password login + JSON negotiate still SEED reauth (default True).
+    # The asymmetry this pins LOST ITS OTHER HALF: AD-password login is retired (BACKLOG #1137), so
+    # the surviving comparison is the /ui/sso leg above (seed_reauth=False) against the JSON
+    # negotiate leg below (default True). Both still reach _complete_ad_login; only the seeding
+    # differs, which is the property under test.
     out = await service.login("jdoe", "pw", provider=AuthProvider.AD)
-    assert out.ok and out.token is not None
-    session = await service.store.get_session(hash_token(out.token))
-    assert session is not None and session.reauth_at is not None
+    assert out.ok is False and out.token is None  # the retired pathway, refused
+
     out = await service.authenticate_kerberos(b"tok")
     assert out.ok and out.token is not None
     session = await service.store.get_session(hash_token(out.token))

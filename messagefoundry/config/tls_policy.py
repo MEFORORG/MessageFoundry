@@ -34,6 +34,8 @@ import ipaddress
 import logging
 import os
 import ssl
+import time
+import urllib.request
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -63,6 +65,7 @@ __all__ = [
     "TrustAnchorPolicy",
     "active_hop_posture",
     "APPROVED_SMTP_AUTH_MECHANISMS",
+    "build_asserted_https_handler",
     "build_smtp_tls_context",
     "smtp_login_approved",
     "build_verifying_client_context",
@@ -209,6 +212,70 @@ def harden_verify_flags(ctx: ssl.SSLContext) -> None:
     ctx.verify_flags |= strict
 
 
+def harden_crl_check(ctx: ssl.SSLContext, crl_file: str) -> None:
+    """Load a CRL onto a *verifying* ``ctx`` and turn on leaf revocation checking (BACKLOG #1005).
+
+    The opt-in revocation half of :func:`harden_verify_flags`, which does strict RFC 5280 path
+    validation and explicitly NOT revocation. Call it only on a context that already verifies the
+    peer, after the CA is loaded.
+
+    **Three refusals, and each one is a measured failure mode rather than defensive habit.**
+    Re-measured on this worktree, CPython 3.14.6 / OpenSSL 3.5.7, TLS 1.2 pinned so client auth is
+    in-handshake:
+
+    * ``cadata=`` loads **zero** CRLs from the same PEM bytes that ``cafile=`` loads one from, while
+      still setting the check flag -- and the observable is not a skipped check, it is EVERY client
+      refused with ``unable to get certificate CRL``. No error and no warning at load time. So this
+      loads through ``cafile=`` only, and asserts ``cert_store_stats()["crl"] >= 1`` afterwards:
+      that count is the only thing that distinguishes "loaded" from "silently ignored".
+    * A CRL past ``nextUpdate`` refuses every client, not just revoked ones (verify error 12).
+      Checked here at construction so an unrefreshed CRL fails loudly at startup instead of at the
+      first partner handshake, where the operator's only symptom is every partner dropping at once.
+    * A missing file must not degrade to "no revocation checking". A configured control that
+      silently does nothing is worse than an absent one.
+
+    **``capath=`` IS MEASURED AND IT WORKS -- and the guard above would REFUSE it.** OpenSSL's
+    hashed directory (``c_rehash`` producing ``<hash>.0`` + ``<hash>.r0``) is the natural shape for
+    a refreshable CRL drop, and measured on this worktree it enforces revocation identically:
+    revoked client REFUSED ``certificate revoked``, good client ACCEPTED, against a ``cafile=``
+    positive control and a CA-only baseline that accepts the revoked client.
+
+    **But ``cert_store_stats()["crl"]`` reports ZERO for it**, because a hashed directory is read
+    LAZILY during verification rather than at load time. So the ``>= 1`` assertion above -- which is
+    exactly right for ``cafile=`` -- is not a valid liveness check for ``capath=`` and would reject
+    a working configuration. Anyone adding ``capath=`` support needs a different proof that the
+    directory is real, not this one. That is why this loader stays ``cafile=``-only for now."""
+    from pathlib import Path
+
+    path = Path(crl_file)
+    if not path.is_file():
+        raise ValueError(
+            f"[tls] crl file {crl_file!r} does not exist; refusing to build a context that would "
+            "advertise revocation checking and perform none"
+        )
+
+    # Freshness BEFORE loading: an expired CRL refuses every client, so say so at startup.
+    from messagefoundry.pki import read_crl_facts
+
+    facts = read_crl_facts(path.read_bytes(), now=time.time())
+    if facts.expired:
+        raise ValueError(
+            f"[tls] crl file {crl_file!r} expired at {facts.next_update_iso} "
+            f"({-facts.days_remaining} day(s) ago); an expired CRL refuses EVERY client, not only "
+            "revoked ones, so this would take the listener down at the first partner handshake"
+        )
+
+    ctx.load_verify_locations(cafile=str(path))  # cafile= ONLY -- cadata= loads zero CRLs
+    loaded = ctx.cert_store_stats().get("crl", 0)
+    if loaded < 1:
+        raise ValueError(
+            f"[tls] crl file {crl_file!r} loaded no CRL into the trust store "
+            f"(cert_store_stats crl={loaded}); the check flag would be set with nothing to check "
+            "against, which refuses every client rather than skipping the check"
+        )
+    ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+
+
 #: OpenSSL ``X509_V_FLAG_NO_CHECK_TIME`` (``openssl/x509_vfy.h``) — a **stable public constant**
 #: (``0x200000``, unchanged since OpenSSL 1.0.2 through 3.x). It disables ONLY the certificate
 #: validity-period check (both ``notBefore`` AND ``notAfter``) during chain verification; the chain
@@ -333,13 +400,24 @@ def validate_proxy_tls_posture(min_version: str | None, ciphers: str | None) -> 
         # Reuse the forward-secrecy gate; re-raise under the proxy field name so the operator sees which
         # setting is at fault (validate_tls_ciphers's message names the generic "tls_ciphers").
         try:
-            validate_tls_ciphers(ciphers)
+            # require_approved_suites=False: this field DECLARES an external proxy's suite list, it
+            # does not configure one of ours. See validate_tls_ciphers' docstring (BACKLOG #1317).
+            validate_tls_ciphers(ciphers, require_approved_suites=False)
         except ValueError as exc:
             raise ValueError(f"[api].proxy_tls_ciphers rejected: {exc}") from exc
 
 
-def validate_tls_ciphers(value: str) -> str:
+def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) -> str:
     """Validate an operator OpenSSL cipher string, rejecting non-forward-secret key exchange.
+
+    ``require_approved_suites`` gates the :data:`_APPROVED_TLS_SUITES` allow-list only; the three
+    property checks always run. Pass ``False`` where the string DESCRIBES A COMPONENT THE ENGINE DOES
+    NOT OPERATE -- today that is ``[api].proxy_tls_ciphers``, which declares what an external
+    TLS-terminating proxy speaks. A declaration and a configuration are different things: refusing an
+    unlisted-but-sound suite there would not harden anything, it would stop an operator describing
+    their proxy truthfully, and a gate that punishes accurate declarations gets fed inaccurate ones.
+    The properties still bind, because declaring a NULL or anonymous proxy floor is a real defect
+    whoever operates it.
 
     Returns ``value`` unchanged when it parses and every resolved TLS 1.2 suite uses (EC)DHE (TLS 1.3
     suites are inherently ECDHE + AEAD). Raises ``ValueError`` — surfaced as a config-load error — for
@@ -350,13 +428,45 @@ def validate_tls_ciphers(value: str) -> str:
         probe.set_ciphers(value)
     except ssl.SSLError as exc:
         raise ValueError(f"tls_ciphers is not a valid OpenSSL cipher string: {exc}") from exc
-    non_fs = sorted(
-        {str(c.get("name", "?")) for c in probe.get_ciphers() if not _is_forward_secret(c)}
-    )
+    resolved = probe.get_ciphers()
+    non_fs = sorted({str(c.get("name", "?")) for c in resolved if not _is_forward_secret(c)})
     if non_fs:
         raise ValueError(
             "tls_ciphers must resolve to forward-secret (EC)DHE suites only (ASVS 11.6.2); "
             f"these admit a non-forward-secret key exchange: {', '.join(non_fs)}"
+        )
+    # BACKLOG #1317. Forward secrecy was historically the ONLY property checked here, and it is not
+    # sufficient: ECDHE-RSA-NULL-SHA (forward-secret, authenticated, PLAINTEXT) and
+    # ADH-AES256-GCM-SHA384 (forward-secret, strongly encrypted, authenticates NOBODY) both passed.
+    plaintext = sorted({str(c.get("name", "?")) for c in resolved if not _is_encrypting(c)})
+    if plaintext:
+        raise ValueError(
+            "tls_ciphers must resolve to suites that ENCRYPT (ASVS 12.1.2); these are NULL ciphers "
+            f"and would transmit plaintext: {', '.join(plaintext)}"
+        )
+    anonymous = sorted({str(c.get("name", "?")) for c in resolved if not _is_peer_authenticated(c)})
+    if anonymous:
+        raise ValueError(
+            "tls_ciphers must resolve to suites that AUTHENTICATE THE PEER (ASVS 12.1.2); these are "
+            f"anonymous key exchanges and are trivially intercepted: {', '.join(anonymous)}"
+        )
+    if not require_approved_suites:
+        return value
+    # The allow-list is last so an operator hitting a specific property failure above gets the precise
+    # reason rather than a bare "not on the list", which says nothing about what is wrong with it.
+    unlisted = sorted(
+        {
+            str(c.get("name", "?"))
+            for c in resolved
+            if str(c.get("name", "")) not in _APPROVED_TLS_SUITES
+        }
+    )
+    if unlisted:
+        raise ValueError(
+            "tls_ciphers must resolve only to suites on the approved list (ASVS 12.1.2, BACKLOG "
+            f"#1317); these are not on it: {', '.join(unlisted)}. The list is AEAD-only and excludes "
+            "the CBC-SHA2 suites the interpreter default enables; widening it for a legacy peer is a "
+            "deliberate change to _APPROVED_TLS_SUITES, not a configuration override."
         )
     return value
 
@@ -382,9 +492,8 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
     Raises :class:`ValueError` at construction — the same class the surrounding TLS config errors use,
     so it surfaces at ``check`` / dry-run / ``serve`` rather than as a wire-time surprise.
     """
-    non_fs = sorted(
-        {str(c.get("name", "?")) for c in ctx.get_ciphers() if not _is_forward_secret(c)}
-    )
+    resolved = ctx.get_ciphers()
+    non_fs = sorted({str(c.get("name", "?")) for c in resolved if not _is_forward_secret(c)})
     if non_fs:
         raise ValueError(
             f"{connector}: the TLS context would negotiate non-forward-secret suite(s) "
@@ -392,6 +501,124 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
             f"list that admits static RSA/DH key exchange lets a future key compromise decrypt "
             f"recorded PHI traffic."
         )
+    # BACKLOG #1317. The two properties forward secrecy cannot speak to. Measured against the shipped
+    # default on every context shape this module builds: 17 suites, ZERO NULL and ZERO anonymous, so
+    # these assert on no supported configuration today and convert two more inherited properties into
+    # checked ones -- the same move, and the same justification, as the assertion above.
+    #
+    # _APPROVED_TLS_SUITES is deliberately NOT applied here. It is AEAD-only and the shipped default
+    # carries six CBC-SHA2 suites, so applying it to an INHERITED context would refuse every current
+    # configuration. The allow-list governs what an operator may CONFIGURE, not what a default may
+    # contain; conflating the two is how a strict list becomes an outage.
+    plaintext = sorted({str(c.get("name", "?")) for c in resolved if not _is_encrypting(c)})
+    if plaintext:
+        raise ValueError(
+            f"{connector}: the TLS context would negotiate NULL-cipher suite(s) "
+            f"{', '.join(plaintext)} (ASVS 12.1.2), which transmit plaintext. A NULL cipher is "
+            f"forward-secret and authenticated, so the forward-secrecy check above cannot see it."
+        )
+    anonymous = sorted({str(c.get("name", "?")) for c in resolved if not _is_peer_authenticated(c)})
+    if anonymous:
+        raise ValueError(
+            f"{connector}: the TLS context would negotiate anonymous suite(s) "
+            f"{', '.join(anonymous)} (ASVS 12.1.2), which authenticate no peer and are trivially "
+            f"intercepted."
+        )
+
+
+#: Suites an operator-configured ``tls_ciphers`` string may resolve to (BACKLOG #1317, ASVS 12.1.2).
+#:
+#: STRICT POSITIVE ALLOW-LIST, by owner ruling of 2026-08-22, and the strictness is the point: the
+#: three properties below are each necessary and **together still not sufficient**, because a suite
+#: can satisfy all three and remain off every current candidate list. Naming the admitted suites is
+#: the only formulation whose failure mode on an unrecognised name is REFUSAL rather than admission.
+#:
+#: AEAD only, so this deliberately EXCLUDES the six CBC-SHA2 suites the interpreter default enables
+#: (``ECDHE-{ECDSA,RSA}-AES{256,128}-SHA{384,256}`` and the two ``DHE-RSA-AES*-SHA256``). That cost
+#: was ruled on with the exclusion named: an operator needing one for a legacy hospital peer files to
+#: widen this set, which is the direction such a request should travel. **This list governs the
+#: operator KNOB only.** :func:`harden_cipher_suites` must never apply it to an inherited default
+#: context -- the shipped default contains those six, so doing so would refuse every current
+#: configuration.
+_APPROVED_TLS_SUITES = frozenset(
+    {
+        # TLS 1.3 -- always negotiable and not configurable down, so they must be admitted here or
+        # every validation would fail on suites the operator cannot remove.
+        "TLS_AES_256_GCM_SHA384",
+        "TLS_CHACHA20_POLY1305_SHA256",
+        "TLS_AES_128_GCM_SHA256",
+        # TLS 1.2 AEAD, forward-secret, authenticated.
+        "ECDHE-ECDSA-AES256-GCM-SHA384",
+        "ECDHE-RSA-AES256-GCM-SHA384",
+        "ECDHE-ECDSA-AES128-GCM-SHA256",
+        "ECDHE-RSA-AES128-GCM-SHA256",
+        "ECDHE-ECDSA-CHACHA20-POLY1305",
+        "ECDHE-RSA-CHACHA20-POLY1305",
+        "DHE-RSA-AES256-GCM-SHA384",
+        "DHE-RSA-AES128-GCM-SHA256",
+    }
+)
+
+
+def _is_encrypting(cipher: Mapping[str, object]) -> bool:
+    """Whether the suite actually encrypts, i.e. is not a ``NULL`` cipher.
+
+    OpenSSL renders a NULL cipher as ``Enc=None`` in the human description. ``ECDHE-RSA-NULL-SHA`` is
+    a real, negotiable suite that is forward-secret and authenticated and transmits **plaintext**, so
+    forward secrecy alone can never exclude it -- which is exactly how it passed every gate before
+    BACKLOG #1317.
+    """
+    return "Enc=None" not in str(cipher.get("description", ""))
+
+
+def _is_peer_authenticated(cipher: Mapping[str, object]) -> bool:
+    """Whether the suite authenticates the peer, i.e. is not an anonymous key exchange.
+
+    OpenSSL renders anonymous authentication as ``Au=None``. ``ADH-*`` suites are forward-secret and
+    strongly encrypted but authenticate nobody, so they are trivially machine-in-the-middled. Note
+    ``Au=any`` is NOT anonymous: TLS 1.3 suites report it because authentication is negotiated
+    separately from the suite.
+    """
+    return "Au=None" not in str(cipher.get("description", ""))
+
+
+def build_asserted_https_handler(*, connector: str) -> urllib.request.HTTPSHandler:
+    """urllib's OWN default https handler, with the context it built ASSERTED forward-secret.
+
+    For the openers that name no ``HTTPSHandler`` at all. ``urllib.request.build_opener(...)`` fills
+    one in from its default class list, and that handler builds a context in its constructor
+    (``http.client._create_https_context``). So a context always existed on those hops — the ENGINE
+    just never held a reference to it, and :func:`harden_cipher_suites` therefore never ran on it.
+    That, not the absence of a context, is the residual: inheritance without assertion.
+
+    **It asserts on urllib's context rather than substituting one, and that is load-bearing.**
+    Measured on CPython 3.14.6 / OpenSSL 3.5.7: ``ssl.create_default_context()`` is NOT equivalent to
+    what urllib builds. urllib's adds ``set_alpn_protocols(["http/1.1"])`` and
+    ``post_handshake_auth=True``; a hand-built look-alike has neither. Passing such a look-alike as
+    ``context=`` would silently drop the ALPN advertisement and TLS 1.3 post-handshake auth from every
+    default HTTP-family hop — a handshake change, on a control whose whole point is to change nothing
+    about the connection. Handing ``build_opener`` this handler is inert by construction: it is the
+    same class ``build_opener`` would have instantiated itself, built the same way, and supplying an
+    instance only stops urllib adding a second one.
+
+    Reads the handler's private ``_context`` deliberately, and **fails closed** if it is not there. A
+    ``getattr(..., None)`` that shrugged and returned would be a security control reporting success
+    forever — exactly the failure :func:`harden_kex_groups` documents. A CPython that renames the
+    attribute must break loudly at construction, not go quiet.
+
+    ``connector`` is the operator-recognisable label :func:`harden_cipher_suites` names in its error.
+    Lives here rather than beside each opener so the two call sites (the HTTP-family destinations and
+    the alert webhook) cannot drift onto different constructions."""
+    handler = urllib.request.HTTPSHandler()
+    ctx = getattr(handler, "_context", None)
+    if not isinstance(ctx, ssl.SSLContext):
+        raise ValueError(
+            f"{connector}: cannot reach the TLS context urllib's HTTPSHandler built "
+            f"(no `_context` attribute on this runtime), so the forward-secrecy assertion "
+            f"(ASVS 12.1.2) cannot run on this hop. Refusing rather than crossing unchecked."
+        )
+    harden_cipher_suites(ctx, connector=connector)
+    return handler
 
 
 def _is_forward_secret(cipher: Mapping[str, object]) -> bool:

@@ -296,7 +296,7 @@ ci-scanners = [
 #                  supplied it. Same spec in both places ⇒ uv resolves ONE version and they cannot
 #                  disagree.
 ci-quality = [
-    "diff-cover==10.5.0",
+    "diff-cover==10.5.1",
     "mutmut==3.7.0",
     "pytest-cov>=7.0",
     "pytest-timeout>=2.3",
