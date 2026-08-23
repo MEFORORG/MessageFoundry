@@ -5916,6 +5916,17 @@ The same `[^"\s]+` class truncated at a SPACE, so any governed root whose path c
 
 **Source:** recorded in #1065 by the adversarial verification pass on #1061's fix; allocated and fixed 2026-08-06. The quoted-KEY half was found by the design review of the fix for the quoted-PATH half, which is why this is a separate item rather than a line in #1065.
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. A SECOND MEASURED INSTANCE, AND A MECHANISM ITEM NOW HOLDS THE
+FIX DIRECTION.** This row frames the class around a `-C` TARGET. A building lane measured the same
+mechanism in a **MESSAGE flag that executes outright**: `git commit -m "$(...)"` is **ALLOWED on both
+tools**, while the unquoted form is denied -- the control proving the gate can see it when quoting does
+not erase it. **Both shells substitute inside double quotes before git is invoked, so the disarm runs.**
+
+***AND THIS ROW CANNOT BE FIXED ALONE.*** Its remedy pulls toward **less** blanking; `#1086`'s pulls
+toward **more**; they are one design error read from two ends. **#1336** carries the reconciliation --
+the two questions need different strings, and the segment object already provides both. **Do not narrow
+the blanking here without measuring `#1086`'s false-deny rows in the same table.**
 ## 1067. Rule 3c governs by PATH PREFIX, so an independent repo vendored under a governed root inherits its governance
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **4/10** · Difficulty **4/10** · _fill-in_. Rule 3c still decides governance by an equality-or-slash-prefix test over the resolved git common dir, so an independent clone under a governed root inherits governance, and the deny text still asserts a shared .git that a vendored clone does not have. Value 4 because it is a false deny in developer tooling with no product surface; difficulty 4 because any fix must pin both directions at once -- allow the vendored clone while keeping the nested .claude/worktrees case denied -- and it forces the git-submodule question the item deliberately deferred. _(was 4/10 · 4/10.)_
@@ -14066,3 +14077,68 @@ a test asserting the two lists match is the minimum, so the next divergence goes
 
 **Expiry:** this stops being right if the CI legs change their extras, or if `new.ps1` stops building a
 per-lane virtualenv.
+
+## 1336. Rule 3c asks one string two questions, so every fix for the false deny widens the bypass and back
+
+> 🔢 **Filed 2026-08-23 - not started.** `#1066` (a quoted danger key is invisible, FAIL OPEN) and `#1086` (a quoted body reads as a command, FALSE DENY) are **the same design error pulling in opposite directions**: rule 3c asks both questions of `$seg.Scan`, the quote-blanked text. Blanking more fixes `#1086` and widens `#1066`. Blanking less does the reverse. **Neither row can be fixed alone.**
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** commit gates / secret scanning. **Priority:** P1 -- higher than either row it reconciles,
+because **a fix to either one alone makes the other worse and the last three attempts did exactly
+that.** **Verdict:** build.
+**Severity:** developer tooling, no product or PHI axis (sec. 0). **But one arm is a live FAIL OPEN in
+a security control**, which is why this is P1 rather than P2.
+
+**THE TWO QUESTIONS, AND THEY NEED DIFFERENT STRINGS:**
+
+| question | must read | if it reads the other |
+| --- | --- | --- |
+| *is there a danger KEY here* | **`$seg.Raw`** | quoting erases the key -- **`#1066`, fail open** |
+| *is this text a COMMAND or DATA* | **`$seg.Scan`** | prose becomes a command -- **`#1086`, false deny** |
+
+***THE SEGMENT OBJECT ALREADY CARRIES BOTH, and the rule already uses `Raw` for target resolution a few
+lines later.*** So the change is **not** *blank more* and **not** *blank less* -- it is **stop asking one
+string two questions.** That framing is the item.
+
+**MEASURED, against `origin/main`'s gate, both tools, with the unquoted row as the control proving the
+gate CAN see it:**
+
+| case | PowerShell | Bash |
+| --- | --- | --- |
+| `git config core.hooksPath /dev/null` | DENY | DENY |
+| `git commit -m $(...)` **unquoted** | DENY | DENY |
+| `git commit -m "$(...)"` **quoted** | **ALLOW** | **ALLOW** |
+| `echo` with a backtick-substituted disarm | -- | **ALLOW** |
+
+**Both shells EXECUTE `$(...)` inside double quotes** -- verified separately by substitution, `"a $(1+1)
+b"` becomes `a 2 b`. **So the disarm runs and the gate does not see it.** These rows are an INSTANCE of
+`#1066`, which frames the class around a `-C` TARGET; **this is a substitution in a MESSAGE flag that
+executes outright.**
+
+***THIS RULE HAS EATEN THREE FIXES, TWO OF WHICH SHIPPED GREEN SUITES OVER REAL FAIL-OPENS.***
+`95abca70` was ruled `DO_NOT_LAND` for weakening the gate and pinning the weakening with a test -- and
+its premise, *"a MESSAGE flag's quoted span is DATA"*, is **false for exactly two of the four quoting
+forms**, because **PowerShell substitutes before git is ever invoked**:
+
+| form | after substitution | safe to blank |
+| --- | --- | --- |
+| `"..."` | `a 2 b` | **NO** |
+| `@"..."@` | `a 2 b` | **NO** |
+| `'...'` | `a $(1+1) b` | yes |
+| `@'...'@` | `a $(1+1) b` | yes |
+
+**`95abca70` blanked more, which is `#1066`'s hole widened.** That is the predicted failure of a
+one-directional fix, and it already happened once.
+
+***THE BUILD CONSTRAINT, AND IT IS THE POINT OF FILING THIS SEPARATELY: MEASURE EVERY CANDIDATE AGAINST
+`#1066`'s BYPASS ROWS AND `#1086`'s FALSE-DENY ROWS IN ONE TABLE.*** A fix that only ever sees one of
+those two lists is how this rule has been broken three times. **A green suite is not evidence here
+unless the suite contains both lists.**
+
+**THIS DOES NOT CLOSE `#1066`, `#1069` or `#1086` BY SIDE EFFECT.** They are instances; this is the
+mechanism. Close each on its own rows passing, not on this landing.
+
+**Expiry:** this stops being right if the segment object stops carrying both `Raw` and `Scan`, or if
+rule 3c stops reading `Scan` for key detection.
