@@ -1750,7 +1750,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user
 
 CREATE TABLE IF NOT EXISTS search_presets (
     id         TEXT PRIMARY KEY,                 -- uuid4 hex; the cell-AAD pk for the encrypted criteria
-    owner      TEXT NOT NULL,                    -- the owning Identity.user_id (BACKLOG #1225: NOT the
+    owner_user_id TEXT NOT NULL,                 -- the owning Identity.user_id (BACKLOG #1225: NOT the
                                                  -- reassignable username); every read is owner-scoped
     name       TEXT NOT NULL,                    -- operator-chosen label, unique per owner
     criteria   TEXT,                             -- JSON of the typed search params; AES-256-GCM at rest
@@ -1763,7 +1763,7 @@ CREATE TABLE IF NOT EXISTS search_presets (
 );
 -- UNIQUE(owner, name) covers both the owner-scoped list (WHERE owner) and the upsert (WHERE owner AND
 -- name); get/delete use the id PK — so no separate owner index is needed (ADR 0136, review follow-up).
-CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets(owner, name);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets(owner_user_id, name);
 
 -- Secret-rotation watch state (ASVS 13.3.4, BACKLOG #282). One row per tracked secret CLASS (the store
 -- DEK by its key-id, plus each configured connector/AD/SMTP/Vault/OIDC secret the engine holds). Every
@@ -8148,7 +8148,9 @@ class MessageStore:
                 # PHI-shaped `criteria` (ADR 0136) persisting with no owner able to reach or purge it,
                 # and counted by nothing. `owner` holds the user_id, not the username, which is what
                 # makes this a single keyed DELETE rather than a name lookup.
-                await self._db.execute("DELETE FROM search_presets WHERE owner=?", (user_id,))
+                await self._db.execute(
+                    "DELETE FROM search_presets WHERE owner_user_id=?", (user_id,)
+                )
                 await self._db.execute("DELETE FROM users WHERE id=?", (user_id,))
                 await self._commit()
             except Exception:
@@ -8253,7 +8255,7 @@ class MessageStore:
             try:
                 await self._db.execute("BEGIN")
                 cur = await self._db.execute(
-                    "SELECT id FROM search_presets WHERE owner=? AND name=?", (owner, name)
+                    "SELECT id FROM search_presets WHERE owner_user_id=? AND name=?", (owner, name)
                 )
                 row = await cur.fetchone()
                 effective_id = str(row["id"]) if row is not None else preset_id
@@ -8267,7 +8269,7 @@ class MessageStore:
                 else:
                     await self._db.execute(
                         "INSERT INTO search_presets"
-                        " (id, owner, name, criteria, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                        " (id, owner_user_id, name, criteria, created_at, updated_at) VALUES (?,?,?,?,?,?)",
                         (effective_id, owner, name, enc, now, now),
                     )
                     replaced = False
@@ -8282,7 +8284,7 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT id, name, created_at, updated_at FROM search_presets"
-                " WHERE owner=? ORDER BY name",
+                " WHERE owner_user_id=? ORDER BY name",
                 (owner,),
             )
             return [dict(r) for r in await cur.fetchall()]
@@ -8301,7 +8303,7 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT id, name, criteria, created_at, updated_at, last_used_at FROM search_presets"
-                " WHERE id=? AND owner=?",
+                " WHERE id=? AND owner_user_id=?",
                 (preset_id, owner),
             )
             row = await cur.fetchone()
@@ -8332,7 +8334,7 @@ class MessageStore:
         """Delete an owner-scoped preset. Returns ``True`` if a row was removed. Idempotent."""
         async with self._lock:
             cur = await self._db.execute(
-                "DELETE FROM search_presets WHERE id=? AND owner=?", (preset_id, owner)
+                "DELETE FROM search_presets WHERE id=? AND owner_user_id=?", (preset_id, owner)
             )
             await self._commit()
             return bool(cur.rowcount)

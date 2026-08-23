@@ -1531,7 +1531,7 @@ _SCHEMA: list[str] = [
     # AES-256-GCM-encrypted at rest (id-keyed cell-AAD, in the cipher registry). Adding this DDL moves
     # _schema_hash() — the ADR 0064 bump. NVARCHAR(MAX) body; owner/name capped for the unique index.
     """IF OBJECT_ID('search_presets','U') IS NULL CREATE TABLE search_presets (
-        id NVARCHAR(64) NOT NULL PRIMARY KEY, owner NVARCHAR(256) NOT NULL, name NVARCHAR(256) NOT NULL,
+        id NVARCHAR(64) NOT NULL PRIMARY KEY, owner_user_id NVARCHAR(256) NOT NULL, name NVARCHAR(256) NOT NULL,
         criteria NVARCHAR(MAX) NULL, created_at FLOAT NOT NULL, updated_at FLOAT NOT NULL,
         last_used_at FLOAT NULL)""",
     # #306: last RECALL stamp (get_search_preset), so the retention window keys on last-USED and not
@@ -1545,7 +1545,7 @@ _SCHEMA: list[str] = [
     # UNIQUE(owner, name) covers the owner-scoped list + the upsert; get/delete use the id PK (no
     # separate owner index needed — ADR 0136, review follow-up).
     """IF INDEXPROPERTY(OBJECT_ID('search_presets'),'ux_search_presets_owner_name','IndexID') IS NULL
-        CREATE UNIQUE INDEX ux_search_presets_owner_name ON search_presets(owner, name)""",
+        CREATE UNIQUE INDEX ux_search_presets_owner_name ON search_presets(owner_user_id, name)""",
     # Secret-rotation watch state (ASVS 13.3.4, BACKLOG #282) — mirrors the SQLite `secret_rotation_meta`
     # table (store/store.py). One row per tracked secret CLASS. EVERY column is NON-SECRET: `fingerprint`
     # is a keyed MAC (DEK-derived HMAC subkey) OR the DEK's one-way key-id — never the value; the dates are
@@ -4843,7 +4843,7 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    "SELECT id FROM search_presets WHERE owner=? AND name=?", (owner, name)
+                    "SELECT id FROM search_presets WHERE owner_user_id=? AND name=?", (owner, name)
                 )
                 row = await cur.fetchone()
                 effective_id = str(row[0]) if row is not None else preset_id
@@ -4857,7 +4857,7 @@ class SqlServerStore:
                 else:
                     await cur.execute(
                         "INSERT INTO search_presets"
-                        " (id, owner, name, criteria, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                        " (id, owner_user_id, name, criteria, created_at, updated_at) VALUES (?,?,?,?,?,?)",
                         (effective_id, owner, name, enc, now, now),
                     )
                     replaced = False
@@ -4870,7 +4870,7 @@ class SqlServerStore:
     async def list_search_presets(self, owner: str) -> list[dict[str, Any]]:
         return await self._fetchall(
             "SELECT id, name, created_at, updated_at FROM search_presets"
-            " WHERE owner=? ORDER BY name",
+            " WHERE owner_user_id=? ORDER BY name",
             (owner,),
         )
 
@@ -4879,7 +4879,7 @@ class SqlServerStore:
     ) -> dict[str, Any] | None:
         row = await self._fetchone(
             "SELECT id, name, criteria, created_at, updated_at, last_used_at FROM search_presets"
-            " WHERE id=? AND owner=?",
+            " WHERE id=? AND owner_user_id=?",
             (preset_id, owner),
         )
         if row is None:
@@ -4902,7 +4902,7 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    "DELETE FROM search_presets WHERE id=? AND owner=?", (preset_id, owner)
+                    "DELETE FROM search_presets WHERE id=? AND owner_user_id=?", (preset_id, owner)
                 )
                 deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
                 await self._commit(conn)
@@ -9501,7 +9501,7 @@ class SqlServerStore:
                 # rows outlive the account carrying PHI-shaped `criteria` (ADR 0136) that no owner can
                 # reach or purge. This leg is CI-only, so an asymmetry between the three backends
                 # surfaces first in CI rather than here.
-                await cur.execute("DELETE FROM search_presets WHERE owner=?", (user_id,))
+                await cur.execute("DELETE FROM search_presets WHERE owner_user_id=?", (user_id,))
                 await cur.execute("DELETE FROM users WHERE id=?", (user_id,))
                 await self._commit(conn)
             except Exception:

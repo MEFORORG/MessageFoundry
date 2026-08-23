@@ -608,7 +608,7 @@ _SCHEMA: list[str] = [
     # _schema_hash() automatically — the ADR 0064 bump.
     """CREATE TABLE IF NOT EXISTS search_presets (
         id         TEXT PRIMARY KEY,
-        owner      TEXT NOT NULL,
+        owner_user_id TEXT NOT NULL,
         name       TEXT NOT NULL,
         criteria   TEXT,
         created_at DOUBLE PRECISION NOT NULL,
@@ -625,7 +625,7 @@ _SCHEMA: list[str] = [
     "ALTER TABLE search_presets ADD COLUMN IF NOT EXISTS last_used_at DOUBLE PRECISION",
     # UNIQUE(owner, name) covers the owner-scoped list + the upsert; get/delete use the id PK (no
     # separate owner index needed — ADR 0136, review follow-up).
-    "CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets(owner, name)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets(owner_user_id, name)",
     # Secret-rotation watch state (ASVS 13.3.4, BACKLOG #282) — mirrors the SQLite `secret_rotation_meta`
     # table (store/store.py). One row per tracked secret CLASS. EVERY column is NON-SECRET: `fingerprint`
     # is a keyed MAC (DEK-derived HMAC subkey) OR the DEK's one-way key-id — never the value; the dates are
@@ -4090,7 +4090,7 @@ class PostgresStore:
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             existing = await conn.fetchval(
-                "SELECT id FROM search_presets WHERE owner=$1 AND name=$2", owner, name
+                "SELECT id FROM search_presets WHERE owner_user_id=$1 AND name=$2", owner, name
             )
             effective_id = str(existing) if existing is not None else preset_id
             enc = self._enc(criteria, aad=cell_aad("search_presets", "criteria", effective_id))
@@ -4103,7 +4103,7 @@ class PostgresStore:
                 )
                 return effective_id, True
             await conn.execute(
-                "INSERT INTO search_presets (id, owner, name, criteria, created_at, updated_at)"
+                "INSERT INTO search_presets (id, owner_user_id, name, criteria, created_at, updated_at)"
                 " VALUES ($1,$2,$3,$4,$5,$6)",
                 effective_id,
                 owner,
@@ -4117,7 +4117,7 @@ class PostgresStore:
     async def list_search_presets(self, owner: str) -> list[dict[str, Any]]:
         rows = await self._pool.fetch(
             "SELECT id, name, created_at, updated_at FROM search_presets"
-            " WHERE owner=$1 ORDER BY name",
+            " WHERE owner_user_id=$1 ORDER BY name",
             owner,
         )
         return [dict(r) for r in rows]
@@ -4127,7 +4127,7 @@ class PostgresStore:
     ) -> dict[str, Any] | None:
         row = await self._pool.fetchrow(
             "SELECT id, name, criteria, created_at, updated_at, last_used_at FROM search_presets"
-            " WHERE id=$1 AND owner=$2",
+            " WHERE id=$1 AND owner_user_id=$2",
             preset_id,
             owner,
         )
@@ -4152,7 +4152,7 @@ class PostgresStore:
     async def delete_search_preset(self, *, preset_id: str, owner: str) -> bool:
         deleted = _delete_count(
             await self._pool.execute(
-                "DELETE FROM search_presets WHERE id=$1 AND owner=$2", preset_id, owner
+                "DELETE FROM search_presets WHERE id=$1 AND owner_user_id=$2", preset_id, owner
             )
         )
         return deleted > 0
@@ -6531,7 +6531,7 @@ class PostgresStore:
             # by Identity.user_id (#1225) with no FK cascade, so without this the rows outlive the
             # account carrying PHI-shaped `criteria` (ADR 0136) that no owner can reach or purge.
             # This leg is CI-only, so a divergence between the three backends surfaces first in CI.
-            await conn.execute("DELETE FROM search_presets WHERE owner=$1", user_id)
+            await conn.execute("DELETE FROM search_presets WHERE owner_user_id=$1", user_id)
             await conn.execute("DELETE FROM users WHERE id=$1", user_id)
 
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:

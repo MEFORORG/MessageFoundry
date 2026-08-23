@@ -81,3 +81,32 @@ async def test_delete_is_idempotent(store: MessageStore) -> None:
     assert await store.delete_search_preset(preset_id="p", owner="op") is True
     assert await store.delete_search_preset(preset_id="p", owner="op") is False
     assert await store.list_search_presets("op") == []
+
+
+def test_the_queue_lease_column_is_still_named_owner() -> None:
+    """GUARD FOR BACKLOG #1232, AND IT PROTECTS A DIFFERENT TABLE THAN THE ONE THAT WAS RENAMED.
+
+    Two columns named ``owner`` live in these modules and they mean unrelated things:
+    ``search_presets.owner`` held an ``Identity.user_id`` and was renamed to ``owner_user_id``
+    because the name misled; ``queue.owner`` is the ROW-CLAIM LEASE HOLDER, written by the
+    claim/release path, and is central to at-least-once delivery.
+
+    ``store.py:380`` names the distinction in its own words: *"Distinct from the row-claim ``owner``
+    column"*. A future rename done by SYMBOL rather than by reading -- the obvious way to do it, and
+    the way the item's own reference count invites -- would rename BOTH. Nothing else in the suite
+    would notice: the preset tests would stay green because their column is correct, and a lease
+    regression surfaces as delivery behaviour, not as a schema error.
+
+    So this asserts the column that must NOT move, which is the only assertion that can fail for the
+    right reason."""
+    from messagefoundry.store import postgres, sqlserver
+
+    pg = "\n".join(postgres._SCHEMA)
+    assert "owner            TEXT," in pg, "queue.owner vanished from the PostgreSQL DDL"
+    ms = "\n".join(sqlserver._SCHEMA)
+    assert "owner NVARCHAR(256) NULL" in ms, "queue.owner vanished from the SQL Server DDL"
+
+    # And the renamed one is genuinely renamed on both, so this test cannot pass vacuously by
+    # asserting a state that predates the change.
+    assert "owner_user_id TEXT NOT NULL" in pg
+    assert "owner_user_id NVARCHAR(256) NOT NULL" in ms
