@@ -5297,6 +5297,48 @@ against the gate **as it will ship**, not as it is.
 
 **Source:** identified 2026-08-05 while fixing #1032, and deliberately deferred rather than swept in, so that fix stayed scoped to one rule. Recorded here because a deferral nobody files is a deferral dropped.
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. THIS IS A SCANNER ITEM, NOT A RULE-3C ITEM, AND `#1332` IS
+RETIRED INTO IT.** I filed `#1332` for this defect without finding this row; a building lane caught the
+duplicate by reading `Get-ScannableSegments` before writing to it, where **this row's number is already
+named in the residual list** (`scripts/hooks/worktree_gate.ps1:624`).
+
+**THE SCOPE IS WIDER THAN THIS ROW'S TITLE SAYS. ALL THREE RULE SITES CALL THE SAME FUNCTION** --
+`:1211`, `:1339` and `:1602`, off the definition at `:557`, measured on the ledger base `a92ab10f`. So
+this is not one rule misreading a here-string; **it is the shared segment scanner losing the fact that
+a body was quoted, for every rule that consults it.**
+
+**AND IT IS WHY `#1305` WAS UNFIXABLE IN ITS FILED FORM.** That item's fix extended the same defect to
+the git program token rather than introducing a new one, which is how it added eleven further
+false-deny classes. **One root cause, more than one rule, one half already live on `main`.**
+
+**MEASURED DIFFERENTIALLY, controls discriminating in BOTH directions** -- an all-allow or all-deny
+harness proves nothing:
+
+| case | result |
+| --- | --- |
+| heredoc, key at LINE START | DENY |
+| heredoc, key MID-LINE | DENY |
+| heredoc, key INDENTED | DENY |
+| heredoc, key in BACKTICKS | ALLOW |
+| single-quoted echo, same line | ALLOW |
+| double-quoted echo, same line | ALLOW |
+
+**Position within the line is IRRELEVANT. The discriminator is HEREDOC versus SAME-LINE QUOTING** --
+same-line quoting is handled correctly and a heredoc body is not. A hypothesis that line 2 of a quoted
+body reads as *program position* was tested against this table and **withdrawn**.
+
+**THE BACKTICK ROW IS LUCK AND MUST NOT BE RELIED ON.** The preceding character is simply outside the
+pattern's leading class. A writer who happens to use backticks escapes; one who does not, does not.
+
+***THE OBJECTION IN THE FUNCTION'S OWN NOTE OUTRANKS THE FIX, AND IT IS THE REAL BLOCKER.*** The
+residual says this was left alone because **no test on this gate could tell the two mechanisms apart,
+and a fix whose green nobody could watch fail is not evidence.** Today a multi-line quoted body denies
+**by accident** -- every line reaches the scanner raw. **A fix that blanks those bodies removes the
+accidental deny, so blanking could trade a false DENY for a silent FAIL-OPEN.** Build the discriminator
+first. **If no test can separate *denied because the rule saw a real command* from *denied because the
+raw scan happened to see one*, then this must not be built as specified** -- and that finding is a
+complete result, not a stall.
 ## 1036. A Rule 4 deny names the first allowlisted repo's tooling regardless of which repo fired it
 
 > ✅ **SHIPPED 2026-08-10 — branch `w2-l3-gate-emitter` (`f911ebe5`).** Value **3/10** · Difficulty **2/10** · _quick win_. Rule 4 fires on the TOOL NAME alone, so it had no path to key on and named the first allowlist entry whichever repo the session was in. It now resolves the session's own governed root: by prefix for the primary and its nested `.claude/worktrees/` trees, and via `rev-parse --git-common-dir` for a sibling worktree, which lives outside every root's path. When neither answers it says so and prints NO runnable command -- a path that exists and runs against an unrelated clone is worse than no remedy. Tested with a TWO-entry allowlist across all four governed shapes plus an ungoverned cwd; the two cases the old code got right stay green on both sides.
@@ -13799,6 +13841,24 @@ needs only `Closing-act`.
 > Verdict: build
 > Research: none
 > Closing-act: code
+
+**RETIRED THE HOUR IT WAS FILED -- THIS IS A DUPLICATE OF `#1086` AND SHOULD NOT BE BUILT. The number
+is kept, retired in place, because a commit (`143d0d42`) and a building lane's claim note already cite
+it.** Build the scanner fix against **#1086**, which is open, carries the same defect in the same
+function, and holds two things this row does not: **a refuted naive fix and the narrower rule that
+replaces it.**
+
+***HOW THE DUPLICATE SURVIVED THREE DISPATCH SCREENS, RECORDED BECAUSE IT IS A GAP IN THE METHOD AND
+NOT A LAPSE.*** This item was brand new, so it had **no unlanded build commit**; it had **no retirement
+marker**; its verdict was **`build`**. All three screens pass it. **The duplicate was visible only from
+the code's own comment** -- `scripts/hooks/worktree_gate.ps1:624` names `#1086` in the residual list of
+the very function the fix would change. **The building lane found it by reading the function before
+writing to it.**
+
+**SO THERE IS A FOURTH SCREEN AND IT CANNOT BE AUTOMATED FROM THE LEDGER: *does the code being changed
+already cite a different item for this change?*** It needs the file open. **As a dispatch instruction:
+read the function you are about to change, and grep it for a backlog number, before the first line of
+code.**
 
 **Cluster:** commit gates / secret scanning. **Priority:** P2. **Verdict:** build.
 **Severity:** false denies on the commit path. **Conditional, per section 0:** zero deployments; the
