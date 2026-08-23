@@ -64,6 +64,36 @@ class _Source:
         self.stop_finished = True
 
 
+# Sampling the concurrency width is COOPERATIVE, never timed. Every source parks, so nothing can
+# COMPLETE while we sample and the count can only rise — a gated implementation pins it at the gate's
+# width and it stays pinned. That is why "unchanged across a few yields" is a sound stop condition and
+# not a guess about how fast the box is. Neither number is a duration; they bound loop turns.
+_WIDTH_SETTLE_YIELDS = 5
+_WIDTH_MAX_YIELDS = 500
+
+# 200 ON PURPOSE: at 8 sources any plausible concurrency width looks identical, so a small N cannot
+# show the defect at all. Named rather than repeated so the assertion and the fixture cannot drift.
+_N_SOURCES = 200
+
+
+async def _settled_stop_width(sources: dict[str, _Source]) -> int:
+    """How many sources have ENTERED ``stop()``, sampled once that number stops moving.
+
+    Returns 0 rather than looping forever if nothing ever starts, so a caller's assertion reports the
+    width it saw instead of the test hanging.
+    """
+    width = 0
+    stable = 0
+    for _ in range(_WIDTH_MAX_YIELDS):
+        await asyncio.sleep(0)
+        seen = sum(src.stop_started for src in sources.values())
+        stable = stable + 1 if seen == width else 0
+        width = seen
+        if width and stable >= _WIDTH_SETTLE_YIELDS:
+            break
+    return width
+
+
 def _bare_runner(**attrs: object) -> RegistryRunner:
     """A RegistryRunner with ONLY the attributes the demotion phase helpers touch.
 
@@ -88,22 +118,43 @@ def _bare_runner(**attrs: object) -> RegistryRunner:
 
 
 async def test_demote_source_phase_is_max_not_sum() -> None:
-    """200 sources, each stopping in 0.4s, under a 3.0s budget must finish in well under 1.5s.
+    """200 sources must ALL be in flight at once: ONE phase-level deadline over every task.
 
-    N is 200 ON PURPOSE. A semaphore of 8 or 64 is structurally incapable of showing the defect at
-    small N — with 8 sources any plausible concurrency width looks identical. Mutation: restore the
-    sequential ``for source in ...: await source.stop()`` loop, or gate the tasks behind a
-    ``Semaphore`` with a per-source ``wait_for``, and this blows the assertion.
+    THE ASSERTION IS CONCURRENCY WIDTH, NOT ELAPSED TIME, and the swap is the whole of BACKLOG #1319.
+    The ``elapsed < 1.5`` bound this replaces could not do the job it was written for: measured on CI,
+    the SHIPPED implementation took 1.92s on a loaded ubuntu runner while the ``Semaphore(64)`` mutant
+    the bound exists to catch took 1.63s. For the duration of that load the CORRECT code was SLOWER
+    than the DEFECT, so no threshold anywhere could separate them and the test was not merely red, it
+    was INCAPABLE.
+
+    Width separates all four implementations with no dependence on how fast the box is — shipped 200,
+    sequential loop 1, ``Semaphore(8)`` 8, ``Semaphore(64)`` 64. The semaphore(64) row is the one that
+    matters: every source finishes under it, so ``all(stop_finished)`` and the empty
+    ``_pending_source_stops`` below both PASS on it and width is the only assertion that refuses.
+
+    It is also the stronger claim on its own terms. ``_stop_sources_demote`` creates every task in a
+    SYNCHRONOUS comprehension before its first ``await`` — its own docstring states that as a design
+    property ("Tasks are created eagerly, outside any gate") — so *all N started* is a fact about the
+    shipped design rather than about the runner.
+
+    Mutation: restore the sequential ``for source in ...: await source.stop()`` loop, or gate the
+    tasks behind a ``Semaphore`` with a per-source ``wait_for``, and this blows the assertion. See
+    ``_N_SOURCES`` for why N is what it is.
     """
-    sources = {f"IB{i}": _Source(delay=0.4) for i in range(200)}
+    park = asyncio.Event()
+    sources = {f"IB{i}": _Source(park=park) for i in range(_N_SOURCES)}
     runner = _bare_runner(_sources=sources)
 
-    loop = asyncio.get_running_loop()
-    started = loop.time()
-    await runner._stop_sources_demote(3.0)
-    elapsed = loop.time() - started
+    phase = asyncio.create_task(runner._stop_sources_demote(3.0))
+    try:
+        width = await _settled_stop_width(sources)
+    finally:
+        park.set()  # release them whatever the sample said, so the phase can always finish
+    await phase
 
-    assert elapsed < 1.5, f"source phase took {elapsed:.2f}s — that is sum-shaped, not max-shaped"
+    assert width == _N_SOURCES, (
+        f"only {width}/{_N_SOURCES} stops were in flight at once — that is gated, not max-shaped"
+    )
     assert all(src.stop_finished for src in sources.values())
     assert runner._pending_source_stops == []
 
