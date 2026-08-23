@@ -13628,6 +13628,22 @@ open item is that work. **Two apparent hits dissolved on reading**: one was the 
 collision above, the other an explicit "it is not graded here" cross-reference. **A nonzero
 count still needs the entry read.**
 
+**A WORKED NEGATIVE CASE, recorded because the next objection to any screen is that it
+over-fires.** [#1026](#1026) is the strongest apparent hit the first run produced: its covering
+security-record entry says in prose that the gap closed at HEAD, while the item stays open. That
+reads like a missing banner flip. **It is not.** #1026's own banner already records
+`partly_shipped` -- the security limb discharged, a documentation line and an unactionable
+refusal string remaining -- and the covering entry is graded `partial` for exactly that reason.
+**The two records AGREE, and agreeing is what the pair looks like.**
+
+**The author of this screen misread that case first**, routed it upward as needing a human, and
+withdrew it after reading the item's banner rather than only the record's. **The failure was
+comparing one record against an EXPECTATION instead of against the other record** -- which is the
+same family as reading a stale corpus, one level up: there the instrument was fine and the corpus
+was wrong; here the comparison was fine and only one side was ever loaded. **So the screen's zero
+is a measured zero and not an untested one**, and a screen that survives a case its own author
+got wrong is worth more than one only ever run on clean data.
+
 **STILL UNRUN, so this row is amended and not closed.** The discriminator as stated compares
 against the banner's **last touch date**; the first run compared against banner **open/closed
 state**, which is weaker and needs no per-item blame. **A flip that happened, but happened late,
