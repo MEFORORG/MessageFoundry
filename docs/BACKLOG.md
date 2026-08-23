@@ -13980,6 +13980,46 @@ says so about closing acts, and it holds identically here. The other four (#1301
 *"build."* and are mechanical. #320 has no inline verdict at all and already carries a banner `Verdict`; it
 needs only `Closing-act`.
 
+
+**AMENDMENT 2026-08-23, dispatcher seat. THIS ROW'S OWN METHOD FOR `Research` IS FALSE, AND FALSE IN
+THE DANGEROUS DIRECTION.** The row says *"`Research` is derivable from the presence of a dated research
+pass."* **The POSITIVE half survives: 95 open items describe a research pass and ALL 95 carry an ISO
+date, so `Research: done <date>` is defensible for them.** ***THE NEGATIVE HALF IS NOT DERIVABLE AT
+ALL.***
+
+**`Research: none` would be an INFERENCE FROM ABSENCE, and the building lane measured how stable that
+inference is by varying only the needle:**
+
+| needle | items matched | `none` inferred for |
+| --- | --- | --- |
+| research pass / round / sweep / researched | 95 | **151** |
+| plus re-measured / verified independently | 136 | **110** |
+| any form of the word "research" | 104 | **142** |
+| plus triage / investigat\* | 141 | **105** |
+
+***THE `none` POPULATION SWINGS BY 46 ITEMS -- NEARLY A FIFTH OF THE LEDGER -- PURELY ON THE CHOICE OF
+WORDS.*** So *"no mention of research"* is **a property of the vocabulary someone picked, not a property
+of the item.** Writing that onto 105-151 rows would be writing **a machine-readable value whose
+correctness rests on a regex nobody agreed to.**
+
+***AND THIS ROW ALREADY CONTAINS THE ARGUMENT AGAINST IT, ONE FIELD OVER:*** *"a wrong closing act is
+worse than an absent one, because it names the wrong seat."* **The same holds for `Research`, and `#320`
+is the standing precedent -- an absent field with a recorded reason is a DECISION; a wrong one is a
+machine-readable lie.**
+
+**THE ASYMMETRY, WHICH IS THE WHOLE ARGUMENT: AN ABSENT FIELD MAKES A SCREEN REFUSE THE ITEM; A WRONG
+ONE BLESSES IT.** *Absence fails safe. A wrong value fails silent.*
+
+**SO THE BUILD IS: write `Research: done <date>` for the ~95 with positive dated evidence, citing the
+date from the item's own text; leave every other item's field ABSENT with a short recorded reason; write
+no `none` that cannot be evidenced.** ***THAT IS NOT A SMALLER JOB THAN THE 245-ROW SCRIPT THIS ROW
+PRESCRIBES -- IT IS A DIFFERENT AND CORRECT ONE***, and the shrinkage also dissolves most of the
+single-writer merge hazard the contention warning above is about.
+
+***THIRD ITEM IN ONE NIGHT WHOSE STATED METHOD DID NOT SURVIVE MEASUREMENT*** -- this row's verdict half
+was already 96 percent done, `#1301`'s rule fired 94 times with none of them the defect, and now this.
+**That is not three bad items; it is what filing-from-reasoning produces. Measure before prescribing a
+tool.**
 ## 1332. Heredoc bodies are scanned as commands, so quoted documentation trips the secret-scanning rules
 
 > 🔢 **Filed 2026-08-23 - not started.** A heredoc body becomes its own line in `Get-ScannableSegments` ([`scripts/hooks/worktree_gate.ps1:557`](../scripts/hooks/worktree_gate.ps1)), and the fact that it is quoted DATA does not survive the newline split. Documentation that QUOTES a config key is scanned as if it SET one. This is the root cause under #1305 and one half of #1306.
