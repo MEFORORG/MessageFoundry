@@ -40,8 +40,13 @@ auth_routes.py::create_local_user::username
 #     SELECT ts, action, detail FROM audit_log WHERE actor = ? AND action LIKE 'auth.%'
 #
 # The username is not labelling a row here -- it IS the WHERE clause that decides which rows the
-# caller may see, which is this item's definition of the defect verbatim. The tell the item predicted
-# holds: two lines above, the sibling route scopes on `identity.user_id`.
+# caller may see, which is this item's definition of the defect verbatim.
+#
+# The PRECEDING route handler in the same file, `my_sessions`, scopes on an immutable id --
+# `list_sessions(identity.user_id)`. That contrast is real but it is NOT evidence of an oversight:
+# the sessions table HAS a user id and `audit_log` does not. Measured on main: 9 `FROM audit_log`
+# sites in store.py, ZERO keyed on `user_id`, against a positive control of 1 keyed on `actor = ?`.
+# THE AUTHOR HAD NO IMMUTABLE KEY AVAILABLE AT THIS SITE.
 #
 # CONDITIONAL SEVERITY (CLAUDE.md section 0 -- zero deployments, nothing is exposed today): on a first
 # deployment, an operator who deleted a user and recreated the same username would hand the new
