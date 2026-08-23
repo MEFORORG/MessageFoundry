@@ -402,3 +402,139 @@ def test_the_checker_is_WIRED_to_the_commit_path() -> None:
         "a generic textual matcher is a SECOND definition of what a readable ledger is; "
         "CLAUDE.md section 11 requires this file be read through parse_items and nothing else"
     )
+
+
+# ---------------------------------------------------------------------------
+# BACKLOG #1338 -- a duplicated banner field is invisible to a count-preserving check.
+#
+# `Item.fields` is a dict, so a repeated `> Research:` line overwrote the first and left no trace.
+# Every signal a seat checks after a ledger edit -- item count, open count, even `len(fields)` --
+# is IDENTICAL with and without the duplicate. `test_the_totals_every_seat_checks_cannot_see_it`
+# below is that claim as an executable assertion, and it is why a new FIELD was needed rather than
+# a new check: the reader could not REPRESENT the defect, so nothing downstream could detect it.
+# ---------------------------------------------------------------------------
+
+_OPEN_BANNER = "> \U0001f522 **Filed 2026-08-23 - not started.**"
+
+_WITH_DUP = (
+    "## 9. an item\n\n"
+    f"{_OPEN_BANNER}\n"
+    "> Verdict: build\n"
+    "> Research: none\n"
+    "> Research: done 2026-08-20\n"
+    "\n**Cluster:** x\n"
+)
+
+_WITHOUT_DUP = (
+    f"## 9. an item\n\n{_OPEN_BANNER}\n> Verdict: build\n> Research: none\n\n**Cluster:** x\n"
+)
+
+
+def test_a_duplicated_banner_field_is_recorded_rather_than_silently_overwritten() -> None:
+    """MUST FIRE, and the record must be ACTIONABLE rather than a bare flag.
+
+    Naming only "this item has a duplicate" leaves the reader to find which key and which line,
+    which is the work the record exists to save."""
+    (item,) = bsc.parse_items(_WITH_DUP)
+    assert len(item.duplicate_fields) == 1, item.duplicate_fields
+    key, line, displaced, kept = item.duplicate_fields[0]
+    assert key == "research"
+    assert line == 6, "the record must name the line of the SECOND occurrence"
+    assert displaced == "none", "the overwritten value must survive in the record"
+    assert kept == "done 2026-08-20"
+    assert item.fields["research"] == "done 2026-08-20", "last-one-wins parsing is unchanged"
+
+
+def test_the_same_item_without_the_duplicate_records_nothing() -> None:
+    """MUST NOT FIRE -- the twin, differing by exactly one line.
+
+    Without it, a detector that recorded unconditionally would satisfy the arm above."""
+    (item,) = bsc.parse_items(_WITHOUT_DUP)
+    assert item.duplicate_fields == []
+    assert item.fields["research"] == "none"
+
+
+def test_the_totals_every_seat_checks_cannot_see_it() -> None:
+    """THE ITEM'S THESIS AS AN ASSERTION. This arm is what justifies changing the reader.
+
+    A seat verifying a ledger edit compares item count and open count. Both are identical across
+    these two texts, and so is `len(fields)`, because a duplicate key does not grow a dict. The
+    check every seat quotes therefore reports success over the corrupted row -- and would have
+    done so for 93 duplicated lines, which is the near-miss this item was filed against."""
+    dup = bsc.parse_items(_WITH_DUP)
+    clean = bsc.parse_items(_WITHOUT_DUP)
+
+    assert len(dup) == len(clean), "item count is blind to it"
+    assert sum(1 for i in dup if i.is_open) == sum(1 for i in clean if i.is_open), (
+        "open count is blind to it"
+    )
+    assert len(dup[0].fields) == len(clean[0].fields), (
+        "even the field COUNT is blind to it -- a duplicate key does not grow a dict"
+    )
+
+    # ...and the one signal that is not blind:
+    assert len(dup[0].duplicate_fields) == 1
+    assert clean[0].duplicate_fields == []
+
+
+def test_a_field_key_in_prose_below_the_banner_is_not_a_duplicate() -> None:
+    """MUST NOT FIRE, AND THIS LANDMINE IS REAL RATHER THAN HYPOTHETICAL.
+
+    The item that DOCUMENTS the verdict vocabulary necessarily writes `Verdict: ...` into its own
+    body, and a sibling checker (#1342) hit exactly that. The banner block ends at the first line
+    that is neither blank nor a blockquote, so prose is already out of scope; this pins it."""
+    text = (
+        "## 9. an item\n\n"
+        f"{_OPEN_BANNER}\n"
+        "> Verdict: build\n"
+        "\n"
+        "The vocabulary is `Verdict: build | research | demand-gate`.\n"
+        "> Verdict: research\n"
+    )
+    (item,) = bsc.parse_items(text)
+    assert item.duplicate_fields == [], "a blockquote below the prose is outside the banner block"
+    assert item.fields["verdict"] == "build"
+
+
+def test_two_items_each_declaring_one_verdict_is_not_a_duplicate() -> None:
+    """MUST NOT FIRE. The record is per ITEM, not per file -- otherwise every ledger with more
+    than one item reports hundreds of duplicates and the signal is worthless."""
+    text = (
+        f"## 9. first\n\n{_OPEN_BANNER}\n> Verdict: build\n\n**Cluster:** x\n\n"
+        f"## 10. second\n\n{_OPEN_BANNER}\n> Verdict: build\n\n**Cluster:** y\n"
+    )
+    items = bsc.parse_items(text)
+    assert len(items) == 2
+    assert all(i.duplicate_fields == [] for i in items)
+
+
+def test_the_real_backlog_carries_no_duplicate_banner_field() -> None:
+    """THE OPERATIVE GUARD, with its denominator asserted so a clean result cannot be vacuous.
+
+    A run that parsed nothing and a run that parsed a clean ledger both report zero duplicates.
+    Pinning the population above a floor is what separates them -- the same reason
+    `test_the_docs_scan_actually_covers_something` exists for the citation detector."""
+    present = [
+        (p.relative_to(_ROOT).as_posix(), p.read_text(encoding="utf-8"))
+        for p in _SOURCES
+        if p.exists()
+    ]
+    assert present, "no backlog source exists -- DEFAULT_SOURCES is stale"
+
+    offenders: list[str] = []
+    with_fields = 0
+    for label, text in present:
+        for item in bsc.parse_items(text):
+            if item.fields:
+                with_fields += 1
+            for key, line, displaced, kept in item.duplicate_fields:
+                offenders.append(
+                    f"{label}:{line} item #{item.num} declares {key!r} twice "
+                    f"({displaced!r} overwritten by {kept!r})"
+                )
+
+    assert with_fields > 100, (
+        f"only {with_fields} items carry a banner field -- too few for this guard to mean "
+        "anything, so the zero below would be an artefact of an empty parse, not a result"
+    )
+    assert not offenders, "duplicated banner field(s):\n  " + "\n  ".join(offenders)

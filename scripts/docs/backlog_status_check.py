@@ -140,10 +140,15 @@ _CL_EXPLICIT = re.compile(r"BACKLOG\s+#(\d+)", re.IGNORECASE)
 _CL_ADR_FORM = re.compile(r"\(#(\d+),\s*\[?ADR", re.IGNORECASE)
 
 
+#: One field line that was overwritten by a later line for the same key: the key, the 1-based
+#: line number of the SECOND occurrence, the value it displaced, and the value that displaced it.
+DuplicateField = tuple[str, int, str, str]
+
+
 class Item:
     """One numbered backlog item and the status banners in its leading blockquote block."""
 
-    __slots__ = ("num", "line", "closed", "open", "fields")
+    __slots__ = ("num", "line", "closed", "open", "fields", "duplicate_fields")
 
     def __init__(self, num: int, line: int) -> None:
         self.num = num
@@ -157,6 +162,12 @@ class Item:
         # dispatched whose every item carried `Verdict: research` -- a verdict that has closed ZERO
         # times in 330 closed items -- and closed zero.
         self.fields: dict[str, str] = {}
+        # A DUPLICATE FIELD LINE USED TO VANISH INTO THE ASSIGNMENT BELOW (#1338). `fields` is a
+        # dict, so a second `> Research: ...` overwrote the first and left NO trace: item count,
+        # open count and even `len(fields)` are identical with and without the duplicate -- and
+        # those totals are the entire check every seat runs after a ledger edit. The reader could
+        # not represent the defect, so nothing downstream could detect it.
+        self.duplicate_fields: list[DuplicateField] = []
 
     @property
     def is_open(self) -> bool:
@@ -202,7 +213,14 @@ def parse_items(text: str) -> list[Item]:
                     (item.closed if emoji in _CLOSED else item.open).append(emoji)
                 f = _FIELD.match(line)
                 if f:
-                    item.fields[f.group("key").strip().lower()] = f.group("value").strip()
+                    key = f.group("key").strip().lower()
+                    value = f.group("value").strip()
+                    # Record before overwriting. `dispatch_gate.py` reads verdict / research /
+                    # closing-act out of this dict and would otherwise act on whichever copy
+                    # happened to come last, with nothing reporting that a second one existed.
+                    if key in item.fields:
+                        item.duplicate_fields.append((key, j + 1, item.fields[key], value))
+                    item.fields[key] = value
                 j += 1
                 continue
             break
