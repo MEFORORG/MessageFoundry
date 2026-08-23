@@ -1214,6 +1214,97 @@ def _render_value(node: ast.expr, source: str) -> Any:
 # --- bounded-expression checks (the ``recognized`` flag) ---------------------
 
 
+# --- ADR 0076 Amendment E: per-argument value classes (BACKLOG #237) ----------
+
+#: The three per-argument modes of ADR 0076 Amendment E, section E.4. ``static`` is a literal,
+#: ``templated`` is the bounded interpolation E.5 admits, and ``dynamic`` is everything else -- an
+#: OPEN set, which is why E.3 keeps it read-only: a rewriter cannot round-trip an open set.
+MODE_STATIC = "static"
+MODE_TEMPLATED = "templated"
+MODE_DYNAMIC = "dynamic"
+
+
+def _is_bounded_message_read(node: ast.expr) -> bool:
+    """Whether ``node`` is a bounded ``Message`` read -- ``msg["LIT"]`` or ``msg.field(LIT, ...)``.
+
+    STRICTER THAN :func:`_is_bounded`, deliberately. That one walks a tree asking whether anything
+    forbidden appears, which is an OPEN predicate: it admits every shape nobody thought to exclude.
+    ADR 0076 E.5 requires a CLOSED set, for the same reason ``scripts/quality/lens_coverage.py``
+    refuses to reimplement recognition -- an open predicate is a second grammar that drifts from the
+    first.
+
+    Erring strict is the safe direction and the asymmetry is the point. A read this WRONGLY REJECTS
+    is classified ``dynamic``, which renders read-only exactly as it does today (E.5: "not a
+    degradation and not an error"). A read it wrongly ACCEPTED would license the rewriter to emit
+    something it cannot round-trip, which is what E.6.3 exists to forbid.
+    """
+    if isinstance(node, ast.Subscript):
+        return (
+            isinstance(node.value, ast.Name)
+            and node.value.id == "msg"
+            and isinstance(node.slice, ast.Constant)
+            and isinstance(node.slice.value, str)
+        )
+    if isinstance(node, ast.Call):
+        func = node.func
+        if not isinstance(func, ast.Attribute) or func.attr != "field":
+            return False
+        if not (isinstance(func.value, ast.Name) and func.value.id == "msg"):
+            return False
+        if node.keywords or not node.args:
+            return False
+        return all(isinstance(a, ast.Constant) for a in node.args)
+    return False
+
+
+def _is_bounded_interpolation(node: ast.expr) -> bool:
+    """Whether ``node`` is the ONE interpolation shape ADR 0076 E.5 admits as writable.
+
+    An f-string whose every ``FormattedValue`` is a bounded ``Message`` read carrying **no format spec
+    and no conversion**, and whose every remaining part is a constant string.
+
+    A format spec or a conversion (``!r``/``!s``/``!a``) is excluded because each is a second rendering
+    step the lens does not model: reading the emitted text back would not recover the same parts, and
+    round-trip totality is a BUILD GATE under E.6.3, not a test wish.
+
+    An f-string with no placeholders is admitted, vacuously -- E.5's condition is universally
+    quantified over parts that are not there. It cannot be ``static`` (it is not ``ast.Constant``, and
+    AC-M2 ties ``static`` to ``literal_params``, which tests exactly that), and it round-trips
+    trivially, so ``templated`` is both the literal reading of E.5 and the harmless one.
+    """
+    if not isinstance(node, ast.JoinedStr):
+        return False
+    for part in node.values:
+        if isinstance(part, ast.Constant):
+            if not isinstance(part.value, str):
+                return False
+            continue
+        if isinstance(part, ast.FormattedValue):
+            # ``conversion`` is -1 when absent; 114/115/97 are !r/!s/!a.
+            if part.conversion != -1 or part.format_spec is not None:
+                return False
+            if not _is_bounded_message_read(part.value):
+                return False
+            continue
+        return False
+    return True
+
+
+def _param_mode(node: ast.expr) -> str:
+    """The ADR 0076 E.4 mode of one argument: ``static``, ``templated`` or ``dynamic``.
+
+    ORDER MATTERS. ``static`` is tested first so it stays exactly ``isinstance(node, ast.Constant)`` --
+    AC-M2 requires it to agree with ``literal_params`` in BOTH directions, and ``literal_params`` is
+    that same test. Any looser definition here makes the newer field a second, drifting truth about
+    which arguments are literals.
+    """
+    if isinstance(node, ast.Constant):
+        return MODE_STATIC
+    if _is_bounded_interpolation(node):
+        return MODE_TEMPLATED
+    return MODE_DYNAMIC
+
+
 def _is_bounded(node: ast.expr) -> bool:
     """Whether an ``if``/``elif`` test is a bounded expression (ADR 0076 §4).
 
