@@ -11929,7 +11929,14 @@ required context **without first clearing the standing failures** *"converts a s
 permanently blocked repository."* **That ordering is not the builder's to clear either.**
 
 ***PRECEDENT WARNING 2026-08-23, from the seat that owns this vocabulary: TODAY'S OWNER RULING DOES NOT
-COVER OPTION (a), AND MUST NOT BE CITED AS PERMISSION FOR IT.***
+COVER PUBLISHING THE ANCHOR MANIFEST -- THE ENUMERATION -- AND MUST NOT BE CITED AS PERMISSION FOR IT.***
+
+***NAMED BY THE MECHANISM ON PURPOSE, corrected 2026-08-23 after reading the ruling in full.*** This
+sentence previously said *"option (a)"*. **The letters are INVERTED between documents** --
+`.github/workflows/asvs-prove-absences.yml` calls the vault-token-in-public-CI design *"option (a)"*,
+while the ruling brief gives that letter to the manifest. **A reader comparing the two takes this
+warning to mean the opposite of what it says.** The ruling states the rule outright: *"STATE THE
+MECHANISM, NEVER THE LETTER."*
 
 **The ruling sanctioned an individual pairing WHEN IT JUSTIFIES A DECISION** -- its whole basis is that
 a single citation in a design record or a tool comment **explains why something was built.** ***IT SAYS
