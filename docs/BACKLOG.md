@@ -10829,7 +10829,7 @@ gate is the wrong shape, validation of the walk is the right one.
 
 > 🔢 **Re-scored 2026-08-20 -> P3.** Value **2/10** · Difficulty **2/10** · _fill-in_. The published defect, a failure message naming an artefact the check never opened, is fixed in place with its reasoning in the docstring, and two guards were added past the filing. The remainder is a one-identifier rename or the document-binding alternative the Scope explicitly makes optional, which ships nothing runnable either way, so value 2 and a small edit on an existing test module. _(was 5/10 · 3/10.)_
 >
-> **Filed 2026-08-11 -- found by Session C, MEASURED not argued.** `tests/test_threat_model_doc_drift.py::test_documented_bounds_match_the_live_constants` compares each live constant to a **hardcoded literal in the test file**, then reports a mismatch as `"doc says {expected!r}, code says {actual!r}"`. **"doc says" is not true of any value it compares** -- the literal is a human transcription, and nothing binds the transcription to the document. All of the roughly 60 rows in the `checks` list share the shape, so the gate catches *code drifting from the transcription* and can never catch *the transcription drifting from the document*.
+> **Filed 2026-08-11 -- found by Session C, MEASURED not argued.** `tests/test_threat_model_doc_drift.py::test_transcribed_bounds_match_the_live_constants` (**renamed 2026-08-23 in `a5d5a9ab`; this row previously cited `test_documented_bounds_...`, which no longer resolves**) compares each live constant to a **hardcoded literal in the test file**, then reports a mismatch as `"doc says {expected!r}, code says {actual!r}"`. **"doc says" is not true of any value it compares** -- the literal is a human transcription, and nothing binds the transcription to the document. All of the roughly 60 rows in the `checks` list share the shape, so the gate catches *code drifting from the transcription* and can never catch *the transcription drifting from the document*.
 > **The proof it does not work is that it PASSES when fully wired.** Session C set `MEFOR_THREAT_MODEL_DOC` and `MEFOR_REQUIRE_THREAT_MODEL_DOC` and ran it against the real vault document: **90 passed, 11 skipped**. A gate that passes against the artefact it claims to compare against is measuring something else.
 > **This is SDS-3.8 -- the instrument answering the adjacent question -- inside the very module built to prevent that class.** It is the sibling of `#1043`, which made this module's doc-absent skip LOUD: the skip is now honest, and the comparison underneath it is still not the one the name promises. Fixing the skip did not fix the measurement.
 > **Scope:** bind the comparison to the DOCUMENT -- parse the value out of the named document at run time and compare that to the live constant -- or rename the check and its failure message to say what it actually asserts. Either is honest; the present state is not.
@@ -11393,6 +11393,55 @@ only check that reads the CODE, and it is the one that decides startability.***
 > **WHY IT IS NOT A DOCUMENTATION ITEM, and why it must not ride #1131.** #1131 asks what the anti-automation documentation must SAY. This item is that the shipped system has no recovery to describe. **If it rode #1131, a documentation edit would close the item while the defect went untracked** -- the reader would see "lockout disclosure fixed" and reasonably conclude recovery exists.
 > **The step-up gate on the sole remedy is a CONSTRAINT here, not a mitigation** (`auth_routes.py:757`, `require_step_up(Permission.USERS_MANAGE)`). It is correct on its own axis and it makes this case harder, which is precisely the shape #1131's amendment first got backwards.
 > **How to prove a fix:** lock the sole administrator, then recover **without** editing the database by hand and **without** an already-authenticated second admin -- and assert the recovery path is itself gated, since an unlock affordance is a control an attacker wants. A fix that only lengthens the docs, or that opens an ungated reset, fails on opposite sides.
+
+***RE-CORRECTED 2026-08-23, SAME HOUR. `admin-unlock` DOES SHIP, AND AN EARLIER CORRECTION IN THIS ROW
+CLAIMING OTHERWISE WAS ITSELF WRONG.*** *Verified repo-wide with both controls firing:* **`__main__.py:604`
+registers the `admin-unlock` subcommand with `--username`, `--db` and `--json`; `:3962` clears the lock via
+`record_login_failure(user.id, failed_attempts=0, locked_until=None)`; `:3964` audits `auth.admin_unlocked`;
+and `:5091` is the DISPATCH-TABLE ENTRY `"admin-unlock": _admin_unlock` -- **the line that makes the
+subcommand reachable at all**.** *Four sites, not three; an earlier draft of this paragraph said `:603`
+and named three. **Both were corrected by an independent repo-wide re-derivation, because a line number
+in a ledger row gets followed.***
+*`3ab27755` added 92 lines to `__main__.py`.*
+
+***SO THE ON-DEMAND AFFORDANCE ALREADY EXISTS AND NEEDS NO BUILD.*** **What remains is narrower:** *a
+**duration-bearing refusal** is absent at all three sites -- `:797` password, `:2243` MFA, `:2608`
+WebAuthn -- and **lock CYCLES are still uncapped**, since `_register_failure` has no counter.* ***THE
+DURATION LIMB IS BLOCKED ON AN OWNER RULING (see below). THE CYCLE CAP IS NOT.***
+
+***THE ENUMERATION TENSION IS NOT SPENT. THIS ROW SAID TWICE THAT IT WAS, AND THAT WAS WRONG BOTH
+TIMES.*** **The distinct strings live ONLY in logs and audit. Verified at the BOUNDARY, with the control
+firing:**
+
+- *`auth/service.py:147`, the `LoginOutcome` contract, verbatim:* **"``error`` is for logs/audit -- never
+  leak the reason to clients"**
+- *`api/auth_routes.py:259` raises* **`HTTPException(401, "invalid credentials")` -- a FIXED STRING**,
+  *whenever `not outcome.ok`, regardless of `outcome.error`*
+- ***`outcome.error` appears ZERO times in `auth_routes.py`, against a control of 7 for `outcome.`***
+
+***SO A CLIENT SEES "invalid credentials" WHETHER THE ACCOUNT IS LOCKED, THE PASSWORD IS WRONG, OR THE
+USER DOES NOT EXIST. THERE IS NO ENUMERATION LEAK TODAY.***
+
+**THAT INVERTS THE CONCLUSION.** *A duration that reaches the locked-out operator is a **NEW
+DISCLOSURE**: it tells an **unauthenticated** caller that the account exists, is locked, and for how
+long.* ***OWNER-LEVEL, AND ROUTED.*** *And a duration added only to the `error` field would help nobody,
+because the operator never sees that field.*
+
+**MFA AND WEBAUTHN RETURN A BARE `False` WITH NO ERROR CHANNEL AT ALL**, *so a duration there needs a
+different mechanism -- **not the same edit three times**, which is what a three-site brief implied.*
+
+## ***HOW THE WRONG CORRECTION WAS PRODUCED, BECAUSE THE CONTROL IS THE LESSON***
+
+*Three layers failed in the same direction:* **a `git show <commit> -- auth/service.py` search returned a
+zero that was TRUE FOR THAT FILE and was published as repo-wide** -- *`admin-unlock` lives in
+`__main__.py`;* **the backstop was both FILTERED and TRUNCATED with `head -8`, so it never reached the
+right file;** *and a control WAS printed and DID pass.*
+
+> ***THE CONTROL CONFIRMED THE INSTRUMENT WORKED ON THE FILE THAT WAS SEARCHED, NOT ON THE CLAIM THAT WAS
+> MADE. A CONTROL THAT CERTIFIES YOUR SCOPE INSTEAD OF YOUR CLAIM IS NOT A CONTROL.***
+
+**A scoped search whose scope is wrong produces a true zero and a false conclusion, and a control drawn
+from the same scope cannot see it.** *The claim was repo-wide; every instrument was file-wide.*
 
 > **AMENDED 2026-08-21 -- THE TEST ABOVE PASSES TODAY, BY WAITING, so it cannot discriminate a fixed system from the shipped one.** The lock is time-bounded and clears itself, by default in 15 minutes (`auth/service.py:851-853`, `auth/policy.py:103`), and simply waiting recovers the account **without** hand-editing the database and **without** a second authenticated admin -- satisfying the criterion above exactly as written. **An acceptance test that a defect-free system and the defective system both pass is not an acceptance test.** A usable criterion has to exclude the passage of time: recovery must be reachable **on demand**, gated, and **faster than `lockout_minutes`**, or the item must say plainly that self-expiry is the accepted recovery and re-scope to what is actually owed. **Measured while amending this, and it settles a limb the premise correction had flagged unmeasured:** an ACTIVE lock cannot be extended -- `service.py:739` returns at `:742` before `_register_failure` at `:746` -- but the NUMBER of lock cycles is unbounded, which `docs/SECURITY.md` already words as bounding the lock rather than the campaign. **Amendment only; no status, score or tier changed by this edit.**
 > Verdict: build
@@ -13000,6 +13049,20 @@ measurement from this row's subject and it is named here rather than performed.*
 > **PROVENANCE, kept separate because these were measured by different seats.** The mechanism, the 59m58s measurement, the 88-minute suppression case and the dedupe finding are the **Steward's**, relayed via the Dispatcher and **not re-verified here**. The paths, the `cmp`, the `FATAL` content and the live baseline are the **Dispatcher's**, measured 2026-08-14 ~22:31Z. **The third glob hit (`scratchpad/fake/run/`) is this seat's**, found while confirming the decoy. Whoever builds this should re-measure rather than inherit -- *a provenance line carried through a handoff is a claim, not a fact*, which is itself a lesson from the same evening.
 > Verdict: build
 > Closing-act: code
+
+***AMENDED 2026-08-23 -- THE MECHANISM THIS ROW PRESCRIBED IS BUILT ON A FILE THAT CANNOT ANSWER THE QUESTION, AND `seat-tick.ps1` SAYS SO IN ITS OWN COMMENT.***
+
+*The row directed the alarm to read `seat-tick.last`. The tool's comment at the state-file declaration states verbatim that it* **"cannot answer 'when did THIS seat last actually get a tick', because a run that reported COLD for a seat OVERWRITES the run in which that seat was SENT"** -- *and that the throttle, needing the same second question, was therefore given `seat-tick.state.json`.*
+
+***BUILDING THIS ROW AS WRITTEN WOULD HAVE PRODUCED THE DEFECT IT WAS FILED TO FIX.*** *The title is "the obvious implementation reads healthy at the moment it should fire"; **an alarm reading that file goes healthy on the overwrite.*** **The row specified its own subject.**
+
+**INVERTED SCOPE, RULED 2026-08-23:** ***`seat-tick.state.json` -- keyed by ABSOLUTE WORKTREE PATH, values unix seconds -- answers WHEN and WHO. `seat-tick.last` answers only WHY NOT, for the exclusion decision alone.*** *Unchanged and still required: the tick-identity dedupe, the exclusion rule, the pinned absolute path, the throttle-age consistency check, and a discriminating test that actually fires.* **The alarm's job did not shrink; only the file assignment moved.**
+
+***AND THE SEAT NAME IS NOT UNIQUE IN `seat-tick.last`.*** *Measured 2026-08-23: `steward`, `lander` and `dispatcher` each appear **TWICE** in one live line -- once `STALE(no-live-session)`, once `SENT:<id>`.* **A first-match scan gets `STALE` for all three.** ***That is the same first-match trap as the fleet roster, in the file this alarm was told to parse*** -- *a third instance of one shape in one day.*
+
+**SCOPE NOTE, NOT A SEPARATE ITEM:** *the emitted vocabulary grew after this row was written.* **`STALE(no-live-session)` at `seat-tick.ps1:654` and the `(roster-blind)` suffix at `:767` are absent from the exclusion list here.** *The list is INCOMPLETE rather than wrong; build against the vocabulary as it stands and say so.*
+
+***THE PIN-THE-PATH RULE IS RIGHT AND ITS EVIDENCE IS STALE, WHICH STRENGTHENS IT.*** *The two decoys this row names are gone; **three exist today, all under a live lane's scratchpad, one in a directory called `ticktest`.*** **Newest-wins would today land in a live lane's test fixture.** *Keep the rule exactly as stated.*
 
 **Cluster:** Fleet coordination / observability. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) -- this is fleet tooling, not engine code. The cost is that the mechanism which keeps every seat alive has no independent observer, so its death is silent by construction, and the first implementation anyone reaches for is green at precisely the moment it should be red.
@@ -15707,3 +15770,118 @@ removed with their sessions.
 **Severity:** no deployment axis (sec. 0). **Conditional, per section 0:** nothing bites today because the guard runs in no session (#1339). If #1339 resolves toward wiring, this becomes the prerequisite -- a guard that refuses the commit documenting it is exactly the friction that gets a control disarmed.
 
 **Related:** #1339 (priority follows its resolution; this is the prerequisite if that resolves toward wiring), #1340 (opposite failure direction in the same file -- a false ALLOW, not a false DENY), #1086 (same class on the sibling hook, and the source of the helper this should consume), #1229 (the reverted program-position experiment and its two fail-opens), #1306 (the other consumer of the same root cause).
+
+## 1349. a rescue ref can silently hold an ancestor instead of the tip, and the population where that matters is the population where it cannot be checked
+
+> 🔢 **Filed 2026-08-23 - not started.** ***A rescue ref whose NAME contains a branch name can dereference to an ANCESTOR of that branch rather than its tip, with nothing reporting it.*** **Confirmed instance, re-derived independently by two seats to the file and the insertion: one dated rescue tag is a STRICT ANCESTOR of the branch its name contains -- 75 commits short, `167 files changed, 23410 insertions(+), 1578 deletions(-)`, holding ZERO commits that branch lacks.** ***THE WORK IS NOT AT RISK AND THE FIRST FILING SAID IT WAS.*** *That branch is gone from every WORKTREE, which was read as gone. **It exists as a ref, and the push-updated namespace holds its tip exactly.** The hazard is a reader reaching for the wrong ref and concluding work is lost, or recovering 75 commits short.*
+> Verdict: build
+> Research: none
+> Closing-act: code
+
+**Cluster:** coordination tooling / naming. **Priority:** P2. **Verdict:** build.
+**Severity:** no product axis (sec. 0). ***The cost is a WRONG RECOVERY DECISION -- reaching for a ref that
+is short, or concluding work is gone when another namespace holds it.*** *NOT data loss: no instance of
+actual loss has been demonstrated, and the one examined case is fully held elsewhere.*
+
+***THE ARGUMENT THAT THIS IS A WRITER DEFECT WAS WITHDRAWN BY ITS AUTHOR AND IS RECORDED HERE ONLY SO IT
+IS NOT RE-DERIVED.*** *It ran: 374 of 730 tags hold the tip, therefore capturing a tip is intended,
+therefore the short ones are broken.* ***374 IS ALSO EXACTLY WHAT SNAPSHOTS OF MOSTLY-DORMANT BRANCHES
+LOOK LIKE.*** **That measurement cannot distinguish "tags track heads" from "most branches have not moved
+since their snapshot" -- a correlation read as intent.** *Tags in this repository are **snapshots by
+design**; the live tracking mechanism is the push-updated namespace.*
+
+| tag-scheme census, 730 refs | count | reading |
+|---|---|---|
+| **hold the tip exactly** | ***374*** | *the contract, working* |
+| ***ANCESTOR -- short of the tip*** | ***22*** | ***MEASURED FACT. Not a defect -- a snapshot older than its branch.*** |
+| diverged from the named branch | *32* | ***UNVERIFIED*** -- *the matcher takes the longest branch name in the tag name, so a pairing may be spurious* |
+| name no local branch | *302* | **NOT a defect** -- *a deleted branch is the case rescue refs exist for* |
+
+***AT LEAST 22 OF 730. The `32` is deliberately NOT added to that figure.***
+
+**A second scheme was censused separately and its numbers do NOT cover the first.** *Of 248 refs under
+`private/rescuetags/auto/`, 114 name a branch that still exists: **103 hold the tip, 10 DIVERGED, 1
+ahead, 0 purely stale**.* ***The `0 purely stale` must not be read as refuting the tag-scheme finding --
+different population, different scheme, and it is evidence about neither.***
+
+**FOUR SHORT REFS WERE IDENTIFIED, AND TWO OF THEM NAME THE SAME BRANCH BY DIFFERENT AMOUNTS -- `75`
+and `106` behind, one in each naming scheme.** *The other two are `55` and `13` behind, and **the
+`55`-behind ref names a branch an independent triage had classified LANDABLE***. *Ref names are held
+outside this file: internal worktree slugs do not belong in a public ledger, and the finding is the
+shape and the counts, not the identifiers.*
+
+## ***THE STRUCTURAL FINDING, AND IT IS WORSE THAN ANY COUNT***
+
+***A RESCUE REF CAN ONLY BE VERIFIED AGAINST A BRANCH THAT STILL EXISTS. 436 REFS NAME A BRANCH THAT IS
+GONE -- AND THOSE ARE PRECISELY THE ONES A RESCUE REF IS FOR.***
+
+> **THE MEASUREMENT IS POSSIBLE EXACTLY WHERE IT DOES NOT MATTER AND IMPOSSIBLE EXACTLY WHERE IT DOES.**
+> ***No census of this kind can bound the risk.*** *The confirmed instance was findable ONLY because its
+> branch happened to survive alongside the tag; had the branch been pruned, the ref would have looked
+> like any of the 302.*
+
+**This is also the one instrument whose failure surfaces only when it is too late to fix** -- *a rescue
+ref is consulted once, in the moment the original is already gone.* ***Every other wrong reading recorded
+today was survivable because something else could still be measured.***
+
+**Two controls, and the second is the hard one:** a ref written for a branch that is then advanced must
+FAIL a tip check, and **a ref must be verifiable without the branch it names** -- *by recording the sha
+it captured at write time, or by refusing to write a ref that is not the tip.* ***A rescue mechanism that
+can only be audited while the thing it rescues still exists has never been shown to work.***
+
+***AMENDED SAME DAY -- THE TWO SCHEMES ARE DIFFERENT MECHANISMS AND MUST NOT BE GENERALISED TOGETHER.
+TWO SEATS MEASURED OPPOSITE OBJECTS AND BOTH SAID "rescue tags".***
+
+| scheme | mechanism | staleness |
+|---|---|---|
+| ***dated tags, 730 refs*** | ***TRUE ONE-TIME SNAPSHOT. Nothing re-takes it.*** | ***PERMANENT*** |
+| auto refs, 248 refs | ***UPDATED BY PUSH*** -- *one ref's reflog shows six updates* | *TRANSIENT LAG* |
+
+*A seat reported an **auto** ref 13 commits behind. That reading was **correct and transient**: it sits at
+that ref's reflog `@{4}` with four pushes after it, and the mechanism caught up.* ***An auto ref that
+looks stale may simply be lagging. A DATED TAG NEVER CATCHES UP, because there is no mechanism behind
+it.*** **The confirmed instance in this row is a DATED tag, which is the half where staleness is
+permanent and therefore the half worth alerting on.**
+
+***AND THE STRUCTURAL PROBLEM IS WORSE THAN THIS ROW FIRST STATED: ALL 730 DATED TAGS ARE UNCOMPARABLE BY
+NAME.*** *Their leaf is a **date-scoped label**, not a branch name, so **zero** of them can be censused
+the way the auto scheme was.* **The confirmed instance was checkable only because the branch it belonged
+to was already known** -- *not because anything in the ref said so.*
+
+**INSTRUMENT NOTE, MEASURED: these are ANNOTATED tags -- 4 of the 730.** *`rev-parse` returns the **tag
+object**, not the commit; `rev-parse ^{commit}` or `%(*objectname)` returns the commit.* ***`diff`,
+`merge-base` and `rev-list` dereference silently, so ancestry and diffstat are unaffected -- but a tag-
+object sha published into a log will not resolve.*** *One such sha was published and corrected here.*
+
+***AMENDED A THIRD TIME, AND THIS IS THE ACTIONABLE FORM: TWO NAMESPACES CARRY NEAR-IDENTICAL NAMES FOR
+THE SAME BRANCH, AND THEY DISAGREE ABOUT ONE TIME IN SEVEN.***
+
+*For one branch, both of these exist in one clone right now:* **a `refs/tags/rescue/auto/...` tag `13`
+commits behind, and a `refs/remotes/private/rescuetags/auto/...` ref holding the head EXACTLY.** ***Both
+readings correct. The names differ by NAMESPACE ALONE.***
+
+| over 110 branches carrying BOTH and still alive | holds the current head |
+|---|---|
+| the **tag** | *86 / 110 -- **78 pct*** |
+| the **remote-tracking ref** | *99 / 110 -- **90 pct*** |
+| ***the two DISAGREE WITH EACH OTHER*** | ***16 / 110 -- 15 pct*** |
+
+***SO "CHECK YOUR RESCUE TAG" RETURNS OPPOSITE ANSWERS ABOUT ONE TIME IN SEVEN, DECIDED ONLY BY WHICH REF
+THE READER HAPPENS TO REACH FOR.***
+
+**AND THE TOOLING HIDES THE OTHER ONE FROM YOU.** *`git tag -l 'rescue/*'` **cannot see** the remotes
+ref. A reflog showing `update by push` **cannot exist** on a tag.* ***Two seats each verified a real
+object with an instrument structurally blind to the other's, then read the other's result as a
+refutation.***
+
+***THE REMEDY IS A NAMING RULE, NOT A REPAIR: QUOTE THE FULL REFNAME. NEVER WRITE "THE RESCUE TAG".***
+*Every count in this row is a slice of a different namespace and **the slices are NOT reconciled here** --
+`730`, `393`, `752`, `248` were each measured over a different set, and forcing them into one figure
+would manufacture exactly the false precision this row is about.*
+
+**WHAT SURVIVES ALL THREE AMENDMENTS:** *the snapshot is least reliable for the **MOST ACTIVE** branch --
+**a tag because it never moves, a remote ref because an active branch outruns the push*** -- *and you
+read it once, in the moment the original is already gone.*
+
+**Expiry:** this stops being right if rescue refs are written with a recorded target sha, or if the
+writer refuses any ref that is not its branch's tip.
