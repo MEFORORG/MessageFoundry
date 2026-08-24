@@ -5785,6 +5785,8 @@ The literal spellings are all caught, including the newline form. Only the indir
 > Verdict: build
 > Closing-act: code
 
+***VERIFIED-BUT-NOT-CLOSEABLE 2026-08-24 (dispatcher, adversarial pass).*** **The code limb IS merged** -- re-verified by content on `6e758a87` rather than from this row's twice-drifted coordinates: `Get-FullPathRaw` at `worktree_gate.ps1:147`, the prescribed two-step at `:1367`/`:1389`/`:1391`, the fail-CLOSED deny at `:1368`, and `tests/test_worktree_gate_control_plane.py:332` under a section header naming this row. ***IT STILL MUST NOT CLOSE: a MERGED COMMIT ON MAIN RECORDS A DELIBERATE REFUSAL TO CLOSE THIS EXACT ROW.*** `12aa0674` (PR #478) states it verbatim -- this row's own body records an unresolved residual and calls one of its measurements load-bearing and stale. **A prior seat already decided this; a later verifier finding the code merged is not new information.**
+
 **Cluster:** Session-drift controls / gate integrity. **Priority:** P1. **Verdict:** build. **Severity:** no product effect and no PHI effect — this governs agent behaviour in development. But it is a **live fail-open in an enforcement control**, measured on the installed hook, and it is the highest-severity gate defect found to date.
 
 **Verified independently by two sessions against the same installed hook** (`~/.claude/hooks/worktree_gate.ps1`, sha256 `be113c20cde5…`). Neither session executed any `git config` command; only read-only primitives and the hook itself were run.
@@ -11048,6 +11050,8 @@ gate is the wrong shape, validation of the walk is the right one.
 > Verdict: build
 > Closing-act: code
 
+***VERIFIED-BUT-NOT-CLOSEABLE 2026-08-24 (dispatcher, adversarial pass).*** **This row names TWO limbs, not one, and a first-pass verification read only the first.** PR #561 is merged (`f973f667`, ancestor of main) and the wiring limb IS closed -- `ci.yml:383-384` and `.pre-commit-config.yaml:237` both invoke the screen with `--baseline`, unfiltered. ***THE SECOND LIMB IS OPEN BY THIS ROW'S OWN TEXT:*** the proof clause requiring the uploads report be REVIEWABLE, where moving `uploader` into `LABEL_NAMES` drops `api/app.py` from 1 candidate to 0 with every existing assertion still satisfied. **That is the destructive narrowing this item names, and NO TEST GUARDS IT.**
+
 **Cluster:** Security / Access control. **Priority:** P3. **Verdict:** build. **Severity:** minor as a screen -- it ships no fix; its value is that the NEXT instance is caught rather than found by accident.
 
 ## 1227. Console resend POST bypasses the engine's step-up requirement across the CoreHandlers seam
@@ -11355,6 +11359,8 @@ only check that reads the CODE, and it is the one that decides startability.***
 > **What makes this filable rather than a style note:** there is **no gate on either side**. The allocator answers *"is this number free"*; nothing asks *"is anything already pointing at it."* And a citation in another repository is invisible to every check this one runs. The two halves are each individually correct and the gap between them is the defect.
 > Verdict: build
 > Closing-act: code
+
+***VERIFIED-BUT-NOT-CLOSEABLE 2026-08-24 (dispatcher, adversarial pass).*** **The engineering is discharged and the row still must not close, because THE MERGED TREE CONTRADICTS THE CLOSING REASON.** PR #560 is merged (`b47c9fd9`) and the wiring is real -- `ci.yml:244` carries the guard in `DOC_GUARDS`, and the noncode regex at `:1500` means a prose-only PR actually runs it. ***BUT THE CLOSING PR FALSIFIED THE DETECTOR'S OWN HEADER AND LEFT IT UNCORRECTED ON MAIN.*** **That is a LIVE DEFECT on main rather than a stale ledger note, and it is unowned** -- flagged here so it is not lost with the pass that found it.
 
 **Cluster:** Process / ledger integrity. **Priority:** P3. **Verdict:** build (the rule). **Severity:** minor and self-inflicted -- it corrupts cross-references between maintainer documents, touches no shipped code, and no deployment can observe it.
 
@@ -12697,6 +12703,8 @@ re-score, **not** a reason to build the version that cannot fire.
 > **AND THAT SEAT TOLD THE FLEET AT 19:35 THAT THE CLOCK "DID NOT MISS A BEAT"** - true of the six consecutive 10.0-minute gaps it was standing in, false as a claim about the clock. **The seat that owns an instrument is not automatically the one who notices it is broken**, and the disproving census was in its own transcript all day, unrun.
 
 > **THE QUALIFICATION ON THESE NUMBERS WAS ONCE DESTROYED IN TRANSIT, WHICH IS WHY IT IS RESTATED HERE RATHER THAN CITED.** A broadcast carrying them was truncated by the mail length cap **mid-word, exactly on the caveat** - `"...so they are a F"` - so the headline survived and the bound did not. Two seats then relayed the figures flat. **A cap bites at the END of a message, which is precisely where a caveat sits.** If a number reaches you from a truncated message, treat it as unqualified until you read the whole message on disk.
+
+***VERIFIED-BUT-NOT-CLOSEABLE 2026-08-24 (dispatcher, adversarial pass).*** ***THE CLOSING CENSUS MEASURED THE WRONG POPULATION.*** It keyed on `kind=broadcast`, and **the seat clock NEVER SENDS THAT KIND** -- `seat-tick.ps1:743` is its only send call and passes no `-Kind`, so ticks default to `note`. Full census of 16,747 mailbox files, 0 unparseable: 1,394 bodies contain `CLOCK TICK` (positive control, so a zero would be real), 1,392 are `note`, and ***ZERO of the 605 `broadcast` messages is a tick.*** ***ON THE CORRECT POPULATION THE SIGNATURE REPRODUCES POST-FIX:*** 731 firings, median inter-firing gap 10.0 min, median 2 recipients, and **324 of 731 (44.3 percent) reached EXACTLY ONE seat** -- against the row as filed at median 2 and ~47 percent. **The `NOT REPRODUCIBLE` verdict is an artefact of the wrong needle.**
 
 **Cluster:** Coordination / session clock. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) - this is fleet tooling. The cost is silent under-delivery of wake-ups, which is indistinguishable from a healthy quiet clock and therefore self-concealing.
@@ -14926,6 +14934,8 @@ writing to it.**
 already cite a different item for this change?*** It needs the file open. **As a dispatch instruction:
 read the function you are about to change, and grep it for a backlog number, before the first line of
 code.**
+
+***VERIFIED-BUT-NOT-CLOSEABLE 2026-08-24 (dispatcher, adversarial pass).*** ***THE MERGED LEDGER STATES THE CONVENTION FOR EXACTLY THIS CASE AND NAMES THIS ROW BY NUMBER.*** Open row `#1334` says an item retired in place **keeps its number, its banner and its fields**, and its table lists `#1332` as retired-in-place, duplicate of `#1086`, graded `ok`. **So this row's CURRENT OPEN STATE IS CORRECT and the defect is in `dispatch_gate.judge()`, not here.** *There is no banner today meaning retired-in-place; `#1334` says that needs a fourth banner key or a body marker.* ***Flipping this tombstone would pre-empt an unbuilt schema decision AND delete the live worked example `#1334`'s third gap is specified against.*** **The sibling `#1309` carries the identical sentence and is also OPEN.**
 
 **Cluster:** commit gates / secret scanning. **Priority:** P2. **Verdict:** build.
 **Severity:** false denies on the commit path. **Conditional, per section 0:** zero deployments; the
