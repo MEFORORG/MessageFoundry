@@ -33,6 +33,7 @@ from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     ADMIN_NEW_IP,
     EMAIL_CHANGED,
+    FEDERATED_IDENTITY_BOUND,
     LOGIN_AFTER_FAILURES,
     MFA_DISABLED,
     MFA_ENABLED,
@@ -1266,6 +1267,27 @@ class AuthService:
             # refused by the guard above. A matching binding is left untouched (no updated_at churn).
             await self._store.set_user_federated_subject(
                 user.id, federated_subject[0], federated_subject[1]
+            )
+            # BACKLOG #1248. Binding an external identity decides WHO MAY SIGN IN as this account
+            # from now on, so it is a privilege change and gets the same two records the role
+            # resync below emits: an audit row, and an out-of-band notice to the account holder
+            # (ASVS 6.3.7). Before this it was the only silent write in the method.
+            await self._audit(
+                "auth.federated_subject_bound",
+                actor=user.username,
+                detail=_json({"issuer": federated_subject[0], "subject": federated_subject[1]}),
+                client=client,
+            )
+            # THE NOTICE CARRIES THE ISSUER AND NOT THE SUBJECT, deliberately. The audit row needs
+            # the exact ``sub`` so an operator can tell two bindings apart; the account holder needs
+            # to know WHICH PROVIDER was linked, and an opaque identifier in an email tells them
+            # nothing while putting it somewhere less protected than the audit store.
+            await self._notify_security(
+                FEDERATED_IDENTITY_BOUND,
+                username=user.username,
+                email=user.email,
+                client=client,
+                detail={"issuer": federated_subject[0]},
             )
         role_ids = sorted(await self._store.roles_for_ad_groups(principal.groups))
         previous = set(await self._store.get_user_role_ids(user.id))
