@@ -10855,9 +10855,9 @@ gate is the wrong shape, validation of the walk is the right one.
 > **COUNT DRIFT, recorded so it is not read as a discrepancy:** this item says *"154 shell blocks; 154 failed"*; the same instrument reported **160 of 160** on 2026-08-14. **The corpus grew; the 100-percent signature -- which is the actual finding -- held at both sizes.**
 > **`#1272` IS THIS ITEM'S DUPLICATE and closes with a pointer here.** It was filed onto an unpushed branch and named the 160 where this one names the 154 -- **two symptoms of one PATH-order defect, filed twice because neither author could see the other's tree.** This number survives on a mechanical asymmetry, not on merit: **a landed item is amendable from any worktree; an unpushed one is editable only by the branch holder.**
 
-***VERIFIED FIXED ON MAIN 2026-08-23 -- FLIP-READY, NOT YET CLOSED.*** **All four resolving test modules import `tests/_bash_resolver.py`. No live `skipif` on bash existence remains anywhere in `tests/`.**
+***VERIFIED FIXED ON MAIN 2026-08-23, AND SINCE CLOSED -- the banner above carries the disposition.*** **All four resolving test modules import `tests/_bash_resolver.py`. No live `skipif` on bash existence remains anywhere in `tests/`.**
 *Control that qualifies it: `skipif` filtered to bash returned five lines, all prose; unfiltered `skipif` returned hits in dozens of test files.* **A search finding nothing anywhere is a broken search, not an absence, so the control is stated rather than implied.**
-***DECIDED BY READING THE CODE, NOT BY COUNTING CITATIONS*** -- *a citation is identity and the question was content (see `#1347`).* **Closing still needs the banner flip, the dropped Priority line and the move to the archive; this row records the measurement, not the disposition.**
+***DECIDED BY READING THE CODE, NOT BY COUNTING CITATIONS*** -- *a citation is identity and the question was content (see `#1347`).* **The banner flip has happened, so this row reads CLOSED to `parse_items`. The Priority line and the archive move are still outstanding, and both are batch hygiene across every closed row rather than anything this row is waiting on.**
 
 > **SHIPPED-BUT-OPEN 2026-08-22 -- builder-2 round 3, same [ADR 0165](adr/0165-a-builder-pr-satisfies-the-ledger-gate-with-a-paired-commit-authored-by-the-dispatcher-or-lander.md) pairing.** A shared resolver now finds a bash that can SEE this process's files, adopted in all four modules that resolve one.
 > **THE SECOND COMMIT IS THE ONE TO READ, AND IT IS AN ADMISSION.** The author's own positive control was an identity -- `assert bash_sees(require_bash(...))`, where `require_bash` returns only a candidate `bash_sees` has already approved, so it was true by construction and incapable of failing. Mutating the probe to `return True` left it GREEN while two sibling tests went red. It certified a resolver with no working namespace check: **the #1216 defect itself, one level up**, in a test written an hour earlier by someone who had spent the night on exactly that class. Kept as a separate commit deliberately, so folding it in cannot erase that it happened.
@@ -12225,9 +12225,9 @@ BUILDS it.*
 > Verdict: build
 > Closing-act: code
 
-***VERIFIED FIXED ON MAIN 2026-08-23 -- FLIP-READY, NOT YET CLOSED.*** **One implementation survives at `controlchars.py:67` with six real importers. The seven remaining `0x7F` lines are unrelated or excluded by this row's own terms.**
+***VERIFIED FIXED ON MAIN 2026-08-23, AND SINCE CLOSED -- the banner above carries the disposition.*** **One implementation survives at `controlchars.py:67` with six real importers. The seven remaining `0x7F` lines are unrelated or excluded by this row's own terms.**
 *Control that qualifies it: the `0x7F` sweep returned seven real hits INCLUDING the known-good `controlchars.py:67`, so the pattern matches this predicate's spelling.* **A search finding nothing anywhere is a broken search, not an absence, so the control is stated rather than implied.**
-***DECIDED BY READING THE CODE, NOT BY COUNTING CITATIONS*** -- *a citation is identity and the question was content (see `#1347`).* **Closing still needs the banner flip, the dropped Priority line and the move to the archive; this row records the measurement, not the disposition.**
+***DECIDED BY READING THE CODE, NOT BY COUNTING CITATIONS*** -- *a citation is identity and the question was content (see `#1347`).* **The banner flip has happened, so this row reads CLOSED to `parse_items`. The Priority line and the archive move are still outstanding, and both are batch hygiene across every closed row rather than anything this row is waiting on.**
 
 **Cluster:** Code quality / drift hazard. **Priority:** P3. **Verdict:** build (small).
 **Severity:** none today, and no deployment axis (§0).
@@ -12385,9 +12385,9 @@ BUILDS it.*
 > Verdict: build
 > Closing-act: code
 
-***VERIFIED FIXED ON MAIN 2026-08-23 -- FLIP-READY, NOT YET CLOSED.*** **`.pre-commit-config.yaml:178` wires `backlog-parses` to `backlog_status_check.py --quiet` -- the half this row was still open against.**
+***VERIFIED FIXED ON MAIN 2026-08-23, AND SINCE CLOSED -- the banner above carries the disposition.*** **`.pre-commit-config.yaml:178` wires `backlog-parses` to `backlog_status_check.py --quiet` -- the half this row was still open against.**
 *Control that qualifies it: `git grep` for `ledger-gate|backlog-parses` returned both, with the known-present `ledger-gate` proving the path resolves on `origin/main`.* **A search finding nothing anywhere is a broken search, not an absence, so the control is stated rather than implied.**
-***DECIDED BY READING THE CODE, NOT BY COUNTING CITATIONS*** -- *a citation is identity and the question was content (see `#1347`).* **Closing still needs the banner flip, the dropped Priority line and the move to the archive; this row records the measurement, not the disposition.**
+***DECIDED BY READING THE CODE, NOT BY COUNTING CITATIONS*** -- *a citation is identity and the question was content (see `#1347`).* **The banner flip has happened, so this row reads CLOSED to `parse_items`. The Priority line and the archive move are still outstanding, and both are batch hygiene across every closed row rather than anything this row is waiting on.**
 
 **Cluster:** Ledger tooling / silent-pass gate. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (§0) -- nothing shipped changes. The cost is a gate that certifies a file no one can parse.
@@ -14007,9 +14007,9 @@ class as the release gate `a92ab10f` fixed, and it is why (b) is not cosmetic.
 > Verdict: build
 > Closing-act: code
 
-***VERIFIED FIXED ON MAIN 2026-08-23 -- FLIP-READY, NOT YET CLOSED.*** **`release.yml:148-159` now exits 1 when `tar` fails or lists zero members, so the gate proves a listing happened before asking the allowlist question.**
+***VERIFIED FIXED ON MAIN 2026-08-23, AND SINCE CLOSED -- the banner above carries the disposition.*** **`release.yml:148-159` now exits 1 when `tar` fails or lists zero members, so the gate proves a listing happened before asking the allowlist question.**
 *Control that qualifies it: `grep -n '|| true'` returned 9 hits on the dumped blob and `tar tzf` returned 2, both inside comments -- the pattern demonstrably matches live text in that file.* **A search finding nothing anywhere is a broken search, not an absence, so the control is stated rather than implied.**
-***DECIDED BY READING THE CODE, NOT BY COUNTING CITATIONS*** -- *a citation is identity and the question was content (see `#1347`).* **Closing still needs the banner flip, the dropped Priority line and the move to the archive; this row records the measurement, not the disposition.**
+***DECIDED BY READING THE CODE, NOT BY COUNTING CITATIONS*** -- *a citation is identity and the question was content (see `#1347`).* **The banner flip has happened, so this row reads CLOSED to `parse_items`. The Priority line and the archive move are still outstanding, and both are batch hygiene across every closed row rather than anything this row is waiting on.**
 
 **Cluster:** CI reliability / supply chain. **Priority:** P1. **Verdict:** build.
 **Severity:** no engine-runtime effect and no deployment axis (sec. 0) -- but this is the **disclosure** path, not the deployment one, and publishing to PyPI is real and current. A silent pass here would let a regression in the `only-include` allowlist republish private documentation to a public index, which is what releases 0.1.0..0.2.15 already did once.
@@ -14019,9 +14019,9 @@ class as the release gate `a92ab10f` fixed, and it is why (b) is not cosmetic.
 > Verdict: build
 > Closing-act: code
 
-***VERIFIED FIXED ON MAIN 2026-08-23 -- FLIP-READY, NOT YET CLOSED.*** **`email.py:221` and `direct.py:243` both raise `ValueError` when `tls_check_hostname` is false and a username is set, outside any escape conditional.**
+***VERIFIED FIXED ON MAIN 2026-08-23, AND SINCE CLOSED -- the banner above carries the disposition.*** **`email.py:221` and `direct.py:243` both raise `ValueError` when `tls_check_hostname` is false and a username is set, outside any escape conditional.**
 *Control that qualifies it: `tls_verify` returned 7 hits from the pre-existing gates and `check_hostname` returned 5 in each file.* **A search finding nothing anywhere is a broken search, not an absence, so the control is stated rather than implied.**
-***DECIDED BY READING THE CODE, NOT BY COUNTING CITATIONS*** -- *a citation is identity and the question was content (see `#1347`).* **Closing still needs the banner flip, the dropped Priority line and the move to the archive; this row records the measurement, not the disposition.**
+***DECIDED BY READING THE CODE, NOT BY COUNTING CITATIONS*** -- *a citation is identity and the question was content (see `#1347`).* **The banner flip has happened, so this row reads CLOSED to `parse_items`. The Priority line and the archive move are still outstanding, and both are batch hygiene across every closed row rather than anything this row is waiting on.**
 
 **Cluster:** Security / transport posture. **Priority:** P1. **Verdict:** build.
 **Severity:** no exposure today ([§0](../CLAUDE.md) - zero deployments). **On first deployment**, a site that set `tls_check_hostname=false` would send SMTP AUTH credentials to any peer presenting a certificate that chains to the configured anchor, **regardless of the name on it**.
@@ -14207,9 +14207,9 @@ which both readings of the cell now require.
 > **WHAT IS NOT ESTABLISHED, stated so nobody reads more into it.** This is **at least one** observed failure. The rate under runner load was never measured, no re-run of the same head was recorded before the session ended, and no cross-branch pair like #1290's was collected. The mutation table above is the strong evidence here; the frequency is not.
 > **DO NOT MERGE THIS INTO #1290 -- same cluster, different failure.** #1290 is a process-table walk on hosted **Windows** that never completes, so its regression assertion never runs. This is a **ubuntu** bound that a fully completed, correct run exceeds. Neither fix touches the other's file.
 
-***VERIFIED FIXED ON MAIN 2026-08-23 -- FLIP-READY, NOT YET CLOSED.*** **The wall-clock bound is gone. `tests/test_adr0157_demote_teardown.py:161` asserts `width == _N_SOURCES`, and the file has no `import time` at all.**
+***VERIFIED FIXED ON MAIN 2026-08-23, AND SINCE CLOSED -- the banner above carries the disposition.*** **The wall-clock bound is gone. `tests/test_adr0157_demote_teardown.py:161` asserts `width == _N_SOURCES`, and the file has no `import time` at all.**
 *Control that qualifies it: `assert ` returned 41 hits, so the file was read; the elapsed/wall-clock pattern returned one docstring line and no assertion.* **A search finding nothing anywhere is a broken search, not an absence, so the control is stated rather than implied.**
-***DECIDED BY READING THE CODE, NOT BY COUNTING CITATIONS*** -- *a citation is identity and the question was content (see `#1347`).* **Closing still needs the banner flip, the dropped Priority line and the move to the archive; this row records the measurement, not the disposition.**
+***DECIDED BY READING THE CODE, NOT BY COUNTING CITATIONS*** -- *a citation is identity and the question was content (see `#1347`).* **The banner flip has happened, so this row reads CLOSED to `parse_items`. The Priority line and the archive move are still outstanding, and both are batch hygiene across every closed row rather than anything this row is waiting on.**
 
 **Cluster:** CI reliability / teardown tests. **Priority:** P2. **Verdict:** build.
 **Severity:** no deployment axis (sec. 0) -- `tests/` ships in no engine path. The cost is that a required context can redden on `main` from runner load alone, and that while it is loaded the test cannot perform the discrimination it was written for.
