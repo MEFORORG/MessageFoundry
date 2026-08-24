@@ -17,3 +17,17 @@
 # reworded. Anchored to the literal 'OIDC core <section>/<rule>' shape, so a real routable IP
 # elsewhere in claims.py (or anywhere else) still trips the scan.
 OIDC core \d+(?:\.\d+)+/\d+
+
+# Generated password-wordlist entries in messagefoundry/auth/data/common_passwords.txt that collide
+# with the estate-identifier SHAPE (a six-digit run joined to a letter-bearing segment). Nine lines
+# on main at 6e758a87; none is a site code. Seven are the wordlist's own ABUSE_<digits>_ABUSE
+# abuse-report markers, two are ordinary user passwords of the form word_word_<6 digits>.
+#
+# ALLOWLISTED RATHER THAN SKIPPING THE FILE, deliberately. tests/test_scan_tokens_source.py::
+# test_estate_identifier_shape_is_not_gated_by_the_site_skip_suffixes pins that this detector DOES
+# scan lock/SVG/password files, because a transform function name (`xform_<code>_to_erp_mfn`) inside
+# one is exactly as much of a leak as anywhere else. A file-level skip would buy the same green and
+# blind that case; these entries excuse only the shapes actually present.
+^ABUSE_\d{6}_ABUSE$
+^lky_vipnyc_\d{6}$
+^dungklose_\d{6}$
