@@ -122,7 +122,13 @@ def _touches_code(paths: list[str]) -> bool:
     for p in paths:
         # THE EXTENSION IS CHECKED FIRST, ON PURPOSE. It must OVERRIDE the location: the whole defect
         # is that a prefix let an executable declare itself documentation.
-        if p.endswith(_CODE_SUFFIXES):
+        #
+        # CASEFOLDED, because a case-SENSITIVE match here is the same defect one keystroke lower down:
+        # `_CODE_SUFFIXES` is all-lowercase, so a bare `endswith` reads `docs/Tool.PY` as documentation
+        # and hands back the hole this test just closed. #1345's own row names that shape -- "a test on
+        # the SPELLING of a path standing in for a question about what the file IS" -- and a suffix is
+        # every bit as spellable as a prefix.
+        if p.casefold().endswith(_CODE_SUFFIXES):
             return True
         if p.startswith(_DOC_PREFIXES):
             continue
