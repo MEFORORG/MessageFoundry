@@ -1,0 +1,63 @@
+# Judged username-as-access-key sites (BACKLOG #1226).
+#
+# A KEY IN THIS FILE RECORDS THAT A HUMAN HAS LOOKED AT THE SITE. It does NOT record that the site is
+# correct: one entry below is a CONFIRMED DEFECT that cannot be fixed inside this item. Treating the
+# baseline as an approval list would turn a screen the item explicitly designed to emit CANDIDATES
+# into the verdict-emitter it forbids.
+#
+# NO LINE NUMBERS, BY CONSTRUCTION. The key is `file::callee::slot`, because the same site is
+# `create_search_preset` or `upsert_search_preset` depending where you stand, at different lines
+# depending on your base. `Candidate.key` was written stable for this and went unused until now.
+#
+# A NEW KEY FAILS THE RUN. That is the whole point of wiring: read the site, decide, then add it here
+# with a reason. Adding a key without reading one is the only way to defeat this, and it is visible in
+# review because every line carries its reasoning.
+
+# ---- CORRECT BY DESIGN: the username is a display label, not a key -------------------------------
+
+# The item names this one itself: the username is deliberately the label while `uploader_id` carries
+# the access key. A screen that auto-classified would be wrong on its own author's code.
+app.py::save::uploader
+
+# Response-model fields. These SHOW a name to the caller; nothing is scoped by them.
+auth_routes.py::CurrentUser::username
+auth_routes.py::UserSummary::username
+auth_routes.py::UserPermissions::username
+
+# ---- CORRECT BY DESIGN: the username IS the subject of the operation ------------------------------
+
+# Looking a user up BY NAME is the function's entire purpose; there is no other key to use yet.
+auth_routes.py::get_user_by_username::arg0
+
+# Policy checks against the PROPOSED name, before any account exists to have an id.
+auth_routes.py::password_violations::username
+auth_routes.py::create_local_user::username
+
+# ---- CONFIRMED INSTANCE, ROUTED ONWARD, NOT FIXED HERE -------------------------------------------
+
+# `GET /me/security-events` -> AuthService.security_events_for(identity.username) ->
+# store.security_events_for_user(username), whose SQL is:
+#     SELECT ts, action, detail FROM audit_log WHERE actor = ? AND action LIKE 'auth.%'
+#
+# The username is not labelling a row here -- it IS the WHERE clause that decides which rows the
+# caller may see, which is this item's definition of the defect verbatim.
+#
+# The PRECEDING route handler in the same file, `my_sessions`, scopes on an immutable id --
+# `list_sessions(identity.user_id)`. That contrast is real but it is NOT evidence of an oversight:
+# the sessions table HAS a user id and `audit_log` does not. Measured on main: 9 `FROM audit_log`
+# sites in store.py, ZERO keyed on `user_id`, against a positive control of 1 keyed on `actor = ?`.
+# THE AUTHOR HAD NO IMMUTABLE KEY AVAILABLE AT THIS SITE.
+#
+# CONDITIONAL SEVERITY (CLAUDE.md section 0 -- zero deployments, nothing is exposed today): on a first
+# deployment, an operator who deleted a user and recreated the same username would hand the new
+# account holder the previous holder's sign-ins, lockouts and password changes.
+#
+# WHY IT IS NOT FIXED IN THIS ITEM, measured rather than assumed: `audit_log` has NO immutable key to
+# re-key onto. Its columns are id/ts/actor/action/channel_id/detail/client/row_hash -- `actor TEXT`
+# is the only identity, and a repo-wide grep for `user_id` against the audit store returns ZERO
+# against a positive control of 3 for `actor`. So the fix is a schema change to a table carrying a
+# `row_hash` TAMPER-EVIDENCE CHAIN, which is a different piece of work with different risks.
+#
+# Named as a subject, not a number, because no number is allocated for it: "the self-service
+# security-events view scopes on a reassignable username and audit_log has no immutable actor id".
+auth_routes.py::security_events_for::arg0
